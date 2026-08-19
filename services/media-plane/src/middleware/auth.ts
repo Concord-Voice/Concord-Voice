@@ -3,6 +3,7 @@ import { createHash, createHmac } from 'node:crypto';
 import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
 import { logger } from '../lib/logger.js';
+import type { TokenBucket } from '../lib/rateLimit.js';
 
 // CV-CAN-007: upper bound of a valid effective-permission bitfield. The
 // control-plane serializes it via strconv.FormatInt(int64(perms), 10) where
@@ -52,6 +53,8 @@ export interface AuthenticatedSocketData {
   avatarUrl?: string;
   roomId?: string;
   rtpCapabilities?: unknown;
+  /** Per-event rate-limit buckets (#2032). Freed with the socket. */
+  rateBuckets?: Map<string, TokenBucket>;
 }
 
 // ---------------------------------------------------------------------------

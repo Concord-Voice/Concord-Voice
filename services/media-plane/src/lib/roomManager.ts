@@ -184,6 +184,15 @@ export interface Participant {
   sendTransport: WebRtcTransport | null;
   /** Multiple recv transports (keyed by transport ID) — supports PiP windows */
   recvTransports: Map<string, WebRtcTransport>;
+  /**
+   * In-flight recv-transport reservations (#2032 / VULN-009). `createTransport`
+   * awaits the router before it can store the transport, so the committed
+   * `recvTransports` count alone is stale across that await — the #1539 TOCTOU
+   * class. Same discipline as `pendingProducerSources`: the committed count is
+   * DERIVED from the authoritative map, so only this one-await-wide delta ever
+   * needs an explicit release path.
+   */
+  pendingRecvTransports: number;
   producers: Map<string, { producer: Producer; source: MediaSource; kind: MediaKind }>;
   consumers: Map<string, Consumer>;
   rtpCapabilities: RtpCapabilities | null;
@@ -205,6 +214,36 @@ export interface Participant {
    * limiter state is freed on leave.
    */
   testingStatusChangeTimes?: number[];
+  /**
+   * Per-requester keyframe cooldown (#2032 / VULN-011), keyed by senderUserId.
+   * Lives on the REQUESTER so cleanup rides the participant lifecycle, exactly
+   * like testingStatusChangeTimes.
+   *
+   * Deliberately NOT a re-keyed room-level map: the room map's prune was
+   * `delete(participant.userId)`, a single-string key that only matches while
+   * the map is victim-keyed. Re-keying it to a (requester, sender) pair would
+   * silently turn that prune into a no-op and leak the map.
+   */
+  keyframeRequestCooldowns: Map<string, number>;
+  /**
+   * In-flight per-participant producer reservations (#2032), keyed by source.
+   * Mirrors `Room.pendingProducerCounts` in shape and lifetime: the committed
+   * count is DERIVED from `producers`, so only this one-await-wide pending
+   * delta ever needs an explicit release path.
+   */
+  pendingProducerSources: Map<MediaSource, number>;
+  /**
+   * Consume dedupe index (#2032 / VULN-010): `consumerKey(producerId,
+   * recvTransportId)` -> consumerId. Bounded by the recv-transport cap times the
+   * room's distinct producers — there is deliberately no absolute numeric
+   * backstop, the bound is derived.
+   */
+  consumersByKey: Map<string, string>;
+  /**
+   * Keys with a `consume()` in flight (#2032). Closes the window between the
+   * index read and the `await recvTransport.consume(...)` that commits it.
+   */
+  pendingConsumeKeys: Set<string>;
   // ── Per-user media entitlement (#1300) ─────────────────────────────────
   /**
    * Subscription tier label — server-authoritative (#1300, never
@@ -325,8 +364,6 @@ export interface Room {
   callParticipantHistory: Map<string, Date>;
   /** Channel rooms only (#1542): the server-owner cap tier from join-authorize. Undefined for DMs. */
   ownerTier?: string;
-  /** Last accepted keyframe request timestamp by sender user ID. */
-  keyframeRequestCooldowns: Map<string, number>;
   /** Raw client camera layer demand, parsed and stored by consumer ID. */
   cameraLayerDemands: Map<string, StoredCameraLayerDemand>;
   /** Current room-level camera layering gate state. */
@@ -395,6 +432,98 @@ export const PREMIUM_VIDEO_PUBLISHER_CAP = 25;
 export const PREMIUM_SCREEN_PRODUCER_CAP = 16;
 
 /**
+ * Per-PARTICIPANT concurrent-producer limits (#2032). A different axis from the
+ * per-room caps above: `resolveProducerCap` returns null for `mic` and
+ * `screen-audio` because a per-ROOM mic cap would be wrong at any value — a
+ * 1000-participant room legitimately carries 1000 live mics. The bound that
+ * actually holds for those sources is per participant.
+ *
+ * `camera` carries a HIGHER limit rather than no limit. The per-room cap (#1542)
+ * alone does not bound it in the way that matters: that cap is a SHARED
+ * resource, and `reserveProducerSlot` counts it room-wide with no per-owner
+ * term — so with no per-participant ceiling one member publishes all
+ * `freeVideoPublisherCap` cameras from a single send transport and every other
+ * member's camera is then refused with 'Video participant limit reached', a
+ * room-wide denial of service by one authenticated peer (#2032 red-team). The
+ * `produce` rate budget cannot bound it either: a budget refills, so it paces
+ * the squat without preventing it. 2 rather than 1 keeps a device switch (which
+ * may briefly hold the old and the new producer) and the plausible multi-camera
+ * client working, while making monopolization impossible for any room cap
+ * above it.
+ */
+export const MAX_PARTICIPANT_CAMERA_PRODUCERS = 2;
+
+const PARTICIPANT_PRODUCER_LIMITS: Partial<Record<MediaSource, number>> = {
+  mic: 1,
+  'screen-audio': 1,
+  screen: 1,
+  camera: MAX_PARTICIPANT_CAMERA_PRODUCERS,
+};
+
+/**
+ * Per-participant live receive-transport ceiling (#2032 / VULN-009). Sized for
+ * the main window plus PiP windows — `pipSignalingProxy.ts` legitimately opens a
+ * second recv transport on the main window's socket.
+ *
+ * This cap is also what makes the consume dedupe key finite: its third component
+ * is the recv transport ID, so without a bound on recv transports the key would
+ * carry an unbounded dimension and an attacker could re-consume one producer
+ * once per newly created transport. The two are inseparable.
+ */
+export const MAX_RECV_TRANSPORTS_PER_PARTICIPANT = 4;
+
+/**
+ * Consume dedupe key.
+ *
+ * THREE parts on purpose — (participant, producerId, recvTransportId), the
+ * participant being the map's owner. VULN-010 proposes the two-part
+ * (consumerUserId, producerId), which is wrong here: `pipSignalingProxy.ts:231`
+ * creates a second recv transport on the main window's socket, `:250` consumes
+ * the same producer, and `:351-373` PAUSES — does not close — the main window's
+ * matching consumers. One participant therefore legitimately holds two live
+ * consumers for one producer on two transports, and a two-part key would hand
+ * the PiP window the paused main-window consumer so its video never started.
+ * Do not "simplify" this; the PiP test in roomManager.test.ts locks it.
+ *
+ * The transport component MUST come from the RESOLVED transport, never from the
+ * caller's optional `transportId` argument — `consume()` falls back to the first
+ * recv transport when it is omitted, so keying on the argument would give two
+ * calls that resolve to the same transport two different keys and silently
+ * disable the dedupe.
+ */
+function consumerKey(producerId: string, recvTransportId: string): string {
+  return `${producerId}|${recvTransportId}`;
+}
+
+/**
+ * The `consume()` wire response for a consumer. Shared by the fresh-create and
+ * the idempotent-hit paths (#2032) so the two can never describe the same
+ * consumer differently.
+ */
+function describeConsumer(
+  consumer: Consumer,
+  producerId: string,
+  producerUserId: string,
+  source: MediaSource
+): {
+  id: string;
+  producerId: string;
+  kind: MediaKind;
+  rtpParameters: RtpParameters;
+  producerUserId: string;
+  source: MediaSource;
+} {
+  return {
+    id: consumer.id,
+    producerId,
+    kind: consumer.kind as MediaKind,
+    rtpParameters: consumer.rtpParameters,
+    producerUserId,
+    source,
+  };
+}
+
+/**
  * Resolve a room's cap tier (#1542). Channels follow the SERVER's Mach tier
  * (the server SUBSCRIPTION provisions the room's egress capacity — neither a
  * premium member nor a premium owner on a free server may raise a large/public
@@ -418,7 +547,15 @@ export function resolveRoomCapTier(room: Room): 'free' | 'premium' {
   return room.ownerTier === 'premium' ? 'premium' : 'free';
 }
 
-/** Per-sender keyframe request cooldown; mirrors the client-side E2EE recovery cooldown. */
+/**
+ * Per-(requester, sender) keyframe cooldown; mirrors the client-side E2EE
+ * recovery cooldown. Composes with — and is tighter than — the general
+ * per-socket `request-keyframe` budget in rateLimit.ts: the budget bounds how
+ * fast one socket may ask, this bounds how often one requester may ask about
+ * one sender. It is deliberately NOT per-sender-only: a shared victim-keyed
+ * slot let one viewer deny keyframe recovery to every other viewer of that
+ * sender (#2032 / VULN-011).
+ */
 export const KEYFRAME_REQUEST_COOLDOWN_MS = 5000;
 
 /**
@@ -1013,7 +1150,6 @@ export class RoomManager {
         roomKind: roomContext?.roomKind ?? 'channel',
         callParticipantHistory: new Map(),
         ownerTier: roomContext?.ownerTier,
-        keyframeRequestCooldowns: new Map(),
         cameraLayerDemands: new Map(),
         cameraLayeringGateEnabled: false,
         screenLayerDemands: new Map(),
@@ -1085,8 +1221,7 @@ export class RoomManager {
     const room = this.rooms.get(roomId);
     if (!room || (expectedRoom && room !== expectedRoom)) return;
 
-    const hasAdmittedDMHistory =
-      room.roomKind === 'dm' && room.callParticipantHistory.size > 0;
+    const hasAdmittedDMHistory = room.roomKind === 'dm' && room.callParticipantHistory.size > 0;
     if (hasAdmittedDMHistory && room.callId) {
       this.rememberClosedDMCall(room.callId);
     }
@@ -1167,9 +1302,7 @@ export class RoomManager {
       !existing &&
       room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS
     ) {
-      throw new Error(
-        `Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`
-      );
+      throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
     }
 
     // Per-user media caps (#1300): from the parsed control-plane entitlement,
@@ -1185,14 +1318,19 @@ export class RoomManager {
       avatarUrl,
       sendTransport: null,
       recvTransports: new Map(),
+      pendingRecvTransports: 0,
       producers: new Map(),
       consumers: new Map(),
+      consumersByKey: new Map(),
+      pendingConsumeKeys: new Set(),
       rtpCapabilities: rtpCapabilities ?? null,
       joinedAt: new Date(),
       serverMuted: false,
       serverDeafened: false,
       isDeafened: false,
       isTesting: false,
+      keyframeRequestCooldowns: new Map(),
+      pendingProducerSources: new Map(),
       tier: ent.tier,
       maxManualBitrateBps: ent.maxManualBitrateBps,
       allowedAudioTiers: [...ent.allowedAudioTiers],
@@ -1533,10 +1671,22 @@ export class RoomManager {
       roomId,
       participant.userId
     );
-    room.keyframeRequestCooldowns.delete(participant.userId);
+    // The leaver's OWN cooldown map is freed with the Participant object
+    // (#2032). What is not freed is the leaver's entry inside every REMAINING
+    // participant's map — those are keyed by sender userId and would otherwise
+    // accumulate one dead entry per departed sender for the life of a long
+    // session (#2032 red-team). Prune them here, alongside the layer demands.
+    this.clearKeyframeCooldownsForSender(room, participant.userId);
 
     this.closeParticipantTransports(participant);
     return removedCameraProducer;
+  }
+
+  /** Drop a departing sender's keyframe-cooldown entry from every requester. */
+  private clearKeyframeCooldownsForSender(room: Room, senderUserId: string): void {
+    for (const [, requester] of room.participants) {
+      requester.keyframeRequestCooldowns.delete(senderUserId);
+    }
   }
 
   private closeParticipantConsumers(participant: Participant): void {
@@ -1544,6 +1694,34 @@ export class RoomManager {
       if (!consumer.closed) consumer.close();
     }
     participant.consumers.clear();
+    // Fourth consumer-removal convergence point (#2032): every consumer just
+    // went away, so the whole dedupe index goes with them.
+    participant.consumersByKey.clear();
+  }
+
+  /**
+   * Drop one consumer from the dedupe index (#2032). Used by the explicit
+   * `closeConsumer` path, which has only a consumerId — mediasoup's
+   * `transportclose` / `producerclose` handlers do NOT fire there, and they are
+   * the ones that close over the key directly.
+   *
+   * The transport half of the key is recovered from the SERVER-SET `appData`,
+   * never from client input. A malformed/legacy appData leaves the entry in
+   * place, which is safe rather than fail-open: the consumer is already gone, so
+   * the next `consume()` for that pair finds a dead entry and prunes it.
+   */
+  private clearConsumerIndexEntry(participant: Participant, consumer: Consumer): void {
+    const appData = consumer.appData as
+      { producerId?: unknown; recvTransportId?: unknown } | undefined;
+    if (typeof appData?.producerId !== 'string' || typeof appData?.recvTransportId !== 'string') {
+      return;
+    }
+    const key = consumerKey(appData.producerId, appData.recvTransportId);
+    // Only clear the entry if it still points at THIS consumer — never evict a
+    // successor that has already claimed the pair.
+    if (participant.consumersByKey.get(key) === consumer.id) {
+      participant.consumersByKey.delete(key);
+    }
   }
 
   private closeParticipantProducers(
@@ -1594,17 +1772,27 @@ export class RoomManager {
     const participant = room.participants.get(userId);
     if (!participant) throw new Error('Participant not found in room');
 
-    const transport = await room.router.createWebRtcTransport({
-      listenIps: config.mediasoup.webRtcTransport.listenIps,
-      enableUdp: config.mediasoup.webRtcTransport.enableUdp,
-      enableTcp: config.mediasoup.webRtcTransport.enableTcp,
-      preferUdp: config.mediasoup.webRtcTransport.preferUdp,
-      initialAvailableOutgoingBitrate:
-        config.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
-    });
+    // Receive-transport cap (#2032 / VULN-009). Synchronous check-and-reserve
+    // with no intervening await, the #1539 TOCTOU-safe shape — otherwise N
+    // concurrent create-transport calls all pass a stale pre-await count.
+    if (direction === 'recv') this.reserveRecvTransportSlot(participant);
 
-    // Set max incoming bitrate.
-    //
+    let transport: WebRtcTransport;
+    try {
+      transport = await room.router.createWebRtcTransport({
+        listenIps: config.mediasoup.webRtcTransport.listenIps,
+        enableUdp: config.mediasoup.webRtcTransport.enableUdp,
+        enableTcp: config.mediasoup.webRtcTransport.enableTcp,
+        preferUdp: config.mediasoup.webRtcTransport.preferUdp,
+        initialAvailableOutgoingBitrate:
+          config.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
+      });
+    } catch (err) {
+      // A failed create must not consume a slot for the rest of the session.
+      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+      throw err;
+    }
+
     // Per-user tier gating (#1300): `setMaxIncomingBitrate` caps the aggregate
     // bitrate the SFU will ACCEPT from this transport — i.e. it caps what the
     // peer can SEND. The producing direction is the `send` transport (the peer
@@ -1630,47 +1818,23 @@ export class RoomManager {
       direction === 'send'
         ? participant.maxManualBitrateBps
         : config.mediasoup.webRtcTransport.maxIncomingBitrate;
-    if (incomingBitrateCap) {
-      try {
-        await transport.setMaxIncomingBitrate(incomingBitrateCap);
-      } catch (err) {
-        // WebRtcTransport ALWAYS supports setMaxIncomingBitrate (unlike Plain/
-        // Pipe transports, which we never create here), so a failure is not a
-        // capability gap — it is a transient worker error. We do NOT fail the
-        // join closed: a legitimate peer should not be blocked by a flaky
-        // worker call. But the fail-open IS observable — the send transport is
-        // left at the mediasoup default (effectively uncapped), so the per-user
-        // bitrate cap silently does not apply for this session. Log it PII-safe
-        // (ids + direction only — NEVER identity/display fields or the err
-        // object, per observability.md #1/#2) so the uncapped state can be
-        // monitored, then proceed.
-        logger.warn(
-          'setMaxIncomingBitrate failed — send transport left uncapped (#1300 fail-open)',
-          {
-            roomId,
-            userId,
-            direction,
-            transportId: transport.id,
-            error: err instanceof Error ? err.message : 'unknown',
-          }
-        );
-      }
+    await this.applyIncomingBitrateCap(transport, incomingBitrateCap, {
+      roomId,
+      userId,
+      direction,
+    });
+
+    // The participant may have left — or reconnected onto a FRESH Participant
+    // object — while the router call was in flight. Storing here would attach
+    // the transport to a detached object that nothing ever closes and that the
+    // recv cap cannot see. Close the orphan and fail closed (#2032).
+    if (room.participants.get(userId) !== participant) {
+      if (!transport.closed) transport.close();
+      if (direction === 'recv') this.releaseRecvTransportReservation(participant);
+      throw new Error('Participant left during transport creation');
     }
 
-    // Store on participant
-    if (direction === 'send') {
-      if (participant.sendTransport && !participant.sendTransport.closed) {
-        participant.sendTransport.close();
-      }
-      participant.sendTransport = transport;
-    } else {
-      // Multiple recv transports are allowed (main window + PiP windows)
-      participant.recvTransports.set(transport.id, transport);
-      // Clean up map entry when router closes the transport
-      transport.on('routerclose', () => {
-        participant.recvTransports.delete(transport.id);
-      });
-    }
+    this.commitTransportToParticipant(participant, transport, direction);
 
     // Log ICE/DTLS state transitions for diagnostics
     const iceLogLevel: Record<string, string> = {
@@ -1907,20 +2071,35 @@ export class RoomManager {
     // permissions before reserving a producer slot (throws on denial).
     assertPublishPermitted(participant, kind, source);
 
-    // Screen-video produce guards (#1924 review fixes A/B): one screen producer
-    // per participant, and simulcast requires the sharer's server-authoritative
-    // screen-layering gate. Synchronous, BEFORE the reservation + produce()
-    // await so a reject never leaks a slot or yields a briefly-existing producer.
+    // Screen-video simulcast guard (#1924 fix A): simulcast requires the
+    // sharer's server-authoritative screen-layering gate. Synchronous, BEFORE
+    // the reservations + produce() await so a reject never leaks a slot or
+    // yields a briefly-existing producer. The one-screen-per-participant half
+    // of #1924 now rides the per-participant reservation below (#2032).
     if (kind === 'video' && source === 'screen') {
-      this.validateScreenVideoSource(room, participant, userId, rtpParameters);
+      this.validateScreenVideoSource(room, userId, rtpParameters);
     }
+
+    // Enforce per-PARTICIPANT concurrent-producer slots (#2032): one live mic,
+    // one screen-audio, one screen. Ordered BEFORE the per-room reservation so a
+    // participant-level reject reports the participant-level reason, and inside
+    // the same no-await section so the two reservations cannot interleave.
+    const participantSlotReserved = this.reserveParticipantProducerSlot(participant, source);
 
     // Enforce per-room concurrent-producer caps (#1542 tier-resolved: camera
     // free 8 / premium 25; screen free 1 / premium 3). TOCTOU-safe (#1539): the
     // check + slot reservation run synchronously with no intervening await, so
     // concurrent invocations observe each other's reservations. The reservation
     // is released once the producer is recorded or if produce() fails.
-    const producerCap = this.reserveProducerSlot(room, source);
+    let producerCap: number | null;
+    try {
+      producerCap = this.reserveProducerSlot(room, source);
+    } catch (err) {
+      // The per-room cap rejected after the participant slot was taken. Release
+      // it here or the participant leaks a pending slot for the whole session.
+      this.releaseParticipantProducerReservation(participant, source, participantSlotReserved);
+      throw err;
+    }
 
     let producer: Producer;
     try {
@@ -1931,12 +2110,28 @@ export class RoomManager {
       });
     } catch (err) {
       this.releaseProducerReservation(room, source, producerCap);
+      this.releaseParticipantProducerReservation(participant, source, participantSlotReserved);
       throw err;
     }
 
+    // The participant may have left — or reconnected onto a FRESH Participant
+    // object — while produce() was in flight. Storing here would attach the
+    // producer to a detached object that no cleanup path walks: leaveRoom
+    // already closed the old participant's producers, and the room's caps count
+    // from the CURRENT participants, so the producer would keep a mediasoup
+    // encoder alive with nothing left to close it. Same hazard, and the same
+    // fix, as createTransport's post-await identity check. (#2793 CodeRabbit.)
+    if (room.participants.get(userId) !== participant) {
+      if (!producer.closed) producer.close();
+      this.releaseProducerReservation(room, source, producerCap);
+      this.releaseParticipantProducerReservation(participant, source, participantSlotReserved);
+      throw new Error('Participant left during producer creation');
+    }
+
     participant.producers.set(producer.id, { producer, source, kind });
-    // Release the reservation: the producer is now counted via participant.producers.
+    // Release both reservations: the producer is now counted via participant.producers.
     this.releaseProducerReservation(room, source, producerCap);
+    this.releaseParticipantProducerReservation(participant, source, participantSlotReserved);
 
     await this.enforceAndTrackRegisteredProducer(
       room,
@@ -2014,7 +2209,10 @@ export class RoomManager {
     if (!sender) throw new Error('Sender not found');
 
     const now = Date.now();
-    const lastRequest = room.keyframeRequestCooldowns.get(senderUserId) ?? 0;
+    // Cooldown state lives on the REQUESTER (#2032 / VULN-011): a sender-keyed
+    // room map gave every viewer of one sender a single shared 5 s slot, so one
+    // viewer could hold it and deny keyframe recovery to all the others.
+    const lastRequest = requester.keyframeRequestCooldowns.get(senderUserId) ?? 0;
     if (now - lastRequest < KEYFRAME_REQUEST_COOLDOWN_MS) return 0;
 
     const videoProducerIds = [...sender.producers.values()]
@@ -2033,11 +2231,11 @@ export class RoomManager {
     );
     if (videoConsumers.length === 0) return 0;
 
-    room.keyframeRequestCooldowns.set(senderUserId, now);
+    requester.keyframeRequestCooldowns.set(senderUserId, now);
     try {
       await Promise.all(videoConsumers.map((consumer) => consumer.requestKeyFrame()));
     } catch (error) {
-      room.keyframeRequestCooldowns.delete(senderUserId);
+      requester.keyframeRequestCooldowns.delete(senderUserId);
       throw error;
     }
     logger.debug('Requested producer keyframe', {
@@ -2159,19 +2357,44 @@ export class RoomManager {
       return null;
     }
 
-    // Create consumer on the specified (or default) recv transport
-    const newConsumer = await recvTransport.consume({
-      producerId,
-      rtpCapabilities: consumer.rtpCapabilities,
-      paused: true, // Start paused — client resumes after setup
-      appData: {
-        source: producerEntry.source,
-        producerUserId,
-        producerId,
-      },
-    });
+    // Consume dedupe (#2032 / VULN-010). The key is built from the RESOLVED
+    // transport, never from the optional `transportId` argument — see
+    // consumerKey's note. Everything from here to the index write below is
+    // synchronous apart from the single create await it guards.
+    const key = consumerKey(producerId, recvTransport.id);
 
-    consumer.consumers.set(newConsumer.id, newConsumer);
+    const alreadyConsuming = this.resolveExistingConsumer(consumer, key);
+    if (alreadyConsuming) {
+      return describeConsumer(alreadyConsuming, producerId, producerUserId, producerEntry.source);
+    }
+
+    if (consumer.pendingConsumeKeys.has(key)) {
+      throw new Error('consume_in_progress');
+    }
+    consumer.pendingConsumeKeys.add(key);
+
+    // Create consumer on the specified (or default) recv transport
+    let newConsumer: Consumer;
+    try {
+      newConsumer = await recvTransport.consume({
+        producerId,
+        rtpCapabilities: consumer.rtpCapabilities,
+        paused: true, // Start paused — client resumes after setup
+        appData: {
+          source: producerEntry.source,
+          producerUserId,
+          producerId,
+          // Server-set (client-uninfluenceable), so `closeConsumer` — which has
+          // only a consumerId — can rebuild this consumer's dedupe key.
+          recvTransportId: recvTransport.id,
+        },
+      });
+
+      consumer.consumers.set(newConsumer.id, newConsumer);
+      consumer.consumersByKey.set(key, newConsumer.id);
+    } finally {
+      consumer.pendingConsumeKeys.delete(key);
+    }
 
     // Per-consumer priority (#1542): audio > screenshare > webcam so the SFU
     // sheds the cheapest-value stream first under BWE congestion. Non-fatal:
@@ -2191,20 +2414,7 @@ export class RoomManager {
     // keeps mediasoup defaults (per-frame thinning is cost-neutral). Non-fatal: a
     // setPreferredLayers worker error is logged PII-safe and consume proceeds, exactly
     // like the setPriority hint above.
-    if (
-      producerEntry.source === 'screen' &&
-      (newConsumer as { type?: unknown }).type === 'simulcast'
-    ) {
-      try {
-        await newConsumer.setPreferredLayers({ spatialLayer: 0, temporalLayer: 0 });
-      } catch {
-        logger.warn('Failed to seed screen consumer preferred layers', {
-          consumerId: newConsumer.id,
-          producerId,
-          source: producerEntry.source,
-        });
-      }
-    }
+    await this.seedScreenConsumerLayers(newConsumer, producerEntry.source, producerId);
 
     // Audio last-N (#1544): if this is a MIC audio consumer whose producer is not
     // currently in the top-N, start it last-N-paused (it was created paused:true)
@@ -2228,12 +2438,14 @@ export class RoomManager {
     // Clean up on close
     newConsumer.on('transportclose', () => {
       consumer.consumers.delete(newConsumer.id);
+      consumer.consumersByKey.delete(key);
       room.lastNPausedConsumers.delete(newConsumer.id);
       this.clearCameraLayerDemand(room, newConsumer.id);
       this.clearScreenLayerDemand(room, newConsumer.id);
     });
     newConsumer.on('producerclose', () => {
       consumer.consumers.delete(newConsumer.id);
+      consumer.consumersByKey.delete(key);
       room.lastNPausedConsumers.delete(newConsumer.id);
       this.clearCameraLayerDemand(room, newConsumer.id);
       this.clearScreenLayerDemand(room, newConsumer.id);
@@ -2251,14 +2463,7 @@ export class RoomManager {
       dtlsState: recvTransport.dtlsState,
     });
 
-    return {
-      id: newConsumer.id,
-      producerId,
-      kind: newConsumer.kind as MediaKind,
-      rtpParameters: newConsumer.rtpParameters,
-      producerUserId,
-      source: producerEntry.source,
-    };
+    return describeConsumer(newConsumer, producerId, producerUserId, producerEntry.source);
   }
 
   /** Resume a consumer (called after client has set up its decoder) */
@@ -2430,6 +2635,7 @@ export class RoomManager {
     // Explicit close does NOT fire the consumer's transportclose/producerclose
     // handlers, so clean up the last-N guard set here too (else the entry leaks).
     room.lastNPausedConsumers.delete(consumerId);
+    this.clearConsumerIndexEntry(participant, consumer);
     this.clearCameraLayerDemand(room, consumerId);
     this.clearScreenLayerDemand(room, consumerId);
     logger.debug('Consumer closed', { consumerId, roomId, userId });
@@ -3117,6 +3323,208 @@ export class RoomManager {
   }
 
   /**
+   * Reserve a per-PARTICIPANT producer slot (#2032). Same discipline as
+   * `reserveProducerSlot`: a synchronous check-and-reserve with no intervening
+   * await (the #1539 TOCTOU-safe path), so concurrent produces observe each
+   * other's reservations instead of all passing a stale pre-await count.
+   *
+   * The committed count is DERIVED from `participant.producers` — a derived
+   * count has no release path to leak — so only the pending delta returned here
+   * needs releasing. Returns true when a slot was taken (the caller must
+   * release it), false for a source with no per-participant limit.
+   */
+  private reserveParticipantProducerSlot(participant: Participant, source: MediaSource): boolean {
+    const limit = PARTICIPANT_PRODUCER_LIMITS[source];
+    if (limit === undefined) return false; // uncapped source — nothing reserved
+
+    let live = 0;
+    for (const [, info] of participant.producers) {
+      if (info.source === source && !info.producer.closed) live += 1;
+    }
+    const pending = participant.pendingProducerSources.get(source) ?? 0;
+    if (live + pending >= limit) {
+      throw new Error(this.participantCapExceededMessage(source));
+    }
+    participant.pendingProducerSources.set(source, pending + 1);
+    return true;
+  }
+
+  /**
+   * Per-participant slot-exceeded message. Static server-side strings only —
+   * the source is client-declared, so it is never interpolated (CWE-117). The
+   * `screen` wording is byte-identical to the pre-#2032 one-per-participant
+   * reject that `validateScreenVideoSource` used to raise.
+   */
+  private participantCapExceededMessage(source: MediaSource): string {
+    if (source === 'mic') return 'Participant already has an active microphone producer';
+    if (source === 'screen-audio') return 'Participant already has an active screen audio producer';
+    if (source === 'camera') {
+      return `Participant camera producer limit reached (max ${MAX_PARTICIPANT_CAMERA_PRODUCERS})`;
+    }
+    return 'Participant already has an active screen producer';
+  }
+
+  /**
+   * Reserve a receive-transport slot (#2032 / VULN-009). Same shape as
+   * `reserveParticipantProducerSlot`: synchronous check-and-reserve with no
+   * intervening await, committed count DERIVED from the authoritative
+   * `recvTransports` map so only the pending delta needs a release path.
+   *
+   * The live count PRUNES already-closed entries in the same synchronous pass.
+   * A transport torn down by ICE/DTLS failure emits no `routerclose` (that fires
+   * only when the ROUTER closes), so its map entry survives its own death —
+   * without this prune those corpses would hold the cap for the rest of the
+   * session and a legitimate PiP reopen would be refused. Check and cleanup are
+   * deliberately one code path: a separate sweep could drift out of step.
+   */
+  /**
+   * Apply the per-direction incoming-bitrate cap, failing OPEN on a worker
+   * error (#1300). Extracted from `createTransport` so that method stays under
+   * the cognitive-complexity budget; the fail-open rationale is unchanged.
+   *
+   * WebRtcTransport ALWAYS supports setMaxIncomingBitrate (unlike Plain/Pipe
+   * transports, which we never create here), so a failure is a transient worker
+   * error, not a capability gap. We do NOT fail the join closed — a legitimate
+   * peer should not be blocked by a flaky worker call — but the fail-open IS
+   * observable: the transport is left at the mediasoup default (effectively
+   * uncapped), so the per-user bitrate cap silently does not apply for this
+   * session. Logged PII-safe (ids + direction only — never identity/display
+   * fields or the err object, per observability.md #1/#2).
+   */
+  private async applyIncomingBitrateCap(
+    transport: WebRtcTransport,
+    cap: number | undefined,
+    ctx: { roomId: string; userId: string; direction: 'send' | 'recv' }
+  ): Promise<void> {
+    if (!cap) return;
+    try {
+      await transport.setMaxIncomingBitrate(cap);
+    } catch (err) {
+      logger.warn('setMaxIncomingBitrate failed — send transport left uncapped (#1300 fail-open)', {
+        roomId: ctx.roomId,
+        userId: ctx.userId,
+        direction: ctx.direction,
+        transportId: transport.id,
+        error: err instanceof Error ? err.message : 'unknown',
+      });
+    }
+  }
+
+  /**
+   * Commit a freshly-created transport to the authoritative participant maps.
+   *
+   * The recv reservation is released HERE, after the store — never between the
+   * create and the store, which would leave the cap momentarily blind to this
+   * transport (#2032). Extracted from `createTransport` to keep that method
+   * under the cognitive-complexity budget; ordering is unchanged.
+   */
+  private commitTransportToParticipant(
+    participant: Participant,
+    transport: WebRtcTransport,
+    direction: 'send' | 'recv'
+  ): void {
+    if (direction === 'send') {
+      if (participant.sendTransport && !participant.sendTransport.closed) {
+        participant.sendTransport.close();
+      }
+      participant.sendTransport = transport;
+      return;
+    }
+
+    // Multiple recv transports are allowed (main window + PiP windows).
+    participant.recvTransports.set(transport.id, transport);
+    // Clean up the map entry when the router closes the transport.
+    transport.on('routerclose', () => {
+      participant.recvTransports.delete(transport.id);
+    });
+    this.releaseRecvTransportReservation(participant);
+  }
+
+  /**
+   * Resolve a live consumer already serving this `(producer, recvTransport)`
+   * key, or `undefined` when a fresh one must be created.
+   *
+   * A hit is idempotent SUCCESS, not an error: a retried or duplicated consume
+   * gets the consumer it already has rather than minting a second one that
+   * nothing will ever close. A stale entry — whose consumer was closed by a
+   * path that could not recover the key — is pruned here, so the index
+   * self-heals instead of sealing the pair off permanently.
+   *
+   * Extracted from `consume` to keep that method under the
+   * cognitive-complexity budget. Purely synchronous, so it stays inside the
+   * no-await window the dedupe depends on.
+   */
+  /**
+   * Default-low seed for a simulcast SCREEN consumer: quality is earned from
+   * demand, never given away by default. SVC screen keeps mediasoup defaults
+   * (per-frame thinning is cost-neutral).
+   *
+   * Non-fatal by design — a setPreferredLayers worker error is logged PII-safe
+   * and the consume proceeds, exactly like the setPriority hint. Extracted from
+   * `consume` to keep that method under the cognitive-complexity budget;
+   * behaviour and ordering are unchanged.
+   */
+  private async seedScreenConsumerLayers(
+    newConsumer: Consumer,
+    source: MediaSource,
+    producerId: string
+  ): Promise<void> {
+    if (source !== 'screen') return;
+    if ((newConsumer as { type?: unknown }).type !== 'simulcast') return;
+
+    try {
+      await newConsumer.setPreferredLayers({ spatialLayer: 0, temporalLayer: 0 });
+    } catch {
+      logger.warn('Failed to seed screen consumer preferred layers', {
+        consumerId: newConsumer.id,
+        producerId,
+        source,
+      });
+    }
+  }
+
+  private resolveExistingConsumer(participant: Participant, key: string): Consumer | undefined {
+    const existingId = participant.consumersByKey.get(key);
+    if (!existingId) return undefined;
+
+    const existing = participant.consumers.get(existingId);
+    if (existing && !existing.closed) return existing;
+
+    participant.consumersByKey.delete(key);
+    return undefined;
+  }
+
+  private reserveRecvTransportSlot(participant: Participant): void {
+    for (const [id, transport] of participant.recvTransports) {
+      if (transport.closed) participant.recvTransports.delete(id);
+    }
+
+    const live = participant.recvTransports.size + participant.pendingRecvTransports;
+    if (live >= MAX_RECV_TRANSPORTS_PER_PARTICIPANT) {
+      throw new Error(
+        `Receive transport limit reached (max ${MAX_RECV_TRANSPORTS_PER_PARTICIPANT})`
+      );
+    }
+    participant.pendingRecvTransports += 1;
+  }
+
+  /** Release a receive-transport reservation. */
+  private releaseRecvTransportReservation(participant: Participant): void {
+    participant.pendingRecvTransports = Math.max(0, participant.pendingRecvTransports - 1);
+  }
+
+  /** Release a per-participant reservation (no-op when none was taken). */
+  private releaseParticipantProducerReservation(
+    participant: Participant,
+    source: MediaSource,
+    reserved: boolean
+  ): void {
+    if (!reserved) return;
+    const pending = participant.pendingProducerSources.get(source) ?? 0;
+    participant.pendingProducerSources.set(source, Math.max(0, pending - 1));
+  }
+
+  /**
    * Audio last-N (#1544) producer-close cleanup: drop a removed producer from the
    * active-speaker decision set and the last-N-managed mic set. Idempotent and
    * safe to call for ANY producer removal — `remove`/`delete` are no-ops for
@@ -3296,37 +3704,32 @@ export class RoomManager {
   }
 
   /**
-   * Screen-VIDEO produce guards (#1924 review fixes A + B). Runs synchronously
-   * BEFORE the cap reservation and the `sendTransport.produce()` await, so a
+   * Screen-VIDEO simulcast guard (#1924 review fix A). Runs synchronously
+   * BEFORE the cap reservations and the `sendTransport.produce()` await, so a
    * reject never leaks a reserved slot or yields a briefly-existing producer
    * (the same TOCTOU-safe discipline as the per-room caps).
    *
-   *  - FIX "B": one active screen producer per participant. A patched client
-   *    cannot publish a 2nd `source: 'screen'` producer without closing the
-   *    first (composes with the per-room #1542 screen cap).
-   *  - FIX "A": simulcast screen publishing (more than one encoding) requires
-   *    the sharer's server-authoritative screen-layering gate to be ENABLED.
-   *    The gate only turns on once the sharer has a heterogeneous viewer pair —
-   *    exactly what triggers a legit client to reproduce its screen as 3-layer
-   *    simulcast — so a patched client publishing simulcast with the gate OFF is
-   *    rejected here. This makes the gate hold against a non-cooperative client
-   *    instead of being a mere client-side signal. A single-encoding screen
-   *    produce is ALWAYS allowed. Static message — never interpolate a
-   *    client-supplied value (CWE-117).
+   * Simulcast screen publishing (more than one encoding) requires the sharer's
+   * server-authoritative screen-layering gate to be ENABLED. The gate only
+   * turns on once the sharer has a heterogeneous viewer pair — exactly what
+   * triggers a legit client to reproduce its screen as 3-layer simulcast — so a
+   * patched client publishing simulcast with the gate OFF is rejected here.
+   * This makes the gate hold against a non-cooperative client instead of being
+   * a mere client-side signal. A single-encoding screen produce is ALWAYS
+   * allowed. Static message — never interpolate a client-supplied value
+   * (CWE-117).
+   *
+   * #1924 fix "B" (one active screen producer per participant) used to live
+   * here as a bare count check, which two concurrent produces both passed — a
+   * live TOCTOU of exactly the class #1539 closed for the per-room caps. It now
+   * lives in `reserveParticipantProducerSlot` (#2032), which raises the same
+   * message from inside the synchronous check-and-reserve section.
    */
   private validateScreenVideoSource(
     room: Room,
-    participant: Participant,
     userId: string,
     rtpParameters: RtpParameters
   ): void {
-    const hasActiveScreen = [...participant.producers.values()].some(
-      (info) => info.source === 'screen' && !info.producer.closed
-    );
-    if (hasActiveScreen) {
-      throw new Error('Participant already has an active screen producer');
-    }
-
     const encodingCount = rtpParameters.encodings?.length ?? 0;
     if (encodingCount > 1 && room.screenLayeringGateBySharer.get(userId) !== true) {
       throw new Error('Screen simulcast not authorized (screen-layering-gate disabled)');

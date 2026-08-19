@@ -453,6 +453,22 @@ export const config = {
     .map((s: string) => s.trim())
     .filter(Boolean),
 
+  // Peer addresses or CIDR blocks whose X-Real-IP / X-Forwarded-For may be
+  // trusted by the #2032 admission gate (`lib/admissionGate.ts`). nginx fronts
+  // the media-plane over a docker bridge, so entries are matched by RANGE — a
+  // bridge address is not a stable literal. Mirrors the control-plane's
+  // TRUSTED_PROXY_CIDRS; both compose files set a literal.
+  //
+  // An empty list makes the gate INERT (allow unconditionally, track nothing)
+  // rather than attributing every client to the proxy and sharing one handshake
+  // budget deployment-wide. Hence no fatal-exit guard: the misconfiguration
+  // degrades to the pre-gate behaviour and is logged once at startup, where a
+  // startup exit would take voice down.
+  trustedProxies: (process.env.TRUSTED_PROXIES ?? '')
+    .split(',')
+    .map((s: string) => s.trim())
+    .filter(Boolean),
+
   // Active speaker detection
   audioLevelObserver: {
     maxEntries: 1, // Report top 1 speaker

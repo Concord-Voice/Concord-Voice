@@ -23,6 +23,7 @@ import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
 import { RedisService } from './lib/redis.js';
 import { createExpressErrorHandler } from './lib/expressErrorHandler.js';
 import { createOriginGate } from './lib/originGate.js';
+import { createAdmissionGate } from './lib/admissionGate.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
@@ -41,12 +42,98 @@ import {
   runSocketBoundJoin,
   withKeyedJoinFence,
 } from './lib/socketJoinLifecycle.js';
+import { withRateLimit as registerRateLimited } from './lib/rateLimit.js';
+import type {
+  RateLimitDeps,
+  RateLimitedSocket,
+  RoomEventName,
+  SocketListener,
+} from './lib/rateLimit.js';
 
 const expectedKeyframeRequestErrors = new Set([
   'Room not found',
   'Requester not found',
   'Sender not found',
 ]);
+
+// ── #2032 rate-limit rejection diagnostic ────────────────────────────────
+// At most one warn per (event, userId) per minute: an attacker who can trip a
+// budget can otherwise turn the limiter's own log into the flood the limiter
+// exists to stop. The throttle map is bounded for the same reason — it must not
+// become the unbounded growth it prevents.
+const RATE_LIMIT_LOG_THROTTLE_MS = 60_000;
+const RATE_LIMIT_LOG_MAX_KEYS = 1024;
+const rateLimitLogLastEmittedMs = new Map<string, number>();
+
+/**
+ * True when this key has not been emitted inside the throttle window.
+ *
+ * Shared by BOTH limiter diagnostics (overflow rejections and handler
+ * failures): a handler-crash path is reachable by the same one-packet flood as
+ * an overflow, so it needs the same ceiling and the same bounded map. The key
+ * is namespaced per reporter so one does not starve the other.
+ */
+function shouldEmitRateLimitLog(key: string): boolean {
+  const nowMs = Date.now();
+  const lastMs = rateLimitLogLastEmittedMs.get(key);
+  if (lastMs !== undefined && nowMs - lastMs < RATE_LIMIT_LOG_THROTTLE_MS) return false;
+
+  if (rateLimitLogLastEmittedMs.size >= RATE_LIMIT_LOG_MAX_KEYS) {
+    for (const [trackedKey, emittedMs] of rateLimitLogLastEmittedMs) {
+      if (nowMs - emittedMs >= RATE_LIMIT_LOG_THROTTLE_MS) {
+        rateLimitLogLastEmittedMs.delete(trackedKey);
+      }
+    }
+    if (rateLimitLogLastEmittedMs.size >= RATE_LIMIT_LOG_MAX_KEYS) {
+      // Still full of in-window entries: evict the oldest insertion (Map
+      // preserves insertion order) rather than growing without limit.
+      const oldest = rateLimitLogLastEmittedMs.keys().next();
+      if (!oldest.done) rateLimitLogLastEmittedMs.delete(oldest.value);
+    }
+  }
+
+  rateLimitLogLastEmittedMs.set(key, nowMs);
+  return true;
+}
+
+function logRateLimitRejection(event: RoomEventName, userId: string): void {
+  if (!shouldEmitRateLimitLog(`reject|${event}|${userId}`)) return;
+  // PII-safe per observability.md #4: the event NAME and the authenticated
+  // userId only — never the rejected payload, never the peer address.
+  logger.warn('Socket event rate-limited', { event, userId });
+}
+
+function logSocketHandlerFailure(event: RoomEventName, userId: string): void {
+  if (!shouldEmitRateLimitLog(`handler-error|${event}|${userId}`)) return;
+  // Same PII-safe fields, and deliberately no error value: the wrapper does not
+  // hand one over, so no `Error.cause` chain can reach this sink
+  // (observability.md #3). Handlers log their own failures with their own
+  // context; this line reports the residue that escaped them.
+  logger.error('Socket handler failed', { event, userId });
+}
+
+const rateLimitDeps: RateLimitDeps = {
+  onReject: logRateLimitRejection,
+  onHandlerError: logSocketHandlerFailure,
+};
+
+/**
+ * Local binding of the shared #2032 wrapper that supplies the throttled
+ * rejection reporter to EVERY registration, so no call site can forget it.
+ *
+ * Keeping the three-argument shape is deliberate: it leaves the handler as the
+ * last argument, which is what lets all 18 conversions stay a pure
+ * `socket.on(` → `withRateLimit(socket, ` rename with untouched handler bodies.
+ * Passing `rateLimitDeps` positionally at each site would make the handler a
+ * non-final argument and force Prettier to re-indent every body.
+ */
+function withRateLimit<H extends SocketListener>(
+  socket: RateLimitedSocket,
+  event: RoomEventName,
+  handler: H
+): void {
+  registerRateLimited(socket, event, handler, rateLimitDeps);
+}
 
 // #1878: extracted from the join-room handler's catch block so that handler
 // stays under the S3776 cognitive-complexity limit. Logs the failure and sends
@@ -139,7 +226,8 @@ function registerJoinRoomHandler(
 
   // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion, callId? }
   // Server responds with: room-joined event containing router caps, existing producers, participants
-  socket.on(
+  withRateLimit(
+    socket,
     'join-room',
     async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion, callId }, callback?) => {
       // Claim before the first await: socket.data can name only one room, so a
@@ -538,6 +626,25 @@ async function main() {
       origin: createOriginGate(config.allowedOrigins),
       credentials: true,
     },
+    // #2032 admission layer — bounds what per-socket budgets structurally
+    // cannot: connection establishment, message size, and idle half-joins.
+    allowRequest: createAdmissionGate({
+      trustedProxies: config.trustedProxies,
+      onReject: () => mediaMetrics.incrementAdmissionRejected(),
+      // Startup-only configuration warnings (empty/invalid TRUSTED_PROXIES).
+      warn: (message) => logger.warn(message),
+    }),
+    // 256 KB. Largest legitimate inbound payload is join-room's
+    // rtpCapabilities (~8-20 KB); this gives ~12x headroom while cutting the
+    // 1 MB default 4x. NOTE: exceeding this CLOSES THE SESSION rather than
+    // rejecting one message, so it is sized conservatively on purpose.
+    maxHttpBufferSize: 262_144,
+    // Down from the 45 s default: this is the window a client holds a socket
+    // with zero authentication.
+    connectTimeout: 10_000,
+    // perMessageDeflate is left at its `false` default DELIBERATELY.
+    // Compression on attacker-controlled inbound payloads is a
+    // decompression-amplification vector. Do not enable it for "performance".
   });
 
   // Socket.IO JWT authentication middleware (A2)
@@ -678,7 +785,7 @@ async function main() {
 
     // ── update-rtp-capabilities ─────────────────────────────────────
     // Client sends this after device.load() to provide its actual RTP capabilities
-    socket.on('update-rtp-capabilities', ({ rtpCapabilities }, callback?) => {
+    withRateLimit(socket, 'update-rtp-capabilities', ({ rtpCapabilities }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -703,7 +810,7 @@ async function main() {
     });
 
     // ── create-transport ─────────────────────────────────────────────
-    socket.on('create-transport', async ({ direction }, callback) => {
+    withRateLimit(socket, 'create-transport', async ({ direction }, callback) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -739,81 +846,90 @@ async function main() {
     });
 
     // ── connect-transport ────────────────────────────────────────────
-    socket.on('connect-transport', async ({ transportId, dtlsParameters }, callback) => {
-      try {
-        const roomId = data.roomId;
-        if (!roomId) {
-          return callback({ error: 'Not in a room' });
+    withRateLimit(
+      socket,
+      'connect-transport',
+      async ({ transportId, dtlsParameters }, callback) => {
+        try {
+          const roomId = data.roomId;
+          if (!roomId) {
+            return callback({ error: 'Not in a room' });
+          }
+
+          logger.info('Transport connect requested', {
+            transportId,
+            roomId,
+            userId: data.userId,
+            dtlsRole: dtlsParameters?.role,
+          });
+
+          await roomManager.connectTransport(roomId, data.userId, transportId, dtlsParameters);
+          callback({ success: true });
+        } catch (error) {
+          logger.error('Error connecting transport', {
+            error,
+            userId: data.userId,
+            transportId,
+          });
+          callback({ error: 'Failed to connect transport' });
         }
-
-        logger.info('Transport connect requested', {
-          transportId,
-          roomId,
-          userId: data.userId,
-          dtlsRole: dtlsParameters?.role,
-        });
-
-        await roomManager.connectTransport(roomId, data.userId, transportId, dtlsParameters);
-        callback({ success: true });
-      } catch (error) {
-        logger.error('Error connecting transport', {
-          error,
-          userId: data.userId,
-          transportId,
-        });
-        callback({ error: 'Failed to connect transport' });
       }
-    });
+    );
 
     // ── produce ──────────────────────────────────────────────────────
     // Client sends: { transportId, kind, rtpParameters, appData: { source } }
-    socket.on('produce', async ({ transportId, kind, rtpParameters, appData }, callback) => {
-      try {
-        const roomId = data.roomId;
-        if (!roomId) {
-          return callback({ error: 'Not in a room' });
+    withRateLimit(
+      socket,
+      'produce',
+      async ({ transportId, kind, rtpParameters, appData }, callback) => {
+        try {
+          const roomId = data.roomId;
+          if (!roomId) {
+            return callback({ error: 'Not in a room' });
+          }
+
+          const source: MediaSource = appData?.source || 'mic';
+          const producerInfo = await roomManager.produce(
+            roomId,
+            data.userId,
+            transportId,
+            kind,
+            rtpParameters,
+            source
+          );
+
+          // Auto-pause audio producers for server-muted participants
+          const participant = roomManager.getParticipant(roomId, data.userId);
+          if (participant?.serverMuted && kind === 'audio') {
+            await roomManager.pauseProducer(roomId, data.userId, producerInfo.producerId);
+          }
+
+          // Notify other users in the room about the new producer
+          // Screen shares require opt-in (Tune In model) — not auto-consumed
+          socket.to(roomId).emit('new-producer', {
+            producerId: producerInfo.producerId,
+            userId: data.userId,
+            kind: producerInfo.kind,
+            source: producerInfo.source,
+            requiresOptIn:
+              producerInfo.source === 'screen' || producerInfo.source === 'screen-audio',
+          });
+
+          callback({ id: producerInfo.producerId });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to produce';
+          logger.error('Error producing', {
+            error: message,
+            userId: data.userId,
+          });
+          // Surface limit errors to client (e.g. "Video participant limit reached (max 25)")
+          callback({ error: message });
         }
-
-        const source: MediaSource = appData?.source || 'mic';
-        const producerInfo = await roomManager.produce(
-          roomId,
-          data.userId,
-          transportId,
-          kind,
-          rtpParameters,
-          source
-        );
-
-        // Auto-pause audio producers for server-muted participants
-        const participant = roomManager.getParticipant(roomId, data.userId);
-        if (participant?.serverMuted && kind === 'audio') {
-          await roomManager.pauseProducer(roomId, data.userId, producerInfo.producerId);
-        }
-
-        // Notify other users in the room about the new producer
-        // Screen shares require opt-in (Tune In model) — not auto-consumed
-        socket.to(roomId).emit('new-producer', {
-          producerId: producerInfo.producerId,
-          userId: data.userId,
-          kind: producerInfo.kind,
-          source: producerInfo.source,
-          requiresOptIn: producerInfo.source === 'screen' || producerInfo.source === 'screen-audio',
-        });
-
-        callback({ id: producerInfo.producerId });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Failed to produce';
-        logger.error('Error producing', {
-          error: message,
-          userId: data.userId,
-        });
-        // Surface limit errors to client (e.g. "Video participant limit reached (max 25)")
-        callback({ error: message });
       }
-    });
+    );
 
     // ── consume ──────────────────────────────────────────────────────
-    socket.on('consume', async ({ producerId, transportId }, callback) => {
+    withRateLimit(socket, 'consume', async ({ producerId, transportId }, callback) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -871,7 +987,7 @@ async function main() {
     });
 
     // ── request-keyframe ─────────────────────────────────────────────
-    socket.on('request-keyframe', async (payload, callback?) => {
+    withRateLimit(socket, 'request-keyframe', async (payload, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -900,7 +1016,7 @@ async function main() {
     });
 
     // ── resume-consumer ──────────────────────────────────────────────
-    socket.on('resume-consumer', async ({ consumerId }, callback?) => {
+    withRateLimit(socket, 'resume-consumer', async ({ consumerId }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -936,7 +1052,7 @@ async function main() {
     });
 
     // ── set-preferred-layers ─────────────────────────────────────────
-    socket.on('set-preferred-layers', async (payload, callback?) => {
+    withRateLimit(socket, 'set-preferred-layers', async (payload, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -956,7 +1072,7 @@ async function main() {
     });
 
     // ── pause-consumer ──────────────────────────────────────────────
-    socket.on('pause-consumer', async ({ consumerId }, callback?) => {
+    withRateLimit(socket, 'pause-consumer', async ({ consumerId }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -975,7 +1091,7 @@ async function main() {
     // ── close-consumer ──────────────────────────────────────────────
     // Client-initiated consumer close (e.g. tune-out of screen share).
     // Frees SFU resources and stops RTP forwarding for this consumer.
-    socket.on('close-consumer', ({ consumerId }, callback?) => {
+    withRateLimit(socket, 'close-consumer', ({ consumerId }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -1004,7 +1120,7 @@ async function main() {
     // ── close-recv-transport ────────────────────────────────────────
     // PiP and other secondary receivers explicitly release only their own
     // receive transport. Unknown/non-owned IDs are acknowledged identically.
-    socket.on('close-recv-transport', (payload: unknown, callback?: unknown) => {
+    withRateLimit(socket, 'close-recv-transport', (payload: unknown, callback?: unknown) => {
       let result: ReturnType<typeof handleCloseRecvTransport>;
       try {
         result = handleCloseRecvTransport(roomManager, data.roomId, data.userId, payload);
@@ -1019,7 +1135,7 @@ async function main() {
     });
 
     // ── pause-producer ───────────────────────────────────────────────
-    socket.on('pause-producer', async ({ producerId }, callback?) => {
+    withRateLimit(socket, 'pause-producer', async ({ producerId }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -1043,7 +1159,7 @@ async function main() {
     });
 
     // ── resume-producer ──────────────────────────────────────────────
-    socket.on('resume-producer', async ({ producerId }, callback?) => {
+    withRateLimit(socket, 'resume-producer', async ({ producerId }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -1084,18 +1200,18 @@ async function main() {
     // mirroring the self-mute `pause-producer` → `producer-paused` flow. Distinct
     // from the moderator `voice.enforce.deafen` NATS path. Logic lives in
     // lib/setDeafen.ts (unit-tested; mirrors the forceDisconnect extraction).
-    socket.on('set-deafen', ({ isDeafened }: { isDeafened?: unknown }, callback?) => {
+    withRateLimit(socket, 'set-deafen', ({ isDeafened }: { isDeafened?: unknown }, callback?) => {
       const result = handleSetDeafen(roomManager, socket, data.roomId, data.userId, isDeafened);
       if (callback) callback(result);
     });
 
-    socket.on('update-test-status', (payload: unknown, callback?) => {
+    withRateLimit(socket, 'update-test-status', (payload: unknown, callback?) => {
       const result = handleSetTestingStatus(roomManager, socket, data.roomId, data.userId, payload);
       if (callback) callback(result);
     });
 
     // ── close-producer ───────────────────────────────────────────────
-    socket.on('close-producer', async ({ producerId }, callback?) => {
+    withRateLimit(socket, 'close-producer', async ({ producerId }, callback?) => {
       try {
         const roomId = data.roomId;
         if (!roomId) {
@@ -1122,7 +1238,7 @@ async function main() {
     });
 
     // ── leave-room ───────────────────────────────────────────────────
-    socket.on('leave-room', async (_, callback?) => {
+    withRateLimit(socket, 'leave-room', async (_, callback?) => {
       try {
         await handleLeaveRoom(socket);
         if (callback) callback({ success: true });

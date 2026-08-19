@@ -22,6 +22,14 @@ export interface MetricsSnapshot {
   peakConcurrentVideoPublishersPerRoom: number;
   participantHoursByKind: { audio: number; webcam: number; screenshare: number };
   egress: { cumulativeBytes: number; currentBps: number; peakBps: number };
+  /**
+   * Handshakes refused by the pre-upgrade admission gate (#2032). A bare count:
+   * no address, no user, no room — the gate's onReject hook is given nothing
+   * else to pass (`observability.md` #2, and /health is aggregate-only).
+   * Deliberately NOT on AggregateMediaMetrics: that feeds the ops-metrics
+   * publisher, whose metric-key catalog is closed (ADR-0030).
+   */
+  admissionRejected: number;
 }
 
 export interface AggregateMediaMetrics {
@@ -50,6 +58,16 @@ export class MediaMetrics {
   private cumulativeBytes = 0;
   private currentBps = 0;
   private peakBps = 0;
+  private admissionRejected = 0;
+
+  /**
+   * Count one admission-gate rejection (#2032). Not fed by `ingest` because it
+   * is event-driven rather than sampled — the gate calls it from the pre-upgrade
+   * path, where no room state exists yet.
+   */
+  incrementAdmissionRejected(): void {
+    this.admissionRejected += 1;
+  }
 
   ingest(sample: MetricsSample, tickSeconds: number): void {
     this.participantSeconds.audio += sample.activeByKind.audio * tickSeconds;
@@ -93,6 +111,7 @@ export class MediaMetrics {
         currentBps: this.currentBps,
         peakBps: this.peakBps,
       },
+      admissionRejected: this.admissionRejected,
     };
   }
 
@@ -119,5 +138,6 @@ export class MediaMetrics {
     this.cumulativeBytes = 0;
     this.currentBps = 0;
     this.peakBps = 0;
+    this.admissionRejected = 0;
   }
 }

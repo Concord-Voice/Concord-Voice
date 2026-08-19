@@ -313,6 +313,19 @@ services:
       # its own copy to its cpus allocation — see docker-compose.production.yml.
       # A literal, not an interpolation: see the production file for why.
       NUM_WORKERS: "4"
+      # Peers whose X-Real-IP / X-Forwarded-For the #2032 admission gate trusts
+      # (src/lib/admissionGate.ts). Matched by CIDR, not string equality — the
+      # media-plane is reached through a docker bridge whose address is not a
+      # stable literal. 172.16.0.0/12 is docker's default address pool, so it
+      # covers both an nginx container on this network and the bridge gateway a
+      # host-level nginx arrives from; it is the same value the control-plane
+      # uses as its dev/CI TRUSTED_PROXY_CIDRS default.
+      #
+      # Unset would NOT be fail-safe in the useful sense: the gate turns itself
+      # off (allow-all, track nothing) rather than bucket every client under the
+      # proxy address, so the per-source-IP handshake ceiling simply stops
+      # existing. Same literal-not-interpolation rationale as NUM_WORKERS above.
+      TRUSTED_PROXIES: "172.16.0.0/12"
     ports:
       - "3000:3000"
       - "40000-40099:40000-40099/udp"  # RTC ports (limited range for dev)

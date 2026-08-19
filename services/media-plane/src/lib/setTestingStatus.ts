@@ -2,9 +2,11 @@ import type { RoomManager } from './roomManager.js';
 
 /**
  * Sliding-window rate limit for testing-status broadcasts (#2030 — the
- * interim mitigation promised by #1163 spec §7.5). The media-plane has no
- * general per-socket rate limiter (known gap), and every STATE-CHANGING
- * call here costs a room-wide broadcast. Only state changes count — the
+ * interim mitigation promised by #1163 spec §7.5). This composes ABOVE the
+ * general per-socket limiter (#2032): that budget is a coarse ceiling on how
+ * fast the event may arrive, while this window is the authoritative semantic
+ * limit, because every STATE-CHANGING call here costs a room-wide
+ * broadcast. Only state changes count — the
  * same-state idempotence guard already absorbs duplicates — so a
  * legitimate start/stop test cycle (2 changes) never trips the budget.
  */
