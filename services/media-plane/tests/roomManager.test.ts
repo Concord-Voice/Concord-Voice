@@ -2137,10 +2137,16 @@ describe('RoomManager', () => {
     });
 
     describe('per-participant producer slots (#2032)', () => {
-      /** Produce `source` for u-1 on the shared send transport with a fresh mock producer. */
+      /**
+       * Produce `source` for u-1 on the shared send transport, then run the
+       * supersede step exactly as the `produce` socket handler does (src/index.ts
+       * calls it after emitting `new-producer`). From a client's point of view
+       * the two are one operation, so the tests compose them the same way.
+       * `producerSupersession.test.ts` is what keeps the real handler honest.
+       */
       async function produceForU1(kind: 'audio' | 'video', source: MediaSource, id?: string) {
         transport.produce.mockResolvedValueOnce(createMockProducer({ kind, id }));
-        return manager.produce(
+        const info = await manager.produce(
           'room-1',
           'u-1',
           transport.id,
@@ -2148,6 +2154,8 @@ describe('RoomManager', () => {
           createRtpParameters() as any,
           source
         );
+        await manager.supersedeOlderCameraProducers('room-1', 'u-1', info.producerId, info.source);
+        return info;
       }
 
       it('rejects a second live microphone producer', async () => {
@@ -2279,14 +2287,103 @@ describe('RoomManager', () => {
         );
       });
 
-      it('caps one participant at MAX_PARTICIPANT_CAMERA_PRODUCERS cameras', async () => {
-        for (let i = 0; i < MAX_PARTICIPANT_CAMERA_PRODUCERS; i += 1) {
-          await expect(produceForU1('video', 'camera', `own-cam-${i}`)).resolves.toBeDefined();
-        }
+      /** Live camera producer IDs held by u-1, in creation order. */
+      function liveCameraIds(): string[] {
+        const participant = manager.getParticipant('room-1', 'u-1');
+        return [...(participant?.producers ?? [])]
+          .filter(([, info]) => info.source === 'camera')
+          .map(([producerId]) => producerId);
+      }
 
-        await expect(produceForU1('video', 'camera', 'own-cam-over')).rejects.toThrow(
-          `Participant camera producer limit reached (max ${MAX_PARTICIPANT_CAMERA_PRODUCERS})`
+      it('supersedes the previous camera rather than accumulating', async () => {
+        const events: unknown[] = [];
+        manager.onEvent((event) => events.push(event));
+
+        const first = await produceForU1('video', 'camera', 'own-cam-1');
+        expect(liveCameraIds()).toEqual(['own-cam-1']);
+
+        const second = await produceForU1('video', 'camera', 'own-cam-2');
+
+        // Steady state is ONE camera, and it is the NEW one.
+        expect(liveCameraIds()).toEqual(['own-cam-2']);
+        expect(second.producerId).toBe('own-cam-2');
+
+        // The superseded producer is genuinely closed, not merely unmapped —
+        // a map-only removal would leak a mediasoup encoder for the session.
+        expect(transport.produce.mock.results).toBeDefined();
+        expect(
+          events.some(
+            (event) =>
+              (event as { type?: string; producerId?: string }).type === 'producer-removed' &&
+              (event as { producerId?: string }).producerId === first.producerId
+          )
+        ).toBe(true);
+
+        // Addition is announced BEFORE the removal, so no viewer observes the
+        // publisher at zero cameras mid-switch.
+        const addedAt = events.findIndex(
+          (event) =>
+            (event as { type?: string; producerId?: string }).type === 'producer-added' &&
+            (event as { producerId?: string }).producerId === 'own-cam-2'
         );
+        const removedAt = events.findIndex(
+          (event) =>
+            (event as { type?: string; producerId?: string }).type === 'producer-removed' &&
+            (event as { producerId?: string }).producerId === first.producerId
+        );
+        expect(addedAt).toBeGreaterThanOrEqual(0);
+        expect(removedAt).toBeGreaterThan(addedAt);
+      });
+
+      it('leaves mic and screen producers untouched when a camera is superseded', async () => {
+        // The eviction filters on source. A bug here would close the user's
+        // microphone every time they switched camera.
+        await produceForU1('audio', 'mic', 'keep-mic');
+        await produceForU1('video', 'screen', 'keep-screen');
+        await produceForU1('video', 'camera', 'swap-cam-1');
+        await produceForU1('video', 'camera', 'swap-cam-2');
+
+        const sources = [...(manager.getParticipant('room-1', 'u-1')?.producers ?? [])].map(
+          ([producerId, info]) => [producerId, info.source]
+        );
+        expect(sources).toEqual([
+          ['keep-mic', 'mic'],
+          ['keep-screen', 'screen'],
+          ['swap-cam-2', 'camera'],
+        ]);
+      });
+
+      it('does not evict a live camera when a non-camera producer is created', async () => {
+        // The eviction walk stops at the NEW producer's own id and closes every
+        // camera it passed on the way. Without the source self-guard a mic
+        // produce would therefore collect every camera created before it and
+        // close them — turning your microphone on would kill your camera. The
+        // ordering here is the point: the camera must come FIRST.
+        await produceForU1('video', 'camera', 'survivor-cam');
+        await produceForU1('audio', 'mic', 'late-mic');
+        await produceForU1('video', 'screen', 'late-screen');
+
+        expect(liveCameraIds()).toEqual(['survivor-cam']);
+      });
+
+      it('keeps the existing camera when the replacement produce fails', async () => {
+        await produceForU1('video', 'camera', 'stable-cam');
+        transport.produce.mockRejectedValueOnce(new Error('transport exploded'));
+
+        await expect(
+          manager.produce(
+            'room-1',
+            'u-1',
+            transport.id,
+            'video',
+            createRtpParameters() as any,
+            'camera'
+          )
+        ).rejects.toThrow('transport exploded');
+
+        // Eviction runs only after the replacement is fully registered, so a
+        // failed switch must not leave the participant dark.
+        expect(liveCameraIds()).toEqual(['stable-cam']);
       });
 
       it('leaves the room camera cap available to other members (anti-squat, #2032)', async () => {
@@ -2295,12 +2392,14 @@ describe('RoomManager', () => {
         // ceiling u-1 takes all 8 slots and every other member's camera is
         // refused 'Video participant limit reached' — a room-wide DoS by one
         // authenticated peer (#2032 red-team FIX 2).
-        for (let i = 0; i < MAX_PARTICIPANT_CAMERA_PRODUCERS; i += 1) {
+        // Replace-in-place makes this stronger than the cap alone did: however
+        // many cameras u-1 publishes, each supersedes the last, so its share of
+        // the shared room cap converges on ONE rather than on the per-participant
+        // ceiling.
+        for (let i = 0; i < MAX_PARTICIPANT_CAMERA_PRODUCERS + 4; i += 1) {
           await produceForU1('video', 'camera', `squat-cam-${i}`);
         }
-        await expect(produceForU1('video', 'camera', 'squat-cam-over')).rejects.toThrow(
-          /Participant camera producer limit reached/
-        );
+        expect(liveCameraIds()).toEqual([`squat-cam-${MAX_PARTICIPANT_CAMERA_PRODUCERS + 3}`]);
 
         await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-cam-peer', 'sock-cam-peer', {
           username: 'peer',
@@ -2353,16 +2452,59 @@ describe('RoomManager', () => {
         );
       });
 
-      it('re-allows a camera producer once one of the live pair is closed', async () => {
-        const first = await produceForU1('video', 'camera', 'reuse-cam-1');
-        await produceForU1('video', 'camera', 'reuse-cam-2');
-        await expect(produceForU1('video', 'camera', 'reuse-cam-3')).rejects.toThrow(
-          /Participant camera producer limit reached/
+      it('leaves exactly one camera live when two produces interleave (mutual eviction)', async () => {
+        // Gitar review, PR #2824. `produce` handlers on one socket are not
+        // serialized — withRateLimit meters, it does not queue — and there is an
+        // await between recording a producer and evicting the older ones. So two
+        // concurrent camera produces can both record before either evicts.
+        //
+        // A close-every-other-camera eviction annihilates them: A keeps A and
+        // closes B, then B keeps B and closes A, and the participant is left
+        // with ZERO live cameras until the client notices and retries. Evicting
+        // only cameras created BEFORE the replacement makes the outcome
+        // order-deterministic instead: the newest survives.
+        let pid = 0;
+        transport.produce.mockImplementation(async () =>
+          createMockProducer({ kind: 'video', id: `race-cam-${pid++}` })
         );
 
-        await manager.closeProducer('room-1', 'u-1', first.producerId);
+        // Each racer composes produce + supersede, the way the socket handler
+        // does — the annihilation needs BOTH evictions to run.
+        const raceOne = async () => {
+          const info = await manager.produce(
+            'room-1',
+            'u-1',
+            transport.id,
+            'video',
+            createRtpParameters() as any,
+            'camera'
+          );
+          await manager.supersedeOlderCameraProducers(
+            'room-1',
+            'u-1',
+            info.producerId,
+            info.source
+          );
+          return info;
+        };
+        const results = await Promise.allSettled([raceOne(), raceOne()]);
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(2);
 
-        await expect(produceForU1('video', 'camera', 'reuse-cam-4')).resolves.toBeDefined();
+        // The invariant that matters: never zero, never accumulating.
+        expect(liveCameraIds()).toHaveLength(1);
+        // And it is the LAST one recorded, not an arbitrary survivor.
+        expect(liveCameraIds()).toEqual(['race-cam-1']);
+      });
+
+      it('re-allows a camera producer once the live one is closed', async () => {
+        // Replace-in-place must not have broken the ordinary close path: an
+        // explicit client close still frees the slot for a fresh camera.
+        const first = await produceForU1('video', 'camera', 'reuse-cam-1');
+        await manager.closeProducer('room-1', 'u-1', first.producerId);
+        expect(liveCameraIds()).toEqual([]);
+
+        await expect(produceForU1('video', 'camera', 'reuse-cam-2')).resolves.toBeDefined();
+        expect(liveCameraIds()).toEqual(['reuse-cam-2']);
       });
 
       it('ignores an already-closed producer still in the map (slot self-heals)', async () => {

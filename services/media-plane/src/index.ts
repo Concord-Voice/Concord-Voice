@@ -634,10 +634,15 @@ async function main() {
       // Startup-only configuration warnings (empty/invalid TRUSTED_PROXIES).
       warn: (message) => logger.warn(message),
     }),
-    // 256 KB. Largest legitimate inbound payload is join-room's
-    // rtpCapabilities (~8-20 KB); this gives ~12x headroom while cutting the
-    // 1 MB default 4x. NOTE: exceeding this CLOSES THE SESSION rather than
-    // rejecting one message, so it is sized conservatively on purpose.
+    // 256 KB. Measured against production 2026-08-19: the largest inbound
+    // frame is `update-rtp-capabilities` at 4,505 B. `join-room` does NOT
+    // carry rtpCapabilities — it sends `undefined` and the client emits them
+    // after `device.load` (client/desktop/src/renderer/services/
+    // voiceService.ts:2950), so join-room measures 94 B. The largest
+    // `produce` frame is 1,933 B (screen simulcast). That is ~58x headroom
+    // while cutting the 1 MB default 4x. NOTE: exceeding this CLOSES THE
+    // SESSION rather than rejecting one message, so it is sized
+    // conservatively on purpose.
     maxHttpBufferSize: 262_144,
     // Down from the 45 s default: this is the window a client holds a socket
     // with zero authentication.
@@ -914,6 +919,19 @@ async function main() {
             requiresOptIn:
               producerInfo.source === 'screen' || producerInfo.source === 'screen-audio',
           });
+
+          // Camera replace-in-place, ordered AFTER the announcement above so the
+          // room learns about the replacement before it learns the old camera
+          // closed. `closeProducer` puts `producer-closed` on the wire
+          // immediately, so evicting inside `roomManager.produce()` would invert
+          // that and show every remote a publisher with no camera for a round
+          // trip. No-ops for every non-camera source.
+          await roomManager.supersedeOlderCameraProducers(
+            roomId,
+            data.userId,
+            producerInfo.producerId,
+            producerInfo.source
+          );
 
           callback({ id: producerInfo.producerId });
         } catch (error) {

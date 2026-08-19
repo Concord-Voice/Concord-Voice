@@ -446,10 +446,20 @@ export const PREMIUM_SCREEN_PRODUCER_CAP = 16;
  * member's camera is then refused with 'Video participant limit reached', a
  * room-wide denial of service by one authenticated peer (#2032 red-team). The
  * `produce` rate budget cannot bound it either: a budget refills, so it paces
- * the squat without preventing it. 2 rather than 1 keeps a device switch (which
- * may briefly hold the old and the new producer) and the plausible multi-camera
- * client working, while making monopolization impossible for any room cap
- * above it.
+ * the squat without preventing it.
+ *
+ * This is now the BACKSTOP, not the primary control. `supersedeOlderCameraProducers`
+ * closes a participant's older cameras once a replacement is fully registered, so
+ * the steady state is ONE camera per participant and the squat is structurally
+ * impossible rather than merely bounded. The limit stays at 2 to admit the
+ * transient overlap a device switch needs — the old producer is still live while
+ * the new one is being created — and to keep a hard ceiling under a concurrent
+ * burst, where several produces clear the synchronous reservation gate before any
+ * of them reaches the eviction that runs after its await.
+ *
+ * Consequence to know before raising it: replace-in-place forecloses a genuine
+ * multi-camera client. Supporting one means changing the eviction rule, not this
+ * number.
  */
 export const MAX_PARTICIPANT_CAMERA_PRODUCERS = 2;
 
@@ -2174,7 +2184,94 @@ export class RoomManager {
       source,
     });
 
+    // Camera replace-in-place is NOT done here. `supersedeOlderCameraProducers`
+    // is the caller's responsibility, invoked after it has announced the new
+    // producer — see that method's doc comment for why the ordering cannot live
+    // inside this function.
     return info;
+  }
+
+  /**
+   * Camera replace-in-place: close the participant's cameras older than
+   * `keepProducerId`, so the steady state is ONE camera per participant.
+   * MAX_PARTICIPANT_CAMERA_PRODUCERS remains the backstop bounding the transient
+   * overlap (see its doc comment).
+   *
+   * CALL THIS AFTER ANNOUNCING THE REPLACEMENT. It is deliberately not called
+   * from `produce`, and the ordering is the entire reason:
+   *
+   * `closeProducer` emits `producer-removed`, which the Socket.IO bridge fans
+   * out immediately as `producer-closed` (`io.to(roomId)` — the publisher
+   * included, so its own client tears the superseded track down). But the new
+   * producer is announced to the room as `new-producer` by the `produce`
+   * HANDLER, only after `produce()` has returned. Evicting inside `produce`
+   * therefore puts the removal on the wire BEFORE the addition, and every remote
+   * client observes the publisher at zero cameras for a round trip. The
+   * internal `producer-added` event does not help — nothing subscribes to it.
+   * (CodeRabbit review, PR #2824.)
+   *
+   * The announcement cannot simply move earlier instead: the handler auto-pauses
+   * audio for server-muted participants between `produce()` and the
+   * announcement, and announcing first would let a remote briefly consume a
+   * server-muted user. So the eviction moves later rather than the announcement
+   * moving earlier.
+   *
+   * Routed through `closeProducer` rather than a bare `producer.close()` so the
+   * eviction takes the SAME path as a client-initiated close: map removal, mic
+   * bookkeeping, camera layering-gate recompute, and the removal event. A bare
+   * close would strand every other participant consuming a producer that is dead
+   * with no signal that it died.
+   */
+  async supersedeOlderCameraProducers(
+    roomId: string,
+    userId: string,
+    keepProducerId: string,
+    source: MediaSource
+  ): Promise<void> {
+    // Self-guarding on source: the caller invokes this after EVERY produce and
+    // the branch lives here, not at the call site. Two reasons — `produce` and
+    // its handler both sit near the S3776 cognitive-complexity ceiling, and a
+    // guard the caller has to remember is a guard the next caller forgets.
+    if (source !== 'camera') return;
+
+    const participant = this.rooms.get(roomId)?.participants.get(userId);
+    if (!participant) return;
+
+    // Walk only as far as the replacement. `participant.producers` is
+    // insertion-ordered, so everything BEFORE `keepProducerId` is older and
+    // everything after it is newer — a concurrent produce that will run its own
+    // eviction and must not be closed by this one.
+    //
+    // Closing every OTHER camera instead of every OLDER one annihilates a
+    // concurrent pair: `produce` handlers on one socket are not serialized
+    // (withRateLimit meters, it does not queue) and there is an await between
+    // recording a producer and evicting, so both can record before either
+    // evicts. A then closes B and B closes A, leaving the participant with zero
+    // cameras. Order-bounded eviction makes the survivor deterministic — the
+    // newest wins — and is what this method's name always claimed it did.
+    // (Gitar review, PR #2824.)
+    const older: string[] = [];
+    for (const [producerId, info] of participant.producers) {
+      if (producerId === keepProducerId) {
+        // Reaching the replacement is the ONLY path that evicts. Structuring it
+        // this way rather than as a `found` flag means the safe outcome is the
+        // fall-through: if the replacement is no longer in the map at all —
+        // a concurrent `close-producer` for it landed during the await above —
+        // this returns having closed nothing, instead of walking the whole map
+        // and closing every camera the participant still has.
+        for (const supersededId of older) {
+          await this.closeProducer(roomId, userId, supersededId);
+          logger.info('Camera producer superseded by replacement', {
+            roomId,
+            userId,
+            supersededProducerId: supersededId,
+            replacementProducerId: keepProducerId,
+          });
+        }
+        return;
+      }
+      if (info.source === 'camera') older.push(producerId);
+    }
   }
 
   /** Pause a producer (mute without removing) */
