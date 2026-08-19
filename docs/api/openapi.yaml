@@ -12678,6 +12678,14 @@ paths:
 
         Rate limit: 10 requests per minute (user-based).
 
+        Step-up auth (#2765): setting `require_auth_before_purge` to `false` requires
+        `current_password` — plus `mfa_code` when MFA is enabled — verified inside the
+        write transaction before anything is persisted. A passwordless SSO account steps
+        up with its MFA code alone. Setting the flag to `true`, and every other field on
+        this endpoint, needs no credentials: tightening a security control is never
+        gated harder than loosening it. Credential-bearing requests carry an additional
+        fail-closed attempt budget beyond the route rate limit.
+
         '
       security:
       - BearerAuth: []
@@ -12686,7 +12694,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PrivacySettings'
+              $ref: '#/components/schemas/PrivacySettingsUpdateRequest'
       responses:
         '200':
           description: Updated privacy settings
@@ -12697,6 +12705,44 @@ paths:
                 properties:
                   privacy:
                     $ref: '#/components/schemas/PrivacySettings'
+        '400':
+          description: >-
+            Invalid body, no fields to update, `dm_privacy_level` out of range, or —
+            when disabling `require_auth_before_purge` — an account with neither a
+            password nor MFA. That last case is deliberately an actionable 400 telling
+            the user how to proceed, never a 500.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: >-
+            The session's credential epoch was superseded (a password change or account
+            recovery committed first). Re-authenticate; nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: >-
+            Step-up required or rejected while disabling `require_auth_before_purge`.
+            The body sets the boolean flag `password_required` when a password is
+            still needed, or `mfa_required` together with a `methods` array when a
+            code is still needed; a supplied-but-wrong factor returns the
+            corresponding invalid-credential message instead. The stored value is
+            unchanged in every case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepUpError'
+        '429':
+          description: >-
+            Too many step-up verification attempts for this user. Fail-closed: this
+            bound also denies when its backing store is unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /users/me/presence-settings:
     get:
       tags:
@@ -15987,6 +16033,73 @@ components:
           type: string
           format: date-time
           nullable: true
+    StepUpError:
+      type: object
+      description: >-
+        A step-up refusal on `PATCH /users/me/privacy` (#2765). The three
+        discriminators are load-bearing: a client uses them to decide which
+        factor to prompt for, so they are modelled here rather than left to the
+        generic `Error` shape, which declares only `error`.
+      properties:
+        error:
+          type: string
+          description: Human-readable reason, safe to display.
+        password_required:
+          type: boolean
+          description: >-
+            Present and true when the account has a password and none was
+            supplied. Absent when the password factor was already satisfied.
+        mfa_required:
+          type: boolean
+          description: >-
+            Present and true when the account has MFA enabled and no code was
+            supplied. NOTE: its presence WITHOUT `password_required` does not
+            imply the account lacks a password — the server verifies the
+            password factor first, so a correct password plus a missing code
+            produces exactly this shape.
+        methods:
+          type: array
+          description: Enabled MFA method names, so the client can name the prompt.
+          items:
+            type: string
+      required:
+      - error
+    PrivacySettingsUpdateRequest:
+      description: >-
+        Body for `PATCH /users/me/privacy`. Every field is optional; only the
+        fields present are changed.
+
+
+        Split from `PrivacySettings` by #2765: the step-up credentials below are
+        request-only, and reusing the response schema for the request body would
+        advertise `current_password` as something the server returns. The 200
+        response stays on `PrivacySettings`.
+      allOf:
+      - $ref: '#/components/schemas/PrivacySettings'
+      - type: object
+        properties:
+          current_password:
+            type: string
+            format: password
+            writeOnly: true
+            description: >-
+              Step-up factor. Required only when setting
+              `require_auth_before_purge` to `false` — disabling the fence
+              demands the same verification the purge itself demands (#2765,
+              CWE-306). Omit it for every other field, and for setting the
+              flag to `true`: tightening the control is never gated.
+
+
+              Omit on a passwordless SSO account (no `password_hash`); MFA
+              alone carries the step-up there.
+          mfa_code:
+            type: string
+            writeOnly: true
+            description: >-
+              Step-up factor. Required alongside `current_password` when
+              setting `require_auth_before_purge` to `false` and the account
+              has MFA enabled. On a passwordless SSO account this is the only
+              factor.
     UserProfile:
       type: object
       properties:

@@ -9,15 +9,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
-const (
-	errMsgPurgeFailed        = "Purge failed"
-	errMsgVerificationFailed = "Verification failed"
-)
+const errMsgPurgeFailed = "Purge failed"
 
 // dmPurgeRequest is the body for DELETE /dm/conversations/:id/messages (#1352).
 // current_password/mfa_code are the step-up factors, required when the acting
@@ -187,87 +184,57 @@ func (h *Handler) requireAuthBeforePurge(ctx context.Context, userID string) boo
 	return v
 }
 
-// verifyPurgeStepUp verifies the actor's identity before a DM/group purge, mirroring
-// the E2EE key-reset step-up (#1293): current password + MFA when enabled. Writes the
-// error response and returns false on any failure — the caller must return without
-// mutating. SSO/passwordless accounts (empty password_hash) step up with their enabled
-// MFA method instead of a password; with neither factor available the request is
-// rejected with an actionable message, never a raw 500 (review finding S1).
+// purgeStepUpCopy is the DM/group wording for the two call-site-specific
+// strings. Byte-identical to the pre-extraction messages (#1352 review
+// finding S1) — the client discriminates on them.
+var purgeStepUpCopy = stepup.Copy{
+	NoFactors:          "Bulk deletion requires verification, but this account has no password and no MFA method. Set a password, enable MFA, or turn off \"Require authentication before purging\" in Privacy & Security.",
+	CredentialRequired: "Current password required to purge messages",
+}
+
+// verifyPurgeStepUp verifies the actor's identity before a DM/group purge:
+// current password + MFA when enabled. Writes the error response and returns
+// false on any failure — the caller must return without mutating.
+//
+// Policy lives in internal/stepup (#2765); this is the DM binding of it. There
+// is no enclosing transaction here, so the non-tx MFA form is correct.
 func (h *Handler) verifyPurgeStepUp(c *gin.Context, userID, currentPassword, mfaCode string) bool {
 	ctx := c.Request.Context()
 
-	var passwordHash string
-	if err := h.db.QueryRowContext(ctx,
-		`SELECT COALESCE(password_hash, '') FROM users WHERE id = $1`, userID).Scan(&passwordHash); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgVerificationFailed})
+	subj, sErr := stepup.LoadSubject(ctx, h.db, userID, h.mfaVerifier)
+	if sErr != nil {
+		h.logPurgeStepUpFailure(sErr)
+		sErr.Write(c)
 		return false
 	}
-
-	mfaEnabled := h.mfaVerifier != nil && h.mfaVerifier.IsEnabled(ctx, userID)
-
-	if !h.verifyPurgePasswordFactor(c, passwordHash, currentPassword, mfaEnabled) {
+	if pErr := stepup.VerifyPasswordFactor(subj, currentPassword, purgeStepUpCopy); pErr != nil {
+		h.logPurgeStepUpFailure(pErr)
+		pErr.Write(c)
 		return false
 	}
-	if mfaEnabled && !h.verifyPurgeMFAFactor(c, userID, mfaCode) {
-		return false
-	}
-	return true
-}
-
-// verifyPurgePasswordFactor checks the password half of the purge step-up. An empty
-// passwordHash means an SSO/passwordless account: MFA becomes the only available
-// factor, so this passes iff MFA is enabled — otherwise the actor is told how to
-// proceed rather than receiving a raw 500 (review finding S1). Writes the error
-// response and returns false on failure.
-func (h *Handler) verifyPurgePasswordFactor(c *gin.Context, passwordHash, currentPassword string, mfaEnabled bool) bool {
-	if passwordHash == "" {
-		if !mfaEnabled {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "Bulk deletion requires verification, but this account has no password and no MFA method. Set a password, enable MFA, or turn off \"Require authentication before purging\" in Privacy & Security.",
-			})
+	if subj.MFAEnabled {
+		if mErr := stepup.VerifyMFAFactor(ctx, h.mfaVerifier, userID, mfaCode); mErr != nil {
+			h.logPurgeStepUpFailure(mErr)
+			mErr.Write(c)
 			return false
 		}
-		return true // passwordless: MFA carries the step-up
-	}
-
-	if currentPassword == "" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Current password required to purge messages", "password_required": true})
-		return false
-	}
-	match, err := auth.VerifyPassword(currentPassword, passwordHash)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgVerificationFailed})
-		return false
-	}
-	if !match {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid password"})
-		return false
 	}
 	return true
 }
 
-// verifyPurgeMFAFactor checks the MFA half of the purge step-up (only called when the
-// actor has MFA enabled). Writes the error response and returns false on failure.
-func (h *Handler) verifyPurgeMFAFactor(c *gin.Context, userID, mfaCode string) bool {
-	ctx := c.Request.Context()
-	if mfaCode == "" {
-		methods, _ := h.mfaVerifier.GetEnabledMethods(ctx, userID)
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "MFA verification required", "mfa_required": true, "methods": methods,
-		})
-		return false
+// logPurgeStepUpFailure records the root cause of a step-up 500. A 4xx carries
+// no Cause and is not logged: a rejected credential is a normal outcome, and
+// logging one would turn ordinary user error into error-level noise while
+// hinting at which accounts are being probed.
+//
+// Cause never contains a credential or a password hash — internal/stepup
+// discards the password-verification error in favour of a fixed sentinel for
+// exactly that reason ([internal]rules/observability.md Core principle #1).
+func (h *Handler) logPurgeStepUpFailure(e *stepup.Error) {
+	if e.Cause == nil {
+		return
 	}
-	valid, err := h.mfaVerifier.VerifyCode(ctx, userID, mfaCode)
-	if err != nil {
-		h.log.Error("Purge step-up: MFA verify failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgVerificationFailed})
-		return false
-	}
-	if !valid {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code"})
-		return false
-	}
-	return true
+	h.log.Error("Purge step-up failed", "status", e.Status, "error", e.Cause)
 }
 
 // emitDMPurged broadcasts the bulk-purge event to the conversation's other

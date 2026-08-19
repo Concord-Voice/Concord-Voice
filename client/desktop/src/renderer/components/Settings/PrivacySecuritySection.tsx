@@ -26,6 +26,7 @@ import PresenceSettingsSection from './PresenceSettingsSection';
 import ActivityHistoryCard from './ActivityHistoryCard';
 import PresenceHistorySection from '../Profile/PresenceHistorySection';
 import ToggleSwitch from './ToggleSwitch';
+import PurgeFenceStepUpDialog from './PurgeFenceStepUpDialog';
 import './MFA.css';
 
 // #1354: the purge dead-end card navigates here by control id
@@ -761,12 +762,21 @@ const PrivacySecuritySection: React.FC = () => {
   // comes back 400. The store maps that one shape to the skew copy; surfacing it
   // here is what stops the flip from failing silently.
   const [purgeAuthError, setPurgeAuthError] = useState<string | null>(null);
+  const [purgeFenceStepUpOpen, setPurgeFenceStepUpOpen] = useState(false);
 
   const setRequireAuthBeforePurge = useCallback(
     async (next: boolean) => {
       setPurgeAuthError(null);
+      // #2765: turning the fence OFF is step-up gated, so the dialog owns that
+      // transition end-to-end — it collects the factors and sends the PATCH.
+      // Nothing goes out from here, and the switch stays bound to the store, so
+      // it does not flip until the server accepts. Turning it ON is ungated.
+      if (!next) {
+        setPurgeFenceStepUpOpen(true);
+        return;
+      }
       try {
-        await updatePrivacy({ requireAuthBeforePurge: next });
+        await updatePrivacy({ requireAuthBeforePurge: true });
       } catch (err) {
         setPurgeAuthError(err instanceof Error ? err.message : 'Failed to update privacy settings');
       }
@@ -1379,6 +1389,11 @@ const PrivacySecuritySection: React.FC = () => {
             inputRole="switch"
           />
         </div>
+
+        <PurgeFenceStepUpDialog
+          open={purgeFenceStepUpOpen}
+          onClose={() => setPurgeFenceStepUpOpen(false)}
+        />
 
         <ContentSafetyControls />
         <SearchVisibilityControls />

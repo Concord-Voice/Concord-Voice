@@ -1112,8 +1112,13 @@ func TestPatchPrivacySettingsRequireAuthBeforePurgeRoundTrips(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "purgepatch")
 
+	// Turning the fence OFF carries the step-up credential since #2765; turning
+	// it ON, and every other privacy field, still needs none.
 	patch := ts.DoRequest(methodPatch, urlUsersMePrivacy,
-		map[string]interface{}{"require_auth_before_purge": false},
+		map[string]interface{}{
+			"require_auth_before_purge": false,
+			keyCurrentPassword:          testhelpers.TestAuthPlaintext,
+		},
 		testhelpers.AuthHeaders(user.AccessToken))
 	require.Equal(t, http.StatusOK, patch.Code, patch.Body.String())
 	assert.False(t, privacyRequireAuthBeforePurge(t, patch.Body.Bytes()),
@@ -1129,7 +1134,10 @@ func TestPatchUnrelatedFieldDoesNotClobberRequireAuthBeforePurge(t *testing.T) {
 	user := ts.CreateTestUser(t, "purgeclobber")
 
 	require.Equal(t, http.StatusOK, ts.DoRequest(methodPatch, urlUsersMePrivacy,
-		map[string]interface{}{"require_auth_before_purge": false},
+		map[string]interface{}{
+			"require_auth_before_purge": false,
+			keyCurrentPassword:          testhelpers.TestAuthPlaintext,
+		},
 		testhelpers.AuthHeaders(user.AccessToken)).Code)
 	// A PATCH that does not mention the field must leave it alone.
 	require.Equal(t, http.StatusOK, ts.DoRequest(methodPatch, urlUsersMePrivacy,
@@ -1158,9 +1166,13 @@ func TestPrivacyToggleGovernsDMPurgeStepUp(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "password_required")
 
-	// Toggle OFF through the privacy endpoint...
+	// Toggle OFF through the privacy endpoint — which since #2765 demands the
+	// same credential the purge itself demands...
 	require.Equal(t, http.StatusOK, ts.DoRequest(methodPatch, urlUsersMePrivacy,
-		map[string]interface{}{"require_auth_before_purge": false},
+		map[string]interface{}{
+			"require_auth_before_purge": false,
+			keyCurrentPassword:          testhelpers.TestAuthPlaintext,
+		},
 		testhelpers.AuthHeaders(actor.AccessToken)).Code)
 
 	// ...and the same request now passes step-up.

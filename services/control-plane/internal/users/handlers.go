@@ -22,11 +22,13 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -38,9 +40,18 @@ const (
 	dataImagePrefix             = "data:image/"
 )
 
-// MFAVerifier checks MFA status and verifies codes for sensitive operations.
+// MFAVerifier is the MFA surface this package needs. VerifyCodeTx is the
+// transaction-scoped form (backup-code redemption is a write, so an enclosing
+// transaction must own it); the other three back step-up policy (#2765), and
+// together the four make this identical to stepup.MFAVerifier, so one value
+// satisfies every internal/stepup entry point.
+//
+// *mfa.Handler satisfies this; router.go already passes it.
 type MFAVerifier interface {
 	VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, code string) (bool, error)
+	IsEnabled(ctx context.Context, userID string) bool
+	VerifyCode(ctx context.Context, userID, code string) (bool, error)
+	GetEnabledMethods(ctx context.Context, userID string) ([]string, error)
 }
 
 type sessionDisconnector interface {
@@ -73,7 +84,11 @@ type activityCleanupPhaseContextFactory func(
 
 // Handler handles user-related requests including profile management and settings.
 type Handler struct {
-	db                                 *sql.DB
+	db *sql.DB
+	// redis backs the fail-closed step-up attempt budget (#2765). Nil DENIES
+	// that one branch rather than skipping the bound; no other handler in this
+	// package reads it.
+	redis                              *redis.Client
 	log                                *logger.Logger
 	hub                                *websocket.Hub
 	presenceHistory                    *presencehistory.Service
@@ -93,6 +108,15 @@ type Handler struct {
 }
 
 // NewHandler creates a new user handler.
+//
+// Redis is NOT a parameter here. It arrives via SetRedis, matching the four
+// dependencies this struct already injects that way (graph presence, presence
+// history, the activity suppressor, the media store). Adding it positionally
+// took the signature to eight parameters and tripped go:S107; more to the
+// point, it broke the pattern this handler was already built on. If a ninth
+// dependency ever genuinely needs to be positional, adopt the HandlerDeps
+// struct that internal/dm, internal/voice, internal/ownership and
+// internal/oauth use rather than growing this list again.
 func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier MFAVerifier, tiers entitlements.TierResolver, credFence *credepoch.Fence, tokenPairs TokenPairIssuer) *Handler {
 	h := &Handler{
 		db:          db,
@@ -108,6 +132,23 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, mfaVerifier 
 	}
 	return h
 }
+
+// SetRedis wires the client backing the fail-closed step-up attempt budget
+// (#2765).
+//
+// A nil client DENIES rather than skipping the bound — see
+// allowPurgeFenceStepUpAttempt. That is the safe direction, but it is also
+// silent: an unwired handler refuses every purge-fence step-up instead of
+// obviously breaking. HasRedis exists so the router's boot guard can catch
+// that at startup rather than in production.
+func (h *Handler) SetRedis(client *redis.Client) {
+	h.redis = client
+}
+
+// HasRedis reports whether SetRedis was called with a non-nil client. The boot
+// guard interrogates the HANDLER through this, never the client value the
+// router happens to hold — the same reasoning as HasGraphPresenceCapture.
+func (h *Handler) HasRedis() bool { return h.redis != nil }
 
 // SetGraphPresenceCapture wires the #2446 pre-mutation presence capture. A nil
 // capture leaves every handler behaving exactly as it did before the hook.
@@ -1969,6 +2010,11 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 }
 
 // updatePrivacyRequest represents a partial update to privacy settings.
+//
+// INVARIANT (#2765): every field here is a privacy_settings COLUMN, and
+// buildPrivacyClauses turns each non-nil one into a SET clause. Nothing that is
+// not a column of that table may ever be added to this struct. Credentials live
+// in updatePrivacyStepUp, which buildPrivacyClauses cannot see.
 type updatePrivacyRequest struct {
 	MessagesFriendsOnly                 *bool `json:"messages_friends_only"`
 	MessagesServerMembers               *bool `json:"messages_server_members"`
@@ -1983,6 +2029,24 @@ type updatePrivacyRequest struct {
 	EnableKlipyProxy                    *bool `json:"enable_klipy_proxy"`
 	SharePersonalizationWithGifProvider *bool `json:"share_personalization_with_gif_provider"`
 	RequireAuthBeforePurge              *bool `json:"require_auth_before_purge"`
+}
+
+// updatePrivacyStepUp carries the step-up factors for the ONE privacy transition
+// that requires them: require_auth_before_purge → false (#2765). Never logged,
+// never persisted, never passed to buildPrivacyClauses. Field shapes are
+// byte-identical to dmPurgeRequest (internal/dm/purge.go) so one client
+// classifier serves both endpoints.
+type updatePrivacyStepUp struct {
+	CurrentPassword string `json:"current_password"`
+	MFACode         string `json:"mfa_code"`
+}
+
+// updatePrivacyBody is the wire body. Embedding keeps the JSON flat — today's
+// shape plus two optional strings — while the halves stay separately
+// addressable, so a credential cannot reach the SET-clause builder by type.
+type updatePrivacyBody struct {
+	updatePrivacyRequest
+	updatePrivacyStepUp
 }
 
 // buildPrivacyClauses constructs the SET clauses for a partial privacy settings update.
@@ -2084,19 +2148,174 @@ func readPriorFoF(ctx context.Context, tx *sql.Tx, userID string) (bool, error) 
 	return fof, nil
 }
 
+// purgeFenceStepUpCopy is the privacy-settings wording for the two
+// call-site-specific step-up strings. It differs from the DM purge copy because
+// the purge path's actionable message tells the user to turn this toggle off —
+// which is the very request being made here. Every other string comes from
+// internal/stepup unchanged, because the client discriminates on them.
+var purgeFenceStepUpCopy = stepup.Copy{
+	NoFactors: "Turning off purge verification requires proving your identity, but this account has no " +
+		"password and no MFA method. Set a password or enable multi-factor authentication first.",
+	CredentialRequired: "Current password required to turn off purge verification",
+}
+
+const (
+	// Bounds are const, never configuration — a configurable security bound is
+	// a fifth place it can be wrong ([internal]rules/backend.md), and the purge
+	// rate limits set the precedent.
+	purgeFenceStepUpLimit  = 5
+	purgeFenceStepUpWindow = 15 * time.Minute
+)
+
+// allowPurgeFenceStepUpAttempt bounds credential guessing against the purge
+// fence. Fail-CLOSED: the route's own limiter is fail-open by design (it
+// protects twelve innocuous fields), so a Redis outage would otherwise remove
+// every bound from a path that verifies passwords.
+//
+// A nil client denies rather than skipping the bound — a rate limiter that
+// silently no-ops when unwired is the failure mode this exists to prevent.
+func (h *Handler) allowPurgeFenceStepUpAttempt(ctx context.Context, userID string) (bool, error) {
+	if h.redis == nil {
+		return false, errors.New("step-up rate limiter unavailable")
+	}
+	return middleware.AllowUserAction(ctx, h.redis,
+		purgeFenceStepUpKey(userID), purgeFenceStepUpLimit, purgeFenceStepUpWindow)
+}
+
+// purgeFenceStepUpKey is the one place the budget's Redis key is spelled, so
+// the consume and the clear below cannot drift apart.
+func purgeFenceStepUpKey(userID string) string {
+	return "stepup:privacy_purge_fence:" + userID
+}
+
+// clearPurgeFenceStepUpAttempts resets the budget after a step-up that actually
+// succeeded and committed.
+//
+// AllowUserAction increments unconditionally, before the outcome is knowable,
+// and never decrements — so without this a legitimate user toggling the fence
+// off and on, or retrying past a transient 401/500, burns the same budget meant
+// to bound password guessing and is eventually locked out WITH correct
+// credentials (Gitar review, #2792). Counting the attempt and clearing it on
+// success is the standard failed-attempts shape; the alternative Gitar offered,
+// raising the bound, only moves the wall further out.
+//
+// Deliberately NOT security-critical, so deliberately best-effort: a failure
+// leaves the counter high, which fails toward MORE limiting, never less. It
+// runs post-commit because only a committed disable is a success — a verified
+// credential whose transaction then rolled back has changed nothing and should
+// still cost an attempt.
+func (h *Handler) clearPurgeFenceStepUpAttempts(ctx context.Context, userID string) {
+	if h.redis == nil {
+		return
+	}
+	if err := h.redis.Del(ctx, purgeFenceStepUpKey(userID)).Err(); err != nil {
+		h.log.Warn("Could not reset the purge-fence step-up budget after a successful disable",
+			"error", err)
+	}
+}
+
+// gatePurgeFenceDisable verifies the actor may disable the purge fence (#2765).
+//
+// ONE statement takes the users row FOR SHARE and reads every input. FOR SHARE
+// (not FOR NO KEY UPDATE — this handler never writes users) conflicts with the
+// FOR NO KEY UPDATE every destructive reset holds, so a request authorized by
+// credentials that were superseded while it waited blocks, re-reads, and fails.
+// That serialization is why the check lives inside the transaction rather than
+// in front of it.
+//
+// The returned error is a *stepup.Error wrapped for transport; the outer
+// handler unwraps it with errors.As so the closure's blanket 500 does not
+// swallow the real status.
+func (h *Handler) gatePurgeFenceDisable(
+	ctx context.Context, c *gin.Context, tx *sql.Tx, userID string, creds updatePrivacyStepUp,
+) error {
+	// The attempt budget is NOT taken here. It runs before BeginTx in the
+	// caller — a Redis round trip inside an open transaction pins a pooled DB
+	// connection for the length of a network call, and the check needs no
+	// transactional consistency with the row lock (Gitar review, #2792).
+
+	// credential_epoch is sql.NullString (NULL = never rotated), matching the
+	// existing precedent in upsertE2EEBlobGuarded. mfa_enabled comes from the
+	// same row rather than mfaVerifier.IsEnabled, which would take a second
+	// pooled connection while this transaction holds one.
+	var subj stepup.Subject
+	var epoch sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(password_hash, ''), credential_epoch, mfa_enabled,
+		       COALESCE(mfa_methods, '{}')
+		FROM users WHERE id = $1 FOR SHARE
+	`, userID).Scan(&subj.PasswordHash, &epoch, &subj.MFAEnabled, pq.Array(&subj.MFAMethods)); err != nil {
+		return &stepup.Error{
+			Status: http.StatusInternalServerError,
+			Body:   gin.H{"error": stepup.ErrMsgVerificationFailed},
+			Cause:  fmt.Errorf("lock user for purge-fence step-up: %w", err),
+		}
+	}
+
+	// The step-up proves knowledge of a password; the fence proves this session
+	// was not revoked. Different facts — see the design's §8. MatchEpoch, not
+	// GuardTx: GuardTx would issue its own SELECT ... FOR SHARE on a row already
+	// locked. Body string matches upsertE2EEBlobGuarded so the client's existing
+	// 401 handling applies unchanged.
+	if credepoch.MatchEpoch(epoch, middleware.TokenCredentialEpoch(c)) != nil {
+		return &stepup.Error{
+			Status: http.StatusUnauthorized,
+			Body:   gin.H{"error": "Authentication required"},
+		}
+	}
+
+	if pErr := stepup.VerifyPasswordFactor(subj, creds.CurrentPassword, purgeFenceStepUpCopy); pErr != nil {
+		return pErr
+	}
+	if !subj.MFAEnabled {
+		return nil
+	}
+	if h.mfaVerifier == nil {
+		// Fail closed: an MFA-enabled account whose verifier is unwired cannot
+		// prove its second factor, so the fence stays up. Same posture as the
+		// password-change path's nil-verifier branch.
+		return &stepup.Error{
+			Status: http.StatusInternalServerError,
+			Body:   gin.H{"error": stepup.ErrMsgVerificationFailed},
+			Cause:  errors.New("MFA verifier is not configured for an MFA-enabled user"),
+		}
+	}
+	// Tx form: backup-code redemption is a write, and a rollback must not burn a
+	// single-use factor.
+	if mErr := stepup.VerifyMFAFactorTx(ctx, tx, h.mfaVerifier, userID, creds.MFACode, subj.MFAMethods); mErr != nil {
+		return mErr
+	}
+	return nil
+}
+
+// logPurgeFenceStepUpFailure records the root cause of a step-up 500. A 4xx
+// carries no Cause and is not logged: a rejected credential is a normal
+// outcome, and logging one would turn ordinary user error into error-level
+// noise while hinting at which accounts are being probed.
+//
+// Cause never contains a credential or a password hash — internal/stepup
+// discards the password-verification error in favour of a fixed sentinel for
+// exactly that reason ([internal]rules/observability.md Core principle #1).
+func (h *Handler) logPurgeFenceStepUpFailure(e *stepup.Error) {
+	if e.Cause == nil {
+		return
+	}
+	h.log.Error("Purge-fence step-up failed", "status", e.Status, "error", e.Cause)
+}
+
 // UpdatePrivacySettings updates the current user's privacy settings.
 // Accepts a partial JSON body — only provided fields are updated.
 // PATCH /users/me/privacy
 func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	var req updatePrivacyRequest
+	var req updatePrivacyBody
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 		return
 	}
 
-	setClauses, extraArgs, status, msg := buildPrivacyClauses(&req)
+	setClauses, extraArgs, status, msg := buildPrivacyClauses(&req.updatePrivacyRequest)
 	if status != 0 {
 		c.JSON(status, gin.H{"error": msg})
 		return
@@ -2119,12 +2338,53 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	// failure response (and its message) is written in exactly one place.
 	var ps privacySettingsResponse
 	ctx := c.Request.Context()
+
+	// The step-up attempt budget runs OUTSIDE the transaction, and before it.
+	// It reads only the actor's id and needs no consistency with the row lock,
+	// so taking it inside would pin a pooled DB connection across a Redis round
+	// trip for nothing (Gitar review, #2792). Denying here also means a request
+	// that was never going to proceed takes no lock at all.
+	//
+	// disablingPurgeFence is computed once and reused below: gate on the
+	// REQUESTED value, never a computed transition — a prior-value read is
+	// ambiguous on a lazily-created row and would be a fail-open surface.
+	disablingPurgeFence := req.RequireAuthBeforePurge != nil && !*req.RequireAuthBeforePurge
+	if disablingPurgeFence {
+		// The only error worth diagnosing is the limiter being unreachable; an
+		// exhausted budget is an ordinary outcome and says nothing but the
+		// actor's own id, which the response already tells them.
+		allowed, rlErr := h.allowPurgeFenceStepUpAttempt(ctx, userID)
+		if rlErr != nil {
+			h.log.Error("Purge-fence step-up budget unavailable", "error", rlErr)
+		}
+		if rlErr != nil || !allowed {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many verification attempts"})
+			return
+		}
+	}
+
 	txErr := func() error {
 		tx, err := h.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer presencehook.RollbackUnlessDone(tx, h.log) // no-op once the terminal committed
+
+		// #2765: disabling require_auth_before_purge requires the same step-up
+		// the purge requires. Gate on the REQUESTED value, not a computed
+		// transition — a prior-value read is ambiguous on a lazily-created row
+		// and would be a fail-open surface. Enabling it, and every other
+		// privacy field, stays unauthenticated: tightening a control must
+		// never cost more than loosening it.
+		//
+		// This runs BEFORE the row-ensuring INSERT so a rejection leaves no
+		// durable trace — otherwise a 403 would still create a privacy_settings
+		// row and flip the fail-closed "no row means true" default.
+		if disablingPurgeFence {
+			if err := h.gatePurgeFenceDisable(ctx, c, tx, userID, req.updatePrivacyStepUp); err != nil {
+				return err
+			}
+		}
 
 		// The row-ensuring INSERT runs BEFORE the prior-value read, and that
 		// order is load-bearing rather than incidental. readPriorFoF locks with
@@ -2201,9 +2461,26 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
 	}()
 	if txErr != nil {
+		// A step-up rejection carries its own status and body; the blanket 500
+		// below is for genuine failures only (#2765).
+		var suErr *stepup.Error
+		if errors.As(txErr, &suErr) {
+			h.logPurgeFenceStepUpFailure(suErr)
+			suErr.Write(c)
+			return
+		}
 		h.log.Error("Failed to update privacy settings", "error", txErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update privacy settings"})
 		return
+	}
+
+	// The step-up succeeded AND committed, so this was not a guess: give the
+	// budget back rather than charging a legitimate actor for correct
+	// credentials (Gitar review, #2792). Post-commit deliberately — a verified
+	// credential whose transaction then rolled back changed nothing and should
+	// still cost an attempt.
+	if disablingPurgeFence {
+		h.clearPurgeFenceStepUpAttempts(ctx, userID)
 	}
 
 	h.log.Info("Privacy settings updated", "user_id", userID)

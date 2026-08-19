@@ -307,6 +307,20 @@ func requireGraphPresenceCaptureWired(
 	}
 }
 
+// requireStepUpBudgetWired fatal-exits when the users handler has no Redis
+// client for the #2765 purge-fence step-up budget.
+//
+// The budget fails CLOSED on a nil client, which is the right direction but a
+// silent one: an unwired handler would answer every attempt to disable
+// require_auth_before_purge with a 429 that no user or operator could explain.
+// Boot is where that should surface. Same reasoning, and same handler-not-value
+// interrogation, as requireGraphPresenceCaptureWired above.
+func requireStepUpBudgetWired(log *logger.Logger, u *users.Handler) {
+	if u == nil || !u.HasRedis() {
+		log.Fatal("users handler has no Redis client: the step-up attempt budget would deny every request")
+	}
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	db *sql.DB,
@@ -448,6 +462,8 @@ func NewRouter(
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
+	usersHandler.SetRedis(redis)
+	requireStepUpBudgetWired(log, usersHandler)
 	usersHandler.SetPresenceHistory(presenceHistoryService)
 	usersHandler.SetActivitySettingsSuppressor(activityService)
 	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)

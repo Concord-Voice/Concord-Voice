@@ -5,6 +5,12 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import PrivacySecuritySection from '@/renderer/components/Settings/PrivacySecuritySection';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useUserStore } from '@/renderer/stores/userStore';
+import { PURGE_AUTH_SKEW_MESSAGE } from '@/renderer/stores/privacyStore';
+
+// Named fixture rather than an inline literal: the pre-commit detect-secrets
+// hook flags a credential-shaped key beside a quoted literal. Mirrors
+// tests/unit/components/Purge/StepUp.test.tsx.
+const FIXTURE_PW = 'fixture-password-do-not-persist';
 
 vi.mock('@/renderer/components/Settings/MFATierSelector', () => ({
   default: () => null,
@@ -111,10 +117,10 @@ describe('PrivacySecuritySection — require authentication before purging (#135
   });
 
   it('warns when the toggle is switched off', async () => {
-    let capturedBody: Record<string, unknown> = {};
+    const patchBodies: unknown[] = [];
     server.use(
       http.patch(PRIVACY_ENDPOINT, async ({ request }) => {
-        capturedBody = (await request.json()) as Record<string, unknown>;
+        patchBodies.push(await request.json());
         return HttpResponse.json({
           privacy: { ...legacyPrivacy, require_auth_before_purge: false },
         });
@@ -125,15 +131,19 @@ describe('PrivacySecuritySection — require authentication before purging (#135
     const toggle = await screen.findByRole('switch', { name: TOGGLE_LABEL });
     await userEvent.click(toggle);
 
-    await waitFor(() =>
-      expect(
-        screen.getByText(
-          'Without this, anyone with access to your unlocked account can permanently purge your message history.'
-        )
-      ).toBeInTheDocument()
-    );
-    expect(capturedBody).toEqual({ require_auth_before_purge: false });
-    expect(screen.getByRole('switch', { name: TOGGLE_LABEL })).not.toBeChecked();
+    // #2765 moved the warning ahead of the change rather than after it: the same
+    // sentence now frames the step-up dialog, and it is shown while the fence is
+    // still up. The user is still warned — just in time to decline.
+    expect(await screen.findByRole('heading', { name: 'Confirm it is you' })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Without this, anyone with access to your unlocked account can permanently purge your message history.'
+      )
+    ).toBeInTheDocument();
+    // Nothing is spent until they confirm, and the control does not move ahead
+    // of the server.
+    expect(patchBodies).toEqual([]);
+    expect(screen.getByRole('switch', { name: TOGGLE_LABEL })).toBeChecked();
   });
 
   it('surfaces the old-server rejection instead of failing silently', async () => {
@@ -144,16 +154,17 @@ describe('PrivacySecuritySection — require authentication before purging (#135
     );
 
     render(<PrivacySecuritySection />);
-    const toggle = await screen.findByRole('switch', { name: TOGGLE_LABEL });
-    await userEvent.click(toggle);
+    await userEvent.click(await screen.findByRole('switch', { name: TOGGLE_LABEL }));
+    // The skew 400 is now reached through the dialog — an old control-plane
+    // still rejects the toggle-only body, and the dialog is where the user finds
+    // out rather than being told nothing at all.
+    await userEvent.type(await screen.findByLabelText('Password'), FIXTURE_PW);
+    await userEvent.click(screen.getByRole('button', { name: 'Turn Off' }));
 
-    await waitFor(() =>
-      expect(
-        screen.getByText("This version of the server doesn't support this setting yet.")
-      ).toBeInTheDocument()
-    );
-    // The setting did not take, so the control stays on and no OFF warning appears.
+    const banner = await screen.findByText(PURGE_AUTH_SKEW_MESSAGE);
+    expect(banner).toHaveClass('purge-modal__deadend');
+    expect(banner).toHaveAttribute('role', 'alert');
+    // The setting did not take, so the control stays on.
     expect(screen.getByRole('switch', { name: TOGGLE_LABEL })).toBeChecked();
-    expect(screen.queryByText(/anyone with access to your unlocked account/i)).toBeNull();
   });
 });
