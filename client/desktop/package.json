@@ -92,7 +92,7 @@
     "eslint-config-prettier": "^10.1.8",
     "gemoji": "^8.1.0",
     "globals": "^17.10.0",
-    "ioredis": "^5.11.1",
+    "ioredis": "^6.0.0",
     "jsdom": "^30.0.1",
     "msw": "^2.15.0",
     "prettier": "^3.9.6",
