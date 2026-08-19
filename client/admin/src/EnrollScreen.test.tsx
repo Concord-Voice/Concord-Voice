@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
@@ -111,7 +111,12 @@ describe("EnrollScreen", () => {
       expect(alert).toHaveTextContent(
         "Enrollment failed. Check the invitation and try again.",
       );
-      expect(alert).toHaveFocus();
+      // findByRole gates on the alert EXISTING; focus is applied by a separate
+      // post-render effect, so it needs its own wait. The negative assertion
+      // below stays bare — waitFor resolves at the first poll where its
+      // condition holds, so a late leak would slip past.
+      // See [internal]rules/tests.md § Async assertions.
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveFocus());
       expect(alert).not.toHaveTextContent(
         /correct horse|enroll-secret|token|attestation/i,
       );
@@ -154,8 +159,10 @@ describe("EnrollScreen", () => {
 
     create.mockResolvedValueOnce(null);
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Security key did not return a credential.",
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Security key did not return a credential.",
+      ),
     );
   });
 });

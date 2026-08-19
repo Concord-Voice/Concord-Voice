@@ -44,7 +44,12 @@ describe("AuthScreen", () => {
     );
     resolveCredential(credential);
     await waitFor(() => expect(onAuthenticated).toHaveBeenCalledTimes(1));
-    expect(screen.getByLabelText("Password")).toHaveValue("");
+    // The password is cleared in the same continuation that calls
+    // onAuthenticated, so that re-render is still pending when the spy gate
+    // above resolves. Wait on the DOM, not on the spy.
+    await waitFor(() =>
+      expect(screen.getByLabelText("Password")).toHaveValue(""),
+    );
   });
 
   it("shows generic password failure text and blocks duplicate submits", async () => {
@@ -69,13 +74,24 @@ describe("AuthScreen", () => {
     const button = screen.getByRole("button", { name: "Continue" });
     await userEvent.click(button);
     await userEvent.click(button);
+    // `attempts` increments immediately before the handler constructs its
+    // promise, so attempts === 1 proves the executor ran and releaseRequest is
+    // no longer the no-op initializer. Calling it earlier would never resolve.
+    await waitFor(() => expect(attempts).toBe(1));
     releaseRequest();
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
       "Sign-in failed. Check your credentials and try again.",
     );
-    expect(alert).toHaveFocus();
+    // findByRole gates on the alert EXISTING; focus is applied by a separate
+    // post-render effect, so it needs its own wait. Re-queried inside the
+    // callback per [internal]rules/tests.md § Async assertions.
+    //
+    // The negative assertion below stays bare deliberately: waitFor resolves
+    // at the first poll where its condition holds, so a leak rendered a tick
+    // later would slip past it.
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveFocus());
     expect(alert).not.toHaveTextContent(/password|token|assertion|session/i);
     expect(attempts).toBe(1);
   });
@@ -116,23 +132,31 @@ describe("AuthScreen", () => {
       new DOMException("The operation was aborted.", "NotAllowedError"),
     );
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Security key verification was canceled.",
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Security key verification was canceled.",
+      ),
     );
     get.mockResolvedValueOnce(null);
     await userEvent.click(
       screen.getByRole("button", { name: "Retry security key" }),
     );
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Security key did not return a credential.",
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Security key did not return a credential.",
+      ),
     );
     get.mockResolvedValueOnce(assertionCredential());
     await userEvent.click(
       screen.getByRole("button", { name: "Retry security key" }),
     );
-    expect(await screen.findByLabelText("Password")).toBeVisible();
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Sign-in failed. Check your credentials and try again.",
+    expect(screen.getByLabelText("Password")).toBeVisible();
+    // The alert is already mounted carrying the PREVIOUS message here, so gate
+    // on the text rather than on the element existing.
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Sign-in failed. Check your credentials and try again.",
+      ),
     );
   });
 
