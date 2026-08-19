@@ -87,7 +87,7 @@
     "app-builder-lib": "26.15.3",
     "concurrently": "^10.0.4",
     "electron": "^43.3.0",
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.28.2",
     "eslint": "^10.8.1",
     "eslint-config-prettier": "^10.1.8",
     "gemoji": "^8.1.0",
