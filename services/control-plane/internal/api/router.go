@@ -31,6 +31,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ownership"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
@@ -289,13 +290,91 @@ func graphPresenceWiringComplete(f *friends.Handler, u *users.Handler) bool {
 	return f.HasGraphPresenceCapture() && u.HasGraphPresenceCapture()
 }
 
+// familyGaps is presencecapture.UnregisteredFamilies behind a package var, so
+// a test can drive graphPresenceFamilyRegistryComplete's FALSE branch. This
+// declaration is its only assignment outside a test, so every boot still reads
+// the real registry.
+//
+// The seam has to sit here rather than in presencecapture. That package's own
+// registry_test produces a gap by swapping the unexported familyRegistry, which
+// an internal/api test cannot reach, and UnregisteredFamilies takes no
+// argument — so without this var nothing could make the zero-arg guard below
+// answer false.
+var familyGaps = presencecapture.UnregisteredFamilies
+
+// graphPresenceFamilyRegistryComplete reports whether every declared
+// presencecapture.Family carries a registry entry. It is separate from the
+// wiring guard because it is a property of the CODE, not of this boot's
+// dependency graph, so it must hold even on a replica with no activity service.
+//
+// This zero-arg form is what the guard calls, so the guard interrogates the
+// registry and never a value a caller constructed: familyGaps is package state,
+// not a parameter, and no boot path can substitute one.
+//
+// Two seams, two mutations. familyRegistryComplete isolates the verdict so a
+// table can drive it over a supplied gap list; familyGaps isolates the lookup
+// so a test can drive THIS composition false. Neither covers the other — the
+// table never calls this function, so rewriting its body to `return true` would
+// leave the suite green and the boot guard inert, which is the same fail-OPEN
+// class the comment above graphPresenceWiringComplete names.
+func graphPresenceFamilyRegistryComplete() bool {
+	return familyRegistryComplete(familyGaps())
+}
+
+// familyRegistryComplete is the verdict over an already-collected gap list.
+// Complete means the list is empty; any missing family is a boot failure.
+func familyRegistryComplete(missing []presencecapture.Family) bool {
+	return len(missing) == 0
+}
+
+// requireGraphPresenceFamilyRegistry fatal-exits on an unregistered family.
+// The count is logged, never the family values: a fixed integer is enough to
+// act on and keeps the line free of anything derived from an enum a future
+// append may name after a customer-visible feature.
+func requireGraphPresenceFamilyRegistry(log *logger.Logger) {
+	if graphPresenceFamilyRegistryComplete() {
+		return
+	}
+	log.Fatal("presence capture family registry is incomplete",
+		"missing_count", len(familyGaps()))
+}
+
+// graphPresenceRailWired reports whether the durable Custom Status leg is wired
+// onto the constructed reconciler.
+//
+// This is the ONE place a #2446 guard legitimately interrogates the reconciler
+// rather than a handler. The rule it appears to break — "ask the HANDLERS,
+// never the constructed reconciler" — exists because graphpresence.New always
+// returns a non-nil pointer, so a nil check on that VALUE is a tautology that
+// still boots with a SetGraphPresenceCapture line deleted. HasTopologyRail is
+// not that: it reports whether SetTopologyRail actually ran, which is exactly
+// the fail-open a deleted wiring line would produce.
+func graphPresenceRailWired(capture *graphpresence.Reconciler) bool {
+	return capture.HasTopologyRail()
+}
+
 // requireGraphPresenceCaptureWired fatal-exits when the activity service exists
-// and any #2446 consumer is unwired. Its scope stops at the handlers it names:
-// adding a third consumer without adding it here is a silent hazard, exactly as
-// the three temp-grant owners remain one for #2445.
+// and any #2446 consumer is unwired, or when the durable Custom Status rail is
+// unwired. Its scope stops at the handlers it names: adding a third consumer
+// without adding it here is a silent hazard, exactly as the three temp-grant
+// owners remain one for #2445.
+//
+// An unwired rail is FATAL rather than a degrade. Without it every hooked write
+// silently reverts to PR 1's in-memory-only behaviour, and Custom Status is the
+// one leg with no level arm to fall back on: a viewer who never reconnects
+// holds the sender's text indefinitely.
+//
+// The activityService == nil early return stays, though not for the reason it
+// looks like: SetGraphPresenceCapture below is unconditional, so such a replica
+// DOES run the #2446 consumers — what it loses is the C1 refresh leg, which
+// fails closed on its own. The return exists for parity with
+// requirePresenceRecheckWired and for direct unit-test calls. On a real boot it
+// is unreachable: presence.NewActivityService returns a struct-literal pointer
+// and never nil.
 func requireGraphPresenceCaptureWired(
 	log *logger.Logger,
 	activityService *presence.ActivityService,
+	capture *graphpresence.Reconciler,
 	f *friends.Handler,
 	u *users.Handler,
 ) {
@@ -304,6 +383,9 @@ func requireGraphPresenceCaptureWired(
 	}
 	if !graphPresenceWiringComplete(f, u) {
 		log.Fatal("graph presence capture is not wired on every consumer handler")
+	}
+	if !graphPresenceRailWired(capture) {
+		log.Fatal("graph presence durable custom status rail is not wired")
 	}
 }
 
@@ -527,9 +609,28 @@ func NewRouter(
 	// leaf. Separate from the #2445 executor by design: that family's durability
 	// belongs to #2635 and must not be conflated with this one.
 	graphPresenceCapture := graphpresence.New(db, activityService, hub, senderPresence, log)
+
+	// The durable Custom Status (C2) leg. It rides the #2419 topology rail that
+	// presenceHistoryService already owns — no second outbox, table, stream, or
+	// dispatcher. Wiring it here, at ONE construction site, is what lets the
+	// durable terminal be swapped in without rewriting a single hook.
+	//
+	// presenceHistoryService is provably non-nil by this line:
+	// bindPresenceHistoryRuntime above returns an error on a nil service and
+	// NewRouter returns it. That matters more than it looks — a typed nil
+	// *Service would still satisfy the TopologyRail interface, so
+	// HasTopologyRail would answer true and the guard below would pass on a
+	// dead rail. Belt and braces: all three TopologyRail methods now fail
+	// closed on a nil receiver, so such a rail errors on first use rather than
+	// panicking, and the proof above is no longer the only thing standing
+	// between a refactor and a nil dereference.
+	graphPresenceCapture.SetTopologyRail(presenceHistoryService)
+
 	friendsHandler.SetGraphPresenceCapture(graphPresenceCapture)
 	usersHandler.SetGraphPresenceCapture(graphPresenceCapture)
-	requireGraphPresenceCaptureWired(log, activityService, friendsHandler, usersHandler)
+	requireGraphPresenceFamilyRegistry(log)
+	requireGraphPresenceCaptureWired(
+		log, activityService, graphPresenceCapture, friendsHandler, usersHandler)
 
 	// Both presence workers own a goroutine and a queue, and NOTHING called
 	// either Close: a graceful shutdown left queued plans undrained, so the

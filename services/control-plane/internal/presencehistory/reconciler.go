@@ -237,34 +237,70 @@ func (s *Service) CompleteClaim(requestCtx context.Context, plan DeliveryPlan) C
 	return ClaimCompletion{Outcome: outcome, Err: err}
 }
 
+// TopologyCompletion reports whether the caller's graph mutation COMMITTED,
+// alongside the completion error.
+//
+// The split exists because the two facts are independent: a post-commit
+// delivery failure means the mutation is durable and only the presence fan-out
+// failed, which is a 503 with the mutation visible — not a 500. Reporting
+// "Failed to remove friend" for a friendship that WAS removed is a correctness
+// lie that produces duplicate-action retries.
+//
+// Committed is false for BOTH a proven rollback and an unresolved commit. The
+// caller must therefore treat false as "not proven" and fail closed; it is not
+// evidence that nothing landed.
+type TopologyCompletion struct {
+	Committed bool
+	Err       error
+}
+
 // CompleteTopologyBatch commits the caller's graph mutation before performing
 // deterministic, bounded delivery. Every delivery claim verifies and releases
 // its database locks before waiting on the WebSocket path.
+//
+// It is retained with its original signature for callers that cannot act on the
+// commit outcome; new callers should prefer CompleteTopologyBatchWithOutcome.
 func (s *Service) CompleteTopologyBatch(
 	requestCtx context.Context,
 	tx *sql.Tx,
 	batch TopologyBatch,
 ) error {
+	return s.CompleteTopologyBatchWithOutcome(requestCtx, tx, batch).Err
+}
+
+// CompleteTopologyBatchWithOutcome is CompleteTopologyBatch plus the commit
+// evidence the caller needs to choose its HTTP status.
+func (s *Service) CompleteTopologyBatchWithOutcome(
+	requestCtx context.Context,
+	tx *sql.Tx,
+	batch TopologyBatch,
+) TopologyCompletion {
 	if err := validateTopologyBatchCompletion(requestCtx, s, tx, batch); err != nil {
-		return errors.Join(err, rollbackTopologyBatch(s, tx))
+		return TopologyCompletion{
+			Committed: false,
+			Err:       errors.Join(err, rollbackTopologyBatch(s, tx)),
+		}
 	}
 	completionCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(requestCtx),
-		2*s.effectiveDeliveryTimeout()+2*commitReadbackTimeout,
+		2*s.effectiveTopologyDeliveryTimeout()+2*commitReadbackTimeout,
 	)
 	defer cancel()
-	plans, completionErr := s.commitTopologyBatch(completionCtx, tx, batch)
-	return errors.Join(completionErr, s.completeTopologyPlans(completionCtx, plans))
+	plans, committed, completionErr := s.commitTopologyBatch(completionCtx, tx, batch)
+	return TopologyCompletion{
+		Committed: committed,
+		Err:       errors.Join(completionErr, s.completeTopologyPlans(completionCtx, plans)),
+	}
 }
 
 func (s *Service) commitTopologyBatch(
 	requestCtx context.Context,
 	tx *sql.Tx,
 	batch TopologyBatch,
-) ([]DeliveryPlan, error) {
+) ([]DeliveryPlan, bool, error) {
 	commitErr := s.CommitTx(tx)
 	if commitErr == nil {
-		return batch.plans, nil
+		return batch.plans, true, nil
 	}
 	completionErr := fmt.Errorf("commit topology audience batch: %w", commitErr)
 	if rollbackErr := s.RollbackTx(tx); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
@@ -273,6 +309,11 @@ func (s *Service) commitTopologyBatch(
 			fmt.Errorf("rollback topology audience batch: %w", rollbackErr),
 		)
 	}
+	// The batch is ONE transaction, so every operation shares its fate. A
+	// CommitConfirmed on any operation therefore proves the whole mutation is
+	// durable despite the driver's error — the same conclusion
+	// commitAndClaimPresenceWriterWithOutcome draws on the settings rail.
+	committed := false
 	plans := make([]DeliveryPlan, 0, len(batch.plans))
 	for index, operation := range batch.operations {
 		if err := requestCtx.Err(); err != nil {
@@ -287,6 +328,7 @@ func (s *Service) commitTopologyBatch(
 		cancel()
 		switch outcome {
 		case CommitConfirmed:
+			committed = true
 			plans = append(plans, batch.plans[index])
 		case CommitUnresolved:
 			completionErr = errors.Join(
@@ -297,7 +339,7 @@ func (s *Service) commitTopologyBatch(
 			// Atomic rollback needs no delivery; a newer marker owns recovery.
 		}
 	}
-	return plans, completionErr
+	return plans, committed, completionErr
 }
 
 func (s *Service) completeTopologyPlans(requestCtx context.Context, plans []DeliveryPlan) error {
@@ -387,7 +429,7 @@ func (s *Service) recoverUnresolvedTopologyCommit(
 	plan.ClearRecipients = nil
 	plan.UpdateRecipients = nil
 	plan.Payload = nil
-	resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveDeliveryTimeout())
+	resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveTopologyDeliveryTimeout())
 	defer cancel()
 	resetErr := s.EmergencyReset(resetCtx, plan)
 	if quarantineErr != nil {
@@ -440,7 +482,7 @@ func (s *Service) deliverTopologyPlan(
 	delivery Delivery,
 	plan DeliveryPlan,
 ) error {
-	deliveryCtx, cancel := context.WithTimeout(ctx, s.effectiveDeliveryTimeout())
+	deliveryCtx, cancel := context.WithTimeout(ctx, s.effectiveTopologyDeliveryTimeout())
 	ack, deliveryErr := delivery.DeliverCustomText(deliveryCtx, plan)
 	cancel()
 	if deliveryErr != nil {
@@ -624,7 +666,7 @@ func (s *Service) recoverTopologyPlan(
 	}
 	plan.UpdateRecipients = nil
 	plan.Payload = nil
-	resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveDeliveryTimeout())
+	resetCtx, cancel := boundedDetachedContext(ctx, s.effectiveTopologyDeliveryTimeout())
 	defer cancel()
 	if err := s.EmergencyReset(resetCtx, plan); err != nil {
 		return errors.Join(cause, fmt.Errorf("emergency topology reset: %w", err))
@@ -1023,6 +1065,20 @@ func (s *Service) effectiveDeliveryTimeout() time.Duration {
 	return s.deliveryTimeout
 }
 
+// effectiveTopologyDeliveryTimeout is the topology rail's uniform per-delivery
+// bound; see topologyDeliveryTimeout for why it is not derived from
+// s.deliveryTimeout.
+//
+// The receiver is unnamed on purpose: the bound is deliberately NOT derived
+// from s.deliveryTimeout. That field is configurable and shared with the
+// settings rail, and reading it here would silently reopen the configuration
+// surface this slice states it does not have. Keeping the method (rather than
+// using the const inline) preserves the symmetry with effectiveDeliveryTimeout
+// so a reader comparing the two rails sees one shape.
+func (*Service) effectiveTopologyDeliveryTimeout() time.Duration {
+	return topologyDeliveryTimeout
+}
+
 // ReconcilePending processes one bounded snapshot of eligible markers.
 func (s *Service) ReconcilePending(ctx context.Context, limit int) (ReconcileStats, error) {
 	runStart := time.Now()
@@ -1258,7 +1314,7 @@ func (s *Service) reconcileTopologyMarker(
 	}
 	claimCtx, cancel := context.WithTimeout(
 		ctx,
-		2*s.effectiveDeliveryTimeout()+2*commitReadbackTimeout,
+		2*s.effectiveTopologyDeliveryTimeout()+2*commitReadbackTimeout,
 	)
 	defer cancel()
 	err := s.completeTopologyPlan(claimCtx, DeliveryPlan{

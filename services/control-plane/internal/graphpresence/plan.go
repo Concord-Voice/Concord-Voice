@@ -33,6 +33,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 )
 
 // Bounds are consts, never configuration. A deployment that needs a different
@@ -100,6 +101,29 @@ type Plan struct {
 	// Degraded path.
 	degraded bool
 	cause    degradeCause
+
+	// Durable Custom Status (C2) path.
+	//
+	// topology is presencehistory's OWN opaque value: TopologyBatch declares
+	// both of its fields unexported (operations, plans), so this package can
+	// carry it and hand it back but cannot read the Custom Status text, emoji,
+	// or recipient sets out of it. That is what keeps the payload inside
+	// presencehistory and satisfies the doc rule above without a second handle
+	// type.
+	topology    presencehistory.TopologyBatch
+	hasTopology bool
+
+	// topologySenders is the focal set the batch was written for, in the order
+	// the bridge derived it. It is kept separately because the batch will not
+	// give it back.
+	topologySenders []uuid.UUID
+
+	// topologyBefore is each sender's PRE-mutation authorized Custom Status
+	// audience, already filtered by the #1234 recipient exceptions. It is
+	// derived viewer IDs, exactly like activeLeg.captured — never a friendship
+	// row and never an edge. A nil entry means the sender was inactive, which
+	// is the only value prepareTopologyPlan accepts for one.
+	topologyBefore map[uuid.UUID]map[uuid.UUID]bool
 }
 
 var _ presencecapture.Plan = (*Plan)(nil)

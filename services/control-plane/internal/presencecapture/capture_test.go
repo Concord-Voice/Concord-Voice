@@ -1,7 +1,10 @@
 package presencecapture
 
 import (
+	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -97,4 +100,40 @@ func TestCauseProvesNoCommit(t *testing.T) {
 	assert.False(t, CauseProvesNoCommit(Cause("something_new")),
 		"an unknown cause must not be treated as proof of no commit")
 	assert.False(t, CauseProvesNoCommit(""), "nor must the zero value")
+}
+
+// The two sentinels drive DIFFERENT handler responses for the same 503 status —
+// pending means the write did not happen and the request is safe to retry,
+// post-commit-delivery means it DID happen and a retry would duplicate it. A
+// PendingError that unwrapped to the wrong sentinel, or to nothing, would route
+// a committed mutation into the retry path.
+func TestPendingErrorUnwrapsToTheSentinel(t *testing.T) {
+	err := error(&PendingError{After: 7 * time.Second})
+
+	assert.True(t, errors.Is(err, ErrCapturePending))
+	assert.False(t, errors.Is(err, ErrPostCommitDelivery))
+
+	var pending *PendingError
+	require.True(t, errors.As(err, &pending))
+	assert.Equal(t, 7*time.Second, pending.After)
+}
+
+// Handlers classify an error that has been wrapped with operation context on the
+// way up, per [internal]rules/backend.md. Both the sentinel test and the Retry-After
+// extraction must survive that wrapping.
+func TestPendingErrorSurvivesWrapping(t *testing.T) {
+	err := fmt.Errorf("accept friend request: %w", &PendingError{After: time.Second})
+
+	assert.True(t, errors.Is(err, ErrCapturePending))
+
+	var pending *PendingError
+	require.True(t, errors.As(err, &pending))
+	assert.Equal(t, time.Second, pending.After)
+}
+
+func TestPostCommitDeliverySentinelIsDistinct(t *testing.T) {
+	err := fmt.Errorf("%w: hub unreachable", ErrPostCommitDelivery)
+
+	assert.True(t, errors.Is(err, ErrPostCommitDelivery))
+	assert.False(t, errors.Is(err, ErrCapturePending))
 }

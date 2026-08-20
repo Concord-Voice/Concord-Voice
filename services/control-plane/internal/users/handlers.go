@@ -2303,6 +2303,33 @@ func (h *Handler) logPurgeFenceStepUpFailure(e *stepup.Error) {
 	h.log.Error("Purge-fence step-up failed", "status", e.Status, "error", e.Cause)
 }
 
+// msgFailedUpdatePrivacySettings is hoisted to a constant so the terminal
+// responder and the handler cannot drift: the body message is part of the route
+// shape and must not change with the classification.
+const msgFailedUpdatePrivacySettings = "Failed to update privacy settings"
+
+// respondPresenceTerminal writes the HTTP shape #2446 §3.6 assigns to a hooked
+// transaction's error. It mirrors internal/friends' copy: same classification,
+// same Retry-After header, the same body message as before, the classification
+// in the structured log's fixed error_class field, and the error logged beside
+// it for the same reason — the 500 arm collapses every distinct cause to
+// "internal", so nothing else records which one occurred.
+//
+// It replaces the blanket 500 ONLY. A *stepup.Error carries a status of its own
+// and is not a presence-capture failure, so its branch runs first at the call
+// site and never reaches this.
+func (h *Handler) respondPresenceTerminal(c *gin.Context, message string, err error) {
+	failure := presencehook.Classify(err)
+	if retry, ok := failure.RetryAfterHeader(); ok {
+		c.Header("Retry-After", retry)
+	}
+	// The LOG keeps the site's own message; the BODY does not. A post-commit
+	// terminal committed, so telling the client "Failed to X" would invite the
+	// duplicate retry the 503 exists to prevent -- see Failure.Body.
+	h.log.Error(message, "error_class", failure.Code, "error", err)
+	c.JSON(failure.Status, gin.H{"error": failure.Body(message)})
+}
+
 // UpdatePrivacySettings updates the current user's privacy settings.
 // Accepts a partial JSON body — only provided fields are updated.
 // PATCH /users/me/privacy
@@ -2334,7 +2361,8 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	// is no conflict and the SET clause never runs. Instead: ensure the row exists
 	// (DO NOTHING), then UPDATE the provided columns. The UPDATE applies all
 	// setClauses — parameterized $N assignments AND fixed legacy literal clauses
-	// from dmPrivacyLegacySync — verbatim. The DB work runs in a closure so the
+	// from dmPrivacyLegacySync — verbatim. The DB work runs in a closure handed
+	// to presencehook.WithGatedTx — which owns BeginTx and the discard — so the
 	// failure response (and its message) is written in exactly one place.
 	var ps privacySettingsResponse
 	ctx := c.Request.Context()
@@ -2363,13 +2391,45 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		}
 	}
 
-	txErr := func() error {
-		tx, err := h.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer presencehook.RollbackUnlessDone(tx, h.log) // no-op once the terminal committed
+	// The gate must be held from BEFORE BeginTx, but whether a capture happens is
+	// known only AFTER readPriorFoF runs inside the transaction. Gate on the
+	// weaker, cheap condition — the field was supplied at all — so a PATCH that
+	// never mentions dm_friends_of_friends takes no gate and opens its
+	// transaction exactly as it did before PR 2.
+	//
+	// A supplied-but-unchanged value still TAKES the gate but writes NO marker
+	// and takes NO row lock, because the capture below stays conditional on an
+	// actual transition. §3.8 refuses to make the MARKER unconditional; a gate
+	// is a far cheaper thing.
+	//
+	// "Takes", not "requests": internal/api/router.go calls SetTopologyRail on
+	// the one reconciler it builds, so graphpresence.WithGatedTx no longer falls
+	// through to a plain transaction here. (It still does for a subject with no
+	// focal sender; this spec always has one, since PrincipalID is the actor.)
+	// The gate is a STRIPE — presencehistory.senderGateStripes is 64 of them,
+	// keyed by hash — not a per-user lock, so this request serializes against
+	// roughly 1/64 of unrelated users, not against nobody.
+	//
+	// ONE value feeds both WithGatedTx and Capture, so the two can never
+	// disagree about whether the hook is live: whenever Capture receives a
+	// non-nil capture, WithGatedTx received the same one. The capture branch is
+	// itself narrower (it also requires an actual transition), so the
+	// implication runs one way only — a gate request with no capture is the
+	// no-op PATCH, and a capture with no gate request cannot be constructed.
+	gatedCapture := h.graphPresence
+	if req.DMFriendsOfFriends == nil {
+		gatedCapture = nil
+	}
+	// One spec, both calls, for the same reason: WithGatedTx derives the gate
+	// set from the Subject it is handed and CaptureInTx derives the marker set
+	// from ITS Subject, and nothing in the contract forces the two to match.
+	spec := presencehook.Spec{
+		Family:      presencecapture.FamilyFriendsOfFriendsToggle,
+		Posture:     presencecapture.FailClosedBlockWrite,
+		PrincipalID: userID,
+	}
 
+	txErr := presencehook.WithGatedTx(ctx, gatedCapture, h.db, h.log, spec, func(tx *sql.Tx) error {
 		// #2765: disabling require_auth_before_purge requires the same step-up
 		// the purge requires. Gate on the REQUESTED value, not a computed
 		// transition — a prior-value read is ambiguous on a lazily-created row
@@ -2408,12 +2468,25 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		// row and a freshly-inserted row both mean false, and no caller branches
 		// on the distinction.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO privacy_settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
-			return err
+			return fmt.Errorf("ensure privacy settings row: %w", err)
 		}
 
 		// The OLD flag value dies with the UPDATE below, so read it inside this
 		// transaction. Reading it afterwards computes the BEFORE audience
 		// against the NEW value and the delta comes out silently empty.
+		//
+		// SITE-SCOPED LOCK-ORDER INVARIANT (#2446 §3.8): readPriorFoF is the
+		// ONLY place in internal/ that takes `privacy_settings … FOR UPDATE`,
+		// and it runs BEFORE the capture — inverse to every other chain in the
+		// family, which runs capture-first over users -> user_presence_settings
+		// -> pending markers. It is safe because both sides are the same user's
+		// own row and no second writer takes both locks, which makes it safe by
+		// COINCIDENCE rather than by construction: a future writer that takes
+		// the capture's locks and then this row would close the cycle. Do NOT
+		// "fix" it by moving this read after the capture — the capture is
+		// conditional on an actual transition, and making it unconditional
+		// would write a durable marker and take three row locks on every
+		// privacy PATCH.
 		oldFoF, err := readPriorFoF(ctx, tx, userID)
 		if err != nil {
 			return err
@@ -2427,11 +2500,7 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		// fresh.
 		var plan presencecapture.Plan
 		if req.DMFriendsOfFriends != nil && *req.DMFriendsOfFriends != oldFoF {
-			plan, err = presencehook.Capture(ctx, h.graphPresence, tx, presencehook.Spec{
-				Family:      presencecapture.FamilyFriendsOfFriendsToggle,
-				Posture:     presencecapture.FailClosedBlockWrite,
-				PrincipalID: userID,
-			})
+			plan, err = presencehook.Capture(ctx, gatedCapture, tx, spec)
 			if err != nil {
 				return fmt.Errorf("presence capture: %w", err)
 			}
@@ -2452,25 +2521,25 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 			&ps.AllowEmbeddedContent, &ps.LoadGifsAutomatically, &ps.EnableKlipyProxy,
 			&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge, &ps.UpdatedAt,
 		); err != nil {
-			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
-			return err
+			presencehook.Abandon(gatedCapture, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("update privacy settings: %w", err)
 		}
 
 		// presencehook.Complete owns the commit on BOTH paths, so this handler never
 		// calls tx.Commit() itself. A nil plan is the benign terminal.
-		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
-	}()
+		return presencehook.Complete(ctx, gatedCapture, tx, plan)
+	})
 	if txErr != nil {
-		// A step-up rejection carries its own status and body; the blanket 500
-		// below is for genuine failures only (#2765).
+		// A step-up rejection carries its own status and body and is NOT a
+		// presence-capture failure, so it is classified first and never reaches
+		// respondPresenceTerminal, which replaces the blanket 500 only (#2765).
 		var suErr *stepup.Error
 		if errors.As(txErr, &suErr) {
 			h.logPurgeFenceStepUpFailure(suErr)
 			suErr.Write(c)
 			return
 		}
-		h.log.Error("Failed to update privacy settings", "error", txErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update privacy settings"})
+		h.respondPresenceTerminal(c, msgFailedUpdatePrivacySettings, txErr)
 		return
 	}
 

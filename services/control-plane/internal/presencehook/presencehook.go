@@ -23,6 +23,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -33,9 +36,32 @@ import (
 // RollbackUnlessDone is the deferred rollback for hooked transactions.
 // sql.ErrTxDone means the terminal already committed and is not an error — it
 // is in fact the normal successful path, because Complete owns the commit.
+//
+// A genuine failure emits BOTH a fixed classification and the driver error,
+// which is the shape this feature's other terminals already use:
+// internal/friends/handlers.go and internal/users/handlers.go each have exactly
+// ONE classified failure sink — respondPresenceTerminal — and both log the
+// classification alongside the error it came from. (They name the field
+// "error_class" where this one says "failure_class"; that divergence is
+// recorded, not resolved here.) The constant is the stable grep target; the
+// error is the cause. Neither substitutes for the other.
+//
+// Keeping the error is load-bearing HERE specifically, because this defer has
+// no return value — the log is the only place a failed discard is ever
+// recorded. Exactly ONE production call site reaches it: WithGatedTx's own
+// unwired fallback below. A hooked handler lands on that fallback whenever it
+// passes a nil capture, which is NOT only the unhooked replica — TWO of the
+// five call sites nil it for their own cheap gate condition, internal/users
+// for a privacy PATCH that never supplies dm_friends_of_friends and
+// internal/friends' ClaimFriendCode for a claim that does not auto-accept.
+// (The other three pass h.graphPresence unconditionally.) A non-nil capture
+// routes the call into graphpresence's runInTx instead, whose defer joins the
+// cause into what it returns and so does not depend on its log. Dropping the
+// error here leaves a rollback failure permanently undiagnosable.
 func RollbackUnlessDone(tx *sql.Tx, log *logger.Logger) {
 	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-		log.Error("presence-hooked transaction rollback failed", "error", err)
+		log.Error("presence-hooked transaction rollback failed",
+			"failure_class", "gated_rollback", "error", err)
 	}
 }
 
@@ -144,4 +170,235 @@ func Abandon(
 	if capture != nil {
 		capture.Abandon(plan, cause)
 	}
+}
+
+// WithGatedTx opens the hooked transaction. It is the ONLY sanctioned way for a
+// handler to begin a transaction that will reach Capture.
+//
+// Wired: it delegates to the capture, which acquires the process-local sender
+// gates BEFORE opening the transaction. The durable topology rail's
+// BeginTopologyBatch requires that order — acquiring the gates after BeginTx
+// creates a gate-vs-row-lock cycle against internal/users/presence_settings.go,
+// whose UpdatePresenceSettings takes the same gates first (through
+// presencehistory.WithReadySenderModeBeforeReconcile) and only then opens its
+// transaction and takes the same users row.
+//
+// Unwired: a plain db.BeginTx plus the deferred RollbackUnlessDone — the
+// pre-#2446-PR-2 shape — so a replica without the hook behaves as it did
+// before and degrades to the pre-existing <=90s presence TTL.
+//
+// It never commits on either path. work's Complete owns the commit.
+//
+// The endpoint IDs are parsed BEFORE anything is opened, so a malformed ID
+// costs no transaction and no gate — and fails closed, because capturing
+// against uuid.Nil would drop that endpoint from the focal set silently. The
+// unwired path deliberately parses NOTHING, matching Capture: an unwired
+// handler must not start failing on an ID it never had to parse before.
+//
+// TWO deliberate differences from the wired bridge, and the second follows from
+// the first:
+//
+//   - graphpresence's runInTx JOINS a failed discard into the returned error
+//     (internal/graphpresence/topology.go); this fallback does not. The join
+//     would change the outcome for exactly one case — work returning nil
+//     without having committed — which the Complete-owns-the-commit contract
+//     excludes, so preserving the pre-existing shape costs nothing.
+//   - RollbackUnlessDone therefore logs the driver error alongside the fixed
+//     failure_class, while runInTx's defer logs the class alone. That defer
+//     loses nothing by omitting it, because it just joined the same error into
+//     what it returns; this one has no return value, so its log is the only
+//     record of the cause.
+func WithGatedTx(
+	ctx context.Context,
+	capture presencecapture.GraphPresenceCapture,
+	db *sql.DB,
+	log *logger.Logger,
+	spec Spec,
+	work func(tx *sql.Tx) error,
+) error {
+	if capture == nil {
+		if db == nil {
+			return errors.New("presencehook: unhooked gated transaction requires a database")
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin unhooked graph mutation: %w", err)
+		}
+		defer RollbackUnlessDone(tx, log)
+		return work(tx)
+	}
+	subject, err := spec.Subject()
+	if err != nil {
+		return err
+	}
+	return capture.WithGatedTx(ctx, subject, work)
+}
+
+// Failure is the HTTP shape a hooked handler returns for a terminal error.
+//
+// It carries no message: each handler keeps its own existing copy so no route
+// shape changes. Code is for the structured log's fixed failure_class field and
+// must stay a closed vocabulary — never an interpolated database error. The
+// basis is [internal]rules/backend.md's #2446 bullet, which requires the cause
+// vocabulary be a named type BECAUSE an untyped parameter invited a caller to
+// pass an interpolated DB error into that field. observability.md carries no
+// such rule; do not cite it here.
+type Failure struct {
+	Status     int
+	Code       string
+	RetryAfter time.Duration
+}
+
+// codePending is the one Failure.Code whose terminal resolves on its own. It is
+// named rather than repeated so Classify and RetryAfterHeader cannot drift: the
+// header must be emitted for exactly the terminal that self-resolves, and a
+// second copy of the string is all it would take for one of them to stop
+// meaning the other.
+const codePending = "presence_operation_pending"
+
+// codeDelivery is the post-commit arm: the mutation COMMITTED and only its
+// presence delivery failed. Named for the same reason as codePending -- Classify
+// and Body must not drift about which arm they mean.
+const codeDelivery = "delivery"
+
+// bodyPostCommitDelivery is what a post-commit terminal tells the client.
+//
+// It exists because the status code alone was not enough. ErrPostCommitDelivery's
+// contract requires "a 503 whose body still describes the mutation as having
+// happened", and reusing the site's failure message broke exactly that: a caller
+// whose friend WAS removed read {"error":"Failed to remove friend"} and had every
+// reason to retry an action that already succeeded -- the duplicate-action lie
+// the sentinel exists to prevent, moved from the status line into the body
+// (Gitar review, PR #2823).
+//
+// Deliberately generic across all five hooked sites. It says the two things a
+// client can act on: the change is saved, and the visible catch-up is delayed.
+const bodyPostCommitDelivery = "Your change was saved. Updating everyone who can see it is taking longer than usual."
+
+// Classify maps a hooked-transaction error onto its HTTP shape.
+//
+//	ErrCapturePending      -> 503 presence_operation_pending + Retry-After, nothing written
+//	ErrPostCommitDelivery  -> 503 delivery, the mutation IS durable
+//	anything else          -> 500 internal, nothing proven, fail closed
+//
+// presencecapture.ErrCaptureBound is deliberately NOT mapped and lands on the
+// 500 arm — but that arm's "nothing proven" does not describe it. Its only
+// producer is checkFocalBound (internal/graphpresence/reconciler.go), which
+// returns it exactly when len(focal) > maxFocalSenders, and both call sites
+// fail CLOSED regardless of posture: graphpresence's WithGatedTx returns before
+// any gate or transaction is taken, and CaptureInTx returns before its savepoint
+// and before the handler's write, leaving the deferred rollback to discard the
+// transaction. An oversized focal set is a defect in the focal-set derivation,
+// not a retryable condition, so 500 is the intended shape — and a response body
+// must not hedge that the mutation may have landed, because it provably did not.
+//
+// The ErrPostCommitDelivery arm is reachable in a running process as of the
+// durable Custom Status leg. graphpresence.classifyTopologyCompletion
+// (internal/graphpresence/topology.go) wraps it when the rail reports Committed
+// with a delivery error, and internal/api/router.go now calls SetTopologyRail at
+// the one site that builds the reconciler — so Reconciler.rail is non-nil on
+// every boot that gets that far, capture.go's marker step sets Plan.hasTopology
+// for any family whose policy carries the topology, and completeTopology runs.
+// A deployed control-plane takes this path.
+//
+// The ordering matters: ErrCapturePending is checked first because a pending
+// marker is the only terminal that both proves no write happened AND is
+// self-resolving, so conflating it with a 500 would tell the client to give up
+// on a request that would succeed 30 seconds later.
+//
+// Every Code is a literal here rather than anything derived from err, which is
+// what keeps the handler's failure_class field a closed enum no matter what the
+// database or the delivery path put in the error's text.
+func Classify(err error) Failure {
+	switch {
+	case err == nil:
+		return Failure{Status: http.StatusOK}
+	case errors.Is(err, presencecapture.ErrCapturePending):
+		return Failure{
+			Status:     http.StatusServiceUnavailable,
+			Code:       codePending,
+			RetryAfter: RetryAfter(err),
+		}
+	case errors.Is(err, presencecapture.ErrPostCommitDelivery):
+		return Failure{Status: http.StatusServiceUnavailable, Code: codeDelivery}
+	default:
+		return Failure{Status: http.StatusInternalServerError, Code: "internal"}
+	}
+}
+
+// RetryAfter surfaces the pending marker's remaining grace. It returns 0 for any
+// other error, including a bare ErrCapturePending with no delay attached.
+//
+// The delay reaches a *PendingError through graphpresence.translateRailError,
+// which has TWO branches and only one of them copies a producer's value: a
+// presencehistory.ServiceError coded presence_operation_pending yields that
+// struct's RetryAfter field, while ErrPendingOperationEligible substitutes
+// graphpresence's own reconcileRetryAfter constant, because a marker whose
+// grace already elapsed carries no producer field left to copy. That
+// translation has a production caller — capture.go's marker step routes
+// BeginTopologyBatch's error through it — and, like the post-commit arm above,
+// it sits behind capture.go's r.rail != nil guard, which internal/api/router.go
+// satisfies at boot. A deployed control-plane reaches it.
+func RetryAfter(err error) time.Duration {
+	var pending *presencecapture.PendingError
+	if errors.As(err, &pending) && pending.After > 0 {
+		return pending.After
+	}
+	return 0
+}
+
+// Body returns the response body for this class, given the call site's own
+// failure message.
+//
+// Only the post-commit arm overrides it, and that override is the whole point:
+// every other class describes a mutation that did NOT land, for which the site's
+// "Failed to X" message is accurate. Returning siteFailure for the delivery arm
+// would contradict this package's own documented contract.
+func (f Failure) Body(siteFailure string) string {
+	if f.Code == codeDelivery {
+		return bodyPostCommitDelivery
+	}
+	return siteFailure
+}
+
+// RetryAfterHeader is the ONLY sanctioned way to derive a Retry-After header
+// from a Failure. It yields a value for the pending terminal and ("", false)
+// for every other one, so a handler writes:
+//
+//	if retry, ok := failure.RetryAfterHeader(); ok {
+//		c.Header("Retry-After", retry)
+//	}
+//
+// The gate IS the point, and it is why retryAfterSeconds is unexported. That
+// conversion floors at 1, so applying it to whatever a Failure happens to carry
+// stamps Retry-After: 1 onto the 500 arm as well — telling every client to
+// re-drive a failure that does not resolve on its own, once per second, which
+// is the inverse of the behaviour the 503-vs-500 split exists to produce
+// (internal/presencecapture/capture.go, ErrCapturePending vs
+// ErrPostCommitDelivery). Only the pending terminal both proves no write
+// happened and clears itself, so only it may promise a retry.
+func (f Failure) RetryAfterHeader() (string, bool) {
+	if f.Code != codePending {
+		return "", false
+	}
+	return strconv.FormatInt(retryAfterSeconds(f.RetryAfter), 10), true
+}
+
+// retryAfterSeconds converts a delay to the whole seconds an HTTP Retry-After
+// header takes, rounding UP and flooring at 1.
+//
+// The floor is load-bearing: Retry-After has one-second granularity, so a
+// sub-second delay truncates to 0, and 0 invites an immediate retry straight
+// back into the marker that is still held. It is also why this is unexported:
+// the floor makes a delay-less Failure look retryable, so the only caller may
+// be RetryAfterHeader, which has already established that a retry is warranted.
+func retryAfterSeconds(d time.Duration) int64 {
+	if d <= 0 {
+		return 1
+	}
+	seconds := int64(d / time.Second)
+	if d%time.Second != 0 {
+		seconds++
+	}
+	return seconds
 }

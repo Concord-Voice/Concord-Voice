@@ -16,7 +16,36 @@ import (
 const (
 	pendingOperationGrace = 30 * time.Second
 	commitReadbackTimeout = 3 * time.Second
-	senderGateStripes     = 64
+
+	// topologyDeliveryTimeout is the topology rail's UNIFORM per-delivery
+	// bound: ONE delivery on this rail gets 1500ms no matter which entry point
+	// reached it. It is shorter than the settings rail's because of the
+	// interactive case — a friend accept must not hold an HTTP request open
+	// while a stalled socket drains — but that case MOTIVATES the bound rather
+	// than scoping it. With commitReadbackTimeout it puts the completion
+	// ceiling at 2*1500ms + 2*3s = 9s, down from 16s.
+	//
+	// The background paths inherit it DELIBERATELY. reconcileTopologyMarker
+	// runs off RunPendingReconciler's ticker with no HTTP request anywhere on
+	// the stack, and deliverTopologyPlan / recoverTopologyPlan are reachable
+	// from both that ticker and the inline completion;
+	// recoverUnresolvedTopologyCommit is inline-only and takes the same uniform
+	// bound. On the ticker a stalled socket consumes a reconciler tick
+	// instead of a request, which is the same bounded-progress argument. Do
+	// NOT revert one of those call sites to effectiveDeliveryTimeout on the
+	// grounds that it "isn't interactive".
+	//
+	// It is a const and takes NO configuration surface. Making it configurable
+	// would let a deployment raise a latency bound instead of fixing whatever
+	// made delivery slow, and #2446 PR 2 ships zero new environment variables.
+	// Residue past this bound converges through RunPendingReconciler's 5s
+	// ticker -> reconcileTopologyMarker -> conservative reset, and that retry
+	// is itself bounded by this same const: convergence comes from repeated
+	// bounded attempts, never from a longer one. The explicit tradeoff is that
+	// a slow path over-clears rather than resolving exactly.
+	topologyDeliveryTimeout = 1500 * time.Millisecond
+
+	senderGateStripes = 64
 
 	// Version 8 is the RFC 9562 application-defined UUID space. Topology
 	// operations use it as durable kind evidence when the settings marker is
@@ -177,6 +206,15 @@ func (s *Service) WithSenders(
 	senderIDs []uuid.UUID,
 	work func() error,
 ) error {
+	// Fail closed on a nil receiver, matching BeginTopologyBatch and
+	// validateTopologyBatchCompletion. This is not defensive padding: a typed
+	// nil *Service still satisfies the graphpresence.TopologyRail interface, so
+	// r.rail != nil answers TRUE and #2446's boot guard passes on a rail that
+	// is dead. Without this guard the failure surfaces as a nil dereference on
+	// s.senderGates below, on the first gated write rather than at boot.
+	if s == nil {
+		return errors.New("presence history sender gates unavailable")
+	}
 	var selected [senderGateStripes]bool
 	indexes := make([]int, 0, min(len(senderIDs), senderGateStripes))
 	for _, senderID := range senderIDs {

@@ -4,6 +4,12 @@ All notable changes to Concord Voice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **A friend or privacy change can briefly delay saving your custom status** ([#2823](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2823)) — accepting or removing a friend, blocking someone, redeeming a friend code, or changing who can see you through friends-of-friends now updates your custom status for everyone who can see it, and does so durably rather than only for people currently connected. While one of those is being applied, your own **Settings ▸ Presence** save may return "service unavailable" for up to 30 seconds, with the wait shown in a `Retry-After` header. That is expected rather than a fault: both writes touch the same presence state, and they are serialized so neither can publish an audience that is already out of date. Retrying after the indicated delay succeeds.
+
 ## [0.2.39] — 2026-07-31
 
 Pointing Concord Voice at a self-hosted server is now checked at the moment it connects, not only when you type the address. A server on your own network or machine is reachable only after you approve it in a confirmation the web layer cannot draw or click.

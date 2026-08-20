@@ -44,6 +44,14 @@ type Reconciler struct {
 	senderPresence presence.SenderPresenceResolver
 	log            *logger.Logger
 	sink           dispatchSink
+
+	// rail is the durable Custom Status (C2) leg, declared in topology.go. It
+	// is a setter-wired field rather than a New parameter so the construction
+	// site adds one line and no existing caller or test changes shape;
+	// HasTopologyRail is what lets a boot guard turn a forgotten
+	// SetTopologyRail into a startup failure instead of a silent
+	// in-memory-only replica.
+	rail TopologyRail
 }
 
 // The presencecapture.GraphPresenceCapture assertion lives in capture.go, next
@@ -122,11 +130,18 @@ func (r *Reconciler) degradePlan(
 // Complete commits tx, then dispatches. It is the last statement that may touch
 // tx: handlers must not call tx.Commit() themselves.
 //
-// The context parameter is part of the presencecapture contract but is unused
-// here: sql.Tx.Commit takes none, and dispatch is post-commit work that must
-// outlive the request context rather than be cancelled with it.
+// The context is THREADED, not discarded. It arrived as `_ context.Context`
+// under a comment calling it unused, which was true while the only terminal was
+// a bare sql.Tx.Commit — that takes no context, and the post-commit in-memory
+// dispatch must outlive the request rather than be cancelled with it. The
+// durable leg changed that: CompleteTopologyBatchWithOutcome reads and delivers
+// under a context, refuses a nil one outright
+// (presencehistory.validateTopologyBatchCompletion), and detaches it from
+// request cancellation itself via context.WithoutCancel before the commit and
+// its classification run. Passing the request context through is therefore both
+// required and safe.
 func (r *Reconciler) Complete(
-	_ context.Context, tx *sql.Tx, plan presencecapture.Plan,
+	ctx context.Context, tx *sql.Tx, plan presencecapture.Plan,
 ) error {
 	if tx == nil {
 		return errors.New("graphpresence: Complete requires a transaction")
@@ -139,6 +154,28 @@ func (r *Reconciler) Complete(
 		return errors.New("graphpresence: Complete received a foreign presencecapture.Plan")
 	}
 
+	if p != nil && p.hasTopology {
+		if r.rail == nil {
+			// Unreachable today — hasTopology is only set under capture.go's own
+			// r.rail != nil guard — and it fails CLOSED anyway, because the one
+			// alternative is worse than a 500. Falling through to the bare
+			// commit below would land the markers and never call
+			// CompleteTopologyBatchWithOutcome, which is invariant TB-1's
+			// failure mode exactly: the batch dropped after BeginTopologyBatch
+			// ran, leaving the sender's Custom Status suppressed for every
+			// reconnecting viewer until the pending-operation grace expires.
+			// A rail swapped out between capture and completion is a wiring
+			// bug, not a posture.
+			return errors.New(
+				"graphpresence: Complete cannot resolve a topology batch without a rail")
+		}
+		// The durable rail owns the COMMIT for this transaction, and with it
+		// every terminal that follows — including the C1 enqueue, because a
+		// topology batch reconciles Custom Status only and says nothing about
+		// Server Voice.
+		return r.completeTopology(ctx, tx, p)
+	}
+
 	if err := tx.Commit(); err != nil {
 		// An unresolved commit fails closed: we cannot prove the write landed,
 		// so we disconnect whatever the capture held rather than assume either
@@ -146,10 +183,17 @@ func (r *Reconciler) Complete(
 		r.Abandon(p, presencecapture.CauseCommitUnresolved)
 		return fmt.Errorf("commit graph mutation: %w", err)
 	}
+	r.enqueue(p)
+	return nil
+}
+
+// enqueue hands a committed plan to the in-memory C1 sink when it has work.
+// HasWork() is false for a plan that carries only topology markers, which is
+// correct: the C2 leg was already delivered synchronously by the rail.
+func (r *Reconciler) enqueue(p *Plan) {
 	if p.HasWork() {
 		r.sink.Enqueue(p)
 	}
-	return nil
 }
 
 // Abandon is the fail-closed terminal. It never touches tx.

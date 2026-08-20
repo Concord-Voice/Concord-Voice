@@ -18,8 +18,10 @@ import (
 )
 
 // TestUpdatePrivacySettingsDBError covers the consolidated transaction-error path
-// of the #1674 fix: when the DB is unavailable, h.db.Begin() fails inside the
-// closure and the handler must respond 500 (not panic, not 200). UpdatePrivacySettings
+// of the #1674 fix: when the DB is unavailable the handler must respond 500
+// (not panic, not 200). The failing BeginTx now lives in presencehook.WithGatedTx
+// rather than in the handler's own closure (#2446 PR 2), which is why this still
+// passes unchanged: the error is returned to the same terminal. UpdatePrivacySettings
 // uses only h.db and h.log, so a nil hub / nil MFA verifier are safe here.
 func TestUpdatePrivacySettingsDBError(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)

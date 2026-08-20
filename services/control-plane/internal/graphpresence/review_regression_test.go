@@ -124,15 +124,19 @@ func TestBoundExceededOnAnAdditiveFamilyDoesNotDisconnect(t *testing.T) {
 		Counterpart: uuid.New(),
 		Family:      presencecapture.FamilyFriendshipAccept,
 	}
-	require.False(t, subject.Family.CanRevokeVisibility(),
-		"precondition: accept is additive")
+	// Read the policy from the registry, exactly as CaptureInTx's step 1 does,
+	// so this test cannot pass by handing planForBoundExceeded an answer the
+	// registry does not actually declare.
+	policy, err := presencecapture.PolicyFor(subject.Family)
+	require.NoError(t, err)
+	require.False(t, policy.CanRevokeVisibility, "precondition: accept is additive")
 
 	r := New(nil, &fakeRefresher{}, &countingDisconnector{}, nil, nil)
 	defer r.Close()
 
 	// Exercise the DECISION, not a hand-built Plan. Asserting on a struct this
 	// test constructed itself would pass with the gate deleted.
-	plan := r.planForBoundExceeded(subject)
+	plan := r.planForBoundExceeded(subject, policy)
 
 	require.False(t, plan.Degraded(),
 		"an additive family over the bound must not degrade")
@@ -144,7 +148,7 @@ func TestBoundExceededOnAnAdditiveFamilyDoesNotDisconnect(t *testing.T) {
 	d := &countingDisconnector{}
 	r2 := New(nil, &fakeRefresher{}, d, nil, nil)
 	defer r2.Close()
-	r2.dispatch(r2.planForBoundExceeded(subject))
+	r2.dispatch(r2.planForBoundExceeded(subject, policy))
 	assert.Equal(t, 0, d.timesAsked(subject.Principal),
 		"accepting a friend request must never disconnect the principal")
 	assert.Equal(t, 0, d.timesAsked(subject.Counterpart),
@@ -159,14 +163,15 @@ func TestBoundExceededOnARevokingFamilyStillDegrades(t *testing.T) {
 		Counterpart: uuid.New(),
 		Family:      presencecapture.FamilyFriendshipRemove,
 	}
-	require.True(t, subject.Family.CanRevokeVisibility(),
-		"precondition: removal can revoke")
+	policy, err := presencecapture.PolicyFor(subject.Family)
+	require.NoError(t, err)
+	require.True(t, policy.CanRevokeVisibility, "precondition: removal can revoke")
 
 	d := &countingDisconnector{}
 	r := New(nil, &fakeRefresher{}, d, nil, nil)
 	defer r.Close()
 
-	degraded := r.planForBoundExceeded(subject)
+	degraded := r.planForBoundExceeded(subject, policy)
 	require.True(t, degraded.Degraded(), "the gate must narrow the fix, not disable the bound")
 	require.True(t, degraded.HasWork())
 

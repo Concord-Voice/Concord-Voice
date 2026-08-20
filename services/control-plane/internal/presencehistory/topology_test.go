@@ -1195,3 +1195,288 @@ func TestPrepareTopologyBatchInactiveStatusRejectsAudienceAndSkipsPayload(t *tes
 	}})
 	require.Error(t, err)
 }
+
+func TestEffectiveTopologyDeliveryTimeoutIgnoresConfiguredDeliveryTimeout(t *testing.T) {
+	service := NewService(nil, DisclosureState{}, false)
+
+	t.Run("default service uses the topology const", func(t *testing.T) {
+		assert.Equal(t, 1500*time.Millisecond, service.effectiveTopologyDeliveryTimeout())
+	})
+
+	t.Run("a configured settings-rail timeout does not move it", func(t *testing.T) {
+		service.deliveryTimeout = 30 * time.Second
+		assert.Equal(t, 1500*time.Millisecond, service.effectiveTopologyDeliveryTimeout())
+		assert.Equal(t, 30*time.Second, service.effectiveDeliveryTimeout())
+	})
+}
+
+func TestCompleteTopologyBatchWithOutcomeRejectsAnInvalidBatch(t *testing.T) {
+	service := NewService(nil, DisclosureState{}, false)
+
+	outcome := service.CompleteTopologyBatchWithOutcome(context.Background(), nil, TopologyBatch{})
+
+	assert.False(t, outcome.Committed)
+	require.Error(t, outcome.Err)
+	assert.Contains(t, outcome.Err.Error(), "invalid topology batch completion")
+}
+
+// topologyOutcomeFixture is one seeded topology sender with a prepared
+// single-sender batch, so the commit-evidence cases below differ only by the
+// commit hook they install.
+type topologyOutcomeFixture struct {
+	service  *Service
+	delivery *task8Delivery
+	senderID uuid.UUID
+	tx       *sql.Tx
+	batch    TopologyBatch
+}
+
+func newTopologyOutcomeFixture(
+	ctx context.Context,
+	t *testing.T,
+	db *sql.DB,
+	delivery *task8Delivery,
+) topologyOutcomeFixture {
+	t.Helper()
+	senderID := testhelpers.CreateUser(t, db)
+	seedTopologyStatus(t, db, senderID, 1, "secret")
+	service := NewService(db, DisclosureState{}, false)
+	require.NoError(t, service.BindDelivery(delivery))
+	tx := operationBeginTx(ctx, t, db)
+	batch, err := service.BeginTopologyBatch(ctx, tx, []uuid.UUID{senderID})
+	require.NoError(t, err)
+	batch, err = PrepareTopologyBatch(batch, []TopologyAudience{{SenderID: senderID}})
+	require.NoError(t, err)
+	return topologyOutcomeFixture{
+		service:  service,
+		delivery: delivery,
+		senderID: senderID,
+		tx:       tx,
+		batch:    batch,
+	}
+}
+
+func TestCompleteTopologyBatchWithOutcomeReportsAPlainCommit(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	fixture := newTopologyOutcomeFixture(ctx, t, db, &task8Delivery{})
+
+	outcome := fixture.service.CompleteTopologyBatchWithOutcome(ctx, fixture.tx, fixture.batch)
+
+	assert.True(t, outcome.Committed)
+	assert.NoError(t, outcome.Err)
+	assert.Equal(t, 0, task8PendingCount(t, db, fixture.senderID))
+	require.Len(t, fixture.delivery.snapshot(), 1)
+}
+
+// A driver error on a transaction that DID commit is the case the outcome type
+// exists for: the mutation is durable, only the fan-out is in doubt, and the
+// caller owes a 503 rather than a 500.
+func TestCompleteTopologyBatchWithOutcomeReportsCommittedDespiteAnAmbiguousCommitError(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	fixture := newTopologyOutcomeFixture(ctx, t, db, &task8Delivery{})
+	errAmbiguous := errors.New("test ambiguous topology commit outcome")
+	restore := fixture.service.SetTransactionTestHooks(TransactionTestHooks{
+		Commit: func(tx *sql.Tx) error {
+			require.NoError(t, tx.Commit())
+			return errAmbiguous
+		},
+	})
+	defer restore()
+
+	outcome := fixture.service.CompleteTopologyBatchWithOutcome(ctx, fixture.tx, fixture.batch)
+
+	assert.True(t, outcome.Committed)
+	require.ErrorIs(t, outcome.Err, errAmbiguous)
+	assert.Equal(t, 0, task8PendingCount(t, db, fixture.senderID))
+	require.Len(t, fixture.delivery.snapshot(), 1)
+}
+
+func TestCompleteTopologyBatchWithOutcomeReportsNotCommittedOnAProvenRollback(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	fixture := newTopologyOutcomeFixture(ctx, t, db, &task8Delivery{})
+	errCommit := errors.New("test rejected topology commit outcome")
+	restore := fixture.service.SetTransactionTestHooks(TransactionTestHooks{
+		Commit: func(*sql.Tx) error { return errCommit },
+	})
+	defer restore()
+
+	outcome := fixture.service.CompleteTopologyBatchWithOutcome(ctx, fixture.tx, fixture.batch)
+
+	assert.False(t, outcome.Committed)
+	require.ErrorIs(t, outcome.Err, errCommit)
+	assert.Equal(t, 0, task8PendingCount(t, db, fixture.senderID))
+	assert.Empty(t, fixture.delivery.snapshot())
+}
+
+// The bound deliverTopologyPlan actually applies is reachable by no other
+// assertion in this file: reverting that one call back to the settings rail's
+// effectiveDeliveryTimeout leaves every other topology test green. Read the
+// deadline handed to the delivery adapter instead of waiting on it, so the
+// assertion costs nothing and does not depend on elapsed time.
+func TestDeliverTopologyPlanBoundsOneDeliveryByTheTopologyTimeout(t *testing.T) {
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	var deadlineSet bool
+	var remaining time.Duration
+	delivery := &task8Delivery{deliver: func(deliveryCtx context.Context, _ DeliveryPlan) error {
+		deadline, ok := deliveryCtx.Deadline()
+		deadlineSet = ok
+		if ok {
+			remaining = time.Until(deadline)
+		}
+		return nil
+	}}
+	fixture := newTopologyOutcomeFixture(ctx, t, db, delivery)
+
+	require.NoError(t, fixture.service.CompleteTopologyBatch(ctx, fixture.tx, fixture.batch))
+
+	require.True(t, deadlineSet)
+	// The settings rail's default is 5s, so the upper bound is what makes this
+	// falsifiable; the lower bound only rejects an accidentally tiny budget.
+	assert.LessOrEqual(t, remaining, topologyDeliveryTimeout)
+	assert.Greater(t, remaining, topologyDeliveryTimeout/2)
+}
+
+// topologyResetDeadline records the deadline the delivery adapter is handed for
+// a conservative reset. Both recovery paths deliver inline on the calling
+// goroutine, so plain fields need no synchronisation.
+type topologyResetDeadline struct {
+	set       bool
+	remaining time.Duration
+}
+
+func (d *topologyResetDeadline) record(ctx context.Context) {
+	deadline, ok := ctx.Deadline()
+	d.set = ok
+	if ok {
+		d.remaining = time.Until(deadline)
+	}
+}
+
+func (d *topologyResetDeadline) assertBoundedByTopologyTimeout(t *testing.T) {
+	t.Helper()
+	require.True(t, d.set)
+	// The settings rail's default is 5s, so the upper bound is what makes this
+	// falsifiable; the lower bound only rejects an accidentally tiny budget.
+	assert.LessOrEqual(t, d.remaining, topologyDeliveryTimeout)
+	assert.Greater(t, d.remaining, topologyDeliveryTimeout/2)
+}
+
+// The bound the two topology RECOVERY paths apply is reachable by no other
+// assertion in this package: reverting recoverTopologyPlan's or
+// recoverUnresolvedTopologyCommit's call back to the settings rail's
+// effectiveDeliveryTimeout leaves every other topology test green. Both sites
+// are observable at the same delivery seam
+// TestDeliverTopologyPlanBoundsOneDeliveryByTheTopologyTimeout uses:
+// boundedDetachedContext clamps to min(9s completion ceiling, now+1500ms) and
+// EmergencyReset then clamps min(that, 5s) at the adapter, so a revert moves
+// the adapter's deadline from 1500ms to 5s. Read the deadline handed to the
+// adapter instead of waiting on it, so the lock does not depend on elapsed
+// time.
+func TestTopologyRecoveryResetsAreBoundedByTheTopologyTimeout(t *testing.T) {
+	t.Run("delivery failure recovery", func(t *testing.T) {
+		db, cleanup := testhelpers.SetupTestDB(t)
+		defer cleanup()
+		ctx := context.Background()
+		senderID := testhelpers.CreateUser(t, db)
+		seedTopologyStatus(t, db, senderID, 1, "secret")
+		var reset topologyResetDeadline
+		delivery := &task8Delivery{deliver: func(deliveryCtx context.Context, plan DeliveryPlan) error {
+			if plan.Mode == DeliveryExactDelta {
+				return errTestDelivery
+			}
+			reset.record(deliveryCtx)
+			return nil
+		}}
+		service := NewService(db, DisclosureState{}, false)
+		require.NoError(t, service.BindDelivery(delivery))
+		tx := operationBeginTx(ctx, t, db)
+		batch, err := service.BeginTopologyBatch(ctx, tx, []uuid.UUID{senderID})
+		require.NoError(t, err)
+		batch, err = PrepareTopologyBatch(batch, []TopologyAudience{{SenderID: senderID}})
+		require.NoError(t, err)
+
+		require.ErrorIs(t, service.CompleteTopologyBatch(ctx, tx, batch), errTestDelivery)
+
+		plans := delivery.snapshot()
+		require.Len(t, plans, 2)
+		require.Equal(t, DeliveryConservativeReset, plans[1].Mode)
+		reset.assertBoundedByTopologyTimeout(t)
+	})
+
+	// TestCompleteTopologyBatchUnresolvedCommitResetsAll drives this same path
+	// through an already-expired request context; this clone keeps a live one
+	// because CompleteTopologyBatchWithOutcome detaches with
+	// context.WithoutCancel before any of this runs, so the expired parent
+	// never reaches the bound under assertion.
+	t.Run("unresolved commit recovery", func(t *testing.T) {
+		db, cleanup := testhelpers.SetupTestDB(t)
+		defer cleanup()
+		ctx := context.Background()
+		senderID := testhelpers.CreateUser(t, db)
+		seedTopologyStatus(t, db, senderID, 1, "secret")
+		var reset topologyResetDeadline
+		delivery := &task8Delivery{deliver: func(deliveryCtx context.Context, _ DeliveryPlan) error {
+			reset.record(deliveryCtx)
+			return nil
+		}}
+		service := NewService(db, DisclosureState{}, false)
+		require.NoError(t, service.BindDelivery(delivery))
+		errCommit := errors.New("test unresolved topology commit bound")
+		service.readCommitState = func(context.Context, uuid.UUID) (audienceCommitState, error) {
+			return audienceCommitState{}, errors.New("test commit readback unavailable")
+		}
+		restore := service.SetTransactionTestHooks(TransactionTestHooks{
+			Commit: func(*sql.Tx) error { return errCommit },
+		})
+		defer restore()
+		tx := operationBeginTx(ctx, t, db)
+		batch, err := service.BeginTopologyBatch(ctx, tx, []uuid.UUID{senderID})
+		require.NoError(t, err)
+		batch, err = PrepareTopologyBatch(batch, []TopologyAudience{{SenderID: senderID}})
+		require.NoError(t, err)
+
+		require.ErrorIs(t, service.CompleteTopologyBatch(ctx, tx, batch), errCommit)
+
+		plans := delivery.snapshot()
+		require.Len(t, plans, 1)
+		require.Equal(t, DeliveryConservativeReset, plans[0].Mode)
+		reset.assertBoundedByTopologyTimeout(t)
+	})
+}
+
+// A typed nil *Service satisfies graphpresence.TopologyRail, so #2446's boot
+// guard (HasTopologyRail) answers TRUE on one and the process boots with a dead
+// rail. Both other rail methods already fail closed on a nil receiver;
+// WithSenders dereferenced s.senderGates and panicked, which surfaces on the
+// first gated write instead of as an error the caller can classify.
+func TestWithSendersFailsClosedOnNilService(t *testing.T) {
+	var service *Service
+
+	require.NotPanics(t, func() {
+		err := service.WithSenders(context.Background(), []uuid.UUID{uuid.New()},
+			func() error { return nil })
+		require.Error(t, err, "a nil service must fail closed, not succeed")
+	}, "a nil receiver must not panic -- the boot guard cannot see a typed nil")
+}
+
+// The work function must never run on a nil service: a caller that read the
+// error but had already been handed a committed transaction would be worse off
+// than one that got a panic.
+func TestWithSendersOnNilServiceNeverRunsWork(t *testing.T) {
+	var service *Service
+	ran := false
+
+	err := service.WithSenders(context.Background(), []uuid.UUID{uuid.New()},
+		func() error { ran = true; return nil })
+
+	require.Error(t, err)
+	assert.False(t, ran, "work must not run when the gates were never acquired")
+}

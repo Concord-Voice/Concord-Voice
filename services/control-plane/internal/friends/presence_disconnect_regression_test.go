@@ -40,6 +40,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -377,6 +378,16 @@ type cancelAfterCapture struct {
 	cancel context.CancelFunc
 }
 
+// WithGatedTx delegates like every other method here: this decorator is a test
+// clock, so the gate-then-transaction ordering must stay the reconciler's. The
+// cancel is NOT fired here — it belongs after the capture read, which is what
+// CaptureInTx below pins.
+func (c *cancelAfterCapture) WithGatedTx(
+	ctx context.Context, subject presencecapture.Subject, work func(tx *sql.Tx) error,
+) error {
+	return c.inner.WithGatedTx(ctx, subject, work)
+}
+
 func (c *cancelAfterCapture) CaptureInTx(
 	ctx context.Context, tx *sql.Tx, subject presencecapture.Subject,
 ) (presencecapture.Plan, error) {
@@ -497,4 +508,203 @@ func TestRemoveFriendDoesNotLeakVoiceStateByTiming(t *testing.T) {
 		idleT, voiceT, float64(voiceT)/float64(idleT))
 	assert.Less(t, float64(voiceT), 3*float64(idleT),
 		"REGRESSION: latency must not disclose whether a stranger is in Server Voice — the gate returns before any audience work")
+}
+
+// ---------------------------------------------------------------------------
+// AC-14 — the same five scenarios, now against a WIRED durable rail.
+//
+// The five regressions above prove no viewer is disconnected. They cannot prove
+// anything about durable markers, because newPoCEnv wires no topology rail and
+// CaptureInTx's marker step is guarded on `r.rail != nil` — so with the rail
+// absent a "no marker was written" assertion passes without exercising anything.
+// That is the tautological shape this PR has already produced elsewhere, and it
+// is why these variants exist rather than extra asserts on the originals.
+//
+// What a failure would mean is worse than the disconnect it supersedes. Markers
+// are written at STEP 5, AFTER the accepted-edge gate. If that gate ever stops
+// short-circuiting, an attacker naming a stranger writes a DURABLE row that
+// suppresses that stranger's Custom Status for every reconnecting viewer —
+// persisting across replicas and restarts, where a disconnect merely dropped a
+// socket the client would re-open.
+// ---------------------------------------------------------------------------
+
+// newRailedPoCEnv is newPoCEnv with the durable Custom Status leg wired, so the
+// marker branch is genuinely reachable and a zero count means the gate held
+// rather than that markers were impossible.
+func newRailedPoCEnv(t *testing.T) (*pocEnv, *deliveryRecorder) {
+	t.Helper()
+	ts := testhelpers.SetupTestServer(t)
+	disc := newRecordingDisconnector()
+	rec := graphpresence.New(ts.DB, noopRefresher{}, disc, alwaysPermittedResolver{}, logger.New("poc"))
+	t.Cleanup(rec.Close)
+	// A SEPARATE rail service over the same database, not ts.PresenceHistory:
+	// SetupTestServer has already bound that one to the hub, and BindDelivery
+	// refuses a second binding ("presence history delivery already bound"). The
+	// service is stateless with respect to the rows, so a second instance over
+	// the same DB observes the same markers.
+	recorder := &deliveryRecorder{}
+	const activationEnabled = true // the rail must be live, or a zero marker count proves nothing
+	rail := presencehistory.NewService(
+		ts.DB, presencehistory.BuildDisclosure(
+			presencehistory.DisclosureOptions{InstanceType: "saas"}), activationEnabled)
+	require.NoError(t, rail.BindDelivery(recorder))
+	rec.SetTopologyRail(rail)
+	require.True(t, rec.HasTopologyRail())
+
+	return &pocEnv{ts: ts, rec: rec, disc: disc}, recorder
+}
+
+// deliveryRecorder captures what the rail tried to deliver.
+//
+// A post-hoc marker count is NOT sufficient on the handler-driven path, and
+// discovering that is what these tests are worth: the full lifecycle runs to
+// completion -- marker written, committed, delivered, acked, and the ack CLEARS
+// the marker -- so the row count reads zero by the time the test queries,
+// whether or not the accepted-edge gate held. The first version of these two
+// tests passed against a deliberately broken gate. Delivery is the observation
+// that survives, because it happens before the clear.
+type deliveryRecorder struct {
+	mu    sync.Mutex
+	plans []presencehistory.DeliveryPlan
+}
+
+func (d *deliveryRecorder) DeliverCustomText(
+	_ context.Context, plan presencehistory.DeliveryPlan,
+) (presencehistory.DeliveryAck, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.plans = append(d.plans, plan)
+	return presencehistory.DeliveryAck{OperationID: plan.OperationID}, nil
+}
+
+// mentions reports whether any recorded plan names the user as the sender whose
+// Custom Status is being reconciled, or as a recipient on either side.
+func (d *deliveryRecorder) mentions(userID uuid.UUID) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, plan := range d.plans {
+		if plan.SenderID == userID ||
+			plan.ClearRecipients[userID] || plan.UpdateRecipients[userID] {
+			return true
+		}
+	}
+	return false
+}
+
+// markerCount reports durable topology markers outstanding for a user.
+func markerCount(t *testing.T, db *sql.DB, userID uuid.UUID) int {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`,
+		userID).Scan(&count))
+	return count
+}
+
+// requireNoDurableSuppression asserts BOTH principals are clean, on both
+// observations. Checking only the victim would miss a gate that reconciled the
+// attacker's own audience instead — the same write with the subjects transposed.
+//
+// Delivery is asserted over a window because the dispatch is asynchronous, and
+// it is asserted FIRST because it is the observation that can actually fail: the
+// marker rows are cleared by the delivery ack, so the counts below are a
+// belt-and-braces check on the steady state rather than the load-bearing one.
+func requireNoDurableSuppression(
+	t *testing.T, db *sql.DB, delivered *deliveryRecorder, attacker, victim uuid.UUID,
+) {
+	t.Helper()
+	require.Never(t, func() bool {
+		return delivered.mentions(victim) || delivered.mentions(attacker)
+	},
+		2*time.Second, 10*time.Millisecond,
+		"REGRESSION: a stranger must not have their Custom Status reconciled — unlike "+
+			"a disconnect, a durable marker survives reconnect, replica and restart, and "+
+			"suppresses their status for every viewer that reconnects while it stands")
+
+	assert.Zero(t, markerCount(t, db, victim), "no marker may remain for the stranger")
+	assert.Zero(t, markerCount(t, db, attacker), "nor for the caller")
+}
+
+func TestBlockingAStrangerWritesNoDurableMarker(t *testing.T) {
+	env, delivered := newRailedPoCEnv(t)
+
+	attacker := testhelpers.CreateUser(t, env.ts.DB)
+	victim := testhelpers.CreateUser(t, env.ts.DB)
+
+	engine := env.attackerEngine(t, attacker.String(), env.rec,
+		func(e *gin.Engine, h *friends.Handler) {
+			e.POST("/friends/:user_id/block", h.BlockUser)
+		})
+
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest(
+		http.MethodPost, "/friends/"+victim.String()+"/block", nil))
+	require.Equal(t, http.StatusOK, w.Code, "block of a stranger still succeeds")
+
+	requireNoDurableSuppression(t, env.ts.DB, delivered, attacker, victim)
+}
+
+// The repeat case is the one that made the original defect a weapon: the write
+// is idempotent-SUCCESSFUL, so every round re-committed. A marker leak here
+// would accumulate rows rather than merely re-firing a socket teardown.
+func TestRepeatedBlockOfAStrangerWritesNoDurableMarker(t *testing.T) {
+	env, delivered := newRailedPoCEnv(t)
+
+	attacker := testhelpers.CreateUser(t, env.ts.DB)
+	victim := testhelpers.CreateUser(t, env.ts.DB)
+
+	engine := env.attackerEngine(t, attacker.String(), env.rec,
+		func(e *gin.Engine, h *friends.Handler) {
+			e.POST("/friends/:user_id/block", h.BlockUser)
+		})
+
+	const rounds = 5
+	for i := 0; i < rounds; i++ {
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(
+			http.MethodPost, "/friends/"+victim.String()+"/block", nil))
+		require.Equal(t, http.StatusOK, w.Code, "re-block round %d", i)
+	}
+
+	requireNoDurableSuppression(t, env.ts.DB, delivered, attacker, victim)
+}
+
+// The direct-capture path, which is where the fan-out lived. A RemoveFriend
+// against a stranger reaches CaptureInTx with a counterpart the caller supplied
+// and no accepted edge behind it.
+func TestCaptureNamingAStrangerLeavesNoDurableMarker(t *testing.T) {
+	env, _ := newRailedPoCEnv(t)
+	ctx := context.Background()
+
+	attacker := testhelpers.CreateUser(t, env.ts.DB)
+	victim := testhelpers.CreateUser(t, env.ts.DB)
+
+	tx, err := env.ts.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	plan, err := env.rec.CaptureInTx(ctx, tx, presencecapture.Subject{
+		Family:      presencecapture.FamilyFriendshipRemove,
+		FailPosture: presencecapture.FailClosedBlockWrite,
+		Principal:   attacker,
+		Counterpart: victim,
+	})
+	require.NoError(t, err, "the capture itself must not error — it must terminate empty")
+	require.NotNil(t, plan)
+	assert.False(t, plan.HasWork(),
+		"proven-no-change must produce an empty plan, not a filtered one")
+
+	// Read inside the transaction: the markers, if any, would be uncommitted
+	// rows this transaction can see and nobody else can.
+	// Two queries rather than ANY($1): that would pull in lib/pq's array
+	// encoder for a two-element list this file otherwise has no need of.
+	for _, id := range []uuid.UUID{attacker, victim} {
+		var count int
+		require.NoError(t, tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM presence_settings_pending_operations WHERE user_id = $1`,
+			id).Scan(&count))
+		assert.Zero(t, count,
+			"REGRESSION: the accepted-edge gate returns BEFORE the marker step, so a "+
+				"stranger-named capture must write no durable row (user %s)", id)
+	}
 }
