@@ -159,6 +159,15 @@
   }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .form-error,
+  .form-success,
+  .form-error-banner,
+  .form-success-banner {
+    animation: none;
+  }
+}
+
 /* Footer */
 .footer-text {
   font-size: calc(13px * var(--font-scale, 1));

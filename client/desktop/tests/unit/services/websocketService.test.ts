@@ -8,6 +8,7 @@ import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
 } from '@/renderer/services/runtimeServerBase';
+import { useAuthStore } from '@/renderer/stores/authStore';
 
 // Mock WebSocket
 class MockWebSocket {
@@ -828,18 +829,18 @@ describe('offline short-circuit (navigator.onLine gate)', () => {
   });
 });
 
-describe('ticket cache', () => {
-  type CacheHarness = {
-    token: string | null;
-    ticketCache: {
-      ticket: string;
-      issuedAt: number;
-      token: string;
-      sessionId: string | null;
-    } | null;
-    consumeCachedTicket: () => string | null;
-  };
+type CacheHarness = {
+  token: string | null;
+  ticketCache: {
+    ticket: string;
+    issuedAt: number;
+    token: string;
+    sessionId: string | null;
+  } | null;
+  consumeCachedTicket: () => string | null;
+};
 
+describe('ticket cache', () => {
   it('consumes cached ticket within TTL for the same token/session', () => {
     const svc = new WebSocketService('ws://localhost:8080');
     const s = svc as unknown as CacheHarness;
@@ -891,6 +892,90 @@ describe('ticket cache', () => {
     const s = svc as unknown as { consumeCachedTicket: () => string | null };
     const consumed = s.consumeCachedTicket();
     expect(consumed).toBeNull();
+  });
+});
+
+// #2415 case 6. The control plane force-closes this user's socket
+// (`sessionDisconnector.DisconnectUser`) BEFORE it writes the committed
+// ChangePassword / ReplaceMyKeys response body, so `updateToken` on a live
+// socket is not the operative path — the RECONNECT's ws-ticket fetch is. That
+// fetch stamps the requester's `cred_epoch` into the Redis ticket and enforces
+// it at redemption, so a reconnect still carrying the pre-rotation token 401s
+// and the client cannot get back online.
+describe('continuation-pair adoption (#2415)', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ticket: 'mock-ticket' }),
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    useAuthStore.setState({ accessToken: 'old-at', sessionId: 'old-sid' });
+  });
+
+  afterEach(() => {
+    useAuthStore.setState({ accessToken: null, sessionId: null });
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+  });
+
+  it('reconnects with the ADOPTED token after the server force-closes the socket', async () => {
+    const svc = new WebSocketService('ws://localhost:8080');
+    svc.connect('old-at');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0][1]?.headers).toMatchObject({
+      Authorization: 'Bearer old-at',
+      'X-Session-ID': 'old-sid',
+    });
+
+    // Forced teardown: a non-1000 close arms the reconnect.
+    const ws = (svc as unknown as { ws: MockWebSocket }).ws;
+    ws.onclose?.(new CloseEvent('close', { code: 4001, reason: 'session_revoked' }));
+    expect(svc.getState()).toBe(ConnectionState.RECONNECTING);
+
+    // Adoption lands: the authStore holds the continuation pair and
+    // useWebSocket's accessToken effect republishes it to the live service.
+    useAuthStore.setState({ accessToken: 'cont-at', sessionId: 'cont-sid' });
+    svc.updateToken('cont-at');
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const afterAdoption = mockFetch.mock.calls.slice(1);
+    expect(afterAdoption.length).toBeGreaterThan(0);
+    // Every post-adoption ticket fetch uses the adopted credentials — the
+    // revoked token must never reach the wire again.
+    for (const [, init] of afterAdoption) {
+      expect(init?.headers).toMatchObject({
+        Authorization: 'Bearer cont-at',
+        'X-Session-ID': 'cont-sid',
+      });
+    }
+
+    svc.disconnect();
+  });
+
+  it('rejects a ticket cached under the pre-adoption session id', () => {
+    // The token leg of this guard is covered above in `ticket cache`; adoption
+    // installs a NEW session id alongside the new token, so the session leg is
+    // what stops a ticket minted under the dead epoch from being replayed.
+    const svc = new WebSocketService('ws://localhost:8080');
+    const s = svc as unknown as CacheHarness;
+    s.token = 'cont-at';
+    s.ticketCache = {
+      ticket: 'pre-adoption-ticket',
+      issuedAt: Date.now(),
+      token: 'cont-at',
+      sessionId: 'old-sid',
+    };
+    useAuthStore.setState({ accessToken: 'cont-at', sessionId: 'cont-sid' });
+
+    expect(s.consumeCachedTicket()).toBeNull();
+    expect(s.ticketCache).toBeNull();
   });
 });
 

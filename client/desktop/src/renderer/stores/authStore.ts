@@ -47,6 +47,21 @@ interface AuthState {
    */
   pendingE2EEUnlockGeneration: number | null;
   beginAuthLifecycle: (accessToken: string, sessionId: string | null) => number;
+  /**
+   * Start a new auth lifecycle iff `expectedGeneration` is still current, and
+   * return the new generation (or null when a successor won the race).
+   *
+   * This is ALSO the #2415 continuation-adoption primitive, deliberately rather
+   * than a second near-identical action: the continuation pair is a brand-new
+   * server session, which is exactly what "begin a lifecycle" means. It bumps
+   * `authGeneration` honestly instead of laundering itself as a refresh rotation
+   * through `rotateAuthCredentials` (which PRESERVES the generation because a
+   * refresh is the same session getting a new token). The bump is the point: it
+   * makes in-flight requests issued under the dead credential epoch non-current,
+   * so their 401s cannot tear down the session just adopted — and it keeps
+   * `applyRefreshedCredentials`' `previous_session_id` lineage proof off the
+   * adoption path entirely.
+   */
   beginAuthLifecycleIfCurrent: (
     expectedGeneration: number,
     accessToken: string,

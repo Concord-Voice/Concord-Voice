@@ -28,6 +28,9 @@ export default function KeyRecoveryPrompt({
   mfaRequired = false,
 }: KeyRecoveryPromptProps) {
   const [acknowledged, setAcknowledged] = useState(false);
+  // Latched on first activation: a second PUT /users/me/keys is the concurrent
+  // destructive flow that makes the server omit the continuation pair (#2415).
+  const [submitting, setSubmitting] = useState(false);
   const [mfaCode, setMfaCode] = useState('');
   const dialogRef = useRef<HTMLDialogElement>(null);
 
@@ -95,14 +98,17 @@ export default function KeyRecoveryPrompt({
               I understand my encrypted message history will be permanently deleted.
             </label>
             <div className="key-recovery-prompt__actions">
-              <button type="button" autoFocus onClick={onCancel}>
+              <button type="button" autoFocus onClick={onCancel} disabled={submitting}>
                 Cancel
               </button>
               <button
                 type="button"
                 className="key-recovery-prompt__danger"
-                disabled={!acknowledged}
-                onClick={() => onReset()}
+                disabled={!acknowledged || submitting}
+                onClick={() => {
+                  setSubmitting(true);
+                  onReset();
+                }}
               >
                 Reset and continue
               </button>

@@ -1,16 +1,29 @@
 package users_test
 
 import (
+	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 const (
@@ -1364,4 +1377,354 @@ func TestUsersUnverifiedEmailBlocked(t *testing.T) {
 	// GET /users/me should still work (in pendingOK group)
 	w = ts.DoRequest("GET", urlUsersMe, nil, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// ── #2415: server-side continuation-token contract ───────────────────────────
+//
+// The desktop Login ordering fix adopts the continuation pair that
+// appendContinuationPair (internal/users/handlers.go) attaches to the committed
+// 2xx of ChangePassword and ReplaceMyKeys. These four tests lock the server
+// behaviours that adoption now depends on. They are deliberately behavioural:
+// each one would go red if the corresponding server-side guarantee were
+// weakened, which is exactly the signal the desktop change needs.
+
+const (
+	// The X-Machine-Id header is validated as a UUID by request middleware, so
+	// the lock below has to send a well-formed one.
+	continuationMachineID = "2415a11c-0000-4000-8000-00000000c0de"
+	headerMachineID       = "X-Machine-Id"
+)
+
+// seedRefreshToken inserts a pre-existing live session for userID and returns
+// its id. remember_me is set FALSE explicitly only so a seeded row is visibly
+// distinct from the continuation row the handler mints. It does NOT make the
+// remember_me assertion in TestChangePasswordContinuationRowShape
+// discriminating — that assertion reads the CONTINUATION row, never these —
+// and no test-side seeding can; see the note at the assertion itself.
+func seedRefreshToken(t *testing.T, ts *testhelpers.TestServer, userID, label string) string {
+	t.Helper()
+	var id string
+	require.NoError(t, ts.DB.QueryRow(
+		`INSERT INTO refresh_tokens (user_id, token_hash, device_name, expires_at, remember_me, machine_id)
+		 VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', FALSE, NULL)
+		 RETURNING id`,
+		userID, "seed-hash-"+userID+"-"+label, label,
+	).Scan(&id))
+	return id
+}
+
+// liveRefreshTokenIDs returns userID's unrevoked refresh-token rows, oldest id
+// first. Both continuation-row locks assert on it: a destructive flow's
+// survivor set must be exactly the continuation row it handed back.
+func liveRefreshTokenIDs(t *testing.T, ts *testhelpers.TestServer, userID string) []string {
+	t.Helper()
+	rows, err := ts.DB.Query(
+		`SELECT id FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id`, userID)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	var liveIDs []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		liveIDs = append(liveIDs, id)
+	}
+	require.NoError(t, rows.Err())
+	return liveIDs
+}
+
+// (a) #2415: the continuation row ChangePassword hands back is a real,
+// machine-bound, remember-me session — not a degraded stub — and it is the ONLY
+// thing that survives: every session the user held before the change is
+// revoked. The desktop client persists this pair as the device's session, so
+// machine_id (copied from the request headers at internal/auth/handlers.go:221)
+// and remember_me = true (hardcoded, :223) are both load-bearing, though only
+// machine_id is lockable by a test — see the note on the remember_me assertion.
+func TestChangePasswordContinuationRowShape(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "controwshape")
+
+	priorSessions := []string{
+		seedRefreshToken(t, ts, user.ID, "prior-a"),
+		seedRefreshToken(t, ts, user.ID, "prior-b"),
+	}
+
+	headers := testhelpers.AuthHeaders(user.AccessToken)
+	headers.Set(headerMachineID, continuationMachineID)
+
+	_, wrappedKey, salt := testhelpers.E2EETestKeys()
+	w := ts.DoRequest("POST", urlUsersMePassword, map[string]interface{}{
+		keyCurrentPassword:   user.Password,
+		keyNewPassword:       "ContinuationPass456!",
+		keyWrappedPrivateKey: wrappedKey,
+		keyKeyDerivationSalt: salt,
+	}, headers)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	sessionID, ok := body["session_id"].(string)
+	require.True(t, ok, "ChangePassword 200 must carry a continuation session_id")
+	require.NotEmpty(t, sessionID)
+	require.NotEmpty(t, body["access_token"], "continuation access_token expected")
+	require.NotEmpty(t, body["refresh_token"], "continuation refresh_token expected")
+
+	var machineID sql.NullString
+	var rememberMe bool
+	var revokedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT machine_id, remember_me, revoked_at FROM refresh_tokens WHERE id = $1`, sessionID,
+	).Scan(&machineID, &rememberMe, &revokedAt))
+
+	assert.True(t, machineID.Valid, "the continuation row must copy X-Machine-Id from the request")
+	assert.Equal(t, continuationMachineID, machineID.String)
+	// Documented as a contract, NOT locked: remember_me is NOT NULL DEFAULT TRUE
+	// (migrations/000012_add_remember_me.up.sql:2), so a continuation row minted
+	// without the hardcoded true at internal/auth/handlers.go:223 still reads
+	// back true here. No test-side seeding changes that — production code
+	// inserts the row, and the column default is exactly what a dropped literal
+	// falls through to. Kept because it states the shape the desktop client
+	// adopts; the literal itself is guarded by review, not by this line.
+	assert.True(t, rememberMe, "the continuation row is minted with remember_me = true")
+	assert.False(t, revokedAt.Valid, "the continuation row must itself be live")
+
+	for _, priorID := range priorSessions {
+		var priorRevoked sql.NullTime
+		require.NoError(t, ts.DB.QueryRow(
+			`SELECT revoked_at FROM refresh_tokens WHERE id = $1`, priorID,
+		).Scan(&priorRevoked))
+		assert.True(t, priorRevoked.Valid,
+			"every pre-change session must be revoked; %s survived", priorID)
+	}
+
+	// And the continuation row is not merely live, it is the ONLY live row. The
+	// desktop client's "adopting this pair means this device owns the only
+	// session" assumption has to hold for BOTH destructive flows, not just for
+	// the key reset locked below.
+	liveIDs := liveRefreshTokenIDs(t, ts, user.ID)
+	require.Len(t, liveIDs, 1, "the password change must leave exactly one live refresh row")
+	assert.Equal(t, sessionID, liveIDs[0],
+		"the single surviving row must be the continuation row returned in the response body")
+}
+
+// (b) #2415, the highest-value lock: ReplaceMyKeys revokes ALL refresh tokens
+// (internal/users/handlers.go:447) and the continuation row it returns is the
+// single survivor. The desktop Login ordering fix rests entirely on this — if a
+// second live row could survive the reset, adopting the returned pair would no
+// longer be equivalent to "this device now owns the only session."
+func TestReplaceMyKeysLeavesExactlyOneLiveRefreshRow(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "replonelive")
+	peer := ts.CreateTestUser(t, "replonelivepeer")
+
+	for _, label := range []string{"live-a", "live-b", "live-c"} {
+		seedRefreshToken(t, ts, user.ID, label)
+	}
+	// An already-revoked row proves the survivor count is measured by
+	// revoked_at and not by row count.
+	alreadyRevoked := seedRefreshToken(t, ts, user.ID, "already-revoked")
+	_, err := ts.DB.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, alreadyRevoked)
+	require.NoError(t, err)
+	// A different user's live session must be untouched — the sweep is
+	// user-scoped, not global.
+	peerSession := seedRefreshToken(t, ts, peer.ID, "peer-live")
+
+	publicKey, wrappedKey, salt := testhelpers.E2EETestKeys()
+	w := ts.DoRequest("PUT", urlUsersMeKeys, map[string]interface{}{
+		keyWrappedPrivateKey:    wrappedKey,
+		keyKeyDerivationSalt:    salt,
+		"key_derivation_alg":    "argon2id",
+		"public_key":            publicKey,
+		"acknowledge_data_loss": true,
+		keyCurrentPassword:      user.Password,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	sessionID, ok := body["session_id"].(string)
+	require.True(t, ok, "ReplaceMyKeys 200 must carry a continuation session_id")
+	require.NotEmpty(t, sessionID)
+
+	liveIDs := liveRefreshTokenIDs(t, ts, user.ID)
+	require.Len(t, liveIDs, 1, "the key reset must leave exactly one live refresh row")
+	assert.Equal(t, sessionID, liveIDs[0],
+		"the single surviving row must be the continuation row returned in the response body")
+
+	var peerRevoked sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT revoked_at FROM refresh_tokens WHERE id = $1`, peerSession,
+	).Scan(&peerRevoked))
+	assert.False(t, peerRevoked.Valid, "another user's session must survive the reset")
+}
+
+// evalFailingRedisHook fails only the Lua-script commands, letting plain
+// key commands through. credepoch's Begin publishes the blocked marker with a
+// plain SET while Op.Commit finalizes it with an owner-scoped CAS run as a
+// script (internal/credepoch/credepoch.go:315-329), so this reproduces the
+// spec §4.3 window — a Redis fault confined to the commit CAS — without
+// touching production code.
+type evalFailingRedisHook struct{}
+
+func (evalFailingRedisHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (evalFailingRedisHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		switch strings.ToLower(cmd.Name()) {
+		case "eval", "evalsha":
+			err := errors.New("simulated redis transport failure")
+			cmd.SetErr(err)
+			return err
+		default:
+			return next(ctx, cmd)
+		}
+	}
+}
+
+func (evalFailingRedisHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// (c) #2415 / spec §4.3: Op.Commit retries its owner-scoped CAS exactly once
+// and then gives up, so a Redis fault confined to that window leaves
+// blocked:<opID> live for up to blockedTTL WHILE the handler still returns 200
+// carrying a structurally valid continuation pair. The lock is the negative
+// claim the desktop client must respect: the presence of access_token /
+// refresh_token / session_id is a CONTRACT guarantee, not a LIVENESS guarantee
+// — the very next request made with that pair can be refused by the fence.
+func TestChangePasswordContinuationPairIsNotALivenessGuarantee(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "contnotlive")
+
+	// One miniredis, two clients: the fence the handler drives has its commit
+	// CAS broken; the reader observes the same keyspace intact.
+	mr := miniredis.RunT(t)
+	handlerRedis := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	handlerRedis.AddHook(evalFailingRedisHook{})
+	readerRedis := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() {
+		_ = handlerRedis.Close()
+		_ = readerRedis.Close()
+	})
+
+	log := logger.NewWithWriter(io.Discard)
+	issuer := auth.NewHandler(ts.DB, ts.Redis, log, testhelpers.TestJWTSecret, nil)
+	h := users.NewHandler(ts.DB, log, nil, nil, nil,
+		credepoch.New(ts.DB, handlerRedis, log), issuer)
+
+	_, wrappedKey, salt := testhelpers.E2EETestKeys()
+	c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
+		keyCurrentPassword:   user.Password,
+		keyNewPassword:       "NotLivenessPass456!",
+		keyWrappedPrivateKey: wrappedKey,
+		keyKeyDerivationSalt: salt,
+	})
+	h.ChangePassword(c)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	accessToken, ok := body["access_token"].(string)
+	require.True(t, ok, "the committed change must still carry a continuation pair")
+	require.NotEmpty(t, accessToken)
+	require.NotEmpty(t, body["refresh_token"])
+	require.NotEmpty(t, body["session_id"])
+
+	// The blocked marker outlived the successful mint.
+	marker, err := mr.Get(credepoch.Key(user.ID))
+	require.NoError(t, err, "the fence key must still exist after the failed commit CAS")
+	assert.True(t, strings.HasPrefix(marker, "blocked:"),
+		"a failed commit CAS leaves the blocked marker live; got a %q-shaped value", marker)
+
+	// And it is authoritative: an independent reader over the same keyspace
+	// refuses the epoch the just-minted pair carries.
+	var committedEpoch string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT credential_epoch FROM users WHERE id = $1`, user.ID).Scan(&committedEpoch))
+	require.NotEmpty(t, committedEpoch, "the destructive flow must have rotated the epoch")
+
+	readerFence := credepoch.New(ts.DB, readerRedis, log)
+	assert.ErrorIs(t,
+		readerFence.Check(context.Background(), user.ID, committedEpoch),
+		credepoch.ErrBlocked,
+		"a live blocked marker must reject even the epoch this flow just committed")
+}
+
+// bodyWatchingDisconnector samples how much response body had been written at
+// the moment DisconnectUser was called. Ordering is the whole point of the
+// assertion: a client must not be able to observe the 200 before its sockets
+// have been severed.
+type bodyWatchingDisconnector struct {
+	recorder      *httptest.ResponseRecorder
+	bodyLenAtCall []int
+}
+
+func (d *bodyWatchingDisconnector) DisconnectUser(uuid.UUID) {
+	d.bodyLenAtCall = append(d.bodyLenAtCall, d.recorder.Body.Len())
+}
+
+// (d) #2415: BOTH destructive flows enqueue the forced socket teardown BEFORE
+// the response body is written — ChangePassword directly
+// (internal/users/handlers.go:1576-1578) and ReplaceMyKeys through
+// completeKeyReplacementClear (:492-494). The desktop client treats the 200 as
+// the point at which its old sockets are already gone; if the body could be
+// observed first, that assumption would be wrong.
+//
+// Both subtests take the committed path, so ForcedClearCompletion.Outcome is a
+// durable one and RequiresDisconnect() (internal/presencehistory/forced_clear.go)
+// is true — it is FALSE for ForcedClearRolledBack. A "must disconnect exactly
+// once" failure below can therefore mean the flow rolled back and never
+// disconnected at all, not that its ordering changed.
+func TestDestructiveFlowsDisconnectBeforeResponseBody(t *testing.T) {
+	_, wrappedKey, salt := testhelpers.E2EETestKeys()
+	publicKey, replaceWrapped, replaceSalt := testhelpers.E2EETestKeys()
+
+	t.Run("ChangePassword severs sockets before writing its 200", func(t *testing.T) {
+		ts := setupTS(t)
+		user := ts.CreateTestUser(t, "disconnectorderpw")
+		h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
+			testCredFence(t, ts.DB), nil)
+
+		c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
+			keyCurrentPassword:   user.Password,
+			keyNewPassword:       "DisconnectOrder456!",
+			keyWrappedPrivateKey: wrappedKey,
+			keyKeyDerivationSalt: salt,
+		})
+		observer := &bodyWatchingDisconnector{recorder: w}
+		users.SetKeyResetSessionDisconnectorForTest(h, observer)
+
+		h.ChangePassword(c)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.Len(t, observer.bodyLenAtCall, 1, "the flow must disconnect exactly once")
+		assert.Zero(t, observer.bodyLenAtCall[0],
+			"no response body may have been written when DisconnectUser fired")
+		assert.NotZero(t, w.Body.Len(), "the body is written after the disconnect, not never")
+	})
+
+	t.Run("ReplaceMyKeys severs sockets before writing its 200", func(t *testing.T) {
+		ts := setupTS(t)
+		user := ts.CreateTestUser(t, "disconnectorderkeys")
+		h := users.NewHandler(ts.DB, logger.NewWithWriter(io.Discard), nil, nil, nil,
+			testCredFence(t, ts.DB), nil)
+		h.SetPresenceHistory(ts.PresenceHistory)
+
+		c, w := newFenceMissingContext(t, user.ID, map[string]interface{}{
+			keyCurrentPassword:      user.Password,
+			keyWrappedPrivateKey:    replaceWrapped,
+			keyKeyDerivationSalt:    replaceSalt,
+			"key_derivation_alg":    "argon2id",
+			"public_key":            publicKey,
+			"acknowledge_data_loss": true,
+		})
+		c.Request.Method = http.MethodPut
+		observer := &bodyWatchingDisconnector{recorder: w}
+		users.SetKeyResetSessionDisconnectorForTest(h, observer)
+
+		h.ReplaceMyKeys(c)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.Len(t, observer.bodyLenAtCall, 1, "the flow must disconnect exactly once")
+		assert.Zero(t, observer.bodyLenAtCall[0],
+			"no response body may have been written when DisconnectUser fired")
+		assert.NotZero(t, w.Body.Len(), "the body is written after the disconnect, not never")
+	})
 }

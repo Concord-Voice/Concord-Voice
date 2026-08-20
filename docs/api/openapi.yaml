@@ -12447,7 +12447,35 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessMessage'
+                allOf:
+                - $ref: '#/components/schemas/SuccessMessage'
+                - type: object
+                  properties:
+                    access_token:
+                      type: string
+                      description: >-
+                        Continuation access token minted under the NEW credential epoch this
+                        key replacement established. OPTIONAL and best-effort (#2201): the
+                        server omits all three continuation fields when the token issuer is
+                        unwired, or when a concurrent destructive credential flow advanced the
+                        epoch in the post-commit window. Absence is a deliberate security
+                        outcome, not an error - the destructive replacement still committed,
+                        and the client MUST re-authenticate. The request MUST NOT be retried.
+                    refresh_token:
+                      type: string
+                      description: >-
+                        Continuation refresh token. The same flow revoked every prior refresh
+                        token for this user, so this is the only live one. Present only when
+                        access_token and session_id are also present; absence carries the same
+                        meaning as above - the client MUST re-authenticate and MUST NOT retry
+                        the request.
+                    session_id:
+                      type: string
+                      description: >-
+                        Identifier of the continuation session. This is a NEW session rather
+                        than a rotation of the caller's previous session, so it carries no
+                        previous_session_id lineage. Present only when access_token and
+                        refresh_token are also present.
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -14799,6 +14827,28 @@ components:
           type: integer
           minimum: 0
           description: Rotated exception version, or zero when no preference row exists
+        access_token:
+          type: string
+          description: >-
+            Continuation access token minted under the NEW credential epoch this password
+            change established. OPTIONAL and best-effort (#2201): the server omits all three
+            continuation fields when the token issuer is unwired, or when a concurrent
+            destructive credential flow advanced the epoch in the post-commit window. Absence
+            is a deliberate security outcome, not an error - the password change still
+            committed, and the client MUST re-authenticate. The request MUST NOT be retried.
+        refresh_token:
+          type: string
+          description: >-
+            Continuation refresh token. The same transaction revoked every prior refresh token
+            for this user, so this is the only live one. Present only when access_token and
+            session_id are also present; absence carries the same meaning as above - the client
+            MUST re-authenticate and MUST NOT retry the request.
+        session_id:
+          type: string
+          description: >-
+            Identifier of the continuation session. This is a NEW session rather than a
+            rotation of the caller's previous session, so it carries no previous_session_id
+            lineage. Present only when access_token and refresh_token are also present.
         sync_domain_versions:
           type: object
           description: Present iff sync_domains was submitted. Each value is the

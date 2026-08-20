@@ -128,7 +128,7 @@ const PasswordChangeForm: React.FC = () => {
 
       {/* Password Error */}
       {passwordErrors.general && (
-        <div className="form-error-banner">
+        <div className="form-error-banner" role="alert">
           <span>{passwordErrors.general}</span>
         </div>
       )}

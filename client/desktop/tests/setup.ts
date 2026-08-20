@@ -62,6 +62,15 @@ if (typeof window !== 'undefined') {
       requestPermission: vi.fn().mockResolvedValue('granted'),
       openPermissionSettings: vi.fn().mockResolvedValue(undefined),
       onPermissionChanged: vi.fn().mockReturnValue(() => {}),
+      // Credential custody. A real preload ALWAYS exposes these, so a stub that
+      // omits them does not model any shipping shell — it models a preload
+      // regression. #2415 made that distinction load-bearing: adoption now fails
+      // closed when the bridge is present but the method is missing (silently
+      // continuing would leave the revoked token on the keychain), so omitting
+      // them here made every password-change test exercise the failure path.
+      storeRefreshToken: vi.fn().mockResolvedValue(1),
+      storeE2EEKeys: vi.fn().mockResolvedValue(true),
+      storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true),
     },
     writable: true,
   });

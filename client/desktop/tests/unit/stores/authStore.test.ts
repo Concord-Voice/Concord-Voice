@@ -127,3 +127,57 @@ describe('authStore', () => {
     expect(useAuthStore.getState().pendingE2EEUnlockGeneration).toBeNull();
   });
 });
+
+describe('continuation adoption via beginAuthLifecycleIfCurrent (#2415)', () => {
+  beforeEach(() => {
+    useAuthStore.setState({ accessToken: 'old-at', sessionId: 'old-sid', authGeneration: 7 });
+  });
+
+  it('installs the pair and BUMPS authGeneration when the generation matches', () => {
+    expect(useAuthStore.getState().beginAuthLifecycleIfCurrent(7, 'new-at', 'new-sid')).toBe(8);
+    const s = useAuthStore.getState();
+    expect(s.accessToken).toBe('new-at');
+    expect(s.sessionId).toBe('new-sid');
+    expect(s.authGeneration).toBe(8);
+  });
+
+  it('declines and changes nothing when the generation moved (concurrent supersession)', () => {
+    expect(useAuthStore.getState().beginAuthLifecycleIfCurrent(6, 'new-at', 'new-sid')).toBeNull();
+    const s = useAuthStore.getState();
+    expect(s.accessToken).toBe('old-at');
+    expect(s.sessionId).toBe('old-sid');
+    expect(s.authGeneration).toBe(7);
+  });
+
+  it('does NOT preserve authGeneration the way a refresh rotation does', () => {
+    // The distinction the adoption path rests on: a refresh is the SAME session
+    // getting a new token (generation preserved), whereas the continuation pair
+    // is a brand-new server session (generation bumped). The bump is what makes
+    // in-flight requests on the dead epoch non-current.
+    const before = useAuthStore.getState().authGeneration;
+    useAuthStore.getState().rotateAuthCredentials(before, 'rot-at', 'old-sid');
+    expect(useAuthStore.getState().authGeneration).toBe(before);
+    useAuthStore.getState().beginAuthLifecycleIfCurrent(before, 'new-at', 'new-sid');
+    expect(useAuthStore.getState().authGeneration).toBe(before + 1);
+  });
+
+  it('cannot be reached with a null access token at an unchanged generation', () => {
+    // The deleted adoptContinuationCredentials carried an extra
+    // `accessToken === null` guard. It was near-redundant: clearAccessToken
+    // itself bumps the generation, so "token cleared but generation unchanged"
+    // is unreachable through the store's own actions — the CAS already covers it.
+    const before = useAuthStore.getState().authGeneration;
+    useAuthStore.getState().clearAccessToken();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(useAuthStore.getState().authGeneration).toBeGreaterThan(before);
+    // A stale caller holding the pre-clear generation is therefore declined.
+    expect(useAuthStore.getState().beginAuthLifecycleIfCurrent(before, 'x', 'y')).toBeNull();
+  });
+
+  it('never stores a refresh token in renderer state', () => {
+    // The main/renderer split: the refresh token lives in the main process only.
+    // The adoption primitive does not even accept one — pin that it cannot leak.
+    useAuthStore.getState().beginAuthLifecycleIfCurrent(7, 'new-at', 'new-sid');
+    expect(JSON.stringify(useAuthStore.getState())).not.toContain('cont-rt');
+  });
+});

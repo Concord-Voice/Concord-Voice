@@ -958,6 +958,15 @@ describe('apiClient', () => {
       expect(globalThis.electron!.refreshToken).toHaveBeenCalledTimes(1);
     });
 
+    // #2415 case 9: the continuation row the password change mints copies
+    // `machine_id` straight from this header, and `checkMachineIDTheft` treats an
+    // EMPTY machine id as permissive — so a rotating POST that lost the header
+    // would silently mint a continuation session with theft detection disabled.
+    // This is the pin for that: `apiFetch`'s own header block is URL- and
+    // method-agnostic, so the ChangePassword POST takes exactly this path on its
+    // first (non-retry) attempt. The 401-refresh retry (`build401RetryHeaders`)
+    // and the 403-attestation retry (`buildAttestationRetryHeaders`) build their
+    // headers separately and are covered separately.
     it('includes X-Machine-Id header when machine ID is cached', async () => {
       // Set up machine ID via ensureMachineId
       globalThis.electron = {

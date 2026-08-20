@@ -1504,6 +1504,253 @@ describe('Login', () => {
     expect(onSuccess).not.toHaveBeenCalled();
   });
 
+  // ── #2415 Continuation-pair adoption after a consented key reset ────────
+
+  it('persists the CONTINUATION refresh token after key recovery, never the revoked login token', async () => {
+    mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+    const { apiFetch } = await import('@/renderer/services/apiClient');
+    // The reset PUT's 2xx body carries the continuation pair. ReplaceMyKeys
+    // revoked every refresh token for this user — including the one this login
+    // just minted — so persisting `mock-refresh` would store a dead token and
+    // silently lose restart survival.
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: 'cont-at',
+        refresh_token: 'cont-rt', // pragma: allowlist secret
+        session_id: 'cont-sid',
+      }),
+    });
+
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken,
+        storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true),
+        checkPermission: vi.fn().mockResolvedValue('granted'),
+      },
+      writable: true,
+    });
+
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => makeLoginResponse() });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('checkbox'));
+    await user.click(within(dialog).getByRole('button', { name: /reset and continue/i }));
+
+    await vi.waitFor(() => expect(storeRefreshToken).toHaveBeenCalledTimes(1));
+    expect(storeRefreshToken).toHaveBeenCalledWith(
+      expect.objectContaining({
+        refreshToken: 'cont-rt',
+        accessToken: 'cont-at',
+        // The desktop keeps its OWN rememberMe — never a server-forced flag.
+        rememberMe: false,
+      })
+    );
+    expect(storeRefreshToken).not.toHaveBeenCalledWith(
+      expect.objectContaining({ refreshToken: 'mock-refresh' })
+    );
+    // Adopted as a NEW auth lifecycle, so the live session is the continuation
+    // one and the generation moved past the login's.
+    expect(useAuthStore.getState().accessToken).toBe('cont-at');
+    expect(useAuthStore.getState().sessionId).toBe('cont-sid');
+  });
+
+  it('revokes the LIVE continuation session when an abort lands after the key reset', async () => {
+    // The security regression a naive substitution introduces: abortedSession
+    // still holding the login response's already-revoked tokens means a
+    // post-reset abort revokes NOTHING and leaves the continuation session
+    // authenticated on the server.
+    mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+    const { apiFetch, revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: 'cont-at',
+        refresh_token: 'cont-rt', // pragma: allowlist secret
+        session_id: 'cont-sid',
+      }),
+    });
+
+    // Abort injected after the reset: the keychain publish fails, which routes
+    // through abortForCredentialPersistenceFailure -> revokeAbortedSession.
+    const storeRefreshToken = vi.fn().mockRejectedValue(new Error('keychain unavailable'));
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken,
+        checkPermission: vi.fn().mockResolvedValue('granted'),
+      },
+      writable: true,
+    });
+
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => makeLoginResponse() });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('checkbox'));
+    await user.click(within(dialog).getByRole('button', { name: /reset and continue/i }));
+
+    await vi.waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
+    expect(revokeAbortedSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accessToken: 'cont-at',
+        refreshToken: 'cont-rt',
+        sessionId: 'cont-sid',
+      })
+    );
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  // VULN-001 regression lock. The abort here lands in the window BETWEEN the
+  // committed reset and the point where adoption used to happen (after
+  // handleKeyRecovery returned) — the origin fence on the very next line after
+  // the continuation pair is parsed. Before the fix, `abortedSession` still held
+  // the login response's tokens in that window, which ReplaceMyKeys had already
+  // revoked, so the abort revoked a corpse and left the live continuation
+  // session — 30 days, remember_me = true — authenticated on the server
+  // (CWE-613). This asserts the SECURE behaviour: the revoke must carry the
+  // continuation credentials and must never carry the dead login pair.
+  it('revokes the CONTINUATION session when an abort lands before adoption used to complete', async () => {
+    mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+    const { apiFetch, revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const loginApiBase = getApiBase();
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => {
+        // A self-hosted origin switch commits while the reset body is being
+        // read, so the fence immediately after the parse aborts the flow. No
+        // await separates the parse from the re-point, so this is the earliest
+        // abort site that can observe the pair at all.
+        setRuntimeServerBase('https://successor-origin.example');
+        return {
+          access_token: 'cont-at',
+          refresh_token: 'cont-rt', // pragma: allowlist secret
+          session_id: 'cont-sid',
+        };
+      },
+    });
+
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken,
+        checkPermission: vi.fn().mockResolvedValue('granted'),
+      },
+      writable: true,
+    });
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeLoginResponse({ refresh_token: 'login-rt' }),
+    });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('checkbox'));
+    await user.click(within(dialog).getByRole('button', { name: /reset and continue/i }));
+
+    await vi.waitFor(() => expect(revokeAbortedSession).toHaveBeenCalled());
+    // The live session, bound to the origin that issued it.
+    expect(revokeAbortedSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accessToken: 'cont-at',
+        refreshToken: 'cont-rt',
+        sessionId: 'cont-sid',
+        apiBase: loginApiBase,
+      })
+    );
+    // The exploit signature: revoking the already-dead login pair instead.
+    expect(revokeAbortedSession).not.toHaveBeenCalledWith(
+      expect.objectContaining({ refreshToken: 'login-rt' })
+    );
+    // Exactly one revoke — the origin abort's, not a second from the rethrow.
+    expect(revokeAbortedSession).toHaveBeenCalledTimes(1);
+    // The abort landed before the recovery reinit, so no keyset was committed
+    // and nothing was persisted for a session that is now revoked.
+    expect(e2eeService.initialize).not.toHaveBeenCalled();
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('fails closed with an explanation when the reset commits without a continuation pair', async () => {
+    mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
+    const { apiFetch } = await import('@/renderer/services/apiClient');
+    // A 2xx carrying no continuation fields is a DELIBERATE server outcome (a
+    // concurrent destructive flow advanced the credential epoch), never a
+    // transport error and never retried.
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({}),
+    });
+
+    const storeRefreshToken = vi.fn().mockResolvedValue(41);
+    Object.defineProperty(globalThis, 'electron', {
+      value: {
+        ...globalThis.electron,
+        storeRefreshToken,
+        checkPermission: vi.fn().mockResolvedValue('granted'),
+      },
+      writable: true,
+    });
+
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => makeLoginResponse() });
+
+    const user = userEvent.setup();
+    render(<Login {...defaultProps} />);
+    await user.type(screen.getByPlaceholderText('you@example.com'), 'test@example.com');
+    await user.type(screen.getByPlaceholderText('Enter your password'), 'Password123!');
+    await user.click(screen.getByText('Sign In'));
+
+    await vi.waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('checkbox'));
+    await user.click(within(dialog).getByRole('button', { name: /reset and continue/i }));
+
+    // The notice renders in the live banner, announced via role="alert" — NOT
+    // staged into authStore.loginNotice, which this already-mounted Login would
+    // never consume.
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent(/your new keys are already active/i);
+    expect(useAuthStore.getState().loginNotice).toBeNull();
+
+    // Prompt closed (it owns a focus trap), submit released, and the
+    // known-revoked login refresh token never persisted.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByText('Sign In')).toBeInTheDocument();
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().accessToken).toBeNull();
+    expect(onSuccess).not.toHaveBeenCalled();
+    // Absence is unrecoverable — exactly one reset PUT, no retry.
+    expect(
+      (apiFetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c) => c[0] === '/api/v1/users/me/keys'
+      ).length
+    ).toBe(1);
+  });
+
   // ── MFA Challenge Flow ─────────────────────────────────────────────────
 
   it('transitions to MFA screen when server returns mfa_required', async () => {

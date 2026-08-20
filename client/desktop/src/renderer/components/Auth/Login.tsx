@@ -9,6 +9,7 @@ import {
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import { parseContinuationPair, type ContinuationPair } from '../../utils/continuationPair';
 import { hydratePostLogin } from '../../services/postLoginHydration';
 import { beginPostLoginHydrationGuard } from '../../services/postLoginHydrationLifecycle';
 import { useAuthStore } from '../../stores/authStore';
@@ -252,6 +253,20 @@ async function checkSafeStorage(): Promise<string | null> {
  */
 const TEARDOWN_ABORT_NOTICE =
   'Your session ended before sign-in could finish. Please sign in again.';
+
+/**
+ * User-facing copy for a consented key reset that COMMITTED but whose
+ * continuation session the server deliberately withheld (#2415, §4.2). The
+ * trailing clause is load-bearing: the user just consented to irreversible
+ * history loss and must not be left wondering whether to repeat it.
+ *
+ * Rendered through component-local `setErrors`, never `authStore.loginNotice`:
+ * Login is already mounted on this path and the notice is consumed by a
+ * useState initializer plus a mount-only effect, so a staged notice would never
+ * render — the exact silent failure #2415 exists to close.
+ */
+const KEY_RESET_REAUTH_NOTICE =
+  'Your encryption keys were reset, but we could not keep you signed in. Sign in again to continue — your new keys are already active.';
 
 class LoginOriginChangedError extends E2EEInitTeardownError {
   constructor() {
@@ -631,25 +646,49 @@ const Login: React.FC<LoginProps> = ({
     setIsSubmitting(false);
   };
 
-  // Drives the consented key-recovery flow when the login unwrap fails: prompts
-  // for consent, performs the step-up-authenticated reset (current password +
-  // MFA retry), and returns true if the keys were reset (continue login) or
-  // false if the user aborted. Throws on reset failure (the caller surfaces the
-  // error; the token is cleared here first). Extracted from
-  // completeLoginFromResponse to keep that function under the cognitive-
-  // complexity threshold (#1293).
-  const handleKeyRecovery = async (
-    teardownEpoch: number | undefined,
-    abortedSession: AbortedSessionRef,
-    requestSelection: RuntimeServerSelection,
-    abortForOriginChange: () => Promise<never>,
-    initializationGuard: E2EEInitializationGuard,
-    requireFlowOwnership: () => Promise<void>,
+  // Bundled rather than passed positionally: the #2415 `adoptLiveContinuation`
+  // addition took this to EIGHT parameters and tripped `typescript:S107` (max 7).
+  // The repo hit the same wall server-side on `users.NewHandler` and answered it
+  // the same way — a deps object, not a shorter list.
+  interface KeyRecoveryDeps {
+    teardownEpoch: number | undefined;
+    abortedSession: AbortedSessionRef;
+    requestSelection: RuntimeServerSelection;
+    abortForOriginChange: () => Promise<never>;
+    initializationGuard: E2EEInitializationGuard;
+    requireFlowOwnership: () => Promise<void>;
     // Set the caller's flowInitializationReceipt from the recovery initialize()'s
     // OWN returned receipt (#2423), so an ownership/origin abort inside this helper
     // wipes the committed keyset instead of no-op'ing on a null receipt (CWE-212).
-    captureFlowReceipt: (receipt: E2EEInitializationReceipt | null) => void
-  ): Promise<boolean> => {
+    captureFlowReceipt: (receipt: E2EEInitializationReceipt | null) => void;
+    // #2415: invoked SYNCHRONOUSLY the instant the committed reset's continuation
+    // pair is parsed, before the next await. Re-points `abortedSession` at the
+    // live session and adopts it. Without this the pair is only adopted after
+    // performReset returns, and every abort site in between revokes the login pair
+    // the reset already killed while the live continuation session stays
+    // authenticated on the server (CWE-613).
+    adoptLiveContinuation: (pair: ContinuationPair) => void;
+  }
+
+  // Drives the consented key-recovery flow when the login unwrap fails: prompts
+  // for consent, performs the step-up-authenticated reset (current password +
+  // MFA retry), and returns false if the user aborted. On a committed reset it
+  // returns the #2415 continuation pair the server appended to the response, or
+  // null when the server deliberately withheld it — the caller adopts the pair
+  // or fails closed, and MUST NOT retry. Throws on reset failure (the caller
+  // surfaces the error; the token is cleared here first). Extracted from
+  // completeLoginFromResponse to keep that function under the cognitive-
+  // complexity threshold (#1293).
+  const handleKeyRecovery = async ({
+    teardownEpoch,
+    abortedSession,
+    requestSelection,
+    abortForOriginChange,
+    initializationGuard,
+    requireFlowOwnership,
+    captureFlowReceipt,
+    adoptLiveContinuation,
+  }: KeyRecoveryDeps): Promise<ContinuationPair | null | false> => {
     // Clear ONLY this flow's own early-set access token — never a successor's.
     // Deduplicated from the two reset-error branches below and kept out of the
     // reset flow so this handler stays under the S3776 cognitive-complexity
@@ -690,13 +729,14 @@ const Login: React.FC<LoginProps> = ({
     // destructive, step-up-authenticated operation, so it sends the current
     // password (already in hand from the login form) and, when the server
     // demands it, an MFA code; then re-inits E2EE with the new keys. Returns
-    // true on success, false if the user cancelled the MFA step-up. Kept as its
-    // own closure (measured separately for cognitive complexity) so this handler
-    // stays under the S3776 threshold; every origin/ownership fence is preserved
-    // exactly, and any failure propagates to handleResetError via the catch.
+    // the #2415 continuation pair on success (null when the server withheld it),
+    // or false if the user cancelled the MFA step-up. Kept as its own closure
+    // (measured separately for cognitive complexity) so this handler stays under
+    // the S3776 threshold; every origin/ownership fence is preserved exactly,
+    // and any failure propagates to handleResetError via the catch.
     const performReset = async (
       resetDecision: Awaited<ReturnType<typeof promptKeyRecovery>>
-    ): Promise<boolean> => {
+    ): Promise<ContinuationPair | null | false> => {
       const newKeys = await generateRegistrationKeys(formData.password);
       const publicKeyB64 = await exportPublicKey(newKeys.publicKey);
       const sendReset = (mfaCode?: string) => {
@@ -749,6 +789,18 @@ const Login: React.FC<LoginProps> = ({
 
       if (!replaceRes.ok) throw new Error('Failed to reset encryption keys. Please try again.');
 
+      // #2415: the continuation pair lives in THIS body. The reset revoked every
+      // refresh token for this user — including the one the login that led here
+      // just minted — so everything the caller persists downstream must come
+      // from the pair, never from the login response. A missing pair is a
+      // deliberate server outcome, never a transport error and never retried.
+      const replaceBody = await replaceRes.json().catch(() => ({}));
+      const continuation = isRecord(replaceBody) ? parseContinuationPair(replaceBody) : null;
+      // #2415 FIX: no await may separate the parse from the re-point. From this
+      // line on, the login pair is a corpse and the continuation pair is the
+      // only live session this flow owns on the server.
+      if (continuation !== null) adoptLiveContinuation(continuation);
+
       if (!runtimeServerSelectionIsCurrent(requestSelection)) {
         await abortForOriginChange();
       }
@@ -767,7 +819,7 @@ const Login: React.FC<LoginProps> = ({
       }
       await requireFlowOwnership();
       console.debug('E2EE keys reset and service initialized!');
-      return true;
+      return continuation;
     };
 
     const decision = await promptKeyRecovery();
@@ -829,6 +881,107 @@ const Login: React.FC<LoginProps> = ({
       refreshToken: data.refresh_token,
       sessionId: data.session_id ?? null,
       apiBase: requestApiBase,
+    };
+
+    // #2415: the continuation pair a consented key reset returned, or null when
+    // no reset happened (the inline unwrap succeeded). ReplaceMyKeys revokes
+    // every refresh token this user holds — including the one this login just
+    // minted — so once a reset commits, `data.access_token` / `data.refresh_token`
+    // are DEAD and the keychain persist below must use the pair instead.
+    let continuation: ContinuationPair | null = null;
+
+    /**
+     * Adopt a committed reset's continuation pair as a NEW auth lifecycle and
+     * re-point every abort site at the credentials that are actually live.
+     * Returns false when the login must stop.
+     *
+     * The adoption and the re-point are ONE synchronous step with no intervening
+     * await, deliberately: until the re-point lands, `abortedSession` still holds
+     * the login response's tokens, which the reset has just revoked — so an abort
+     * taken in that window would revoke NOTHING and leave the live continuation
+     * session authenticated on the server. Mutation is the established idiom here
+     * (see the flowAuthGeneration reassignment below).
+     *
+     * `beginAuthLifecycleIfCurrent` rather than a rotation: the pair is a
+     * brand-new server session, so it bumps `authGeneration` honestly and never
+     * goes near `applyRefreshedCredentials`' previous_session_id lineage proof.
+     * Both `flowAuthGeneration` and `abortedSession.authGeneration` follow it so
+     * `flowOwnsAuthStore()` and the abort-path token strips keep matching.
+     */
+    let continuationAdopted = false;
+
+    /**
+     * #2415 FIX. Re-point every abort site at the LIVE continuation credentials
+     * and adopt them as a new auth lifecycle. Called synchronously from inside
+     * performReset the instant the pair is parsed — the re-point must not trail
+     * the parse across any await.
+     *
+     * The re-point happens even when the CAS declines: the login pair is already
+     * revoked server-side, so revoking it is a guaranteed no-op, whereas the
+     * continuation row is live for 30 days with remember_me = true. An abort
+     * must always be able to reach the session this flow actually created.
+     */
+    const adoptLiveContinuation = (pair: ContinuationPair): void => {
+      abortedSession.accessToken = pair.accessToken;
+      abortedSession.refreshToken = pair.refreshToken;
+      abortedSession.sessionId = pair.sessionId;
+      continuation = pair;
+      // Narrowing only: flowAuthGeneration is published before the unwrap that
+      // leads here, so null is unreachable — and a non-null assertion is not
+      // allowed on an auth path.
+      if (flowAuthGeneration === null) return;
+      const adoptedGeneration = useAuthStore
+        .getState()
+        .beginAuthLifecycleIfCurrent(flowAuthGeneration, pair.accessToken, pair.sessionId);
+      // A successor lifecycle became current while the reset was in flight; do
+      // not clobber it with a half-applied adoption.
+      if (adoptedGeneration === null) return;
+      flowAuthGeneration = adoptedGeneration;
+      abortedSession.authGeneration = adoptedGeneration;
+      continuationAdopted = true;
+    };
+
+    const adoptResetContinuation = (pair: ContinuationPair | null): boolean => {
+      if (pair === null) {
+        // Committed reset, no session (§4.2). Close the prompt FIRST: it is a
+        // native <dialog> opened with showModal() that owns a focus trap, so
+        // leaving it open strands the user away from the sign-in form they now
+        // have to use. Mirrors abortKeyRecovery. The known-revoked login refresh
+        // token is never persisted on this path — the caller stops here.
+        setKeyRecoveryResolver(null);
+        // performReset already committed a NEW keyset via e2eeService.initialize,
+        // so returning to the login screen without clearing it leaves account A's
+        // private key resident on a mounted Login with no session — and a
+        // different account signing in here would run its initialize against a
+        // singleton still holding A's keys. Every other post-commit abort in this
+        // function clears; the ChangePassword sibling clears via nuclearReset.
+        // clearFlowSessionKeys (not bare clearKeys) routes through
+        // clearKeysIfInitializationCurrent, so it cannot wipe a successor's
+        // committed keyset. Safe to drop: the server durably holds the new
+        // wrapped key, so re-login re-derives it. (CWE-212)
+        clearFlowSessionKeys();
+        // Generation-guarded, like every other token strip in this file — a bare
+        // clearAccessToken() would log out a successor that became current in the
+        // microtask window across the awaited handleKeyRecovery boundary.
+        stripAbortedToken();
+        setErrors({ general: KEY_RESET_REAUTH_NOTICE });
+        setIsSubmitting(false);
+        return false;
+      }
+      // The pair was adopted inside performReset, before its first post-parse
+      // await (#2415 FIX). Here we only report whether this flow still owns the
+      // auth store; a declined CAS already left abortedSession pointing at the
+      // live session so the caller's abort revokes it rather than a corpse.
+      if (!continuationAdopted) {
+        // A successor lifecycle owns the store, so touch NOTHING global — no
+        // token strip, no notice, no key teardown. But this component's own
+        // spinner and modal are ours to release: the caller returns immediately
+        // after this, and without these the user is left on a disabled button
+        // behind a focus-trapping <dialog> with no explanation.
+        setKeyRecoveryResolver(null);
+        setIsSubmitting(false);
+      }
+      return continuationAdopted;
     };
 
     let credentialOwner: CredentialOwner | null = null;
@@ -975,18 +1128,22 @@ const Login: React.FC<LoginProps> = ({
           'Key unwrap failed; prompting for consented key reset',
           errorMessage(unwrapError)
         );
-        const recovered = await handleKeyRecovery(
+        const recovered = await handleKeyRecovery({
           teardownEpoch,
           abortedSession,
           requestSelection,
           abortForOriginChange,
           initializationGuard,
           requireFlowOwnership,
-          (receipt) => {
+          captureFlowReceipt: (receipt) => {
             flowInitializationReceipt = receipt;
-          }
-        );
-        if (!recovered) return false;
+          },
+          adoptLiveContinuation,
+        });
+        if (recovered === false) return false;
+        // #2415: adopt the pair (or fail closed when the server withheld it)
+        // before ANY further await — see adoptResetContinuation.
+        if (!adoptResetContinuation(recovered)) return false;
         await fenceOriginAndOwnership();
         return true;
       }
@@ -1027,11 +1184,15 @@ const Login: React.FC<LoginProps> = ({
         }
         let storedOwner: CredentialOwner | { status: 'rejected' } | null = null;
         try {
+          // #2415: the continuation credentials when a consented key reset ran
+          // (the login pair is revoked by then), otherwise the login's own.
+          // `rememberMe` deliberately stays on the LOGIN response's flag — the
+          // desktop does not adopt the server's forced remember_me.
           storedOwner = await globalThis.electron.storeRefreshToken({
-            refreshToken: data.refresh_token,
+            refreshToken: continuation?.refreshToken ?? data.refresh_token,
             rememberMe: data.remember_me ?? formData.rememberMe,
             apiBase: requestApiBase,
-            accessToken: data.access_token,
+            accessToken: continuation?.accessToken ?? data.access_token,
           });
         } catch (storeError) {
           await abortForCredentialPersistenceFailure(storeError);
@@ -1525,7 +1686,7 @@ const Login: React.FC<LoginProps> = ({
 
           {/* General Error */}
           {errors.general && (
-            <div className="form-error-banner">
+            <div className="form-error-banner" role="alert">
               <span>{errors.general}</span>
             </div>
           )}

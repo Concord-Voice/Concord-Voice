@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, within } from '../../../test-utils';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -319,6 +319,35 @@ describe('AccountSection profile and password forms', () => {
     const submitBtn = changePwdButtons[changePwdButtons.length - 1];
     fireEvent.click(submitBtn);
     expect(screen.getByText('Password must be at least 12 characters')).toBeInTheDocument();
+  });
+
+  // The general error banner is the only announcement a screen-reader user gets
+  // when the server rejects the change — the per-field <span class="form-error">
+  // messages never render for it. Without role="alert" the banner is a silent
+  // <div>: sighted users see it, everyone else is left on a form that looks like
+  // it did nothing. Login's equivalent banner is pinned the same way.
+  it('announces a rejected password change through an alert live region', async () => {
+    const changePassword = vi
+      .fn()
+      .mockResolvedValue({ success: false, error: 'Current password is incorrect' });
+    useUserStore.setState({ changePassword } as never);
+    render(<AccountSection />);
+    fireEvent.change(screen.getByPlaceholderText('Enter your current password'), {
+      target: { value: 'oldpass123456' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('Enter your new password'), {
+      target: { value: 'newpass123456' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('Confirm your new password'), {
+      target: { value: 'newpass123456' },
+    });
+    const changePwdButtons = screen.getAllByText('Change Password');
+    fireEvent.click(changePwdButtons[changePwdButtons.length - 1]);
+
+    const passwordSection = document.getElementById('section-password') as HTMLElement;
+    const banner = await within(passwordSection).findByRole('alert');
+    expect(banner).toHaveTextContent('Current password is incorrect');
+    expect(changePassword).toHaveBeenCalledWith('oldpass123456', 'newpass123456');
   });
 
   it('hides add link button when at max links', () => {

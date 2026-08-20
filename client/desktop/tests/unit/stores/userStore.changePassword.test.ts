@@ -1,9 +1,14 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // Mock all external dependencies before importing the store
 
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: vi.fn(),
+  // #2415: changePassword warms the per-origin machine-id cache before the
+  // rotating POST, because apiFetch reads it SYNCHRONOUSLY and a session-restore
+  // launch never populates it — leaving the continuation row with machine_id
+  // NULL, which the server treats as permissive for theft detection.
+  ensureMachineId: vi.fn().mockResolvedValue('test-machine-id'),
 }));
 
 vi.mock('@/renderer/services/websocketService', () => ({
@@ -17,6 +22,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
     isInitialized: false,
     initialize: vi.fn().mockResolvedValue(undefined),
     encryptPreferences: vi.fn(),
+    // #2415: the post-adoption E2EE re-persist reads the freshly derived keyset.
+    getSessionKeys: vi.fn().mockReturnValue(null),
   },
 }));
 
@@ -84,6 +91,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
 
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { ensureMachineId } from '@/renderer/services/apiClient';
 import { E2EEInitTeardownError } from '@/renderer/services/e2eeErrors';
 import { apiFetch } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
@@ -117,6 +125,20 @@ function deferred<T>(): {
   return { promise, resolve };
 }
 
+/**
+ * #2415: the continuation triple an ADOPTING server appends to a committed 2xx
+ * (`appendContinuationPair`). Spread into every committed-2xx fixture that models
+ * a current server — without it the body is the "new client / old server" case
+ * (spec 5), which deliberately routes to `failClosedToReauth` and returns
+ * `{ success: false }`. That is intended behaviour, not a regression, so a fixture
+ * asserting a successful change must carry all three fields.
+ */
+const CONTINUATION_FIELDS = {
+  access_token: 'cont-at',
+  refresh_token: 'cont-rt',
+  session_id: 'cont-sid',
+} as const;
+
 describe('userStore - changePassword', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -130,6 +152,16 @@ describe('userStore - changePassword', () => {
     vi.mocked(presenceOverrideSyncService.save).mockResolvedValue(true);
     mockFetchBlobRowForRotation.mockResolvedValue({ kind: 'absent' });
     mockPushEncryptedBlob.mockResolvedValue(undefined);
+    // vi.clearAllMocks() clears usage data only, so restate the defaults here.
+    // Every persistent implementation a later test installs (`mockResolvedValue`,
+    // not `...Once`) outlives that test and silently becomes the module default
+    // for the rest of the file — an order-dependence that only stays green
+    // because the default file order happens to run the victims first. Restating
+    // each one here makes every test start from the declared module default,
+    // whatever order the runner picks.
+    vi.mocked(e2eeService.getSessionKeys).mockReturnValue(null);
+    mockEncryptBlob.mockResolvedValue('new-preference-key-ciphertext');
+    vi.mocked(e2eeService.encryptPreferences).mockResolvedValue(undefined as never);
   });
 
   it('successfully changes password with re-wrapped keys', async () => {
@@ -171,6 +203,7 @@ describe('userStore - changePassword', () => {
       json: async () => ({
         message: 'Password changed successfully',
         presence_override_version: 8,
+        ...CONTINUATION_FIELDS,
       }),
     } as Response);
 
@@ -269,7 +302,7 @@ describe('userStore - changePassword', () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ presence_override_version: 9 }),
+        json: async () => ({ presence_override_version: 9, ...CONTINUATION_FIELDS }),
       } as Response);
 
     await expect(useUserStore.getState().changePassword('oldpass', 'newpass')).resolves.toEqual({
@@ -299,6 +332,7 @@ describe('userStore - changePassword', () => {
         json: async () => ({
           message: 'Password changed successfully',
           presence_override_version: 0,
+          ...CONTINUATION_FIELDS,
         }),
       } as Response);
 
@@ -406,7 +440,7 @@ describe('userStore - changePassword', () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ presence_override_version: 8 }),
+        json: async () => ({ presence_override_version: 8, ...CONTINUATION_FIELDS }),
       } as Response);
     vi.mocked(e2eeService.initialize).mockImplementationOnce(() => heldInitialize.promise);
 
@@ -444,7 +478,7 @@ describe('userStore - changePassword', () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ presence_override_version: 8 }),
+        json: async () => ({ presence_override_version: 8, ...CONTINUATION_FIELDS }),
       } as Response);
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
 
@@ -580,7 +614,7 @@ describe('userStore - changePassword', () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ presence_override_version: 8 }),
+        json: async () => ({ presence_override_version: 8, ...CONTINUATION_FIELDS }),
       } as Response);
     // The teardown that throws E2EEInitTeardownError also cleared the token (as a real
     // nuclearReset would), so the password-change lifecycle is already superseded when the
@@ -610,7 +644,7 @@ describe('userStore - changePassword', () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ presence_override_version: 8 }),
+        json: async () => ({ presence_override_version: 8, ...CONTINUATION_FIELDS }),
       } as Response);
     // A newer login became current mid-re-init (its token replaced ours). The stale
     // password-change flow must NOT nuclearReset it and must NOT clobber its loginNotice.
@@ -639,7 +673,7 @@ describe('userStore - changePassword', () => {
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ presence_override_version: 8 }),
+        json: async () => ({ presence_override_version: 8, ...CONTINUATION_FIELDS }),
       } as Response);
     // A non-teardown error is a normal failure — it must propagate unchanged, NOT trigger
     // the fail-closed re-auth path (no notice, no nuclearReset).
@@ -763,6 +797,7 @@ describe('userStore - changePassword', () => {
         json: async () => ({
           message: 'Password changed successfully',
           presence_override_version: 0,
+          ...CONTINUATION_FIELDS,
           sync_domain_versions: syncVersions,
         }),
       }) as Response;
@@ -878,7 +913,21 @@ describe('userStore - changePassword', () => {
       ).toHaveLength(2);
     });
 
-    it('treats a transport failure as COMMITTED when the persisted salt matches the submitted one', async () => {
+    // #2415 BEHAVIOUR CHANGE (was: "treats a transport failure as COMMITTED").
+    // A `committed-ambiguous` outcome has NO response body and therefore no
+    // continuation pair, so adoption fails closed by design. The salt-match
+    // reconciliation still proves the change COMMITTED — fail-closed re-auth is
+    // exactly what a committed-but-unadoptable session must produce, and is not a
+    // retryable cancellation. (Context: `reconcileAmbiguousPasswordCommit`
+    // re-fetches with the OLD access token, which the credential-epoch fence now
+    // rejects, so a true commit rarely reaches this arm at all; the arm and this
+    // lock stay because the 'not-committed' branch below is still live.)
+    it('fails closed to re-auth when a transport failure resolves to a COMMITTED change', async () => {
+      // A real nuclearReset clears the token; model it (Once) so the finally sees
+      // the superseded lifecycle and leaves the quiesced watchers stopped.
+      mockNuclearReset.mockImplementationOnce(() => {
+        useAuthStore.getState().clearAccessToken();
+      });
       mockApiFetch.mockResolvedValueOnce(keysResponse);
       mockApiFetch.mockRejectedValueOnce(new TypeError('network dropped'));
       // Reconcile fetch: server already persisted the salt this attempt submitted
@@ -896,10 +945,23 @@ describe('userStore - changePassword', () => {
 
       const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
 
-      expect(result).toEqual({ success: true });
-      expect(e2eeService.initialize).toHaveBeenCalled();
-      // No response body existed, so the presence version is reconciled by refetch.
-      expect(presenceOverrideSyncService.fetchAndApply).toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sign in again with your new password');
+      expect(useAuthStore.getState().loginNotice).toContain('sign in again with your new password');
+      expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+      // Nothing sequenced after adoption may run on the fenced old token: no
+      // reinit, no presence refetch.
+      expect(e2eeService.initialize).not.toHaveBeenCalled();
+      expect(presenceOverrideSyncService.fetchAndApply).not.toHaveBeenCalled();
+      // Absence of a pair is NEVER retried (the routes are rate-limited).
+      expect(
+        mockApiFetch.mock.calls.filter(([url]) => url === '/api/v1/users/me/password')
+      ).toHaveLength(1);
+      // Watchers quiesced for the rotation and deliberately left stopped.
+      expect(preferencesSyncService.stopWatching).toHaveBeenCalled();
+      expect(preferencesSyncService.startWatching).not.toHaveBeenCalled();
+      expect(savedGifsSyncService.startWatching).not.toHaveBeenCalled();
+      expect(friendOrgSyncService.startWatching).not.toHaveBeenCalled();
     });
 
     it('reports a retryable not-committed outcome when the persisted salt is unchanged', async () => {
@@ -950,6 +1012,7 @@ describe('userStore - changePassword', () => {
         json: async () => ({
           message: 'Password changed successfully',
           presence_override_version: 0,
+          ...CONTINUATION_FIELDS,
         }),
       } as Response);
       // Repair PUT for the one decryptable domain.
@@ -981,7 +1044,7 @@ describe('userStore - changePassword', () => {
       mockApiFetch.mockResolvedValueOnce({
         ok: true,
         status: 200,
-        json: async () => ({ message: 'ok', presence_override_version: 0 }),
+        json: async () => ({ message: 'ok', presence_override_version: 0, ...CONTINUATION_FIELDS }),
       } as Response);
       // Repair PUT fails.
       mockApiFetch.mockResolvedValueOnce({ ok: false, status: 500 } as Response);
@@ -993,14 +1056,22 @@ describe('userStore - changePassword', () => {
       expect(result.error).toMatch(/preferences/);
     });
 
-    it('runs the same new-key repair after an ambiguous commit resolves to committed', async () => {
+    // #2415 BEHAVIOUR CHANGE (was: "runs the same new-key repair after an
+    // ambiguous commit resolves to committed"). The repair PUTs would run on the
+    // OLD access token, which the credential-epoch fence rejects, and the
+    // ambiguous arm can carry no continuation pair to replace it — so the flow
+    // fails closed BEFORE the repush instead of issuing PUTs that must 401.
+    it('never repushes domains after an ambiguous commit — it fails closed first', async () => {
+      mockNuclearReset.mockImplementationOnce(() => {
+        useAuthStore.getState().clearAccessToken();
+      });
       mockDomainRows({
         saved_gifs: { kind: 'present', version: 2, plaintext: { v: 1, data: { gifs: [] } } },
       });
       vi.mocked(e2eeService.encryptPreferences).mockResolvedValue('repair-ciphertext');
       mockApiFetch.mockResolvedValueOnce(keysResponse);
       mockApiFetch.mockRejectedValueOnce(new TypeError('network dropped'));
-      // Reconcile: persisted salt matches the submitted one → committed.
+      // Reconcile: persisted salt matches the submitted one → committed-ambiguous.
       mockApiFetch.mockResolvedValueOnce({
         ok: true,
         status: 200,
@@ -1011,15 +1082,20 @@ describe('userStore - changePassword', () => {
           },
         }),
       } as Response);
-      // Repair PUT for the decryptable domain.
-      mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      // Deliberately NO repair-PUT response queued: a repush must never be attempted,
+      // and an unconsumed `...Once` would leak into the next test in this file.
 
       const result = await useUserStore.getState().changePassword('oldpass', 'newpass');
 
-      expect(result).toEqual({ success: true });
-      const repairCall = mockApiFetch.mock.calls.at(-1)!;
-      expect(repairCall[0]).toBe('/api/v1/users/me/saved-gifs');
-      expect((repairCall[1] as RequestInit).method).toBe('PUT');
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sign in again with your new password');
+      expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+      expect(e2eeService.encryptPreferences).not.toHaveBeenCalled();
+      expect(
+        mockApiFetch.mock.calls.filter(
+          ([, init]) => (init as RequestInit | undefined)?.method === 'PUT'
+        )
+      ).toHaveLength(0);
     });
 
     it('quiesces the sync watchers around the rotation and restarts them for the current session', async () => {
@@ -1051,6 +1127,414 @@ describe('userStore - changePassword', () => {
       // The superseded snapshot-push methods were removed outright; only the
       // still-existing preferences push can regress here.
       expect(preferencesSyncService.pushPreferences).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('continuation-pair adoption (#2415)', () => {
+    const keysResponse = () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          e2ee_keys: {
+            wrapped_private_key: 'old-wrapped-key',
+            key_derivation_salt: 'old-salt',
+          },
+        }),
+      }) as Response;
+
+    const committedWithPair = () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          message: 'Password changed successfully',
+          presence_override_version: 2,
+          sync_domain_versions: { preferences: 1, saved_gifs: 1, friend_organization: 1 },
+          access_token: 'cont-at',
+          refresh_token: 'cont-rt',
+          session_id: 'cont-sid',
+        }),
+      }) as Response;
+
+    // tests/setup.ts defines window.electron non-configurably, so vi.stubGlobal
+    // cannot redefine it; assign through and restore, as clipboard.test.ts does.
+    const realElectron = globalThis.electron;
+    function stubElectron(overrides: Record<string, unknown>): void {
+      globalThis.electron = { ...realElectron, ...overrides } as typeof globalThis.electron;
+    }
+    beforeEach(() => {
+      // vi.clearAllMocks() clears usage data but NOT queued `...Once` values or
+      // implementations, so an upstream case that consumed fewer responses than
+      // it seeded would otherwise hand this suite its leftovers (including a
+      // deliberately never-resolving `initialize`). Seed both from empty.
+      mockApiFetch.mockReset();
+      vi.mocked(e2eeService.initialize).mockReset().mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      globalThis.electron = realElectron;
+    });
+
+    it('adopts the continuation pair before any follow-up network call', async () => {
+      const storeRefreshToken = vi.fn().mockResolvedValue(3);
+      stubElectron({
+        storeRefreshToken,
+        storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true),
+      });
+      useAuthStore.setState({
+        accessToken: 'old-at',
+        sessionId: 'old-sid',
+        authGeneration: 1,
+        rememberMe: false,
+      });
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      // The adopted session survives: the change must NOT fail closed, and the
+      // lifecycle watcher must not read the new session id as a switch.
+      expect(result).toEqual({ success: true });
+      expect(useAuthStore.getState().accessToken).toBe('cont-at');
+      expect(useAuthStore.getState().sessionId).toBe('cont-sid');
+      // A NEW lifecycle, not a refresh rotation — the bump is the point.
+      expect(useAuthStore.getState().authGeneration).toBe(2);
+      expect(useAuthStore.getState().loginNotice).toBeNull();
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      // The client's OWN rememberMe, never a server-supplied remember_me (spec 2.6 SE-2).
+      expect(storeRefreshToken).toHaveBeenCalledTimes(1);
+      expect(storeRefreshToken).toHaveBeenCalledWith(
+        expect.objectContaining({
+          refreshToken: 'cont-rt',
+          accessToken: 'cont-at',
+          rememberMe: false,
+        })
+      );
+      // Adoption precedes the E2EE reinit, and therefore every later network call.
+      expect(storeRefreshToken.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(e2eeService.initialize).mock.invocationCallOrder[0]
+      );
+    });
+
+    it('proceeds when the machine-id warm-up REJECTS, instead of escaping as an unhandled rejection', async () => {
+      // The warm-up runs BEFORE beginPasswordChange, so an unguarded rejection
+      // would escape changePassword entirely and the caller's spinner/error
+      // handling would never run (Gitar, #2849). It degrades to warn-and-proceed:
+      // ensureMachineId already returns '' when there is no bridge, so the only
+      // way to reject is a broken bridge, and blocking a password change on that
+      // is the worse trade.
+      vi.mocked(ensureMachineId).mockRejectedValueOnce(new Error('IPC torn down'));
+      const storeRefreshToken = vi.fn().mockResolvedValue(3);
+      stubElectron({ storeRefreshToken, storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true) });
+      useAuthStore.setState({
+        accessToken: 'old-at',
+        sessionId: 'old-sid',
+        authGeneration: 1,
+        rememberMe: false,
+      });
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      // Resolves normally — the caller can render an outcome either way.
+      expect(result).toEqual({ success: true });
+      expect(useAuthStore.getState().accessToken).toBe('cont-at');
+    });
+
+    it('re-persists E2EE keys under the new credential owner after the change', async () => {
+      const storeRefreshToken = vi.fn().mockResolvedValue(9);
+      const storeE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
+      stubElectron({ storeRefreshToken, storeE2EEKeysIfOwner });
+      vi.mocked(e2eeService.getSessionKeys).mockReturnValue({
+        marker: 'post-change-keys',
+      } as unknown as ReturnType<typeof e2eeService.getSessionKeys>);
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      expect(result).toEqual({ success: true });
+      expect(storeE2EEKeysIfOwner).toHaveBeenCalledWith({ marker: 'post-change-keys' }, 9);
+      // Ordering is load-bearing: storeRefreshToken mints the owner BEFORE the
+      // reinit, but the keys it persists do not exist until the reinit has run.
+      expect(storeRefreshToken.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(e2eeService.initialize).mock.invocationCallOrder[0]
+      );
+      expect(vi.mocked(e2eeService.initialize).mock.invocationCallOrder[0]).toBeLessThan(
+        storeE2EEKeysIfOwner.mock.invocationCallOrder[0]
+      );
+    });
+
+    // ── Case 2: absent / partial continuation fields ────────────────────────
+    // The server omits all three fields when a CONCURRENT destructive flow
+    // advanced the credential epoch in the post-commit window. Absence is a
+    // deliberate security outcome, never a transport error, and is NEVER
+    // retried: the epoch signal is unrecoverable from any later 401 (whose body
+    // is deliberately generic, so it cannot serve as an epoch oracle) and both
+    // routes are rate-limited per user. A partial set cannot come from a healthy
+    // server — `appendContinuationPair` writes all three or none — so a proxy
+    // that stripped one field, or a version-skewed server, must be
+    // indistinguishable from full absence.
+    const committedWithoutPair = (continuationFields: Record<string, unknown>) =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          message: 'Password changed successfully',
+          presence_override_version: 8,
+          sync_domain_versions: { preferences: 1, saved_gifs: 1, friend_organization: 1 },
+          ...continuationFields,
+        }),
+      }) as Response;
+
+    it.each([
+      ['no continuation fields at all', {}],
+      [
+        'only access_token and refresh_token',
+        { access_token: 'cont-at', refresh_token: 'cont-rt' },
+      ],
+      ['only access_token and session_id', { access_token: 'cont-at', session_id: 'cont-sid' }],
+      ['only refresh_token and session_id', { refresh_token: 'cont-rt', session_id: 'cont-sid' }],
+      [
+        'an empty-string field in an otherwise complete set',
+        { access_token: '', refresh_token: 'cont-rt', session_id: 'cont-sid' },
+      ],
+    ] as ReadonlyArray<[string, Record<string, unknown>]>)(
+      'fails closed to re-auth when a committed 2xx carries %s',
+      async (_label, continuationFields) => {
+        // A real nuclearReset clears the token; model that (Once, so it does not
+        // leak into later tests) so the `finally` sees the superseded lifecycle
+        // and leaves the quiesced watchers stopped — matching the #2422 case above.
+        mockNuclearReset.mockImplementationOnce(() => {
+          useAuthStore.getState().clearAccessToken();
+        });
+        const storeRefreshToken = vi.fn().mockResolvedValue(3);
+        stubElectron({ storeRefreshToken, storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true) });
+        useAuthStore.setState({
+          accessToken: 'old-at',
+          sessionId: 'old-sid',
+          authGeneration: 1,
+          rememberMe: true,
+          loginNotice: null,
+        });
+        mockApiFetch.mockResolvedValueOnce(keysResponse());
+        mockApiFetch.mockResolvedValueOnce(committedWithoutPair(continuationFields));
+
+        const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('sign in again with your new password');
+        // The notice survives clearAccessToken so the login screen can render it.
+        expect(useAuthStore.getState().loginNotice).toContain(
+          'sign in again with your new password'
+        );
+        expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+        // No partial adoption: a stripped field is never installed, and nothing
+        // reaches the keychain on the fail-closed path.
+        expect(useAuthStore.getState().accessToken).toBeNull();
+        expect(storeRefreshToken).not.toHaveBeenCalled();
+        // Nothing sequenced after adoption runs on the fenced old token.
+        expect(e2eeService.initialize).not.toHaveBeenCalled();
+        expect(presenceOverrideSyncService.fetchAndApply).not.toHaveBeenCalled();
+        // ZERO retries — exactly the keys GET plus the one password POST.
+        expect(mockApiFetch).toHaveBeenCalledTimes(2);
+        // The data-loss crux: watchers quiesced for the rotation, left stopped.
+        expect(preferencesSyncService.stopWatching).toHaveBeenCalled();
+        expect(preferencesSyncService.startWatching).not.toHaveBeenCalled();
+        expect(savedGifsSyncService.startWatching).not.toHaveBeenCalled();
+        expect(friendOrgSyncService.startWatching).not.toHaveBeenCalled();
+      }
+    );
+
+    // ── Case 3: concurrent-epoch supersession ───────────────────────────────
+    it('declines the CAS when the auth generation moved, leaving the successor session intact', async () => {
+      const storeRefreshToken = vi.fn().mockResolvedValue(3);
+      stubElectron({
+        storeRefreshToken,
+        storeE2EEKeysIfOwner: vi.fn().mockResolvedValue(true),
+      });
+      useAuthStore.setState({
+        accessToken: 'old-at',
+        sessionId: 'old-sid',
+        authGeneration: 1,
+        rememberMe: false,
+      });
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => {
+          // A successor lifecycle becomes current while the committed body is
+          // being read. It keeps this session id on purpose: the coarse
+          // lifecycle watcher keys on the session id, so leaving it unchanged
+          // isolates the generation CAS as the ONLY guard left standing.
+          useAuthStore.getState().beginAuthLifecycleIfCurrent(1, 'successor-at', 'old-sid');
+          return {
+            message: 'Password changed successfully',
+            presence_override_version: 2,
+            sync_domain_versions: { preferences: 1, saved_gifs: 1, friend_organization: 1 },
+            access_token: 'cont-at',
+            refresh_token: 'cont-rt',
+            session_id: 'cont-sid',
+          };
+        },
+      } as Response);
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sign in again with your new password');
+      // The successor is NOT clobbered — no field of the pair was installed.
+      expect(useAuthStore.getState().accessToken).toBe('successor-at');
+      expect(useAuthStore.getState().sessionId).toBe('old-sid');
+      expect(useAuthStore.getState().authGeneration).toBe(2);
+      // No partial adoption: the republish never runs on a declined CAS, so the
+      // keychain keeps the successor's refresh token.
+      expect(storeRefreshToken).not.toHaveBeenCalled();
+      expect(e2eeService.initialize).not.toHaveBeenCalled();
+      // A declined CAS is itself proof a successor became current, so this arm
+      // returns the notice DIRECTLY instead of routing through
+      // failClosedToReauth — whose isCurrent() is blind to a generation-only
+      // supersession and would nuclearReset the SUCCESSOR's credentials, E2EE
+      // custody and disk token (CWE-672).
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+    });
+
+    // ── Case 4: the keychain republish ──────────────────────────────────────
+    // `ipcRenderer.invoke` REJECTS when the main handler throws or the bridge is
+    // torn down mid-call, and resolves a non-number when main declines. Both
+    // mean restart-survival is gone and the keychain owner is unknown, so the
+    // change must fail closed rather than continue with an adopted session whose
+    // custody nobody holds.
+    it('fails closed when the keychain republish REJECTS', async () => {
+      // A real nuclearReset clears the token; model it (Once) so the `finally`
+      // sees the superseded lifecycle and leaves the quiesced watchers stopped.
+      // Without this the watcher assertions below would pass for the wrong
+      // reason (see the #2422 case earlier in this file).
+      mockNuclearReset.mockImplementationOnce(() => {
+        useAuthStore.getState().clearAccessToken();
+      });
+      const storeRefreshToken = vi.fn().mockRejectedValue(new Error('keychain unavailable'));
+      const storeE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
+      stubElectron({ storeRefreshToken, storeE2EEKeysIfOwner });
+      useAuthStore.setState({
+        accessToken: 'old-at',
+        sessionId: 'old-sid',
+        authGeneration: 1,
+        rememberMe: false,
+        loginNotice: null,
+      });
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      // The rejection is CAUGHT: unguarded it would unwind into changePassword's
+      // catch and be reported as an ordinary retryable failure for a change that
+      // COMMITTED, with the sync watchers restarted under the OLD preferences
+      // key against already-rotated rows (the CWE-212 class #2422 fenced off).
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sign in again with your new password');
+      expect(useAuthStore.getState().loginNotice).toContain('sign in again with your new password');
+      expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+      expect(storeRefreshToken).toHaveBeenCalledTimes(1);
+      // Nothing sequenced after the republish ran.
+      expect(e2eeService.initialize).not.toHaveBeenCalled();
+      expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+      // Watchers quiesced for the rotation and deliberately left stopped.
+      expect(preferencesSyncService.stopWatching).toHaveBeenCalled();
+      expect(preferencesSyncService.startWatching).not.toHaveBeenCalled();
+      expect(savedGifsSyncService.startWatching).not.toHaveBeenCalled();
+      expect(friendOrgSyncService.startWatching).not.toHaveBeenCalled();
+    });
+
+    it('fails closed — and never persists keys — when the republish resolves a NON-owner', async () => {
+      mockNuclearReset.mockImplementationOnce(() => {
+        useAuthStore.getState().clearAccessToken();
+      });
+      // Main declined the publish: the resolved value is not a CredentialOwner.
+      const storeRefreshToken = vi.fn().mockResolvedValue({ status: 'rejected' });
+      const storeE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
+      stubElectron({ storeRefreshToken, storeE2EEKeysIfOwner });
+      vi.mocked(e2eeService.getSessionKeys).mockReturnValue({
+        marker: 'post-change-keys',
+      } as unknown as ReturnType<typeof e2eeService.getSessionKeys>);
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sign in again with your new password');
+      expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+      // The actual hazard: the keychain owner is UNKNOWN, so writing the new
+      // keyset under it would persist E2EE material against a bogus owner.
+      expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+      expect(e2eeService.initialize).not.toHaveBeenCalled();
+      expect(preferencesSyncService.startWatching).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when the bridge is present but storeRefreshToken is MISSING', async () => {
+      mockNuclearReset.mockImplementationOnce(() => {
+        useAuthStore.getState().clearAccessToken();
+      });
+      // A preload regression, NOT a web/dev shell. Silently continuing would
+      // leave the OLD, now-revoked token on the keychain and skip the E2EE
+      // re-persist — restart survival lost with no signal.
+      const storeE2EEKeysIfOwner = vi.fn().mockResolvedValue(true);
+      const bridge: Record<string, unknown> = { ...realElectron, storeE2EEKeysIfOwner };
+      delete bridge.storeRefreshToken;
+      globalThis.electron = bridge as unknown as typeof globalThis.electron;
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sign in again with your new password');
+      expect(mockNuclearReset).toHaveBeenCalledTimes(1);
+      expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+      expect(e2eeService.initialize).not.toHaveBeenCalled();
+      expect(preferencesSyncService.startWatching).not.toHaveBeenCalled();
+    });
+
+    it('succeeds with NO republish and NO key re-persist when there is no bridge at all', async () => {
+      // The web/dev shell. Named explicitly because it was previously covered
+      // only incidentally, as a side effect of every success-path test — nothing
+      // asserted that the *absence* of a bridge is a continue rather than a
+      // fail-closed, which is the distinction the missing-method case above
+      // draws against.
+      globalThis.electron = undefined as unknown as typeof globalThis.electron;
+      vi.mocked(e2eeService.getSessionKeys).mockReturnValue({
+        marker: 'post-change-keys',
+      } as unknown as ReturnType<typeof e2eeService.getSessionKeys>);
+      useAuthStore.setState({
+        accessToken: 'old-at',
+        sessionId: 'old-sid',
+        authGeneration: 1,
+        rememberMe: false,
+        loginNotice: null,
+      });
+      mockApiFetch.mockResolvedValueOnce(keysResponse());
+      mockApiFetch.mockResolvedValueOnce(committedWithPair());
+
+      const result = await useUserStore.getState().changePassword('old-pw', 'new-pw');
+
+      expect(result).toEqual({ success: true });
+      // The pair is still adopted in renderer state — only the persistence legs
+      // are skipped, exactly as before #2415 (there was nothing to persist to).
+      expect(useAuthStore.getState().accessToken).toBe('cont-at');
+      expect(useAuthStore.getState().sessionId).toBe('cont-sid');
+      expect(mockNuclearReset).not.toHaveBeenCalled();
+      expect(useAuthStore.getState().loginNotice).toBeNull();
+      // No owner was minted, so the E2EE re-persist is skipped outright rather
+      // than run under a null owner.
+      expect(realElectron?.storeRefreshToken).not.toHaveBeenCalled();
+      expect(realElectron?.storeE2EEKeysIfOwner).not.toHaveBeenCalled();
+      // A success still restarts the watchers for the adopted session.
+      expect(preferencesSyncService.startWatching).toHaveBeenCalled();
     });
   });
 });
