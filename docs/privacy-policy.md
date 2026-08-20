@@ -392,6 +392,16 @@ for service operation may be collected and processed. This includes:
   Status, which are used to enforce your recipient choices
 - Aggregate counts (number of messages in a channel, etc.)
 - Payment records (handled by Stripe, see [Section 1](#payment-data))
+- Profile and community imagery: avatars, profile banners, server icons and
+  banners, and group conversation icons. These images are stored unencrypted
+  because they are shown to people who do not hold encryption keys with you.
+  A server icon appears in an invite preview before you are a member, and an
+  avatar appears to anyone who can see your messages, so no key exists that
+  would both protect the image and let its intended audience see it. Camera,
+  device, and location metadata is removed from these images when they are
+  processed on upload. Files you attach to messages are **not** in this
+  category: attachments remain end-to-end encrypted and are not readable by us
+  (see [Section 2.3](#23-what-concord-voice-cannot-access)).
 
 Metadata and server-visible presence information are processed under the
 legal bases described in
