@@ -226,7 +226,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 | `friends`       | Friend requests, acceptance/decline, blocking, friend codes                                  |
 | `invites`       | Server invite code generation, listing, revoking, joining, preview                           |
 | `klipy`         | KLIPY GIF API + media proxy with SSRF egress guard                                           |
-| `media`         | Object-store handler: avatar, banner, server-icon, attachment up/download                    |
+| `media`         | Object-store handler: avatar, banner, server-icon, attachment up/download. Tier-1 uploads are decoded and re-encoded, which strips EXIF/XMP/IPTC (#2469) |
 | `members`       | Server membership: add, update role, remove, ban/unban (optional purge-on-ban/kick of the removed user's messages, #1353) |
 | `messages`      | Channel + DM message CRUD, reactions, pins, embed suppression                                |
 | `mfa`           | TOTP, WebAuthn, backup codes, recovery key, trusted devices, recovery circle                 |
@@ -422,6 +422,58 @@ erDiagram
         SMALLINT media_tier "1=server-readable, 2=E2EE"
     }
 ```
+
+#### Image metadata handling (#2469)
+
+Uploaded images carry EXIF, XMP, and IPTC metadata — GPS coordinates, device
+identifiers, capture timestamps. Both tiers remove it, by **different mechanisms
+for a structural reason**: the server can only strip what it can read.
+
+**Tier 1 (avatars, banners, server icons, group-DM icons) — server-side.**
+`internal/media/processing.go` fully decodes and re-encodes every upload through
+Go's standard-library encoders, which emit no EXIF/XMP/IPTC segment. The
+animated-GIF branch builds a fresh `gif.GIF` struct, so comment and application
+extension blocks are dropped too. Re-encoding also neutralises polyglot and
+malformed-image payloads, which a metadata-only strip would leave intact.
+
+Removal is therefore a **side effect of processing**, not a dedicated step.
+`processing_metadata_test.go` pins it as an invariant — including the
+no-resize-required path, which is what a future "skip the re-encode for images
+already within bounds" optimisation would take.
+
+**Tier 2 (message attachments) — client-side, before encryption.** These are
+end-to-end encrypted, so the server never sees plaintext and cannot strip
+anything; a GPS-tagged photo would reach every recipient intact and could not be
+remediated after the fact. `client/desktop/src/renderer/utils/imageMetadata/`
+rewrites the container byte-for-byte before `encryptFile` runs.
+
+That module parses containers rather than re-encoding pixels, which keeps the
+strip lossless — no recompression, no ICC loss, APNG and animated GIF keep their
+frames. Three decisions are load-bearing:
+
+- **Dispatch on magic bytes, not the declared MIME.** `file.type` comes from the
+  OS and is attacker-influenced by renaming.
+- **Fail closed.** A file that sniffs as a handled container but will not parse
+  throws and the upload is rejected. It never falls back to sending the original,
+  which would silently void the control.
+- **Identifying metadata only.** ICC colour profiles, GIF `NETSCAPE2.0` loop
+  counts, and EXIF Orientation are preserved — stripping them degrades the image
+  while buying no privacy. Orientation in particular shares a block with GPS, so
+  JPEG rebuilds a minimal Orientation-only APP1 rather than dropping the block
+  and rendering every portrait photo sideways.
+
+HEIC is stripped offset-stably: where its `iloc` box holds absolute file offsets
+(`construction_method = 0`), the EXIF item's bytes are zeroed in place and its
+extent length cleared rather than removing the box and rewriting every offset
+after it. The idat- and item-relative methods are refused rather than resolved —
+zeroing a relative offset as if it were absolute would destroy an unrelated byte
+range while the real EXIF survived, and report success. TIFF is the exception
+that needs a true rewrite, because there the container *is* the metadata format —
+EXIF is an IFD, and pixel data is addressed by offsets living in the same
+directory as GPS.
+
+Video metadata is not yet stripped; the ISO-BMFF walker this module already
+carries is the path to it, since HEIC and MP4/MOV share a container.
 
 **E2EE key material (epoch-tracked, with server channels and DMs in parallel):**
 
@@ -1191,7 +1243,7 @@ Concord/
 | Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |
 | Cache          | Redis 7 (server, node-redis 6.x client) | Sessions, presence, RBAC cache, rate limiting, voice room state     |
 | Messaging      | NATS 2.x                                | Lightweight inter-service voice events                              |
-| Object storage | MinIO / S3                              | Avatars, banners, attachments (tiered: server-readable vs E2EE)     |
+| Object storage | MinIO / S3                              | Avatars, banners, attachments (tiered: server-readable vs E2EE; image metadata stripped on both tiers — see Image metadata handling) |
 | SPA serving    | Cloudflare Pages                        | Atomic deploys, decoupled from the control plane (ADR-0015)         |
 | Auth           | JWT + HttpOnly refresh                  | Stateless access, revocable refresh                                 |
 | GIF search     | Klipy (privacy proxy)                   | Tenant key + SSRF-guarded server-side proxy. No direct client calls |

@@ -42,8 +42,110 @@ vi.mock('@/renderer/utils/attachmentCrypto', async () => {
   };
 });
 
+/**
+ * A minimal, structurally valid PNG: signature, IHDR, one IDAT, IEND.
+ *
+ * #2469: an image file's CONTENT now matters. The upload path strips metadata
+ * before encrypting and fails closed on a buffer that declares a handled image
+ * type but whose bytes match no image format — precisely so a renamed or corrupt
+ * file cannot be uploaded unstripped. A zero-filled ArrayBuffer labelled
+ * `image/png` is exactly that case, so these fixtures now carry real bytes.
+ */
+const MINIMAL_PNG = new Uint8Array([
+  0x89,
+  0x50,
+  0x4e,
+  0x47,
+  0x0d,
+  0x0a,
+  0x1a,
+  0x0a, // signature
+  0x00,
+  0x00,
+  0x00,
+  0x0d,
+  0x49,
+  0x48,
+  0x44,
+  0x52, // IHDR length + type
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x00,
+  0x01, // 1x1
+  0x08,
+  0x06,
+  0x00,
+  0x00,
+  0x00,
+  0x1f,
+  0x15,
+  0xc4,
+  0x89,
+  0x00,
+  0x00,
+  0x00,
+  0x0a,
+  0x49,
+  0x44,
+  0x41,
+  0x54, // IDAT length + type
+  0x78,
+  0x9c,
+  0x63,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x05,
+  0x00,
+  0x01,
+  0x0d,
+  0x0a,
+  0x2d,
+  0xb4,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x49,
+  0x45,
+  0x4e,
+  0x44, // IEND
+  0xae,
+  0x42,
+  0x60,
+  0x82,
+]);
+
+function indexOf(haystack: Uint8Array, needle: number[]): number {
+  outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+const IMAGE_TYPES = new Set(['image/png', 'image/apng', 'image/jpeg', 'image/jpg']);
+
+/**
+ * Builds a mock File of exactly `size` bytes. For an image type the buffer opens
+ * with a real PNG and is padded to length — the padding sits after IEND, which
+ * the chunk walker stops at, so it is inert. Keeping the requested size exact
+ * matters because several tests drive the MAX_FILE_SIZE limit through this
+ * helper.
+ */
 function createMockFile(name: string, size: number, type: string): File {
-  const buffer = new ArrayBuffer(size);
+  if (!IMAGE_TYPES.has(type)) {
+    return new File([new ArrayBuffer(size)], name, { type });
+  }
+  const buffer = new Uint8Array(Math.max(size, MINIMAL_PNG.byteLength));
+  buffer.set(MINIMAL_PNG, 0);
   return new File([buffer], name, { type });
 }
 
@@ -220,6 +322,51 @@ describe('useFileUpload', () => {
     });
     expect(result.current.files).toHaveLength(1);
     expect(result.current.files[0].file.name).toBe('b.pdf');
+  });
+
+  // filesRef is the SYNCHRONOUS mirror addFiles validates and rebuilds from.
+  // addFiles writes it eagerly; removeFile/clearFiles used to write only through
+  // setFiles and rely on a passive useEffect to catch the mirror up. Passive
+  // effects run after paint, so an addFiles landing in that window read a stale
+  // mirror and rebuilt the queue from it — resurrecting the entry just removed.
+  //
+  // Both calls sit in ONE act() deliberately: act flushes effects at its close,
+  // so splitting them would let the reconciling effect run in between and hide
+  // the race the test exists to catch.
+  it('does not resurrect a removed file when addFiles runs before the effect', () => {
+    const { result } = renderHook(() => useFileUpload());
+
+    act(() => {
+      result.current.addFiles([createMockFile('gone.png', 100, 'image/png')]);
+    });
+    expect(result.current.files).toHaveLength(1);
+
+    act(() => {
+      result.current.removeFile(0);
+      result.current.addFiles([createMockFile('kept.png', 100, 'image/png')]);
+    });
+
+    expect(result.current.files.map((f) => f.file.name)).toEqual(['kept.png']);
+  });
+
+  // Same mirror, same window, via clearFiles.
+  it('does not resurrect cleared files when addFiles runs before the effect', () => {
+    const { result } = renderHook(() => useFileUpload());
+
+    act(() => {
+      result.current.addFiles([
+        createMockFile('x.png', 100, 'image/png'),
+        createMockFile('y.png', 100, 'image/png'),
+      ]);
+    });
+    expect(result.current.files).toHaveLength(2);
+
+    act(() => {
+      result.current.clearFiles();
+      result.current.addFiles([createMockFile('fresh.png', 100, 'image/png')]);
+    });
+
+    expect(result.current.files.map((f) => f.file.name)).toEqual(['fresh.png']);
   });
 
   it('clears all files', () => {
@@ -409,6 +556,53 @@ describe('useFileUpload', () => {
 
     expect(encryptFile).toHaveBeenCalled();
     expect(result.current.files[0].status).toBe('done');
+  });
+
+  // #2469: the bytes handed to encryptFile must be the STRIPPED ones. Asserting
+  // only that stripFileMetadata was called would not prove that — the upload
+  // could still encrypt the original. This inspects what encryptFile actually
+  // received and requires the GPS marker to be absent from it.
+  it('strips image metadata before the bytes reach encryptFile', async () => {
+    const { encryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
+    mockSafeJson.mockResolvedValue({ file_id: 'strip-1', file_type: 'photo', file_size: 100 });
+
+    // A real PNG carrying a tEXt chunk with a recognisable payload.
+    const marker = [0x47, 0x50, 0x53, 0xde, 0xad, 0xbe, 0xef];
+    const text = [0x74, 0x45, 0x58, 0x74]; // 'tEXt'
+    const chunk = [
+      0x00,
+      0x00,
+      0x00,
+      marker.length,
+      ...text,
+      ...marker,
+      0x00,
+      0x00,
+      0x00,
+      0x00, // CRC (not validated on a chunk we drop)
+    ];
+    const base = Array.from(MINIMAL_PNG);
+    // Splice the tEXt chunk in before IEND (the final 12 bytes).
+    const withText = new Uint8Array([
+      ...base.slice(0, base.length - 12),
+      ...chunk,
+      ...base.slice(base.length - 12),
+    ]);
+    expect(indexOf(withText, marker)).toBeGreaterThanOrEqual(0);
+
+    const file = new File([withText], 'gps.png', { type: 'image/png' });
+    const { result } = renderHook(() => useFileUpload());
+    act(() => {
+      result.current.addFiles([file]);
+    });
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+
+    expect(encryptFile).toHaveBeenCalled();
+    const passed = new Uint8Array(vi.mocked(encryptFile).mock.calls[0][0] as ArrayBuffer);
+    expect(indexOf(passed, marker)).toBe(-1);
   });
 
   // #2843: the uploaded bytes must be the ENCRYPTED buffer, never the raw file.

@@ -7,6 +7,7 @@ import {
   isImageType,
   MAX_ATTACHMENTS,
 } from '../utils/attachmentCrypto';
+import { stripFileMetadata } from '../utils/imageMetadata';
 import {
   formatLimitBytes,
   resolveAttachmentLimit,
@@ -375,7 +376,21 @@ async function encryptAndBuildForm(
   channelId: string,
   conversationId?: string
 ): Promise<FormData> {
-  const fileData = await entry.file.arrayBuffer();
+  const raw = await entry.file.arrayBuffer();
+
+  // #2469: strip identifying metadata BEFORE encryption. These attachments are
+  // end-to-end encrypted, so the server never sees plaintext and cannot strip
+  // anything — a GPS-tagged photo would reach every recipient intact and could
+  // not be remediated afterwards. Only the sending client can remove it.
+  //
+  // It sits ahead of the encrypt call rather than inside encryptFile, which
+  // takes an ArrayBuffer with no MIME context to dispatch on.
+  //
+  // stripFileMetadata THROWS on a file that sniffs as a handled image but will
+  // not parse. That propagates to uploadPendingFiles, which marks the file
+  // errored — the upload fails rather than silently sending unstripped bytes.
+  const { data: fileData } = stripFileMetadata(raw, entry.file.type);
+
   const uploadData = await encryptFile(fileData, channelKey);
 
   const formData = new FormData();
@@ -419,8 +434,10 @@ export function useFileUpload() {
   // Computing inside a setFiles updater and reading a ref straight after is
   // unsound: React may defer the updater, so the read can return a PREVIOUS
   // selection's result — the composer then shows a stale notice, or none.
-  // Written eagerly by addFiles (so back-to-back calls compose) and reconciled
-  // by the effect below for every other path that mutates `files`.
+  // Written eagerly by every path that mutates `files` (addFiles, removeFile,
+  // clearFiles) so back-to-back calls compose within a single tick. The effect
+  // below reconciles it against committed state for async patches such as
+  // hydrateDimensions and upload-status updates.
   const filesRef = useRef<FileUploadState[]>(files);
   useEffect(() => {
     filesRef.current = files;
@@ -463,23 +480,41 @@ export function useFileUpload() {
     return { accepted: accepted.length, rejections };
   }, []);
 
+  // These write `filesRef` eagerly, the same way addFiles does. Leaving the
+  // mirror to the passive effect above is not enough: passive effects run after
+  // paint, so an addFiles in that window rebuilt the queue from a stale mirror
+  // and RESURRECTED the entry just removed. Removing an attachment and adding
+  // another in the same tick is an ordinary composer action, not a rare
+  // interleaving.
+  //
+  // The write must sit OUTSIDE the updater. React may defer an updater, so
+  // assigning the ref inside one lands after a same-tick addFiles has already
+  // read the mirror — the exact unsoundness addFiles documents above. Revoking
+  // out here is the safer half of the same move: an updater may run more than
+  // once, and revoking twice on a re-invocation is not idempotent.
   const removeFile = useCallback((index: number) => {
-    setFiles((prev) => {
-      const removed = prev[index];
-      if (removed?.previewUrl) {
-        URL.revokeObjectURL(removed.previewUrl);
-      }
-      return prev.filter((_, i) => i !== index);
-    });
+    const mirror = filesRef.current;
+    const removed = mirror[index];
+    if (removed?.previewUrl) {
+      URL.revokeObjectURL(removed.previewUrl);
+    }
+    filesRef.current = mirror.filter((_, i) => i !== index);
+    // The ref write is eager; the STATE write stays functional. Rebuilding state
+    // from the ref instead would clobber an async patch — hydrateDimensions
+    // commits through a functional update, and the ref only catches up in the
+    // effect. Functional-from-committed-`prev` keeps that patch; the effect then
+    // reconciles the ref back to committed state. hydrateDimensions patches
+    // fields in place without reordering or removing, so the index means the
+    // same thing in both.
+    setFiles((prev) => prev.filter((_, i) => i !== index));
   }, []);
 
   const clearFiles = useCallback(() => {
-    setFiles((prev) => {
-      for (const f of prev) {
-        if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
-      }
-      return [];
-    });
+    for (const f of filesRef.current) {
+      if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+    }
+    filesRef.current = [];
+    setFiles([]);
   }, []);
 
   const uploadAll = useCallback(
