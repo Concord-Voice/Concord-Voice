@@ -1,294 +1,251 @@
 # Security Policy
 
+Concord Voice builds privacy- and security-critical software. We take vulnerabilities seriously and genuinely appreciate responsible disclosure.
+
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.x.x   | :white_check_mark: |
+| Version | Supported |
+| ------- | --------- |
+| 0.x.x   | Yes       |
 
-<!-- audit-exempt: historical reference (v0.1.0-Alpha is a shipped versioned identifier) -->
-
-**Note:** Concord Voice is currently in active development. Phase 1 is live (v0.1.0-Alpha). Phase 2A is near-complete and Phase 2B is in flight, with active development toward v0.2.0-Beta. Security updates are provided for the latest development version.
+**Note:** Concord Voice is in active development toward v0.2.0-Beta, with v1.0 targeted for January 2027. Security updates are provided for the current development release.
 
 ## Reporting a Vulnerability
 
-**DO NOT** open public GitHub issues for security vulnerabilities.
+**Please do not open public issues, pull requests, or discussions for security vulnerabilities.**
 
-### How to Report
+Report privately to **[security@concordvoice.com](mailto:security@concordvoice.com)**. A PGP key is available on request.
 
-Send security reports to: **security@concordvoice.com**
+Where possible, please include:
 
-Include:
-
-- Description of the vulnerability
-- Steps to reproduce
-- Potential impact
-- Suggested fix (if any)
-- Your contact information
+- A description of the vulnerability and its potential impact
+- Steps to reproduce, or a proof-of-concept
+- Affected component(s) and version(s)
+- Any suggested remediation
+- How you would like to be credited
 
 ### What to Expect
 
-1. **Acknowledgment**: Within 48 hours
-2. **Initial Assessment**: Within 7 days
-3. **Status Updates**: Every 7 days until resolved
-4. **Resolution**: Depends on severity
+| Stage | Target |
+| :-- | :-- |
+| Acknowledgement of your report | within **48 hours** |
+| Triage and severity assessment | within **7 days** |
+| Status updates | every **7 days** until resolved |
+| Coordinated fix and disclosure | we will keep you updated throughout |
 
-### Severity Levels
+We will credit you for the discovery once a fix ships, unless you prefer to remain anonymous. Please give us a reasonable window to remediate before any public disclosure.
 
-#### Critical (24-48 hour response)
+### Severity and Response Targets
 
-- Remote code execution
-- Authentication bypass
-- Data exposure of all users
-- Privilege escalation to admin
+| Severity | Response | Examples |
+| :-- | :-- | :-- |
+| **Critical** | 24-48 hours | Remote code execution; authentication bypass; data exposure affecting all users; privilege escalation to admin |
+| **High** | 3-7 days | SQL injection; XSS; CSRF; unauthorized data access |
+| **Medium** | 7-14 days | Denial of service; information disclosure; session management issues |
+| **Low** | 14-30 days | Missing security headers; weak cryptography; minor information leaks |
 
-#### High (3-7 day response)
+### Disclosure Timeline
 
-- SQL injection
-- XSS vulnerabilities
-- CSRF vulnerabilities
-- Unauthorized data access
+1. **Day 0** — vulnerability reported
+2. **Day 1-2** — acknowledgement sent
+3. **Day 1-7** — initial assessment and severity classification
+4. **Day 7-30** — patch development and testing
+5. **Day 30** — patch released (critical and high severity)
+6. **Day 30-60** — public disclosure, after patch deployment
 
-#### Medium (7-14 day response)
+## Scope
 
-- Denial of service
-- Information disclosure
-- Session management issues
-
-#### Low (14-30 day response)
-
-- Missing security headers
-- Weak cryptography
-- Minor information leaks
-
-## Security Best Practices
-
-### For Users
-
-1. **Keep Updated**: Always use the latest version
-2. **Strong Passwords**: Minimum 12 characters, mixed case, numbers, symbols
-3. **End-to-End Encryption**: All conversations are end-to-end encrypted by default — there is no setting to disable it (see [ADR-0003](../[internal]0003-e2ee-always.md))
-4. **Verify Identity**: Verify server identity when connecting to self-hosted instances
-5. **Secure Your Keys**: Back up encryption keys securely
-
-### For Developers
-
-1. **Environment Variables**: Never commit `.env` files
-2. **Dependencies**: Keep dependencies updated
-3. **Secret Detection**: Pre-commit hooks prevent secret commits
-4. **Code Review**: All code requires review before merge
-5. **Input Validation**: Validate all user input
-6. **Parameterized Queries**: Use parameterized queries to prevent SQL injection
-7. **HTTPS Only**: All production traffic must use HTTPS/TLS
-
-### For Self-Hosters
-
-1. **TLS Certificates**: Use valid TLS certificates (Let's Encrypt recommended)
-2. **Firewall**: Configure firewall to restrict access
-3. **Database Security**: Use strong database passwords, restrict network access
-4. **Regular Backups**: Implement automated backup strategy
-5. **Monitoring**: Set up monitoring and alerting
-6. **Updates**: Subscribe to security announcements
-
-## Security Features
-
-### Current Implementation
-
-- ✅ **End-to-End Encryption (E2EE)**: RSA-OAEP 4096-bit + AES-256-GCM
-- ✅ **Password Hashing**: Argon2id (OWASP recommended)
-- ✅ **JWT Authentication**: Short-lived access tokens (15 min)
-- ✅ **Refresh Tokens**: HttpOnly cookies (30 days)
-- ✅ **Rate Limiting**: Redis-based, per-IP and per-user
-- ✅ **Input Validation**: Gin binding validation
-- ✅ **SQL Injection Protection**: Parameterized queries
-- ✅ **CORS**: Configurable allowed origins
-- ✅ **Dependency Scanning**: GitHub Dependabot
-- ✅ **Secret Detection**: TruffleHog pre-commit hooks
-- ✅ **MFA/2FA**: TOTP-based multi-factor authentication with backup codes
-- ✅ **Security Keys**: WebAuthn/FIDO2 support
-- ✅ **Recovery Circles**: Social recovery for account access
-- ✅ **Token Theft Detection**: Device binding with machine ID verification
-- ✅ **CI/CD Security**: GitHub Actions (build.yml) + SonarQube Quality Gate enforcement
-- ✅ **Key-Compromise Runbook**: [[internal]incident-response-key-compromise.md](../[internal]incident-response-key-compromise.md) — IR playbook covering E2EE keys, JWT signing keys, API/service tokens, and update signing certificates
-
-### Planned Features
-
-- 🔄 **Audit Logging**: Comprehensive security event logging
-- 🔄 **IP Whitelisting**: Server-level IP restrictions
-- 🔄 **Key Rotation**: Automated encryption key rotation
-
-## Cryptography
-
-### E2EE Implementation
-
-**Key Exchange:**
-
-- RSA-OAEP 4096-bit keys (upgraded from 2048 in PR #98)
-- Key derivation: PBKDF2 (600,000 iterations)
-
-**Message Encryption:**
-
-- AES-GCM 256-bit
-- Unique IV per message
-- Authenticated encryption
-
-**Transport Security:**
-
-- TLS 1.3 required in production
-- Perfect forward secrecy
-
-### Password Security
-
-**Hashing:**
-
-- Algorithm: Argon2id
-- Time cost: 3
-- Memory cost: 64 MB
-- Parallelism: 4
-- Salt: Unique per user (16 bytes)
-- Key length: 32 bytes
-
-**Requirements:**
-
-- Minimum length: 12 characters
-- Must contain: at least 3 of uppercase, lowercase, number, special characters
-- Maximum length: 128 characters
-
-## Vulnerability Disclosure Timeline
-
-1. **Day 0**: Vulnerability reported
-2. **Day 1-2**: Acknowledgment sent
-3. **Day 1-7**: Initial assessment and severity classification
-4. **Day 7-30**: Patch development and testing
-5. **Day 30**: Patch released (critical/high severity)
-6. **Day 30-60**: Public disclosure (after patch deployment)
-
-## Security Updates
-
-Subscribe to security announcements:
-
-- GitHub Security Advisories
-- Email: security@concordvoice.com (for critical updates)
+This policy applies to all repositories under the [Concord Voice organization](https://github.com/Concord-Voice) and the services hosted at `concordvoice.com` and `concordvoice.chat`.
 
 ## Bug Bounty Program
 
-**Status:** Targeted for v1.0.0 (formal program not yet launched). In the interim, vulnerability reports are welcomed via the channels in "Reporting a Vulnerability" above. Researchers will be acknowledged in the section below.
+**Status:** targeted for v1.0.0. A formal program has not launched, and we are not currently paying vulnerability rewards. In the interim, reports are welcome through the channels above and researchers are credited in the Acknowledgements section below.
 
-Scope will include:
+Anticipated in scope:
 
 - Authentication bypass
 - Data exposure
 - Privilege escalation
 - Remote code execution
-- E2EE implementation flaws
+- End-to-end encryption implementation flaws
 
-Out of scope:
+Anticipated out of scope:
 
 - Social engineering
 - Physical attacks
 - Denial of service
 - Self-XSS
 
-## Security Audit
+## Safe Harbor
 
-**Last Audit:** Phase 2A documentation and security audit (2026-03-27). Covered MFA/WebAuthn implementation, RBAC, CORS hardening, credential extraction defenses, token theft detection, device binding, recovery circles, and CI reactivation with SonarQube Quality Gate enforcement. Previous: internal security hardening (PR #97, 2026-02).
-**Next Audit:** Formal third-party audit planned for v1.0 release.
+If you follow this policy in good faith, we treat your research as authorized. We will not pursue legal action against you for it, and if a third party does, we will state plainly that you were acting within this policy.
 
-## AI-Introduced Vulnerability Response
+Good-faith research means: use your own accounts, or your own self-hosted instance; do not access, modify, or retain anyone else's data; do not run denial-of-service, load, or stress tests against our hosted services; and do not social-engineer our team, our users, or our vendors. If a proof-of-concept would require crossing one of those lines, describe it rather than running it — we would rather read the write-up.
 
-Concord uses AI code generation tools (Claude Code, GitHub Copilot, OpenAI Codex). AI-generated code is subject to the same security standards as human-authored code, but introduces distinct risk patterns. This playbook covers incident response when a vulnerability is traced to AI-generated code.
+If you are unsure whether something is in scope, ask first at [security@concordvoice.com](mailto:security@concordvoice.com). Asking will never count against you.
 
-### Identification
+## Our Security Posture
 
-1. Run `git blame` on the affected file to identify the introducing commit
-2. Check for `Co-Authored-By` trailer to confirm AI tool involvement and identify the model
-3. If confirmed AI-generated, proceed with this playbook in addition to standard vulnerability response
+Concord Voice is engineered for defense in depth.
 
-### Scope Assessment
+### Implemented
 
-Search for the same vulnerability pattern in other AI-generated commits:
+- **End-to-end encryption:** AES-256-GCM with RSA-OAEP 4096-bit key wrapping. Always on — there is no setting to disable it.
+- **Epoch-based key rotation:** automated rotation of channel and conversation keys, with rotation fingerprints binding successor epochs.
+- **Password hashing:** Argon2id, OWASP-recommended parameters.
+- **Credential protection:** OS-keychain-backed storage on desktop.
+- **Strong authentication:** TOTP multi-factor with backup codes, and WebAuthn/FIDO2 security keys and passkeys.
+- **Recovery circles:** social recovery for account access.
+- **Token theft detection:** device binding with machine-ID verification.
+- **Session security:** short-lived JWT access tokens (15 minutes) and HttpOnly refresh cookies (30 days, rolling).
+- **Access control:** role-based and scope-based permissions.
+- **Rate limiting:** Redis-backed, per-IP and per-user.
+- **Injection defenses:** parameterized queries throughout; validation at every request boundary.
+- **Transport security:** TLS 1.3 required in production, with perfect forward secrecy.
+- **Static and dynamic analysis in CI:** CodeQL, Semgrep, ESLint, OSV-Scanner, govulncheck, OpenSSF Scorecard, and an API DAST pass, with results published to GitHub Code Scanning. A subset are merge-gated by branch rulesets.
+- **Secret detection:** detect-secrets, TruffleHog, and gitleaks in pre-commit, plus a CI secret-scanning gate.
+- **Dependency scanning:** Dependabot alerts, `npm audit`, and Go vulnerability database checks.
+- **Quality gate:** SonarQube analysis with AI-Code Assurance enabled, enforced on every pull request.
 
-```bash
-# Find all commits by the same AI tool touching similar files
-git log --grep="Co-Authored-By.*Claude" --all -- "<affected-file-pattern>"
-```
+### Planned
 
-Assess whether the vulnerability is an isolated incident or a systematic model behavior pattern (same model + similar prompt = same flaw).
+- Comprehensive security event audit logging
+- Server-level IP allowlisting
 
-### Remediation
+## Cryptography
 
-1. **Fix** the vulnerability following standard severity timelines (see above)
-2. **Pattern search** — check if the same flaw exists elsewhere in AI-generated code
-3. **Instruction update** — add the vulnerability pattern as a negative example in AI instruction files (`[internal]`, `.github/copilot-instructions.md`)
-4. **Rule creation** — add a custom Semgrep rule to catch the pattern automatically in future code (Semgrep integration planned in Phase 3, #457. Until then, document the pattern in AI instruction files)
-5. **Template update** — if a prompt template exists for the affected code area, update it to prevent recurrence
+**Key exchange**
 
-### Reporting
+- RSA-OAEP 4096-bit keys
+- Key derivation: PBKDF2, 600,000 iterations
 
-Document the incident in the next quarterly AI security review (see `.github/ISSUE_TEMPLATE/quarterly-ai-review.md`). Include: originating tool/model, vulnerability type, root cause analysis, and preventive measures taken.
+**Message encryption**
 
-### Reference
+- AES-GCM 256-bit
+- Unique IV per message
+- Authenticated encryption
 
-- Full AI governance policy: `docs/policies/ai-generated-code-policy.md`
-- MCP server controls: `docs/policies/mcp-server-policy.md`
-- Audit log retention: `[internal]`
+**Transport**
 
-## Compliance
+- TLS 1.3 required in production
+- Perfect forward secrecy
 
-### Current Status
+**Password storage**
 
-- **GDPR**: Partial compliance (data minimization, user rights)
-- **CCPA**: Partial compliance
-- **SOC 2**: Not audited (planned for enterprise offering)
+- Algorithm: Argon2id
+- Time cost 3, memory cost 64 MB, parallelism 4
+- Unique 16-byte salt per user, 32-byte key length
+- Minimum 12 characters, maximum 128, requiring at least three of: uppercase, lowercase, number, symbol
 
-### Data Handling
+## Data Handling
 
-**Stored Data:**
+**Stored**
 
-- User credentials (hashed)
-- Message metadata (encrypted if E2EE enabled)
-- Server/channel membership
+- User credentials, hashed
+- Message metadata: sender, timestamp, and channel or conversation membership
+- Server and channel membership
 - Session information
 
-**Not Stored:**
+**Not stored**
 
-- Message content (when E2EE is enabled)
+- Message content in any form we can read. Messages are persisted only as ciphertext for which we hold no key.
 - Private encryption keys
 - Plaintext passwords
 
-## Third-Party Dependencies
+## Security Best Practices
 
-Regularly audited via:
+### For Users
 
-- `npm audit` (frontend)
-- `go list -m all` + vulnerability databases (backend)
-- GitHub Dependabot alerts
-- Pre-commit hooks (TruffleHog, Semgrep)
+1. **Keep updated** — always run the latest version.
+2. **Use a strong password** — minimum 12 characters, mixed case, numbers, symbols.
+3. **Verify identity** — verify server identity when connecting to self-hosted instances.
+4. **Secure your keys** — back up your encryption keys somewhere safe. We cannot recover them for you.
 
-See current vulnerability status: [Security tab](https://github.com/Concord-Voice/Concord-Voice-Alpha/security)
+### For Contributors
+
+1. **Never commit `.env` files** or any credential material.
+2. **Keep dependencies updated.**
+3. **Do not bypass pre-commit hooks** — they exist to catch secrets before they leave your machine.
+4. **All code requires review before merge.**
+5. **Validate all user input** at the trust boundary.
+6. **Use parameterized queries** — never string-formatted SQL.
+7. **HTTPS only** for all production traffic.
+
+### For Self-Hosters
+
+1. **TLS certificates** — use valid certificates; Let's Encrypt is recommended.
+2. **Firewall** — restrict access to the services that need to be reachable.
+3. **Database security** — strong passwords, restricted network access.
+4. **Regular backups** — automate them, and test a restore.
+5. **Monitoring** — set up monitoring and alerting.
+6. **Updates** — subscribe to security announcements.
+
+## AI-Introduced Vulnerability Response
+
+Concord Voice uses AI code generation tools. AI-generated code is held to the same security standards as human-authored code, but it introduces distinct risk patterns. This playbook applies when a vulnerability is traced to AI-generated code, in addition to the standard response above.
+
+**Identification.** Run `git blame` on the affected file to find the introducing commit, and check for a `Co-Authored-By` trailer to confirm AI involvement and identify the model.
+
+**Scope assessment.** Search for the same pattern across other AI-generated commits — the same model given a similar prompt tends to produce the same flaw, so an isolated-looking bug may be systematic:
+
+```bash
+git log --grep="Co-Authored-By.*Claude" --all -- "<affected-file-pattern>"
+```
+
+**Remediation.**
+
+1. Fix the vulnerability on the standard severity timeline.
+2. Search for the same flaw elsewhere in AI-generated code.
+3. Add the pattern as a negative example in the AI instruction files.
+4. Add a Semgrep rule so the pattern is caught automatically in future.
+5. Update any prompt template covering the affected area.
+
+**Reporting.** Document the incident in the next quarterly AI security review, including originating tool and model, vulnerability class, root cause, and preventive measures taken.
+
+## Security Audits
+
+**Last audit:** internal security audit, 2026-03-27 — covering multi-factor authentication and WebAuthn, role-based access control, CORS hardening, credential extraction defenses, token theft detection, device binding, and recovery circles.
+
+**Next audit:** a formal third-party audit is planned ahead of the v1.0 release.
+
+## Compliance
+
+- **GDPR** — partial compliance: data minimization and user rights implemented.
+- **CCPA** — partial compliance.
+- **SOC 2** — not audited. Planned for the enterprise offering.
+
+We would rather state this plainly than imply a certification we do not hold.
+
+## Security Updates
+
+Subscribe to security announcements through GitHub Security Advisories on this organization, or by email at [security@concordvoice.com](mailto:security@concordvoice.com) for critical updates.
+
+Current vulnerability status for any repository is published on that repository's Security tab.
+
+## Internal Security Documentation
+
+The following documents describe the technical implementation of Concord Voice's security properties. They live in the working repository and are intended for contributors and security reviewers — for vulnerability reports, use the process above.
+
+- Update trust model — per-platform auto-update trust model, CI integrity gate, and known gaps
+- AI-generated code policy — governance and constraints on AI-authored code
+- Agentic AI controls — execution safety controls for agentic tooling
+- Key-compromise incident response — playbook for cryptographic key and credential compromise
+- Signing-certificate compromise and rotation — Apple Developer ID and Windows signing certificates
 
 ## Contact
 
-- **Security Issues**: security@concordvoice.com
-- **Data Privacy**: privacy@concordvoice.com
-- **General Inquiries**: contact-us@concordvoice.com
+- **Security issues:** [security@concordvoice.com](mailto:security@concordvoice.com)
+- **Data privacy:** [privacy@concordvoice.com](mailto:privacy@concordvoice.com)
+- **General inquiries:** [contact-us@concordvoice.com](mailto:contact-us@concordvoice.com)
 
-## Acknowledgments
+## Acknowledgements
 
 We thank the following researchers for responsibly disclosing vulnerabilities:
 
-- (None yet - project in development)
+- None yet — the project is in active development.
 
-## Technical security documents
-
-These documents describe the technical implementation of Concord Voice's security properties. They are intended for contributors and security reviewers — for vulnerability reports, see the "Reporting a Vulnerability" section above.
-
-- [`docs/policies/update-trust-model.md`](../docs/policies/update-trust-model.md) — per-platform auto-update trust model, CI integrity gate, and known gaps
-- [`docs/policies/ai-generated-code-policy.md`](../docs/policies/ai-generated-code-policy.md) — AI-generated code governance and constraints
-- [`docs/policies/agentic-ai-controls.md`](../docs/policies/agentic-ai-controls.md) — agentic-AI execution safety controls
-- [`[internal]incident-response-key-compromise.md`](../[internal]incident-response-key-compromise.md) — incident response playbook for cryptographic key / credential compromise
-- [`[internal]macos-cert-compromise.md`](../[internal]macos-cert-compromise.md) — Apple Developer ID signing-cert compromise + rotation (completes #645)
+Thank you for helping keep Concord Voice and its users safe.
 
 ---
 
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-08-20
