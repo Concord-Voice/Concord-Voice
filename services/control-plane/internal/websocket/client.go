@@ -204,6 +204,48 @@ func (c *Client) enqueueOutbound(data []byte) bool {
 	}
 }
 
+// enqueueOutboundBootstrapSafe delivers a frame whose loss is tolerable and
+// which must NEVER be able to fail a client's reconnect replacement.
+//
+// It deliberately does NOT call bufferBootstrapLive. Appending to that buffer is
+// a disconnect primitive for any producer an unauthenticated peer can drive:
+// overflow latches bootstrapFailed, and even a non-overflowing append inflates
+// completeClientBootstrap's `cap(Send)-len(Send) < frameCount` preflight. Either
+// route ends at failClientBootstrapFlushLocked -> disconnectPrivacyCriticalClient,
+// so a caller that merely observes a false return still disconnected the client,
+// asynchronously, on the client's own bootstrap goroutine.
+//
+// A client inside the replacement window therefore drops the frame outright. That
+// is safe precisely for frames the pending snapshot already subsumes: an erasure
+// clear retracts a sender the authorized snapshot will not contain in the first
+// place. Do not reuse this for a frame the snapshot does not subsume.
+//
+// bootstrapCanceled is treated as bootstrapping so a frame is never written into
+// a queue whose replacement is unwinding.
+func (c *Client) enqueueOutboundBootstrapSafe(data []byte) bool {
+	// sendMu before bootstrapMu, matching enqueuePostBootstrap and
+	// completeClientBootstrap. Holding sendMu across the check keeps a
+	// replacement from starting between the check and the send, which would
+	// otherwise consume the capacity the flush preflight is about to require.
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	c.bootstrapMu.Lock()
+	bootstrapping := c.bootstrapActive || c.bootstrapCanceled
+	c.bootstrapMu.Unlock()
+	if bootstrapping {
+		return false
+	}
+	if c.sendClosed || c.Send == nil {
+		return false
+	}
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Client) enqueueOutboundBlocking(data []byte) bool {
 	switch c.bufferBootstrapLive(data) {
 	case bootstrapBufferEnqueued:

@@ -398,9 +398,34 @@ func (h *Hub) disconnectAllPrivacyCriticalClients(ctx context.Context) error {
 // for an arbitrary id is inert rather than destructive, and the honest cost is
 // one small frame per connected client instead of a fleet-wide reconnect storm.
 //
-// Delivery is best-effort per client, exactly as sendPrivacyClearToUsers: a
-// client whose queue has no immediate capacity is disconnected so its reconnect
-// performs a fresh authorized snapshot.
+// Delivery is best-effort per client and DROPS rather than disconnecting —
+// deliberately unlike sendPrivacyClearToUsers, which closes on a full queue.
+// There the frame IS the authorization revocation, so a client that misses it
+// must reconnect for a fresh authorized snapshot. Here it is not: this frame
+// only retracts a display string for a sender who no longer exists.
+//
+// The cost of a dropped frame, stated precisely because the obvious bound is
+// wrong. Custom Status carries NO TTL and is not republished on a heartbeat
+// (delete_account.go's publishErasureCleared says so explicitly), and
+// ActivityStateTTL bounds activity categories, not this. A viewer that already
+// held the erased sender's status keeps rendering it until its next
+// presence_snapshot, which fires only on reconnect or sign-out. That can be an
+// entire session — not 90 seconds. It is in-memory only (the renderer store has
+// no persist middleware) and the erased user has cascaded out of the viewer's
+// friend and member lists, so it is a stale string rather than live disclosure.
+//
+// Closing on overflow instead made the fan-out a denial-of-service primitive:
+// the bus is unauthenticated and the fan-out unconditional, so 257 forged
+// messages disconnected every Rich Presence client on the replica and left each
+// one permanently in the disconnect branch.
+//
+// What dropping does NOT buy, so no later reader assumes it: a forged clear is
+// not inert. The fan-out is still unconditional, so a burst still costs one
+// frame per connected client, and an attacker who saturates a viewer's queue can
+// make a GENUINE clear be dropped, leaving the erased status resident. Those are
+// accepted here and closed by stage B1's rate limit at the NATS subscriber
+// dispatch boundary, which stops a burst before it reaches any client. B2 is not
+// safe to sit on indefinitely without B1. #2854 stage B2.
 func (h *Hub) ClearErasedSenderCustomText(senderID uuid.UUID) {
 	// Fail closed on a nil receiver rather than panicking, matching the
 	// TopologyRail methods: a hub-less replica has no local clients to clear, and
@@ -416,15 +441,43 @@ func (h *Hub) ClearErasedSenderCustomText(senderID uuid.UUID) {
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	dropped := 0
 	for _, client := range h.clients {
 		if !activityRichPresenceClient(client) {
 			continue
 		}
-		// enqueuePrivacyCritical already closes the client on overflow; the
-		// outcome is inspected only so the degrade is observable.
-		if enqueuePrivacyCritical(client, data) == privacyCriticalEnqueueDisconnectRequired {
-			log.Printf("[hub] erased-sender clear could not be enqueued; client disconnected")
+		// enqueueOutboundBootstrapSafe never closes the client and never touches
+		// the reconnect-replacement buffer.
+		//
+		// Plain enqueueOutbound is NOT used here. Its first act is
+		// bufferBootstrapLive, so for a client inside its replacement window a
+		// forged burst latches bootstrapFailed (or inflates completeClientBootstrap's
+		// capacity preflight) and the bootstrap path disconnects the client on its
+		// own goroutine — the same fleet-wide disconnect, moved off the fan-out and
+		// out of sight of a fan-out-only assertion. That variant is CHEAPER than the
+		// one this stage removed (256 vs 257), independent of Send capacity, and
+		// self-sustaining, because each disconnect returns the victim to a
+		// replacement window. Proven by PoC before it shipped.
+		//
+		// enqueuePrivacyCritical is NOT used here either — its close-on-overflow arm
+		// is correct only for sendPrivacyClearToUsers, where the frame carries an
+		// authorization revocation.
+		if !client.enqueueOutboundBootstrapSafe(data) {
+			dropped++
 		}
+	}
+	if dropped > 0 {
+		// ONE aggregate line per fan-out, never one per client: per-client
+		// logging would hand a forged flood O(clients) writes per message,
+		// re-creating in the log the amplification just removed from the socket.
+		//
+		// Worded "erasure-clear", not "erased-sender clear", deliberately. The
+		// AST guard in customtext_log_emissions_test.go rejects a sensitive field
+		// label within 32 characters of a format verb, and "sender" next to %d
+		// reads as a sender identifier even though this operand is an aggregate
+		// count. Keep any future edit free of those labels rather than widening
+		// the guard.
+		log.Printf("[hub] erasure-clear frames dropped for %d client(s); resource_limit", dropped)
 	}
 }
 
