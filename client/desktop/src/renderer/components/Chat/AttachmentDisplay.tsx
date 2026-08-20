@@ -3,6 +3,12 @@ import { Download, FileText, Film, Music, File, Loader2, Maximize2 } from 'lucid
 import { apiFetch } from '../../services/apiClient';
 import { e2eeService } from '../../services/e2eeService';
 import { decryptFile, formatFileSize } from '../../utils/attachmentCrypto';
+import {
+  AttachmentTooLargeError,
+  readBoundedBody,
+  tooLargeMessage,
+} from '../../utils/boundedResponseBody';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/entitlementLimits';
 import type { AttachmentSummary } from '../../types/chat';
 import { useSettingsStore } from '../../stores/settingsStore';
 import OverflowMarkdownAttachment from './OverflowMarkdownAttachment';
@@ -24,46 +30,198 @@ interface AttachmentItemProps {
 }
 
 // LRU cache for decrypted blob URLs — evicts oldest entries to bound memory.
+/** Secondary entry-count cap: keeps a channel full of thumbnails from growing
+ *  the Map without limit even when the byte budget is nowhere near. */
 const BLOB_CACHE_MAX = 50;
-const blobUrlCache = new Map<string, string>();
 
-function cacheBlobUrl(fileId: string, url: string): void {
-  // Evict oldest entry if at capacity (Map preserves insertion order)
-  if (blobUrlCache.size >= BLOB_CACHE_MAX) {
-    const oldest = blobUrlCache.keys().next().value;
-    if (oldest !== undefined) {
-      const oldestUrl = blobUrlCache.get(oldest);
-      if (oldestUrl !== undefined) {
-        URL.revokeObjectURL(oldestUrl);
-      }
-      blobUrlCache.delete(oldest);
-    }
-  }
-  blobUrlCache.set(fileId, url);
+/** 256 MiB — total decrypted bytes held live across the whole cache (#2157 A1).
+ *  The entry cap alone made retained memory scale with the download guard
+ *  (50 x 256 MiB = ~12.8 GB), because up to BLOB_CACHE_MAX decrypted blobs are
+ *  alive simultaneously — the dominant memory term, not the per-file transient. */
+const BLOB_CACHE_MAX_BYTES = 268_435_456;
+
+interface CachedBlob {
+  readonly url: string;
+  readonly bytes: number;
 }
 
-async function fetchAndDecrypt(fileId: string, channelId: string): Promise<string> {
-  const cached = blobUrlCache.get(fileId);
-  if (cached) {
-    // Move to end for LRU freshness
+const blobUrlCache = new Map<string, CachedBlob>();
+let cachedBytes = 0;
+
+/**
+ * File ids currently rendered by at least one mounted surface, with a count.
+ *
+ * Deliberately NOT a refcount stored on the cache entry. A handoff scheme —
+ * loader retains, component releases — leaks a permanent reference whenever a
+ * surface unmounts while its load is still in flight, because the release never
+ * runs. Keying on "is anything mounted showing this?" is derived state owned
+ * entirely by the effect below, so an abandoned load simply never registers.
+ */
+const liveSurfaces = new Map<string, number>();
+
+/**
+ * Hold this file id for as long as a surface renders its url, so eviction
+ * cannot revoke a blob out from under a mounted `<img>` (#2157 review,
+ * VULN-002-C). A revoked url on screen is a silently broken image, and
+ * `handleSaveImage`'s fetch of it fails into a swallowed catch.
+ *
+ * Known narrow window: a surface is protected from the moment its effect runs,
+ * not from the moment its bytes are admitted. Several loads resolving inside a
+ * single tick, before React flushes any effect, can still evict one another.
+ * The realistic case — images already on screen when another arrives — is
+ * covered, and the residual is a broken image rather than anything unsafe.
+ */
+function useRetainedBlobUrl(fileId: string, url: string | null): void {
+  useEffect(() => {
+    if (!url) return;
+    liveSurfaces.set(fileId, (liveSurfaces.get(fileId) ?? 0) + 1);
+    return () => {
+      const remaining = (liveSurfaces.get(fileId) ?? 1) - 1;
+      if (remaining > 0) liveSurfaces.set(fileId, remaining);
+      else liveSurfaces.delete(fileId);
+    };
+  }, [fileId, url]);
+}
+
+/**
+ * Drops the least-recently-used entry that no mounted surface is showing.
+ *
+ * Returns false when every candidate is on screen — which terminates the
+ * eviction loop and is the correct answer: the budget bounds cache RETENTION,
+ * not what the user is currently looking at, so it is exceeded rather than
+ * breaking a live image.
+ */
+function evictOldestBlob(): boolean {
+  for (const [fileId, entry] of blobUrlCache) {
+    if (liveSurfaces.has(fileId)) continue; // on screen — try the next-oldest
+    URL.revokeObjectURL(entry.url);
+    cachedBytes -= entry.bytes;
     blobUrlCache.delete(fileId);
-    blobUrlCache.set(fileId, cached);
-    return cached;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Drop every cached blob and all derived accounting.
+ *
+ * Exported for tests ONLY. `blobUrlCache`, `cachedBytes`, `liveSurfaces` and
+ * `inFlightLoads` are module scope, and Vitest isolates modules per FILE rather
+ * than per test — so without this, every test in a file shares one cache and
+ * the byte-budget assertions silently depend on what earlier tests left behind.
+ * Production code must never call it: revoking urls a surface still renders is
+ * exactly what `liveSurfaces` exists to prevent.
+ */
+export function __resetBlobCacheForTests(): void {
+  for (const entry of blobUrlCache.values()) URL.revokeObjectURL(entry.url);
+  blobUrlCache.clear();
+  liveSurfaces.clear();
+  inFlightLoads.clear();
+  cachedBytes = 0;
+}
+
+function cacheBlobUrl(fileId: string, url: string, bytes: number): void {
+  const superseded = blobUrlCache.get(fileId);
+  if (superseded !== undefined) {
+    // Unreachable while loads are coalesced, but it must not leak if it ever
+    // is: dropping an entry from the Map without revoking puts its url beyond
+    // eviction's reach forever. Only safe to revoke when nothing is showing it.
+    if (!liveSurfaces.has(fileId)) URL.revokeObjectURL(superseded.url);
+    cachedBytes -= superseded.bytes;
+    blobUrlCache.delete(fileId);
+  }
+
+  // Evict oldest-first until the incoming entry fits both bounds. Map preserves
+  // insertion order, so the iteration order is LRU-first.
+  while (
+    (cachedBytes + bytes > BLOB_CACHE_MAX_BYTES || blobUrlCache.size >= BLOB_CACHE_MAX) &&
+    evictOldestBlob()
+  ) {
+    /* eviction happens in the condition */
+  }
+  blobUrlCache.set(fileId, { url, bytes });
+  cachedBytes += bytes;
+}
+
+/** Loads in progress, keyed by file id. */
+const inFlightLoads = new Map<string, Promise<string>>();
+
+async function loadAndCache(
+  fileId: string,
+  channelId: string,
+  declaredSize: number
+): Promise<string> {
+  // Guards run BEFORE the allocating operation, not between two of them.
+  // `file_size` rides on the summary, so an oversized attachment costs no
+  // network at all. It is server-supplied metadata though, so it is a fast
+  // path, never the real bound — readBoundedBody measures the actual bytes.
+  if (declaredSize > MAX_DECRYPTABLE_ATTACHMENT_BYTES) {
+    throw new AttachmentTooLargeError(declaredSize);
   }
 
   const response = await apiFetch(`/api/v1/media/attachments/${fileId}`);
   if (!response.ok) throw new Error(`Failed to fetch attachment (${response.status})`);
 
-  let data = await response.arrayBuffer();
   const mimeType = response.headers.get('X-File-Mime-Type') || 'application/octet-stream';
+  let data = await readBoundedBody(response, MAX_DECRYPTABLE_ATTACHMENT_BYTES);
 
   const channelKey = await e2eeService.getChannelKey(channelId);
   data = await decryptFile(data, channelKey);
 
   const blob = new Blob([data], { type: mimeType });
   const url = URL.createObjectURL(blob);
-  cacheBlobUrl(fileId, url);
+  cacheBlobUrl(fileId, url, data.byteLength);
   return url;
+}
+
+async function fetchAndDecrypt(
+  fileId: string,
+  channelId: string,
+  declaredSize: number
+): Promise<string> {
+  const cached = blobUrlCache.get(fileId);
+  if (cached) {
+    // Move to end for LRU freshness
+    blobUrlCache.delete(fileId);
+    blobUrlCache.set(fileId, cached);
+    return cached.url;
+  }
+
+  // Coalesce concurrent loads of one attachment onto a single fetch + decrypt.
+  // The same file legitimately appears on several surfaces at once (a message
+  // and the pinned-message list, or repeated posts of one upload — the server
+  // does not restrict a file to one message), and IntersectionObserver's 200px
+  // rootMargin brings them in together. Without coalescing each surface minted
+  // its own blob url, and every one but the last was dropped from the cache
+  // WITHOUT being revoked: an unreachable, un-revokable Blob pinned for the
+  // life of the document, and a byte budget that under-reported live memory by
+  // a growing margin. Coalescing removes the duplicates rather than trying to
+  // clean up after them, and saves N-1 fetches and decrypts besides.
+  const existing = inFlightLoads.get(fileId);
+  if (existing) return existing;
+
+  const load = loadAndCache(fileId, channelId, declaredSize).finally(() => {
+    inFlightLoads.delete(fileId);
+  });
+  inFlightLoads.set(fileId, load);
+  return load;
+}
+
+/** Guard copy, rendered in the chip footprint so the refusal sits where the
+ *  file is. Assertive because the user asked for this file and it will not
+ *  arrive — the alternative to the sentence is an OOM. */
+function AttachmentTooLargeNotice({
+  bytes,
+  truncated = false,
+}: {
+  readonly bytes: number;
+  readonly truncated?: boolean;
+}) {
+  return (
+    <div className="attachment-error" role="alert">
+      {tooLargeMessage(bytes, truncated, formatFileSize)}
+    </div>
+  );
 }
 
 function FileIcon({ fileType }: { readonly fileType: string }) {
@@ -120,9 +278,14 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const isAnimated = attachment.file_type === 'animated';
   const gatedByHover = isAnimated && reduceAnimations;
   const [hovering, setHovering] = useState(false);
-  const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id) || null);
+  const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(!url);
   const [error, setError] = useState(false);
+  // Keep this url alive while it is on screen (#2157 review, VULN-002-C):
+  // eviction may not revoke a blob a mounted surface is still pointing at.
+  useRetainedBlobUrl(attachment.id, url);
+  // Byte count of a refusal, or null when the attachment was never refused.
+  const [tooLarge, setTooLarge] = useState<{ bytes: number; truncated: boolean } | null>(null);
   // Aspect ratio learned from <img onLoad> as a fallback for messages whose
   // summary lacks pre-known width/height (e.g. older history rows fetched
   // from the server before the dim-plumbing was in place).
@@ -154,15 +317,18 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const load = useCallback(async () => {
     try {
       setLoading(true);
-      const blobUrl = await fetchAndDecrypt(attachment.id, channelId);
+      const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
       setUrl(blobUrl);
-    } catch {
-      // Fetch or decryption failed — show inline error state
-      setError(true);
+    } catch (err) {
+      // A refusal is a different failure from a broken fetch or decrypt: the
+      // bytes were never requested, so say so instead of "failed to load".
+      if (err instanceof AttachmentTooLargeError)
+        setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
+      else setError(true);
     } finally {
       setLoading(false);
     }
-  }, [attachment.id, channelId]);
+  }, [attachment.id, attachment.file_size, channelId]);
 
   useEffect(() => {
     if (url) return; // already loaded
@@ -224,6 +390,9 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
         </div>
       )}
       {error && <div className="attachment-error">Failed to load image</div>}
+      {tooLarge !== null && (
+        <AttachmentTooLargeNotice bytes={tooLarge.bytes} truncated={tooLarge.truncated} />
+      )}
       {showLiveImage && (
         <button
           type="button"
@@ -250,7 +419,7 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
           />
         </button>
       )}
-      {gatedByHover && !hovering && !loading && !error && (
+      {gatedByHover && !hovering && !loading && !error && tooLarge === null && (
         <div className="attachment-reduced-motion-hint" aria-hidden="true">
           Hover to play
         </div>
@@ -288,9 +457,13 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
 }
 
 function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
-  const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id) || null);
+  const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
+  // Keep this url alive while it is on screen (#2157 review, VULN-002-C):
+  // eviction may not revoke a blob a mounted surface is still pointing at.
+  useRetainedBlobUrl(attachment.id, url);
+  const [tooLarge, setTooLarge] = useState<{ bytes: number; truncated: boolean } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   // Videos auto-lazy-load so the browser can render the first frame as a natural
   // poster — no separate thumbnail pipeline needed. Audio stays click-to-load
@@ -302,14 +475,16 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
     setError(false);
     setLoading(true);
     try {
-      const blobUrl = await fetchAndDecrypt(attachment.id, channelId);
+      const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
       setUrl(blobUrl);
-    } catch {
-      setError(true);
+    } catch (err) {
+      if (err instanceof AttachmentTooLargeError)
+        setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
+      else setError(true);
     } finally {
       setLoading(false);
     }
-  }, [attachment.id, channelId, url]);
+  }, [attachment.id, attachment.file_size, channelId, url]);
 
   useEffect(() => {
     if (!autoLoad || url) return;
@@ -343,7 +518,10 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
       {url && attachment.file_type === 'audio' && (
         <ThemedMediaPlayer src={url} variant="audio" className="attachment-audio" />
       )}
-      {!url && (
+      {tooLarge !== null && (
+        <AttachmentTooLargeNotice bytes={tooLarge.bytes} truncated={tooLarge.truncated} />
+      )}
+      {!url && tooLarge === null && (
         <button
           className="attachment-load-btn attachment-load-btn-rich"
           onClick={load}
@@ -364,19 +542,36 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
 
 function FileAttachment({ attachment, channelId }: AttachmentItemProps) {
   const [downloading, setDownloading] = useState(false);
+  const [tooLarge, setTooLarge] = useState<{ bytes: number; truncated: boolean } | null>(null);
+  // Holds the url the download is reading.
+  //
+  // An earlier version deliberately did NOT retain here, reasoning that no
+  // eviction can interleave because there is no `await` between the load
+  // resolving and `a.click()`. That covers the interval BEFORE the click and
+  // not the one after it: `a.click()` starts an asynchronous browser download
+  // that reads the blob over time, and for an attachment near the 256 MiB guard
+  // that read is long-lived. Another attachment loading during it would evict
+  // and revoke the url mid-read (#2837 review, row 1).
+  const [downloadedUrl, setDownloadedUrl] = useState<string | null>(null);
+  useRetainedBlobUrl(attachment.id, downloadedUrl);
 
   const handleDownload = async () => {
     setDownloading(true);
     try {
-      const blobUrl = await fetchAndDecrypt(attachment.id, channelId);
+      const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
+      setDownloadedUrl(blobUrl);
       const a = document.createElement('a');
       a.href = blobUrl;
       a.download = `attachment-${attachment.id}`;
       document.body.appendChild(a);
       a.click();
       a.remove();
-    } catch {
-      // Non-fatal: download failed, no UI feedback needed for file cards
+    } catch (err) {
+      // A refusal is the one download failure worth surfacing on a file card:
+      // retrying can never succeed, so the card says why.
+      if (err instanceof AttachmentTooLargeError)
+        setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
+      // Otherwise non-fatal: download failed, no UI feedback needed here.
     } finally {
       setDownloading(false);
     }
@@ -388,6 +583,9 @@ function FileAttachment({ attachment, channelId }: AttachmentItemProps) {
       <div className="attachment-file-info">
         <span className="attachment-file-type">{attachment.mime_type}</span>
         <span className="attachment-file-size">{formatFileSize(attachment.file_size)}</span>
+        {tooLarge !== null && (
+          <AttachmentTooLargeNotice bytes={tooLarge.bytes} truncated={tooLarge.truncated} />
+        )}
       </div>
       <button
         className="attachment-download-btn"

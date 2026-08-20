@@ -1,14 +1,18 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { apiFetch, safeJson } from '../services/apiClient';
 import { e2eeService } from '../services/e2eeService';
 import {
   encryptFile,
   classifyFileType,
-  formatFileSize,
   isImageType,
-  MAX_FILE_SIZE,
   MAX_ATTACHMENTS,
 } from '../utils/attachmentCrypto';
+import {
+  formatLimitBytes,
+  resolveAttachmentLimit,
+  type AttachmentLimit,
+} from '../utils/entitlementLimits';
+import { useEntitlement } from './useEntitlement';
 import type { AttachmentSummary } from '../types/chat';
 
 const DEFAULT_MIME = 'application/octet-stream';
@@ -39,24 +43,59 @@ interface UploadResponse {
   file_size: number;
 }
 
+export type AttachmentRejectionKind = 'over-limit' | 'too-many' | 'empty';
+
+export interface AttachmentRejection {
+  kind: AttachmentRejectionKind;
+  fileName?: string;
+  fileSize?: number;
+  /** Carries limitBytes + source + entitlementBytes so the copy layer can pick
+   *  its branch and name both numbers without re-resolving the limit. */
+  limit: AttachmentLimit;
+}
+
 /**
- * Validates files before adding to the queue.
- * Returns an error string if validation fails, null if valid.
+ * Partition a selection against the resolved limit.
+ *
+ * Returns NO strings: copy lives in `AttachmentNotice`, so this stays pure,
+ * copy-agnostic, and testable without a renderer.
+ *
+ * Accepted files are queued even when siblings are rejected. Before #2157 a
+ * single oversized file made the whole selection bounce — a five-file drop with
+ * one 40 MB video in it silently discarded all five.
  */
-export function validateFiles(newFiles: File[], existingCount: number): string | null {
-  const totalCount = existingCount + newFiles.length;
-  if (totalCount > MAX_ATTACHMENTS) {
-    return `Maximum ${MAX_ATTACHMENTS} attachments per message`;
-  }
+export function validateFiles(
+  newFiles: File[],
+  existingCount: number,
+  limit: AttachmentLimit
+): { accepted: File[]; rejections: AttachmentRejection[] } {
+  const accepted: File[] = [];
+  const rejections: AttachmentRejection[] = [];
+  let capacity = MAX_ATTACHMENTS - existingCount;
+  let reportedTooMany = false;
+
   for (const file of newFiles) {
-    if (file.size > MAX_FILE_SIZE) {
-      return `${file.name} exceeds the ${formatFileSize(MAX_FILE_SIZE)} limit`;
+    if (capacity <= 0) {
+      // Reported once for the selection, not once per surplus file.
+      if (!reportedTooMany) {
+        rejections.push({ kind: 'too-many', limit });
+        reportedTooMany = true;
+      }
+      continue;
     }
     if (file.size === 0) {
-      return `${file.name} is empty`;
+      rejections.push({ kind: 'empty', fileName: file.name, fileSize: 0, limit });
+      continue;
     }
+    if (file.size > limit.limitBytes) {
+      rejections.push({ kind: 'over-limit', fileName: file.name, fileSize: file.size, limit });
+      continue;
+    }
+    accepted.push(file);
+    capacity -= 1;
   }
-  return null;
+
+  return { accepted, rejections };
 }
 
 function fileMime(entry: FileUploadState): string {
@@ -136,15 +175,79 @@ async function readImageDimensions(file: File): Promise<{ width: number; height:
  * @param conversationId - Conversation ID (used for DMs, takes precedence).
  * @param abortRef - Shared abort flag; if set mid-loop, remaining files are skipped.
  */
+/** Everything an upload pass needs that does not vary per file. Bundled so the
+ *  two upload helpers take a context rather than a parameter list nobody can
+ *  read at the call site. */
+interface UploadContext {
+  /** Non-nullable, and `keyVersion` likewise required — #2843/#2848 removed the
+   *  fail-open `channelKey ? encrypt : plaintext` branch and narrowed these
+   *  across the upload path so `tsc` re-proves the plaintext case unreachable
+   *  on every build. Bundling them into this context must not re-widen them:
+   *  that would restore the representability of a plaintext upload while
+   *  compiling perfectly cleanly, since widening is not a type error. */
+  channelKey: CryptoKey;
+  keyVersion: number;
+  channelId: string;
+  conversationId: string | undefined;
+  abortRef: React.MutableRefObject<boolean>;
+  limit: AttachmentLimit;
+}
+
+/** Marks an entry refused because it no longer fits the current limit. */
+function markOverLimit(setFiles: SetFilesFn, index: number, limit: AttachmentLimit): void {
+  setFiles((prev) =>
+    prev.map((f, idx) =>
+      idx === index
+        ? {
+            ...f,
+            status: 'error' as const,
+            error: `${f.file.name} exceeds the ${formatLimitBytes(limit.limitBytes)} limit`,
+          }
+        : f
+    )
+  );
+}
+
+/** Upload one pending entry, moving it through uploading → done | error.
+ *  Returns its id + summary, or null when the upload failed. Extracted so the
+ *  loop below reads as a dispatcher rather than carrying every branch itself. */
+async function uploadOnePending(
+  entry: FileUploadState,
+  index: number,
+  setFiles: SetFilesFn,
+  ctx: UploadContext
+): Promise<{ id: string; summary: AttachmentSummary } | null> {
+  const { channelKey, keyVersion, channelId, conversationId } = ctx;
+
+  setFiles((prev) =>
+    prev.map((f, idx) => (idx === index ? { ...f, status: 'uploading' as const, progress: 0 } : f))
+  );
+
+  try {
+    const result = await uploadSingleFile(entry, channelKey, keyVersion, channelId, conversationId);
+    setFiles((prev) =>
+      prev.map((f, idx) =>
+        idx === index ? { ...f, status: 'done' as const, progress: 100, id: result.file_id } : f
+      )
+    );
+    return { id: result.file_id, summary: buildSummary(result.file_id, entry) };
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : 'Upload failed';
+    setFiles((prev) =>
+      prev.map((f, idx) =>
+        idx === index ? { ...f, status: 'error' as const, error: errorMsg } : f
+      )
+    );
+    return null;
+  }
+}
+
 async function uploadPendingFiles(
   files: FileUploadState[],
   setFiles: SetFilesFn,
-  channelKey: CryptoKey,
-  keyVersion: number,
-  channelId: string,
-  conversationId: string | undefined,
-  abortRef: React.MutableRefObject<boolean>
+  ctx: UploadContext
 ): Promise<{ ids: string[]; summaries: AttachmentSummary[] }> {
+  const { abortRef, limit } = ctx;
   const ids: string[] = [];
   const summaries: AttachmentSummary[] = [];
 
@@ -152,7 +255,7 @@ async function uploadPendingFiles(
     if (abortRef.current) break;
     const entry = files[i];
 
-    // Already-done files: collect without re-uploading
+    // Already-done files: collect without re-uploading.
     if (entry.status !== 'pending') {
       if (isDoneWithId(entry)) {
         ids.push(entry.id);
@@ -161,30 +264,19 @@ async function uploadPendingFiles(
       continue;
     }
 
-    setFiles((prev) =>
-      prev.map((f, idx) => (idx === i ? { ...f, status: 'uploading' as const, progress: 0 } : f))
-    );
+    // Re-check against the CURRENT limit, not the one in force when the file
+    // was queued. An entitlement can drop between queueing and sending, and a
+    // premium file left pending through a downgrade would otherwise be
+    // encrypted and uploaded only for the server to 413 it.
+    if (entry.file.size > limit.limitBytes) {
+      markOverLimit(setFiles, i, limit);
+      continue;
+    }
 
-    try {
-      const result = await uploadSingleFile(
-        entry,
-        channelKey,
-        keyVersion,
-        channelId,
-        conversationId
-      );
-      ids.push(result.file_id);
-      summaries.push(buildSummary(result.file_id, entry));
-      setFiles((prev) =>
-        prev.map((f, idx) =>
-          idx === i ? { ...f, status: 'done' as const, progress: 100, id: result.file_id } : f
-        )
-      );
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Upload failed';
-      setFiles((prev) =>
-        prev.map((f, idx) => (idx === i ? { ...f, status: 'error' as const, error: errorMsg } : f))
-      );
+    const uploaded = await uploadOnePending(entry, i, setFiles, ctx);
+    if (uploaded) {
+      ids.push(uploaded.id);
+      summaries.push(uploaded.summary);
     }
   }
 
@@ -202,12 +294,19 @@ async function uploadAdditionalFiles(
   keyVersion: number,
   channelId: string,
   conversationId: string | undefined,
-  abortRef: React.MutableRefObject<boolean>
+  abortRef: React.MutableRefObject<boolean>,
+  limit: AttachmentLimit
 ): Promise<{ ids: string[]; summaries: AttachmentSummary[] }> {
   const ids: string[] = [];
   const summaries: AttachmentSummary[] = [];
   for (const file of files) {
     if (abortRef.current) break;
+    // This path builds FileUploadState directly and so never met validateFiles.
+    // Same boundary, enforced here — safe to throw only because uploadAll wraps
+    // the call in a try/finally that resets isUploading.
+    if (file.size > limit.limitBytes) {
+      throw new Error(`${file.name} exceeds the ${formatLimitBytes(limit.limitBytes)} limit`);
+    }
     const entry: FileUploadState = { file, progress: 0, status: 'pending' };
     const result = await uploadSingleFile(entry, channelKey, keyVersion, channelId, conversationId);
     ids.push(result.file_id);
@@ -295,38 +394,73 @@ async function encryptAndBuildForm(
 export function useFileUpload() {
   const [files, setFiles] = useState<FileUploadState[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+
+  // Read the entitlement UNCONDITIONALLY — no `hydrated`/`degraded` branch. The
+  // store is already FREE when unhydrated and preserves last-known-good on a
+  // reconnect blip (#2172), so a hydration gate here could only ever escalate
+  // above the store's current value. See `resolveAttachmentLimit`.
+  const userMaxAttachmentBytes = useEntitlement((e) => e.maxAttachmentBytes);
+  const limit = useMemo(
+    // #1556 SEAM: pass `serverMaxUploadBytes` here once the server composes the
+    // Mach axis. Nothing else in this file changes when it does.
+    () => resolveAttachmentLimit({ userMaxAttachmentBytes }),
+    [userMaxAttachmentBytes]
+  );
+
+  // `addFiles` is a useCallback with an EMPTY dep array whose body runs inside a
+  // setFiles updater. Putting `limit` in its deps would churn its identity every
+  // render and propagate into every memoized consumer, so the current value is
+  // handed over by ref instead. Do not "simplify" this into a dep.
+  const limitRef = useRef(limit);
+  limitRef.current = limit;
   const abortRef = useRef(false);
-  const validationResultRef = useRef<string | null>(null);
+
+  // Mirror of the queue, kept current so addFiles can validate SYNCHRONOUSLY.
+  // Computing inside a setFiles updater and reading a ref straight after is
+  // unsound: React may defer the updater, so the read can return a PREVIOUS
+  // selection's result — the composer then shows a stale notice, or none.
+  // Written eagerly by addFiles (so back-to-back calls compose) and reconciled
+  // by the effect below for every other path that mutates `files`.
+  const filesRef = useRef<FileUploadState[]>(files);
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
 
   const addFiles = useCallback((newFiles: FileList | File[]) => {
     const fileArray = Array.from(newFiles);
+    const { accepted, rejections } = validateFiles(
+      fileArray,
+      filesRef.current.length,
+      limitRef.current
+    );
 
-    setFiles((prev) => {
-      const error = validateFiles(fileArray, prev.length);
-      validationResultRef.current = error;
-      if (error) {
-        return prev;
-      }
-
-      const newEntries: FileUploadState[] = fileArray.map((file) => ({
+    if (accepted.length > 0) {
+      // Object URLs are minted HERE rather than inside the updater: React may
+      // invoke an updater more than once (StrictMode does so deliberately), and
+      // every extra invocation would mint a url nothing ever revokes.
+      const newEntries: FileUploadState[] = accepted.map((file) => ({
         file,
         progress: 0,
         status: 'pending' as const,
         previewUrl: isImageType(file.type) ? URL.createObjectURL(file) : undefined,
       }));
-      return [...prev, ...newEntries];
-    });
+      const next = [...filesRef.current, ...newEntries];
+      filesRef.current = next;
+      setFiles(next);
 
-    // Asynchronously read image dimensions and patch the matching entries.
-    // Dim-reading races against the user clicking "Send", but uploadAll only
-    // builds summaries from the latest state, so a late-arriving dim still
-    // ends up on the optimistic message in practice.
-    for (const file of fileArray) {
-      if (!isImageType(file.type)) continue;
-      hydrateDimensions(file, setFiles);
+      // Asynchronously read image dimensions and patch the matching entries.
+      // Iterates ACCEPTED only: hydrating a rejected file would mint an object
+      // url for an entry that never enters the queue.
+      for (const file of accepted) {
+        if (isImageType(file.type)) hydrateDimensions(file, setFiles);
+      }
     }
 
-    return validationResultRef.current;
+    // The accepted COUNT is reported rather than derived: a `too-many`
+    // rejection is emitted once for a whole surplus, so
+    // `total - rejections.length` over-reports. Dropping 8 files on an empty
+    // queue accepts 5 and discards 3, but yields one rejection.
+    return { accepted: accepted.length, rejections };
   }, []);
 
   const removeFile = useCallback((index: number) => {
@@ -368,41 +502,49 @@ export function useFileUpload() {
       setIsUploading(true);
       abortRef.current = false;
 
-      const keyChannelId = conversationId || channelId;
-      const channelKey = await e2eeService.getChannelKey(keyChannelId);
-      const keyVersion = e2eeService.getCurrentKeyVersion(keyChannelId);
+      // Without this finally, ANY throw below leaves isUploading === true and
+      // the composer's send button disabled for the rest of the session — a
+      // network blip during one upload bricks the composer until reload. The
+      // size guard in uploadAdditionalFiles is only safe because of it.
+      try {
+        const keyChannelId = conversationId || channelId;
+        const channelKey = await e2eeService.getChannelKey(keyChannelId);
+        const keyVersion = e2eeService.getCurrentKeyVersion(keyChannelId);
 
-      // Upload pending files from React state (user-added via picker / drag-drop).
-      const pending = await uploadPendingFiles(
-        files,
-        setFiles,
-        channelKey,
-        keyVersion,
-        channelId,
-        conversationId,
-        abortRef
-      );
+        // Upload pending files from React state (user-added via picker / drag-drop).
+        const ctx: UploadContext = {
+          channelKey,
+          keyVersion,
+          channelId,
+          conversationId,
+          abortRef,
+          limit: limitRef.current,
+        };
+        const pending = await uploadPendingFiles(files, setFiles, ctx);
 
-      // Upload any additional files passed synchronously (e.g., overflow .md).
-      // These are NOT in React state so they bypass the addFiles→setFiles
-      // async-update race entirely.
-      const extra =
-        hasAdditional && additionalFiles
-          ? await uploadAdditionalFiles(
-              additionalFiles,
-              channelKey,
-              keyVersion,
-              channelId,
-              conversationId,
-              abortRef
-            )
-          : { ids: [], summaries: [] };
+        // Upload any additional files passed synchronously (e.g., overflow .md).
+        // These are NOT in React state so they bypass the addFiles→setFiles
+        // async-update race entirely.
+        const extra =
+          hasAdditional && additionalFiles
+            ? await uploadAdditionalFiles(
+                additionalFiles,
+                channelKey,
+                keyVersion,
+                channelId,
+                conversationId,
+                abortRef,
+                limitRef.current
+              )
+            : { ids: [], summaries: [] };
 
-      setIsUploading(false);
-      return {
-        ids: [...pending.ids, ...extra.ids],
-        summaries: [...pending.summaries, ...extra.summaries],
-      };
+        return {
+          ids: [...pending.ids, ...extra.ids],
+          summaries: [...pending.summaries, ...extra.summaries],
+        };
+      } finally {
+        setIsUploading(false);
+      }
     },
     [files]
   );
@@ -417,5 +559,9 @@ export function useFileUpload() {
     uploadAll,
     isUploading,
     hasFiles,
+    /** The resolved per-file limit. Consumers render copy from this rather than
+     *  re-deriving it, so the enforced number and the named number cannot drift
+     *  apart — which is exactly how #2157 happened. */
+    limit,
   };
 }

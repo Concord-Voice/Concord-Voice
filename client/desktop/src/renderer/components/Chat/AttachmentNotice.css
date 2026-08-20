@@ -1,0 +1,54 @@
+/* Single pre-queue attachment rejection surface (#2157). Replaces
+   .attachment-upsell-banner, which advised against one number while
+   validateFiles enforced another. */
+
+.attachment-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 4px 0;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+/* The element is always mounted so assistive tech observes the live region
+   before it fills; emptiness is hidden here rather than by unmounting. */
+.attachment-notice:empty {
+  display: none;
+}
+
+.attachment-notice--error {
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-secondary));
+  border: 1px solid var(--danger);
+}
+
+/* A capability gap, not a plan gate — deliberately not the danger treatment. */
+.attachment-notice--limitation {
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent-secondary, var(--accent-primary));
+}
+
+.attachment-notice__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.attachment-notice__dismiss {
+  /* >=24x24 CSS px hit area via padding. WCAG 2.1 AA has no target-size SC
+     (2.5.5 is AAA, 2.5.8 is WCAG 2.2) — this is a deliberate, standards-anchored
+     choice, not a deferred defect. */
+  padding: 4px 8px;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.attachment-notice__dismiss:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}

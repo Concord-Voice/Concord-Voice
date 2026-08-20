@@ -5,8 +5,12 @@
 
 const AES_GCM_IV_LENGTH = 12;
 
-/** Maximum file size in bytes (25 MiB). */
-export const MAX_FILE_SIZE = 26_214_400;
+// MAX_FILE_SIZE lived here until #2157: a flat, entitlement-blind 25 MiB cap
+// that rejected uploads between 25 and 32 MiB which the server and the pricing
+// page both accept. The per-file limit is now derived from the user's live
+// entitlement — see `resolveAttachmentLimit` in `utils/entitlementLimits.ts`.
+// This module is crypto + MIME classification only; tier policy does not
+// belong in it.
 
 /** Maximum number of attachments per message. */
 export const MAX_ATTACHMENTS = 5;

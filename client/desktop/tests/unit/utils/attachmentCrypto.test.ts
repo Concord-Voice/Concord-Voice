@@ -5,7 +5,6 @@ import {
   classifyFileType,
   formatFileSize,
   isImageType,
-  MAX_FILE_SIZE,
   MAX_ATTACHMENTS,
 } from '@/renderer/utils/attachmentCrypto';
 
@@ -152,9 +151,11 @@ describe('attachmentCrypto', () => {
   });
 
   describe('constants', () => {
-    it('MAX_FILE_SIZE is 25 MiB', () => {
-      expect(MAX_FILE_SIZE).toBe(26_214_400);
-    });
+    // The MAX_FILE_SIZE doc-pin test lived here until #2157. It asserted the
+    // constant equalled 26_214_400 — pinning the defect rather than any
+    // behaviour, so the bug could not be fixed without "breaking" a test. The
+    // limit is now derived, and its LOGIC is tested in
+    // tests/unit/utils/entitlementLimits.test.ts.
 
     it('MAX_ATTACHMENTS is 5', () => {
       expect(MAX_ATTACHMENTS).toBe(5);

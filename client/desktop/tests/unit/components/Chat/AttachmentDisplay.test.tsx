@@ -1,12 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '../../../test-utils';
 import userEvent from '@testing-library/user-event';
-import AttachmentDisplay, { extFromMime } from '@/renderer/components/Chat/AttachmentDisplay';
+import AttachmentDisplay, {
+  extFromMime,
+  __resetBlobCacheForTests,
+} from '@/renderer/components/Chat/AttachmentDisplay';
 import type { AttachmentSummary } from '@/renderer/types/chat';
 import { mockAttachment, mockAttachment2 } from '../../../mocks/fixtures';
 import { useSettingsStore } from '@/renderer/stores/settingsStore';
 import { fireEvent } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/entitlementLimits';
+import { AttachmentTooLargeError } from '@/renderer/utils/boundedResponseBody';
 
 // Mock OverflowMarkdownAttachment so we can assert dispatch without exercising
 // the full decrypt/expand path (covered by OverflowMarkdownAttachment.test.tsx).
@@ -97,6 +102,11 @@ const OriginalIO = globalThis.IntersectionObserver;
 describe('AttachmentDisplay', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Vitest isolates modules per FILE, not per test, so the blob cache and its
+    // byte accounting persist across every test here. The budget assertions are
+    // absolute ("admitting the third forces the first out"), so a leftover entry
+    // from an earlier test would silently invalidate them (#2837 review, row 9).
+    __resetBlobCacheForTests();
     mockDecryptFile.mockImplementation((data: ArrayBuffer) => Promise.resolve(data));
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);
   });
@@ -677,5 +687,442 @@ describe('extFromMime (#1729 Save-As default name)', () => {
     expect(extFromMime('application/pdf')).toBe('');
     expect(extFromMime('')).toBe('');
     expect(extFromMime(undefined)).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2157 — download guard (Task 5) + blob-cache byte budget (Task 6 / A1)
+// ---------------------------------------------------------------------------
+
+function photoOf(id: string, fileSize: number): AttachmentSummary {
+  return { ...mockAttachment, id, mime_type: 'image/png', file_size: fileSize };
+}
+
+/** A real (small) ArrayBuffer whose `byteLength` reports `bytes`. The blob cache
+ *  accounts for `byteLength`, so shadowing it exercises the budget without
+ *  allocating hundreds of megabytes inside jsdom. */
+function bufferOfDeclaredSize(bytes: number): ArrayBuffer {
+  const buf = new ArrayBuffer(8);
+  Object.defineProperty(buf, 'byteLength', { value: bytes });
+  return buf;
+}
+
+describe('AttachmentDisplay download size guard (#2157)', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockDecryptFile.mockImplementation((data: ArrayBuffer) => Promise.resolve(data));
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+  });
+
+  afterEach(() => {
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = OriginalIO;
+    ioCallback = null;
+  });
+
+  // R2: the guard is sized to the PREMIUM entitlement, not to the interim upload
+  // ceiling — PR 2 will produce files above that ceiling and this build must
+  // still open them.
+  it('still opens a 200 MiB attachment', async () => {
+    mockFetchSuccess();
+    installImmediateIO();
+
+    const { container } = render(
+      <AttachmentDisplay attachments={[photoOf('guard-200mib', 209_715_200)]} channelId="ch-1" />
+    );
+
+    await waitFor(() =>
+      expect(container.querySelector('img.attachment-image')).toBeInTheDocument()
+    );
+    expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/media/attachments/guard-200mib');
+  });
+
+  it('rejects on file_size without issuing a network request', async () => {
+    mockFetchSuccess();
+    installImmediateIO();
+
+    render(
+      <AttachmentDisplay
+        attachments={[photoOf('guard-oversize', MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1)]}
+        channelId="ch-1"
+      />
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This file is 256.0 MB and is too large to open in this version of Concord.'
+    );
+    // The whole point of gating on the summary: no bytes are ever requested.
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+
+  it('treats a Content-Length above the guard as a rejection and never reads the body', async () => {
+    const arrayBuffer = vi.fn(() => Promise.resolve(new ArrayBuffer(8)));
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer,
+      headers: new Headers({
+        'X-File-Mime-Type': 'image/png',
+        'Content-Length': String(MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1),
+      }),
+    });
+    installImmediateIO();
+
+    render(
+      <AttachmentDisplay attachments={[photoOf('guard-content-length', 1024)]} channelId="ch-1" />
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /too large to open in this version of Concord/
+    );
+    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(mockDecryptFile).not.toHaveBeenCalled();
+  });
+
+  it('refuses an oversized file-card download in the chip footprint', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <AttachmentDisplay
+        attachments={[
+          {
+            ...mockAttachment2,
+            id: 'guard-file-card',
+            file_size: MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1,
+          },
+        ]}
+        channelId="ch-1"
+      />
+    );
+
+    await user.click(screen.getByRole('button', { name: /download/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /too large to open in this version of Concord/
+    );
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses an oversized video and replaces the load button with the notice', async () => {
+    const user = userEvent.setup();
+    const video: AttachmentSummary = {
+      id: 'guard-video',
+      file_type: 'video',
+      mime_type: 'video/mp4',
+      file_size: MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1,
+    };
+
+    render(<AttachmentDisplay attachments={[video]} channelId="ch-1" />);
+
+    await user.click(screen.getByText('Load video'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /too large to open in this version of Concord/
+    );
+    expect(screen.queryByText('Load video')).not.toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  let urlSeq = 0;
+  let revoked: string[] = [];
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    revoked = [];
+    // setup.ts stubs createObjectURL with a CONSTANT url, which cannot express
+    // "which entry was evicted" — hand out a distinct url per blob instead.
+    URL.createObjectURL = () => `blob:cache-${++urlSeq}`;
+    URL.revokeObjectURL = (url: string) => {
+      revoked.push(url);
+    };
+  });
+
+  afterEach(() => {
+    URL.createObjectURL = originalCreateObjectURL;
+    URL.revokeObjectURL = originalRevokeObjectURL;
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = OriginalIO;
+    ioCallback = null;
+  });
+
+  /** Loads one photo per render, in declaration order, and returns the blob url
+   *  each one was cached under (read off the rendered <img>, so the assertion
+   *  gates on the DOM rather than on the mock). */
+  async function loadPhotos(sizes: readonly number[], idPrefix: string): Promise<string[]> {
+    const urls: string[] = [];
+    for (let i = 0; i < sizes.length; i++) {
+      const bytes = sizes[i];
+      mockApiFetch.mockResolvedValue({
+        ok: true,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+        headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+      });
+      mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(bytes));
+      installImmediateIO();
+
+      const { container, unmount } = render(
+        <AttachmentDisplay attachments={[photoOf(`${idPrefix}-${i}`, bytes)]} channelId="ch-1" />
+      );
+      const img = await waitFor(() => {
+        const node = container.querySelector('img.attachment-image');
+        expect(node).toBeInTheDocument();
+        return node as HTMLImageElement;
+      });
+      urls.push(img.getAttribute('src') ?? '');
+      unmount();
+    }
+    return urls;
+  }
+
+  it('evicts oldest-first once the byte budget is exceeded and revokes the evicted url', async () => {
+    // Three 100 MiB entries against a 256 MiB budget: admitting the third
+    // forces the first out, and only the first.
+    const [first, second, third] = await loadPhotos(
+      [104_857_600, 104_857_600, 104_857_600],
+      'budget'
+    );
+
+    expect(revoked).toContain(first);
+    expect(revoked).not.toContain(second);
+    expect(revoked).not.toContain(third);
+  });
+
+  it('does not wedge on a single entry larger than the whole budget', async () => {
+    // The giant is admitted (emptying the map on the way in) and is then itself
+    // evicted by the next admission — the loop must terminate, not spin.
+    const [giant, small] = await loadPhotos([MAX_DECRYPTABLE_ATTACHMENT_BYTES, 1024], 'wedge');
+
+    expect(revoked).toContain(giant);
+    expect(revoked).not.toContain(small);
+  });
+
+  it('keeps the byte accounting straight when two surfaces race on one attachment', async () => {
+    // Both surfaces mount before either fetch settles. Coalescing is what keeps
+    // the accounting straight now: they share ONE in-flight load and one insert,
+    // so `cacheBlobUrl`'s supersede branch is never reached. This guards the
+    // invariant (100 MiB counted once), not that branch — which has no coverage
+    // here, and should not be assumed to (#2837 review, row 10).
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+    installImmediateIO();
+
+    const first = render(
+      <AttachmentDisplay attachments={[photoOf('race', 104_857_600)]} channelId="ch-1" />
+    );
+    const second = render(
+      <AttachmentDisplay attachments={[photoOf('race', 104_857_600)]} channelId="ch-1" />
+    );
+
+    const surviving = await waitFor(() => {
+      expect(first.container.querySelector('img.attachment-image')).toBeInTheDocument();
+      const node = second.container.querySelector('img.attachment-image');
+      expect(node).toBeInTheDocument();
+      return (node as HTMLImageElement).getAttribute('src') ?? '';
+    });
+
+    // 100 MiB counted once leaves room for a second 100 MiB admission under the
+    // 256 MiB budget. Counted twice it does not, and the surviving entry is
+    // evicted to make way — which is how a phantom becomes visible.
+    await loadPhotos([104_857_600], 'race-next');
+    expect(revoked).not.toContain(surviving);
+
+    first.unmount();
+    second.unmount();
+  });
+
+  // VULN-002 (#2157 adversarial review). Two surfaces racing used to mint two
+  // blob urls, and the superseded one left the Map without being revoked — so
+  // evictOldestBlob could never reach it and the Blob was pinned for the life
+  // of the document, while `cachedBytes` reported memory nobody controlled.
+  // Coalescing removes the duplicate rather than cleaning up after it.
+  it('coalesces concurrent loads of one attachment onto a single fetch and url', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+    installImmediateIO();
+
+    const surfaces = [0, 1, 2, 3].map(() =>
+      render(
+        <AttachmentDisplay attachments={[photoOf('coalesce', 104_857_600)]} channelId="ch-1" />
+      )
+    );
+
+    const srcs = await waitFor(() =>
+      surfaces.map((s) => {
+        const node = s.container.querySelector('img.attachment-image');
+        expect(node).toBeInTheDocument();
+        return (node as HTMLImageElement).getAttribute('src') ?? '';
+      })
+    );
+
+    // One url handed to all four, so there is no superseded entry to orphan.
+    expect(new Set(srcs).size).toBe(1);
+    // One network fetch and one decrypt, not four.
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(mockDecryptFile).toHaveBeenCalledTimes(1);
+    expect(revoked).not.toContain(srcs[0]);
+
+    for (const s of surfaces) s.unmount();
+  });
+
+  // VULN-002-COLLATERAL (#2157 adversarial review): the byte budget used to
+  // revoke a url a mounted <img> was still pointing at — a silently broken
+  // image, and handleSaveImage's fetch of it failing into a swallowed catch.
+  // The budget bounds cache RETENTION, never what the user is looking at.
+  it('never revokes a url while a surface is still rendering it', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+    installImmediateIO();
+
+    // Mount each and let it settle, which is the real shape of the hazard: two
+    // 100 MiB images already on screen when a third arrives. 300 MiB against a
+    // 256 MiB budget forces an eviction, and every candidate is mounted.
+    const surfaces = [];
+    const srcs: string[] = [];
+    for (const id of ['live-a', 'live-b', 'live-c']) {
+      const view = render(
+        <AttachmentDisplay attachments={[photoOf(id, 104_857_600)]} channelId="ch-1" />
+      );
+      surfaces.push(view);
+      srcs.push(
+        await waitFor(() => {
+          const node = view.container.querySelector('img.attachment-image');
+          expect(node).toBeInTheDocument();
+          return (node as HTMLImageElement).getAttribute('src') ?? '';
+        })
+      );
+    }
+
+    // Exceeding the budget is the correct outcome here; breaking a live image
+    // is not. Nothing on screen may be revoked.
+    for (const src of srcs) expect(revoked).not.toContain(src);
+
+    // Once they leave the screen the bytes become reclaimable again — the
+    // budget is enforced, just never at the cost of what the user is viewing.
+    for (const view of surfaces) view.unmount();
+    await loadPhotos([104_857_600], 'after-release');
+    expect(revoked).toContain(srcs[0]);
+  });
+
+  // Review row 1: `a.click()` starts an ASYNCHRONOUS browser download that
+  // reads the blob over time. An earlier version reasoned only about the
+  // synchronous window before the click and left the file card unretained, so a
+  // later load could evict and revoke the url mid-read.
+  it("keeps a downloading file card's url alive while other attachments load", async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'application/pdf' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(104_857_600));
+
+    // Capture the href the download anchor actually receives.
+    let downloadedUrl = '';
+    const realCreate = document.createElement.bind(document);
+    const createSpy = vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = realCreate(tag) as HTMLElement;
+      if (tag === 'a') {
+        Object.defineProperty(el, 'href', {
+          set(v: string) {
+            downloadedUrl = v;
+          },
+          get: () => downloadedUrl,
+          configurable: true,
+        });
+        (el as HTMLAnchorElement).click = () => undefined;
+      }
+      return el;
+    });
+
+    const card = render(
+      <AttachmentDisplay
+        attachments={[
+          {
+            ...mockAttachment,
+            id: 'dl',
+            file_type: 'file',
+            mime_type: 'application/pdf',
+            file_size: 104_857_600,
+          },
+        ]}
+        channelId="ch-1"
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Download attachment' }));
+    await waitFor(() => expect(downloadedUrl).toMatch(/^blob:cache-/));
+    createSpy.mockRestore();
+
+    // Two more 100 MiB attachments: 300 MiB against a 256 MiB budget forces
+    // eviction while the card is mounted and its download still reading.
+    await loadPhotos([104_857_600, 104_857_600], 'dl-pressure');
+
+    expect(revoked).not.toContain(downloadedUrl);
+
+    // Once the card unmounts the bytes become reclaimable again.
+    card.unmount();
+    await loadPhotos([104_857_600], 'dl-after');
+    expect(revoked).toContain(downloadedUrl);
+  });
+
+  // Gitar (#2837): `truncated` was plumbed through the error and the notice but
+  // never captured at the catch sites, so a mid-stream-cancelled refusal still
+  // stated its partial byte count as the file's real size.
+  //
+  // The component's contract is PROPAGATING the flag, not producing it — a
+  // genuine cancellation needs a >256 MiB body, which is not something to
+  // stream inside jsdom. readBoundedBody's own truncated behaviour is covered
+  // in tests/unit/utils/boundedResponseBody.test.ts; here the error is thrown
+  // directly so the copy branch is what is under test.
+  it('says "over N" when the refusal was truncated mid-stream', async () => {
+    mockApiFetch.mockImplementation(() => {
+      const err = new AttachmentTooLargeError(268_435_456, true);
+      return Promise.reject(err);
+    });
+    installImmediateIO();
+
+    render(<AttachmentDisplay attachments={[photoOf('truncated', 1024)]} channelId="ch-1" />);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/^This file is over 256\.0 MB/);
+  });
+
+  it('states the size outright when the refusal was an honest declared size', async () => {
+    mockApiFetch.mockClear();
+    installImmediateIO();
+    render(
+      <AttachmentDisplay
+        attachments={[photoOf('honest', MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1)]}
+        channelId="ch-1"
+      />
+    );
+    const alert = await screen.findByRole('alert');
+    // Refused on file_size before any fetch, so the count is the real size.
+    expect(alert.textContent).toMatch(/^This file is 256\.0 MB/);
+    expect(alert.textContent).not.toMatch(/is over /);
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+
+  it('still caps entry count for a channel full of thumbnails', async () => {
+    // 60 x 1 KiB is ~60 KiB total, so the byte budget cannot be the cause of an
+    // eviction here — only the secondary entry cap can.
+    const urls = await loadPhotos(new Array(60).fill(1024), 'thumb');
+
+    expect(revoked).toContain(urls[0]);
+    expect(revoked).not.toContain(urls[59]);
   });
 });

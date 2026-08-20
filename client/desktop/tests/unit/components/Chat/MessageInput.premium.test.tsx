@@ -9,7 +9,10 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({
 }));
 vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false }));
 
-const mockAddFiles = vi.fn().mockReturnValue(null);
+/** addFiles returns { accepted, rejections } — the accepted COUNT is reported
+ *  explicitly rather than derived, because one `too-many` rejection can stand
+ *  for several discarded files. */
+const mockAddFiles = vi.fn().mockReturnValue({ accepted: 0, rejections: [] });
 let mockUploadFiles: Array<{ file: File; progress: number; status: 'pending' }> = [];
 const mockRemoveFile = vi.fn((index: number) => {
   mockUploadFiles = mockUploadFiles.filter((_, i) => i !== index);
@@ -33,13 +36,14 @@ vi.mock('@/renderer/components/Chat/AttachmentUploadPreview', () => ({
   ),
 }));
 
-// Entitlement: FREE floor by default (maxMessageChars 5120, maxAttachmentBytes 25 MiB).
+// Entitlement: FREE floor by default (maxMessageChars 5120, maxAttachmentBytes 32 MiB —
+// mirrors the Go free floor; this said 25 MiB before #2157, which was the bug).
 const entitlementOverrides: Record<string, unknown> = {};
 function freeEntitlement() {
   return {
     tier: 'free',
     maxMessageChars: 5120,
-    maxAttachmentBytes: 26_214_400,
+    maxAttachmentBytes: 33_554_432,
     ...entitlementOverrides,
   };
 }
@@ -53,6 +57,11 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
+import {
+  FREE_ATTACHMENT_BYTES,
+  PREMIUM_ATTACHMENT_BYTES,
+  resolveAttachmentLimit,
+} from '@/renderer/utils/entitlementLimits';
 
 function setEntitlement(overrides: Record<string, unknown>) {
   for (const k of Object.keys(entitlementOverrides)) delete entitlementOverrides[k];
@@ -158,88 +167,129 @@ describe('MessageInput — L7 message-length (informational)', () => {
 
 // ─── L9: attachment-size upsell banner ──────────────────────────────────────
 
-describe('MessageInput — L9 attachment-size upsell', () => {
-  it('shows the non-modal banner with correct sizes for an over-limit file', () => {
-    render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    const big = makeFile('huge.png', 40 * 1024 * 1024); // 40 MiB > 25 MiB free
-    fireEvent.change(input, { target: { files: [big] } });
-    const banner = document.querySelector('.attachment-upsell-banner') as HTMLElement;
-    expect(banner).toBeInTheDocument();
-    expect(banner.textContent).toContain('huge.png is');
-    expect(banner.textContent).toContain('Free limit');
-    expect(banner.textContent).toContain('Premium raises it to');
+describe('MessageInput — attachment rejection notice (#2157)', () => {
+  const freeLimit = resolveAttachmentLimit({ userMaxAttachmentBytes: FREE_ATTACHMENT_BYTES });
+  const ceilingLimit = resolveAttachmentLimit({
+    userMaxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES,
   });
 
-  it('does NOT block — the file still flows to addFiles', () => {
-    render(<MessageInput onSendMessage={onSendMessage} />);
+  function overLimit(name: string, size: number, limit = freeLimit) {
+    return [{ kind: 'over-limit' as const, fileName: name, fileSize: size, limit }];
+  }
+
+  /** Shape addFiles now returns. */
+  function accepting(accepted: number, rejections: unknown[]) {
+    return { accepted, rejections };
+  }
+
+  function attach(file: File) {
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    const big = makeFile('huge.png', 40 * 1024 * 1024);
-    fireEvent.change(input, { target: { files: [big] } });
+    fireEvent.change(input, { target: { files: [file] } });
+  }
+
+  it('renders the rejection addFiles returned, with both limit numbers', () => {
+    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    attach(makeFile('huge.png', 40 * 1024 * 1024));
+
+    const notice = document.querySelector('.attachment-notice') as HTMLElement;
+    expect(notice.textContent).toContain('huge.png is');
+    expect(notice.textContent).toContain('over the 32 MB free limit');
+    expect(notice.textContent).toContain('Premium raises it to 256 MB');
+  });
+
+  // The file no longer "flows through" a permissive banner — enforcement and
+  // messaging are the same decision now, taken inside addFiles.
+  it('routes every attach path through addFiles', () => {
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    attach(makeFile('a.png', 1024));
     expect(mockAddFiles).toHaveBeenCalled();
   });
 
-  it('no banner for a within-limit file', () => {
+  it('shows nothing when addFiles accepts everything', () => {
+    mockAddFiles.mockReturnValueOnce(accepting(1, []));
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    const small = makeFile('ok.png', 1 * 1024 * 1024); // 1 MiB
-    fireEvent.change(input, { target: { files: [small] } });
-    expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+    attach(makeFile('ok.png', 1024 * 1024));
+    expect(document.querySelector('.attachment-notice')).toBeEmptyDOMElement();
   });
 
-  it('the banner is dismissible', () => {
+  it('is dismissible and returns focus to the textarea', () => {
+    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [makeFile('huge.png', 40 * 1024 * 1024)] } });
+    attach(makeFile('huge.png', 40 * 1024 * 1024));
+
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
-    expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+
+    expect(document.querySelector('.attachment-notice')).toBeEmptyDOMElement();
+    // Collapsing the region must not drop focus to <body>.
+    expect(document.activeElement).toBe(screen.getByRole('textbox'));
   });
 
-  it('entitled (premium attachment cap): no banner for a file within the higher cap', () => {
-    setEntitlement({ tier: 'premium', maxAttachmentBytes: 100 * 1024 * 1024 });
+  it('gives a premium user over their own limit no upsell', () => {
+    setEntitlement({ tier: 'premium', maxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES });
+    mockAddFiles.mockReturnValueOnce(
+      accepting(
+        0,
+        overLimit('huge.bin', 300 * 1024 * 1024, {
+          // Both byte fields carry the premium entitlement. Spreading
+          // `ceilingLimit` and flipping only `source` left limitBytes at the
+          // 128 MiB client ceiling, modelling a 128 MiB entitlement that cannot
+          // exist — and so asserted the wrong number (#2837 review, row 3).
+          limitBytes: PREMIUM_ATTACHMENT_BYTES,
+          entitlementBytes: PREMIUM_ATTACHMENT_BYTES,
+          source: 'entitlement' as const,
+        })
+      )
+    );
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [makeFile('huge.png', 40 * 1024 * 1024)] } });
-    expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+    attach(makeFile('huge.bin', 300 * 1024 * 1024));
+
+    const notice = document.querySelector('.attachment-notice') as HTMLElement;
+    expect(notice.textContent).toContain('over your 256 MB limit');
+    expect(notice.textContent).not.toContain('Premium raises it to');
+    expect(screen.queryByRole('button', { name: /Premium/ })).not.toBeInTheDocument();
   });
 
-  it('labels an over-premium file with the current limit, not free-tier upsell copy', () => {
-    setEntitlement({ tier: 'premium', maxAttachmentBytes: 100 * 1024 * 1024 });
+  it('explains the client-capability gap without an upsell', () => {
+    setEntitlement({ tier: 'premium', maxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES });
+    mockAddFiles.mockReturnValueOnce(
+      accepting(0, overLimit('film.mp4', 200 * 1024 * 1024, ceilingLimit))
+    );
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [makeFile('huge.png', 120 * 1024 * 1024)] } });
-    const banner = document.querySelector('.attachment-upsell-banner') as HTMLElement;
-    expect(banner.textContent).toContain('Current limit');
-    expect(banner.textContent).not.toContain('Free limit');
-    expect(banner.textContent).not.toContain('Premium raises it to');
+    attach(makeFile('film.mp4', 200 * 1024 * 1024));
+
+    const notice = document.querySelector('.attachment-notice') as HTMLElement;
+    expect(notice.textContent).toContain('Your plan allows 256 MB');
+    expect(notice.textContent).toContain('this version of Concord can send files up to 128 MB');
+    expect(screen.queryByRole('button', { name: /Premium/ })).not.toBeInTheDocument();
   });
 
-  it('clears the attachment upsell after the offending file is removed', () => {
-    const oversizedFile = makeFile('huge.png', 40 * 1024 * 1024);
-    mockUploadFiles = [{ file: oversizedFile, progress: 0, status: 'pending' }];
+  it('clears the notice after the offending file is removed', () => {
+    const oversized = makeFile('huge.png', 40 * 1024 * 1024);
+    mockUploadFiles = [{ file: oversized, progress: 0, status: 'pending' }];
+    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [oversizedFile] } });
-    expect(document.querySelector('.attachment-upsell-banner')).toBeInTheDocument();
+    attach(oversized);
+    expect(document.querySelector('.attachment-notice')).not.toBeEmptyDOMElement();
 
     fireEvent.click(screen.getByRole('button', { name: 'Remove upload' }));
 
     expect(mockRemoveFile).toHaveBeenCalledWith(0);
-    expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+    expect(document.querySelector('.attachment-notice')).toBeEmptyDOMElement();
   });
 
-  it('clears the attachment upsell after a successful send', async () => {
+  it('clears the notice after a successful send', async () => {
+    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [makeFile('huge.png', 40 * 1024 * 1024)] } });
-    expect(document.querySelector('.attachment-upsell-banner')).toBeInTheDocument();
+    attach(makeFile('huge.png', 40 * 1024 * 1024));
+    expect(document.querySelector('.attachment-notice')).not.toBeEmptyDOMElement();
 
     const textarea = screen.getByRole('textbox');
     fireEvent.change(textarea, { target: { value: 'ship it' } });
     fireEvent.keyDown(textarea, { key: 'Enter' });
 
     await waitFor(() => {
-      expect(document.querySelector('.attachment-upsell-banner')).not.toBeInTheDocument();
+      expect(document.querySelector('.attachment-notice')).toBeEmptyDOMElement();
     });
   });
 });

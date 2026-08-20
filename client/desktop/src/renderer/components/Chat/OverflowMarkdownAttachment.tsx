@@ -4,7 +4,13 @@ import MarkdownContent from '../Markdown/MarkdownContent';
 import { apiFetch } from '../../services/apiClient';
 import { e2eeService } from '../../services/e2eeService';
 import { decryptFile, formatFileSize } from '../../utils/attachmentCrypto';
+import {
+  AttachmentTooLargeError,
+  readBoundedBody,
+  tooLargeMessage,
+} from '../../utils/boundedResponseBody';
 import { isRenderableMarkdown, MAX_RENDERABLE_MD_BYTES } from '../../utils/renderableMarkdown';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/entitlementLimits';
 import type { AttachmentSummary } from '../../types/chat';
 import type { MentionLookup } from './messageUtils';
 import './OverflowMarkdownAttachment.css';
@@ -25,20 +31,69 @@ const EMPTY_MENTION_LOOKUP: MentionLookup = {
 };
 
 /**
- * Discriminated union covering all 5 display states.
+ * Discriminated union covering all 6 display states.
  *
  * - collapsed: shows preview + Expand button
  * - loading: fetch + decrypt in flight; shows preview + spinner
  * - rendered: full content decoded; shows full markdown + Collapse button
  * - preview-unavailable: fetch or decrypt failed, or isRenderableMarkdown returned false
- * - too-large: decrypted bytes > MAX_RENDERABLE_MD_BYTES
+ * - too-large: decrypted bytes > MAX_RENDERABLE_MD_BYTES (a RENDER-cost refusal)
+ * - too-large-to-open: declared bytes > MAX_DECRYPTABLE_ATTACHMENT_BYTES, refused
+ *   before any allocation (a DOWNLOAD refusal — a different limit for a
+ *   different cost, so it carries the size that tripped it)
  */
 type ExpandedState =
   | { kind: 'collapsed' }
   | { kind: 'loading' }
   | { kind: 'rendered'; content: string }
   | { kind: 'preview-unavailable' }
-  | { kind: 'too-large' };
+  | { kind: 'too-large' }
+  | { kind: 'too-large-to-open'; bytes: number; truncated?: boolean };
+
+/** The subset of ExpandedState a completed load can produce. */
+type LoadOutcome = Extract<
+  ExpandedState,
+  | { kind: 'rendered' }
+  | { kind: 'preview-unavailable' }
+  | { kind: 'too-large' }
+  | { kind: 'too-large-to-open' }
+>;
+
+/**
+ * Fetch, bound, decrypt and validate the overflow `.md` body, returning the
+ * state to apply. Never throws and never touches React, so the effect below
+ * stays a thin apply step rather than carrying the whole chain's branching
+ * (SonarQube S3776 — the inline version reached cognitive complexity 19).
+ *
+ * Folding the size refusal into the single catch also widens it: an
+ * AttachmentTooLargeError raised anywhere in the chain now reports as
+ * `too-large-to-open` rather than only the one raised by readBoundedBody.
+ */
+async function loadOverflowMarkdown(fileId: string, channelId: string): Promise<LoadOutcome> {
+  try {
+    const response = await apiFetch(`/api/v1/media/attachments/${fileId}`);
+    if (!response.ok) return { kind: 'preview-unavailable' };
+
+    // Measure the body as it arrives rather than trusting either declared size:
+    // `file_size` is server-supplied metadata, and Content-Length is absent
+    // under chunked transfer encoding and understates a gzipped body.
+    const ciphertext = await readBoundedBody(response, MAX_DECRYPTABLE_ATTACHMENT_BYTES);
+    const channelKey = await e2eeService.getChannelKey(channelId);
+    const decrypted = new Uint8Array(await decryptFile(ciphertext, channelKey));
+
+    // Render-cost gate, distinct from the download guard above: cheaper than
+    // the full UTF-8 decode plus regex scan that follows.
+    if (decrypted.byteLength > MAX_RENDERABLE_MD_BYTES) return { kind: 'too-large' };
+    if (!isRenderableMarkdown(decrypted)) return { kind: 'preview-unavailable' };
+
+    return { kind: 'rendered', content: new TextDecoder('utf-8').decode(decrypted) };
+  } catch (err) {
+    if (err instanceof AttachmentTooLargeError) {
+      return { kind: 'too-large-to-open', bytes: err.byteLength, truncated: err.truncated };
+    }
+    return { kind: 'preview-unavailable' };
+  }
+}
 
 const OverflowMarkdownAttachment: React.FC<OverflowMarkdownAttachmentProps> = ({
   attachment,
@@ -66,46 +121,29 @@ const OverflowMarkdownAttachment: React.FC<OverflowMarkdownAttachmentProps> = ({
       return;
     }
 
+    // Guards run BEFORE the allocating operation, not between two of them.
+    // `file_size` rides on the summary, so an oversized attachment costs no
+    // network at all — this is a different limit from MAX_RENDERABLE_MD_BYTES
+    // below, which is about render cost once the bytes are already resident.
+    if (attachment.file_size > MAX_DECRYPTABLE_ATTACHMENT_BYTES) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: refuses the download on the declared size before any fetch is issued; not a render loop
+      setState({ kind: 'too-large-to-open', bytes: attachment.file_size });
+      return;
+    }
+
     let cancelled = false;
 
-    (async () => {
-      try {
-        const response = await apiFetch(`/api/v1/media/attachments/${attachment.id}`);
-        if (!response.ok) {
-          if (!cancelled) setState({ kind: 'preview-unavailable' });
-          return;
-        }
-
-        const ciphertextBuffer = await response.arrayBuffer();
-        const channelKey = await e2eeService.getChannelKey(channelId);
-        const decryptedBuffer = await decryptFile(ciphertextBuffer, channelKey);
-        const decryptedBytes = new Uint8Array(decryptedBuffer);
-
-        // Size gate first (cheaper than the full UTF-8 decode + regex scan).
-        if (decryptedBytes.byteLength > MAX_RENDERABLE_MD_BYTES) {
-          if (!cancelled) setState({ kind: 'too-large' });
-          return;
-        }
-
-        if (!isRenderableMarkdown(decryptedBytes)) {
-          if (!cancelled) setState({ kind: 'preview-unavailable' });
-          return;
-        }
-
-        const text = new TextDecoder('utf-8').decode(decryptedBytes);
-        if (!cancelled) {
-          setCachedContent(text);
-          setState({ kind: 'rendered', content: text });
-        }
-      } catch {
-        if (!cancelled) setState({ kind: 'preview-unavailable' });
-      }
+    void (async () => {
+      const outcome = await loadOverflowMarkdown(attachment.id, channelId);
+      if (cancelled) return;
+      if (outcome.kind === 'rendered') setCachedContent(outcome.content);
+      setState(outcome);
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [state.kind, attachment.id, channelId, cachedContent]);
+  }, [state.kind, attachment.id, attachment.file_size, channelId, cachedContent]);
 
   // Move keyboard focus to the Collapse button once the rendered state is entered,
   // so keyboard users are not stranded at <body> after the Expand button disappears.
@@ -190,15 +228,25 @@ const OverflowMarkdownAttachment: React.FC<OverflowMarkdownAttachmentProps> = ({
   }
 
   // ------------------------------------------------------------------
-  // Fallback states: preview-unavailable or too-large
+  // Fallback states: preview-unavailable, too-large, or too-large-to-open
   // ------------------------------------------------------------------
-  const fallbackMessage =
-    state.kind === 'too-large'
-      ? `Markdown file (${formatFileSize(attachment.file_size)}) — too large to preview, download to view.`
-      : 'Preview unavailable — download to view.';
+  let fallbackMessage: string;
+  if (state.kind === 'too-large-to-open') {
+    // Shared with AttachmentDisplay so the wording cannot drift between the
+    // two refusal surfaces (two test files assert it).
+    fallbackMessage = tooLargeMessage(state.bytes, state.truncated, formatFileSize);
+  } else if (state.kind === 'too-large') {
+    fallbackMessage = `Markdown file (${formatFileSize(attachment.file_size)}) — too large to preview, download to view.`;
+  } else {
+    fallbackMessage = 'Preview unavailable — download to view.';
+  }
+
+  // The refusal is announced: the user just pressed Expand and the content will
+  // never arrive. The other two fallbacks are static chip copy.
+  const fallbackRole = state.kind === 'too-large-to-open' ? 'alert' : undefined;
 
   return (
-    <div className="overflow-md-attachment overflow-md-attachment--fallback">
+    <div className="overflow-md-attachment overflow-md-attachment--fallback" role={fallbackRole}>
       <FileText size={16} aria-hidden="true" />
       {/* AttachmentSummary carries no filename field; "message.md" is the
           conventional display name for overflow markdown attachments. */}

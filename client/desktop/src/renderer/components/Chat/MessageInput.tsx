@@ -13,7 +13,7 @@ import { useClientConfigStore } from '../../stores/clientConfigStore';
 import { selectSidebarDock, type SidebarContext, useLayoutStore } from '../../stores/layoutStore';
 import { buildAddendum, encodeMentionMeta, type ParsedMention } from '../../utils/mentions';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
-import { useFileUpload } from '../../hooks/useFileUpload';
+import { useFileUpload, type AttachmentRejection } from '../../hooks/useFileUpload';
 import { useDraftMessage } from '../../hooks/useDraftMessage';
 import { useEntitlement } from '../../hooks/useEntitlement';
 import { useChatStore } from '../../stores/chatStore';
@@ -24,8 +24,9 @@ import { buildInviteUrl } from '../../utils/inviteUrl';
 import AttachmentUploadPreview from './AttachmentUploadPreview';
 import ReplyPreviewBar from './ReplyPreviewBar';
 import { composeMarkdownOverflow } from '../../utils/overflowToMarkdown';
-import { MAX_ATTACHMENTS, formatFileSize } from '../../utils/attachmentCrypto';
-import { PREMIUM_ATTACHMENT_BYTES, clampMessageCharsForTier } from '../../utils/entitlementLimits';
+import { MAX_ATTACHMENTS } from '../../utils/attachmentCrypto';
+import { clampMessageCharsForTier } from '../../utils/entitlementLimits';
+import AttachmentNotice from './AttachmentNotice';
 import './MessageInput.css';
 
 /** Premium raises the free message limit by this factor (UX hint copy only —
@@ -166,7 +167,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
   // NEVER a hard client block (the server re-checks every send/upload).
   const entitlementTier = useEntitlement((e) => e.tier);
   const maxMessageChars = useEntitlement((e) => e.maxMessageChars);
-  const maxAttachmentBytes = useEntitlement((e) => e.maxAttachmentBytes);
   // The plaintext char split is client-authoritative (server sees only
   // ciphertext under E2EE). Source it from the live entitlement so the counter
   // and the .md overflow react to free (5120) / premium (10240) without a
@@ -174,7 +174,12 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const maxLength = maxLengthProp ?? clampMessageCharsForTier(entitlementTier, maxMessageChars);
   const [content, setContent] = useState('');
   // L9: a non-modal inline banner for an over-limit attachment attempt.
-  const [attachUpsell, setAttachUpsell] = useState<string | null>(null);
+  const [rejections, setRejections] = useState<AttachmentRejection[]>([]);
+  const [acceptedCount, setAcceptedCount] = useState(0);
+  /** Size of the whole selection — the notice reports "N of M", and M is not
+   *  derivable from acceptedCount + rejections.length (one `too-many` rejection
+   *  can stand for several discarded files). */
+  const [selectionCount, setSelectionCount] = useState(0);
   const [helpModalOpen, setHelpModalOpen] = useState(false);
   const draftTargetId = channelId || conversationId;
   const {
@@ -672,7 +677,9 @@ const MessageInput: React.FC<MessageInputProps> = ({
       setShowMentions(false);
       selectedMentionsRef.current = [];
       clearFiles();
-      setAttachUpsell(null);
+      setRejections([]);
+      setAcceptedCount(0);
+      setSelectionCount(0);
       onCancelReply?.();
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
@@ -683,42 +690,41 @@ const MessageInput: React.FC<MessageInputProps> = ({
   };
 
   /**
-   * L9 (#1301): inspect a selection for a file over the free attachment-size
-   * cap and surface a non-modal upsell banner. Returns the over-limit file's
-   * banner text (also stored in `attachUpsell`) or null. This does NOT block —
-   * the file still flows to `addFiles`, whose own hard MAX_FILE_SIZE validation
-   * (the DoS ceiling) decides acceptance. The banner is purely informational.
+   * Single entry point for every attach path (picker, drop, paste). #2157
+   * collapsed the old advisory-banner-plus-hard-rejection split into one
+   * surface: `addFiles` partitions the selection against the entitlement-derived
+   * limit and returns only what it refused, so the number enforced and the
+   * number shown are the same number by construction.
    */
-  const checkAttachmentUpsell = (incoming: FileList | File[]): void => {
-    const over = Array.from(incoming).find((f) => f.size > maxAttachmentBytes);
-    if (!over) {
-      setAttachUpsell(null);
-      return;
-    }
-    const prefix = `${over.name} is ${formatFileSize(over.size)}.`;
-    setAttachUpsell(
-      entitlementTier === 'premium'
-        ? `${prefix} Current limit ${formatFileSize(maxAttachmentBytes)}.`
-        : `${prefix} Free limit ${formatFileSize(
-            maxAttachmentBytes
-          )}. Premium raises it to ${formatFileSize(PREMIUM_ATTACHMENT_BYTES)}.`
-    );
+  const handleIncomingFiles = (incoming: FileList | File[]): void => {
+    const { accepted, rejections: refused } = addFiles(incoming);
+    setRejections(refused);
+    setAcceptedCount(accepted);
+    setSelectionCount(Array.from(incoming).length);
+    setUploadError(null);
+  };
+
+  const dismissNotice = (): void => {
+    setRejections([]);
+    setAcceptedCount(0);
+    setSelectionCount(0);
+    // Collapsing the region would otherwise drop focus to <body>.
+    textareaRef.current?.focus();
   };
 
   const handleRemoveFile = useCallback(
     (index: number) => {
       removeFile(index);
-      setAttachUpsell(null);
+      setRejections([]);
+      setAcceptedCount(0);
+      setSelectionCount(0);
     },
     [removeFile]
   );
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      checkAttachmentUpsell(e.target.files);
-      const error = addFiles(e.target.files);
-      if (error) setUploadError(error);
-      else setUploadError(null);
+      handleIncomingFiles(e.target.files);
     }
     // Reset input so same file can be re-selected
     e.target.value = '';
@@ -742,10 +748,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
     e.stopPropagation();
     setDragOver(false);
     if (!canAttachFiles || !e.dataTransfer.files.length) return;
-    checkAttachmentUpsell(e.dataTransfer.files);
-    const error = addFiles(e.dataTransfer.files);
-    if (error) setUploadError(error);
-    else setUploadError(null);
+    handleIncomingFiles(e.dataTransfer.files);
   };
 
   // Route nav keys to whichever composer typeahead is open. Mentions (@) and
@@ -930,22 +933,21 @@ const MessageInput: React.FC<MessageInputProps> = ({
             </div>
           )}
           {hasFiles && <AttachmentUploadPreview files={uploadFiles} onRemove={handleRemoveFile} />}
-          {uploadError && <div className="upload-error">{uploadError}</div>}
-          {uploadStatus && !uploadError && <div className="upload-status">{uploadStatus}</div>}
-          {/* L9: non-modal inline attachment-size upsell banner (#1301). */}
-          {attachUpsell && (
-            <output className="attachment-upsell-banner">
-              <span>{attachUpsell}</span>
-              <button
-                type="button"
-                className="attachment-upsell-dismiss"
-                aria-label="Dismiss"
-                onClick={() => setAttachUpsell(null)}
-              >
-                ×
-              </button>
-            </output>
+          {/* Post-queue transport/encrypt failures only. Pre-queue rejections
+              live in AttachmentNotice's polite region, so the two never compete. */}
+          {uploadError && (
+            <div className="upload-error" role="alert">
+              {uploadError}
+            </div>
           )}
+          {uploadStatus && !uploadError && <div className="upload-status">{uploadStatus}</div>}
+          <AttachmentNotice
+            rejections={rejections}
+            acceptedCount={acceptedCount}
+            selectionCount={selectionCount}
+            tier={entitlementTier}
+            onDismiss={dismissNotice}
+          />
           <textarea
             id={textareaId}
             ref={textareaRef}
@@ -958,10 +960,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             onPaste={(e) => {
               if (canAttachFiles && e.clipboardData.files.length > 0) {
                 e.preventDefault();
-                checkAttachmentUpsell(e.clipboardData.files);
-                const error = addFiles(e.clipboardData.files);
-                if (error) setUploadError(error);
-                else setUploadError(null);
+                handleIncomingFiles(e.clipboardData.files);
               }
             }}
             disabled={disabled}

@@ -5,6 +5,7 @@ import OverflowMarkdownAttachment from '@/renderer/components/Chat/OverflowMarkd
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 import type { AttachmentSummary } from '@/renderer/types/chat';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/entitlementLimits';
 
 // ---------------------------------------------------------------------------
 // Module-level mocks
@@ -328,6 +329,67 @@ describe('OverflowMarkdownAttachment', () => {
     expect(consoleErrorSpy).not.toHaveBeenCalledWith(expect.stringContaining('unmounted'));
 
     consoleErrorSpy.mockRestore();
+  });
+
+  // -------------------------------------------------------------------------
+  // 9. Download guard (#2157) — refuse before the bytes are ever requested
+  // -------------------------------------------------------------------------
+  it('refuses an oversized attachment on file_size without issuing a request', async () => {
+    const handler = vi.fn(
+      () =>
+        new HttpResponse(enc.encode('mock').buffer, {
+          status: 200,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        })
+    );
+    server.use(http.get('http://localhost:8080/api/v1/media/attachments/att-1', handler));
+
+    render(
+      <OverflowMarkdownAttachment
+        attachment={{ ...sampleAttachment, file_size: MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1 }}
+        previewBody="preview…"
+        channelId="ch-1"
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /expand/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This file is 256.0 MB and is too large to open in this version of Concord.'
+    );
+    // Gating on the summary is the whole point: no bytes are ever requested.
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('treats a Content-Length above the guard as a rejection and never decrypts', async () => {
+    await setupDecryptFile('# never reached');
+    server.use(
+      http.get(
+        'http://localhost:8080/api/v1/media/attachments/att-1',
+        () =>
+          new HttpResponse(enc.encode('mock').buffer, {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(MAX_DECRYPTABLE_ATTACHMENT_BYTES + 1),
+            },
+          })
+      )
+    );
+
+    render(
+      <OverflowMarkdownAttachment
+        attachment={sampleAttachment}
+        previewBody="preview…"
+        channelId="ch-1"
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /expand/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /too large to open in this version of Concord/
+    );
+    const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    expect(decryptFile).not.toHaveBeenCalled();
   });
 
   // -------------------------------------------------------------------------

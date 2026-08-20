@@ -1,6 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useFileUpload, validateFiles } from '@/renderer/hooks/useFileUpload';
+import {
+  useFileUpload,
+  validateFiles,
+  type AttachmentRejection,
+} from '@/renderer/hooks/useFileUpload';
+import {
+  FREE_ATTACHMENT_BYTES,
+  PREMIUM_ATTACHMENT_BYTES,
+  resolveAttachmentLimit,
+} from '@/renderer/utils/entitlementLimits';
+import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 
 // Mock apiClient
 const mockApiFetch = vi.fn();
@@ -37,37 +47,111 @@ function createMockFile(name: string, size: number, type: string): File {
   return new File([buffer], name, { type });
 }
 
+/** Fakes `size` instead of allocating it — a 40 MB ArrayBuffer per test case is
+ *  real memory for no test value. */
+function sizedFile(name: string, size: number, type = 'application/octet-stream'): File {
+  const f = new File(['x'], name, { type });
+  Object.defineProperty(f, 'size', { value: size });
+  return f;
+}
+
+const freeLimit = resolveAttachmentLimit({ userMaxAttachmentBytes: FREE_ATTACHMENT_BYTES });
+
 describe('validateFiles', () => {
-  it('returns null for valid files', () => {
-    const files = [createMockFile('test.png', 1000, 'image/png')];
-    expect(validateFiles(files, 0)).toBeNull();
+  it('accepts a file under the limit', () => {
+    const r = validateFiles([sizedFile('test.png', 1000, 'image/png')], 0, freeLimit);
+    expect(r.accepted).toHaveLength(1);
+    expect(r.rejections).toEqual([]);
   });
 
-  it('rejects files exceeding max size', () => {
-    const files = [createMockFile('big.zip', 30 * 1024 * 1024, 'application/zip')];
-    const error = validateFiles(files, 0);
-    expect(error).toContain('exceeds');
+  // THE BUG (#2157). 30 MiB is over the old flat 25 MiB constant but under the
+  // 32 MiB free entitlement that the server and the pricing page both honour.
+  // This case previously asserted rejection — it encoded the defect.
+  it('accepts a 30 MiB file for a free user', () => {
+    const r = validateFiles([sizedFile('big.zip', 30 * 1024 * 1024)], 0, freeLimit);
+    expect(r.accepted).toHaveLength(1);
+    expect(r.rejections).toEqual([]);
   });
 
-  it('rejects when total count exceeds max', () => {
-    const files = [createMockFile('test.png', 100, 'image/png')];
-    const error = validateFiles(files, 5);
-    expect(error).toContain('Maximum 5');
+  it('accepts a file exactly at the limit', () => {
+    const r = validateFiles([sizedFile('edge.bin', FREE_ATTACHMENT_BYTES)], 0, freeLimit);
+    expect(r.accepted).toHaveLength(1);
   });
 
-  it('rejects empty files', () => {
-    const files = [createMockFile('empty.txt', 0, 'text/plain')];
-    const error = validateFiles(files, 0);
-    expect(error).toContain('empty');
+  it('rejects one byte over the limit and carries the limit for the copy layer', () => {
+    const r = validateFiles([sizedFile('over.bin', FREE_ATTACHMENT_BYTES + 1)], 0, freeLimit);
+    expect(r.accepted).toEqual([]);
+    expect(r.rejections).toHaveLength(1);
+    expect(r.rejections[0]).toMatchObject({
+      kind: 'over-limit',
+      fileName: 'over.bin',
+      fileSize: FREE_ATTACHMENT_BYTES + 1,
+    });
+    expect(r.rejections[0].limit).toEqual(freeLimit);
+  });
+
+  it('returns NO strings — copy belongs to the component', () => {
+    const r = validateFiles([sizedFile('over.bin', FREE_ATTACHMENT_BYTES + 1)], 0, freeLimit);
+    expect(JSON.stringify(r.rejections)).not.toMatch(/exceeds|limit is|MB/i);
+  });
+
+  it('rejects an empty file', () => {
+    const r = validateFiles([sizedFile('empty.txt', 0, 'text/plain')], 0, freeLimit);
+    expect(r.rejections[0].kind).toBe('empty');
+    expect(r.accepted).toEqual([]);
+  });
+
+  // R6: one oversized file used to discard the whole drop.
+  it('queues the valid files from a mixed batch and names only the bad one', () => {
+    const r = validateFiles(
+      [
+        sizedFile('ok1.png', 1024),
+        sizedFile('huge.bin', FREE_ATTACHMENT_BYTES + 1),
+        sizedFile('ok2.png', 2048),
+        sizedFile('ok3.png', 4096),
+      ],
+      0,
+      freeLimit
+    );
+    expect(r.accepted.map((f) => f.name)).toEqual(['ok1.png', 'ok2.png', 'ok3.png']);
+    expect(r.rejections).toHaveLength(1);
+    expect(r.rejections[0].fileName).toBe('huge.bin');
+  });
+
+  it('fills remaining capacity then reports too-many exactly once', () => {
+    const r = validateFiles(
+      [sizedFile('a.png', 1), sizedFile('b.png', 1), sizedFile('c.png', 1), sizedFile('d.png', 1)],
+      3,
+      freeLimit
+    );
+    expect(r.accepted.map((f) => f.name)).toEqual(['a.png', 'b.png']);
+    expect(r.rejections.filter((x) => x.kind === 'too-many')).toHaveLength(1);
+  });
+
+  it('reports too-many once when already full', () => {
+    const r = validateFiles([sizedFile('a.png', 1)], 5, freeLimit);
+    expect(r.accepted).toEqual([]);
+    expect(r.rejections).toEqual([expect.objectContaining({ kind: 'too-many' })]);
+  });
+
+  it('returns nothing for an empty input', () => {
+    const r = validateFiles([], 0, freeLimit);
+    expect(r.accepted).toEqual([]);
+    expect(r.rejections).toEqual([]);
   });
 
   it('allows multiple valid files within limits', () => {
-    const files = [
-      createMockFile('a.png', 1000, 'image/png'),
-      createMockFile('b.jpg', 2000, 'image/jpeg'),
-      createMockFile('c.pdf', 3000, 'application/pdf'),
-    ];
-    expect(validateFiles(files, 0)).toBeNull();
+    const r = validateFiles(
+      [
+        sizedFile('a.png', 1000, 'image/png'),
+        sizedFile('b.jpg', 2000, 'image/jpeg'),
+        sizedFile('c.pdf', 3000, 'application/pdf'),
+      ],
+      0,
+      freeLimit
+    );
+    expect(r.accepted).toHaveLength(3);
+    expect(r.rejections).toEqual([]);
   });
 });
 
@@ -156,17 +240,104 @@ describe('useFileUpload', () => {
     expect(result.current.hasFiles).toBe(false);
   });
 
-  it('returns validation error from addFiles', () => {
+  it('returns structured rejections from addFiles for an over-limit file', () => {
     const { result } = renderHook(() => useFileUpload());
-    const bigFile = createMockFile('huge.zip', 30 * 1024 * 1024, 'application/zip');
+    // 40 MiB is over the 32 MiB free floor the unhydrated store reports.
+    const bigFile = sizedFile('huge.zip', 40 * 1024 * 1024, 'application/zip');
 
-    let error: string | null = null;
+    let rejections: AttachmentRejection[] = [];
     act(() => {
-      error = result.current.addFiles([bigFile]);
+      rejections = result.current.addFiles([bigFile]).rejections;
     });
 
-    expect(error).toContain('exceeds');
+    expect(rejections).toHaveLength(1);
+    expect(rejections[0]).toMatchObject({ kind: 'over-limit', fileName: 'huge.zip' });
     expect(result.current.files).toHaveLength(0);
+  });
+
+  it('accepts a 30 MiB file that the old flat 25 MiB cap rejected', () => {
+    const { result } = renderHook(() => useFileUpload());
+    act(() => {
+      result.current.addFiles([sizedFile('was-blocked.zip', 30 * 1024 * 1024)]);
+    });
+    expect(result.current.files).toHaveLength(1);
+  });
+
+  // VULN-004 (#2157 adversarial review): `too-many` is emitted ONCE for a whole
+  // surplus, so `total - rejections.length` over-reports what was queued.
+  // Dropping 8 files on an empty queue accepts 5 and discards 3, but produces a
+  // single rejection — the old derivation claimed 7 were added.
+  it('reports the ACCEPTED count explicitly, not derivable from the rejection count', () => {
+    const { result } = renderHook(() => useFileUpload());
+    let outcome = { accepted: -1, rejections: [] as AttachmentRejection[] };
+    act(() => {
+      outcome = result.current.addFiles(
+        Array.from({ length: 8 }, (_, i) => sizedFile(`f${i}.png`, 1024))
+      );
+    });
+
+    expect(outcome.accepted).toBe(5);
+    expect(outcome.rejections).toHaveLength(1);
+    // The trap: this subtraction says 7 and is wrong by the 3 silently dropped.
+    expect(8 - outcome.rejections.length).not.toBe(outcome.accepted);
+    expect(result.current.files).toHaveLength(5);
+  });
+
+  // Review row 2: addFiles used to compute inside a setFiles updater and read
+  // the result from a ref straight after. React may defer the updater, so the
+  // read could return a PREVIOUS selection's rejections.
+  it("returns THIS selection's result on back-to-back calls", () => {
+    const { result } = renderHook(() => useFileUpload());
+    let first = { accepted: -1, rejections: [] as AttachmentRejection[] };
+    let second = { accepted: -1, rejections: [] as AttachmentRejection[] };
+    act(() => {
+      first = result.current.addFiles([sizedFile('ok.png', 1024)]);
+      // Same tick, before React has flushed anything from the first call.
+      second = result.current.addFiles([sizedFile('huge.bin', 40 * 1024 * 1024)]);
+    });
+
+    expect(first).toEqual({ accepted: 1, rejections: [] });
+    expect(second.accepted).toBe(0);
+    expect(second.rejections).toHaveLength(1);
+    expect(second.rejections[0].fileName).toBe('huge.bin');
+    // The second call saw the first call's file in the queue.
+    expect(result.current.files.map((f) => f.file.name)).toEqual(['ok.png']);
+  });
+
+  it('composes capacity across back-to-back calls', () => {
+    const { result } = renderHook(() => useFileUpload());
+    let last = { accepted: -1, rejections: [] as AttachmentRejection[] };
+    act(() => {
+      result.current.addFiles([
+        sizedFile('a.png', 1),
+        sizedFile('b.png', 1),
+        sizedFile('c.png', 1),
+      ]);
+      last = result.current.addFiles([
+        sizedFile('d.png', 1),
+        sizedFile('e.png', 1),
+        sizedFile('f.png', 1),
+      ]);
+    });
+    // 3 queued, capacity 2 left, so 2 accepted and one too-many rejection.
+    expect(last.accepted).toBe(2);
+    expect(last.rejections).toEqual([expect.objectContaining({ kind: 'too-many' })]);
+    expect(result.current.files).toHaveLength(5);
+  });
+
+  it('exposes the resolved limit so consumers never re-derive it', () => {
+    const { result } = renderHook(() => useFileUpload());
+    expect(result.current.limit.limitBytes).toBe(FREE_ATTACHMENT_BYTES);
+    expect(result.current.limit.source).toBe('entitlement');
+  });
+
+  it('keeps addFiles identity stable across re-renders', () => {
+    const { result, rerender } = renderHook(() => useFileUpload());
+    const first = result.current.addFiles;
+    rerender();
+    // The limit travels by ref, not by dep — a dep would churn every memoized
+    // consumer of addFiles on every render.
+    expect(result.current.addFiles).toBe(first);
   });
 
   it('uploads files and returns IDs', async () => {
@@ -644,5 +815,48 @@ describe('useFileUpload — uploadAll with additionalFiles', () => {
     });
 
     expect(result.current.isUploading).toBe(false);
+  });
+});
+
+// Review row 5: an entitlement can drop between queueing and sending.
+describe('useFileUpload — entitlement downgrade after queueing', () => {
+  afterEach(() => {
+    useSubscriptionStore.getState().reset?.();
+  });
+
+  it('refuses a queued file that no longer fits, instead of uploading it', async () => {
+    act(() => {
+      useSubscriptionStore.getState().setEntitlement({
+        ...useSubscriptionStore.getState().entitlement,
+        tier: 'premium',
+        maxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES,
+      });
+    });
+    const { result } = renderHook(() => useFileUpload());
+
+    // 40 MiB: fine under premium, over the 32 MiB free floor.
+    act(() => {
+      result.current.addFiles([sizedFile('premium.bin', 40 * 1024 * 1024)]);
+    });
+    expect(result.current.files).toHaveLength(1);
+
+    // Downgrade while it sits in the queue.
+    act(() => {
+      useSubscriptionStore.getState().setEntitlement({
+        ...useSubscriptionStore.getState().entitlement,
+        tier: 'free',
+        maxAttachmentBytes: FREE_ATTACHMENT_BYTES,
+      });
+    });
+
+    mockApiFetch.mockClear();
+    await act(async () => {
+      await result.current.uploadAll('chan-1');
+    });
+
+    // Never uploaded; the entry carries the refusal.
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(result.current.files[0].status).toBe('error');
+    expect(result.current.files[0].error).toMatch(/exceeds the 32 MB limit/);
   });
 });
