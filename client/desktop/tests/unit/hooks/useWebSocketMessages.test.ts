@@ -53,30 +53,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
-
-// Build a mock wsService with on() that captures handlers
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyHandler = (...args: any[]) => void;
-
-function createMockWsService() {
-  const handlers = new Map<string, AnyHandler>();
-  let connectionListener: ((state: unknown) => void) | undefined;
-  return {
-    handlers,
-    on: vi.fn((type: string, handler: AnyHandler) => {
-      handlers.set(type, handler);
-      return () => handlers.delete(type);
-    }),
-    onConnectionChange: vi.fn((cb: (state: unknown) => void) => {
-      connectionListener = cb;
-      return () => {
-        connectionListener = undefined;
-      };
-    }),
-    // Test helper: drive the captured connection listener.
-    emitConnectionChange: (state: unknown) => connectionListener?.(state),
-  };
-}
+import { createMockWsService } from '../../helpers/wsServiceMock';
 
 beforeEach(() => {
   resetAllStores();

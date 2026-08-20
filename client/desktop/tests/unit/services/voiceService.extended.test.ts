@@ -286,14 +286,6 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
   };
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
-  });
-  return { promise, resolve };
-}
-
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
@@ -304,6 +296,7 @@ import { useUserStore } from '@/renderer/stores/userStore';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
 import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import { deferred } from '../../helpers/deferred';
 import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,

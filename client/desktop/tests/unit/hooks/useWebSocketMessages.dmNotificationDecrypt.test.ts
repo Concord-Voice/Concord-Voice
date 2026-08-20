@@ -60,6 +60,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { createMockWsService } from '../../helpers/wsServiceMock';
 import {
   desktopNotificationService,
   applyContentPrivacy,
@@ -71,21 +72,6 @@ import {
 // flag it; the assertions only need a value distinct from the plaintext.
 const CIPHERTEXT = 'encrypted-dm-wire-content-that-must-never-be-shown';
 const PLAINTEXT = 'Hey, are we still on for lunch?';
-
-type HandlerFn = (...args: unknown[]) => void;
-
-function createMockWsService() {
-  const handlers = new Map<string, HandlerFn>();
-  return {
-    handlers,
-    on: vi.fn((type: string, handler: HandlerFn) => {
-      handlers.set(type, handler);
-      return () => handlers.delete(type);
-    }),
-    onConnectionChange: vi.fn(() => () => {}),
-    disconnect: vi.fn(),
-  };
-}
 
 function dmEvent(content: string, keyVersion?: number) {
   return {

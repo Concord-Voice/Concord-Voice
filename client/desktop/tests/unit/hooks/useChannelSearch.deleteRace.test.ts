@@ -23,6 +23,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 import { processBackfillMessage, useChannelSearch } from '@/renderer/hooks/useChannelSearch';
+import { deferred } from '../../helpers/deferred';
 import {
   beginSearchBackfill,
   clearIndex,
@@ -32,14 +33,6 @@ import {
   removeScope,
   searchMessages,
 } from '@/renderer/services/searchService';
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
-}
 
 function makeMessage(): MessageWithUser {
   return {

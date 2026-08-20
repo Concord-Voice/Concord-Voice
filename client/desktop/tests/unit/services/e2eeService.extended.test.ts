@@ -27,31 +27,12 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 import { apiFetch } from '@/renderer/services/apiClient';
+import { deferred } from '../../helpers/deferred';
 const mockApiFetch = vi.mocked(apiFetch);
 
 describe('e2eeService — extended', () => {
   const testPassword = 'TestPassword123!';
   let regKeys: Awaited<ReturnType<typeof generateRegistrationKeys>>;
-
-  function deferred<T>() {
-    let resolvePromise: ((value: T) => void) | undefined;
-    let rejectPromise: ((reason?: unknown) => void) | undefined;
-    const promise = new Promise<T>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
-    });
-    return {
-      promise,
-      resolve(value: T) {
-        if (!resolvePromise) throw new Error('deferred promise was not initialized');
-        resolvePromise(value);
-      },
-      reject(reason?: unknown) {
-        if (!rejectPromise) throw new Error('deferred promise was not initialized');
-        rejectPromise(reason);
-      },
-    };
-  }
 
   type PromiseOutcome<T> =
     { status: 'fulfilled'; value: T } | { status: 'rejected'; reason: unknown };

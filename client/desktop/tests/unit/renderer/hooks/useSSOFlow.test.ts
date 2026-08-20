@@ -38,25 +38,12 @@ vi.mock('@/renderer/services/postLoginHydration', () => ({
 import { startSSOFlow, type SSOResult } from '@/renderer/services/ssoService';
 import { revokeAbortedSession } from '@/renderer/services/apiClient';
 import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
+import { deferred } from '../../../helpers/deferred';
 const mockedStartSSOFlow = startSSOFlow as unknown as ReturnType<typeof vi.fn>;
 const mockedRevokeAbortedSession = vi.mocked(revokeAbortedSession);
 const mockedHydratePostLogin = vi.mocked(hydratePostLogin);
 
 let originalElectron: typeof globalThis.electron;
-
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
-  let finish: ((value: T) => void) | null = null;
-  const promise = new Promise<T>((resolve) => {
-    finish = resolve;
-  });
-  return {
-    promise,
-    resolve: (value) => {
-      if (finish === null) throw new Error('deferred resolver was not initialized');
-      finish(value);
-    },
-  };
-}
 
 beforeEach(() => {
   // resetAllStores covers all known stores per the [internal]rules/tests.md

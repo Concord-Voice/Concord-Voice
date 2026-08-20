@@ -42,14 +42,6 @@ function jsonResponse(payload: unknown): Response {
   } as Response;
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
-  let resolvePromise: (value: T) => void = () => {};
-  const promise = new Promise<T>((resolve) => {
-    resolvePromise = resolve;
-  });
-  return { promise, resolve: resolvePromise };
-}
-
 async function flushFetchPath(): Promise<void> {
   for (let i = 0; i < 8; i += 1) {
     await Promise.resolve();
@@ -58,6 +50,7 @@ async function flushFetchPath(): Promise<void> {
 
 // Import after mocking
 import { clientConfigService } from '@/renderer/services/clientConfigService';
+import { deferred } from '../../helpers/deferred';
 
 beforeEach(() => {
   vi.useFakeTimers();

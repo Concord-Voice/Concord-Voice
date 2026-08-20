@@ -15,6 +15,7 @@ import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { vi } from 'vitest';
+import { deferred } from '../../../helpers/deferred';
 
 vi.mock('@/renderer/services/presenceHistoryService', async (importOriginal) => {
   const actual =
@@ -82,16 +83,6 @@ const UNAVAILABLE_SETTINGS: PresenceHistorySettings = {
   available: false,
   requiredConsent: null,
 };
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 
 function setOwner(userId = 'user-a', sessionId = 'session-a'): void {
   useUserStore.setState({

@@ -6,6 +6,7 @@ import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrid
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { useFriendStore, type Friend } from '@/renderer/stores/friendStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
+import { deferred } from '../../../helpers/deferred';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
@@ -20,14 +21,6 @@ const friend = (userId: string, username: string, displayName?: string): Friend 
   displayName,
   status: 'online',
 });
-
-function deferred() {
-  let resolve: () => void = () => {};
-  const promise = new Promise<void>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
 
 interface HarnessProps {
   onSaved?: (message: string) => void;

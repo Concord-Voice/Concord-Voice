@@ -14,6 +14,7 @@ import {
   searchMessages,
 } from '@/renderer/services/searchService';
 import type { ChatContext, MessageWithStatus } from '@/renderer/types/chat';
+import { deferred } from '../../helpers/deferred';
 
 // --- Mocks ---
 
@@ -139,14 +140,6 @@ const voiceCtx: ChatContext = {
   id: 'channel-3',
   serverId: 'server-1',
 };
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
-}
 
 // --- Tests ---
 

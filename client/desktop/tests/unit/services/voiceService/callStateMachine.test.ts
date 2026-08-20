@@ -46,6 +46,7 @@ import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useDMStore } from '@/renderer/stores/dmStore';
 import type { DMConversation } from '@/renderer/stores/dmStore';
 import type { CallState } from '@/renderer/services/voiceService/callStateMachine';
+import { deferred } from '../../../helpers/deferred';
 
 import {
   initiateDMCall,
@@ -125,16 +126,6 @@ function errorResponse(status: number, body: string): Response {
     json: async () => ({}),
     text: async () => body,
   } as Response;
-}
-
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
 }
 
 beforeEach(() => {

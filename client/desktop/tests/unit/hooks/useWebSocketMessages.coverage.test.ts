@@ -95,30 +95,10 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
 
 import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
 import { speak as ttsSpeak } from '@/renderer/services/ttsService';
+import { createMockWsService, requireHandler } from '../../helpers/wsServiceMock';
+import { deferred } from '../../helpers/deferred';
 
 const mockTtsSpeak = vi.mocked(ttsSpeak);
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyHandler = (...args: any[]) => void;
-
-function createMockWsService() {
-  const handlers = new Map<string, AnyHandler>();
-  return {
-    handlers,
-    on: vi.fn((type: string, handler: AnyHandler) => {
-      handlers.set(type, handler);
-      return () => handlers.delete(type);
-    }),
-    onConnectionChange: vi.fn(() => () => {}),
-    disconnect: vi.fn(),
-  };
-}
-
-function requireHandler(ws: ReturnType<typeof createMockWsService>, eventName: string): AnyHandler {
-  const handler = ws.handlers.get(eventName);
-  if (!handler) throw new Error(`missing ${eventName} handler`);
-  return handler;
-}
 
 /** Helper to render the hook and get a handler by event name. */
 function setupHandler(eventName: string) {
@@ -127,26 +107,6 @@ function setupHandler(eventName: string) {
   const handler = requireHandler(ws, eventName);
   expect(handler).toBeDefined();
   return { ws, handler, unmount };
-}
-
-function deferred<T>() {
-  let resolvePromise: ((value: T) => void) | undefined;
-  let rejectPromise: ((reason?: unknown) => void) | undefined;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  return {
-    promise,
-    resolve(value: T) {
-      if (!resolvePromise) throw new Error('deferred promise was not initialized');
-      resolvePromise(value);
-    },
-    reject(reason?: unknown) {
-      if (!rejectPromise) throw new Error('deferred promise was not initialized');
-      rejectPromise(reason);
-    },
-  };
 }
 
 beforeEach(() => {

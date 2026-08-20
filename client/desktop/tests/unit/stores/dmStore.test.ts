@@ -7,6 +7,7 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { mockMessage } from '../../mocks/fixtures';
 import { http, HttpResponse } from 'msw';
+import { deferred } from '../../helpers/deferred';
 
 const mockInvalidateChannelKey = vi.fn();
 
@@ -22,14 +23,6 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 const API_BASE = 'http://localhost:8080';
-
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-}
 
 const mockConversation: DMConversation = {
   id: 'conv-1',

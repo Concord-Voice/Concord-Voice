@@ -108,22 +108,12 @@ import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStor
 import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { mockUser } from '../../mocks/fixtures';
+import { deferred } from '../../helpers/deferred';
 
 const mockApiFetch = vi.mocked(apiFetch);
 const mockDerivePreferencesKey = vi.mocked(derivePreferencesKeyArgon2id);
 const mockEncryptBlob = vi.mocked(encryptBlob);
 const mockUnwrapPrivateKey = vi.mocked(unwrapPrivateKey);
-
-function deferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
 
 /**
  * #2415: the continuation triple an ADOPTING server appends to a committed 2xx

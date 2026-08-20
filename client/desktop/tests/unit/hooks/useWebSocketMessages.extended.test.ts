@@ -68,21 +68,9 @@ vi.mock('@/renderer/services/apiClient', () => ({
 import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
 import { notificationSoundService } from '@/renderer/services/notificationSoundService';
+import { createMockWsService } from '../../helpers/wsServiceMock';
 
 // Build a mock wsService with on() that captures handlers
-function createMockWsService() {
-  type HandlerFn = (...args: unknown[]) => void;
-  const handlers = new Map<string, HandlerFn>();
-  return {
-    handlers,
-    on: vi.fn((type: string, handler: HandlerFn) => {
-      handlers.set(type, handler);
-      return () => handlers.delete(type);
-    }),
-    onConnectionChange: vi.fn(() => () => {}),
-    disconnect: vi.fn(),
-  };
-}
 
 function addDMConversation(id: string, unreadCount = 0) {
   useDMStore.getState().addConversation({

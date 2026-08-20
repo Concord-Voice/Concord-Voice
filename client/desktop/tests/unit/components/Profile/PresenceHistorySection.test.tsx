@@ -8,6 +8,7 @@ import { useAuthStore } from '@/renderer/stores/authStore';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { clientConfigService } from '@/renderer/services/clientConfigService';
 import PresenceHistorySection from '@/renderer/components/Profile/PresenceHistorySection';
+import { deferred } from '../../../helpers/deferred';
 
 const API_BASE = 'http://localhost:8080';
 const HISTORY_ENDPOINT = `${API_BASE}/api/v1/users/me/presence-history`;
@@ -35,25 +36,6 @@ const CATEGORY_LABELS = {
 } as const;
 
 type HistoryCategory = keyof typeof CATEGORY_LABELS;
-
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolvePromise: ((value: T) => void) | undefined;
-  const promise = new Promise<T>((resolve) => {
-    resolvePromise = resolve;
-  });
-  return {
-    promise,
-    resolve: (value) => {
-      if (!resolvePromise) throw new Error('Deferred promise was not initialized');
-      resolvePromise(value);
-    },
-  };
-}
 
 function settings(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

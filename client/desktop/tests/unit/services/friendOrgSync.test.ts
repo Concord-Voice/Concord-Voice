@@ -7,14 +7,6 @@ import { http, HttpResponse } from 'msw';
 
 const API_BASE = 'http://localhost:8080';
 
-function deferred<T>() {
-  let resolve: (value: T | PromiseLike<T>) => void = () => {};
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
-
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
@@ -24,6 +16,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 import { e2eeService } from '@/renderer/services/e2eeService';
+import { deferred } from '../../helpers/deferred';
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => server.close());

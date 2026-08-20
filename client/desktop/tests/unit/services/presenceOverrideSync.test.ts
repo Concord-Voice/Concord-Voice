@@ -20,16 +20,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 import { e2eeService } from '@/renderer/services/e2eeService';
-
-function deferred<T>() {
-  let resolve: (value: T | PromiseLike<T>) => void = () => {};
-  let reject: (reason?: unknown) => void = () => {};
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
+import { deferred } from '../../helpers/deferred';
 
 function remotePreference(version: number, encryptedData = 'remote-ciphertext') {
   return {

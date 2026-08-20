@@ -68,21 +68,9 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { createMockWsService } from '../../helpers/wsServiceMock';
 
 // ── Mock wsService that captures handlers ──────────────────────────────────
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyHandler = (...args: any[]) => void;
-function createMockWsService() {
-  const handlers = new Map<string, AnyHandler>();
-  return {
-    handlers,
-    on: vi.fn((type: string, handler: AnyHandler) => {
-      handlers.set(type, handler);
-      return () => handlers.delete(type);
-    }),
-    onConnectionChange: vi.fn(() => () => {}),
-  };
-}
 
 const UUID_FROM = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const UUID_TO = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
