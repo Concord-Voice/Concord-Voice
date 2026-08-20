@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -351,4 +352,135 @@ func TestHandleDMMessagePlaintextAcceptedWithKeyVersion(t *testing.T) {
 
 	resp := readClientMsg(t, setup.client)
 	assert.NotEqual(t, "error", resp["type"], "DM with valid key_version should be accepted under E2EE-everywhere")
+}
+
+// #2832: enforceWSEpoch and enforceDMEpoch previously answered `return true` for a
+// non-positive epoch, which SKIPPED the revocation lookup entirely — a client that
+// sent key_version 0 was waved past the very check the epoch exists to drive. They
+// now fail closed.
+//
+// These functions are called DIRECTLY here on purpose. Through the real callers the
+// values below are unreachable: validateEnvelope rejects a missing or non-positive
+// key_version upstream and closes the socket, so no fixture routed through
+// handleMessage or handleDMMessage can exercise the guard. Do not delete this test
+// as "unreachable" — a direct call is the only way to pin the guard's behaviour
+// independently of the upstream validation that currently masks it, and it is that
+// masking which let the inverted condition survive from the pre-#201 era.
+func TestEnforceEpochGuards_RejectNonPositiveKeyVersion(t *testing.T) {
+	tests := []struct {
+		name       string
+		keyVersion int
+	}{
+		{name: "zero", keyVersion: 0},
+		{name: "negative", keyVersion: -1},
+	}
+
+	for _, tt := range tests {
+		t.Run("enforceWSEpoch "+tt.name, func(t *testing.T) {
+			setup := setupEpochTest(t, false, false)
+			channelUUID := uuid.New()
+			msg := IncomingMessage{ClientID: setup.client.ID}
+
+			assert.False(t, setup.hub.enforceWSEpoch(msg, channelUUID, channelUUID.String(), tt.keyVersion))
+
+			resp := readClientMsg(t, setup.client)
+			assert.Equal(t, "error", resp["type"])
+			data, dataOK := resp["data"].(map[string]interface{})
+			require.True(t, dataOK, "error response must carry a data object")
+			assert.Equal(t, errMsgFailedVerifyKeyEpoch, data["message"])
+		})
+
+		t.Run("enforceDMEpoch "+tt.name, func(t *testing.T) {
+			setup := setupEpochTest(t, false, false)
+			convUUID, err := uuid.Parse(setup.convID)
+			require.NoError(t, err)
+			msg := IncomingMessage{ClientID: setup.client.ID}
+
+			assert.False(t, setup.hub.enforceDMEpoch(msg, convUUID, tt.keyVersion))
+
+			resp := readClientMsg(t, setup.client)
+			assert.Equal(t, "error", resp["type"])
+			data, dataOK := resp["data"].(map[string]interface{})
+			require.True(t, dataOK, "error response must carry a data object")
+			assert.Equal(t, errMsgFailedVerifyKeyEpoch, data["message"])
+		})
+	}
+}
+
+// #2832: extractKeyVersion must mirror validateEnvelope's accepted type set exactly.
+// The int case is the one that regressed: it passed validateEnvelope, then failed the
+// call sites' float64-only assertion and was silently relabelled epoch 1.
+// TestValidateEnvelopeAgreesWithExtractKeyVersion pins the #2832 invariant that
+// validateEnvelope and extractKeyVersion cannot diverge. They were separate
+// predicates over the same field and disagreed twice — on int-typed values and
+// on NaN — which is how a validated value got replaced by a server-chosen one.
+// validateEnvelope now delegates, so this test fails loudly if anyone
+// reintroduces an independent predicate.
+func TestValidateEnvelopeAgreesWithExtractKeyVersion(t *testing.T) {
+	values := []interface{}{
+		float64(1), float64(3), float64(maxKeyVersion), 1, 3, maxKeyVersion,
+		float64(0), float64(-1), 0, -1, 3.5, 1.25,
+		math.Inf(1), math.Inf(-1), math.NaN(), 1e100, maxKeyVersion + 1,
+		"1", nil, true,
+	}
+
+	for _, v := range values {
+		msg := &IncomingMessage{Data: map[string]interface{}{keyKeyVersion: v}}
+		_, extractOK := extractKeyVersion(msg)
+		validateOK := validateEnvelope(msg) == nil
+		assert.Equal(t, extractOK, validateOK,
+			"validateEnvelope and extractKeyVersion disagree on %#v", v)
+	}
+
+	// Absent key, checked separately since the map has no entry at all.
+	empty := &IncomingMessage{Data: map[string]interface{}{}}
+	_, extractOK := extractKeyVersion(empty)
+	assert.False(t, extractOK)
+	assert.Error(t, validateEnvelope(empty))
+}
+
+func TestExtractKeyVersion(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     map[string]interface{}
+		expected int
+		ok       bool
+	}{
+		{name: "float64 three", data: map[string]interface{}{keyKeyVersion: float64(3)}, expected: 3, ok: true},
+		{name: "int three", data: map[string]interface{}{keyKeyVersion: 3}, expected: 3, ok: true},
+		{name: "float64 zero", data: map[string]interface{}{keyKeyVersion: float64(0)}},
+		{name: "int zero", data: map[string]interface{}{keyKeyVersion: 0}},
+		{name: "float64 negative", data: map[string]interface{}{keyKeyVersion: float64(-1)}},
+		{name: "int negative", data: map[string]interface{}{keyKeyVersion: -1}},
+		{name: "string", data: map[string]interface{}{keyKeyVersion: "1"}},
+		{name: "missing", data: map[string]interface{}{}},
+
+		// #2832 (CodeRabbit): a JSON number arrives as float64, and int(v) is
+		// lossy in ways that would persist an epoch the sender never claimed.
+		// Each case below returned a WRONG accepted value before the guard:
+		// 3.5 -> 3, 1.25 -> 1, +Inf -> MaxInt64, 1e100 -> MaxInt64. NaN passed
+		// the old negated bound check (!(NaN < 1) is true) and extracted as 0 —
+		// the very value the epoch guards exist to reject.
+		{name: "float64 fractional truncates to a different epoch", data: map[string]interface{}{keyKeyVersion: 3.5}},
+		{name: "float64 fractional just above one", data: map[string]interface{}{keyKeyVersion: 1.25}},
+		{name: "float64 positive infinity", data: map[string]interface{}{keyKeyVersion: math.Inf(1)}},
+		{name: "float64 negative infinity", data: map[string]interface{}{keyKeyVersion: math.Inf(-1)}},
+		{name: "float64 NaN", data: map[string]interface{}{keyKeyVersion: math.NaN()}},
+		{name: "float64 beyond int32", data: map[string]interface{}{keyKeyVersion: 1e100}},
+		{name: "int beyond maxKeyVersion", data: map[string]interface{}{keyKeyVersion: maxKeyVersion + 1}},
+
+		// Boundaries that MUST still be accepted.
+		{name: "float64 one", data: map[string]interface{}{keyKeyVersion: float64(1)}, expected: 1, ok: true},
+		{name: "float64 at maxKeyVersion", data: map[string]interface{}{keyKeyVersion: float64(maxKeyVersion)}, expected: maxKeyVersion, ok: true},
+		{name: "int at maxKeyVersion", data: map[string]interface{}{keyKeyVersion: maxKeyVersion}, expected: maxKeyVersion, ok: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			keyVersion, ok := extractKeyVersion(&IncomingMessage{Data: tt.data})
+
+			assert.Equal(t, tt.ok, ok)
+			assert.Equal(t, tt.expected, keyVersion)
+		})
+	}
 }

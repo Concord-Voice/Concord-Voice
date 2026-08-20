@@ -55,8 +55,9 @@ func TestGetMessagesCustomLimit(t *testing.T) {
 	// Send 3 messages
 	for i := 0; i < 3; i++ {
 		w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(user.AccessToken))
 		require.Equal(t, http.StatusCreated, w.Code)
 	}
@@ -94,8 +95,9 @@ func TestGetMessagesWithBeforePagination(t *testing.T) {
 	var msgIDs []string
 	for i := 0; i < 3; i++ {
 		w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(user.AccessToken))
 		require.Equal(t, http.StatusCreated, w.Code)
 
@@ -124,8 +126,9 @@ func TestSendMessageInvalidChannelID(t *testing.T) {
 	user := ts.CreateTestUser(t, "sendmsginvch")
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": "not-a-uuid",
-		"content":    "Hello",
+		"channel_id":  "not-a-uuid",
+		"content":     "Hello",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -138,7 +141,8 @@ func TestSendMessageMissingContent(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
+		"channel_id":  channelID,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -149,7 +153,8 @@ func TestSendMessageMissingChannelID(t *testing.T) {
 	user := ts.CreateTestUser(t, "sendmsgnoch")
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"content": "Hello world",
+		"content":     "Hello world",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -174,8 +179,9 @@ func TestSendMessageE2EEWithInvalidCiphertext(t *testing.T) {
 
 	// Content is not valid base64 ciphertext
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    "not-valid-base64-ciphertext",
+		"channel_id":  channelID,
+		"content":     "not-valid-base64-ciphertext",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -203,23 +209,33 @@ func TestSendMessageE2EEWithKeyVersion(t *testing.T) {
 	assert.Equal(t, float64(2), msg["key_version"])
 }
 
-func TestSendMessageDefaultKeyVersion(t *testing.T) {
+// #2832: this test previously asserted the opposite — that omitting key_version
+// yielded 201 with a server-invented epoch 1. Do NOT restore that. The epoch is
+// CLIENT-ATTESTED: if the server substitutes one, the revocation check in
+// enforceChannelEpoch runs against a value the sender never claimed, so a client
+// that simply omits the field sails past a revoked epoch. Missing key_version is
+// rejected, never defaulted.
+//
+// The 400 body is the generic bind error, not errMsgInvalidKeyVersion: the
+// `binding:"required,min=1"` tag on SendMessageRequest.KeyVersion rejects at
+// ShouldBindJSON, before enforceE2EE's fail-closed guard can be reached over
+// HTTP. That guard is defence-in-depth for non-HTTP callers.
+func TestSendMessageRejectsMissingKeyVersion(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "senddefkv")
 	serverID := ts.CreateTestServer(t, user.ID, "DefKV Server")
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
-	// key_version not set — should default to 1
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
 		"channel_id": channelID,
 		"content":    testhelpers.ValidCiphertext(),
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
-	assert.Equal(t, http.StatusCreated, w.Code)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	msg := body["message"].(map[string]interface{})
-	assert.Equal(t, float64(1), msg["key_version"])
+	assert.Equal(t, "Invalid request body", body["error"])
+	assert.Zero(t, countChannelMessages(t, ts, channelID), "no message may persist under a server-invented epoch")
 }
 
 func TestSendMessageEmbedsSuppressedByDefault(t *testing.T) {
@@ -230,8 +246,9 @@ func TestSendMessageEmbedsSuppressedByDefault(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -247,8 +264,9 @@ func TestSendMessageNonExistentChannel(t *testing.T) {
 	fakeChannelID := uuid.New().String()
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": fakeChannelID,
-		"content":    "Hello ghost channel",
+		"channel_id":  fakeChannelID,
+		"content":     "Hello ghost channel",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -309,8 +327,9 @@ func TestUpdateMessageE2EEEnforcement(t *testing.T) {
 
 	// Send encrypted message first
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 	require.Equal(t, http.StatusCreated, w.Code)
 
@@ -339,8 +358,9 @@ func TestUpdateMessageE2EESuccess(t *testing.T) {
 
 	// Send encrypted message
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 	require.Equal(t, http.StatusCreated, w.Code)
 
@@ -600,8 +620,9 @@ func TestSendMessage_RacingMembershipRemovalCannotOutrunPurge(t *testing.T) {
 	sendResult := make(chan int, 1)
 	go func() {
 		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(victim.AccessToken))
 		sendResult <- w.Code
 	}()
@@ -678,8 +699,9 @@ func TestSendMessage_RejoinedMemberCannotRestoreStaleSend(t *testing.T) {
 	sendResult := make(chan int, 1)
 	go func() {
 		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(victim.AccessToken))
 		sendResult <- w.Code
 	}()
@@ -725,8 +747,9 @@ func TestSendMessage_TimedOutDuringPreflightCannotPersist(t *testing.T) {
 	sendResult := make(chan int, 1)
 	go func() {
 		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(member.AccessToken))
 		sendResult <- w.Code
 	}()
@@ -767,8 +790,9 @@ func TestSendMessage_RejoinedMemberCannotUseStalePermissionCache(t *testing.T) {
 	ts.CreateChannelOverride(t, channelID, "user", member.ID, 0, int64(rbac.PermSendMessages))
 
 	w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(member.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -797,8 +821,9 @@ func TestSendMessage_MembershipLockHonorsTimeout(t *testing.T) {
 	started := time.Now()
 	go func() {
 		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(member.AccessToken))
 		result <- w.Code
 	}()
@@ -832,8 +857,9 @@ func TestSendMessage_MembershipLockWriterFirstIsPurgedAfterRemoval(t *testing.T)
 	sendResult := make(chan int, 1)
 	go func() {
 		w := ts.DoRequest(http.MethodPost, pathAPIMessages, map[string]any{
-			"channel_id": channelID,
-			"content":    testhelpers.ValidCiphertext(),
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
 		}, testhelpers.AuthHeaders(victim.AccessToken))
 		sendResult <- w.Code
 	}()
@@ -954,8 +980,9 @@ func TestSuppressEmbedsSuccess(t *testing.T) {
 
 	// Send a message (embeds allowed since server permits)
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusCreated, w.Code)
 
@@ -1001,8 +1028,9 @@ func TestSuppressEmbedsAlreadySuppressed(t *testing.T) {
 
 	// Server has allow_embedded_content=false by default, so embeds_suppressed=true already
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusCreated, w.Code)
 
@@ -1034,8 +1062,9 @@ func TestSuppressEmbedsInsufficientPermissions(t *testing.T) {
 
 	// Owner sends a message
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	require.Equal(t, http.StatusCreated, w.Code)
 
@@ -1079,6 +1108,109 @@ func TestSendMessageRevokedEpochRejected(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Equal(t, "epoch_revoked", body["code"])
 	assert.Equal(t, float64(2), body["current_epoch"], "the ledger remains authoritative without an epoch-2 key row")
+}
+
+// #2832: every non-positive or non-integer key_version is rejected outright. The
+// pre-#2832 handler quietly rewrote such a value to epoch 1, which made the
+// revocation lookup run against an epoch the sender never attested to.
+func TestSendMessageRejectsInvalidKeyVersion(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "sendbadkv")
+	serverID := ts.CreateTestServer(t, user.ID, "BadKV Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+
+	tests := []struct {
+		name       string
+		keyVersion interface{}
+	}{
+		{name: "zero", keyVersion: 0},
+		{name: "negative", keyVersion: -1},
+		{name: "non-integer string", keyVersion: "1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
+				"channel_id":  channelID,
+				"content":     testhelpers.ValidCiphertext(),
+				"key_version": tt.keyVersion,
+			}, testhelpers.AuthHeaders(user.AccessToken))
+
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Zero(t, countChannelMessages(t, ts, channelID), "no message may persist for a rejected epoch")
+		})
+	}
+}
+
+// #2832: the persisted epoch is the one the client submitted, byte for byte. The
+// value is deliberately not 1 — a regression to the old hardcoded default would
+// otherwise still satisfy this assertion.
+func TestSendMessagePersistsSubmittedKeyVersion(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "sendkv3")
+	serverID := ts.CreateTestServer(t, user.ID, "KV3 Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+
+	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 3,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	require.Equal(t, http.StatusCreated, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	msg := testhelpers.JSONField[map[string]interface{}](t, body, "message")
+	assert.Equal(t, float64(3), msg["key_version"])
+
+	var storedKeyVersion int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT key_version FROM messages WHERE id = $1`,
+		testhelpers.JSONField[string](t, msg, "id"),
+	).Scan(&storedKeyVersion))
+	assert.Equal(t, 3, storedKeyVersion, "the stored epoch must be the submitted one, not a default")
+}
+
+// #2832: revocation is evaluated against the SUBMITTED epoch. Epoch 1 is revoked
+// here precisely because it is the value the old code substituted — a send under
+// epoch 5 must be judged on epoch 5, and a send under a revoked epoch must be
+// refused even though a live successor exists.
+func TestSendMessageRevocationUsesSubmittedEpoch(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "sendkvrevoked")
+	serverID := ts.CreateTestServer(t, user.ID, "Submitted Epoch Server")
+	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
+
+	_, err := ts.DB.Exec(
+		`INSERT INTO key_revocations (channel_id, revoked_epoch, successor_epoch, reason, revoked_by)
+		 VALUES ($1, 1, 5, 'test', $2)`,
+		channelID, user.ID,
+	)
+	require.NoError(t, err)
+
+	t.Run("unrevoked submitted epoch is accepted", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 5,
+		}, testhelpers.AuthHeaders(user.AccessToken))
+
+		assert.Equal(t, http.StatusCreated, w.Code, "epoch 5 is live; only the defaulted epoch 1 is revoked")
+	})
+
+	t.Run("revoked submitted epoch is refused", func(t *testing.T) {
+		w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
+			"channel_id":  channelID,
+			"content":     testhelpers.ValidCiphertext(),
+			"key_version": 1,
+		}, testhelpers.AuthHeaders(user.AccessToken))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, "epoch_revoked", body["code"])
+		assert.Equal(t, float64(5), body["current_epoch"])
+	})
 }
 
 // =====================================================================
@@ -1133,8 +1265,9 @@ func TestSendMessagePermissionDenied(t *testing.T) {
 	ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, 2048)
 
 	w := ts.DoRequest("POST", pathAPIMessages, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    "Should be denied",
+		"channel_id":  channelID,
+		"content":     "Should be denied",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(member.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)

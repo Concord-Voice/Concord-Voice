@@ -71,8 +71,9 @@ func TestOpsMessageCounterRESTCountsOnlySuccessfulInsert(t *testing.T) {
 	counter := &opsMessageCounterSpy{}
 
 	response := exerciseOpsMessageHandler(t, ts, counter, user.ID, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	})
 
 	require.Equal(t, http.StatusCreated, response.Code)
@@ -87,8 +88,9 @@ func TestOpsMessageCounterRESTSkipsValidationAndInsertFailures(t *testing.T) {
 	counter := &opsMessageCounterSpy{}
 
 	invalidResponse := exerciseOpsMessageHandler(t, ts, counter, user.ID, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    "",
+		"channel_id":  channelID,
+		"content":     "",
+		"key_version": 1,
 	})
 	require.Equal(t, http.StatusBadRequest, invalidResponse.Code)
 
@@ -109,8 +111,9 @@ func TestOpsMessageCounterRESTSkipsValidationAndInsertFailures(t *testing.T) {
 	})
 
 	failedResponse := exerciseOpsMessageHandler(t, ts, counter, user.ID, map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	})
 	require.Equal(t, http.StatusInternalServerError, failedResponse.Code)
 	require.Zero(t, counter.count(opsmetrics.MetricChannelMessagesTotal))
@@ -124,8 +127,9 @@ func setupWithMessage(t *testing.T) (*testhelpers.TestServer, testhelpers.TestUs
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	var body map[string]interface{}
@@ -146,8 +150,9 @@ func TestSendMessageSuccess(t *testing.T) {
 
 	ciphertext := testhelpers.ValidCiphertext()
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    ciphertext,
+		"channel_id":  channelID,
+		"content":     ciphertext,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -170,8 +175,9 @@ func TestSendMessageTimedOutMemberForbidden(t *testing.T) {
 	assert.NoError(t, err)
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(member.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -188,8 +194,9 @@ func TestSendMessageEmptyContent(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    "",
+		"channel_id":  channelID,
+		"content":     "",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -203,8 +210,9 @@ func TestSendMessageNotMember(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    "Unauthorized message",
+		"channel_id":  channelID,
+		"content":     "Unauthorized message",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(outsider.AccessToken))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -219,8 +227,9 @@ func TestSendMessageEncryptedChannelRequiresCiphertext(t *testing.T) {
 	// All channels require ciphertext under E2EE-everywhere (#201).
 	// Plaintext content should fail base64 + minimum-size validation.
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    "plaintext message",
+		"channel_id":  channelID,
+		"content":     "plaintext message",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -233,8 +242,9 @@ func TestSendMessageEncryptedChannelValidCiphertext(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "encrypted")
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -285,8 +295,9 @@ func TestGetMessagesPagination(t *testing.T) {
 
 	// Send a second message
 	ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	// Get messages before the first message
@@ -377,8 +388,9 @@ func TestSendMessageContentLength_AcceptsAt65536(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    strings.Repeat("A", 65536),
+		"channel_id":  channelID,
+		"content":     strings.Repeat("A", 65536),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -396,8 +408,9 @@ func TestSendMessageContentLength_RejectsAt65537(t *testing.T) {
 	channelID := ts.CreateTestChannel(t, serverID, "general")
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    strings.Repeat("A", 65537),
+		"channel_id":  channelID,
+		"content":     strings.Repeat("A", 65537),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)

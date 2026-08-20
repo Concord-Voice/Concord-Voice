@@ -22,8 +22,9 @@ func TestCredEpochRace_MessageSendRejected(t *testing.T) {
 	stale := ts.SimulateStaleEpochWindow(t, user.ID)
 
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    testhelpers.ValidCiphertext(),
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(stale))
 	assert.Equal(t, http.StatusUnauthorized, w.Code, "GuardTx must reject the admitted stale send")
 
@@ -44,8 +45,9 @@ func TestCredEpochRace_MessageEditRejected(t *testing.T) {
 
 	original := testhelpers.ValidCiphertext()
 	w := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
-		"channel_id": channelID,
-		"content":    original,
+		"channel_id":  channelID,
+		"content":     original,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 	require.Equal(t, http.StatusCreated, w.Code)
 	var body map[string]interface{}

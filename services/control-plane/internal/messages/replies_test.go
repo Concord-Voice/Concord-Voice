@@ -26,6 +26,7 @@ func TestSendMessageWithReply(t *testing.T) {
 		"channel_id":  channelID,
 		"content":     testhelpers.ValidCiphertext(),
 		"reply_to_id": originalID,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -51,6 +52,7 @@ func TestSendMessageReplyInvalidUUID(t *testing.T) {
 		"channel_id":  channelID,
 		"content":     testhelpers.ValidCiphertext(),
 		"reply_to_id": "not-a-uuid",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -67,6 +69,7 @@ func TestSendMessageReplyNonexistent(t *testing.T) {
 		"channel_id":  channelID,
 		"content":     testhelpers.ValidCiphertext(),
 		"reply_to_id": fakeID,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -85,6 +88,7 @@ func TestSendMessageReplyCrossChannel(t *testing.T) {
 		"channel_id":  channel2,
 		"content":     testhelpers.ValidCiphertext(),
 		"reply_to_id": msgInChannel1,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -101,6 +105,7 @@ func TestSendMessageReplyEmptyString(t *testing.T) {
 		"channel_id":  channelID,
 		"content":     testhelpers.ValidCiphertext(),
 		"reply_to_id": "",
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -126,6 +131,7 @@ func TestGetMessagesWithReplies(t *testing.T) {
 		"channel_id":  channelID,
 		"content":     testhelpers.ValidCiphertext(),
 		"reply_to_id": originalID,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	// Fetch messages
@@ -166,6 +172,7 @@ func TestGetMessagesReplyToDeleted(t *testing.T) {
 		"channel_id":  channelID,
 		"content":     replyCiphertext,
 		"reply_to_id": originalID,
+		"key_version": 1,
 	}, testhelpers.AuthHeaders(user.AccessToken))
 
 	// Delete the original message

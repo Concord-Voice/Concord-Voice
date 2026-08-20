@@ -15096,6 +15096,7 @@ components:
       required:
       - channel_id
       - content
+      - key_version
       properties:
         channel_id:
           type: string
@@ -15106,6 +15107,12 @@ components:
           maxLength: 65536
           description: 'Base64-encoded AES-256-GCM ciphertext (all channels are E2EE under the E2EE-everywhere
             posture, #201)'
+        key_version:
+          type: integer
+          minimum: 1
+          description: 'Key epoch used to encrypt content; revoked epochs are rejected. Client-attested and
+            required — the server never substitutes a default, so that revocation is checked against the epoch
+            the sender actually claimed (#2832)'
     UpdateMessageRequest:
       type: object
       required:

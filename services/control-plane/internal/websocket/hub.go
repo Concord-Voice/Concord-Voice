@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -1835,29 +1836,60 @@ type messageInput struct {
 // for the receiving client to identify the wrapping epoch.
 var errMissingKeyVersion = errors.New("missing or invalid key_version")
 
+// maxKeyVersion bounds an accepted epoch. int32's ceiling sits far above any
+// plausible rotation count and keeps the float64 range check exact: every int32
+// is representable in a float64 without rounding, so `v <= maxKeyVersion` admits
+// no value that int() would then convert differently.
+const maxKeyVersion = 1<<31 - 1
+
 // validateEnvelope returns errMissingKeyVersion if the incoming message's
-// Data map lacks key_version or carries a non-positive / non-integer
-// value. Called from both the channel-send and DM-send paths before any
-// DB work. On failure, the caller MUST send close frame 4400
+// Data map lacks key_version or carries a value that is not a usable epoch.
+// Called from both the channel-send and DM-send paths before any DB work. On
+// failure, the caller MUST send close frame 4400
 // "missing_or_invalid_key_version" and disconnect.
+//
+// #2832: this DELEGATES to extractKeyVersion rather than restating its rules.
+// The two were separate predicates over the same field and they disagreed
+// twice: on accepted types (an int passed validation, then fell through the
+// extractor's float64-only assertion and was relabelled epoch 1) and on NaN
+// (`!(NaN < 1)` is true, so NaN passed validation while the extractor's `>= 1`
+// rejected it). One predicate cannot disagree with itself.
 func validateEnvelope(msg *IncomingMessage) error {
-	raw, ok := msg.Data[keyKeyVersion]
-	if !ok {
-		return errMissingKeyVersion
-	}
-	switch v := raw.(type) {
-	case float64:
-		if v < 1 {
-			return errMissingKeyVersion
-		}
-	case int:
-		if v < 1 {
-			return errMissingKeyVersion
-		}
-	default:
+	if _, ok := extractKeyVersion(msg); !ok {
 		return errMissingKeyVersion
 	}
 	return nil
+}
+
+// extractKeyVersion returns the client-attested epoch, or ok=false when the
+// field is absent or unusable. It is the single authority on what counts as a
+// valid key_version; validateEnvelope defers to it.
+//
+// #2832: the stored epoch must be exactly what the sender claimed. A JSON
+// number arrives as float64, and a bare int(v) conversion is lossy in three
+// ways that each persist an epoch the client never sent:
+//
+//   - fractional values truncate: key_version 3.5 would be stored as epoch 3;
+//   - non-finite and oversized values are implementation-defined in Go, where
+//     +Inf and 1e100 both convert to MaxInt64;
+//   - NaN compares false against every bound, so it has to be excluded by a
+//     positive test (`v >= 1`) rather than a negated one (`!(v < 1)`).
+//
+// `v == math.Trunc(v)` admits only whole numbers, `v <= maxKeyVersion` excludes
+// +Inf and oversized magnitudes, and `v >= 1` excludes NaN and negative
+// infinity. The int case needs only the bounds; it cannot be fractional.
+func extractKeyVersion(msg *IncomingMessage) (int, bool) {
+	switch v := msg.Data[keyKeyVersion].(type) {
+	case float64:
+		if v >= 1 && v <= maxKeyVersion && v == math.Trunc(v) {
+			return int(v), true
+		}
+	case int:
+		if v >= 1 && v <= maxKeyVersion {
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 // rejectEnvelope writes the 4400 close frame to the client's WebSocket
@@ -1905,9 +1937,10 @@ func (h *Hub) parseMessageInput(msg IncomingMessage) *messageInput {
 		return nil
 	}
 
-	keyVersion := 1
-	if kv, ok := msg.Data[keyKeyVersion].(float64); ok && kv > 0 {
-		keyVersion = int(kv)
+	keyVersion, kvOK := extractKeyVersion(&msg)
+	if !kvOK {
+		h.rejectEnvelope(msg)
+		return nil
 	}
 
 	// All channels are encrypted under E2EE-everywhere (#201); allow ciphertext-length payloads.
@@ -2097,8 +2130,14 @@ func (h *Hub) fetchServerChannelDeliveryAuth(serverID uuid.UUID) (map[uuid.UUID]
 
 // enforceWSEpoch checks that the key epoch is not revoked. Returns false if revoked or on error.
 func (h *Hub) enforceWSEpoch(msg IncomingMessage, channelUUID uuid.UUID, channelID string, keyVersion int) bool {
-	if keyVersion <= 0 {
-		return true
+	// #2832: a non-positive epoch is REJECTED, not waved through. This previously read
+	// `return true`, which skipped the key_revocations lookup entirely — residue from
+	// the pre-#201 pre-image `if !isEncrypted || keyVersion <= 0`, whose first disjunct
+	// #1042 removed while leaving the second. validateEnvelope already rejects such a
+	// value upstream, so this is defence-in-depth against a future caller that does not.
+	if keyVersion < 1 {
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
+		return false
 	}
 	var epochRevoked bool
 	if err := h.db.QueryRow(
@@ -3410,9 +3449,10 @@ func (h *Hub) parseDMMessageFields(msg IncomingMessage) (*dmMessageInput, bool) 
 		msgType = "system"
 	}
 
-	keyVersion := 1
-	if kv, ok := msg.Data[keyKeyVersion].(float64); ok && kv > 0 {
-		keyVersion = int(kv)
+	keyVersion, kvOK := extractKeyVersion(&msg)
+	if !kvOK {
+		h.rejectEnvelope(msg)
+		return nil, false
 	}
 
 	if !h.validateContentLength(msg.ClientID, content) {
@@ -3486,8 +3526,11 @@ func (h *Hub) enforceDMEncryption(msg IncomingMessage, convUUID uuid.UUID, keyVe
 }
 
 func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion int) bool {
-	if keyVersion <= 0 {
-		return true
+	// #2832: see enforceWSEpoch — a non-positive epoch is rejected, never waved past the
+	// dm_key_revocations lookup.
+	if keyVersion < 1 {
+		h.sendError(msg.ClientID, errMsgFailedVerifyKeyEpoch)
+		return false
 	}
 	var epochRevoked bool
 	if err := h.db.QueryRow(

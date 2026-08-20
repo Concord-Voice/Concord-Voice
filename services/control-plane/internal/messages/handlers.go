@@ -40,6 +40,7 @@ const (
 	errMsgNotMember              = "Not a member of this channel's server"
 	errMsgFailedCheckMembership  = "Failed to check membership"
 	errMsgInvalidCiphertext      = "Invalid ciphertext format for E2EE channel"
+	errMsgInvalidKeyVersion      = "key_version is required and must be a positive integer"
 	messageWriteTimeout          = 3 * time.Second
 )
 
@@ -117,7 +118,7 @@ func NewHandler(db *sql.DB, log *logger.Logger, hub *websocket.Hub, resolver *rb
 type SendMessageRequest struct {
 	ChannelID   string  `json:"channel_id" binding:"required,uuid"`
 	Content     string  `json:"content" binding:"required,min=1,max=65536"`
-	KeyVersion  int     `json:"key_version"`
+	KeyVersion  int     `json:"key_version" binding:"required,min=1"`
 	ReplyToID   *string `json:"reply_to_id,omitempty"`  // Optional: UUID of message being replied to (must be same channel)
 	MentionMeta string  `json:"mention_meta,omitempty"` // Accepted but unused — mention routing is WebSocket-only. Field exists so REST clients don't get a 400 for including it.
 	GifSlug     *string `json:"gif_slug,omitempty"`     // Optional: KLIPY GIF slug to embed in the message
@@ -559,9 +560,21 @@ func (h *Handler) enforceE2EE(c *gin.Context, channelID string, content string, 
 		return 0, false
 	}
 
+	// #2832: the epoch is CLIENT-ATTESTED, never server-supplied. This previously read
+	// `if keyVersion <= 0 { keyVersion = 1 }` — residue from the pre-#201 era, when an
+	// unencrypted channel legitimately omitted the field. Left in place after #1042
+	// removed the is_encrypted selector, it made enforceChannelEpoch below check
+	// revocation against an epoch the sender never claimed.
+	//
+	// `binding:"required,min=1"` on SendMessageRequest.KeyVersion already rejects a
+	// missing or non-positive value at the bind boundary. This guard is deliberate
+	// defence-in-depth rather than redundancy: the defect being fixed here existed
+	// precisely because one layer assumed another had enforced the invariant. Reject —
+	// never substitute a default.
 	keyVersion := reqKeyVersion
-	if keyVersion <= 0 {
-		keyVersion = 1
+	if keyVersion < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidKeyVersion})
+		return 0, false
 	}
 
 	if !h.enforceChannelEpoch(c, h.db, channelID, keyVersion) {
