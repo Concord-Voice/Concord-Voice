@@ -13,9 +13,13 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/members"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
+	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
 // nopCapture is a wired-but-inert presencecapture.GraphPresenceCapture. The
@@ -41,28 +45,77 @@ func (nopCapture) CaptureInTx(
 func (nopCapture) Complete(context.Context, *sql.Tx, presencecapture.Plan) error { return nil }
 func (nopCapture) Abandon(presencecapture.Plan, presencecapture.Cause)           {}
 
-// The guard must interrogate handler state. Mirrors the #2445 review finding
-// that a check on the constructed value is a tautology.
-func TestGraphPresenceGuardDetectsUnwiredHandler(t *testing.T) {
-	f := &friends.Handler{}
-	u := &users.Handler{}
-
-	require.False(t, graphPresenceWiringComplete(f, u),
-		"guard must report incomplete when neither handler is wired")
-
-	f.SetGraphPresenceCapture(nopCapture{})
-	require.False(t, graphPresenceWiringComplete(f, u),
-		"guard must report incomplete while the users handler is still unwired")
+func fullyWiredGraphPresenceConsumers() graphPresenceConsumers {
+	c := graphPresenceConsumers{
+		friends: &friends.Handler{},
+		users:   &users.Handler{},
+		members: &members.Handler{},
+		invites: &invites.Handler{},
+		servers: &servers.Handler{},
+		erasure: &users.AccountService{},
+	}
+	c.friends.SetGraphPresenceCapture(nopCapture{})
+	c.users.SetGraphPresenceCapture(nopCapture{})
+	c.members.SetGraphPresenceCapture(nopCapture{})
+	c.invites.SetGraphPresenceCapture(nopCapture{})
+	c.servers.SetGraphPresenceCapture(nopCapture{})
+	c.erasure.SetGraphPresenceCapture(nopCapture{})
+	c.erasure.SetNATS(&natsclient.Client{})
+	return c
 }
 
-func TestGraphPresenceGuardPassesWhenBothWired(t *testing.T) {
-	f := &friends.Handler{}
-	u := &users.Handler{}
-	f.SetGraphPresenceCapture(nopCapture{})
-	u.SetGraphPresenceCapture(nopCapture{})
+func (c graphPresenceConsumers) complete() bool {
+	return graphPresenceWiringComplete(c)
+}
 
-	require.True(t, graphPresenceWiringComplete(f, u),
-		"guard must pass when both handlers are wired")
+// The guard must interrogate consumer state. Mirrors the #2445 review finding
+// that a check on the constructed value is a tautology.
+func TestGraphPresenceGuardDetectsUnwiredHandler(t *testing.T) {
+	c := graphPresenceConsumers{friends: &friends.Handler{}, users: &users.Handler{},
+		members: &members.Handler{}, invites: &invites.Handler{},
+		servers: &servers.Handler{}, erasure: &users.AccountService{}}
+
+	require.False(t, c.complete(),
+		"guard must report incomplete when no consumer is wired")
+
+	c.friends.SetGraphPresenceCapture(nopCapture{})
+	require.False(t, c.complete(),
+		"guard must report incomplete while the other consumers are still unwired")
+}
+
+// Every one of the six consumers must be able to fail the guard ON ITS OWN. A
+// guard that only notices the first missing arm is how #2447's four new
+// consumers would ship unwired and silently skip reconciliation.
+func TestGraphPresenceGuardDetectsEachUnwiredConsumer(t *testing.T) {
+	unwire := map[string]func(*graphPresenceConsumers){
+		"friends": func(c *graphPresenceConsumers) { c.friends = &friends.Handler{} },
+		"users":   func(c *graphPresenceConsumers) { c.users = &users.Handler{} },
+		"members": func(c *graphPresenceConsumers) { c.members = &members.Handler{} },
+		"invites": func(c *graphPresenceConsumers) { c.invites = &invites.Handler{} },
+		"servers": func(c *graphPresenceConsumers) { c.servers = &servers.Handler{} },
+		"erasure": func(c *graphPresenceConsumers) { c.erasure = &users.AccountService{} },
+		"erasure clear publisher": func(c *graphPresenceConsumers) {
+			// Capture wired, publisher NOT. The publish is the only mechanism
+			// that retracts an erased user's Custom Status, so a boot without
+			// NATS must fail rather than erase accounts that stay visible.
+			fresh := &users.AccountService{}
+			fresh.SetGraphPresenceCapture(nopCapture{})
+			c.erasure = fresh
+		},
+	}
+	for name, drop := range unwire {
+		t.Run(name, func(t *testing.T) {
+			c := fullyWiredGraphPresenceConsumers()
+			drop(&c)
+			require.False(t, c.complete(),
+				"an unwired %s must fail the boot guard, not silently skip reconciliation", name)
+		})
+	}
+}
+
+func TestGraphPresenceGuardPassesWhenAllSixWired(t *testing.T) {
+	require.True(t, fullyWiredGraphPresenceConsumers().complete(),
+		"guard must pass when every consumer is wired")
 }
 
 func TestGraphPresenceFamilyRegistryComplete(t *testing.T) {

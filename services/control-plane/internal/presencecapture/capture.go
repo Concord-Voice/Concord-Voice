@@ -50,6 +50,16 @@ const (
 	FamilyBlock
 	FamilyFriendsOfFriendsToggle
 
+	// #2447 membership and account lifecycle. Appended ABOVE familyCount so the
+	// dense enum's bound rises with iota and UnregisteredFamilies can still see a
+	// family whose author forgot the registry entry. Never reorder the values
+	// above: the enum is positionally dense and persisted nowhere, but two
+	// concurrent slices appending families collide AND compile.
+	FamilyMemberAdd
+	FamilyMemberJoin
+	FamilyMemberRemove
+	FamilyMemberBan
+
 	// familyCount is NOT a family. It is the exclusive upper bound of the dense
 	// enum, maintained by iota so an appended family raises it with no second
 	// edit — which is what lets UnregisteredFamilies see a family whose author
@@ -109,6 +119,17 @@ var familyRegistry = map[Family]FamilyPolicy{
 	FamilyFriendshipRemove:       {CanRevokeVisibility: true, CarriesCustomTextTopology: true},
 	FamilyBlock:                  {CanRevokeVisibility: true, CarriesCustomTextTopology: true},
 	FamilyFriendsOfFriendsToggle: {CanRevokeVisibility: true, CarriesCustomTextTopology: true},
+
+	// #2447. The additive pair MUST keep CanRevokeVisibility false: true seeds
+	// plan.viewers, which is a full device teardown of the user who just joined
+	// — the exact regression the pre-registry `default: return true` fallthrough
+	// caused. CarriesCustomTextTopology is true for all four because every
+	// membership change moves the Custom Status audience; the two axes are
+	// deliberately independent and must not be collapsed into one field.
+	FamilyMemberAdd:    {CanRevokeVisibility: false, CarriesCustomTextTopology: true},
+	FamilyMemberJoin:   {CanRevokeVisibility: false, CarriesCustomTextTopology: true},
+	FamilyMemberRemove: {CanRevokeVisibility: true, CarriesCustomTextTopology: true},
+	FamilyMemberBan:    {CanRevokeVisibility: true, CarriesCustomTextTopology: true},
 }
 
 // PolicyFor returns the registered policy for f, or ErrFamilyUnregistered.

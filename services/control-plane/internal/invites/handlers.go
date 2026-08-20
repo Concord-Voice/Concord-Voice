@@ -1,12 +1,18 @@
 package invites
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -29,6 +35,12 @@ type Handler struct {
 	log      *logger.Logger
 	hub      *websocket.Hub
 	resolver *rbac.Resolver
+
+	// graphPresence is the #2447 membership presence capture. nil means unwired.
+	graphPresence presencecapture.GraphPresenceCapture
+	// snapshots serves the additive (hydrate) direction, outside the
+	// presencecapture contract. nil means no hydrate.
+	snapshots *presence.ActivitySnapshotService
 }
 
 // NewHandler creates a new invite handler.
@@ -156,10 +168,20 @@ func checkBanAndMembership(tx txQuerier, serverID, userID string) (int, string, 
 	return 0, "", nil
 }
 
+// addMemberToServer inserts the membership row and its default roles inside the
+// caller's transaction.
+//
+// Both inserts carry ON CONFLICT DO NOTHING, matching members.AddMember. That is
+// what makes JoinServer's fail-OPEN posture safe: the additive path returns 200
+// on a committed row even when post-commit delivery fails (with
+// "presence":"pending"), so a client may
+// legitimately retry the join, and without ON CONFLICT that retry would 500 on a
+// duplicate key.
 func addMemberToServer(tx txQuerier, serverID, userID, inviteID string) error {
 	_, err := tx.Exec(`
 		INSERT INTO server_members (server_id, user_id, role, joined_at)
 		VALUES ($1, $2, 'member', NOW())
+		ON CONFLICT (server_id, user_id) DO NOTHING
 	`, serverID, userID)
 	if err != nil {
 		return err
@@ -169,6 +191,7 @@ func addMemberToServer(tx txQuerier, serverID, userID, inviteID string) error {
 		INSERT INTO member_roles (server_id, user_id, role_id)
 		SELECT $1, $2, id FROM roles
 		WHERE server_id = $1 AND is_default = TRUE
+		ON CONFLICT DO NOTHING
 	`, serverID, userID)
 	if err != nil {
 		return err
@@ -420,68 +443,148 @@ func (h *Handler) JoinServer(c *gin.Context) {
 		return
 	}
 
-	tx, err := h.db.Begin()
-	if err != nil {
-		h.log.Error("Failed to begin transaction", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedJoinServer})
-		return
+	ctx := c.Request.Context()
+
+	// ONE spec for the gates, the capture and the focal set. Invite join is
+	// ADDITIVE: FamilyMemberJoin is registered with CanRevokeVisibility false,
+	// because true would seed plan.viewers and disconnect every device of the
+	// user who just joined.
+	spec := presencehook.Spec{
+		Family:      presencecapture.FamilyMemberJoin,
+		Posture:     presencecapture.FailClosedBlockWrite,
+		PrincipalID: userID,
 	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback", "error", rbErr)
+
+	var server models.Server
+	var serverID string
+
+	// WithGatedTx acquires the sender gates BEFORE opening the transaction and
+	// owns both the rollback and — through Complete — the commit. This handler
+	// no longer calls tx.Commit(): doing so would yield sql.ErrTxDone.
+	err := presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		invite, lookupErr := h.lookupInvite(tx, req.Code)
+		if errors.Is(lookupErr, sql.ErrNoRows) {
+			return &joinRejection{status: http.StatusNotFound, msg: errMsgInvalidInviteCode}
 		}
-	}()
+		if lookupErr != nil {
+			return fmt.Errorf("query invite: %w", lookupErr)
+		}
 
-	invite, err := h.lookupInvite(tx, req.Code)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgInvalidInviteCode})
+		if status, msg := validateInvite(invite); status != 0 {
+			return &joinRejection{status: status, msg: msg}
+		}
+
+		if status, msg, checkErr := checkBanAndMembership(tx, invite.ServerID, userID); checkErr != nil {
+			return fmt.Errorf("check ban/membership: %w", checkErr)
+		} else if status != 0 {
+			return &joinRejection{status: status, msg: msg}
+		}
+
+		serverID = invite.ServerID
+
+		// Capture strictly precedes the write, with nothing between them.
+		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
+		if captureErr != nil {
+			return fmt.Errorf("capture invite join presence: %w", captureErr)
+		}
+
+		if addErr := addMemberToServer(tx, invite.ServerID, userID, invite.ID); addErr != nil {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("add member to server: %w", addErr)
+		}
+
+		fetched, fetchErr := h.fetchServer(tx, invite.ServerID)
+		if fetchErr != nil {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("fetch server: %w", fetchErr)
+		}
+		server = fetched
+
+		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+	})
+
+	var rejection *joinRejection
+	if errors.As(err, &rejection) {
+		c.JSON(rejection.status, gin.H{"error": rejection.msg})
 		return
 	}
+	// A DURABLE join whose presence delivery failed must NOT return here. The
+	// membership row is committed, and returning would skip broadcastMemberJoined
+	// and — far worse — createPendingKeyRequests, leaving the joiner with no path
+	// to any channel key. The retry that might repair it does not exist:
+	// checkBanAndMembership 409s a second join before the insert is reached. Same
+	// class as the kick/ban fall-through (code review, PR #2840).
+	var deliveryFailure *presencehook.Failure
 	if err != nil {
-		h.log.Error("Failed to query invite", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedJoinServer})
-		return
+		failure := presencehook.Classify(err)
+		h.log.Error("Failed to join server", "failure_class", failure.Code, "error", err)
+		if !errors.Is(err, presencecapture.ErrPostCommitDelivery) {
+			if retryAfter, ok := failure.RetryAfterHeader(); ok {
+				c.Header(presencehook.HeaderRetryAfter, retryAfter)
+			}
+			c.JSON(failure.Status, gin.H{"error": failure.Body(errMsgFailedJoinServer)})
+			return
+		}
+		deliveryFailure = &failure
 	}
 
-	if status, msg := validateInvite(invite); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
+	server.ServerTier = entitlements.ResolveServerTier(ctx, h.db, server.ID)
+
+	h.log.Info("User joined server", "user_id", userID, "server_id", serverID)
+	h.broadcastMemberJoined(serverID, userID)
+	h.createPendingKeyRequests(serverID, userID)
+
+	// Post-commit and fail-OPEN, exactly as members.AddMember: a missed hydrate
+	// shows the joiner less than they are entitled to and self-corrects.
+	h.hydrateJoinerPresence(ctx, userID)
+
+	// Joined, broadcast and key-requested; only presence delivery is unsettled.
+	// The additive posture fails OPEN, so this stays a success — it just reports
+	// the unsettled fan-out rather than a bare 200.
+	if deliveryFailure != nil {
+		c.JSON(http.StatusOK, gin.H{"server": server, "role": "member", "presence": "pending"})
 		return
 	}
-
-	if status, msg, checkErr := checkBanAndMembership(tx, invite.ServerID, userID); checkErr != nil {
-		h.log.Error("Failed to check ban/membership", "error", checkErr)
-		c.JSON(status, gin.H{"error": msg})
-		return
-	} else if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
-	}
-
-	if err := addMemberToServer(tx, invite.ServerID, userID, invite.ID); err != nil {
-		h.log.Error("Failed to add member to server", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedJoinServer})
-		return
-	}
-
-	server, err := h.fetchServer(tx, invite.ServerID)
-	if err != nil {
-		h.log.Error("Failed to fetch server", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedJoinServer})
-		return
-	}
-	server.ServerTier = entitlements.ResolveServerTier(c.Request.Context(), h.db, server.ID)
-
-	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedJoinServer})
-		return
-	}
-
-	h.log.Info("User joined server", "user_id", userID, "server_id", invite.ServerID)
-	h.broadcastMemberJoined(invite.ServerID, userID)
-	h.createPendingKeyRequests(invite.ServerID, userID)
 
 	c.JSON(http.StatusOK, gin.H{"server": server, "role": "member"})
+}
+
+// joinRejection carries a non-5xx outcome out of the hooked transaction. The
+// pre-hook handler wrote its response inline and relied on the deferred
+// rollback; WithGatedTx's closure must return an error instead, so the status
+// and message ride along rather than being flattened into a generic 500.
+type joinRejection struct {
+	status int
+	msg    string
+}
+
+func (e *joinRejection) Error() string { return e.msg }
+
+// hydrateJoinerPresence pushes the newly authorized viewer their current
+// snapshot. It runs AFTER the commit and NEVER changes the response: hydration
+// has no minuend, so a missed hydrate shows the joiner less than they are
+// entitled to and self-corrects on the next presence event.
+//
+// Duplicated in members and invites, and it stays that way — the #2840 scope
+// review proposed hoisting it, and BOTH obvious homes are blocked by a real
+// constraint. internal/presence cannot host it: that package forbids importing
+// pkg/logger at all, enforced by TestActivityProductionEmitsNoPayloadOrIdentityLogs,
+// so a helper that logs cannot live there. internal/presencehook cannot host it
+// either: it deliberately imports only the zero-internal-dependency
+// presencecapture leaf, and giving it a dependency on presence to host a helper
+// would invert that layering. Twelve duplicated lines is the cheaper defect.
+func (h *Handler) hydrateJoinerPresence(ctx context.Context, viewerID string) {
+	if h.snapshots == nil {
+		return
+	}
+	parsed, parseErr := uuid.Parse(viewerID)
+	if parseErr != nil {
+		h.log.Error("Presence hydrate skipped", "failure_class", "invalid_viewer")
+		return
+	}
+	if _, err := h.snapshots.Snapshot(ctx, parsed); err != nil {
+		h.log.Error("Presence hydrate failed", "failure_class", "delivery")
+	}
 }
 
 func (h *Handler) lookupInvite(tx *sql.Tx, code string) (models.ServerInvite, error) {
@@ -620,4 +723,26 @@ func (h *Handler) GetInviteInfo(c *gin.Context) {
 		"member_count":  memberCount,
 		"valid":         valid,
 	})
+}
+
+// SetGraphPresenceCapture wires the #2447 membership presence capture. A nil
+// capture leaves this handler behaving exactly as it did before the hook, so a
+// replica without it degrades to the pre-existing <=90s presence TTL.
+func (h *Handler) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {
+	h.graphPresence = c
+}
+
+// HasGraphPresenceCapture reports whether the capture was wired. The router's
+// boot guard interrogates the HANDLER through this, never the constructed
+// reconciler value: graphpresence.New always returns a non-nil pointer, so a
+// check on that value is a tautology that still boots with the wiring line
+// deleted -- the one fail-OPEN path the guard exists to catch.
+func (h *Handler) HasGraphPresenceCapture() bool { return h.graphPresence != nil }
+
+// SetActivitySnapshots wires the viewer-scoped snapshot service the additive
+// direction hydrates through. Nil means no hydrate, which is a safe degrade:
+// hydration has no minuend, so a missed hydrate shows the joiner LESS than they
+// are entitled to and self-corrects on the next presence event.
+func (h *Handler) SetActivitySnapshots(s *presence.ActivitySnapshotService) {
+	h.snapshots = s
 }

@@ -2,16 +2,20 @@
 package servers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -40,6 +44,9 @@ type Handler struct {
 	tiers       entitlements.TierResolver       // user-axis tier resolution (#1555 server-creation cap)
 	serverTiers entitlements.ServerTierResolver // server-axis tier resolution (#1521)
 	store       media.ObjectDeleter             // nil when object storage is not configured
+
+	// graphPresence is the #2447 membership presence capture. nil means unwired.
+	graphPresence presencecapture.GraphPresenceCapture
 }
 
 // NewHandler creates a new server handler
@@ -581,18 +588,41 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 		return
 	}
 
-	// Check if user is owner
-	var ownerID string
-	ownerQuery := `
-		SELECT owner_id FROM servers WHERE id = $1
-	`
+	ctx := c.Request.Context()
 
-	err := h.db.QueryRow(ownerQuery, serverID).Scan(&ownerID)
-	if err == sql.ErrNoRows {
+	// ONE transaction covering lock -> owner check -> capture -> delete. The
+	// ownership read and the delete used to be two separate autocommit
+	// statements, leaving a TOCTOU window: ownership could transfer between
+	// them and the delete would still proceed on the stale answer.
+	//
+	// Server delete takes NO presencehook.Spec and appends no family. It carries
+	// no rail obligation: the fan-out is N senders, the sender set is unknowable
+	// before the gates are acquired, and a large member set would saturate the
+	// sender-gate stripe array. So the capture here is in-memory and fail-closed,
+	// and graphPresence stays wired on this handler only as the seam #2448 needs.
+	//
+	// Lock order: users FIRST, then servers. This path's users set is empty, so
+	// the chain degenerates to `servers FOR UPDATE` alone — but the rule binds
+	// the moment #2448 adds a rail obligation, which is why it is stated here.
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error(errMsgFailedDelete, "failure_class", "begin")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+		return
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back server delete", "failure_class", "rollback")
+		}
+	}()
+
+	var ownerID string
+	err = tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
 		return
 	} else if err != nil {
-		h.log.Error("Failed to check ownership", "error", err)
+		h.log.Error("Failed to check ownership", "failure_class", "lock")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
 		return
 	}
@@ -602,14 +632,51 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 		return
 	}
 
-	// Delete server (cascades to members and channels)
-	deleteQuery := `DELETE FROM servers WHERE id = $1`
-
-	_, err = h.db.Exec(deleteQuery, serverID)
-	if err != nil {
-		h.log.Error("Failed to delete server", "error", err)
+	// Capture BEFORE the cascade, fail closed. server_members cascades from
+	// servers, so after the DELETE below this read returns nothing — which is
+	// the entire reason the capture has to precede it.
+	affected, captureErr := h.captureServerAudience(ctx, tx, serverID)
+	oversized := errors.Is(captureErr, errServerAudienceTooLarge)
+	if captureErr != nil && !oversized {
+		h.log.Error(errMsgFailedDelete, "failure_class", "capture")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
 		return
+	}
+
+	// Delete server (cascades to members and channels)
+	if _, err = tx.ExecContext(ctx, `DELETE FROM servers WHERE id = $1`, serverID); err != nil {
+		h.log.Error(errMsgFailedDelete, "failure_class", "write")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		h.log.Error(errMsgFailedDelete, "failure_class", "commit_unresolved")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+		return
+	}
+
+	// context.WithoutCancel, not ctx: the delete has already COMMITTED, so this
+	// is a compensating action and a client that aborts the request must not be
+	// able to skip it. Same defect class as the ctx.Err() guard removed from
+	// publishErasureCleared in this PR; the sibling site had it too (security
+	// review, PR #2840).
+	reconcileCtx, cancelReconcile := context.WithTimeout(
+		context.WithoutCancel(ctx), serverDeletePresenceTimeout)
+	defer cancelReconcile()
+	if oversized {
+		// Audience too large to reconcile exactly. Fall back to the conservative
+		// fleet-wide disconnect — the sanctioned substitute wherever the affected
+		// set cannot be resolved safely. Reconciling a TRUNCATED audience would be
+		// worse: the untouched remainder would hold revoked state with no signal.
+		h.log.Info("Server delete audience exceeded the capture bound; disconnecting conservatively")
+		if h.hub != nil {
+			if err := h.hub.DisconnectAllRichPresenceClients(reconcileCtx); err != nil {
+				h.log.Error("Server delete conservative disconnect failed", "failure_class", "delivery")
+			}
+		}
+	} else {
+		h.disconnectServerAudience(reconcileCtx, affected)
 	}
 
 	h.log.Info("Server deleted", "server_id", serverID, "user_id", userID)
@@ -625,4 +692,97 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Server deleted successfully"})
+}
+
+// SetGraphPresenceCapture wires the #2447 membership presence capture. A nil
+// capture leaves this handler behaving exactly as it did before the hook, so a
+// replica without it degrades to the pre-existing <=90s presence TTL.
+func (h *Handler) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {
+	h.graphPresence = c
+}
+
+// HasGraphPresenceCapture reports whether the capture was wired. The router's
+// boot guard interrogates the HANDLER through this, never the constructed
+// reconciler value: graphpresence.New always returns a non-nil pointer, so a
+// check on that value is a tautology that still boots with the wiring line
+// deleted -- the one fail-OPEN path the guard exists to catch.
+func (h *Handler) HasGraphPresenceCapture() bool { return h.graphPresence != nil }
+
+// serverDeletePresenceTimeout bounds the post-commit presence reconcile. It is
+// a const rather than configuration, matching the bounds discipline the other
+// capture paths use.
+const serverDeletePresenceTimeout = 10 * time.Second
+
+// maxServerDeleteAudience bounds the in-memory capture. Every other capture path
+// carries a const bound (maxFocalSenders, maxCapturedViewers); this hand-rolled
+// one did not, so a very large server handed an unbounded slice to a synchronous
+// in-request disconnect (security review, PR #2840).
+const maxServerDeleteAudience = 5000
+
+// errServerAudienceTooLarge signals that the member set exceeded
+// maxServerDeleteAudience. The caller degrades to the conservative fleet-wide
+// disconnect rather than reconciling a truncated audience: a partial clear would
+// leave the untouched remainder holding revoked state with no signal at all,
+// which is worse than over-disconnecting.
+var errServerAudienceTooLarge = errors.New("servers: server audience exceeds the capture bound")
+
+// captureServerAudience reads the member set that defines this server's presence
+// audience, inside the caller's transaction and BEFORE the delete.
+//
+// Fails closed: a read error refuses the delete rather than proceeding with an
+// audience the handler can no longer reconstruct. Once DELETE FROM servers runs,
+// server_members has cascaded and this information is gone for good.
+func (h *Handler) captureServerAudience(ctx context.Context, tx *sql.Tx, serverID string) ([]uuid.UUID, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM server_members WHERE server_id = $1`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("read server audience: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var members []uuid.UUID
+	for rows.Next() {
+		var member uuid.UUID
+		if scanErr := rows.Scan(&member); scanErr != nil {
+			return nil, fmt.Errorf("scan server audience: %w", scanErr)
+		}
+		members = append(members, member)
+		if len(members) > maxServerDeleteAudience {
+			return nil, errServerAudienceTooLarge
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("iterate server audience: %w", rowsErr)
+	}
+	return members, nil
+}
+
+// disconnectServerAudience closes the captured members' Rich Presence clients so
+// each reconnect rebuilds an authorized snapshot. The deleted server's rows are
+// gone by then, so the rebuild simply omits it.
+//
+// A disconnect rather than an exact clear, deliberately. ClearServerVoice is
+// keyed on the specific voice channel a sender occupies, and discovering that
+// per member is the N-sender fan-out this path is explicitly excused from. The
+// conservative disconnect is the sanctioned fail-closed substitute the voice
+// bridge already uses wherever the audience cannot be determined safely.
+//
+// ponytail: blunt disconnect of the whole member set, no durable plan. Server
+// deletion is rare, so the hammer is affordable. Interim residual, named rather
+// than bounded: the active category decays within the presence TTL, but Custom
+// Status has no TTL and no heartbeat, so a member who is offline at delete time
+// keeps a stale value until their next reconnect. The failure mode is stale
+// state, never clear-a-successor. Upgrade path is #2448's rail, which resolves
+// the sender set durably.
+func (h *Handler) disconnectServerAudience(ctx context.Context, members []uuid.UUID) {
+	if h.hub == nil || len(members) == 0 {
+		return
+	}
+	recipients := make(map[uuid.UUID]bool, len(members))
+	for _, member := range members {
+		recipients[member] = true
+	}
+	if err := h.hub.DisconnectRichPresenceClients(ctx, recipients); err != nil {
+		h.log.Error("Server delete presence disconnect failed", "failure_class", "delivery")
+	}
+	h.log.Info("Server delete presence reconciled", "member_count", len(members))
 }

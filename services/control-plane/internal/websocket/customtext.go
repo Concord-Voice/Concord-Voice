@@ -381,6 +381,53 @@ func (h *Hub) disconnectAllPrivacyCriticalClients(ctx context.Context) error {
 	return errors.Join(disconnectErr, ctx.Err())
 }
 
+// ClearErasedSenderCustomText broadcasts a Custom Status clear for ONE sender to
+// every local Rich Presence client, without computing an audience and without
+// disconnecting anyone.
+//
+// It exists for account erasure, where neither of the other two options works.
+// ClearCustomTextForPresenceAudience cannot: it recomputes the audience from the
+// database, and after erasure the sender's rows have cascaded away, so it would
+// resolve an empty set and clear nobody. A fleet-wide DISCONNECT can, but makes
+// the triggering message a denial-of-service primitive — the red-team PoCs on
+// PR #2840 proved a forged publish carrying any random UUID, an unbounded replay
+// of a genuine one, and a lookup error all reached that sink.
+//
+// A clear frame makes the action PROPORTIONAL to the claim. A client that never
+// held this sender's status ignores the frame, so a forged or replayed message
+// for an arbitrary id is inert rather than destructive, and the honest cost is
+// one small frame per connected client instead of a fleet-wide reconnect storm.
+//
+// Delivery is best-effort per client, exactly as sendPrivacyClearToUsers: a
+// client whose queue has no immediate capacity is disconnected so its reconnect
+// performs a fresh authorized snapshot.
+func (h *Hub) ClearErasedSenderCustomText(senderID uuid.UUID) {
+	// Fail closed on a nil receiver rather than panicking, matching the
+	// TopologyRail methods: a hub-less replica has no local clients to clear, and
+	// a panic inside a NATS callback would take the subscriber down.
+	if h == nil {
+		return
+	}
+	data, err := marshalCustomTextFrame(senderID, nil)
+	if err != nil {
+		log.Printf("[hub] failed to marshal erased-sender custom-text clear: %T", err)
+		return
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, client := range h.clients {
+		if !activityRichPresenceClient(client) {
+			continue
+		}
+		// enqueuePrivacyCritical already closes the client on overflow; the
+		// outcome is inspected only so the degrade is observable.
+		if enqueuePrivacyCritical(client, data) == privacyCriticalEnqueueDisconnectRequired {
+			log.Printf("[hub] erased-sender clear could not be enqueued; client disconnected")
+		}
+	}
+}
+
 // ClearCustomTextForPresenceAudience sends a privacy-critical clear only to the
 // sender's conservative base presence audience. Destructive key resets force
 // the Custom Status tier Off and delete materialized exceptions before fan-out,

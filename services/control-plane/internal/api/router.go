@@ -281,13 +281,40 @@ func requirePresenceRecheckWired(
 	}
 }
 
-// graphPresenceWiringComplete reports whether every #2446 consumer handler was
-// wired. It asks the HANDLERS, never the constructed reconciler:
+// graphPresenceWiringComplete reports whether every graph-presence consumer was
+// wired. It asks the CONSUMERS, never the constructed reconciler:
 // graphpresence.New always returns a non-nil pointer, so a check on that value
 // is a tautology that still boots with a SetGraphPresenceCapture line deleted —
 // the one fail-OPEN path this guard exists to catch.
-func graphPresenceWiringComplete(f *friends.Handler, u *users.Handler) bool {
-	return f.HasGraphPresenceCapture() && u.HasGraphPresenceCapture()
+//
+// Six consumers as of #2447: the two #2446 graph consumers plus membership,
+// invite join, server delete and account erasure — and, for erasure, its
+// cross-replica clear publisher too, because that publish is the only mechanism
+// that retracts an erased user's Custom Status anywhere. An unwired consumer is
+// a SILENT hazard — the handler serves traffic and skips reconciliation with no
+// error anywhere — which is why this stays a log.Fatal rather than a warning.
+func graphPresenceWiringComplete(c graphPresenceConsumers) bool {
+	return c.friends.HasGraphPresenceCapture() &&
+		c.users.HasGraphPresenceCapture() &&
+		c.members.HasGraphPresenceCapture() &&
+		c.invites.HasGraphPresenceCapture() &&
+		c.servers.HasGraphPresenceCapture() &&
+		c.erasure.HasGraphPresenceCapture() &&
+		c.erasure.HasErasureClearPublisher()
+}
+
+// graphPresenceConsumers groups the six consumers the boot guard interrogates.
+// A struct rather than six positional parameters: threading them individually
+// pushed requireGraphPresenceCaptureWired past the parameter limit, and six
+// same-shaped pointers in a row is exactly the signature where a transposed
+// argument compiles and silently checks the wrong handler twice.
+type graphPresenceConsumers struct {
+	friends *friends.Handler
+	users   *users.Handler
+	members *members.Handler
+	invites *invites.Handler
+	servers *servers.Handler
+	erasure *users.AccountService
 }
 
 // familyGaps is presencecapture.UnregisteredFamilies behind a package var, so
@@ -375,13 +402,12 @@ func requireGraphPresenceCaptureWired(
 	log *logger.Logger,
 	activityService *presence.ActivityService,
 	capture *graphpresence.Reconciler,
-	f *friends.Handler,
-	u *users.Handler,
+	consumers graphPresenceConsumers,
 ) {
 	if activityService == nil {
 		return
 	}
-	if !graphPresenceWiringComplete(f, u) {
+	if !graphPresenceWiringComplete(consumers) {
 		log.Fatal("graph presence capture is not wired on every consumer handler")
 	}
 	if !graphPresenceRailWired(capture) {
@@ -628,9 +654,21 @@ func NewRouter(
 
 	friendsHandler.SetGraphPresenceCapture(graphPresenceCapture)
 	usersHandler.SetGraphPresenceCapture(graphPresenceCapture)
+
+	// #2447 membership and account-lifecycle consumers. The erasure consumer
+	// (users.AccountService) is constructed later, inside buildPrivacyHandler, so
+	// requireGraphPresenceCaptureWired has moved to just after that call — a
+	// guard that runs before its last consumer exists would pass on a nil.
+	membersHandler.SetGraphPresenceCapture(graphPresenceCapture)
+	invitesHandler.SetGraphPresenceCapture(graphPresenceCapture)
+	serversHandler.SetGraphPresenceCapture(graphPresenceCapture)
+
+	// The additive (hydrate) direction. Deliberately NOT the capture: hydration
+	// sits outside the presencecapture contract because it has no minuend.
+	membersHandler.SetActivitySnapshots(activitySnapshotService)
+	invitesHandler.SetActivitySnapshots(activitySnapshotService)
+
 	requireGraphPresenceFamilyRegistry(log)
-	requireGraphPresenceCaptureWired(
-		log, activityService, graphPresenceCapture, friendsHandler, usersHandler)
 
 	// Both presence workers own a goroutine and a queue, and NOTHING called
 	// either Close: a graceful shutdown left queued plans undrained, so the
@@ -674,7 +712,21 @@ func NewRouter(
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
 	updatesHandler := updates.NewHandler(cfg, log)
-	privacyHandler := buildPrivacyHandler(db, redis, log, usersHandler, hub)
+	privacyHandler, accountService := buildPrivacyHandler(
+		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient)
+
+	// Runs here, not beside the other wiring: accountService is the last #2447
+	// consumer and is constructed on the line above.
+	requireGraphPresenceCaptureWired(
+		log, activityService, graphPresenceCapture,
+		graphPresenceConsumers{
+			friends: friendsHandler,
+			users:   usersHandler,
+			members: membersHandler,
+			invites: invitesHandler,
+			servers: serversHandler,
+			erasure: accountService,
+		})
 	oauthHandler := buildOAuthHandler(db, redis, cfg, authHandler, log)
 
 	// Client attestation (#677, ADR-0010). When REQUIRE_CLIENT_ATTESTATION=false

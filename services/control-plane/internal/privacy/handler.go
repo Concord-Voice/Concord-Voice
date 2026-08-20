@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"io"
 	"net/http"
 	"time"
@@ -76,19 +77,40 @@ func (h *Handler) EraseAccount(c *gin.Context) {
 		return
 	}
 
+	// deliveryFailed marks a DURABLE erasure whose presence delivery did not
+	// settle. The account is gone; only the fan-out failed.
+	var deliveryFailed bool
 	if err := h.account.DeleteAccount(c.Request.Context(), userID); err != nil {
 		if errors.Is(err, users.ErrUserNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
 			return
 		}
+		if !errors.Is(err, presencecapture.ErrPostCommitDelivery) {
+			if h.log != nil {
+				h.log.Error("erase-account: account deletion failed",
+					"user_id", userID,
+					"error", err,
+				)
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "account deletion failed"})
+			return
+		}
+		// Returning here would be two separate failures. First it would answer
+		// 500 for an account that IS erased, and a client retry then gets 404 —
+		// the duplicate-action lie the post-commit classification exists to
+		// prevent. Second, and worse, it would skip revokeAccessTokens below, so
+		// the jti blacklist and the user_disabled:<id> key are never written and
+		// an already-issued access token keeps working against an erased
+		// account. [internal]rules/backend.md requires both to be set BEFORE
+		// returning success (code review, PR #2840).
+		deliveryFailed = true
 		if h.log != nil {
-			h.log.Error("erase-account: account deletion failed",
+			h.log.Error("erase-account: presence delivery did not settle",
 				"user_id", userID,
+				"failure_class", "delivery",
 				"error", err,
 			)
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "account deletion failed"})
-		return
 	}
 
 	if err := h.revokeAccessTokens(c, userID); err != nil {
@@ -99,6 +121,15 @@ func (h *Handler) EraseAccount(c *gin.Context) {
 			)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "access token revocation failed"})
+		return
+	}
+
+	// Erased and de-authorized; only the presence fan-out is unsettled. Report
+	// that rather than a 204 the caller would read as fully settled.
+	if deliveryFailed {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Your account was deleted. Updating everyone who could see you is taking longer than usual.",
+		})
 		return
 	}
 

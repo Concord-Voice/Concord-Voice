@@ -18,6 +18,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
@@ -55,6 +56,14 @@ type NATSSubscriber struct {
 	dmRoomEmptyVerificationHook    func() error
 	// Deterministic test seam for conservative reconnect assertions.
 	disconnectAllRichPresenceClientsHook func()
+
+	// clearErasedSenderHook observes the erasure-clear sink in tests. It exists
+	// for the same reason the hook above does: the sink is a Hub call, and
+	// without a seam a test can only assert "nothing panicked", which holds
+	// even when the handler never reaches the sink at all. That is precisely
+	// how the erasure-clear tests went vacuous when this handler stopped
+	// disconnecting and started clearing (CodeRabbit, PR #2840).
+	clearErasedSenderHook func(uuid.UUID)
 	// permEnforcer re-pushes fresh permissions when a join lands (CV-CAN-007
 	// review P1 join-race): a join-authorize resolved before a mutation whose
 	// recheck sweep ran before this voice_participants row existed would
@@ -81,8 +90,13 @@ const (
 	// fall back to the existing 90-second presence expiry.
 	dmRoomEmptyCleanupAttempts   = 3
 	richPresenceLifecycleTimeout = 10 * time.Second
-	maxVoiceMutationReplayBytes  = 16 * 1024
-	maxVoiceReplayRemovedRooms   = 255
+
+	// msgErasureClearRejected is the single rejection message for the erasure
+	// clear. Named because every rejection arm shares it and a stray literal in a
+	// fifth would be invisible to a grep for the constant.
+	msgErasureClearRejected     = "Presence erasure clear rejected"
+	maxVoiceMutationReplayBytes = 16 * 1024
+	maxVoiceReplayRemovedRooms  = 255
 	// Private Calls are tightly bounded because their lifecycle generation is
 	// claimed and delivered as one participant set. Server rooms have a larger,
 	// explicit media-admission bound; heartbeat DB and media sets are each capped
@@ -3468,9 +3482,8 @@ func (s *NATSSubscriber) Subscribe() error {
 		s.handleVoiceLifecycleEvent,
 		s.handleVoiceLifecycleDispatchOverflow,
 	)
-	if _, err := s.nats.SubscribeWithSubject(
-		natsSubjectVoiceWildcard, dispatcher.enqueue,
-	); err != nil {
+	voiceSub, err := s.nats.SubscribeWithSubject(natsSubjectVoiceWildcard, dispatcher.enqueue)
+	if err != nil {
 		dispatcher.close()
 		return err
 	}
@@ -3478,8 +3491,168 @@ func (s *NATSSubscriber) Subscribe() error {
 	s.lifecycleDispatcher = dispatcher
 	s.lifecycleDispatchMu.Unlock()
 
+	// #2447: the cross-replica Custom Status clear for an erased account. This
+	// subscriber is the only place in the tree that already holds both a NATS
+	// connection and the Hub, so it carries the fan-out even though the event is
+	// not a voice event. The alternative -- giving the Hub its own NATS
+	// connection -- would add a transport to a component that deliberately has
+	// none.
+	if _, err := s.nats.Subscribe(
+		users.NATSSubjectPresenceErasureCleared, s.handlePresenceErasureCleared,
+	); err != nil {
+		s.unwindLifecycleSubscription(voiceSub, dispatcher)
+		return fmt.Errorf("subscribe presence erasure clear: %w", err)
+	}
+
 	s.log.Info("Subscribed to voice NATS events")
 	return nil
+}
+
+// handlePresenceErasureCleared drops the erased principal's already-delivered
+// Custom Status on THIS replica.
+//
+// It reuses the conservative disconnect rather than a targeted clear. Every
+// viewer reconnects, and readCustomTextSnapshotCandidate then re-derives
+// authorization per (viewer, sender) against rows the erasure has already
+// cascaded away, so the erased principal resolves to not-authorized with no
+// clear frame required. That is the same collapse the kick and ban paths rely
+// on.
+//
+// The payload is validated BEFORE acting: an unparseable id must not escalate
+// into a fleet-wide disconnect of every Rich Presence client.
+//
+// ponytail: fleet-wide conservative disconnect per erasure. Account erasure is
+// rare, so the hammer is affordable. Upgrade path if that ever stops being true:
+// carry the affected viewer set in the payload and disconnect only those.
+// erasedAccountStillExists reports whether the named account is STILL present,
+// which is the one case a clear provably must not act on.
+//
+// Defence in depth, not the barrier — "absent" is true of every id that was
+// never a user, so this cannot distinguish a forged id from an erased one. The
+// barrier is that the action itself is inert on a false claim. A lookup error
+// therefore reports "not present" and lets the clear proceed: an unreachable
+// database must not suppress a legitimate erasure clear, and a targeted clear is
+// harmless if the claim turns out to be wrong.
+func (s *NATSSubscriber) erasedAccountStillExists(erased uuid.UUID) bool {
+	checkCtx, cancelCheck := context.WithTimeout(
+		context.Background(), richPresenceLifecycleTimeout)
+	defer cancelCheck()
+
+	stillExists := false
+	queryErr := s.db.QueryRowContext(checkCtx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, erased,
+	).Scan(&stillExists)
+	if queryErr != nil {
+		s.log.Error("Presence erasure clear proceeding without confirmation",
+			"failure_class", "lookup")
+		return false
+	}
+	return stillExists
+}
+
+// unsubscriber is the one method unwindLifecycleSubscription needs from a
+// subscription. An interface rather than *nats.Subscription so this file does
+// not take a direct nats.go dependency purely to name a parameter.
+type unsubscriber interface{ Unsubscribe() error }
+
+// unwindLifecycleSubscription reverses what Subscribe already established, so a
+// later failure in the same call does not leave the dispatcher goroutine and the
+// wildcard subscription live.
+//
+// Extracted so it can be tested directly: reaching it through Subscribe would
+// need the erasure subscription to fail while the wildcard one succeeded, and
+// s.nats is a concrete client with no seam to make one call fail and not the
+// other. Without this the leak fix would ship unexercised (CodeRabbit, PR #2840).
+func (s *NATSSubscriber) unwindLifecycleSubscription(
+	voiceSub unsubscriber, dispatcher *voiceLifecycleDispatcher,
+) {
+	// A typed-nil *nats.Subscription is non-nil as an interface, so guard the
+	// call rather than the value — Unsubscribe on a nil subscription errors
+	// harmlessly, which is why the result is discarded.
+	if voiceSub != nil {
+		_ = voiceSub.Unsubscribe()
+	}
+	s.lifecycleDispatchMu.Lock()
+	s.lifecycleDispatcher = nil
+	s.lifecycleDispatchMu.Unlock()
+	if dispatcher != nil {
+		dispatcher.close()
+	}
+}
+
+func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
+	var payload struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		s.log.Error(msgErasureClearRejected, "failure_class", "malformed_payload")
+		return
+	}
+	erased, err := uuid.Parse(payload.UserID)
+	if err != nil {
+		s.log.Error(msgErasureClearRejected, "failure_class", "invalid_user")
+		return
+	}
+
+	// Confirm the account is actually gone before acting.
+	//
+	// A UUID check alone is only syntactic, and this handler's blast radius is
+	// every Rich Presence client on this replica. NATS carries no per-service
+	// authorization in this deployment (the media-plane, which terminates
+	// untrusted WebRTC traffic, shares the same bus), so a syntactically valid
+	// message from anywhere on that network would otherwise be an arbitrarily
+	// repeatable fleet-wide session-teardown primitive. The users row is the
+	// authoritative post-erasure signal, and it makes a forged or replayed
+	// message a no-op (security review, PR #2840; also raised by Gitar and the
+	// RBAC review).
+	//
+	// Fails OPEN on a read error, deliberately: the clear is inert when the claim
+	// is false, so letting it through costs nothing, whereas failing closed would
+	// let an unreachable database suppress a legitimate erasure clear.
+	// No database means the claim cannot be authorized at all. Refuse rather
+	// than escalate: an unverifiable message must not be able to tear down every
+	// Rich Presence client on the replica (code review, PR #2840).
+	if s.db == nil {
+		s.log.Error(msgErasureClearRejected, "failure_class", "unverifiable")
+		return
+	}
+
+	if s.erasedAccountStillExists(erased) {
+		s.log.Error(msgErasureClearRejected, "failure_class", "user_not_erased")
+		return
+	}
+
+	// A targeted CLEAR for this one sender, not a fleet-wide disconnect.
+	//
+	// The disconnect was a denial-of-service primitive: red-team PoCs on PR #2840
+	// proved a forged publish carrying ANY random UUID reached it (the existence
+	// check accepts "absent", and every id that was never a user is absent), that
+	// a genuine message could be replayed without bound, and that a lookup error
+	// fell open into it. Making the action proportional to the claim removes all
+	// three at once — a client that never held this sender's status ignores the
+	// frame, so a forged or replayed clear is inert rather than destructive.
+	//
+	// The existence check above is retained as defence in depth, not as the
+	// barrier: it rejects the one case it genuinely proves wrong, a clear naming
+	// an account that still exists.
+	if s.clearErasedSenderHook != nil {
+		s.clearErasedSenderHook(erased)
+		return
+	}
+	// Kept for its diagnostic value only: it tells an operator a clear was
+	// dropped on a hub-less replica, which would otherwise be silent on a privacy
+	// path. It is NOT load-bearing for safety — ClearErasedSenderCustomText fails
+	// closed on a nil receiver already.
+	//
+	// Deliberately untested, and stated rather than covered by a test that cannot
+	// fail: with the Hub's own nil guard in place, removing this changes nothing
+	// observable except the log line, so a NotPanics assertion here passed with
+	// the guard deleted. That test was removed rather than kept as coverage.
+	if s.hub == nil {
+		s.log.Error("Presence erasure clear skipped", "failure_class", "no_hub")
+		return
+	}
+	s.hub.ClearErasedSenderCustomText(erased)
 }
 
 func (s *NATSSubscriber) handleVoiceLifecycleDispatchOverflow(_, _ string) {

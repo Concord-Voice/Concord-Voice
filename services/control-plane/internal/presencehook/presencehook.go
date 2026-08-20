@@ -234,6 +234,13 @@ func WithGatedTx(
 	return capture.WithGatedTx(ctx, subject, work)
 }
 
+// HeaderRetryAfter is the response header RetryAfterHeader's value belongs in.
+//
+// Exported and homed here because two handler packages were each declaring a
+// private copy, which is the drift this naming exists to prevent (CodeRabbit,
+// PR #2840). The value and the header name now live in the same package.
+const HeaderRetryAfter = "Retry-After"
+
 // Failure is the HTTP shape a hooked handler returns for a terminal error.
 //
 // It carries no message: each handler keeps its own existing copy so no route

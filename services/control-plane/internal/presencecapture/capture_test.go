@@ -27,6 +27,10 @@ func TestFamilyEnumIsDenseAndDistinct(t *testing.T) {
 		FamilyFriendshipRemove,
 		FamilyBlock,
 		FamilyFriendsOfFriendsToggle,
+		FamilyMemberAdd,
+		FamilyMemberJoin,
+		FamilyMemberRemove,
+		FamilyMemberBan,
 	}
 	seen := make(map[Family]bool, len(all))
 	for i, f := range all {

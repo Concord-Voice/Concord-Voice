@@ -882,13 +882,27 @@ func TestSendMessage_MembershipLockWriterFirstIsPurgedAfterRemoval(t *testing.T)
 		removalResult <- w.Code
 	}()
 
+	// The removal must be parked behind the in-flight writer. WHICH statement it
+	// parks on moved in #2447: the removal path now captures presence inside its
+	// transaction, and the canonical lock order takes the users row FIRST, before
+	// the domain parent and before the mutation write. So the removal blocks on
+	// `SELECT id FROM users ... FOR NO KEY UPDATE` and never reaches
+	// `DELETE FROM server_members` while the writer holds its locks.
+	//
+	// Accepting either statement keeps the assertion honest rather than weakening
+	// it: the property under test is that the removal WAITS, and the substantive
+	// proof is downstream — the purge must find and remove the message the writer
+	// commits after this unblocks, which is asserted by countChannelMessages
+	// below. Matching one exact query string pinned the pre-hook first-blocking
+	// statement, not the invariant.
 	require.Eventually(t, func() bool {
 		var waiting bool
 		queryErr := ts.DB.QueryRow(`SELECT EXISTS (
 			SELECT 1 FROM pg_stat_activity
 			WHERE datname = current_database()
 			  AND wait_event_type = 'Lock'
-			  AND query LIKE '%DELETE FROM server_members%'
+			  AND (query LIKE '%DELETE FROM server_members%'
+			       OR query LIKE '%SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE%')
 		)`).Scan(&waiting)
 		return queryErr == nil && waiting
 	}, time.Second, 10*time.Millisecond, "removal should wait on the writer's membership lock")

@@ -59,3 +59,28 @@ func TestUnregisteredFamiliesReportsAGap(t *testing.T) {
 
 	assert.Equal(t, []Family{FamilyBlock}, UnregisteredFamilies())
 }
+
+// The membership families appended by #2447. The additive pair is the sharp
+// case: CanRevokeVisibility true would seed plan.viewers and tear down the
+// devices of the user who just joined.
+func TestAdditiveMembershipFamiliesCannotRevokeVisibility(t *testing.T) {
+	for _, family := range []Family{FamilyMemberAdd, FamilyMemberJoin} {
+		policy, err := PolicyFor(family)
+		require.NoError(t, err, "family %d must be registered", family)
+		assert.False(t, policy.CanRevokeVisibility,
+			"family %d is additive; revoking would disconnect the joining user", family)
+		assert.True(t, policy.CarriesCustomTextTopology,
+			"family %d still changes the Custom Status audience", family)
+	}
+}
+
+func TestRevokingMembershipFamiliesCarryBothAxes(t *testing.T) {
+	for _, family := range []Family{FamilyMemberRemove, FamilyMemberBan} {
+		policy, err := PolicyFor(family)
+		require.NoError(t, err, "family %d must be registered", family)
+		assert.True(t, policy.CanRevokeVisibility,
+			"family %d removes shared-server visibility", family)
+		assert.True(t, policy.CarriesCustomTextTopology,
+			"family %d changes the Custom Status audience", family)
+	}
+}

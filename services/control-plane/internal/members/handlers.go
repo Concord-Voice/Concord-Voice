@@ -14,6 +14,9 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -70,6 +73,12 @@ type Handler struct {
 	// consistently. Zero falls back to the package defaults.
 	purgeRateLimit  int
 	purgeRateWindow time.Duration
+
+	// graphPresence is the #2447 membership presence capture. nil means unwired.
+	graphPresence presencecapture.GraphPresenceCapture
+	// snapshots serves the additive (hydrate) direction, outside the
+	// presencecapture contract. nil means no hydrate.
+	snapshots *presence.ActivitySnapshotService
 }
 
 // SetVoiceEnforcer wires the mid-session voice permission push. Called once at
@@ -490,21 +499,6 @@ func (h *Handler) AddMember(c *gin.Context) {
 		return
 	}
 
-	// Check if target user is banned from this server
-	var isBanned bool
-	if err := h.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM server_bans WHERE server_id = $1 AND user_id = $2)`,
-		serverID, req.UserID,
-	).Scan(&isBanned); err != nil {
-		h.log.Error("Failed to check ban status", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
-		return
-	}
-	if isBanned {
-		c.JSON(http.StatusForbidden, gin.H{"error": "User is banned from this server"})
-		return
-	}
-
 	insertQuery := `
 		INSERT INTO server_members (server_id, user_id, role, joined_at)
 		VALUES ($1, $2, 'member', NOW())
@@ -517,27 +511,200 @@ func (h *Handler) AddMember(c *gin.Context) {
 	member.UserID = req.UserID
 	member.Role = "member"
 
-	err = h.db.QueryRow(insertQuery, serverID, req.UserID).Scan(&member.JoinedAt)
-	if err == sql.ErrNoRows {
+	ctx := c.Request.Context()
+
+	// ONE spec for the gates, the capture and the focal set, so the three cannot
+	// drift apart. Direct add is ADDITIVE: FamilyMemberAdd is registered with
+	// CanRevokeVisibility false, because true would seed plan.viewers and tear
+	// down every device of the user who was just added.
+	spec := presencehook.Spec{
+		Family:      presencecapture.FamilyMemberAdd,
+		Posture:     presencecapture.FailClosedBlockWrite,
+		PrincipalID: req.UserID,
+	}
+
+	// WithGatedTx acquires the sender gates BEFORE opening the transaction and
+	// owns the deferred rollback. Both writes now share that transaction: the
+	// default-role insert used to be a blank-discarded h.db.Exec, so a failure
+	// left a member with no roles and still returned 201.
+	err = presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		// The ban and existing-membership reads run INSIDE the transaction and
+		// BEFORE the capture, for two separate reasons.
+		//
+		// Ban: this read used to be an autocommit h.db.QueryRow before the
+		// transaction opened, so a ban committing in that window still lost the
+		// race — the ON CONFLICT insert below would re-establish membership for a
+		// user who is banned. invites.JoinServer already reads it in-transaction;
+		// this is the same shape (rbac review, PR #2840).
+		//
+		// Membership: capturing first would take the TARGET's sender gate and
+		// write topology markers (users / user_presence_settings /
+		// presence_settings_pending_operations FOR UPDATE on them) before
+		// discovering the add is a no-op. Since AddMember needs no consent from
+		// the target, that let an actor repeatedly re-add an existing member and
+		// hold a stranger's presence locks, surfacing to them as 503s on their own
+		// presence writes (security review, PR #2840).
+		var isBanned bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM server_bans WHERE server_id = $1 AND user_id = $2)`,
+			serverID, req.UserID,
+		).Scan(&isBanned); err != nil {
+			return fmt.Errorf("check ban status: %w", err)
+		}
+		if isBanned {
+			return errMemberBanned
+		}
+
+		var alreadyMember bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
+			serverID, req.UserID,
+		).Scan(&alreadyMember); err != nil {
+			return fmt.Errorf("check existing membership: %w", err)
+		}
+		if alreadyMember {
+			return errMemberAlreadyPresent
+		}
+
+		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
+		if captureErr != nil {
+			return fmt.Errorf("capture member add presence: %w", captureErr)
+		}
+
+		scanErr := tx.QueryRowContext(ctx, insertQuery, serverID, req.UserID).Scan(&member.JoinedAt)
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			// Nothing was written, so drop the plan WITHOUT disconnecting anyone:
+			// the rollback also discards the topology markers, which is what keeps
+			// a no-op add from suppressing a Custom Status snapshot for the whole
+			// grace window.
+			return errMemberAlreadyPresent
+		}
+		if scanErr != nil {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("insert server member: %w", scanErr)
+		}
+
+		// Assign all default roles (including @all) to the new member.
+		if _, roleErr := tx.ExecContext(ctx, `
+			INSERT INTO member_roles (server_id, user_id, role_id)
+			SELECT $1, $2, id FROM roles
+			WHERE server_id = $1 AND is_default = TRUE
+			ON CONFLICT DO NOTHING
+		`, serverID, req.UserID); roleErr != nil {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("assign default roles: %w", roleErr)
+		}
+
+		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+	})
+	if errors.Is(err, errMemberBanned) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "User is banned from this server"})
+		return
+	}
+	if errors.Is(err, errMemberAlreadyPresent) {
 		c.JSON(http.StatusConflict, gin.H{"error": "User is already a member"})
 		return
-	} else if err != nil {
-		h.log.Error("Failed to add member", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
+	}
+	if err != nil {
+		failure := presencehook.Classify(err)
+		if retryAfter, ok := failure.RetryAfterHeader(); ok {
+			c.Header(presencehook.HeaderRetryAfter, retryAfter)
+		}
+		h.log.Error("Failed to add member", "failure_class", failure.Code, "error", err)
+		c.JSON(failure.Status, gin.H{"error": failure.Body(errMsgFailedAddMember)})
 		return
 	}
 
-	// Assign all default roles (including @all) to the new member
-	_, _ = h.db.Exec(`
-		INSERT INTO member_roles (server_id, user_id, role_id)
-		SELECT $1, $2, id FROM roles
-		WHERE server_id = $1 AND is_default = TRUE
-		ON CONFLICT DO NOTHING
-	`, serverID, req.UserID)
+	// Post-commit and deliberately fail-OPEN: hydration has no minuend, so a
+	// missed hydrate shows the joiner LESS than they are entitled to and
+	// self-corrects. Returning 5xx on a committed membership row would instead
+	// drive duplicate-add retries.
+	h.hydrateJoinerPresence(ctx, req.UserID)
 
 	h.log.Info("Member added", "server_id", serverID, "new_member", req.UserID, "added_by", userID)
 
 	c.JSON(http.StatusCreated, gin.H{"member": member})
+}
+
+// errMemberAlreadyPresent is the in-transaction signal for a no-op add. It never
+// reaches the client as an error string; AddMember maps it to 409.
+// classifyMutationOutcome splits a hooked-mutation error into the two outcomes
+// the handlers must treat differently, so neither has to re-derive the
+// distinction inline.
+//
+// Returns (nil, true) when the caller should stop: the mutation did NOT commit
+// and the response has been written. Returns (failure, false) for a DURABLE
+// outcome whose delivery failed — the caller continues through its
+// de-authorization sequence and reports the failure afterwards.
+func (h *Handler) classifyMutationOutcome(
+	c *gin.Context, err error, logMessage, userMessage string, logArgs ...any,
+) (*presencehook.Failure, bool) {
+	failure := presencehook.Classify(err)
+	h.log.Error(logMessage, append([]any{"failure_class", failure.Code, "error", err}, logArgs...)...)
+
+	if errors.Is(err, presencecapture.ErrPostCommitDelivery) {
+		return &failure, false
+	}
+	if retryAfter, ok := failure.RetryAfterHeader(); ok {
+		c.Header(presencehook.HeaderRetryAfter, retryAfter)
+	}
+	c.JSON(failure.Status, gin.H{"error": failure.Body(userMessage)})
+	return nil, true
+}
+
+// respondDurableDeliveryFailure reports a mutation that COMMITTED but whose
+// presence delivery did not settle. It is called only after the caller has run
+// its full de-authorization sequence — returning before that is what left
+// removed members holding a live RBAC cache entry (rbac review, PR #2840).
+//
+// The purge outcome rides along when there is one: the purge already happened,
+// and dropping it loses a moderation result on exactly the path where the caller
+// most needs to know it ran.
+func (h *Handler) respondDurableDeliveryFailure(
+	c *gin.Context, failure *presencehook.Failure, message string, resp gin.H,
+) {
+	if retryAfter, ok := failure.RetryAfterHeader(); ok {
+		c.Header(presencehook.HeaderRetryAfter, retryAfter)
+	}
+	body := gin.H{"error": failure.Body(message)}
+	if purge, ok := resp["purge"]; ok {
+		body["purge"] = purge
+	}
+	c.JSON(failure.Status, body)
+}
+
+var errMemberAlreadyPresent = errors.New("members: user is already a member")
+
+// errMemberBanned is the in-transaction signal for a banned target. Like
+// errMemberAlreadyPresent it never reaches the client as a string; AddMember
+// maps it to 403.
+var errMemberBanned = errors.New("members: user is banned from this server")
+
+// hydrateJoinerPresence pushes the newly authorized viewer their current
+// snapshot. It runs AFTER the commit and NEVER changes the response: hydration
+// has no minuend, so a missed hydrate shows the joiner less than they are
+// entitled to and self-corrects on the next presence event.
+//
+// Duplicated in members and invites, and it stays that way — the #2840 scope
+// review proposed hoisting it, and BOTH obvious homes are blocked by a real
+// constraint. internal/presence cannot host it: that package forbids importing
+// pkg/logger at all, enforced by TestActivityProductionEmitsNoPayloadOrIdentityLogs,
+// so a helper that logs cannot live there. internal/presencehook cannot host it
+// either: it deliberately imports only the zero-internal-dependency
+// presencecapture leaf, and giving it a dependency on presence to host a helper
+// would invert that layering. Twelve duplicated lines is the cheaper defect.
+func (h *Handler) hydrateJoinerPresence(ctx context.Context, viewerID string) {
+	if h.snapshots == nil {
+		return
+	}
+	parsed, parseErr := uuid.Parse(viewerID)
+	if parseErr != nil {
+		h.log.Error("Presence hydrate skipped", "failure_class", "invalid_viewer")
+		return
+	}
+	if _, err := h.snapshots.Snapshot(ctx, parsed); err != nil {
+		h.log.Error("Presence hydrate failed", "failure_class", "delivery")
+	}
 }
 
 // UpdateMember updates a member's role
@@ -847,30 +1014,49 @@ func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserI
 	return &removalAuth{isSelfRemoval: false}, 0, ""
 }
 
-func (h *Handler) execRemovalTx(serverID, targetUserID string) error {
-	tx, err := h.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback transaction", "error", rbErr)
-		}
-	}()
-
-	queries := []struct{ query string }{
-		{`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`},
-		{`DELETE FROM channel_keys WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`},
-		{`DELETE FROM pending_key_requests WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`},
-		{`DELETE FROM channel_read_states WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`},
-	}
-	for _, q := range queries {
-		if _, err := tx.Exec(q.query, serverID, targetUserID); err != nil {
-			return err
-		}
+// execRemovalTx removes the member inside a HOOKED transaction. It no longer
+// begins or commits: presencehook.WithGatedTx acquires the process-local sender
+// gates BEFORE opening the transaction — the durable topology rail requires that
+// order, because acquiring them after BeginTx creates a gate-vs-row-lock cycle
+// against users/presence_settings.go — and Complete owns the commit.
+//
+// Covers kick AND self-leave: there is no separate Leave handler. RemoveMember
+// branches on isSelfRemoval, and a user leaves by naming themselves on
+// DELETE /servers/:id/members/:user_id.
+//
+// The capture strictly precedes DELETE FROM server_members, which is the write
+// that destroys the audience being captured. Everything after this function —
+// including BroadcastToServerAndPrune's deliver-then-prune ordering — is
+// untouched: the presence work has already completed by then.
+func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID string) error {
+	spec := presencehook.Spec{
+		Family:      presencecapture.FamilyMemberRemove,
+		Posture:     presencecapture.FailClosedBlockWrite,
+		PrincipalID: targetUserID,
 	}
 
-	return tx.Commit()
+	return presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
+		if captureErr != nil {
+			return fmt.Errorf("capture member removal presence: %w", captureErr)
+		}
+
+		queries := []string{
+			// FIRST, and deliberately: this is the audience-destroying write.
+			`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`,
+			`DELETE FROM channel_keys WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
+			`DELETE FROM pending_key_requests WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
+			`DELETE FROM channel_read_states WHERE user_id = $2 AND channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
+		}
+		for _, query := range queries {
+			if _, execErr := tx.ExecContext(ctx, query, serverID, targetUserID); execErr != nil {
+				presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+				return fmt.Errorf("remove member rows: %w", execErr)
+			}
+		}
+
+		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+	})
 }
 
 func (h *Handler) invalidateMemberPermissions(serverID, userID, action string) {
@@ -946,10 +1132,28 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	if err := h.execRemovalTx(serverID, targetUserID); err != nil {
-		h.log.Error("Failed to remove member", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
-		return
+	// deliveryFailure is non-nil only for a DURABLE outcome whose presence
+	// delivery failed. The de-authorization sequence still runs; the 503 is
+	// written after it.
+	var deliveryFailure *presencehook.Failure
+	if err := h.execRemovalTx(c.Request.Context(), serverID, targetUserID); err != nil {
+		// Classify distinguishes a PRE-commit failure (500, nothing written) from
+		// a POST-commit delivery failure (503, the member IS removed and a retry
+		// is safe). The old blanket 500 told a client nothing had happened when
+		// the removal had in fact committed.
+		// A PRE-commit failure means nothing landed and classifyMutationOutcome
+		// has already responded. A POST-COMMIT delivery failure has NOT: the
+		// membership row is already gone, and returning early would skip every
+		// de-authorization step below — leaving the removed member with a live
+		// RBAC cache entry, an intact WS subscription, un-revoked channel keys and
+		// a media-plane session. That is stale authorization on a user who has
+		// actually been removed.
+		var handled bool
+		deliveryFailure, handled = h.classifyMutationOutcome(
+			c, err, "Failed to remove member", errMsgFailedRemoveMember)
+		if handled {
+			return
+		}
 	}
 
 	action := "removed"
@@ -995,6 +1199,17 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	if req.PurgeMessages && !auth.isSelfRemoval {
 		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "kick")
 	}
+
+	// The member is removed and fully de-authorized by this point; only presence
+	// delivery failed. Reported AFTER the purge, not before: returning first
+	// silently skipped a requested moderation purge, and the action was
+	// unrecoverable because a retry 404s on checkMembership. The purge result
+	// rides along so the caller still learns what happened (code review, PR #2840).
+	if deliveryFailure != nil {
+		h.respondDurableDeliveryFailure(c, deliveryFailure, errMsgFailedRemoveMember, resp)
+		return
+	}
+
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1017,46 +1232,97 @@ type BannedMember struct {
 	CreatedAt    string  `json:"created_at"`
 }
 
-func (h *Handler) execBanTx(serverID, targetUserID, actorID string, reason *string) error {
-	tx, err := h.db.Begin()
-	if err != nil {
-		return err
+// execBanTx bans the member inside a HOOKED transaction, on the same contract as
+// execRemovalTx: WithGatedTx gates before BeginTx, Complete owns the commit.
+//
+// Ban is the sharpest case this slice exists for. A banned user who keeps
+// receiving the server's live voice activity for the remaining TTL is both a
+// privacy failure and a moderation-bypass signal, which is why the posture is
+// fail-closed: a capture read that fails refuses the ban rather than completing
+// one it cannot reconcile.
+//
+// Capture precedes DELETE FROM server_members specifically. execBanTx's explicit
+// member_roles delete is already covered by the composite FK cascade (000035),
+// so it is retained for explicitness but is NOT the audience-destroying write.
+func (h *Handler) execBanTx(ctx context.Context, serverID, targetUserID, actorID string, reason *string) error {
+	spec := presencehook.Spec{
+		Family:      presencecapture.FamilyMemberBan,
+		Posture:     presencecapture.FailClosedBlockWrite,
+		PrincipalID: targetUserID,
 	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback", "error", rbErr)
+
+	return presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		// Capture ONLY when the target is actually a member, and read that
+		// inside this transaction so there is no window to race.
+		//
+		// Banning a non-member is permitted (a pre-emptive ban) and changes no
+		// shared-server audience, so there is nothing to reconcile. The capture
+		// would not know that: FamilyMemberBan is a revoking family and this
+		// family carries no counterpart, so graphpresence's accepted-edge gate
+		// (`policy.CanRevokeVisibility && subject.Counterpart != uuid.Nil`) is
+		// structurally unreachable here and the capture seeds plan.viewers with
+		// the named principal unconditionally. On the SUCCESS path that is a full
+		// websocket teardown of every device belonging to whoever was named.
+		//
+		// Any user can create a server and thereby hold PermBan on it, so leaving
+		// that ungated lets an attacker force-disconnect an arbitrary stranger
+		// with no relationship to the server — the exact abuse the accepted-edge
+		// gate's own comment describes, re-opened through a family that has no
+		// counterpart to gate on (security review, PR #2840).
+		//
+		// A nil plan is well-defined: Complete's foreign-plan guard is
+		// `!ok && plan != nil`, so nil falls through to the bare commit.
+		var isMember bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
+			serverID, targetUserID,
+		).Scan(&isMember); err != nil {
+			return fmt.Errorf("check ban target membership: %w", err)
 		}
-	}()
 
-	_, err = tx.Exec(`
-		INSERT INTO server_bans (server_id, user_id, banned_by, reason)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (server_id, user_id) DO UPDATE SET
-			banned_by = EXCLUDED.banned_by,
-			reason = EXCLUDED.reason,
-			created_at = NOW()
-	`, serverID, targetUserID, actorID, reason)
-	if err != nil {
-		return err
-	}
+		var plan presencecapture.Plan
+		if isMember {
+			var captureErr error
+			plan, captureErr = presencehook.Capture(ctx, h.graphPresence, tx, spec)
+			if captureErr != nil {
+				return fmt.Errorf("capture member ban presence: %w", captureErr)
+			}
+		}
 
-	if _, err := tx.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
-		return fmt.Errorf("delete server member: %w", err)
-	}
-	if _, err := tx.Exec(`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
-		return fmt.Errorf("delete member roles: %w", err)
-	}
-	if _, err := tx.Exec(`DELETE FROM channel_keys WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
-		return fmt.Errorf("delete channel keys: %w", err)
-	}
-	if _, err := tx.Exec(`DELETE FROM pending_key_requests WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
-		return fmt.Errorf("delete pending key requests: %w", err)
-	}
-	if _, err := tx.Exec(`DELETE FROM channel_read_states WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
-		return fmt.Errorf("delete channel read states: %w", err)
-	}
+		abandon := func(err error, msg string) error {
+			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			return fmt.Errorf("%s: %w", msg, err)
+		}
 
-	return tx.Commit()
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO server_bans (server_id, user_id, banned_by, reason)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (server_id, user_id) DO UPDATE SET
+				banned_by = EXCLUDED.banned_by,
+				reason = EXCLUDED.reason,
+				created_at = NOW()
+		`, serverID, targetUserID, actorID, reason); err != nil {
+			return abandon(err, "record server ban")
+		}
+
+		if _, err := tx.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
+			return abandon(err, "delete server member")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2`, serverID, targetUserID); err != nil {
+			return abandon(err, "delete member roles")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM channel_keys WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
+			return abandon(err, "delete channel keys")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_key_requests WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
+			return abandon(err, "delete pending key requests")
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM channel_read_states WHERE user_id = $1 AND channel_id IN (SELECT id FROM channels WHERE server_id = $2)`, targetUserID, serverID); err != nil {
+			return abandon(err, "delete channel read states")
+		}
+
+		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+	})
 }
 
 // BanMember bans a member from a server (removes + prevents rejoin)
@@ -1116,10 +1382,23 @@ func (h *Handler) BanMember(c *gin.Context) {
 		reason = &req.Reason
 	}
 
-	if err := h.execBanTx(serverID, targetUserID, userID, reason); err != nil {
-		h.log.Error("Failed to ban member", "error", err, "server_id", serverID, "user_id", targetUserID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedBanMember})
-		return
+	// banDeliveryFailure is non-nil only for a DURABLE ban whose presence delivery
+	// failed. As in RemoveMember, the de-authorization sequence still runs.
+	var banDeliveryFailure *presencehook.Failure
+	if err := h.execBanTx(c.Request.Context(), serverID, targetUserID, userID, reason); err != nil {
+		// Same split as RemoveMember: a post-commit delivery failure means the
+		// member IS banned, so it must not be reported as a 500 that implies
+		// nothing happened — and must not skip the de-authorization below. A
+		// banned user left holding a live RBAC cache entry, an intact WS
+		// subscription and un-revoked channel keys is the moderation bypass this
+		// whole slice exists to close.
+		var handled bool
+		banDeliveryFailure, handled = h.classifyMutationOutcome(
+			c, err, "Failed to ban member", errMsgFailedBanMember,
+			"server_id", serverID, "user_id", targetUserID)
+		if handled {
+			return
+		}
 	}
 	if h.audit != nil {
 		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "member_banned", "member", &targetUserID, //nolint:errcheck
@@ -1163,6 +1442,14 @@ func (h *Handler) BanMember(c *gin.Context) {
 	if req.PurgeMessages {
 		resp["purge"] = h.applyPurgeOnModeration(purgeCtx, serverID, userID, targetUserID, "ban")
 	}
+
+	// Banned and fully de-authorized by this point; only presence delivery
+	// failed. Report that rather than a 200 the caller would read as settled.
+	if banDeliveryFailure != nil {
+		h.respondDurableDeliveryFailure(c, banDeliveryFailure, errMsgFailedBanMember, resp)
+		return
+	}
+
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1289,4 +1576,26 @@ func (h *Handler) triggerKeyRevocationsForServer(serverID, removedUserID, actorI
 // internal tests keep exercising the rotation path through the handler.
 func (h *Handler) triggerKeyRevocationForChannel(channelID, reason, actorID string) {
 	h.rotator.TriggerForChannel(channelID, reason, actorID)
+}
+
+// SetGraphPresenceCapture wires the #2447 membership presence capture. A nil
+// capture leaves this handler behaving exactly as it did before the hook, so a
+// replica without it degrades to the pre-existing <=90s presence TTL.
+func (h *Handler) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {
+	h.graphPresence = c
+}
+
+// HasGraphPresenceCapture reports whether the capture was wired. The router's
+// boot guard interrogates the HANDLER through this, never the constructed
+// reconciler value: graphpresence.New always returns a non-nil pointer, so a
+// check on that value is a tautology that still boots with the wiring line
+// deleted -- the one fail-OPEN path the guard exists to catch.
+func (h *Handler) HasGraphPresenceCapture() bool { return h.graphPresence != nil }
+
+// SetActivitySnapshots wires the viewer-scoped snapshot service the additive
+// direction hydrates through. Nil means no hydrate, which is a safe degrade:
+// hydration has no minuend, so a missed hydrate shows the joiner LESS than they
+// are entitled to and self-corrects on the next presence event.
+func (h *Handler) SetActivitySnapshots(s *presence.ActivitySnapshotService) {
+	h.snapshots = s
 }

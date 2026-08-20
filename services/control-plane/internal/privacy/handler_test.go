@@ -3,6 +3,8 @@ package privacy_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/privacy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
@@ -243,4 +246,66 @@ func TestEraseAccount_IgnoresUnknownClientIdField(t *testing.T) {
 		"unknown clientId field must be silently ignored — POST returns 204")
 	assert.True(t, stub.called,
 		"DeleteAccount must still be invoked when the body has an extra field")
+}
+
+// A DURABLE erasure — the account IS gone, only presence delivery failed — must
+// NOT be treated as a failed deletion.
+//
+// Before this was handled, the endpoint answered 500 for an account that no
+// longer existed (so a client retry then got 404), and, far worse, it returned
+// before revokeAccessTokens — leaving the jti blacklist and the user_disabled
+// key unwritten for an erased account. backend.md requires both before
+// returning success (code review, PR #2840).
+func TestEraseAccount_DurableDeliveryFailureStillRevokesTokens(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rdb := redistest.Client(t)
+	userID := "test-user-uuid"
+	jti := "durable-delivery-jti"
+
+	stub := &stubAccountDeleter{
+		err: fmt.Errorf("delete account: presence delivery: %w",
+			presencecapture.ErrPostCommitDelivery),
+	}
+	h := privacy.NewHandler(stub, rdb, logger.New("test"))
+
+	c, _ := newTestContext(t, `{}`, userID)
+	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{
+		"jti": jti,
+		"exp": float64(time.Now().Add(10 * time.Minute).Unix()),
+	})
+
+	h.EraseAccount(c)
+
+	require.True(t, stub.called)
+	assert.Equal(t, http.StatusServiceUnavailable, c.Writer.Status(),
+		"a durable erasure is 503, never the 500 that says nothing happened")
+
+	// The point of the fix, and what the name claims: returning early on the
+	// durable arm skipped revokeAccessTokens entirely, leaving an already-issued
+	// access token working against an account that is gone. Asserting only the
+	// status would not have caught that (CodeRabbit, PR #2840).
+	ctx := context.Background()
+	blacklisted, err := rdb.Exists(ctx, "blacklist:"+jti).Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, blacklisted, "the access token's jti must be blacklisted")
+
+	disabled, err := rdb.Exists(ctx, middleware.UserDisabledKey(userID)).Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, disabled, "the user_disabled key must be set")
+
+	ttl, err := rdb.TTL(ctx, middleware.UserDisabledKey(userID)).Result()
+	require.NoError(t, err)
+	assert.Positive(t, ttl, "the disabled marker must carry a TTL, not linger forever")
+}
+
+// A genuine pre-commit failure must still be a 500 — the durable arm must not
+// swallow real failures.
+func TestEraseAccount_PreCommitFailureStill500(t *testing.T) {
+	stub := &stubAccountDeleter{err: errors.New("begin tx: connection refused")}
+	h := privacy.NewHandler(stub, nil, logger.New("test"))
+
+	c, _ := newTestContext(t, `{}`, "test-user-uuid")
+	h.EraseAccount(c)
+
+	assert.Equal(t, http.StatusInternalServerError, c.Writer.Status())
 }
