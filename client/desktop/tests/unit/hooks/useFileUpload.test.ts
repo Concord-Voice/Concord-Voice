@@ -240,6 +240,72 @@ describe('useFileUpload', () => {
     expect(result.current.files[0].status).toBe('done');
   });
 
+  // #2843: the uploaded bytes must be the ENCRYPTED buffer, never the raw file.
+  // encryptAndBuildForm used to read
+  //   `const uploadData = channelKey ? await encryptFile(...) : fileData`
+  // with `channelKey: CryptoKey | null` — so a null key uploaded the file in the
+  // clear. That branch was residue from before #1024, when an unencrypted
+  // channel legitimately sent plaintext, and #1031 removed the `isEncrypted`
+  // selector without removing the branch it selected.
+  //
+  // Asserting `encryptFile` was CALLED is not enough: it would still pass if a
+  // fallback path uploaded the original bytes alongside. This asserts on the
+  // bytes that actually reach the transport.
+  it('uploads the encrypted buffer, never the raw file bytes', async () => {
+    const { encryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const ciphertext = new ArrayBuffer(64);
+    vi.mocked(encryptFile).mockResolvedValueOnce(ciphertext);
+
+    mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
+    mockSafeJson.mockResolvedValue({
+      file_id: 'attach-cipher-1',
+      file_type: 'photo',
+      file_size: 64,
+    });
+
+    const { result } = renderHook(() => useFileUpload());
+
+    // Distinct size so raw-vs-ciphertext is unambiguous in the assertion.
+    act(() => {
+      result.current.addFiles([createMockFile('gps.jpg', 4096, 'image/jpeg')]);
+    });
+
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+
+    const body = mockApiFetch.mock.calls[0][1].body as FormData;
+    const sent = body.get('file') as Blob;
+    expect(sent.size).toBe(ciphertext.byteLength);
+    expect(sent.size).not.toBe(4096);
+  });
+
+  // #2843: key_version is now sent unconditionally. It used to be guarded by
+  // `if (keyVersion !== undefined)`, which paired with the nullable key above —
+  // omitting it let the server invent an epoch the sender never claimed, the
+  // same defect fixed on the message-send path in #2832.
+  it('always sends key_version on the upload form', async () => {
+    mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
+    mockSafeJson.mockResolvedValue({
+      file_id: 'attach-kv-1',
+      file_type: 'photo',
+      file_size: 1000,
+    });
+
+    const { result } = renderHook(() => useFileUpload());
+
+    act(() => {
+      result.current.addFiles([createMockFile('kv.png', 1000, 'image/png')]);
+    });
+
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+
+    const body = mockApiFetch.mock.calls[0][1].body as FormData;
+    expect(body.get('key_version')).toBe('1');
+  });
+
   it('uploads with conversationId for DMs', async () => {
     mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
     mockSafeJson.mockResolvedValue({
@@ -436,8 +502,7 @@ describe('useFileUpload — image dimension hydration', () => {
     });
 
     let uploadResult:
-      | { ids: string[]; summaries: { width?: number; height?: number }[] }
-      | undefined;
+      { ids: string[]; summaries: { width?: number; height?: number }[] } | undefined;
     await act(async () => {
       uploadResult = (await result.current.uploadAll('channel-1')) as typeof uploadResult;
     });

@@ -477,6 +477,67 @@ describe('WebSocketService', () => {
       expect(sent.data.attachment_ids).toBeUndefined();
     });
 
+    // #2843: `gif_slug` is a CLEARTEXT wire field and must never appear on an
+    // outbound frame. The slug travels INSIDE the ciphertext via
+    // wrapContentWithGifSlug (dmMessageSender.ts), so a wire-level copy would
+    // leak, in the clear, exactly what the E2EE envelope was hiding. The old
+    // `gifSlug` opt was unreachable — nothing passed it — but it was a leak
+    // waiting for its first caller. These two tests force a stray `gifSlug`
+    // through a cast (the property is no longer in the opts type) and assert on
+    // the frame the transport actually serialized. If either fails, the
+    // cleartext field has been reintroduced.
+    it('sendMessage never emits gif_slug, even when a stray gifSlug is passed', async () => {
+      const ws = await connectAndWaitForOpen(service);
+      ws.simulateMessage({
+        type: 'connected',
+        data: {
+          client_id: '11111111-1111-4111-8111-111111111111',
+          user_id: '22222222-2222-4222-8222-222222222222',
+        },
+      });
+
+      type SendMessageOpts = NonNullable<Parameters<WebSocketService['sendMessage']>[2]>;
+      service.sendMessage('ch-1', 'ciphertext-blob', {
+        nonce: 'nonce-gif',
+        gifSlug: 'cat-wave',
+      } as unknown as SendMessageOpts);
+
+      const raw = ws.sentMessages[ws.sentMessages.length - 1];
+      expect(raw).not.toContain('gif_slug');
+      expect(raw).not.toContain('cat-wave');
+
+      const sent = JSON.parse(raw);
+      expect(sent.type).toBe('message');
+      expect(Object.keys(sent.data)).not.toContain('gif_slug');
+      expect(sent.data.content).toBe('ciphertext-blob');
+    });
+
+    it('sendDMMessage never emits gif_slug, even when a stray gifSlug is passed', async () => {
+      const ws = await connectAndWaitForOpen(service);
+      ws.simulateMessage({
+        type: 'connected',
+        data: {
+          client_id: '11111111-1111-4111-8111-111111111111',
+          user_id: '22222222-2222-4222-8222-222222222222',
+        },
+      });
+
+      type SendDMMessageOpts = NonNullable<Parameters<WebSocketService['sendDMMessage']>[2]>;
+      service.sendDMMessage('conv-1', 'ciphertext-blob', {
+        nonce: 'nonce-dm-gif',
+        gifSlug: 'cat-wave',
+      } as unknown as SendDMMessageOpts);
+
+      const raw = ws.sentMessages[ws.sentMessages.length - 1];
+      expect(raw).not.toContain('gif_slug');
+      expect(raw).not.toContain('cat-wave');
+
+      const sent = JSON.parse(raw);
+      expect(sent.type).toBe('dm_message');
+      expect(Object.keys(sent.data)).not.toContain('gif_slug');
+      expect(sent.data.content).toBe('ciphertext-blob');
+    });
+
     it('sendTypingIndicator builds correct payload', async () => {
       const ws = await connectAndWaitForOpen(service);
       ws.simulateMessage({

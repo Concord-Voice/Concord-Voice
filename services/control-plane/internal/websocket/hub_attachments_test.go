@@ -15,6 +15,125 @@ const (
 	testTimestamp = "2026-01-01T00:00:00Z"
 )
 
+// --- validateAndLinkAttachment tests (#2843) ---
+//
+// This function had NO coverage before #2843, which is how a five-line change to
+// it failed the 80% new-code gate on its own. The tests below cover the DB
+// lookup, the tier filter, and the happy path.
+
+// seedDMMessage creates a dm_messages row so an attachment has something to link
+// to, and returns its id.
+func seedDMMessage(t *testing.T, setup *hubTestSetup) uuid.UUID {
+	t.Helper()
+	msgID := uuid.New()
+	_, err := setup.db.Exec(
+		`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version)
+		 VALUES ($1, $2, $3, $4, 1)`,
+		msgID, setup.convID, setup.user1.String(), "Y2lwaGVydGV4dA==",
+	)
+	require.NoError(t, err)
+	return msgID
+}
+
+// seedMediaFile inserts a media_files row at the given tier. Tier 2 carries the
+// conversation binding and a key_version; tier 1 must have neither, per the
+// valid_media_context CHECK added in migration 000062.
+func seedMediaFile(t *testing.T, setup *hubTestSetup, tier int) string {
+	t.Helper()
+	fileID := uuid.New().String()
+	if tier == 2 {
+		_, err := setup.db.Exec(
+			`INSERT INTO media_files
+			   (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id)
+			 VALUES ($1, $2, 'photo', 2, 'image/png', 100, $3, 1, $4)`,
+			fileID, setup.user1.String(), "attachments/"+fileID, setup.convID,
+		)
+		require.NoError(t, err)
+		return fileID
+	}
+	_, err := setup.db.Exec(
+		`INSERT INTO media_files
+		   (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
+		 VALUES ($1, $2, 'photo', 1, 'image/png', 100, $3)`,
+		fileID, setup.user1.String(), "avatars/"+fileID,
+	)
+	require.NoError(t, err)
+	return fileID
+}
+
+func dmLinkCtx(setup *hubTestSetup, msgID uuid.UUID) attachmentLinkCtx {
+	return attachmentLinkCtx{
+		userID:         setup.user1.String(),
+		conversationID: setup.convID,
+		messageID:      msgID,
+		// Verbatim from linkDMAttachments (hub.go), so this exercises the same
+		// statement production uses rather than an approximation of it.
+		insertSQL: `INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+	}
+}
+
+func TestValidateAndLinkAttachmentTier2Succeeds(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	msgID := seedDMMessage(t, setup)
+	fileID := seedMediaFile(t, setup, 2)
+
+	summary, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), fileID, 0)
+
+	require.True(t, ok, "a tier-2 attachment owned by the sender must link")
+	assert.Equal(t, fileID, summary.ID)
+
+	var linked int
+	require.NoError(t, setup.db.QueryRow(
+		`SELECT COUNT(*) FROM dm_message_attachments WHERE message_id = $1 AND file_id = $2`,
+		msgID, fileID,
+	).Scan(&linked))
+	assert.Equal(t, 1, linked)
+}
+
+// TestValidateAndLinkAttachmentRejectsTier1 pins the #2843 filter. A tier-1 row
+// (avatar, banner, server icon, group-DM icon) is server-readable media and must
+// never be linked to a message as an E2EE attachment. It was already unreachable
+// — tier-1 rows leave channel_id and conversation_id NULL, and
+// verifyAttachmentAccess requires an exact match — but nothing in the SELECT said
+// so. The `AND media_tier = 2` filter makes the query itself refuse.
+func TestValidateAndLinkAttachmentRejectsTier1(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	msgID := seedDMMessage(t, setup)
+	fileID := seedMediaFile(t, setup, 1)
+
+	_, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), fileID, 0)
+
+	assert.False(t, ok, "a tier-1 row must not be linkable as a message attachment")
+
+	var linked int
+	require.NoError(t, setup.db.QueryRow(
+		`SELECT COUNT(*) FROM dm_message_attachments WHERE message_id = $1`,
+		msgID,
+	).Scan(&linked))
+	assert.Zero(t, linked)
+}
+
+func TestValidateAndLinkAttachmentUnknownFile(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	msgID := seedDMMessage(t, setup)
+
+	_, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), uuid.New().String(), 0)
+
+	assert.False(t, ok, "an unknown file id must not link")
+}
+
+func TestValidateAndLinkAttachmentSoftDeletedFile(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	msgID := seedDMMessage(t, setup)
+	fileID := seedMediaFile(t, setup, 2)
+	_, err := setup.db.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
+	require.NoError(t, err)
+
+	_, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), fileID, 0)
+
+	assert.False(t, ok, "a soft-deleted file must not link")
+}
+
 // --- parseAttachmentIDs tests ---
 
 func TestParseAttachmentIDsNone(t *testing.T) {

@@ -526,9 +526,10 @@ func TestUploadAttachmentMembershipRequired(t *testing.T) {
 	channelID := ts.createTestChannel(t, serverID, "general")
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "file",
-		"mime_type":  mimeOctetStream,
+		"channel_id":  channelID,
+		"file_type":   "file",
+		"mime_type":   mimeOctetStream,
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, outsider, body, ct)
@@ -545,9 +546,10 @@ func TestUploadAttachmentSuccessChannel(t *testing.T) {
 	channelID := ts.createTestChannel(t, serverID, "uploads")
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext-data"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "photo",
-		"mime_type":  "image/jpeg",
+		"channel_id":  channelID,
+		"file_type":   "photo",
+		"mime_type":   "image/jpeg",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
@@ -574,9 +576,10 @@ func TestUploadAttachment_Resolver_OwnerSucceeds(t *testing.T) {
 	channelID := ts.createTestChannel(t, serverID, "res-uploads")
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "photo",
-		"mime_type":  "image/jpeg",
+		"channel_id":  channelID,
+		"file_type":   "photo",
+		"mime_type":   "image/jpeg",
+		"key_version": "1",
 	})
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
 
@@ -601,9 +604,10 @@ func TestUploadAttachment_Resolver_NoSendPermission403(t *testing.T) {
 	require.NoError(t, err)
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "file",
-		"mime_type":  mimeOctetStream,
+		"channel_id":  channelID,
+		"file_type":   "file",
+		"mime_type":   mimeOctetStream,
+		"key_version": "1",
 	})
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, member, body, ct)
 
@@ -624,9 +628,10 @@ func TestUploadAttachment_Resolver_Error500(t *testing.T) {
 	channelID := ts.createTestChannel(t, serverID, "res-uploads3")
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "file",
-		"mime_type":  mimeOctetStream,
+		"channel_id":  channelID,
+		"file_type":   "file",
+		"mime_type":   mimeOctetStream,
+		"key_version": "1",
 	})
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
 
@@ -659,9 +664,10 @@ func TestUploadAttachment_Resolver_TimedOutMember403(t *testing.T) {
 	ts.createTestRoleWithPerms(t, serverID, member, "full", rbac.BasePermissions)
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "file",
-		"mime_type":  mimeOctetStream,
+		"channel_id":  channelID,
+		"file_type":   "file",
+		"mime_type":   mimeOctetStream,
+		"key_version": "1",
 	})
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, member, body, ct)
 
@@ -773,9 +779,10 @@ func TestUploadAttachmentStorageDisabledReturns503(t *testing.T) {
 	ts.handler.store = nil
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("ciphertext-data"), map[string]string{
-		"channel_id": channelID,
-		"file_type":  "photo",
-		"mime_type":  "image/jpeg",
+		"channel_id":  channelID,
+		"file_type":   "photo",
+		"mime_type":   "image/jpeg",
+		"key_version": "1",
 	})
 
 	var w *httptest.ResponseRecorder
@@ -793,6 +800,7 @@ func TestUploadAttachmentXORBothContexts(t *testing.T) {
 		"channel_id":      uuid.New().String(),
 		"conversation_id": uuid.New().String(),
 		"file_type":       "file",
+		"key_version":     "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, user, body, ct)
@@ -807,7 +815,8 @@ func TestUploadAttachmentXORNeitherContext(t *testing.T) {
 	user := ts.createTestUser(t, "xorneither")
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("data"), map[string]string{
-		"file_type": "file",
+		"file_type":   "file",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, user, body, ct)
@@ -822,8 +831,9 @@ func TestUploadAttachmentInvalidChannelID(t *testing.T) {
 	user := ts.createTestUser(t, "badchanid")
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("data"), map[string]string{
-		"channel_id": valueNotUUID,
-		"file_type":  "file",
+		"channel_id":  valueNotUUID,
+		"file_type":   "file",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, user, body, ct)
@@ -841,6 +851,7 @@ func TestUploadAttachmentDMSuccess(t *testing.T) {
 		"conversation_id": convID,
 		"file_type":       "audio",
 		"mime_type":       "audio/mpeg",
+		"key_version":     "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, user1, body, ct)
@@ -860,6 +871,7 @@ func TestUploadAttachmentDMNonParticipant(t *testing.T) {
 	body, ct := multipartBody(t, "file", "secret.bin", []byte("hack"), map[string]string{
 		"conversation_id": convID,
 		"file_type":       "file",
+		"key_version":     "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, outsider, body, ct)

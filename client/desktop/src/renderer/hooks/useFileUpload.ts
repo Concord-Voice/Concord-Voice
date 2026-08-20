@@ -139,8 +139,8 @@ async function readImageDimensions(file: File): Promise<{ width: number; height:
 async function uploadPendingFiles(
   files: FileUploadState[],
   setFiles: SetFilesFn,
-  channelKey: CryptoKey | null,
-  keyVersion: number | undefined,
+  channelKey: CryptoKey,
+  keyVersion: number,
   channelId: string,
   conversationId: string | undefined,
   abortRef: React.MutableRefObject<boolean>
@@ -198,8 +198,8 @@ async function uploadPendingFiles(
  */
 async function uploadAdditionalFiles(
   files: File[],
-  channelKey: CryptoKey | null,
-  keyVersion: number | undefined,
+  channelKey: CryptoKey,
+  keyVersion: number,
   channelId: string,
   conversationId: string | undefined,
   abortRef: React.MutableRefObject<boolean>
@@ -230,8 +230,8 @@ function collectDoneFiles(files: FileUploadState[]): UploadResult {
 
 async function uploadSingleFile(
   entry: FileUploadState,
-  channelKey: CryptoKey | null,
-  keyVersion: number | undefined,
+  channelKey: CryptoKey,
+  keyVersion: number,
   channelId: string,
   conversationId?: string
 ): Promise<UploadResponse> {
@@ -253,23 +253,37 @@ async function uploadSingleFile(
   return safeJson<UploadResponse>(response);
 }
 
+/**
+ * Encrypts one attachment and builds its upload form.
+ *
+ * #2843: `channelKey` is non-nullable and there is deliberately no unencrypted
+ * path. This previously read `channelKey ? await encryptFile(...) : fileData`,
+ * with `channelKey: CryptoKey | null` — residue from before #1024, when an
+ * `is_encrypted = false` channel legitimately uploaded plaintext and the null
+ * key meant "this channel is not encrypted". #1031 removed the `isEncrypted`
+ * gate that selected that branch but left the branch itself, so a null key
+ * would have silently uploaded the file in the clear.
+ *
+ * `e2eeService.getChannelKey` returns `Promise<CryptoKey>` and throws rather
+ * than resolving null, so the null case is unrepresentable — expressing that in
+ * the type is what keeps it unrepresentable. `key_version` is likewise always
+ * sent: `getCurrentKeyVersion` returns a number, never undefined.
+ */
 async function encryptAndBuildForm(
   entry: FileUploadState,
-  channelKey: CryptoKey | null,
-  keyVersion: number | undefined,
+  channelKey: CryptoKey,
+  keyVersion: number,
   channelId: string,
   conversationId?: string
 ): Promise<FormData> {
   const fileData = await entry.file.arrayBuffer();
-  const uploadData = channelKey ? await encryptFile(fileData, channelKey) : fileData;
+  const uploadData = await encryptFile(fileData, channelKey);
 
   const formData = new FormData();
   formData.append('file', new Blob([uploadData]), entry.file.name);
   formData.append('file_type', classifyFileType(entry.file.type));
   formData.append('mime_type', entry.file.type || DEFAULT_MIME);
-  if (keyVersion !== undefined) {
-    formData.append('key_version', String(keyVersion));
-  }
+  formData.append('key_version', String(keyVersion));
   if (conversationId) {
     formData.append('conversation_id', conversationId);
   } else {

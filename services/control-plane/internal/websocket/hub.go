@@ -2258,8 +2258,12 @@ func (h *Hub) validateAndLinkAttachment(ctx attachmentLinkCtx, fileID string, po
 	var fileChannelID, fileConvID *string
 
 	err := h.db.QueryRow(
+		// #2843: media_tier = 2 is defence in depth. Tier-1 rows leave channel_id
+		// and conversation_id NULL and verifyAttachmentAccess requires an exact
+		// match, so a tier-1 row cannot currently be linked to a message — but
+		// nothing in THIS query said so, and the filter is free.
 		`SELECT uploader_id, file_type, mime_type, file_size, channel_id, conversation_id
-		 FROM media_files WHERE id = $1 AND deleted_at IS NULL`,
+		 FROM media_files WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`,
 		fileID,
 	).Scan(&uploaderID, &summary.FileType, &summary.MimeType, &summary.FileSize, &fileChannelID, &fileConvID)
 	if err != nil {

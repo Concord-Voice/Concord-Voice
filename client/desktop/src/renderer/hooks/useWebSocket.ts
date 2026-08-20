@@ -384,14 +384,6 @@ export function useWebSocket() {
     [wsService]
   );
 
-  // Send a message
-  const sendMessage = useCallback(
-    (channelId: string, content: string) => {
-      wsService.sendMessage(channelId, content);
-    },
-    [wsService]
-  );
-
   // Send typing indicator
   const sendTyping = useCallback(
     (channelId: string, isTyping: boolean) => {
@@ -405,10 +397,16 @@ export function useWebSocket() {
     return wsService.getState();
   }, [wsService]);
 
+  // #2843: `sendMessage` deliberately absent. It used to be exported here and
+  // called wsService.sendMessage(channelId, content) with no encryption and no
+  // keyVersion — residue from before #1024, when an unencrypted channel could
+  // legitimately send plaintext. Nothing consumed it (App.tsx discards this
+  // hook's return value), but the name invited exactly the wrong call, and this
+  // hook holds no e2eeService key material, so there is no correct version of
+  // it to keep. Encrypted sends go through useMessaging / dmMessageSender.
   return {
     subscribe,
     unsubscribe,
-    sendMessage,
     sendTyping,
     getState,
   };

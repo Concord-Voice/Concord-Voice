@@ -7105,6 +7105,7 @@ paths:
               type: object
               required:
               - file
+              - key_version
               properties:
                 file:
                   type: string
@@ -7125,8 +7126,9 @@ paths:
                 key_version:
                   type: integer
                   minimum: 1
-                  default: 1
-                  description: E2EE key epoch the attachment was encrypted under
+                  description: 'E2EE key epoch the attachment was encrypted under. Client-attested and required
+                    — the server never substitutes a default, so a stored attachment always carries the epoch
+                    its sender claimed (#2843)'
                 channel_id:
                   type: string
                   format: uuid

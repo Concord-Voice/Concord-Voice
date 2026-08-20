@@ -332,6 +332,17 @@ func (h *Handler) admitCreateChannelRequest(c *gin.Context, req CreateChannelReq
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Encrypted channels require wrapped keys for all members"})
 		return false
 	}
+	// #2843: presence of a map entry is not presence of key material. Only the
+	// map length was checked, so `{"<uuid>": ""}` created a channel whose
+	// channel_keys rows held empty strings — a channel nobody can decrypt,
+	// indistinguishable at the schema level from a correctly wrapped one.
+	for recipient, wrapped := range req.WrappedKeys {
+		if strings.TrimSpace(wrapped) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Wrapped key must not be empty"})
+			h.log.Warn("Rejected empty wrapped key", "recipient_user_id", recipient)
+			return false
+		}
+	}
 	return true
 }
 

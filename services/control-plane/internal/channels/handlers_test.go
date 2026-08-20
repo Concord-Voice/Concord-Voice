@@ -96,6 +96,61 @@ func TestCreateChannelSuccess(t *testing.T) {
 	assert.Equal(t, "new-channel", channel["name"])
 }
 
+// TestCreateChannelRejectsEmptyWrappedKey pins the #2843 fix. Only
+// `len(req.WrappedKeys) == 0` was checked, never the VALUES — so
+// `{"<uuid>": ""}` was accepted and stored, creating a channel whose
+// channel_keys rows held empty strings. Nobody could decrypt it, and at the
+// schema level it was indistinguishable from a correctly wrapped channel:
+// presence of a map entry is not presence of key material.
+//
+// Scope is self-inflicted (a creator can only do this to their own channel),
+// which is why it is LOW severity — but a validation that counts entries
+// instead of inspecting them is the same shape as a CHECK constraint that
+// proves presence rather than authenticity. Do not relax this to a length check.
+func TestCreateChannelRejectsEmptyWrappedKey(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "emptywrap")
+	serverID := ts.CreateTestServer(t, user.ID, "Empty Wrap Server")
+
+	w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+		keyServerID: serverID,
+		"name":      "empty-wrap-channel",
+		"type":      "text",
+		keyWrappedKeys: map[string]string{
+			user.ID: "",
+		},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	// No channel may exist, and therefore no undecryptable key rows.
+	var count int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channels WHERE server_id = $1 AND name = $2`,
+		serverID, "empty-wrap-channel",
+	).Scan(&count))
+	assert.Zero(t, count, "a channel must not be created with empty key material")
+}
+
+// TestCreateChannelRejectsWhitespaceWrappedKey covers the whitespace-only form,
+// which a bare `!= ""` check would let through.
+func TestCreateChannelRejectsWhitespaceWrappedKey(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "wswrap")
+	serverID := ts.CreateTestServer(t, user.ID, "WS Wrap Server")
+
+	w := ts.DoRequest("POST", pathChannels, map[string]interface{}{
+		keyServerID: serverID,
+		"name":      "ws-wrap-channel",
+		"type":      "text",
+		keyWrappedKeys: map[string]string{
+			user.ID: "   ",
+		},
+	}, testhelpers.AuthHeaders(user.AccessToken))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestCreateChannel_OverflowBindsInitialDistributionToCreator(t *testing.T) {
 	ts := setupTS(t)
 	creator := ts.CreateTestUser(t, "overflowcreator")

@@ -193,6 +193,7 @@ func TestUploadAttachmentInvalidConversationID(t *testing.T) {
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("data"), map[string]string{
 		keyConversationID: "not-a-uuid",
 		keyFileType:       "file",
+		"key_version":     "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, user, body, ct)
@@ -200,6 +201,64 @@ func TestUploadAttachmentInvalidConversationID(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	resp := parseBody(t, w)
 	assert.Contains(t, resp["error"], "Invalid conversation_id")
+}
+
+// TestUploadAttachmentMissingKeyVersion pins the #2843 fix. An ABSENT
+// key_version used to be silently supplied by the server (`keyVersion = 1`,
+// validated only when the field was present), so a tier-2 row could carry an
+// epoch its sender never claimed — and the media_files CHECK constraint
+// (media_tier = 2 AND key_version IS NOT NULL) could not detect it, because the
+// value it checks for was the server's own. A constraint on a server-suppliable
+// field proves presence, not authenticity.
+//
+// The malformed cases below this were already covered; the ABSENT case is the
+// one that was accepted. Do not "fix" a failure here by restoring the default.
+func TestUploadAttachmentMissingKeyVersion(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "nokeyver")
+	serverID := ts.createTestServer(t, owner, "NoKeyVer Server")
+	channelID := ts.createTestChannel(t, serverID, "nokeyver")
+
+	// key_version deliberately omitted entirely.
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("data"), map[string]string{
+		keyChannelID: channelID,
+		keyFileType:  "file",
+	})
+
+	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	resp := parseBody(t, w)
+	assert.Contains(t, resp["error"], "key_version")
+
+	// Nothing may be persisted under a server-invented epoch.
+	var count int
+	err := ts.db.QueryRow(
+		`SELECT COUNT(*) FROM media_files WHERE channel_id = $1`, channelID,
+	).Scan(&count)
+	require.NoError(t, err)
+	assert.Zero(t, count, "no media_files row may be created without a client-attested epoch")
+}
+
+// TestUploadAttachmentEmptyKeyVersion covers the empty-string form of the same
+// omission, which the old `if keyVersionStr != ""` guard also skipped.
+func TestUploadAttachmentEmptyKeyVersion(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "emptykeyver")
+	serverID := ts.createTestServer(t, owner, "EmptyKeyVer Server")
+	channelID := ts.createTestChannel(t, serverID, "emptykeyver")
+
+	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("data"), map[string]string{
+		keyChannelID:  channelID,
+		keyFileType:   "file",
+		"key_version": "",
+	})
+
+	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	resp := parseBody(t, w)
+	assert.Contains(t, resp["error"], "key_version")
 }
 
 func TestUploadAttachmentInvalidKeyVersion(t *testing.T) {
@@ -246,8 +305,9 @@ func TestUploadAttachmentDefaultFileType(t *testing.T) {
 
 	// Send an invalid file_type; should default to "file"
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte(testCiphertextData), map[string]string{
-		keyChannelID: channelID,
-		keyFileType:  "invalid_type",
+		keyChannelID:  channelID,
+		keyFileType:   "invalid_type",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
@@ -265,7 +325,8 @@ func TestUploadAttachmentDefaultMimeType(t *testing.T) {
 
 	// Do not send mime_type; should default to application/octet-stream
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte(testCiphertextData), map[string]string{
-		keyChannelID: channelID,
+		keyChannelID:  channelID,
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
@@ -297,9 +358,10 @@ func TestUploadAttachmentVideoFileType(t *testing.T) {
 	channelID := ts.createTestChannel(t, serverID, "videoft")
 
 	body, ct := multipartBody(t, "file", "video.mp4", []byte("video-ciphertext"), map[string]string{
-		keyChannelID: channelID,
-		keyFileType:  "video",
-		keyMimeType:  "video/mp4",
+		keyChannelID:  channelID,
+		keyFileType:   "video",
+		keyMimeType:   "video/mp4",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
@@ -316,9 +378,10 @@ func TestUploadAttachmentAnimatedFileType(t *testing.T) {
 	channelID := ts.createTestChannel(t, serverID, "animft")
 
 	body, ct := multipartBody(t, "file", "anim.gif", []byte("animated-ciphertext"), map[string]string{
-		keyChannelID: channelID,
-		keyFileType:  "animated",
-		keyMimeType:  "image/gif",
+		keyChannelID:  channelID,
+		keyFileType:   "animated",
+		keyMimeType:   "image/gif",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)
@@ -876,8 +939,9 @@ func TestUploadAttachmentStoreFailure(t *testing.T) {
 	defer func() { ts.store.putErr = nil }()
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte(testCiphertextData), map[string]string{
-		keyChannelID: channelID,
-		keyFileType:  "file",
+		keyChannelID:  channelID,
+		keyFileType:   "file",
+		"key_version": "1",
 	})
 
 	w := ts.doMultipart(ts.handler.UploadAttachment, "POST", pathUploadAttachment, owner, body, ct)

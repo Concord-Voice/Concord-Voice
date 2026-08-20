@@ -272,7 +272,7 @@ describe('useWebSocket — extended', () => {
     });
   });
 
-  describe('subscribe/unsubscribe/sendMessage/sendTyping', () => {
+  describe('subscribe/unsubscribe/sendTyping', () => {
     it('unsubscribe delegates to wsService', () => {
       useAuthStore.getState().setAccessToken('test-token');
       const { result } = renderHook(() => useWebSocket());

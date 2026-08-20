@@ -109,8 +109,11 @@ wsService.connect(token);
 // Subscribe to a channel
 wsService.subscribe(channelId);
 
-// Send a message
-wsService.sendMessage(channelId, 'Hello world!');
+// Send a message. `content` MUST already be ciphertext, and key_version MUST be
+// the epoch it was encrypted under — the server rejects a frame without one
+// (close 4400). Encrypt via e2eeService rather than calling this directly; see
+// useMessaging.ts for the real send path.
+wsService.sendMessage(channelId, ciphertext, { keyVersion, nonce });
 
 // Listen for messages
 const unsubscribe = wsService.on('message', (msg) => {
@@ -193,7 +196,7 @@ React hook that bridges `websocketService` with `chatStore`.
 import { useWebSocket } from '../hooks/useWebSocket';
 
 function MyComponent() {
-  const { subscribe, unsubscribe, sendMessage, sendTyping } = useWebSocket();
+  const { subscribe, unsubscribe, sendTyping } = useWebSocket();
 
   // Subscribe to a channel
   useEffect(() => {
@@ -201,14 +204,40 @@ function MyComponent() {
     return () => unsubscribe(channelId);
   }, [channelId]);
 
-  // Send a message
+  return <div>...</div>;
+}
+```
+
+This hook deliberately exposes **no** send-message function. It used to export a
+`sendMessage(channelId, content)` that forwarded straight to the service with no
+encryption and no `key_version` — residue from before #1024, when an unencrypted
+channel could legitimately send plaintext. It was removed in #2843: the hook
+holds no `e2eeService` key material, so there is no correct version of it, and
+the name invited exactly the wrong call.
+
+Send an encrypted message through `useMessaging` (channels and DMs). It encrypts
+via `e2eeService` and stamps the `key_version` the server requires, and it is
+fail-closed: if encryption fails, nothing is sent.
+
+```typescript
+import { useMessaging } from '../hooks/useMessaging';
+
+function Composer({ channelId, username }: { channelId: string; username: string }) {
+  const messaging = useMessaging();
+
   const handleSend = (content: string) => {
-    sendMessage(channelId, content);
+    // `content` is plaintext here — useMessaging encrypts it before it reaches
+    // the socket. Never call wsService.sendMessage with plaintext directly.
+    messaging.sendMessage(channelId, content, username);
   };
 
   return <div>...</div>;
 }
 ```
+
+`messaging.sendDMMessage(conversationId, content, username, opts)` is the DM
+equivalent; see `useChatController.ts` for a live call site that picks between
+them.
 
 ---
 
@@ -407,7 +436,8 @@ Visual indicator of WebSocket connection state.
 
 ### 3. Sending a Message
 1. User types message → clicks send
-2. Frontend calls `wsService.sendMessage(channelId, content)`
+2. Frontend encrypts via `e2eeService`, then calls
+   `wsService.sendMessage(channelId, ciphertext, { keyVersion, ... })`
 3. Backend receives message → broadcasts to all subscribers (including sender)
 4. All clients receive `message` event → update UI
 

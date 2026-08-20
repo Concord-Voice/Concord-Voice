@@ -687,13 +687,12 @@ describe('useWebSocket', () => {
   });
 
   describe('returned API', () => {
-    it('returns subscribe/unsubscribe/sendMessage/sendTyping/getState functions', () => {
+    it('returns subscribe/unsubscribe/sendTyping/getState functions', () => {
       useAuthStore.getState().setAccessToken('test-token');
       const { result } = renderHook(() => useWebSocket());
 
       expect(typeof result.current.subscribe).toBe('function');
       expect(typeof result.current.unsubscribe).toBe('function');
-      expect(typeof result.current.sendMessage).toBe('function');
       expect(typeof result.current.sendTyping).toBe('function');
       expect(typeof result.current.getState).toBe('function');
     });
@@ -706,12 +705,27 @@ describe('useWebSocket', () => {
       expect(mockWsService.subscribe).toHaveBeenCalledWith('ch-1');
     });
 
-    it('sendMessage delegates to wsService', () => {
+    // #2843: the absence of `sendMessage` is deliberate, not an oversight.
+    // The hook used to export `sendMessage(channelId, content)`, which forwarded
+    // straight to wsService with no encryption and no key_version — an E2EE
+    // bypass left behind when #1031 removed the `is_encrypted` selector that had
+    // once made a plaintext send legitimate. This hook holds no e2eeService key
+    // material, so there is no correct version of it to keep; encrypted sends go
+    // through useMessaging (channels) or dmMessageSender (DMs). If this test
+    // fails, a plaintext send path has been reintroduced — do not "fix" it by
+    // re-adding the export.
+    it('exposes no sendMessage — encrypted sends go via useMessaging/dmMessageSender', () => {
       useAuthStore.getState().setAccessToken('test-token');
       const { result } = renderHook(() => useWebSocket());
 
-      result.current.sendMessage('ch-1', 'Hello');
-      expect(mockWsService.sendMessage).toHaveBeenCalledWith('ch-1', 'Hello');
+      expect(result.current).not.toHaveProperty('sendMessage');
+      expect(Object.keys(result.current)).toEqual([
+        'subscribe',
+        'unsubscribe',
+        'sendTyping',
+        'getState',
+      ]);
+      expect(mockWsService.sendMessage).not.toHaveBeenCalled();
     });
   });
 });

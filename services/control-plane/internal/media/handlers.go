@@ -924,6 +924,10 @@ func parseAttachmentFile(c *gin.Context, maxSize int64) (multipart.File, *multip
 	return file, header, nil
 }
 
+// errMsgKeyVersionRequired is returned when a tier-2 attachment upload omits or
+// malforms key_version. The epoch must come from the sender (#2843).
+const errMsgKeyVersionRequired = "key_version is required and must be a positive integer"
+
 func validateAttachmentRequest(c *gin.Context) (fileType FileType, mimeType string, keyVersion int, ok bool) {
 	fileType = FileType(c.PostForm("file_type"))
 	if !isValidFileType(fileType) {
@@ -935,13 +939,25 @@ func validateAttachmentRequest(c *gin.Context) (fileType FileType, mimeType stri
 		mimeType = mimeOctetStream
 	}
 
-	keyVersion = 1
+	// #2843: a tier-2 attachment's epoch is CLIENT-ATTESTED, never invented here.
+	// This previously seeded `keyVersion = 1` and validated only when the field
+	// was present, so an ABSENT key_version was silently supplied by the server —
+	// and the media_files CHECK constraint (media_tier = 2 AND key_version IS NOT
+	// NULL) could not detect it, because the value it checks for was the server's
+	// own. A constraint on a server-suppliable field proves presence, not
+	// authenticity. Same defect and same fix as #2832 on the message-send path.
+	//
+	// The default dates to #418 (2026-04-03), when an unencrypted upload
+	// legitimately omitted the field; #1042 removed the is_encrypted selector
+	// without removing the accommodation.
 	keyVersionStr := c.PostForm("key_version")
-	if keyVersionStr != "" {
-		if v, err := fmt.Sscanf(keyVersionStr, "%d", &keyVersion); err != nil || v != 1 || keyVersion < 1 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "key_version must be a positive integer"})
-			return "", "", 0, false
-		}
+	if keyVersionStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgKeyVersionRequired})
+		return "", "", 0, false
+	}
+	if v, err := fmt.Sscanf(keyVersionStr, "%d", &keyVersion); err != nil || v != 1 || keyVersion < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgKeyVersionRequired})
+		return "", "", 0, false
 	}
 
 	return fileType, mimeType, keyVersion, true
