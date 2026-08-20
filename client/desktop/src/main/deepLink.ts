@@ -1,7 +1,17 @@
+/**
+ * The 8-char ambiguity-stripped charset predicate for this surface. It is one of
+ * THREE independent copies — the others are `INVITE_CODE_PATTERN` in
+ * [internal]workers/invite-landing/src/stub.ts and `CODE_CLASS`
+ * in client/desktop/src/renderer/utils/inviteUrl.ts. #1557's variable-length
+ * vanity slugs must relax all three; missing the Worker copy is a validation
+ * bypass on the anonymous edge path.
+ */
 const INVITE_CODE_RE = /^[A-HJ-NP-Za-hj-km-np-z2-9]{8}$/;
 
+export type DeepLinkKind = 'invite' | 'friend';
+
 export type InviteDeepLinkResult =
-  | { ok: true; code: string }
+  | { ok: true; kind: DeepLinkKind; code: string }
   | {
       ok: false;
       reason: 'empty' | 'invalid-url' | 'wrong-protocol' | 'wrong-host' | 'bad-path' | 'bad-code';
@@ -18,7 +28,9 @@ export function normalizeInviteDeepLink(raw: string | undefined): InviteDeepLink
   }
 
   if (parsed.protocol !== 'concord:') return { ok: false, reason: 'wrong-protocol' };
-  if (parsed.host !== 'invite') return { ok: false, reason: 'wrong-host' };
+  if (parsed.host !== 'invite' && parsed.host !== 'friend') {
+    return { ok: false, reason: 'wrong-host' };
+  }
 
   const parts = parsed.pathname.split('/').filter(Boolean);
   if (parts.length !== 1) return { ok: false, reason: 'bad-path' };
@@ -27,7 +39,7 @@ export function normalizeInviteDeepLink(raw: string | undefined): InviteDeepLink
   if (code === undefined || !INVITE_CODE_RE.test(code)) {
     return { ok: false, reason: 'bad-code' };
   }
-  return { ok: true, code };
+  return { ok: true, kind: parsed.host === 'friend' ? 'friend' : 'invite', code };
 }
 
 export function extractInviteDeepLinkFromArgv(argv?: readonly string[]): InviteDeepLinkResult {

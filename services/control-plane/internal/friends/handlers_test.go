@@ -1,14 +1,25 @@
 package friends_test
 
 import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 const (
@@ -1296,7 +1307,7 @@ func TestPreviewFriendCode_NotFound(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "codepreview3")
 
-	w := ts.DoRequest("GET", pathFriendCodes+"/ABCD1234", nil, testhelpers.AuthHeaders(user.AccessToken))
+	w := ts.DoRequest("GET", pathFriendCodes+"/ABCD2345", nil, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
@@ -1332,10 +1343,10 @@ func TestPreviewFriendCode_ExpiredCodeShowsInvalid(t *testing.T) {
 
 	// Insert an already-expired code directly
 	expiredAt := time.Now().UTC().Add(-1 * time.Hour)
-	createFriendCode(t, ts, user.ID, "EXPR1234", nil, &expiredAt, false)
+	createFriendCode(t, ts, user.ID, "EXPR2345", nil, &expiredAt, false)
 
 	viewer := ts.CreateTestUser(t, "codeviewer5")
-	w := ts.DoRequest("GET", pathFriendCodes+"/EXPR1234", nil, testhelpers.AuthHeaders(viewer.AccessToken))
+	w := ts.DoRequest("GET", pathFriendCodes+"/EXPR2345", nil, testhelpers.AuthHeaders(viewer.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	var body map[string]interface{}
@@ -1350,14 +1361,14 @@ func TestPreviewFriendCode_MaxUsesReachedShowsInvalid(t *testing.T) {
 	// Insert a code with max_uses=1 and use_count=1
 	maxUses := 1
 	futureExpiry := time.Now().UTC().Add(1 * time.Hour)
-	codeID := createFriendCode(t, ts, user.ID, "MAXU1234", &maxUses, &futureExpiry, false)
+	codeID := createFriendCode(t, ts, user.ID, "MAXU2345", &maxUses, &futureExpiry, false)
 
 	// Manually set use_count to max
 	_, err := ts.DB.Exec(`UPDATE friend_codes SET use_count = 1 WHERE id = $1`, codeID)
 	require.NoError(t, err)
 
 	viewer := ts.CreateTestUser(t, "codeviewer6")
-	w := ts.DoRequest("GET", pathFriendCodes+"/MAXU1234", nil, testhelpers.AuthHeaders(viewer.AccessToken))
+	w := ts.DoRequest("GET", pathFriendCodes+"/MAXU2345", nil, testhelpers.AuthHeaders(viewer.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	var body map[string]interface{}
@@ -1796,4 +1807,196 @@ func TestFriendLifecycle_BlockAfterFriends(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	testhelpers.ParseJSON(t, w, &body)
 	assert.Len(t, body["friends"].([]interface{}), 0)
+}
+
+// ============================================================
+// Public friend-code preview + avatar fallback (#945)
+//
+// The internal/api suite drives these two handlers through the production
+// router and proves routing, middleware and the privacy contract end to end.
+// It cannot credit coverage to THIS package: `go test -coverprofile`
+// instruments only the package under test, so a test binary living in another
+// directory records nothing here. The tests below exercise the same handlers
+// from their own package, branch by branch.
+// ============================================================
+
+const (
+	previewSuffix         = "/preview"
+	avatarSuffix          = "/avatar"
+	publicFriendCodesPath = pathFriendCodes + "/"
+	svgContentType        = "image/svg+xml; charset=utf-8"
+	shortPublicCache      = "public, max-age=60, must-revalidate"
+	headerCacheControl    = "Cache-Control"
+	headerContentType     = "Content-Type"
+	bodyInvalidFriendCode = `{"valid":false}`
+)
+
+// newPublicFriendCodeRouter mounts the two public friend-code handlers on their
+// production route patterns over db, minus the rate-limit middleware the real
+// router wraps them in. Gin still performs the percent-decoding and the :code
+// extraction, so the RawPath guard is reached exactly as production reaches it;
+// dropping the per-IP bucket only stops a branch-by-branch test from throttling
+// itself on a limiter it is not testing.
+func newPublicFriendCodeRouter(t *testing.T, db *sql.DB) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	h := friends.NewHandler(db, logger.NewWithWriter(io.Discard), nil)
+	router := gin.New()
+	router.GET(publicFriendCodesPath+":code"+previewSuffix, h.GetPublicFriendCodePreview)
+	router.GET(publicFriendCodesPath+":code"+avatarSuffix, h.GetPublicFriendAvatarFallback)
+	return router
+}
+
+// getPublicFriendCode issues an anonymous GET against a complete wire path, so
+// percent-encoded cases can be expressed exactly as an attacker would send them.
+func getPublicFriendCode(t *testing.T, router *gin.Engine, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	return w
+}
+
+// percentEncodeFirstByte returns code with its leading byte percent-encoded.
+// The DECODED path is byte-identical to the canonical one, so gin routes it to
+// the same handler with the same :code param; the only difference lives in
+// URL.RawPath - which is precisely what the edge rate-limit rule matches on and
+// the origin must therefore reject (#945, VULN-001).
+func percentEncodeFirstByte(code string) string {
+	return fmt.Sprintf("%%%02X%s", code[0], code[1:])
+}
+
+func TestGetPublicFriendCodePreview(t *testing.T) {
+	ts := setupTS(t)
+	router := newPublicFriendCodeRouter(t, ts.DB)
+
+	valid := ts.SeedFriendCode(t, testhelpers.FriendCodeSeed{
+		Username: "pubfcalice", DisplayName: "Alice A", AvatarURL: "/api/v1/media/avatars/alice",
+	})
+	plain := ts.SeedFriendCode(t, testhelpers.FriendCodeSeed{Username: "pubfcbob"})
+	expired := ts.SeedFriendCode(t, testhelpers.FriendCodeSeed{Username: "pubfccarol", Expired: true})
+	revoked := ts.SeedFriendCode(t, testhelpers.FriendCodeSeed{Username: "pubfcdave", Revoked: true})
+	maxed := ts.SeedFriendCode(t, testhelpers.FriendCodeSeed{
+		Username: "pubfcerin", MaxUses: 1, UseCount: 1,
+	})
+
+	preview := func(t *testing.T, code string) *httptest.ResponseRecorder {
+		t.Helper()
+		return getPublicFriendCode(t, router, publicFriendCodesPath+code+previewSuffix)
+	}
+
+	t.Run("valid code returns username and display name only", func(t *testing.T) {
+		w := preview(t, valid.Code)
+		require.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, true, body["valid"])
+		assert.Equal(t, "pubfcalice", body["username"])
+		assert.Equal(t, "Alice A", body["display_name"])
+
+		// Key ABSENCE, not emptiness: a present-but-empty key would still hand
+		// the caller a field to grow a branch on.
+		for _, key := range []string{"user_id", "avatar_url"} {
+			_, present := body[key]
+			assert.Falsef(t, present, "%s must never appear in a public preview", key)
+		}
+		assert.NotContains(t, w.Body.String(), valid.Owner.ID)
+	})
+
+	t.Run("valid code omits display_name when the owner has none", func(t *testing.T) {
+		w := preview(t, plain.Code)
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.JSONEq(t, `{"valid":true,"username":"pubfcbob"}`, w.Body.String())
+	})
+
+	t.Run("every invalid class is byte-identical", func(t *testing.T) {
+		// Ordered, not a map: the reference must be a fixed case rather than
+		// whichever one Go's randomized map iteration happened to visit first.
+		//
+		// The last two carry percent-encoding and use the VALID code on
+		// purpose. They must land in the same uniform shape as every other
+		// rejected class - rejecting them distinguishably would trade the
+		// rate-limit bypass for an enumeration oracle (#945, VULN-001).
+		cases := []struct{ name, path string }{
+			{"malformed charset", publicFriendCodesPath + "AAAA000I" + previewSuffix},
+			{"length 7", publicFriendCodesPath + "AAAAAAA" + previewSuffix},
+			{"length 9", publicFriendCodesPath + "AAAAAAAAA" + previewSuffix},
+			{"unknown", publicFriendCodesPath + "ZZZZZZZZ" + previewSuffix},
+			{"expired", publicFriendCodesPath + expired.Code + previewSuffix},
+			{"revoked", publicFriendCodesPath + revoked.Code + previewSuffix},
+			{"max used", publicFriendCodesPath + maxed.Code + previewSuffix},
+			{"encoded separator", publicFriendCodesPath + valid.Code + "%2Fpreview"},
+			{
+				"encoded character inside the code",
+				publicFriendCodesPath + percentEncodeFirstByte(valid.Code) + previewSuffix,
+			},
+		}
+
+		reference := getPublicFriendCode(t, router, cases[0].path)
+		require.Equal(t, http.StatusOK, reference.Code)
+		require.JSONEq(t, bodyInvalidFriendCode, reference.Body.String())
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				w := getPublicFriendCode(t, router, tc.path)
+				assert.Equal(t, http.StatusOK, w.Code)
+				// Byte equality, not field equality: a whitespace, key-order or
+				// extra-key difference between classes is itself an oracle.
+				assert.Equal(t, reference.Body.Bytes(), w.Body.Bytes(),
+					"invalid classes must be byte-indistinguishable")
+				assert.NotContains(t, w.Body.String(), "pubfc",
+					"no owner username may survive an invalid classification")
+			})
+		}
+	})
+}
+
+// TestGetPublicFriendCodePreviewDatabaseError covers the one permitted
+// divergence from the uniform invalid shape, and proves it still leaks nothing.
+//
+// The pool is closed rather than the shared test table renamed: every query on
+// a closed pool fails with a real driver error, which isolates the handler's
+// defensive 500 branch without mutating state other tests share.
+func TestGetPublicFriendCodePreviewDatabaseError(t *testing.T) {
+	closed, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+
+	router := newPublicFriendCodeRouter(t, closed)
+	const code = "ABCDEFGH"
+	w := getPublicFriendCode(t, router, publicFriendCodesPath+code+previewSuffix)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.JSONEq(t, `{"error":"Failed to fetch friend code preview"}`, w.Body.String())
+	assert.NotContains(t, w.Body.String(), code, "the code is bearer material")
+}
+
+// TestGetPublicFriendAvatarFallback drives the store-less arm of the public
+// avatar route. It consults nothing - no database row, no object store - so it
+// runs against a nil pool: reaching for either would be the regression.
+func TestGetPublicFriendAvatarFallback(t *testing.T) {
+	router := newPublicFriendCodeRouter(t, nil)
+
+	reference := getPublicFriendCode(t, router, publicFriendCodesPath+"ABCDEFGH"+avatarSuffix)
+	require.Equal(t, http.StatusOK, reference.Code)
+	assert.Equal(t, svgContentType, reference.Header().Get(headerContentType))
+	assert.Equal(t, shortPublicCache, reference.Header().Get(headerCacheControl))
+	assert.Equal(t, invites.PublicInviteIconSVG, reference.Body.String(),
+		"the fallback must serve the shared silhouette the proxying arm serves")
+
+	// Headers included: the two arms of publicFriendAvatarHandler must be
+	// indistinguishable from each other, or the fallback itself is a signal.
+	for _, tc := range []struct{ name, path string }{
+		{"unknown code", publicFriendCodesPath + "ZZZZZZZZ" + avatarSuffix},
+		{"malformed charset", publicFriendCodesPath + "AAAA000I" + avatarSuffix},
+		{"encoded separator", publicFriendCodesPath + "ABCDEFGH%2Favatar"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := getPublicFriendCode(t, router, tc.path)
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, reference.Body.Bytes(), w.Body.Bytes())
+			assert.Equal(t, svgContentType, w.Header().Get(headerContentType))
+			assert.Equal(t, shortPublicCache, w.Header().Get(headerCacheControl))
+		})
+	}
 }

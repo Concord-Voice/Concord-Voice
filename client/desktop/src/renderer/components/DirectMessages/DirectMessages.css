@@ -750,6 +750,20 @@
   border: 0;
 }
 
+/* Visually-hidden label for the friend-code input (geometry only — no color,
+   so this rule needs no theme block) */
+.add-friend-modal .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ─── Personal Thread (pinned entry) ────────────────────────────────── */
 
 .conversation-item.personal-thread {
@@ -891,6 +905,9 @@
 }
 
 .add-friend-success {
+  /* Rendered as <output>, which is inline by default — without this the vertical
+     padding below would not affect the line box (sonar typescript:S6819). */
+  display: block;
   font-size: calc(12px * var(--font-scale, 1));
   color: var(--status-connected);
   padding: calc(4px * var(--sp, 1)) 0;

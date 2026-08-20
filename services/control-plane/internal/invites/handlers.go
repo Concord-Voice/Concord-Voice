@@ -632,6 +632,19 @@ func (h *Handler) lookupPublicInvitePreview(code string) (publicInvitePreview, e
 // GetPublicInvitePreview returns an unauthenticated, privacy-trimmed invite
 // card for invite.concordvoice.chat.
 func (h *Handler) GetPublicInvitePreview(c *gin.Context) {
+	// The edge rate-limit rule matches on the RAW wire path, but gin routes on
+	// the percent-DECODED path, so /…/CODE%2Fpreview reaches this handler while
+	// matching no WAF rule — no managed challenge, no edge bucket.
+	// URL.RawPath is non-empty only when the raw and decoded forms differ, i.e.
+	// exactly when something was percent-encoded, and no legitimate caller
+	// encodes anything here: the code charset is entirely RFC-3986 unreserved.
+	// Reject in the SAME uniform shape as every other invalid class, so closing
+	// the rate-limit bypass introduces no enumeration oracle (#945, VULN-001).
+	if c.Request.URL.RawPath != "" {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+
 	code := c.Param("code")
 	if !IsValidCode(code) {
 		c.JSON(http.StatusOK, gin.H{"valid": false})

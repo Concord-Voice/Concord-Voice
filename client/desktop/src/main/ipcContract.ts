@@ -149,8 +149,28 @@
  *        channel is additive, and a shell without it degrades to the pre-#2394
  *        bug (E2EE keys session-only, recoverable by unlock or re-login) —
  *        never to a weaker or unowned credential writer.
+ * - v22: Friend-code deep links (#945): deeplink:friend-code (main -> renderer,
+ *        { code }) and deeplink:renderer-ready (renderer -> main). A
+ *        concord://friend/CODE deep link lands on this pair; invite:received
+ *        keeps emitting a bare { code } forever.
+ *
+ *        A SECOND channel rather than a widened invite:received payload,
+ *        because spaLoader's version gate is one-directional: it refuses an SPA
+ *        NEWER than the shell but loads an older one indefinitely, and
+ *        SPA_IPC_CONTRACT is an operator-set, hot-reloadable env var, so the
+ *        window is unbounded by deploy. A { kind, code } payload on
+ *        invite:received would reach a pre-22 SPA that ignores the unknown
+ *        field and opens the SERVER-join modal with a friend code. On its own
+ *        channel that SPA simply never subscribes and the deep link no-ops.
+ *        Main keeps ONE {kind, code} queue with TWO independent readiness
+ *        flags for the same reason — a shared flag would let an old SPA's
+ *        invite subscription vouch for a friend subscription it never made.
+ *
+ *        The SERVER's spaIpcContract stays 19 — the channel is purely additive
+ *        (v9/v10/v20/v21 precedent), and a shell without it simply never
+ *        delivers the friend deep link.
  */
-export const IPC_CONTRACT_VERSION = 21;
+export const IPC_CONTRACT_VERSION = 22;
 
 /**
  * Opaque main-process identity for one stored credential lifecycle.

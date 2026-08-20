@@ -1,6 +1,7 @@
 package invites_test
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,6 +14,20 @@ import (
 func setupTS(t *testing.T) *testhelpers.TestServer {
 	t.Helper()
 	return testhelpers.SetupTestServer(t)
+}
+
+const (
+	invitesPath         = "/api/v1/invites/"
+	invitePreviewSuffix = "/preview"
+)
+
+// percentEncodeFirstByte returns code with its leading byte percent-encoded.
+// The DECODED path is byte-identical to the canonical one, so gin routes it to
+// the same handler with the same :code param; the only difference lives in
+// URL.RawPath — which is precisely what the edge rate-limit rule matches on and
+// the origin must therefore reject (#945, VULN-001).
+func percentEncodeFirstByte(code string) string {
+	return fmt.Sprintf("%%%02X%s", code[0], code[1:])
 }
 
 // Helper to create invite and return the code
@@ -194,21 +209,64 @@ func TestGetPublicInvitePreviewDeadStatesAreUniform(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "publicdeadown")
 	serverID := ts.CreateTestServer(t, owner.ID, "Hidden Dead Server")
-	code := createInvite(t, ts, serverID, owner.AccessToken)
-	_, err := ts.DB.Exec(`UPDATE server_invites SET is_revoked = true WHERE code = $1`, code)
+	revoked := createInvite(t, ts, serverID, owner.AccessToken)
+	_, err := ts.DB.Exec(`UPDATE server_invites SET is_revoked = true WHERE code = $1`, revoked)
 	require.NoError(t, err)
+	valid := createInvite(t, ts, serverID, owner.AccessToken)
 
-	for _, path := range []string{
-		"/api/v1/invites/" + code + "/preview",
-		"/api/v1/invites/GHJKMNPQ/preview",
-		"/api/v1/invites/not-a-code/preview",
-	} {
-		w := ts.DoRequest("GET", path, nil, nil)
-		assert.Equal(t, http.StatusOK, w.Code, path)
-		var body map[string]interface{}
-		testhelpers.ParseJSON(t, w, &body)
-		assert.Equal(t, map[string]interface{}{"valid": false}, body)
-	}
+	t.Run("every invalid class returns byte-identical output", func(t *testing.T) {
+		// Ordered, not a map: the reference body must be a fixed case rather
+		// than whichever one Go's randomized map iteration happened to visit
+		// first.
+		//
+		// The last three carry percent-encoding and use the VALID code on
+		// purpose. Gin routes on the DECODED URL.Path while the edge
+		// rate-limit rule matches the RAW wire path, so these reach the handler
+		// with no managed challenge and no edge bucket. They must land in the
+		// same uniform invalid shape as every other rejected class — rejecting
+		// them with anything distinguishable would trade the rate-limit bypass
+		// for an enumeration oracle (#945, VULN-001).
+		cases := []struct{ name, path string }{
+			{"revoked", invitesPath + revoked + invitePreviewSuffix},
+			{"unknown", invitesPath + "GHJKMNPQ" + invitePreviewSuffix},
+			{"malformed", invitesPath + "not-a-code" + invitePreviewSuffix},
+			{"encoded separator, uppercase", invitesPath + valid + "%2Fpreview"},
+			{"encoded separator, lowercase", invitesPath + valid + "%2fpreview"},
+			{
+				"encoded character inside the code",
+				invitesPath + percentEncodeFirstByte(valid) + invitePreviewSuffix,
+			},
+		}
+
+		reference := ts.DoRequest("GET", cases[0].path, nil, nil)
+		require.Equal(t, http.StatusOK, reference.Code)
+		require.JSONEq(t, `{"valid":false}`, reference.Body.String())
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				w := ts.DoRequest("GET", tc.path, nil, nil)
+				assert.Equal(t, http.StatusOK, w.Code)
+				// Byte equality, not field equality: a whitespace, key-order,
+				// or extra-key difference between classes is itself an oracle.
+				assert.Equal(t, reference.Body.Bytes(), w.Body.Bytes(),
+					"invalid classes must be byte-indistinguishable")
+			})
+		}
+	})
+
+	t.Run("the canonical path still previews while its encoded twin does not", func(t *testing.T) {
+		// The pairing is the point: the guard must reject the encoded form
+		// WITHOUT costing the canonical form its preview.
+		canonical := ts.DoRequest("GET", invitesPath+valid+invitePreviewSuffix, nil, nil)
+		require.Equal(t, http.StatusOK, canonical.Code)
+		require.Contains(t, canonical.Body.String(), `"valid":true`)
+		require.Contains(t, canonical.Body.String(), "Hidden Dead Server")
+
+		encoded := ts.DoRequest("GET", invitesPath+valid+"%2Fpreview", nil, nil)
+		assert.Equal(t, http.StatusOK, encoded.Code)
+		assert.NotContains(t, encoded.Body.String(), "Hidden Dead Server",
+			"the encoded path must disclose nothing about the invite's server")
+	})
 }
 
 func TestInviteHandlersDoNotLogRawInviteCodes(t *testing.T) {

@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.40] — 2026-08-20
+
+Friend codes now have a web page of their own. Opening someone's friend link in a browser shows who it belongs to and offers to open Concord, and the page looks the same whether the code is live or not, so nobody can use it to work out which codes exist.
+
+### Added
+
+- **Friend code links now open a real page, and open the app** ([#945](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/945)) — a friend link shared outside Concord used to lead nowhere useful. It now opens a page showing the username, display name and avatar of whoever the code belongs to, with a button that opens Concord straight to the request. Codes that have expired, been revoked, or been used up show a neutral "code unavailable" page — deliberately the same size and shape as a live one, so someone guessing codes cannot tell from the page which guesses landed.
+
+### Fixed
+
+- **Clicking several friend or invite links quickly no longer loses the ones in the middle** ([#945](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/945)) — links arriving close together were collapsed to the newest, so clicking three in a row opened only the last. All of them now open, in the order you clicked, one per second. A repeat of the link already on screen is still ignored, since re-opening it would change nothing.
+- **A friend link clicked before signing in no longer follows you into someone else's account** ([#945](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/945)) — a link clicked while signed out was held and opened after signing in, which is intended, but it was never cleared when you signed out. On a shared computer the next person to sign in saw it. Signing out now discards anything held.
+- **A brief server problem no longer reports a working friend code as dead** ([#945](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/945)) — if the server was briefly busy or unwell, the page said the code was no longer valid and that answer was remembered for a minute, outliving the problem. The page now distinguishes "this code is not valid" from "we could not check right now", and recovers within seconds.
+- **Revoking a friend code now tells you when it fails** ([#945](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/945)) — if revoking failed — offline, signed out, or a server error — nothing was shown and the code stayed listed, so you could believe a still-live code had been withdrawn. Revoking is the only way to take a friend code's public page offline, so the failure is now reported.
+
 ### Fixed
 
 - **Leaving, being kicked from, or being banned from a server now stops your activity showing there immediately** ([#2447](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2447)) — until now, someone who left or was removed from a server could keep seeing what its members were doing in voice for up to a minute and a half, and a member who had just joined saw nothing until the next thing happened. Both are fixed: the people who can see you are worked out and updated at the moment membership changes. Being kicked or banned now signs you out on every device you have open rather than refreshing what you can see, so nothing stale is left behind. Someone who can still see you another way — a second shared server, or through friends — is unaffected and is not cleared by mistake.

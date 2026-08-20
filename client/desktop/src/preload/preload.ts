@@ -218,6 +218,19 @@ contextBridge.exposeInMainWorld('electron', {
   },
   inviteRendererReady: () => ipcRenderer.send('invite:renderer-ready'),
 
+  // Friend-code deep link (#945). Deliberately a SEPARATE channel from
+  // 'invite:received' rather than a widened invite payload: an older SPA that
+  // knows only the invite channel never calls friendRendererReady, so main
+  // holds the friend code back instead of it landing in JoinServerModal.
+  onFriendCodeReceived: (callback: (data: { code: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { code: string }) => callback(data);
+    ipcRenderer.on('deeplink:friend-code', handler);
+    return () => {
+      ipcRenderer.removeListener('deeplink:friend-code', handler);
+    };
+  },
+  friendRendererReady: () => ipcRenderer.send('deeplink:renderer-ready'),
+
   // Machine ID for token theft detection (#89)
   getMachineId: (apiBase?: string) =>
     ipcRenderer.invoke('auth:getMachineId', apiBase) as Promise<string>,
@@ -594,6 +607,8 @@ export interface ElectronAPI {
   onConfigFetchFailed: (callback: (data: SpaFallbackDiagnostic) => void) => () => void;
   onInviteReceived: (callback: (data: { code: string }) => void) => () => void;
   inviteRendererReady: () => void;
+  onFriendCodeReceived: (callback: (data: { code: string }) => void) => () => void;
+  friendRendererReady: () => void;
 
   // Machine ID for token theft detection
   getMachineId: (apiBase?: string) => Promise<string>;

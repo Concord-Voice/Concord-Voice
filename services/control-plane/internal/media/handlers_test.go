@@ -1716,3 +1716,161 @@ func TestUploadAvatarAnimatedGIF_BombGuardRejects400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
 	assert.False(t, ts.store.hasObject(fmt.Sprintf("avatars/%s", userID)))
 }
+
+// ============================================================
+// ProxyFriendCodeAvatar (#945)
+//
+// The internal/api suite drives this handler through the production route and
+// proves the privacy contract end to end. It cannot credit coverage to THIS
+// package: `go test -coverprofile` instruments only the package under test, so
+// a test binary living in another directory records nothing here. The tests
+// below exercise the handler from its own package, branch by branch.
+// ============================================================
+
+const (
+	friendCodesPath        = "/api/v1/friends/codes/"
+	friendCodeAvatarSuffix = "/avatar"
+	mimeImageSVG           = "image/svg+xml"
+)
+
+// setUserAvatarURL points a user's avatar_url at a stored object, which is what
+// lets ProxyFriendCodeAvatar reach the object store instead of the fallback.
+func (ts *testSetup) setUserAvatarURL(t *testing.T, userID, avatarURL string) {
+	t.Helper()
+	_, err := ts.db.Exec(`UPDATE users SET avatar_url = $1 WHERE id = $2`, avatarURL, userID)
+	require.NoError(t, err)
+}
+
+// createTestFriendCode inserts a friend_codes row verbatim. maxUses is written
+// as given: 0 means "unlimited" to the handler's validity predicate, so the
+// exhausted case is spelled maxUses=1, useCount=1.
+func (ts *testSetup) createTestFriendCode(
+	t *testing.T, userID, code string, revoked bool, expiresAt *time.Time, maxUses, useCount int,
+) {
+	t.Helper()
+	_, err := ts.db.Exec(
+		`INSERT INTO friend_codes (user_id, code, max_uses, use_count, is_revoked, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		userID, code, maxUses, useCount, revoked, expiresAt,
+	)
+	require.NoError(t, err)
+}
+
+// getFriendCodeAvatar invokes ProxyFriendCodeAvatar over a complete wire path
+// while supplying the DECODED :code gin would have extracted from it - so a
+// percent-encoded request reaches the handler in exactly the state the router
+// leaves it in, which is the state the RawPath guard exists to reject.
+func (ts *testSetup) getFriendCodeAvatar(path, code string) *httptest.ResponseRecorder {
+	return ts.doNoAuth(
+		ts.handler.ProxyFriendCodeAvatar, http.MethodGet, path,
+		gin.Params{{Key: "code", Value: code}},
+	)
+}
+
+// friendCodeAvatarPath is the canonical wire path for a code's avatar.
+func friendCodeAvatarPath(code string) string {
+	return friendCodesPath + code + friendCodeAvatarSuffix
+}
+
+func TestProxyFriendCodeAvatarSuccess(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "fcavatarok")
+	ts.setUserAvatarURL(t, owner, "avatars/"+owner)
+	ts.createTestFriendCode(t, owner, "ABCDEFGH", false, nil, 0, 0)
+
+	avatar := makePNG(t, 32, 32)
+	key := fmt.Sprintf("avatars/%s", owner)
+	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(avatar), 100, mimeImagePNG))
+
+	w := ts.getFriendCodeAvatar(friendCodeAvatarPath("ABCDEFGH"), "ABCDEFGH")
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, avatar, w.Body.Bytes(), "the owner's avatar must be proxied, never redirected to")
+	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
+	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=3600")
+	// The route is keyed by CODE precisely so the owner's UUID never escapes -
+	// including via a redirect, which would put it in Location. Sweep every
+	// header rather than the one or two a redirect would have used.
+	assert.Empty(t, w.Header().Get("Location"))
+	for name, values := range w.Result().Header {
+		for _, v := range values {
+			assert.NotContainsf(t, v, owner, "header %s leaked the owner UUID", name)
+		}
+	}
+}
+
+// TestProxyFriendCodeAvatarFallbackClasses proves every rejected class serves
+// the shared silhouette, byte for byte and header for header. An attacker who
+// could tell "unknown code" from "revoked code" would have an enumeration
+// oracle, so the assertion is byte equality against a reference - not a status
+// code, which all of them share with the success path anyway.
+func TestProxyFriendCodeAvatarFallbackClasses(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "fcavatarfb")
+	ts.setUserAvatarURL(t, owner, "avatars/"+owner)
+	require.NoError(t, ts.store.PutObject(
+		context.TODO(), "avatars/"+owner, bytes.NewReader(makePNG(t, 32, 32)), 100, mimeImagePNG,
+	))
+
+	past := time.Now().UTC().Add(-time.Hour)
+	ts.createTestFriendCode(t, owner, "ABCDEFGH", false, nil, 0, 0) // live, has avatar
+	ts.createTestFriendCode(t, owner, "BCDEFGHJ", true, nil, 0, 0)  // revoked
+	ts.createTestFriendCode(t, owner, "CDEFGHJK", false, &past, 0, 0)
+	ts.createTestFriendCode(t, owner, "DEFGHJKL", false, nil, 1, 1) // exhausted
+
+	// A live code whose owner has no avatar at all: valid, but nothing to serve.
+	bare := ts.createTestUser(t, "fcavatarbare")
+	ts.createTestFriendCode(t, bare, "EFGHJKLM", false, nil, 0, 0)
+
+	reference := ts.getFriendCodeAvatar(friendCodeAvatarPath("ZZZZZZZZ"), "ZZZZZZZZ")
+	require.Equal(t, http.StatusOK, reference.Code)
+	require.Contains(t, reference.Header().Get(hdrContentType), mimeImageSVG)
+	require.Contains(t, reference.Header().Get(hdrCacheControl), "max-age=60")
+
+	for _, tc := range []struct{ name, path, code string }{
+		{"malformed charset", friendCodeAvatarPath("AAAA000I"), "AAAA000I"},
+		{"length 7", friendCodeAvatarPath("AAAAAAA"), "AAAAAAA"},
+		{"length 9", friendCodeAvatarPath("AAAAAAAAA"), "AAAAAAAAA"},
+		{"unknown", friendCodeAvatarPath("ZZZZZZZZ"), "ZZZZZZZZ"},
+		{"revoked", friendCodeAvatarPath("BCDEFGHJ"), "BCDEFGHJ"},
+		{"expired", friendCodeAvatarPath("CDEFGHJK"), "CDEFGHJK"},
+		{"max used", friendCodeAvatarPath("DEFGHJKL"), "DEFGHJKL"},
+		{"owner has no avatar", friendCodeAvatarPath("EFGHJKLM"), "EFGHJKLM"},
+		// Percent-encoded: gin routes on the DECODED path while the edge
+		// rate-limit rule matches the RAW one, so this reaches the handler with
+		// no managed challenge and no edge bucket. The code is a LIVE one whose
+		// owner does have an avatar - serving those bytes here is exactly the
+		// bypass the guard closes (#945, VULN-001).
+		{"encoded separator", friendCodesPath + "ABCDEFGH%2Favatar", "ABCDEFGH"},
+		{"encoded character inside the code", friendCodesPath + "%41BCDEFGH" + friendCodeAvatarSuffix, "ABCDEFGH"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := ts.getFriendCodeAvatar(tc.path, tc.code)
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, reference.Body.Bytes(), w.Body.Bytes(),
+				"every rejected class must serve the fallback, byte for byte")
+			assert.Equal(t, reference.Header().Get(hdrContentType), w.Header().Get(hdrContentType))
+			assert.Equal(t, reference.Header().Get(hdrCacheControl), w.Header().Get(hdrCacheControl))
+			assert.NotContains(t, w.Body.String(), owner)
+		})
+	}
+}
+
+// TestProxyFriendCodeAvatarDatabaseError isolates the handler's defensive 500
+// branch. The pool is closed rather than a shared table renamed: every query on
+// a closed pool fails with a real driver error and no other test's state moves.
+func TestProxyFriendCodeAvatarDatabaseError(t *testing.T) {
+	closed, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+
+	store := newMockStore()
+	h := NewHandler(closed, store, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+	ts := &testSetup{handler: h, store: store, db: closed}
+
+	w := ts.getFriendCodeAvatar(friendCodeAvatarPath("ABCDEFGH"), "ABCDEFGH")
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.JSONEq(t, `{"error":"`+errMsgInternalServer+`"}`, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "ABCDEFGH", "the code is bearer material")
+}

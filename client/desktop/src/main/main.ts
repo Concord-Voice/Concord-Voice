@@ -108,7 +108,11 @@ import { resolveCachedSpa } from './spaCache/resolveCachedSpa';
 import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from './spaCache/manifestSchema';
 import { handleDidFailLoad, handleSpaRequestSelfHeal } from './spaSelfHealMainFrame';
 import { buildRemotePipUrl, isValidPipOpenSender } from './pipUrl';
-import { extractInviteDeepLinkFromArgv, normalizeInviteDeepLink } from './deepLink';
+import {
+  extractInviteDeepLinkFromArgv,
+  normalizeInviteDeepLink,
+  type DeepLinkKind,
+} from './deepLink';
 import {
   getRemoteSpaBaseDir,
   getRemoteSpaBaseUrl,
@@ -227,8 +231,108 @@ if (app.isPackaged) {
 }
 
 let mainWindow: BrowserWindow | null = null;
+// Two INDEPENDENT readiness flags, never one shared flag: a pre-22 SPA signals
+// only 'invite:renderer-ready', and a shared flag would make main believe the
+// friend subscription is live when it is not (#945).
 let inviteRendererReady = false;
-const pendingInviteCodes: string[] = [];
+let friendRendererReady = false;
+
+type PendingDeepLink = { kind: DeepLinkKind; code: string };
+
+const DEEP_LINK_KINDS: readonly DeepLinkKind[] = ['invite', 'friend'];
+
+// Bounded because every argv/open-url deep link arriving before renderer-ready
+// appends here, and #945 doubles the write sites. Drop-oldest: a stale queued
+// code is worth less than the one the user just clicked.
+//
+// One queue PER KIND, never one shared array. Both kinds arrive from the same
+// untrusted surfaces but wait on independent readiness flags, so on a shared
+// queue a burst of friend codes spends the invite allowance: the invite the
+// user actually clicked during cold start is evicted and silently never
+// delivered. Same reasoning the friend arm already applies at the edge, where
+// its WAF rule carries its own ref and counter.
+const PENDING_DEEP_LINK_CAP = 8;
+const pendingDeepLinks: Record<DeepLinkKind, string[]> = { invite: [], friend: [] };
+
+// Delivery after renderer-ready is otherwise unbounded: a page the user merely
+// visits can fire N concord:// links and get N IPC sends, N forced modal
+// re-opens, and N authenticated preview calls — each modal prefilled with an
+// attacker-chosen code, one click from sending. emitDeepLink is the single
+// choke point every delivery crosses (live and drained, invite and friend), so
+// the bound lives here and neither renderer arm has to defend itself. Per kind:
+//   - the first delivery goes out immediately — a single click must feel instant;
+//   - anything arriving inside the window is HELD in a bounded FIFO and released
+//     one per window edge. A different code is deferred, never dropped, so a user
+//     who clicks invite A then B then C lands on all three in order. A repeat of
+//     the code already showing (or already queued behind) collapses to nothing,
+//     because re-sending it would change nothing it displays.
+//
+// The FIFO replaced a single newest-wins slot (#945, M0): three codes inside one
+// window lost the middle one with no log and no trace, and a queue DRAIN of
+// eight delivered #1 and #8 while silently discarding six user actions the
+// 8-deep queue exists to preserve — while both this comment and spec §6a
+// asserted the opposite, and §6a used that invariant as the stated reason a hard
+// per-session cap was rejected. Bounded, so it cannot grow without limit; an
+// overflow drops the OLDEST and SAYS SO, which is what "never silently" means.
+// Short on purpose: long enough to collapse a burst, short enough that
+// re-clicking the same link after closing its modal still opens it again.
+export const DEEP_LINK_EMIT_WINDOW_MS = 1_000;
+
+type DeepLinkEmitGate = {
+  /** Code last sent — what this renderer lifecycle is currently showing. */
+  lastCode: string | null;
+  /** When it was sent; 0 means nothing sent yet this renderer lifecycle. */
+  lastAt: number;
+  /** Codes held back by the window, oldest first; one is released per edge. */
+  held: string[];
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+/** Matches the per-kind pending-queue depth: the gate must not be the narrower bound. */
+export const DEEP_LINK_HELD_MAX = 8;
+
+const deepLinkEmitGates: Record<DeepLinkKind, DeepLinkEmitGate> = {
+  invite: { lastCode: null, lastAt: 0, held: [], timer: null },
+  friend: { lastCode: null, lastAt: 0, held: [], timer: null },
+};
+
+// Both readiness flags drop together at every renderer-lifecycle boundary
+// (window creation, reload, crash, close), and the emit gate resets with them:
+// a fresh renderer displays nothing, so it must be able to receive the same
+// code again and must not inherit the previous lifecycle's window.
+//
+// The timer and the held FIFO are cleared here too (#945, Md3). Leaving them
+// live was not exploitable — the boundary is driven by navigation, close or
+// crash, never by the external concord:// surface — but it was wrong in two
+// visible ways: a stale timer SUPPRESSED the fresh lifecycle's immediate send
+// (`gate.timer !== null` short-circuits the fast path), delaying a click by up
+// to a second after any reload; and a code the previous renderer had already
+// consumed could be re-delivered into the new one, re-opening the modal.
+//
+// Held codes are re-QUEUED rather than discarded: readiness is already false
+// above, so each falls through emitDeepLink into the pending queue and the next
+// drain hands it to the new renderer. Snapshot before queueing — queueDeepLink
+// re-enters this module's state.
+function resetDeepLinkDelivery(): void {
+  inviteRendererReady = false;
+  friendRendererReady = false;
+  for (const kind of DEEP_LINK_KINDS) {
+    const gate = deepLinkEmitGates[kind];
+    gate.lastCode = null;
+    gate.lastAt = 0;
+    if (gate.timer !== null) {
+      clearTimeout(gate.timer);
+      gate.timer = null;
+    }
+    const carried = gate.held;
+    gate.held = [];
+    for (const code of carried) queueDeepLink({ kind, code });
+  }
+}
+
+function isRendererReadyFor(kind: DeepLinkKind): boolean {
+  return kind === 'friend' ? friendRendererReady : inviteRendererReady;
+}
 
 function registerInviteProtocolClient(): void {
   if (!app.isPackaged) return;
@@ -244,41 +348,115 @@ function registerInviteProtocolClient(): void {
   }
 }
 
-function emitInviteReceived(code: string): boolean {
+// Friend codes ride their own channel; 'invite:received' keeps emitting a bare
+// { code } forever. spaLoader refuses an SPA NEWER than the shell but loads an
+// older one indefinitely, and SPA_IPC_CONTRACT is an operator-set, hot-reloadable
+// var — so a contract-22 shell can host a 19-era SPA with no bound. A widened
+// { kind, code } payload would reach that SPA, which ignores the unknown field
+// and opens the SERVER-join modal with a friend code. On a second channel the
+// same SPA simply never subscribes and the deep link no-ops (#945, spec X1).
+function sendDeepLink(kind: DeepLinkKind, code: string): void {
+  const gate = deepLinkEmitGates[kind];
+  gate.lastCode = code;
+  gate.lastAt = Date.now();
+  if (kind === 'friend') {
+    mainWindow?.webContents.send('deeplink:friend-code', { code });
+    return;
+  }
+  mainWindow?.webContents.send('invite:received', { code });
+}
+
+/** Window edge: deliver whatever the window held back, newest only. */
+function flushDeepLinkGate(kind: DeepLinkKind): void {
+  const gate = deepLinkEmitGates[kind];
+  gate.timer = null;
+  const code = gate.held.shift();
+  if (code === undefined) return;
+  // Re-arm BEFORE any early return below, so a collapsed repeat or a departed
+  // renderer cannot strand the rest of the FIFO unreleased.
+  if (gate.held.length > 0) {
+    gate.timer = setTimeout(() => flushDeepLinkGate(kind), DEEP_LINK_EMIT_WINDOW_MS);
+  }
+  if (code === gate.lastCode) return;
+  if (!mainWindow || mainWindow.isDestroyed() || !isRendererReadyFor(kind)) {
+    // The renderer went away inside the window — hand the code back to its
+    // queue instead of dropping it; the next drain delivers it.
+    queueDeepLink({ kind, code });
+    return;
+  }
+  sendDeepLink(kind, code);
+}
+
+/** True once the entry is accounted for: sent, or held for the window edge. */
+function emitDeepLink(entry: PendingDeepLink): boolean {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
-  if (!inviteRendererReady) return false;
-  mainWindow.webContents.send('invite:received', { code });
+  if (!isRendererReadyFor(entry.kind)) return false;
+
+  const gate = deepLinkEmitGates[entry.kind];
+  const waited = Date.now() - gate.lastAt;
+  if (gate.timer !== null || waited < DEEP_LINK_EMIT_WINDOW_MS) {
+    // Collapse only an immediate repeat — of the code showing now, or of the one
+    // already queued last. A DIFFERENT code always takes its own slot.
+    const previous = gate.held.length > 0 ? gate.held[gate.held.length - 1] : gate.lastCode;
+    if (entry.code !== previous) {
+      if (gate.held.length >= DEEP_LINK_HELD_MAX) {
+        // Oldest out, and never silently: kind and reason only, never the code —
+        // it is bearer material (see [internal]rules/observability.md).
+        gate.held.shift();
+        console.warn(
+          `Deep-link hold buffer full for kind=${entry.kind}; dropped the oldest held code`
+        );
+      }
+      gate.held.push(entry.code);
+    }
+    gate.timer ??= setTimeout(
+      () => flushDeepLinkGate(entry.kind),
+      DEEP_LINK_EMIT_WINDOW_MS - waited
+    );
+    return true;
+  }
+  sendDeepLink(entry.kind, entry.code);
   return true;
 }
 
-function queueInviteCode(code: string): void {
-  if (!emitInviteReceived(code)) pendingInviteCodes.push(code);
+function queueDeepLink(entry: PendingDeepLink): void {
+  if (emitDeepLink(entry)) return;
+  const queue = pendingDeepLinks[entry.kind];
+  queue.push(entry.code);
+  while (queue.length > PENDING_DEEP_LINK_CAP) queue.shift();
 }
 
-function drainPendingInviteCodes(): void {
-  const codes = pendingInviteCodes.splice(0);
-  for (const code of codes) {
-    queueInviteCode(code);
+// Must FILTER, not blind-re-queue. This runs from three sites, and with per-kind
+// readiness flags a blind re-push of an unemittable entry re-enters the queue
+// within the same tick — forever.
+function drainPendingDeepLinks(): void {
+  for (const kind of DEEP_LINK_KINDS) {
+    const queue = pendingDeepLinks[kind];
+    for (const code of queue.splice(0)) {
+      if (!emitDeepLink({ kind, code })) queue.push(code);
+    }
   }
 }
 
+// Only result.reason is logged. Invite and friend codes are bearer material and
+// never reach a log line.
 function handleInviteDeepLink(raw: string | undefined, source: string): void {
   const result = normalizeInviteDeepLink(raw);
   if (result.ok) {
-    queueInviteCode(result.code);
+    queueDeepLink({ kind: result.kind, code: result.code });
     return;
   }
   if (result.reason !== 'empty') {
-    console.warn('[DeepLink] rejected invite deep link', 'source', source, 'reason', result.reason);
+    console.warn('[DeepLink] rejected deep link', 'source', source, 'reason', result.reason);
   }
 }
 
 function handleInviteDeepLinksFromArgv(argv: readonly string[] | undefined, source: string): void {
   const result = extractInviteDeepLinkFromArgv(argv);
   if (result.ok) {
-    queueInviteCode(result.code);
+    queueDeepLink({ kind: result.kind, code: result.code });
   } else if (result.reason !== 'empty') {
-    console.warn('[DeepLink] rejected invite argv', 'source', source, 'reason', result.reason);
+    console.warn('[DeepLink] rejected deep link argv', 'source', source, 'reason', result.reason);
   }
 }
 
@@ -536,14 +714,14 @@ const createWindow = async (): Promise<void> => {
     width: savedState.width,
     height: savedState.height,
   });
-  inviteRendererReady = false;
+  resetDeepLinkDelivery();
 
   if (savedState.isMaximized) {
     mainWindow.maximize();
   }
 
   mainWindow.webContents.on('did-start-loading', () => {
-    inviteRendererReady = false;
+    resetDeepLinkDelivery();
   });
 
   // Wire resize/move/maximize/unmaximize/close listeners that persist
@@ -694,12 +872,12 @@ const createWindow = async (): Promise<void> => {
     cancelActiveAppleFlow();
     cancelActiveGoogleFlow();
     mainWindow = null;
-    inviteRendererReady = false;
+    resetDeepLinkDelivery();
   });
 
   // Log renderer crashes to diagnose voice join segfaults
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
-    inviteRendererReady = false;
+    resetDeepLinkDelivery();
     console.error('[MAIN] Renderer process gone:', details.reason, 'exitCode:', details.exitCode);
   });
 };
@@ -866,8 +1044,8 @@ app.whenReady().then(async () => {
   }
 
   void createWindow().then(() => {
-    drainPendingInviteCodes();
-    setTimeout(drainPendingInviteCodes, 1000);
+    drainPendingDeepLinks();
+    setTimeout(drainPendingDeepLinks, 1000);
 
     // Remove orphaned Squirrel.Windows residue left by the NSIS migration (#2402).
     //
@@ -1877,7 +2055,16 @@ ipcMain.handle('spa:requestSelfHeal', async (event, payload: unknown) => {
 ipcMain.on('invite:renderer-ready', (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents) return;
   inviteRendererReady = true;
-  drainPendingInviteCodes();
+  drainPendingDeepLinks();
+});
+
+// #945: the friend arm's own readiness signal. Deliberately separate from
+// 'invite:renderer-ready' so an SPA that only knows the invite channel can never
+// arm the friend one — see emitDeepLink above.
+ipcMain.on('deeplink:renderer-ready', (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return;
+  friendRendererReady = true;
+  drainPendingDeepLinks();
 });
 
 // Prevent multiple instances

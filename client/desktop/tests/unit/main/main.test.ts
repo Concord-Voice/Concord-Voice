@@ -2057,6 +2057,283 @@ describe('main.ts', () => {
     });
   });
 
+  describe('deep-link queue (#945)', () => {
+    // Valid codes only — deepLink.ts rejects I/O/l/0/1 and anything but 8 chars.
+    const TEN_CODES = [
+      'AAAAAAA2',
+      'AAAAAAA3',
+      'AAAAAAA4',
+      'AAAAAAA5',
+      'AAAAAAA6',
+      'AAAAAAA7',
+      'AAAAAAA8',
+      'AAAAAAA9',
+      'AAAAAAB2',
+      'AAAAAAB3',
+    ];
+    const FRIEND_CODE = 'AbCdEfGh';
+    const INVITE_CODE = 'AbCdEfGj';
+    const rendererEvent = { sender: mockWebContents };
+
+    let DEEP_LINK_EMIT_WINDOW_MS: number;
+    let deliverDeepLink: (url: string) => void;
+    let signalInviteReady: CallbackFn;
+    let signalFriendReady: CallbackFn;
+    let simulateReload: CallbackFn;
+
+    beforeAll(async () => {
+      const { ipcMain } = await import('electron');
+      const ipcListener = (channel: string): CallbackFn => {
+        const call = (ipcMain.on as Mock).mock.calls.find((c: unknown[]) => c[0] === channel);
+        expect(call, `ipcMain.on('${channel}') was never registered`).toBeDefined();
+        return call![1] as CallbackFn;
+      };
+      signalInviteReady = ipcListener('invite:renderer-ready');
+      signalFriendReady = ipcListener('deeplink:renderer-ready');
+
+      const didStartLoading = mockWebContents.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'did-start-loading'
+      )?.[1] as CallbackFn | undefined;
+      expect(didStartLoading).toBeDefined();
+      simulateReload = didStartLoading!;
+
+      const openUrl = appOnCallbacks.get('open-url');
+      expect(openUrl).toBeDefined();
+      deliverDeepLink = (url: string) => openUrl!({ preventDefault: vi.fn() }, url);
+
+      // Import the window rather than restating 1000: a burst test that
+      // advanced a stale literal would leave a real deferred send to fire
+      // mid-suite and pollute a later test's send assertions.
+      ({ DEEP_LINK_EMIT_WINDOW_MS } = await import('../../../src/main/main'));
+    });
+
+    // The queue and both readiness flags are module state in main.ts that
+    // outlives a single test. Arm both flags so a drain empties whatever a
+    // previous test left queued, then drop both the way a renderer reload does.
+    // Synchronous on purpose: an await here would let createWindow's 1s
+    // deferred drain interleave with a test's own arm/drain sequence.
+    // Drains to quiescence rather than assuming one ready+reload empties things.
+    // Since #945 (M0/Md3) the gate holds a bounded FIFO and releases ONE code per
+    // emit window, and a lifecycle reset re-queues whatever is still held instead
+    // of relying on a timer it has just cleared — so after a burst test a single
+    // ready+reload leaves codes queued, and they surfaced in whichever test ran
+    // next. Cycling ready + one window until the buffers are empty is what makes
+    // each case independent again.
+    function resetDeepLinkState(): void {
+      vi.useFakeTimers();
+      try {
+        // Loop to QUIESCENCE, not a fixed count: switching back to real timers
+        // destroys any still-pending flush, which would strand a held code that
+        // the closing reload then re-queues — the leak this helper exists to
+        // prevent. A cycle that emits nothing means both buffers are empty.
+        for (let i = 0; i < 40; i += 1) {
+          const before = mockWebContents.send.mock.calls.length;
+          // Reload FIRST. A prior test usually leaves readiness already true, so
+          // signalling it again drains nothing and the quiescence check would
+          // break out on cycle 0 with codes still queued. The reload drops both
+          // flags (and re-queues anything held), so the signals below are always
+          // a false->true transition and always force a drain.
+          simulateReload();
+          signalInviteReady(rendererEvent);
+          signalFriendReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+          if (mockWebContents.send.mock.calls.length === before) break;
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+      simulateReload();
+      mockWebContents.send.mockClear();
+    }
+
+    function sentOn(channel: string): string[] {
+      return mockWebContents.send.mock.calls
+        .filter((c: unknown[]) => c[0] === channel)
+        .map((c: unknown[]) => (c[1] as { code: string }).code);
+    }
+
+    it('caps the pending queue at 8 entries, dropping oldest', () => {
+      resetDeepLinkState();
+      vi.useFakeTimers();
+      try {
+        for (const code of TEN_CODES) deliverDeepLink(`concord://invite/${code}`);
+
+        signalInviteReady(rendererEvent);
+
+        // The two oldest were dropped by the cap, so the drain leads with the
+        // third code and not the first — that is the drop-oldest proof.
+        expect(sentOn('invite:received')).toEqual([TEN_CODES[2]]);
+
+        // #945 (M0): the rest are released IN ORDER, one per window — they are no
+        // longer collapsed to the newest. This assertion previously read
+        // `[TEN_CODES[2], TEN_CODES[9]]`, and that collapse is exactly the silent
+        // drop the fix removes: six codes the user clicked vanished with no log
+        // and no trace, while both the gate comment and spec §6a asserted a
+        // different code is deferred and never dropped.
+        vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+        expect(sentOn('invite:received')).toEqual([TEN_CODES[2], TEN_CODES[3]]);
+
+        // Drain the remainder to prove every queued code arrives, in click order.
+        for (let i = 0; i < 6; i += 1) vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+        expect(sentOn('invite:received')).toEqual(TEN_CODES.slice(2));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // VULN-005: one shared queue let friend traffic spend the invite allowance.
+    // The kinds arrive from the same untrusted surfaces but wait on independent
+    // readiness flags, so they get independent queues — the same reasoning that
+    // gave the friend WAF rule its own ref and counter.
+    it('keeps a queued invite when a friend burst fills the friend queue', () => {
+      resetDeepLinkState();
+      vi.useFakeTimers();
+      try {
+        // The user clicks a genuine invite during cold start...
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        // ...and a page they have open fires a full cap's worth of friend codes.
+        for (const code of TEN_CODES.slice(0, 8)) deliverDeepLink(`concord://friend/${code}`);
+
+        signalInviteReady(rendererEvent);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        signalFriendReady(rendererEvent);
+        // The friend queue kept its own eight, and #945 (M0) releases them IN
+        // ORDER, one per window — previously this asserted
+        // `[TEN_CODES[0], TEN_CODES[7]]`, collapsing the burst to its newest and
+        // silently discarding the six between.
+        vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+        expect(sentOn('deeplink:friend-code')).toEqual([TEN_CODES[0], TEN_CODES[1]]);
+
+        // Every one of the eight arrives, in click order — the invariant the
+        // gate comment and spec §6a both assert.
+        for (let i = 0; i < 6; i += 1) vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+        expect(sentOn('deeplink:friend-code')).toEqual(TEN_CODES.slice(0, 8));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // VULN-006: post-readiness delivery was unbounded — N deliveries meant N IPC
+    // sends, N forced AddFriendModal re-opens, and N authenticated
+    // previewFriendCode calls, from a page the user merely visited.
+    it('collapses a post-readiness burst of one code into a single send', () => {
+      resetDeepLinkState();
+      signalFriendReady(rendererEvent);
+      vi.useFakeTimers();
+      try {
+        for (let i = 0; i < 250; i += 1) deliverDeepLink(`concord://friend/${FRIEND_CODE}`);
+        expect(sentOn('deeplink:friend-code')).toEqual([FRIEND_CODE]);
+
+        // Nothing is waiting at the window edge: re-sending the code the
+        // renderer is already showing would change nothing.
+        vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+        expect(sentOn('deeplink:friend-code')).toEqual([FRIEND_CODE]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('defers, never drops, a different code arriving inside the window', () => {
+      resetDeepLinkState();
+      signalInviteReady(rendererEvent);
+      vi.useFakeTimers();
+      try {
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        deliverDeepLink(`concord://invite/${TEN_CODES[9]}`);
+        // Invite B is held back by the window, not discarded...
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+        // ...so a user who clicks invite A then invite B still lands on B.
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE, TEN_CODES[9]]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('terminates the drain when only the invite renderer is ready', () => {
+      resetDeepLinkState();
+      deliverDeepLink(`concord://friend/${FRIEND_CODE}`);
+      deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+      signalInviteReady(rendererEvent);
+
+      // A blind re-queue of the unemittable friend entry would re-enter the
+      // queue in this same tick and loop forever. A filtered drain emits
+      // exactly the one emittable entry and stops.
+      expect(mockWebContents.send).toHaveBeenCalledTimes(1);
+      expect(mockWebContents.send).toHaveBeenCalledWith('invite:received', { code: INVITE_CODE });
+    });
+
+    it('preserves a friend entry across an invite-only drain', () => {
+      resetDeepLinkState();
+      deliverDeepLink(`concord://friend/${FRIEND_CODE}`);
+      deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+      signalInviteReady(rendererEvent);
+      expect(sentOn('deeplink:friend-code')).toEqual([]);
+
+      signalFriendReady(rendererEvent);
+      expect(sentOn('deeplink:friend-code')).toEqual([FRIEND_CODE]);
+      expect(mockWebContents.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('emits ZERO invite:received for a friend deep link (old-SPA safety lock)', () => {
+      resetDeepLinkState();
+      deliverDeepLink(`concord://friend/${FRIEND_CODE}`);
+
+      // A pre-22 SPA subscribes to invite:received and never calls
+      // friendRendererReady. It must receive NOTHING — a widened
+      // invite:received payload would instead open JoinServerModal with a
+      // friend code (spec X1). Repeat the signal: every drain site must stay
+      // silent, not just the first.
+      signalInviteReady(rendererEvent);
+      signalInviteReady(rendererEvent);
+
+      expect(mockWebContents.send).not.toHaveBeenCalled();
+      expect(sentOn('invite:received')).toEqual([]);
+    });
+
+    it('keeps invite:received emitting a bare { code } payload', () => {
+      resetDeepLinkState();
+      signalInviteReady(rendererEvent);
+      deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+      const call = mockWebContents.send.mock.calls.find(
+        (c: unknown[]) => c[0] === 'invite:received'
+      );
+      expect(call).toBeDefined();
+      // toEqual, not toMatchObject — a `kind` field would fail this.
+      expect(call![1]).toEqual({ code: INVITE_CODE });
+    });
+
+    it('ignores a friend readiness signal from an untrusted sender', () => {
+      resetDeepLinkState();
+      deliverDeepLink(`concord://friend/${FRIEND_CODE}`);
+
+      signalFriendReady({ sender: { id: 99 } });
+      expect(mockWebContents.send).not.toHaveBeenCalled();
+
+      signalFriendReady(rendererEvent);
+      expect(sentOn('deeplink:friend-code')).toEqual([FRIEND_CODE]);
+    });
+
+    it('logs only the rejection reason, never the code', () => {
+      resetDeepLinkState();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        deliverDeepLink('concord://friend/nope');
+        expect(warn).toHaveBeenCalled();
+        for (const call of warn.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain('nope');
+        }
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   describe('createWindow callbacks', () => {
     it('ready-to-show shows the window', () => {
       const readyCall = mockMainWindow.once.mock.calls.find(

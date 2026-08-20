@@ -6,6 +6,13 @@ export const INVITE_HOST = 'invite.concordvoice.chat';
  * services/control-plane/internal/invites/code.go:
  *   ABCDEFGHJKLMNPQRSTUVWXYZ abcdefghjkmnpqrstuvwxyz 23456789
  * Upper excludes I,O (keeps L); lower excludes i,l,o; digits exclude 0,1.
+ *
+ * This is one of THREE independent copies of the charset predicate — the others
+ * are `INVITE_CODE_PATTERN` in
+ * [internal]workers/invite-landing/src/stub.ts and
+ * `INVITE_CODE_RE` in client/desktop/src/main/deepLink.ts. #1557's
+ * variable-length vanity slugs must relax all three; missing the Worker copy is
+ * a validation bypass on the anonymous edge path.
  */
 const CODE_CLASS = 'A-HJ-NP-Za-hj-km-np-z2-9';
 const INVITE_CODE_RE = new RegExp(`^[${CODE_CLASS}]{8}$`);

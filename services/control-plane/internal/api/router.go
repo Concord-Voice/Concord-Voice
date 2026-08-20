@@ -219,6 +219,13 @@ func publicInviteIconHandler(invitesHandler *invites.Handler, mediaHandler *medi
 	return invitesHandler.GetPublicInviteIconFallback
 }
 
+func publicFriendAvatarHandler(friendsHandler *friends.Handler, mediaHandler *media.Handler) gin.HandlerFunc {
+	if mediaHandler != nil {
+		return mediaHandler.ProxyFriendCodeAvatar
+	}
+	return friendsHandler.GetPublicFriendAvatarFallback
+}
+
 func bindPresenceHistoryRuntime(
 	hub *websocket.Hub,
 	presenceHistoryService *presencehistory.Service,
@@ -975,6 +982,20 @@ func NewRouter(
 		v1.GET("/invites/:code/icon",
 			middleware.RateLimitByIP(redis, 60, 1*time.Minute),
 			publicInviteIconHandler(invitesHandler, mediaHandler),
+		)
+
+		// Public friend-code preview/avatar routes for invite.concordvoice.chat.
+		// Same privacy posture as the invite pair above: a uniform invalid shape
+		// for every failure class, and no user_id anywhere — which is why the
+		// avatar is keyed by code rather than by the owner's UUID (#945).
+		v1.GET("/friends/codes/:code/preview",
+			middleware.RateLimitByIP(redis, 20, 1*time.Minute),
+			middleware.RateLimitGlobal(redis, "ratelimit:global:friend-code-preview", 2000, 1*time.Minute),
+			friendsHandler.GetPublicFriendCodePreview,
+		)
+		v1.GET("/friends/codes/:code/avatar",
+			middleware.RateLimitByIP(redis, 60, 1*time.Minute),
+			publicFriendAvatarHandler(friendsHandler, mediaHandler),
 		)
 
 		// Tier 1 user image proxy GETs (public — required so <img> tags can

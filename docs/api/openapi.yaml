@@ -5787,19 +5787,28 @@ paths:
                   user_id:
                     type: string
                     format: uuid
+                    description: Always present, including when valid is false.
                   username:
                     type: string
+                    description: Present only when valid is true; omitted otherwise (#945).
                   display_name:
                     type: string
                     nullable: true
+                    description: Present only when valid is true; omitted otherwise (#945).
                   avatar_url:
                     type: string
                     nullable: true
+                    description: Present only when valid is true; omitted otherwise (#945).
                   valid:
                     type: boolean
                     description: False when revoked, expired, or at max uses
+                required:
+                - user_id
+                - valid
         '400':
-          description: Code is not exactly 8 characters
+          description: Code is not a well-formed friend code — wrong length, or a character
+            outside the confusable-free code charset (#945 moved this guard from a bare
+            length check to full charset validation).
           content:
             application/json:
               schema:
@@ -6375,6 +6384,109 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '500':
           description: Failed to fetch invite preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /friends/codes/{code}/preview:
+    get:
+      tags:
+      - FriendCodes
+      summary: Get a public friend-code preview
+      operationId: friendsPublicCodePreview
+      description: 'Anonymous, privacy-trimmed friend-code preview for invite.concordvoice.chat.
+
+        Malformed, unknown, expired, revoked, and maxed-out codes all return an identical
+        `valid: false` body with HTTP 200 — never a 404 — so an anonymous caller cannot
+        enumerate codes. The owner''s user_id is never returned; the avatar is served from
+        the code-keyed /avatar route so no user UUID appears on this path.
+
+        Rate limit: 20 requests per minute (per IP), 2000 per minute (global).
+
+        '
+      security: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 8
+          maxLength: 8
+          pattern: ^[ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789]{8}$
+        description: 8-character friend code
+      responses:
+        '200':
+          description: Public friend-code preview
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - valid
+                properties:
+                  valid:
+                    type: boolean
+                  username:
+                    type: string
+                    description: Present only when the code is valid
+                  display_name:
+                    type: string
+                    description: Present only when the code is valid and the owner set one
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Failed to fetch friend code preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /friends/codes/{code}/avatar:
+    get:
+      tags:
+      - FriendCodes
+      summary: Get a friend-code owner's avatar by code
+      operationId: friendsPublicCodeAvatar
+      description: 'Serves the code owner''s avatar keyed by CODE rather than by user id.
+
+        Every invalid class — malformed, unknown, expired, revoked, maxed-out — and every
+        owner without an avatar returns the same silhouette fallback with identical BYTES.
+        Headers are not identical: the success path sends Cache-Control max-age=3600 and
+        every fallback sends max-age=60, so the cache directive still distinguishes a live
+        code whose owner has an avatar. Bytes are proxied, never redirected:
+        a 302 would put the owner''s UUID in the Location header.
+
+        Rate limit: 60 requests per minute (per IP).
+
+        '
+      security: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 8
+          maxLength: 8
+          pattern: ^[ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789]{8}$
+        description: 8-character friend code
+      responses:
+        '200':
+          description: Avatar image bytes, or the shared silhouette fallback
+          headers:
+            Cache-Control:
+              description: public cache directive for the avatar stream
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Internal server error
           content:
             application/json:
               schema:

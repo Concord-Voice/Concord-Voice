@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Copy, Check, UserPlus, Search, Trash2 } from 'lucide-react';
 import {
   useFriendStore,
@@ -15,6 +15,8 @@ import './DirectMessages.css';
 interface AddFriendModalProps {
   isOpen: boolean;
   onClose: () => void;
+  /** Pre-fills the friend-code field, e.g. from a concord://friend/CODE deep link (#945). */
+  initialCode?: string | null;
 }
 
 const EXPIRY_OPTIONS = [
@@ -34,11 +36,13 @@ const MAX_USES_OPTIONS = [
 
 const USER_SEARCH_MIN_CHARS = 2;
 
-const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
+const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose, initialCode }) => {
   // Friend code claim
   const [codeInput, setCodeInput] = useState('');
   const [codePreview, setCodePreview] = useState<FriendCodePreview | null>(null);
   const [codeError, setCodeError] = useState('');
+  const [revokeError, setRevokeError] = useState('');
+  const codeInputRef = useRef<HTMLInputElement | null>(null);
   const [claimStatus, setClaimStatus] = useState('');
   const [isClaiming, setIsClaiming] = useState(false);
 
@@ -116,6 +120,18 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
     },
     [previewFriendCode, checkIfServerInvite]
   );
+
+  // Prefill from a deep link. Never auto-claims: the user still clicks
+  // Send Friend Request, so opening a link stays a preview, not an action (#945).
+  useEffect(() => {
+    if (!isOpen || !initialCode) return;
+    void handleCodeInput(initialCode);
+    const input = codeInputRef.current;
+    if (input) {
+      input.focus();
+      input.setSelectionRange(initialCode.length, initialCode.length);
+    }
+  }, [isOpen, initialCode, handleCodeInput]);
 
   // Claim friend code
   const handleClaim = useCallback(async () => {
@@ -217,10 +233,20 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
   // Revoke code
   const handleRevoke = useCallback(
     async (id: string) => {
+      setRevokeError('');
       try {
         await revokeFriendCode(id);
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // A friend code is a PUBLIC URL that anonymously resolves the owner's
+        // username, display name and avatar (#945). Revoke is the only control a
+        // user has to take that disclosure offline, so swallowing the failure
+        // leaves them believing a live code is dead — 401 after token expiry,
+        // 403, 404, 429, 500 and offline were all invisible before this.
+        setRevokeError(
+          err instanceof Error
+            ? `Failed to revoke: ${err.message}. The code may still be active.`
+            : 'Failed to revoke. The code may still be active.'
+        );
       }
     },
     [revokeFriendCode]
@@ -232,8 +258,13 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
         {/* Section 1: Add a Friend */}
         <div className="add-friend-section">
           <h4 className="add-friend-section-title">Add by Friend Code</h4>
+          <label className="sr-only" htmlFor="add-friend-code-input">
+            Friend code
+          </label>
           <div className="add-friend-code-input-row">
             <input
+              id="add-friend-code-input"
+              ref={codeInputRef}
               type="text"
               className="add-friend-input"
               placeholder="Enter 8-character code..."
@@ -243,11 +274,18 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
             />
           </div>
 
-          {codeError && <div className="add-friend-error">{codeError}</div>}
-          {claimStatus && <div className="add-friend-success">{claimStatus}</div>}
+          {codeError && (
+            <div className="add-friend-error" role="alert">
+              {codeError}
+            </div>
+          )}
+          {/* <output> is the native live region for the result of an operation and
+              carries role="status" implicitly — preferred over an ARIA role on a div
+              (sonar typescript:S6819). */}
+          {claimStatus && <output className="add-friend-success">{claimStatus}</output>}
 
           {codePreview?.valid && (
-            <div className="friend-code-preview">
+            <output className="friend-code-preview">
               <div className="member-avatar">
                 <span className="member-avatar-initial">
                   {(codePreview.displayName || codePreview.username).charAt(0).toUpperCase()}
@@ -260,7 +298,7 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
                 <UserPlus size={14} />
                 {isClaiming ? 'Sending...' : 'Send Friend Request'}
               </button>
-            </div>
+            </output>
           )}
 
           <div className="add-friend-divider" />
@@ -275,7 +313,11 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
             value={searchQuery}
             onChange={(e) => handleSearch(e.target.value)}
           />
-          {searchError && <div className="add-friend-error">{searchError}</div>}
+          {searchError && (
+            <div className="add-friend-error" role="alert">
+              {searchError}
+            </div>
+          )}
           {hasSearchedUsers && !searchError && searchResults.length === 0 && (
             <div className="add-friend-empty">No users found</div>
           )}
@@ -374,6 +416,11 @@ const AddFriendModal: React.FC<AddFriendModalProps> = ({ isOpen, onClose }) => {
           {friendCodes.length > 0 && (
             <div className="add-friend-active-codes">
               <h5>Active Codes</h5>
+              {revokeError && (
+                <div className="add-friend-error" role="alert">
+                  {revokeError}
+                </div>
+              )}
               {friendCodes.map((fc) => {
                 const expired = fc.expiresAt && new Date(fc.expiresAt) < new Date();
                 const maxed = fc.maxUses !== null && fc.useCount >= fc.maxUses;

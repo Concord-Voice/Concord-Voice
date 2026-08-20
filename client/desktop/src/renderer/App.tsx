@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useState } from 'react';
+import { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import { Routes, Route, Navigate, Outlet, useNavigate } from 'react-router';
 import { Titlebar } from './components/Titlebar/Titlebar';
 import AuthFlow from './components/Auth/AuthFlow';
@@ -22,6 +22,7 @@ import MFAChallengeModal from './components/Auth/MFAChallengeModal';
 import AttestationFailedModalHost from './components/AttestationFailedModal';
 import ChangelogModalHost from './components/ChangelogModal/ChangelogModal';
 import JoinServerModal from './components/Servers/JoinServerModal';
+import AddFriendModal from './components/DirectMessages/AddFriendModal';
 import SSOEagerUnlock from './components/Auth/SSOEagerUnlock';
 import { useAuthStore } from './stores/authStore';
 import { useE2EEStore } from './stores/e2eeStore';
@@ -377,6 +378,8 @@ function App() {
   const [isRestoring, setIsRestoring] = useState(!isPipWindow);
   const [deepLinkInviteCode, setDeepLinkInviteCode] = useState<string | null>(null);
   const [isDeepLinkInviteOpen, setIsDeepLinkInviteOpen] = useState(false);
+  const [deepLinkFriendCode, setDeepLinkFriendCode] = useState<string | null>(null);
+  const [isDeepLinkFriendOpen, setIsDeepLinkFriendOpen] = useState(false);
   const accessToken = useAuthStore((state) => state.accessToken);
   const emailVerified = useAuthStore((state) => state.emailVerified);
   const authGeneration = useAuthStore((state) => state.authGeneration);
@@ -425,6 +428,68 @@ function App() {
       setIsDeepLinkInviteOpen(true);
     }
   }, [deepLinkInviteCode, accessToken, emailVerified]);
+
+  // Friend-code deep links ride their own channel rather than a widened invite
+  // payload (#945), so an older SPA that knows only 'invite:received' can never
+  // route a friend code into JoinServerModal. A code that arrives while logged
+  // out is held silently and replayed after auth — deliberately with NO
+  // login-screen notice, since announcing whom the machine is about to friend
+  // is a disclosure on a possibly-shared logged-out desktop.
+  useEffect(() => {
+    if (isPipWindow) return undefined;
+    const subscribe = globalThis.electron?.onFriendCodeReceived;
+    if (typeof subscribe !== 'function') return undefined;
+    const unsubscribe = subscribe(({ code }) => {
+      setDeepLinkFriendCode(code);
+      if (useAuthStore.getState().accessToken && useAuthStore.getState().emailVerified) {
+        setIsDeepLinkFriendOpen(true);
+      }
+    });
+    // Optional call: a bundled SPA served to an older shell has no friend
+    // readiness channel, and must not throw on the missing method.
+    globalThis.electron?.friendRendererReady?.();
+    return unsubscribe;
+  }, [isPipWindow]);
+
+  useEffect(() => {
+    if (deepLinkFriendCode && accessToken && emailVerified) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: opens queued friend modal after auth state becomes eligible; not a render loop
+      setIsDeepLinkFriendOpen(true);
+    }
+  }, [deepLinkFriendCode, accessToken, emailVerified]);
+
+  // A held deep-link code must not outlive the session that was current when it
+  // arrived (#945, M4). Nothing cleared these but the modals' own onClose, so a
+  // code held on this machine replayed into whichever account logged in next:
+  // the two effects above fire on [code, accessToken, emailVerified], so a
+  // different user's session opened the modal prefilled and fetched a preview
+  // under THEIR token. That is precisely the disclosure the "NO login-screen
+  // notice" decision above exists to avoid. Both arms are cleared — the invite
+  // arm has the identical shape and predates #945.
+  //
+  // The edge is accessToken → null (logout), NOT an authGeneration change:
+  // beginAuthLifecycle advances the generation on LOGIN as well, so keying on it
+  // would clear the code at the exact moment the hold-and-replay feature is
+  // supposed to deliver it. rotateAuthCredentials deliberately preserves both,
+  // so an ordinary token refresh never disturbs a held code.
+  const hadAccessTokenRef = useRef(accessToken !== null);
+  useEffect(() => {
+    const hasAccessToken = accessToken !== null;
+    const loggedOut = hadAccessTokenRef.current && !hasAccessToken;
+    hadAccessTokenRef.current = hasAccessToken;
+    if (!loggedOut) return;
+    /* eslint-disable @eslint-react/set-state-in-effect -- intentional: this is a
+       reaction to an external store transition (the auth store clearing its
+       token), not derived render state, and it runs only on the logout edge —
+       `loggedOut` is false on every other pass, so there is no render loop. The
+       four clears share one rationale; disabling per line would repeat it four
+       times. */
+    setDeepLinkInviteCode(null);
+    setIsDeepLinkInviteOpen(false);
+    setDeepLinkFriendCode(null);
+    setIsDeepLinkFriendOpen(false);
+    /* eslint-enable @eslint-react/set-state-in-effect -- end of the logout-edge clear */
+  }, [accessToken]);
 
   // Restore session on startup: ask main process to decrypt the
   // safeStorage-encrypted refresh token and exchange it for a fresh
@@ -570,6 +635,17 @@ function App() {
               setIsDeepLinkInviteOpen(false);
               setDeepLinkInviteCode(null);
               navigate('/app');
+            }}
+          />
+          <AddFriendModal
+            isOpen={!!deepLinkFriendCode && isDeepLinkFriendOpen && !!accessToken && emailVerified}
+            initialCode={deepLinkFriendCode}
+            onClose={() => {
+              setIsDeepLinkFriendOpen(false);
+              // Clearing the code as well as the open flag is load-bearing: the
+              // modal's prefill effect keys on [isOpen, initialCode], so a
+              // retained code would not re-prefill a field the user had edited.
+              setDeepLinkFriendCode(null);
             }}
           />
           <Suspense fallback={null}>

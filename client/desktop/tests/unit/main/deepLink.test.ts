@@ -6,6 +6,7 @@ describe('normalizeInviteDeepLink', () => {
   it('accepts concord://invite/{exact-8-code}', () => {
     expect(normalizeInviteDeepLink('concord://invite/GHJKMNPQ')).toEqual({
       ok: true,
+      kind: 'invite',
       code: 'GHJKMNPQ',
     });
   });
@@ -28,10 +29,65 @@ describe('normalizeInviteDeepLink', () => {
   });
 });
 
+describe('normalizeInviteDeepLink — two arms', () => {
+  it('accepts a friend deep link', () => {
+    expect(normalizeInviteDeepLink('concord://friend/AbCdEfGh')).toEqual({
+      ok: true,
+      kind: 'friend',
+      code: 'AbCdEfGh',
+    });
+  });
+
+  it('still accepts an invite deep link (regression)', () => {
+    expect(normalizeInviteDeepLink('concord://invite/AbCdEfGh')).toEqual({
+      ok: true,
+      kind: 'invite',
+      code: 'AbCdEfGh',
+    });
+  });
+
+  it('rejects a plural host', () => {
+    expect(normalizeInviteDeepLink('concord://friends/AbCdEfGh')).toEqual({
+      ok: false,
+      reason: 'wrong-host',
+    });
+  });
+
+  it('rejects the wrong scheme', () => {
+    expect(normalizeInviteDeepLink('concordvoice://friend/AbCdEfGh')).toEqual({
+      ok: false,
+      reason: 'wrong-protocol',
+    });
+  });
+
+  it('rejects a bad charset', () => {
+    expect(normalizeInviteDeepLink('concord://friend/badcode')).toEqual({
+      ok: false,
+      reason: 'bad-code',
+    });
+  });
+
+  it('rejects extra path segments', () => {
+    expect(normalizeInviteDeepLink('concord://friend/AbCdEfGh/x')).toEqual({
+      ok: false,
+      reason: 'bad-path',
+    });
+  });
+});
+
 describe('extractInviteDeepLinkFromArgv', () => {
   it('finds the first valid deep link in argv', () => {
     expect(extractInviteDeepLinkFromArgv(['app', '--flag', 'concord://invite/GHJKMNPQ'])).toEqual({
       ok: true,
+      kind: 'invite',
+      code: 'GHJKMNPQ',
+    });
+  });
+
+  it('forwards the friend arm unchanged', () => {
+    expect(extractInviteDeepLinkFromArgv(['app', '--flag', 'concord://friend/GHJKMNPQ'])).toEqual({
+      ok: true,
+      kind: 'friend',
       code: 'GHJKMNPQ',
     });
   });

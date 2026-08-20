@@ -72,7 +72,8 @@ interface ApiFriendCodeResponse extends ApiErrorBody {
 
 interface ApiFriendCodePreviewResponse extends ApiErrorBody {
   user_id: string;
-  username: string;
+  /** Omitted by the server when valid is false (#945). */
+  username?: string;
   display_name?: string;
   avatar_url?: string;
   valid: boolean;
@@ -120,13 +121,25 @@ export interface FriendCode {
   createdAt: string;
 }
 
-export interface FriendCodePreview {
-  userId: string;
-  username: string;
-  displayName?: string;
-  avatarUrl?: string;
-  valid: boolean;
-}
+/**
+ * Discriminated on `valid`, because the server stopped sending the identity
+ * fields for an invalid code (#945). A flat interface declaring `username:
+ * string` was a lie the compiler could not catch: the only thing standing
+ * between it and a TypeError on `.charAt(0)` was one `codePreview?.valid`
+ * guard in AddFriendModal. Narrowing makes that guard structural.
+ */
+export type FriendCodePreview =
+  | {
+      valid: true;
+      userId: string;
+      username: string;
+      displayName?: string;
+      avatarUrl?: string;
+    }
+  | {
+      valid: false;
+      userId: string;
+    };
 
 export interface SearchResult {
   id: string;
@@ -455,12 +468,17 @@ export const useFriendStore = wrapStore(
             throw new Error(data.error || 'Invalid friend code');
           }
           const data = await safeJson<ApiFriendCodePreviewResponse>(response);
+          // Fail closed: a "valid" payload missing its username is a wire-contract
+          // violation, and rendering a blank avatar initial would hide it.
+          if (!data.valid || typeof data.username !== 'string') {
+            return { valid: false, userId: data.user_id };
+          }
           return {
+            valid: true,
             userId: data.user_id,
             username: data.username,
             displayName: data.display_name,
             avatarUrl: data.avatar_url,
-            valid: data.valid,
           };
         },
 

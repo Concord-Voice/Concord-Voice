@@ -1087,7 +1087,7 @@ func (h *Handler) RevokeFriendCode(c *gin.Context) {
 func (h *Handler) PreviewFriendCode(c *gin.Context) {
 	code := c.Param("code")
 
-	if len(code) != 8 {
+	if !invites.IsValidCode(code) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid friend code format"})
 		return
 	}
@@ -1127,6 +1127,22 @@ func (h *Handler) PreviewFriendCode(c *gin.Context) {
 		(expiresAt == nil || expiresAt.After(time.Now().UTC())) &&
 		(maxUses == nil || *maxUses == 0 || useCount < *maxUses)
 
+	// An invalid code still returns user_id. That field predates #945 and is part
+	// of this authenticated route's established contract, so it stays — but the
+	// owner UUID IS disclosed here, and the previous wording of this comment
+	// ("discloses nothing about its owner") sat directly above the line that
+	// returns it. What #945 actually drops is username/display_name/avatar_url:
+	// AddFriendModal renders only an error string when valid is false, so
+	// removing those three is a reduction with no client change.
+	//
+	// This route requires authentication AND the caller already holds the code.
+	// The UNauthenticated GetPublicFriendCodePreview below is the one that must
+	// disclose nothing, and it omits user_id entirely.
+	if !valid {
+		c.JSON(http.StatusOK, gin.H{"user_id": ownerID, "valid": false})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":      ownerID,
 		"username":     username,
@@ -1134,6 +1150,95 @@ func (h *Handler) PreviewFriendCode(c *gin.Context) {
 		"avatar_url":   avatarURL,
 		"valid":        valid,
 	})
+}
+
+// GetPublicFriendCodePreview serves an anonymous, privacy-trimmed preview of a
+// friend code for the invite-landing Worker.
+//
+// It is deliberately NOT the authenticated PreviewFriendCode with the auth
+// removed. Every failure class - malformed charset, wrong length, unknown code,
+// expired, revoked, max-used - returns an identical HTTP 200 {"valid": false},
+// so an anonymous caller learns nothing about which codes exist. The owner's
+// user_id is never returned, in the body or anywhere else; the avatar is served
+// from the code-keyed /avatar route precisely so no UUID escapes this path.
+// GET /friends/codes/:code/preview
+func (h *Handler) GetPublicFriendCodePreview(c *gin.Context) {
+	// The edge rate-limit rule matches on the RAW wire path, but gin routes on
+	// the percent-DECODED path, so /…/CODE%2Fpreview reaches this handler while
+	// matching no WAF rule — no managed challenge, no edge bucket.
+	// URL.RawPath is non-empty only when the raw and decoded forms differ, i.e.
+	// exactly when something was percent-encoded, and no legitimate caller
+	// encodes anything here: the code charset is entirely RFC-3986 unreserved.
+	// Reject in the SAME uniform shape as every other invalid class, so closing
+	// the rate-limit bypass introduces no enumeration oracle (#945, VULN-001).
+	if c.Request.URL.RawPath != "" {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+
+	code := c.Param("code")
+	if !invites.IsValidCode(code) {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+
+	var (
+		username    string
+		displayName *string
+		expiresAt   *time.Time
+		isRevoked   bool
+		maxUses     *int
+		useCount    int
+	)
+
+	// Deliberately selects no fc.user_id: the column is not needed here, and not
+	// selecting it removes any chance of it reaching the response by accident.
+	err := h.db.QueryRow(`
+		SELECT u.username, u.display_name,
+		       fc.expires_at, fc.is_revoked, fc.max_uses, fc.use_count
+		FROM friend_codes fc
+		INNER JOIN users u ON fc.user_id = u.id
+		WHERE fc.code = $1
+	`, code).Scan(&username, &displayName, &expiresAt, &isRevoked, &maxUses, &useCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+	if err != nil {
+		// The code is bearer material: log the error only, never the code.
+		h.log.Error("Failed to fetch public friend code preview", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch friend code preview"})
+		return
+	}
+
+	// Byte-identical to the predicate in PreviewFriendCode so the authenticated
+	// and public paths can never disagree about what "valid" means.
+	valid := !isRevoked &&
+		(expiresAt == nil || expiresAt.After(time.Now().UTC())) &&
+		(maxUses == nil || *maxUses == 0 || useCount < *maxUses)
+	if !valid {
+		c.JSON(http.StatusOK, gin.H{"valid": false})
+		return
+	}
+
+	body := gin.H{"valid": true, "username": username}
+	if displayName != nil {
+		body["display_name"] = *displayName
+	}
+	c.JSON(http.StatusOK, body)
+}
+
+// GetPublicFriendAvatarFallback serves the shared silhouette when no object
+// store is configured, so the public avatar route always answers with the same
+// bytes regardless of which arm the router selected.
+//
+// The status, Cache-Control, Content-Type and body are copied verbatim from
+// media.serveInviteIconFallback: the two arms must be byte-identical, headers
+// included, or the fallback itself becomes a signal.
+// GET /api/v1/friends/codes/:code/avatar
+func (h *Handler) GetPublicFriendAvatarFallback(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=60, must-revalidate")
+	c.Data(http.StatusOK, "image/svg+xml; charset=utf-8", []byte(invites.PublicInviteIconSVG))
 }
 
 type friendCodeRow struct {

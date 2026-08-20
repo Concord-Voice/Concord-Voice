@@ -463,6 +463,92 @@ func (h *Handler) ProxyInviteServerIcon(c *gin.Context) {
 	h.proxyInviteIcon(c, fmt.Sprintf("server-icons/%s", serverID))
 }
 
+// ProxyFriendCodeAvatar serves a friend-code owner's avatar keyed by CODE.
+//
+// The public avatar route is /api/v1/media/avatars/:user_id, so returning a raw
+// avatar_url from the friend-code preview would re-leak the owner UUID that the
+// preview body deliberately omits. This route closes that hole: the code is the
+// only identifier in the URL, and the bytes are proxied - never redirected,
+// because a 302 would put the UUID in the Location header.
+//
+// Every invalid class and every no-avatar case serves the shared silhouette
+// fallback with identical BYTES, so an anonymous caller cannot tell them apart
+// from the body.
+//
+// Headers are NOT identical, and an earlier version of this comment wrongly
+// claimed they were: the success path emits Cache-Control max-age=3600 and
+// every fallback emits max-age=60, so the directive itself still separates
+// "live code with an avatar" from everything else. That residual is recorded
+// rather than papered over — closing it needs a friend-code-specific object
+// path (the success arm currently delegates to proxyInviteIcon, which is
+// shared with server icons and cannot be retimed unilaterally).
+// GET /api/v1/friends/codes/:code/avatar
+func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
+	// The edge rate-limit rule matches on the RAW wire path, but gin routes on
+	// the percent-DECODED path, so /…/CODE%2Favatar reaches this handler while
+	// matching no WAF rule — no managed challenge, no edge bucket.
+	// URL.RawPath is set only when net/url's own re-encoding of Path differs
+	// from the wire string. That is NARROWER than "something was percent-
+	// encoded": a 256-byte sweep found 181 single-byte encodings (%20, %25,
+	// %3F, %7B, ...) that round-trip through escape(encodePath) and leave
+	// RawPath EMPTY — so the guard does not, and cannot, mean "nothing was
+	// encoded".
+	//
+	// It is still sufficient here, for a different reason than that: every byte
+	// Go re-escapes is a byte that can never appear in a valid code, so such a
+	// request fails IsValidCode on the next line regardless. The code charset is
+	// entirely RFC-3986 unreserved, and encoding ANY unreserved character does
+	// produce a Path/RawPath divergence. The sweep confirmed 0 bypasses, and the
+	// property survives widening the charset to -_.~ (#1557).
+	// Reject in the SAME uniform shape as every other invalid class, so closing
+	// the rate-limit bypass introduces no enumeration oracle (#945, VULN-001).
+	if c.Request.URL.RawPath != "" {
+		serveInviteIconFallback(c)
+		return
+	}
+
+	code := c.Param("code")
+	if !invitecodes.IsValidCode(code) {
+		serveInviteIconFallback(c)
+		return
+	}
+
+	var (
+		ownerID   string
+		expiresAt *time.Time
+		isRevoked bool
+		maxUses   *int
+		useCount  int
+		avatarURL *string
+	)
+	err := h.db.QueryRow(`
+		SELECT fc.user_id, fc.expires_at, fc.is_revoked, fc.max_uses, fc.use_count,
+		       u.avatar_url
+		FROM friend_codes fc
+		INNER JOIN users u ON fc.user_id = u.id
+		WHERE fc.code = $1
+	`, code).Scan(&ownerID, &expiresAt, &isRevoked, &maxUses, &useCount, &avatarURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		serveInviteIconFallback(c)
+		return
+	}
+	if err != nil {
+		// The code is bearer material: log the error only, never the code.
+		h.log.Error("Failed to fetch public friend code avatar", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalServer})
+		return
+	}
+	valid := !isRevoked &&
+		(expiresAt == nil || expiresAt.After(time.Now().UTC())) &&
+		(maxUses == nil || *maxUses == 0 || useCount < *maxUses)
+	if !valid || avatarURL == nil {
+		serveInviteIconFallback(c)
+		return
+	}
+
+	h.proxyInviteIcon(c, fmt.Sprintf("avatars/%s", ownerID))
+}
+
 // ProxyServerBanner serves a server's banner through the control plane.
 // GET /api/v1/media/server-banners/:server_id
 // Public for the same reason as ProxyServerIcon.

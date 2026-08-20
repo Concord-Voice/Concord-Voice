@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { useFriendStore } from '@/renderer/stores/friendStore';
 import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 
 // Mock apiFetch — controllable per test
@@ -43,6 +44,7 @@ describe('AddFriendModal', () => {
   const mockOnClose = vi.fn();
 
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     useFriendStore.setState({
       friendCodes: [],
@@ -472,5 +474,117 @@ describe('AddFriendModal', () => {
       expect(consoleSpy).toHaveBeenCalledWith('Failed to generate code:', 'boom');
     });
     consoleSpy.mockRestore();
+  });
+});
+
+describe('AddFriendModal initialCode (#945)', () => {
+  const mockOnClose = vi.fn();
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    useFriendStore.setState({
+      friendCodes: [],
+      previewFriendCode: vi
+        .fn()
+        .mockResolvedValue({ valid: true, username: 'alice', displayName: 'Alice' }),
+      claimFriendCode: vi
+        .fn()
+        .mockResolvedValue({ status: 'pending', user: { username: 'alice' } }),
+      generateFriendCode: vi.fn().mockResolvedValue({ code: 'ABCD1234' }),
+      revokeFriendCode: vi.fn().mockResolvedValue(undefined),
+      fetchFriendCodes: vi.fn().mockResolvedValue(undefined),
+      searchUsers: vi.fn().mockResolvedValue([]),
+      sendRequest: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+
+  it('prefills and previews the code when opened with one', async () => {
+    const mockPreview = vi
+      .fn()
+      .mockResolvedValue({ valid: true, username: 'alice', displayName: 'Alice' });
+    useFriendStore.setState({ previewFriendCode: mockPreview });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} initialCode="AbCdEfGh" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByLabelText(/friend code/i)).toHaveValue('AbCdEfGh');
+    });
+    expect(mockPreview).toHaveBeenCalledWith('AbCdEfGh');
+    await vi.waitFor(() => {
+      expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
+    });
+  });
+
+  it('focuses the code input and puts the caret at the end', async () => {
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} initialCode="AbCdEfGh" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByLabelText(/friend code/i)).toHaveFocus();
+    });
+    const input = screen.getByLabelText(/friend code/i) as HTMLInputElement;
+    expect(input.selectionStart).toBe(8);
+    expect(input.selectionEnd).toBe(8);
+  });
+
+  it('does not auto-submit the prefilled code', async () => {
+    const mockClaim = vi.fn().mockResolvedValue({ status: 'pending', user: { username: 'alice' } });
+    useFriendStore.setState({ claimFriendCode: mockClaim });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} initialCode="AbCdEfGh" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
+    });
+    expect(mockClaim).not.toHaveBeenCalled();
+  });
+
+  it('leaves the code input empty when no initialCode is supplied', () => {
+    const mockPreview = vi.fn();
+    useFriendStore.setState({ previewFriendCode: mockPreview });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} />);
+
+    expect(screen.getByLabelText(/friend code/i)).toHaveValue('');
+    expect(mockPreview).not.toHaveBeenCalled();
+  });
+
+  it('does not prefill while the modal is closed', () => {
+    const mockPreview = vi.fn();
+    useFriendStore.setState({ previewFriendCode: mockPreview });
+    render(<AddFriendModal isOpen={false} onClose={mockOnClose} initialCode="AbCdEfGh" />);
+
+    expect(mockPreview).not.toHaveBeenCalled();
+  });
+
+  it('announces the preview result to assistive technology', async () => {
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} initialCode="AbCdEfGh" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('Alice');
+    });
+  });
+
+  it('announces a dead code as an alert', async () => {
+    useFriendStore.setState({ previewFriendCode: vi.fn().mockResolvedValue({ valid: false }) });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} initialCode="DeAdC0dE" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('This code is expired or has been used');
+    });
+  });
+
+  it('announces claim success to assistive technology', async () => {
+    useFriendStore.setState({
+      claimFriendCode: vi
+        .fn()
+        .mockResolvedValue({ status: 'accepted', user: { username: 'alice' } }),
+    });
+    render(<AddFriendModal isOpen={true} onClose={mockOnClose} initialCode="AbCdEfGh" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Send Friend Request'));
+    await vi.waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('You are now friends with alice!');
+    });
   });
 });

@@ -9,6 +9,9 @@ import { useE2EEStore } from '@/renderer/stores/e2eeStore';
 import { useInviteStore } from '@/renderer/stores/inviteStore';
 import { useVoiceStore } from '@/renderer/stores/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import { useFriendStore } from '@/renderer/stores/friendStore';
+import { extractInviteCodes } from '@/renderer/utils/inviteUrl';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 const mockDirectMessagesView = vi.hoisted(() => ({ shouldThrow: false }));
 // Mock child components to prevent complex rendering
@@ -134,6 +137,7 @@ describe('App', () => {
   beforeEach(() => {
     mockDirectMessagesView.shouldThrow = false;
     vi.clearAllMocks();
+    resetAllStores();
     useAuthStore.getState().clearAccessToken();
     useUserStore.setState({ user: null });
     usePendingRegistrationStore.getState().clearPending();
@@ -146,6 +150,8 @@ describe('App', () => {
       clearTokens: undefined,
       onInviteReceived: undefined,
       inviteRendererReady: undefined,
+      onFriendCodeReceived: undefined,
+      friendRendererReady: undefined,
       getDisplayInfo: undefined,
     });
   });
@@ -523,6 +529,54 @@ describe('App', () => {
     expect((screen.getByPlaceholderText('AbCd1234') as HTMLInputElement).value).toBe('GHJKMNPQ');
   });
 
+  it('replays a pre-auth friend code into AddFriendModal, not JoinServerModal', async () => {
+    let friendHandler: ((payload: { code: string }) => void) | undefined;
+    const mockFriendRendererReady = vi.fn();
+    Object.assign(globalThis.electron ?? {}, {
+      onFriendCodeReceived: vi.fn((handler: (payload: { code: string }) => void) => {
+        friendHandler = handler;
+        return vi.fn();
+      }),
+      friendRendererReady: mockFriendRendererReady,
+    });
+    useFriendStore.setState({
+      fetchFriendCodes: vi.fn().mockResolvedValue(undefined),
+      previewFriendCode: vi.fn().mockResolvedValue({
+        userId: 'friend-1',
+        username: 'alice',
+        valid: true,
+      }),
+    });
+
+    render(<App />);
+
+    expect(mockFriendRendererReady).toHaveBeenCalled();
+
+    act(() => {
+      friendHandler?.({ code: 'AbCdEfGh' });
+    });
+
+    // Held silently while logged out — no modal and no login-screen notice,
+    // since naming the person being added is a disclosure on a shared machine.
+    expect(screen.queryByText('Add Friend')).not.toBeInTheDocument();
+
+    act(() => {
+      authenticateUser();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Add Friend')).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(
+        (screen.getByPlaceholderText('Enter 8-character code...') as HTMLInputElement).value
+      ).toBe('AbCdEfGh');
+    });
+    // The friend arm must never land in the server-join flow.
+    expect(screen.queryByText('Join a Server')).not.toBeInTheDocument();
+  });
+
   // ── SSO eager-unlock gate (#270 Task 21b) ─────────────────────────────────
 
   it('mounts SSOEagerUnlock when an SSO user lacks unwrapped E2EE keys', () => {
@@ -629,5 +683,17 @@ describe('handleAppRootError', () => {
     });
     globalThis.onunhandledrejection = origOnUnhandledRejection;
     consoleSpy.mockRestore();
+  });
+});
+
+// Guards the DM render path against the friend landing URL: /f/CODE is a friend
+// link, so it must not auto-unfurl as a server invite when pasted into a message.
+describe('extractInviteCodes — friend links (#945)', () => {
+  it('does not treat a friend link as an invite in DM text', () => {
+    expect(extractInviteCodes('https://invite.concordvoice.chat/f/AbCdEfGh')).toEqual([]);
+  });
+
+  it('still extracts a canonical server invite link', () => {
+    expect(extractInviteCodes('https://invite.concordvoice.chat/AbCdEfGh')).toEqual(['AbCdEfGh']);
   });
 });
