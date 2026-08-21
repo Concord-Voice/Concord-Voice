@@ -270,12 +270,24 @@ func (s *AccountService) HasGraphPresenceCapture() bool { return s.graphPresence
 // users row first, and after the erasure commits that row is gone, so delivery
 // is skipped with no error at all.
 //
-// Without this arm a control-plane booted with NATS unavailable would erase
-// accounts while leaving their status text displayed to every connected viewer
-// indefinitely — no TTL, no heartbeat, nothing left to re-derive against — with
-// only a startup warning as evidence. On a right-to-erasure path that is a
-// durable data-retention failure, so it fails at boot like every other consumer
-// (security review, PR #2840).
+// FAILING CLOSED HERE IS STILL RIGHT. #2854 finding A did not change that; it
+// changed what a nil MEANS. Before `RetryOnFailedConnect` (pkg/nats.Connect) a
+// nil could be a transient bus outage, and fataling on that took auth and
+// health down with it and crash-looped self-hosted and dev deployments. It can
+// no longer: an outage now yields a reconnecting client, so a nil arriving here
+// is a DELETED WIRING LINE or an unparseable NATS_URL — both deterministic
+// deploy defects that never fix themselves, which is exactly what a boot guard
+// is for.
+//
+// DO NOT weaken this to a "was SetNATS called" flag to make some future
+// outage-shaped crash-loop go away. That was built and rejected in #2854 stage
+// A, for three reasons found by three separate reviewers: it boots on a
+// misconfiguration too; a nil client silently disables the voice permission
+// enforcer's dispatch (internal/voice/permission_enforcer.go), so a banned or
+// permission-revoked member keeps talking in a live room; and it removes the
+// only observer of `s.nats`'s assignment, after which deleting `s.nats = c`
+// kills the erasure clear on every replica with every test still green. Fix the
+// connection, not the guard.
 func (s *AccountService) HasErasureClearPublisher() bool { return s.nats != nil }
 
 // SetNATS wires the cross-replica erasure-clear publisher.

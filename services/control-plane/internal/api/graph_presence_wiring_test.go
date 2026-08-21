@@ -95,9 +95,13 @@ func TestGraphPresenceGuardDetectsEachUnwiredConsumer(t *testing.T) {
 		"servers": func(c *graphPresenceConsumers) { c.servers = &servers.Handler{} },
 		"erasure": func(c *graphPresenceConsumers) { c.erasure = &users.AccountService{} },
 		"erasure clear publisher": func(c *graphPresenceConsumers) {
-			// Capture wired, publisher NOT. The publish is the only mechanism
-			// that retracts an erased user's Custom Status, so a boot without
-			// NATS must fail rather than erase accounts that stay visible.
+			// Capture wired, SetNATS NEVER CALLED. Still fails closed, and
+			// #2854 stage A sharpened WHY: a nil here is now a deleted wiring
+			// line or an unparseable NATS_URL, never a transient outage.
+			// RetryOnFailedConnect (pkg/nats.Connect) makes an unreachable bus
+			// return a reconnecting client, so an outage no longer reaches this
+			// predicate at all. An earlier revision of this comment said "a boot
+			// without NATS must fail", which conflated the two.
 			fresh := &users.AccountService{}
 			fresh.SetGraphPresenceCapture(nopCapture{})
 			c.erasure = fresh

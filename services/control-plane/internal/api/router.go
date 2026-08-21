@@ -475,7 +475,26 @@ func NewRouter(
 	var natsClient *natsclient.Client
 	nc, err := natsclient.Connect(cfg.NATSUrl)
 	if err != nil {
-		log.Warn("NATS connection failed — voice state sync disabled", "error", err)
+		// Reaching here means a CONFIGURATION fault, not an outage.
+		// RetryOnFailedConnect (pkg/nats.Connect) makes an unreachable bus
+		// return a reconnecting client rather than an error (#2854 finding A),
+		// so what is left is an unparseable URL or bad credentials -- a
+		// deterministic deploy defect. The boot guard fatals shortly after; this
+		// is the line that says why.
+		//
+		// Deliberately NOT a list of affected features (#2875). The old text
+		// named only voice-state sync while the bus had since gained the
+		// erasure-clear leg, graph presence and voice permission enforcement, so
+		// an operator chasing "why is a deleted account's presence still
+		// visible" got no signal from it. An enumeration is exactly what goes
+		// stale when a subject is added, and nothing about adding one prompts
+		// anyone to revisit this string.
+		//
+		// The raw error is NOT logged: natsclient.Connect wraps nats.Connect,
+		// whose *url.Error formats the raw URL, so a nats://<user>:<pass>@host
+		// misconfiguration would write the credential into the log (CWE-532).
+		log.Warn("NATS configuration is invalid — every bus-dependent feature "+
+			"would be degraded; boot will fail", "failure_class", "nats_config")
 	} else {
 		natsClient = nc
 	}

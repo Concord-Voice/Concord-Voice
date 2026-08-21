@@ -18,6 +18,22 @@ type Client struct {
 func Connect(url string) (*Client, error) {
 	nc, err := nats.Connect(url,
 		nats.Name("concordvoice-control-plane"),
+		// #2854 finding A. MaxReconnects and ReconnectWait govern reconnection
+		// only AFTER an initial successful dial, so without this a bus that is
+		// down at boot returned an error, left natsClient nil, and NOTHING ever
+		// retried -- bindRouter runs once. The nil was PERMANENT for the process
+		// lifetime, and the old boot guard turned that into log.Fatal, taking
+		// auth and health down and crash-looping self-hosted and dev deploys.
+		//
+		// With this the connection enters the reconnecting state instead and
+		// heals itself when the bus returns; Connect then errors only on a
+		// genuine CONFIGURATION fault (unparseable URL, bad TLS or credentials),
+		// which is a deterministic deploy defect that SHOULD stay fatal.
+		//
+		// That distinction is the whole fix: an outage stops producing nil, so
+		// the boot guard never sees one, and no guard predicate had to be
+		// weakened to permit it.
+		nats.RetryOnFailedConnect(true),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(nats.DefaultReconnectWait),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
