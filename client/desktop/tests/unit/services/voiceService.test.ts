@@ -5923,6 +5923,9 @@ describe('receive-transform bypass probe', () => {
     svc.e2eeWorker = worker;
     svc.consumers = new Map();
     svc.bypassProbes.clear();
+    // Legacy-fallback state is storage-backed; clearing storage resets it.
+    sessionStorage.removeItem('concord.e2eeLegacyFallback');
+    localStorage.removeItem('concord.forceLegacyE2EE');
   });
 
   afterEach(() => {
@@ -6060,7 +6063,8 @@ describe('receive-transform bypass probe', () => {
     expect(svc.consumers.has('c5')).toBe(false);
   });
 
-  it('fails closed when the re-attach itself throws', async () => {
+  it('fails closed AND engages the legacy fallback when the re-attach throws', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.stubGlobal(
       'RTCRtpScriptTransform',
       class {
@@ -6069,14 +6073,162 @@ describe('receive-transform bypass probe', () => {
         }
       }
     );
-    const consumer = fakeConsumer('c6', 315);
-    svc.consumers.set('c6', consumer);
-    svc.bypassProbes.set('c6', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+    vi.stubGlobal('RTCRtpSender', { prototype: { createEncodedStreams: () => ({}) } });
+    useVoiceStore.setState({ activeChannelId: 'chan-1', isDMCall: false });
+    const origLeave = svc.leaveChannel;
+    const origJoin = svc.joinChannel;
+    svc.leaveChannel = vi.fn().mockImplementation(async () => {
+      useVoiceStore.setState({ activeChannelId: null });
+    });
+    svc.joinChannel = vi.fn().mockResolvedValue(undefined);
+    try {
+      const consumer = fakeConsumer('c6', 315);
+      svc.consumers.set('c6', consumer);
+      svc.bypassProbes.set('c6', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
 
-    await svc.evaluateBypassProbe('c6', 0);
+      await svc.evaluateBypassProbe('c6', 0);
 
-    expect(consumer.close).toHaveBeenCalled();
-    expect(svc.consumers.has('c6')).toBe(false);
+      expect(consumer.close).toHaveBeenCalled();
+      expect(svc.consumers.has('c6')).toBe(false);
+      // A spec-conformant synchronous InvalidStateError must heal the session
+      // too, not only the async succeed-but-still-bypassed path (Gitar #2866).
+      await vi.waitFor(() => {
+        expect(svc.joinChannel).toHaveBeenCalledWith('chan-1', 'channel', {
+          internalRebuild: true,
+        });
+      });
+    } finally {
+      svc.leaveChannel = origLeave;
+      svc.joinChannel = origJoin;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('engages the legacy fallback once when a bypass survives re-attach', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Legacy API must exist for the fallback to be viable (per-call probe).
+    vi.stubGlobal('RTCRtpSender', { prototype: { createEncodedStreams: () => ({}) } });
+    useVoiceStore.setState({ activeChannelId: 'chan-1', isDMCall: false });
+
+    const origLeave = svc.leaveChannel;
+    const origJoin = svc.joinChannel;
+    // The real leaveChannel nulls activeChannelId; the stub must too, or the
+    // rebuild's another-call-active guard reads the stale id as a user join.
+    svc.leaveChannel = vi.fn().mockImplementation(async () => {
+      useVoiceStore.setState({ activeChannelId: null });
+    });
+    svc.joinChannel = vi.fn().mockResolvedValue(undefined);
+    try {
+      const c1 = fakeConsumer('cf1', 500);
+      svc.consumers.set('cf1', c1);
+      svc.bypassProbes.set('cf1', { senderUserId: 'user-1', phase: 'reattached', attempt: 1 });
+      await svc.evaluateBypassProbe('cf1', 0);
+      await vi.waitFor(() => {
+        expect(svc.joinChannel).toHaveBeenCalledWith('chan-1', 'channel', {
+          internalRebuild: true,
+        });
+      });
+      expect(svc.leaveChannel).toHaveBeenCalledTimes(1);
+      expect(sessionStorage.getItem('concord.e2eeLegacyFallback')).toBe('1');
+
+      // A second consumer confirming bypass must NOT trigger a second rebuild.
+      const c2 = fakeConsumer('cf2', 500);
+      svc.consumers.set('cf2', c2);
+      svc.bypassProbes.set('cf2', { senderUserId: 'user-1', phase: 'reattached', attempt: 1 });
+      await svc.evaluateBypassProbe('cf2', 0);
+      expect(svc.leaveChannel).toHaveBeenCalledTimes(1);
+      expect(c2.close).toHaveBeenCalled(); // still fails closed
+    } finally {
+      svc.leaveChannel = origLeave;
+      svc.joinChannel = origJoin;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('cancels the fallback rebuild when the user leaves during the window', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('RTCRtpSender', { prototype: { createEncodedStreams: () => ({}) } });
+    useVoiceStore.setState({ activeChannelId: 'chan-1', isDMCall: false });
+
+    const origLeave = svc.leaveChannel;
+    const origJoin = svc.joinChannel;
+    // The rebuild's own leave resolves only after we simulate the user's leave
+    // arriving mid-window (a plain call without internalRebuild).
+    svc.leaveChannel = vi.fn().mockImplementation(async (opts?: { internalRebuild?: boolean }) => {
+      if (opts?.internalRebuild) {
+        svc.legacyRebuildIntent = null; // what the user's racing leaveChannel() does
+      }
+    });
+    svc.joinChannel = vi.fn().mockResolvedValue(undefined);
+    try {
+      const c = fakeConsumer('cr1', 500);
+      svc.consumers.set('cr1', c);
+      svc.bypassProbes.set('cr1', { senderUserId: 'user-1', phase: 'reattached', attempt: 1 });
+      await svc.evaluateBypassProbe('cr1', 0);
+      await vi.waitFor(() => {
+        expect(svc.leaveChannel).toHaveBeenCalled();
+      });
+      await Promise.resolve();
+      // The user's action won: no auto-rejoin of a call they left.
+      expect(svc.joinChannel).not.toHaveBeenCalled();
+    } finally {
+      svc.leaveChannel = origLeave;
+      svc.joinChannel = origJoin;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('stays fail-closed without a rebuild when the legacy API is unavailable', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Remove the legacy API entirely (the suite defines a legacy-capable
+    // RTCRtpSender at module scope) → the override is not viable.
+    vi.stubGlobal('RTCRtpSender', undefined);
+    useVoiceStore.setState({ activeChannelId: 'chan-1', isDMCall: false });
+    const origLeave = svc.leaveChannel;
+    svc.leaveChannel = vi.fn().mockResolvedValue(undefined);
+    try {
+      const c = fakeConsumer('cf3', 500);
+      svc.consumers.set('cf3', c);
+      svc.bypassProbes.set('cf3', { senderUserId: 'user-1', phase: 'reattached', attempt: 1 });
+      await svc.evaluateBypassProbe('cf3', 0);
+      expect(c.close).toHaveBeenCalled();
+      expect(svc.leaveChannel).not.toHaveBeenCalled();
+    } finally {
+      svc.leaveChannel = origLeave;
+      consoleError.mockRestore();
+    }
+  });
+
+  it('skips re-attaching in applyDecryptTransform when the creation-time transform is present', async () => {
+    const sentinel = new FakeScriptTransform({}, {});
+    const consumer = fakeConsumer('cf4', 0);
+    consumer.rtpReceiver.transform = sentinel;
+    svc.consumers.set('cf4', consumer);
+
+    (svc as any).applyDecryptTransform(consumer, 'user-1');
+
+    expect(consumer.rtpReceiver.transform).toBe(sentinel); // not replaced
+    await vi.advanceTimersByTimeAsync(5_000); // probe armed anyway
+    expect(worker.postMessage).toHaveBeenCalledWith({
+      type: 'queryDecryptStats',
+      probeId: 'cf4',
+    });
+  });
+
+  it('logs when the creation-time attach is skipped because the worker is not ready', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = { id: 'cx1', producerUserId: 'user-1', rtpParameters: { codecs: [] } };
+    svc.e2eeWorker = null;
+    expect((svc as any).creationAttachConsumeOption(result)).toEqual({});
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('creation-time decrypt attach skipped'),
+      { consumerId: 'cx1' }
+    );
+
+    svc.e2eeWorker = worker;
+    const opt = (svc as any).creationAttachConsumeOption(result);
+    expect(typeof opt.onRtpReceiver).toBe('function');
+    warn.mockRestore();
   });
 
   it('abandons the evaluation when getStats rejects mid-teardown', async () => {

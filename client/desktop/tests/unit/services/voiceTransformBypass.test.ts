@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
+import { afterEach, vi } from 'vitest';
 import {
   BYPASS_PROBE_MAX_ATTEMPTS,
+  buildDecryptCreationAttach,
   decideBypassProbeAction,
 } from '../../../src/renderer/services/voiceTransformBypass';
 
@@ -25,5 +27,63 @@ describe('decideBypassProbeAction', () => {
   it('confirms bypass: re-attach on the first phase, fail-closed after', () => {
     expect(decideBypassProbeAction(315, 0, 'first', 1)).toBe('reattach');
     expect(decideBypassProbeAction(315, 0, 'reattached', 1)).toBe('close');
+  });
+});
+
+describe('buildDecryptCreationAttach', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('attaches a decrypt transform with the full option set at receiver creation', () => {
+    class FakeScriptTransform {
+      constructor(
+        public worker: unknown,
+        public options: unknown
+      ) {}
+    }
+    vi.stubGlobal('RTCRtpScriptTransform', FakeScriptTransform);
+    const worker = {} as Worker;
+    const receiver = { transform: null } as unknown as RTCRtpReceiver;
+
+    buildDecryptCreationAttach(worker, 'user-1', 'opus', 'consumer-9')(receiver);
+
+    expect(receiver.transform).toBeInstanceOf(FakeScriptTransform);
+    expect((receiver.transform as unknown as FakeScriptTransform).worker).toBe(worker);
+    expect((receiver.transform as unknown as FakeScriptTransform).options).toEqual({
+      role: 'decrypt',
+      senderUserId: 'user-1',
+      codecFamily: 'opus',
+      probeId: 'consumer-9',
+    });
+  });
+
+  it('propagates a constructor failure to the caller (consume rejects, fail-closed)', () => {
+    vi.stubGlobal(
+      'RTCRtpScriptTransform',
+      class {
+        constructor() {
+          throw new Error('attach refused');
+        }
+      }
+    );
+    const receiver = { transform: null } as unknown as RTCRtpReceiver;
+    const attach = buildDecryptCreationAttach({} as Worker, 'user-1', 'opus', 'c2');
+    expect(() => attach(receiver)).toThrow('attach refused');
+    expect(receiver.transform).toBeNull(); // nothing half-attached
+  });
+
+  it('reads the constructor at call time, so a late-defined global works', () => {
+    const receiver = { transform: null } as unknown as RTCRtpReceiver;
+    const attach = buildDecryptCreationAttach({} as Worker, 'user-1', undefined, 'c1');
+    class LateTransform {
+      constructor(
+        public worker: unknown,
+        public options: unknown
+      ) {}
+    }
+    vi.stubGlobal('RTCRtpScriptTransform', LateTransform);
+    attach(receiver);
+    expect(receiver.transform).toBeInstanceOf(LateTransform);
   });
 });

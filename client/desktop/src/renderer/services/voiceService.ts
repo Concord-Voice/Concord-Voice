@@ -38,6 +38,7 @@ import {
 import { apiFetch } from './apiClient';
 import {
   BYPASS_PROBE_DELAY_MS,
+  buildDecryptCreationAttach,
   BYPASS_PROBE_MAX_ATTEMPTS,
   BYPASS_PROBE_SLOW_DELAY_MS,
   decideBypassProbeAction,
@@ -71,7 +72,10 @@ import {
   type CodecLookup,
 } from './voiceCodecSelection';
 import { extractWebrtcHwSignal, shouldReselectForHwDowngrade } from './webrtcHwSignal';
-import { resolveEncodedTransformSupport } from './encodedTransformSupport';
+import {
+  resolveEncodedTransformSupport,
+  type EncodedTransformPath,
+} from './encodedTransformSupport';
 import {
   DecoderBudgetSampler,
   selectInboundVideoDecoderReport,
@@ -197,20 +201,67 @@ interface TestSuspensionRestorePolicy {
   keepProducersPaused: boolean;
   keepMicPaused: boolean;
 }
-const ENCODED_TRANSFORM_APIS = {
-  scriptTransform: typeof RTCRtpScriptTransform === 'undefined' ? undefined : RTCRtpScriptTransform,
-  createEncodedStreams:
-    typeof RTCRtpSender === 'undefined'
-      ? undefined
-      : (RTCRtpSender.prototype as RtpSenderWithEncodedStreams).createEncodedStreams,
-};
-const ENCODED_TRANSFORM_PATH = resolveEncodedTransformSupport(ENCODED_TRANSFORM_APIS);
+// Probed per call, not at module load: the legacy-fallback override can engage
+// mid-session, and per-call probing keeps the decision testable and immune to
+// late-defined globals. Called a handful of times per media session — never
+// per frame — so the typeof checks are free.
+function currentEncodedTransformApis() {
+  return {
+    scriptTransform:
+      typeof RTCRtpScriptTransform === 'undefined' ? undefined : RTCRtpScriptTransform,
+    createEncodedStreams:
+      typeof RTCRtpSender === 'undefined'
+        ? undefined
+        : (RTCRtpSender.prototype as RtpSenderWithEncodedStreams).createEncodedStreams,
+  };
+}
+// Session-sticky legacy override. Set automatically when the bypass probe
+// confirms the engine ignores an attached receive transform even at receiver
+// creation (Chromium 149/150 V2 regression), persisted for THIS page session
+// only via sessionStorage — a fresh launch retries the modern path, since an
+// engine update may have fixed it. localStorage 'concord.forceLegacyE2EE'='1'
+// is the manual/support override and persists until cleared.
+// In-memory fallback only when storage itself is unavailable; storage is the
+// single source of truth otherwise, so tests reset by clearing storage.
+let inMemoryLegacyOverride = false;
+
+function readLegacyTransformOverride(): boolean {
+  try {
+    // Storage is the single source of truth when it works (tests reset by
+    // clearing it); the in-memory flag matters only when storage throws.
+    return (
+      globalThis.localStorage?.getItem('concord.forceLegacyE2EE') === '1' ||
+      globalThis.sessionStorage?.getItem('concord.e2eeLegacyFallback') === '1'
+    );
+  } catch {
+    return inMemoryLegacyOverride;
+  }
+}
+
+/** The active transform path. Dynamic — the legacy fallback can engage mid-session. */
+function currentTransformPath(): EncodedTransformPath {
+  return resolveEncodedTransformSupport(currentEncodedTransformApis(), {
+    forceLegacy: readLegacyTransformOverride(),
+  });
+}
+
+/** Engage the legacy fallback for the rest of this page session. Returns false if already engaged. */
+function engageLegacyTransformOverride(): boolean {
+  if (readLegacyTransformOverride()) return false;
+  inMemoryLegacyOverride = true;
+  try {
+    globalThis.sessionStorage?.setItem('concord.e2eeLegacyFallback', '1');
+  } catch {
+    /* storage unavailable — the in-memory flag governs this session */
+  }
+  return true;
+}
 
 if (E2EE_VERBOSE) {
   console.debug('E2EE API detection:', {
-    hasEncodedStreams: typeof ENCODED_TRANSFORM_APIS.createEncodedStreams === 'function',
-    hasScriptTransform: typeof ENCODED_TRANSFORM_APIS.scriptTransform === 'function',
-    selectedPath: ENCODED_TRANSFORM_PATH,
+    hasEncodedStreams: typeof currentEncodedTransformApis().createEncodedStreams === 'function',
+    hasScriptTransform: typeof currentEncodedTransformApis().scriptTransform === 'function',
+    selectedPath: currentTransformPath(),
   });
 }
 
@@ -2627,7 +2678,15 @@ class VoiceService {
   }
 
   /** Authorize and join a voice channel */
-  async joinChannel(channelId: string, joinType: 'channel' | 'dm' = 'channel'): Promise<void> {
+  async joinChannel(
+    channelId: string,
+    joinType: 'channel' | 'dm' = 'channel',
+    opts?: { internalRebuild?: boolean }
+  ): Promise<void> {
+    // A user joining anything supersedes a pending legacy-fallback rebuild.
+    // The rebuild's own join runs after its intent check, so clearing here is
+    // harmless for it and decisive against a racing user join.
+    this.legacyRebuildIntent = null;
     if (this.joinInFlight) throw new Error('Another voice call is already in progress');
     this.joinInFlight = true;
     let shouldRecoverJoinFailure = false;
@@ -2658,7 +2717,10 @@ class VoiceService {
       this.applyJoinMetadata(store, joinData, joinType, channelId);
 
       // Start outgoing ringback for DM calls
-      if (joinType === 'dm') notificationSoundService.playLoop('call-outgoing');
+      // Silent during a legacy-fallback rebuild: the peer never left the call,
+      // so ringback would be a false signal (Gitar, PR #2866).
+      if (joinType === 'dm' && !opts?.internalRebuild)
+        notificationSoundService.playLoop('call-outgoing');
 
       this.resolveQualityTier(store, channel.audio_quality_tier ?? undefined);
 
@@ -2733,7 +2795,8 @@ class VoiceService {
 
       store.setConnectionState('connected');
       notificationSoundService.stopAllLoops();
-      notificationSoundService.play(joinType === 'dm' ? 'call-connected' : 'voice-join');
+      if (!opts?.internalRebuild)
+        notificationSoundService.play(joinType === 'dm' ? 'call-connected' : 'voice-join');
       if (directDMJoiningState && useVoiceStore.getState().callState === directDMJoiningState) {
         store.setCallState({ kind: 'in-call' });
       }
@@ -2823,7 +2886,11 @@ class VoiceService {
   }
 
   /** Leave the current voice channel */
-  async leaveChannel(): Promise<void> {
+  async leaveChannel(opts?: { internalRebuild?: boolean }): Promise<void> {
+    // Any user-initiated leave cancels a pending legacy-fallback rebuild —
+    // rejoining a call the user explicitly left is never acceptable
+    // (CodeRabbit, PR #2866). The rebuild's own leave passes internalRebuild.
+    if (!opts?.internalRebuild) this.legacyRebuildIntent = null;
     const store = useVoiceStore.getState();
     const channelId = store.activeChannelId;
     const isDMCall = store.isDMCall;
@@ -2835,7 +2902,9 @@ class VoiceService {
     await this.cleanup();
 
     notificationSoundService.stopAllLoops();
-    notificationSoundService.play(isDMCall ? 'call-ended' : 'voice-leave');
+    // Silent during the legacy-fallback rebuild — the user is not leaving.
+    if (!opts?.internalRebuild)
+      notificationSoundService.play(isDMCall ? 'call-ended' : 'voice-leave');
 
     // Remove local user from channel voice members immediately so the
     // channel sidebar updates without waiting for the server roundtrip.
@@ -5288,7 +5357,7 @@ class VoiceService {
       // E2EE (legacy path): encodedInsertableStreams enables createEncodedStreams().
       // NOT set for RTCRtpScriptTransform — the two mechanisms conflict (#295).
       // All channels are always encrypted, so this is unconditionally applied when supported.
-      ...(ENCODED_TRANSFORM_PATH === 'encoded-streams' && {
+      ...(currentTransformPath() === 'encoded-streams' && {
         additionalSettings: {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
@@ -5357,7 +5426,7 @@ class VoiceService {
       iceCandidates: options.iceCandidates,
       dtlsParameters: options.dtlsParameters,
       // E2EE (legacy path only) — see send transport comment (#295)
-      ...(ENCODED_TRANSFORM_PATH === 'encoded-streams' && {
+      ...(currentTransformPath() === 'encoded-streams' && {
         additionalSettings: {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
@@ -5598,11 +5667,21 @@ class VoiceService {
         return;
       }
 
+      // Chromium ≥149 (encoded-transform V2 line) ignores a receive transform
+      // attached after the receiver is live: zero frames enter it and
+      // ciphertext reaches the decoder (2026-08-21 incident, PR #2865). The
+      // transform therefore attaches AT RECEIVER CREATION via onRtpReceiver —
+      // after setRemoteDescription, before createAnswer — mirroring the
+      // sender-side onRtpSender hook, which works on the same engines.
+      // applyDecryptTransform stays as the verifier: it detects the
+      // creation-time attachment, schedules the bypass probe, and remains the
+      // fail-closed late-attach path for the legacy pipeline.
       const consumer = await recvTransport.consume({
         id: result.id,
         producerId: result.producerId,
         kind: result.kind,
         rtpParameters: result.rtpParameters,
+        ...this.creationAttachConsumeOption(result, senderUserId),
       });
 
       this.consumers.set(consumer.id, consumer);
@@ -6757,7 +6836,7 @@ class VoiceService {
     attempt: number,
     initContext?: E2EEInitContext
   ): Promise<void> {
-    if (ENCODED_TRANSFORM_PATH === 'unavailable') {
+    if (currentTransformPath() === 'unavailable') {
       throw new Error('E2EE: no encoded transform API available');
     }
     const ownsContext = initContext === undefined;
@@ -6779,7 +6858,7 @@ class VoiceService {
       candidateMediaEncryption = new MediaEncryption();
       candidateMediaEncryption.initFromKey(encryptKey, 0);
       candidateMediaEncryption.setKeyVersion(keyVersion);
-      if (ENCODED_TRANSFORM_PATH === 'script-transform') {
+      if (currentTransformPath() === 'script-transform') {
         candidateWorker = this.createE2EEWorker();
         candidateWorker.postMessage({
           type: 'init',
@@ -6801,8 +6880,8 @@ class VoiceService {
         userId: context.userId,
         keyVersion: context.expectedMediaEncryption?.getKeyVersion() ?? keyVersion,
         attempt: attempt + 1,
-        useScriptTransform: ENCODED_TRANSFORM_PATH === 'script-transform',
-        transformPath: ENCODED_TRANSFORM_PATH,
+        useScriptTransform: currentTransformPath() === 'script-transform',
+        transformPath: currentTransformPath(),
       });
     } finally {
       if (!committed) {
@@ -7163,7 +7242,7 @@ class VoiceService {
    * For legacy path: delegates to MediaEncryption.debouncedRotateKeys().
    */
   private debouncedRotateE2EEKeys(): void {
-    if (ENCODED_TRANSFORM_PATH === 'encoded-streams') {
+    if (currentTransformPath() === 'encoded-streams') {
       // Legacy path: MediaEncryption handles its own debounce
       this.mediaEncryption?.debouncedRotateKeys();
       return;
@@ -7404,7 +7483,7 @@ class VoiceService {
     source?: string
   ): void {
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
-    if (ENCODED_TRANSFORM_PATH === 'script-transform') {
+    if (currentTransformPath() === 'script-transform') {
       if (!this.e2eeWorker) {
         this.failClosedEncryptTransform(source, 'E2EE Worker is not initialized');
       }
@@ -7419,7 +7498,7 @@ class VoiceService {
       return;
     }
 
-    if (ENCODED_TRANSFORM_PATH === 'unavailable') {
+    if (currentTransformPath() === 'unavailable') {
       this.failClosedEncryptTransform(source, 'encoded transform API unavailable');
     }
 
@@ -7535,7 +7614,7 @@ class VoiceService {
           keyId
         );
         this.assertCurrentDecryptKeyContext(channelId, localUserId, mediaEncryption, e2eeWorker);
-        if (ENCODED_TRANSFORM_PATH === 'script-transform' && e2eeWorker) {
+        if (currentTransformPath() === 'script-transform' && e2eeWorker) {
           e2eeWorker.postMessage({
             type: 'addDecryptKey',
             senderUserId,
@@ -7595,9 +7674,16 @@ class VoiceService {
     const codecFamily = codecFamilyFromRtpParameters(consumer.rtpParameters);
 
     // Modern path: RTCRtpScriptTransform (Chromium 129+)
-    if (ENCODED_TRANSFORM_PATH === 'script-transform') {
+    if (currentTransformPath() === 'script-transform') {
       if (!this.e2eeWorker) {
         throw new Error('E2EE: failed to attach decrypt transform (Worker is not initialized)');
+      }
+      if (receiver.transform) {
+        // Attached at receiver creation (onRtpReceiver in the consume call).
+        // Nothing to install — arm the bypass probe that verifies the engine
+        // actually routes frames through it.
+        this.scheduleBypassProbe(consumer.id, senderUserId, 'first', 1);
+        return;
       }
       try {
         const options: E2EETransformOptions = {
@@ -7620,7 +7706,7 @@ class VoiceService {
       return;
     }
 
-    if (ENCODED_TRANSFORM_PATH === 'unavailable') {
+    if (currentTransformPath() === 'unavailable') {
       throw new Error('E2EE: failed to attach decrypt transform (encoded transform unavailable)');
     }
 
@@ -7649,10 +7735,46 @@ class VoiceService {
   // Pending probes are keyed by consumer id; every async hop re-validates the
   // consumer and worker, so stale timers after teardown are harmless no-ops.
 
+  /** Ownership token for the one-shot legacy-fallback rebuild (see engageLegacyFallback). */
+  private legacyRebuildIntent: symbol | null = null;
+
   private readonly bypassProbes = new Map<
     string,
     { senderUserId: string; phase: BypassProbePhase; attempt: number }
   >();
+
+  /**
+   * The onRtpReceiver fragment for a consume() call, or nothing. Extracted so
+   * consumeProducerImpl stays under the complexity ceiling and the Worker
+   * narrows by early return instead of an assertion.
+   */
+  private creationAttachConsumeOption(
+    result: ConsumeResponse,
+    senderUserId?: string
+  ): { onRtpReceiver?: (receiver: RTCRtpReceiver) => void } {
+    if (currentTransformPath() !== 'script-transform') return {};
+    const worker = this.e2eeWorker;
+    if (!worker) {
+      // Lazy-init race: E2EE finishes initializing AFTER this consume (the
+      // ensureE2EEForConsumer path). The consumer degrades to late attach,
+      // which Chromium ≥149 bypasses — the probe then fails it closed and the
+      // legacy fallback restores audio. Self-healing, but log it so the
+      // degraded window is observable instead of silent (Gitar, PR #2866).
+      console.warn(
+        'E2EE: creation-time decrypt attach skipped — worker not ready at consume; late attach will be probed',
+        { consumerId: result.id }
+      );
+      return {};
+    }
+    return {
+      onRtpReceiver: buildDecryptCreationAttach(
+        worker,
+        senderUserId || result.producerUserId,
+        codecFamilyFromRtpParameters(result.rtpParameters),
+        result.id
+      ),
+    };
+  }
 
   private scheduleBypassProbe(
     consumerId: string,
@@ -7742,6 +7864,13 @@ class VoiceService {
             consumer,
             `bypass re-attach failed: ${errorMessage(err)}`
           );
+          // A throwing replacement is the same engine signal as a persisting
+          // bypass — the modern path is broken here. Engage the fallback so
+          // the session heals instead of permanently losing consumers
+          // (Gitar finding, PR #2866). Chromium 150 fails the replacement
+          // asynchronously (pipe error) and reaches the 'close' action, but a
+          // spec-conformant synchronous InvalidStateError lands in THIS catch.
+          this.engageLegacyFallback();
         }
         return;
       }
@@ -7754,8 +7883,55 @@ class VoiceService {
           consumer,
           'receive transform bypassed — ciphertext reaching decoder'
         );
+        this.engageLegacyFallback();
         return;
     }
+  }
+
+  /**
+   * Engine-level bypass confirmed even for a creation-time attachment: switch
+   * this page session to the legacy createEncodedStreams pipeline (main
+   * thread, parity-hardened in PR #2863) and rebuild the media session once so
+   * new transports pick up encodedInsertableStreams. One shot per session —
+   * if the legacy path also bypasses (unknown engine), consumers keep failing
+   * closed and no rebuild loop can start.
+   */
+  private engageLegacyFallback(): void {
+    if (!engageLegacyTransformOverride()) return;
+    if (currentTransformPath() !== 'encoded-streams') {
+      console.error(
+        'E2EE: legacy fallback requested but createEncodedStreams is unavailable — staying fail-closed'
+      );
+      return;
+    }
+    const store = useVoiceStore.getState();
+    const channelId = store.activeChannelId;
+    console.error(
+      'E2EE: receive transforms are bypassed on this engine — switching to the legacy encoded-streams pipeline and rebuilding the media session',
+      { channelId }
+    );
+    if (!channelId) return;
+    const joinType = store.isDMCall ? ('dm' as const) : ('channel' as const);
+    const intent = Symbol('legacy-rebuild');
+    this.legacyRebuildIntent = intent;
+    void (async () => {
+      try {
+        await this.leaveChannel({ internalRebuild: true });
+        // Ownership check: a user-initiated leave or join during the rebuild
+        // window clears the intent — the user's action wins, no auto-rejoin.
+        if (this.legacyRebuildIntent !== intent) {
+          console.debug('E2EE: legacy fallback rebuild cancelled — user acted during rebuild');
+          return;
+        }
+        if (useVoiceStore.getState().activeChannelId !== null) {
+          console.debug('E2EE: legacy fallback rebuild skipped — another call is active');
+          return;
+        }
+        await this.joinChannel(channelId, joinType, { internalRebuild: true });
+      } catch (err) {
+        console.error('E2EE: legacy fallback rebuild failed:', errorMessage(err));
+      }
+    })();
   }
 
   private closeConsumerAfterDecryptTransformFailure(

@@ -38,3 +38,31 @@ describe('resolveEncodedTransformSupport', () => {
     ).toBe('encoded-streams');
   });
 });
+
+describe('resolveEncodedTransformSupport — forceLegacy override', () => {
+  const fn = () => {};
+
+  it('prefers the legacy pipeline when forced and available', () => {
+    expect(
+      resolveEncodedTransformSupport(
+        { scriptTransform: fn, createEncodedStreams: fn },
+        { forceLegacy: true }
+      )
+    ).toBe('encoded-streams');
+  });
+
+  it('ignores the override when the legacy API is absent — never a path to unavailable', () => {
+    expect(
+      resolveEncodedTransformSupport(
+        { scriptTransform: fn, createEncodedStreams: undefined },
+        { forceLegacy: true }
+      )
+    ).toBe('script-transform');
+  });
+
+  it('defaults to the modern preference when the override is not passed', () => {
+    expect(resolveEncodedTransformSupport({ scriptTransform: fn, createEncodedStreams: fn })).toBe(
+      'script-transform'
+    );
+  });
+});

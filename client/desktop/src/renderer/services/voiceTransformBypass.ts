@@ -13,6 +13,41 @@
  * Pure function so the policy is testable without a VoiceService instance.
  */
 
+import type { CodecFamily, E2EETransformOptions } from '../workers/e2eeProtocol';
+
+/**
+ * Build the ConsumerOptions.onRtpReceiver callback that attaches the decrypt
+ * transform AT RECEIVER CREATION — after setRemoteDescription, before
+ * createAnswer, before any media routing exists. Chromium ≥149 (encoded
+ * transform V2 line) does not route frames through a transform attached after
+ * the receiver is live: the pipe stays empty and ciphertext reaches the
+ * decoder (2026-08-21 field capture, PR #2865). Creation-time attachment
+ * mirrors the sender-side onRtpSender hook, which works on the same engines.
+ *
+ * Reads the RTCRtpScriptTransform constructor from globalThis at CALL time so
+ * the caller's path decision (script-transform vs legacy) stays the single
+ * gate and tests can stub the global.
+ */
+export function buildDecryptCreationAttach(
+  worker: Worker,
+  senderUserId: string,
+  codecFamily: CodecFamily | undefined,
+  probeId: string
+): (receiver: RTCRtpReceiver) => void {
+  return (receiver) => {
+    const options: E2EETransformOptions = {
+      role: 'decrypt',
+      senderUserId,
+      codecFamily,
+      probeId,
+    };
+    receiver.transform = new RTCRtpScriptTransform(worker, options);
+    console.debug(
+      `E2EE: decrypt transform applied for ${senderUserId} (RTCRtpScriptTransform, at receiver creation)`
+    );
+  };
+}
+
 /** Delay after attach (and between retries) before pairing the two counters. */
 export const BYPASS_PROBE_DELAY_MS = 5_000;
 /** Fewer received packets than this is inconclusive (paused/silent producer). */
