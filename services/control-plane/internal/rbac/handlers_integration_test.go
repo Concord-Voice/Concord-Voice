@@ -2,11 +2,15 @@ package rbac_test
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
@@ -627,6 +631,521 @@ func TestReorderRoles_HierarchyViolation_CannotReorderAbove(t *testing.T) {
 	}
 	w := ts.DoRequest("PATCH", reorderRolesPath(serverID), body, testhelpers.AuthHeaders(member.AccessToken))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// waitForBlockedSession polls pg_stat_activity until a session is parked on a
+// lock, so the interleaving below is deterministic rather than a timing race.
+// Post-fix the parked statement is the advisory lock; pre-fix it is the
+// position UPDATE. Either one proves the handler has passed its authorization
+// reads and is already committed to writing.
+func waitForBlockedSession(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		err := db.QueryRow(`
+			SELECT COUNT(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND state = 'active'
+			  AND wait_event_type = 'Lock'
+			  AND (query ILIKE '%pg_advisory_xact_lock%' OR query ILIKE '%UPDATE roles SET position%')`).Scan(&n)
+		require.NoError(t, err)
+		if n > 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("no session became lock-blocked within 10s; the interleaving did not set up")
+}
+
+// TestReorderRoles_TOCTOU_PromotedTargetIsRefused is the inverted PoC from
+// issue #2851 (TestPoC_H4a_ReorderTOCTOU). It PASSED pre-fix by observing 200:
+// an actor whose highest role sat at position 5 demoted a role that had been
+// promoted to 19 after the handler's authorization reads had already passed.
+// It now asserts 403. If this starts failing, CWE-367 is back on this handler.
+func TestReorderRoles_TOCTOU_PromotedTargetIsRefused(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+
+	grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+
+	target := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "TOCTOUTarget", 0)
+	filler := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "TOCTOUFiller", 0)
+	_, err := ts.DB.Exec(`UPDATE roles SET position = 2 WHERE id IN ($1, $2)`, target, filler)
+	require.NoError(t, err)
+
+	// The helper stands in for the concurrent promoter the issue describes —
+	// "the owner or another admin issuing their own reorder" — so it holds the
+	// SAME per-server advisory lock every role-authority writer takes, and a row
+	// lock on the target as the original proof of concept does.
+	//
+	// Both locks matter, and for different halves of this test. Pre-fix the
+	// handler took no advisory lock at all, so it parked on the ROW lock
+	// mid-UPDATE with its authorization already passed, and the promotion then
+	// landed underneath it. Post-fix it parks on the ADVISORY lock before
+	// reading anything authoritative, so the promotion is visible to the
+	// re-evaluation. Holding only the row lock would model a promoter that
+	// bypasses the advisory order, which no writer in the control plane does:
+	// applyRolePositions is the sole UPDATE of roles.position.
+	lockKey, err := rbac.ServerVisibilityCaptureAdvisoryKey(serverID)
+	require.NoError(t, err)
+
+	holder, err := ts.DB.Begin()
+	require.NoError(t, err)
+	defer func() { _ = holder.Rollback() }()
+
+	_, err = holder.Exec(`SELECT pg_advisory_xact_lock($1)`, lockKey)
+	require.NoError(t, err)
+
+	var parked string
+	require.NoError(t, holder.QueryRow(`SELECT id FROM roles WHERE id = $1 FOR UPDATE`, target).Scan(&parked))
+
+	codes := make(chan int, 1)
+	go func() {
+		rec := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+			map[string]interface{}{"role_ids": []string{target, filler}},
+			testhelpers.AuthHeaders(member.AccessToken))
+		codes <- rec.Code
+	}()
+
+	waitForBlockedSession(t, ts.DB)
+
+	// Promote the target far above the actor, then commit.
+	_, err = holder.Exec(`UPDATE roles SET position = 19 WHERE id = $1`, target)
+	require.NoError(t, err)
+	require.NoError(t, holder.Commit())
+
+	select {
+	case code := <-codes:
+		assert.Equal(t, http.StatusForbidden, code,
+			"an actor at position 5 must not reorder a role promoted to 19; 200 here is CWE-367")
+	case <-time.After(20 * time.Second):
+		t.Fatal("handler did not return within 20s")
+	}
+
+	var finalPosition int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, target).Scan(&finalPosition))
+	assert.Equal(t, 19, finalPosition, "the refused reorder must not have written a position")
+}
+
+// clearReorderRateLimit deletes a user's rate-limit counters so a contention
+// test can run more rounds than the route's 5/min budget allows. It is scoped
+// to the one user's keys — never a FLUSHDB, which would destroy session and
+// token state this suite depends on.
+func clearReorderRateLimit(t *testing.T, ts *testhelpers.TestServer, userIDs ...string) {
+	t.Helper()
+	for _, id := range userIDs {
+		keys, err := ts.Redis.Keys(context.Background(), "ratelimit:user:"+id+":*").Result()
+		require.NoError(t, err)
+		if len(keys) > 0 {
+			require.NoError(t, ts.Redis.Del(context.Background(), keys...).Err())
+		}
+	}
+}
+
+// TestReorderRoles_ConcurrentOppositeOrders_Serialize locks the live 40P01
+// deadlock reported on issue #2851. applyRolePositions iterates the
+// CLIENT-SUPPLIED role order, so pre-fix two concurrent reorders submitting
+// opposing orderings took row locks in opposite sequences —
+// "T1 holds A wants B / T2 holds B wants A" — and the losing side got a
+// generic 500 with nothing written to the audit log.
+//
+// It uses TWO admins deliberately, which is both the reported scenario ("two
+// users reordering roles on the same server at the same time") and the case
+// the route's own 5/min-per-USER rate limit does not throttle at all.
+//
+// Self-validating, following the #2721 occupancy-test precedent: it first
+// asserts an uncontended reorder succeeds, so a failure below is genuine
+// contention rather than a mis-seeded fixture producing a green test that
+// proves nothing.
+//
+// WHAT THIS TEST DOES AND DOES NOT PIN — stated because it changed during
+// review. When written, the write was a per-role loop and this test failed
+// with 40P01 whenever the advisory lock was removed, so it pinned the LOCK.
+// The write is now a single batched UPDATE, and two concurrent single
+// statements of the same shape cannot deadlock — so this test passes with the
+// lock removed and no longer isolates it. It still pins the OUTCOME (no
+// deadlock reaches a caller) via either mechanism, which is what users care
+// about. The advisory lock's own regression pin is
+// TestReorderRoles_TOCTOU_PromotedTargetIsRefused, which was re-verified red
+// with the lock disabled AFTER the batched rewrite.
+func TestReorderRoles_ConcurrentOppositeOrders_Serialize(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+
+	// A second admin, high enough that every role below is fair game.
+	grantPermToUser(t, ts, serverID, member.ID, 20, int64(rbac.PermManageRoles))
+
+	roleA := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "DeadlockA", 0)
+	roleB := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "DeadlockB", 0)
+	roleC := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "DeadlockC", 0)
+	_, err := ts.DB.Exec(`UPDATE roles SET position = 0 WHERE id IN ($1, $2, $3)`, roleA, roleB, roleC)
+	require.NoError(t, err)
+
+	forward := []string{roleA, roleB, roleC}
+	reverse := []string{roleC, roleB, roleA}
+
+	warm := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": forward}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, warm.Code, "uncontended reorder must succeed; the fixture is wrong")
+
+	type attempt struct {
+		token string
+		order []string
+	}
+
+	const rounds = 10
+	var (
+		mu     sync.Mutex
+		codes  []int
+		wg     sync.WaitGroup
+		actors = []string{owner.AccessToken, member.AccessToken}
+	)
+
+	for r := 0; r < rounds; r++ {
+		// Stay inside the 5/min-per-user budget: two requests per user per
+		// round, counters cleared between rounds. A 429 here would mask the
+		// deadlock this test exists to catch.
+		clearReorderRateLimit(t, ts, owner.ID, member.ID)
+
+		attempts := []attempt{
+			{actors[0], forward}, {actors[1], reverse},
+			{actors[0], reverse}, {actors[1], forward},
+		}
+		for _, a := range attempts {
+			wg.Add(1)
+			go func(a attempt) {
+				defer wg.Done()
+				rec := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+					map[string]interface{}{"role_ids": a.order},
+					testhelpers.AuthHeaders(a.token))
+				mu.Lock()
+				codes = append(codes, rec.Code)
+				mu.Unlock()
+			}(a)
+		}
+		wg.Wait()
+	}
+
+	require.Len(t, codes, rounds*4)
+	for idx, code := range codes {
+		assert.Equal(t, http.StatusOK, code,
+			"request %d returned %d; a 500 here is the 40P01 deadlock the advisory lock exists to prevent", idx, code)
+	}
+}
+
+// TestReorderRoles_ManagedRole_Forbidden pins the F4-analogue fix: a managed
+// role named in a reorder is refused by the guard, rather than passing it and
+// being filtered out of the UPDATE afterwards.
+//
+// Originally that filter made the write a SILENT no-op — every other role
+// moved, the managed role kept its position, two roles ended up sharing one
+// position value, and the caller got 200 OK for a write that never happened.
+// execRequiringRow already turned that into a hard failure, but it surfaced as
+// 404 "Role not found", which is a lie about a role that plainly exists. The
+// guard now gives the real answer.
+func TestReorderRoles_ManagedRole_Forbidden(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	managed := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "ManagedReorder", 0)
+	plain := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "PlainReorder", 0)
+	_, err := ts.DB.Exec(`UPDATE roles SET is_managed = TRUE WHERE id = $1`, managed)
+	require.NoError(t, err)
+
+	var before int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, managed).Scan(&before))
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{managed, plain}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	assert.Equal(t, "Cannot reorder managed roles", resp["error"])
+
+	var after int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, managed).Scan(&after))
+	assert.Equal(t, before, after, "a refused reorder must write nothing")
+}
+
+// TestReorderRoles_NullIsManaged_Reorderable pins the COALESCE interpretation.
+// roles.is_managed is NULLABLE — 000035_rbac_system.up.sql declares it
+// BOOLEAN DEFAULT FALSE with no NOT NULL, and no later migration tightens it —
+// so the original `AND is_managed = FALSE` write filter evaluated to NULL for
+// such a row and skipped it. That is the same silent-skip defect as an
+// explicitly managed role, reached by a second and even less visible route.
+//
+// NULL means not-managed, which is what the column's own DEFAULT intends. The
+// guard and the write filter both COALESCE so they cannot disagree.
+func TestReorderRoles_NullIsManaged_Reorderable(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	nullFlag := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "NullManaged", 0)
+	other := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "OtherManaged", 0)
+	_, err := ts.DB.Exec(`UPDATE roles SET is_managed = NULL WHERE id = $1`, nullFlag)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{nullFlag, other}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var position int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, nullFlag).Scan(&position))
+	// Position 2, not 1: @all is not named here, so positionOffset reserves 0
+	// for it and the two named roles take 2 and 1.
+	assert.Equal(t, 2, position, "a NULL is_managed role must be reordered, not skipped")
+}
+
+// TestReorderRoles_UnknownRoleID_NotFound pins a deliberate behaviour change.
+// The write loop previously used a bare tx.Exec, so a role_ids entry naming a
+// role that does not exist on this server matched no rows, was skipped without
+// comment, and the caller still got 200 OK — while every other named role was
+// repositioned by list index, silently producing an order the caller never
+// asked for. execRequiringRow now reports sql.ErrNoRows and the whole
+// transaction rolls back.
+//
+// 404 is deliberate over 500: the role genuinely is not found, and the answer
+// discloses nothing an actor with ManageRoles cannot already read from
+// ListRoles on the same server. Input SHAPE (bounds, duplicates) is #2841.
+func TestReorderRoles_UnknownRoleID_NotFound(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	real1 := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "RealReorder1", 0)
+	real2 := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "RealReorder2", 0)
+
+	var before1, before2 int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, real1).Scan(&before1))
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, real2).Scan(&before2))
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{real1, uuid.New().String(), real2}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	assert.Equal(t, "Role not found", resp["error"])
+
+	// The whole transaction rolls back — no partial reorder survives.
+	var after1, after2 int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, real1).Scan(&after1))
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, real2).Scan(&after2))
+	assert.Equal(t, before1, after1, "a rejected reorder must not have repositioned real1")
+	assert.Equal(t, before2, after2, "a rejected reorder must not have repositioned real2")
+}
+
+// TestReorderRoles_MalformedRoleID_Rejected closes CodeQL go/log-injection
+// (alert 1262, medium) on this handler.
+//
+// ReorderRolesRequest.RoleIDs was `binding:"required"` with NO element
+// validation, so an entry could be any string. A non-UUID entry reaches
+// PostgreSQL as `roles.id = ANY($3)`, which fails with
+// `invalid input syntax for type uuid: "<attacker string>"`. That error is
+// neither sql.ErrNoRows nor a guard denial, so it lands in the default branch
+// and is written to the log — carrying the attacker's string, newlines and
+// all, into the log stream. A caller with ManageRoles could forge log entries.
+//
+// Validating the elements kills the class at the boundary rather than
+// scrubbing it at the sink: no malformed value ever reaches the database, the
+// log, or the 500 path. Input BOUNDS (max length, duplicates, @everyone) stay
+// with #2841; this is only the element type.
+func TestReorderRoles_MalformedRoleID_Rejected(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	real1 := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "MalformedPeer", 0)
+
+	// Assert the SECURITY property, not just the status code. A 400 proves the
+	// request was refused; only the log buffer proves the probe never reached a
+	// sink, which is what go/log-injection is actually about.
+	logs := ts.CaptureLogs(t)
+
+	for _, probe := range []string{
+		"not-a-uuid",
+		"\n2026-01-01T00:00:00Z level=ERROR msg=\"forged log line\"",
+		"'; DROP TABLE roles; --",
+	} {
+		w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+			map[string]interface{}{"role_ids": []string{real1, probe}},
+			testhelpers.AuthHeaders(owner.AccessToken))
+		assert.Equal(t, http.StatusBadRequest, w.Code,
+			"malformed role_id %q must be rejected at the binding boundary, never reach the DB or the log", probe)
+		assert.NotContains(t, logs.String(), probe,
+			"the rejected probe %q must not appear in any log line", probe)
+	}
+}
+
+// TestReorderRoles_EmptyRoleIDs_Rejected pins `min=1`. The `required` tag alone
+// does NOT reject a non-nil empty slice — it only rejects nil — so
+// `{"role_ids": []}` bound successfully and committed a no-op reorder reported
+// as 200 OK. Verified by probe before min=1 was added.
+func TestReorderRoles_EmptyRoleIDs_Rejected(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code,
+		"an empty role_ids array must be rejected, not silently accepted as a no-op")
+}
+
+// TestReorderRoles_OmittingDefault_KeepsItStrictlyLowest covers the second way
+// the @all invariant can break: leaving it OUT of the payload entirely. The
+// last named role would otherwise take position 0 alongside @all — a tie, so
+// @all is no longer STRICTLY lowest — and RowsAffected still matches, so the
+// write commits. positionOffset reserves 0.
+func TestReorderRoles_OmittingDefault_KeepsItStrictlyLowest(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	allRoleID := defaultRoleID(t, ts, serverID)
+	a := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "OmitA", 0)
+	b := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "OmitB", 0)
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{a, b}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, "a partial reorder omitting @all is legitimate and must succeed")
+
+	var pAll, pA, pB int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id=$1`, allRoleID).Scan(&pAll))
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id=$1`, a).Scan(&pA))
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id=$1`, b).Scan(&pB))
+
+	assert.Equal(t, 0, pAll, "@all stays at position 0")
+	assert.Greater(t, pB, pAll, "the lowest NAMED role must sit strictly above @all, not tie with it")
+	assert.Greater(t, pA, pB, "relative order of the named roles is preserved")
+}
+
+// TestReorderRoles_FullListIncludingDefault_Succeeds is the natural payload the
+// incoming reorder UI sends (PR #2839): the ENTIRE display-ordered role list,
+// which necessarily contains @all.
+//
+// @all is created `is_default = TRUE, is_managed = TRUE` on every server
+// (internal/servers/handlers.go:191), so a managed-role refusal that does not
+// exempt the default role rejects every full-list reorder — for the owner too.
+// #2839's roleOrder.ts builds its payload from the whole displayed list and
+// only marks @all non-draggable, so it does send it.
+func TestReorderRoles_FullListIncludingDefault_Succeeds(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	allRoleID := defaultRoleID(t, ts, serverID)
+
+	var allManaged bool
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COALESCE(is_managed, FALSE) FROM roles WHERE id = $1`, allRoleID).Scan(&allManaged))
+	require.True(t, allManaged, "premise: @all is created is_managed = TRUE")
+
+	top := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "FullListTop", 0)
+	mid := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "FullListMid", 0)
+
+	// Display order: highest authority first, @all last — exactly what
+	// roleOrder.ts produces, and position = len-i-1 lands @all back at 0.
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{top, mid, allRoleID}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code,
+		"a full-list reorder naming @all must succeed; 403 here breaks the #2839 reorder UI")
+
+	var allPos int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, allRoleID).Scan(&allPos))
+	assert.Equal(t, 0, allPos, "@all must remain at the lowest position")
+}
+
+// defaultRoleID returns the server's @all role, which every member holds.
+func defaultRoleID(t *testing.T, ts *testhelpers.TestServer, serverID string) string {
+	t.Helper()
+	var id string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&id))
+	return id
+}
+
+// TestReorderRoles_DefaultRoleCannotBePromoted_EvenByOwner is the hard
+// invariant: @all is ALWAYS the lowest role in the hierarchy, and nobody —
+// not even the server owner — can promote it above anything.
+//
+// This is a security rule, not a cosmetic one. Every member of the server
+// holds @all, so its position sets the floor of COALESCE(MAX(r.position), 0)
+// for the entire membership. Promoting it by one reorder would raise EVERY
+// member's hierarchy ceiling at once, handing the whole server authority over
+// every role beneath the new position — a mass privilege change wearing the
+// costume of a drag-and-drop.
+func TestReorderRoles_DefaultRoleCannotBePromoted_EvenByOwner(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	allRoleID := defaultRoleID(t, ts, serverID)
+	top := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "PromoteTop", 0)
+	mid := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "PromoteMid", 0)
+
+	var before int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, allRoleID).Scan(&before))
+
+	// @all first in display order == highest authority == position len-1.
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{allRoleID, top, mid}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code,
+		"not even the owner may promote the default role above other roles")
+
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	assert.Equal(t, "The default role must remain the lowest role", resp["error"])
+
+	var after int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, allRoleID).Scan(&after))
+	assert.Equal(t, before, after, "the refused reorder must not have moved @all")
+	assert.Equal(t, 0, after, "@all remains the lowest role")
+}
+
+// TestReorderRoles_DefaultRoleMidList_Forbidden covers the subtler case: @all
+// neither first nor last still resolves to a position above 0.
+func TestReorderRoles_DefaultRoleMidList_Forbidden(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	allRoleID := defaultRoleID(t, ts, serverID)
+	top := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "MidTop", 0)
+	low := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "MidLow", 0)
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{top, allRoleID, low}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusForbidden, w.Code, "@all anywhere but last resolves above position 0")
+
+	var after int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, allRoleID).Scan(&after))
+	assert.Equal(t, 0, after)
+}
+
+// TestReorderRoles_DuplicateRoleIDs_Rejected pins the `unique` binding tag.
+// Duplicates are not merely untidy: the batched UPDATE verifies
+// RowsAffected == len(RoleIDs), and a repeated id matches one row while
+// counting twice, so the all-or-nothing check would misfire.
+func TestReorderRoles_DuplicateRoleIDs_Rejected(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	roleA := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "DupA", 0)
+	roleB := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "DupB", 0)
+
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": []string{roleA, roleB, roleA}},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestReorderRoles_OversizedPayload_Rejected pins the `max=500` bound. The
+// advisory lock is held until COMMIT, so an unbounded list is a lock-hold
+// question, not a formatting one.
+func TestReorderRoles_OversizedPayload_Rejected(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	ids := make([]string, 501)
+	for i := range ids {
+		ids[i] = uuid.New().String()
+	}
+	w := ts.DoRequest("PATCH", reorderRolesPath(serverID),
+		map[string]interface{}{"role_ids": ids},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code,
+		"an oversized reorder must be refused before it can hold the server-wide lock")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

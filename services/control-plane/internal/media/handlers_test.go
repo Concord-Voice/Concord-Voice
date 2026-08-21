@@ -1787,7 +1787,12 @@ func TestProxyFriendCodeAvatarSuccess(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, avatar, w.Body.Bytes(), "the owner's avatar must be proxied, never redirected to")
 	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
-	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=3600")
+	// max-age=60, matching EVERY fallback, not the 3600 this asserted before
+	// #945 Md6. Equalizing bytes and status while the success path still emitted
+	// a distinct cache directive left the same validity oracle in a header: any
+	// shared proxy could separate "live code whose owner has an avatar" from
+	// every other class by TTL alone. The short TTL is the fix, not an accident.
+	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=60")
 	// The route is keyed by CODE precisely so the owner's UUID never escapes -
 	// including via a redirect, which would put it in Location. Sweep every
 	// header rather than the one or two a redirect would have used.

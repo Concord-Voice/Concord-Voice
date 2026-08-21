@@ -6449,12 +6449,13 @@ paths:
       operationId: friendsPublicCodeAvatar
       description: 'Serves the code owner''s avatar keyed by CODE rather than by user id.
 
-        Every invalid class — malformed, unknown, expired, revoked, maxed-out — and every
-        owner without an avatar returns the same silhouette fallback with identical BYTES.
-        Headers are not identical: the success path sends Cache-Control max-age=3600 and
-        every fallback sends max-age=60, so the cache directive still distinguishes a live
-        code whose owner has an avatar. Bytes are proxied, never redirected:
-        a 302 would put the owner''s UUID in the Location header.
+        Every invalid class — malformed, unknown, expired, revoked, maxed-out — every
+        owner without an avatar, and every object-storage failure returns the same
+        silhouette fallback with identical bytes AND identical headers, including
+        Cache-Control: public, max-age=60, must-revalidate on the success path too.
+        A storage outage therefore cannot turn this route into a validity oracle.
+        Bytes are proxied, never redirected: a 302 would put the owner''s UUID in
+        the Location header.
 
         Rate limit: 60 requests per minute (per IP).
 
@@ -11267,6 +11268,13 @@ paths:
 
         Requires the Manage Roles permission; non-owners cannot move roles to or above their own position.
 
+        role_ids must contain 1-500 unique role UUIDs. Every named role must exist on this server —
+        the reorder is applied atomically and is rejected in full if any entry does not match.
+
+        The default role (@all) must appear LAST when it is named, so that it keeps the lowest
+        position. It can never be promoted above another role, including by the server owner.
+        Other system-managed roles cannot be reordered at all.
+
         Rate limit: 5 requests per minute.
 
         '
@@ -11289,13 +11297,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessMessage'
         '400':
-          description: Invalid server ID or request body
+          description: Invalid server ID, malformed request body, a role_ids entry that is
+            not a UUID, more than 500 entries, or duplicate entries
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions or reorder would violate role hierarchy
+          description: Insufficient permissions; reorder would violate role hierarchy; a
+            system-managed role was named; or the default role (@all) was not placed last
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: A named role does not exist on this server. No positions are changed —
+            the reorder is applied atomically or not at all.
           content:
             application/json:
               schema:
@@ -17121,10 +17138,16 @@ components:
       properties:
         role_ids:
           type: array
+          minItems: 1
+          maxItems: 500
+          uniqueItems: true
           items:
             type: string
             format: uuid
-          description: Role IDs in desired order; positions assigned descending in list order
+          description: 'Role IDs in desired order, highest authority first; positions are
+            assigned descending in list order. Every ID must name a role on this server.
+            The default role (@all) must be LAST when included, and when it is omitted the
+            lowest position stays reserved for it, so it is always strictly the lowest role.'
     AssignRoleRequest:
       type: object
       required:

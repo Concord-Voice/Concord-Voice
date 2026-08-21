@@ -3,6 +3,7 @@ package media
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -16,7 +17,29 @@ type mockStore struct {
 	mu      sync.Mutex
 	objects map[string]*mockObject
 	putErr  error // if non-nil, PutObject returns this error
+	getErr  error // if non-nil, GetObject returns this error (see friend_avatar_outage_test.go)
+	// getPartial, when non-nil, makes GetObject SUCCEED and hand back a reader
+	// that yields these bytes and then fails — a connection dropped mid-transfer.
+	// The pre-read and mid-read failures are the same defect at two moments.
+	getPartial []byte
 }
+
+// partialReader yields its bytes once, then fails.
+type partialReader struct {
+	data []byte
+	done bool
+}
+
+func (r *partialReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, errors.New("connection reset mid-transfer")
+	}
+	r.done = true
+	n := copy(p, r.data)
+	return n, nil
+}
+
+func (r *partialReader) Close() error { return nil }
 
 type mockObject struct {
 	data        []byte
@@ -44,6 +67,15 @@ func (m *mockStore) PutObject(_ context.Context, key string, reader io.Reader, _
 func (m *mockStore) GetObject(_ context.Context, key string) (io.ReadCloser, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.getPartial != nil {
+		return &partialReader{data: m.getPartial}, "image/png", nil
+	}
+	if m.getErr != nil {
+		// Deliberately NOT wrapped in storage.ErrObjectNotFound: this models a
+		// live backend fault (an R2/S3 incident), which is the branch that made
+		// the friend-avatar route a validity classifier.
+		return nil, "", m.getErr
+	}
 	obj, ok := m.objects[key]
 	if !ok {
 		// Wrapped to mirror the real client, proving errors.Is sees through wrapping.

@@ -471,17 +471,15 @@ func (h *Handler) ProxyInviteServerIcon(c *gin.Context) {
 // only identifier in the URL, and the bytes are proxied - never redirected,
 // because a 302 would put the UUID in the Location header.
 //
-// Every invalid class and every no-avatar case serves the shared silhouette
-// fallback with identical BYTES, so an anonymous caller cannot tell them apart
-// from the body.
+// Every invalid class, every no-avatar case, and every storage failure serves
+// the shared silhouette fallback with identical BYTES *and* identical headers,
+// so an anonymous caller cannot tell them apart at all.
 //
-// Headers are NOT identical, and an earlier version of this comment wrongly
-// claimed they were: the success path emits Cache-Control max-age=3600 and
-// every fallback emits max-age=60, so the directive itself still separates
-// "live code with an avatar" from everything else. That residual is recorded
-// rather than papered over — closing it needs a friend-code-specific object
-// path (the success arm currently delegates to proxyInviteIcon, which is
-// shared with server icons and cannot be retimed unilaterally).
+// Header parity is now real rather than aspirational: the success arm routes
+// through proxyFriendCodeAvatarObject (not the shared proxyInviteIcon) and emits
+// the same max-age=60 every fallback does. An earlier revision emitted 3600 on
+// success, leaving the cache directive as an oracle after the bytes had been
+// equalized; a revision before THAT claimed parity it did not have.
 // GET /api/v1/friends/codes/:code/avatar
 func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
 	// The edge rate-limit rule matches on the RAW wire path, but gin routes on
@@ -546,7 +544,78 @@ func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
 		return
 	}
 
-	h.proxyInviteIcon(c, fmt.Sprintf("avatars/%s", ownerID))
+	h.proxyFriendCodeAvatarObject(c, fmt.Sprintf("avatars/%s", ownerID))
+}
+
+// friendAvatarMaxBytes bounds the in-memory buffer below. It matches the largest
+// MaxAvatarBytes any entitlement tier permits at upload (8 MiB), so it cannot
+// reject an object the service itself accepted; stored avatars are re-encoded to
+// 512x512 and in practice sit far below it.
+const friendAvatarMaxBytes int64 = 8 * 1024 * 1024
+
+// proxyFriendCodeAvatarObject is proxyInviteIcon's fail-uniform twin, and exists
+// because the two callers need opposite behaviour on a storage fault.
+//
+// proxyInviteIcon answers a non-not-found storage error with 500 and a nil store
+// with 503. That is right for a server icon, where the caller already knows the
+// server exists. It is wrong here: this arm is reachable ONLY by a code that is
+// well-formed, exists, is live, and whose owner has an avatar, so a distinct
+// status turns the route into a clean binary classifier for exactly the question
+// the shared silhouette exists to refuse — and the nil-store branch makes that
+// permanent in any deployment with no object store, not merely incident-scoped
+// (CWE-203, #945 Md6).
+//
+// So every failure serves the same silhouette the invalid classes get. The error
+// is logged rather than surfaced; an <img> consumer reads bytes, not status, so
+// nothing downstream needs to tell these apart.
+func (h *Handler) proxyFriendCodeAvatarObject(c *gin.Context, key string) {
+	if h.store == nil {
+		serveFriendCodeAvatarFallback(c)
+		return
+	}
+	obj, contentType, err := h.store.GetObject(c.Request.Context(), key)
+	if err != nil {
+		if !errors.Is(err, storage.ErrObjectNotFound) {
+			// Key only — never the code, which is bearer material.
+			h.log.Error("Failed to fetch friend-code avatar from storage", "error", err, "key", key)
+		}
+		serveFriendCodeAvatarFallback(c)
+		return
+	}
+	defer func() { _ = obj.Close() }()
+
+	// Buffer BEFORE committing anything, rather than streaming with io.Copy.
+	// A reader that yields bytes and then fails mid-stream would otherwise leave
+	// a truncated 200 on the wire with the headers already sent and no way to
+	// retract them — and a truncated body is distinguishable from the silhouette,
+	// which is this route's oracle re-opened one step later in the flow. The
+	// pre-read failure above and this mid-read failure are the same defect at
+	// two different moments, so they get the same uniform answer.
+	//
+	// Bounded, because the reader's length is not trusted: read one byte past the
+	// ceiling so an over-long object is detected rather than silently truncated,
+	// and treat that overflow as a failure too.
+	buf, err := io.ReadAll(io.LimitReader(obj, friendAvatarMaxBytes+1))
+	if err != nil || int64(len(buf)) > friendAvatarMaxBytes {
+		// Key only — never the code, which is bearer material.
+		h.log.Error("Failed to read friend-code avatar from storage",
+			"error", err, "key", key, "bytes", len(buf))
+		serveFriendCodeAvatarFallback(c)
+		return
+	}
+
+	// The SHORT TTL, deliberately not cacheControlPublic. Every fallback answers
+	// with max-age=60, so a 3600 here would leave the cache directive itself
+	// separating "live code with an avatar" from everything else — the same
+	// oracle in a header instead of a status line.
+	c.Header(headerCacheControl, cacheControlPublicShort)
+	c.Data(http.StatusOK, contentType, buf)
+}
+
+// serveFriendCodeAvatarFallback is serveInviteIconFallback under a name that
+// says which route's uniformity contract it belongs to.
+func serveFriendCodeAvatarFallback(c *gin.Context) {
+	serveInviteIconFallback(c)
 }
 
 // ProxyServerBanner serves a server's banner through the control plane.

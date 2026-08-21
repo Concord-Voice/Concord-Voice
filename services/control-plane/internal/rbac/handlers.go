@@ -32,6 +32,8 @@ const (
 	errMsgFailedUpdateRole        = "Failed to update role"
 	errMsgFailedDeleteRole        = "Failed to delete role"
 	errMsgFailedReorderRoles      = "Failed to reorder roles"
+	errMsgCannotReorderManaged    = "Cannot reorder managed roles"
+	errMsgDefaultRoleMustBeLowest = "The default role must remain the lowest role"
 	errMsgFailedAssignRole        = "Failed to assign role"
 	errMsgFailedUnassignRole      = "Failed to unassign role"
 	errMsgFailedFetchOverrides    = "Failed to fetch overrides"
@@ -126,9 +128,24 @@ type UpdateRoleRequest struct {
 	DisplaySeparately *bool   `json:"display_separately,omitempty"`
 }
 
-// ReorderRolesRequest represents a request to reorder roles (changes position values)
+// ReorderRolesRequest represents a request to reorder roles (changes position values).
+//
+// `dive,uuid` validates every ELEMENT, not just the slice, and closes CodeQL
+// go/log-injection (alert 1262) at the boundary rather than at the sink. Without
+// it a non-UUID entry reached PostgreSQL as `roles.id = ANY($3)`, raised
+// `invalid input syntax for type uuid: "<attacker string>"`, and that error —
+// carrying the attacker's string and any newlines in it — was written to the
+// log by the handler's default error branch. The same value also turned what
+// should be a 400 into a 500. One boundary check removes all three symptoms.
+//
+// `max` and `unique` are load-bearing for the WRITE, not merely hygiene, which
+// is why they live here rather than waiting for #2841. `applyRolePositions`
+// holds a SERVER-WIDE advisory lock until COMMIT, so an unbounded list let one
+// request monopolise every role mutation on the server; and the batched UPDATE
+// verifies `RowsAffected == len(RoleIDs)`, a comparison that is only exact when
+// no id appears twice. #2841 still owns the wider input policy.
 type ReorderRolesRequest struct {
-	RoleIDs []string `json:"role_ids" binding:"required"`
+	RoleIDs []string `json:"role_ids" binding:"required,min=1,max=500,unique,dive,uuid"`
 }
 
 // ListRoles returns all roles for a server
@@ -678,7 +695,172 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Role deleted"})
 }
 
-// ReorderRoles updates position values for roles (for role hierarchy)
+// reorderVerdict is the outcome of one evaluation of the ReorderRoles guards.
+// It carries no *gin.Context and writes no response, which is what lets the
+// identical evaluation run both on the pooled connection and inside the write
+// transaction.
+type reorderVerdict struct {
+	denied bool
+	reason string
+	// positionOffset shifts every assigned position upward so that position 0
+	// belongs to the default role and to nothing else. It is 0 when the default
+	// role is named (it takes 0 itself) and 1 when it is absent, RESERVING 0.
+	//
+	// Without it, a reorder that simply omits @all assigns the last named role
+	// position 0 while @all also sits at 0 — a tie, so @all is no longer
+	// strictly the lowest role, and RowsAffected still matches so the write
+	// commits. Verified by probe before this was added.
+	positionOffset int
+}
+
+// reorderDeniedError carries an in-transaction guard denial back out of
+// applyRolePositions so ReorderRoles can map it to 403 rather than a generic 500.
+type reorderDeniedError struct{ reason string }
+
+func (e *reorderDeniedError) Error() string { return "reorder denied: " + e.reason }
+
+// reorderGuardQuery reads every operand of the reorder decision in ONE
+// statement so they share a snapshot. Three separate autocommit reads is the
+// incoherence #2721 found across the sibling handlers: under READ COMMITTED
+// each read takes its own snapshot, so `position >= actorMaxPosition` can
+// compare operands captured at different points in time.
+//
+// It carries NO locking clause, and cannot: the actor ceiling is an aggregate
+// and PostgreSQL rejects a locking clause at a query level carrying
+// aggregation. That constraint is load-bearing at the pre-transaction call
+// site, where no SET LOCAL lock_timeout applies and a locking clause could
+// therefore block indefinitely — recreating #2721's F1 by another route.
+//
+// COALESCE on is_managed is deliberate: roles.is_managed is NULLABLE
+// (000035_rbac_system.up.sql declares BOOLEAN DEFAULT FALSE with no NOT NULL),
+// and the write filter COALESCEs identically so the guard's verdict and the
+// write's filter cannot disagree about what NULL means.
+const reorderGuardQuery = `
+WITH actor AS (
+    SELECT COALESCE(MAX(r.position), 0) AS max_position
+    FROM member_roles mr
+    INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = $1
+    WHERE mr.server_id = $1 AND mr.user_id = $2
+), named AS (
+    SELECT r.id,
+           r.position,
+           COALESCE(r.is_managed, FALSE) AS is_managed,
+           COALESCE(r.is_default, FALSE) AS is_default
+    FROM roles r
+    WHERE r.server_id = $1 AND r.id = ANY($3)
+)
+SELECT s.owner_id,
+       a.max_position,
+       (SELECT COUNT(*) FROM named n WHERE n.position >= a.max_position),
+       (SELECT COUNT(*) FROM named n WHERE n.is_managed AND NOT n.is_default),
+       (SELECT d.id::text FROM roles d
+         WHERE d.server_id = $1 AND COALESCE(d.is_default, FALSE) LIMIT 1)
+FROM servers s
+CROSS JOIN actor a
+WHERE s.id = $1`
+
+// evaluateReorderGuards decides whether an actor may apply the requested role
+// order. It replaces checkReorderHierarchy and checkRolePositionViolations,
+// which read on h.db in autocommit while the write ran in its own transaction.
+//
+// The CALLER decides what a denial means. ReorderRoles runs this once on the
+// pooled connection as a cheap fast path that FAILS OPEN, and once inside the
+// write transaction where it is authoritative.
+func evaluateReorderGuards(
+	ctx context.Context, q rowQuerier, serverID, userID string, roleIDs []string,
+) (reorderVerdict, error) {
+	var (
+		ownerID          string
+		actorMaxPosition int
+		violations       int
+		managedNamed     int
+		serverDefaultID  sql.NullString
+	)
+	if err := q.QueryRowContext(ctx, reorderGuardQuery, serverID, userID, pq.Array(roleIDs)).
+		Scan(&ownerID, &actorMaxPosition, &violations, &managedNamed, &serverDefaultID); err != nil {
+		return reorderVerdict{}, err
+	}
+
+	// Managed roles are refused for EVERY caller, the server owner included:
+	// this is an integrity rule, not a hierarchy one, matching
+	// loadDeletableRole's refusal to delete managed roles. Placing it ABOVE the
+	// owner bypass is therefore deliberate.
+	//
+	// Before this, the flag was enforced only by the UPDATE's WHERE clause, so
+	// a named managed role passed the guard and was then filtered out of the
+	// write while every other role still moved — 200 OK for a partial write
+	// that left two roles sharing a position. That is #2721's F4 shape: a flag
+	// read by nothing authoritative.
+	//
+	// The DEFAULT role is excluded from this refusal on purpose. `@all` is
+	// created `is_default = TRUE, is_managed = TRUE` on every server
+	// (internal/servers/handlers.go), so refusing every managed role would
+	// reject any FULL-LIST reorder — which is exactly the payload the role
+	// hierarchy UI sends. The default role is governed by the stricter rule
+	// below instead.
+	if managedNamed > 0 {
+		return reorderVerdict{denied: true, reason: errMsgCannotReorderManaged}, nil
+	}
+
+	// The default role is ALWAYS the lowest role in the hierarchy and can never
+	// be promoted above anything — by anyone, the server owner included.
+	//
+	// This is not stylistic. Every member of the server holds `@all`, so it is
+	// the term that sets the floor of `COALESCE(MAX(r.position), 0)` for the
+	// entire membership. Raising it by one reorder would raise EVERY member's
+	// hierarchy ceiling simultaneously, handing the whole server authority over
+	// every role beneath the new position — a mass privilege change disguised
+	// as a drag-and-drop.
+	//
+	// TWO distinct ways to break the invariant, so there are two defences:
+	//
+	//  1. NAMING it somewhere other than last. Positions run high-to-low, so
+	//     any earlier slot resolves above 0. Refused rather than silently
+	//     corrected — a caller asking to move it is asking for something that
+	//     must not happen and should be told so.
+	//
+	//  2. OMITTING it. The last named role would then take position 0 while the
+	//     default role also sits at 0 — a tie, and no longer STRICTLY the
+	//     lowest. `positionOffset` reserves 0 instead. This is why the query
+	//     resolves the server's default role independently of the payload: a
+	//     lookup scoped to the named set cannot see a role that was left out.
+	positionOffset := 0
+	if serverDefaultID.Valid {
+		namedDefault := false
+		for _, id := range roleIDs {
+			if strings.EqualFold(id, serverDefaultID.String) {
+				namedDefault = true
+				break
+			}
+		}
+		switch {
+		case namedDefault && !strings.EqualFold(roleIDs[len(roleIDs)-1], serverDefaultID.String):
+			return reorderVerdict{denied: true, reason: errMsgDefaultRoleMustBeLowest}, nil
+		case !namedDefault:
+			positionOffset = 1
+		}
+	}
+
+	if ownerID == userID {
+		return reorderVerdict{positionOffset: positionOffset}, nil
+	}
+	if violations > 0 {
+		return reorderVerdict{denied: true, reason: "Cannot reorder roles at or above your own position"}, nil
+	}
+	// Compare the HIGHEST position this request would actually assign, which is
+	// offset-dependent — not `len(roleIDs)-1`, which understates it by one
+	// whenever position 0 is being reserved.
+	if len(roleIDs)-1+positionOffset >= actorMaxPosition {
+		return reorderVerdict{denied: true, reason: "Reorder would create roles at or above your position"}, nil
+	}
+	return reorderVerdict{positionOffset: positionOffset}, nil
+}
+
+// ReorderRoles updates position values for roles (for role hierarchy).
+//
+// Authorization is evaluated TWICE, deliberately. The call below is a cheap
+// fast path; the authoritative decision runs inside applyRolePositions'
+// transaction, under the per-server advisory lock. See evaluateReorderGuards.
 func (h *Handler) ReorderRoles(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
@@ -700,13 +882,33 @@ func (h *Handler) ReorderRoles(c *gin.Context) {
 		return
 	}
 
-	if h.checkReorderHierarchy(c, serverID, userID, req.RoleIDs) {
+	ctx := c.Request.Context()
+
+	// Cheap NON-AUTHORITATIVE fast path on the pooled connection. It exists only
+	// so a request that is certainly going to be denied does not have to open a
+	// transaction and take the per-server advisory lock to learn that (#2721
+	// F1/F2). It FAILS OPEN by construction — an error falls through to the
+	// authoritative evaluation inside applyRolePositions — so it can only ever
+	// save work, never grant it.
+	//
+	// Do NOT make this authoritative, do NOT deny on its error, and do NOT add a
+	// locking clause to its query.
+	if verdict, guardErr := evaluateReorderGuards(ctx, h.db, serverID, userID, req.RoleIDs); guardErr == nil && verdict.denied {
+		c.JSON(http.StatusForbidden, gin.H{"error": verdict.reason})
 		return
 	}
 
-	if err := h.applyRolePositions(serverID, req.RoleIDs); err != nil {
-		h.log.Error("Failed to apply role positions", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReorderRoles})
+	if err := h.applyRolePositions(ctx, serverID, userID, req.RoleIDs); err != nil {
+		var denied *reorderDeniedError
+		switch {
+		case errors.As(err, &denied):
+			c.JSON(http.StatusForbidden, gin.H{"error": denied.reason})
+		case errors.Is(err, sql.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
+		default:
+			h.log.Error("Failed to apply role positions", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReorderRoles})
+		}
 		return
 	}
 
@@ -729,81 +931,98 @@ func (h *Handler) ReorderRoles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Roles reordered"})
 }
 
-func (h *Handler) checkReorderHierarchy(c *gin.Context, serverID, userID string, roleIDs []string) bool {
-	var actorMaxPosition int
-	if err := h.db.QueryRow(
-		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
-		serverID, userID,
-	).Scan(&actorMaxPosition); err != nil {
-		h.log.Error(errMsgFailedGetActorPosition, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReorderRoles})
-		return true
-	}
-
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReorderRoles})
-		return true
-	}
-
-	if ownerID == userID {
-		return false
-	}
-
-	if h.checkRolePositionViolations(c, serverID, actorMaxPosition, roleIDs) {
-		return true
-	}
-
-	if len(roleIDs)-1 >= actorMaxPosition {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Reorder would create roles at or above your position"})
-		return true
-	}
-	return false
-}
-
-func (h *Handler) checkRolePositionViolations(c *gin.Context, serverID string, actorMaxPosition int, roleIDs []string) bool {
-	args := make([]interface{}, 0, 2+len(roleIDs))
-	args = append(args, serverID, actorMaxPosition)
-	placeholders := make([]string, len(roleIDs))
-	for i, id := range roleIDs {
-		placeholders[i] = "$" + strconv.Itoa(i+3)
-		args = append(args, id)
-	}
-	inClause := strings.Join(placeholders, ", ")
-
-	var violationCount int
-	checkQuery := `SELECT COUNT(*) FROM roles WHERE server_id = $1 AND position >= $2 AND id IN (` + inClause + `)`
-	if err := h.db.QueryRow(checkQuery, args...).Scan(&violationCount); err != nil {
-		h.log.Error("Failed to check role positions", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReorderRoles})
-		return true
-	}
-	if violationCount > 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot reorder roles at or above your own position"})
-		return true
-	}
-	return false
-}
-
-func (h *Handler) applyRolePositions(serverID string, roleIDs []string) error {
-	tx, err := h.db.Begin()
+// applyRolePositions writes the requested order under the per-server advisory
+// lock, re-evaluating authorization inside the transaction.
+//
+// The lock is the transaction's FIRST statement, per authority_tx.go. It does
+// two jobs at once. It gives the guard re-evaluation below meaning — nothing
+// can move the hierarchy between the decision and the write, which is the
+// CWE-367 straddle issue #2851 proves with a PoC. And it stops two concurrent
+// reorders from taking row locks in opposite CLIENT-SUPPLIED orders, which was
+// a 40P01 deadlock reproducible on main with no attacker and no privilege.
+func (h *Handler) applyRolePositions(ctx context.Context, serverID, userID string, roleIDs []string) error {
+	// READ COMMITTED is REQUIRED, not incidental, and is pinned rather than
+	// inherited from the server default. The lock is the first statement, so
+	// under READ COMMITTED the guard SELECT below takes its snapshot AFTER the
+	// lock is granted and therefore observes everything the previous holder
+	// committed — which is the entire reason the re-evaluation is
+	// authoritative. Under REPEATABLE READ the snapshot would be registered at
+	// the first statement, i.e. before the lock is granted, and the guard would
+	// read the pre-lock world: the CWE-367 straddle would silently reopen with
+	// every test in this package still green. `sql.LevelRepeatableRead` is
+	// already used elsewhere in this package (resolver.go), so the idiom is
+	// live and the drift is plausible.
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
+		return fmt.Errorf("begin reorder transaction: %w", err)
+	}
+	defer func() {
+		// discard: Rollback is a no-op after a successful Commit, and the
+		// failure paths already return an error.
+		_ = tx.Rollback()
+	}()
+
+	if err := LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
 		return err
 	}
-	defer tx.Rollback() //nolint:errcheck
 
-	for i, roleID := range roleIDs {
-		position := len(roleIDs) - i - 1
-		if _, err := tx.Exec(
-			`UPDATE roles SET position = $1, updated_at = NOW() WHERE id = $2 AND server_id = $3 AND is_managed = FALSE`,
-			position, roleID, serverID,
-		); err != nil {
-			return fmt.Errorf("role %s: %w", roleID, err)
-		}
+	// AUTHORITATIVE. The pre-transaction call in ReorderRoles is a fast path
+	// only; this is the decision.
+	verdict, err := evaluateReorderGuards(ctx, tx, serverID, userID, roleIDs)
+	if err != nil {
+		return fmt.Errorf("evaluate reorder guards: %w", err)
+	}
+	if verdict.denied {
+		return &reorderDeniedError{reason: verdict.reason}
 	}
 
-	return tx.Commit()
+	// ONE statement, not one per role. The advisory lock is held until COMMIT,
+	// so a per-role loop kept a SERVER-WIDE lock — the same key that serializes
+	// every other role-authority write and internal/voice's temporary-SBAC
+	// revoke — across N round trips, with N supplied by the client. Collapsing
+	// the loop bounds the hold to a single statement regardless of N, which
+	// makes that class structurally hard to reintroduce rather than merely
+	// bounded by an input check.
+	//
+	// `WITH ORDINALITY` numbers the array from 1, so `cardinality - ord`
+	// reproduces the previous `len(roleIDs) - i - 1` exactly.
+	//
+	// The managed-role predicate mirrors the guard's: refuse managed roles that
+	// are NOT default, so `@all` — created is_default AND is_managed — is
+	// written normally while integration-owned roles are excluded. Guard and
+	// write derive from the same rule and cannot disagree.
+	result, err := tx.ExecContext(ctx,
+		`UPDATE roles AS r
+		 SET position = u.new_position, updated_at = NOW()
+		 FROM (
+		     SELECT t.id, (cardinality($1::uuid[]) - t.ord + $3)::int AS new_position
+		     FROM unnest($1::uuid[]) WITH ORDINALITY AS t(id, ord)
+		 ) AS u
+		 WHERE r.id = u.id
+		   AND r.server_id = $2
+		   AND NOT (COALESCE(r.is_managed, FALSE) AND NOT COALESCE(r.is_default, FALSE))`,
+		pq.Array(roleIDs), serverID, verdict.positionOffset,
+	)
+	if err != nil {
+		return fmt.Errorf("apply role positions: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read reorder rows affected: %w", err)
+	}
+	// Every named role must have matched. A shortfall means an id names no role
+	// on this server (or a managed one slipped past the guard), and the whole
+	// reorder rolls back rather than applying a partial order the caller never
+	// asked for. `unique` on the binding tag guarantees no id is counted twice,
+	// so this comparison is exact.
+	if affected != int64(len(roleIDs)) {
+		return fmt.Errorf("reorder matched %d of %d roles: %w", affected, len(roleIDs), sql.ErrNoRows)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit reorder transaction: %w", err)
+	}
+	return nil
 }
 
 // AssignRole assigns a role to a member
