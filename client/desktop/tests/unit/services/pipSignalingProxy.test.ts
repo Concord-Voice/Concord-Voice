@@ -14,6 +14,7 @@ const mockVoiceService = {
   pauseConsumer: vi.fn(),
   resumeConsumer: vi.fn(),
   emitPreferredLayersForConsumer: vi.fn(),
+  deriveFrameKeyForPip: vi.fn(),
   toggleMute: vi.fn().mockResolvedValue(undefined),
   toggleDeafen: vi.fn(),
   toggleVideo: vi.fn().mockResolvedValue(undefined),
@@ -644,6 +645,59 @@ describe('PipSignalingProxy', () => {
         expect.any(String)
       );
       consoleSpy.mockRestore();
+    });
+  });
+
+  // ── get-frame-key (2026-08-21 PiP E2EE gap) ─────────────────────────────────────────────
+  // A PiP window decrypts its own consumers, so it needs frame keys the main
+  // window already derives. Only the non-extractable CryptoKey crosses the
+  // channel — raw key bytes never do.
+
+  describe('get-frame-key', () => {
+    it('returns the derived key for an explicit version and epoch', async () => {
+      const key = { type: 'secret' } as unknown as CryptoKey;
+      mockVoiceService.deriveFrameKeyForPip.mockResolvedValueOnce({
+        key,
+        keyVersion: 9,
+        keyId: 4,
+      });
+
+      const result = await sendRpc(getChannel(), 'get-frame-key', {
+        senderUserId: 'alice',
+        keyVersion: 9,
+        keyId: 4,
+      });
+
+      expect(mockVoiceService.deriveFrameKeyForPip).toHaveBeenCalledWith('alice', 9, 4);
+      expect(result).toEqual({ key, keyVersion: 9, keyId: 4 });
+    });
+
+    it('lets the main window choose version and epoch when the PiP omits them', async () => {
+      mockVoiceService.deriveFrameKeyForPip.mockResolvedValueOnce({
+        key: {} as CryptoKey,
+        keyVersion: 3,
+        keyId: 0,
+      });
+
+      const result = await sendRpc(getChannel(), 'get-frame-key', { senderUserId: 'bob' });
+
+      expect(mockVoiceService.deriveFrameKeyForPip).toHaveBeenCalledWith(
+        'bob',
+        undefined,
+        undefined
+      );
+      // The PiP keys its Worker map by the pair the main window actually used.
+      expect(result).toEqual({ key: {}, keyVersion: 3, keyId: 0 });
+    });
+
+    it('surfaces a derivation failure as an RPC error so the PiP fails closed', async () => {
+      mockVoiceService.deriveFrameKeyForPip.mockRejectedValueOnce(
+        new Error('E2EE: no active voice channel')
+      );
+
+      await expect(
+        sendRpc(getChannel(), 'get-frame-key', { senderUserId: 'alice' })
+      ).rejects.toThrow('E2EE: no active voice channel');
     });
   });
 });

@@ -9,6 +9,35 @@ const mockConsumerOn = vi.fn();
 const mockTransportClose = vi.fn();
 const mockTransportOn = vi.fn();
 
+// ── E2EE globals (2026-08-21 PiP E2EE gap) ────────────────────────────────────────────────
+// The PiP attaches a decrypt transform at receiver creation and refuses to play
+// a stream without one, so every consume() path needs a working engine modelled
+// here. Suites that assert the fail-closed behaviour live in
+// pipVoiceClient.e2ee.test.ts.
+
+class StubRTCRtpScriptTransform {
+  constructor(
+    public worker: unknown,
+    public options: unknown
+  ) {}
+}
+vi.stubGlobal('RTCRtpScriptTransform', StubRTCRtpScriptTransform);
+
+const mockWorkerPostMessage = vi.fn();
+const mockWorkerTerminate = vi.fn();
+class StubWorker {
+  onmessage: ((e: MessageEvent) => void) | null = null;
+  onerror: ((e: unknown) => void) | null = null;
+  postMessage = mockWorkerPostMessage;
+  terminate = mockWorkerTerminate;
+}
+vi.stubGlobal('Worker', StubWorker as unknown as typeof Worker);
+
+/** A receiver whose `transform` setter is a plain property, as in Chromium. */
+function makeStubReceiver(): { transform: unknown; getStats: () => Promise<Map<string, unknown>> } {
+  return { transform: null, getStats: async () => new Map() };
+}
+
 const mockTransportConsume = vi.fn().mockResolvedValue({
   id: 'consumer-1',
   producerId: 'producer-1',
@@ -80,6 +109,7 @@ const defaultRpcResponses: Record<string, unknown> = {
     rtpParameters: { codecs: [], headerExtensions: [], encodings: [] },
   },
   'resume-consumer': { success: true },
+  'get-frame-key': { key: { type: 'secret' }, keyVersion: 1, keyId: 0 },
   'pause-consumer': { success: true },
   'set-preferred-layers': { success: true },
   action: { success: true },
@@ -203,16 +233,37 @@ describe('PipVoiceClient', () => {
     mockTransportConsume
       .mockReset()
       .mockImplementation(
-        async ({ id, producerId, kind }: { id: string; producerId: string; kind: string }) => ({
+        async ({
           id,
           producerId,
           kind,
-          track: { id: 'track-' + id, kind },
-          close: mockConsumerClose,
-          on: mockConsumerOn,
-        })
+          onRtpReceiver,
+        }: {
+          id: string;
+          producerId: string;
+          kind: string;
+          onRtpReceiver?: (receiver: unknown) => void;
+        }) => {
+          // Model a conforming engine: mediasoup invokes onRtpReceiver during
+          // consume, which is where the decrypt transform attaches.
+          const rtpReceiver = makeStubReceiver();
+          onRtpReceiver?.(rtpReceiver);
+          return {
+            id,
+            producerId,
+            kind,
+            track: { id: 'track-' + id, kind },
+            rtpReceiver,
+            rtpParameters: { codecs: [{ mimeType: 'audio/opus' }] },
+            closed: false,
+            close: mockConsumerClose,
+            on: mockConsumerOn,
+          };
+        }
       );
     mockConsumerClose.mockReset();
+    mockWorkerPostMessage.mockReset();
+    mockWorkerTerminate.mockReset();
   });
 
   afterEach(async () => {

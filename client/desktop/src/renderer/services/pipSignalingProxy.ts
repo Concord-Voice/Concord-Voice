@@ -26,6 +26,7 @@ import type {
   VoiceStateResult,
   CreateRecvTransportResult,
   ConsumeResult,
+  GetFrameKeyResult,
 } from './pipSignalingTypes';
 import { useVoiceStore } from '../stores/voiceStore';
 import { useUserStore } from '../stores/userStore';
@@ -52,6 +53,11 @@ type VoiceService = {
   pauseConsumer(consumerId: string): void;
   resumeConsumer(consumerId: string): void;
   emitPreferredLayersForConsumer(consumerId: string, renderState: PipConsumerRenderState): void;
+  deriveFrameKeyForPip(
+    senderUserId: string,
+    keyVersion?: number,
+    keyId?: number
+  ): Promise<{ key: CryptoKey; keyVersion: number; keyId: number }>;
   toggleMute(): Promise<void>;
   toggleDeafen(): void;
   toggleVideo(): Promise<void>;
@@ -168,6 +174,9 @@ export class PipSignalingProxy {
           break;
         case 'pip-closing':
           await this.handlePipClosing(req);
+          break;
+        case 'get-frame-key':
+          await this.handleGetFrameKey(req);
           break;
         default: {
           const unknownReq = req as PipRpcRequest;
@@ -286,6 +295,28 @@ export class PipSignalingProxy {
       transportId: params.transportId,
     });
     this.respond(req.id, { success: true });
+  }
+
+  /**
+   * PiP E2EE: derive one decrypt frame key for a PiP window's own E2EE Worker.
+   *
+   * The PiP consumes producers independently, so its receive transforms need
+   * their own keys. Only the derived `CryptoKey` crosses the channel — it is
+   * structured-cloneable, so no raw key bytes are serialized — though the
+   * handle itself is extractable (the ratchet requires it), so this is not a
+   * boundary against same-origin script. See pipSignalingTypes. A throw here becomes an RPC error, which the PiP treats as
+   * fail-closed (the stream is not played).
+   */
+  private async handleGetFrameKey(req: AnyPipRpcRequest): Promise<void> {
+    const params = (
+      req as { params: { senderUserId: string; keyVersion?: number; keyId?: number } }
+    ).params;
+    const result = await this.voiceService.deriveFrameKeyForPip(
+      params.senderUserId,
+      params.keyVersion,
+      params.keyId
+    );
+    this.respond(req.id, result satisfies GetFrameKeyResult);
   }
 
   /**

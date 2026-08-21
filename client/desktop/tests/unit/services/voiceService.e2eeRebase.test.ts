@@ -1111,4 +1111,79 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
     });
     expect(e2eeService.getChannelKeyByVersion).toHaveBeenCalledWith(CHANNEL, 8);
   });
+
+  // ── deriveFrameKeyForPip (2026-08-21 PiP E2EE gap) ──────────────────────────────────────
+  // A PiP BrowserWindow decrypts its own consumers but has no e2eeService, no
+  // IndexedDB private key and no CSK unwrap. It asks the main window for the one
+  // derived artifact it needs. Throwing here is how the PiP learns to fail
+  // closed, so the error paths matter as much as the happy one.
+
+  describe('deriveFrameKeyForPip', () => {
+    it("derives at the channel's current version and epoch when the PiP omits them", async () => {
+      e2eeMockState.channelKeyVersion = 7;
+      await svc.initEncryptionCore(CHANNEL, 0);
+      const enc = latestEncryption();
+      enc.getCurrentKeyId.mockReturnValue(2);
+      const pipKey = { __pipKey: true } as unknown as CryptoKey;
+      enc.addDecryptKeyAtVersion.mockResolvedValueOnce(pipKey);
+
+      const result = await svc.deriveFrameKeyForPip('alice');
+
+      expect(enc.addDecryptKeyAtVersion).toHaveBeenCalledWith(fakeCsk, 'alice', 7, 2);
+      // The PiP keys its Worker map by the pair actually used, so both come back.
+      expect(result).toEqual({ key: pipKey, keyVersion: 7, keyId: 2 });
+    });
+
+    it('fetches the exact CSK version when the PiP reports a miss for an older epoch', async () => {
+      e2eeMockState.channelKeyVersion = 7;
+      await svc.initEncryptionCore(CHANNEL, 0);
+      const olderCsk = { __cskV5: true } as unknown as CryptoKey;
+      (mockedE2EEService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        olderCsk
+      );
+      const enc = latestEncryption();
+
+      const result = await svc.deriveFrameKeyForPip('alice', 5, 1);
+
+      // Deriving from the CURRENT CSK for a version-5 frame would hand back a key
+      // that decrypts to garbage — the version must drive the CSK lookup.
+      expect(mockedE2EEService.getChannelKeyByVersion).toHaveBeenCalledWith(CHANNEL, 5);
+      expect(enc.addDecryptKeyAtVersion).toHaveBeenCalledWith(olderCsk, 'alice', 5, 1);
+      expect(result.keyVersion).toBe(5);
+      expect(result.keyId).toBe(1);
+    });
+
+    it('propagates a DENIED versioned CSK lookup and installs no key', async () => {
+      // Server-gated: getChannelKeyByVersion denies on revocation or lost
+      // membership. That must surface as a rejection so the PiP fails closed —
+      // installing anything here would hand back a key for an epoch this user
+      // is no longer entitled to. (CodeRabbit, PR #2870)
+      e2eeMockState.channelKeyVersion = 7;
+      await svc.initEncryptionCore(CHANNEL, 0);
+      const enc = latestEncryption();
+      enc.addDecryptKeyAtVersion.mockClear();
+      (mockedE2EEService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('key revoked for this member')
+      );
+
+      await expect(svc.deriveFrameKeyForPip('alice', 5, 1)).rejects.toThrow(
+        'key revoked for this member'
+      );
+      expect(enc.addDecryptKeyAtVersion).not.toHaveBeenCalled();
+    });
+
+    it('rejects when there is no active voice channel', async () => {
+      await svc.initEncryptionCore(CHANNEL, 0);
+      useVoiceStore.setState({ activeChannelId: null });
+
+      await expect(svc.deriveFrameKeyForPip('alice')).rejects.toThrow('no active voice channel');
+    });
+
+    it('rejects when E2EE is not initialized', async () => {
+      // No initEncryptionCore — mediaEncryption is null.
+      await expect(svc.deriveFrameKeyForPip('alice')).rejects.toThrow(
+        'media encryption is not initialized'
+      );
+    });
+  });
 });

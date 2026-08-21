@@ -6052,6 +6052,30 @@ describe('receive-transform bypass probe', () => {
     });
   });
 
+  it('fails closed when a confirmed bypass has no receiver to re-attach to', async () => {
+    // Pre-existing since #2865 and mirrored into the PiP client, where Gitar
+    // caught it (PR #2870): the bypass is already CONFIRMED at this point, so
+    // returning left a consumer known to be feeding ciphertext to the decoder
+    // playing on with no further probe.
+    const consumer = fakeConsumer('c9', 800);
+    svc.consumers.set('c9', consumer);
+    svc.bypassProbes.set('c9', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+    // Receiver reports the packets that confirm the bypass, then vanishes
+    // before the re-attach reads it.
+    const receiver = consumer.rtpReceiver;
+    const originalGetStats = receiver.getStats.bind(receiver);
+    receiver.getStats = async () => {
+      const stats = await originalGetStats();
+      consumer.rtpReceiver = null;
+      return stats;
+    };
+
+    await svc.evaluateBypassProbe('c9', 0);
+
+    expect(consumer.close).toHaveBeenCalled();
+    expect(svc.consumers.has('c9')).toBe(false);
+  });
+
   it('closes the consumer fail-closed when the bypass survives re-attach', async () => {
     const consumer = fakeConsumer('c5', 800);
     svc.consumers.set('c5', consumer);

@@ -73,6 +73,7 @@ import {
 } from './voiceCodecSelection';
 import { extractWebrtcHwSignal, shouldReselectForHwDowngrade } from './webrtcHwSignal';
 import {
+  FORCE_LEGACY_E2EE_KEY,
   resolveEncodedTransformSupport,
   type EncodedTransformPath,
 } from './encodedTransformSupport';
@@ -230,7 +231,7 @@ function readLegacyTransformOverride(): boolean {
     // Storage is the single source of truth when it works (tests reset by
     // clearing it); the in-memory flag matters only when storage throws.
     return (
-      globalThis.localStorage?.getItem('concord.forceLegacyE2EE') === '1' ||
+      globalThis.localStorage?.getItem(FORCE_LEGACY_E2EE_KEY) === '1' ||
       globalThis.sessionStorage?.getItem('concord.e2eeLegacyFallback') === '1'
     );
   } catch {
@@ -5171,6 +5172,61 @@ class VoiceService {
     return new Map(this.consumerMeta);
   }
 
+  /**
+   * Derive a decrypt frame key for a PiP window's own E2EE Worker (2026-08-21 PiP E2EE gap).
+   *
+   * A PiP BrowserWindow consumes producers independently, so it needs its own
+   * decrypt transform and therefore its own frame keys — but it has no
+   * e2eeService, no IndexedDB private key and no CSK unwrap. The main window
+   * owns all of that already, so the PiP asks for the one derived artifact it
+   * needs. The returned `CryptoKey` travels the BroadcastChannel by structured
+   * clone, as a handle rather than raw bytes — but frame keys are EXTRACTABLE
+   * by construction (the ratchet must export them), so this is not a
+   * confidentiality boundary against same-origin script, only an avoidance of
+   * materializing key bytes. See pipSignalingTypes.GetFrameKeyRequest.
+   *
+   * `keyVersion`/`keyId` are optional: omitted for the PiP's initial
+   * pre-consume provision (answered with the channel's current pair), supplied
+   * verbatim when the PiP Worker reports a typed miss for an exact epoch.
+   *
+   * Throws when there is no active channel or E2EE is not initialized — the PiP
+   * treats that as fail-closed and does not play the stream.
+   */
+  async deriveFrameKeyForPip(
+    senderUserId: string,
+    keyVersion?: number,
+    keyId?: number
+  ): Promise<{ key: CryptoKey; keyVersion: number; keyId: number }> {
+    const mediaEncryption = this.mediaEncryption;
+    if (!mediaEncryption) throw new Error('E2EE: media encryption is not initialized');
+
+    const channelId = useVoiceStore.getState().activeChannelId;
+    if (!channelId) throw new Error('E2EE: no active voice channel');
+
+    const material = await e2eeService.getChannelKeyMaterial(channelId);
+    const resolvedVersion = keyVersion ?? material.keyVersion;
+    const resolvedKeyId = keyId ?? mediaEncryption.getCurrentKeyId();
+
+    // A miss for a version other than the one we hold must fetch THAT version's
+    // CSK: deriving from the current CSK for an older version's frame yields a
+    // key that decrypts to garbage. (An earlier draft of this comment described
+    // failing closed here instead — it described a superseded design, not this
+    // code, and restoring it would break mid-session CSK-rotation recovery for
+    // PiP consumers. CodeRabbit, PR #2870.)
+    const csk =
+      resolvedVersion === material.keyVersion
+        ? material.channelKey
+        : await e2eeService.getChannelKeyByVersion(channelId, resolvedVersion);
+
+    const key = await mediaEncryption.addDecryptKeyAtVersion(
+      csk,
+      senderUserId,
+      resolvedVersion,
+      resolvedKeyId
+    );
+    return { key, keyVersion: resolvedVersion, keyId: resolvedKeyId };
+  }
+
   /** Proxy a signaling event to the media plane (used by PiP signaling proxy) */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- T defaults to `any` to avoid forcing PiP-proxy callers to parameterize every signaling forward; callers that care about the response type set T explicitly
   forwardToServer<T = any>(event: string, data?: unknown): Promise<T> {
@@ -7845,7 +7901,17 @@ class VoiceService {
         );
         const receiver = consumer.rtpReceiver;
         const worker = this.e2eeWorker;
-        if (!receiver || !worker) return;
+        if (!receiver || !worker) {
+          // Bypass already CONFIRMED — returning here would leave a consumer
+          // known to be feeding ciphertext to the decoder playing on with no
+          // further probe. Fail closed instead. (Gitar, PR #2870; the same
+          // shape it found in the PiP mirror of this code.)
+          this.closeConsumerAfterDecryptTransformFailure(
+            consumer,
+            'confirmed bypass could not be re-attached (receiver or worker unavailable)'
+          );
+          return;
+        }
         try {
           // Direct replacement — NEVER null-then-set: per the encoded-transform
           // spec, assigning null enables the PASSTHROUGH algorithm, i.e. a

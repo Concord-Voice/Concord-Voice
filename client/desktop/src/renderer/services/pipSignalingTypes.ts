@@ -157,6 +157,39 @@ export type PipReadyRequest = PipRpcRequest<
   }
 >;
 
+/**
+ * Ask the main window to derive a decrypt frame key for one sender/epoch (2026-08-21 PiP E2EE gap).
+ *
+ * A PiP BrowserWindow is a separate renderer context with no e2eeService, no
+ * IndexedDB private key and no CSK unwrap — it only needs the derived frame
+ * key. `CryptoKey` is structured-cloneable, so the key crosses the
+ * BroadcastChannel as a handle rather than raw bytes. Frame keys are EXTRACTABLE by
+ * construction — `deriveFrameKey`/`ratchetKey` must export raw bytes to ratchet
+ * the next epoch — so passing the `CryptoKey` handle avoids materializing key
+ * bytes in JS buffers but does NOT make the transport safe against a
+ * same-origin listener on this channel. That is the same trust boundary the
+ * main window's `worker.postMessage` already relies on, widened from
+ * point-to-point to a named channel; treat same-origin script execution as
+ * out-of-model (it can read the CSK directly).
+ *
+ * `keyVersion`/`keyId` are omitted for the initial pre-consume provision (main
+ * answers with the channel's current pair) and supplied verbatim when the PiP's
+ * E2EE Worker reports a typed decrypt miss for an exact epoch.
+ */
+export type GetFrameKeyRequest = PipRpcRequest<
+  'get-frame-key',
+  {
+    senderUserId: string;
+    keyVersion?: number;
+    keyId?: number;
+  }
+>;
+export interface GetFrameKeyResult {
+  key: CryptoKey;
+  keyVersion: number;
+  keyId: number;
+}
+
 /** Signal that PiP is about to close (pre-close for smooth transition) */
 export type PipClosingRequest = PipRpcRequest<'pip-closing', Record<string, never>>;
 
@@ -173,7 +206,8 @@ export type AnyPipRpcRequest =
   | RequestStateRequest
   | ActionRequest
   | PipReadyRequest
-  | PipClosingRequest;
+  | PipClosingRequest
+  | GetFrameKeyRequest;
 
 // ── Broadcast Events (Main → PiP, no request ID) ───────────────────
 

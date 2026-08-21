@@ -1,3 +1,11 @@
+/**
+ * Manual/support override forcing the legacy pipeline. Read by voiceService and
+ * — because localStorage is shared per-origin across BrowserWindows — by the PiP
+ * window, which uses it to refuse up front instead of attaching and waiting for
+ * its bypass probe. Exported so the two readers cannot drift on the key.
+ */
+export const FORCE_LEGACY_E2EE_KEY = 'concord.forceLegacyE2EE';
+
 export type EncodedTransformPath = 'script-transform' | 'encoded-streams' | 'unavailable';
 
 interface EncodedTransformApis {
