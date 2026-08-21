@@ -11213,7 +11213,7 @@ paths:
       tags:
       - Servers
       summary: Create a role
-      description: 'Create a new role positioned above @all. Requires the Manage Roles permission;
+      description: 'Create a new role. A role created by a non-owner is placed strictly below the highest role that actor holds, and existing roles at or above that position shift up by one; a role created by the server owner is placed above all existing roles. Requires the Manage Roles permission;
 
         granted permissions must be a subset of the actor''s own.
 
@@ -11248,7 +11248,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Insufficient permissions or attempt to grant permissions the actor lacks
+          description: >-
+            Insufficient permissions, an attempt to grant permissions the actor lacks,
+            or no available role position below the actor's own highest role (returned
+            when that role sits at position 0 or 1, since position 0 is the default role's).
           content:
             application/json:
               schema:

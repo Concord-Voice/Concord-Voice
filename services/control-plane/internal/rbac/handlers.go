@@ -44,6 +44,8 @@ const (
 	errMsgCannotGrantPerms        = "Cannot grant permissions you do not have"
 	errMsgFailedGetServerOwner    = "Failed to get server owner"
 	errMsgFailedGetActorPosition  = "Failed to get actor role position"
+	errMsgNoLegalRolePosition     = "No available role position below your own"
+	errMsgInvalidColorFormat      = "Invalid color format (expected #RRGGBB)"
 	errMsgFailedQueryRole         = "Failed to query role"
 	errMsgFailedQueryChannel      = "Failed to query channel"
 	errMsgFailedQueryCategory     = "Failed to query category"
@@ -190,6 +192,148 @@ func (h *Handler) ListRoles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"roles": roles})
 }
 
+// validateHexColor checks an optional role colour is #RRGGBB.
+//
+// It validates the hex DIGITS, not just the leading '#' and the length: the
+// previous check accepted "#ZZZZZZ". The value is rendered into a React style
+// prop, and while CSSOM drops an invalid colour rather than executing it, a
+// validator that admits arbitrary characters is not one worth having.
+//
+// Returns false once a response has been written; the caller must return.
+func validateHexColor(c *gin.Context, color *string) bool {
+	if color == nil || len(*color) == 0 {
+		return true
+	}
+	v := *color
+	if len(v) != 7 || v[0] != '#' {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidColorFormat})
+		return false
+	}
+	for i := 1; i < len(v); i++ {
+		d := v[i]
+		isHex := (d >= '0' && d <= '9') || (d >= 'a' && d <= 'f') || (d >= 'A' && d <= 'F')
+		if !isHex {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidColorFormat})
+			return false
+		}
+	}
+	return true
+}
+
+// resolveNewRolePosition returns the position a newly created role should take,
+// making room for it inside tx when the actor is not the server owner.
+//
+// Non-owners get a slot strictly below their own highest role. CreateRole
+// previously used a server-wide MAX(position)+1, which placed every created role
+// above the entire hierarchy including Admin (#2359) — durable authority rather
+// than a display artifact, since roles.position is the axis every role and member
+// mutation compares against.
+//
+// It SHIFTS rather than clamps. A clamp to actorMaxPosition-1 always returns that
+// same value (the actor's roles are a subset of the server's, so MAX(position)+1
+// can never be the smaller operand), so every role an actor created collided on
+// one position. Searching for a free slot below the actor does not help either:
+// applyRolePositions repacks positions densely as len-i-1 on every reorder, so a
+// server that has been reordered once has no gaps at all. Raising everything at or
+// above the actor by one is the only approach that yields a distinct position in a
+// densely-packed server. Relative order is preserved and no authority changes.
+//
+// The actorMaxPosition < 2 guard keeps the shift floor at 2 or higher, so the
+// default @everyone role at position 0 is never moved.
+//
+// The owner check is identity on servers.owner_id, matching checkRoleOwnerAndHierarchy
+// and AssignRole — never PermAdministrator.
+//
+// Returns (position, true) on success. On failure it has already written the
+// response and returns (0, false); the caller must return immediately.
+// Returns the position, and whether other roles were SHIFTED to make room --
+// the caller must tell clients when they were, since a shift moves roles the
+// role_created broadcast does not name.
+func (h *Handler) resolveNewRolePosition(ctx context.Context, tx *sql.Tx, serverID, userID string) (int, bool, error) {
+	// One query, one snapshot. Three sequential reads would observe three
+	// different snapshots of a hierarchy another writer may be mutating.
+	//
+	// No FOR SHARE here, unlike roleGuardQuery: this statement names no target
+	// role to lock, and the ceiling is an aggregate, which PostgreSQL refuses to
+	// lock at all. Snapshot coherence plus the advisory lock the caller already
+	// holds is the available mechanism, and it is the same one role_guard.go
+	// relies on.
+	const snapshotQuery = `
+		SELECT
+			(SELECT owner_id FROM servers WHERE id = $1),
+			(SELECT COALESCE(MAX(position), 0) FROM roles WHERE server_id = $1),
+			(SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr
+			   INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
+			   WHERE mr.server_id = $1 AND mr.user_id = $2)
+	`
+	var ownerID string
+	var maxPosition, actorMaxPosition int
+	if err := tx.QueryRowContext(ctx, snapshotQuery, serverID, userID).
+		Scan(&ownerID, &maxPosition, &actorMaxPosition); err != nil {
+		return 0, false, fmt.Errorf("create role: resolve position snapshot: %w", err)
+	}
+
+	// Owner bypass is identity on servers.owner_id, matching the role guard --
+	// never PermAdministrator.
+	if ownerID == userID {
+		return maxPosition + 1, false, nil
+	}
+
+	// No branch here for "the actor holds no roles at all": it is UNREACHABLE.
+	// RequirePermission(PermManageRoles) gates this route and permissions derive
+	// solely from member_roles, so a member with no rows resolves to zero
+	// permissions and is refused before this handler runs -- and an owner has
+	// already returned above. Defensive code for an impossible state is worse
+	// than none; TestCreateRole_ActorWithNoRoles_RefusedByMiddleware pins which
+	// layer actually refuses.
+
+	// Strictly below the actor, and never at the default role's slot.
+	//
+	// Only actorMaxPosition == 0 has no legal slot: the shift below is
+	// `position >= actorMaxPosition`, so shifting at 0 would raise the default
+	// role off position 0 -- the one thing that must never happen, since every
+	// member holds it and raising it lifts the whole server's ceiling at once.
+	//
+	// At 1 there IS a legal slot: the shift moves the actor 1 -> 2 and leaves
+	// position 0 untouched, freeing slot 1 strictly below them. An earlier
+	// revision refused `< 2` here, which looked equivalent and was not: a fresh
+	// server holds only the default role at 0, so the owner's FIRST created role
+	// lands at 1 -- and granting that role is the ordinary way to delegate Manage
+	// Roles. Refusing at 1 therefore locked the first delegated admin out of role
+	// creation permanently, through the product's own happy path, with only the
+	// owner able to undo it. The test that covered the refusal seeded position 1
+	// directly and so never surfaced how a real server reaches it.
+	if actorMaxPosition < 1 {
+		return 0, false, fmt.Errorf("create role: no legal position below %d: %w", actorMaxPosition, errHierarchyDenied)
+	}
+
+	// SHIFT rather than clamp. A clamp to actorMaxPosition-1 always returns that
+	// one value -- the actor's roles are a subset of the server's, so
+	// MAX(position)+1 is never the smaller operand -- and every role an actor
+	// created would collide on it, in an axis with no unique constraint.
+	// Searching for a free slot below the actor does not help either, because
+	// applyRolePositions repacks densely as len-i-1 on every reorder, so a server
+	// reordered even once has no gaps. Raising everything at or above the actor
+	// by one is the only approach yielding a distinct position in a dense server.
+	// Relative order is preserved and no authority relationship changes.
+	//
+	// This makes CreateRole a MULTI-ROW roles.position writer, which is only safe
+	// because the caller takes LockServerVisibilityCapture as its first statement
+	// and applyRolePositions now does the same (#2861) -- the two families are
+	// totally ordered and cannot interleave. Before #2856 this shift was an
+	// escalation primitive: it let an actor raise their own ceiling between a
+	// guard's two unsynchronized reads. roleGuardQuery closed that by making the
+	// ceiling structurally unable to be newer than the target.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE roles SET position = position + 1, updated_at = NOW() WHERE server_id = $1 AND position >= $2`,
+		serverID, actorMaxPosition,
+	); err != nil {
+		return 0, false, fmt.Errorf("create role: shift role positions: %w", err)
+	}
+
+	return actorMaxPosition, true, nil
+}
+
 // CreateRole creates a new role in a server
 func (h *Handler) CreateRole(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -214,15 +358,10 @@ func (h *Handler) CreateRole(c *gin.Context) {
 	// just-demoted actor mint a permanent over-privileged role that the
 	// role_created audit entry then recorded as legitimate.
 
-	// Validate color format if provided
-	if req.Color != nil && len(*req.Color) > 0 {
-		if (*req.Color)[0] != '#' || len(*req.Color) != 7 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid color format (expected #RRGGBB)"})
-			return
-		}
+	if !validateHexColor(c, req.Color) {
+		return
 	}
 
-	// Create role — place above @all (position 0) by assigning max(position) + 1
 	roleID := uuid.New().String()
 
 	query := `
@@ -240,6 +379,9 @@ func (h *Handler) CreateRole(c *gin.Context) {
 	role.Permissions = req.Permissions
 	role.Mentionable = req.Mentionable
 	role.DisplaySeparately = req.DisplaySeparately
+
+	// Set inside the transaction below; read after it commits.
+	shifted := false
 
 	// CreateRole deliberately does NOT use withAuthorityCapture: a memberless new
 	// role changes nobody's Rich Presence visibility, so there is no pre-mutation
@@ -287,14 +429,16 @@ func (h *Handler) CreateRole(c *gin.Context) {
 			return errEscalationDenied
 		}
 
-		// Unchanged, but now inside the advisory order. #2850 replaces this with
-		// resolveNewRolePosition; this transaction is shaped as its container.
-		if posErr := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(MAX(position), 0) + 1 FROM roles WHERE server_id = $1`,
-			serverID,
-		).Scan(&role.Position); posErr != nil {
-			return fmt.Errorf("get next role position: %w", posErr)
+		// Non-owners get a slot strictly below their own highest role, shifting
+		// everything at or above them up by one to make room (#2359). The owner
+		// is unclamped at MAX(position)+1. This is the replacement #2856 shaped
+		// this transaction to hold.
+		position, didShift, posErr := h.resolveNewRolePosition(ctx, tx, serverID, userID)
+		if posErr != nil {
+			return posErr
 		}
+		role.Position = position
+		shifted = didShift
 
 		if insErr := tx.QueryRowContext(ctx,
 			query, roleID, serverID, req.Name, req.Color, req.Emoji,
@@ -313,22 +457,32 @@ func (h *Handler) CreateRole(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "A role with that name already exists in this server"})
 			return
 		}
-		// hierarchyMsg is empty: CreateRole has no hierarchy check (it places the
-		// new role at MAX(position)+1 and errHierarchyDenied is unreachable here).
-		h.mapGuardError(c, err, "Cannot create a role at or above your own position", errMsgFailedCreateRole)
+		// errHierarchyDenied IS reachable here as of #2359: resolveNewRolePosition
+		// returns it when the actor's highest role sits at position 0 or 1, so
+		// there is no slot strictly below them and above the default role.
+		h.mapGuardError(c, err, errMsgNoLegalRolePosition, errMsgFailedCreateRole)
 		return
 	}
 
-	// Invalidate permission cache for entire server
+	h.announceRoleCreated(c, serverID, userID, roleID, req, role, shifted)
+	c.JSON(http.StatusCreated, gin.H{"role": role})
+}
+
+// announceRoleCreated performs every post-commit side effect of a successful
+// create: cache invalidation, the audit entry, the client broadcasts, and the
+// log line. Extracted from CreateRole, which had grown past the cognitive
+// complexity limit -- and these are one coherent unit, all of them "the write
+// committed, now tell everyone", none of them able to fail the request.
+func (h *Handler) announceRoleCreated(
+	c *gin.Context, serverID, userID, roleID string, req CreateRoleRequest, role Role, shifted bool,
+) {
 	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
 
-	// Audit log
 	if h.audit != nil {
 		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "role_created", "role", &roleID,
 			map[string]interface{}{"role_name": req.Name, "permissions": req.Permissions})
 	}
 
-	// Broadcast role_created event
 	serverUUID, _ := uuid.Parse(serverID)
 	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
 		Type: "role_created",
@@ -338,8 +492,22 @@ func (h *Handler) CreateRole(c *gin.Context) {
 		},
 	})
 
+	// A non-owner create SHIFTS the actor's own role and everything above it up
+	// by one, so role_created alone leaves every other client rendering from
+	// cached positions with a stale order -- the new role and the actor's role
+	// both appearing at the same slot until something forces a refetch. Authority
+	// is unaffected (every guard re-reads position fresh), so this is display
+	// only, but ReorderRoles already emits roles_reordered when it moves roles
+	// and CreateRole now moves roles too. Reusing that event rather than adding a
+	// type keeps the client contract at one "positions changed, refetch" signal.
+	if shifted {
+		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+			Type: "roles_reordered",
+			Data: map[string]interface{}{"server_id": serverID},
+		})
+	}
+
 	h.log.Info("Role created", "role_id", roleID, "server_id", serverID, "name", req.Name)
-	c.JSON(http.StatusCreated, gin.H{"role": role})
 }
 
 // UpdateRole updates an existing role
@@ -504,8 +672,9 @@ func (h *Handler) validateRoleColor(c *gin.Context, color *string, updates *[]st
 	if color == nil || len(*color) == 0 {
 		return false
 	}
-	if (*color)[0] != '#' || len(*color) != 7 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid color format (expected #RRGGBB)"})
+	// Same format check as CreateRole. NOTE the inverted polarity of this
+	// method: it returns true when it has WRITTEN a response.
+	if !validateHexColor(c, color) {
 		return true
 	}
 	*updates = append(*updates, "color = $"+strconv.Itoa(*argIdx))

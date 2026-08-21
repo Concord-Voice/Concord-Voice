@@ -283,6 +283,314 @@ func TestCreateRole_DuplicateName_Conflict(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, w.Code)
 }
 
+// A non-owner's newly created role must land strictly below the creator's own
+// highest role, not above the whole server. Regression guard for #2359.
+// roleFromCreateResponse decodes a 201 CreateRole body. Comma-ok throughout:
+// a single-return assertion panics on a shape mismatch and a panic aborts the
+// whole package binary (#2811).
+func roleFromCreateResponse(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	role, ok := resp["role"].(map[string]interface{})
+	require.True(t, ok, "response has no role object: %v", resp)
+	return role
+}
+
+func rolePositionFromCreateResponse(t *testing.T, w *httptest.ResponseRecorder) int {
+	t.Helper()
+	role := roleFromCreateResponse(t, w)
+	pos, ok := role["position"].(float64)
+	require.True(t, ok, "role has no numeric position: %v", role)
+	return int(pos)
+}
+
+// A non-owner's new role takes the actor's own slot, and the actor's role is
+// shifted up out of the way. Asserts the EXACT position: a range assertion here
+// would pass under a constant and under the pre-fix MAX(position)+1 clamp alike.
+// Regression guard for #2359.
+func TestCreateRole_NonOwner_ClampedBelowActor(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+
+	// Owner-owned high role the member must never outrank.
+	_ = grantPermToUser(t, ts, serverID, owner.ID, 10, int64(rbac.AdminPermissions))
+	// Member sits at position 5 with Manage Roles.
+	memberRoleID := grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+
+	body := map[string]interface{}{"name": "Supporter", "permissions": "0"}
+	w := ts.DoRequest("POST", rolesPath(serverID), body, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+
+	assert.Equal(t, 5, rolePositionFromCreateResponse(t, w),
+		"new role takes the actor's vacated slot")
+
+	// The actor's own role must have been shifted strictly above it.
+	var memberRolePosition int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT position FROM roles WHERE id = $1`, memberRoleID,
+	).Scan(&memberRolePosition))
+	assert.Equal(t, 6, memberRolePosition, "the creator's own role shifts up by one")
+}
+
+// Stripping every role row removes the permission too, so the request is refused
+// by the RequirePermission middleware and never reaches the handler. This pins
+// WHY resolveNewRolePosition needs no zero-row branch: that state cannot reach
+// it. Asserts 403 specifically, and asserts WHICH 403 -- a bare "not 201" would
+// pass for any refusal and prove nothing about which layer refused.
+func TestCreateRole_ActorWithNoRoles_RefusedByMiddleware(t *testing.T) {
+	ts, _, member, serverID := setupOwnerAndMember(t)
+	_ = grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+	// Strip every role row, leaving the server_members row intact.
+	_, err := ts.DB.Exec(`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2`, serverID, member.ID)
+	require.NoError(t, err)
+	invalidatePermCache(t, ts, serverID, member.ID)
+
+	w := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "Orphaned", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	errMsg, ok := resp["error"].(string)
+	require.True(t, ok, "403 body has no error string: %v", resp)
+	assert.NotContains(t, errMsg, "No available role position",
+		"must be the permission middleware, not the handler no-legal-slot guard")
+}
+
+// The colour validator checks the hex DIGITS, not just '#' and length. The
+// previous check accepted "#ZZZZZZ", and the value is rendered into a React
+// style prop.
+func TestCreateRole_NonHexColor_Rejected(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+
+	for _, bad := range []string{"#ZZZZZZ", "#12345G", "#-12345"} {
+		w := ts.DoRequest("POST", rolesPath(serverID),
+			map[string]interface{}{"name": "Bad" + bad[1:], "permissions": "0", "color": bad},
+			testhelpers.AuthHeaders(owner.AccessToken))
+		assert.Equal(t, http.StatusBadRequest, w.Code, "colour %q must be rejected, body: %s", bad, w.Body.String())
+	}
+
+	// A well-formed colour still passes, in both cases.
+	for _, good := range []string{"#a1B2c3", "#FFFFFF"} {
+		w := ts.DoRequest("POST", rolesPath(serverID),
+			map[string]interface{}{"name": "Good" + good[1:], "permissions": "0", "color": good},
+			testhelpers.AuthHeaders(owner.AccessToken))
+		assert.Equal(t, http.StatusCreated, w.Code, "colour %q must be accepted, body: %s", good, w.Body.String())
+	}
+}
+
+// Two roles created by the same non-owner must land on DISTINCT positions.
+// The pre-fix clamp min(maxPosition+1, actorMaxPosition-1) returned
+// actorMaxPosition-1 unconditionally, so every role an actor created collided on
+// one position -- invisible to any single-create test.
+func TestCreateRole_NonOwner_TwoRoles_DistinctPositions(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	_ = grantPermToUser(t, ts, serverID, owner.ID, 10, int64(rbac.AdminPermissions))
+	_ = grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+
+	first := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "First", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, first.Code, "body: %s", first.Body.String())
+	firstPos := rolePositionFromCreateResponse(t, first)
+
+	second := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "Second", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, second.Code, "body: %s", second.Body.String())
+	secondPos := rolePositionFromCreateResponse(t, second)
+
+	assert.NotEqual(t, firstPos, secondPos, "roles created by the same actor must not collide")
+	assert.Equal(t, 5, firstPos)
+	assert.Equal(t, 6, secondPos, "the second create takes the slot the first shifted the actor into")
+}
+
+// A new role must never collide with a role already occupying the target slot.
+func TestCreateRole_NonOwner_DoesNotCollideWithExistingRole(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	_ = grantPermToUser(t, ts, serverID, owner.ID, 10, int64(rbac.AdminPermissions))
+	_ = grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+	// An unrelated role already sits directly below the actor.
+	_ = ts.CreateTestRole(t, serverID, "Occupant", 4, 0)
+
+	w := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "Newcomer", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	newPos := rolePositionFromCreateResponse(t, w)
+
+	var occupantCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM roles WHERE server_id = $1 AND position = $2`, serverID, newPos,
+	).Scan(&occupantCount))
+	assert.Equal(t, 1, occupantCount, "exactly one role may occupy the new role's position")
+}
+
+// The server owner bypasses the clamp and still receives the top slot.
+func TestCreateRole_Owner_UnclampedTop(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+	ownerRoleID := grantPermToUser(t, ts, serverID, owner.ID, 10, int64(rbac.AdminPermissions))
+
+	body := map[string]interface{}{"name": "OwnerRole", "permissions": "0"}
+	w := ts.DoRequest("POST", rolesPath(serverID), body, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+
+	assert.Equal(t, 11, rolePositionFromCreateResponse(t, w), "owner gets MAX(position)+1")
+
+	// The owner path must NOT shift: it takes the free slot above everything, so
+	// no existing role moves. This pins the condition guarding the extra
+	// roles_reordered broadcast -- a shift that fired here would tell every
+	// client to refetch for nothing.
+	var ownerRolePosition int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT position FROM roles WHERE id = $1`, ownerRoleID,
+	).Scan(&ownerRolePosition))
+	assert.Equal(t, 10, ownerRolePosition, "an owner create must move no existing role")
+}
+
+// An actor at position 2 is the lowest rank that can still create: the shift
+// floor is 2, so @everyone at 0 never moves. Pins the guard's boundary --
+// changing `< 2` to `<= 2` would silently start refusing legitimate creates.
+func TestCreateRole_ActorAtPositionTwo_Succeeds(t *testing.T) {
+	ts, _, member, serverID := setupOwnerAndMember(t)
+	_ = grantPermToUser(t, ts, serverID, member.ID, 2, int64(rbac.PermManageRoles))
+
+	w := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "Lowest", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, 2, rolePositionFromCreateResponse(t, w))
+
+	// @everyone must be untouched at 0.
+	var defaultPosition int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT position FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&defaultPosition))
+	assert.Equal(t, 0, defaultPosition, "the default role must never be shifted")
+}
+
+// member_roles has no composite FK to roles(id, server_id) -- role_id references
+// roles(id) alone -- so a row whose server_id differs from its role's server is
+// schema-legal. Every ceiling aggregate that joins on role_id ALONE would then
+// import a foreign role's position as this server's ceiling.
+//
+// No first-party path can create such a row: all four production INSERT sites
+// scope the role to the same server. This test seeds it directly, which is the
+// only way to reach the state, and pins that the server-qualified join refuses
+// to import it. Without `AND r.server_id = mr.server_id` the foreign position
+// becomes the ceiling and the new role lands above the victim server's admin --
+// re-opening the very bug this PR closes.
+//
+// Defence-in-depth, not a live exploit. The durable fix is a composite FK, the
+// shape migration 000082 used for channel groups; tracked separately.
+func TestCreateRole_ForeignServerRoleDoesNotInflateCeiling(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	_ = grantPermToUser(t, ts, serverID, owner.ID, 10, int64(rbac.AdminPermissions))
+	_ = grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+
+	// A second server the member is not scoped to, carrying a very high role.
+	otherServerID := ts.CreateTestServer(t, owner.ID, "Other Server")
+	foreignRoleID := ts.CreateTestRole(t, otherServerID, "Foreign", 999, 0)
+
+	// Schema-legal, unreachable through the API: this server's id, that server's role.
+	_, err := ts.DB.Exec(
+		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`,
+		serverID, member.ID, foreignRoleID)
+	require.NoError(t, err, "the row is schema-legal, which is the point")
+	invalidatePermCache(t, ts, serverID, member.ID)
+
+	w := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "ShouldNotOutrank", "permissions": "0"},
+		testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+
+	pos := rolePositionFromCreateResponse(t, w)
+	assert.Less(t, pos, 10, "must not outrank this server's admin role")
+	assert.Less(t, pos, 999, "the foreign role's position must not become the ceiling")
+	assert.Equal(t, 5, pos, "ceiling must come from this server's roles only")
+}
+
+// The FIRST role an owner creates on a fresh server lands at position 1, because
+// a new server holds only the default role at 0. Granting that role is the
+// ordinary way to delegate Manage Roles -- so position 1 is not an edge case,
+// it is the product's happy path, and its holder must be able to create roles.
+//
+// An earlier revision refused below position 2, which looked equivalent and was
+// not: it locked the first delegated admin out of role creation permanently,
+// with only the owner able to undo it. Every step here is through the public
+// API, which is what makes it a regression test rather than a boundary probe.
+func TestCreateRole_FirstDelegatedAdmin_CanCreate(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+
+	// Owner creates the delegation role through the API -- it lands at 1.
+	w1 := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "Moderator", "permissions": fmt.Sprintf("%d", int64(rbac.PermManageRoles))},
+		testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusCreated, w1.Code, "body: %s", w1.Body.String())
+	delegated := roleFromCreateResponse(t, w1)
+	require.Equal(t, float64(1), delegated["position"], "an owner's first create lands at 1 on a fresh server")
+
+	delegatedID, ok := delegated["id"].(string)
+	require.True(t, ok)
+	ts.AssignRoleToUser(t, serverID, member.ID, delegatedID)
+	invalidatePermCache(t, ts, serverID, member.ID)
+
+	// The delegate must now be able to create a role.
+	w2 := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "Helper", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, w2.Code,
+		"the first delegated admin must not be locked out of role creation, body: %s", w2.Body.String())
+	assert.Equal(t, 1, rolePositionFromCreateResponse(t, w2), "new role takes the delegate's vacated slot")
+
+	// The delegate's own role shifted up; the default role did NOT move.
+	var delegatedPos, defaultPos int
+	require.NoError(t, ts.DB.QueryRow(`SELECT position FROM roles WHERE id = $1`, delegatedID).Scan(&delegatedPos))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT position FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&defaultPos))
+	assert.Equal(t, 2, delegatedPos, "the delegate's own role shifts up by one")
+	assert.Equal(t, 0, defaultPos, "the default role must never be shifted")
+}
+
+// An admin whose Manage Roles comes only from @everyone (position 0) is refused,
+// and this is now the ONLY case with no legal slot: the shift is
+// `position >= actorMaxPosition`, so shifting at 0 would raise the default role
+// off position 0 -- the one thing that must never happen. At 1 and above a slot
+// always exists (see TestCreateRole_FirstDelegatedAdmin_CanCreate).
+//
+// Deliberate behaviour change: before #2359 this create succeeded and placed the
+// role above the entire hierarchy. Pinned so it is a decision, not an accident.
+func TestCreateRole_ManageRolesViaEveryone_Forbidden(t *testing.T) {
+	ts, _, member, serverID := setupOwnerAndMember(t)
+	_, err := ts.DB.Exec(
+		`UPDATE roles SET permissions = $1 WHERE server_id = $2 AND is_default = TRUE`,
+		int64(rbac.PermManageRoles), serverID)
+	require.NoError(t, err)
+	invalidatePermCache(t, ts, serverID, member.ID)
+
+	w := ts.DoRequest("POST", rolesPath(serverID),
+		map[string]interface{}{"name": "FromEveryone", "permissions": "0"}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+
+	var resp map[string]interface{}
+	testhelpers.ParseJSON(t, w, &resp)
+	errMsg, ok := resp["error"].(string)
+	require.True(t, ok, "403 body has no error string: %v", resp)
+	assert.Contains(t, errMsg, "No available role position")
+}
+
+func TestCreateRole_CreatorCanManageOwnRole(t *testing.T) {
+	ts, _, member, serverID := setupOwnerAndMember(t)
+	_ = grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
+
+	body := map[string]interface{}{"name": "Mine", "permissions": "0"}
+	w := ts.DoRequest("POST", rolesPath(serverID), body, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	role := roleFromCreateResponse(t, w)
+	roleID, ok := role["id"].(string)
+	require.True(t, ok, "role has no id string: %v", role)
+
+	upd := map[string]interface{}{"name": "MineRenamed"}
+	w2 := ts.DoRequest("PATCH", rolePath(serverID, roleID), upd, testhelpers.AuthHeaders(member.AccessToken))
+	assert.Equal(t, http.StatusOK, w2.Code, "creator must be able to edit their own new role, body: %s", w2.Body.String())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // UpdateRole
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1640,11 +1948,16 @@ func TestGetAuditLog_Success_Owner(t *testing.T) {
 
 	var resp map[string]interface{}
 	testhelpers.ParseJSON(t, w, &resp)
-	entries := resp["entries"].([]interface{})
-	assert.GreaterOrEqual(t, len(entries), 1, "should have at least one audit entry")
+	// Two-value form: the single-return assertion panicked here when a
+	// concurrent test-DB reset left "entries" nil, and a panic aborts the whole
+	// package binary rather than failing this one test (#2811).
+	entries, ok := resp["entries"].([]interface{})
+	require.True(t, ok, "entries missing or not an array: %v", resp)
+	require.GreaterOrEqual(t, len(entries), 1, "should have at least one audit entry")
 
 	// Verify entry structure
-	entry := entries[0].(map[string]interface{})
+	entry, ok := entries[0].(map[string]interface{})
+	require.True(t, ok, "first entry is not an object: %v", entries[0])
 	assert.NotEmpty(t, entry["id"])
 	assert.NotEmpty(t, entry["action"])
 	assert.NotEmpty(t, entry["created_at"])
