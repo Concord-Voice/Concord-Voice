@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { apiFetch, safeJson } from '../../../services/apiClient';
 import { useSubscriptionStore } from '../../../stores/subscriptionStore';
+import { easterEggMessage, type RedeemResult } from './redeemEasterEgg';
 
 // The universal redeem form (#1304 / #1303 engine). Labelled input → POST
 // /api/v1/redeem {code}. On 200 it shows the server-returned `description` (what
@@ -31,24 +32,35 @@ interface RedeemCodeFormProps {
 const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
   const [code, setCode] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [success, setSuccess] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<RedeemResult | null>(null);
   const hydrateEntitlements = useSubscriptionStore((s) => s.hydrate);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // The server is authoritative on format (checksum, prefix); we never validate
+    // the code shape here. There is deliberately no empty-input branch: the submit
+    // button is disabled while `code.trim()` is empty, and HTML implicit submission
+    // does not fire when the form's default button is disabled, so one would be
+    // unreachable.
     const trimmed = code.trim();
-    // Client-side non-empty guard only — the server is authoritative on format
-    // (checksum, prefix). We never try to validate the code shape here.
-    if (!trimmed) {
-      setError('Enter a code to redeem.');
-      setSuccess(null);
+
+    // Two ciphertexts from the intro-video blackboard (#2859) get a neutral local
+    // reply and no request at all. The /redeem limiters (10/min per user, 20/min
+    // per IP) are fail-OPEN, so this is an availability and UX benefit rather than
+    // a security control: a curious viewer gets a friendly reply instead of a red
+    // failure, and a shared-NAT audience does not push each other toward a 429.
+    //
+    // This MUST sit before setSubmitting(true): the early return skips the
+    // finally block below, so a short-circuit placed after it would leave the
+    // form permanently disabled with the button stuck on "Redeeming…".
+    const egg = easterEggMessage(trimmed);
+    if (egg) {
+      setResult({ kind: 'notice', message: egg });
       return;
     }
 
     setSubmitting(true);
-    setError(null);
-    setSuccess(null);
+    setResult(null);
 
     try {
       const res = await apiFetch('/api/v1/redeem', {
@@ -69,7 +81,7 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
         } catch {
           // Unparseable success body — keep the generic confirmation.
         }
-        setSuccess(description);
+        setResult({ kind: 'success', message: description });
         setCode('');
         // Re-hydrate the entitlement store immediately (the WS push also fires,
         // but this makes the FeatureGrid/PlanCard update without a race), then
@@ -79,9 +91,12 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
         return;
       }
 
-      setError(messageForStatus(res.status));
+      setResult({ kind: 'error', message: messageForStatus(res.status) });
     } catch {
-      setError('Could not reach the server. Check your connection and try again.');
+      setResult({
+        kind: 'error',
+        message: 'Could not reach the server. Check your connection and try again.',
+      });
     } finally {
       setSubmitting(false);
     }
@@ -107,7 +122,7 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
           value={code}
           onChange={(ev) => {
             setCode(ev.target.value);
-            if (error) setError(null);
+            if (result?.kind === 'error') setResult(null);
           }}
           disabled={submitting}
         />
@@ -120,15 +135,17 @@ const RedeemCodeForm: React.FC<RedeemCodeFormProps> = ({ onRedeemed }) => {
         </button>
       </div>
 
-      {error && (
+      {result?.kind === 'error' && (
         <div className="subscription-redeem-alert" role="alert">
-          {error}
+          {result.message}
         </div>
       )}
-      {success && (
+      {result && result.kind !== 'error' && (
         // Native <output> — implicit role="status" with better AT support (Sonar
-        // S6819). getByRole('status') still matches it.
-        <output className="subscription-redeem-status">{success}</output>
+        // S6819). getByRole('status') still matches it. `success` and `notice`
+        // both land here: a neutral reply must never interrupt a screen reader
+        // the way role="alert" does.
+        <output className="subscription-redeem-status">{result.message}</output>
       )}
     </form>
   );
