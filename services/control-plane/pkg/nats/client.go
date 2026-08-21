@@ -26,6 +26,20 @@ func Connect(url string) (*Client, error) {
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			log.Printf("NATS reconnected to %s", nc.ConnectedUrl())
 		}),
+		// Without this the client library sheds SILENTLY (#2854 B1). Each async
+		// subscription defaults to DefaultSubPendingMsgsLimit (500k) and
+		// DefaultSubPendingBytesLimit (64MB); on overflow it sets
+		// ErrSlowConsumer, increments a drop counter and discards, with no log
+		// line and no failure_class. That is a second shedder alongside the
+		// ingress gates in internal/voice, and an invisible one -- it would
+		// falsify the claim that every shed message is attributable.
+		//
+		// This LOGS only. It deliberately does NOT call SetPendingLimits:
+		// altering the drop thresholds is a separate decision with its own
+		// blast radius and does not belong in this change.
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			log.Print(asyncErrorLogLine(sub, err))
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect: %w", err)
