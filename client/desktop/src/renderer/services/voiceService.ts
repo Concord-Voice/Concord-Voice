@@ -7524,8 +7524,19 @@ class VoiceService {
             key,
           } satisfies E2EEWorkerMessage);
         }
-      } catch {
-        /* fail-closed: getChannelKeyByVersion rate-limits; worker caps retries */
+      } catch (err) {
+        // Fail-closed: getChannelKeyByVersion rate-limits and the Worker caps
+        // retries, so swallowing is SAFE — but swallowing SILENTLY is not. A
+        // permanently failing provision is indistinguishable from a working one
+        // in the console, which is how a key-miss storm stays invisible. Log at
+        // debug (this fires per missed key and pending-404 is an expected
+        // transient), PII-safe: ids and the reason only.
+        console.debug('E2EE: frame-key provision failed', {
+          senderUserId,
+          keyVersion,
+          keyId,
+          reason: errorMessage(err),
+        });
       }
     })();
   }

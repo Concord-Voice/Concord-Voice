@@ -20,6 +20,62 @@ function isFrameKeyMiss(err: unknown): err is FrameKeyMissError {
   return err instanceof Error && err.name === 'FrameKeyMissError';
 }
 
+/** Min gap between on-demand requests for the same key (mirrors e2eeWorker.ts). */
+const FRAME_KEY_BACKOFF_MS = 350;
+/** Requests per burst before pausing (mirrors e2eeWorker.ts). */
+const FRAME_KEY_BURST_CAP = 8;
+/** Idle gap after which a burst resets, so a slow-published key still recovers. */
+const FRAME_KEY_RETRY_RESET_MS = 15_000;
+/** Global size cap per pipeline (DoS bound — mirrors e2eeWorker.ts). */
+const FRAME_KEY_MAX_TRACKED = 512;
+
+/**
+ * Decide whether to issue an on-demand key request for a typed miss, bounding
+ * a persistent miss to bursts instead of one fetch per frame. Same policy as
+ * the Worker's requestFrameKeyOnce: burst, pause, reset after an idle gap — so
+ * a legitimately slow-published key (pending-404) still recovers, while a
+ * permanent 403 settles to roughly one request per reset window.
+ *
+ * Two properties this shape must hold, both mirroring the Worker:
+ *   (1) An idle-reset DELETES the stale entry rather than overwriting it on the
+ *       next recurrence. Overwrite-only leaves an entry per distinct
+ *       (sender, keyVersion, keyId) alive for the whole session.
+ *   (2) The map is size-capped with least-recently-TOUCHED eviction, so a
+ *       sender stamping a unique (keyVersion, keyId) per frame cannot grow it
+ *       unboundedly. The LRU touch requires delete-then-set: a plain `set` on
+ *       an existing key does NOT move it in Map insertion order, which would
+ *       silently make eviction FIFO-oldest-inserted and evict the key being
+ *       actively requested.
+ *
+ * Exported for unit testing of the retry policy; the pipeline uses it via the
+ * closure-local map.
+ */
+export function shouldRequestFrameKey(
+  requests: Map<string, { lastAttempt: number; attempts: number }>,
+  miss: Pick<FrameKeyMissError, 'senderUserId' | 'keyVersion' | 'keyId'>
+): boolean {
+  const key = `${miss.senderUserId}:${miss.keyVersion}:${miss.keyId}`;
+  const now = Date.now();
+  let state = requests.get(key);
+
+  if (state && now - state.lastAttempt >= FRAME_KEY_RETRY_RESET_MS) {
+    requests.delete(key);
+    state = undefined;
+  }
+
+  if (state) {
+    if (state.attempts >= FRAME_KEY_BURST_CAP) return false;
+    if (now - state.lastAttempt < FRAME_KEY_BACKOFF_MS) return false;
+    requests.delete(key);
+  } else if (requests.size >= FRAME_KEY_MAX_TRACKED) {
+    const oldest = requests.keys().next().value;
+    if (oldest !== undefined) requests.delete(oldest);
+  }
+
+  requests.set(key, { lastAttempt: now, attempts: (state?.attempts ?? 0) + 1 });
+  return true;
+}
+
 // ─── Types ───────────────────────────────────────────────────────────
 
 /** Minimal interface for an RTP receiver that supports the legacy Insertable Streams API. */
@@ -124,6 +180,44 @@ function attemptSelfHealingRecovery(
 // ─── Public API ──────────────────────────────────────────────────────
 
 /**
+ * Handle a typed key miss on the legacy decrypt path: make it observable and
+ * request the exact key within the budget. Returns the updated miss count.
+ *
+ * Extracted from the transform closure rather than inlined because the closure
+ * already carries the success, first-frame, recovery and generic-drop paths;
+ * adding this branch to it pushed its cognitive complexity past the S3776
+ * threshold. Behaviour is unchanged — the caller still returns immediately, so
+ * the frame stays fail-closed and never reaches the decoder.
+ *
+ * #1895: the typed miss is NOT counted toward the generic drop/self-heal
+ * counter — that recovery is version-blind (the #1878/#1885 residual this
+ * fixes); only the wrong-base OperationError case needs it.
+ *
+ * Parity with the Worker ([internal]rules/e2ee.md — "Both transform APIs are
+ * load-bearing"): this branch was silent on both paths, so a receiver missing
+ * every key logged nothing at all on either.
+ */
+function handleTypedKeyMiss(
+  senderUserId: string,
+  miss: FrameKeyMissError,
+  missCount: number,
+  missRequests: Map<string, { lastAttempt: number; attempts: number }>,
+  callbacks: DecryptRecoveryCallbacks
+): number {
+  const next = missCount + 1;
+  if (next === 1 || next % 100 === 0) {
+    console.warn(`E2EE: no key for ${senderUserId} frame — dropped (misses: ${next})`, {
+      wantKeyVersion: miss.keyVersion,
+      wantKeyId: miss.keyId,
+    });
+  }
+  if (shouldRequestFrameKey(missRequests, miss)) {
+    callbacks.requestFrameKey?.(miss.senderUserId, miss.keyVersion, miss.keyId);
+  }
+  return next;
+}
+
+/**
  * Create and pipe a legacy decrypt TransformStream on a consumer's
  * createEncodedStreams API.
  *
@@ -148,8 +242,15 @@ export function applyLegacyDecryptPipeline(
   try {
     const { readable, writable } = receiver.createEncodedStreams();
     let dropCount = 0;
+    let missCount = 0;
     let firstDecryptLogged = false;
     const recoveryState = { recoveryInProgress: false, lastRecoveryAttempt: 0 };
+    // Per-pipeline request budget for typed key misses, mirroring the Worker's
+    // frameKeyRequests policy (e2eeWorker.ts). Kept local rather than shared:
+    // one pipeline is already scoped to one sender, so the closure IS the right
+    // scope and no module-global cap is needed. Without it a persistent miss
+    // calls getChannelKeyByVersion once per frame (~50/s for audio).
+    const missRequests = new Map<string, { lastAttempt: number; attempts: number }>();
 
     const transform = new TransformStream({
       transform: async (frame: RTCEncodedAudioFrame | RTCEncodedVideoFrame, controller) => {
@@ -161,10 +262,19 @@ export function applyLegacyDecryptPipeline(
             firstDecryptLogged = true;
             console.debug(`E2EE: first frame decrypted for ${senderUserId}`);
           }
-          if (dropCount > 0) {
+          if (dropCount > 0 || missCount > 0) {
             console.debug(
-              `E2EE: decrypt recovered after ${dropCount} dropped frames for ${senderUserId}`
+              `E2EE: decrypt recovered for ${senderUserId} (${dropCount} drops, ${missCount} key misses)`
             );
+            missCount = 0;
+            // Deliberately NOT missRequests.clear(). One decryptable frame does
+            // not mean every tracked key became available: if decodable frames
+            // interleave with misses for a still-unresolved key, a wholesale
+            // clear makes each miss a fresh first request and restores
+            // frame-rate fetching — defeating the burst cap this map exists to
+            // enforce. Entries age out per key via the idle reset, or are
+            // evicted by the size cap. The Worker does the same: it clears one
+            // key on arrival (clearFrameKeyRequest) and never the whole map.
             if ('type' in frame) {
               callbacks.requestKeyframe(senderUserId);
             }
@@ -172,17 +282,12 @@ export function applyLegacyDecryptPipeline(
           }
         } catch (decryptErr) {
           if (isFrameKeyMiss(decryptErr)) {
-            // #1895: typed version miss — provision the exact (keyVersion, keyId)
-            // on demand, mirroring the Worker path (e2eeWorker.ts). Fail-closed:
-            // the frame is dropped while the key is fetched; a later frame
-            // decrypts once it lands. NOT counted toward the generic
-            // drop/self-heal counter below — that recovery is version-blind (the
-            // #1878/#1885 residual this fixes); only the wrong-base OperationError
-            // case needs it.
-            callbacks.requestFrameKey?.(
-              decryptErr.senderUserId,
-              decryptErr.keyVersion,
-              decryptErr.keyId
+            missCount = handleTypedKeyMiss(
+              senderUserId,
+              decryptErr,
+              missCount,
+              missRequests,
+              callbacks
             );
             return;
           }

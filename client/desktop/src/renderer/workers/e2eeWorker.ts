@@ -190,6 +190,11 @@ function handleEncrypt(
           log('debug', 'E2EE: first frame encrypted', {
             kind: 'type' in frame ? 'video' : 'audio',
             dataSize: frame.data.byteLength,
+            // #1742-class observability: the epoch/version this sender STAMPS.
+            // Without it a receiver-side key miss is undiagnosable from logs —
+            // you cannot tell whether the sender or the receiver drifted.
+            keyId: encryption.getCurrentKeyId(),
+            keyVersion: encryption.getKeyVersion(),
           });
         }
         if (dropCount > 0) {
@@ -311,6 +316,7 @@ function handleDecrypt(
   codecFamily: CodecFamily | undefined
 ): void {
   let dropCount = 0;
+  let missCount = 0;
   let firstLogged = false;
 
   const transform = new TransformStream<
@@ -325,8 +331,12 @@ function handleDecrypt(
           firstLogged = true;
           log('debug', `E2EE: first frame decrypted for ${senderUserId}`);
         }
-        if (dropCount > 0) {
-          log('info', `E2EE: decrypt recovered after ${dropCount} drops for ${senderUserId}`);
+        if (dropCount > 0 || missCount > 0) {
+          log(
+            'info',
+            `E2EE: decrypt recovered for ${senderUserId} (${dropCount} drops, ${missCount} key misses)`
+          );
+          missCount = 0;
           if ('type' in frame) {
             postToMain({ type: 'requestKeyframe', senderUserId });
           }
@@ -336,6 +346,19 @@ function handleDecrypt(
         if (isFrameKeyMiss(decryptErr)) {
           // #1878: typed miss — request the exact key on demand. The frame is
           // dropped (fail-closed); it is never enqueued as ciphertext.
+          //
+          // This branch was silent by construction, which cost two investigations:
+          // every frame can miss its key and the console shows neither a success
+          // nor a drop. Counted separately from dropCount so the 50/500 recovery
+          // thresholds keep their original meaning.
+          missCount++;
+          if (missCount === 1 || missCount % 100 === 0) {
+            log('warn', `E2EE: no key for ${senderUserId} frame — dropped (misses: ${missCount})`, {
+              wantKeyVersion: decryptErr.keyVersion,
+              wantKeyId: decryptErr.keyId,
+              detail: decryptErr.message,
+            });
+          }
           requestFrameKeyOnce(decryptErr.senderUserId, decryptErr.keyVersion, decryptErr.keyId);
         } else {
           // OperationError (wrong-base GCM auth) / other — existing self-heal path.

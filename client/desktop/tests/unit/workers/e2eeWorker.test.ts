@@ -153,6 +153,86 @@ describe('e2eeWorker keyframe recovery', () => {
   });
 });
 
+describe('e2eeWorker key-miss observability', () => {
+  let postMessage: ReturnType<typeof vi.fn>;
+  let rtctransformListener: ((event: { transformer: unknown }) => void) | undefined;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    mockEncryptFrame.mockResolvedValue(undefined);
+    postMessage = vi.fn();
+    rtctransformListener = undefined;
+    vi.stubGlobal('self', {
+      postMessage,
+      onmessage: null,
+      addEventListener: vi.fn((event: string, listener: EventListener) => {
+        if (event === 'rtctransform') {
+          rtctransformListener = listener as unknown as (event: { transformer: unknown }) => void;
+        }
+      }),
+    });
+    await import('@/renderer/workers/e2eeWorker');
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * A FrameKeyMissError used to drop the frame in total silence — no success
+   * log, no drop warning — so a receiver missing every key looked identical in
+   * the console to one decrypting cleanly. That cost two investigations (#1742
+   * hid in the passthrough branch, this one in the key-miss branch).
+   */
+  it('logs a warning naming the wanted (keyVersion, keyId) on a key miss', async () => {
+    const miss = Object.assign(new Error('E2EE: no decrypt key for sender=sender-1 v=1 keyId=7'), {
+      name: 'FrameKeyMissError',
+      senderUserId: 'sender-1',
+      keyVersion: 1,
+      keyId: 7,
+    });
+    mockDecryptFrame.mockRejectedValue(miss);
+
+    const frame = { type: 'key', data: new ArrayBuffer(64) } as RTCEncodedVideoFrame;
+    const written: unknown[] = [];
+    const readable = new ReadableStream<RTCEncodedVideoFrame>({
+      start(controller) {
+        controller.enqueue(frame);
+        controller.close();
+      },
+    });
+    const writable = new WritableStream<RTCEncodedVideoFrame>({
+      write(chunk) {
+        written.push(chunk);
+      },
+    });
+
+    expect(rtctransformListener).toBeTypeOf('function');
+    rtctransformListener!({
+      transformer: {
+        options: { role: 'decrypt', senderUserId: 'sender-1' },
+        readable,
+        writable,
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'log',
+          level: 'warn',
+          message: expect.stringContaining('no key for sender-1'),
+          data: expect.objectContaining({ wantKeyVersion: 1, wantKeyId: 7 }),
+        })
+      );
+    });
+
+    // Still fail-closed: an undecryptable frame is never forwarded to the decoder.
+    expect(written).toEqual([]);
+  });
+});
+
 describe('e2eeWorker requestFrameKey retry policy (#1885)', () => {
   let postMessage: ReturnType<typeof vi.fn>;
   let requestFrameKeyOnce: (s: string, v: number, k: number) => void;

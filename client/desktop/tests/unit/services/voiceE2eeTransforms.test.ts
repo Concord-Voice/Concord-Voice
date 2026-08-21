@@ -9,6 +9,7 @@ import {
   applyLegacyDecryptPipeline,
   type DecryptRecoveryCallbacks,
   type InsertableStreamsReceiver,
+  shouldRequestFrameKey,
 } from '../../../src/renderer/services/voiceE2eeTransforms';
 
 // ─── Mock Helpers ────────────────────────────────────────────────────
@@ -305,7 +306,7 @@ describe('applyLegacyDecryptPipeline', () => {
     }
 
     expect(console.debug).toHaveBeenCalledWith(
-      expect.stringContaining('E2EE: decrypt recovered after 3 dropped frames')
+      expect.stringContaining('E2EE: decrypt recovered for user-1 (3 drops, 0 key misses)')
     );
     expect(controller.enqueue).toHaveBeenCalledTimes(1);
   });
@@ -383,6 +384,138 @@ describe('applyLegacyDecryptPipeline', () => {
     // The fix: the exact (keyVersion, keyId) is requested on the FIRST typed
     // miss — not after 50 version-blind self-heal drops, and not never.
     expect(requestFrameKey).toHaveBeenCalledWith('user-1', 5, 0);
+  });
+
+  /**
+   * Parity with the Worker path ([internal]rules/e2ee.md — "Both transform APIs
+   * are load-bearing"). The typed-miss branch dropped the frame in total
+   * silence on BOTH paths, so a receiver missing every key looked identical to
+   * one decrypting cleanly. Fixing only the Worker would leave the fallback
+   * blind the moment RTCRtpScriptTransform is unavailable.
+   */
+  it('logs the wanted (keyVersion, keyId) on a typed FrameKeyMiss', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const encryption = {
+      decryptFrame: vi
+        .fn()
+        .mockRejectedValue(
+          new FrameKeyMissError(
+            'user-1',
+            5,
+            7,
+            'E2EE: no decrypt key for sender=user-1 v=5 keyId=7'
+          )
+        ),
+      getCurrentKeyId: vi.fn().mockReturnValue(0),
+    } as unknown as MediaEncryption;
+
+    const callbacks = {
+      ...mockCallbacks(),
+      requestFrameKey: vi.fn(),
+    } as DecryptRecoveryCallbacks & { requestFrameKey: ReturnType<typeof vi.fn> };
+
+    applyLegacyDecryptPipeline(mockReceiver(), 'user-1', encryption, callbacks, false);
+
+    const controller = { enqueue: vi.fn() };
+    await requireCapturedTransformFn()({ data: new ArrayBuffer(100), type: 'delta' }, controller);
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('no key for user-1'),
+      expect.objectContaining({ wantKeyVersion: 5, wantKeyId: 7 })
+    );
+    // Still fail-closed: never enqueued as ciphertext.
+    expect(controller.enqueue).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  /**
+   * A persistent miss used to call getChannelKeyByVersion once per frame
+   * (~50/s for audio) because only the Worker path carried a request budget.
+   * The legacy path now bursts then pauses, exactly like requestFrameKeyOnce.
+   */
+  it('bounds repeated on-demand key requests for the same key', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const encryption = {
+      decryptFrame: vi
+        .fn()
+        .mockRejectedValue(
+          new FrameKeyMissError(
+            'user-1',
+            5,
+            7,
+            'E2EE: no decrypt key for sender=user-1 v=5 keyId=7'
+          )
+        ),
+      getCurrentKeyId: vi.fn().mockReturnValue(0),
+    } as unknown as MediaEncryption;
+
+    const requestFrameKey = vi.fn();
+    const callbacks = {
+      ...mockCallbacks(),
+      requestFrameKey,
+    } as DecryptRecoveryCallbacks & { requestFrameKey: typeof requestFrameKey };
+
+    applyLegacyDecryptPipeline(mockReceiver(), 'user-1', encryption, callbacks, false);
+    const transform = requireCapturedTransformFn();
+
+    // 60 back-to-back missing-key frames — one second of audio.
+    for (let i = 0; i < 60; i++) {
+      await transform({ data: new ArrayBuffer(100), type: 'delta' }, { enqueue: vi.fn() });
+    }
+
+    // Without a budget this would be 60. The backoff admits the first only,
+    // since the whole loop runs well inside FRAME_KEY_BACKOFF_MS.
+    expect(requestFrameKey.mock.calls.length).toBeLessThanOrEqual(8);
+    expect(requestFrameKey).toHaveBeenCalledWith('user-1', 5, 7);
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Lives inside this describe deliberately: `capturedTransformFn` is module-level
+   * state reset by THIS block's beforeEach. A copy appended at file scope silently
+   * reuses a stale transform from an earlier test and asserts nothing.
+   */
+  it('does not re-burst when decodable frames interleave with an unresolved key', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'debug').mockImplementation(() => {});
+
+    // Alternate: one frame decrypts, the next misses the SAME unresolved key.
+    let n = 0;
+    const encryption = {
+      decryptFrame: vi.fn().mockImplementation(() => {
+        n += 1;
+        return n % 2 === 1
+          ? Promise.resolve(undefined)
+          : Promise.reject(
+              new FrameKeyMissError(
+                'user-1',
+                5,
+                7,
+                'E2EE: no decrypt key for sender=user-1 v=5 keyId=7'
+              )
+            );
+      }),
+      getCurrentKeyId: vi.fn().mockReturnValue(0),
+    } as unknown as MediaEncryption;
+
+    const requestFrameKey = vi.fn();
+    const callbacks = {
+      ...mockCallbacks(),
+      requestFrameKey,
+    } as DecryptRecoveryCallbacks & { requestFrameKey: typeof requestFrameKey };
+
+    applyLegacyDecryptPipeline(mockReceiver(), 'user-1', encryption, callbacks, false);
+    const transform = requireCapturedTransformFn();
+
+    // 120 frames — 60 successes interleaved with 60 misses of the same key.
+    for (let i = 0; i < 120; i++) {
+      await transform({ data: new ArrayBuffer(100), type: 'delta' }, { enqueue: vi.fn() });
+    }
+
+    // A wholesale clear on each success would make every miss a first request
+    // (60 calls). The per-key budget must survive the interleaved successes.
+    expect(requestFrameKey.mock.calls.length).toBeLessThanOrEqual(8);
+    vi.restoreAllMocks();
   });
 });
 
@@ -558,5 +691,75 @@ describe('#1895 diagnostics removed (rig out of pass-through)', () => {
     expect(src).toMatch(/const E2EE_VERBOSE = false/);
     expect(src).not.toMatch(/AV1_PASSTHROUGH_DIAG/);
     expect(src).not.toMatch(/AV1-PAYLOAD SEND/);
+  });
+});
+
+// ─── Frame-key request policy (Gitar finding, PR #2863) ─────────────────────
+//
+// The first cut of this policy only ever grew the map: an idle-reset overwrote
+// an entry when that same key recurred, so a sender churning distinct
+// (keyVersion, keyId) values accumulated one entry per key for the session.
+// The Worker path it claims parity with caps the map and evicts
+// least-recently-TOUCHED. These lock both halves.
+
+describe('shouldRequestFrameKey — request budget parity with the Worker', () => {
+  const miss = (keyId: number, keyVersion = 1) => ({
+    senderUserId: 'user-1',
+    keyVersion,
+    keyId,
+  });
+
+  it('bounds the tracked map when a sender churns unique keys', () => {
+    const requests = new Map<string, { lastAttempt: number; attempts: number }>();
+
+    // 600 distinct keys — more than the 512 cap.
+    for (let i = 0; i < 600; i++) {
+      shouldRequestFrameKey(requests, miss(i));
+    }
+
+    expect(requests.size).toBeLessThanOrEqual(512);
+  });
+
+  it('evicts the least-recently-touched key, not the actively-requested one', () => {
+    const requests = new Map<string, { lastAttempt: number; attempts: number }>();
+    const hot = miss(0);
+
+    // Seed the hot key first so FIFO-oldest-inserted would evict it.
+    shouldRequestFrameKey(requests, hot);
+
+    // Fill past the cap, touching the hot key along the way. Each touch must
+    // re-insert it at the most-recent position (delete-then-set) — a plain
+    // `set` on an existing key does not reorder a JS Map, which is exactly the
+    // trap this asserts against.
+    for (let i = 1; i < 600; i++) {
+      shouldRequestFrameKey(requests, miss(i));
+      if (i % 50 === 0) {
+        const entry = requests.get('user-1:1:0');
+        if (entry) entry.lastAttempt = 0; // clear the backoff so the touch admits
+        shouldRequestFrameKey(requests, hot);
+      }
+    }
+
+    expect(requests.size).toBeLessThanOrEqual(512);
+    expect(requests.has('user-1:1:0')).toBe(true);
+  });
+
+  it('resets the burst after the idle window and drops the stale entry', () => {
+    const requests = new Map<string, { lastAttempt: number; attempts: number }>();
+
+    // Exhaust the burst for one key.
+    for (let i = 0; i < 20; i++) {
+      const entry = requests.get('user-1:1:7');
+      if (entry) entry.lastAttempt = Date.now() - 400; // past the 350ms backoff
+      shouldRequestFrameKey(requests, miss(7));
+    }
+    expect(requests.get('user-1:1:7')?.attempts).toBe(8); // capped at the burst
+    expect(shouldRequestFrameKey(requests, miss(7))).toBe(false);
+
+    // Age it past the 15s idle window: the burst resets from scratch.
+    const stale = requests.get('user-1:1:7');
+    if (stale) stale.lastAttempt = Date.now() - 16_000;
+    expect(shouldRequestFrameKey(requests, miss(7))).toBe(true);
+    expect(requests.get('user-1:1:7')?.attempts).toBe(1);
   });
 });
