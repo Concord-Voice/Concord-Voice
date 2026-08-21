@@ -141,6 +141,27 @@ func (r *Resolver) ResolveEffectivePermissionsUncached(ctx context.Context, serv
 	return perms, nil
 }
 
+// ResolveServerPermissionsTx resolves a member's SERVER-scope effective
+// permissions on a caller-supplied transaction, reading and publishing NO cache
+// entry. The RBAC role-mutation guards (#2721) use it so the actor's permission
+// set is resolved inside the same transaction as the write it authorizes.
+//
+// It deliberately mirrors ResolveEffectivePermissionsUncached, NOT ...Fresh.
+// Fresh calls cache.Set; publishing from a transaction that then rolls back
+// would seed Redis with a state that never committed. It also does not open its
+// own REPEATABLE READ snapshot the way ...Uncached does — the caller's
+// transaction IS the snapshot, which is the entire point of taking a rowQuerier.
+//
+// Channel scope is intentionally unsupported: every caller authorizes a
+// server-level roles.permissions bitfield. For channel scope use
+// ResolveEffectivePermissionsForChannelsFresh instead.
+func (r *Resolver) ResolveServerPermissionsTx(
+	ctx context.Context, q rowQuerier, serverID, userID string,
+) (Permission, error) {
+	perms, _, err := r.resolveServerPermissions(ctx, q, serverID, userID)
+	return perms, err
+}
+
 // ResolveEffectivePermissionsForChannelsFresh resolves a member's effective
 // permissions for channels from one server in one fresh database pass. It keeps
 // per-channel SBAC allow/deny semantics while avoiding an N+1 preflight loop.

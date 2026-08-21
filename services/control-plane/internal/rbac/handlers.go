@@ -206,17 +206,13 @@ func (h *Handler) CreateRole(c *gin.Context) {
 		return
 	}
 
-	// Privilege escalation check: new role permissions must be a subset of actor's permissions
-	actorPerms, err := h.resolver.GetEffectivePermissions(c.Request.Context(), serverID, userID, "")
-	if err != nil {
-		h.log.Error(errMsgFailedGetActorPerms, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateRole})
-		return
-	}
-	if Permission(req.Permissions)&^actorPerms != 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgCannotGrantPerms})
-		return
-	}
+	// The privilege-escalation check moved INSIDE the transaction below (#2721).
+	// It previously ran here against h.resolver.GetEffectivePermissions, which is
+	// CACHE-FIRST with a 5-minute TTL — while UpdateRole and AssignRole both
+	// resolved cache-bypassing. CreateRole writes a roles.permissions bitfield,
+	// the most durable authority in the model, so a stale cache entry let a
+	// just-demoted actor mint a permanent over-privileged role that the
+	// role_created audit entry then recorded as legitimate.
 
 	// Validate color format if provided
 	if req.Color != nil && len(*req.Color) > 0 {
@@ -228,14 +224,6 @@ func (h *Handler) CreateRole(c *gin.Context) {
 
 	// Create role — place above @all (position 0) by assigning max(position) + 1
 	roleID := uuid.New().String()
-
-	var nextPosition int
-	err = h.db.QueryRow(`SELECT COALESCE(MAX(position), 0) + 1 FROM roles WHERE server_id = $1`, serverID).Scan(&nextPosition)
-	if err != nil {
-		h.log.Error("Failed to get next role position", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateRole})
-		return
-	}
 
 	query := `
 		INSERT INTO roles (id, server_id, name, color, emoji, position, permissions, mentionable, display_separately)
@@ -249,23 +237,85 @@ func (h *Handler) CreateRole(c *gin.Context) {
 	role.Name = req.Name
 	role.Color = req.Color
 	role.Emoji = req.Emoji
-	role.Position = nextPosition
 	role.Permissions = req.Permissions
 	role.Mentionable = req.Mentionable
 	role.DisplaySeparately = req.DisplaySeparately
 
-	err = h.db.QueryRow(
-		query, roleID, serverID, req.Name, req.Color, req.Emoji,
-		nextPosition, req.Permissions, req.Mentionable, req.DisplaySeparately,
-	).Scan(&role.CreatedAt, &role.UpdatedAt)
+	// CreateRole deliberately does NOT use withAuthorityCapture: a memberless new
+	// role changes nobody's Rich Presence visibility, so there is no pre-mutation
+	// audience to capture. It uses the same lighter seam the category-override
+	// paths already use — BeginTx -> LockServerVisibilityCapture -> work -> Commit
+	// — so it joins the per-server advisory total order without adding a fifth
+	// transaction pattern (#2721).
+	err := func() error {
+		ctx := c.Request.Context()
+		tx, txErr := h.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return fmt.Errorf("begin create role transaction: %w", txErr)
+		}
+		defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+		// FIRST statement, and the only advisory key this transaction takes.
+		if lockErr := LockServerVisibilityCapture(ctx, tx, serverID); lockErr != nil {
+			return fmt.Errorf("lock server for create role: %w", lockErr)
+		}
+		if toErr := applyGuardLockTimeout(ctx, tx); toErr != nil {
+			return toErr
+		}
+
+		// Cache-free and in-transaction. There is deliberately NO owner bypass
+		// here: an owner's effective set is OwnerPermissions, which EXCLUDES bit
+		// 62, so this is what actually keeps PermAdministrator out of a server.
+		// Do not add a bypass for symmetry with UpdateRole/AssignRole.
+		actorPerms, permErr := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
+		if permErr != nil {
+			// %w, not %v: errors.Is unwraps, so ErrNotMember stays matchable and
+			// mapGuardError still renders its 403 rather than the default 500.
+			return fmt.Errorf("create role: resolve actor permissions: %w", permErr)
+		}
+		// The route decorator's HasPermission is cache-first with a 5-minute TTL,
+		// and CreateRole has no hierarchy check to fail closed behind it — so a
+		// fully-demoted actor riding a stale entry could still mint a
+		// permissions=0 role, complete with a role_created audit entry and
+		// broadcast attributed to someone who no longer holds ManageRoles. The
+		// other four handlers are covered by the ceiling dropping to 0. This is
+		// one comparison on a value already resolved above; it costs no query.
+		if actorPerms&PermManageRoles == 0 {
+			return errEscalationDenied
+		}
+		if Permission(req.Permissions)&^actorPerms != 0 {
+			return errEscalationDenied
+		}
+
+		// Unchanged, but now inside the advisory order. #2850 replaces this with
+		// resolveNewRolePosition; this transaction is shaped as its container.
+		if posErr := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(MAX(position), 0) + 1 FROM roles WHERE server_id = $1`,
+			serverID,
+		).Scan(&role.Position); posErr != nil {
+			return fmt.Errorf("get next role position: %w", posErr)
+		}
+
+		if insErr := tx.QueryRowContext(ctx,
+			query, roleID, serverID, req.Name, req.Color, req.Emoji,
+			role.Position, req.Permissions, req.Mentionable, req.DisplaySeparately,
+		).Scan(&role.CreatedAt, &role.UpdatedAt); insErr != nil {
+			// %w, not %v: errors.As unwraps, so the call site's
+			// errors.As(err, &pqErr) still sees the 23505 and renders the 409.
+			return fmt.Errorf("create role: insert: %w", insErr)
+		}
+		return tx.Commit()
+	}()
 
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
 			c.JSON(http.StatusConflict, gin.H{"error": "A role with that name already exists in this server"})
 			return
 		}
-		h.log.Error("Failed to create role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCreateRole})
+		// hierarchyMsg is empty: CreateRole has no hierarchy check (it places the
+		// new role at MAX(position)+1 and errHierarchyDenied is unreachable here).
+		h.mapGuardError(c, err, "Cannot create a role at or above your own position", errMsgFailedCreateRole)
 		return
 	}
 
@@ -313,17 +363,24 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		return
 	}
 
-	rolePosition, err := h.validateRoleModifiable(c, roleID, serverID)
-	if err != nil {
+	// Cheap pre-check only: rejects a missing or managed role without paying
+	// PrepareCapture's O(#senders) cost on the common denial. NOT authoritative —
+	// the position it returns is deliberately discarded, because the guard inside
+	// the write transaction re-reads it under FOR SHARE (#2721).
+	if _, err := h.validateRoleModifiable(c, roleID, serverID); err != nil {
 		return // Response already written
 	}
 
-	isOwner, err := h.checkRoleOwnerAndHierarchy(c, serverID, userID, rolePosition)
-	if err != nil {
-		return // Response already written
+	guardMode, guardRequested := confersNothing, int64(0)
+	if req.Permissions != nil {
+		guardMode, guardRequested = confersRequested, *req.Permissions
 	}
 
-	if h.checkPermissionEscalation(c, serverID, userID, isOwner, req.Permissions, errMsgFailedUpdateRole) {
+	// Cheap, non-authoritative hierarchy denial BEFORE the transaction, so a
+	// certain 403 never pays PrepareCapture, never takes the advisory lock, and
+	// can never observe ErrPresenceCaptureLimited (#2721 red-team F1/F2/F3).
+	if preErr := h.preCheckRoleMutation(c.Request.Context(), serverID, userID, roleID, guardMode, guardRequested); preErr != nil {
+		h.mapGuardError(c, preErr, "Cannot modify a role at or above your own position", errMsgFailedUpdateRole)
 		return
 	}
 
@@ -346,6 +403,21 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 	// member's visibility).
 	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, nil,
 		func(ctx context.Context, tx *sql.Tx) error {
+			if lockErr := applyGuardLockTimeout(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+			// Authoritative guard: same transaction, same snapshot, one row lock.
+			// Must stay BELOW capturePresenceVisibility (run by withAuthorityCapture
+			// before this closure) — capture is the exact pre-write audience (#2445).
+			res, guardErr := h.authorizeRoleMutationTx(
+				ctx, tx, serverID, userID, roleID, guardMode, guardRequested,
+			)
+			if guardErr != nil {
+				return guardErr
+			}
+			if flagErr := rejectRoleFlags(res, "Cannot modify managed roles", ""); flagErr != nil {
+				return flagErr
+			}
 			return tx.QueryRowContext(ctx, query, args...).Scan(
 				&role.ID, &role.ServerID, &role.Name, &role.Color, &role.Emoji,
 				&role.Position, &role.Permissions, &role.IsDefault, &role.IsManaged,
@@ -353,13 +425,8 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 			)
 		},
 	)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to update role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
+	if h.mapGuardError(c, err,
+		"Cannot modify a role at or above your own position", errMsgFailedUpdateRole) {
 		return
 	}
 
@@ -380,7 +447,7 @@ func (h *Handler) validateRoleModifiable(c *gin.Context, roleID, serverID string
 	var isManaged bool
 	var rolePosition int
 	err := h.db.QueryRow(`SELECT is_managed, position FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID).Scan(&isManaged, &rolePosition)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
 		return 0, err
 	}
@@ -394,76 +461,6 @@ func (h *Handler) validateRoleModifiable(c *gin.Context, roleID, serverID string
 		return 0, fmt.Errorf("managed role")
 	}
 	return rolePosition, nil
-}
-
-// checkRoleOwnerAndHierarchy checks if the user is the owner (bypasses hierarchy) and enforces
-// role hierarchy for non-owners. Returns (isOwner, error). Error means response was written.
-func (h *Handler) checkRoleOwnerAndHierarchy(c *gin.Context, serverID, userID string, rolePosition int) (bool, error) {
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
-		return false, err
-	}
-	if ownerID == userID {
-		return true, nil
-	}
-
-	var actorMaxPosition int
-	if err := h.db.QueryRow(
-		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
-		serverID, userID,
-	).Scan(&actorMaxPosition); err != nil {
-		h.log.Error(errMsgFailedGetActorPosition, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateRole})
-		return false, err
-	}
-	if rolePosition >= actorMaxPosition {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot modify a role at or above your own position"})
-		return false, fmt.Errorf("hierarchy check failed")
-	}
-	return false, nil
-}
-
-// checkPermissionEscalation verifies the actor cannot grant permissions they don't have.
-// failureMsg is the caller-specific 500 error body used when the actor's own
-// permissions cannot be resolved; the 403 body is always errMsgCannotGrantPerms.
-// Returns true if the request was blocked (response written).
-//
-// The actor's permissions are resolved CACHE-BYPASSING. Both callers of this
-// guard (UpdateRole, AssignRole) write DURABLE authority — a role bitfield or a
-// member_roles row — that outlives the 5-minute cache entry which authorized it.
-// A concurrently in-flight pre-mutation compute can repopulate that entry after
-// a demotion invalidated it, so a cached read would let a just-demoted actor
-// mint a permanent grant. That is the exact race
-// ResolveEffectivePermissionsFresh exists for; the cost is one DB round-trip on
-// endpoints already rate-limited to 5/min. Do NOT switch this back to
-// GetEffectivePermissions for symmetry with the ephemeral HasPermission checks —
-// their staleness expires with the cache entry, this one does not.
-//
-// PermAdministrator is deliberately NOT exempted here. UpsertChannelOverride and
-// UpsertCategoryOverride do exempt it, so a holder of that bit alone is refused a
-// role carrying bits they do not literally hold while being allowed the
-// equivalent channel override. That asymmetry is accepted: it fails CLOSED (it
-// over-blocks, never over-grants), and adding a bypass to an escalation guard to
-// buy symmetry would weaken the control. The containment that actually keeps bit
-// 62 out of a server is CreateRole having no owner bypass — an owner's effective
-// set is OwnerPermissions, which excludes it — not this omission.
-func (h *Handler) checkPermissionEscalation(c *gin.Context, serverID, userID string, isOwner bool, permissions *int64, failureMsg string) bool {
-	if isOwner || permissions == nil {
-		return false
-	}
-	actorPerms, permErr := h.resolver.ResolveEffectivePermissionsFresh(c.Request.Context(), serverID, userID, "")
-	if permErr != nil {
-		h.log.Error(errMsgFailedGetActorPerms, "error", permErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": failureMsg})
-		return true
-	}
-	if Permission(*permissions)&^actorPerms != 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgCannotGrantPerms})
-		return true
-	}
-	return false
 }
 
 // buildRoleUpdateClauses builds the SET clauses and args for the role update query
@@ -563,37 +560,6 @@ func execRequiringRow(ctx context.Context, tx *sql.Tx, query string, args ...int
 	return nil
 }
 
-// authorizeRoleHierarchy enforces the actor's role-hierarchy bound: the actor may
-// only act on roles below their own highest role position. Server owners bypass
-// it. forbiddenMsg is the 403 body and failureMsg the 500 body for the calling
-// handler. Returns false once a response has been written.
-func (h *Handler) authorizeRoleHierarchy(
-	c *gin.Context, serverID, actorID string, rolePosition int, forbiddenMsg, failureMsg string,
-) bool {
-	var actorMaxPosition int
-	if err := h.db.QueryRow(
-		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
-		serverID, actorID,
-	).Scan(&actorMaxPosition); err != nil {
-		h.log.Error(errMsgFailedGetActorPosition, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": failureMsg})
-		return false
-	}
-
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": failureMsg})
-		return false
-	}
-
-	if ownerID != actorID && rolePosition >= actorMaxPosition {
-		c.JSON(http.StatusForbidden, gin.H{"error": forbiddenMsg})
-		return false
-	}
-	return true
-}
-
 // loadDeletableRole loads the role's hierarchy position after rejecting managed
 // and default roles, which cannot be deleted. Returns false once a response has
 // been written.
@@ -604,7 +570,7 @@ func (h *Handler) loadDeletableRole(c *gin.Context, roleID, serverID string) (in
 		`SELECT is_managed, is_default, position FROM roles WHERE id = $1 AND server_id = $2`,
 		roleID, serverID,
 	).Scan(&isManaged, &isDefault, &rolePosition)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
 		return 0, false
 	}
@@ -640,15 +606,14 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 		return
 	}
 
-	// Check if role is managed or default (cannot be deleted) and get position for hierarchy check
-	rolePosition, ok := h.loadDeletableRole(c, roleID, serverID)
-	if !ok {
+	// Cheap pre-check only: rejects managed/default roles without paying
+	// PrepareCapture's cost. NOT authoritative — the position it returns is
+	// deliberately discarded; the in-transaction guard re-reads it (#2721).
+	if _, ok := h.loadDeletableRole(c, roleID, serverID); !ok {
 		return
 	}
-
-	// Hierarchy check: actor can only delete roles below their highest role position
-	if !h.authorizeRoleHierarchy(c, serverID, userID, rolePosition,
-		"Cannot delete a role at or above your own position", errMsgFailedDeleteRole) {
+	if preErr := h.preCheckRoleMutation(c.Request.Context(), serverID, userID, roleID, confersNothing, 0); preErr != nil {
+		h.mapGuardError(c, preErr, "Cannot delete a role at or above your own position", errMsgFailedDeleteRole)
 		return
 	}
 
@@ -656,17 +621,26 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 	// nil channelIDs = server scope; nil onlyUserID = the full candidate set.
 	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, nil,
 		func(ctx context.Context, tx *sql.Tx) error {
+			if lockErr := applyGuardLockTimeout(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+			// confersNothing: a delete grants no bits.
+			res, guardErr := h.authorizeRoleMutationTx(
+				ctx, tx, serverID, userID, roleID, confersNothing, 0,
+			)
+			if guardErr != nil {
+				return guardErr
+			}
+			if flagErr := rejectRoleFlags(res,
+				"Cannot delete managed roles", "Cannot delete default roles"); flagErr != nil {
+				return flagErr
+			}
 			return execRequiringRow(ctx, tx,
 				`DELETE FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID)
 		},
 	)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to delete role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteRole})
+	if h.mapGuardError(c, err,
+		"Cannot delete a role at or above your own position", errMsgFailedDeleteRole) {
 		return
 	}
 
@@ -1063,56 +1037,24 @@ func (h *Handler) AssignRole(c *gin.Context) {
 		return
 	}
 
-	// Verify role exists; read its position for the hierarchy check and its
-	// permission bitfield for the escalation guard below.
-	var rolePosition int
-	var rolePermissions int64
-	err := h.db.QueryRow(
-		`SELECT position, permissions FROM roles WHERE id = $1 AND server_id = $2`,
-		req.RoleID, serverID,
-	).Scan(&rolePosition, &rolePermissions)
-	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
-		return
-	}
-	if err != nil {
-		h.log.Error(errMsgFailedQueryRole, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAssignRole})
+	// Cheap, non-authoritative hierarchy denial before the transaction, so a
+	// certain 403 never pays PrepareCapture and never takes the advisory lock
+	// (#2721 red-team F1/F2/F3).
+	if preErr := h.preCheckRoleMutation(c.Request.Context(), serverID, actorID, req.RoleID, confersTargetRole, 0); preErr != nil {
+		h.mapGuardError(c, preErr,
+			"Cannot assign a role with equal or higher position than your own", errMsgFailedAssignRole)
 		return
 	}
 
-	// Hierarchy check: actor can only assign roles with lower position than their highest role
-	var actorMaxPosition int
-	if err := h.db.QueryRow(
-		`SELECT COALESCE(MAX(r.position), 0) FROM member_roles mr INNER JOIN roles r ON mr.role_id = r.id WHERE mr.server_id = $1 AND mr.user_id = $2`,
-		serverID, actorID,
-	).Scan(&actorMaxPosition); err != nil {
-		h.log.Error(errMsgFailedGetActorPosition, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAssignRole})
-		return
-	}
-
-	// Check if actor is server owner (owners bypass hierarchy and the escalation guard)
-	var ownerID string
-	if err := h.db.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
-		h.log.Error(errMsgFailedGetServerOwner, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAssignRole})
-		return
-	}
-	isOwner := ownerID == actorID
-
-	if !isOwner && rolePosition >= actorMaxPosition {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot assign a role with equal or higher position than your own"})
-		return
-	}
-
-	// Privilege escalation check: the assigned role's permissions must be a subset
-	// of the actor's own effective permissions (CWE-269). Position bounds WHICH
-	// roles the actor may assign; this bounds WHICH BITS they may confer. Both are
-	// required — a lower-positioned role can carry a bit the actor does not hold.
-	if h.checkPermissionEscalation(c, serverID, actorID, isOwner, &rolePermissions, errMsgFailedAssignRole) {
-		return
-	}
+	// The role's position, its permission bitfield, the actor's ceiling and the
+	// server owner are ALL read by the in-transaction guard below, in one
+	// statement under one snapshot (#2721). They were previously four separate
+	// autocommit reads whose comparison straddled four snapshots.
+	//
+	// Position bounds WHICH roles the actor may assign; the subset check bounds
+	// WHICH BITS they may confer (CWE-269). Both are required — a lower-positioned
+	// role can carry a bit the actor does not hold. Neither substitutes for the
+	// other; do not remove one as "redundant".
 
 	// Assign role
 	// nil channelIDs = server scope; the phase-2 visibility-filter input is
@@ -1120,6 +1062,18 @@ func (h *Handler) AssignRole(c *gin.Context) {
 	// inputs changed. Candidate SETS are never pruned by mutation shape.
 	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, &targetUserID,
 		func(ctx context.Context, tx *sql.Tx) error {
+			if lockErr := applyGuardLockTimeout(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+			// confersTargetRole: an assignment confers whatever the role CURRENTLY
+			// carries, so the subset check must use the bitfield the guard re-read
+			// under FOR SHARE — the same value this INSERT commits against.
+			// AssignRole rejects neither flag, matching its pre-#2721 behaviour.
+			if _, guardErr := h.authorizeRoleMutationTx(
+				ctx, tx, serverID, actorID, req.RoleID, confersTargetRole, 0,
+			); guardErr != nil {
+				return guardErr
+			}
 			_, execErr := tx.ExecContext(ctx,
 				`INSERT INTO member_roles (server_id, user_id, role_id, assigned_by)
 				 VALUES ($1, $2, $3, $4)
@@ -1129,9 +1083,9 @@ func (h *Handler) AssignRole(c *gin.Context) {
 			return execErr
 		},
 	)
-	if err != nil {
-		h.log.Error("Failed to assign role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAssignRole})
+	if h.mapGuardError(c, err,
+		"Cannot assign a role with equal or higher position than your own",
+		errMsgFailedAssignRole) {
 		return
 	}
 
@@ -1168,7 +1122,7 @@ func (h *Handler) loadUnassignableRole(c *gin.Context, roleID, serverID string) 
 	var isDefault bool
 	var rolePosition int
 	err := h.db.QueryRow(`SELECT is_default, position FROM roles WHERE id = $1 AND server_id = $2`, roleID, serverID).Scan(&isDefault, &rolePosition)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgRoleNotFound})
 		return 0, false
 	}
@@ -1204,15 +1158,15 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 		return
 	}
 
-	// Cannot unassign default roles
-	rolePosition, ok := h.loadUnassignableRole(c, roleID, serverID)
-	if !ok {
+	// Cheap pre-check only: rejects default roles without paying PrepareCapture's
+	// cost. NOT authoritative — the position it returns is deliberately discarded;
+	// the in-transaction guard re-reads it under FOR SHARE (#2721).
+	if _, ok := h.loadUnassignableRole(c, roleID, serverID); !ok {
 		return
 	}
-
-	// Hierarchy check: actor can only unassign roles with lower position than their highest role
-	if !h.authorizeRoleHierarchy(c, serverID, actorID, rolePosition,
-		"Cannot unassign a role with equal or higher position than your own", errMsgFailedUnassignRole) {
+	if preErr := h.preCheckRoleMutation(c.Request.Context(), serverID, actorID, roleID, confersNothing, 0); preErr != nil {
+		h.mapGuardError(c, preErr,
+			"Cannot unassign a role with equal or higher position than your own", errMsgFailedUnassignRole)
 		return
 	}
 
@@ -1221,19 +1175,39 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 	// bounded to the one affected user.
 	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, nil, &targetUserID,
 		func(ctx context.Context, tx *sql.Tx) error {
+			if lockErr := applyGuardLockTimeout(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+			// confersNothing: removal grants no bits AT SERVER SCOPE. The channel
+			// -scope exception (DENY subtraction makes removal a widening) is #2724
+			// and is deliberately not addressed here — see conferredMode's doc.
+			res, guardErr := h.authorizeRoleMutationTx(
+				ctx, tx, serverID, actorID, roleID, confersNothing, 0,
+			)
+			if guardErr != nil {
+				return guardErr
+			}
+			if flagErr := rejectRoleFlags(res, "", "Cannot unassign default roles"); flagErr != nil {
+				return flagErr
+			}
 			return execRequiringRow(ctx, tx,
 				`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`,
 				serverID, targetUserID, roleID,
 			)
 		},
 	)
+	// ORDER MATTERS. execRequiringRow returns a bare sql.ErrNoRows for "no such
+	// ASSIGNMENT", while a missing ROLE surfaces as errRoleGone, which does NOT
+	// wrap sql.ErrNoRows. Checking sql.ErrNoRows first therefore keeps the two
+	// 404 bodies distinct; mapGuardError alone would collapse both to "Role not
+	// found" and drift the wire contract.
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role assignment not found"})
 		return
 	}
-	if err != nil {
-		h.log.Error("Failed to unassign role", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUnassignRole})
+	if h.mapGuardError(c, err,
+		"Cannot unassign a role with equal or higher position than your own",
+		errMsgFailedUnassignRole) {
 		return
 	}
 
@@ -1353,7 +1327,7 @@ func (h *Handler) ListChannelOverrides(c *gin.Context) {
 	// Verify channel exists and get server ID for membership check
 	var serverID string
 	err := h.db.QueryRow(`SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		return
 	}
@@ -1430,7 +1404,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	// Verify channel exists and get server ID for permission check
 	var serverID string
 	err := h.db.QueryRow(`SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		return
 	}
@@ -1542,7 +1516,7 @@ func (h *Handler) DeleteChannelOverride(c *gin.Context) {
 	// Verify channel exists and get server ID for permission check
 	var serverID string
 	err := h.db.QueryRow(`SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		return
 	}
@@ -1623,7 +1597,7 @@ func (h *Handler) GetMyChannelPermissions(c *gin.Context) {
 	// Get server ID
 	var serverID string
 	err := h.db.QueryRow(`SELECT server_id FROM channels WHERE id = $1`, channelID).Scan(&serverID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		return
 	}
@@ -1694,7 +1668,7 @@ func (h *Handler) ListCategoryOverrides(c *gin.Context) {
 	}
 
 	serverID, err := h.getCategoryServerID(categoryID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgCategoryNotFound})
 		return
 	}
@@ -1769,7 +1743,7 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 	}
 
 	serverID, err := h.getCategoryServerID(categoryID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgCategoryNotFound})
 		return
 	}
@@ -1870,7 +1844,7 @@ func (h *Handler) DeleteCategoryOverride(c *gin.Context) {
 	}
 
 	serverID, err := h.getCategoryServerID(categoryID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgCategoryNotFound})
 		return
 	}
@@ -1897,7 +1871,7 @@ func (h *Handler) DeleteCategoryOverride(c *gin.Context) {
 		`SELECT target_type, target_id FROM category_permission_overrides WHERE id = $1 AND category_id = $2`,
 		overrideID, categoryID,
 	).Scan(&targetType, &targetID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Override not found"})
 		return
 	}
@@ -1956,7 +1930,7 @@ func (h *Handler) SetChannelPermissionSync(c *gin.Context) {
 	}
 
 	serverID, groupID, err := h.getChannelSyncInfo(channelID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgChannelNotFound})
 		return
 	}

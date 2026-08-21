@@ -1378,37 +1378,76 @@ func TestAssignRole_PrivilegeEscalation(t *testing.T) {
 	}
 }
 
-// TestAssignRole_ResolverError_FailsClosed covers the guard's 500 branch (#2350).
+// TestAssignRole_GuardError_FailsClosed covers the guard's 500 branch
+// (#2350, retargeted by #2721).
 //
 // Two things are asserted that nothing else in the suite reaches:
 //
 //  1. The 500 body is errMsgFailedAssignRole ("Failed to assign role"), not
 //     errMsgFailedUpdateRole. That string IS the entire reason the failureMsg
-//     parameter was added to checkPermissionEscalation — without this case the
-//     argument could be wired to the wrong constant and every other test passes.
-//  2. No member_roles row is written. The guard must fail CLOSED: a permission
-//     resolution failure denies the assignment rather than falling through.
+//     parameter exists — without this case the argument could be wired to the
+//     wrong constant and every other test still passes.
+//  2. No member_roles row is written. The guard must fail CLOSED: a guard
+//     failure denies the assignment rather than falling through.
 //
-// Reaching the branch needs error injection, because a healthy resolver never
-// errors on a valid request. testhelpers.BrokenResolver is the sanctioned seam:
-// a resolver over a closed DB, paired with the handler's own working DB so the
-// membership and role lookups still succeed and control reaches the guard.
-func TestAssignRole_ResolverError_FailsClosed(t *testing.T) {
+// WHY THE INJECTION SEAM MOVED (#2721). This test previously injected via
+// testhelpers.BrokenResolver — a *rbac.Resolver over a CLOSED database — because
+// the escalation guard called ResolveEffectivePermissionsFresh, which read
+// through the resolver's OWN db handle. #2721 moved the actor resolve inside the
+// write transaction via ResolveServerPermissionsTx, which reads through the
+// CALLER'S transaction and never touches r.db. That is the entire point of the
+// change, and it makes a closed-db resolver inert here: every read succeeds on
+// the handler's working transaction, so the old seam injected nothing and the
+// assignment completed.
+//
+// The property under test did not weaken — it strengthened. The resolve now runs
+// in the same transaction as the INSERT, so ANY guard error rolls the write back,
+// rather than relying on an early return happening before the write. Fail-closed
+// is now structural rather than control-flow.
+//
+// So the injection moves to a failure the new path can actually take: a
+// conflicting row lock on the target role, held from a second connection, makes
+// the guard's `FOR SHARE OF r` block until its `SET LOCAL lock_timeout = '3s'`
+// fires (PostgreSQL 55P03) — the guard_lock_timeout branch #2721 introduced.
+// BrokenResolver remains the right seam for the five other call sites that still
+// resolve on the pool; it is only THIS guard that stopped reading r.db.
+func TestAssignRole_GuardError_FailsClosed(t *testing.T) {
 	ts, owner, member, serverID := setupOwnerAndMember(t)
 
-	// A role the actor could legitimately assign if the resolver worked:
+	// A role the actor could legitimately assign if the guard succeeded:
 	// permissions 0 is a subset of anything, and position 2 is below the actor's 5.
 	roleID := ts.CreateTestRole(t, serverID, "failclosed_"+uuid.New().String()[:8], 2, 0)
 	grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRolesAssign))
 
+	// Hold a conflicting lock on the target role from a SEPARATE POOL — never
+	// ts.DB, which is the handler's own 5-connection pool. Borrowing one of those
+	// to hold the barrier starves the request under test, and the starvation would
+	// present as a lock-timeout flake indistinguishable from the behaviour this
+	// test asserts. openLockProbePool exists for exactly this (#2721).
+	//
+	// FOR NO KEY UPDATE conflicts with the guard's FOR SHARE, so the guard blocks
+	// and its lock_timeout fires. Rolled back by the defer, never committed, so
+	// the row itself is unchanged.
+	//
+	// COST: this test spends a hard 3s of wall clock by construction — it waits
+	// out `SET LOCAL lock_timeout = '3s'` (role_guard.go). That is the assertion,
+	// not overhead. Do not "optimise" the timeout constant to speed this up.
+	blocker, blockErr := openLockProbePool(t).Begin()
+	require.NoError(t, blockErr)
+	defer func() { _ = blocker.Rollback() }()
+	var blockedPosition int
+	require.NoError(t, blocker.QueryRow(
+		`SELECT position FROM roles WHERE id = $1 FOR NO KEY UPDATE`, roleID,
+	).Scan(&blockedPosition))
+
 	handler := rbac.NewHandler(
-		ts.DB,                                   // working DB: membership + role lookups succeed
-		logger.New("test"),                      //
-		ts.Redis,                                //
-		nil,                                     // hub: unreached, the 500 returns before any broadcast
-		testhelpers.BrokenResolver(t, ts.Redis), // closed DB => every permission resolve errors
-		rbac.NewPermissionCache(ts.Redis),       //
-		nil,                                     // audit: unreached, and nil-checked regardless
+		ts.DB,              // working DB: pre-checks and BeginTx succeed
+		logger.New("test"), //
+		ts.Redis,           //
+		nil,                // hub: unreached, the 500 returns before any broadcast
+		rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), logger.New("test")),
+		rbac.NewPermissionCache(ts.Redis), //
+		nil,                               // audit: unreached, and nil-checked regardless
 	)
 
 	gin.SetMode(gin.TestMode)
@@ -1437,7 +1476,7 @@ func TestAssignRole_ResolverError_FailsClosed(t *testing.T) {
 		`SELECT EXISTS(SELECT 1 FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3)`,
 		serverID, owner.ID, roleID,
 	).Scan(&exists))
-	assert.False(t, exists, "a resolver error must not write a member_roles row (fail closed)")
+	assert.False(t, exists, "a guard failure must not write a member_roles row (fail closed)")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
