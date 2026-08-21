@@ -42,6 +42,54 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
     useMemberStore.getState().setSelfStatus('offline');
   }
 
+  // Only NOW tear down an active voice session. The media plane is a separate
+  // socket (media.concordvoice.chat, not even proxied by the same edge), so a
+  // transient control-plane 1006 that reconnects in <1s says nothing about the
+  // health of an in-progress call — running emergencyCleanup on the FIRST
+  // disconnect event destroyed healthy joins on every blip (the 2026-08-21
+  // incident: a voice join that had already encrypted its first frame was torn
+  // down by a control-plane close that recovered 300ms later). A grace period
+  // that expires still-down is the genuine sustained outage: past this point
+  // the client may be missing key-revocation and membership events, so bounded
+  // staleness (the 15s window) is the fail-closed budget for keeping the call
+  // up. Capture the channel first so the recovery-path reconnect can rejoin.
+  // Capture the rejoin stash SYNCHRONOUSLY at preflight entry, then RETRACT it
+  // below if the cleanup that justifies it doesn't run. Two races bound the
+  // design and this is the only shape that closes both:
+  //  - Gitar (PR #2873): if the stash is set but emergencyCleanup is later
+  //    skipped (user left voice during the import window), a persisted stash
+  //    phantom-rejoins a channel they deliberately left. Closed by retracting
+  //    the stash in the skip/failure branches below.
+  //  - A stash written INSIDE the async .then() (an earlier cut) could land
+  //    AFTER a reconnect's connectionStore.reset() cleared it — orphaning a
+  //    stale value a later outage cycle would replay. Closed by writing the
+  //    stash synchronously here, before control returns to the event loop, so
+  //    any reconnect handler observes the written value and reset() clears it.
+  // The stash is live only because part 2 revived the previously dead rejoin.
+  // Cleanup keys on connectionState alone (a mid-join 'connecting' session with
+  // no channel id yet still needs teardown); only the stash needs a channel id.
+  const voiceState = useVoiceStore.getState();
+  if (voiceState.connectionState !== 'disconnected' && voiceState.activeChannelId) {
+    store.setLastVoiceChannelId(voiceState.activeChannelId);
+  }
+  if (voiceState.connectionState !== 'disconnected') {
+    import('../services/voiceService')
+      .then(({ voiceService }) => {
+        if (useVoiceStore.getState().connectionState !== 'disconnected') {
+          voiceService.emergencyCleanup();
+        } else {
+          // User left voice during the import window — teardown is a no-op, so
+          // retract the stash or the reconnect rejoins a channel they left.
+          store.setLastVoiceChannelId(null);
+        }
+      })
+      .catch(() => {
+        // Voice module never loaded — no teardown happened, so the session is
+        // still live and needs no rejoin; retract the unjustified stash.
+        store.setLastVoiceChannelId(null);
+      });
+  }
+
   // Guard the lazy import: a stale SPA chunk here previously rejected and was
   // swallowed by the caller's `.catch(console.debug)`, leaving the store stuck
   // in 'preflight' with no diagnostics and no recovery. runRecoveryModule
@@ -100,20 +148,11 @@ function handleConnectionLoss(wsService: ReturnType<typeof getWebSocketService>)
   connStore.startGracePeriod();
   wsService.setAggressiveReconnect(true);
 
-  const voiceState = useVoiceStore.getState();
-  if (voiceState.connectionState !== 'disconnected' && voiceState.activeChannelId) {
-    connStore.setLastVoiceChannelId(voiceState.activeChannelId);
-  }
-
-  import('../services/voiceService')
-    .then(({ voiceService }) => {
-      if (useVoiceStore.getState().connectionState !== 'disconnected') {
-        voiceService.emergencyCleanup();
-      }
-    })
-    .catch(() => {
-      /* voice module never loaded */
-    });
+  // Deliberately NO voice teardown here. The control-plane WS drops with 1006
+  // routinely (proxy-edge churn) and reconnects within the grace period; the
+  // media-plane session rides a separate socket and stays healthy through it.
+  // Teardown happens in runPreflightDiagnostics, only after the grace period
+  // expires with the socket still down — see the rationale there.
 
   setTimeout(() => {
     runPreflightDiagnostics(wsService).catch(console.debug);
@@ -123,7 +162,10 @@ function handleConnectionLoss(wsService: ReturnType<typeof getWebSocketService>)
 /**
  * Restores application state after the WebSocket reconnects.
  *
- * Performs recovery hydration for recovery phases, restores pending E2EE and voice state after a grace-period reconnect, and resets incomplete connection phases.
+ * Performs recovery hydration and the post-outage voice rejoin for recovery
+ * phases, restores pending E2EE state after a grace-period reconnect (voice is
+ * untouched there — it was never torn down inside the grace window), and
+ * resets incomplete connection phases.
  */
 function handleReconnected(
   wsService: ReturnType<typeof getWebSocketService>,
@@ -133,6 +175,11 @@ function handleReconnected(
   wsService.setAggressiveReconnect(false);
 
   if (phase === 'recovery_a' || phase === 'preflight') {
+    // Capture the voice stash BEFORE reset() below wipes it (reset() nulls
+    // lastVoiceChannelId). The pre-fix grace-period branch read it AFTER
+    // reset(), which made the auto-rejoin dead code — every reconnect found
+    // null and silently dropped the user from voice.
+    const lastVoiceId = useConnectionStore.getState().lastVoiceChannelId;
     // Floated intentionally — runRecoveryModule never rejects (it swallows a
     // stale-chunk import failure and triggers self-heal), so this cannot
     // surface as the Uncaught (in promise) seen in the origin-502-storm logs.
@@ -175,6 +222,18 @@ function handleReconnected(
       'clearCrashFlag'
     );
     if (e2eeService.isInitialized) validateEpochsOnReconnect().catch(() => {});
+    // Voice was torn down when the grace period expired (preflight entry), so
+    // rejoin the channel the user was in. Blips shorter than the grace period
+    // never reach preflight and keep their live media session — this fires
+    // only after a genuine sustained outage. reset() above already cleared the
+    // stash, so a second reconnect cannot double-join.
+    if (lastVoiceId) {
+      import('../services/voiceService')
+        .then(({ voiceService }) => voiceService.joinChannel(lastVoiceId))
+        .catch(() => {
+          /* voice module not available */
+        });
+    }
     return;
   }
 
@@ -186,15 +245,10 @@ function handleReconnected(
         console.debug('[WebSocket] validate_epochs failed:', err);
       });
     }
-    const lastVoiceId = useConnectionStore.getState().lastVoiceChannelId;
-    if (lastVoiceId) {
-      useConnectionStore.getState().setLastVoiceChannelId(null);
-      import('../services/voiceService')
-        .then(({ voiceService }) => voiceService.joinChannel(lastVoiceId))
-        .catch(() => {
-          /* voice module not available */
-        });
-    }
+    // No voice rejoin here: a reconnect inside the grace period never tore
+    // voice down (see handleConnectionLoss), so there is nothing to restore —
+    // the media session is still live. lastVoiceChannelId is only ever set at
+    // preflight entry, which is past this phase.
     return;
   }
 

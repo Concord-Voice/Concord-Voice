@@ -12,10 +12,12 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 69 schemas total: 67 subscriber events (handled via wsService.on) + 2
- * envelope-only events (connected, connection_ready) consumed internally
- * by wsService.handleMessage's switch — both must be in the union so that
- * the post-safeParse code accesses message.data fields without `as` casts.
+ * 70 schemas total: 67 subscriber events (handled via wsService.on) + 3
+ * envelope-only events (connected, connection_ready, heartbeat_ack) consumed
+ * internally by wsService.handleMessage — all must be in the union so that
+ * the post-safeParse code accesses message.data fields without `as` casts
+ * (heartbeat_ack has no consumer at all; it is in the union so the dispatch
+ * boundary does not count it as a wire violation).
  *
  * @see [internal]specs/2026-05-23-709-ws-discriminated-union-design.md
  * @see [internal]rules/frontend.md ("WebSocket payload validation" section)
@@ -1399,6 +1401,25 @@ export const ConnectionReadySchema = z.object({
   data: z.object({}),
 });
 
+/**
+ * `heartbeat_ack` — ENVELOPE-ONLY keepalive echo. The hub answers each client
+ * `heartbeat` (sent every 30s by websocketService.startPingInterval) with this
+ * application-level DATA frame so every proxy hop — the Cloudflare edge in
+ * particular, whose ~100s idle tracking does not reliably count WS protocol
+ * ping/pong control frames — sees origin→client traffic at the heartbeat
+ * cadence. Without it the CF leg starved during quiet periods and abruptly
+ * closed production sockets with 1006 every few minutes.
+ *
+ * No consumer: wsService.handleMessage validates it and drops it (no switch
+ * case, no subscribers). Its entire job is to exist on the wire.
+ * Server emitter: `heartbeatAckFrame` in
+ * `services/control-plane/internal/websocket/messages.go` — keep in sync.
+ */
+export const HeartbeatAckSchema = z.object({
+  type: z.literal('heartbeat_ack'),
+  data: z.object({}),
+});
+
 // ──────────── Message purge (#1352) — 3 events ───────────────────────────
 
 /**
@@ -1457,7 +1478,7 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (69 schemas: 67 subscriber + 2 envelope)
+// 4. The discriminated union (70 schemas: 67 subscriber + 3 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 export const WebSocketEventSchema = z.discriminatedUnion('type', [
@@ -1547,15 +1568,16 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   DmPurgedSchema,
   ServerPurgedSchema,
 
-  // System + envelope (5: 3 subscriber + 2 envelope-only)
+  // System + envelope (6: 3 subscriber + 3 envelope-only)
   SubscribedSchema,
   ErrorSchema,
   SessionRevokedSchema,
   ConnectedSchema,
   ConnectionReadySchema,
+  HeartbeatAckSchema,
 ]);
-// TOTAL: 69 schemas (67 subscriber + 2 envelope-only;
-// +channel_purged/dm_purged/server_purged #1352)
+// TOTAL: 70 schemas (67 subscriber + 3 envelope-only;
+// +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive)
 
 // ════════════════════════════════════════════════════════════════════════
 // 5. Derived types
@@ -1563,7 +1585,7 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
 
 export type WebSocketEvent = z.infer<typeof WebSocketEventSchema>;
 export type WSEventType = WebSocketEvent['type'];
-// Literal union: 'message' | 'message_update' | ... | 'connected' | 'connection_ready'
+// Literal union: 'message' | 'message_update' | ... | 'connection_ready' | 'heartbeat_ack'
 
 // Per-event payload aliases (used when a function takes a single payload by type)
 // Chat messages
@@ -1665,6 +1687,7 @@ export type ErrorPayload = z.infer<typeof ErrorSchema>['data'];
 export type SessionRevokedPayload = z.infer<typeof SessionRevokedSchema>['data'];
 export type ConnectedPayload = z.infer<typeof ConnectedSchema>['data'];
 export type ConnectionReadyPayload = z.infer<typeof ConnectionReadySchema>['data'];
+export type HeartbeatAckPayload = z.infer<typeof HeartbeatAckSchema>['data'];
 
 // ════════════════════════════════════════════════════════════════════════
 // 6. PII-safe issue scrubber

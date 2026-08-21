@@ -30,8 +30,9 @@ vi.mock('@/renderer/services/websocketService', () => ({
 }));
 
 const mockEmergencyCleanup = vi.fn();
+const mockJoinChannel = vi.fn().mockResolvedValue(undefined);
 vi.mock('@/renderer/services/voiceService', () => ({
-  voiceService: { emergencyCleanup: mockEmergencyCleanup, joinChannel: vi.fn() },
+  voiceService: { emergencyCleanup: mockEmergencyCleanup, joinChannel: mockJoinChannel },
 }));
 
 const mockRunPreflight = vi.fn();
@@ -105,7 +106,10 @@ describe('useConnectionRecovery — extended', () => {
       expect(mockSetAggressiveReconnect).toHaveBeenCalledWith(true);
     });
 
-    it('captures voice channel before cleanup', () => {
+    it('leaves voice untouched during the grace period (no capture, no cleanup)', async () => {
+      // A control-plane 1006 that reconnects in <1s says nothing about the
+      // health of the separate media-plane session; tearing it down on the
+      // first disconnect event destroyed healthy in-progress joins.
       useVoiceStore.setState({
         activeChannelId: 'voice-123',
         connectionState: 'connected',
@@ -114,21 +118,10 @@ describe('useConnectionRecovery — extended', () => {
       const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
 
       result.current('RECONNECTING' as never);
-
-      expect(useConnectionStore.getState().lastVoiceChannelId).toBe('voice-123');
-    });
-
-    it('does not capture voice if already disconnected', () => {
-      useVoiceStore.setState({
-        activeChannelId: null,
-        connectionState: 'disconnected',
-      });
-
-      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
-
-      result.current('RECONNECTING' as never);
+      await vi.dynamicImportSettled();
 
       expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
     });
 
     it('does not start grace if already in recovery', () => {
@@ -143,6 +136,101 @@ describe('useConnectionRecovery — extended', () => {
   });
 
   describe('grace period timeout (15 seconds)', () => {
+    it('tears down voice and captures the channel only at grace expiry', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({
+        activeChannelId: 'voice-123',
+        connectionState: 'connected',
+      });
+
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      // Still inside the grace window: untouched.
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+
+      expect(useConnectionStore.getState().lastVoiceChannelId).toBe('voice-123');
+      expect(mockEmergencyCleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('still cleans up a mid-join session (connecting, no channel id yet) at grace expiry', async () => {
+      // Between setConnectionState('connecting') and setActiveChannel there is
+      // an awaited authorize round-trip — a session can be active with no
+      // channel id. Cleanup keys on connectionState alone; only the rejoin
+      // stash needs the id.
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({
+        activeChannelId: null,
+        connectionState: 'connecting',
+      });
+
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).toHaveBeenCalledTimes(1);
+      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+    });
+
+    it('retracts the stash and skips cleanup if voice ends during the import window (Gitar #2873)', async () => {
+      // The stash is captured synchronously at preflight entry, then RETRACTED
+      // if the cleanup that justifies it is skipped. Fire the 15s preflight timer
+      // synchronously (dispatches the voice-service import but does NOT flush its
+      // microtask, so the guarded .then() is still pending), then have the user
+      // leave voice, then flush the import. Cleanup is correctly skipped (they
+      // left) and the stash must end up null — otherwise the reconnect would
+      // phantom-rejoin a channel the user deliberately left.
+      mockGetState.mockReturnValue('DISCONNECTED');
+      useVoiceStore.setState({ activeChannelId: 'voice-123', connectionState: 'connected' });
+
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      vi.advanceTimersByTime(15_000); // sync: preflight fires, stash set, import dispatched, .then() pending
+      useVoiceStore.setState({ activeChannelId: null, connectionState: 'disconnected' }); // user leaves
+      await vi.dynamicImportSettled(); // flush import → guarded .then() re-checks + retracts
+
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
+      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+    });
+
+    it('does not touch voice at grace expiry when no session is active', async () => {
+      mockGetState.mockReturnValue('DISCONNECTED');
+
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+
+      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
+    });
+
+    it('never tears down voice when the socket reconnects within the grace period', async () => {
+      mockGetState.mockReturnValue('CONNECTED');
+      useVoiceStore.setState({
+        activeChannelId: 'voice-123',
+        connectionState: 'connected',
+      });
+
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('RECONNECTING' as never);
+      result.current('CONNECTED' as never);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.dynamicImportSettled();
+
+      expect(mockEmergencyCleanup).not.toHaveBeenCalled();
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+      expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
+    });
+
     it('enters preflight after 15s if still disconnected', async () => {
       mockGetState.mockReturnValue('DISCONNECTED');
 
@@ -292,20 +380,34 @@ describe('useConnectionRecovery — extended', () => {
       expect(validateEpochs).toHaveBeenCalled();
     });
 
-    it('rejoins voice channel if was in one before disconnect', () => {
+    it('does not rejoin voice on a grace reconnect — the session was never torn down', async () => {
       useConnectionStore.getState().startGracePeriod();
+
+      const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
+
+      result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
+
+      expect(mockJoinChannel).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('CONNECTED during recovery_a', () => {
+    it('rejoins the voice channel captured at grace expiry', async () => {
+      // Sustained outage: preflight tore voice down and stashed the channel;
+      // the recovery reconnect restores it. (Short blips never set the stash.)
+      useConnectionStore.getState().enterRecoveryA();
       useConnectionStore.getState().setLastVoiceChannelId('voice-123');
 
       const { result } = renderHook(() => useConnectionRecovery(mockWsService as never, vi.fn()));
 
       result.current('CONNECTED' as never);
+      await vi.dynamicImportSettled();
 
-      // lastVoiceChannelId should be cleared
+      expect(mockJoinChannel).toHaveBeenCalledWith('voice-123');
       expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
     });
-  });
 
-  describe('CONNECTED during recovery_a', () => {
     it('performs recovery reset and fetches user', async () => {
       useConnectionStore.getState().enterRecoveryA();
 

@@ -856,6 +856,19 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(true);
   });
 
+  it('WebSocketEventSchema accepts the server heartbeat_ack keepalive echo', () => {
+    // Exact frame the hub emits (heartbeatAckFrame in
+    // services/control-plane/internal/websocket/messages.go). Must parse
+    // cleanly — a rejection would count every 30s ack as a wire violation.
+    const result = WebSocketEventSchema.safeParse(JSON.parse('{"type":"heartbeat_ack","data":{}}'));
+    expect(result.success).toBe(true);
+  });
+
+  it('heartbeat_ack rejects a missing data envelope', () => {
+    const result = WebSocketEventSchema.safeParse({ type: 'heartbeat_ack' });
+    expect(result.success).toBe(false);
+  });
+
   // ──────────── Message purge (#1352) (3) ──────────────────────────────
 
   it('ChannelPurgedSchema accepts a canonical channel_purged envelope', () => {

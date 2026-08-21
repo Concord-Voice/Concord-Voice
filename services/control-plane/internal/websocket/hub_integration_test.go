@@ -1462,6 +1462,57 @@ func TestHandleHeartbeatRecoversLocallyHiddenOfflineAfterRedisRecovers(t *testin
 	assert.Greater(t, redisClient.TTL(ctx, key).Val(), 100*time.Second)
 }
 
+// Regression for the production 1006 churn: every client heartbeat must be
+// answered with an application-level heartbeat_ack DATA frame. The hub's WS
+// protocol pings do not reliably count as activity across the Cloudflare
+// edge's ~100s idle tracking, so without this echo the CF→client leg starves
+// and the edge abruptly closes the socket (client sees close code 1006).
+func TestHandlePresenceIncomingHeartbeatSendsAck(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+	// Seed a persisted status so handleHeartbeat takes the quiet TTL-refresh
+	// path and the ack is deterministically the only frame on client.Send.
+	ctx := context.Background()
+	require.NoError(t, redisClient.Set(ctx, presence.StatusRedisKey(userID), statusOnline, 120*time.Second).Err())
+
+	hub.handlePresenceIncoming(IncomingMessage{Type: "heartbeat", UserID: userID, ClientID: client.ID})
+
+	message := readClientMsg(t, client)
+	assert.Equal(t, "heartbeat_ack", message["type"])
+	assert.Equal(t, map[string]interface{}{}, message["data"])
+}
+
+// The ack must never block the hub loop or wedge a slow consumer further: a
+// full send buffer drops the ack silently (real traffic is already flowing,
+// which serves the keepalive purpose the ack exists for).
+func TestHandlePresenceIncomingHeartbeatAckDropsOnFullBuffer(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+
+	userID := uuid.New()
+	client := newTestClient(hub, userID)
+	hub.clients[client.ID] = client
+	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+
+	ctx := context.Background()
+	require.NoError(t, redisClient.Set(ctx, presence.StatusRedisKey(userID), statusOnline, 120*time.Second).Err())
+
+	for i := 0; i < cap(client.Send); i++ {
+		client.Send <- []byte(`{"type":"filler","data":{}}`)
+	}
+
+	// Must return without blocking and without displacing queued frames.
+	hub.handlePresenceIncoming(IncomingMessage{Type: "heartbeat", UserID: userID, ClientID: client.ID})
+
+	assert.Len(t, client.Send, cap(client.Send))
+}
+
 func TestHandleHeartbeatRepairsInvisibleWhenRedisHasStaleVisibleStatus(t *testing.T) {
 	tests := []struct {
 		name       string

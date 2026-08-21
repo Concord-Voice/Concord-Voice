@@ -48,7 +48,7 @@ vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
 }));
 
 vi.mock('@/renderer/services/voiceService', () => ({
-  voiceService: { emergencyCleanup: vi.fn() },
+  voiceService: { emergencyCleanup: vi.fn(), joinChannel: vi.fn().mockResolvedValue(undefined) },
 }));
 
 vi.mock('@/renderer/services/recoveryService', () => ({
@@ -71,6 +71,7 @@ import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
 import { gracefulReset, recoveryReset } from '@/renderer/services/resetService';
 import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
 import { useUserStore } from '@/renderer/stores/userStore';
+import { voiceService } from '@/renderer/services/voiceService';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -99,7 +100,10 @@ describe('useConnectionRecovery', () => {
     expect(mockSetAggressiveReconnect).toHaveBeenCalledWith(true);
   });
 
-  it('captures voice channel ID before cleanup', () => {
+  it('leaves an active voice session untouched on a transient disconnect', async () => {
+    // A 1006 blip that reconnects within the grace period must not tear down
+    // the (independent, still-healthy) media-plane session. Capture + cleanup
+    // moved to grace expiry — see the extended suite for the expiry path.
     useVoiceStore.setState({
       activeChannelId: 'voice-123',
       connectionState: 'connected',
@@ -110,8 +114,10 @@ describe('useConnectionRecovery', () => {
     );
 
     result.current('RECONNECTING' as never);
+    await vi.dynamicImportSettled();
 
-    expect(useConnectionStore.getState().lastVoiceChannelId).toBe('voice-123');
+    expect(voiceService.emergencyCleanup).not.toHaveBeenCalled();
+    expect(useConnectionStore.getState().lastVoiceChannelId).toBeNull();
   });
 
   it('does not start grace period if already in recovery', () => {

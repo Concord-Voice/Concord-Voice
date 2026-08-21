@@ -57,7 +57,15 @@ WebSocket connections use **ticket-based authentication**:
 4. **Confirmation** - Server sends `connected` message with client/user IDs
 5. **Subscribe** - Client subscribes to channels
 6. **Messaging** - Bidirectional message exchange
-7. **Heartbeat** - Automatic ping/pong every 54 seconds
+7. **Heartbeat** - Two layers, both required:
+   - WS protocol ping/pong every 54 seconds (dead-connection detection via the
+     60s read deadline).
+   - Application-level `heartbeat` (client, every 30s) answered with a
+     `heartbeat_ack` DATA frame (server). The ack exists because the
+     Cloudflare edge in front of `api.concordvoice.chat` does not reliably
+     count protocol control frames against its ~100s idle tracking — without
+     origin→client *data* traffic, quiet connections were abruptly closed
+     (client-observed close code 1006) every few minutes.
 8. **Disconnect** - Client closes connection or timeout
 9. **Unregister** - Client removed from Hub and all subscriptions
 
@@ -108,7 +116,27 @@ WebSocket connections use **ticket-based authentication**:
 }
 ```
 
+#### Heartbeat (presence TTL refresh + keepalive)
+```json
+{
+  "type": "heartbeat",
+  "data": {}
+}
+```
+
 ### Server -> Client (Outgoing)
+
+#### Heartbeat Ack (keepalive echo)
+```json
+{
+  "type": "heartbeat_ack",
+  "data": {}
+}
+```
+Constant frame (`heartbeatAckFrame` in `messages.go`) echoed for every client
+`heartbeat` so proxies see origin→client application traffic at the 30s
+heartbeat cadence — see Connection Lifecycle step 7. Keep in sync with
+`HeartbeatAckSchema` in `client/desktop/src/renderer/types/ws-events.ts`.
 
 #### Connection Confirmation
 ```json
@@ -204,12 +232,27 @@ No server-side version negotiation required.
 
 ## Heartbeat Mechanism
 
+Two independent layers (see Connection Lifecycle step 7):
+
+**1. WS protocol ping/pong** — dead-connection detection.
+
 - **Ping Interval**: 54 seconds (9/10 of pong timeout)
 - **Pong Timeout**: 60 seconds
 - **Read Timeout**: Updated on each pong received
 - **Write Timeout**: 10 seconds per message
 
 If a client fails to respond to a ping within 60 seconds, the hub closes the connection.
+
+**2. Application-level `heartbeat` / `heartbeat_ack`** — proxy keepalive.
+
+The client sends a `heartbeat` DATA frame every 30 seconds (it also refreshes
+Redis presence TTL); the hub answers each one with a constant `heartbeat_ack`
+DATA frame (`heartbeatAckFrame`). This layer exists because the Cloudflare edge
+in front of `api.concordvoice.chat` does not reliably count WS protocol control
+frames against its ~100s idle tracking — without origin→client *data* traffic,
+quiet connections were abruptly closed (client-observed close code 1006) every
+few minutes. The `heartbeat_ack` guarantees origin→client application traffic at
+the 30s heartbeat cadence, well under the idle threshold.
 
 ## Configuration
 

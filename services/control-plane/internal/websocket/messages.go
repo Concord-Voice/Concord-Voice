@@ -28,6 +28,17 @@ type OutgoingMessage struct {
 	Data map[string]interface{} `json:"data"`
 }
 
+// heartbeatAckFrame is the constant reply to a client "heartbeat" frame. It is
+// an application-level DATA frame — not a WS ping/pong control frame — because
+// the Cloudflare edge in front of api.concordvoice.chat does not reliably count
+// protocol control frames against its ~100s idle tracking. The hub's 54s
+// protocol pings kept the origin leg alive while the CF→client leg starved,
+// closing production sockets with 1006 every few minutes. Echoing the client's
+// 30s heartbeat as data guarantees origin→client application traffic on every
+// hop at well under the idle threshold. Keep the shape in sync with
+// HeartbeatAckSchema in client/desktop/src/renderer/types/ws-events.ts.
+var heartbeatAckFrame = []byte(`{"type":"heartbeat_ack","data":{}}`)
+
 // BroadcastMessage represents a message to be broadcast to channel subscribers
 type BroadcastMessage struct {
 	// Target channel ID

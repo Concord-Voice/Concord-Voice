@@ -1165,6 +1165,17 @@ func (h *Hub) handlePresenceIncoming(msg IncomingMessage) {
 	}
 	if msg.Type == "heartbeat" {
 		h.handleHeartbeat(msg)
+		// Answer with an application-level DATA frame so the Cloudflare-proxied
+		// path sees origin→client traffic at the client's 30s heartbeat cadence
+		// (see heartbeatAckFrame in messages.go for the 1006-churn rationale).
+		// enqueueOutboundBootstrapSafe is the right primitive: the ack is
+		// loss-tolerable (the next heartbeat re-earns it 30s later) and must
+		// never inflate a reconnect replacement's bootstrap buffer — and during
+		// a bootstrap window the replacement's own snapshot flush already
+		// provides the origin→client traffic the ack exists to create, so the
+		// snapshot subsumes the ack's entire function. Drop-on-full is likewise
+		// fine: a full send buffer means real traffic is already flowing.
+		_ = client.enqueueOutboundBootstrapSafe(heartbeatAckFrame)
 		return
 	}
 	h.handleSetStatus(msg)
