@@ -23,7 +23,7 @@ export function makeGuardedLookup(deps: {
 }): net.LookupFunction {
   const resolver = deps.resolver ?? dns.lookup;
   return ((hostname, opts, cb) => {
-    resolver(hostname, { ...(opts as object), all: true } as never, (err, addrs) => {
+    resolver(hostname, { ...(opts as object), all: true }, (err, addrs) => {
       if (err) return cb(err, '', 0); // fail closed
       const list = (Array.isArray(addrs) ? addrs : []) as { address: string; family: number }[];
       if (list.length === 0) {
@@ -208,7 +208,7 @@ export async function resolveForDisplay(
     return { ok: true, address: bare, addresses: [bare], decision };
   }
   const lookup = new Promise<ResolveForDisplayResult>((resolve) => {
-    resolver(host, { all: true } as never, (err, addrs) => {
+    resolver(host, { all: true }, (err, addrs) => {
       const list = (Array.isArray(addrs) ? addrs : []) as { address: string }[];
       if (err || list.length === 0) return resolve({ ok: false, kind: 'unreachable' });
       const decisions = list.map((a) => classifyAddress(a.address));

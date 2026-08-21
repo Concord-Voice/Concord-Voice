@@ -176,20 +176,17 @@ const ServerInput: React.FC<ServerInputProps> = ({ onConnect, onBack }) => {
       setTimeout(
         () => setState((s) => (s.k === 'probing' ? { k: 'probing-visible' } : s)),
         PROBING_VISIBLE_MS
-      )
-    );
-    timersRef.current.push(
+      ),
       setTimeout(
         () => setState((s) => (s.k === 'probing-visible' ? { k: 'approval-pending' } : s)),
         APPROVAL_PENDING_MS
-      )
-    );
-    // Only `approval-pending` can be current at 4000ms: all three timers arm in the same
-    // tick, the 3000ms one moves probing-visible on unconditionally, nothing else can
-    // transition while busy (input readOnly, both buttons guarded, Enter gated on !busy),
-    // and a settled probe clears the timers. A `probing-visible` arm here would be a
-    // permanently-uncovered branch implying a transition the machine does not have.
-    timersRef.current.push(
+      ),
+      // Only `approval-pending` can be current at 4000ms: all three timers arm in the same
+      // tick (one push, arguments evaluated left to right), the 3000ms one moves
+      // probing-visible on unconditionally, nothing else can transition while busy (input
+      // readOnly, both buttons guarded, Enter gated on !busy), and a settled probe clears
+      // the timers. A `probing-visible` arm here would be a permanently-uncovered branch
+      // implying a transition the machine does not have.
       setTimeout(
         () => setState((s) => (s.k === 'approval-pending' ? { k: 'probing-slow' } : s)),
         PROBING_SLOW_MS

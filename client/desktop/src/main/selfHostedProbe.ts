@@ -44,7 +44,7 @@ const MAX_HOSTNAME_LENGTH = 253;
 // pass-through into the renderer. Inert while the renderer reads only `apiBase`, but the
 // pass-through exists to be extended, and the first `Object.assign({}, clientConfig)`
 // downstream is CWE-1321. Strip at the boundary that owns the bound.
-const FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'];
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function boundedObject(value: unknown): Record<string, unknown> | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
@@ -53,7 +53,7 @@ function boundedObject(value: unknown): Record<string, unknown> | null {
   if (keys.length > MAX_JSON_KEYS) return null;
   const safe: Record<string, unknown> = {};
   for (const key of keys) {
-    if (FORBIDDEN_KEYS.includes(key)) continue;
+    if (FORBIDDEN_KEYS.has(key)) continue;
     safe[key] = obj[key];
   }
   return safe;

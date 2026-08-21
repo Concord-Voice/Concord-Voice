@@ -397,7 +397,7 @@ function emitDeepLink(entry: PendingDeepLink): boolean {
   if (gate.timer !== null || waited < DEEP_LINK_EMIT_WINDOW_MS) {
     // Collapse only an immediate repeat — of the code showing now, or of the one
     // already queued last. A DIFFERENT code always takes its own slot.
-    const previous = gate.held.length > 0 ? gate.held[gate.held.length - 1] : gate.lastCode;
+    const previous = gate.held.length > 0 ? gate.held.at(-1) : gate.lastCode;
     if (entry.code !== previous) {
       if (gate.held.length >= DEEP_LINK_HELD_MAX) {
         // Oldest out, and never silently: kind and reason only, never the code —
@@ -1488,19 +1488,21 @@ export function buildApprovalDialogCopy(p: ApprovalDialogParams): {
   return { message, detail };
 }
 
+const defaultShowMessageBox = (w: unknown, o: unknown): Promise<{ response: number }> =>
+  w
+    ? dialog.showMessageBox(w as BrowserWindow, o as Electron.MessageBoxOptions)
+    : dialog.showMessageBox(o as Electron.MessageBoxOptions);
+
 /** Exported for unit test. showMessageBox is injected (the applicationsFolderGate pattern). */
 export async function requestSelfHostedApproval(
   win: unknown,
   p: ApprovalDialogParams,
-  deps: { showMessageBox: (w: unknown, o: unknown) => Promise<{ response: number }> } = {
-    showMessageBox: (w, o) =>
-      w
-        ? dialog.showMessageBox(w as BrowserWindow, o as Electron.MessageBoxOptions)
-        : dialog.showMessageBox(o as Electron.MessageBoxOptions),
-  }
+  {
+    showMessageBox = defaultShowMessageBox,
+  }: { showMessageBox?: (w: unknown, o: unknown) => Promise<{ response: number }> } = {}
 ): Promise<boolean> {
   const { message, detail } = buildApprovalDialogCopy(p);
-  const { response } = await deps.showMessageBox(win, {
+  const { response } = await showMessageBox(win, {
     type: 'warning',
     title: 'Concord Voice',
     message,

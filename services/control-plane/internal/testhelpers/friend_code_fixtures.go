@@ -60,18 +60,14 @@ func (ts *TestServer) SeedFriendCode(t *testing.T, seed FriendCodeSeed) SeededFr
 		t.Fatalf("testhelpers: failed to generate friend code: %v", err)
 	}
 
-	expiresAt := "NULL"
-	if seed.Expired {
-		expiresAt = "NOW() - INTERVAL '1 hour'"
-	}
-
-	// expiresAt is one of two package-private literals, never caller input, so
-	// this interpolation cannot carry untrusted data. Every value that can is
-	// bound as a parameter.
+	// expires_at is chosen in SQL from a bound boolean rather than string-built, so
+	// the statement is fully static. NOW() stays server-side, keeping the fixture on
+	// the database clock exactly as before.
 	if _, err := ts.DB.Exec(
 		`INSERT INTO friend_codes (user_id, code, max_uses, use_count, is_revoked, expires_at)
-		 VALUES ($1, $2, $3, $4, $5, `+expiresAt+`)`,
-		owner.ID, code, seed.MaxUses, seed.UseCount, seed.Revoked,
+		 VALUES ($1, $2, $3, $4, $5,
+		         CASE WHEN $6::boolean THEN NOW() - INTERVAL '1 hour' ELSE NULL END)`,
+		owner.ID, code, seed.MaxUses, seed.UseCount, seed.Revoked, seed.Expired,
 	); err != nil {
 		t.Fatalf("testhelpers: failed to seed friend code: %v", err)
 	}

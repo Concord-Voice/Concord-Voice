@@ -21,7 +21,7 @@ RUN npm run build && test -f dist/index.html
 # encoding/asn1 and net/url), deterministically, not reliant on Docker Hub
 # tag-float + a GOTOOLCHAIN build-time download. Keep in lockstep with
 # services/control-plane/go.mod's `go` directive.
-FROM golang:1.26.6-alpine AS builder
+FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS builder
 
 WORKDIR /app
 
@@ -41,7 +41,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o migrate-media ./c
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mfa-rekey ./cmd/mfa-rekey
 
 # Final stage. Tracks the supported Alpine line -- 3.21 reaches EOL 2026-11-01.
-FROM alpine:3.24
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 LABEL org.opencontainers.image.source="https://github.com/Concord-Voice/Concord-Voice-Alpha"
 LABEL org.opencontainers.image.description="Concord Voice control-plane service"
