@@ -52,9 +52,9 @@ const mockRole: Role = {
   position: 1,
   permissions: '3',
   is_default: false,
+  is_managed: false,
   display_separately: false,
   mentionable: false,
-  require_mfa: false,
   emoji: '',
   created_at: '2025-01-01T00:00:00Z',
   updated_at: '2025-01-01T00:00:00Z',
@@ -66,6 +66,7 @@ const defaultRole: Role = {
   name: '@everyone',
   position: 0,
   is_default: true,
+  is_managed: true,
   color: '#99aab5',
 };
 

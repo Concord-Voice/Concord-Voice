@@ -12,12 +12,17 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 70 schemas total: 67 subscriber events (handled via wsService.on) + 3
+ * 76 schemas total: 73 subscriber events (handled via wsService.on) + 3
  * envelope-only events (connected, connection_ready, heartbeat_ack) consumed
  * internally by wsService.handleMessage — all must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts
  * (heartbeat_ack has no consumer at all; it is in the union so the dispatch
  * boundary does not count it as a wire violation).
+ *
+ * A schema with no registered handler is deliberate, not an oversight: five of
+ * the six server-role events (#2359) are validated here purely so the dispatch
+ * boundary stops counting them as wire violations, and fall through to any
+ * `wsService.on()` subscriber.
  *
  * @see [internal]specs/2026-05-23-709-ws-discriminated-union-design.md
  * @see [internal]rules/frontend.md ("WebSocket payload validation" section)
@@ -240,6 +245,31 @@ const ChannelReorderEntrySchema = z.object({
   channel_id: UUID,
   group_id: UUID.nullable(),
   position: z.number(),
+});
+
+/**
+ * Wire shape for a Role in role_created / role_updated. Mirrors the `Role` DTO
+ * at `services/control-plane/internal/rbac/handlers.go:95-109`.
+ *
+ * `permissions` is a STRING on the wire, not a number — the Go field is an
+ * int64 carrying the `permissions,string` json tag, because the bitfield runs
+ * past Number.MAX_SAFE_INTEGER. `color` and `emoji` are `*string` with
+ * `omitempty`, so they are OMITTED when unset, never null.
+ */
+const RolePayloadSchema = z.object({
+  id: UUID,
+  server_id: UUID,
+  name: z.string(),
+  color: z.string().optional(),
+  emoji: z.string().optional(),
+  position: z.number(),
+  permissions: z.string(),
+  is_default: z.boolean(),
+  is_managed: z.boolean(),
+  mentionable: z.boolean(),
+  display_separately: z.boolean(),
+  created_at: ISOTimestamp,
+  updated_at: ISOTimestamp,
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1184,6 +1214,98 @@ export const UnreadNotifySchema = z.object({
   }),
 });
 
+// ──────────── Server roles (6 events) — #2359 ─────────────────────────
+//
+// All six are emitted by `services/control-plane/internal/rbac/handlers.go`.
+// Only `roles_reordered` has a renderer handler; the other five are declared
+// here so the dispatch boundary RECOGNISES them. A valid-but-unhandled event
+// falls harmlessly through to `wsService.on()` subscribers, whereas an
+// unrecognised one increments `wireViolationCount` — so before these schemas
+// existed, every role mutation corrupted the connection-quality signal on
+// every connected member's client.
+
+/**
+ * `role_created` — new server role, carrying the full role DTO.
+ * Server emitter: `services/control-plane/internal/rbac/handlers.go:334`.
+ */
+export const RoleCreatedSchema = z.object({
+  type: z.literal('role_created'),
+  data: z.object({
+    server_id: UUID,
+    role: RolePayloadSchema,
+  }),
+});
+
+/**
+ * `role_updated` — role metadata edited. Carries `role_id` AND the full role
+ * DTO whose `id` is that same value; the redundancy is the server's shape.
+ * Server emitter: `services/control-plane/internal/rbac/handlers.go:536`
+ * (`broadcastRoleUpdated`).
+ */
+export const RoleUpdatedSchema = z.object({
+  type: z.literal('role_updated'),
+  data: z.object({
+    server_id: UUID,
+    role_id: UUID,
+    role: RolePayloadSchema,
+  }),
+});
+
+/**
+ * `role_deleted` — role removed from the server.
+ * Server emitter: `services/control-plane/internal/rbac/handlers.go:661`.
+ */
+export const RoleDeletedSchema = z.object({
+  type: z.literal('role_deleted'),
+  data: z.object({
+    server_id: UUID,
+    role_id: UUID,
+  }),
+});
+
+/**
+ * `roles_reordered` — role hierarchy positions rewritten.
+ *
+ * Unlike `channels_reordered`, this payload carries NO positions and is NOT the
+ * full role list: `role_ids` is the client-supplied ordering the server just
+ * applied (`ReorderRolesRequest.RoleIDs`). The resulting positions therefore
+ * cannot be derived from the event — the handler refetches instead.
+ * Server emitter: `services/control-plane/internal/rbac/handlers.go:898`.
+ */
+export const RolesReorderedSchema = z.object({
+  type: z.literal('roles_reordered'),
+  data: z.object({
+    server_id: UUID,
+    role_ids: z.array(UUID),
+  }),
+});
+
+/**
+ * `role_assigned` — role granted to a member.
+ * Server emitter: `services/control-plane/internal/rbac/handlers.go:1107`.
+ */
+export const RoleAssignedSchema = z.object({
+  type: z.literal('role_assigned'),
+  data: z.object({
+    server_id: UUID,
+    user_id: UUID,
+    role_id: UUID,
+  }),
+});
+
+/**
+ * `role_unassigned` — role revoked from a member.
+ * Server emitter: `services/control-plane/internal/rbac/handlers.go:1229`.
+ */
+export const RoleUnassignedSchema = z.object({
+  type: z.literal('role_unassigned'),
+  data: z.object({
+    server_id: UUID,
+    user_id: UUID,
+    role_id: UUID,
+  }),
+});
+
 // ──────────── E2EE (3 events) — Task A9 (security-verified) ───────────
 
 /**
@@ -1478,7 +1600,7 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (70 schemas: 67 subscriber + 3 envelope)
+// 4. The discriminated union (76 schemas: 73 subscriber + 3 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 export const WebSocketEventSchema = z.discriminatedUnion('type', [
@@ -1549,6 +1671,14 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ChannelsReorderedSchema,
   UnreadNotifySchema,
 
+  // Server roles (#2359) (6 — only roles_reordered has a handler)
+  RoleCreatedSchema,
+  RoleUpdatedSchema,
+  RoleDeletedSchema,
+  RolesReorderedSchema,
+  RoleAssignedSchema,
+  RoleUnassignedSchema,
+
   // E2EE (3)
   KeyNeededSchema,
   KeyRevocationSchema,
@@ -1576,8 +1706,11 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ConnectionReadySchema,
   HeartbeatAckSchema,
 ]);
-// TOTAL: 70 schemas (67 subscriber + 3 envelope-only;
-// +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive)
+// TOTAL: 76 schemas (73 subscriber + 3 envelope-only;
+// +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive;
+// +6 server-role events #2359).
+// The count is asserted in tests/unit/types/ws-events.test.ts so an addition
+// cannot silently drift the number quoted in [internal]rules/frontend.md.
 
 // ════════════════════════════════════════════════════════════════════════
 // 5. Derived types
@@ -1657,6 +1790,14 @@ export type ChannelGroupUpdatedPayload = z.infer<typeof ChannelGroupUpdatedSchem
 export type ChannelGroupDeletedPayload = z.infer<typeof ChannelGroupDeletedSchema>['data'];
 export type ChannelsReorderedPayload = z.infer<typeof ChannelsReorderedSchema>['data'];
 export type UnreadNotifyPayload = z.infer<typeof UnreadNotifySchema>['data'];
+
+// Server roles (#2359)
+export type RoleCreatedPayload = z.infer<typeof RoleCreatedSchema>['data'];
+export type RoleUpdatedPayload = z.infer<typeof RoleUpdatedSchema>['data'];
+export type RoleDeletedPayload = z.infer<typeof RoleDeletedSchema>['data'];
+export type RolesReorderedPayload = z.infer<typeof RolesReorderedSchema>['data'];
+export type RoleAssignedPayload = z.infer<typeof RoleAssignedSchema>['data'];
+export type RoleUnassignedPayload = z.infer<typeof RoleUnassignedSchema>['data'];
 
 // E2EE
 export type KeyNeededPayload = z.infer<typeof KeyNeededSchema>['data'];

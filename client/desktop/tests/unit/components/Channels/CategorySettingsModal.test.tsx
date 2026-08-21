@@ -52,9 +52,9 @@ const mockRole: Role = {
   position: 1,
   permissions: '0',
   is_default: false,
+  is_managed: false,
   display_separately: false,
   mentionable: false,
-  require_mfa: false,
   created_at: '2025-01-01T00:00:00Z',
   updated_at: '2025-01-01T00:00:00Z',
 };

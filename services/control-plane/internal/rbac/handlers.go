@@ -36,6 +36,7 @@ const (
 	errMsgDefaultRoleMustBeLowest = "The default role must remain the lowest role"
 	errMsgFailedAssignRole        = "Failed to assign role"
 	errMsgFailedUnassignRole      = "Failed to unassign role"
+	errMsgFailedFetchRoles        = "Failed to fetch roles"
 	errMsgFailedFetchOverrides    = "Failed to fetch overrides"
 	errMsgFailedSaveOverride      = "Failed to save override"
 	errMsgFailedDeleteOverride    = "Failed to delete override"
@@ -110,6 +111,40 @@ type Role struct {
 	UpdatedAt         string  `json:"updated_at"`
 }
 
+// RoleListViewer is the CALLING actor's own standing in the role hierarchy,
+// published alongside the role list. Without it a client cannot tell which
+// roles it may reorder: there is no /members/me endpoint, and deriving the
+// ceiling from the member list would mean an unbounded member fetch to learn
+// one integer.
+//
+// The wire shape is a discriminated union on Kind:
+//
+//	{"kind": "owner"}                            — hierarchy guards do not apply
+//	{"kind": "bounded", "max_role_position": 3}  — ceiling is 3
+//
+// An ABSENT viewer block means "unknown", and a client seeing that must fail
+// closed (read-only). That is why MaxRolePosition is a pointer with omitempty
+// rather than a plain int: a bounded ceiling of 0 is a real answer and must be
+// emitted, while the owner case must carry no ceiling at all. Never emit null,
+// and never emit a guessed ceiling — the client cannot distinguish a guess
+// from the truth, which is exactly how a client ends up building a payload the
+// server will refuse.
+//
+// The value is ADVISORY. It may be stale by the time the client acts on it, so
+// it may only ever shrink what the UI offers — never permit anything. A 403
+// from the reorder endpoint remains a first-class expected outcome.
+type RoleListViewer struct {
+	Kind            string `json:"kind"`
+	MaxRolePosition *int   `json:"max_role_position,omitempty"`
+}
+
+// Wire values for RoleListViewer.Kind. PINNED — the desktop client models these
+// as a discriminated union and treats anything else as unknown.
+const (
+	viewerKindOwner   = "owner"
+	viewerKindBounded = "bounded"
+)
+
 // CreateRoleRequest represents a request to create a new role
 type CreateRoleRequest struct {
 	Name              string  `json:"name" binding:"required,min=1,max=100"`
@@ -150,6 +185,32 @@ type ReorderRolesRequest struct {
 	RoleIDs []string `json:"role_ids" binding:"required,min=1,max=500,unique,dive,uuid"`
 }
 
+// resolveRoleListViewer computes the calling actor's own hierarchy standing on
+// a server from the same ceiling expression the reorder guard enforces.
+//
+// Read-only and additive: it changes no guard verdict and no other query's
+// result. The caller OMITS the block on error rather than substituting a
+// default — absent means unknown, and unknown means read-only client-side.
+func resolveRoleListViewer(ctx context.Context, q rowQuerier, serverID, userID string) (RoleListViewer, error) {
+	var (
+		ownerID     string
+		maxPosition int
+	)
+	if err := q.QueryRowContext(ctx, viewerCeilingQuery, serverID, userID).
+		Scan(&ownerID, &maxPosition); err != nil {
+		return RoleListViewer{}, fmt.Errorf("resolve role list viewer: %w", err)
+	}
+
+	// The same identity comparison evaluateReorderGuards makes. The owner
+	// bypasses the hierarchy guards, so reporting a ceiling for them would be
+	// reporting a bound that does not exist — and a client that believed it
+	// would hide roles the owner can in fact move.
+	if ownerID == userID {
+		return RoleListViewer{Kind: viewerKindOwner}, nil
+	}
+	return RoleListViewer{Kind: viewerKindBounded, MaxRolePosition: &maxPosition}, nil
+}
+
 // ListRoles returns all roles for a server
 func (h *Handler) ListRoles(c *gin.Context) {
 	serverID := c.Param("id")
@@ -170,7 +231,7 @@ func (h *Handler) ListRoles(c *gin.Context) {
 	rows, err := h.db.Query(query, serverID)
 	if err != nil {
 		h.log.Error("Failed to query roles", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch roles"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchRoles})
 		return
 	}
 	defer rows.Close() //nolint:errcheck
@@ -184,12 +245,53 @@ func (h *Handler) ListRoles(c *gin.Context) {
 			&role.Mentionable, &role.DisplaySeparately, &role.CreatedAt, &role.UpdatedAt,
 		); err != nil {
 			h.log.Error("Failed to scan role", "error", err)
-			continue
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchRoles})
+			return
 		}
 		roles = append(roles, role)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"roles": roles})
+	// A SHORT role list must never reach the client as 200.
+	//
+	// This endpoint is the input to the role-hierarchy rail, which sends back the
+	// COMPLETE band of roles below the caller's ceiling. applyRolePositions
+	// renumbers only the ids it is given and leaves omitted roles exactly where
+	// they are, so a list that arrives silently short produces a payload that is
+	// silently short — and that commits with DUPLICATE POSITIONS at HTTP 200,
+	// proven by probe (#2359 design spec §2.1). Nothing in this response says
+	// "this is all of them", so the client cannot detect the shortfall; the
+	// completeness guarantee has to be made here, where the list is produced.
+	//
+	// Two leaks, closed above and below. A per-row scan error used to `continue`,
+	// dropping that role from an otherwise-200 response. And rows.Err() was never
+	// read at all, so a driver error mid-iteration ended the loop
+	// indistinguishably from a clean finish. Failing loudly beats a partial
+	// hierarchy that reads as complete. Mandated by [internal]rules/backend.md §25;
+	// this file already does it at three other sites.
+	if err := rows.Err(); err != nil {
+		h.log.Error("Failed to iterate roles", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchRoles})
+		return
+	}
+
+	resp := gin.H{"roles": roles}
+
+	// Self-scoped: the CALLER's own ceiling only, never another member's. The
+	// route carries RequireMembership so user_id is present; the emptiness
+	// check guards the impossible case, not a supported one.
+	//
+	// Fails closed by OMISSION — an unreadable ceiling leaves the block out and
+	// the client reads that as unknown.
+	if userID := c.GetString("user_id"); userID != "" {
+		viewer, viewerErr := resolveRoleListViewer(c.Request.Context(), h.db, serverID, userID)
+		if viewerErr != nil {
+			h.log.Error("Failed to resolve role list viewer", "error", viewerErr)
+		} else {
+			resp["viewer"] = viewer
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // validateHexColor checks an optional role colour is #RRGGBB.
@@ -862,6 +964,43 @@ type reorderDeniedError struct{ reason string }
 
 func (e *reorderDeniedError) Error() string { return "reorder denied: " + e.reason }
 
+// actorCeilingSelect is THE definition of an actor's hierarchy ceiling: the
+// highest position among the roles that actor actually holds on this server,
+// COALESCEd to 0 for an actor holding none.
+//
+// It exists as ONE expression because two consumers must agree on it exactly:
+// reorderGuardQuery, which ENFORCES the ceiling, and viewerCeilingQuery, which
+// REPORTS it to the client so the client can build a payload the guard will
+// accept. A second copy would let the number the UI plans against and the
+// number the server refuses it with drift apart silently on the next edit to
+// either — the ceiling is only useful to a client if it is the same ceiling.
+//
+// The placeholders are positional and part of the contract: $1 = server id,
+// $2 = actor user id. Any query embedding this must bind them in that order.
+const actorCeilingSelect = `
+    SELECT COALESCE(MAX(r.position), 0) AS max_position
+    FROM member_roles mr
+    INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = $1
+    WHERE mr.server_id = $1 AND mr.user_id = $2`
+
+// viewerCeilingQuery resolves the SELF-SCOPED reorder viewer for ListRoles: the
+// server's owner and the CALLING actor's own ceiling. It reports nothing about
+// any other member, and nothing that this endpoint does not already publish —
+// every role's position is in the response body already.
+//
+// Like reorderGuardQuery it carries no locking clause (the ceiling is an
+// aggregate, and PostgreSQL rejects a locking clause at an aggregating query
+// level). The value is therefore ADVISORY and may be stale by the time the
+// client acts on it; the authoritative decision stays where it is, inside
+// applyRolePositions' transaction.
+const viewerCeilingQuery = `
+WITH actor AS (` + actorCeilingSelect + `
+)
+SELECT s.owner_id, a.max_position
+FROM servers s
+CROSS JOIN actor a
+WHERE s.id = $1`
+
 // reorderGuardQuery reads every operand of the reorder decision in ONE
 // statement so they share a snapshot. Three separate autocommit reads is the
 // incoherence #2721 found across the sibling handlers: under READ COMMITTED
@@ -879,11 +1018,7 @@ func (e *reorderDeniedError) Error() string { return "reorder denied: " + e.reas
 // and the write filter COALESCEs identically so the guard's verdict and the
 // write's filter cannot disagree about what NULL means.
 const reorderGuardQuery = `
-WITH actor AS (
-    SELECT COALESCE(MAX(r.position), 0) AS max_position
-    FROM member_roles mr
-    INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = $1
-    WHERE mr.server_id = $1 AND mr.user_id = $2
+WITH actor AS (` + actorCeilingSelect + `
 ), named AS (
     SELECT r.id,
            r.position,

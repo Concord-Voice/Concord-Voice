@@ -556,6 +556,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
     <div className="settings-section" id="section-role-list">
       <h2 className="settings-section-title">Roles</h2>
       <RoleEditorPanel
+        serverId={serverId}
         roles={serverRoles}
         onCreateRole={handleCreateRole}
         onSaveRole={handleSaveRole}

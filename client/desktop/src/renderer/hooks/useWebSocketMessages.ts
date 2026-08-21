@@ -11,6 +11,7 @@ import type { Channel, ChannelGroup } from '../types/chat';
 import { useChannelStore } from '../stores/channelStore';
 import { useServerStore } from '../stores/serverStore';
 import { useMemberStore } from '../stores/memberStore';
+import { usePermissionStore } from '../stores/permissionStore';
 import { useUserStore } from '../stores/userStore';
 import { useUnreadStore } from '../stores/unreadStore';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
@@ -1447,6 +1448,49 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       );
     });
 
+    // Roles reordered — msg.data narrowed to RolesReorderedPayload.
+    //
+    // The payload carries only the ids the actor moved and no positions (see
+    // RolesReorderedSchema), so the new hierarchy can only come from a refetch;
+    // this is what makes a concurrent admin's reorder land in this client.
+    // Deliberately NOT gated on activeServerId: the server-settings overlay is
+    // opened with an explicit serverId and can be showing a server that is not
+    // the active one, which is exactly the window this handler exists to close.
+    // `fetchRoles` swallows its own errors and never rejects, so `void` is the
+    // whole of the error handling it needs.
+    const unsubRolesReordered = wsService.on('roles_reordered', (msg) => {
+      void usePermissionStore.getState().fetchRoles(msg.data.server_id);
+    });
+
+    // Role created / deleted — the role SET changed, which is what the reorder
+    // band is derived from, so these two are correctness for the hierarchy rail
+    // rather than mere freshness.
+    //
+    // Without them a rail built before the change keeps rendering a stale band.
+    // On Apply that produces one of two bad outcomes, and the quiet one is the
+    // dangerous one: a payload naming a DELETED role trips the server's
+    // `affected != len` rollback and returns 404, which the store maps to
+    // `unexpected` — the draft is preserved and every retry fails identically,
+    // a dead end until the panel is reopened. A payload MISSING a role that
+    // belongs to the band is worse: the server renumbers only the named ids and
+    // leaves the omitted one where it is, committing duplicate positions with
+    // HTTP 200 and no error anywhere.
+    //
+    // Refetching narrows that window; it does not close it, because a role can
+    // still be created between the last event and the Apply click. The Apply
+    // path therefore reconciles before it builds (see RoleHierarchyList).
+    //
+    // The other three role events (`role_updated`, `role_assigned`,
+    // `role_unassigned`) stay schema-only: they change a role's attributes or a
+    // member's grants, not the set of roles the band is drawn from.
+    const unsubRoleCreated = wsService.on('role_created', (msg) => {
+      void usePermissionStore.getState().fetchRoles(msg.data.server_id);
+    });
+
+    const unsubRoleDeleted = wsService.on('role_deleted', (msg) => {
+      void usePermissionStore.getState().fetchRoles(msg.data.server_id);
+    });
+
     // Server deleted — msg.data narrowed to ServerDeletedPayload.
     const unsubServerDeleted = wsService.on('server_deleted', (msg) => {
       useServerStore.getState().removeServer(msg.data.server_id);
@@ -2370,6 +2414,9 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubGroupUpdated();
       unsubGroupDeleted();
       unsubChannelsReordered();
+      unsubRolesReordered();
+      unsubRoleCreated();
+      unsubRoleDeleted();
       unsubServerDeleted();
       unsubMemberRemoved();
       unsubMemberTimeout();

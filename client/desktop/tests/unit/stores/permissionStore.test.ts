@@ -3,7 +3,8 @@ import { useAuthStore } from '@/renderer/stores/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
-import type { Role } from '@/renderer/types/server';
+import type { Role, RoleHierarchy } from '@/renderer/types/server';
+import { buildReorderPayload } from '@/renderer/utils/roleHierarchy';
 import { ADMINISTRATOR, MANAGE_SERVER, SEND_MESSAGES } from '@/renderer/utils/permissions';
 
 const API_BASE = 'http://localhost:8080';
@@ -15,9 +16,12 @@ const makeRole = (overrides: Partial<Role> = {}): Role => ({
   position: 0,
   permissions: '1023',
   is_default: true,
+  // `@all` is created is_default=TRUE **and** is_managed=TRUE by the control
+  // plane (internal/servers/handlers.go:191), so the base fixture carries both.
+  // Every override that flips `is_default: false` must flip `is_managed` too.
+  is_managed: true,
   display_separately: false,
   mentionable: false,
-  require_mfa: false,
   created_at: '2025-01-01T00:00:00Z',
   updated_at: '2025-01-01T00:00:00Z',
   ...overrides,
@@ -32,6 +36,7 @@ beforeEach(() => {
   useAuthStore.getState().setAccessToken('mock-token');
   usePermissionStore.setState({
     serverRoles: {},
+    roleViewer: {},
     serverPermissions: {},
     channelPermissions: {},
     channelOverrides: {},
@@ -102,7 +107,13 @@ describe('permissionStore', () => {
           return HttpResponse.json({
             roles: [
               makeRole({ id: 'role-1', name: '@all', position: 0 }),
-              makeRole({ id: 'role-2', name: 'Admin', position: 10, is_default: false }),
+              makeRole({
+                id: 'role-2',
+                name: 'Admin',
+                position: 10,
+                is_default: false,
+                is_managed: false,
+              }),
             ],
           });
         })
@@ -186,6 +197,103 @@ describe('permissionStore', () => {
     });
   });
 
+  // ── fetchRoles → roleViewer ───────────────────────────────────────────
+
+  describe('fetchRoles — viewer block', () => {
+    const respondWithViewer = (viewer: unknown) =>
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers/:id/roles`, () => {
+          return HttpResponse.json(
+            viewer === undefined ? { roles: [makeRole()] } : { roles: [makeRole()], viewer }
+          );
+        })
+      );
+
+    it('stores an owner viewer', async () => {
+      respondWithViewer({ kind: 'owner' });
+      await usePermissionStore.getState().fetchRoles('server-1');
+      expect(usePermissionStore.getState().roleViewer['server-1']).toEqual({ kind: 'owner' });
+    });
+
+    it('stores a bounded viewer, mapping max_role_position → maxRolePosition', async () => {
+      respondWithViewer({ kind: 'bounded', max_role_position: 7 });
+      await usePermissionStore.getState().fetchRoles('server-1');
+      expect(usePermissionStore.getState().roleViewer['server-1']).toEqual({
+        kind: 'bounded',
+        maxRolePosition: 7,
+      });
+    });
+
+    it('falls back to unknown when the viewer block is absent', async () => {
+      // A control plane older than the viewer block is a real self-hosted
+      // deployment. Fail closed to read-only; never derive a ceiling.
+      respondWithViewer(undefined);
+      await usePermissionStore.getState().fetchRoles('server-1');
+      expect(usePermissionStore.getState().roleViewer['server-1']).toEqual({ kind: 'unknown' });
+    });
+
+    it('falls back to unknown when a bounded ceiling is malformed', async () => {
+      respondWithViewer({ kind: 'bounded', max_role_position: 'high' });
+      await usePermissionStore.getState().fetchRoles('server-1');
+      expect(usePermissionStore.getState().roleViewer['server-1']).toEqual({ kind: 'unknown' });
+    });
+
+    it('falls back to unknown when a bounded ceiling is a non-integer number', async () => {
+      respondWithViewer({ kind: 'bounded', max_role_position: 7.5 });
+      await usePermissionStore.getState().fetchRoles('server-1');
+      expect(usePermissionStore.getState().roleViewer['server-1']).toEqual({ kind: 'unknown' });
+    });
+
+    it('falls back to unknown when the viewer block is null', async () => {
+      respondWithViewer(null);
+      await usePermissionStore.getState().fetchRoles('server-1');
+      expect(usePermissionStore.getState().roleViewer['server-1']).toEqual({ kind: 'unknown' });
+    });
+  });
+
+  // ── fetchRoles → return value (#2859) ─────────────────────────────────
+
+  describe('fetchRoles — return value', () => {
+    // The return value reports whether THIS call refreshed the view. It replaced
+    // a per-server revision counter, which any concurrent successful fetch could
+    // satisfy: a read that started before a write and landed after it would mark
+    // a FAILED refetch as reconciled while the view still showed pre-write data.
+    // That is one-sided in the unsafe direction, so the caller must learn about
+    // its OWN read, never about shared state.
+    it('returns true when the fetch lands and the view is refreshed', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers/:id/roles`, () =>
+          HttpResponse.json({ roles: [makeRole()], viewer: { kind: 'owner' } })
+        )
+      );
+
+      await expect(usePermissionStore.getState().fetchRoles('server-1')).resolves.toBe(true);
+      expect(usePermissionStore.getState().serverRoles['server-1']).toHaveLength(1);
+    });
+
+    it('returns false on a non-ok response and leaves the existing view alone', async () => {
+      const existing = [makeRole({ id: 'role-existing' })];
+      usePermissionStore.setState({ serverRoles: { 'server-1': existing } });
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers/:id/roles`, () =>
+          HttpResponse.json({ error: 'nope' }, { status: 500 })
+        )
+      );
+
+      await expect(usePermissionStore.getState().fetchRoles('server-1')).resolves.toBe(false);
+      expect(usePermissionStore.getState().serverRoles['server-1']).toEqual(existing);
+    });
+
+    it('returns false when the request throws', async () => {
+      const existing = [makeRole({ id: 'role-existing' })];
+      usePermissionStore.setState({ serverRoles: { 'server-1': existing } });
+      server.use(http.get(`${API_BASE}/api/v1/servers/:id/roles`, () => HttpResponse.error()));
+
+      await expect(usePermissionStore.getState().fetchRoles('server-1')).resolves.toBe(false);
+      expect(usePermissionStore.getState().serverRoles['server-1']).toEqual(existing);
+    });
+  });
+
   // ── createRole ────────────────────────────────────────────────────────
 
   describe('createRole', () => {
@@ -195,6 +303,7 @@ describe('permissionStore', () => {
         name: 'Moderator',
         position: 5,
         is_default: false,
+        is_managed: false,
       });
       server.use(
         http.post(`${API_BASE}/api/v1/servers/:id/roles`, () => {
@@ -216,7 +325,13 @@ describe('permissionStore', () => {
 
     it('sorts roles by position descending after creation', async () => {
       const existingRole = makeRole({ id: 'role-1', name: '@all', position: 0 });
-      const newRole = makeRole({ id: 'role-new', name: 'Admin', position: 10, is_default: false });
+      const newRole = makeRole({
+        id: 'role-new',
+        name: 'Admin',
+        position: 10,
+        is_default: false,
+        is_managed: false,
+      });
 
       server.use(
         http.post(`${API_BASE}/api/v1/servers/:id/roles`, () => {
@@ -254,7 +369,12 @@ describe('permissionStore', () => {
     });
 
     it('initializes server roles array if none exists', async () => {
-      const newRole = makeRole({ id: 'role-new', position: 5, is_default: false });
+      const newRole = makeRole({
+        id: 'role-new',
+        position: 5,
+        is_default: false,
+        is_managed: false,
+      });
       server.use(
         http.post(`${API_BASE}/api/v1/servers/:id/roles`, () => {
           return HttpResponse.json({ role: newRole }, { status: 201 });
@@ -388,7 +508,13 @@ describe('permissionStore', () => {
         serverRoles: {
           'server-1': [
             makeRole({ id: 'role-1' }),
-            makeRole({ id: 'role-2', name: 'Mod', position: 5, is_default: false }),
+            makeRole({
+              id: 'role-2',
+              name: 'Mod',
+              position: 5,
+              is_default: false,
+              is_managed: false,
+            }),
           ],
         },
       });
@@ -426,53 +552,154 @@ describe('permissionStore', () => {
   // ── reorderRoles ──────────────────────────────────────────────────────
 
   describe('reorderRoles', () => {
-    it('reorders roles and refetches', async () => {
-      const reorderedRoles = [
-        makeRole({ id: 'role-2', position: 1 }),
-        makeRole({ id: 'role-1', position: 0 }),
-      ];
+    // The band is what the payload projects; `buildReorderPayload` is the ONLY
+    // constructor of the branded payload, so tests go through it rather than
+    // casting a bare string[] into the brand.
+    const bandRoles = [
+      makeRole({ id: 'role-2', name: 'Admin', position: 2, is_default: false, is_managed: false }),
+      makeRole({ id: 'role-1', name: 'Mod', position: 1, is_default: false, is_managed: false }),
+    ];
+    const hierarchy: RoleHierarchy = {
+      aboveCeiling: [],
+      band: bandRoles,
+      managed: [],
+      pinned: [],
+    };
+    const payload = () => buildReorderPayload(hierarchy, ['role-1', 'role-2']);
 
+    it('returns ok with reconciled=true when the write lands and the refetch succeeds', async () => {
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, async ({ request }) => {
+          patchBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ message: 'Reordered' });
+        }),
+        http.get(`${API_BASE}/api/v1/servers/:id/roles`, () => {
+          return HttpResponse.json({
+            roles: [
+              makeRole({
+                id: 'role-1',
+                name: 'Mod',
+                position: 2,
+                is_default: false,
+                is_managed: false,
+              }),
+              makeRole({
+                id: 'role-2',
+                name: 'Admin',
+                position: 1,
+                is_default: false,
+                is_managed: false,
+              }),
+            ],
+          });
+        })
+      );
+
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+
+      expect(result).toEqual({ ok: true, reconciled: true });
+      // The brand is compile-time custody only — it must never reach the wire.
+      expect(patchBody).toEqual({ role_ids: ['role-1', 'role-2'] });
+      // Reconciled means the view really was refreshed.
+      const roles = usePermissionStore.getState().serverRoles['server-1'];
+      expect(roles).toHaveLength(2);
+      expect(roles[0].id).toBe('role-1');
+    });
+
+    it('returns ok with reconciled=false when the write lands but the refetch fails', async () => {
+      // The honesty case: the PATCH is durable, the view is stale. The old
+      // boolean contract returned a bare `true` here and told the user "saved"
+      // while showing them the pre-reorder order.
       server.use(
         http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, () => {
           return HttpResponse.json({ message: 'Reordered' });
         }),
         http.get(`${API_BASE}/api/v1/servers/:id/roles`, () => {
-          return HttpResponse.json({ roles: reorderedRoles });
+          return HttpResponse.json({ error: 'Internal error' }, { status: 500 });
         })
       );
 
-      const result = await usePermissionStore
-        .getState()
-        .reorderRoles('server-1', ['role-2', 'role-1']);
-      expect(result).toBe(true);
+      usePermissionStore.setState({ serverRoles: { 'server-1': bandRoles } });
 
-      // Should have refetched roles
-      const roles = usePermissionStore.getState().serverRoles['server-1'];
-      expect(roles).toHaveLength(2);
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+
+      expect(result).toEqual({ ok: true, reconciled: false });
+      // Stale, not wrong: the pre-reorder view survives untouched.
+      expect(usePermissionStore.getState().serverRoles['server-1']).toEqual(bandRoles);
     });
 
-    it('returns false on API error', async () => {
+    it('returns denied with the server reason verbatim on 403', async () => {
+      const reason = 'Cannot reorder roles at or above your own position';
       server.use(
         http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, () => {
-          return HttpResponse.json({ error: 'Forbidden' }, { status: 403 });
+          return HttpResponse.json({ error: reason }, { status: 403 });
         })
       );
 
-      const result = await usePermissionStore
-        .getState()
-        .reorderRoles('server-1', ['role-1', 'role-2']);
-      expect(result).toBe(false);
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+
+      // Verbatim — the reorder guards return distinct actionable strings and the
+      // banner renders whichever one came back; never a re-worded substitute.
+      expect(result).toEqual({ ok: false, kind: 'denied', reason });
     });
 
-    it('returns false on network error', async () => {
+    it('returns throttled — NOT denied — on 429', async () => {
+      server.use(
+        http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, () => {
+          return HttpResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
+        })
+      );
+
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+
+      // Apply is a whole-band write against a 5/min/user limit, so a user
+      // correcting a mistake reaches it in ordinary use. `denied` reverts and
+      // discards the draft — folding 429 into it destroys a careful
+      // arrangement over a transient throttle.
+      expect(result).toEqual({ ok: false, kind: 'throttled' });
+      if (!result.ok) expect(result.kind).not.toBe('denied');
+    });
+
+    it('returns network on a transport failure', async () => {
       server.use(
         http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, () => {
           return HttpResponse.error();
         })
       );
 
-      const result = await usePermissionStore.getState().reorderRoles('server-1', ['role-1']);
-      expect(result).toBe(false);
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+      expect(result).toEqual({ ok: false, kind: 'network' });
+    });
+
+    it('returns unexpected on any other non-2xx status', async () => {
+      server.use(
+        http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, () => {
+          return HttpResponse.json({ error: 'Server exploded' }, { status: 500 });
+        })
+      );
+
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+      expect(result).toEqual({ ok: false, kind: 'unexpected' });
+    });
+
+    it('falls back to a generic reason when a 403 body is not readable JSON', async () => {
+      server.use(
+        http.patch(`${API_BASE}/api/v1/servers/:id/roles/reorder`, () => {
+          return new HttpResponse('<html>denied</html>', {
+            status: 403,
+            headers: { 'Content-Type': 'text/html' },
+          });
+        })
+      );
+
+      const result = await usePermissionStore.getState().reorderRoles('server-1', payload());
+
+      expect(result).toEqual({
+        ok: false,
+        kind: 'denied',
+        reason: 'You cannot reorder these roles.',
+      });
     });
   });
 

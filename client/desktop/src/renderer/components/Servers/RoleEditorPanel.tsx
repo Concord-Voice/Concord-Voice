@@ -3,10 +3,12 @@ import PermissionGrid from '../Permissions/PermissionGrid';
 import ToggleSwitch from '../Settings/ToggleSwitch';
 import EmojiPicker from '../EmojiPicker/LazyEmojiPicker';
 import LoadingSpinner from '../Auth/LoadingSpinner';
+import RoleHierarchyList from './RoleHierarchyList';
 import { parsePermissions } from '../../utils/permissions';
 import type { Role } from '../../types/server';
 
 interface RoleEditorPanelProps {
+  serverId: string;
   roles: Role[];
   onCreateRole: () => Promise<Role | null | void>;
   onSaveRole: (
@@ -24,6 +26,7 @@ interface RoleEditorPanelProps {
 }
 
 const RoleEditorPanel: React.FC<RoleEditorPanelProps> = ({
+  serverId,
   roles,
   onCreateRole,
   onSaveRole,
@@ -89,36 +92,26 @@ const RoleEditorPanel: React.FC<RoleEditorPanelProps> = ({
     setSelectedRoleId(null);
   };
 
+  // Selecting the freshly created role is the only reason this is not simply
+  // `onCreateRole` — the rail renders the button, the panel owns the selection.
+  const handleCreateRole = useCallback(() => {
+    void (async () => {
+      const created = await onCreateRole();
+      if (created && 'id' in created) {
+        setSelectedRoleId(created.id);
+      }
+    })();
+  }, [onCreateRole]);
+
   return (
     <div className="roles-layout">
-      <div className="roles-list">
-        {[...roles]
-          .sort((a, b) => b.position - a.position)
-          .map((role) => (
-            <button
-              key={role.id}
-              className={`role-item ${selectedRoleId === role.id ? 'selected' : ''}`}
-              onClick={() => setSelectedRoleId(role.id)}
-            >
-              <span
-                className="role-color-dot"
-                style={{ backgroundColor: role.color || '#99aab5' }}
-              />
-              <span style={role.color ? { color: role.color } : undefined}>{role.name}</span>
-            </button>
-          ))}
-        <button
-          className="create-role-btn"
-          onClick={async () => {
-            const created = await onCreateRole();
-            if (created && 'id' in created) {
-              setSelectedRoleId(created.id);
-            }
-          }}
-        >
-          + Create Role
-        </button>
-      </div>
+      <RoleHierarchyList
+        serverId={serverId}
+        roles={roles}
+        selectedRoleId={selectedRoleId}
+        onSelectRole={setSelectedRoleId}
+        onCreateRole={handleCreateRole}
+      />
 
       <div className="role-editor">
         {selectedRole ? (

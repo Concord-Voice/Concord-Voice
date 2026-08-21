@@ -29,6 +29,12 @@ const KNOWN_TEXT_FREE_FILLS = new Set([
   '.add-friend-toggle input:checked + .add-friend-toggle-track',
   '.channel-drag-ghost',
   '.force-update-progress-fill',
+  // Role-hierarchy drop indicator (#2359): a 2px rule drawn between rows during a
+  // drag. Text-free by construction — it is an empty <li aria-hidden>. Co-located
+  // in ServerSettingsPage.css rather than reusing .channel-drag-ghost, which is
+  // visually identical but owned by ChannelList and only in scope while that
+  // component is bundled.
+  '.role-drag-ghost',
   // Friend-category DnD state indicators (#324): accent used as the drag-handle icon
   // color and the grabbed-section outline — decorative/text-free, no text on an accent fill.
   ".friend-category-drag-handle[aria-pressed='true']",

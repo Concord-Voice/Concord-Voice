@@ -5,7 +5,12 @@
 
 import { createStore } from '../utils/createStore';
 import { apiFetch } from '../services/apiClient';
-import { Role } from '../types/server';
+import {
+  Role,
+  type ReorderOutcome,
+  type RoleReorderPayload,
+  type RoleViewer,
+} from '../types/server';
 import { hasPermission, parsePermissions } from '../utils/permissions';
 
 export interface ChannelOverride {
@@ -26,9 +31,73 @@ export interface UpsertOverrideRequest {
   deny: string;
 }
 
+/** Shown when a 403 carries no readable `error` string — never a re-worded server reason. */
+const REORDER_DENIED_FALLBACK = 'You cannot reorder these roles.';
+
+/** Upper bound on the server-supplied denial text rendered in the reorder banner. */
+const MAX_DENIAL_REASON_CHARS = 200;
+
+/**
+ * Read the self-scoped `viewer` block from GET /servers/{id}/roles.
+ *
+ * Absent, malformed, or a non-integer ceiling all collapse to `unknown`, which
+ * drives the reorder UI read-only. A control plane older than the `viewer` block
+ * is a real self-hosted deployment, so the ceiling is NEVER guessed or derived —
+ * guessing a ceiling is what shipped the previous attempt's owner-only bug.
+ *
+ * Wire is snake_case (`max_role_position`); the client model is camelCase.
+ */
+function parseRoleViewer(raw: unknown): RoleViewer {
+  if (typeof raw !== 'object' || raw === null) return { kind: 'unknown' };
+  const viewer = raw as { kind?: unknown; max_role_position?: unknown };
+  if (viewer.kind === 'owner') return { kind: 'owner' };
+  if (
+    viewer.kind === 'bounded' &&
+    typeof viewer.max_role_position === 'number' &&
+    Number.isInteger(viewer.max_role_position) &&
+    // `>= 0` is explicit rather than emergent. A negative ceiling already fails
+    // closed — every role reads as above it, the band empties, and the rail goes
+    // read-only — but that outcome falls out of downstream arithmetic rather
+    // than being stated here, so a later change to `isAboveCeiling` could
+    // silently turn it into an open failure. Positions are non-negative by
+    // construction; say so at the boundary.
+    viewer.max_role_position >= 0
+  ) {
+    return { kind: 'bounded', maxRolePosition: viewer.max_role_position };
+  }
+  return { kind: 'unknown' };
+}
+
+/**
+ * Carry the server's actionable denial text verbatim — the reorder guards return
+ * distinct, user-facing strings ("Cannot reorder roles at or above your own
+ * position" vs "Reorder would create roles at or above your position") and the
+ * banner renders whichever one came back. Body parsing has its own guard so a
+ * non-JSON 403 degrades to the fallback instead of surfacing as a network error.
+ */
+async function readDenialReason(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body.error === 'string' && body.error.trim() !== '') {
+      // Bounded because this string is SERVER-CONTROLLED and is rendered into the
+      // banner verbatim. React escapes it, so there is no injection path; the
+      // residual is a hostile or misconfigured self-hosted control plane emitting
+      // a multi-kilobyte or misleading banner. The real guard reasons are all
+      // short static literals, so this truncation can only ever fire on a
+      // response the genuine server would not send.
+      return body.error.slice(0, MAX_DENIAL_REASON_CHARS);
+    }
+  } catch {
+    // Non-JSON or truncated body — fall through to the fallback.
+  }
+  return REORDER_DENIED_FALLBACK;
+}
+
 interface PermissionState {
   // Server roles keyed by server ID
   serverRoles: Record<string, Role[]>;
+  // Reorder ceiling of the current user per server, from the roles `viewer` block
+  roleViewer: Record<string, RoleViewer>;
   // User's effective permissions per server (BigInt as string for storage)
   serverPermissions: Record<string, bigint>;
   // User's effective permissions per channel
@@ -40,7 +109,7 @@ interface PermissionState {
   hasServerPermission: (serverId: string, perm: bigint) => boolean;
 
   // --- Role management ---
-  fetchRoles: (serverId: string) => Promise<void>;
+  fetchRoles: (serverId: string) => Promise<boolean>;
   createRole: (
     serverId: string,
     data: { name: string; color?: string; permissions?: string }
@@ -58,7 +127,7 @@ interface PermissionState {
     }>
   ) => Promise<boolean>;
   deleteRole: (serverId: string, roleId: string) => Promise<boolean>;
-  reorderRoles: (serverId: string, roleIds: string[]) => Promise<boolean>;
+  reorderRoles: (serverId: string, payload: RoleReorderPayload) => Promise<ReorderOutcome>;
   assignRole: (serverId: string, userId: string, roleId: string) => Promise<boolean>;
   unassignRole: (serverId: string, userId: string, roleId: string) => Promise<boolean>;
 
@@ -82,6 +151,7 @@ interface PermissionState {
 
 export const usePermissionStore = createStore<PermissionState>()((set, get) => ({
   serverRoles: {},
+  roleViewer: {},
   serverPermissions: {},
   channelPermissions: {},
   channelOverrides: {},
@@ -94,16 +164,27 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
 
   // ─── Role Management ──────────────────────────────────────────────
 
-  fetchRoles: async (serverId: string) => {
+  // Returns whether THIS call refreshed the view. Callers that need to know
+  // whether their own read landed (reorderRoles reporting `reconciled`) must use
+  // this return value, NOT an observation of shared state: a per-server revision
+  // counter is satisfied by ANY concurrent successful fetch, so a fetch that
+  // started before a write and landed after it would mark a failed refetch as
+  // reconciled while the view still showed pre-write data. That is one-sided in
+  // the unsafe direction, and `roles_reordered` makes concurrent fetches routine.
+  // Existing callers that ignore the value keep the previous swallow behaviour.
+  fetchRoles: async (serverId: string): Promise<boolean> => {
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles`);
-      if (!res.ok) return;
+      if (!res.ok) return false;
       const data = await res.json();
       set((state) => ({
         serverRoles: { ...state.serverRoles, [serverId]: data.roles ?? [] },
+        roleViewer: { ...state.roleViewer, [serverId]: parseRoleViewer(data.viewer) },
       }));
+      return true;
     } catch {
       // Network error — leave existing state
+      return false;
     }
   },
 
@@ -187,19 +268,36 @@ export const usePermissionStore = createStore<PermissionState>()((set, get) => (
     }
   },
 
-  reorderRoles: async (serverId: string, roleIds: string[]) => {
+  reorderRoles: async (serverId: string, payload: RoleReorderPayload): Promise<ReorderOutcome> => {
     try {
       const res = await apiFetch(`/api/v1/servers/${serverId}/roles/reorder`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role_ids: roleIds }),
+        // The brand is a compile-time custody guard, never part of the wire body.
+        body: JSON.stringify({ role_ids: payload.role_ids }),
       });
-      if (!res.ok) return false;
-      // Refetch to get updated positions
-      await get().fetchRoles(serverId);
-      return true;
+
+      if (res.ok) {
+        // Refetch to pick up the new positions. `reconciled` reports whether THIS
+        // read landed: the write is committed either way, but the view may be
+        // stale, and the UI says so rather than lying in either direction.
+        const reconciled = await get().fetchRoles(serverId);
+        return { ok: true, reconciled };
+      }
+
+      if (res.status === 403) {
+        return { ok: false, kind: 'denied', reason: await readDenialReason(res) };
+      }
+
+      // 429 is deliberately NOT folded into `denied`. Apply is a whole-band write
+      // against a 5/min/user limit, so a user correcting a mistake reaches it in
+      // ordinary use — and `denied` discards the draft, destroying that work over a
+      // transient throttle.
+      if (res.status === 429) return { ok: false, kind: 'throttled' };
+
+      return { ok: false, kind: 'unexpected' };
     } catch {
-      return false;
+      return { ok: false, kind: 'network' };
     }
   },
 

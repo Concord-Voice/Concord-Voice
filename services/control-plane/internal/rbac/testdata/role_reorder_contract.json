@@ -1,0 +1,480 @@
+{
+  "version": 1,
+  "title": "Role reorder wire contract - shared cross-language oracle",
+  "issue": "#2359",
+  "spec": "[internal]specs/2026-08-21-2359-role-reorder-ui-design.md",
+  "consumers": [
+    "services/control-plane/internal/rbac/reorder_contract_test.go (Go - seeds the world, PATCHes the declared payload, asks the REAL server for the verdict)",
+    "client/desktop TypeScript consumer (lands in T3 - asserts partitionRoleHierarchy + buildReorderPayload against the declared hierarchy and payload)"
+  ],
+  "why_this_file_exists": [
+    "PR #2839 shipped a reorder that worked only for the server owner while its test suite was fully green.",
+    "The production code and the Vitest suite encoded the SAME wrong belief about the wire contract, sourced from the same docstring, asserted against a vi.fn() stub. Every green Go test for a non-owner sent a hand-written partial payload that happened to sit inside every budget. Both sides passed; the contradiction lived only in the gap between them.",
+    "This table is that gap, made into an artifact. The TypeScript side asserts what the client WOULD send. The Go side asks the real server whether that is acceptable. A wrong belief cannot be green on both sides, because one side is not asking a mock.",
+    "Neither consumer may re-implement the guards. A Go helper or an MSW handler that reproduces evaluateReorderGuards has exactly the defect this file exists to remove, in a new costume."
+  ],
+  "contract": {
+    "endpoint": "PATCH /api/v1/servers/{id}/roles/reorder",
+    "body": "{\"role_ids\": [...]} - binding: required,min=1,max=500,unique,dive,uuid",
+    "ordering": "role_ids is HIGHEST-AUTHORITY-FIRST. The write assigns position = cardinality(role_ids) - ord + offset, ord 1-based, so index 0 receives the highest position number.",
+    "guards": [
+      "G1 - any named role with (is_managed AND NOT is_default) is refused for EVERYONE, the server owner included. Reason: 'Cannot reorder managed roles'.",
+      "G2 - the default role, if named, must be the LAST element, else 403 'The default role must remain the lowest role'. Binds the owner too.",
+      "G2b - the default role, if OMITTED, sets offset = 1, reserving position 0 for it.",
+      "G3 - the owner bypasses G4 and G5 ONLY.",
+      "G4 - non-owner: any named role whose current position >= actorMaxPosition -> 403 'Cannot reorder roles at or above your own position'.",
+      "G5 - non-owner: len(role_ids) - 1 + offset >= actorMaxPosition -> 403 'Reorder would create roles at or above your position'.",
+      "G6 - every named id must match a row on this server or the whole write rolls back."
+    ],
+    "actor_ceiling": "actorMaxPosition = COALESCE(MAX(r.position), 0) over the roles the actor holds in this server. Every member holds the default role, so the floor is 0.",
+    "renumber_scope": "The write renumbers ONLY named ids. Omitted roles KEEP their current positions - which is why an under-sent payload silently collides instead of failing."
+  },
+  "invariant": {
+    "statement": "The payload is EXACTLY the set of roles whose current position is strictly below the actor's ceiling, minus the default role, minus non-default managed roles - in the chosen order, highest authority first. NOTHING MORE, NOTHING LESS.",
+    "nothing_more": "#2839 sent the whole display list. Loud 403 for every non-owner (scenario s1, probe s1-p1).",
+    "nothing_less": "The obvious correction - sending only what the user dragged - is worse. Omitted roles keep their positions, so the write commits duplicate positions with HTTP 200 and no error anywhere (scenario s6, probe s6-p1).",
+    "structural_consequence": "For every scenario carrying an expected_payload, set(expected_payload.role_ids) == set(expected_hierarchy.band). Both consumers assert this as a table-wide law, not just in scenario s6."
+  },
+  "ordering_rules": {
+    "group_display_order": "Within every group of expected_hierarchy, roles are listed position DESC, then name ASC, then key ASC. The tie-break only bites where positions duplicate (scenario s5), which is a state the server can actually produce - see s6-p1.",
+    "payload_order": "expected_payload.role_ids is the order the user's declared draft produces. It is a permutation of band, not necessarily band's display order."
+  },
+  "schema": {
+    "scenario.id": "stable slug; never renumber",
+    "scenario.spec_scenario": "1-8, the numbering in spec section 6. Each appears exactly once.",
+    "scenario.world": "SERVER TRUTH. The Go consumer seeds exactly this.",
+    "scenario.client_snapshot": "What the client believed when it built the payload. null means identical to world. Non-null models staleness (scenario s7).",
+    "scenario.expected_hierarchy": "The four disjoint groups of spec section 5.1, computed from client_snapshot. Their union is exactly the role set, with no overlap.",
+    "scenario.expected_precondition": "'ok' or the read-only reason the client must render instead of offering a doomed drag.",
+    "scenario.expected_payload": "null means the client must send NOTHING. Never [] - the server rejects an empty array at the binding (scenario s2, probe s2-p1).",
+    "scenario.server": "null when there is no payload to send. Otherwise the verdict the REAL server returns for expected_payload, plus every role's position afterwards.",
+    "scenario.probes": "Extra payloads sent against a FRESHLY SEEDED copy of the same world. purpose='falsification' probes are the mandatory red demonstrations; 'negative' probes are refusals; 'tolerance' probes record something the server accepts that the client must still never send.",
+    "scenario.go_exercisable": "false only where the distinguishing behaviour is unreachable from a server test.",
+    "role.permissions": "symbolic permission names granted by that role. 'manage_roles' is the only one this table needs; the endpoint requires it."
+  },
+  "scenarios": [
+    {
+      "id": "s1-nonowner-band-smaller-than-role-list",
+      "spec_scenario": 1,
+      "title": "Non-owner, mid-hierarchy ceiling, band SMALLER than the full role list",
+      "rationale": "THE CASE THAT WAS NEVER TESTED. The existing non-owner test (handlers_integration_test.go:2677) parks the actor at position 20, comfortably inside every budget, and never compares against what a client would actually send. Here the ceiling sits in the middle of the hierarchy, so the payload and the display list differ - and #2839's builder 403s.",
+      "world": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "support", "name": "Support", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "helper", "name": "Helper", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "mod", "name": "Moderator", "position": 3, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] },
+          { "key": "admin", "name": "Admin", "position": 4, "is_default": false, "is_managed": false },
+          { "key": "head", "name": "Head Admin", "position": 5, "is_default": false, "is_managed": false }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "mod"],
+          "viewer": { "kind": "bounded", "max_role_position": 3 }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": ["head", "admin", "mod"],
+        "band": ["helper", "support"],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "ok",
+      "draft": "The user drags Support above Helper.",
+      "expected_payload": { "role_ids": ["support", "helper"] },
+      "server": {
+        "status": 200,
+        "error_contains": null,
+        "positions_after": { "all": 0, "helper": 1, "support": 2, "mod": 3, "admin": 4, "head": 5 }
+      },
+      "probes": [
+        {
+          "id": "s1-p1-full-display-list",
+          "purpose": "falsification",
+          "wrong_builder": "full-display-list - every rendered role, highest first, @all last. This is #2839's actual behaviour.",
+          "role_ids": ["head", "admin", "mod", "helper", "support", "all"],
+          "expected": {
+            "status": 403,
+            "error_contains": "Cannot reorder roles at or above your own position",
+            "positions_after": { "all": 0, "support": 1, "helper": 2, "mod": 3, "admin": 4, "head": 5 }
+          },
+          "note": "Loud failure. G1 does not fire (@all is default, so it is exempt from the managed refusal) and G2 is satisfied (@all is last) - it is G4 that refuses, because the payload names three roles at or above the actor's ceiling."
+        }
+      ],
+      "go_exercisable": true
+    },
+    {
+      "id": "s2-nonowner-empty-band",
+      "spec_scenario": 2,
+      "title": "Non-owner whose band is EMPTY - read-only, and must NOT send []",
+      "rationale": "The actor's own role is the lowest non-default role, so nothing is below their ceiling. The UI renders read-only with 'no-movable-roles'. A builder that emits [] for an empty band turns a silent no-op into a 400.",
+      "world": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "support", "name": "Support", "position": 1, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] },
+          { "key": "staff", "name": "Staff", "position": 2, "is_default": false, "is_managed": false }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "support"],
+          "viewer": { "kind": "bounded", "max_role_position": 1 }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": ["staff", "support"],
+        "band": [],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "no-movable-roles",
+      "draft": "Nothing is draggable; there is no draft.",
+      "expected_payload": null,
+      "server": null,
+      "probes": [
+        {
+          "id": "s2-p1-empty-array",
+          "purpose": "negative",
+          "wrong_builder": "empty-band-still-sends - a builder that projects an empty band to [] rather than declining to send.",
+          "role_ids": [],
+          "expected": {
+            "status": 400,
+            "error_contains": "Invalid request body",
+            "positions_after": { "all": 0, "support": 1, "staff": 2 }
+          },
+          "note": "min=1 on the binding tag. The actor holds manage_roles, so the request clears the permission gate and is refused on shape."
+        }
+      ],
+      "go_exercisable": true
+    },
+    {
+      "id": "s3-owner-full-band",
+      "spec_scenario": 3,
+      "title": "Owner - the band is every non-default, non-managed role",
+      "rationale": "The owner has no ceiling (G3 bypasses G4 and G5), so above_ceiling is empty and the band is the whole reorderable set. The probe records why #2839 shipped: for the OWNER the full display list produces exactly the same positions as the correct payload, so the defect is invisible on every path a developer with owner rights exercises.",
+      "world": {
+        "owner_is_actor": true,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "support", "name": "Support", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "helper", "name": "Helper", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "staff", "name": "Staff", "position": 3, "is_default": false, "is_managed": false }
+        ],
+        "actor": {
+          "held_role_keys": ["all"],
+          "viewer": { "kind": "owner" }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": [],
+        "band": ["staff", "helper", "support"],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "ok",
+      "draft": "The user drags Support to the top of the band.",
+      "expected_payload": { "role_ids": ["support", "staff", "helper"] },
+      "server": {
+        "status": 200,
+        "error_contains": null,
+        "positions_after": { "all": 0, "helper": 1, "staff": 2, "support": 3 }
+      },
+      "probes": [
+        {
+          "id": "s3-p1-owner-tolerates-full-display-list",
+          "purpose": "tolerance",
+          "wrong_builder": "full-display-list - the same #2839 builder that 403s in s1-p1.",
+          "role_ids": ["support", "staff", "helper", "all"],
+          "expected": {
+            "status": 200,
+            "error_contains": null,
+            "positions_after": { "all": 0, "helper": 1, "staff": 2, "support": 3 }
+          },
+          "note": "Identical resulting positions to the correct payload: naming @all last sets offset 0 and adds one element, which cancels exactly. This is the whole #2839 story in one probe - the wrong builder is indistinguishable from the right one when the actor is the owner. The client must still never send @all, because for a non-owner the same builder is s1-p1."
+        }
+      ],
+      "go_exercisable": true
+    },
+    {
+      "id": "s4-default-role-never-in-payload",
+      "spec_scenario": 4,
+      "title": "@all present in the store - never in the payload, ever",
+      "rationale": "The default role is 'pinned': rendered last, never draggable, never projected. The two probes bound the server's actual tolerance in both directions so the client rule is not mistaken for a server rule.",
+      "world": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "alpha", "name": "Alpha", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "beta", "name": "Beta", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "mod", "name": "Moderator", "position": 5, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "mod"],
+          "viewer": { "kind": "bounded", "max_role_position": 5 }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": ["mod"],
+        "band": ["beta", "alpha"],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "ok",
+      "draft": "The user drags Alpha above Beta.",
+      "expected_payload": { "role_ids": ["alpha", "beta"] },
+      "server": {
+        "status": 200,
+        "error_contains": null,
+        "positions_after": { "all": 0, "beta": 1, "alpha": 2, "mod": 5 }
+      },
+      "probes": [
+        {
+          "id": "s4-p1-default-first",
+          "purpose": "negative",
+          "wrong_builder": "default-role-draggable - a builder that lets @all be moved out of last place.",
+          "role_ids": ["all", "alpha", "beta"],
+          "expected": {
+            "status": 403,
+            "error_contains": "The default role must remain the lowest role",
+            "positions_after": { "all": 0, "alpha": 1, "beta": 2, "mod": 5 }
+          },
+          "note": "G2, and it binds the owner too. Every member holds @all, so promoting it raises the hierarchy ceiling of the entire membership at once."
+        },
+        {
+          "id": "s4-p2-default-last-is-tolerated",
+          "purpose": "tolerance",
+          "wrong_builder": "full-display-list, @all last.",
+          "role_ids": ["alpha", "beta", "all"],
+          "expected": {
+            "status": 200,
+            "error_contains": null,
+            "positions_after": { "all": 0, "beta": 1, "alpha": 2, "mod": 5 }
+          },
+          "note": "Accepted here only because this actor's ceiling (5) leaves slack. The client still excludes @all unconditionally: the pinned partition makes any other placement unexpressible, so G2 becomes unreachable by construction rather than something error handling has to explain."
+        }
+      ],
+      "go_exercisable": true
+    },
+    {
+      "id": "s5-managed-in-band-and-budget-exceeded",
+      "spec_scenario": 5,
+      "title": "A non-default managed role inside the band, over a hierarchy whose positions are no longer dense",
+      "rationale": "Two things at once. The managed role is excluded from the band AND from any payload (G1 refuses it for everyone). And because positions duplicate - the residue of exactly the under-sent reorder in s6-p1 - the band no longer fits the budget, so EVERY order this actor can construct 403s. The client must detect len(band) > ceiling - 1 up front and render read-only rather than offer a drag that always fails. Spec section 2.2: the budget identity is emergent under dense positions, not a law.",
+      "world": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "alpha", "name": "Alpha", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "gamma", "name": "Gamma", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "beta", "name": "Beta", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "botlink", "name": "Bot Link", "position": 2, "is_default": false, "is_managed": true },
+          { "key": "mod", "name": "Moderator", "position": 3, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "mod"],
+          "viewer": { "kind": "bounded", "max_role_position": 3 }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": ["mod"],
+        "band": ["beta", "alpha", "gamma"],
+        "managed": ["botlink"],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "band-exceeds-ceiling",
+      "also_true": ["managed-present"],
+      "precedence_note": "Both read-only reasons hold. This scenario PINS the precedence: band-exceeds-ceiling wins, because it is the condition under which no constructible order can succeed, and its notice is therefore the honest one to show. managed-present alone would also render read-only (spec section 5.5), so nothing is lost by the ordering.",
+      "draft": "There is no draft - the band is not draggable.",
+      "expected_payload": null,
+      "server": null,
+      "probes": [
+        {
+          "id": "s5-p1-doomed-band",
+          "purpose": "negative",
+          "wrong_builder": "precondition-blind - a builder that projects the band without checking len(band) <= ceiling - 1.",
+          "role_ids": ["beta", "alpha", "gamma"],
+          "expected": {
+            "status": 403,
+            "error_contains": "Reorder would create roles at or above your position",
+            "positions_after": { "all": 0, "alpha": 1, "gamma": 1, "beta": 2, "botlink": 2, "mod": 3 }
+          },
+          "note": "G5. Nothing named is at or above the ceiling, so G4 is silent; it is the BUDGET that refuses: len(3) - 1 + offset(1) = 3 >= ceiling(3). This is the proof that the client-side precondition is real and not defensive decoration - the server refuses the only payload the invariant permits."
+        },
+        {
+          "id": "s5-p2-band-including-managed",
+          "purpose": "negative",
+          "wrong_builder": "managed-blind - a builder whose managed predicate omits the && !is_default clause the server's own filter carries, so it treats every managed role alike.",
+          "role_ids": ["beta", "botlink", "alpha", "gamma"],
+          "expected": {
+            "status": 403,
+            "error_contains": "Cannot reorder managed roles",
+            "positions_after": { "all": 0, "alpha": 1, "gamma": 1, "beta": 2, "botlink": 2, "mod": 3 }
+          },
+          "note": "G1 is evaluated ABOVE the owner bypass, so this refusal binds the owner too. Ordering matters: G1 fires before the budget check that refuses s5-p1."
+        }
+      ],
+      "go_exercisable": true
+    },
+    {
+      "id": "s6-subset-collision-guard",
+      "spec_scenario": 6,
+      "title": "SUBSET-COLLISION GUARD - the payload is the COMPLETE band, not the roles the user dragged",
+      "rationale": "The 'nothing less' half of the invariant, and the dangerous one, because it fails silently. applyRolePositions renumbers only named ids; omitted roles keep their positions. A subset therefore commits duplicate positions under HTTP 200. The actor is the OWNER so no hierarchy guard can mask the effect - this is purely the write semantics.",
+      "world": {
+        "owner_is_actor": true,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "a", "name": "Role A", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "b", "name": "Role B", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "c", "name": "Role C", "position": 3, "is_default": false, "is_managed": false },
+          { "key": "d", "name": "Role D", "position": 4, "is_default": false, "is_managed": false }
+        ],
+        "actor": {
+          "held_role_keys": ["all"],
+          "viewer": { "kind": "owner" }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": [],
+        "band": ["d", "c", "b", "a"],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "ok",
+      "draft": "The user drags Role C above Role D. Two roles moved; four must be sent.",
+      "expected_payload": { "role_ids": ["c", "d", "b", "a"] },
+      "server": {
+        "status": 200,
+        "error_contains": null,
+        "positions_after": { "all": 0, "a": 1, "b": 2, "d": 3, "c": 4 }
+      },
+      "probes": [
+        {
+          "id": "s6-p1-dragged-roles-only",
+          "purpose": "falsification",
+          "wrong_builder": "dragged-roles-only - emits just the roles the user moved, in their new relative order. The obvious correction to #2839, and worse than the bug it fixes.",
+          "role_ids": ["c", "d"],
+          "expected": {
+            "status": 200,
+            "error_contains": null,
+            "positions_after": { "all": 0, "d": 1, "a": 1, "b": 2, "c": 2 },
+            "collisions": [
+              { "position": 1, "role_keys": ["a", "d"] },
+              { "position": 2, "role_keys": ["b", "c"] }
+            ]
+          },
+          "note": "200 OK, corrupted hierarchy, no error anywhere. RowsAffected == len(role_ids), so G6 is satisfied and the transaction commits. Over-sending fails loudly; under-sending fails silently - the safer-looking builder is the more dangerous one. Server-side hardening of this is explicitly out of scope (spec section 7, section 8 follow-up 1); the client's defence is that the payload is always the complete band."
+        }
+      ],
+      "go_exercisable": true
+    },
+    {
+      "id": "s7-stale-ceiling-403",
+      "spec_scenario": 7,
+      "title": "Ceiling stale - the client's world moved under it, so a correct payload still 403s",
+      "rationale": "The viewer ceiling is ADVISORY. It shrinks the draggable band and must never be used to permit anything. Here the actor was demoted after the client cached the hierarchy: the payload is exactly the band the client could see, and the server refuses it. A 403 is a first-class expected outcome, not a bug.",
+      "world": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "mod", "name": "Moderator", "position": 1, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] },
+          { "key": "support", "name": "Support", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "helper", "name": "Helper", "position": 3, "is_default": false, "is_managed": false },
+          { "key": "admin", "name": "Admin", "position": 4, "is_default": false, "is_managed": false }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "mod"],
+          "viewer": { "kind": "bounded", "max_role_position": 1 }
+        }
+      },
+      "client_snapshot": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "support", "name": "Support", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "helper", "name": "Helper", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "mod", "name": "Moderator", "position": 3, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] },
+          { "key": "admin", "name": "Admin", "position": 4, "is_default": false, "is_managed": false }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "mod"],
+          "viewer": { "kind": "bounded", "max_role_position": 3 }
+        }
+      },
+      "expected_hierarchy": {
+        "above_ceiling": ["admin", "mod"],
+        "band": ["helper", "support"],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "ok",
+      "draft": "The user drags Support above Helper - against the stale snapshot, an entirely valid move.",
+      "expected_payload": { "role_ids": ["support", "helper"] },
+      "server": {
+        "status": 403,
+        "error_contains": "Cannot reorder roles at or above your own position",
+        "positions_after": { "all": 0, "mod": 1, "support": 2, "helper": 3, "admin": 4 }
+      },
+      "client_expectations": {
+        "outcome": { "ok": false, "kind": "denied" },
+        "reason_is_verbatim_server_text": true,
+        "draft_order": "cleared",
+        "refetch": "issued",
+        "banner_role": "alert"
+      },
+      "probes": [],
+      "go_exercisable": true,
+      "go_note": "positions_after is the UNCHANGED world: the assertion is not only that the request is refused but that nothing was written. A partial write under a denial would be the worst of both."
+    },
+    {
+      "id": "s8-patch-ok-refetch-fails",
+      "spec_scenario": 8,
+      "title": "PATCH 200 then the refetch fails - { ok: true, reconciled: false }, never a bare true",
+      "rationale": "reorderRoles currently returns Promise<boolean> and returns true when the PATCH landed but the refetch silently failed (fetchRoles swallows every error and returns void). The honest answer is that the write landed and the view may be stale. The server half of this scenario is exercised by Go; the refetch failure is reachable only from the client.",
+      "world": {
+        "owner_is_actor": false,
+        "roles": [
+          { "key": "all", "name": "@all", "position": 0, "is_default": true, "is_managed": true },
+          { "key": "alpha", "name": "Alpha", "position": 1, "is_default": false, "is_managed": false },
+          { "key": "beta", "name": "Beta", "position": 2, "is_default": false, "is_managed": false },
+          { "key": "mod", "name": "Moderator", "position": 4, "is_default": false, "is_managed": false, "permissions": ["manage_roles"] }
+        ],
+        "actor": {
+          "held_role_keys": ["all", "mod"],
+          "viewer": { "kind": "bounded", "max_role_position": 4 }
+        }
+      },
+      "client_snapshot": null,
+      "expected_hierarchy": {
+        "above_ceiling": ["mod"],
+        "band": ["beta", "alpha"],
+        "managed": [],
+        "pinned": ["all"]
+      },
+      "expected_precondition": "ok",
+      "draft": "The user drags Alpha above Beta.",
+      "expected_payload": { "role_ids": ["alpha", "beta"] },
+      "server": {
+        "status": 200,
+        "error_contains": null,
+        "positions_after": { "all": 0, "beta": 1, "alpha": 2, "mod": 4 }
+      },
+      "client_only": {
+        "transport": { "patch_status": 200, "refetch": "fails" },
+        "expected_outcome": { "ok": true, "reconciled": false },
+        "draft_order": "cleared",
+        "apply_bar": "unmounts",
+        "banner_role": "alert",
+        "note": "The TS consumer drives this with MSW: the PATCH succeeds, the subsequent GET /roles fails. The store must not collapse it to a bare true, and the UI must say the list could not refresh rather than pretend either that the save failed or that the view is current."
+      },
+      "probes": [],
+      "go_exercisable": true,
+      "go_note": "Go exercises the server half only - the 200 and the resulting positions. The distinguishing behaviour (refetch failure -> reconciled:false) has no server-side expression, so it lives in client_only and is asserted in T3."
+    }
+  ]
+}

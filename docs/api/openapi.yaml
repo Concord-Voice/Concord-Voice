@@ -11181,6 +11181,16 @@ paths:
       summary: List server roles
       description: 'List all roles for a server, highest position first. Requires server membership.
 
+        Also returns a self-scoped `viewer` block describing the CALLER''s own standing in the
+
+        role hierarchy, so a client can build a role-reorder payload the server will accept
+
+        without enumerating the membership. The block describes the caller only, never another
+
+        member. An ABSENT `viewer` means unknown — a client must fail closed (read-only) rather
+
+        than assume a ceiling.
+
         Rate limit: 30 requests per minute.
 
         '
@@ -11201,6 +11211,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Role'
+                  viewer:
+                    $ref: '#/components/schemas/RoleListViewer'
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
@@ -17093,6 +17105,62 @@ components:
       - display_separately
       - created_at
       - updated_at
+    RoleListViewer:
+      description: >-
+        The calling actor's own standing in the role hierarchy, published with the role list
+        because there is no `/members/me` endpoint and deriving the ceiling client-side would
+        need an unbounded member fetch to learn one integer.
+
+
+        The value is ADVISORY and may be stale: it may only ever shrink what a client offers,
+        never permit anything, and a 403 from `PATCH /servers/{id}/roles/reorder` remains a
+        first-class expected outcome. It is computed from the same SQL expression the reorder
+        guards enforce, so the reported ceiling and the enforced one cannot drift apart.
+
+
+        Omitted entirely when the ceiling could not be resolved, or by a control plane older
+        than this field (Concord is self-hostable, so that is a real state). Absent means
+        unknown and the client must fail closed; it is never emitted as null.
+      oneOf:
+      - $ref: '#/components/schemas/RoleListViewerOwner'
+      - $ref: '#/components/schemas/RoleListViewerBounded'
+      discriminator:
+        propertyName: kind
+        mapping:
+          owner: '#/components/schemas/RoleListViewerOwner'
+          bounded: '#/components/schemas/RoleListViewerBounded'
+    RoleListViewerOwner:
+      type: object
+      description: >-
+        The caller owns this server. The hierarchy guards on role reorder do not apply, so no
+        ceiling is reported — there is none.
+      required:
+      - kind
+      properties:
+        kind:
+          type: string
+          enum:
+          - owner
+    RoleListViewerBounded:
+      type: object
+      description: >-
+        The caller is a non-owner member bounded by their own highest-held role.
+      required:
+      - kind
+      - max_role_position
+      properties:
+        kind:
+          type: string
+          enum:
+          - bounded
+        max_role_position:
+          type: integer
+          minimum: 0
+          description: >-
+            Highest position among the roles the caller holds on this server, or 0 when they
+            hold none above @all. A reorder is refused for any named role already at or above
+            this position, and for any payload that would assign a position at or above it.
+          example: 3
     CreateRoleRequest:
       type: object
       required:

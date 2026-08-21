@@ -173,29 +173,233 @@
   gap: 4px;
 }
 
+/* The role rail (#2359). `.role-item` is a flex <li> wrapper with no handler,
+   no tabIndex and no role: the select button and the handle/lock slot are
+   siblings inside it. It stopped being a <button> because a nested <button>
+   handle inside a row button is invalid HTML and fails WCAG SC 4.1.2. */
+.role-hierarchy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
 .role-item {
   display: flex;
   align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+}
+
+.role-item--dragging {
+  opacity: 0.4;
+}
+
+.role-select-btn {
+  display: flex;
+  align-items: center;
   gap: 8px;
+  flex: 1;
+  min-width: 0;
   padding: 8px 12px;
   border-radius: 6px;
   cursor: pointer;
   transition: background 0.15s ease;
   border: none;
   background: none;
-  width: 100%;
   text-align: left;
   color: var(--text-primary);
   font-size: calc(13px * var(--font-scale, 1));
 }
 
-.role-item:hover {
+.role-select-btn:hover {
   background: var(--bg-tertiary);
 }
 
-.role-item.selected {
+.role-select-btn.selected {
   background: var(--bg-tertiary);
   border-left: 2px solid var(--state-selected);
+}
+
+.role-select-btn:focus-visible,
+.role-drag-handle:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.role-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Handle and lock glyph share one 24x24 slot so a row does not shift when it
+   moves between hierarchy groups. */
+.role-drag-handle,
+.role-lock-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.role-drag-handle {
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  cursor: grab;
+}
+
+.role-drag-handle:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.role-drag-handle:active {
+  cursor: grabbing;
+}
+
+/* Marks the top of the movable range for a bounded viewer. */
+.role-reorder-boundary {
+  display: flex;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.role-reorder-boundary-chip {
+  font-size: calc(10px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  line-height: 1.3;
+}
+
+.role-reorder-toolbar {
+  display: flex;
+  gap: 4px;
+}
+
+.role-reorder-move-btn {
+  flex: 1;
+  padding: 6px 8px;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.role-reorder-move-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.role-reorder-move-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.role-reorder-notice,
+.role-reorder-alert {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  font-size: calc(11px * var(--font-scale, 1));
+  line-height: 1.4;
+}
+
+.role-reorder-notice {
+  color: var(--text-muted);
+}
+
+.role-reorder-alert {
+  color: var(--text-primary);
+  border-left: 2px solid var(--danger);
+}
+
+/* Mounted only once a move is COMMITTED, at the foot of .roles-list, so it
+   appends a tab stop and displaces nothing. */
+.role-reorder-apply-bar {
+  display: flex;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+}
+
+.role-reorder-apply-btn,
+.role-reorder-discard-btn {
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.role-reorder-discard-btn {
+  background: none;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.role-reorder-discard-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* Deliberately NOT a var(--accent-fill) solid: a text-bearing accent fill needs a
+   Pride legibility halo in pride-flourishes.css (locked by
+   tests/unit/styles/accent-fill.test.ts). An accent OUTLINE carries the same
+   emphasis in a 200px rail without that coupling. */
+.role-reorder-apply-btn {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.role-reorder-apply-btn:hover:not(:disabled) {
+  background: var(--bg-secondary);
+}
+
+.role-reorder-apply-btn:disabled,
+.role-reorder-discard-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Visually-hidden lock reasons and the reorder live region. */
+.roles-list .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* There is deliberately no shuffle/reflow animation to suppress here — rows
+   move instantly. Only the hover/press transitions are motion. */
+@media (prefers-reduced-motion: reduce) {
+  .role-select-btn,
+  .role-reorder-move-btn,
+  .role-reorder-apply-btn,
+  .role-reorder-discard-btn {
+    transition: none;
+  }
 }
 
 .role-color-dot {
@@ -454,4 +658,21 @@
 
 .member-role-dropdown__item:hover {
   background: var(--bg-tertiary);
+}
+
+/* Drop indicator for the role hierarchy rail.
+ *
+ * Deliberately co-located rather than reusing `.channel-drag-ghost`, which is
+ * visually identical but defined in Channels/ChannelList.css and imported only
+ * by ChannelList. Borrowing it renders correctly today purely because that
+ * component happens to be in the main bundle — lazy-load it, or rename the
+ * rule, and this indicator silently becomes an invisible zero-height <li>.
+ * Vitest runs `css: false`, so no unit test can catch that. */
+.role-drag-ghost {
+  height: 2px;
+  margin: 0;
+  background: var(--accent-fill);
+  border-radius: 1px;
+  pointer-events: none;
+  list-style: none;
 }

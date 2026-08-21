@@ -84,6 +84,13 @@ import {
   ChannelPurgedSchema,
   DmPurgedSchema,
   ServerPurgedSchema,
+  // Server roles (#2359) (6)
+  RoleCreatedSchema,
+  RoleUpdatedSchema,
+  RoleDeletedSchema,
+  RolesReorderedSchema,
+  RoleAssignedSchema,
+  RoleUnassignedSchema,
   // Union + scrubber
   WebSocketEventSchema,
   EntitlementsChangedSchema,
@@ -1602,5 +1609,178 @@ describe('Presence override metadata', () => {
         excluded_user_ids: [UUID_A],
       }).success
     ).toBe(false);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// Server role events (#2359)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Six events are broadcast by services/control-plane/internal/rbac/handlers.go;
+// only roles_reordered has a renderer handler. The other five are validated
+// purely so the dispatch boundary does not count them as wire violations, so
+// the schema itself is the whole of their coverage.
+
+describe('Server role events (#2359)', () => {
+  // Mirrors the Go Role DTO (rbac/handlers.go:95-109) exactly: permissions is a
+  // STRING (`,string` json tag), color/emoji are omitempty pointers.
+  const ROLE = {
+    id: UUID_A,
+    server_id: UUID_B,
+    name: 'Moderator',
+    color: '#5865F2',
+    emoji: '🛡️',
+    position: 3,
+    permissions: '4611686018427387904',
+    is_default: false,
+    is_managed: false,
+    mentionable: true,
+    display_separately: true,
+    created_at: ISO_NOW,
+    updated_at: ISO_NOW,
+  };
+
+  it('RoleCreatedSchema accepts a canonical role_created envelope', () => {
+    const result = RoleCreatedSchema.safeParse({
+      type: 'role_created',
+      data: { server_id: UUID_B, role: ROLE },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RoleCreatedSchema accepts a role with color and emoji omitted', () => {
+    // Go emits *string + omitempty, so an unset color/emoji is ABSENT, not null.
+    const { color: _color, emoji: _emoji, ...bare } = ROLE;
+    const result = RoleCreatedSchema.safeParse({
+      type: 'role_created',
+      data: { server_id: UUID_B, role: bare },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RoleCreatedSchema rejects a numeric permissions bitfield', () => {
+    // The wire carries permissions as a string; a number here would mean the
+    // `,string` json tag was dropped server-side and precision is at risk.
+    const result = RoleCreatedSchema.safeParse({
+      type: 'role_created',
+      data: { server_id: UUID_B, role: { ...ROLE, permissions: 4611686018427387904 } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('RoleCreatedSchema rejects a role missing is_managed', () => {
+    // is_managed drives the managed/unmovable partition of the hierarchy UI —
+    // a role without it must never reach a store.
+    const { is_managed: _isManaged, ...withoutManaged } = ROLE;
+    const result = RoleCreatedSchema.safeParse({
+      type: 'role_created',
+      data: { server_id: UUID_B, role: withoutManaged },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('RoleUpdatedSchema accepts role_id alongside the full role DTO', () => {
+    const result = RoleUpdatedSchema.safeParse({
+      type: 'role_updated',
+      data: { server_id: UUID_B, role_id: UUID_A, role: ROLE },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RoleUpdatedSchema rejects a payload missing role_id', () => {
+    const result = RoleUpdatedSchema.safeParse({
+      type: 'role_updated',
+      data: { server_id: UUID_B, role: ROLE },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('RoleDeletedSchema accepts a canonical role_deleted envelope', () => {
+    const result = RoleDeletedSchema.safeParse({
+      type: 'role_deleted',
+      data: { server_id: UUID_B, role_id: UUID_A },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RoleDeletedSchema rejects a malformed role_id', () => {
+    const result = RoleDeletedSchema.safeParse({
+      type: 'role_deleted',
+      data: { server_id: UUID_B, role_id: 'not-a-uuid' },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('RolesReorderedSchema accepts the applied ordering slice', () => {
+    const result = RolesReorderedSchema.safeParse({
+      type: 'roles_reordered',
+      data: { server_id: UUID_B, role_ids: [UUID_A, UUID_C] },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RolesReorderedSchema rejects a non-UUID entry inside role_ids', () => {
+    const result = RolesReorderedSchema.safeParse({
+      type: 'roles_reordered',
+      data: { server_id: UUID_B, role_ids: [UUID_A, 'not-a-uuid'] },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('RoleAssignedSchema accepts a canonical role_assigned envelope', () => {
+    const result = RoleAssignedSchema.safeParse({
+      type: 'role_assigned',
+      data: { server_id: UUID_B, user_id: UUID_C, role_id: UUID_A },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RoleAssignedSchema rejects a payload missing user_id', () => {
+    const result = RoleAssignedSchema.safeParse({
+      type: 'role_assigned',
+      data: { server_id: UUID_B, role_id: UUID_A },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('RoleUnassignedSchema accepts a canonical role_unassigned envelope', () => {
+    const result = RoleUnassignedSchema.safeParse({
+      type: 'role_unassigned',
+      data: { server_id: UUID_B, user_id: UUID_C, role_id: UUID_A },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('RoleUnassignedSchema rejects a numeric role_id', () => {
+    const result = RoleUnassignedSchema.safeParse({
+      type: 'role_unassigned',
+      data: { server_id: UUID_B, user_id: UUID_C, role_id: 42 },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('WebSocketEventSchema routes every role event to its member schema', () => {
+    // The registration half of the fix: before these six were in the union, the
+    // dispatch boundary logged them as unknown and incremented
+    // wireViolationCount on every connected member's client.
+    const envelopes = [
+      { type: 'role_created', data: { server_id: UUID_B, role: ROLE } },
+      { type: 'role_updated', data: { server_id: UUID_B, role_id: UUID_A, role: ROLE } },
+      { type: 'role_deleted', data: { server_id: UUID_B, role_id: UUID_A } },
+      { type: 'roles_reordered', data: { server_id: UUID_B, role_ids: [UUID_A, UUID_C] } },
+      { type: 'role_assigned', data: { server_id: UUID_B, user_id: UUID_C, role_id: UUID_A } },
+      { type: 'role_unassigned', data: { server_id: UUID_B, user_id: UUID_C, role_id: UUID_A } },
+    ];
+    for (const envelope of envelopes) {
+      const result = WebSocketEventSchema.safeParse(envelope);
+      expect(result.success, `${envelope.type} must parse`).toBe(true);
+      if (result.success) expect(result.data.type).toBe(envelope.type);
+    }
+  });
+
+  it('WebSocketEventSchema has exactly 75 members', () => {
+    // Pins the count quoted in [internal]rules/frontend.md and in the ws-events.ts
+    // header, so a future addition cannot silently drift the docs.
+    expect(WebSocketEventSchema.options).toHaveLength(76);
   });
 });
