@@ -68,6 +68,26 @@ const FRAME_KEY_BURST_CAP = 8; // requests per burst before pausing
 const FRAME_KEY_RETRY_RESET_MS = 15_000; // idle gap after which a burst resets (slow-key recovery)
 const FRAME_KEY_MAX_TRACKED = 512; // global size cap (DoS bound)
 
+// Transform-bypass probe (2026-08-21): frames ENTERING each decrypt pipeline,
+// keyed by probeId (the consumer id from E2EETransformOptions). Counts every
+// transform() invocation before any decrypt outcome, so the main thread can
+// pair it with receiver.getStats(): packets arriving + entered === 0 means
+// frames are reaching the decoder WITHOUT passing the attached transform.
+// Exported for unit tests. Size-capped: the worker never learns when a
+// consumer closes, so stale ids accumulate; at cap, evict the oldest.
+export const decryptEnteredCounts = new Map<string, number>();
+const DECRYPT_COUNTS_MAX = 256;
+
+export function recordDecryptEntry(probeId: string | undefined): void {
+  if (!probeId) return;
+  const current = decryptEnteredCounts.get(probeId);
+  if (current === undefined && decryptEnteredCounts.size >= DECRYPT_COUNTS_MAX) {
+    const oldest = decryptEnteredCounts.keys().next().value;
+    if (oldest !== undefined) decryptEnteredCounts.delete(oldest);
+  }
+  decryptEnteredCounts.set(probeId, (current ?? 0) + 1);
+}
+
 function postToMain(msg: E2EEMainMessage): void {
   self.postMessage(msg);
 }
@@ -135,10 +155,19 @@ self.onmessage = (event: MessageEvent<E2EEWorkerMessage>) => {
         });
       break;
 
+    case 'queryDecryptStats':
+      postToMain({
+        type: 'decryptStats',
+        probeId: msg.probeId,
+        entered: decryptEnteredCounts.get(msg.probeId) ?? 0,
+      });
+      break;
+
     case 'destroy':
       encryption.destroy();
       recoveryState.clear();
       frameKeyRequests.clear();
+      decryptEnteredCounts.clear();
       log('debug', 'E2EE Worker: destroyed');
       break;
   }
@@ -161,7 +190,13 @@ self.addEventListener('rtctransform', ((event: RTCTransformEvent) => {
       log('error', 'E2EE: decrypt transform missing senderUserId');
       return;
     }
-    handleDecrypt(transformer.readable, transformer.writable, opts.senderUserId, opts.codecFamily);
+    handleDecrypt(
+      transformer.readable,
+      transformer.writable,
+      opts.senderUserId,
+      opts.codecFamily,
+      opts.probeId
+    );
   } else {
     log('error', 'E2EE: unknown transform role', { role: String(opts.role) });
   }
@@ -313,17 +348,26 @@ function handleDecrypt(
   readable: ReadableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>,
   writable: WritableStream<RTCEncodedAudioFrame | RTCEncodedVideoFrame>,
   senderUserId: string,
-  codecFamily: CodecFamily | undefined
+  codecFamily: CodecFamily | undefined,
+  probeId?: string
 ): void {
   let dropCount = 0;
   let missCount = 0;
   let firstLogged = false;
+  let firstEntryLogged = false;
 
   const transform = new TransformStream<
     RTCEncodedAudioFrame | RTCEncodedVideoFrame,
     RTCEncodedAudioFrame | RTCEncodedVideoFrame
   >({
     async transform(frame, controller) {
+      // Bypass probe: count entry BEFORE any decrypt outcome — this is the
+      // counter the main thread pairs with receiver.getStats().
+      recordDecryptEntry(probeId);
+      if (!firstEntryLogged) {
+        firstEntryLogged = true;
+        log('debug', `E2EE: first frame entered decrypt transform for ${senderUserId}`);
+      }
       try {
         await encryption.decryptFrame(frame, senderUserId, codecFamily);
         controller.enqueue(frame);

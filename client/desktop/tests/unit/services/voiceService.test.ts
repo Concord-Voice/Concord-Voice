@@ -5878,3 +5878,216 @@ describe('tune-in hardening (#2088 review fixes)', () => {
     expect(svc.consumers.has('cons-late')).toBe(false);
   });
 });
+
+// ─── Receive-transform bypass probe (2026-08-21 incident) ────────────────────
+//
+// Chrome 149 / Electron 43 decoded arriving RTP as ciphertext while the
+// attached RTCRtpScriptTransform processed zero frames. The probe pairs
+// receiver.getStats() with the worker's entered-frame count and fails closed.
+// These cover the VoiceService orchestration; the decision policy itself is
+// tested in voiceTransformBypass.test.ts and the counter in e2eeWorker.test.ts.
+
+describe('receive-transform bypass probe', () => {
+  const svc = voiceService as any;
+
+  class FakeScriptTransform {
+    constructor(
+      public worker: unknown,
+      public options: unknown
+    ) {}
+  }
+
+  function fakeConsumer(id: string, packetsReceived: number) {
+    const receiver: any = {
+      transform: null,
+      getStats: vi
+        .fn()
+        .mockResolvedValue(new Map([[`in-${id}`, { type: 'inbound-rtp', packetsReceived }]])),
+    };
+    return {
+      id,
+      closed: false,
+      close: vi.fn(),
+      rtpReceiver: receiver,
+      rtpParameters: { codecs: [{ mimeType: 'audio/opus' }] },
+      on: vi.fn(),
+    } as any;
+  }
+
+  let worker: { postMessage: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('RTCRtpScriptTransform', FakeScriptTransform);
+    worker = { postMessage: vi.fn() };
+    svc.e2eeWorker = worker;
+    svc.consumers = new Map();
+    svc.bypassProbes.clear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    svc.e2eeWorker = null;
+    svc.consumers.clear();
+    svc.bypassProbes.clear();
+  });
+
+  it('schedules a probe that queries the worker for the entered count', async () => {
+    const consumer = fakeConsumer('c1', 100);
+    svc.consumers.set('c1', consumer);
+
+    svc.scheduleBypassProbe('c1', 'user-1', 'first', 1);
+    expect(worker.postMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(worker.postMessage).toHaveBeenCalledWith({
+      type: 'queryDecryptStats',
+      probeId: 'c1',
+    });
+    expect(svc.bypassProbes.get('c1')).toEqual({
+      senderUserId: 'user-1',
+      phase: 'first',
+      attempt: 1,
+    });
+  });
+
+  it('skips the probe when the consumer or worker is gone (stale timer no-op)', async () => {
+    svc.scheduleBypassProbe('gone', 'user-1', 'first', 1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(worker.postMessage).not.toHaveBeenCalled();
+
+    // Stale reply with no pending probe is ignored too.
+    await svc.evaluateBypassProbe('gone', 0);
+  });
+
+  it('verifies a healthy transform and stops probing', async () => {
+    const consumer = fakeConsumer('c2', 500);
+    svc.consumers.set('c2', consumer);
+    svc.bypassProbes.set('c2', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+
+    await svc.evaluateBypassProbe('c2', 42);
+
+    expect(svc.bypassProbes.has('c2')).toBe(false);
+    expect(consumer.close).not.toHaveBeenCalled();
+    expect(consumer.rtpReceiver.transform).toBeNull(); // untouched
+  });
+
+  it('retries an inconclusive probe and gives up after the attempt cap', async () => {
+    const consumer = fakeConsumer('c3', 0); // paused producer — no packets
+    svc.consumers.set('c3', consumer);
+
+    svc.bypassProbes.set('c3', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+    await svc.evaluateBypassProbe('c3', 0);
+    await vi.advanceTimersByTimeAsync(5_000); // the retry it scheduled
+    expect(svc.bypassProbes.get('c3')).toEqual({
+      senderUserId: 'user-1',
+      phase: 'first',
+      attempt: 2,
+    });
+
+    // At the attempt cap it drops to the SLOW poll instead of giving up —
+    // a muted joiner can start sending minutes later (Gitar, PR #2865).
+    svc.bypassProbes.set('c3', { senderUserId: 'user-1', phase: 'first', attempt: 3 });
+    worker.postMessage.mockClear();
+    await svc.evaluateBypassProbe('c3', 0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(worker.postMessage).not.toHaveBeenCalled(); // not at the fast cadence
+    await vi.advanceTimersByTimeAsync(20_000); // …but at 30s the slow poll fires
+    expect(worker.postMessage).toHaveBeenCalledWith({
+      type: 'queryDecryptStats',
+      probeId: 'c3',
+    });
+    expect(consumer.close).not.toHaveBeenCalled();
+  });
+
+  it('surfaces an unexpected evaluation failure instead of rejecting unhandled', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const consumer = fakeConsumer('c8', 315);
+    // Force a throw OUTSIDE the getStats try/catch: a receiver whose transform
+    // setter explodes during re-attach teardown.
+    Object.defineProperty(consumer.rtpReceiver, 'transform', {
+      get: () => null,
+      set: () => {
+        throw new Error('setter exploded');
+      },
+    });
+    svc.consumers.set('c8', consumer);
+    svc.bypassProbes.set('c8', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+
+    // Route through the SAME floating call site the worker reply uses.
+    (svc as any).handleWorkerMessage({ type: 'decryptStats', probeId: 'c8', entered: 0 });
+    await vi.waitFor(() => {
+      // The setter throw is caught by the re-attach catch → fail-closed close.
+      expect(consumer.close).toHaveBeenCalled();
+    });
+    consoleError.mockRestore();
+  });
+
+  it('re-attaches once on a confirmed bypass, then schedules the reattached probe', async () => {
+    const consumer = fakeConsumer('c4', 315);
+    svc.consumers.set('c4', consumer);
+    svc.bypassProbes.set('c4', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+
+    await svc.evaluateBypassProbe('c4', 0);
+
+    const attached = consumer.rtpReceiver.transform;
+    expect(attached).toBeInstanceOf(FakeScriptTransform);
+    expect((attached as any).options).toMatchObject({
+      role: 'decrypt',
+      senderUserId: 'user-1',
+      codecFamily: 'opus',
+      probeId: 'c4',
+    });
+    expect(consumer.close).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(svc.bypassProbes.get('c4')).toEqual({
+      senderUserId: 'user-1',
+      phase: 'reattached',
+      attempt: 1,
+    });
+  });
+
+  it('closes the consumer fail-closed when the bypass survives re-attach', async () => {
+    const consumer = fakeConsumer('c5', 800);
+    svc.consumers.set('c5', consumer);
+    svc.bypassProbes.set('c5', { senderUserId: 'user-1', phase: 'reattached', attempt: 1 });
+
+    await svc.evaluateBypassProbe('c5', 0);
+
+    expect(consumer.close).toHaveBeenCalled();
+    expect(svc.consumers.has('c5')).toBe(false);
+  });
+
+  it('fails closed when the re-attach itself throws', async () => {
+    vi.stubGlobal(
+      'RTCRtpScriptTransform',
+      class {
+        constructor() {
+          throw new Error('attach refused');
+        }
+      }
+    );
+    const consumer = fakeConsumer('c6', 315);
+    svc.consumers.set('c6', consumer);
+    svc.bypassProbes.set('c6', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+
+    await svc.evaluateBypassProbe('c6', 0);
+
+    expect(consumer.close).toHaveBeenCalled();
+    expect(svc.consumers.has('c6')).toBe(false);
+  });
+
+  it('abandons the evaluation when getStats rejects mid-teardown', async () => {
+    const consumer = fakeConsumer('c7', 0);
+    consumer.rtpReceiver.getStats = vi.fn().mockRejectedValue(new Error('torn down'));
+    svc.consumers.set('c7', consumer);
+    svc.bypassProbes.set('c7', { senderUserId: 'user-1', phase: 'first', attempt: 1 });
+
+    await svc.evaluateBypassProbe('c7', 0);
+
+    expect(consumer.close).not.toHaveBeenCalled();
+    expect(svc.bypassProbes.has('c7')).toBe(false);
+  });
+});

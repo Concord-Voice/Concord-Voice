@@ -37,6 +37,13 @@ import {
 } from '../stores/videoSettingsStore';
 import { apiFetch } from './apiClient';
 import {
+  BYPASS_PROBE_DELAY_MS,
+  BYPASS_PROBE_MAX_ATTEMPTS,
+  BYPASS_PROBE_SLOW_DELAY_MS,
+  decideBypassProbeAction,
+  type BypassProbePhase,
+} from './voiceTransformBypass';
+import {
   MEDIA_E2EE_FRAME_CRYPTO_VERSION,
   MediaEncryption,
   deriveFrameKey,
@@ -3164,6 +3171,10 @@ class VoiceService {
     // Must precede every other teardown operation: a key-fetch/derivation
     // continuation may otherwise publish a fresh Worker after cleanup began.
     this.invalidatePendingE2EEInit();
+    // Pending bypass probes reference consumers of the session being torn
+    // down; a worker terminated mid-probe can never deliver the reply that
+    // would clear them (CodeRabbit, PR #2865).
+    this.bypassProbes.clear();
     this.teardownSharedE2EEState();
     this.stopLocalVAD();
     this.stopPacketLossMonitor();
@@ -7083,6 +7094,15 @@ class VoiceService {
         break;
       }
 
+      case 'decryptStats': {
+        // Floating by design; the catch keeps an unexpected throw in the
+        // reattach/close branches from becoming an unhandled rejection.
+        void this.evaluateBypassProbe(msg.probeId, msg.entered).catch((err) =>
+          console.error('E2EE: bypass probe evaluation failed:', errorMessage(err))
+        );
+        break;
+      }
+
       case 'log':
         // Forward Worker logs to renderer console
         // eslint-disable-next-line no-console -- worker log bridge; levels beyond .warn/.error/.debug need to propagate as the worker emitted them for parity with worker-side output
@@ -7580,11 +7600,17 @@ class VoiceService {
         throw new Error('E2EE: failed to attach decrypt transform (Worker is not initialized)');
       }
       try {
-        const options: E2EETransformOptions = { role: 'decrypt', senderUserId, codecFamily };
+        const options: E2EETransformOptions = {
+          role: 'decrypt',
+          senderUserId,
+          codecFamily,
+          probeId: consumer.id,
+        };
         receiver.transform = new RTCRtpScriptTransform(this.e2eeWorker, options);
         console.debug(
           `E2EE: decrypt transform applied for ${senderUserId} (RTCRtpScriptTransform)`
         );
+        this.scheduleBypassProbe(consumer.id, senderUserId, 'first', 1);
       } catch (err) {
         console.error('E2EE: RTCRtpScriptTransform failed on receiver:', errorMessage(err));
         throw new Error(
@@ -7612,6 +7638,124 @@ class VoiceService {
       E2EE_VERBOSE,
       codecFamily
     );
+  }
+
+  // ── Receive-transform bypass probe (2026-08-21 incident) ─────────────
+  // Decoder-side getStats() and the worker's entered-frame counter are paired
+  // ~5s after attach. Packets arriving while zero frames entered the transform
+  // means ciphertext is reaching the decoder (garbled audio / black video).
+  // One re-attach is attempted; if the bypass persists, the consumer is closed
+  // fail-closed — silence is strictly better than decoded ciphertext.
+  // Pending probes are keyed by consumer id; every async hop re-validates the
+  // consumer and worker, so stale timers after teardown are harmless no-ops.
+
+  private readonly bypassProbes = new Map<
+    string,
+    { senderUserId: string; phase: BypassProbePhase; attempt: number }
+  >();
+
+  private scheduleBypassProbe(
+    consumerId: string,
+    senderUserId: string,
+    phase: BypassProbePhase,
+    attempt: number,
+    delayMs: number = BYPASS_PROBE_DELAY_MS
+  ): void {
+    setTimeout(() => {
+      const consumer = this.consumers.get(consumerId);
+      const worker = this.e2eeWorker;
+      if (!consumer || consumer.closed || !worker) return;
+      this.bypassProbes.set(consumerId, { senderUserId, phase, attempt });
+      worker.postMessage({
+        type: 'queryDecryptStats',
+        probeId: consumerId,
+      } satisfies E2EEWorkerMessage);
+    }, delayMs);
+  }
+
+  private async evaluateBypassProbe(consumerId: string, entered: number): Promise<void> {
+    const probe = this.bypassProbes.get(consumerId);
+    if (!probe) return;
+    this.bypassProbes.delete(consumerId);
+
+    const consumer = this.consumers.get(consumerId);
+    if (!consumer || consumer.closed) return;
+
+    let packetsReceived = 0;
+    try {
+      const stats = await consumer.rtpReceiver?.getStats();
+      stats?.forEach((report: { type?: string; packetsReceived?: number }) => {
+        if (report.type === 'inbound-rtp') packetsReceived += report.packetsReceived ?? 0;
+      });
+    } catch {
+      return; // stats unavailable (torn down mid-probe) — nothing to judge
+    }
+
+    const action = decideBypassProbeAction(packetsReceived, entered, probe.phase, probe.attempt);
+    switch (action) {
+      case 'verified':
+        console.debug('E2EE: receive transform verified', {
+          consumerId,
+          entered,
+          packetsReceived,
+        });
+        return;
+      case 'retry':
+        this.scheduleBypassProbe(consumerId, probe.senderUserId, probe.phase, probe.attempt + 1);
+        return;
+      case 'slow-retry':
+        // Log the transition once, then poll quietly for the consumer's life.
+        if (probe.attempt === BYPASS_PROBE_MAX_ATTEMPTS) {
+          console.debug('E2EE: bypass probe entering slow poll — no media yet', { consumerId });
+        }
+        this.scheduleBypassProbe(
+          consumerId,
+          probe.senderUserId,
+          probe.phase,
+          Math.min(probe.attempt + 1, BYPASS_PROBE_MAX_ATTEMPTS + 1),
+          BYPASS_PROBE_SLOW_DELAY_MS
+        );
+        return;
+      case 'reattach': {
+        console.error(
+          'E2EE: receive transform BYPASSED — encrypted frames are reaching the decoder; re-attaching',
+          { consumerId, senderUserId: probe.senderUserId, packetsReceived }
+        );
+        const receiver = consumer.rtpReceiver;
+        const worker = this.e2eeWorker;
+        if (!receiver || !worker) return;
+        try {
+          // Direct replacement — NEVER null-then-set: per the encoded-transform
+          // spec, assigning null enables the PASSTHROUGH algorithm, i.e. a
+          // window where ciphertext flows to the decoder by design
+          // (CodeRabbit, PR #2865 / CWE-693). A single assignment is the
+          // defined dynamic update.
+          receiver.transform = new RTCRtpScriptTransform(worker, {
+            role: 'decrypt',
+            senderUserId: probe.senderUserId,
+            codecFamily: codecFamilyFromRtpParameters(consumer.rtpParameters),
+            probeId: consumerId,
+          } satisfies E2EETransformOptions);
+          this.scheduleBypassProbe(consumerId, probe.senderUserId, 'reattached', 1);
+        } catch (err) {
+          this.closeConsumerAfterDecryptTransformFailure(
+            consumer,
+            `bypass re-attach failed: ${errorMessage(err)}`
+          );
+        }
+        return;
+      }
+      case 'close':
+        console.error(
+          'E2EE: receive transform still bypassed after re-attach — closing consumer fail-closed',
+          { consumerId, senderUserId: probe.senderUserId, packetsReceived }
+        );
+        this.closeConsumerAfterDecryptTransformFailure(
+          consumer,
+          'receive transform bypassed — ciphertext reaching decoder'
+        );
+        return;
+    }
   }
 
   private closeConsumerAfterDecryptTransformFailure(
@@ -7710,6 +7854,7 @@ class VoiceService {
     // Invalidate asynchronous crypto work and drop the live rotation listener
     // before closeProducer reaches the first await.
     this.invalidatePendingE2EEInit();
+    this.bypassProbes.clear(); // same stale-probe reasoning as cleanupTimersAndE2EE
     this.teardownSharedE2EEState();
     this.invalidateVideoReproduces();
     // Clear solo bandwidth saving state

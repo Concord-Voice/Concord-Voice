@@ -233,6 +233,99 @@ describe('e2eeWorker key-miss observability', () => {
   });
 });
 
+describe('e2eeWorker decrypt entered-frame counter (bypass probe)', () => {
+  let postMessage: ReturnType<typeof vi.fn>;
+  let rtctransformListener: ((event: { transformer: unknown }) => void) | undefined;
+  let workerOnMessage: ((event: { data: unknown }) => void) | null;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    postMessage = vi.fn();
+    rtctransformListener = undefined;
+    const stub = {
+      postMessage,
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+      addEventListener: vi.fn((event: string, listener: EventListener) => {
+        if (event === 'rtctransform') {
+          rtctransformListener = listener as unknown as (event: { transformer: unknown }) => void;
+        }
+      }),
+    };
+    vi.stubGlobal('self', stub);
+    await import('@/renderer/workers/e2eeWorker');
+    workerOnMessage = stub.onmessage;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * The bypass probe pairs receiver.getStats() with this counter: packets
+   * arriving while entered === 0 is the signature of ciphertext reaching the
+   * decoder around the transform (2026-08-21 incident). The counter must tick
+   * on ENTRY — before any decrypt outcome — so a failing decrypt still counts.
+   */
+  it('counts entries per probeId and answers queryDecryptStats', async () => {
+    const miss = Object.assign(new Error('no key'), {
+      name: 'FrameKeyMissError',
+      senderUserId: 'sender-1',
+      keyVersion: 1,
+      keyId: 3,
+    });
+    mockDecryptFrame.mockRejectedValue(miss);
+
+    const frames = [
+      { type: 'key', data: new ArrayBuffer(64) },
+      { type: 'delta', data: new ArrayBuffer(64) },
+    ] as RTCEncodedVideoFrame[];
+    const readable = new ReadableStream<RTCEncodedVideoFrame>({
+      start(controller) {
+        for (const f of frames) controller.enqueue(f);
+        controller.close();
+      },
+    });
+    const writable = new WritableStream<RTCEncodedVideoFrame>({ write() {} });
+
+    expect(rtctransformListener).toBeTypeOf('function');
+    rtctransformListener!({
+      transformer: {
+        options: { role: 'decrypt', senderUserId: 'sender-1', probeId: 'consumer-42' },
+        readable,
+        writable,
+      },
+    });
+
+    const { decryptEnteredCounts } = await import('@/renderer/workers/e2eeWorker');
+    await vi.waitFor(() => {
+      expect(decryptEnteredCounts.get('consumer-42')).toBe(2);
+    });
+
+    expect(workerOnMessage).toBeTypeOf('function');
+    workerOnMessage!({ data: { type: 'queryDecryptStats', probeId: 'consumer-42' } });
+    expect(postMessage).toHaveBeenCalledWith({
+      type: 'decryptStats',
+      probeId: 'consumer-42',
+      entered: 2,
+    });
+
+    // An unknown probeId answers 0, never throws.
+    workerOnMessage!({ data: { type: 'queryDecryptStats', probeId: 'nope' } });
+    expect(postMessage).toHaveBeenCalledWith({ type: 'decryptStats', probeId: 'nope', entered: 0 });
+  });
+
+  it('caps the counter map and evicts the oldest id', async () => {
+    const { decryptEnteredCounts, recordDecryptEntry } =
+      await import('@/renderer/workers/e2eeWorker');
+    decryptEnteredCounts.clear();
+    for (let i = 0; i < 300; i++) recordDecryptEntry(`c${i}`);
+    expect(decryptEnteredCounts.size).toBeLessThanOrEqual(256);
+    expect(decryptEnteredCounts.has('c0')).toBe(false); // oldest evicted
+    expect(decryptEnteredCounts.has('c299')).toBe(true);
+  });
+});
+
 describe('e2eeWorker requestFrameKey retry policy (#1885)', () => {
   let postMessage: ReturnType<typeof vi.fn>;
   let requestFrameKeyOnce: (s: string, v: number, k: number) => void;

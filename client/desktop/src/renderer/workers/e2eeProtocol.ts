@@ -21,6 +21,11 @@ export type E2EEWorkerMessage =
     }
   | { type: 'rotateKeys' }
   | { type: 'catchUpToEpoch'; targetEpoch: number }
+  // Transform-bypass probe: ask the worker how many frames have ENTERED the
+  // decrypt pipeline identified by probeId (the consumer id). Pairs with the
+  // main thread's receiver.getStats() to detect frames reaching the decoder
+  // without passing the attached transform.
+  | { type: 'queryDecryptStats'; probeId: string }
   | { type: 'destroy' };
 
 // ─── Worker → Main Thread ────────────────────────────────────────────
@@ -47,7 +52,10 @@ export type E2EEMainMessage =
       level: 'debug' | 'info' | 'warn' | 'error';
       message: string;
       data?: Record<string, unknown>;
-    };
+    }
+  // Reply to queryDecryptStats. entered counts every frame the pipeline's
+  // transform() callback has been invoked for, regardless of decrypt outcome.
+  | { type: 'decryptStats'; probeId: string; entered: number };
 
 // ─── RTCRtpScriptTransform options ───────────────────────────────────
 
@@ -133,4 +141,8 @@ export interface E2EETransformOptions {
   // crypto dispatch (H.264 NAL-aware, AV1 per-OBU, otherwise whole-frame).
   // Undefined → whole-frame.
   codecFamily?: CodecFamily;
+  // Transform-bypass probe id — the consumer id owning this decrypt transform.
+  // Keys the worker's per-pipeline entered-frame counter so the main thread
+  // can pair decoder-side getStats() with worker-side frame counts.
+  probeId?: string;
 }
