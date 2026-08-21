@@ -416,8 +416,7 @@ concord/
 │   └── web/              # Web client (future)
 ├── services/
 │   ├── control-plane/    # Go service - auth, channels
-│   ├── media-plane/      # Node.js - WebRTC SFU
-│   └── licensing-authority/  # Go - license validation
+│   └── media-plane/      # Node.js - WebRTC SFU
 ├── docs/                 # Documentation
 ├── infrastructure/       # Docker, K8s configs
 ├── shared/              # Shared types

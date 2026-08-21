@@ -12,12 +12,12 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 395 third-party software components across its three
+Concord Voice distributes 394 third-party software components across its three
 CVSL application artifact families:
 
 - **59** Go modules in the control-plane runtime binary
 - **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
-- **149** npm packages in the media-plane production bundle
+- **148** npm packages in the media-plane production bundle
 
 (Counts exclude Concord Voice's own private packages — `@concordvoice/desktop`,
 `@concordvoice/media-plane` — and the local stub override
@@ -41,7 +41,7 @@ No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the three
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 395-component count.
+recorded separately below; it is not part of the 394-component count.
 
 ## License Texts
 
@@ -426,7 +426,6 @@ bundle (services/media-plane):
 | data-uri-to-buffer | 4.0.1 | MIT | https://github.com/TooTallNate/node-data-uri-to-buffer |
 | debug | 4.4.3 | MIT | https://github.com/debug-js/debug |
 | depd | 2.0.0 | MIT | https://github.com/dougwilson/nodejs-depd |
-| dotenv | 17.4.2 | BSD-2-Clause | https://github.com/motdotla/dotenv |
 | dunder-proto | 1.0.1 | MIT | https://github.com/es-shims/dunder-proto |
 | ecdsa-sig-formatter | 1.0.11 | Apache-2.0 | https://github.com/Brightspace/node-ecdsa-sig-formatter |
 | ee-first | 1.1.1 | MIT | https://github.com/jonathanong/ee-first |

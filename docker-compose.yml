@@ -354,28 +354,6 @@ services:
     profiles:
       - services
 
-  # Licensing Authority Service (Go)
-  licensing-authority:
-    build:
-      context: ./services/licensing-authority
-      dockerfile: Dockerfile
-    container_name: concordvoice-licensing-authority
-    environment:
-      DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:?}@postgres:5432/concord?sslmode=disable
-      PRIVATE_KEY_PATH: /app/keys/license_private_key.pem
-      PORT: 8082
-    ports:
-      - "8082:8082"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./infrastructure/docker/licensing/keys:/app/keys
-    networks:
-      - concordvoice-data
-    profiles:
-      - licensing
-
 volumes:
   postgres-data:
     driver: local

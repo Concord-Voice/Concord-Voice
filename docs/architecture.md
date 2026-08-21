@@ -10,7 +10,7 @@ Concord Voice is a distributed real-time communications platform with clear sepa
 2. **Control Plane** (Go) — auth, business logic, RBAC, messaging hub, E2EE ciphertext relay, object-storage proxy.
 3. **Media Plane** (Node.js + mediasoup) — WebRTC SFU for voice/video.
 
-The **Licensing Authority** (self-hosted license management) is a Phase-3 planned service and is **not yet built** — its directory is profile-gated out of the production stack.
+The **Licensing Authority** (self-hosted license management) is a Phase-3 planned service and is **not yet built**. Its stub directory and compose/deploy plumbing were removed in #1785; the design remains in the self-hosted deployment docs until implementation starts.
 
 ## Quick Overview
 
@@ -1130,7 +1130,7 @@ The direct self-host nginx installer domain-renders the committed strong HSTS de
 
 **Requirements:** 4+ CPU cores, 8+ GB RAM, 50+ GB storage, public IP for WebRTC, UDP 40000–41999 open. The `coturn` service runs STUN and TURN with TLS. A certbot deploy hook provisions the cert.
 
-The `tools` compose profile gates the dev and test services (`pgadmin`, `redis-commander`). The `licensing` profile gates `licensing-authority`, which is not production-active.
+The `tools` compose profile gates the dev and test services (`pgadmin`, `redis-commander`).
 
 ## Security Architecture
 
@@ -1224,8 +1224,7 @@ Concord/
 │   └── src/constants/        # Typed constants + build-time generators
 ├── services/
 │   ├── control-plane/        # Go backend (generated internal-package count; migrations/)
-│   ├── media-plane/          # Node.js mediasoup WebRTC SFU (src/lib/ RoomManager, mediasoup)
-│   └── licensing-authority/  # Planned (Phase 3) — profile-gated, not production-active
+│   └── media-plane/          # Node.js mediasoup WebRTC SFU (src/lib/ RoomManager, mediasoup)
 ├── infrastructure/
 │   ├── deploy/               # deploy-spa.sh, copy-certs.sh, provisioning
 │   └── docker/               # postgres, coturn, buildtools base images
@@ -1252,7 +1251,7 @@ Concord/
 
 These describe intended future work, **not** current architecture. This section keeps them visible so contributors can tell shipped reality from roadmap.
 
-- **Licensing Authority** (Go, port 8082) — signed-license generation/validation and periodic check-ins for self-hosted instances. Directory exists but is profile-gated out of production (Phase 3).
+- **Licensing Authority** (Go, port 8082) — signed-license generation/validation and periodic check-ins for self-hosted instances. Planned for Phase 3; no directory is present in the tree (the stub was removed in #1785).
 - **Web client (PWA)** — a browser client sharing renderer code with the desktop app. Not built. The desktop client is the only shipping client.
 - **Kubernetes / multi-region** — Helm charts, horizontal pod autoscaling, geographic DNS routing, and read-replica fan-out for a multi-region SaaS. Current production is a single-VM Docker Compose deployment.
 - **`messages`-table partitioning** — declarative hash-partitioning by `channel_id` is specified but deliberately **not** implemented. Concrete trigger criteria gate it: query p99 > 100ms, any channel > 100k messages, or > 10M rows with observed bloat. Earliest candidate: v1.2.0.

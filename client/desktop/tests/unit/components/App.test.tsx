@@ -126,6 +126,31 @@ vi.mock('@/renderer/services/savedGifsSync', () => ({
   },
 }));
 
+// #1785: App.tsx side-effect-imports `services/gifProvider`, whose module body
+// applies the stored privacy preference to the active provider. Mock the
+// provider so importing App does no real KLIPY work, and record the calls in a
+// plain array rather than a vi.fn() — the wiring fires once at module-import
+// time (below), which is BEFORE this suite's beforeEach runs, so a spy would be
+// wiped by vi.clearAllMocks() before any test could read it.
+const klipyPersonalizationCalls = vi.hoisted(() => [] as boolean[]);
+vi.mock('@/renderer/services/gifProvider/klipyProvider', () => ({
+  klipyProvider: {
+    name: 'KLIPY',
+    searchPlaceholder: 'Search KLIPY',
+    poweredByText: 'Powered by KLIPY',
+    supportsRecent: true,
+    supportsCategories: true,
+    setPersonalizationEnabled: (enabled: boolean) => {
+      klipyPersonalizationCalls.push(enabled);
+    },
+    trending: vi.fn(),
+    search: vi.fn(),
+    recent: vi.fn(),
+    categories: vi.fn(),
+    getBySlug: vi.fn(),
+  },
+}));
+
 const mockHydratePostLogin = vi.fn().mockResolvedValue(undefined);
 vi.mock('@/renderer/services/postLoginHydration', () => ({
   hydratePostLogin: (...args: unknown[]) => mockHydratePostLogin(...args),
@@ -695,5 +720,30 @@ describe('extractInviteCodes — friend links (#945)', () => {
 
   it('still extracts a canonical server invite link', () => {
     expect(extractInviteCodes('https://invite.concordvoice.chat/AbCdEfGh')).toEqual(['AbCdEfGh']);
+  });
+});
+
+describe('KLIPY personalization wiring (#1785)', () => {
+  it('applies the personalization preference eagerly when App is imported, with no GIF surface mounted', () => {
+    // App.tsx carries a side-effect `import './services/gifProvider'`. That
+    // module owns the personalization wiring and applies the stored preference
+    // on evaluation. Nothing here mounts GifPicker or GifEmbed — and that is
+    // precisely the case that matters: Settings > Content Safety reads
+    // klipyClient directly, so the preference must already be applied for a
+    // user who has never opened the picker.
+    //
+    // Falsifier: drop the side-effect import from App.tsx and this fails.
+    // Every other route into services/gifProvider is mocked out in this file
+    // (MainView, DirectMessagesView, SettingsPage, savedGifsSync), so App.tsx
+    // is the only importer left.
+    expect(klipyPersonalizationCalls.length).toBeGreaterThan(0);
+
+    // Assert the VALUE, not merely that a call happened. privacyStore defaults
+    // sharePersonalizationWithGifProvider to `true` while klipyClient's class
+    // field defaults to `false` — that asymmetry IS the regression, so the
+    // wiring is only correct if `true` actually reaches the provider. A guard
+    // that checked call-count alone would still pass if the wiring fired with
+    // a hardcoded or wrongly-sourced value.
+    expect(klipyPersonalizationCalls).toContain(true);
   });
 });

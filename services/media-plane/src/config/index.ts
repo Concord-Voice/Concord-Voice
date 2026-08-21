@@ -1,7 +1,15 @@
-import dotenv from 'dotenv';
 import type { RouterRtpCodecCapability } from 'mediasoup/types';
 
-dotenv.config();
+// Node 24+ native .env loading, replacing the third-party `dotenv` package.
+// `process.loadEnvFile()` reads ./.env and THROWS when the file is absent,
+// whereas `dotenv.config()` soft-failed. Swallow only ENOENT so a missing
+// .env stays non-fatal (the deployed services supply env directly) while a
+// real fault — unreadable file, bad permissions — still surfaces.
+try {
+  process.loadEnvFile();
+} catch (err) {
+  if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+}
 
 // ---------------------------------------------------------------------------
 // Audio quality tiers — enforced client-side via producer codecOptions.

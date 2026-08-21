@@ -38,7 +38,13 @@ import { e2eeService } from './services/e2eeService';
 import { E2EEInitTeardownError } from './services/e2eeErrors';
 import { hydratePostLogin } from './services/postLoginHydration';
 import { usePrivacyStore } from './stores/privacyStore';
-import { klipyClient } from './services/gifProvider/klipyClient';
+// Side-effect import: this module owns the KLIPY personalization wiring —
+// it applies the privacy preference to the provider singleton and keeps it
+// in sync. Importing it here (rather than duplicating the subscription in
+// this component) makes the wiring eager at app load, so surfaces that read
+// klipyClient directly — e.g. Settings > Content Safety — see the correct
+// state even when no GIF picker or embed has ever mounted.
+import './services/gifProvider';
 import { clientConfigService } from './services/clientConfigService';
 import { detectCodecCapabilities, prewarmWebRTC } from './services/mediaCapabilities';
 import { useNotificationNavigationStore } from './stores/notificationNavigationStore';
@@ -254,22 +260,12 @@ function AuthenticatedLayout() {
     prewarmWebRTC();
   }, []);
 
-  // Load privacy settings + wire KLIPY personalization preference.
-  // KLIPY traffic always routes through the control-plane proxy now, so we
-  // only need to forward the personalization (customer_id) preference.
+  // Fetch privacy settings on login. The KLIPY personalization preference is
+  // applied by services/gifProvider (side-effect import above), which owns that
+  // wiring and stays subscribed to the privacy store.
   useEffect(() => {
     if (!accessToken) return;
-    const applyKlipyMode = (s: ReturnType<typeof usePrivacyStore.getState>['settings']) => {
-      klipyClient.setPersonalizationEnabled(s.sharePersonalizationWithGifProvider);
-    };
-    usePrivacyStore
-      .getState()
-      .fetchPrivacy()
-      .then(() => {
-        applyKlipyMode(usePrivacyStore.getState().settings);
-      });
-    const unsub = usePrivacyStore.subscribe((state) => applyKlipyMode(state.settings));
-    return () => unsub();
+    usePrivacyStore.getState().fetchPrivacy();
   }, [accessToken]);
 
   // Pre-cache codec capabilities, GPU info, and detect system HDR

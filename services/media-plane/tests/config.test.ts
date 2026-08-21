@@ -1,12 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { RouterRtpCodecCapability } from 'mediasoup/types';
 
 // Mock mediasoup types import (used by config module)
 vi.mock('mediasoup/node/lib/rtpParametersTypes.js', () => ({}));
 
-// Silence dotenv
-vi.mock('dotenv', () => ({
-  default: { config: vi.fn() },
-}));
+// Silence native env-file loading so tests never pick up a developer's local
+// .env. The config module calls process.loadEnvFile() at import time.
+const loadEnvFileSpy = vi.spyOn(process, 'loadEnvFile').mockImplementation(() => {});
 
 // Helper: dynamically import config with fresh module evaluation
 async function loadConfig(envOverrides: Record<string, string> = {}) {
@@ -48,6 +48,41 @@ describe('config', () => {
     delete process.env.OPS_METRICS_SHARED_SECRET;
     delete process.env.OPS_METRICS_INTERVAL;
     delete process.env.OPS_METRICS_ROLE;
+    loadEnvFileSpy.mockReset();
+    loadEnvFileSpy.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    loadEnvFileSpy.mockImplementation(() => {});
+  });
+
+  // ── Native .env loading (replaces dotenv) ───────────────────────────
+
+  describe('env file loading', () => {
+    it('loads .env via the native process.loadEnvFile on import', async () => {
+      await loadConfig();
+      expect(loadEnvFileSpy).toHaveBeenCalled();
+    });
+
+    it('starts normally when no .env file exists (ENOENT is soft-failed)', async () => {
+      const enoent = Object.assign(new Error('no such file or directory'), { code: 'ENOENT' });
+      loadEnvFileSpy.mockImplementation(() => {
+        throw enoent;
+      });
+
+      // Must not reject: a missing .env is the normal deployed state.
+      const mod = await loadConfig();
+      expect(mod.AUDIO_QUALITY_TIERS).toBeDefined();
+    });
+
+    it('rethrows a non-ENOENT failure instead of silently starting', async () => {
+      const eacces = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      loadEnvFileSpy.mockImplementation(() => {
+        throw eacces;
+      });
+
+      await expect(loadConfig()).rejects.toThrow('permission denied');
+    });
   });
 
   // ── Audio Quality Tiers ─────────────────────────────────────────────
@@ -95,13 +130,13 @@ describe('config', () => {
       const { config } = await loadConfig();
       const codecs = config.mediasoup.router.mediaCodecs;
       expect(codecs).toHaveLength(8);
-      expect(codecs.filter((c: any) => c.kind === 'audio')).toHaveLength(1);
-      expect(codecs.filter((c: any) => c.kind === 'video')).toHaveLength(7);
+      expect(codecs.filter((c: RouterRtpCodecCapability) => c.kind === 'audio')).toHaveLength(1);
+      expect(codecs.filter((c: RouterRtpCodecCapability) => c.kind === 'video')).toHaveLength(7);
     });
 
     it('audio codec is opus at 48kHz stereo', async () => {
       const { config } = await loadConfig();
-      const audio = config.mediasoup.router.mediaCodecs.find((c: any) => c.kind === 'audio');
+      const audio = config.mediasoup.router.mediaCodecs.find((c: RouterRtpCodecCapability) => c.kind === 'audio');
       expect(audio).toBeDefined();
       expect(audio.mimeType).toBe('audio/opus');
       expect(audio.clockRate).toBe(48000);
@@ -111,7 +146,7 @@ describe('config', () => {
     it('all video codecs have rtcpFeedback', async () => {
       const { config } = await loadConfig();
       const videoCodecs = config.mediasoup.router.mediaCodecs.filter(
-        (c: any) => c.kind === 'video'
+        (c: RouterRtpCodecCapability) => c.kind === 'video'
       );
       for (const codec of videoCodecs) {
         expect(codec.rtcpFeedback).toBeDefined();
