@@ -182,7 +182,7 @@ func (r *recordingUnsubscriber) Unsubscribe() error { r.calls++; return nil }
 // failure unrecoverable (CodeRabbit, PR #2840).
 func TestUnwindLifecycleSubscriptionReleasesEverything(t *testing.T) {
 	sub := &recordingUnsubscriber{}
-	dispatcher := newVoiceLifecycleDispatcher(func(string, []byte) {}, func(string, string) {})
+	dispatcher := newVoiceLifecycleDispatcher(func(string, []byte) {}, func(voiceLifecycleDropCounts) {})
 
 	s := &NATSSubscriber{log: logger.New("test")}
 	s.lifecycleDispatcher = dispatcher

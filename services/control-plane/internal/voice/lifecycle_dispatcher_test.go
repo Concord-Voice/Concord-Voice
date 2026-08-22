@@ -40,7 +40,7 @@ func TestVoiceLifecycleDispatcherPreservesPerRoomOrder(t *testing.T) {
 			close(done)
 		}
 		mu.Unlock()
-	})
+	}, func(voiceLifecycleDropCounts) {})
 	t.Cleanup(dispatcher.close)
 
 	roomID := "same-room"
@@ -75,7 +75,7 @@ func TestVoiceLifecycleDispatcherRunsIndependentRoomsConcurrently(t *testing.T) 
 			return
 		}
 		close(independentDone)
-	})
+	}, func(voiceLifecycleDropCounts) {})
 	t.Cleanup(dispatcher.close)
 	t.Cleanup(release)
 
@@ -128,7 +128,7 @@ func TestVoiceLifecycleDispatcherCoalescesOnlyAdjacentPendingHeartbeats(t *testi
 			return
 		}
 		sequences <- lifecycleDispatchSequence(t, data)
-	})
+	}, func(voiceLifecycleDropCounts) {})
 	t.Cleanup(dispatcher.close)
 	t.Cleanup(release)
 	blockAllVoiceLifecycleWorkers(t, dispatcher, started)
@@ -169,7 +169,7 @@ func TestVoiceLifecycleDispatcherDoesNotCoalesceAcrossRoomBoundary(t *testing.T)
 			return
 		}
 		sequences <- lifecycleDispatchSequence(t, data)
-	})
+	}, func(voiceLifecycleDropCounts) {})
 	t.Cleanup(dispatcher.close)
 	t.Cleanup(release)
 	blockAllVoiceLifecycleWorkers(t, dispatcher, started)
@@ -220,7 +220,7 @@ func TestVoiceLifecycleDispatcherSaturatedRoomDoesNotBlockIngress(t *testing.T) 
 				close(independentDone)
 			}
 		},
-		func(_, _ string) {
+		func(_ voiceLifecycleDropCounts) {
 			overflowCount.Add(1)
 			overflowStarted <- struct{}{}
 			<-overflowBlocked
@@ -284,7 +284,7 @@ func TestVoiceLifecycleDispatcherCloseDropsQueuedWork(t *testing.T) {
 		}
 		started <- struct{}{}
 		<-blocked
-	})
+	}, func(voiceLifecycleDropCounts) {})
 
 	for index := range voiceLifecycleDispatchWorkerCount {
 		dispatcher.enqueue(
@@ -323,4 +323,113 @@ func TestVoiceLifecycleDispatcherCloseDropsQueuedWork(t *testing.T) {
 		t.Fatal("dispatcher close drained queued lifecycle work")
 	}
 	assert.Zero(t, queuedProcessed.Load())
+}
+
+func TestClassifyVoiceLifecycleDrop(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		subject  string
+		resolved bool
+		want     voiceLifecycleDropClass
+	}{
+		{"heartbeat is convergent", natsSubjectVoiceHeartbeat, true, voiceLifecycleDropConvergent},
+		{"joined is convergent", natsSubjectVoiceJoined, true, voiceLifecycleDropConvergent},
+		{"left is convergent", natsSubjectVoiceLeft, true, voiceLifecycleDropConvergent},
+		{"room_empty is terminal", natsSubjectVoiceRoomEmpty, true, voiceLifecycleDropTerminal},
+		{"unresolved key wins over subject", natsSubjectVoiceHeartbeat, false, voiceLifecycleDropUnresolvable},
+		{"unknown subject is terminal", "voice.unknown", true, voiceLifecycleDropTerminal},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := classifyVoiceLifecycleDrop(testCase.subject, testCase.resolved); got != testCase.want {
+				t.Fatalf("classifyVoiceLifecycleDrop(%q, %v) = %d, want %d",
+					testCase.subject, testCase.resolved, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestVoiceLifecycleDispatchRoomKeyReportsResolution(t *testing.T) {
+	key, resolved := voiceLifecycleDispatchRoomKey(
+		natsSubjectVoiceJoined, []byte(`{"channelId":"c0ffee00-0000-4000-8000-000000000001"}`))
+	if !resolved || key != "c0ffee00-0000-4000-8000-000000000001" {
+		t.Fatalf("channelId arm: key=%q resolved=%v", key, resolved)
+	}
+
+	// No channelId: the SHA-256 fallback arm. Production-unreachable post-#2871
+	// G1, which rejects any event whose channelId is not a canonical UUID. This
+	// test is the reason the fallback cannot be deleted (#2757 owns that).
+	fallbackKey, fallbackResolved := voiceLifecycleDispatchRoomKey(
+		natsSubjectVoiceJoined, []byte(`{}`))
+	if fallbackResolved {
+		t.Fatal("fallback arm must report resolved=false")
+	}
+	if fallbackKey == "" {
+		t.Fatal("fallback arm must still produce a key")
+	}
+}
+
+// TestVoiceLifecycleDispatcherCoalescingDoesNotMaskADropClass pins spec R5: while
+// an overflow is pending, scheduleOverflowLocked returns early. If counting were
+// done at the callback, a terminal drop arriving behind a convergent one would be
+// invisible. Counting happens BEFORE the pending check, so both survive.
+func TestVoiceLifecycleDispatcherCoalescingDoesNotMaskADropClass(t *testing.T) {
+	blocked := make(chan struct{})
+	parked := make(chan struct{}, 1)
+	release := make(chan struct{})
+	reported := make(chan voiceLifecycleDropCounts, 4)
+	dispatcher := newVoiceLifecycleDispatcher(
+		func(_ string, _ []byte) { <-blocked },
+		func(counts voiceLifecycleDropCounts) {
+			select {
+			case parked <- struct{}{}:
+				// First entry only: hold the overflow worker here. nextOverflow
+				// has already cleared overflowPending for the primer, and the
+				// worker cannot clear it again while it is parked — so the two
+				// graded drops below provably arrive under a HELD overflowPending.
+				<-release
+			default:
+			}
+			reported <- counts
+		},
+	)
+	t.Cleanup(func() { close(blocked); dispatcher.close() })
+
+	// Fill every room slot so the next distinct key overflows.
+	for index := range voiceLifecycleDispatchRoomCount {
+		dispatcher.enqueue(natsSubjectVoiceJoined, lifecycleDispatchPayload(
+			fmt.Sprintf("00000000-0000-4000-8000-%012d", index), 0))
+	}
+
+	// Primer overflow, solely to park the overflow worker inside the callback.
+	// Without it this test has a vacuity axis: if the worker drains between the
+	// two graded drops below, overflowPending is cleared and the second drop is
+	// counted even when the increment sits AFTER the pending check — so the test
+	// would pass against the very defect it exists to catch. Parking removes the
+	// race instead of relying on it being narrow.
+	dispatcher.enqueue(natsSubjectVoiceJoined, lifecycleDispatchPayload("primer", 0))
+	<-parked
+
+	// Two overflows of DIFFERENT classes while overflowPending is held.
+	dispatcher.enqueue(natsSubjectVoiceHeartbeat, lifecycleDispatchPayload("overflow-a", 0))
+	dispatcher.enqueue(natsSubjectVoiceRoomEmpty, lifecycleDispatchPayload("overflow-b", 0))
+	close(release)
+
+	// Expected: primer + overflow-a are convergent (2), overflow-b is terminal (1).
+	// With the increment after the pending check, overflow-b is masked entirely
+	// and terminal stays 0.
+	var total voiceLifecycleDropCounts
+	deadline := time.After(5 * time.Second)
+	for total[voiceLifecycleDropConvergent] < 2 || total[voiceLifecycleDropTerminal] < 1 {
+		select {
+		case counts := <-reported:
+			for class := range counts {
+				total[class] += counts[class]
+			}
+		case <-deadline:
+			t.Fatalf("classes masked by coalescing: %v", total)
+		}
+	}
+	if total[voiceLifecycleDropConvergent] != 2 || total[voiceLifecycleDropTerminal] != 1 {
+		t.Fatalf("counts not exact: %v", total)
+	}
 }

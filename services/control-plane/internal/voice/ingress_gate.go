@@ -2,6 +2,7 @@ package voice
 
 import (
 	"encoding/json"
+	"math"
 	"sync"
 	"time"
 
@@ -78,11 +79,28 @@ const (
 	//
 	// Shedding heartbeat is a DELAY: it is idempotent, self-repairing, and
 	// already coalesced by coalescePendingVoiceHeartbeat. Shedding a one-shot
-	// transition is PERMANENT DIVERGENCE: voice_participants has exactly one
-	// INSERT site (handleJoined) and heartbeat reconciliation is removal-only, so
-	// a shed joined leaves no row for the session; and a shed room_empty is
-	// terminal, because the room is already destroyed and no successor message
-	// exists. Metering a class whose loss is unrecoverable was the error.
+	// transition is not -- specifically a shed room_empty, which is TERMINAL because the room is
+	// already destroyed and no successor message exists. Metering a class whose
+	// loss is unrecoverable was the error.
+	//
+	// CORRECTED in #2868. This note used to add that voice_participants "has
+	// exactly one INSERT site (handleJoined) and heartbeat reconciliation is
+	// removal-only, so a shed joined leaves no row for the session". That was
+	// FALSE. There is exactly one INSERT STATEMENT -- in moveServerVoiceParticipant,
+	// running ON CONFLICT (channel_id, user_id) DO UPDATE -- but two paths reach
+	// it: handleServerVoiceJoined AND the heartbeat's
+	// refreshServerHeartbeatParticipant, both via applyServerHeartbeatParticipant
+	// -> upsertServerVoiceParticipant. bulkRefreshPrivateVoiceParticipants
+	// upserts dm_voice_participants the same way. Reconciliation is therefore
+	// BIDIRECTIONAL -- reconcileServerHeartbeatParticipants removes the rows the
+	// media list omits, the refresh adds the ones it names -- so a lost joined
+	// converges on the room's next tick.
+	//
+	// THE SUBJECT RESTRICTION IS UNAFFECTED BY THAT CORRECTION. It rests on the
+	// two independent facts stated above -- the measured starvation (486 genuine
+	// voice.left offered in 1.2s under producer churn, ZERO admitted) and
+	// room_empty's terminality -- and joined's convergence touches neither. Do
+	// not read the correction as licence to meter the one-shot subjects.
 	//
 	// Burst is now derived from ONE room's heartbeat behaviour alone, which does
 	// not tighten as the fleet grows, and being per-room is what makes it
@@ -153,24 +171,71 @@ type ingressShedState struct {
 	mu       sync.Mutex
 	counts   map[string]int
 	loggedAt time.Time
+	// reported marks classes that have already had a report emitted. Only
+	// recordNReportFirst consults it; recordN never sets it.
+	reported map[string]bool
 }
 
-// record counts a shed and returns the accumulated counts when a report is due,
-// nil otherwise.
+// record counts one shed and returns the accumulated counts when a report is
+// due, nil otherwise.
+func (g *ingressShedState) record(class string, now time.Time) map[string]int {
+	return g.recordN(class, 1, now)
+}
+
+// recordN counts n sheds of one class and returns the accumulated counts when a
+// report is due, nil otherwise. The dispatcher reports a whole coalesced burst
+// at once, so it needs a count rather than n calls.
 //
 // Counting and reporting are AGGREGATED, never once per message. A gate that
 // logs once per rejection IS an amplification primitive: it hands a forged flood
 // one log write per message and recreates in the log exactly the amplification
 // the gate just removed from the socket. Same reasoning as
 // Hub.ClearErasedSenderCustomText (internal/websocket/customtext.go).
-func (g *ingressShedState) record(class string, now time.Time) map[string]int {
+func (g *ingressShedState) recordN(class string, n int, now time.Time) map[string]int {
+	return g.recordClass(class, n, now, false)
+}
+
+// recordNReportFirst is recordN except that the FIRST report of a class is
+// EMITTED rather than merely arming the interval.
+//
+// recordN's arming branch is right for a recoverable shed -- a single stray
+// message should not itself be a log line. It is wrong for a drop whose loss is
+// unrecoverable. Reporting here is shed-DRIVEN, not time-driven, so a bounded
+// burst that ends is never reported at all: the first drop arms the window and
+// no later drop arrives to flush it. Before #2868 the overflow arm logged
+// unconditionally on every wakeup, so retiring the teardown without this would
+// have traded a disproportionate response for a SILENT one (CWE-778).
+//
+// It is not an amplification primitive. failure_class is a closed three-value
+// vocabulary, so this emits at most one extra line per class for the life of a
+// replica; every subsequent report is interval-gated exactly as recordN's are.
+// A blanket "always emit for this class" WOULD be one -- the overflow worker can
+// wake as fast as it can write.
+func (g *ingressShedState) recordNReportFirst(class string, n int, now time.Time) map[string]int {
+	return g.recordClass(class, n, now, true)
+}
+
+func (g *ingressShedState) recordClass(
+	class string, n int, now time.Time, reportFirst bool,
+) map[string]int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	if g.counts == nil {
 		g.counts = map[string]int{}
 	}
-	g.counts[class]++
+	g.counts[class] += n
+
+	if reportFirst && !g.reported[class] {
+		if g.reported == nil {
+			g.reported = map[string]bool{}
+		}
+		g.reported[class] = true
+		due := g.counts
+		g.counts = map[string]int{}
+		g.loggedAt = now
+		return due
+	}
 
 	if g.loggedAt.IsZero() {
 		// The first shed of the process arms the interval rather than reporting
@@ -196,6 +261,8 @@ func (g *ingressShedState) record(class string, now time.Time) map[string]int {
 	g.loggedAt = now
 	return due
 }
+
+const voiceDropShedMessage = "Voice lifecycle events dropped at the dispatcher"
 
 // erasureShed records a shed on the erasure door.
 func (s *NATSSubscriber) erasureShed(class string) {
@@ -223,6 +290,73 @@ func (s *NATSSubscriber) reportShed(state *ingressShedState, msg, class string) 
 	}
 }
 
+// voiceDropShed records count dispatcher drops of one class and emits the
+// interval-aggregated report when one is due.
+//
+// The EMISSION lives here rather than at its call site in nats.go, for the same
+// reason reportShed above does. nats_rich_presence_log_guard_test walks nats.go
+// for structured log values and admits only a string literal for failure_class
+// and only an int literal or len() for a count, so an aggregated report -- whose
+// entire payload is a class name and a running total -- cannot be emitted from
+// that file at all. Both values are closed and neither is wire-derived: the
+// class is one of the three voiceLifecycleDropClassName literals, and the count
+// is an integer this package produced.
+func (s *NATSSubscriber) voiceDropShed(class string, count uint64) {
+	dropped := boundedShedCount(count)
+	// Hoisted rather than tested per iteration: the hook is nil in production,
+	// and a burst can carry a large tally that must not buy a spin per drop.
+	if s.ingressShedObservedHook != nil {
+		for range dropped {
+			s.ingressShedObservedHook(class)
+		}
+	}
+	// A convergent drop repairs itself on the room's next heartbeat tick, so its
+	// first occurrence may arm the window silently like any recoverable shed. A
+	// terminal or unresolvable drop has no successor event -- if its first
+	// occurrence is swallowed and the burst then ends, nothing ever reports it.
+	convergent := voiceLifecycleDropClassName(voiceLifecycleDropConvergent)
+	var due map[string]int
+	if class == convergent {
+		due = s.voiceDropShedState.recordN(class, dropped, time.Now())
+	} else {
+		due = s.voiceDropShedState.recordNReportFirst(class, dropped, time.Now())
+	}
+	if due == nil {
+		return
+	}
+	for dueClass, dueCount := range due {
+		// Severity is per REPORTED class, not per triggering class: a flush
+		// carries every class accumulated in the window, not only the one that
+		// happened to cross the interval. A convergent drop is repaired by the
+		// room's next heartbeat; a terminal or unresolvable one has no successor
+		// event, so it is the level that wakes someone.
+		if dueClass == convergent {
+			s.log.Warn(voiceDropShedMessage, "failure_class", dueClass, "dropped", dueCount)
+			continue
+		}
+		s.log.Error(voiceDropShedMessage, "failure_class", dueClass, "dropped", dueCount)
+	}
+	// AFTER the emit loop, unlike reportShed: the hook fires where it proves the
+	// lines were written. ingress_gate_test.go records that watching it before
+	// the loop left deleting the loop entirely green.
+	if s.ingressShedLoggedHook != nil {
+		s.ingressShedLoggedHook()
+	}
+}
+
+// boundedShedCount clamps a drop tally into int32 range so the value is safe on
+// any int width. NOTE the counter itself is int (64-bit on every target), so
+// this is a portability floor rather than the counter's own width.
+// Saturation is indistinguishable from a genuine 2147483647. The tally
+// accumulates under the dispatcher lock with no ceiling, so it is clamped rather
+// than converted: a report that wrapped negative would read as a healthy replica.
+func boundedShedCount(count uint64) int {
+	if count > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int(count)
+}
+
 // voiceIngressChannelID extracts the room key G1 requires, and returns "" for
 // anything it will not admit.
 //
@@ -243,8 +377,14 @@ func (s *NATSSubscriber) reportShed(state *ingressShedState, msg, class string) 
 // forged byte-string mints a distinct room key. That fallback IS the
 // room-map-exhaustion primitive G1 exists to remove. Gating here rather than
 // deleting the fallback localizes this change to its own surface -- the fallback
-// is depended on by lifecycle_dispatcher_test.go, and removing it belongs with
-// #2757's restructuring of this path.
+// is depended on by lifecycle_dispatcher_test.go, so removing it needs a change
+// that owns that test too.
+//
+// An earlier revision attributed that removal to #2757. Verified 2026-08-22:
+// #2757's body ("WS state externalization: Redis interest maps + NATS bcast
+// fan-out") contains ZERO occurrences of "dispatcher" and restructures hub.go,
+// not this path. The constraint stands on the test dependency alone; do not
+// wait on #2757 for it, and do not cite #2757 as its owner.
 func voiceIngressChannelID(data []byte) string {
 	var envelope struct {
 		ChannelID string `json:"channelId"`
@@ -327,16 +467,24 @@ var voiceIngressMeteredSubjects = map[string]bool{
 //     global new-key budget and such a budget starves honest rooms (see the
 //     removal note above).
 //   - It therefore does NOT prevent dispatcher room-map exhaustion, and does not
-//     prevent handleVoiceLifecycleDispatchOverflow from firing.
-//   - Nor could it. That teardown is reachable by HONEST LOAD with no attacker:
+//     prevent handleVoiceLifecycleDispatchOverflow from firing. That CONDITION
+//     is still uncovered, and bounding it is #2757's scope, not this gate's.
+//   - Nor could it. The condition is reachable by HONEST LOAD with no attacker:
 //     worst-case dispatcher drain is voiceLifecycleDispatchWorkerCount divided by
 //     richPresenceLifecycleTimeout, while an unpaced heartbeat tick from a large
 //     deployment far exceeds it. That is latency amplification, not volume
-//     amplification, and no ingress rate limit closes it. Owned by #2868.
-//   - disconnectAllRichPresenceClients has 48 call sites in this file. Only one
-//     is the overflow arm; the rest are fail-closed arms on deadline, state_read
-//     and dependency failures, and ALL are reachable by load. This gate raises
-//     the cost of DRIVING them. It does not remove any of them.
+//     amplification, and no ingress rate limit closes it.
+//   - What the overflow arm DOES on that condition changed in #2868: it no
+//     longer disconnects anything. Each dropped event is classified and counted
+//     (dispatch_drop_convergent, dispatch_drop_terminal,
+//     dispatch_drop_unresolvable) and reported per class on an interval by
+//     voiceDropShed above. The events are still dropped -- that cost is
+//     unchanged -- but crossing the ceiling is no longer destructive.
+//   - disconnectAllRichPresenceClients has 47 call sites in nats.go, down from
+//     48: the overflow arm was the one this gate could point at. The rest are
+//     fail-closed arms on deadline, state_read and dependency failures, and ALL
+//     are reachable by load. This gate raises the cost of DRIVING them. It does
+//     not remove any of them.
 func (s *NATSSubscriber) gateVoiceLifecycle(
 	next func(string, []byte),
 ) func(string, []byte) {

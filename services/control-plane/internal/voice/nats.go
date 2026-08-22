@@ -86,6 +86,15 @@ type NATSSubscriber struct {
 	voiceRoomBudget  *ingressbudget.KeyedBuckets
 	erasureShedState ingressShedState
 	voiceShedState   ingressShedState
+	// voiceDropShedState aggregates voice-lifecycle events DROPPED at the
+	// dispatcher, separately from voiceShedState so each keeps an accurate
+	// message: the gate sheds at ingress, the dispatcher drops under saturation.
+	//
+	// A FIELD, not a package global, for the reason stated above newErasureBudget:
+	// package-level state stayed mutated after the test that set it and handed
+	// every later test in the package the leftover (CodeRabbit, PR #2871). This
+	// one dies with the subscriber, like its two siblings.
+	voiceDropShedState ingressShedState
 	// erasureExistenceProbedHook counts existence queries, which is how the
 	// dedup-ahead-of-the-database ordering is asserted rather than assumed.
 	erasureExistenceProbedHook func()
@@ -3797,11 +3806,50 @@ func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
 	s.hub.ClearErasedSenderCustomText(erased)
 }
 
-func (s *NATSSubscriber) handleVoiceLifecycleDispatchOverflow(_, _ string) {
-	s.log.Error("Voice lifecycle dispatch queue overflow; dropped event",
-		"failure_class", "resource_limit",
-		"action", "disconnect_all_presence_clients")
-	s.disconnectAllRichPresenceClients()
+// handleVoiceLifecycleDispatchOverflow reports dispatcher drops. It does NOT
+// disconnect.
+//
+// The drop happens inside enqueue, BEFORE any handler runs, so nothing is
+// partially applied: client and server state are identical and both stale by
+// the same event. A disconnected client would reconnect and rebuild from
+// voice_participants (still holding the phantom row) and the Redis activity
+// store (TTL not yet expired), re-reading exactly the state it already had --
+// a no-op with a DoS attached.
+//
+// Keeping the teardown for the terminal class was considered and rejected:
+// voice.room_empty is forgeable on the unauthenticated bus and is NOT metered
+// by G2 (voiceIngressMeteredSubjects is heartbeat only), so that would
+// concentrate a fleet-disconnect primitive into the one subject an attacker can
+// forge freely and no budget bounds. See #2868 spec section 2, R1.
+//
+// Reporting is delegated to voiceDropShed rather than emitted here: the whole
+// payload of an aggregated report is a class name and a running total, and
+// nats_rich_presence_log_guard_test admits neither as a value in this file.
+func (s *NATSSubscriber) handleVoiceLifecycleDispatchOverflow(
+	counts voiceLifecycleDropCounts,
+) {
+	for class := range voiceLifecycleDropClassCount {
+		if counts[class] == 0 {
+			continue
+		}
+		s.voiceDropShed(voiceLifecycleDropClassName(class), counts[class])
+	}
+}
+
+// voiceLifecycleDropClassName returns the failure_class literal for a class.
+// The three names MUST stay string literals here -- [internal]rules/backend.md
+// pins failure_class as a CLOSED vocabulary whose values carry alerting meaning,
+// so a name assembled by concatenation or fmt.Sprintf is not greppable and not
+// alertable.
+func voiceLifecycleDropClassName(class voiceLifecycleDropClass) string {
+	switch class {
+	case voiceLifecycleDropTerminal:
+		return "dispatch_drop_terminal"
+	case voiceLifecycleDropUnresolvable:
+		return "dispatch_drop_unresolvable"
+	default:
+		return "dispatch_drop_convergent"
+	}
 }
 
 // Close drains and joins the lifecycle dispatcher before its NATS, database,
