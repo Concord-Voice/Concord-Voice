@@ -28,7 +28,7 @@
     "jsonwebtoken": "^9.0.3",
     "mediasoup": "^3.24.2",
     "nats": "^2.29.3",
-    "redis": "^6.2.0",
+    "redis": "^6.2.1",
     "socket.io": "^4.8.3",
     "winston": "^3.11.0"
   },
@@ -40,7 +40,7 @@
     "@typescript/native": "npm:typescript@^7.0.2",
     "@vitest/coverage-istanbul": "^4.1.8",
     "eslint": "^10.8.1",
-    "globals": "^17.9.0",
+    "globals": "^17.11.0",
     "tsx": "^4.23.12",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.67.0",
