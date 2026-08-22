@@ -10,6 +10,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 )
 
 // CaptureInTx completes the contract implementation, so the assertion lives
@@ -29,30 +30,7 @@ var _ presencecapture.GraphPresenceCapture = (*Reconciler)(nil)
 func (r *Reconciler) CaptureInTx(
 	ctx context.Context, tx *sql.Tx, subject presencecapture.Subject,
 ) (presencecapture.Plan, error) {
-	if tx == nil {
-		return nil, errors.New("graphpresence: CaptureInTx requires a transaction")
-	}
-
-	// STEP 1. All three checks fail CLOSED regardless of posture: an empty focal
-	// set and an oversized one are both derivation bugs, and an unregistered
-	// family is a family whose author never stated its policy. All three run
-	// before any statement, so none can poison the transaction.
-	focal := focalSenders(subject)
-	if len(focal) == 0 {
-		// Posture- and rail-independent: the answer is the same whether or not
-		// a rail is wired, which is why this check sits above the rail branch
-		// rather than inside it. Without it an all-nil Subject reaches
-		// presencehistory.canonicalTopologySenders and 500s with "invalid
-		// topology sender batch", which names neither this function nor the
-		// empty Subject that caused it. Blocking the write here is not the
-		// short-circuit-to-empty-plan alternative — that one would commit the
-		// mutation with the markers silently skipped.
-		return nil, errors.New("graphpresence: CaptureInTx requires at least one principal")
-	}
-	if err := r.checkFocalBound(focal); err != nil {
-		return nil, err
-	}
-	policy, err := presencecapture.PolicyFor(subject.Family)
+	focal, policy, err := r.prepareCapture(tx, subject)
 	if err != nil {
 		return nil, err
 	}
@@ -101,25 +79,8 @@ func (r *Reconciler) CaptureInTx(
 	// durable row that suppresses that stranger's Custom Status for every
 	// reconnecting viewer. Proven-no-change must not reconcile, exactly as
 	// RemoveFriend's rowsAffected == 0 branch already argues.
-	if policy.CanRevokeVisibility && subject.Counterpart != uuid.Nil {
-		destroys, edgeErr := acceptedEdgeExists(ctx, tx, subject.Principal, subject.Counterpart)
-		if edgeErr != nil {
-			if subject.FailPosture == presencecapture.FailConservativeDegrade {
-				return degradeAtGate(causeAudienceRead)
-			}
-			return nil, edgeErr
-		}
-		if !destroys {
-			// Benign empty terminal: nothing is written that any viewer's
-			// authorization depends on, so there is nothing to reconcile,
-			// nobody to disconnect, and NO MARKERS.
-			//
-			// The gate savepoint is deliberately NOT released here. Nothing
-			// after this point can roll back to it, and a RELEASE would add a
-			// fail-closed error path to a terminal that writes nothing; the
-			// caller's transaction is resolved either way by runInTx.
-			return &Plan{subject: subject}, nil
-		}
+	if gated, handled, gateErr := r.gateOnAcceptedEdge(ctx, tx, subject, policy, degradeAtGate); handled {
+		return gated, gateErr
 	}
 
 	// STEP 4. Release the gate savepoint. Nothing may roll back past this point
@@ -163,24 +124,14 @@ func (r *Reconciler) CaptureInTx(
 	// (internal/websocket/richpresence.go), not merely a presence subscription,
 	// so seeding it unconditionally tore down both principals' sessions on
 	// every friend acceptance for no reconciliation benefit (#2738 review).
-	if policy.CanRevokeVisibility {
-		plan.viewers = make(map[uuid.UUID]bool, len(focal))
-		for _, id := range focal {
-			plan.viewers[id] = true
-		}
-	}
+	seedPeripheralViewers(plan, policy, focal)
 
 	// STEP 8. The C1 legs. This is the ONLY stage that may degrade, and the
 	// markers written in step 5 survive that degrade.
-	for _, senderID := range focal {
-		legs, legErr := r.captureActiveLegs(ctx, tx, senderID)
-		if legErr != nil {
-			if subject.FailPosture == presencecapture.FailConservativeDegrade {
-				return degradeAtCapture(causeActiveScopeRead)
-			}
-			return nil, legErr
-		}
-		plan.active = append(plan.active, legs...)
+	if degraded, handled, legsErr := r.captureAllActiveLegs(
+		ctx, tx, subject, focal, plan, degradeAtCapture,
+	); handled {
+		return degraded, legsErr
 	}
 	if err := captureRelease(); err != nil {
 		return nil, err
@@ -195,6 +146,144 @@ func (r *Reconciler) CaptureInTx(
 		return bounded, nil
 	}
 	return plan, nil
+}
+
+// prepareCapture is STEP 1 plus the nil-transaction guard, extracted for the
+// same S3776 reason as the helpers below. Behaviour is unchanged.
+//
+// ALL of these fail CLOSED regardless of posture: an empty focal set and an
+// oversized one are both derivation bugs, and an unregistered family is a family
+// whose author never stated its policy. Every check runs BEFORE any statement,
+// so none can poison the caller's transaction — which is why this whole block
+// sits above the gate savepoint rather than inside it. Do not move a check that
+// issues SQL into this function.
+//
+// The empty-focal case is posture- and rail-independent: the answer is the same
+// whether or not a rail is wired. Without it an all-nil Subject reaches
+// presencehistory.canonicalTopologySenders and 500s with "invalid topology
+// sender batch", naming neither this function nor the Subject that caused it.
+// Blocking the write here is NOT the short-circuit-to-empty-plan alternative —
+// that one would commit the mutation with the markers silently skipped.
+func (r *Reconciler) prepareCapture(
+	tx *sql.Tx, subject presencecapture.Subject,
+) ([]uuid.UUID, presencecapture.FamilyPolicy, error) {
+	var zero presencecapture.FamilyPolicy
+	if tx == nil {
+		return nil, zero, errors.New("graphpresence: CaptureInTx requires a transaction")
+	}
+
+	focal := focalSenders(subject)
+	if len(focal) == 0 {
+		return nil, zero, errors.New("graphpresence: CaptureInTx requires at least one principal")
+	}
+	if err := r.checkFocalBound(focal); err != nil {
+		return nil, zero, err
+	}
+
+	policy, err := presencecapture.PolicyFor(subject.Family)
+	if err != nil {
+		return nil, zero, err
+	}
+	return focal, policy, nil
+}
+
+// seedPeripheralViewers seeds the peripheral leg — a viewer-scoped disconnect of
+// the principals — and ONLY for mutations that can revoke authorization.
+//
+// It exists to clear state a principal may still hold for senders reachable only
+// through the mutated edge, and an ADDITIVE mutation creates no such state.
+// DisconnectRichPresenceClients closes every local DEVICE for those users
+// (internal/websocket/richpresence.go), not merely a presence subscription, so
+// seeding it unconditionally tore down both principals' sessions on every friend
+// acceptance for no reconciliation benefit (#2738 review). The
+// CanRevokeVisibility guard is that fix and must not be relaxed.
+func seedPeripheralViewers(plan *Plan, policy presencecapture.FamilyPolicy, focal []uuid.UUID) {
+	if !policy.CanRevokeVisibility {
+		return
+	}
+	plan.viewers = make(map[uuid.UUID]bool, len(focal))
+	for _, id := range focal {
+		plan.viewers[id] = true
+	}
+}
+
+// gateOnAcceptedEdge is STEP 3, extracted so CaptureInTx stays under the
+// cognitive-complexity bound (SonarQube S3776) — the same reason, and the same
+// shape, as captureTopologyMarkers below. Nothing about the gate's behaviour
+// changes; only where the block lives.
+//
+// handled=true means the gate reached a TERMINAL and CaptureInTx must return
+// immediately with what it hands back. handled=false means the mutation really
+// does destroy an accepted edge and the capture proceeds.
+//
+// THE GATE SAVEPOINT IS DELIBERATELY NOT RELEASED on the empty-plan terminal,
+// and that survives the extraction: nothing after that point can roll back to
+// it, and a RELEASE would add a fail-closed error path to a terminal that writes
+// nothing. The caller's transaction is resolved either way by runInTx. Do not
+// "tidy" a release into this function.
+//
+// #2738: a revoking family with a counterpart only narrows an audience when an
+// ACCEPTED edge exists at capture time. Without this gate the counterpart is a
+// raw path parameter, and any authenticated caller could name a stranger and
+// seed that stranger into the viewer set — a full websocket teardown of their
+// every device. Proven-no-change must not reconcile.
+func (r *Reconciler) gateOnAcceptedEdge(
+	ctx context.Context,
+	tx *sql.Tx,
+	subject presencecapture.Subject,
+	policy presencecapture.FamilyPolicy,
+	degradeAtGate func(degradeCause) (presencecapture.Plan, error),
+) (presencecapture.Plan, bool, error) {
+	if !policy.CanRevokeVisibility || subject.Counterpart == uuid.Nil {
+		return nil, false, nil
+	}
+
+	destroys, edgeErr := acceptedEdgeExists(ctx, tx, subject.Principal, subject.Counterpart)
+	if edgeErr != nil {
+		if subject.FailPosture == presencecapture.FailConservativeDegrade {
+			plan, err := degradeAtGate(causeAudienceRead)
+			return plan, true, err
+		}
+		return nil, true, edgeErr
+	}
+	if !destroys {
+		// Benign empty terminal: nothing is written that any viewer's
+		// authorization depends on, so there is nothing to reconcile, nobody to
+		// disconnect, and NO MARKERS.
+		return &Plan{subject: subject}, true, nil
+	}
+	return nil, false, nil
+}
+
+// captureAllActiveLegs is STEP 8, extracted for the same S3776 reason.
+//
+// It is the ONLY stage that may degrade, and the markers written in step 5
+// survive that degrade — degradeAtCapture rolls back to the CAPTURE savepoint,
+// which was opened after the markers precisely so it cannot reach them.
+//
+// handled=true means a degrade terminal was reached and CaptureInTx returns what
+// this hands back. handled=false means every focal sender's legs were appended
+// to plan.active and the capture continues.
+func (r *Reconciler) captureAllActiveLegs(
+	ctx context.Context,
+	tx *sql.Tx,
+	subject presencecapture.Subject,
+	focal []uuid.UUID,
+	plan *Plan,
+	degradeAtCapture func(degradeCause) (presencecapture.Plan, error),
+) (presencecapture.Plan, bool, error) {
+	for _, senderID := range focal {
+		legs, legErr := r.captureActiveLegs(ctx, tx, senderID)
+		if legErr != nil {
+			if subject.FailPosture == presencecapture.FailConservativeDegrade {
+				degraded, err := degradeAtCapture(causeActiveScopeRead)
+				return degraded, true, err
+			}
+			return nil, true, legErr
+		}
+		plan.active = append(plan.active, legs...)
+	}
+	return nil, false, nil
 }
 
 // captureTopologyMarkers is STEPS 5 and 6, extracted so CaptureInTx stays under
@@ -409,23 +498,17 @@ func countCaptured(p *Plan) int {
 
 // acceptedEdgeExists reports whether an accepted friendship joins the two
 // principals inside tx. It is the ONLY presence-visibility edge a #2446
-// friendship or block write can destroy; the query is the same predicate
-// RemoveFriend's DELETE uses, so the gate and the write agree by construction.
+// friendship or block write can destroy.
+//
+// The predicate itself now lives in presencehook.AcceptedEdgeExists, so this
+// gate, RemoveFriend's probe, BlockUser's probe and BlockUser's authoritative
+// in-transaction read are ONE function rather than four copies (#2854 stage C).
+// The gate and the write still agree by construction; they now agree by sharing
+// code rather than by sharing a copied string.
 func acceptedEdgeExists(
 	ctx context.Context, tx *sql.Tx, principal, counterpart uuid.UUID,
 ) (bool, error) {
-	var exists bool
-	if err := tx.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM friendships
-			WHERE ((requester_id = $1 AND addressee_id = $2)
-			    OR (requester_id = $2 AND addressee_id = $1))
-			  AND status = 'accepted'
-		)
-	`, principal, counterpart).Scan(&exists); err != nil {
-		return false, fmt.Errorf("read accepted friendship edge: %w", err)
-	}
-	return exists, nil
+	return presencehook.AcceptedEdgeExists(ctx, tx, principal, counterpart)
 }
 
 // The savepoint statements are FIXED literals rather than names concatenated

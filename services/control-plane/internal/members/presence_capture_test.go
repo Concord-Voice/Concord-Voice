@@ -98,7 +98,9 @@ func TestRemovalCaptureSubject(t *testing.T) {
 func TestBanCaptureSubject(t *testing.T) {
 	h, capture := newCaptureHandler(t)
 
-	err := h.execBanTx(context.Background(), captureServerID, captureTargetID, captureActorID, nil)
+	// probedMember=true is the MEMBER case: the ban revokes a real audience, so
+	// the gate is warranted and the capture must run (#2854 stage C).
+	err := h.execBanTx(context.Background(), captureServerID, captureTargetID, captureActorID, nil, true)
 	require.ErrorIs(t, err, errCaptureDoubleReached,
 		"the ban must enter through presencehook.WithGatedTx")
 
@@ -240,4 +242,55 @@ func TestClassifyMutationOutcomeSplitsDurableFromTerminal(t *testing.T) {
 		require.Empty(t, rec.Body.String(),
 			"nothing may be written yet; the handler still has de-authorization to do")
 	})
+}
+
+// TestPreEmptiveBanOfANonMemberTakesNoGate is the #2854 stage C acceptance
+// criterion for the ban path: "BanMember against a non-member target acquires
+// NO gate for the target".
+//
+// It needs no database. With probedMember=false the capture is nil'd, so
+// presencehook.WithGatedTx takes its UNWIRED arm and never reaches the double —
+// which is exactly the observable: recordingCapture records a subject only when
+// the gated path is entered, so an empty subjects slice IS "no gate was taken".
+//
+// The paired error assertion matters. An empty subjects slice alone would also
+// be satisfied by a handler that failed before reaching WithGatedTx at all, so
+// the test additionally pins WHICH terminal it reached: the unwired arm's
+// missing-database error, proving it went through presencehook rather than
+// bailing earlier.
+func TestPreEmptiveBanOfANonMemberTakesNoGate(t *testing.T) {
+	h, capture := newCaptureHandler(t)
+
+	err := h.execBanTx(context.Background(), captureServerID, captureTargetID, captureActorID, nil, false)
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, errCaptureDoubleReached,
+		"AC (#2854): a pre-emptive ban must NOT enter the gated path")
+	require.Contains(t, err.Error(), "requires a database",
+		"it reached presencehook's UNWIRED arm, which is the path a nil capture selects")
+
+	require.Empty(t, capture.subjects,
+		"AC (#2854): no gate may be acquired for a target with no audience to reconcile")
+}
+
+// TestBanFailsClosedWhenTheProbeWentStale pins the C4 fail-closed arm's
+// PRESENCE. The behavioural half — that nothing is written — needs a real
+// transaction and lives in the DB-backed test; what this asserts is that the
+// arm is reachable at all from a nil capture, which is the precondition the
+// stale case depends on.
+//
+// It is deliberately NOT a "gate not taken" assertion. Removing the gate leaves
+// this green; only deleting the fail-closed branch or the in-transaction read
+// changes it, which is the ORDERING invariant rather than the presence one.
+func TestExecBanTxSelectsTheUngatedPathFromTheProbeVerdict(t *testing.T) {
+	h, capture := newCaptureHandler(t)
+
+	gatedErr := h.execBanTx(context.Background(), captureServerID, captureTargetID, captureActorID, nil, true)
+	require.ErrorIs(t, gatedErr, errCaptureDoubleReached)
+	require.Len(t, capture.subjects, 1, "member -> gated")
+
+	h2, capture2 := newCaptureHandler(t)
+	ungatedErr := h2.execBanTx(context.Background(), captureServerID, captureTargetID, captureActorID, nil, false)
+	require.NotErrorIs(t, ungatedErr, errCaptureDoubleReached)
+	require.Empty(t, capture2.subjects, "non-member -> ungated")
 }

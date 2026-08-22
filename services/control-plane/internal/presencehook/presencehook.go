@@ -50,11 +50,22 @@ import (
 // no return value — the log is the only place a failed discard is ever
 // recorded. Exactly ONE production call site reaches it: WithGatedTx's own
 // unwired fallback below. A hooked handler lands on that fallback whenever it
-// passes a nil capture, which is NOT only the unhooked replica — TWO of the
-// five call sites nil it for their own cheap gate condition, internal/users
-// for a privacy PATCH that never supplies dm_friends_of_friends and
-// internal/friends' ClaimFriendCode for a claim that does not auto-accept.
-// (The other three pass h.graphPresence unconditionally.) A non-nil capture
+// passes a nil capture, which is NOT only the unhooked replica.
+//
+// The set that nils it deliberately (the count was stale at "TWO of the five"
+// and the five was itself stale — there are NINE call sites):
+//   - internal/users, a privacy PATCH that never supplies dm_friends_of_friends
+//   - internal/friends' ClaimFriendCode, a claim that does not auto-accept
+//   - internal/friends' BlockUser, when its probe finds no accepted edge
+//   - internal/members' execBanTx, when its probe finds the target is not a
+//     member (a pre-emptive ban reconciles nothing)
+//
+// The last two arrived with #2854 stage C and change this fallback's character:
+// it is no longer a degraded-replica path but a HOT one carrying real writes —
+// stranger blocks and pre-emptive bans — on every replica. Its divergence from
+// graphpresence's runInTx (this defer logs the driver error rather than joining
+// it into a return value, because it has no return value) is therefore now
+// load-bearing for ordinary production traffic, not just for an unhooked boot. A non-nil capture
 // routes the call into graphpresence's runInTx instead, whose defer joins the
 // cause into what it returns and so does not depend on its log. Dropping the
 // error here leaves a rollback failure permanently undiagnosable.
@@ -268,6 +279,41 @@ const codePending = "presence_operation_pending"
 // and Body must not drift about which arm they mean.
 const codeDelivery = "delivery"
 
+// ErrProbeStale is the terminal for a pre-transaction probe that the
+// authoritative in-transaction read contradicted, on a path that would
+// otherwise perform an audience-destroying write with no capture.
+//
+// It is FAIL-CLOSED (#2854 stage C). Proceeding would DELETE a membership or
+// flip a friendship to blocked while the counterpart keeps holding the
+// principal's Custom Status -- which carries no TTL and is not republished on a
+// heartbeat, so "indefinitely" is literal. That is CWE-284, the exact class the
+// #2446 family exists to close.
+//
+// It carries NO presencecapture.Cause and must never reach Abandon: no plan was
+// created on the ungated path, so asserting one existed would put a
+// DisconnectRichPresenceClients call on a path that proved nothing happened --
+// the defect PR #2738 removed from RemoveFriend.
+//
+// It must never be handled by re-entering WithGatedTx to "promote" the request.
+// Acquiring a gate while the failed transaction still holds row locks
+// reconstructs the channel-vs-row cycle no deadlock detector can break, because
+// half of it is a Go channel. The retry belongs to the CLIENT, after the
+// transaction has fully unwound.
+var ErrProbeStale = errors.New("presencehook: probe disagreed with the authoritative read")
+
+// codeProbeStale is the failure_class for ErrProbeStale.
+//
+// Deliberately NOT codePending: that value means another operation holds this
+// sender's durable marker, which is false here, and collapsing the two would
+// make a benign race indistinguishable from marker contention in logs and
+// alerting.
+const codeProbeStale = "probe_stale"
+
+// probeStaleRetryAfter is a const, never configuration -- consistent with every
+// other bound in this family, where making a latency bound configurable would
+// let a deployment raise it instead of fixing what made the path slow.
+const probeStaleRetryAfter = time.Second
+
 // bodyPostCommitDelivery is what a post-commit terminal tells the client.
 //
 // It exists because the status code alone was not enough. ErrPostCommitDelivery's
@@ -308,10 +354,19 @@ const bodyPostCommitDelivery = "Your change was saved. Updating everyone who can
 // for any family whose policy carries the topology, and completeTopology runs.
 // A deployed control-plane takes this path.
 //
-// The ordering matters: ErrCapturePending is checked first because a pending
-// marker is the only terminal that both proves no write happened AND is
-// self-resolving, so conflating it with a 500 would tell the client to give up
-// on a request that would succeed 30 seconds later.
+// The ordering matters: ErrCapturePending is checked first because it is ONE OF
+// TWO terminals that both prove no write happened AND are self-resolving, so
+// conflating it with a 500 would tell the client to give up on a request that
+// would succeed 30 seconds later.
+//
+// ErrProbeStale is the second such terminal (#2854 stage C). A pre-transaction
+// probe selected the ungated path, the authoritative in-transaction read
+// disagreed, and the write was abandoned rather than performed without a
+// capture. It is checked after the two capture terminals because it is the
+// narrower condition -- it can only arise on a path that already chose to run
+// ungated -- and its retry succeeds for a different reason than a pending
+// marker's: the retry's probe reads the now-committed state and takes the gated
+// path, rather than waiting for a marker to clear.
 //
 // Every Code is a literal here rather than anything derived from err, which is
 // what keeps the handler's failure_class field a closed enum no matter what the
@@ -328,6 +383,12 @@ func Classify(err error) Failure {
 		}
 	case errors.Is(err, presencecapture.ErrPostCommitDelivery):
 		return Failure{Status: http.StatusServiceUnavailable, Code: codeDelivery}
+	case errors.Is(err, ErrProbeStale):
+		return Failure{
+			Status:     http.StatusServiceUnavailable,
+			Code:       codeProbeStale,
+			RetryAfter: probeStaleRetryAfter,
+		}
 	default:
 		return Failure{Status: http.StatusInternalServerError, Code: "internal"}
 	}
@@ -382,10 +443,12 @@ func (f Failure) Body(siteFailure string) string {
 // re-drive a failure that does not resolve on its own, once per second, which
 // is the inverse of the behaviour the 503-vs-500 split exists to produce
 // (internal/presencecapture/capture.go, ErrCapturePending vs
-// ErrPostCommitDelivery). Only the pending terminal both proves no write
-// happened and clears itself, so only it may promise a retry.
+// ErrPostCommitDelivery). Exactly TWO terminals both prove no write happened
+// and clear themselves -- the pending marker and ErrProbeStale (#2854 stage C)
+// -- so only those two may promise a retry. The gate is an allowlist for that
+// reason: a new Code defaults to no header, which is the safe direction.
 func (f Failure) RetryAfterHeader() (string, bool) {
-	if f.Code != codePending {
+	if f.Code != codePending && f.Code != codeProbeStale {
 		return "", false
 	}
 	return strconv.FormatInt(retryAfterSeconds(f.RetryAfter), 10), true
@@ -408,4 +471,61 @@ func retryAfterSeconds(d time.Duration) int64 {
 		seconds++
 	}
 	return seconds
+}
+
+// RowQuerier is the single-row read both *sql.DB and *sql.Tx satisfy.
+//
+// It is declared HERE, at the consumer, matching the shape
+// graphpresence.TopologyRail already uses, rather than importing a database
+// abstraction from anywhere.
+type RowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// AcceptedEdgeExists reports whether an accepted friendship joins the two
+// principals. It is the ONLY presence-visibility edge a #2446 friendship or
+// block write can destroy.
+//
+// It lives here, and graphpresence delegates to it, because three callers need
+// the same predicate against different handles: RemoveFriend's pooled probe,
+// BlockUser's pooled probe, and BlockUser's in-transaction authoritative read
+// (#2854 stage C).
+//
+// A shared CONSTANT was considered and rejected. It would deduplicate the SQL
+// text while leaving each site to bind its own arguments and scan its own
+// target — removing textual drift and leaving semantic drift, since this
+// predicate is symmetric in (requester_id, addressee_id) and a swapped-argument
+// copy is textually identical. Sharing the function removes both, because the
+// binding is shared too.
+//
+// DIRECTION NOTE: graphpresence -> presencehook reads backwards for an
+// implementation package importing handler plumbing. It is acyclic and
+// deliberate — presencehook imports only stdlib, uuid, presencecapture and
+// pkg/logger, and holds no handler types. Do NOT "fix" it by copying the body
+// back into graphpresence; that reintroduces the duplication this removes.
+//
+// The caller chooses the handle and therefore the semantics: pass *sql.DB for a
+// non-authoritative pooled probe, *sql.Tx for an authoritative in-transaction
+// read. The query takes NO row lock in either case, which is load-bearing for
+// the pooled form: no SET LOCAL lock_timeout applies on the pool, so a locking
+// clause here could block indefinitely.
+//
+// An error is returned rather than folded into a false verdict, because every
+// probe call site fails OPEN on error and can only do so if it can tell an
+// error from a negative answer.
+func AcceptedEdgeExists(
+	ctx context.Context, q RowQuerier, principal, counterpart uuid.UUID,
+) (bool, error) {
+	var exists bool
+	if err := q.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM friendships
+			WHERE ((requester_id = $1 AND addressee_id = $2)
+			    OR (requester_id = $2 AND addressee_id = $1))
+			  AND status = 'accepted'
+		)
+	`, principal, counterpart).Scan(&exists); err != nil {
+		return false, fmt.Errorf("read accepted friendship edge: %w", err)
+	}
+	return exists, nil
 }

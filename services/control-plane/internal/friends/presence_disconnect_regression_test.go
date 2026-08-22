@@ -438,9 +438,26 @@ func TestAbortedRemoveFriendDisconnectsNobody(t *testing.T) {
 	w := httptest.NewRecorder()
 	engine.ServeHTTP(w, req)
 
-	// The attacker has NO friendship with the victim; the write would have been
-	// a 404 no-op. The aborted request instead reaches the write_failed abandon.
-	require.Equal(t, http.StatusInternalServerError, w.Code)
+	// UPDATED BY #2854 STAGE C. This case now returns 404, not 500, and the
+	// reason is a strengthening rather than a loss.
+	//
+	// The attacker has NO friendship with the victim, so RemoveFriend's
+	// pre-transaction probe short-circuits before any transaction opens. The
+	// aborted request therefore never reaches the write_failed abandon it used
+	// to reach.
+	//
+	// Losing that reach costs this case nothing, because it never truly tested
+	// the abandon: CaptureInTx gates on an ACCEPTED edge, so a stranger capture
+	// produced an EMPTY plan and "disconnects nobody" was guaranteed by that
+	// gate rather than by CauseWriteFailed. The abandon path is now exercised
+	// against a real captured audience by the sibling test below, which is the
+	// stronger form of the same claim.
+	//
+	// What this case still proves, and proves through the REAL reconciler
+	// rather than a double: a stranger-targeted DELETE reaches no gate, no
+	// capture and no disconnect, with 40 bystanders in a shared voice room.
+	require.Equal(t, http.StatusNotFound, w.Code,
+		"#2854 stage C: a stranger removal short-circuits before the transaction")
 
 	hit := 0
 	for _, u := range audience {
@@ -454,6 +471,87 @@ func TestAbortedRemoveFriendDisconnectsNobody(t *testing.T) {
 		"REGRESSION: an aborted DELETE proves no commit, so it must disconnect nobody")
 	t.Logf("regression check: aborted DELETE /friends/%s -> %d disconnected (want 0)",
 		victim, env.disc.distinct())
+}
+
+// countFriendshipRows counts accepted friendship rows between a and b in either
+// direction. Local to this file: the sibling helpers in presence_capture_db_test.go
+// take string IDs, and the PoC harness works in uuid.UUID throughout.
+func countFriendshipRows(t *testing.T, db *sql.DB, a, b uuid.UUID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM friendships
+		WHERE ((requester_id = $1 AND addressee_id = $2)
+		    OR (requester_id = $2 AND addressee_id = $1))
+		  AND status = 'accepted'
+	`, a, b).Scan(&n))
+	return n
+}
+
+// TestAbortedRemoveFriendOfARealFriendDisconnectsNobody is the case that
+// actually exercises the CauseWriteFailed abandon, and it exists because
+// #2854 stage C's probe took that reach away from the stranger case above.
+//
+// Here the actor and the victim ARE accepted friends, so the probe passes, the
+// gated transaction opens, and CaptureInTx produces a REAL plan naming a REAL
+// audience. Cancelling the request context after the capture then drives the
+// write to fail and the plan to be abandoned with CauseWriteFailed.
+//
+// That is the #2738 invariant in its load-bearing form: a cause that PROVES no
+// commit must disconnect nobody, even when the abandoned plan is non-empty.
+// The stranger variant could never assert that, because its plan was empty.
+func TestAbortedRemoveFriendOfARealFriendDisconnectsNobody(t *testing.T) {
+	env := newPoCEnv(t)
+
+	actor := testhelpers.CreateUser(t, env.ts.DB)
+	victim := testhelpers.CreateUser(t, env.ts.DB)
+	testhelpers.AddFriendship(t, env.ts.DB, actor, victim)
+
+	serverID := testhelpers.CreateServer(t, env.ts.DB, victim)
+	testhelpers.AddServerMember(t, env.ts.DB, serverID, victim)
+	setServerVoiceTier(t, env.ts.DB, victim, 2)
+	const bystanders = 40
+	audience := make([]uuid.UUID, 0, bystanders)
+	for i := 0; i < bystanders; i++ {
+		u := testhelpers.CreateUser(t, env.ts.DB)
+		testhelpers.AddServerMember(t, env.ts.DB, serverID, u)
+		testhelpers.AddFriendship(t, env.ts.DB, victim, u)
+		audience = append(audience, u)
+	}
+	joinVoice(t, env.ts.DB, serverID, victim)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	capture := &cancelAfterCapture{inner: env.rec, cancel: cancel}
+
+	engine := env.attackerEngine(t, actor.String(), capture,
+		func(e *gin.Engine, h *friends.Handler) {
+			e.DELETE("/friends/:user_id", h.RemoveFriend)
+		})
+
+	req := httptest.NewRequest(http.MethodDelete, "/friends/"+victim.String(), nil).
+		WithContext(reqCtx)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	// The probe passed, the transaction opened, the capture ran, and the
+	// cancelled context failed the write. 500 is the aborted-write terminal.
+	require.Equal(t, http.StatusInternalServerError, w.Code,
+		"a real friendship must still reach the gated write path and its abandon")
+
+	hit := 0
+	for _, u := range audience {
+		if env.disc.hits(u) > 0 {
+			hit++
+		}
+	}
+	require.Zero(t, env.disc.globalCalls(),
+		"no global teardown may be escalated from an aborted write")
+	require.Zero(t, hit,
+		"REGRESSION (#2738): an aborted DELETE proves no commit, so it must disconnect nobody — "+
+			"and here the abandoned plan was NON-empty, which is the form the stranger case could not test")
+	require.Equal(t, 1, countFriendshipRows(t, env.ts.DB, actor, victim),
+		"the friendship must survive an aborted removal")
 }
 
 // ---------------------------------------------------------------------------

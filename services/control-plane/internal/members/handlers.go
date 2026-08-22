@@ -513,6 +513,29 @@ func (h *Handler) AddMember(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	// Probe-then-gate (#2854 stage C, finding C). Adding a user who is already
+	// a member is a proven no-op, and entering WithGatedTx for it holds one of
+	// 64 shared sender stripes on a user who is not party to this request.
+	//
+	// Placed AFTER the permission and user-exists checks on purpose: earlier,
+	// the 409-vs-fallthrough distinction would be a membership oracle for a
+	// server the caller cannot see.
+	//
+	// MEMBERSHIP ONLY. The ban read stays inside the transaction -- hoisting it
+	// lost a race once already, and the ON CONFLICT insert re-established
+	// membership for a banned user.
+	//
+	// Non-authoritative: the in-transaction alreadyMember read below remains the
+	// authority and is unchanged. FAILS OPEN -- a probe error falls through to
+	// today's gated path, because an unreadable probe proves nothing.
+	//
+	// Accepted delta: a target removed between this read and the response yields
+	// a retryable 409 where today it would 201.
+	if alreadyMember, probeErr := h.checkMembership(ctx, serverID, req.UserID); probeErr == nil && alreadyMember {
+		c.JSON(http.StatusConflict, gin.H{"error": "User is already a member"})
+		return
+	}
+
 	// ONE spec for the gates, the capture and the focal set, so the three cannot
 	// drift apart. Direct add is ADDITIVE: FamilyMemberAdd is registered with
 	// CanRevokeVisibility false, because true would seed plan.viewers and tear
@@ -802,7 +825,7 @@ func (h *Handler) authorizeTimeout(c *gin.Context, serverID, userID, targetUserI
 		return http.StatusBadRequest, "Cannot timeout yourself", false
 	}
 
-	targetExists, err := h.checkMembership(serverID, targetUserID)
+	targetExists, err := h.checkMembership(c.Request.Context(), serverID, targetUserID)
 	if err != nil {
 		h.log.Error("Failed to check target membership", "error", err)
 		return http.StatusInternalServerError, errMsgFailedTimeoutMember, false
@@ -967,9 +990,18 @@ func (h *Handler) RemoveTimeout(c *gin.Context) {
 	})
 }
 
-func (h *Handler) checkMembership(serverID, userID string) (bool, error) {
+// checkMembership reports whether userID is a member of serverID.
+//
+// It takes a context because it also serves as the pre-transaction MEMBERSHIP
+// PROBE for #2854 stage C. Without one it ignores client disconnect and blocks
+// unboundedly on pool acquisition under saturation — the same unbounded wait
+// the probe contract's no-locking-clause rule exists to keep off the pool.
+//
+// It carries NO locking clause, and must not gain one: on the pooled connection
+// no SET LOCAL lock_timeout applies.
+func (h *Handler) checkMembership(ctx context.Context, serverID, userID string) (bool, error) {
 	var exists bool
-	err := h.db.QueryRow(
+	err := h.db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)`,
 		serverID, userID,
 	).Scan(&exists)
@@ -1108,12 +1140,12 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	requesterExists, err := h.checkMembership(serverID, userID)
+	requesterExists, err := h.checkMembership(c.Request.Context(), serverID, userID)
 	if err != nil || !requesterExists {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotMember})
 		return
 	}
-	targetExists, err := h.checkMembership(serverID, targetUserID)
+	targetExists, err := h.checkMembership(c.Request.Context(), serverID, targetUserID)
 	if err != nil || !targetExists {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotMember})
 		return
@@ -1244,16 +1276,52 @@ type BannedMember struct {
 // Capture precedes DELETE FROM server_members specifically. execBanTx's explicit
 // member_roles delete is already covered by the composite FK cascade (000035),
 // so it is retained for explicitness but is NOT the audience-destroying write.
-func (h *Handler) execBanTx(ctx context.Context, serverID, targetUserID, actorID string, reason *string) error {
+//
+// probedMember is a pooled, NON-AUTHORITATIVE pre-transaction read of whether
+// the target is a member (#2854 stage C). Banning a NON-member is a supported
+// feature -- a pre-emptive ban -- and changes no shared-server audience, so
+// there is nothing to reconcile and no reason to hold that stranger's stripe.
+// The ban is recorded either way.
+//
+// ONE value -- gated -- feeds WithGatedTx, Capture, Abandon and Complete.
+// Feeding it to WithGatedTx alone would leave Capture running UNGATED, taking
+// FOR UPDATE row locks with no stripe held: the lock-order invariant violated
+// in the one direction it forbids, and invisible to every behavioural test
+// because the response and the durable state come out byte-identical.
+func (h *Handler) execBanTx(
+	ctx context.Context, serverID, targetUserID, actorID string, reason *string, probedMember bool,
+) error {
+	// `gated` and `skipGateForProbe` are SEPARATE on purpose, and conflating them
+	// was a real defect (CodeRabbit, PR #2883). A nil capture means TWO different
+	// things: "this replica has no capture wired at all" — the documented unwired
+	// fallback, which requireGraphPresenceCaptureWired does NOT rule out because
+	// it early-returns when activityService is nil — and "the probe said this ban
+	// reconciles nothing, so skip the gate".
+	//
+	// Only the second may raise ErrProbeStale. Testing `gated == nil` for
+	// staleness made every ban of a real member 503 on an unwired replica, which
+	// is a fail-closed refusal of a moderation action that should simply proceed.
+	gated := h.graphPresence
+	skipGateForProbe := false
+	if gated != nil && !probedMember {
+		gated = nil
+		skipGateForProbe = true
+	}
+
 	spec := presencehook.Spec{
 		Family:      presencecapture.FamilyMemberBan,
 		Posture:     presencecapture.FailClosedBlockWrite,
 		PrincipalID: targetUserID,
 	}
 
-	return presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
-		// Capture ONLY when the target is actually a member, and read that
-		// inside this transaction so there is no window to race.
+	return presencehook.WithGatedTx(ctx, gated, h.db, h.log, spec, func(tx *sql.Tx) error {
+		// Capture ONLY when the target is actually a member.
+		//
+		// This read stays INSIDE the transaction and remains THE AUTHORITY
+		// (#2854 stage C). A pooled probe now precedes it and decides only
+		// whether a gate is taken; its verdict is never substituted for this
+		// read. When the two disagree the request fails CLOSED below rather
+		// than writing a revocation with no capture.
 		//
 		// Banning a non-member is permitted (a pre-emptive ban) and changes no
 		// shared-server audience, so there is nothing to reconcile. The capture
@@ -1280,17 +1348,28 @@ func (h *Handler) execBanTx(ctx context.Context, serverID, targetUserID, actorID
 			return fmt.Errorf("check ban target membership: %w", err)
 		}
 
+		// C4 fail-closed. The probe said this target had no audience, so no gate
+		// was taken and no capture exists -- but the authoritative read
+		// disagrees. Proceeding would DELETE this member's rows with NO
+		// reconciliation, leaving every viewer holding their Custom Status,
+		// which carries no TTL (CWE-284). The deferred rollback discards the
+		// transaction; the ban is idempotent, so a retry bans correctly and
+		// WITH a capture.
+		if isMember && skipGateForProbe {
+			return presencehook.ErrProbeStale
+		}
+
 		var plan presencecapture.Plan
 		if isMember {
 			var captureErr error
-			plan, captureErr = presencehook.Capture(ctx, h.graphPresence, tx, spec)
+			plan, captureErr = presencehook.Capture(ctx, gated, tx, spec)
 			if captureErr != nil {
 				return fmt.Errorf("capture member ban presence: %w", captureErr)
 			}
 		}
 
 		abandon := func(err error, msg string) error {
-			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
 			return fmt.Errorf("%s: %w", msg, err)
 		}
 
@@ -1321,7 +1400,7 @@ func (h *Handler) execBanTx(ctx context.Context, serverID, targetUserID, actorID
 			return abandon(err, "delete channel read states")
 		}
 
-		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+		return presencehook.Complete(ctx, gated, tx, plan)
 	})
 }
 
@@ -1385,7 +1464,15 @@ func (h *Handler) BanMember(c *gin.Context) {
 	// banDeliveryFailure is non-nil only for a DURABLE ban whose presence delivery
 	// failed. As in RemoveMember, the de-authorization sequence still runs.
 	var banDeliveryFailure *presencehook.Failure
-	if err := h.execBanTx(c.Request.Context(), serverID, targetUserID, userID, reason); err != nil {
+	// Probe-then-gate (#2854 stage C). A probe ERROR yields true, which is the
+	// fail-OPEN direction here: it takes the gate and captures, i.e. today's
+	// behaviour.
+	probedMember, probeErr := h.checkMembership(c.Request.Context(), serverID, targetUserID)
+	if probeErr != nil {
+		probedMember = true
+	}
+
+	if err := h.execBanTx(c.Request.Context(), serverID, targetUserID, userID, reason, probedMember); err != nil {
 		// Same split as RemoveMember: a post-commit delivery failure means the
 		// member IS banned, so it must not be reported as a 500 that implies
 		// nothing happened — and must not skip the de-authorization below. A

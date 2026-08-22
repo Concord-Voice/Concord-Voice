@@ -306,8 +306,19 @@ func TestBlockUserCapturesBeforeTheFriendshipWrite(t *testing.T) {
 	assert.Equal(t, 1, countFriendships(t, ts, user1.ID, user2.ID, statusBlocked))
 }
 
-// No prior friendship row exists, so the write is an INSERT. The capture is
-// still unconditional — the delta simply comes out empty. No status branch.
+// No prior friendship row exists, so the write is an INSERT.
+//
+// UPDATED BY #2854 STAGE C. This test used to assert "the capture is still
+// unconditional — the delta simply comes out empty. No status branch." Stage C
+// deliberately introduced that branch: with no accepted edge the capture is
+// nil'd, because CaptureInTx's own accepted-edge gate would have produced an
+// empty plan anyway and entering the gated path to compute it holds one of 64
+// shared stripes on a user who is not party to the request.
+//
+// What this test uniquely still proves, and no other test does: the UNGATED
+// path still COMMITS. presencehook.Complete with a nil capture and a nil plan
+// takes the bare-commit arm, so the block lands even though nothing was
+// captured. That is the property a naive "skip the transaction" fix would break.
 func TestBlockUserCapturesWithNoPriorFriendship(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "blocker_new")
@@ -323,9 +334,14 @@ func TestBlockUserCapturesWithNoPriorFriendship(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 
 	subjects, _, completes, _ := capture.snapshot()
-	require.Len(t, subjects, 1, "block captures unconditionally, whatever the prior status")
-	assert.Equal(t, 1, completes)
-	assert.Equal(t, 1, countFriendships(t, ts, user1.ID, user2.ID, statusBlocked))
+	require.Empty(t, subjects,
+		"#2854 stage C: with no accepted edge the capture is nil'd, so none runs")
+	require.Empty(t, capture.gated(),
+		"and no stripe is held on a user with no relationship to the actor")
+	assert.Equal(t, 0, completes,
+		"Complete never reaches the double either — the unwired arm commits directly")
+	assert.Equal(t, 1, countFriendships(t, ts, user1.ID, user2.ID, statusBlocked),
+		"the ungated path MUST still commit the block")
 }
 
 // Degraded() is a counter, never a business-logic branch: the block still
@@ -349,10 +365,17 @@ func TestBlockUserSucceedsWithADegradedPlan(t *testing.T) {
 
 // A stage-2 failure — the error the bridge returns rather than a degraded plan —
 // still blocks the write regardless of the declared posture.
+//
+// UPDATED BY #2854 STAGE C: the two users are now ACCEPTED FRIENDS. Without an
+// accepted edge the capture is nil'd and captureErr can never fire, so this
+// test would pass while exercising nothing — the same vacuity that hid in
+// TestAbortedRemoveFriendDisconnectsNobody. A real edge keeps the capture on
+// the path this test exists to fail.
 func TestBlockUserCaptureErrorBlocksTheWrite(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "blocker_err")
 	user2 := ts.CreateTestUser(t, "blocked_err")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
 
 	capture := &probingCapture{db: ts.DB, captureErr: errors.New("capture boom")}
 	engine := hookedHandler(t, ts, capture, user1.ID, func(e *gin.Engine, h *friends.Handler) {

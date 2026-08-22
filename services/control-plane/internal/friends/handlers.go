@@ -609,6 +609,35 @@ func (h *Handler) RemoveFriend(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	// Probe-then-gate (#2854 stage C, finding C).
+	//
+	// targetUserID is a raw path parameter and focalSenders gates BOTH
+	// endpoints, so without this a caller with no relationship and no
+	// permission holds an arbitrary stranger's stripe -- one of only 64 --
+	// for a BEGIN / EXISTS / DELETE / ROLLBACK that provably deletes nothing.
+	//
+	// The probe is POOLED, carries NO locking clause, and is NON-AUTHORITATIVE:
+	// the in-transaction rowsAffected == 0 branch below remains the authority
+	// and is unchanged. Its value is never passed into the closure.
+	//
+	// It FAILS OPEN. A probe error, or an unparseable actor ID, falls through
+	// to the gated path -- today's behaviour -- because an unreadable probe
+	// proves nothing and must not deny.
+	//
+	// The accepted cost is a stale cell: a friendship accepted between this
+	// read and the response yields a retryable 404 where today it would 200.
+	// That requires the COUNTERPART to act inside a sub-millisecond window, it
+	// leaves the friendship intact, and a retry succeeds.
+	if actorUUID, actorErr := uuid.Parse(userID); actorErr == nil {
+		if targetUUID, targetErr := uuid.Parse(targetUserID); targetErr == nil {
+			edge, probeErr := presencehook.AcceptedEdgeExists(ctx, h.db, actorUUID, targetUUID)
+			if probeErr == nil && !edge {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Friendship not found"})
+				return
+			}
+		}
+	}
+
 	// ONE spec for the gates, the capture and the focal set — see the note in
 	// acceptFriendRequest on why two separately-built subjects are a silent
 	// hazard.
@@ -701,13 +730,47 @@ func (h *Handler) RemoveFriend(c *gin.Context) {
 // inside tx. It deliberately does NOT commit: presencehook.Complete owns the commit
 // so the durable rail can replace the terminal without touching this site.
 //
-// The capture is unconditional. The site sees all three prior friendship states
-// (accepted, pending, absent) and must not branch on them: the delta is simply
-// empty where nothing changed.
+// The capture is NO LONGER UNCONDITIONAL (#2854 stage C). This comment previously
+// read "the capture is unconditional ... must not branch on [prior friendship
+// state]"; that is now exactly backwards, and the stale wording is called out
+// here rather than silently deleted because following it would undo the fix.
+// BlockUser probes for an accepted edge and nils the capture when there is none.
+//
+// It therefore takes the capture as a PARAMETER rather than reading
+// h.graphPresence, because BlockUser decides per request whether a gate is
+// warranted and ONE value must feed WithGatedTx, Capture, Abandon and Complete
+// alike. Reading the field here would leave the capture running UNGATED --
+// taking FOR UPDATE row locks with no stripe held, which is the lock-order
+// invariant violated in the direction it forbids, and invisible to every
+// behavioural test because the response and the durable state are
+// byte-identical. claimFriendCodeInTx uses the same parameter form.
 func (h *Handler) executeBlockTx(
-	ctx context.Context, tx *sql.Tx, userID, targetUserID string,
+	ctx context.Context, gated presencecapture.GraphPresenceCapture,
+	probeSkippedGate bool, tx *sql.Tx, userID, targetUserID string,
 ) (presencecapture.Plan, error) {
-	plan, err := presencehook.Capture(ctx, h.graphPresence, tx, blockCaptureSpec(userID, targetUserID))
+	// Fail closed on a stale probe. On the ungated path CaptureInTx's own
+	// accepted-edge gate never runs, so this read is the authoritative one.
+	// A live edge here means the probe went stale and the block would revoke a
+	// real audience with NO reconciliation, leaving the counterpart holding the
+	// principal's Custom Status -- which carries no TTL (CWE-284).
+	//
+	// The deferred rollback discards everything; nothing is written. The client
+	// retries and the retry's probe reads the now-committed state.
+	if probeSkippedGate {
+		principal, pErr := uuid.Parse(userID)
+		counterpart, cErr := uuid.Parse(targetUserID)
+		if pErr == nil && cErr == nil {
+			edge, edgeErr := presencehook.AcceptedEdgeExists(ctx, tx, principal, counterpart)
+			if edgeErr != nil {
+				return nil, fmt.Errorf("re-assert accepted edge: %w", edgeErr)
+			}
+			if edge {
+				return nil, presencehook.ErrProbeStale
+			}
+		}
+	}
+
+	plan, err := presencehook.Capture(ctx, gated, tx, blockCaptureSpec(userID, targetUserID))
 	if err != nil {
 		return nil, fmt.Errorf("capture block presence: %w", err)
 	}
@@ -884,10 +947,45 @@ func (h *Handler) BlockUser(c *gin.Context) {
 	// heartbeat and no TTL, so degrading it would leave a blocked user holding
 	// the blocker's status indefinitely. The consequence is stated rather than
 	// hidden — a topology-rail fault does 500 a block.
-	err := presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
-		plan, blockErr := h.executeBlockTx(ctx, tx, userID, targetUserID)
+	// Probe-then-gate (#2854 stage C, finding C). targetUserID is a raw path
+	// parameter and focalSenders gates BOTH endpoints, so without this
+	// POST /friends/<stranger>/block holds an arbitrary stranger's stripe --
+	// one of only 64 -- to compute a capture that CaptureInTx's accepted-edge
+	// gate makes structurally empty.
+	//
+	// Unlike RemoveFriend this CANNOT short-circuit: the block is a real write
+	// and a safety affordance, so refusing it would itself be the regression.
+	// The capture is nil'd instead. ONE value feeds WithGatedTx, executeBlockTx,
+	// both Abandons and Complete.
+	//
+	// Pooled, no locking clause, FAILS OPEN: a probe error keeps today's gated
+	// behaviour. The stale case is caught authoritatively inside the
+	// transaction and fails closed with ErrProbeStale.
+	// `gated` and `probeSkippedGate` are SEPARATE on purpose (CodeRabbit, PR
+	// #2883). A nil capture means TWO different things — the documented UNWIRED
+	// fallback, which requireGraphPresenceCaptureWired does not rule out because
+	// it early-returns when activityService is nil, and "the probe found no
+	// accepted edge, so skip the gate". Only the second may raise ErrProbeStale;
+	// conflating them made every block of a real friend 503 on an unwired
+	// replica, refusing a safety affordance that should simply proceed.
+	gated := h.graphPresence
+	probeSkippedGate := false
+	if gated != nil {
+		if principal, pErr := uuid.Parse(userID); pErr == nil {
+			if counterpart, cErr := uuid.Parse(targetUserID); cErr == nil {
+				edge, probeErr := presencehook.AcceptedEdgeExists(ctx, h.db, principal, counterpart)
+				if probeErr == nil && !edge {
+					gated = nil
+					probeSkippedGate = true
+				}
+			}
+		}
+	}
+
+	err := presencehook.WithGatedTx(ctx, gated, h.db, h.log, spec, func(tx *sql.Tx) error {
+		plan, blockErr := h.executeBlockTx(ctx, gated, probeSkippedGate, tx, userID, targetUserID)
 		if blockErr != nil {
-			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
 			return blockErr
 		}
 
@@ -896,11 +994,11 @@ func (h *Handler) BlockUser(c *gin.Context) {
 			// have revoked. The rollback discards the friendship write too, so
 			// nothing landed — hence CauseWriteFailed, which proves no commit
 			// and therefore disconnects nobody.
-			presencehook.Abandon(h.graphPresence, plan, presencecapture.CauseWriteFailed)
+			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
 			return fmt.Errorf("revoke blocked DM keys: %w", revokeErr)
 		}
 
-		return presencehook.Complete(ctx, h.graphPresence, tx, plan)
+		return presencehook.Complete(ctx, gated, tx, plan)
 	})
 	if err != nil {
 		h.respondPresenceTerminal(c, errMsgFailedBlockUser, err)
