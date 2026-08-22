@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 )
 
 var (
@@ -31,6 +34,17 @@ type Claims struct {
 	// SessionID is the refresh_tokens.id this access token descends from
 	// (#2201 — the seam for future per-session revocation; not yet enforced).
 	SessionID string `json:"sid,omitempty"`
+	// Purpose exists ONLY so this reader can see whether the wire carried a
+	// `purpose` key at all (#2899). It is never set at mint: nil marshals away
+	// under omitempty, so the emitted token is byte-identical to before.
+	//
+	// json.RawMessage rather than string is deliberate. A string field cannot
+	// distinguish "absent" from "present and null" (both decode to ""), and a
+	// non-string value would make ParseWithClaims fail with a decode error rather
+	// than a clean auth rejection. RawMessage captures the raw bytes of ANY value,
+	// so len(Purpose) > 0 means "the key was present", which is the property
+	// middleware.IsAccessToken enforces on the untyped path.
+	Purpose json.RawMessage `json:"purpose,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -68,7 +82,7 @@ func GenerateAccessToken(userID, jwtSecret string, emailVerified bool, credentia
 			ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
-			Issuer:    "concordvoice-control-plane",
+			Issuer:    middleware.AccessTokenIssuer,
 		},
 	}
 
@@ -97,7 +111,14 @@ func ValidateAccessToken(tokenString, jwtSecret string) (*Claims, error) {
 		return nil, ErrInvalidToken
 	}
 
-	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+	// Reject a validly-signed JWT that is not an access token. The MFA challenge and
+	// recovery families share this HMAC secret and unmarshal happily into Claims
+	// (unknown fields are ignored), populating UserID — so before this check, Logout's
+	// blacklistAccessToken accepted a challenge token and let its holder revoke the
+	// victim's sessions. Delegates to middleware.IsAccessTokenClass rather than
+	// restating the rule, so this reader cannot drift from the untyped one.
+	if claims, ok := token.Claims.(*Claims); ok && token.Valid &&
+		middleware.IsAccessTokenClass(claims.Issuer, len(claims.Purpose) > 0) {
 		return claims, nil
 	}
 

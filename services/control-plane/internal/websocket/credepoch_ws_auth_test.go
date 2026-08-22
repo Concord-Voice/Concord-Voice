@@ -32,6 +32,14 @@ func fenceWiredWSHandler(t *testing.T) (*Handler, *redis.Client) {
 
 func signedJWTWithClaims(t *testing.T, claims jwt.MapClaims) string {
 	t.Helper()
+	// Default the access-token issuer so every fixture here is shaped like a token
+	// auth.GenerateAccessToken actually mints. Without it middleware.IsAccessToken
+	// rejects the token up front and each test below stops reaching the specific
+	// guard (epoch fence, disabled-user, Redis outage) it exists to assert on —
+	// still failing closed, but for the wrong reason and proving nothing.
+	if _, ok := claims["iss"]; !ok {
+		claims["iss"] = middleware.AccessTokenIssuer
+	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	s, err := tok.SignedString([]byte(testJWTSecret))
 	require.NoError(t, err)

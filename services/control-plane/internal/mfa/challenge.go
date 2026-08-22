@@ -21,6 +21,13 @@ const (
 	PurposeRecovery          ChallengePurpose = "recovery"
 )
 
+// ChallengeTokenIssuer is the `iss` claim on every MFA-family token. Named for the
+// same reason middleware.AccessTokenIssuer is: this value is the reciprocal half of
+// the #2899 token-class boundary — it is what stops an ACCESS token being redeemed
+// as a challenge — and it was previously a bare literal at both the mint and the
+// read, one careless edit from letting the two disagree.
+const ChallengeTokenIssuer = "concordvoice-mfa"
+
 // recoveryTTL is the lifetime of recovery tokens. Must exceed the longest recovery
 // flow (social recovery requests expire after 24 hours, device requests after 15 minutes).
 const recoveryTTL = 25 * time.Hour
@@ -90,7 +97,7 @@ func generateChallengeTokenWithTTL(userID string, purpose ChallengePurpose, jwtS
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 			NotBefore: jwt.NewNumericDate(now),
-			Issuer:    "concordvoice-mfa",
+			Issuer:    ChallengeTokenIssuer,
 		},
 		UserID:          userID,
 		Purpose:         purpose,
@@ -123,7 +130,7 @@ func ValidateChallengeToken(tokenString, jwtSecret string, expectedPurpose Chall
 		return nil, fmt.Errorf("invalid challenge token claims")
 	}
 
-	if claims.Issuer != "concordvoice-mfa" {
+	if claims.Issuer != ChallengeTokenIssuer {
 		return nil, fmt.Errorf("invalid issuer: %s", claims.Issuer)
 	}
 

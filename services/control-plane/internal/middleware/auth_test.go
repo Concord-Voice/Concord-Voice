@@ -26,7 +26,22 @@ const (
 // makeToken creates a JWT token with the given claims for testing.
 func makeToken(t *testing.T, claims jwt.MapClaims, secret string) string {
 	t.Helper()
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	// Default the access-token issuer (#2899) so fixtures are shaped like a token
+	// auth.GenerateAccessToken actually emits — without it IsAccessToken rejects them
+	// up front and each caller stops short of the guard it means to assert on.
+	//
+	// Copy first: mutating the caller's map would leak across subtests that share a
+	// claims literal, and would silently satisfy a future "issuer absent => reject"
+	// test that meant to omit it.
+	local := make(jwt.MapClaims, len(claims)+1)
+	for k, v := range claims {
+		local[k] = v
+	}
+	if _, ok := local["iss"]; !ok {
+		local["iss"] = middleware.AccessTokenIssuer
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, local)
+	// nosemgrep: go.jwt-go.security.jwt.hardcoded-jwt-key — test fixture, not a real credential
 	s, err := token.SignedString([]byte(secret))
 	require.NoError(t, err)
 	return s

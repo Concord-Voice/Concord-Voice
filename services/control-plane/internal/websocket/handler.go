@@ -256,8 +256,13 @@ func (h *Handler) authenticateViaJWT(c *gin.Context, tokenString string) (uuid.U
 		return uuid.Nil, "", err
 	}
 
+	// IsAccessToken rejects an MFA-challenge or account-recovery JWT presented here.
+	// Those are signed with the same secret and carry `user_id`, so before this the
+	// WS handshake was a second front door for the same bypass AuthRequired had —
+	// and the `email_verified` gate below does not stop them, since a challenge token
+	// omits the claim and emailVerifiedFromClaims defaults an absent claim to true.
 	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok || !token.Valid {
+	if !ok || !token.Valid || !middleware.IsAccessToken(claims) {
 		return uuid.Nil, "", fmt.Errorf("invalid authentication")
 	}
 

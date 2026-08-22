@@ -24,6 +24,16 @@ const (
 	// JWTClaimsContextKey stores validated JWT claims on the Gin context for
 	// handlers that must act on the current token without reparsing it.
 	JWTClaimsContextKey = "jwt_claims"
+
+	// AccessTokenIssuer is the `iss` claim carried by control-plane access tokens —
+	// the single source of truth WITHIN THE CONTROL-PLANE, shared by the minter
+	// (auth.GenerateAccessToken) and every Go reader so the two cannot drift. Same
+	// writer/reader-share discipline as UserDisabledKey below.
+	//
+	// Deliberately not the only place this string exists in the system:
+	// services/media-plane/src/middleware/auth.ts hard-codes the same value in
+	// another language, where no Go constant can reach it.
+	AccessTokenIssuer = "concordvoice-control-plane"
 )
 
 // AuthRequired returns a middleware that validates JWT tokens and checks the
@@ -200,7 +210,41 @@ func parseAndValidateJWT(tokenString, jwtSecret string) (jwt.MapClaims, bool) {
 		return nil, false
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
-	return claims, ok
+	if !ok || !IsAccessToken(claims) {
+		return nil, false
+	}
+	return claims, true
+}
+
+// IsAccessTokenClass is the token-class rule, in one place. The two readers differ
+// only in HOW they discover the issuer and whether a `purpose` key was present —
+// never in what the answer means. A boundary expressed twice is one edit away from
+// being enforced differently by surface, and an attacker picks the surface.
+func IsAccessTokenClass(issuer string, hasPurpose bool) bool {
+	return issuer == AccessTokenIssuer && !hasPurpose
+}
+
+// IsAccessToken reports whether already-signature-validated claims describe a
+// control-plane access token, rather than some other JWT that merely happens to be
+// signed with the same HMAC secret.
+//
+// A valid signature is NOT an authorization boundary here: mfa.GenerateChallengeToken
+// signs the MFA-login, suspicious-refresh, MFA-upgrade and account-recovery families
+// with the same cfg.JWTSecret, and every one carries a `user_id` claim. The incident
+// and why neither the jti blacklist nor the #2201 epoch fence caught it are recorded
+// once in [internal]rules/backend.md § Token-class binding (#2899).
+//
+// SCOPE — the constant's name overstates it: this is the boundary for the three
+// CONTROL-PLANE readers. The media-plane verifies the same secret and checks the
+// issuer ONLY (services/media-plane/src/middleware/auth.ts), so the boundary is not
+// identical on every reader of this secret.
+func IsAccessToken(claims jwt.MapClaims) bool {
+	iss, _ := claims["iss"].(string)
+	// Test for the KEY, not a value: `claims["purpose"].(string)` yields "" for any
+	// non-string, so a numeric / null / object / bool purpose walked straight through
+	// the first version of this guard. An attacker picks the encoding.
+	_, hasPurpose := claims["purpose"]
+	return IsAccessTokenClass(iss, hasPurpose)
 }
 
 func isTokenBlacklisted(c *gin.Context, redisClient *redis.Client, claims jwt.MapClaims) bool {

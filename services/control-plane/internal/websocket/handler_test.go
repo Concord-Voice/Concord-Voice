@@ -16,6 +16,8 @@ import (
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 )
 
 const (
@@ -290,6 +292,7 @@ func generateTestJWT(t *testing.T, userID string, secret string) string {
 	t.Helper()
 	now := time.Now()
 	claims := jwt.MapClaims{
+		"iss":     middleware.AccessTokenIssuer,
 		"user_id": userID,
 		"exp":     jwt.NewNumericDate(now.Add(15 * time.Minute)),
 		"iat":     jwt.NewNumericDate(now),
@@ -366,6 +369,7 @@ func TestAuthenticateWebSocketExpiredJWT(t *testing.T) {
 	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
+		"iss":     middleware.AccessTokenIssuer,
 		"user_id": uuid.New().String(),
 		"exp":     jwt.NewNumericDate(now.Add(-1 * time.Hour)),
 		"iat":     jwt.NewNumericDate(now.Add(-2 * time.Hour)),
@@ -386,6 +390,7 @@ func TestAuthenticateWebSocketJWTMissingUserIDClaim(t *testing.T) {
 	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
+		"iss": middleware.AccessTokenIssuer,
 		"sub": "something",
 		"exp": jwt.NewNumericDate(now.Add(15 * time.Minute)),
 		"iat": jwt.NewNumericDate(now),
@@ -407,6 +412,7 @@ func TestAuthenticateWebSocketJWTInvalidUserIDFormat(t *testing.T) {
 	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
+		"iss":     middleware.AccessTokenIssuer,
 		"user_id": notAValidUUID,
 		"exp":     jwt.NewNumericDate(now.Add(15 * time.Minute)),
 		"iat":     jwt.NewNumericDate(now),
@@ -427,6 +433,7 @@ func TestAuthenticateWebSocketJWTNonHMACSigningMethod(t *testing.T) {
 	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
 	now := time.Now()
 	claims := jwt.MapClaims{
+		"iss":     middleware.AccessTokenIssuer,
 		"user_id": uuid.New().String(),
 		"exp":     jwt.NewNumericDate(now.Add(15 * time.Minute)),
 		"iat":     jwt.NewNumericDate(now),
@@ -577,6 +584,7 @@ func TestAuthenticateWebSocketBlacklistedJWT(t *testing.T) {
 	jti := uuid.New().String()
 	now := time.Now()
 	claims := jwt.MapClaims{
+		"iss":     middleware.AccessTokenIssuer,
 		"user_id": userID.String(),
 		"jti":     jti,
 		"exp":     jwt.NewNumericDate(now.Add(15 * time.Minute)),
