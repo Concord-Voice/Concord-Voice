@@ -1,5 +1,6 @@
 import React from 'react';
 import { useFriendRequestState } from '../../hooks/useFriendRequestState';
+import './sendFriendRequestButton.css';
 
 interface SendFriendRequestButtonProps {
   userId: string | undefined;

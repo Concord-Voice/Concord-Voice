@@ -10,6 +10,16 @@
   flex-direction: column;
   gap: 6px;
   margin-bottom: 16px;
+  /*
+   * #1241 / Sonar S6819 — these tier controls are native <fieldset> elements
+   * rather than <div role="group">, matching PresenceSettingsSection and
+   * VoiceViewSwitch. The four declarations below reset the user-agent fieldset
+   * chrome so the rendering is identical to the previous <div>.
+   */
+  margin-inline: 0;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
 }
 
 /*
@@ -250,4 +260,19 @@
     transition: none;
     animation: none;
   }
+}
+
+/*
+ * #1241 — 3-tier friend-request privacy track. Generalises this file's
+ * inset = 100/(2N)% pattern to N=3. Geometry only: zero color, zero new custom
+ * properties, zero changes to any of the 32 theme blocks, so it cannot
+ * introduce a per-scheme contrast regression by construction.
+ */
+.friend-request-track {
+  padding: 0 calc(100% / 6 - 10px);
+}
+
+.friend-request-track .settings-tier-ticks {
+  left: calc(100% / 6);
+  right: calc(100% / 6);
 }

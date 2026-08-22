@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useId, useRef, useMemo } from 'react';
+import { prefetchEligibility } from '../../services/friendEligibility';
 import { useServerStore } from '../../stores/serverStore';
 import { useUserStore } from '../../stores/userStore';
 import { useMemberStore, ServerMember, PresenceStatus } from '../../stores/memberStore';
@@ -222,6 +223,11 @@ const MemberList: React.FC<MemberListProps> = ({ compact = false }) => {
   const handleMemberContextMenu = useCallback((e: React.MouseEvent, member: ServerMember) => {
     e.preventDefault();
     e.stopPropagation();
+    // #1241: warm the eligibility cache on open-intent. The menu freezes its
+    // verdict at paint, so without this every cold open lands on the
+    // degrade-open branch. The DOM contextmenu event also fires for the
+    // keyboard Menu key and Shift+F10, so this covers both input paths.
+    prefetchEligibility(member.user_id);
     setContextMenu({
       member,
       position: { x: e.clientX, y: e.clientY },

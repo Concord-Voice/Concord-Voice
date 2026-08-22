@@ -1,6 +1,8 @@
 import ToggleSwitch from './ToggleSwitch';
 import { usePrivacyStore, DMPrivacyLevel } from '../../stores/privacyStore';
 
+const DM_LABEL_ID = 'dm-privacy-label';
+
 const DM_LEVEL_TITLES: Record<DMPrivacyLevel, string> = {
   0: 'No One',
   1: 'Friends Only',
@@ -33,16 +35,29 @@ function isFofDisabled(dmLevel: DMPrivacyLevel): boolean {
 interface DMPrivacyControlsProps {
   localDmLevel: DMPrivacyLevel;
   setDmPrivacyLevel: (level: DMPrivacyLevel) => void;
+  /** #1241 / AC-19: a rejected PATCH reverts the slider and says so. */
+  saveError?: string | null;
 }
 
-const DMPrivacyControls = ({ localDmLevel, setDmPrivacyLevel }: DMPrivacyControlsProps) => {
+const DMPrivacyControls = ({
+  localDmLevel,
+  setDmPrivacyLevel,
+  saveError = null,
+}: DMPrivacyControlsProps) => {
   const privacySettings = usePrivacyStore((s) => s.settings);
   const updatePrivacy = usePrivacyStore((s) => s.updatePrivacy);
 
   return (
     <>
-      <div className="settings-tier-slider-container">
-        <span className="settings-row-label">Who Can DM You</span>
+      {/* Native <fieldset> (implicit role="group") per S6819 — see
+          FriendRequestPrivacyControls for the shared rationale. */}
+      {/* Native <fieldset> rather than <div role="group"> (S6819). No <legend>:
+          the group is named by aria-label, so the visible label stays the single
+          text node and the legend never has to participate in the flex layout. */}
+      <fieldset className="settings-tier-slider-container" aria-label="Who Can DM You">
+        <span className="settings-row-label" id={DM_LABEL_ID}>
+          Who Can DM You
+        </span>
         <div className="settings-tier-labels">
           {(['No One', 'Friends', 'Friends + Server', 'Everyone'] as const).map((label, i) => (
             <button
@@ -72,6 +87,8 @@ const DMPrivacyControls = ({ localDmLevel, setDmPrivacyLevel }: DMPrivacyControl
             max={3}
             step={1}
             value={localDmLevel}
+            aria-labelledby={DM_LABEL_ID}
+            aria-valuetext={DM_LEVEL_TITLES[localDmLevel]}
             onChange={(e) => setDmPrivacyLevel(Number(e.target.value) as DMPrivacyLevel)}
           />
         </div>
@@ -79,7 +96,12 @@ const DMPrivacyControls = ({ localDmLevel, setDmPrivacyLevel }: DMPrivacyControl
           <span>{DM_LEVEL_TITLES[localDmLevel]}</span>
           <span>{DM_LEVEL_DESCRIPTIONS[localDmLevel]}</span>
         </div>
-      </div>
+        {saveError && (
+          <span className="settings-row-hint" role="alert">
+            {saveError}
+          </span>
+        )}
+      </fieldset>
 
       <div className={`settings-row ${isFofDisabled(localDmLevel) ? 'settings-row-disabled' : ''}`}>
         <div className="settings-row-info">

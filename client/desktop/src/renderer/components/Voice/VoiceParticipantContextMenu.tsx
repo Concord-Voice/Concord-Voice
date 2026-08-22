@@ -131,7 +131,8 @@ export function VoiceParticipantContextMenu({
   const hasServerPerm = usePermissionStore((s) => s.hasServerPermission);
   const channels = useChannelStore((s) => s.channels);
 
-  const friendReq = useFriendRequestState(participant.userId);
+  // #1241: freeze at open — the menu's item set must not mutate after paint.
+  const friendReq = useFriendRequestState(participant.userId, { freezeAtOpen: true });
   const { isFriend, hasPendingRequest } = friendReq;
 
   const [showMoveTargets, setShowMoveTargets] = useState(false);
@@ -209,7 +210,8 @@ export function VoiceParticipantContextMenu({
 
       {/* Send DM / Friend Request — hidden for self */}
       {!isSelf && <ContextMenu.Item icon={dmIcon} label="Send DM" onClick={handleSendDM} />}
-      {!isSelf && (
+      {/* #1241: `visible` carries self AND the privacy verdict. */}
+      {friendReq.visible && (
         <ContextMenu.Item
           icon={friendIcon}
           label={friendReq.label}

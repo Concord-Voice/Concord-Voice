@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { prefetchEligibility } from '../../services/friendEligibility';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { createPortal } from 'react-dom';
 import { MicOff, HeadphoneOff, Lock, Clock } from 'lucide-react';
@@ -177,6 +178,12 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
   const handleContextMenu = useCallback((e: React.MouseEvent, member: ServerMember) => {
     e.preventDefault();
     e.stopPropagation();
+    // #1241: warm the eligibility cache on open-intent. MemberContextMenu freezes
+    // its verdict at paint and peekEligibility reads only settled verdicts, so a
+    // host that never prefetches leaves EVERY open on the degrade-open branch —
+    // the gate would simply never apply on this surface. MemberList does the
+    // same at its single open path; this panel has three.
+    prefetchEligibility(member.user_id);
     setContextMenu({ member, position: { x: e.clientX, y: e.clientY } });
   }, []);
 
@@ -201,6 +208,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
         const rect = e.currentTarget.getBoundingClientRect();
+        prefetchEligibility(member.user_id);
         setContextMenu({ member, position: { x: rect.left, y: rect.bottom } });
       }
     },
@@ -262,6 +270,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
                   onKeyDown={(e) => handleKeyDown(e, member)}
                   onClick={(e) => {
                     const rect = e.currentTarget.getBoundingClientRect();
+                    prefetchEligibility(member.user_id);
                     setContextMenu({ member, position: { x: rect.left, y: rect.bottom } });
                   }}
                 />

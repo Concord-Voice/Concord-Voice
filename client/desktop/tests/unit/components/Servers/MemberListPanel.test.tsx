@@ -4,6 +4,7 @@ import MemberListPanel from '@/renderer/components/Servers/MemberListPanel';
 import { vi } from 'vitest';
 import type { ServerMember } from '@/renderer/stores/memberStore';
 import type { Role } from '@/renderer/types/server';
+import { prefetchEligibility } from '@/renderer/services/friendEligibility';
 
 // Mock heavy child dependencies so right-click surfaces a simple test double
 vi.mock('@/renderer/components/Members/MemberContextMenu', () => ({
@@ -44,6 +45,12 @@ vi.mock('@/renderer/components/Members/UserProfileModal', () => ({
 vi.mock('@/renderer/components/ui/ConfirmActionModal', () => ({
   default: ({ isOpen, title }: { isOpen: boolean; title: string }) =>
     isOpen ? <div data-testid="confirm-modal">{title}</div> : null,
+}));
+
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  prefetchEligibility: vi.fn(),
+  peekEligibility: vi.fn(() => 'pending'),
+  fetchEligibility: vi.fn(async () => 'unknown'),
 }));
 
 vi.mock('@/renderer/services/apiClient', () => ({
@@ -484,5 +491,40 @@ describe('MemberListPanel', () => {
     render(<MemberListPanel {...defaultProps} members={members} />);
     expect(screen.getByTitle('Server Deafened')).toBeInTheDocument();
     expect(screen.queryByTitle('Server Muted')).not.toBeInTheDocument();
+  });
+});
+
+// ── #1241: eligibility prefetch on open-intent ───────────────────────────────
+// MemberContextMenu freezes its verdict at paint and `peekEligibility` reads
+// only SETTLED verdicts, so a host that never warms the cache leaves every open
+// on the degrade-open branch — the privacy gate would silently never apply on
+// this surface. That was a real finding: this panel has THREE open paths and
+// originally warmed none of them, so covering only one would have left two live.
+describe('MemberListPanel — warms the eligibility cache on every open path (#1241)', () => {
+  const mockPrefetch = prefetchEligibility as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockPrefetch.mockClear();
+  });
+
+  it('right-click warms the cache for the row it opened', () => {
+    render(<MemberListPanel {...defaultProps} />);
+    fireEvent.contextMenu(screen.getByText('Alice').closest('.member-row')!);
+    expect(screen.getByTestId('ctx-menu')).toBeInTheDocument();
+    expect(mockPrefetch).toHaveBeenCalledWith('u1');
+  });
+
+  it('the keyboard trigger warms the cache on Enter', () => {
+    render(<MemberListPanel {...defaultProps} />);
+    fireEvent.keyDown(screen.getByLabelText('Open context menu for Alice'), { key: 'Enter' });
+    expect(screen.getByTestId('ctx-menu')).toBeInTheDocument();
+    expect(mockPrefetch).toHaveBeenCalledWith('u1');
+  });
+
+  it('clicking the keyboard trigger warms the cache', () => {
+    render(<MemberListPanel {...defaultProps} />);
+    fireEvent.click(screen.getByLabelText('Open context menu for Alice'));
+    expect(screen.getByTestId('ctx-menu')).toBeInTheDocument();
+    expect(mockPrefetch).toHaveBeenCalledWith('u1');
   });
 });

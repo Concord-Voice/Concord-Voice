@@ -3,7 +3,20 @@ import MemberProfileCard from '@/renderer/components/Members/MemberProfileCard';
 import { mockMember } from '../../../mocks/fixtures';
 import { useUserStore } from '@/renderer/stores/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { fetchEligibility, peekEligibility } from '@/renderer/services/friendEligibility';
 import { resetAllStores } from '../../../helpers/store-helpers';
+
+// #1241: the affordance is now gated on server eligibility. Most of these tests
+// are about rendering and sending, not about the gate (which has its own suite
+// in tests/unit/hooks/useFriendRequestState.test.ts), so the default verdict is
+// eligible. The § "eligibility gate" block below overrides it per test.
+//
+// The defaults are load-bearing: a bare vi.fn() returns undefined, and the hook
+// does fetchEligibility(id).then(...), which would throw in every test here.
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  fetchEligibility: vi.fn().mockResolvedValue('eligible'),
+  peekEligibility: vi.fn().mockReturnValue('eligible'),
+}));
 
 describe('MemberProfileCard', () => {
   const mockOnClose = vi.fn();
@@ -17,6 +30,10 @@ describe('MemberProfileCard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllStores();
+    // Re-arm explicitly rather than relying on the factory defaults surviving
+    // whatever vi.clearAllMocks() does to them.
+    vi.mocked(fetchEligibility).mockResolvedValue('eligible');
+    vi.mocked(peekEligibility).mockReturnValue('eligible');
   });
 
   it('renders member username and display name', () => {
@@ -232,6 +249,48 @@ describe('MemberProfileCard', () => {
     render(<MemberProfileCard {...defaultProps} onViewFullProfile={vi.fn()} />);
     // Friend button hidden (self) but the row persists for View Full Profile.
     expect(screen.queryByRole('button', { name: 'Send friend request' })).not.toBeInTheDocument();
+    expect(screen.getByText('View Full Profile')).toBeInTheDocument();
+  });
+
+  // ── Server eligibility gate (#1241) ──
+  //
+  // The card's `showActions` is `friendActionVisible || !!onViewFullProfile`, so
+  // an ineligible verdict does NOT necessarily suppress the action row — that is
+  // intended. The narrower guarantee these tests pin is that
+  // SendFriendRequestButton self-gates on the same verdict (`if (!visible)
+  // return null`), so the friend-request BUTTON is absent whenever the verdict
+  // is ineligible, whatever else the row is carrying.
+
+  it('renders the Send Friend Request button for an eligible verdict', () => {
+    // Positive control for the two negatives below: without it, an ineligible
+    // assertion could pass merely because the card failed to render at all.
+    render(<MemberProfileCard {...defaultProps} />);
+
+    expect(screen.getByRole('button', { name: 'Send friend request' })).toBeInTheDocument();
+  });
+
+  it('hides the friend-request button for an ineligible verdict', () => {
+    vi.mocked(peekEligibility).mockReturnValue('ineligible');
+    vi.mocked(fetchEligibility).mockResolvedValue('ineligible');
+
+    render(<MemberProfileCard {...defaultProps} />);
+
+    // The card itself rendered — the absence below is the gate, not a crash.
+    expect(screen.getByText('@testuser')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send friend request' })).not.toBeInTheDocument();
+    // Nothing else wanted the row, so it is suppressed entirely.
+    expect(document.querySelector('.member-profile-actions')).not.toBeInTheDocument();
+  });
+
+  it('keeps View Full Profile while hiding the friend-request button when ineligible', () => {
+    vi.mocked(peekEligibility).mockReturnValue('ineligible');
+    vi.mocked(fetchEligibility).mockResolvedValue('ineligible');
+
+    render(<MemberProfileCard {...defaultProps} onViewFullProfile={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Send friend request' })).not.toBeInTheDocument();
+    // The row survives for the other affordance — only the gated button goes.
+    expect(document.querySelector('.member-profile-actions')).toBeInTheDocument();
     expect(screen.getByText('View Full Profile')).toBeInTheDocument();
   });
 });

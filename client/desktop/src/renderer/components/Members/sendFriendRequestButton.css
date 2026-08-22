@@ -1,0 +1,30 @@
+/*
+ * #1241 — the affordance resolves after paint on a cold cache, so it arrives
+ * rather than blinking in.
+ *
+ * It animates hidden -> shown ONLY. It cannot distinguish "verdict in flight"
+ * from "not eligible", and that is required, not incidental: both states must
+ * render identically (absent). A skeleton, a reserved gap, a disabled-grey
+ * variant, or a distinguishing hover state would each leak the verdict that the
+ * boolean-only endpoint exists to hide.
+ */
+.send-friend-request-btn {
+  animation: friend-request-pop-in var(--motion-duration-fast) var(--motion-curve-decel) both;
+}
+
+@keyframes friend-request-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .send-friend-request-btn {
+    animation: none;
+  }
+}

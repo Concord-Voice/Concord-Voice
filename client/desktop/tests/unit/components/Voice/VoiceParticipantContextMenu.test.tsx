@@ -21,6 +21,20 @@ vi.mock('@/renderer/services/voiceParticipantApi', () => ({
   disconnectVoiceParticipant: (...args: unknown[]) => mockDisconnect(...args),
 }));
 
+// #1241: the menu freezes its eligibility verdict at open, reading it from the
+// synchronous cache. Left unmocked this file never exercised the privacy gate
+// at all — the real service issued an unmocked apiFetch, failed, and degraded
+// OPEN, so the one Friend Request assertion passed on the fallback branch
+// rather than on a verdict. `peekEligibility` MUST have a default return: a
+// bare vi.fn() returns undefined, and `fetchEligibility` is `.then`-ed by the
+// hook, so an undefined default throws.
+const mockPeekEligibility = vi.fn().mockReturnValue('eligible');
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  fetchEligibility: vi.fn().mockResolvedValue('eligible'),
+  peekEligibility: (userId: string) => mockPeekEligibility(userId),
+  prefetchEligibility: vi.fn(),
+}));
+
 const SERVER_ID = 'server-1';
 const SELF_ID = 'user-self';
 const TARGET_ID = 'user-2';
@@ -85,7 +99,9 @@ describe('VoiceParticipantContextMenu', () => {
   });
 
   it('shows Mute when actor holds MUTE_MEMBERS', () => {
-    usePermissionStore.setState({ serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MUTE_MEMBERS } });
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MUTE_MEMBERS },
+    });
     render(<VoiceParticipantContextMenu {...baseProps} />);
     expect(screen.getByText('Mute')).toBeInTheDocument();
   });
@@ -97,7 +113,9 @@ describe('VoiceParticipantContextMenu', () => {
   });
 
   it('shows Move to + Disconnect when actor holds MOVE_MEMBERS', () => {
-    usePermissionStore.setState({ serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS } });
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS },
+    });
     render(<VoiceParticipantContextMenu {...baseProps} />);
     expect(screen.getByText('Move to')).toBeInTheDocument();
     expect(screen.getByText('Disconnect')).toBeInTheDocument();
@@ -126,7 +144,9 @@ describe('VoiceParticipantContextMenu', () => {
   });
 
   it('Move-to submenu lists only same-server voice channels except the current one', () => {
-    usePermissionStore.setState({ serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS } });
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS },
+    });
     render(<VoiceParticipantContextMenu {...baseProps} />);
     fireEvent.click(screen.getByText('Move to'));
     // Other same-server voice channel appears.
@@ -138,7 +158,9 @@ describe('VoiceParticipantContextMenu', () => {
   });
 
   it('clicking a Move-to target calls moveVoiceParticipant with the target channel', () => {
-    usePermissionStore.setState({ serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS } });
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS },
+    });
     render(<VoiceParticipantContextMenu {...baseProps} />);
     fireEvent.click(screen.getByText('Move to'));
     fireEvent.click(screen.getByText('Other Voice'));
@@ -146,7 +168,9 @@ describe('VoiceParticipantContextMenu', () => {
   });
 
   it('clicking Disconnect calls disconnectVoiceParticipant', () => {
-    usePermissionStore.setState({ serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS } });
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS | MOVE_MEMBERS },
+    });
     render(<VoiceParticipantContextMenu {...baseProps} />);
     fireEvent.click(screen.getByText('Disconnect'));
     expect(mockDisconnect).toHaveBeenCalledWith(SERVER_ID, TARGET_ID);
@@ -175,5 +199,46 @@ describe('VoiceParticipantContextMenu', () => {
     render(<VoiceParticipantContextMenu {...baseProps} />);
     expect(screen.queryByText('Kick')).not.toBeInTheDocument();
     expect(screen.queryByText('Ban')).not.toBeInTheDocument();
+  });
+});
+
+// ── #1241: the friend-request gate has a HIDE direction ──────────────────────
+//
+// Reverting the guard from `friendReq.visible &&` to `!isSelf &&` left all 56
+// pre-existing tests green: the surviving assertion is a SHOW, and with the
+// verdict degrading open a show passes either way. Nothing proved this surface
+// ever hides the affordance.
+describe('VoiceParticipantContextMenu — friend-request eligibility gate (#1241)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetAllStores();
+    useUserStore.setState({ user: { id: SELF_ID, username: 'me' } as never });
+    seedVoiceChannels();
+    usePermissionStore.setState({ serverPermissions: { [SERVER_ID]: BASE_PERMISSIONS } });
+  });
+
+  afterEach(() => {
+    // mockClear does not drop a mockReturnValue, so restore the file default.
+    mockPeekEligibility.mockReturnValue('eligible');
+  });
+
+  it('omits the Friend Request item on a warm INELIGIBLE verdict', () => {
+    mockPeekEligibility.mockReturnValue('ineligible');
+    render(<VoiceParticipantContextMenu {...baseProps} />);
+
+    expect(screen.queryByText('Send Friend Request')).not.toBeInTheDocument();
+    // Positive control for the render itself: the menu is up, and the sibling
+    // item guarded only by `!isSelf` is present. So the absence above is the
+    // eligibility gate, not a menu that failed to render.
+    expect(screen.getByText('Send DM')).toBeInTheDocument();
+    expect(screen.getByText('View Profile')).toBeInTheDocument();
+  });
+
+  it('renders the Friend Request item on a warm ELIGIBLE verdict', () => {
+    mockPeekEligibility.mockReturnValue('eligible');
+    render(<VoiceParticipantContextMenu {...baseProps} />);
+
+    expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
+    expect(screen.getByText('Send DM')).toBeInTheDocument();
   });
 });

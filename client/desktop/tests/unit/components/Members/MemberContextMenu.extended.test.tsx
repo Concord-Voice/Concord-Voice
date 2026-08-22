@@ -10,6 +10,17 @@ import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';
 
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  // Defaults matter: a bare vi.fn() returns undefined and the hook does
+  // fetchEligibility(id).then(...), which would throw for every test in this
+  // file rather than only the ones that care about eligibility.
+  fetchEligibility: vi.fn().mockResolvedValue('eligible'),
+  peekEligibility: vi.fn().mockReturnValue('eligible'),
+}));
+import { fetchEligibility, peekEligibility } from '@/renderer/services/friendEligibility';
+const mockFetchEligibility = fetchEligibility as ReturnType<typeof vi.fn>;
+const mockPeekEligibility = peekEligibility as ReturnType<typeof vi.fn>;
+
 const SERVER_ID = 'server-1';
 const OWNER_USER_ID = 'user-1';
 
@@ -76,6 +87,8 @@ describe('MemberContextMenu — extended coverage', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockFetchEligibility.mockResolvedValue('eligible');
+    mockPeekEligibility.mockReturnValue('eligible');
     vi.useFakeTimers();
     resetAllStores();
     usePermissionStore.setState({
@@ -314,5 +327,71 @@ describe('MemberContextMenu — extended coverage', () => {
       expect(mockSendRequest).toHaveBeenCalled();
       expect(mockOnClose).toHaveBeenCalled();
     });
+  });
+});
+
+// ── #1241: freeze-at-open ────────────────────────────────────────────────────
+
+describe('MemberContextMenu — eligibility freeze-at-open (#1241)', () => {
+  const props = {
+    member: mockMember2,
+    position: { x: 0, y: 0 },
+    serverId: SERVER_ID,
+    ownerUserId: OWNER_USER_ID,
+    onClose: vi.fn(),
+    onViewProfile: vi.fn(),
+    onBan: vi.fn(),
+    onKick: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetAllStores();
+    usePermissionStore.setState({
+      serverPermissions: { [SERVER_ID]: ADMIN_PERMISSIONS },
+      serverRoles: { [SERVER_ID]: mockRoles },
+    });
+    useUserStore.setState({ user: { id: OWNER_USER_ID, username: 'testuser' } as never });
+  });
+
+  // A row that appears in an already-painted menu is a layout shift, a
+  // focus-order mutation (WCAG 2.4.3), and invisible to a screen reader that
+  // already announced the item count (4.1.3). The verdict is frozen at open.
+  it('does not change its item set after the verdict resolves', async () => {
+    mockPeekEligibility.mockReturnValue('pending');
+    let resolveVerdict!: (v: string) => void;
+    mockFetchEligibility.mockReturnValue(
+      new Promise((r) => {
+        resolveVerdict = r as (v: string) => void;
+      })
+    );
+
+    const { rerender } = render(<MemberContextMenu {...props} />);
+    const before = screen.getAllByRole('button').length;
+    expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveVerdict('ineligible');
+    });
+    rerender(<MemberContextMenu {...props} />);
+
+    expect(screen.getAllByRole('button')).toHaveLength(before);
+    expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
+  });
+
+  // Degrade open is only for an UNRESOLVED verdict. A menu opened with the
+  // answer already cached must honour it at paint.
+  it('honours a warm ineligible verdict at open', () => {
+    mockPeekEligibility.mockReturnValue('ineligible');
+    mockFetchEligibility.mockResolvedValue('ineligible');
+    render(<MemberContextMenu {...props} />);
+    expect(screen.queryByText('Send Friend Request')).not.toBeInTheDocument();
+  });
+
+  it('shows the item on a warm eligible verdict', () => {
+    mockPeekEligibility.mockReturnValue('eligible');
+    mockFetchEligibility.mockResolvedValue('eligible');
+    render(<MemberContextMenu {...props} />);
+    expect(screen.getByText('Send Friend Request')).toBeInTheDocument();
   });
 });

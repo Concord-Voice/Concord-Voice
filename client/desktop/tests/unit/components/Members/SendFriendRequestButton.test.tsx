@@ -10,6 +10,14 @@ vi.mock('@/renderer/services/apiClient', () => ({
   // light real-ish impl so the error-path test surfaces the API's message.
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
+// #1241: the affordance is now gated on server eligibility. These tests are
+// about rendering and sending, not about the gate (which has its own suite in
+// tests/unit/hooks/useFriendRequestState.test.ts), so pin an eligible verdict.
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  fetchEligibility: vi.fn().mockResolvedValue('eligible'),
+  peekEligibility: vi.fn().mockReturnValue('eligible'),
+}));
+
 import { apiFetch } from '@/renderer/services/apiClient';
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 

@@ -37,6 +37,14 @@ vi.mock('@/renderer/services/notificationPrefsService', () => ({
   stopExpirySweep: vi.fn(() => resetOrder.push('notification-sweep-stop')),
 }));
 
+// #1241: the module-scope eligibility cache lives outside every store, so the
+// only thing that clears it on an account transition is resetService's explicit
+// call. Spy on it so the REGISTRATION is verified here — the clear function's
+// own behaviour is covered in friendEligibility.test.ts.
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  clearFriendEligibilityCache: vi.fn(),
+}));
+
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     fencePendingOperations: vi.fn(),
@@ -68,6 +76,7 @@ import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
 import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { stopExpirySweep } from '@/renderer/services/notificationPrefsService';
+import { clearFriendEligibilityCache } from '@/renderer/services/friendEligibility';
 import { stopProactiveRefresh } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
@@ -86,6 +95,7 @@ beforeEach(() => {
   vi.mocked(savedGifsSyncService.stopWatching).mockClear();
   vi.mocked(stopExpirySweep).mockClear();
   vi.mocked(stopProactiveRefresh).mockClear();
+  vi.mocked(clearFriendEligibilityCache).mockClear();
   vi.mocked(e2eeService.fencePendingOperations).mockReset();
   vi.mocked(e2eeService.clearKeys).mockReset();
   vi.mocked(e2eeService.revokeChannelAccess).mockReset();
@@ -238,6 +248,18 @@ describe('resetService', () => {
       expect(useSubscriptionStore.getState().degraded).toBe(false);
     });
 
+    it('clears the friend-request eligibility cache (#1241 cross-account leak fix)', () => {
+      // The verdict cache is module-scope, not a store, so resetAllStores() and
+      // every store-level clear leave it untouched. This asserts the
+      // REGISTRATION — that gracefulReset actually calls the clear — because
+      // that call is the whole guard. Without it, account A's per-user verdicts
+      // (and the process-wide `unsupported` latch) are served to account B on a
+      // shared device.
+      gracefulReset();
+
+      expect(clearFriendEligibilityCache).toHaveBeenCalledTimes(1);
+    });
+
     it('preserves auth tokens', () => {
       gracefulReset();
       expect(useAuthStore.getState().accessToken).toBe('test-token');
@@ -336,6 +358,14 @@ describe('resetService', () => {
       expect(useAudioSettingsStore.getState().perParticipantVolume).toEqual({});
     });
 
+    it('inherits the friend-request eligibility clear (#1241)', () => {
+      // Every login-screen transition routes through here, so the guard must
+      // hold on the widest tier too — it does by delegation to gracefulReset.
+      nuclearReset();
+
+      expect(clearFriendEligibilityCache).toHaveBeenCalledTimes(1);
+    });
+
     it('calls electron clearTokens', () => {
       const clearTokens = vi.fn();
       window.electron.clearTokens = clearTokens;
@@ -410,6 +440,12 @@ describe('resetService', () => {
       recoveryReset();
 
       expect(stopProactiveRefresh).not.toHaveBeenCalled();
+    });
+
+    it('keeps the eligibility cache — the account did not change (#1241)', () => {
+      recoveryReset();
+
+      expect(clearFriendEligibilityCache).not.toHaveBeenCalled();
     });
 
     it('does not stop account-bound watchers — hydratePostLogin re-arms them idempotently', () => {

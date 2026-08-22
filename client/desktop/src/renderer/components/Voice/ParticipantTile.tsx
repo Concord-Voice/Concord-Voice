@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useMemo, useState, useId } from 'react';
+import { prefetchEligibility } from '../../services/friendEligibility';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { MicOff, HeadphoneOff, Lock, Monitor, MoreVertical, Wrench } from 'lucide-react';
 import { VoiceParticipantContextMenu } from './VoiceParticipantContextMenu';
@@ -315,6 +316,8 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
     e.preventDefault();
     e.stopPropagation();
     if (isLocal) return;
+    // #1241: warm the eligibility cache on open-intent (see MemberList).
+    prefetchEligibility(participant.userId);
     setCtxMenu({ x: e.clientX, y: e.clientY });
   };
 
@@ -323,6 +326,10 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   // free from native semantics — no role/tabIndex/onKeyDown on the outer div.
   const handleMenuButtonClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    // #1241: the keyboard path to the same menu. Prefetching only on the
+    // pointer path would leave keyboard users permanently on the degrade-open
+    // branch — a silent loss of the gate for exactly those users.
+    prefetchEligibility(participant.userId);
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setCtxMenu({ x: rect.left, y: rect.bottom });
   };

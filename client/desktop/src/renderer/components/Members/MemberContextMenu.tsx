@@ -67,7 +67,8 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
   // Friend-request relationship state + send action, shared with the member
   // profile card and chat profile card via the same hook (single source of
   // truth for the Friends / Request Pending / Send Friend Request labels).
-  const friendReq = useFriendRequestState(member.user_id);
+  // #1241: freeze at open — the menu's item set must not mutate after paint.
+  const friendReq = useFriendRequestState(member.user_id, { freezeAtOpen: true });
   const { isFriend, hasPendingRequest } = friendReq;
 
   const isSelf = member.user_id === currentUserId;
@@ -259,8 +260,11 @@ const MemberContextMenu: React.FC<MemberContextMenuProps> = ({
         />
       )}
 
-      {/* Friend Request — hidden for self */}
-      {!isSelf && (
+      {/* Friend Request — hidden for self, and for a target whose privacy
+          setting rejects requests from this viewer (#1241). `visible` carries
+          both; before #1241 it was only ever false for self, so this guard used
+          to read `!isSelf`. */}
+      {friendReq.visible && (
         <ContextMenu.Item
           icon={
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">

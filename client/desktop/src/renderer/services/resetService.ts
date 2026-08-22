@@ -48,6 +48,7 @@ import { preferencesSyncService } from './preferencesSync';
 import { savedGifsSyncService } from './savedGifsSync';
 import { friendOrgSyncService } from './friendOrgSync';
 import { presenceOverrideSyncService } from './presenceOverrideSync';
+import { clearFriendEligibilityCache } from './friendEligibility';
 import { stopExpirySweep } from './notificationPrefsService';
 import { useFriendOrgStore } from '../stores/friendOrgStore';
 import { useSavedGifsStore } from '../stores/savedGifsStore';
@@ -128,6 +129,9 @@ export function gracefulReset(): void {
   useDMStore.getState().clearDMs();
   useFriendStore.getState().clearFriends();
   usePrivacyStore.getState().clearPrivacy();
+  // #1241: module-scope eligibility cache. Surviving logout would serve the
+  // previous account's verdicts to the next user on a shared device.
+  clearFriendEligibilityCache();
   useMemberStore.getState().clearMembers();
   useUnreadStore.getState().clearAll();
   useVoiceStore.getState().reset();

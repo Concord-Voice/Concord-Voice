@@ -2,7 +2,12 @@ import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router';
 import { useAuthStore } from '../../stores/authStore';
 import { useUserStore } from '../../stores/userStore';
-import { usePrivacyStore, DMPrivacyLevel } from '../../stores/privacyStore';
+import {
+  usePrivacyStore,
+  DMPrivacyLevel,
+  type FriendRequestPrivacyMode,
+  type PrivacySettings,
+} from '../../stores/privacyStore';
 import { useClientConfigStore } from '../../stores/clientConfigStore';
 import { apiFetch, API_BASE } from '../../services/apiClient';
 import LoadingSpinner from '../Auth/LoadingSpinner';
@@ -19,6 +24,7 @@ import {
   type OsPermissionStatus,
 } from '../../stores/osPermissionStore';
 import DMPrivacyControls from './DMPrivacyControls';
+import FriendRequestPrivacyControls from './FriendRequestPrivacyControls';
 import ContentSafetyControls from './ContentSafetyControls';
 import SearchVisibilityControls from './SearchVisibilityControls';
 import LinkedAccountsList from './LinkedAccountsList';
@@ -663,6 +669,7 @@ const PrivacySecuritySection: React.FC = () => {
   const privacySettings = usePrivacyStore((s) => s.settings);
   const fetchPrivacy = usePrivacyStore((s) => s.fetchPrivacy);
   const updatePrivacy = usePrivacyStore((s) => s.updatePrivacy);
+  const privacyLoaded = usePrivacyStore((s) => s.loaded);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
   const [activityHistoryControlsVisible, setActivityHistoryControlsVisible] = useState(false);
@@ -740,21 +747,117 @@ const PrivacySecuritySection: React.FC = () => {
     setLocalDmLevel(privacySettings.dmPrivacyLevel);
   }, [privacySettings.dmPrivacyLevel]);
 
+  // #1241 / AC-19: one revert mechanism for BOTH tier sliders. Each optimistic
+  // local value must fall back to the last value the server confirmed — leaving
+  // a control showing a mode the server rejected misrepresents the user's actual
+  // protection, which on a privacy control is worse than showing an error.
+  // Implementing it once and applying it to both is less code than two
+  // mechanisms, so the spec's lockstep-companion-PR escape hatch is not needed.
+  // Monotonic tier-mutation counters, keyed PER FIELD. The debounce coalesces
+  // rapid clicks, but two selections more than 300 ms apart put two PATCHes in
+  // flight at once and their responses can land out of order.
+  //
+  // The key is load-bearing. A single shared counter let one control supersede
+  // the OTHER: both tier controls route through commitPrivacyTier, so changing
+  // the friend-request mode while a DM PATCH was in flight bumped the counter,
+  // the DM rejection was judged superseded, and its error was swallowed and its
+  // revert skipped — reintroducing, from an unrelated control, exactly the
+  // silent failure this guard exists to prevent. Found by Gitar and CodeRabbit
+  // independently on PR #2888.
+  const tierMutationRef = useRef<Record<string, number>>({});
+
+  const commitPrivacyTier = useCallback(
+    (
+      updates: Partial<PrivacySettings>,
+      revert: (confirmed: PrivacySettings) => void,
+      setError: (message: string | null) => void
+    ) => {
+      // Supersession is per FIELD, not per field-set. Keying on the joined set
+      // would mean a `{a, b}` write neither supersedes nor is superseded by an
+      // in-flight `{a}` — the same cross-write staleness this fence exists to
+      // stop, reappearing the moment anyone passes two fields. Every caller
+      // passes one today; the signature is `Partial<PrivacySettings>`.
+      const stamps = (Object.keys(updates) as (keyof PrivacySettings)[]).map((field) => {
+        const next = (tierMutationRef.current[field] ?? 0) + 1;
+        tierMutationRef.current[field] = next;
+        return [field, next] as const;
+      });
+      setError(null);
+      // Previously the DM path called updatePrivacy() bare, so a rejection was
+      // an unhandled promise AND the slider kept the value the server refused.
+      void updatePrivacy(updates).catch((err: unknown) => {
+        // A superseded request must not act on its own outcome. Without this,
+        // a slow rejection of an ALREADY-REPLACED selection reverts the user's
+        // newer choice and reports an error for a request they abandoned.
+        if (stamps.some(([field, stamp]) => tierMutationRef.current[field] !== stamp)) return;
+        setError(err instanceof Error ? err.message : 'Failed to update privacy settings');
+        try {
+          revert(usePrivacyStore.getState().settings);
+        } catch {
+          // The error is already surfaced. A failed revert must not mask it —
+          // guarded rather than relying on statement order, so a future reorder
+          // cannot reintroduce the silent failure.
+        }
+      });
+    },
+    [updatePrivacy]
+  );
+
+  const [dmSaveError, setDmSaveError] = useState<string | null>(null);
+
   const setDmPrivacyLevel = useCallback(
     (level: DMPrivacyLevel) => {
       setLocalDmLevel(level);
       if (dmDebounceRef.current) clearTimeout(dmDebounceRef.current);
       dmDebounceRef.current = setTimeout(() => {
-        updatePrivacy({ dmPrivacyLevel: level });
+        commitPrivacyTier(
+          { dmPrivacyLevel: level },
+          (confirmed) => setLocalDmLevel(confirmed.dmPrivacyLevel),
+          setDmSaveError
+        );
       }, 300);
     },
-    [updatePrivacy]
+    [commitPrivacyTier]
   );
 
   // Cleanup debounce timer
   useEffect(() => {
     return () => {
       if (dmDebounceRef.current) clearTimeout(dmDebounceRef.current);
+    };
+  }, []);
+
+  // #1241: local mode for a responsive slider, debounced like the DM tier.
+  const [localFriendRequestMode, setLocalFriendRequestMode] = useState<FriendRequestPrivacyMode>(
+    privacySettings.allowFriendRequestsFrom
+  );
+  const [friendRequestError, setFriendRequestError] = useState<string | null>(null);
+  const friendRequestDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: syncs localFriendRequestMode from the store after the settings fetch; not a render loop
+    setLocalFriendRequestMode(privacySettings.allowFriendRequestsFrom);
+  }, [privacySettings.allowFriendRequestsFrom]);
+
+  const setFriendRequestMode = useCallback(
+    (mode: FriendRequestPrivacyMode) => {
+      setLocalFriendRequestMode(mode);
+      setFriendRequestError(null);
+      if (friendRequestDebounceRef.current) clearTimeout(friendRequestDebounceRef.current);
+      friendRequestDebounceRef.current = setTimeout(() => {
+        commitPrivacyTier(
+          { allowFriendRequestsFrom: mode },
+          (confirmed) => setLocalFriendRequestMode(confirmed.allowFriendRequestsFrom),
+          setFriendRequestError
+        );
+      }, 300);
+    },
+    [commitPrivacyTier]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (friendRequestDebounceRef.current) clearTimeout(friendRequestDebounceRef.current);
     };
   }, []);
 
@@ -1355,7 +1458,18 @@ const PrivacySecuritySection: React.FC = () => {
           Control who can message you and how others can find you.
         </p>
 
-        <DMPrivacyControls localDmLevel={localDmLevel} setDmPrivacyLevel={setDmPrivacyLevel} />
+        <DMPrivacyControls
+          localDmLevel={localDmLevel}
+          setDmPrivacyLevel={setDmPrivacyLevel}
+          saveError={dmSaveError}
+        />
+
+        <FriendRequestPrivacyControls
+          localMode={localFriendRequestMode}
+          setMode={setFriendRequestMode}
+          saveError={friendRequestError}
+          isLoaded={privacyLoaded}
+        />
 
         <div className="settings-row">
           <div className="settings-row-info">

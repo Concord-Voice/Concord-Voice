@@ -1,4 +1,15 @@
 import { render, screen, fireEvent, act, userEvent, within } from '../../../test-utils';
+
+// #1241: opening a member context menu prefetches the friend-request
+// eligibility verdict. Left unmocked it issues a real apiFetch and consumes the
+// mockResolvedValueOnce queued for the ban/kick call under test, so the failure
+// path silently gets the generic success response instead. Mock the service so
+// these tests exercise ban/kick, not the privacy gate.
+vi.mock('@/renderer/services/friendEligibility', () => ({
+  fetchEligibility: vi.fn().mockResolvedValue('eligible'),
+  peekEligibility: vi.fn().mockReturnValue('eligible'),
+  prefetchEligibility: vi.fn(),
+}));
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
 import { useServerStore } from '@/renderer/stores/serverStore';
