@@ -67,7 +67,7 @@
     "@eslint-react/eslint-plugin": "^5.18.4",
     "@microsoft/eslint-formatter-sarif": "3.1.0",
     "@playwright/test": "^1.62.1",
-    "@reforged/maker-appimage": "^5.2.0",
+    "@reforged/maker-appimage": "^5.3.1",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.4",
