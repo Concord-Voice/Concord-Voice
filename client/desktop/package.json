@@ -82,7 +82,7 @@
     "ajv-formats": "^3.0.1",
     "app-builder-bin": "^4.2.0",
     "app-builder-lib": "26.15.3",
-    "concurrently": "^10.0.4",
+    "concurrently": "^10.0.5",
     "electron": "^43.4.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.8.1",
