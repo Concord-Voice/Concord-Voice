@@ -1951,6 +1951,7 @@ type privacySettingsResponse struct {
 	EnableKlipyProxy                    bool   `json:"enable_klipy_proxy"`
 	SharePersonalizationWithGifProvider bool   `json:"share_personalization_with_gif_provider"`
 	RequireAuthBeforePurge              bool   `json:"require_auth_before_purge"`
+	AllowFriendRequestsFrom             string `json:"allow_friend_requests_from"`
 	UpdatedAt                           string `json:"updated_at,omitempty"`
 }
 
@@ -1965,14 +1966,16 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 		SELECT messages_friends_only, messages_server_members, dm_privacy_level, dm_friends_of_friends,
 		       auto_accept_friend_codes, searchable_by_username, searchable_by_email, searchable_by_phone,
 		       allow_embedded_content, load_gifs_automatically, enable_klipy_proxy,
-		       share_personalization_with_gif_provider, require_auth_before_purge, updated_at
+		       share_personalization_with_gif_provider, require_auth_before_purge,
+		       allow_friend_requests_from, updated_at
 		FROM privacy_settings
 		WHERE user_id = $1
 	`, userID).Scan(
 		&ps.MessagesFriendsOnly, &ps.MessagesServerMembers, &ps.DMPrivacyLevel, &ps.DMFriendsOfFriends,
 		&ps.AutoAcceptFriendCodes, &ps.SearchableByUsername, &ps.SearchableByEmail, &ps.SearchableByPhone,
 		&ps.AllowEmbeddedContent, &ps.LoadGifsAutomatically, &ps.EnableKlipyProxy,
-		&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge, &ps.UpdatedAt,
+		&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge,
+		&ps.AllowFriendRequestsFrom, &ps.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		// Return full defaults matching the schema defaults (all fields explicit)
@@ -1995,7 +1998,8 @@ func (h *Handler) GetPrivacySettings(c *gin.Context) {
 				// privacy_settings rows are created lazily, so a false here would render
 				// the toggle OFF for every user who has never PATCHed their settings while
 				// their purges kept 403-ing.
-				RequireAuthBeforePurge: true,
+				RequireAuthBeforePurge:  true,
+				AllowFriendRequestsFrom: "everyone",
 			},
 		})
 		return
@@ -2029,7 +2033,24 @@ type updatePrivacyRequest struct {
 	EnableKlipyProxy                    *bool `json:"enable_klipy_proxy"`
 	SharePersonalizationWithGifProvider *bool `json:"share_personalization_with_gif_provider"`
 	RequireAuthBeforePurge              *bool `json:"require_auth_before_purge"`
+	// #1240. Deliberately *friendRequestMode and NOT *string. The #2765
+	// structural guard bans a bare *string on this struct because that shape is
+	// how a credential would reach buildPrivacyClauses; a named domain type
+	// admits this one real enum column without reopening that door, since
+	// nothing would ever spell a password field *friendRequestMode.
+	AllowFriendRequestsFrom *friendRequestMode `json:"allow_friend_requests_from"`
 }
+
+// friendRequestMode is the allow_friend_requests_from enum. It exists as a
+// named type rather than a bare string so the #2765 struct guard can keep
+// banning *string on updatePrivacyRequest — see privacy_struct_invariant_test.go.
+type friendRequestMode string
+
+const (
+	friendRequestModeEveryone      friendRequestMode = "everyone"
+	friendRequestModeMutualServers friendRequestMode = "mutual_servers"
+	friendRequestModeNobody        friendRequestMode = "nobody"
+)
 
 // updatePrivacyStepUp carries the step-up factors for the ONE privacy transition
 // that requires them: require_auth_before_purge → false (#2765). Never logged,
@@ -2089,6 +2110,21 @@ func buildPrivacyClauses(req *updatePrivacyRequest) ([]string, []interface{}, in
 	addBoolClause("enable_klipy_proxy", req.EnableKlipyProxy)
 	addBoolClause("share_personalization_with_gif_provider", req.SharePersonalizationWithGifProvider)
 	addBoolClause("require_auth_before_purge", req.RequireAuthBeforePurge)
+
+	// Validate-then-append, copying dm_privacy_level's SHAPE only. There is no
+	// analogue of its dmPrivacyLegacySync tail here — that is a legacy
+	// compatibility artifact, not part of the pattern.
+	if req.AllowFriendRequestsFrom != nil {
+		mode := *req.AllowFriendRequestsFrom
+		if mode != friendRequestModeEveryone && mode != friendRequestModeMutualServers &&
+			mode != friendRequestModeNobody {
+			return nil, nil, http.StatusBadRequest,
+				"allow_friend_requests_from must be everyone, mutual_servers, or nobody"
+		}
+		setClauses = append(setClauses, fmt.Sprintf("allow_friend_requests_from = $%d", argIdx))
+		args = append(args, string(mode))
+		argIdx++
+	}
 
 	return setClauses, args, 0, ""
 }
@@ -2512,14 +2548,16 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 			RETURNING messages_friends_only, messages_server_members, dm_privacy_level, dm_friends_of_friends,
 			          auto_accept_friend_codes, searchable_by_username, searchable_by_email, searchable_by_phone,
 			          allow_embedded_content, load_gifs_automatically, enable_klipy_proxy,
-			          share_personalization_with_gif_provider, require_auth_before_purge, updated_at
+			          share_personalization_with_gif_provider, require_auth_before_purge,
+			          allow_friend_requests_from, updated_at
 		`, strings.Join(setClauses, ", "))
 
 		if err := tx.QueryRowContext(ctx, query, args...).Scan(
 			&ps.MessagesFriendsOnly, &ps.MessagesServerMembers, &ps.DMPrivacyLevel, &ps.DMFriendsOfFriends,
 			&ps.AutoAcceptFriendCodes, &ps.SearchableByUsername, &ps.SearchableByEmail, &ps.SearchableByPhone,
 			&ps.AllowEmbeddedContent, &ps.LoadGifsAutomatically, &ps.EnableKlipyProxy,
-			&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge, &ps.UpdatedAt,
+			&ps.SharePersonalizationWithGifProvider, &ps.RequireAuthBeforePurge,
+			&ps.AllowFriendRequestsFrom, &ps.UpdatedAt,
 		); err != nil {
 			presencehook.Abandon(gatedCapture, plan, presencecapture.CauseWriteFailed)
 			return fmt.Errorf("update privacy settings: %w", err)

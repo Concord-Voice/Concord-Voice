@@ -13905,6 +13905,79 @@ paths:
                         avatar_url:
                           type: string
                           nullable: true
+  /users/{user_id}/friend-request-eligibility:
+    get:
+      tags:
+      - Users
+      summary: Check whether a friend request to this user would be accepted
+      description: >-
+        Returns a single boolean reflecting the target's
+        `allow_friend_requests_from` setting evaluated against the caller. The
+        response is deliberately one bit: it never reveals which of the three
+        modes produced a `false`, and all three perform identical database work
+        for a fixed (caller, target) pair.
+
+
+        A self-target returns `{"eligible": false}` — the endpoint answers
+        "would a request be accepted", and for self it would not.
+
+
+        `false` is deliberately overloaded: it covers the target's privacy
+        setting, an existing block in either direction, and an existing or
+        pending friendship. Collapsing those onto one value is the point — it is
+        what stops a caller pairing this endpoint with the 403 from
+        `POST /friends/request` to work out which of them applies.
+
+
+        This is a presentation affordance only. `POST /friends/request` remains
+        authoritative and enforces the same gate independently, so a client that
+        ignores this endpoint gains nothing.
+
+
+        Rate limit: 10 requests per minute — the same budget as
+        `POST /friends/request`, so a read about a third party's privacy
+        preference is never cheaper than the action it predicts. The limiter
+        keys per path, so probing does not consume the send budget.
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Eligibility verdict
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                - eligible
+                properties:
+                  eligible:
+                    type: boolean
+        '400':
+          description: user_id is not a UUID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /users/{user_id}/profile:
     get:
       tags:
@@ -16232,6 +16305,15 @@ components:
             Require password (and MFA when enabled) before purging DM messages
             (default true). A user with no saved privacy settings reads as true —
             the DM purge endpoint fail-closes to the same value.
+        allow_friend_requests_from:
+          type: string
+          enum: [everyone, mutual_servers, nobody]
+          description: >-
+            Who may send this user a friend request (default `everyone`).
+            `mutual_servers` restricts it to users who share at least one server;
+            `nobody` blocks all new incoming requests. It does not affect friend
+            requests already pending, nor existing friendships. A server that
+            predates #1240 omits this key entirely — treat absent as `everyone`.
         updated_at:
           type: string
           format: date-time

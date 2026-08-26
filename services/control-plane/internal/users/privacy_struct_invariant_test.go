@@ -34,6 +34,19 @@ import (
 
 const privacyHandlersFile = "handlers.go"
 
+// permittedRequestFieldTypes is what a updatePrivacyRequest field may point at.
+//
+// "string" is deliberately ABSENT and must stay absent: a bare *string is the
+// exact shape a submitted credential would take, and banning it is what makes
+// the #2765 isolation structural instead of a convention.
+//
+// Named domain types are admitted one at a time, each with its reason:
+//
+//   - friendRequestMode — the allow_friend_requests_from enum (#1240). A real
+//     VARCHAR column on privacy_settings, so it cannot be a bool or an int, and
+//     no credential field would ever be spelled with this type.
+var permittedRequestFieldTypes = []string{"bool", "int", "friendRequestMode"}
+
 // credentialFieldFragments are name fragments that can only mean a submitted
 // credential.
 //
@@ -96,11 +109,35 @@ func TestUpdatePrivacyRequestHoldsOnlyPointerScalars(t *testing.T) {
 			"field %s on updatePrivacyRequest points at a non-basic type. Only *bool and "+
 				"*int are permitted (#2765).", fieldNames(field))
 
-		require.Containsf(t, []string{"bool", "int"}, ident.Name,
-			"field %s on updatePrivacyRequest is *%s. Only *bool and *int are permitted — "+
-				"a *string here is precisely how a credential would reach the SQL builder. "+
-				"Put it on updatePrivacyStepUp instead (#2765).",
-			fieldNames(field), ident.Name)
+		// A named domain type is only safe while nothing credential-shaped wears
+		// one. Before #1240 the type ban carried this alone — a credential
+		// cannot meaningfully be a *bool — but admitting a string-backed named
+		// type reopens it, so the name check that guards the response struct now
+		// guards this one too.
+		lowerName := strings.ToLower(fieldNames(field))
+		lowerTag := ""
+		if field.Tag != nil {
+			lowerTag = strings.ToLower(field.Tag.Value)
+		}
+		for _, fragment := range credentialFieldFragments {
+			require.NotContainsf(t, lowerName, fragment,
+				"field %s on updatePrivacyRequest looks credential-shaped (%q). Every field "+
+					"here becomes a SQL SET clause; credentials belong on updatePrivacyStepUp "+
+					"(#2765).", fieldNames(field), fragment)
+			require.NotContainsf(t, lowerTag, fragment,
+				"json tag on updatePrivacyRequest field %s looks credential-shaped (%q). "+
+					"Credentials belong on updatePrivacyStepUp (#2765).",
+				fieldNames(field), fragment)
+		}
+
+		require.Containsf(t, permittedRequestFieldTypes, ident.Name,
+			"field %s on updatePrivacyRequest is *%s. Only %v are permitted — "+
+				"a bare *string here is precisely how a credential would reach the SQL "+
+				"builder. If this is a step-up credential, put it on updatePrivacyStepUp "+
+				"(#2765). If it is a genuine non-scalar privacy COLUMN, give it a named "+
+				"domain type and add that name here with a one-line justification — do "+
+				"NOT add \"string\".",
+			fieldNames(field), ident.Name, permittedRequestFieldTypes)
 	}
 }
 

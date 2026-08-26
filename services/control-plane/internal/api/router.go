@@ -1506,6 +1506,21 @@ func NewRouter(
 					usersHandler.GetPublicProfile,
 				)
 
+				// #1240: would a friend request from the caller be accepted?
+				// Registered on userRoutes for the :user_id path position but
+				// handled by friendsHandler, so this buys the position without
+				// creating a users -> friends import edge (precedent:
+				// friendsHandler.GetPublicFriendCodePreview on the v1 group).
+				//
+				// 10/min, not the 30/min user-scoped-read convention: a read
+				// ABOUT a third party's privacy preference must not be cheaper
+				// than POST /friends/request, the action it predicts. The key is
+				// per-FullPath, so this never consumes the send budget.
+				userRoutes.GET("/:user_id/friend-request-eligibility",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					friendsHandler.GetFriendRequestEligibility,
+				)
+
 				// Encrypted user preferences (cross-device sync)
 				userRoutes.GET("/me/preferences",
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),

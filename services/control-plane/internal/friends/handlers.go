@@ -290,10 +290,16 @@ type resolveResult struct {
 
 func (h *Handler) resolveTargetUserID(req SendRequestBody) resolveResult {
 	if req.UserID != nil {
-		if _, err := uuid.Parse(*req.UserID); err != nil {
+		parsed, err := uuid.Parse(*req.UserID)
+		if err != nil {
 			return resolveResult{status: http.StatusBadRequest, errMsg: "Invalid user_id"}
 		}
-		return resolveResult{targetUserID: *req.UserID}
+		// RED-TEAM FIX RT-3: forward the CANONICAL form, not the raw one.
+		// uuid.Parse accepts "urn:uuid:…" (which Postgres cannot cast, turning a
+		// validated input into a 500 + ERROR log) and uppercase hex (which slips
+		// past the self-compare in SendRequest and then trips the
+		// friendships_check CHECK constraint as another 500).
+		return resolveResult{targetUserID: parsed.String()}
 	}
 	if req.Username != nil {
 		var targetUserID string
@@ -388,14 +394,27 @@ func (h *Handler) SendRequest(c *gin.Context) {
 	}
 	targetUserID := resolved.targetUserID
 
-	if targetUserID == userID {
+	// Canonical-vs-canonical: resolveTargetUserID normalises the target, but the
+	// JWT claim is never parsed, so compare UUID values (see sameUser).
+	if sameUser(targetUserID, userID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot send a friend request to yourself"})
 		return
 	}
 
-	var exists bool
-	if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, targetUserID).Scan(&exists); err != nil || !exists {
+	// #1240: the eligibility read REPLACES the bare users-EXISTS probe. It is
+	// unconditional and its result is discarded on every conflict path, so a
+	// user-blocked rejection and a privacy-blocked rejection perform identical
+	// database work. Do NOT move it below the friendship check, and do NOT
+	// re-add a separate existence query — either change reopens the timing
+	// channel by making one rejection cost a query the other does not.
+	eligible, err := h.canReceiveFriendRequestFrom(c.Request.Context(), targetUserID, userID)
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+	if err != nil {
+		h.log.Error(errMsgFailedEligibility, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendFriendRequest})
 		return
 	}
 
@@ -406,9 +425,18 @@ func (h *Handler) SendRequest(c *gin.Context) {
 			c.JSON(code, gin.H{"error": msg})
 			return
 		}
-	} else if err != sql.ErrNoRows {
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		h.log.Error("Failed to check existing friendship", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendFriendRequest})
+		return
+	}
+
+	if !eligible {
+		// Byte-identical to the user-blocked rejection by CONSTRUCTION: the same
+		// function produces both, so the two cannot drift apart. No log line, no
+		// metric, no error code, no header distinguishes this path.
+		code, msg := friendshipConflictResponse("blocked")
+		c.JSON(code, gin.H{"error": msg})
 		return
 	}
 
@@ -1656,6 +1684,28 @@ func (h *Handler) claimFriendCodeInTx(
 		return claim, &claimRejection{status: errCode, message: errMsg}
 	}
 
+	// RED-TEAM FIX RT-1: the #1240 gate is evaluated HERE too.
+	//
+	// Before this, POST /friends/codes/:code/claim was a complete bypass of
+	// allow_friend_requests_from: it is the other production writer of a
+	// friendships row, and it consulted no privacy state at all. A target who
+	// set `nobody` after publishing a code kept receiving pending requests from
+	// strangers, and an auto_accept code manufactured an ACCEPTED friendship —
+	// DM rights, presence audience, friends-of-friends visibility — with no
+	// action by the target. `mutual_servers` was defeated outright, since a
+	// published code reaches people who share no server.
+	//
+	// Read unconditionally and applied only after the conflict check, mirroring
+	// SendRequest exactly: same statement, same position relative to the
+	// friendship probe, same 403 body as the block path — so a privacy refusal
+	// on this route is indistinguishable from a block refusal here too.
+	eligible, eligErr := h.canReceiveFriendRequestFromQ(ctx, tx, fc.ownerID, userID)
+	if eligErr != nil {
+		// The owner is a friend_codes FK, so ErrNoRows here is impossible and
+		// means the row vanished mid-transaction. Fail closed, never open.
+		return claim, fmt.Errorf("check friend request eligibility: %w", eligErr)
+	}
+
 	existingStatus, existingErr := checkExistingFriendship(tx, userID, fc.ownerID)
 	if existingErr == nil {
 		if respCode, msg := claimFriendshipConflictResponse(existingStatus); respCode != 0 {
@@ -1663,6 +1713,11 @@ func (h *Handler) claimFriendCodeInTx(
 		}
 	} else if !errors.Is(existingErr, sql.ErrNoRows) {
 		return claim, fmt.Errorf("check existing friendship: %w", existingErr)
+	}
+
+	if !eligible {
+		respCode, msg := claimFriendshipConflictResponse("blocked")
+		return claim, &claimRejection{status: respCode, message: msg}
 	}
 
 	claim, claimErr := h.executeFriendCodeClaim(
