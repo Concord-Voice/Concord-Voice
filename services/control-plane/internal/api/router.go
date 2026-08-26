@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/channels"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/clientconfig"
@@ -294,12 +295,22 @@ func requirePresenceRecheckWired(
 // is a tautology that still boots with a SetGraphPresenceCapture line deleted —
 // the one fail-OPEN path this guard exists to catch.
 //
-// Six consumers as of #2447: the two #2446 graph consumers plus membership,
+// Seven consumers as of #2448: the two #2446 graph consumers plus membership,
 // invite join, server delete and account erasure — and, for erasure, its
 // cross-replica clear publisher too, because that publish is the only mechanism
-// that retracts an erased user's Custom Status anywhere. An unwired consumer is
-// a SILENT hazard — the handler serves traffic and skips reconciliation with no
-// error anywhere — which is why this stays a log.Fatal rather than a warning.
+// that retracts an erased user's Custom Status anywhere. #2448 adds the seventh,
+// DM group deletion, and a third erasure arm, the durable active-category drain.
+// An unwired consumer is a SILENT hazard — the handler serves traffic and skips
+// reconciliation with no error anywhere — which is why this stays a log.Fatal
+// rather than a warning.
+//
+// The #2448 arms are the sharpest case yet for that posture.
+// activepresence.Reconciler.Run discards every pass error by design, so an
+// unwired DM rail deletes a group, commits the cascade, records NO obligation,
+// and destroys the C3 evidence — dm_voice_participants and the Redis lease — in
+// that same commit. There is no later recovery, and no error is raised anywhere.
+// An unwired erasure drain is louder but still wrong: the erasure hits migration
+// 000111's RESTRICT and fails with an opaque 23503.
 func graphPresenceWiringComplete(c graphPresenceConsumers) bool {
 	return c.friends.HasGraphPresenceCapture() &&
 		c.users.HasGraphPresenceCapture() &&
@@ -307,12 +318,14 @@ func graphPresenceWiringComplete(c graphPresenceConsumers) bool {
 		c.invites.HasGraphPresenceCapture() &&
 		c.servers.HasGraphPresenceCapture() &&
 		c.erasure.HasGraphPresenceCapture() &&
-		c.erasure.HasErasureClearPublisher()
+		c.erasure.HasErasureClearPublisher() &&
+		c.dm.HasActivePlanRail() &&
+		c.erasure.HasActivePlanDrain()
 }
 
-// graphPresenceConsumers groups the six consumers the boot guard interrogates.
-// A struct rather than six positional parameters: threading them individually
-// pushed requireGraphPresenceCaptureWired past the parameter limit, and six
+// graphPresenceConsumers groups the seven consumers the boot guard interrogates.
+// A struct rather than seven positional parameters: threading them individually
+// pushed requireGraphPresenceCaptureWired past the parameter limit, and seven
 // same-shaped pointers in a row is exactly the signature where a transposed
 // argument compiles and silently checks the wrong handler twice.
 type graphPresenceConsumers struct {
@@ -321,6 +334,7 @@ type graphPresenceConsumers struct {
 	members *members.Handler
 	invites *invites.Handler
 	servers *servers.Handler
+	dm      *dm.Handler
 	erasure *users.AccountService
 }
 
@@ -387,6 +401,44 @@ func graphPresenceRailWired(capture *graphpresence.Reconciler) bool {
 	return capture.HasTopologyRail()
 }
 
+// activePlanRailWired reports whether the #2448 durable active-category rail can
+// deliver. Like graphPresenceRailWired it legitimately interrogates the
+// constructed value, because HasReconciler reports whether the wiring actually
+// RAN rather than whether a pointer is non-nil: activepresence.NewRail and
+// NewReconciler both always return non-nil, so `rail != nil` would be the exact
+// tautology that boots with the terminal never attached.
+//
+// It is separate from graphPresenceWiringComplete's consumer clauses because it
+// asks a different question. Those ask whether each handler received A rail;
+// this asks whether the one rail they all received can reach a client.
+func activePlanRailWired(rail *activepresence.Rail) bool {
+	return rail.HasReconciler()
+}
+
+// buildActivePlanRail constructs the #2448 rail and hands back both halves: the
+// rail its three consumers hold, and the reconciler cmd/server drives from the
+// Activity History startup pass and its ticker.
+//
+// It is a helper rather than two lines inside NewRouter for a measured reason —
+// NewRouter sits at the go:S3776 cognitive-complexity limit of 15, so every
+// addition there has to be branch-free, and keeping the construction out of it
+// leaves the budget for the wiring the guard checks.
+//
+// store is passed twice on purpose: ActivityStore is both the StateReader the
+// resolver reads through and the GenerationDeleter the terminal deletes through.
+// The deleter is CompareAndDelete, never Delete — Delete ignores the generation
+// and would destroy a newer one that raced in.
+func buildActivePlanRail(
+	db *sql.DB,
+	gate activepresence.Gate,
+	store *presence.ActivityStore,
+	deliverer activepresence.Deliverer,
+	log *logger.Logger,
+) (*activepresence.Rail, *activepresence.Reconciler) {
+	reconciler := activepresence.NewReconciler(db, gate, store, store, deliverer, log)
+	return activepresence.NewRail(db, gate, reconciler, log), reconciler
+}
+
 // requireGraphPresenceCaptureWired fatal-exits when the activity service exists
 // and any #2446 consumer is unwired, or when the durable Custom Status rail is
 // unwired. Its scope stops at the handlers it names: adding a third consumer
@@ -409,6 +461,7 @@ func requireGraphPresenceCaptureWired(
 	log *logger.Logger,
 	activityService *presence.ActivityService,
 	capture *graphpresence.Reconciler,
+	activePlanRail *activepresence.Rail,
 	consumers graphPresenceConsumers,
 ) {
 	if activityService == nil {
@@ -419,6 +472,9 @@ func requireGraphPresenceCaptureWired(
 	}
 	if !graphPresenceRailWired(capture) {
 		log.Fatal("graph presence durable custom status rail is not wired")
+	}
+	if !activePlanRailWired(activePlanRail) {
+		log.Fatal("durable active-category presence rail is not wired")
 	}
 }
 
@@ -445,7 +501,7 @@ func NewRouter(
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
-) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), error) {
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Reconciler, error) {
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	router := gin.New()
@@ -468,7 +524,7 @@ func NewRouter(
 	// Initialize WebSocket hub
 	hub := websocket.NewHub(db, redis, opsCounters)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Initialize NATS (inter-service messaging with media plane)
@@ -638,6 +694,15 @@ func NewRouter(
 	// subscriber, and the nightly sweep); an unwired owner revokes with no capture
 	// and no clear, which is the disclosure this issue closes.
 	voiceHandler.SetPresenceRecheck(presenceRecheckExecutor)
+	// The #2448 durable active-category rail. ONE instance: the reconciler owns
+	// the claim/ack loop, so a second would have two pass loops racing for the
+	// same rows. presenceHistoryService is its gate — both rails share ONE gate
+	// array, because a duplicated array would not be a gate — and it is provably
+	// non-nil here for the same reason graphPresenceCapture's rail is:
+	// bindPresenceHistoryRuntime above returns an error on a nil service.
+	activePlanRail, activePlanReconciler := buildActivePlanRail(
+		db, presenceHistoryService, activityStore, hub, log)
+
 	// mfaHandler implements mfa.Verifier — the DM purge step-up gate (#1352).
 	dmHandler := dm.NewHandler(dm.HandlerDeps{
 		DB:          db,
@@ -649,6 +714,7 @@ func NewRouter(
 		EntCache:    entCache,
 		PurgeEngine: purgeEngine,
 		MFAVerifier: mfaHandler,
+		ActivePlans: activePlanRail,
 	})
 	// Wire DM voice ring cleanup-on-disconnect (#1209 plan task B7 Part 2).
 	// When a user's last WS connection drops, the hub invokes
@@ -741,16 +807,22 @@ func NewRouter(
 	privacyHandler, accountService := buildPrivacyHandler(
 		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient)
 
+	// The erasure drain (#2448). Wired here rather than beside the DM rail for
+	// the same reason the guard below runs here: accountService does not exist
+	// until buildPrivacyHandler returns on the line above.
+	accountService.SetActivePlanRail(activePlanRail)
+
 	// Runs here, not beside the other wiring: accountService is the last #2447
 	// consumer and is constructed on the line above.
 	requireGraphPresenceCaptureWired(
-		log, activityService, graphPresenceCapture,
+		log, activityService, graphPresenceCapture, activePlanRail,
 		graphPresenceConsumers{
 			friends: friendsHandler,
 			users:   usersHandler,
 			members: membersHandler,
 			invites: invitesHandler,
 			servers: serversHandler,
+			dm:      dmHandler,
 			erasure: accountService,
 		})
 	oauthHandler := buildOAuthHandler(db, redis, cfg, authHandler, log)
@@ -2466,7 +2538,7 @@ func NewRouter(
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
-	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, nil
+	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, nil
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

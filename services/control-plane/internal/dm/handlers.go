@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	messagehandlers "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
@@ -85,6 +86,31 @@ const (
 	dmPrivacyOpenToAll        = 3 // Anyone may DM
 )
 
+// ActivePlanRail is the durable active-category reconciliation seam (#2448),
+// implemented by *activepresence.Rail.
+//
+// It is declared HERE, at the consumer, so this package depends on the three
+// methods it uses rather than on the whole rail — the same shape
+// graphpresence.TopologyRail uses, and the reason internal/dm still imports no
+// presence package. Category values are named through the rail's own
+// re-exported activepresence.CategoryPrivateCall for exactly that reason.
+type ActivePlanRail interface {
+	// WithGatedTx acquires every subject's process-local sender gate and only
+	// THEN opens the transaction. Gates before BeginTx is not a style
+	// preference: taking a gate while holding row locks builds a cycle whose
+	// other half is a Go channel, which no deadlock detector can break.
+	WithGatedTx(ctx context.Context, subjects []uuid.UUID, work func(tx *sql.Tx) error) error
+
+	// CapturePlansTx writes the durable obligations inside the caller's
+	// transaction, before the evidence-destroying DELETE.
+	CapturePlansTx(ctx context.Context, tx *sql.Tx, plans []activepresence.Plan) error
+
+	// CompleteAlreadyGated resolves and delivers the just-committed plans
+	// without re-entering the gate. It is called AFTER the caller's commit and
+	// from INSIDE WithGatedTx's closure.
+	CompleteAlreadyGated(ctx context.Context, tx *sql.Tx, keys []activepresence.PlanKey) error
+}
+
 // Handler handles DM-related requests.
 type Handler struct {
 	db          *sql.DB
@@ -94,8 +120,18 @@ type Handler struct {
 	nats        *natsclient.Client
 	redis       *redis.Client
 	entCache    *entitlements.Cache
-	purgeEngine *purge.Engine // bulk message purge (#1352)
-	mfaVerifier mfa.Verifier  // step-up auth for DM/group purge (#1352)
+	purgeEngine *purge.Engine  // bulk message purge (#1352)
+	mfaVerifier mfa.Verifier   // step-up auth for DM/group purge (#1352)
+	activePlans ActivePlanRail // durable active-category reconciliation (#2448)
+
+	// Test seams for deleteGroupData's ordering, nil in production. The two
+	// windows they open — between the candidate read and the conversation lock,
+	// and between the users lock and the conversation lock — are exactly the
+	// ones no external observer can reach, and the invariants that live in them
+	// (fail closed on drift; users before dm_conversations) are the whole point
+	// of #2448's restructure. A grep cannot verify a conditional acquisition.
+	afterCandidateReadHook func()
+	afterUsersLockHook     func(tx *sql.Tx)
 }
 
 type epochQueryRower interface {
@@ -121,6 +157,10 @@ type HandlerDeps struct {
 	// gate (#1352). Both may be nil in tests that do not exercise purge.
 	PurgeEngine *purge.Engine
 	MFAVerifier mfa.Verifier
+	// ActivePlans is the durable active-category rail (#2448). Nil in tests and
+	// on a replica whose wiring line was deleted, in which case group deletion
+	// keeps its pre-#2448 behaviour and degrades to the presence TTL.
+	ActivePlans ActivePlanRail
 }
 
 // NewHandler creates a new DM handler from its dependency bundle.
@@ -135,8 +175,23 @@ func NewHandler(deps HandlerDeps) *Handler {
 		entCache:    deps.EntCache,
 		purgeEngine: deps.PurgeEngine,
 		mfaVerifier: deps.MFAVerifier,
+		activePlans: deps.ActivePlans,
 	}
 }
+
+// SetActivePlanRail wires the #2448 durable active-category rail.
+func (h *Handler) SetActivePlanRail(rail ActivePlanRail) {
+	if h == nil {
+		return
+	}
+	h.activePlans = rail
+}
+
+// HasActivePlanRail reports whether the rail is wired. The boot guard asks the
+// HANDLER, never the constructed rail: activepresence.NewRail never returns
+// nil, so a nil check on the rail value is a tautology that still boots with
+// the wiring line deleted.
+func (h *Handler) HasActivePlanRail() bool { return h != nil && h.activePlans != nil }
 
 // dmMessageResponse represents a DM message in API responses.
 type dmMessageResponse struct {

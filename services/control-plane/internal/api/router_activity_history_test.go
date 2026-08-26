@@ -37,12 +37,12 @@ func TestNewRouterRequiresOneUnboundActivityHistoryService(t *testing.T) {
 	cfg := &config.Config{Environment: "test"}
 	log := logger.NewWithWriter(io.Discard)
 
-	_, _, _, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
+	_, _, _, _, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
 	require.Error(t, err)
 
 	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(preboundActivityHistoryDelivery{}))
-	_, _, _, _, _, _, _, err = api.NewRouter(
+	_, _, _, _, _, _, _, _, err = api.NewRouter(
 		nil,
 		nil,
 		nil,
@@ -69,9 +69,12 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 		"go hub.Run()",
 		// #2445 added a 7th return value (the shared presence-recheck executor);
 		// #2738 added an 8th, the closer that drains BOTH presence dispatch
-		// workers at shutdown — nothing called either Close before it.
+		// workers at shutdown — nothing called either Close before it. #2448
+		// added a 9th: the durable active-category reconciler, carried out so
+		// its startup pass and ticker join cmd/server's Activity History runtime
+		// instead of a second one under no guard.
 		"return router, hub, natsClient, opsRuntime, voicePermEnforcer, " +
-			"presenceRecheckExecutor, closePresenceWorkers, nil",
+			"presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, nil",
 	}
 	prior := -1
 	for _, needle := range needles {

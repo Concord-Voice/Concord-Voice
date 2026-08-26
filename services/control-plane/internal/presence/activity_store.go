@@ -99,6 +99,38 @@ end
 return {status}
 `)
 
+// getActivityStateWithLeaseScript is getActivityStateScript plus the expiry
+// guard the lifecycle scripts already apply.
+//
+// A SIBLING rather than an edit: the shared script feeds ActivityStore.Get and
+// the reconnect-snapshot pipeline, both of which decode a 1-or-2 element reply.
+// Growing a third status there for the reconciler's benefit would change the hot
+// path.
+//
+// The guard is in Lua because that is where the PTTL sentinel is a raw integer.
+// In go-redis v9.22.0 the -1/-2 sentinels arrive UNSCALED from DurationCmd --
+// one and two NANOSECONDS -- so a Go-side `ttl == -1*time.Second` is permanently
+// false and its branch is dead code that reads correctly.
+//
+// PTTL is atomic with the preceding TYPE inside the script, so -2 cannot occur
+// on a key that just typed as 'string'; `<= 0` therefore means exactly "exists
+// with no expiry".
+var getActivityStateWithLeaseScript = redis.NewScript(readActivityStateLua + `
+local status, raw = read_activity_state(KEYS[1])
+if status ~= 'string' then
+  return {status}
+end
+if redis.call('PTTL', KEYS[1]) <= 0 then
+  return {'unexpiring'}
+end
+return {status, raw}
+`)
+
+// ErrUnexpiringActivityState reports a state key that exists without an expiry.
+// It has no 90-second level arm, so its reader must escalate rather than assume
+// convergence.
+var ErrUnexpiringActivityState = errors.New("rich-presence activity state has no expiry")
+
 var compareAndSetActivityScript = redis.NewScript(decodeActivityStateLua + readActivityStateLua + `
 local status, current = read_activity_state(KEYS[1])
 if status == 'string' then
@@ -524,6 +556,61 @@ func activityStateScriptResult(command *redis.Cmd) (string, []byte, error) {
 		}
 	}
 	return "", nil, errors.New("invalid rich-presence activity script reply")
+}
+
+// GetWithLease is Get plus the expiry guard. It is for reconciliation readers
+// that must not treat an unexpiring key as self-healing.
+func (s *ActivityStore) GetWithLease(
+	ctx context.Context,
+	userID uuid.UUID,
+	category Category,
+) (ActivityState, bool, error) {
+	key, err := activityKey(userID, category)
+	if err != nil {
+		return ActivityState{}, false, err
+	}
+	if s == nil || s.redis == nil {
+		return ActivityState{}, false, errors.New("rich-presence activity store unavailable")
+	}
+
+	status, raw, err := leasedActivityStateScriptResult(
+		getActivityStateWithLeaseScript.Run(ctx, s.redis, []string{key}),
+	)
+	if err != nil {
+		return ActivityState{}, false, fmt.Errorf("read leased rich-presence activity state: %w", err)
+	}
+	switch status {
+	case "none":
+		return ActivityState{}, false, nil
+	case "malformed":
+		return ActivityState{}, false, ErrMalformedActivityState
+	case "unexpiring":
+		return ActivityState{}, false, ErrUnexpiringActivityState
+	}
+
+	state, err := decodeActivityState(raw)
+	if err != nil {
+		return ActivityState{}, false, err
+	}
+	return state, true, nil
+}
+
+// leasedActivityStateScriptResult decodes the sibling script's reply. The extra
+// 'unexpiring' status is absorbed here rather than in
+// activityStateScriptResult, so the shared decoder -- and with it
+// ActivityStore.Get and the reconnect-snapshot pipeline -- keeps its exact
+// two-status vocabulary.
+func leasedActivityStateScriptResult(command *redis.Cmd) (string, []byte, error) {
+	values, err := command.Slice()
+	if err != nil {
+		return "", nil, err
+	}
+	if len(values) == 1 {
+		if status, ok := values[0].(string); ok && status == "unexpiring" {
+			return status, nil, nil
+		}
+	}
+	return activityStateScriptResult(command)
 }
 
 // Refresh renews the TTL only for an exact lifecycle generation.

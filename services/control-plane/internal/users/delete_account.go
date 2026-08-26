@@ -10,6 +10,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -34,6 +35,43 @@ type AccountDeleter interface {
 // erasure removes an incomplete channel.
 type ChannelDeletedBroadcaster func(serverID, channelID string)
 
+// ActivePlanDrain is the #2448 durable active-category rail's erasure seam,
+// implemented by *activepresence.Rail.
+//
+// Declared HERE, at the consumer, so this package depends on the two methods it
+// uses rather than on the whole rail -- the same shape dm.ActivePlanRail uses,
+// and what keeps internal/users free of an internal/activepresence import.
+//
+// Both methods are the ...AlreadyGated flavour by necessity, not preference.
+// DeleteAccount already holds this user's presencehistory sender gate; the
+// gated flavours (Rail.WithGatedTx) would take the same buffered-1 channel a
+// second time and block forever, with no timeout and no deadlock detector,
+// because half the cycle is a Go channel rather than a database lock.
+type ActivePlanDrain interface {
+	// DrainAlreadyGated removes every outstanding obligation for one subject
+	// inside the caller's transaction and reports which categories it removed.
+	DrainAlreadyGated(
+		ctx context.Context, tx *sql.Tx, subjectID uuid.UUID,
+	) ([]presence.Category, error)
+
+	// ClearDrained transfers the drained obligation to one proportional clear
+	// frame per category. It returns nothing DELIBERATELY: it runs after the
+	// erasure has committed, and a presence delivery failure must never fail an
+	// erasure that already happened.
+	ClearDrained(ctx context.Context, subjectID uuid.UUID, categories []presence.Category)
+}
+
+// drainedObligation is deleteAccountTx's transferable output: the subject whose
+// plans were drained, and the categories it now owes a clear frame for.
+//
+// It carries the PARSED subject rather than leaving deleteAccount to re-parse
+// the caller's string post-commit, where a parse failure would have nowhere to
+// go but a log line on a path that has already succeeded.
+type drainedObligation struct {
+	subject    uuid.UUID
+	categories []presence.Category
+}
+
 // AccountService is the concrete AccountDeleter backed by the primary
 // Postgres pool. Its erasure transaction starts only after sender-gated
 // activity cleanup has completed.
@@ -45,6 +83,12 @@ type AccountService struct {
 
 	// graphPresence is the #2447 erasure presence capture. nil means unwired.
 	graphPresence presencecapture.GraphPresenceCapture
+
+	// activePlans is the #2448 durable active-category drain. nil means
+	// unwired, in which case an erasure of a user holding an outstanding plan
+	// fails on migration 000111's ON DELETE RESTRICT with an undiagnosable
+	// 23503 -- which is why the boot guard refuses to start without it.
+	activePlans ActivePlanDrain
 
 	// nats fans the erasure clear out to every replica (#2447). The Hub closes
 	// only LOCAL clients, so without this a viewer on another replica keeps the
@@ -139,7 +183,7 @@ func (s *AccountService) deleteAccount(ctx context.Context, userID string) error
 			}
 		}
 	}()
-	channelIDs, serverIDs, plan, err := s.deleteAccountTx(ctx, tx, userID)
+	channelIDs, serverIDs, plan, drained, err := s.deleteAccountTx(ctx, tx, userID)
 	if err != nil {
 		// CauseWriteFailed and friends prove no commit happened, so Abandon does
 		// NOT disconnect anyone on those causes -- the deferred rollback discards
@@ -165,14 +209,8 @@ func (s *AccountService) deleteAccount(ctx context.Context, userID string) error
 		deliveryErr = err
 	}
 
-	// Cross-replica Custom Status clear (#2447). AFTER the commit: publishing
-	// first would tell the fleet to clear an account that may still exist.
-	s.publishErasureCleared(userID)
-	if s.channelDeleted != nil {
-		for index, channelID := range channelIDs {
-			s.channelDeleted(serverIDs[index], channelID)
-		}
-	}
+	s.runPostCommitObligations(ctx, userID, channelIDs, serverIDs, drained)
+
 	// Surfaced only after every post-commit obligation has run. The account IS
 	// erased; this reports that presence delivery did not settle.
 	if deliveryErr != nil {
@@ -181,17 +219,60 @@ func (s *AccountService) deleteAccount(ctx context.Context, userID string) error
 	return nil
 }
 
+// runPostCommitObligations discharges everything the erasure owes AFTER its
+// commit. Every member is best effort by design: the users row is gone, so
+// failing the request would invite a retry against state that no longer exists.
+func (s *AccountService) runPostCommitObligations(
+	ctx context.Context,
+	userID string,
+	channelIDs, serverIDs pq.StringArray,
+	drained drainedObligation,
+) {
+	// Cross-replica Custom Status clear (#2447). AFTER the commit: publishing
+	// first would tell the fleet to clear an account that may still exist.
+	s.publishErasureCleared(userID)
+	s.transferDrainedActivePlans(ctx, drained)
+	if s.channelDeleted == nil {
+		return
+	}
+	for index, channelID := range channelIDs {
+		s.channelDeleted(serverIDs[index], channelID)
+	}
+}
+
+// transferDrainedActivePlans is the post-commit half of the erasure drain
+// (#2448): one proportional clear frame per category the drain removed, at most
+// two for one user.
+//
+// The obligation is TRANSFERRED, not discarded. Deleting the plan row without
+// this would discharge a durable privacy repair on paper and leave the erased
+// principal's Server Voice / Private Call activity resident on every viewer
+// that already received it -- the exact residue the rail exists to retract.
+//
+// It must run after the commit, never inside deleteAccountTx: the reconciler's
+// terminal is a WebSocket fan-out, and emitting it from inside the transaction
+// would tell viewers about an erasure that can still roll back.
+func (s *AccountService) transferDrainedActivePlans(
+	ctx context.Context,
+	drained drainedObligation,
+) {
+	if s.activePlans == nil || len(drained.categories) == 0 {
+		return
+	}
+	s.activePlans.ClearDrained(ctx, drained.subject, drained.categories)
+}
+
 func (s *AccountService) deleteAccountTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	userID string,
-) (pq.StringArray, pq.StringArray, presencecapture.Plan, error) {
+) (pq.StringArray, pq.StringArray, presencecapture.Plan, drainedObligation, error) {
 	var lockedUserID string
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil, nil, ErrUserNotFound
+			return nil, nil, nil, drainedObligation{}, ErrUserNotFound
 		}
-		return nil, nil, nil, fmt.Errorf("delete account: lock user: %w", err)
+		return nil, nil, nil, drainedObligation{}, fmt.Errorf("delete account: lock user: %w", err)
 	}
 
 	// Capture-before-cascade, under the user-row lock, with nothing between it
@@ -204,9 +285,61 @@ func (s *AccountService) deleteAccountTx(
 	// SuppressAllActivityAlreadyGated before this transaction opens.
 	plan, captureErr := s.captureErasureAlreadyGated(ctx, tx, lockedUserID)
 	if captureErr != nil {
-		return nil, nil, nil, fmt.Errorf("delete account: capture presence: %w", captureErr)
+		return nil, nil, nil, drainedObligation{}, fmt.Errorf(
+			"delete account: capture presence: %w", captureErr)
 	}
 
+	// Drain the durable active-category obligation under the user-row lock, and
+	// BEFORE the DELETE below.
+	//
+	// presence_active_pending_plans is ON DELETE RESTRICT (migration 000111),
+	// so without this the DELETE raises an opaque 23503 and a GDPR erasure
+	// fails on a presence marker with no diagnosable operator symptom. Draining
+	// first is migration 000110's fail-closed-with-a-diagnosable-error
+	// precedent: if the drain itself fails, this returns a wrapped error naming
+	// the drain rather than letting Postgres report a constraint nobody
+	// interpreting the 500 would recognise.
+	drained, drainErr := s.drainActivePlansAlreadyGated(ctx, tx, lockedUserID)
+	if drainErr != nil {
+		return nil, nil, plan, drainedObligation{}, drainErr
+	}
+
+	channelIDs, serverIDs, err := deleteIncompleteChannelsTx(ctx, tx, lockedUserID)
+	if err != nil {
+		return nil, nil, plan, drainedObligation{}, err
+	}
+
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM users WHERE id = $1`,
+		lockedUserID,
+	)
+	if err != nil {
+		return nil, nil, plan, drainedObligation{}, fmt.Errorf("delete account: delete user: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, nil, plan, drainedObligation{}, fmt.Errorf("delete account: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return nil, nil, plan, drainedObligation{}, ErrUserNotFound
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO account_deletions (user_id) VALUES (NULL)`,
+	); err != nil {
+		return nil, nil, plan, drainedObligation{}, fmt.Errorf("delete account: insert audit: %w", err)
+	}
+	return channelIDs, serverIDs, plan, drained, nil
+}
+
+// deleteIncompleteChannelsTx removes the E2EE channels this user created but
+// never finished distributing keys for, and reports them so the post-commit
+// caller can notify their server members.
+func deleteIncompleteChannelsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	lockedUserID string,
+) (pq.StringArray, pq.StringArray, error) {
 	var channelIDs, serverIDs pq.StringArray
 	if err := tx.QueryRowContext(ctx, `
 		WITH incomplete AS (
@@ -220,36 +353,68 @@ func (s *AccountService) deleteAccountTx(
 		WHERE c.id IN (SELECT channel_id FROM incomplete)
 		   OR c.linked_voice_channel_id IN (SELECT channel_id FROM incomplete)`, lockedUserID,
 	).Scan(&channelIDs, &serverIDs); err != nil {
-		return nil, nil, plan, fmt.Errorf("delete account: list incomplete channels: %w", err)
+		return nil, nil, fmt.Errorf("delete account: list incomplete channels: %w", err)
 	}
-	if len(channelIDs) > 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = ANY($1::uuid[])`, pq.Array(channelIDs)); err != nil {
-			return nil, nil, plan, fmt.Errorf("delete account: delete incomplete channels: %w", err)
-		}
+	if len(channelIDs) == 0 {
+		return channelIDs, serverIDs, nil
 	}
-
-	result, err := tx.ExecContext(ctx,
-		`DELETE FROM users WHERE id = $1`,
-		lockedUserID,
-	)
-	if err != nil {
-		return nil, nil, plan, fmt.Errorf("delete account: delete user: %w", err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return nil, nil, plan, fmt.Errorf("delete account: rows affected: %w", err)
-	}
-	if rows == 0 {
-		return nil, nil, plan, ErrUserNotFound
-	}
-
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO account_deletions (user_id) VALUES (NULL)`,
+		`DELETE FROM channels WHERE id = ANY($1::uuid[])`, pq.Array(channelIDs),
 	); err != nil {
-		return nil, nil, plan, fmt.Errorf("delete account: insert audit: %w", err)
+		return nil, nil, fmt.Errorf("delete account: delete incomplete channels: %w", err)
 	}
-	return channelIDs, serverIDs, plan, nil
+	return channelIDs, serverIDs, nil
 }
+
+// drainActivePlansAlreadyGated removes this user's outstanding #2448
+// active-category obligations on a transaction whose sender gate the caller
+// ALREADY holds.
+//
+// DrainAlreadyGated, never the rail's WithGatedTx, for the reason
+// captureErasureAlreadyGated documents below: DeleteAccount already runs inside
+// presenceHistory.WithSender, and the rail shares that same buffered-1 gate
+// array, so the gated flavour would block on a stripe this goroutine holds --
+// forever, with no timeout and no detector.
+//
+// An unwired drain returns no obligation rather than an error. That is a
+// deliberate degrade to pre-#2448 behaviour for a replica whose wiring line was
+// deleted, and it is safe ONLY because RESTRICT still fails the erasure loudly
+// if such a replica meets a user who owes a plan; the boot guard is what stops
+// it happening in production.
+func (s *AccountService) drainActivePlansAlreadyGated(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+) (drainedObligation, error) {
+	if s.activePlans == nil {
+		return drainedObligation{}, nil
+	}
+	parsed, err := uuid.Parse(userID)
+	if err != nil {
+		// Fail closed: draining uuid.Nil would delete nothing, report nothing,
+		// and let the DELETE below fail on the 23503 this exists to prevent.
+		return drainedObligation{}, fmt.Errorf(
+			"delete account: drain presence plans: parse subject: %w", err)
+	}
+	categories, err := s.activePlans.DrainAlreadyGated(ctx, tx, parsed)
+	if err != nil {
+		return drainedObligation{}, fmt.Errorf(
+			"delete account: drain presence plans: %w", err)
+	}
+	return drainedObligation{subject: parsed, categories: categories}, nil
+}
+
+// SetActivePlanRail wires the #2448 durable active-category rail so erasure can
+// drain an outstanding obligation instead of hitting the FK RESTRICT.
+func (s *AccountService) SetActivePlanRail(rail ActivePlanDrain) { s.activePlans = rail }
+
+// HasActivePlanDrain reports whether the drain is wired. The router's boot guard
+// interrogates the SERVICE through this, never the constructed rail, for the
+// same reason HasGraphPresenceCapture does: activepresence.NewRail never returns
+// nil, so a check on that value is a tautology that still boots with the
+// SetActivePlanRail line deleted. Unwired, an erasure of a user with an
+// outstanding plan fails with an undiagnosable 23503.
+func (s *AccountService) HasActivePlanDrain() bool { return s.activePlans != nil }
 
 // SetGraphPresenceCapture wires the #2447 erasure presence capture.
 func (s *AccountService) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {

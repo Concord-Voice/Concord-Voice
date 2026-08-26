@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	controlwebsocket "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -144,6 +145,16 @@ func TestInitializeActivityHistoryRuntimeOrdersStartupAndFailsClosed(t *testing.
 			events = append(events, "pending")
 			return presencehistory.ReconcileStats{}, nil
 		},
+		reconcileActivePlans: func(ctx context.Context, limit int) (activepresence.PassStats, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("active-plan startup reconciliation context is not bounded")
+			}
+			if limit != activityHistoryStartupBatch {
+				t.Fatalf("active-plan startup limit = %d, want %d", limit, activityHistoryStartupBatch)
+			}
+			events = append(events, "active_plans")
+			return activepresence.PassStats{}, nil
+		},
 		startWorkers: func() { events = append(events, "workers") },
 	}
 
@@ -154,12 +165,12 @@ func TestInitializeActivityHistoryRuntimeOrdersStartupAndFailsClosed(t *testing.
 	if paused != 2 {
 		t.Fatalf("paused = %d, want 2", paused)
 	}
-	want := []string{"disclosure", "bind", "pending", "workers"}
+	want := []string{"disclosure", "bind", "pending", "active_plans", "workers"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("startup order = %v, want %v", events, want)
 	}
 
-	for _, failure := range []string{"disclosure", "bind", "pending"} {
+	for _, failure := range []string{"disclosure", "bind", "pending", "active_plans"} {
 		t.Run("failure at "+failure, func(t *testing.T) {
 			calls := make([]string, 0, 4)
 			fail := errors.New("classified startup failure")
@@ -185,6 +196,13 @@ func TestInitializeActivityHistoryRuntimeOrdersStartupAndFailsClosed(t *testing.
 					}
 					return presencehistory.ReconcileStats{}, nil
 				},
+				reconcileActivePlans: func(context.Context, int) (activepresence.PassStats, error) {
+					calls = append(calls, "active_plans")
+					if failure == "active_plans" {
+						return activepresence.PassStats{}, fail
+					}
+					return activepresence.PassStats{}, nil
+				},
 				startWorkers: func() { calls = append(calls, "workers") },
 			}
 			_, err := initializeActivityHistoryRuntime(context.Background(), steps)
@@ -208,7 +226,7 @@ func TestStartActivityHistoryRuntimeReturnsBoundDependenciesAndWorkers(t *testin
 	router := &gin.Engine{}
 	hub := &controlwebsocket.Hub{}
 	natsClient := &natsclient.Client{}
-	started := make(chan string, 2)
+	started := make(chan string, 3)
 	runtime, err := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
 		startupContext: context.Background(),
 		workerContext:  context.Background(),
@@ -221,8 +239,12 @@ func TestStartActivityHistoryRuntimeReturnsBoundDependenciesAndWorkers(t *testin
 		reconcilePending: func(context.Context, int) (presencehistory.ReconcileStats, error) {
 			return presencehistory.ReconcileStats{}, nil
 		},
-		pendingWorker:   func(context.Context) { started <- "pending" },
-		retentionWorker: func(context.Context) { started <- "retention" },
+		reconcileActivePlans: func(context.Context, int) (activepresence.PassStats, error) {
+			return activepresence.PassStats{}, nil
+		},
+		pendingWorker:    func(context.Context) { started <- "pending" },
+		activePlanWorker: func(context.Context) { started <- "active_plans" },
+		retentionWorker:  func(context.Context) { started <- "retention" },
 	})
 	if err != nil {
 		t.Fatalf("start runtime: %v", err)
@@ -234,15 +256,71 @@ func TestStartActivityHistoryRuntimeReturnsBoundDependenciesAndWorkers(t *testin
 	if runtime.paused != 3 {
 		t.Fatalf("paused = %d, want 3", runtime.paused)
 	}
-	seen := map[string]bool{<-started: true, <-started: true}
-	if !seen["pending"] || !seen["retention"] {
-		t.Fatalf("started workers = %v, want pending and retention", seen)
+	seen := startedWorkerSet(t, started, 3)
+	if !seen["pending"] || !seen["active_plans"] || !seen["retention"] {
+		t.Fatalf("started workers = %v, want pending, active_plans and retention", seen)
 	}
 }
 
-func TestStartActivityHistoryWorkersStartsExactlyTwoAndWaitsForCancellation(t *testing.T) {
+// startedWorkerSet collects exactly count worker names, or fails by NAME.
+//
+// A bare <-started would block forever on a worker that never launched, so the
+// suite would report a 10-minute panic rather than the missing worker — which is
+// precisely the regression a variadic launcher can introduce.
+func startedWorkerSet(t *testing.T, started <-chan string, count int) map[string]bool {
+	t.Helper()
+	seen := make(map[string]bool, count)
+	for i := 0; i < count; i++ {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d background workers started: %v", i, count, seen)
+		}
+	}
+	return seen
+}
+
+// A failed startup pass must FAIL BOOT rather than degrade. Reconciler.Run
+// discards every pass error on purpose, so a process that came up with the rail
+// unable to reach its database would accumulate plans and deliver nothing, with
+// no error anywhere. This is the surface that says so.
+func TestStartActivityHistoryRuntimeFailsBootWhenActivePlanReconciliationFails(t *testing.T) {
+	unreachable := errors.New("classified active-plan startup failure")
+	started := make(chan string, 3)
+	_, err := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
+		startupContext:      context.Background(),
+		workerContext:       context.Background(),
+		reconcileDisclosure: func(context.Context) (int64, error) { return 0, nil },
+		bindRouter: func() (*gin.Engine, *controlwebsocket.Hub, *natsclient.Client, error) {
+			return &gin.Engine{}, &controlwebsocket.Hub{}, &natsclient.Client{}, nil
+		},
+		reconcilePending: func(context.Context, int) (presencehistory.ReconcileStats, error) {
+			return presencehistory.ReconcileStats{}, nil
+		},
+		reconcileActivePlans: func(context.Context, int) (activepresence.PassStats, error) {
+			return activepresence.PassStats{}, unreachable
+		},
+		pendingWorker:    func(context.Context) { started <- "pending" },
+		activePlanWorker: func(context.Context) { started <- "active_plans" },
+		retentionWorker:  func(context.Context) { started <- "retention" },
+	})
+	if !errors.Is(err, unreachable) {
+		t.Fatalf("error = %v, want the classified startup failure", err)
+	}
+	select {
+	case name := <-started:
+		t.Fatalf("worker %q started after a failed startup pass", name)
+	default:
+	}
+}
+
+// Three workers, not two: startActivityHistoryWorkers is variadic so a fourth
+// never again requires editing a hardcoded Add(2), and a loop that dropped its
+// last worker is exactly what a two-worker table would miss.
+func TestStartActivityHistoryWorkersStartsEverySuppliedWorkerAndWaitsForCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	started := make(chan string, 2)
+	started := make(chan string, 3)
 	var mu sync.Mutex
 	counts := map[string]int{}
 	worker := func(name string) func(context.Context) {
@@ -254,11 +332,10 @@ func TestStartActivityHistoryWorkersStartsExactlyTwoAndWaitsForCancellation(t *t
 			<-ctx.Done()
 		}
 	}
-	wait := startActivityHistoryWorkers(ctx, worker("pending"), worker("retention"))
-	seen := map[string]bool{}
-	seen[<-started] = true
-	seen[<-started] = true
-	if !seen["pending"] || !seen["retention"] {
+	wait := startActivityHistoryWorkers(ctx,
+		worker("pending"), worker("active_plans"), worker("retention"))
+	seen := startedWorkerSet(t, started, 3)
+	if !seen["pending"] || !seen["active_plans"] || !seen["retention"] {
 		t.Fatalf("started workers = %v", seen)
 	}
 
@@ -277,7 +354,7 @@ func TestStartActivityHistoryWorkersStartsExactlyTwoAndWaitsForCancellation(t *t
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if counts["pending"] != 1 || counts["retention"] != 1 {
+	if counts["pending"] != 1 || counts["active_plans"] != 1 || counts["retention"] != 1 {
 		t.Fatalf("worker counts = %v, want one each", counts)
 	}
 }

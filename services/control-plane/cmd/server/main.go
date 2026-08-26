@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/admin"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
@@ -169,13 +170,25 @@ func runControlPlane() (runErr error) {
 	// Closes both presence dispatch workers; ordered before hub.Shutdown so
 	// their fail-closed drains can still reach live sockets (#2738).
 	closePresenceWorkers := func() {}
+	// #2448: the durable active-category reconciler is built inside NewRouter —
+	// it needs the hub as its terminal and the activity store as its reader, both
+	// of which live there — and carried out here so its startup pass and its
+	// ticker join the Activity History runtime below rather than a second one.
+	//
+	// Both closures below are safe to build before it exists: bindRouter runs
+	// first inside initializeActivityHistoryRuntime, so the assignment has
+	// happened by the time either is called. A boot that somehow reached
+	// reconcileActivePlans with this still nil fails closed — ReconcilePass
+	// nil-checks its receiver and returns ErrReconcilerNotWired — and the worker
+	// never starts, because a failed startup pass aborts before startWorkers.
+	var activePlanReconciler *activepresence.Reconciler
 	runtime, startupErr := startActivityHistoryRuntime(activityHistoryRuntimeDependencies{
 		startupContext:      context.Background(),
 		workerContext:       cleanupCtx,
 		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
 			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck,
-				closePresence, routerErr := api.NewRouter(
+				closePresence, activePlans, routerErr := api.NewRouter(
 				db,
 				redisClient,
 				storageClient,
@@ -194,10 +207,15 @@ func runControlPlane() (runErr error) {
 			voicePermissionEnforcer = permissionEnforcer
 			voicePresenceRecheck = presenceRecheck
 			closePresenceWorkers = closePresence
+			activePlanReconciler = activePlans
 			return router, hub, natsClient, nil
 		},
 		reconcilePending: presenceHistoryService.ReconcilePending,
+		reconcileActivePlans: func(ctx context.Context, limit int) (activepresence.PassStats, error) {
+			return activePlanReconciler.ReconcilePass(ctx, limit)
+		},
 		pendingWorker:    presenceHistoryService.RunPendingReconciler,
+		activePlanWorker: func(ctx context.Context) { activePlanReconciler.Run(ctx) },
 		retentionWorker:  retentionWorker.Run,
 	})
 	if startupErr != nil {
@@ -400,13 +418,15 @@ func shutdownControlPlane(
 }
 
 type activityHistoryRuntimeDependencies struct {
-	startupContext      context.Context
-	workerContext       context.Context
-	reconcileDisclosure func(context.Context) (int64, error)
-	bindRouter          func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error)
-	reconcilePending    func(context.Context, int) (presencehistory.ReconcileStats, error)
-	pendingWorker       func(context.Context)
-	retentionWorker     func(context.Context)
+	startupContext       context.Context
+	workerContext        context.Context
+	reconcileDisclosure  func(context.Context) (int64, error)
+	bindRouter           func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error)
+	reconcilePending     func(context.Context, int) (presencehistory.ReconcileStats, error)
+	reconcileActivePlans func(context.Context, int) (activepresence.PassStats, error)
+	pendingWorker        func(context.Context)
+	activePlanWorker     func(context.Context)
+	retentionWorker      func(context.Context)
 }
 
 type activityHistoryRuntime struct {
@@ -422,7 +442,8 @@ func startActivityHistoryRuntime(
 ) (activityHistoryRuntime, error) {
 	if dependencies.startupContext == nil || dependencies.workerContext == nil ||
 		dependencies.reconcileDisclosure == nil || dependencies.bindRouter == nil ||
-		dependencies.reconcilePending == nil || dependencies.pendingWorker == nil ||
+		dependencies.reconcilePending == nil || dependencies.reconcileActivePlans == nil ||
+		dependencies.pendingWorker == nil || dependencies.activePlanWorker == nil ||
 		dependencies.retentionWorker == nil {
 		return activityHistoryRuntime{}, errors.New("activity history runtime dependency unavailable")
 	}
@@ -437,11 +458,13 @@ func startActivityHistoryRuntime(
 				runtime.router, runtime.hub, runtime.natsClient, bindErr = dependencies.bindRouter()
 				return bindErr
 			},
-			reconcilePending: dependencies.reconcilePending,
+			reconcilePending:     dependencies.reconcilePending,
+			reconcileActivePlans: dependencies.reconcileActivePlans,
 			startWorkers: func() {
 				runtime.waitWorkers = startActivityHistoryWorkers(
 					dependencies.workerContext,
 					dependencies.pendingWorker,
+					dependencies.activePlanWorker,
 					dependencies.retentionWorker,
 				)
 			},
@@ -455,10 +478,11 @@ func startActivityHistoryRuntime(
 }
 
 type activityHistoryStartupSteps struct {
-	reconcileDisclosure func(context.Context) (int64, error)
-	bindRuntime         func() error
-	reconcilePending    func(context.Context, int) (presencehistory.ReconcileStats, error)
-	startWorkers        func()
+	reconcileDisclosure  func(context.Context) (int64, error)
+	bindRuntime          func() error
+	reconcilePending     func(context.Context, int) (presencehistory.ReconcileStats, error)
+	reconcileActivePlans func(context.Context, int) (activepresence.PassStats, error)
+	startWorkers         func()
 }
 
 func initializeActivityHistoryRuntime(
@@ -466,7 +490,8 @@ func initializeActivityHistoryRuntime(
 	steps activityHistoryStartupSteps,
 ) (int64, error) {
 	if steps.reconcileDisclosure == nil || steps.bindRuntime == nil ||
-		steps.reconcilePending == nil || steps.startWorkers == nil {
+		steps.reconcilePending == nil || steps.reconcileActivePlans == nil ||
+		steps.startWorkers == nil {
 		return 0, errors.New("activity history startup dependency unavailable")
 	}
 	startupCtx, cancel := context.WithTimeout(ctx, activityHistoryStartupTimeout)
@@ -481,6 +506,14 @@ func initializeActivityHistoryRuntime(
 	}
 	if _, err := steps.reconcilePending(startupCtx, activityHistoryStartupBatch); err != nil {
 		return 0, fmt.Errorf("reconcile pending activity history operations: %w", err)
+	}
+	// #2448 joins HERE rather than getting its own startup call: this is the one
+	// place that already establishes "startup reconciliation completes, under
+	// activityHistoryStartupTimeout, before workers start, and boot FAILS if it
+	// does not". That contract is the whole reason activepresence.Reconciler.Run
+	// may discard its pass errors — a rail that cannot reconcile never serves.
+	if _, err := steps.reconcileActivePlans(startupCtx, activityHistoryStartupBatch); err != nil {
+		return 0, fmt.Errorf("reconcile pending active-category plans: %w", err)
 	}
 	steps.startWorkers()
 	return paused, nil
@@ -499,22 +532,26 @@ func buildActivityHistoryDisclosure(cfg *config.Config) presencehistory.Disclosu
 	})
 }
 
+// startActivityHistoryWorkers launches every supplied background loop and
+// returns the wait function for all of them.
+//
+// Variadic rather than one parameter per worker: the previous form hardcoded
+// Add(2) beside two named parameters, so #2448's third worker could not be added
+// without editing a count that nothing would have failed on if it were missed —
+// the wait would have returned while a worker was still running.
 func startActivityHistoryWorkers(
 	ctx context.Context,
-	pendingWorker func(context.Context),
-	retentionWorker func(context.Context),
+	workers ...func(context.Context),
 ) func() {
-	var workers sync.WaitGroup
-	workers.Add(2)
-	go func() {
-		defer workers.Done()
-		pendingWorker(ctx)
-	}()
-	go func() {
-		defer workers.Done()
-		retentionWorker(ctx)
-	}()
-	return workers.Wait
+	var group sync.WaitGroup
+	group.Add(len(workers))
+	for _, worker := range workers {
+		go func(run func(context.Context)) {
+			defer group.Done()
+			run(ctx)
+		}(worker)
+	}
+	return group.Wait
 }
 
 func closeDatabase(db *sql.DB, log *logger.Logger) {

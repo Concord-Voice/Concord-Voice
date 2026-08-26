@@ -11,9 +11,16 @@ import (
 // fan out concurrent gate acquisitions.
 const dispatchQueueDepth = 256
 
-// dispatchSink is the seam #2448 replaces. The in-memory implementation drops
-// its queue on shutdown; the durable one will additionally acknowledge by
-// deleting its outbox row. Swapping it is a construction-site change.
+// dispatchSink is the swap point for durable dispatch. The one implementation
+// that exists is in-memory: it drops whatever is still queued at shutdown, so a
+// plan that never reached its worker is lost with no durable record.
+//
+// #2448 did NOT replace it. That slice built a SIBLING rail
+// (internal/activepresence, migration 000111) for the destructive active-category
+// paths and left this leg untouched; retrofitting graphpresence onto durable
+// dispatch is the shared enforcement outbox (#2635), whose acknowledgement is a
+// row delete rather than a channel receive. Swapping it stays a
+// construction-site change.
 type dispatchSink interface {
 	Enqueue(plan *Plan)
 	Close()
