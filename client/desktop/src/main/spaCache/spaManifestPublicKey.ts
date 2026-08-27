@@ -1,31 +1,45 @@
 /**
- * SPA manifest verification PUBLIC key (#1870).
+ * SPA manifest verification PUBLIC keys (#1870), during rotation (#2958).
  *
- * This is the public half of the RSA-4096 keypair whose private half signs
- * `spa-manifest.json` in the deploy pipeline (env `SPA_MANIFEST_SIGNING_KEY`,
- * consumed only by the `deploy-spa` CI job). Public keys are safe to commit and
- * bake into the binary.
+ * These are the public halves of the RSA-4096 keypairs whose private halves
+ * sign `spa-manifest.json` in the deploy pipeline. Public keys are safe to
+ * commit and bake into the binary.
  *
- * ── ACTIVATION (operator, one-time key ceremony) ───────────────────────────
- * The cache is DORMANT until a real keypair exists. To activate:
- *   1. Run `scripts/gen-spa-signing-key.sh` (generates RSA-4096).
- *   2. `gh secret set SPA_MANIFEST_SIGNING_KEY < spa-signing-key.pem` (production env).
- *   3. Replace `SPA_MANIFEST_PUBLIC_KEY_PEM` below with the printed public key.
- *   4. Rebuild + ship the desktop client; redeploy the SPA.
- * See [internal]spa-manifest-signing.md.
+ * ── DUAL TRUST (rotation window, closes 2026-11-27) ─────────────────────────
+ * The client currently trusts TWO keys so the signing key can be rotated
+ * without stranding already-shipped binaries:
+ *
+ *   V1  OUTGOING  private half lives in the GitHub `production` environment
+ *                 secret `SPA_MANIFEST_SIGNING_KEY`. This is what the deploy
+ *                 signs with TODAY.
+ *   V2  INCOMING  private half lives in Infisical at
+ *                 `prod:/sync/production/SPA_MANIFEST_SIGNING_KEY_V2`. Nothing
+ *                 signs with it yet — it is pre-trusted so that when the deploy
+ *                 switches over, clients already in the field accept it.
+ *
+ * A binary trusts the keys it was BUILT with, so the incoming key has to ship
+ * and reach users BEFORE anything signs with it. That ordering is the whole
+ * reason this list has two entries; retiring V1 on day one would brick every
+ * client that had not yet updated.
+ *
+ * Retirement (#2958, on/after 2026-11-27, in this order):
+ *   1. Point the deploy at V2 (`SPA_MANIFEST_SIGNING_KEY` <- the V2 private half).
+ *   2. Confirm a real deploy verifies in the field.
+ *   3. THEN delete `SPA_MANIFEST_PUBLIC_KEY_V1_PEM` and its array entry, and
+ *      delete the GitHub secret. Doing 3 before 2 fails closed but takes the
+ *      SPA cache down until the next client release.
  *
  * ── FAIL-CLOSED ────────────────────────────────────────────────────────────
- * While the placeholder (empty) value is in place, `isSpaManifestKeyConfigured()`
- * returns false and the verifier refuses ALL manifests — the cache stays
- * disabled and the client falls back to remote→bundled exactly as before this
- * feature shipped. A placeholder key can NEVER falsely verify a manifest.
+ * With no non-blank key configured, `isSpaManifestKeyConfigured()` returns
+ * false and the verifier refuses ALL manifests — the cache stays disabled and
+ * the client falls back to remote->bundled exactly as before this feature
+ * shipped. A placeholder key can NEVER falsely verify a manifest, and adding a
+ * key to this list can only ever ADD an accepted signer, never bypass the
+ * signature check itself.
  */
 
-/**
- * PEM-encoded RSA-4096 SPKI public key, or '' (placeholder) before the operator
- * runs the key ceremony. MUST begin with the SPKI header once configured.
- */
-export const SPA_MANIFEST_PUBLIC_KEY_PEM = `
+/** OUTGOING signer (#1870). Retire per #2958 once the deploy signs with V2. */
+export const SPA_MANIFEST_PUBLIC_KEY_V1_PEM = `
 -----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAhed4jelYZcSwE6SFPkEG
 GgqCrxrOh4bjeU1xwCoBV/6eSucz+lJeSpdglGXxFgHgOP5/2dvAtbvhib+HHsNH
@@ -42,7 +56,39 @@ n0KoRpM0ehtGnDHzJtSt1DMCAwEAAQ==
 -----END PUBLIC KEY-----
 `;
 
-/** True only when a non-placeholder public key is configured. */
+/** INCOMING signer (#2958). Pre-trusted; nothing signs with it yet. */
+export const SPA_MANIFEST_PUBLIC_KEY_V2_PEM = `
+-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAkTKfO0U9umDgpHV03nv3
+EJfwuGo4wLdUKDfMFqa8ThkmaEGiTVA/FqOKQB+H2nqfDBn9xOAj6/U2JHX2AHk7
+y2Li6NIqzoOo7a2paBOglfDUSaNLmSi1ejS/qxhd39ynsyVMK46HhxOW7yF5C8Pl
+oBdPCZ16GTqj1AkVNurOia85LKVJqclwdqA88YNFzQnQx/UMyf6/I7Z3R4gQK9UD
+Qo/5ECowifO2/aThqONIYlLiyh5unZSIwNvrL/wzgDRraX/Wn9KrLsYbs9ngvER0
+rnTqsIEklVzmfBLvPj8iJNadPw8kf67lINlV3lINC0mdxHobdpPhHBcniAgt6LKg
+PjvnCkZ/Qpz6u8fwx+P8iEe+RrkNV4bX9Q9rebhQdqbE/HozmhDWJtWfCbMHA3c6
+mxJfc83yuv1YR06/Kfnvq3LsK5Eaa4DYuStW3YqaWpdVLiJF9GKS+Z7pltTvo1Uj
+QOkCwWh9OP2uf0utZCrOjMhg0nDtGh513rWJOQkna1isiakN9w06L1IXx6Hbi7eS
+MN1ZVJ65hYR5QHN1Yi9ptVF3+AY8nz63WSCWvYbD7NQWOp+814Ua7H0J+fLYeZzi
+1TlOksZ4wEuGniyTbpDDfwAfOptRHv8uzbW+xAMmy0VYLdgi/WKdCZzakveqQQCa
+0v/GlAfhkC//60LHTkHxYPUCAwEAAQ==
+-----END PUBLIC KEY-----
+`;
+
+/**
+ * Every public key the client accepts as a manifest signer, most-current first.
+ * A manifest is trusted when its signature verifies under ANY entry.
+ */
+export const SPA_MANIFEST_PUBLIC_KEYS_PEM: readonly string[] = [
+  SPA_MANIFEST_PUBLIC_KEY_V2_PEM,
+  SPA_MANIFEST_PUBLIC_KEY_V1_PEM,
+];
+
+/**
+ * True only when at least one non-placeholder public key is configured.
+ *
+ * Filters blanks BEFORE testing emptiness: a list of only placeholders must
+ * report "dormant", not "configured with a key that never verifies".
+ */
 export function isSpaManifestKeyConfigured(): boolean {
-  return SPA_MANIFEST_PUBLIC_KEY_PEM.trim().length > 0;
+  return SPA_MANIFEST_PUBLIC_KEYS_PEM.some((pem) => pem.trim().length > 0);
 }

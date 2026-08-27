@@ -39,8 +39,8 @@ vi.mock('electron', () => ({
 }));
 
 vi.mock('@/main/spaCache/spaManifestPublicKey', () => ({
-  get SPA_MANIFEST_PUBLIC_KEY_PEM() {
-    return KP.publicKeyPem;
+  get SPA_MANIFEST_PUBLIC_KEYS_PEM() {
+    return [KP.publicKeyPem];
   },
   isSpaManifestKeyConfigured: () => true,
 }));

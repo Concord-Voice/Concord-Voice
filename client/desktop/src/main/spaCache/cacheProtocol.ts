@@ -30,13 +30,12 @@ import { createHash } from 'node:crypto';
 import { readLiveManifest } from './cacheStore';
 import { verifyManifest } from './verifyManifest';
 import { readVerifiedLiveFile } from './cacheIntegrity';
-import { SPA_MANIFEST_PUBLIC_KEY_PEM } from './spaManifestPublicKey';
+import { SPA_MANIFEST_PUBLIC_KEYS_PEM } from './spaManifestPublicKey';
 import { IPC_CONTRACT_VERSION } from '../ipcContract';
 import { SPA_CACHE_HOST, type SpaManifest, type SpaManifestFile } from './manifestSchema';
 
 export type CachePathResolveResult =
-  | { ok: true; absolutePath: string }
-  | { ok: false; status: 403 | 404 };
+  { ok: true; absolutePath: string } | { ok: false; status: 403 | 404 };
 
 /**
  * Pure URL → absolute-path resolver for the cache scheme. Returns the resolved
@@ -132,7 +131,7 @@ function getVerifiedManifestFileMap(): Map<string, SpaManifestFile> | null {
   const verified = verifyManifest({
     manifestBytes: live.manifestBytes,
     signatureBase64: live.signatureBase64,
-    publicKeyPem: SPA_MANIFEST_PUBLIC_KEY_PEM,
+    publicKeyPems: SPA_MANIFEST_PUBLIC_KEYS_PEM,
     shellIpcContract: IPC_CONTRACT_VERSION,
     nowMs: Date.now(),
   });

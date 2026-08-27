@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.41] — 2026-08-27
+
+Groundwork for changing the key that signs Concord's interface updates. Nothing looks different this release, but a future key change will no longer quietly cost you the cached interface.
+
+### Changed
+
+- **Concord now trusts more than one interface-signing key at a time** ([#2958](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2958)) — Concord keeps a verified copy of its own interface, so a network problem drops you back to the last good version instead of an older one built into the app. That copy is only trusted when it was signed with a key baked in at the time your copy of Concord was built, and until now exactly one key was accepted. Changing that key would therefore have silently disabled the cache for everyone who had not yet updated, with no way to tell them otherwise. Concord now accepts a list of keys, so the outgoing and incoming key both work while a changeover is in progress and nobody loses the cache in between.
+
 ## [0.2.40] — 2026-08-20
 
 Friend codes now have a web page of their own. Opening someone's friend link in a browser shows who it belongs to and offers to open Concord, and the page looks the same whether the code is live or not, so nobody can use it to work out which codes exist.

@@ -86,7 +86,7 @@ describe('signerVerifier crosscheck (#1870)', () => {
     const result = verifyManifest({
       manifestBytes,
       signatureBase64,
-      publicKeyPem,
+      publicKeyPems: [publicKeyPem],
       shellIpcContract: IPC_CONTRACT,
       nowMs: Date.parse(manifest.generatedAt),
     });
@@ -122,7 +122,7 @@ describe('signerVerifier crosscheck (#1870)', () => {
     const result = verifyManifest({
       manifestBytes,
       signatureBase64,
-      publicKeyPem,
+      publicKeyPems: [publicKeyPem],
       shellIpcContract: IPC_CONTRACT,
       nowMs: Date.parse(manifest.generatedAt),
     });
@@ -154,7 +154,7 @@ describe('signerVerifier crosscheck (#1870)', () => {
     const result = verifyManifest({
       manifestBytes,
       signatureBase64,
-      publicKeyPem,
+      publicKeyPems: [publicKeyPem],
       shellIpcContract: IPC_CONTRACT,
       nowMs: Date.parse(generatedAt),
     });
@@ -180,7 +180,7 @@ describe('signerVerifier crosscheck (#1870)', () => {
     const result = verifyManifest({
       manifestBytes,
       signatureBase64,
-      publicKeyPem: otherPublicKey as string,
+      publicKeyPems: [otherPublicKey as string],
       shellIpcContract: IPC_CONTRACT,
       nowMs: Date.parse(manifest.generatedAt),
     });

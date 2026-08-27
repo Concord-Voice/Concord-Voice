@@ -22,7 +22,7 @@ import { net } from 'electron';
 import { createHash } from 'node:crypto';
 import { verifyManifest } from './verifyManifest';
 import { promoteStagingToLive, resetStaging, writeStagedFile } from './cacheStore';
-import { SPA_MANIFEST_PUBLIC_KEY_PEM, isSpaManifestKeyConfigured } from './spaManifestPublicKey';
+import { SPA_MANIFEST_PUBLIC_KEYS_PEM, isSpaManifestKeyConfigured } from './spaManifestPublicKey';
 import { IPC_CONTRACT_VERSION } from '../ipcContract';
 import {
   SPA_CACHE_MAX_FILE_BYTES,
@@ -157,7 +157,7 @@ async function doPopulate(remoteBaseUrl: string): Promise<PopulateResult> {
   const verified = verifyManifest({
     manifestBytes,
     signatureBase64,
-    publicKeyPem: SPA_MANIFEST_PUBLIC_KEY_PEM,
+    publicKeyPems: SPA_MANIFEST_PUBLIC_KEYS_PEM,
     shellIpcContract: IPC_CONTRACT_VERSION,
     nowMs: Date.now(),
   });

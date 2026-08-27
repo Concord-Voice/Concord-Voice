@@ -14,9 +14,9 @@
  * so this out-of-band check is what enforces update authenticity on Linux.
  *
  * ── NO PLACEHOLDER / FAIL-LOUD ─────────────────────────────────────────────
- * Unlike `spaCache/spaManifestPublicKey.ts` (which ships an empty placeholder and
- * fail-SAFE disables its cache), an update-security gate must NOT have a
- * skip-when-empty path: an empty or wrong key makes every Linux install fail
+ * Unlike `spaCache/spaManifestPublicKey.ts` (whose trust list may be empty or
+ * all-placeholder, which fail-SAFE disables its cache), an update-security gate
+ * must NOT have a skip-when-empty path: an empty or wrong key makes every Linux install fail
  * CLOSED (refuse), never fail open. The CI self-verify step re-checks each
  * signature against this same public key, so a key mismatch fails the release
  * build before any user is affected.

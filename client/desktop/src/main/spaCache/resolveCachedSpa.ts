@@ -23,7 +23,7 @@ import { readLiveManifest } from './cacheStore';
 import { verifyManifest } from './verifyManifest';
 import { verifyAllLiveAssets } from './cacheIntegrity';
 import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from './manifestSchema';
-import { SPA_MANIFEST_PUBLIC_KEY_PEM } from './spaManifestPublicKey';
+import { SPA_MANIFEST_PUBLIC_KEYS_PEM } from './spaManifestPublicKey';
 import { IPC_CONTRACT_VERSION } from '../ipcContract';
 
 export interface CachedSpaDecision {
@@ -43,7 +43,7 @@ export function resolveCachedSpa(nowMs: number = Date.now()): CachedSpaDecision 
   const verified = verifyManifest({
     manifestBytes: live.manifestBytes,
     signatureBase64: live.signatureBase64,
-    publicKeyPem: SPA_MANIFEST_PUBLIC_KEY_PEM,
+    publicKeyPems: SPA_MANIFEST_PUBLIC_KEYS_PEM,
     shellIpcContract: IPC_CONTRACT_VERSION,
     nowMs,
   });
