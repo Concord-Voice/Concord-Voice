@@ -22,6 +22,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
@@ -275,6 +276,23 @@ func runControlPlane() (runErr error) {
 	expiryEntCache := entitlements.NewCacheForInstance(redisClient, db, cfg.InstanceType)
 	expiryNotifier := api.NewEntitlementNotifier(hub, log)
 	subscriptions.StartExpirySweepWorker(cleanupCtx, db, log, expiryEntCache, expiryNotifier, subscriptions.DefaultExpirySweepInterval)
+
+	// Reclaims object-store bytes staged by chunked attachment upload sessions
+	// that were never committed or cancelled (#2157 PR 2).
+	//
+	// This is LOAD-BEARING FOR CORRECTNESS, not defence in depth. Every other
+	// cleanup path -- the client's cancel button, the unmount keepalive DELETE,
+	// the 410 hard-TTL expiry -- reads or writes a Redis session record, so all
+	// of them fail together the moment Redis does, which is exactly when uploads
+	// get orphaned. This sweeper derives its work queue from the object store
+	// itself, so a total Redis loss cannot strand bytes. That guarantee is what
+	// lets the client-side paths be genuinely best-effort.
+	//
+	// Skipped when storage is unconfigured -- the same condition under which no
+	// media route is registered at all, so there is nothing to sweep.
+	if storageClient != nil {
+		media.StartSessionSweepWorker(cleanupCtx, storageClient, log, media.DefaultSessionSweepInterval)
+	}
 
 	// Create HTTP server
 	srv := &http.Server{

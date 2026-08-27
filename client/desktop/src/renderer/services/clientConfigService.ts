@@ -6,9 +6,12 @@
  * from the App root so minVersion enforcement works regardless of auth state.
  */
 
-import { z } from 'zod';
 import { apiFetch } from './apiClient';
-import { useClientConfigStore, type ServerCapabilities } from '../stores/clientConfigStore';
+import {
+  useClientConfigStore,
+  ServerCapabilitiesSchema,
+  type ServerCapabilities,
+} from '../stores/clientConfigStore';
 import { useVoiceStore } from '../stores/voiceStore';
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -23,15 +26,6 @@ interface ServerConfigResponse {
   spaUrl?: string;
   spaIpcContract?: number;
 }
-
-const ServerCapabilitiesSchema = z.object({
-  auth: z.object({
-    oauthProviders: z.array(z.string()),
-  }),
-  features: z.object({
-    activityHistorySupported: z.boolean().optional(),
-  }),
-});
 
 class ClientConfigService {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -233,6 +227,11 @@ class ClientConfigService {
           ? { status: 'supported' }
           : { status: 'confirmed-unsupported' }
       );
+      store.setChunkedUploadCapability(
+        capabilities.features.chunkedAttachmentUpload === true
+          ? { status: 'supported' }
+          : { status: 'confirmed-unsupported' }
+      );
     } catch {
       if (this.isCurrentCapabilityRequest(controller, generation)) {
         this.setCapabilityError();
@@ -268,6 +267,10 @@ class ClientConfigService {
     const store = useClientConfigStore.getState();
     const previous = store.activityHistoryCapability;
     store.setServerCapabilities(null);
+    // 'error' is NOT 'confirmed-unsupported'. Both fail closed to the legacy
+    // path, but only one of them is a fact about the server -- and the copy the
+    // user sees differs.
+    store.setChunkedUploadCapability({ status: 'error' });
     store.setActivityHistoryCapability({
       status: 'error',
       lastConfirmedSupported:

@@ -182,6 +182,80 @@ describe('clientConfigService', () => {
     });
   });
 
+  describe('chunked-upload capability discovery — THROUGH THE PARSER', () => {
+    // These go through refreshServerCapabilities, not through the store setter,
+    // because the bug they exist to catch lived BETWEEN the two. The schema
+    // omitted chunkedAttachmentUpload while the hand-written interface declared
+    // it, and zod strips unknown keys -- so the parsed value was always
+    // undefined, the capability always read confirmed-unsupported, and every
+    // upload silently took the legacy path this feature replaces. tsc was happy
+    // and every existing test passed, because they all set the store directly.
+
+    /** A capabilities payload with `chunkedAttachmentUpload` present. */
+    const withChunked = (v: unknown): unknown => ({
+      server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+      auth: { emailVerificationRequired: true, oauthProviders: ['google'] },
+      features: { voiceTiersSupported: true, chunkedAttachmentUpload: v },
+      policyVersion: 'test',
+    });
+
+    it('SURVIVES the parse — a true capability reaches the store', async () => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(withChunked(true)));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      // The store state is the contract the uploader reads...
+      expect(useClientConfigStore.getState().chunkedUploadCapability).toEqual({
+        status: 'supported',
+      });
+      // ...and the parsed payload must still CARRY the field. Asserting only
+      // the derived state would keep passing if the parser dropped it and some
+      // other path set the flag.
+      expect(
+        useClientConfigStore.getState().serverCapabilities?.features.chunkedAttachmentUpload
+      ).toBe(true);
+    });
+
+    it('an explicit false is confirmed-unsupported, not an error', async () => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(withChunked(false)));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().chunkedUploadCapability).toEqual({
+        status: 'confirmed-unsupported',
+      });
+    });
+
+    it('an absent field is confirmed-unsupported — a server predating the field', async () => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload()));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().chunkedUploadCapability).toEqual({
+        status: 'confirmed-unsupported',
+      });
+      expect(
+        useClientConfigStore.getState().serverCapabilities?.features.chunkedAttachmentUpload
+      ).toBeUndefined();
+    });
+
+    it.each([
+      ['string', 'yes'],
+      ['number', 1],
+      ['null', null],
+    ])('rejects a non-boolean %s capability rather than coercing it', async (_label, value) => {
+      mockApiFetch.mockResolvedValueOnce(jsonResponse(withChunked(value)));
+
+      await clientConfigService.refreshServerCapabilities();
+
+      // A payload that fails the schema is an ERROR, not a "no" -- we could
+      // not ask, which is the third state.
+      expect(useClientConfigStore.getState().chunkedUploadCapability).toEqual({
+        status: 'error',
+      });
+    });
+  });
+
   describe('Activity History capability discovery', () => {
     it('records a valid true capability as supported', async () => {
       mockApiFetch.mockResolvedValueOnce(jsonResponse(serverCapabilitiesPayload(true)));

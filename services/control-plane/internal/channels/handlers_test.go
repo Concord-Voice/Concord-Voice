@@ -2260,3 +2260,66 @@ func TestUpdateChannel_AcceptsMachAudioTierFromServerTierCache(t *testing.T) {
 	}, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 }
+
+func TestGetUnifiedKeysDMHonoursTheVersionParameter(t *testing.T) {
+	// The DM branch used to IGNORE ?version= entirely, always answering
+	// ORDER BY key_version DESC LIMIT 1 -- so it returned HTTP 200 with the
+	// CURRENT key for any epoch a caller named. Two consequences:
+	//
+	//   1. Historical DM content stayed undecryptable after a rotation, because
+	//      a request for the epoch it was sealed under silently got the current
+	//      key instead. That is the bug #2157 PR 2 set out to fix, and it was
+	//      unfixed for DMs while the channel branch worked.
+	//   2. A 200 for an epoch that does not exist let a fabricated key_version
+	//      be cached and recorded as a real epoch on the client, poisoning a
+	//      MONOTONIC rotation watermark that then suppressed every genuine
+	//      rotation for the session.
+	ts := setupTS(t)
+	userA := ts.CreateTestUser(t, "dmversionA")
+	userB := ts.CreateTestUser(t, "dmversionB")
+	conversationID := ts.CreateDMConversation(t, userA.ID, userB.ID)
+
+	for _, epoch := range []int{1, 2} {
+		_, err := ts.DB.Exec(
+			`INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version)
+			 VALUES ($1, $2, $3, $4)`,
+			conversationID, userA.ID, fmt.Sprintf("wrap-epoch-%d", epoch), epoch)
+		require.NoError(t, err)
+	}
+
+	get := func(query string) *httptest.ResponseRecorder {
+		return ts.DoRequest("GET", "/api/v1/e2ee/keys/"+conversationID+query, nil,
+			testhelpers.AuthHeaders(userA.AccessToken))
+	}
+	wrapOf := func(w *httptest.ResponseRecorder) (string, float64) {
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		key, _ := body["key"].(map[string]interface{})
+		wrapped, _ := key["wrapped_key"].(string)
+		version, _ := key["key_version"].(float64)
+		return wrapped, version
+	}
+
+	// The HISTORICAL epoch, which is the whole point.
+	w := get("?version=1")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	wrapped, version := wrapOf(w)
+	assert.Equal(t, "wrap-epoch-1", wrapped)
+	assert.Equal(t, float64(1), version)
+
+	// POSITIVE CONTROL: no parameter still means "current". Without this, a
+	// branch that always returned epoch 1 would pass the assertion above.
+	w = get("")
+	require.Equal(t, http.StatusOK, w.Code)
+	wrapped, version = wrapOf(w)
+	assert.Equal(t, "wrap-epoch-2", wrapped)
+	assert.Equal(t, float64(2), version)
+
+	// An epoch that does not exist is a 404, NOT a 200 carrying the current key.
+	w = get("?version=2147483647")
+	assert.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+
+	// A malformed one is a 400, matching the channel branch.
+	w = get("?version=abc")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+}

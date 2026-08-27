@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
 import { renderHook, act } from '@testing-library/react';
 import {
   useFileUpload,
@@ -8,6 +9,7 @@ import {
 import {
   FREE_ATTACHMENT_BYTES,
   PREMIUM_ATTACHMENT_BYTES,
+  IMAGE_STRIP_MAX_BYTES,
   resolveAttachmentLimit,
 } from '@/renderer/utils/entitlementLimits';
 import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
@@ -15,6 +17,22 @@ import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 // Mock apiClient
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
+const mockUploadAttachmentChunked = vi.fn();
+const mockAbandonSession = vi.fn();
+class MockUploadAbortedError extends Error {
+  constructor() {
+    super('Upload aborted');
+    this.name = 'UploadAbortedError';
+  }
+}
+vi.mock('@/renderer/services/attachmentUploadSession', () => ({
+  uploadAttachmentChunked: (...args: unknown[]) => mockUploadAttachmentChunked(...args),
+  abandonSessionOnUnload: (...args: unknown[]) => mockAbandonSession(...args),
+  get UploadAbortedError() {
+    return MockUploadAbortedError;
+  },
+}));
+
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
@@ -157,11 +175,82 @@ function sizedFile(name: string, size: number, type = 'application/octet-stream'
   return f;
 }
 
-const freeLimit = resolveAttachmentLimit({ userMaxAttachmentBytes: FREE_ATTACHMENT_BYTES });
+/** Like sizedFile, but with REAL leading bytes so the sniffer can dispatch on
+ *  them. Size is still faked — the point is the magic, not the payload. */
+function magicFile(
+  name: string,
+  size: number,
+  magic: number[],
+  type = 'application/octet-stream'
+): File {
+  const f = new File([new Uint8Array(magic)], name, { type });
+  Object.defineProperty(f, 'size', { value: size });
+  return f;
+}
+
+const JPEG_MAGIC = [0xff, 0xd8, 0xff, 0xe0];
+
+const freeLimit = resolveAttachmentLimit({
+  userMaxAttachmentBytes: FREE_ATTACHMENT_BYTES,
+  chunkedUploadSupported: false,
+});
+
+/** Premium on a server that supports chunking, so the entitlement is not
+ *  clamped and the image ceiling is the only thing that can bite. */
+const chunkedPremiumLimit = resolveAttachmentLimit({
+  userMaxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES,
+  chunkedUploadSupported: true,
+});
+
+describe('validateFiles — image ceiling (sniffed, not declared)', () => {
+  it('refuses an image above IMAGE_STRIP_MAX_BYTES before it is ever queued', async () => {
+    const r = await validateFiles(
+      [magicFile('huge.jpg', IMAGE_STRIP_MAX_BYTES + 1, JPEG_MAGIC, 'image/jpeg')],
+      0,
+      chunkedPremiumLimit
+    );
+    expect(r.accepted).toHaveLength(0);
+    expect(r.rejections[0].kind).toBe('image-too-large');
+  });
+
+  it('sniffs a JPEG uploaded as application/octet-stream (#2469)', async () => {
+    // Dispatching on the DECLARED type would let this bypass the whole-file
+    // strip path, which is a privacy regression, not a miscategorisation.
+    const r = await validateFiles(
+      [magicFile('sneaky.bin', IMAGE_STRIP_MAX_BYTES + 1, JPEG_MAGIC)],
+      0,
+      chunkedPremiumLimit
+    );
+    expect(r.accepted).toHaveLength(0);
+    expect(r.rejections[0].kind).toBe('image-too-large');
+  });
+
+  it('lets a NON-image of the same size through — the ceiling is image-only', async () => {
+    // This is the whole point of the chunked format: a 200 MB archive is
+    // chunk-read and bounded, so no ceiling applies to it.
+    const r = await validateFiles(
+      [magicFile('archive.bin', IMAGE_STRIP_MAX_BYTES + 1, [0x00, 0x01, 0x02, 0x03])],
+      0,
+      chunkedPremiumLimit
+    );
+    expect(r.rejections).toHaveLength(0);
+    expect(r.accepted).toHaveLength(1);
+  });
+
+  it('accepts an image UNDER the ceiling', async () => {
+    const r = await validateFiles(
+      [magicFile('ok.jpg', 1_000_000, JPEG_MAGIC, 'image/jpeg')],
+      0,
+      chunkedPremiumLimit
+    );
+    expect(r.rejections).toHaveLength(0);
+    expect(r.accepted).toHaveLength(1);
+  });
+});
 
 describe('validateFiles', () => {
-  it('accepts a file under the limit', () => {
-    const r = validateFiles([sizedFile('test.png', 1000, 'image/png')], 0, freeLimit);
+  it('accepts a file under the limit', async () => {
+    const r = await validateFiles([sizedFile('test.png', 1000, 'image/png')], 0, freeLimit);
     expect(r.accepted).toHaveLength(1);
     expect(r.rejections).toEqual([]);
   });
@@ -169,19 +258,19 @@ describe('validateFiles', () => {
   // THE BUG (#2157). 30 MiB is over the old flat 25 MiB constant but under the
   // 32 MiB free entitlement that the server and the pricing page both honour.
   // This case previously asserted rejection — it encoded the defect.
-  it('accepts a 30 MiB file for a free user', () => {
-    const r = validateFiles([sizedFile('big.zip', 30 * 1024 * 1024)], 0, freeLimit);
+  it('accepts a 30 MiB file for a free user', async () => {
+    const r = await validateFiles([sizedFile('big.zip', 30 * 1024 * 1024)], 0, freeLimit);
     expect(r.accepted).toHaveLength(1);
     expect(r.rejections).toEqual([]);
   });
 
-  it('accepts a file exactly at the limit', () => {
-    const r = validateFiles([sizedFile('edge.bin', FREE_ATTACHMENT_BYTES)], 0, freeLimit);
+  it('accepts a file exactly at the limit', async () => {
+    const r = await validateFiles([sizedFile('edge.bin', FREE_ATTACHMENT_BYTES)], 0, freeLimit);
     expect(r.accepted).toHaveLength(1);
   });
 
-  it('rejects one byte over the limit and carries the limit for the copy layer', () => {
-    const r = validateFiles([sizedFile('over.bin', FREE_ATTACHMENT_BYTES + 1)], 0, freeLimit);
+  it('rejects one byte over the limit and carries the limit for the copy layer', async () => {
+    const r = await validateFiles([sizedFile('over.bin', FREE_ATTACHMENT_BYTES + 1)], 0, freeLimit);
     expect(r.accepted).toEqual([]);
     expect(r.rejections).toHaveLength(1);
     expect(r.rejections[0]).toMatchObject({
@@ -192,20 +281,20 @@ describe('validateFiles', () => {
     expect(r.rejections[0].limit).toEqual(freeLimit);
   });
 
-  it('returns NO strings — copy belongs to the component', () => {
-    const r = validateFiles([sizedFile('over.bin', FREE_ATTACHMENT_BYTES + 1)], 0, freeLimit);
+  it('returns NO strings — copy belongs to the component', async () => {
+    const r = await validateFiles([sizedFile('over.bin', FREE_ATTACHMENT_BYTES + 1)], 0, freeLimit);
     expect(JSON.stringify(r.rejections)).not.toMatch(/exceeds|limit is|MB/i);
   });
 
-  it('rejects an empty file', () => {
-    const r = validateFiles([sizedFile('empty.txt', 0, 'text/plain')], 0, freeLimit);
+  it('rejects an empty file', async () => {
+    const r = await validateFiles([sizedFile('empty.txt', 0, 'text/plain')], 0, freeLimit);
     expect(r.rejections[0].kind).toBe('empty');
     expect(r.accepted).toEqual([]);
   });
 
   // R6: one oversized file used to discard the whole drop.
-  it('queues the valid files from a mixed batch and names only the bad one', () => {
-    const r = validateFiles(
+  it('queues the valid files from a mixed batch and names only the bad one', async () => {
+    const r = await validateFiles(
       [
         sizedFile('ok1.png', 1024),
         sizedFile('huge.bin', FREE_ATTACHMENT_BYTES + 1),
@@ -220,8 +309,8 @@ describe('validateFiles', () => {
     expect(r.rejections[0].fileName).toBe('huge.bin');
   });
 
-  it('fills remaining capacity then reports too-many exactly once', () => {
-    const r = validateFiles(
+  it('fills remaining capacity then reports too-many exactly once', async () => {
+    const r = await validateFiles(
       [sizedFile('a.png', 1), sizedFile('b.png', 1), sizedFile('c.png', 1), sizedFile('d.png', 1)],
       3,
       freeLimit
@@ -230,20 +319,20 @@ describe('validateFiles', () => {
     expect(r.rejections.filter((x) => x.kind === 'too-many')).toHaveLength(1);
   });
 
-  it('reports too-many once when already full', () => {
-    const r = validateFiles([sizedFile('a.png', 1)], 5, freeLimit);
+  it('reports too-many once when already full', async () => {
+    const r = await validateFiles([sizedFile('a.png', 1)], 5, freeLimit);
     expect(r.accepted).toEqual([]);
     expect(r.rejections).toEqual([expect.objectContaining({ kind: 'too-many' })]);
   });
 
-  it('returns nothing for an empty input', () => {
-    const r = validateFiles([], 0, freeLimit);
+  it('returns nothing for an empty input', async () => {
+    const r = await validateFiles([], 0, freeLimit);
     expect(r.accepted).toEqual([]);
     expect(r.rejections).toEqual([]);
   });
 
-  it('allows multiple valid files within limits', () => {
-    const r = validateFiles(
+  it('allows multiple valid files within limits', async () => {
+    const r = await validateFiles(
       [
         sizedFile('a.png', 1000, 'image/png'),
         sizedFile('b.jpg', 2000, 'image/jpeg'),
@@ -257,6 +346,21 @@ describe('validateFiles', () => {
   });
 });
 
+/** Sets the raw capability object AND the derived three-state the hook reads.
+ *  They are separate on purpose -- `serverCapabilities: null` cannot distinguish
+ *  "not fetched yet" from "fetch failed" -- but a fixture that sets only one of
+ *  them silently stops exercising the path it names. */
+function setChunkedCapability(supported: boolean): void {
+  const store = useClientConfigStore.getState();
+  store.setServerCapabilities({
+    auth: { oauthProviders: [] },
+    features: supported ? { chunkedAttachmentUpload: true } : {},
+  });
+  store.setChunkedUploadCapability({
+    status: supported ? 'supported' : 'confirmed-unsupported',
+  });
+}
+
 describe('useFileUpload', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -269,12 +373,12 @@ describe('useFileUpload', () => {
     expect(result.current.hasFiles).toBe(false);
   });
 
-  it('adds files to the queue', () => {
+  it('adds files to the queue', async () => {
     const { result } = renderHook(() => useFileUpload());
     const file = createMockFile('test.png', 1000, 'image/png');
 
-    act(() => {
-      result.current.addFiles([file]);
+    await act(async () => {
+      await result.current.addFiles([file]);
     });
 
     expect(result.current.files).toHaveLength(1);
@@ -283,34 +387,34 @@ describe('useFileUpload', () => {
     expect(result.current.hasFiles).toBe(true);
   });
 
-  it('generates preview URL for images', () => {
+  it('generates preview URL for images', async () => {
     const { result } = renderHook(() => useFileUpload());
     const file = createMockFile('photo.png', 1000, 'image/png');
 
-    act(() => {
-      result.current.addFiles([file]);
+    await act(async () => {
+      await result.current.addFiles([file]);
     });
 
     expect(result.current.files[0].previewUrl).toBeDefined();
     expect(result.current.files[0].previewUrl).toContain('blob:');
   });
 
-  it('does not generate preview URL for non-images', () => {
+  it('does not generate preview URL for non-images', async () => {
     const { result } = renderHook(() => useFileUpload());
     const file = createMockFile('doc.pdf', 1000, 'application/pdf');
 
-    act(() => {
-      result.current.addFiles([file]);
+    await act(async () => {
+      await result.current.addFiles([file]);
     });
 
     expect(result.current.files[0].previewUrl).toBeUndefined();
   });
 
-  it('removes a file from the queue', () => {
+  it('removes a file from the queue', async () => {
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([
+    await act(async () => {
+      await result.current.addFiles([
         createMockFile('a.png', 100, 'image/png'),
         createMockFile('b.pdf', 200, 'application/pdf'),
       ]);
@@ -333,47 +437,47 @@ describe('useFileUpload', () => {
   // Both calls sit in ONE act() deliberately: act flushes effects at its close,
   // so splitting them would let the reconciling effect run in between and hide
   // the race the test exists to catch.
-  it('does not resurrect a removed file when addFiles runs before the effect', () => {
+  it('does not resurrect a removed file when addFiles runs before the effect', async () => {
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('gone.png', 100, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('gone.png', 100, 'image/png')]);
     });
     expect(result.current.files).toHaveLength(1);
 
-    act(() => {
+    await act(async () => {
       result.current.removeFile(0);
-      result.current.addFiles([createMockFile('kept.png', 100, 'image/png')]);
+      await result.current.addFiles([createMockFile('kept.png', 100, 'image/png')]);
     });
 
     expect(result.current.files.map((f) => f.file.name)).toEqual(['kept.png']);
   });
 
   // Same mirror, same window, via clearFiles.
-  it('does not resurrect cleared files when addFiles runs before the effect', () => {
+  it('does not resurrect cleared files when addFiles runs before the effect', async () => {
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([
+    await act(async () => {
+      await result.current.addFiles([
         createMockFile('x.png', 100, 'image/png'),
         createMockFile('y.png', 100, 'image/png'),
       ]);
     });
     expect(result.current.files).toHaveLength(2);
 
-    act(() => {
+    await act(async () => {
       result.current.clearFiles();
-      result.current.addFiles([createMockFile('fresh.png', 100, 'image/png')]);
+      await result.current.addFiles([createMockFile('fresh.png', 100, 'image/png')]);
     });
 
     expect(result.current.files.map((f) => f.file.name)).toEqual(['fresh.png']);
   });
 
-  it('clears all files', () => {
+  it('clears all files', async () => {
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([
+    await act(async () => {
+      await result.current.addFiles([
         createMockFile('a.png', 100, 'image/png'),
         createMockFile('b.pdf', 200, 'application/pdf'),
       ]);
@@ -387,14 +491,14 @@ describe('useFileUpload', () => {
     expect(result.current.hasFiles).toBe(false);
   });
 
-  it('returns structured rejections from addFiles for an over-limit file', () => {
+  it('returns structured rejections from addFiles for an over-limit file', async () => {
     const { result } = renderHook(() => useFileUpload());
     // 40 MiB is over the 32 MiB free floor the unhydrated store reports.
     const bigFile = sizedFile('huge.zip', 40 * 1024 * 1024, 'application/zip');
 
     let rejections: AttachmentRejection[] = [];
-    act(() => {
-      rejections = result.current.addFiles([bigFile]).rejections;
+    await act(async () => {
+      rejections = (await result.current.addFiles([bigFile])).rejections;
     });
 
     expect(rejections).toHaveLength(1);
@@ -402,10 +506,10 @@ describe('useFileUpload', () => {
     expect(result.current.files).toHaveLength(0);
   });
 
-  it('accepts a 30 MiB file that the old flat 25 MiB cap rejected', () => {
+  it('accepts a 30 MiB file that the old flat 25 MiB cap rejected', async () => {
     const { result } = renderHook(() => useFileUpload());
-    act(() => {
-      result.current.addFiles([sizedFile('was-blocked.zip', 30 * 1024 * 1024)]);
+    await act(async () => {
+      await result.current.addFiles([sizedFile('was-blocked.zip', 30 * 1024 * 1024)]);
     });
     expect(result.current.files).toHaveLength(1);
   });
@@ -414,11 +518,11 @@ describe('useFileUpload', () => {
   // surplus, so `total - rejections.length` over-reports what was queued.
   // Dropping 8 files on an empty queue accepts 5 and discards 3, but produces a
   // single rejection — the old derivation claimed 7 were added.
-  it('reports the ACCEPTED count explicitly, not derivable from the rejection count', () => {
+  it('reports the ACCEPTED count explicitly, not derivable from the rejection count', async () => {
     const { result } = renderHook(() => useFileUpload());
     let outcome = { accepted: -1, rejections: [] as AttachmentRejection[] };
-    act(() => {
-      outcome = result.current.addFiles(
+    await act(async () => {
+      outcome = await result.current.addFiles(
         Array.from({ length: 8 }, (_, i) => sizedFile(`f${i}.png`, 1024))
       );
     });
@@ -433,14 +537,14 @@ describe('useFileUpload', () => {
   // Review row 2: addFiles used to compute inside a setFiles updater and read
   // the result from a ref straight after. React may defer the updater, so the
   // read could return a PREVIOUS selection's rejections.
-  it("returns THIS selection's result on back-to-back calls", () => {
+  it("returns THIS selection's result on back-to-back calls", async () => {
     const { result } = renderHook(() => useFileUpload());
     let first = { accepted: -1, rejections: [] as AttachmentRejection[] };
     let second = { accepted: -1, rejections: [] as AttachmentRejection[] };
-    act(() => {
-      first = result.current.addFiles([sizedFile('ok.png', 1024)]);
+    await act(async () => {
+      first = await result.current.addFiles([sizedFile('ok.png', 1024)]);
       // Same tick, before React has flushed anything from the first call.
-      second = result.current.addFiles([sizedFile('huge.bin', 40 * 1024 * 1024)]);
+      second = await result.current.addFiles([sizedFile('huge.bin', 40 * 1024 * 1024)]);
     });
 
     expect(first).toEqual({ accepted: 1, rejections: [] });
@@ -451,16 +555,16 @@ describe('useFileUpload', () => {
     expect(result.current.files.map((f) => f.file.name)).toEqual(['ok.png']);
   });
 
-  it('composes capacity across back-to-back calls', () => {
+  it('composes capacity across back-to-back calls', async () => {
     const { result } = renderHook(() => useFileUpload());
     let last = { accepted: -1, rejections: [] as AttachmentRejection[] };
-    act(() => {
-      result.current.addFiles([
+    await act(async () => {
+      await result.current.addFiles([
         sizedFile('a.png', 1),
         sizedFile('b.png', 1),
         sizedFile('c.png', 1),
       ]);
-      last = result.current.addFiles([
+      last = await result.current.addFiles([
         sizedFile('d.png', 1),
         sizedFile('e.png', 1),
         sizedFile('f.png', 1),
@@ -487,6 +591,60 @@ describe('useFileUpload', () => {
     expect(result.current.addFiles).toBe(first);
   });
 
+  it('actually USES the chunked session when the server advertises it', async () => {
+    // Written, tested, and unreachable is the failure mode this PR has already
+    // hit twice -- session routes registered on no router, and this client with
+    // no caller. A unit test of the session client cannot catch it; only a test
+    // that drives the real dispatch can.
+    setChunkedCapability(true);
+    mockUploadAttachmentChunked.mockResolvedValue({
+      file_id: 'chunked-1',
+      storage_key: 'attachments/x',
+      file_type: 'file',
+      file_size: 4096,
+    });
+
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+
+    let out: { ids: string[] } | undefined;
+    await act(async () => {
+      out = await result.current.uploadAll('channel-1');
+    });
+
+    expect(mockUploadAttachmentChunked).toHaveBeenCalledTimes(1);
+    expect(out?.ids).toContain('chunked-1');
+    // And the legacy multipart endpoint is NOT hit.
+    expect(mockApiFetch).not.toHaveBeenCalledWith(
+      '/api/v1/media/upload/attachment',
+      expect.anything()
+    );
+  });
+
+  it('falls back to the legacy path when the server does not advertise it', async () => {
+    // Fail-closed is the whole point: an absent capability must never be read
+    // as present.
+    setChunkedCapability(false);
+    mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
+    mockSafeJson.mockResolvedValue({ file_id: 'legacy-1', file_type: 'file', file_size: 4096 });
+
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+
+    expect(mockUploadAttachmentChunked).not.toHaveBeenCalled();
+    expect(mockApiFetch).toHaveBeenCalledWith(
+      '/api/v1/media/upload/attachment',
+      expect.objectContaining({ method: 'POST' })
+    );
+  });
+
   it('uploads files and returns IDs', async () => {
     mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
     mockSafeJson.mockResolvedValue({
@@ -497,8 +655,8 @@ describe('useFileUpload', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('test.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('test.png', 1000, 'image/png')]);
     });
 
     let uploadResult: { ids: string[]; summaries: unknown[] } | undefined;
@@ -514,6 +672,54 @@ describe('useFileUpload', () => {
     );
   });
 
+  it("never stamps a removed file's id onto a surviving one", async () => {
+    // uploadPendingFiles iterates a SNAPSHOT and passes the snapshot index into
+    // setFiles(prev => prev.map((f, idx) => idx === i ? ... )), where `prev` is
+    // LIVE state. Remove an earlier file while its upload is in flight and the
+    // completion write lands on whichever file shifted into that index -- which
+    // would send the survivor as an attachment pointing at the removed file's
+    // ciphertext. The window is one small upload today and minutes once uploads
+    // are chunked.
+    let releaseFirst = (): void => {};
+    const firstInFlight = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    let call = 0;
+    mockApiFetch.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) await firstInFlight;
+      return { ok: true, status: 201 };
+    });
+    mockSafeJson.mockImplementation(async () => ({
+      file_id: `attach-${call}`,
+      file_type: 'file',
+      file_size: 1,
+    }));
+
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([
+        createMockFile('doomed.png', 100, 'image/png'),
+        createMockFile('survivor.png', 100, 'image/png'),
+      ]);
+    });
+
+    await act(async () => {
+      const running = result.current.uploadAll('channel-1');
+      result.current.removeFile(0); // pull the in-flight file out from under it
+      releaseFirst();
+      await running;
+    });
+
+    const survivor = result.current.files.find((f) => f.file.name === 'survivor.png');
+    // Assert it carries ITS OWN id, not merely "not the removed file's". A
+    // not-equal assertion passes for any wrong-but-different value, including
+    // ids produced by a positional write that happens to land correctly on the
+    // last pass.
+    expect(survivor?.id).toBe('attach-2');
+    expect(result.current.files).toHaveLength(1);
+  });
+
   it('handles upload errors gracefully', async () => {
     mockApiFetch.mockResolvedValue({
       ok: false,
@@ -523,8 +729,8 @@ describe('useFileUpload', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('test.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('test.png', 1000, 'image/png')]);
     });
 
     await act(async () => {
@@ -546,8 +752,8 @@ describe('useFileUpload', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('secret.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('secret.png', 1000, 'image/png')]);
     });
 
     await act(async () => {
@@ -593,8 +799,8 @@ describe('useFileUpload', () => {
 
     const file = new File([withText], 'gps.png', { type: 'image/png' });
     const { result } = renderHook(() => useFileUpload());
-    act(() => {
-      result.current.addFiles([file]);
+    await act(async () => {
+      await result.current.addFiles([file]);
     });
     await act(async () => {
       await result.current.uploadAll('channel-1');
@@ -631,8 +837,8 @@ describe('useFileUpload', () => {
     const { result } = renderHook(() => useFileUpload());
 
     // Distinct size so raw-vs-ciphertext is unambiguous in the assertion.
-    act(() => {
-      result.current.addFiles([createMockFile('gps.jpg', 4096, 'image/jpeg')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('gps.jpg', 4096, 'image/jpeg')]);
     });
 
     await act(async () => {
@@ -659,8 +865,8 @@ describe('useFileUpload', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('kv.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('kv.png', 1000, 'image/png')]);
     });
 
     await act(async () => {
@@ -681,8 +887,8 @@ describe('useFileUpload', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('dm.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('dm.png', 1000, 'image/png')]);
     });
 
     await act(async () => {
@@ -705,8 +911,8 @@ describe('useFileUpload', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('test.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('test.png', 1000, 'image/png')]);
     });
 
     // First upload
@@ -723,12 +929,12 @@ describe('useFileUpload', () => {
     expect(secondResult?.ids).toContain('attach-first');
   });
 
-  it('revokes preview URLs on clearFiles', () => {
+  it('revokes preview URLs on clearFiles', async () => {
     const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('img.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('img.png', 1000, 'image/png')]);
     });
 
     expect(result.current.files[0].previewUrl).toBeDefined();
@@ -741,12 +947,12 @@ describe('useFileUpload', () => {
     revokeSpy.mockRestore();
   });
 
-  it('revokes preview URL on removeFile', () => {
+  it('revokes preview URL on removeFile', async () => {
     const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('img.png', 1000, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('img.png', 1000, 'image/png')]);
     });
 
     act(() => {
@@ -920,8 +1126,8 @@ describe('useFileUpload — uploadAll with additionalFiles', () => {
 
     const { result } = renderHook(() => useFileUpload());
 
-    act(() => {
-      result.current.addFiles([createMockFile('user.png', 100, 'image/png')]);
+    await act(async () => {
+      await result.current.addFiles([createMockFile('user.png', 100, 'image/png')]);
     });
 
     const overflowFile = createMockFile('overflow.md', 200, 'text/markdown');
@@ -1029,8 +1235,8 @@ describe('useFileUpload — entitlement downgrade after queueing', () => {
     const { result } = renderHook(() => useFileUpload());
 
     // 40 MiB: fine under premium, over the 32 MiB free floor.
-    act(() => {
-      result.current.addFiles([sizedFile('premium.bin', 40 * 1024 * 1024)]);
+    await act(async () => {
+      await result.current.addFiles([sizedFile('premium.bin', 40 * 1024 * 1024)]);
     });
     expect(result.current.files).toHaveLength(1);
 
@@ -1052,5 +1258,654 @@ describe('useFileUpload — entitlement downgrade after queueing', () => {
     expect(mockApiFetch).not.toHaveBeenCalled();
     expect(result.current.files[0].status).toBe('error');
     expect(result.current.files[0].error).toMatch(/exceeds the 32 MB limit/);
+  });
+});
+
+describe("useFileUpload — A10'-a: no whole-file buffering on the chunked path", () => {
+  // STRUCTURAL, not behavioural. The point of the chunked format is that a
+  // 256 MiB attachment is never held in memory whole -- but "we do not call
+  // arrayBuffer()" is invisible to any assertion about the RESULT, because a
+  // handler that buffered and then streamed would produce an identical upload.
+  //
+  // Making File.prototype.arrayBuffer THROW turns the absence of that call into
+  // something a test can see. A non-image is used deliberately: images take the
+  // metadata-strip path, which needs the whole file by construction and is
+  // exactly why they carry their own ceiling.
+  it('never calls File.arrayBuffer for a chunked non-image upload', async () => {
+    const original = File.prototype.arrayBuffer;
+    const calls: string[] = [];
+    File.prototype.arrayBuffer = function (this: File) {
+      calls.push(this.name);
+      throw new Error('arrayBuffer() called — the whole file was buffered');
+    };
+
+    try {
+      setChunkedCapability(true);
+      mockUploadAttachmentChunked.mockResolvedValue({
+        file_id: 'streamed-1',
+        storage_key: 'attachments/x',
+        file_type: 'file',
+        file_size: 4096,
+      });
+
+      const { result } = renderHook(() => useFileUpload());
+      await act(async () => {
+        await result.current.addFiles([
+          createMockFile('big.bin', 4096, 'application/octet-stream'),
+        ]);
+      });
+
+      let out: { ids: string[] } | undefined;
+      await act(async () => {
+        out = await result.current.uploadAll('channel-1');
+      });
+
+      expect(calls).toEqual([]);
+      expect(out?.ids).toContain('streamed-1');
+      expect(result.current.files[0].status).toBe('done');
+    } finally {
+      File.prototype.arrayBuffer = original;
+    }
+  });
+
+  it('POSITIVE CONTROL: the legacy path does buffer, and the stub proves it', async () => {
+    // Without this, the test above cannot tell "we did not buffer" from "the
+    // stub was never installed". A test that can only ever pass is not evidence.
+    const original = File.prototype.arrayBuffer;
+    const calls: string[] = [];
+    File.prototype.arrayBuffer = function (this: File) {
+      calls.push(this.name);
+      throw new Error('arrayBuffer() called');
+    };
+
+    try {
+      setChunkedCapability(false);
+
+      const { result } = renderHook(() => useFileUpload());
+      await act(async () => {
+        await result.current.addFiles([
+          createMockFile('big.bin', 4096, 'application/octet-stream'),
+        ]);
+      });
+      await act(async () => {
+        await result.current.uploadAll('channel-1');
+      });
+
+      expect(calls).toEqual(['big.bin']);
+      expect(result.current.files[0].status).toBe('error');
+    } finally {
+      File.prototype.arrayBuffer = original;
+    }
+  });
+});
+
+describe('useFileUpload — cancel, stall, and unmount', () => {
+  beforeEach(() => {
+    // RTL auto-unmounts each prior hook at cleanup, and every one of those that
+    // left a session open fires the abandon DELETE. Without this the counts
+    // below measure the whole describe block, not the test.
+    mockAbandonSession.mockClear();
+    setChunkedCapability(true);
+  });
+
+  /** Drives the chunked upload up to a chosen chunk, then hands control back so
+   *  the test can act mid-flight. */
+  function pausableUpload() {
+    let release!: () => void;
+    const paused = new Promise<void>((r) => (release = r));
+    let seenSignal: AbortSignal | undefined;
+    let commit!: (i: number, total: number) => void;
+
+    mockUploadAttachmentChunked.mockImplementation(
+      async (
+        _file: File,
+        _key: unknown,
+        _ctx: unknown,
+        signal: AbortSignal,
+        cb: {
+          onChunkCommitted: (i: number, t: number) => void;
+          onSessionOpened?: (id: string) => void;
+        }
+      ) => {
+        seenSignal = signal;
+        commit = cb.onChunkCommitted;
+        cb.onSessionOpened?.('sess-live');
+        await paused;
+        if (signal.aborted) throw new MockUploadAbortedError();
+        return {
+          file_id: 'chunked-ok',
+          storage_key: 'k',
+          file_type: 'file',
+          file_size: 4096,
+        };
+      }
+    );
+    return {
+      release,
+      commitChunk: (i: number, t: number) => commit(i, t),
+      signal: () => seenSignal,
+    };
+  }
+
+  it('a cancelled upload is CANCELLED, not an error', async () => {
+    // A user who pressed stop has not hit a failure. Reporting one as `error`
+    // puts a red row and a retry affordance in front of a deliberate act.
+    const flight = pausableUpload();
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    const id = result.current.files[0].uploadId;
+    await act(async () => {
+      result.current.cancelUpload(id);
+      flight.release();
+      await done;
+    });
+
+    expect(result.current.files[0].status).toBe('cancelled');
+    expect(result.current.files[0].error).toBeUndefined();
+  });
+
+  it('cancel actually aborts the in-flight request', async () => {
+    // A status flip without an abort is a cancel that does not cancel: the
+    // bytes keep uploading behind a row that says they stopped.
+    const flight = pausableUpload();
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    expect(flight.signal()?.aborted).toBe(false);
+    await act(async () => {
+      result.current.cancelUpload(result.current.files[0].uploadId);
+    });
+    expect(flight.signal()?.aborted).toBe(true);
+
+    await act(async () => {
+      flight.release();
+      await done;
+    });
+  });
+
+  it('a cancelled file gets its OWN signal and does not poison the queue', async () => {
+    // Uploads run sequentially, so "per-file" cannot be shown by cancelling an
+    // idle row -- it has no controller registered, so the call is a no-op
+    // whether the signal is per-file or shared, and the test proves nothing.
+    // The property that actually distinguishes the two is that cancelling the
+    // file IN FLIGHT stops that file while the next still completes, on a
+    // signal of its own.
+    let release!: () => void;
+    const paused = new Promise<void>((r) => (release = r));
+    const signals: AbortSignal[] = [];
+
+    mockUploadAttachmentChunked.mockImplementation(
+      async (
+        _f: File,
+        _k: unknown,
+        _c: unknown,
+        signal: AbortSignal,
+        cb: { onSessionOpened?: (id: string) => void; onSessionClosed?: (id: string) => void }
+      ) => {
+        signals.push(signal);
+        const nth = signals.length;
+        cb.onSessionOpened?.(`sess-${nth}`);
+        if (nth === 1) {
+          await paused;
+          if (signal.aborted) throw new MockUploadAbortedError();
+        }
+        cb.onSessionClosed?.(`sess-${nth}`);
+        return { file_id: `file-${nth}`, storage_key: 'k', file_type: 'file', file_size: 4096 };
+      }
+    );
+
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('a.bin', 4096), createMockFile('b.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      result.current.cancelUpload(result.current.files[0].uploadId);
+      release();
+      await done;
+    });
+
+    expect(result.current.files[0].status).toBe('cancelled');
+    expect(result.current.files[1].status).toBe('done');
+    // Distinct controllers, and the survivor's was never aborted.
+    expect(signals[1]).not.toBe(signals[0]);
+    expect(signals[1].aborted).toBe(false);
+  });
+
+  it('reports plaintext bytes the server ACCEPTED, not bytes handed to fetch', async () => {
+    const flight = pausableUpload();
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      flight.commitChunk(0, 4);
+    });
+
+    expect(result.current.files[0].status).toBe('uploading');
+    expect(result.current.files[0].progress).toBe(25);
+    // 4096-byte file, so one 8 MiB chunk covers all of it -- capped at the file
+    // size rather than reporting a chunk that is larger than the file.
+    expect(result.current.files[0].bytesSent).toBe(4096);
+
+    await act(async () => {
+      flight.release();
+      await done;
+    });
+  });
+
+  it('opens as preparing on the chunked path — nothing is committed yet', async () => {
+    const flight = pausableUpload();
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    expect(result.current.files[0].status).toBe('preparing');
+    expect(result.current.files[0].stalled).toBe(false);
+
+    await act(async () => {
+      flight.release();
+      await done;
+    });
+  });
+
+  it('never claims a stall before the first commit — there is no history yet', async () => {
+    // A first chunk that never lands shows as plain progress at 0. Honest, if
+    // unhelpful: with no observed chunk time there is nothing to compare
+    // against, and any threshold would be invented.
+    vi.useFakeTimers();
+    try {
+      const flight = pausableUpload();
+      const { result } = renderHook(() => useFileUpload());
+      await act(async () => {
+        await result.current.addFiles([createMockFile('big.bin', 4096)]);
+      });
+      let done!: Promise<unknown>;
+      await act(async () => {
+        done = result.current.uploadAll('channel-1');
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(600_000);
+      });
+      expect(result.current.files[0].stalled).toBe(false);
+      expect(result.current.files[0].status).toBe('preparing');
+
+      await act(async () => {
+        flight.release();
+        await done;
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('raises the threshold on a slow link instead of firing at the floor', async () => {
+    // 2x median, not a constant. An 8 MiB chunk at 1 Mbps takes ~67 s; firing at
+    // 30 s there would mark every slow-but-healthy upload as stalled.
+    vi.useFakeTimers();
+    try {
+      const flight = pausableUpload();
+      const { result } = renderHook(() => useFileUpload());
+      await act(async () => {
+        await result.current.addFiles([createMockFile('big.bin', 4096)]);
+      });
+      let done!: Promise<unknown>;
+      await act(async () => {
+        done = result.current.uploadAll('channel-1');
+        await Promise.resolve();
+      });
+
+      // A 70 s first chunk. Median is now 70 s, so the threshold is 140 s.
+      await act(async () => {
+        vi.advanceTimersByTime(70_000);
+      });
+      await act(async () => {
+        flight.commitChunk(0, 4);
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(139_999);
+      });
+      expect(result.current.files[0].stalled).toBe(false);
+
+      await act(async () => {
+        vi.advanceTimersByTime(2);
+      });
+      expect(result.current.files[0].stalled).toBe(true);
+
+      await act(async () => {
+        flight.release();
+        await done;
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('goes stalled only after the floor, and clears on the next commit', async () => {
+    // History-derived, with a 30 s floor. One 8 MiB chunk on a 1 Mbps link takes
+    // ~67 s, so a short fixed timer would false-fire on every slow link and
+    // train the user to ignore the signal entirely.
+    vi.useFakeTimers();
+    try {
+      const flight = pausableUpload();
+      const { result } = renderHook(() => useFileUpload());
+      await act(async () => {
+        await result.current.addFiles([createMockFile('big.bin', 4096)]);
+      });
+
+      let done!: Promise<unknown>;
+      await act(async () => {
+        done = result.current.uploadAll('channel-1');
+        await Promise.resolve();
+      });
+
+      // Commit immediately: the gap is ~0, so the threshold falls to the floor.
+      // Idling first would make THAT the median and push the threshold to twice
+      // it -- correct behaviour, but it is not what this test is measuring.
+      await act(async () => {
+        flight.commitChunk(0, 4);
+      });
+      expect(result.current.files[0].stalled).toBe(false);
+
+      await act(async () => {
+        vi.advanceTimersByTime(29_999);
+      });
+      expect(result.current.files[0].stalled).toBe(false);
+
+      await act(async () => {
+        vi.advanceTimersByTime(2);
+      });
+      expect(result.current.files[0].stalled).toBe(true);
+
+      // A commit is proof of life; the row must stop saying otherwise.
+      await act(async () => {
+        flight.commitChunk(1, 4);
+      });
+      expect(result.current.files[0].stalled).toBe(false);
+
+      await act(async () => {
+        flight.release();
+        await done;
+      });
+      expect(result.current.files[0].stalled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts the in-flight upload when its card is REMOVED', async () => {
+    // removeFile dropped the row and revoked its preview URL but never aborted,
+    // so the chunk PUT loop kept running against a session the UI no longer
+    // showed -- burning the user's bandwidth and ingress budget on a file they
+    // just deleted, and leaving the staged bytes to the sweeper's hard TTL.
+    // Harmless before the chunked path existed; there was nothing to strand.
+    const flight = pausableUpload();
+    mockUploadAttachmentChunked.mockClear();
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('doomed.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    // POSITIVE CONTROL: the upload is genuinely in flight and NOT yet aborted,
+    // so the assertion below cannot pass for the wrong reason.
+    expect(flight.signal()).toBeDefined();
+    expect(flight.signal()?.aborted).toBe(false);
+
+    await act(async () => {
+      result.current.removeFile(0);
+    });
+
+    expect(flight.signal()?.aborted).toBe(true);
+
+    await act(async () => {
+      flight.release();
+      await done.catch(() => undefined);
+    });
+  });
+
+  it('does not start the NEXT file after unmount', async () => {
+    // The unmount drain aborts what is in flight, but uploadOnePending CATCHES
+    // an abort and returns null, so the loop used to march on: a fresh
+    // controller nothing would ever abort, and a new server session added to
+    // the Set unmount had just cleared -- a session no client-side path can
+    // abandon, left for the sweeper's hard TTL. The old abortRef looked like it
+    // guarded exactly this, but was only ever assigned false.
+    const flight = pausableUpload();
+    // pausableUpload installs an implementation but keeps the call history this
+    // describe's earlier tests left behind; the counts below are the assertion.
+    mockUploadAttachmentChunked.mockClear();
+    const { result, unmount } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([
+        createMockFile('one.bin', 4096),
+        createMockFile('two.bin', 4096),
+      ]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    // POSITIVE CONTROL: exactly ONE upload is in flight, so "one call" after
+    // unmount means the second never started -- not that neither ever did.
+    expect(mockUploadAttachmentChunked).toHaveBeenCalledTimes(1);
+
+    unmount();
+
+    await act(async () => {
+      flight.release();
+      await done.catch(() => undefined);
+    });
+
+    expect(mockUploadAttachmentChunked).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts an overflow-file upload on unmount, same as any other', async () => {
+    // additionalFiles are not in React state, so they have no card and no
+    // cancel control. They used to hold only a RUN-WIDE controller that nothing
+    // ever aborted, so leaving the composer mid-upload left the request running
+    // and its session staged. They now register in the same per-file map every
+    // other upload uses, which the unmount effect drains.
+    const flight = pausableUpload();
+    const { result, unmount } = renderHook(() => useFileUpload());
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1', undefined, [
+        createMockFile('overflow.md', 4096, 'text/markdown'),
+      ]);
+      await Promise.resolve();
+    });
+
+    // POSITIVE CONTROL: the abort assertion below is vacuous unless the upload
+    // is actually in flight and holding a signal at unmount time.
+    expect(flight.signal()).toBeDefined();
+    expect(flight.signal()?.aborted).toBe(false);
+
+    unmount();
+
+    expect(flight.signal()?.aborted).toBe(true);
+
+    await act(async () => {
+      flight.release();
+      await done.catch(() => undefined);
+    });
+  });
+
+  it('abandons live sessions on unmount so staged bytes are not orphaned', async () => {
+    // Best-effort only: keepalive can still be dropped, which is exactly why the
+    // server-side sweeper is load-bearing for correctness, not defence in depth.
+    const flight = pausableUpload();
+    const { result, unmount } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+
+    unmount();
+
+    expect(mockAbandonSession).toHaveBeenCalledWith('sess-live');
+    expect(flight.signal()?.aborted).toBe(true);
+
+    await act(async () => {
+      flight.release();
+      await done.catch(() => undefined);
+    });
+  });
+
+  it('does not chase a session the server already finished', async () => {
+    // onSessionClosed fires on commit. Without it the unmount DELETEs a spent
+    // id, which is a wasted authenticated request on every successful upload.
+    mockUploadAttachmentChunked.mockImplementation(
+      async (
+        _f: File,
+        _k: unknown,
+        _c: unknown,
+        _s: AbortSignal,
+        cb: { onSessionOpened?: (id: string) => void; onSessionClosed?: (id: string) => void }
+      ) => {
+        cb.onSessionOpened?.('sess-done');
+        cb.onSessionClosed?.('sess-done');
+        return { file_id: 'x', storage_key: 'k', file_type: 'file', file_size: 4096 };
+      }
+    );
+
+    const { result, unmount } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([createMockFile('big.bin', 4096)]);
+    });
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+
+    unmount();
+
+    expect(mockAbandonSession).not.toHaveBeenCalled();
+  });
+});
+
+/** Shared by the legacy and chunked strip tests: a real PNG carrying a tEXt
+ *  chunk with a recognisable payload. Duplicating the construction was how the
+ *  chunked path ended up with no strip coverage at all. */
+const STRIP_MARKER = [0x47, 0x50, 0x53, 0xde, 0xad, 0xbe, 0xef];
+
+function createMockImageWithMetadata(name: string): File {
+  const text = [0x74, 0x45, 0x58, 0x74]; // 'tEXt'
+  const chunk = [0x00, 0x00, 0x00, STRIP_MARKER.length, ...text, ...STRIP_MARKER, 0, 0, 0, 0];
+  const base = Array.from(MINIMAL_PNG);
+  const withText = new Uint8Array([
+    ...base.slice(0, base.length - 12),
+    ...chunk,
+    ...base.slice(base.length - 12),
+  ]);
+  return new File([withText], name, { type: 'image/png' });
+}
+
+function bytesContain(haystack: Uint8Array, needle: number[]): boolean {
+  outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
+    return true;
+  }
+  return false;
+}
+
+describe('useFileUpload — the chunked path strips metadata too', () => {
+  beforeEach(() => {
+    // The chunked mock is module-level and nothing resets it globally, so a
+    // call-count assertion otherwise measures every prior test in the file.
+    // (The analyzer flagged the same latent order-dependency across this suite.)
+    mockUploadAttachmentChunked.mockReset();
+  });
+
+  // CRITICALITY 9. The only strip test asserts on encryptFile's arguments,
+  // which exist ONLY on the legacy path, and every chunked test used a
+  // non-image. mockUploadAttachmentChunked.mock.calls was inspected ZERO times
+  // in this file, so changing `stripToUploadable(entry.file)` to `entry.file`
+  // passed the whole suite -- shipping GPS and EXIF to every recipient over the
+  // path any capability-advertising server selects, unremediable after the fact
+  // because the server never sees plaintext.
+  it('hands uploadAttachmentChunked a STRIPPED file, not the original', async () => {
+    setChunkedCapability(true);
+    mockUploadAttachmentChunked.mockResolvedValue({
+      file_id: 'stripped-1',
+      storage_key: 'attachments/x',
+      file_type: 'photo',
+      file_size: 100,
+    });
+
+    const original = createMockImageWithMetadata('geotagged.png');
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([original]);
+    });
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+
+    expect(mockUploadAttachmentChunked).toHaveBeenCalledTimes(1);
+    const sent = mockUploadAttachmentChunked.mock.calls[0][0] as File;
+
+    // Not the same object, and the marker bytes are gone.
+    expect(sent).not.toBe(original);
+    const bytes = new Uint8Array(await sent.arrayBuffer());
+    expect(bytesContain(bytes, STRIP_MARKER)).toBe(false);
+
+    // Positive control: the marker WAS present before the strip, so a test that
+    // greps for its absence is not asserting against a file that never had it.
+    const before = new Uint8Array(await original.arrayBuffer());
+    expect(bytesContain(before, STRIP_MARKER)).toBe(true);
   });
 });

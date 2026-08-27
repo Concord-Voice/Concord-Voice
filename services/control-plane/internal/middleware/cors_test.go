@@ -46,9 +46,20 @@ func TestCORSAllowedOriginSetsHeaders(t *testing.T) {
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Machine-Id")
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Attestation-Token")
 	assert.Equal(t,
-		middleware.SessionIssuedHeader+", "+middleware.SessionIDHeader+", "+middleware.RateLimitResetHeader+", "+middleware.RetryAfterHeader,
+		middleware.SessionIssuedHeader+", "+middleware.SessionIDHeader+", "+
+			middleware.RateLimitResetHeader+", "+middleware.RetryAfterHeader+", "+
+			middleware.FileMimeTypeHeader+", "+middleware.FileKeyVersionHeader,
 		w.Header().Get("Access-Control-Expose-Headers"),
 	)
+
+	// Named individually as well as in the exact-match above: an attachment's
+	// MIME type and CSK epoch exist ONLY as headers, because the body is
+	// ciphertext. A cross-origin renderer that cannot read the epoch decrypts
+	// with the current key and reports every pre-rotation attachment as
+	// tampering, so dropping either from this list is a silent breakage.
+	exposed := w.Header().Get("Access-Control-Expose-Headers")
+	assert.Contains(t, exposed, middleware.FileMimeTypeHeader)
+	assert.Contains(t, exposed, middleware.FileKeyVersionHeader)
 }
 
 func TestCORSEmptyOriginNoCORSHeaders(t *testing.T) {

@@ -107,3 +107,45 @@ func (m *mockStore) hasObject(key string) bool {
 	_, ok := m.objects[key]
 	return ok
 }
+
+// --- Multipart upload: interface satisfaction only -------------------------
+//
+// The chunked attachment session is exercised against a real MinIO in
+// upload_session_test.go, because its whole contract is "the object store is
+// authoritative" -- an in-memory fake that agrees with the caller by
+// construction would prove nothing about it.
+//
+// These therefore fail loudly rather than returning a zero value: a test that
+// reaches them has strayed onto the multipart path by accident, and should say
+// so instead of quietly succeeding.
+var errMockStoreNoMultipart = errors.New("mockStore: multipart is exercised against real MinIO, not this fake")
+
+func (m *mockStore) NewMultipartUpload(_ context.Context, _, _ string) (string, error) {
+	return "", errMockStoreNoMultipart
+}
+
+func (m *mockStore) PutObjectPart(
+	_ context.Context, _, _ string, _ int, _ io.Reader, _ int64,
+) (storage.ObjectPartInfo, error) {
+	return storage.ObjectPartInfo{}, errMockStoreNoMultipart
+}
+
+func (m *mockStore) ListObjectParts(_ context.Context, _, _ string) ([]storage.ObjectPartInfo, error) {
+	return nil, errMockStoreNoMultipart
+}
+
+func (m *mockStore) CompleteMultipartUpload(
+	_ context.Context, _, _ string, _ []storage.ObjectPartInfo,
+) error {
+	return errMockStoreNoMultipart
+}
+
+func (m *mockStore) AbortMultipartUpload(_ context.Context, _, _ string) error {
+	return errMockStoreNoMultipart
+}
+
+func (m *mockStore) ListIncompleteUploads(
+	_ context.Context, _ time.Time,
+) ([]storage.IncompleteUpload, error) {
+	return nil, errMockStoreNoMultipart
+}

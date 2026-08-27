@@ -19,11 +19,13 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
@@ -64,6 +66,21 @@ type ObjectStore interface {
 	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
 	PresignedGetURL(ctx context.Context, key string, expires time.Duration) (string, error)
 	DeleteObject(ctx context.Context, key string) error
+
+	// Multipart upload, for the chunked attachment format (#2157 PR 2).
+	//
+	// Fail-closed by construction: an incomplete multipart upload is NOT
+	// readable via GetObject, so there is no window in which a partial
+	// attachment can be downloaded. The final object appears atomically at
+	// CompleteMultipartUpload, byte-identical to what the single-shot path
+	// writes -- which is why DownloadAttachment, DeleteMedia and CleanupObject
+	// need no changes at all.
+	NewMultipartUpload(ctx context.Context, key, contentType string) (uploadID string, err error)
+	PutObjectPart(ctx context.Context, key, uploadID string, partNumber int, r io.Reader, size int64) (storage.ObjectPartInfo, error)
+	ListObjectParts(ctx context.Context, key, uploadID string) ([]storage.ObjectPartInfo, error)
+	CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []storage.ObjectPartInfo) error
+	AbortMultipartUpload(ctx context.Context, key, uploadID string) error
+	ListIncompleteUploads(ctx context.Context, olderThan time.Time) ([]storage.IncompleteUpload, error)
 }
 
 // Tier 1 profile image dimension limits (output size after processing).
@@ -122,6 +139,10 @@ type Handler struct {
 	tiers       entitlements.TierResolver
 	serverTiers entitlements.ServerTierResolver
 	opsCounter  interface{ Increment(opsmetrics.MetricKey) }
+	// sessionRedis backs the chunked attachment upload sessions (#2157 PR 2).
+	// Injected via SetSessionRedis rather than NewHandler so the constructor
+	// signature stays put; every session route answers 503 when it is nil.
+	sessionRedis *redis.Client
 }
 
 // SetOpsCounter enables aggregate successful-upload counting.
@@ -219,7 +240,11 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 	// cannot apply here because channel_id arrives IN the multipart body — #1556
 	// wires the composed limit alongside the query-param wire change (spec
 	// 2026-07-03-1522 §S3).
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, ent.MaxAttachmentBytes+4096) // +4KB for multipart headers
+	// Plaintext entitlement + the v1 envelope (IV + tag) + 4 KiB for multipart
+	// headers. The envelope term is not slack: without it this cap sits BELOW the
+	// size a fully-allowed file actually puts on the wire.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body,
+		ent.MaxAttachmentBytes+LegacyEnvelopeOverheadBytes+4096)
 
 	file, header, err := parseAttachmentFile(c, ent.MaxAttachmentBytes)
 	if err != nil {
@@ -234,6 +259,13 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 
 	channelID, conversationID, ok := validateAttachmentContext(c, h, userID)
 	if !ok {
+		return
+	}
+
+	// Same gate as the chunked init. Both paths write media_files.key_version
+	// and the download reflects it back to a viewer's key selection, so a check
+	// on only one of them just moves the exploit to the other.
+	if !h.validateAttestedEpoch(c, channelID, conversationID, keyVersion) {
 		return
 	}
 
@@ -306,10 +338,15 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	var storageKey, mimeType string
 	var fileSize int64
 	var channelID, conversationID *string
+	// NULLable: rows predating the client-attested epoch (#2832) carry none, and
+	// the client correctly falls back to the current key for those.
+	var keyVersion *int
 
-	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id FROM media_files
+	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version
+	          FROM media_files
 	          WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`
-	err := h.db.QueryRow(query, fileID).Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID)
+	err := h.db.QueryRow(query, fileID).
+		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
 		return
@@ -345,7 +382,23 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	_ = contentType // from storage (application/octet-stream)
 	c.Header(headerContentType, mimeOctetStream)
 	c.Header("Content-Length", fmt.Sprintf("%d", fileSize))
-	c.Header("X-File-Mime-Type", mimeType) // original MIME type hint for client-side decryption
+	c.Header(middleware.FileMimeTypeHeader, mimeType) // original MIME type hint for client-side decryption
+	// THE EPOCH THE FILE WAS ENCRYPTED UNDER.
+	//
+	// The upload path has attested this since #2832 and the column has always
+	// held it -- it simply never reached the client, so both decrypt call sites
+	// used getChannelKey (the LATEST epoch). Every revocation rotates the CSK, so
+	// each rotation permanently orphaned every attachment uploaded before it: the
+	// key still existed and was fetchable, the client just never asked for it.
+	// Worse, the failure surfaced as "may be damaged or altered" -- a rotation
+	// reported to the user as tampering.
+	//
+	// A header rather than a change to the message payload: the value is already
+	// on this row, so existing attachments become decryptable again with no
+	// backfill and no change to AttachmentSummary.
+	if keyVersion != nil {
+		c.Header(middleware.FileKeyVersionHeader, strconv.Itoa(*keyVersion))
+	}
 	c.Header(headerCacheControl, "private, no-store")
 	c.Status(http.StatusOK)
 
@@ -1068,7 +1121,17 @@ func parseAttachmentFile(c *gin.Context, maxSize int64) (multipart.File, *multip
 		}
 		return nil, nil, err
 	}
-	if header.Size > maxSize {
+	// header.Size is CIPHERTEXT; maxSize is the PLAINTEXT entitlement. Comparing
+	// them directly is a live defect: a file in the top LegacyEnvelopeOverheadBytes
+	// of a user's allowance passes the client's plaintext check and then 413s here.
+	// Convert first so both sides are in the same unit.
+	//
+	// This route only ever carries the v1 single-shot envelope, whose overhead is
+	// exactly IV + tag. The chunked format goes through the upload-session routes,
+	// which do their own arithmetic — and the server never parses the envelope
+	// header to find out, because that would re-create the trust inversion the
+	// in-band AAD design exists to avoid.
+	if header.Size-LegacyEnvelopeOverheadBytes > maxSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 			"error":    fmt.Sprintf("File exceeds maximum upload size of %d bytes", maxSize),
 			"max_size": maxSize,
@@ -1082,6 +1145,11 @@ func parseAttachmentFile(c *gin.Context, maxSize int64) (multipart.File, *multip
 // errMsgKeyVersionRequired is returned when a tier-2 attachment upload omits or
 // malforms key_version. The epoch must come from the sender (#2843).
 const errMsgKeyVersionRequired = "key_version is required and must be a positive integer"
+
+// errMsgKeyVersionUnknown answers an epoch that has never existed for the
+// context. Distinct from errMsgKeyVersionRequired, which is about the shape of
+// the value rather than whether the server has ever issued it.
+const errMsgKeyVersionUnknown = "key_version names an epoch that does not exist for this context"
 
 func validateAttachmentRequest(c *gin.Context) (fileType FileType, mimeType string, keyVersion int, ok bool) {
 	fileType = FileType(c.PostForm("file_type"))

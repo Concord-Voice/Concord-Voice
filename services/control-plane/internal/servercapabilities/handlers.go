@@ -21,12 +21,33 @@ const (
 // Handler serves GET /api/v1/server/capabilities.
 type Handler struct {
 	cfg *config.Config
+	// Set by the router to mirror the exact condition under which the chunked
+	// upload session routes are registered. See SetChunkedAttachmentUpload.
+	chunkedAttachmentUpload bool
 }
 
 // NewHandler creates a capabilities handler. No logger: the handler is a pure
 // config read with no error paths to log.
 func NewHandler(cfg *config.Config) *Handler {
 	return &Handler{cfg: cfg}
+}
+
+// SetChunkedAttachmentUpload records whether the chunked upload session routes
+// are actually reachable on this deployment. It is a setter rather than a
+// constructor parameter for the same reason SetSessionRedis is: the wiring is
+// known in the router, not in config, and a new parameter would touch every
+// call site to say nothing.
+//
+// The zero value is FALSE, and that is the load-bearing part. This capability
+// is not a description of the build -- the routes are compiled in
+// unconditionally -- it is a description of whether THIS deployment can serve
+// them, and it can fail either of two ways. Without object storage the media
+// handler is nil, the routes are never registered, and the client meets a 404.
+// With storage but no Redis the routes ARE registered and every one of them
+// answers 503. Defaulting to true would advertise both, and the client would
+// take it at its word.
+func (h *Handler) SetChunkedAttachmentUpload(v bool) {
+	h.chunkedAttachmentUpload = v
 }
 
 // ServerInfo identifies the server and its deployment type.
@@ -53,6 +74,11 @@ type FeaturesInfo struct {
 	MaxMembersPerServer      int    `json:"maxMembersPerServer"`
 	EntitlementMode          string `json:"entitlementMode"`
 	ActivityHistorySupported *bool  `json:"activityHistorySupported,omitempty"`
+	// Whether the chunked attachment upload session (#2157 PR 2) is reachable.
+	// NOT omitempty: an explicit false is the useful answer for a deployment
+	// without object storage, and a client that fails closed on a missing field
+	// should never have to guess which of the two it is looking at.
+	ChunkedAttachmentUpload bool `json:"chunkedAttachmentUpload"`
 }
 
 // Response is the payload for GET /api/v1/server/capabilities. The schema is
@@ -120,6 +146,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			MaxMembersPerServer:      maxMembersPerServer,
 			EntitlementMode:          entitlementMode,
 			ActivityHistorySupported: activityHistorySupported(h.cfg),
+			ChunkedAttachmentUpload:  h.chunkedAttachmentUpload,
 		},
 		PolicyVersion: policyVersion,
 	}

@@ -2,7 +2,14 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Download, FileText, Film, Music, File, Loader2, Maximize2 } from 'lucide-react';
 import { apiFetch } from '../../services/apiClient';
 import { e2eeService } from '../../services/e2eeService';
-import { decryptFile, formatFileSize } from '../../utils/attachmentCrypto';
+import {
+  parseKeyVersionHeader,
+  AttachmentKeyEpochError,
+  decryptAttachmentBlob,
+  UnsupportedAttachmentFormatError,
+  AttachmentIntegrityError,
+} from '../../utils/attachmentChunkedCrypto';
+import { formatFileSize } from '../../utils/attachmentCrypto';
 import {
   AttachmentTooLargeError,
   readBoundedBody,
@@ -39,6 +46,27 @@ const BLOB_CACHE_MAX = 50;
  *  (50 x 256 MiB = ~12.8 GB), because up to BLOB_CACHE_MAX decrypted blobs are
  *  alive simultaneously — the dominant memory term, not the per-file transient. */
 const BLOB_CACHE_MAX_BYTES = 268_435_456;
+
+/** Largest decrypted blob worth RETAINING, as HALF the budget.
+ *
+ *  A single entry at or near the whole budget is pathological: admitting it
+ *  drains every other entry on the way in and then occupies all of it, so one
+ *  large attachment empties the cache for everything else on screen. Capping
+ *  admission at half guarantees two entries can always coexist, so no single
+ *  admission can ever drain the cache. Anything larger is shown but never
+ *  cached -- one re-fetch if the reader scrolls back, against evicting
+ *  everything else exactly once.
+ *
+ *  Chunked uploads make this reachable: before them the upload ceiling held
+ *  attachments to 128 MiB, and a 256 MiB file is now a normal premium upload.
+ *
+ *  A QUARTER was tried first and rejected on evidence. At 64 MiB the existing
+ *  100 MiB eviction fixtures stopped being cached at all, which broke one test
+ *  and — worse — made several neighbours pass VACUOUSLY: "never revokes a url
+ *  while a surface is rendering it" holds trivially when nothing was cached.
+ *  A threshold that converts working tests into vacuous ones is too aggressive
+ *  for this budget, not a reason to rewrite the tests. */
+export const BLOB_CACHE_RETAIN_MAX_BYTES = Math.floor(BLOB_CACHE_MAX_BYTES / 2);
 
 interface CachedBlob {
   readonly url: string;
@@ -77,8 +105,17 @@ function useRetainedBlobUrl(fileId: string, url: string | null): void {
     liveSurfaces.set(fileId, (liveSurfaces.get(fileId) ?? 0) + 1);
     return () => {
       const remaining = (liveSurfaces.get(fileId) ?? 1) - 1;
-      if (remaining > 0) liveSurfaces.set(fileId, remaining);
-      else liveSurfaces.delete(fileId);
+      if (remaining > 0) {
+        liveSurfaces.set(fileId, remaining);
+        return;
+      }
+      liveSurfaces.delete(fileId);
+      // Nothing in the cache means nothing will ever evict it, and eviction is
+      // the only other revoker. An entry above BLOB_CACHE_RETAIN_MAX_BYTES is
+      // deliberately never cached, so the last surface to let go owns the
+      // revoke -- otherwise declining to cache would trade an eviction storm
+      // for a permanent leak.
+      if (!blobUrlCache.has(fileId)) URL.revokeObjectURL(url);
     };
   }, [fileId, url]);
 }
@@ -121,6 +158,11 @@ export function __resetBlobCacheForTests(): void {
 }
 
 function cacheBlobUrl(fileId: string, url: string, bytes: number): void {
+  // Too large to retain: show it, do not cache it. useRetainedBlobUrl revokes it
+  // when the last surface unmounts -- without that this would leak, because the
+  // cache is otherwise the ONLY thing that ever revokes a url.
+  if (bytes > BLOB_CACHE_RETAIN_MAX_BYTES) return;
+
   const superseded = blobUrlCache.get(fileId);
   if (superseded !== undefined) {
     // Unreachable while loads are coalesced, but it must not leak if it ever
@@ -146,6 +188,42 @@ function cacheBlobUrl(fileId: string, url: string, bytes: number): void {
 /** Loads in progress, keyed by file id. */
 const inFlightLoads = new Map<string, Promise<string>>();
 
+/** Why an attachment could not be shown.
+ *
+ *  A format this build cannot read, bytes that failed authentication, and a
+ *  fault on THIS side are different situations calling for different responses
+ *  from the reader, and collapsing them into "failed to load" tells them
+ *  nothing. Only `generic` offers a retry, because only `generic` covers
+ *  something a retry can change -- a dropped connection, a 5xx. The other three
+ *  are terminal: retrying re-fetches identical bytes through identical code.
+ *
+ *  `client` is the one that is NOT the file's fault. A key the browser refused
+ *  to use, an unavailable algorithm, an epoch header that arrived mangled --
+ *  reporting any of those as damage sends the reader hunting a corrupted file
+ *  over a bug on our side. */
+type AttachmentFailure = null | 'generic' | 'unsupported' | 'integrity' | 'client';
+
+function failureOf(err: unknown): Exclude<AttachmentFailure, null> {
+  if (err instanceof UnsupportedAttachmentFormatError) return 'unsupported';
+  if (err instanceof AttachmentIntegrityError) return 'integrity';
+  if (err instanceof AttachmentKeyEpochError) return 'client';
+  // A WebCrypto rejection that is NOT an authentication failure reaches here
+  // untouched by decryptAttachmentBlob (see isAuthenticationFailure). It is a
+  // fault in our call -- a key without the `decrypt` usage, a missing
+  // algorithm -- and a retry cannot fix it.
+  if (typeof err === 'object' && err !== null && (err as Error).name === 'InvalidAccessError') {
+    return 'client';
+  }
+  return 'generic';
+}
+
+const FAILURE_COPY: Record<Exclude<AttachmentFailure, null>, string> = {
+  generic: 'Failed to load image',
+  unsupported: 'This attachment needs a newer version of Concord to open.',
+  integrity: 'This attachment could not be verified — it may be damaged or altered.',
+  client: 'Concord could not decrypt this attachment on this device.',
+};
+
 async function loadAndCache(
   fileId: string,
   channelId: string,
@@ -163,14 +241,30 @@ async function loadAndCache(
   if (!response.ok) throw new Error(`Failed to fetch attachment (${response.status})`);
 
   const mimeType = response.headers.get('X-File-Mime-Type') || 'application/octet-stream';
-  let data = await readBoundedBody(response, MAX_DECRYPTABLE_ATTACHMENT_BYTES);
+  // SELECT THE KEY BY EPOCH, not "whatever is current".
+  //
+  // Every revocation rotates the CSK, so decrypting with the latest key
+  // permanently orphaned every attachment uploaded before the most recent
+  // rotation -- and reported it as "damaged or altered", i.e. tampering. The
+  // upload has attested this epoch since #2832; it just never reached the
+  // client. Absent header = a row predating the attestation, where the current
+  // key IS the right one.
+  const keyVersion = parseKeyVersionHeader(response.headers.get('X-File-Key-Version'));
+  const data = await readBoundedBody(response, MAX_DECRYPTABLE_ATTACHMENT_BYTES);
 
-  const channelKey = await e2eeService.getChannelKey(channelId);
-  data = await decryptFile(data, channelKey);
+  const channelKey =
+    keyVersion === null
+      ? await e2eeService.getChannelKey(channelId)
+      : await e2eeService.getChannelKeyByVersion(channelId, keyVersion);
+  // Handles BOTH formats. Dispatch is deterministic and decided before any key
+  // is used, so a v2 blob and a legacy one each take exactly one path -- see
+  // classifyEnvelope. A Blob rather than an ArrayBuffer is the point on this
+  // path: chunk plaintexts are appended as separate parts, so no single
+  // contiguous copy of a 256 MiB file is ever built.
+  const blob = await decryptAttachmentBlob(new Uint8Array(data), channelKey, mimeType);
 
-  const blob = new Blob([data], { type: mimeType });
   const url = URL.createObjectURL(blob);
-  cacheBlobUrl(fileId, url, data.byteLength);
+  cacheBlobUrl(fileId, url, blob.size);
   return url;
 }
 
@@ -280,7 +374,7 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const [hovering, setHovering] = useState(false);
   const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(!url);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<AttachmentFailure>(null);
   // Keep this url alive while it is on screen (#2157 review, VULN-002-C):
   // eviction may not revoke a blob a mounted surface is still pointing at.
   useRetainedBlobUrl(attachment.id, url);
@@ -324,7 +418,7 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
       // bytes were never requested, so say so instead of "failed to load".
       if (err instanceof AttachmentTooLargeError)
         setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
-      else setError(true);
+      else setError(failureOf(err));
     } finally {
       setLoading(false);
     }
@@ -389,7 +483,11 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
           <Loader2 size={20} className="spinner" />
         </div>
       )}
-      {error && <div className="attachment-error">Failed to load image</div>}
+      {error !== null && (
+        <div className="attachment-error" role="alert">
+          {FAILURE_COPY[error]}
+        </div>
+      )}
       {tooLarge !== null && (
         <AttachmentTooLargeNotice bytes={tooLarge.bytes} truncated={tooLarge.truncated} />
       )}
@@ -459,7 +557,7 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
 function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
   const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<AttachmentFailure>(null);
   // Keep this url alive while it is on screen (#2157 review, VULN-002-C):
   // eviction may not revoke a blob a mounted surface is still pointing at.
   useRetainedBlobUrl(attachment.id, url);
@@ -472,7 +570,7 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
 
   const load = useCallback(async () => {
     if (url) return;
-    setError(false);
+    setError(null);
     setLoading(true);
     try {
       const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
@@ -480,7 +578,7 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
     } catch (err) {
       if (err instanceof AttachmentTooLargeError)
         setTooLarge({ bytes: err.byteLength, truncated: err.truncated });
-      else setError(true);
+      else setError(failureOf(err));
     } finally {
       setLoading(false);
     }
@@ -506,8 +604,12 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
   const Icon = attachment.file_type === 'video' ? Film : Music;
   const label = attachment.file_type === 'video' ? 'video' : 'audio';
   const sizeLabel = formatFileSize(attachment.file_size);
+  // A format this build cannot read, and bytes that failed authentication, are
+  // TERMINAL: retrying re-fetches the same bytes and fails the same way. Only a
+  // generic failure (a dropped fetch, a transient 5xx) is worth another go.
+  const terminal = error !== null && error !== 'generic';
   let loadTitle = `Load ${label}`;
-  if (error) loadTitle = `Failed to load ${label} — retry`;
+  if (error === 'generic') loadTitle = `Failed to load ${label} — retry`;
   else if (loading) loadTitle = `Loading ${label}…`;
 
   return (
@@ -521,7 +623,12 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
       {tooLarge !== null && (
         <AttachmentTooLargeNotice bytes={tooLarge.bytes} truncated={tooLarge.truncated} />
       )}
-      {!url && tooLarge === null && (
+      {terminal && error !== null && (
+        <div className="attachment-error" role="alert">
+          {FAILURE_COPY[error]}
+        </div>
+      )}
+      {!url && tooLarge === null && !terminal && (
         <button
           className="attachment-load-btn attachment-load-btn-rich"
           onClick={load}

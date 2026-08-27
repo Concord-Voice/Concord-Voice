@@ -3118,6 +3118,7 @@ paths:
                     - e2eeEnforcedEverywhere
                     - maxMembersPerServer
                     - entitlementMode
+                    - chunkedAttachmentUpload
                     properties:
                       voiceTiersSupported:
                         type: boolean
@@ -3130,6 +3131,21 @@ paths:
                         enum:
                         - saas
                         - self-hosted-unlocked
+                      chunkedAttachmentUpload:
+                        type: boolean
+                        description: >-
+                          Whether this DEPLOYMENT can serve the chunked
+                          attachment upload session. Not a property of the build
+                          — the routes are compiled in unconditionally — so it is
+                          true only when object storage and the session Redis are
+                          both configured, which is exactly the condition under
+                          which the routes are registered and answer anything but
+                          503. Always present, never omitted: an old client
+                          failing closed on a missing key and a new server
+                          meaning "no" would otherwise be indistinguishable.
+                          Clients MUST fail closed to the single-shot
+                          /media/upload/attachment path on anything but an
+                          explicit true.
                       activityHistorySupported:
                         type: boolean
                         description: >-
@@ -6866,7 +6882,9 @@ paths:
 
         Requires membership in the owning channel or DM conversation. The body is opaque ciphertext;
 
-        the original MIME type hint is returned in the X-File-Mime-Type header.
+        the original MIME type hint is returned in the X-File-Mime-Type header, and the CSK epoch
+
+        the file was sealed under in X-File-Key-Version.
 
         Rate limit: 60 requests per minute.
 
@@ -6889,6 +6907,21 @@ paths:
               description: Original MIME type hint for client-side decryption
               schema:
                 type: string
+            X-File-Key-Version:
+              description: 'CSK epoch the file was sealed under, as attested by the uploader.
+
+                The client must decrypt with THIS epoch, not the current one: every revocation
+
+                rotates the key, so decrypting with the latest would fail authentication on
+
+                every attachment predating the most recent rotation. Absent only from an older
+
+                control-plane instance mid-rollout, since key_version is NOT NULL for media_tier 2.
+
+                '
+              schema:
+                type: integer
+                minimum: 1
             Cache-Control:
               description: private, no-store
               schema:
@@ -7283,6 +7316,298 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /media/upload/attachment/session:
+    post:
+      tags:
+      - Media
+      summary: Open a chunked E2EE attachment upload session
+      operationId: mediaOpenUploadSession
+      description: 'Opens a multipart upload for an attachment larger than the single-shot path can
+
+        carry. The client then PUTs each chunk and commits.
+
+
+        The server NEVER parses the attachment envelope. It sees opaque ciphertext and a declared
+
+        length, and validates only arithmetic — that the declared byte count matches the chunk
+
+        count and size the client asked for. Chunk framing, nonces, and AAD are the client''s
+
+        alone; the server could not verify them without the key, and pretending otherwise would
+
+        invite a check that fails open.
+
+
+        Availability is advertised by features.chunkedAttachmentUpload on /server/capabilities.
+
+        Clients MUST fail closed to /media/upload/attachment on anything but an explicit true.
+
+
+        Rate limit: 10 per minute, FAIL-CLOSED — this is where the per-user byte budget
+
+        (1 GiB per 10 minutes) and the concurrent-session cap (3) are reserved, and a budget that
+
+        cannot be read cannot be enforced.
+
+        '
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - key_version
+              - file_type
+              - chunk_size
+              - total_chunks
+              - declared_ciphertext_bytes
+              properties:
+                channel_id:
+                  type: string
+                  format: uuid
+                  description: Owning channel (mutually exclusive with conversation_id)
+                conversation_id:
+                  type: string
+                  format: uuid
+                  description: Owning DM conversation (mutually exclusive with channel_id)
+                key_version:
+                  type: integer
+                  minimum: 1
+                  description: E2EE key epoch the attachment was encrypted under. Client-attested.
+                file_type:
+                  type: string
+                  enum:
+                  - photo
+                  - animated
+                  - video
+                  - audio
+                  - file
+                mime_type:
+                  type: string
+                chunk_size:
+                  type: integer
+                  description: Plaintext bytes per chunk. Fixed by the wire format.
+                total_chunks:
+                  type: integer
+                  minimum: 1
+                declared_ciphertext_bytes:
+                  type: integer
+                  format: int64
+                  description: >-
+                    Total ciphertext length the client will upload. Checked against chunk_size and
+                    total_chunks, and against the user''s entitlement ceiling, BEFORE any storage is
+                    allocated.
+      responses:
+        '201':
+          description: Session opened
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id:
+                    type: string
+                    description: >-
+                      Bearer capability for this upload — anyone holding it can write chunks into
+                      the session, so it deserves the same care as a credential. Never logged
+                      server-side.
+                  file_id:
+                    type: string
+                    format: uuid
+                  chunk_size:
+                    type: integer
+                  expires_at:
+                    type: string
+                    format: date-time
+        '400':
+          description: Declared size disagrees with chunk_size x total_chunks, or ambiguous target
+        '403':
+          description: Missing ATTACH_FILES permission on the target channel
+        '413':
+          description: Declared size exceeds the entitlement ceiling
+        '429':
+          description: Rate limit, concurrent-session cap, or byte budget exhausted
+        '502':
+          description: >-
+            The object store refused to start the multipart upload. The byte budget and
+            the concurrency slot are both released before this is returned, so a storage
+            outage does not consume the caller's ingress allowance.
+        '503':
+          description: Session backend unavailable (fail-closed)
+
+  /media/upload/attachment/session/{session_id}/chunk/{index}:
+    put:
+      tags:
+      - Media
+      summary: Upload one chunk of an attachment session
+      operationId: mediaPutUploadChunk
+      description: 'Body is the opaque ciphertext for exactly one chunk. Idempotent per index: re-sending
+
+        an index replaces it, which is what makes commit-time repair possible.
+
+
+        Rate limit: 300 per minute, FAIL-OPEN. Deliberate — a 256 MiB upload is 32 requests over
+
+        many minutes, and failing closed here would let a momentary Redis blip destroy a
+
+        20-minute upload that is 90% done, for no security gain: the session exists, its bytes are
+
+        budgeted, and its ceiling is fixed. Ingress control lives at init instead.
+
+        '
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: index
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 0
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Chunk stored
+        '400':
+          description: Index out of range, or body length disagrees with the declared chunk size
+        '404':
+          description: >-
+            Unknown session, or a session owned by another user. 404 rather than 403 on purpose —
+            403 would confirm the id exists to someone who guessed it.
+        '410':
+          description: Session expired
+        '413':
+          description: >-
+            The declared body length exceeds what the session's arithmetic allows for this index.
+            Checked BEFORE the body is read, so an oversized chunk costs no bandwidth.
+        '429':
+          description: >-
+            The chunk rate limit, or the session's ingress allowance. The allowance bounds TOTAL
+            bytes a session may push at a multiple of what it declared — re-sending an index is
+            supported (it is how repair works) but is not free.
+        '502':
+          description: Object storage error
+        '503':
+          description: >-
+            The session's sliding-TTL refresh could not be written. Fail-closed: continuing
+            would let a session expire under an upload that appeared to be progressing.
+  /media/upload/attachment/session/{session_id}:
+    delete:
+      tags:
+      - Media
+      summary: Cancel an attachment upload session
+      operationId: mediaCancelUploadSession
+      description: 'Aborts the multipart upload and discards staged parts. Best-effort from the client''s
+
+        side: the object-store-derived sweeper is the authority for reclaiming bytes, because every
+
+        client path depends on the session record that a Redis loss destroys.
+
+
+        Rate limit: 60 per minute, fail-open — refusing a cancel strands bytes, which is the
+
+        opposite of what the limiter is for.
+
+        '
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '429':
+          description: Rate limit (fail-open — a refused cancel would strand bytes)
+        '204':
+          description: >-
+            Returned for an owned session, an unknown session id, AND a session belonging to
+            another user — all three are byte-identical. The indistinguishability is the point:
+            any status that separated them would turn this endpoint into an oracle for whether
+            a guessed session id exists. There is no 404 on this path.
+        '503':
+          description: Session state unavailable
+
+  /media/upload/attachment/session/{session_id}/commit:
+    post:
+      tags:
+      - Media
+      summary: Commit a chunked attachment upload
+      operationId: mediaCommitUploadSession
+      description: 'Concatenates the staged parts into the final object. The OBJECT STORE is the authority
+
+        on which parts exist — a 409 names exactly the indices it is missing, so the client re-sends
+
+        only those rather than restarting the upload.
+
+
+        Rate limit: 20 per minute, fail-closed. It is the expensive operation and it is cheap to
+
+        retry, so refusing under uncertainty costs one button press.
+
+        '
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '201':
+          description: Attachment stored. Byte-identical in shape to the single-shot upload response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaAttachmentUploadResponse'
+        '401':
+          description: >-
+            The caller's credential epoch advanced during the upload (#2201). The session is
+            abandoned rather than committed — a long upload must not outlive the credentials
+            that authorised it.
+        '403':
+          description: >-
+            Channel membership was lost between init and commit. Checked at COMMIT, not only
+            at init, because a multi-request upload spans a window in which access can be revoked.
+        '404':
+          description: Unknown session, or a session owned by another user
+        '429':
+          description: Rate limit (fail-closed)
+        '409':
+          description: Parts are missing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  missing:
+                    type: array
+                    items:
+                      type: integer
+                    description: Wire indices the object store does not hold. Re-send exactly these.
+        '410':
+          description: Session expired
+        '502':
+          description: Object storage error
+        '503':
+          description: Session backend unavailable (fail-closed)
+
   /media/upload/avatar:
     post:
       tags:

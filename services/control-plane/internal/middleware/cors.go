@@ -13,6 +13,14 @@ const (
 	RateLimitResetHeader = "X-RateLimit-Reset"
 	// RetryAfterHeader tells browser clients when a rate-limited request can retry.
 	RetryAfterHeader = "Retry-After"
+	// FileMimeTypeHeader carries an attachment's original MIME type. The body is
+	// opaque ciphertext, so this is the only place the real type survives.
+	FileMimeTypeHeader = "X-File-Mime-Type"
+	// FileKeyVersionHeader carries the CSK epoch an attachment was sealed under.
+	// Without it a cross-origin renderer decrypts with the CURRENT key, which
+	// fails authentication on everything older than the last rotation -- and
+	// reports it as tampering.
+	FileKeyVersionHeader = "X-File-Key-Version"
 )
 
 // CORS returns a middleware that handles CORS.
@@ -51,7 +59,12 @@ func setCORSHeaders(c *gin.Context, origin string) {
 	c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
 	c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 	c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Refresh-Token, X-Session-ID, X-Machine-Id, X-Device-Name, X-Request-ID, X-Attestation-Token")
-	c.Writer.Header().Set("Access-Control-Expose-Headers", SessionIssuedHeader+", "+SessionIDHeader+", "+RateLimitResetHeader+", "+RetryAfterHeader)
+	// Both attachment headers are exposed: a cross-origin renderer (the remote
+	// SPA mode) cannot READ a response header that is not on this list, and both
+	// carry metadata that only exists here because the body is ciphertext.
+	c.Writer.Header().Set("Access-Control-Expose-Headers",
+		SessionIssuedHeader+", "+SessionIDHeader+", "+RateLimitResetHeader+", "+
+			RetryAfterHeader+", "+FileMimeTypeHeader+", "+FileKeyVersionHeader)
 	c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	c.Writer.Header().Set("Access-Control-Max-Age", "86400")
 }

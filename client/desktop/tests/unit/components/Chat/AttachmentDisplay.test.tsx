@@ -40,14 +40,41 @@ vi.mock('@/renderer/services/apiClient', () => ({
 
 // Mock e2eeService
 const mockGetChannelKey = vi.fn();
+const mockGetChannelKeyByVersion = vi.fn();
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return true;
     },
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
+    getChannelKeyByVersion: (...args: unknown[]) => mockGetChannelKeyByVersion(...args),
   },
 }));
+
+/** decryptAttachmentBlob is the format-aware entry point the component now uses.
+ *
+ *  Default behaviour mirrors production: dispatch to the (mocked) legacy
+ *  decryptFile and wrap the result in a Blob. The Blob's `size` is shadowed
+ *  with the decrypted byteLength so `bufferOfDeclaredSize` keeps working — the
+ *  cache accounts the DECRYPTED payload, and a real Blob would report the 8
+ *  bytes the fake actually holds rather than the size under test. Real format
+ *  dispatch is covered at the unit level in attachmentChunkedCrypto.test.ts. */
+const mockDecryptAttachmentBlob = vi.fn();
+vi.mock('@/renderer/utils/attachmentChunkedCrypto', async () => {
+  const actual = await vi.importActual<typeof import('@/renderer/utils/attachmentChunkedCrypto')>(
+    '@/renderer/utils/attachmentChunkedCrypto'
+  );
+  return {
+    ...actual,
+    decryptAttachmentBlob: (...args: unknown[]) => mockDecryptAttachmentBlob(...args),
+  };
+});
+
+import { BLOB_CACHE_RETAIN_MAX_BYTES } from '@/renderer/components/Chat/AttachmentDisplay';
+import {
+  UnsupportedAttachmentFormatError,
+  AttachmentIntegrityError,
+} from '@/renderer/utils/attachmentChunkedCrypto';
 
 // Mock decryptFile
 const mockDecryptFile = vi.fn();
@@ -108,6 +135,14 @@ describe('AttachmentDisplay', () => {
     // from an earlier test would silently invalidate them (#2837 review, row 9).
     __resetBlobCacheForTests();
     mockDecryptFile.mockImplementation((data: ArrayBuffer) => Promise.resolve(data));
+    mockDecryptAttachmentBlob.mockImplementation(
+      async (bytes: Uint8Array, key: unknown, mime: string) => {
+        const plain = (await mockDecryptFile(bytes.buffer ?? bytes, key)) as ArrayBuffer;
+        const blob = new Blob([], { type: mime });
+        Object.defineProperty(blob, 'size', { value: plain.byteLength });
+        return blob;
+      }
+    );
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);
   });
 
@@ -707,11 +742,87 @@ function bufferOfDeclaredSize(bytes: number): ArrayBuffer {
   return buf;
 }
 
+describe('AttachmentDisplay typed format failures (#2157 PR 2)', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(64)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    installImmediateIO();
+  });
+
+  const renderFailingWith = async (err: Error) => {
+    mockDecryptAttachmentBlob.mockRejectedValue(err);
+    const { container } = render(
+      <AttachmentDisplay attachments={[photoOf('typed-1', 1024)]} channelId="ch-1" />
+    );
+    await waitFor(() => {
+      expect(container.querySelector('.attachment-error')).toBeInTheDocument();
+    });
+    return container;
+  };
+
+  it('says the build cannot open the format, not that loading failed', async () => {
+    const c = await renderFailingWith(
+      new UnsupportedAttachmentFormatError('unsupported version 3')
+    );
+    const text = c.querySelector('.attachment-error')?.textContent ?? '';
+    expect(text).toMatch(/newer version|cannot open|not supported/i);
+    // Terminal: retrying re-fetches the same bytes and fails the same way, so
+    // nothing may invite the reader to try again. The media surface expresses
+    // retry through the load button's title, which is the affordance to check.
+    const retryish = Array.from(c.querySelectorAll('button')).filter((b) =>
+      /retry/i.test(b.getAttribute('title') ?? b.textContent ?? '')
+    );
+    expect(retryish).toHaveLength(0);
+  });
+
+  it('says integrity could not be verified, which is a DIFFERENT message', async () => {
+    const unsupported = await renderFailingWith(
+      new UnsupportedAttachmentFormatError('unsupported version 3')
+    );
+    const unsupportedText = unsupported.querySelector('.attachment-error')?.textContent ?? '';
+
+    vi.clearAllMocks();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(64)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    const integrity = await renderFailingWith(
+      new AttachmentIntegrityError('attachment chunk 0 of 1 failed authentication')
+    );
+    const integrityText = integrity.querySelector('.attachment-error')?.textContent ?? '';
+
+    expect(integrityText).toMatch(/verif|altered|damaged/i);
+    // The distinction is the point: "this build is too old" and "these bytes
+    // are not what was sent" call for different responses from the reader.
+    expect(integrityText).not.toBe(unsupportedText);
+    const integrityRetry = Array.from(integrity.querySelectorAll('button')).filter((b) =>
+      /retry/i.test(b.getAttribute('title') ?? b.textContent ?? '')
+    );
+    expect(integrityRetry).toHaveLength(0);
+  });
+});
+
 describe('AttachmentDisplay download size guard (#2157)', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
     mockDecryptFile.mockImplementation((data: ArrayBuffer) => Promise.resolve(data));
+    mockDecryptAttachmentBlob.mockImplementation(
+      async (bytes: Uint8Array, key: unknown, mime: string) => {
+        const plain = (await mockDecryptFile(bytes.buffer ?? bytes, key)) as ArrayBuffer;
+        const blob = new Blob([], { type: mime });
+        Object.defineProperty(blob, 'size', { value: plain.byteLength });
+        return blob;
+      }
+    );
     mockGetChannelKey.mockResolvedValue({} as CryptoKey);
   });
 
@@ -877,6 +988,53 @@ describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
     }
     return urls;
   }
+
+  it('does not let one huge attachment evict the whole cache', async () => {
+    // A 256 MiB entry equals the entire budget, so admitting it drained
+    // everything else and then occupied all of it. Blobs above the retain
+    // threshold are no longer cached at all.
+    await loadPhotos([1024, 1024], 'huge-pre');
+    // Measure the DELTA rather than the absolute set: blobUrlCache and
+    // cachedBytes are module-level and persist across every test in this file,
+    // so an absolute assertion would be reading other tests' leftovers.
+    const before = revoked.length;
+
+    const [huge] = await loadPhotos([BLOB_CACHE_RETAIN_MAX_BYTES + 1], 'huge-main');
+
+    // Admitting it must cost NO collateral eviction — that is the whole point.
+    expect(revoked.filter((u) => u !== huge)).toHaveLength(before);
+    // And it revokes itself on unmount rather than being retained.
+    expect(revoked).toContain(huge);
+  });
+
+  it('revokes an uncached huge url when its last surface unmounts', async () => {
+    // The cache is the only revoker, so declining to cache something would leak
+    // it forever unless the retention hook takes over. This is that path.
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      headers: new Headers({ 'X-File-Mime-Type': 'image/png' }),
+    });
+    mockDecryptFile.mockResolvedValue(bufferOfDeclaredSize(BLOB_CACHE_RETAIN_MAX_BYTES + 1));
+    installImmediateIO();
+
+    const { container, unmount } = render(
+      <AttachmentDisplay
+        attachments={[photoOf('leak-1', BLOB_CACHE_RETAIN_MAX_BYTES + 1)]}
+        channelId="ch-1"
+      />
+    );
+    const img = await waitFor(() => {
+      const node = container.querySelector('img.attachment-image');
+      expect(node).toBeInTheDocument();
+      return node as HTMLImageElement;
+    });
+    const url = img.getAttribute('src') ?? '';
+    expect(revoked).not.toContain(url); // still on screen
+
+    unmount();
+    expect(revoked).toContain(url);
+  });
 
   it('evicts oldest-first once the byte budget is exceeded and revokes the evicted url', async () => {
     // Three 100 MiB entries against a 256 MiB budget: admitting the third
@@ -1124,5 +1282,103 @@ describe('AttachmentDisplay blob cache byte budget (#2157 A1)', () => {
 
     expect(revoked).toContain(urls[0]);
     expect(revoked).not.toContain(urls[59]);
+  });
+});
+
+describe('AttachmentDisplay decrypts under the epoch the file was sealed with', () => {
+  // Every mandatory revocation rotates the CSK. Decrypting with the LATEST key
+  // permanently orphaned every attachment sealed before the most recent
+  // rotation -- the key still existed and was fetchable, the client just never
+  // asked for it. Worse, the failure surfaced as "may be damaged or altered":
+  // a routine rotation reported to the user as tampering.
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockGetChannelKeyByVersion.mockResolvedValue({} as CryptoKey);
+    mockDecryptAttachmentBlob.mockResolvedValue(new Blob([new Uint8Array(8)]));
+    installImmediateIO();
+  });
+
+  /** Renders one photo whose download carries `keyVersionHeader`, and waits
+   *  until the component has resolved SOME channel key -- the assertion under
+   *  test is always which of the two it asked for.
+   *
+   *  The id must be unique per call: decrypted blobs are cached module-wide by
+   *  attachment id, so a repeated id is served from cache and never downloads
+   *  (which reads as "the key was never fetched" rather than as a cache hit). */
+  let epochCaseId = 0;
+  const renderWithEpochHeader = async (
+    keyVersionHeader: string | null,
+    opts: { expectError?: boolean } = {}
+  ) => {
+    epochCaseId += 1;
+    const headers = new Headers({ 'X-File-Mime-Type': 'image/png' });
+    if (keyVersionHeader !== null) headers.set('X-File-Key-Version', keyVersionHeader);
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(64)),
+      headers,
+    });
+    const { container } = render(
+      <AttachmentDisplay attachments={[photoOf(`epoch-${epochCaseId}`, 1024)]} channelId="ch-1" />
+    );
+    if (opts.expectError) {
+      await waitFor(() => {
+        expect(container.querySelector('.attachment-error')).toBeInTheDocument();
+      });
+    } else {
+      await waitFor(() => {
+        expect(
+          mockGetChannelKey.mock.calls.length + mockGetChannelKeyByVersion.mock.calls.length
+        ).toBeGreaterThan(0);
+      });
+    }
+    return { container };
+  };
+
+  it('asks for the epoch named by X-File-Key-Version', async () => {
+    await renderWithEpochHeader('7');
+
+    expect(mockGetChannelKeyByVersion).toHaveBeenCalledWith('ch-1', 7);
+    expect(mockGetChannelKey).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the current key when no epoch is on record', async () => {
+    // Rows predating the client-attested epoch carry a NULL key_version, and
+    // for those the current key IS the right one.
+    await renderWithEpochHeader(null);
+
+    expect(mockGetChannelKey).toHaveBeenCalledWith('ch-1');
+    expect(mockGetChannelKeyByVersion).not.toHaveBeenCalled();
+  });
+
+  // No leading-space case here: Headers.set trims per spec, so " 7" arrives as
+  // "7". attachmentChunkedCrypto.test.ts covers it against the parser directly.
+  it.each(['0', '-1', 'abc', '1.5', '', '1e3'])(
+    'refuses to guess a key for the mangled epoch %j',
+    async (raw) => {
+      // NOT a fallback to the current key. Falling back would decrypt with the
+      // WRONG CSK, fail GCM, and be reported as tampering -- the exact
+      // misdiagnosis this change exists to remove. A mangled header is a
+      // transport fault, so it says so and fetches no key at all.
+      await renderWithEpochHeader(raw, { expectError: true });
+
+      expect(mockGetChannelKey).not.toHaveBeenCalled();
+      expect(mockGetChannelKeyByVersion).not.toHaveBeenCalled();
+    }
+  );
+
+  it('calls a mangled epoch a THIS-DEVICE fault, not a damaged file', async () => {
+    const { container } = await renderWithEpochHeader('abc', { expectError: true });
+    const text = container.querySelector('.attachment-error')?.textContent ?? '';
+
+    expect(text).not.toMatch(/damaged|altered|verified/i);
+    expect(text).toMatch(/could not decrypt|this device/i);
+    // Terminal: retrying re-fetches the same mangled header.
+    const retryish = Array.from(container.querySelectorAll('button')).filter((b) =>
+      /retry/i.test(b.getAttribute('title') ?? b.textContent ?? '')
+    );
+    expect(retryish).toHaveLength(0);
   });
 });

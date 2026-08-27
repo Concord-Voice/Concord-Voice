@@ -707,7 +707,9 @@ describe('MessageInput cap reduction + overflow', () => {
     uploadMockOverrides.hasFiles = false;
     uploadMockOverrides.isUploading = false;
     uploadMockOverrides.files = [];
-    mockAddFiles.mockReturnValue(null);
+    // Resolves a real partition shape: addFiles never returns null, and a mock
+    // that does hides a destructuring crash rather than exposing one.
+    mockAddFiles.mockResolvedValue({ accepted: 0, rejections: [] });
     mockUploadAll.mockResolvedValue({ ids: [], summaries: [] });
   });
 

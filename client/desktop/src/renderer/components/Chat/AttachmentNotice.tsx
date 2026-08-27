@@ -3,7 +3,11 @@ import { AlertTriangle, Clock } from 'lucide-react';
 import PremiumChip from '../common/PremiumChip';
 import { useGateActivation } from '../../hooks/useGateActivation';
 import { formatFileSize, MAX_ATTACHMENTS } from '../../utils/attachmentCrypto';
-import { formatLimitBytes, PREMIUM_ATTACHMENT_BYTES } from '../../utils/entitlementLimits';
+import {
+  formatLimitBytes,
+  PREMIUM_ATTACHMENT_BYTES,
+  IMAGE_STRIP_MAX_BYTES,
+} from '../../utils/entitlementLimits';
 import type { AttachmentRejection } from '../../hooks/useFileUpload';
 import './AttachmentNotice.css';
 
@@ -50,15 +54,69 @@ function describeRejection(r: AttachmentRejection, tier: string): NoticeCopy {
 
   const size = formatFileSize(r.fileSize ?? 0);
 
-  // The client-capability gap: the user's PLAN allows more than this build can
-  // encrypt. NOT a plan gate — so no upsell and no lock glyph. Telling someone
-  // to upgrade for something they already bought is worse than saying nothing.
-  if (r.limit.source === 'client-ceiling') {
+  // The image ceiling. NOT a plan gate and not a server-version gate: metadata
+  // stripping needs the whole image in hand, so this is the one path where a
+  // whole-file transient survives the chunked format. Clock, not Lock, and no
+  // upsell — no plan or server upgrade moves it, and the same size of NON-image
+  // uploads fine, which the copy says so the refusal does not read as arbitrary.
+  if (r.kind === 'image-too-large') {
+    return {
+      text:
+        `${r.fileName} is ${size}. Images are limited to ` +
+        `${formatLimitBytes(IMAGE_STRIP_MAX_BYTES)} because Concord removes their ` +
+        `location and camera data before sending, which needs the whole image at once. ` +
+        `Other file types this size are fine.`,
+      severity: 'limitation',
+    };
+  }
+
+  // A SERVER-version gap: the user's PLAN allows more than the connected control
+  // plane can accept, because it predates the chunked upload session. NOT a plan
+  // gate — so no upsell and no lock glyph. Telling someone to upgrade for
+  // something they already bought is worse than saying nothing, and here it
+  // would also be a lie: no plan change can move a server-version limit.
+  //
+  // The copy names the SERVER, not the build. PR 1's wording said "this version
+  // of Concord", which described the client — but this branch now fires only
+  // when the client is the NEW side and the server is behind. "Support is
+  // coming" was likewise wrong: it has arrived, on the other end.
+  // The capability could not be FETCHED. Same clamp, entirely different cause --
+  // and the old copy blamed the server's release version for what is a network
+  // blip, or (worse, via the generic branch) implied the user's own plan was the
+  // limit. Neither is true and neither suggests the thing that actually helps.
+  if (r.limit.source === 'capability-unknown') {
+    return {
+      text:
+        `${r.fileName} is ${size}. Concord can't reach the server right now, so ` +
+        `attachments are limited to ${formatLimitBytes(r.limit.limitBytes)} until it ` +
+        `responds. Your plan allows ${formatLimitBytes(r.limit.entitlementBytes)} — ` +
+        `try again in a moment.`,
+      severity: 'limitation',
+    };
+  }
+
+  // The clamp is THIS BUILD's, not the server's and not the plan's. The server
+  // would accept the file; no desktop client could then open it, this one
+  // included. Saying "your plan allows more" without saying who is refusing
+  // would send the user to support over a limit nobody there can lift.
+  if (r.limit.source === 'decryptable-ceiling') {
+    return {
+      text:
+        `${r.fileName} is ${size}. This server allows more, but Concord on ` +
+        `desktop can only open attachments up to ` +
+        `${formatLimitBytes(r.limit.limitBytes)} — a larger one would upload and ` +
+        `then fail to open, for everyone.`,
+      severity: 'limitation',
+    };
+  }
+
+  if (r.limit.source === 'legacy-upload-path') {
     return {
       text:
         `${r.fileName} is ${size}. Your plan allows ` +
-        `${formatLimitBytes(r.limit.entitlementBytes)}, but this version of Concord can send ` +
-        `files up to ${formatLimitBytes(r.limit.limitBytes)}. Support for larger files is coming.`,
+        `${formatLimitBytes(r.limit.entitlementBytes)}, but this server accepts files up to ` +
+        `${formatLimitBytes(r.limit.limitBytes)}. Larger files need a server running a newer ` +
+        `Concord release.`,
       severity: 'limitation',
     };
   }

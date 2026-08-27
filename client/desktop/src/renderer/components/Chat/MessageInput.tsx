@@ -196,6 +196,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
     files: uploadFiles,
     addFiles,
     removeFile,
+    cancelUpload,
     clearFiles,
     uploadAll,
     isUploading,
@@ -697,11 +698,29 @@ const MessageInput: React.FC<MessageInputProps> = ({
    * number shown are the same number by construction.
    */
   const handleIncomingFiles = (incoming: FileList | File[]): void => {
-    const { accepted, rejections: refused } = addFiles(incoming);
-    setRejections(refused);
-    setAcceptedCount(accepted);
+    // Async since #2157 PR 2: validation reads each file's leading bytes to
+    // decide whether the image ceiling applies, because that depends on what a
+    // file IS rather than what it claims to be. The selection count is set
+    // synchronously so the notice region never renders a stale total while the
+    // sniff is in flight; the partition lands a tick later.
     setSelectionCount(Array.from(incoming).length);
     setUploadError(null);
+    void addFiles(incoming)
+      .then(({ accepted, rejections: refused }) => {
+        setRejections(refused);
+        setAcceptedCount(accepted);
+      })
+      .catch(() => {
+        // addFiles reads file bytes now (validateFiles sniffs the first 64 KiB),
+        // and that read REJECTS when the underlying file is gone -- moved or
+        // renamed between the picker closing and the read. Without a handler the
+        // runtime reports an unhandled rejection and, worse, the composer shows
+        // NOTHING: selectionCount is already set but rejections stays empty, so
+        // the notice renders an empty region and the whole selection vanishes
+        // with no feedback. Reset the count and say so.
+        setSelectionCount(0);
+        setUploadError('Those files could not be read. They may have been moved or renamed.');
+      });
   };
 
   const dismissNotice = (): void => {
@@ -932,7 +951,13 @@ const MessageInput: React.FC<MessageInputProps> = ({
               <UserPanel compact />
             </div>
           )}
-          {hasFiles && <AttachmentUploadPreview files={uploadFiles} onRemove={handleRemoveFile} />}
+          {hasFiles && (
+            <AttachmentUploadPreview
+              files={uploadFiles}
+              onRemove={handleRemoveFile}
+              onCancel={cancelUpload}
+            />
+          )}
           {/* Post-queue transport/encrypt failures only. Pre-queue rejections
               live in AttachmentNotice's polite region, so the two never compete. */}
           {uploadError && (

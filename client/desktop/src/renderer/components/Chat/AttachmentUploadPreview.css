@@ -23,19 +23,49 @@
   border-color: var(--error-color);
 }
 
-.attachment-preview-item.uploading {
+/* The dim used to sit on the whole card, which put 0.7 opacity over live
+   tertiary-on-secondary byte text -- text that already sits near the AA floor
+   at full strength. It now applies to the thumbnail only, which carries no
+   text and no contrast obligation. */
+.attachment-preview-item.uploading .attachment-preview-thumbnail,
+.attachment-preview-item.preparing .attachment-preview-thumbnail,
+.attachment-preview-item.uploading .attachment-preview-icon,
+.attachment-preview-item.preparing .attachment-preview-icon {
   opacity: 0.7;
+}
+
+.attachment-preview-item.cancelled {
+  border-color: var(--border-color);
+  opacity: 0.75;
 }
 
 .attachment-remove-btn {
   position: absolute;
-  top: 4px;
-  right: 4px;
+  /* 24x24 pointer target (WCAG 2.1 AA 2.5.8) without changing the 20 px visual.
+     With box-sizing: content-box the declared 20 px is the CONTENT box, so the
+     2 px transparent border grows the hit area to 24x24 while background-clip
+     keeps the painted pill at 20 px. Growing the button itself would have
+     re-laid-out the card.
+
+     DECLARATION ORDER IS LOAD-BEARING HERE, and the first attempt got it wrong
+     in two ways that CSS reports silently:
+       - `border: 2px solid transparent` was followed by `border: none`, so the
+         ring never existed and the target stayed 20x20;
+       - `background-clip` came BEFORE a `background` shorthand, which resets it
+         to border-box.
+     The longhand `background-color` is used deliberately -- it cannot reset
+     background-clip, so a later colour change (see :hover) is safe. No test
+     caught either: jsdom has no layout engine, so nothing here can measure a
+     rendered hit area. */
+  top: 2px;
+  right: 2px;
   width: 20px;
   height: 20px;
+  box-sizing: content-box;
+  border: 2px solid transparent;
   border-radius: 50%;
-  background: var(--bg-tertiary);
-  border: none;
+  background-color: var(--bg-tertiary);
+  background-clip: padding-box;
   color: var(--text-secondary);
   cursor: pointer;
   display: flex;
@@ -46,8 +76,16 @@
 }
 
 .attachment-remove-btn:hover {
-  background: var(--error-color);
+  /* Longhand, not the `background` shorthand: the shorthand would reset
+     background-clip to border-box and paint the hover colour across the
+     transparent hit-area ring, making the target look 24 px on hover only. */
+  background-color: var(--error-color);
   color: white;
+}
+
+.attachment-remove-btn:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
 }
 
 .attachment-preview-thumbnail {
@@ -87,20 +125,104 @@
   color: var(--text-tertiary);
 }
 
-.attachment-progress-bar {
-  width: 100%;
-  height: 3px;
-  background: var(--bg-tertiary);
-  border-radius: 2px;
-  margin-top: 4px;
-  overflow: hidden;
+/* MEASURED, not assumed. --text-tertiary on --bg-secondary ranges 1.70:1
+   (Eclipse Dark) to 4.43:1 across the 33 theme blocks -- it fails WCAG 1.4.3 in
+   every one of them, and at 10px there is no large-text exemption to fall back
+   on. That pairing is preexisting and stays put for the STATIC file size, which
+   is supplementary to the filename beside it.
+
+   It does not stay put for live progress. This element now carries upload state
+   -- byte counts, "Preparing...", "Still uploading..." -- which is the only
+   place that information appears as text, so it has to be readable.
+   --text-secondary measures 4.77:1 at worst across the same 33 blocks and
+   passes. Scoping the change to the live states fixes what this PR made
+   consequential without touching a single theme token. */
+.attachment-preview-item.uploading .attachment-preview-size,
+.attachment-preview-item.preparing .attachment-preview-size {
+  color: var(--text-secondary);
 }
 
-.attachment-progress-fill {
-  height: 100%;
-  background: var(--accent-color);
+/* Native <progress>. Chromium-only styling is fine here: this renders in
+   Electron, so ::-webkit-progress-* is the only engine that matters. */
+.attachment-progress-bar {
+  display: block;
+  width: 100%;
+  height: 3px;
+  margin-top: 4px;
+  border: none;
   border-radius: 2px;
-  transition: width 0.2s ease;
+  overflow: hidden;
+  appearance: none;
+  /* Fallback colour for the indeterminate state, where no ::-webkit-progress-value
+     box exists to paint. */
+  background-color: var(--bg-tertiary);
+}
+
+.attachment-progress-bar::-webkit-progress-bar {
+  background-color: var(--bg-tertiary);
+  border-radius: 2px;
+}
+
+.attachment-progress-bar::-webkit-progress-value {
+  background-color: var(--accent-color);
+  border-radius: 2px;
+  /* 600ms, not 200ms. Progress advances exactly 1/totalChunks per commit, so at
+     32 chunks each step is a 3.1% jump; a short transition reads as a stutter,
+     a long one reads as motion. This does NOT interpolate the value -- the
+     reported number changes only on commit. */
+  transition: width 600ms ease;
+}
+
+/* Indeterminate: preparing, or stalled. Chromium paints NO ::-webkit-progress-value
+   box when `value` is absent, so the sweep is drawn on the bar itself via a
+   gradient rather than on a child element. This is the one case where movement
+   is not a claim about progress. */
+.attachment-progress-bar:indeterminate::-webkit-progress-bar {
+  background-image: linear-gradient(
+    90deg,
+    var(--bg-tertiary) 0%,
+    var(--accent-color) 50%,
+    var(--bg-tertiary) 100%
+  );
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: attachment-progress-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes attachment-progress-sweep {
+  0% {
+    background-position: -60% 0;
+  }
+  100% {
+    background-position: 160% 0;
+  }
+}
+
+/* CSS-only, per the per-stylesheet convention in this codebase. A JS hook would
+   add a second source of truth for a preference the platform already exposes. */
+@media (prefers-reduced-motion: reduce) {
+  .attachment-progress-bar::-webkit-progress-value {
+    transition: none;
+  }
+
+  .attachment-progress-bar:indeterminate::-webkit-progress-bar {
+    animation: none;
+    /* Still visibly distinct from a determinate bar, without motion. */
+    background-image: none;
+    background-color: var(--accent-color);
+    opacity: 0.5;
+  }
+}
+
+/* --text-secondary, matching the live-progress fix above. "Cancelled" is the
+   SOLE textual indicator that a row is in a terminal user-caused state, and
+   --text-tertiary measures 1.70:1 in the darkest scheme -- the same failure the
+   comment at the top of this file documents. I wrote that reasoning and then
+   added this label using the token it condemns. */
+.attachment-cancelled-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin-top: 2px;
 }
 
 .attachment-error-label {

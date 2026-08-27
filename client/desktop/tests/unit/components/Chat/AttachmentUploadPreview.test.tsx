@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '../../../test-utils';
+import { render, screen, fireEvent } from '../../../test-utils';
 import AttachmentUploadPreview from '@/renderer/components/Chat/AttachmentUploadPreview';
 import type { FileUploadState } from '@/renderer/hooks/useFileUpload';
 
@@ -11,7 +11,7 @@ function createFileEntry(
   previewUrl?: string
 ): FileUploadState {
   const file = new File([new ArrayBuffer(size)], name, { type });
-  return { file, progress: 0, status, previewUrl };
+  return { file, uploadId: `up-${name}`, progress: 0, status, previewUrl };
 }
 
 describe('AttachmentUploadPreview', () => {
@@ -87,11 +87,13 @@ describe('AttachmentUploadPreview', () => {
       },
     ];
 
-    const { container } = render(<AttachmentUploadPreview files={files} onRemove={vi.fn()} />);
+    render(<AttachmentUploadPreview files={files} onRemove={vi.fn()} />);
 
-    const progressFill = container.querySelector('.attachment-progress-fill');
-    expect(progressFill).toBeInTheDocument();
-    expect(progressFill).toHaveStyle({ width: '50%' });
+    // Native <progress> carries the value itself; there is no fill div to
+    // inspect, and the percentage lives on the element rather than in a style.
+    const bar = screen.getByRole('progressbar');
+    expect(bar.tagName).toBe('PROGRESS');
+    expect(bar).toHaveValue(50);
   });
 
   it('shows error label when upload fails', () => {
@@ -119,5 +121,107 @@ describe('AttachmentUploadPreview', () => {
 
     const item = container.querySelector('.attachment-preview-item');
     expect(item).toHaveClass('error');
+  });
+});
+
+describe('AttachmentUploadPreview — progress, cancel, and accessibility', () => {
+  it('exposes the bar as a progressbar with the committed value', () => {
+    const entry = {
+      ...createFileEntry('big.bin', 100, 'application/octet-stream', 'uploading'),
+      progress: 25,
+      bytesSent: 2_097_152,
+    };
+    Object.defineProperty(entry.file, 'size', { value: 8_388_608 });
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={vi.fn()} />);
+
+    const bar = screen.getByRole('progressbar');
+    // A native <progress>, not a div wearing the role: the element supplies
+    // min/max/now semantics itself, so there are no aria-value* attributes to
+    // keep in sync with the rendered state.
+    expect(bar.tagName).toBe('PROGRESS');
+    expect(bar).toHaveValue(25);
+    expect(bar).toHaveAttribute('max', '100');
+    expect(bar).toHaveAttribute('aria-valuetext', '2.0 MB / 8.0 MB');
+  });
+
+  it('OMITS aria-valuenow while preparing — an unknown value must not read as a real one', () => {
+    const entry = createFileEntry('big.bin', 100, 'application/octet-stream', 'preparing');
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={vi.fn()} />);
+
+    const bar = screen.getByRole('progressbar');
+    // OMITTING `value` is how HTML spells indeterminate. The platform enforces
+    // it -- :indeterminate matches -- where the previous div had to remember to
+    // drop aria-valuenow. A stale number would make a frozen upload read live.
+    expect(bar).not.toHaveAttribute('value');
+    expect(bar.matches(':indeterminate')).toBe(true);
+    expect(screen.getByText('Preparing…')).toBeInTheDocument();
+  });
+
+  it('goes indeterminate when stalled and names no cause', () => {
+    const entry = {
+      ...createFileEntry('big.bin', 100, 'application/octet-stream', 'uploading'),
+      progress: 40,
+      bytesSent: 1024,
+      stalled: true,
+    };
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={vi.fn()} />);
+
+    const bar = screen.getByRole('progressbar');
+    expect(bar).not.toHaveAttribute('value');
+    expect(bar.matches(':indeterminate')).toBe(true);
+    expect(screen.getByText('Still uploading…')).toBeInTheDocument();
+    // A stall cannot distinguish a slow chunk from a token refresh from a dead
+    // link, so it must not claim any of them.
+    expect(screen.queryByText(/reconnect|offline|network|connection/i)).toBeNull();
+  });
+
+  it('cancels an in-flight upload instead of removing the row', () => {
+    const onRemove = vi.fn();
+    const onCancel = vi.fn();
+    const entry = createFileEntry('big.bin', 100, 'application/octet-stream', 'uploading');
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={onRemove} onCancel={onCancel} />);
+
+    const btn = screen.getByLabelText('Cancel upload of big.bin');
+    fireEvent.click(btn);
+
+    expect(onCancel).toHaveBeenCalledWith('up-big.bin');
+    expect(onRemove).not.toHaveBeenCalled();
+  });
+
+  it('removes — not cancels — a row that is not live', () => {
+    const onRemove = vi.fn();
+    const onCancel = vi.fn();
+    const entry = createFileEntry('done.bin', 100, 'application/octet-stream', 'done');
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={onRemove} onCancel={onCancel} />);
+
+    fireEvent.click(screen.getByLabelText('Remove done.bin'));
+
+    expect(onRemove).toHaveBeenCalledWith(0);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it('shows a cancelled row as cancelled, not as an error', () => {
+    const entry = createFileEntry('gone.bin', 100, 'application/octet-stream', 'cancelled');
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={vi.fn()} />);
+
+    expect(screen.getByText('Cancelled')).toBeInTheDocument();
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    // A user who pressed stop has not hit a failure.
+    expect(screen.queryByText(/failed/i)).toBeNull();
+  });
+
+  it('renders no progressbar at all for a queued file', () => {
+    const entry = createFileEntry('queued.bin', 2048, 'application/octet-stream', 'pending');
+
+    render(<AttachmentUploadPreview files={[entry]} onRemove={vi.fn()} />);
+
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    expect(screen.getByText('2.0 KB')).toBeInTheDocument();
   });
 });

@@ -27,7 +27,7 @@ vi.mock('@/renderer/utils/attachmentCrypto', async () => {
 });
 
 const freeLimit = resolveAttachmentLimit({ userMaxAttachmentBytes: FREE_ATTACHMENT_BYTES });
-/** Premium is clamped by the interim ceiling, so source === 'client-ceiling'. */
+/** Premium clamped by the legacy fallback ceiling, so source === 'legacy-upload-path'. */
 const ceilingLimit = resolveAttachmentLimit({ userMaxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES });
 /** Premium over its OWN entitlement — the ceiling did not bind.
  *  Both byte fields must be the premium entitlement: spreading `ceilingLimit`
@@ -88,7 +88,7 @@ describe('AttachmentNotice', () => {
 
   // R4: a lock next to "your plan allows 256 MB" tells the user to buy
   // something they already bought.
-  it('uses a clock and no upsell for the client-capability gap', () => {
+  it('uses a clock and no upsell for the server-version gap', () => {
     const { container } = render(
       <AttachmentNotice
         rejections={[
@@ -99,10 +99,13 @@ describe('AttachmentNotice', () => {
       />
     );
     expect(
-      screen.getByText(
-        /Your plan allows 256 MB, but this version of Concord can send files up to 128 MB/
-      )
+      screen.getByText(/Your plan allows 256 MB, but this server accepts files up to 128 MB/)
     ).toBeInTheDocument();
+    // The attribution matters: this branch fires when the CLIENT is the newer
+    // side, so blaming "this version of Concord" points at the wrong end, and
+    // "support is coming" is false — it has arrived, on the server's side.
+    expect(screen.queryByText(/this version of Concord/)).toBeNull();
+    expect(screen.queryByText(/coming/)).toBeNull();
     expect(container.querySelector('.lucide-clock')).not.toBeNull();
     expect(container.querySelector('.lucide-triangle-alert')).toBeNull();
     // PremiumChip owns the lock glyph app-wide; a capability gap must not wear it.

@@ -795,6 +795,10 @@ func NewRouter(
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
 		mediaHandler.SetOpsCounter(opsCounters)
+		// Backs the chunked attachment upload sessions (#2157 PR 2). Injected
+		// rather than passed to NewHandler so the constructor signature stays
+		// put; every session route answers 503 when this is nil.
+		mediaHandler.SetSessionRedis(redis)
 		usersHandler.SetMediaStore(store)
 		serversHandler.SetMediaStore(store)
 	}
@@ -803,6 +807,13 @@ func NewRouter(
 	wsTicketHandler := auth.NewWSTicketHandler(redis, cfg.JWTSecret)
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
+	// Mirrors the registration condition of the chunked upload session routes
+	// EXACTLY: they are registered only when mediaHandler is non-nil, and every
+	// one of them answers 503 when the session Redis is nil. Advertising the
+	// capability on any weaker condition tells the client to take a path that
+	// cannot complete -- and the client believes it, because a capability is
+	// the only evidence it has.
+	serverCapabilitiesHandler.SetChunkedAttachmentUpload(mediaHandler != nil && redis != nil)
 	updatesHandler := updates.NewHandler(cfg, log)
 	privacyHandler, accountService := buildPrivacyHandler(
 		db, redis, log, usersHandler, hub, graphPresenceCapture, natsClient)
@@ -2514,6 +2525,13 @@ func NewRouter(
 				middleware.RateLimitByUser(redis, 30, 1*time.Minute),
 				mediaHandler.UploadAttachment,
 			)
+
+			// Tier 2 chunked upload session (#2157 PR 2) — init / PUT chunk /
+			// commit / cancel. Registered WITHOUT trailing slashes: Gin's 301
+			// fires during the router tree walk, before the handler chain, so a
+			// trailing-slash form would silently skip auth and rate limiting.
+			// TestUploadSessionRouteShapes locks the exact paths.
+			media.RegisterUploadSessionRoutes(mediaRoutes, mediaHandler, redis)
 
 			// Tier 2 proxy download (E2EE attachment — proxied, not presigned)
 			mediaRoutes.GET("/attachments/:file_id",

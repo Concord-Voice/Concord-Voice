@@ -78,7 +78,7 @@ func mediaBrokenResolver(t *testing.T, rdb *redis.Client) *rbac.Resolver {
 }
 
 // freeTierStub satisfies entitlements.TierResolver and always returns TierFree.
-// Used by tests that do not need tier-dependent enforcement (pre-Task 3/4 tests).
+// Used by tests that do not need tier-dependent enforcement.
 type freeTierStub struct{}
 
 func (freeTierStub) GetTier(context.Context, string) string { return entitlements.TierFree }

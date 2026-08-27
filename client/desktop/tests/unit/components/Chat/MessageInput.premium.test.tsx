@@ -12,7 +12,7 @@ vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false })
 /** addFiles returns { accepted, rejections } — the accepted COUNT is reported
  *  explicitly rather than derived, because one `too-many` rejection can stand
  *  for several discarded files. */
-const mockAddFiles = vi.fn().mockReturnValue({ accepted: 0, rejections: [] });
+const mockAddFiles = vi.fn().mockResolvedValue({ accepted: 0, rejections: [] });
 let mockUploadFiles: Array<{ file: File; progress: number; status: 'pending' }> = [];
 const mockRemoveFile = vi.fn((index: number) => {
   mockUploadFiles = mockUploadFiles.filter((_, i) => i !== index);
@@ -55,6 +55,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
+import { act } from 'react';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 import {
@@ -187,10 +188,13 @@ describe('MessageInput — attachment rejection notice (#2157)', () => {
     fireEvent.change(input, { target: { files: [file] } });
   }
 
-  it('renders the rejection addFiles returned, with both limit numbers', () => {
-    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
+  it('renders the rejection addFiles returned, with both limit numbers', async () => {
+    mockAddFiles.mockResolvedValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('huge.png', 40 * 1024 * 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
 
     const notice = document.querySelector('.attachment-notice') as HTMLElement;
     expect(notice.textContent).toContain('huge.png is');
@@ -200,23 +204,32 @@ describe('MessageInput — attachment rejection notice (#2157)', () => {
 
   // The file no longer "flows through" a permissive banner — enforcement and
   // messaging are the same decision now, taken inside addFiles.
-  it('routes every attach path through addFiles', () => {
+  it('routes every attach path through addFiles', async () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('a.png', 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
     expect(mockAddFiles).toHaveBeenCalled();
   });
 
-  it('shows nothing when addFiles accepts everything', () => {
-    mockAddFiles.mockReturnValueOnce(accepting(1, []));
+  it('shows nothing when addFiles accepts everything', async () => {
+    mockAddFiles.mockResolvedValueOnce(accepting(1, []));
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('ok.png', 1024 * 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
     expect(document.querySelector('.attachment-notice')).toBeEmptyDOMElement();
   });
 
-  it('is dismissible and returns focus to the textarea', () => {
-    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
+  it('is dismissible and returns focus to the textarea', async () => {
+    mockAddFiles.mockResolvedValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('huge.png', 40 * 1024 * 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
 
@@ -225,9 +238,9 @@ describe('MessageInput — attachment rejection notice (#2157)', () => {
     expect(document.activeElement).toBe(screen.getByRole('textbox'));
   });
 
-  it('gives a premium user over their own limit no upsell', () => {
+  it('gives a premium user over their own limit no upsell', async () => {
     setEntitlement({ tier: 'premium', maxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES });
-    mockAddFiles.mockReturnValueOnce(
+    mockAddFiles.mockResolvedValueOnce(
       accepting(
         0,
         overLimit('huge.bin', 300 * 1024 * 1024, {
@@ -243,6 +256,9 @@ describe('MessageInput — attachment rejection notice (#2157)', () => {
     );
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('huge.bin', 300 * 1024 * 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
 
     const notice = document.querySelector('.attachment-notice') as HTMLElement;
     expect(notice.textContent).toContain('over your 256 MB limit');
@@ -250,26 +266,32 @@ describe('MessageInput — attachment rejection notice (#2157)', () => {
     expect(screen.queryByRole('button', { name: /Premium/ })).not.toBeInTheDocument();
   });
 
-  it('explains the client-capability gap without an upsell', () => {
+  it('explains the server-version gap without an upsell', async () => {
     setEntitlement({ tier: 'premium', maxAttachmentBytes: PREMIUM_ATTACHMENT_BYTES });
-    mockAddFiles.mockReturnValueOnce(
+    mockAddFiles.mockResolvedValueOnce(
       accepting(0, overLimit('film.mp4', 200 * 1024 * 1024, ceilingLimit))
     );
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('film.mp4', 200 * 1024 * 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
 
     const notice = document.querySelector('.attachment-notice') as HTMLElement;
     expect(notice.textContent).toContain('Your plan allows 256 MB');
-    expect(notice.textContent).toContain('this version of Concord can send files up to 128 MB');
+    expect(notice.textContent).toContain('this server accepts files up to 128 MB');
     expect(screen.queryByRole('button', { name: /Premium/ })).not.toBeInTheDocument();
   });
 
-  it('clears the notice after the offending file is removed', () => {
+  it('clears the notice after the offending file is removed', async () => {
     const oversized = makeFile('huge.png', 40 * 1024 * 1024);
     mockUploadFiles = [{ file: oversized, progress: 0, status: 'pending' }];
-    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
+    mockAddFiles.mockResolvedValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(oversized);
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
     expect(document.querySelector('.attachment-notice')).not.toBeEmptyDOMElement();
 
     fireEvent.click(screen.getByRole('button', { name: 'Remove upload' }));
@@ -279,9 +301,12 @@ describe('MessageInput — attachment rejection notice (#2157)', () => {
   });
 
   it('clears the notice after a successful send', async () => {
-    mockAddFiles.mockReturnValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
+    mockAddFiles.mockResolvedValueOnce(accepting(0, overLimit('huge.png', 40 * 1024 * 1024)));
     render(<MessageInput onSendMessage={onSendMessage} />);
     attach(makeFile('huge.png', 40 * 1024 * 1024));
+    // addFiles is async since #2157 PR 2 (it sniffs leading bytes), so the
+    // partition lands a microtask later than the attach event.
+    await act(async () => {});
     expect(document.querySelector('.attachment-notice')).not.toBeEmptyDOMElement();
 
     const textarea = screen.getByRole('textbox');

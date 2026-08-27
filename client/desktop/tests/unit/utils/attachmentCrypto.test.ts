@@ -17,7 +17,16 @@ describe('attachmentCrypto', () => {
     ]);
   }
 
-  describe('encryptFile / decryptFile', () => {
+  // These cover the LEGACY (v1) single-shot format: [IV:12][ciphertext+tag],
+  // empty AAD. It is not the format new attachments are written in -- that is
+  // the chunked v2 envelope in attachmentChunkedCrypto.ts, covered by
+  // tests/unit/utils/attachmentChunkedCrypto.test.ts.
+  //
+  // They are deliberately NOT deleted: v1 is the format of every attachment
+  // already stored in the field, decryptFile is still the legacy branch of
+  // decryptAttachmentBlob, and removing these would drop the only coverage of
+  // the path most existing files still take.
+  describe('encryptFile / decryptFile (legacy v1 single-shot format)', () => {
     it('encrypts and decrypts a file roundtrip', async () => {
       const key = await generateTestKey();
       const originalData = new TextEncoder().encode('Hello, file content!').buffer;
@@ -30,7 +39,7 @@ describe('attachmentCrypto', () => {
       expect(decryptedText).toBe('Hello, file content!');
     });
 
-    it('prepends 12-byte IV to ciphertext', async () => {
+    it('prepends 12-byte IV to ciphertext (v1 layout — v2 prepends a 28-byte header)', async () => {
       const key = await generateTestKey();
       const data = new Uint8Array(10).buffer;
 

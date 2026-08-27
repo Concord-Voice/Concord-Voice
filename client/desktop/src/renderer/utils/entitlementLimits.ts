@@ -1,4 +1,9 @@
 import { formatFileSize } from './attachmentCrypto';
+import {
+  CHUNK_PLAINTEXT_BYTES,
+  CHUNK_OVERHEAD_BYTES,
+  ENVELOPE_HEADER_BYTES,
+} from './attachmentChunkedCrypto';
 
 export const FREE_MESSAGE_CHARS = 5120;
 export const PREMIUM_MESSAGE_CHARS = 10240;
@@ -15,25 +20,58 @@ export const FREE_ATTACHMENT_BYTES = 33_554_432;
  *  buys is 256 MB. */
 export const PREMIUM_ATTACHMENT_BYTES = 268_435_456;
 
-/** Interim renderer-memory ceiling (#2157 PR 1, provisional).
+/** Renderer-memory ceiling for the LEGACY single-shot upload path.
  *
- *  `encryptAndBuildForm` does a whole-file `arrayBuffer()` → one
- *  `crypto.subtle.encrypt` → a `Blob` copy, so the transient is ~3x file size
- *  and the premium 256 MiB entitlement is not reachable on this path.
+ *  Renamed from INTERIM_CLIENT_ATTACHMENT_CEILING_BYTES, value unchanged.
  *
- *  DELETED BY PR 2, which replaces the single-shot path with a chunked wire
- *  format and removes the reason for a ceiling at all. */
-export const INTERIM_CLIENT_ATTACHMENT_CEILING_BYTES = 134_217_728;
+ *  PR 2's spec said this constant would be DELETED. It cannot be. Concord is
+ *  self-hostable, so a current desktop build can be pointed at a control plane
+ *  that predates the upload-session routes; on that fallback the client is still
+ *  doing whole-file `arrayBuffer()` -> one `crypto.subtle.encrypt` -> a `Blob`,
+ *  and the ~3x transient is still real. What changes is that the clamp is now
+ *  CONDITIONAL on the server capability rather than unconditional.
+ *
+ *  On our own edge the legacy fallback tops out well below this anyway (nginx
+ *  40M, Cloudflare ~100 MB); the client surfaces that as the 413 it already
+ *  handles. Self-hosted edges vary, and a 413 is the authoritative answer. */
+export const LEGACY_UPLOAD_PATH_CEILING_BYTES = 134_217_728;
+
+/** Ceiling for the WHOLE-FILE image path.
+ *
+ *  Metadata stripping needs the entire image in hand — EXIF and XMP are
+ *  rewritten, not skipped — so this is the one place a whole-file transient
+ *  survives the chunked format. Worst case is raw + stripped + one chunk, about
+ *  264 MiB at this ceiling, which is strictly better than the ~384 MiB PR 1
+ *  permitted at the same 128 MiB and never measured.
+ *
+ *  Non-images are chunk-read and bounded to roughly two chunks regardless of
+ *  size, so they are not subject to this at all. Bounded memory at ANY file
+ *  size is therefore unreachable as #2157 words it, and the docs say so rather
+ *  than implying otherwise.
+ *
+ *  This is the rollback lever if the §7 harness finds the bound optimistic. */
+export const IMAGE_STRIP_MAX_BYTES = 134_217_728;
 
 /** Download-side guard.
  *
- *  Sized to the PREMIUM entitlement, deliberately NOT to the interim upload
- *  ceiling: the download path faces bytes the server already holds, and PR 2
- *  will produce files above the interim ceiling that this build must still be
- *  able to open. Invariant: upload ceiling <= download capability.
- *  The +4096 slack mirrors the server's multipart-header allowance
- *  (`media/handlers.go:222`). */
-export const MAX_DECRYPTABLE_ATTACHMENT_BYTES = PREMIUM_ATTACHMENT_BYTES + 4096;
+ *  Derived, never a magic number. It must admit a maximum-size v2 envelope:
+ *  the 28-byte per-file header plus 28 bytes (IV + tag) per chunk. At the
+ *  premium ceiling that is 28 + 28*32 = 924 bytes of overhead.
+ *
+ *  The previous value was PREMIUM + 4096, with a comment claiming the 4096
+ *  mirrored the server's multipart-header allowance. That derivation is wrong
+ *  for this format -- it happened to be large enough, which is not the same as
+ *  being correct. Expressing the arithmetic means a future chunk-size change
+ *  moves this with it instead of silently outgrowing it.
+ *
+ *  Sized to the PREMIUM entitlement rather than the legacy upload ceiling on
+ *  purpose: the download path faces bytes the server already holds, and the
+ *  chunked upload path produces files above that ceiling which this build must
+ *  still open. Invariant: upload ceiling <= download capability. */
+export const MAX_DECRYPTABLE_ATTACHMENT_BYTES =
+  PREMIUM_ATTACHMENT_BYTES +
+  ENVELOPE_HEADER_BYTES +
+  CHUNK_OVERHEAD_BYTES * Math.ceil(PREMIUM_ATTACHMENT_BYTES / CHUNK_PLAINTEXT_BYTES);
 
 export function clampMessageCharsForTier(tier: string, value: number): number {
   const ceiling = tier === 'premium' ? PREMIUM_MESSAGE_CHARS : FREE_MESSAGE_CHARS;
@@ -65,13 +103,37 @@ export interface AttachmentLimitInput {
    *  #1556 MUST translate the sentinel to a real byte ceiling before passing it
    *  in; the Go caller contract says the same thing in the same words. */
   serverMaxUploadBytes?: number;
+  /** Whether the connected control plane exposes the chunked upload session.
+   *
+   *  REQUIRED, not optional-defaulting-to-false. A default would let a caller
+   *  that forgets to wire the capability silently inherit the safe branch --
+   *  safe, but it would pin premium users at the legacy ceiling with no signal
+   *  that anything was missing. Making it required forces the decision to be
+   *  visible at every call site. */
+  chunkedUploadSupported: boolean;
+  /** True when the capability could not be FETCHED, as opposed to the server
+   *  answering no. Both clamp to the legacy ceiling; only the copy differs, and
+   *  telling a user their plan is the reason when the real reason is a network
+   *  blip is the part worth getting right. */
+  capabilityUnknown?: boolean;
 }
 
 export interface AttachmentLimit {
   /** The number enforced AND named in copy. */
   limitBytes: number;
   /** Which input won — selects the copy branch. */
-  source: 'entitlement' | 'client-ceiling';
+  /** Which input won — selects the copy branch.
+   *
+   *  Does NOT collapse to a single value: the legacy fallback survives, so both
+   *  branches remain reachable. */
+  source:
+    | 'entitlement'
+    | 'legacy-upload-path'
+    | 'capability-unknown'
+    /** Clamped to what this build can DECRYPT. Reachable when a server-wide
+     *  Mach grant lifts the composed limit above the renderer's measured memory
+     *  ceiling -- the file would upload and then open for nobody. */
+    | 'decryptable-ceiling';
   /** The composed entitlement before the ceiling clamp, so the interim-ceiling
    *  copy can honestly name both numbers ("your plan allows X, this version
    *  sends up to Y"). */
@@ -113,15 +175,47 @@ export function resolveAttachmentLimit(input: AttachmentLimitInput): AttachmentL
     : undefined;
   const composed = isUsable(serverAxis) ? Math.max(user, serverAxis) : user;
 
-  // 3. Clamp DOWN to what this build can actually encrypt without exhausting
-  //    the renderer. Only ever narrows.
-  const limitBytes = Math.min(composed, INTERIM_CLIENT_ATTACHMENT_CEILING_BYTES);
+  // 3. Clamp DOWN to what this build can actually encrypt, but ONLY on the
+  //    legacy single-shot path. With the chunked session available the
+  //    transient is bounded to about two chunks regardless of file size, so
+  //    there is nothing left for a ceiling to protect.
+  //
+  //    Fail-closed direction: an absent or unknown capability means `false`,
+  //    which keeps the ceiling. Never the other way round.
+  const pathCeiling = input.chunkedUploadSupported
+    ? composed
+    : Math.min(composed, LEGACY_UPLOAD_PATH_CEILING_BYTES);
 
-  return {
-    limitBytes,
-    source: limitBytes < composed ? 'client-ceiling' : 'entitlement',
-    entitlementBytes: composed,
-  };
+  // 4. Clamp DOWN to what this build can DECRYPT, on every path.
+  //
+  //    The server-wide Mach grant lifts a member to 512 MiB, but
+  //    MAX_DECRYPTABLE_ATTACHMENT_BYTES is derived from the 256 MiB premium
+  //    entitlement -- and it is not arbitrary, it is where measurement put the
+  //    renderer's memory ceiling. So a 512 MiB attachment could be uploaded and
+  //    then opened by nobody, including its own author.
+  //
+  //    That mismatch was latent while the legacy ceiling capped uploads at
+  //    128 MiB. The chunked path is what makes 512 MiB reachable, so it is this
+  //    change's job to keep the invariant the constant already claims:
+  //    upload ceiling <= download capability.
+  //
+  //    Deliberately CLIENT-SIDE only. The server tier stays as sold, because a
+  //    client that can produce and consume 512 MiB should still get it; this
+  //    build reports its own capability rather than redefining the product.
+  const limitBytes = Math.min(pathCeiling, MAX_DECRYPTABLE_ATTACHMENT_BYTES);
+
+  // Four-way, and none of the clamped cases are interchangeable: the caller
+  // words each differently, so the REASON has to survive to here, not just the
+  // number. A server that answered "no", a server we could not ask, and a build
+  // that cannot open the file are three different things to tell a user.
+  let source: AttachmentLimit['source'] = 'entitlement';
+  if (limitBytes < pathCeiling) {
+    source = 'decryptable-ceiling';
+  } else if (limitBytes < composed) {
+    source = input.capabilityUnknown === true ? 'capability-unknown' : 'legacy-upload-path';
+  }
+
+  return { limitBytes, source, entitlementBytes: composed };
 }
 
 /**

@@ -6,6 +6,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -69,4 +70,56 @@ func TestMapNotFound(t *testing.T) {
 	require.False(t, errors.Is(mapNotFound(other), ErrObjectNotFound))
 
 	require.NoError(t, mapNotFound(nil))
+}
+
+// A listing loop that trusts IsTruncated without checking that the marker moved
+// spins forever on SUCCESSFUL calls: nothing to return, nothing to cancel, and
+// the accumulator growing until the process dies.
+func TestListingMarkersMustAdvance(t *testing.T) {
+	t.Run("part marker", func(t *testing.T) {
+		next, err := nextPartMarker(0, 1000)
+		require.NoError(t, err)
+		assert.Equal(t, 1000, next)
+
+		for _, stuck := range []int{1000, 999, 0, -1} {
+			_, err := nextPartMarker(1000, stuck)
+			require.Error(t, err, "marker %d does not advance past 1000", stuck)
+			assert.Contains(t, err.Error(), "did not advance")
+		}
+	})
+
+	t.Run("upload marker pair", func(t *testing.T) {
+		// Many uploads can share one key, so a repeated keyMarker with a moving
+		// uploadIDMarker IS progress. Only the pair standing still is not.
+		k, id, err := nextUploadMarkers("k", "a", "k", "b")
+		require.NoError(t, err)
+		assert.Equal(t, "k", k)
+		assert.Equal(t, "b", id)
+
+		_, _, err = nextUploadMarkers("k", "a", "k", "a")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "did not advance")
+
+		// BACKWARDS is not progress either, though the pair did change. A
+		// backend cycling A -> B -> A satisfies "different" on every hop and
+		// loops forever -- the exact non-termination this guard exists to stop.
+		for _, tc := range []struct{ curKey, curID, nextKey, nextID string }{
+			{"k2", "b", "k1", "z"}, // key regressed
+			{"k", "b", "k", "a"},   // same key, id regressed
+			{"k", "b", "", ""},     // reset to the first-page markers
+		} {
+			_, _, err = nextUploadMarkers(tc.curKey, tc.curID, tc.nextKey, tc.nextID)
+			require.Error(t, err, "%q/%q -> %q/%q is not forward progress",
+				tc.curKey, tc.curID, tc.nextKey, tc.nextID)
+		}
+
+		// POSITIVE CONTROL: forward IS accepted, on both axes.
+		_, _, err = nextUploadMarkers("k", "b", "k2", "a")
+		require.NoError(t, err, "a later key is progress even with an earlier id")
+
+		// The first page starts from the empty pair, so a backend that answers
+		// "truncated" with empty markers is stuck too, not starting.
+		_, _, err = nextUploadMarkers("", "", "", "")
+		require.Error(t, err)
+	})
 }

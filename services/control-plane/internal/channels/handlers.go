@@ -52,18 +52,22 @@ const (
 	errMsgFailedDeleteChannel         = "Failed to delete channel"
 	errMsgFailedCheckMembership       = "Failed to check membership"
 	errMsgFailedFetchKeys             = "Failed to fetch keys"
-	errMsgFailedFetchPendingKeys      = "Failed to fetch pending key requests"
-	errMsgFailedFetchUnreadCounts     = "Failed to fetch unread counts"
-	errMsgFailedMarkServerRead        = "Failed to mark server read"
-	errMsgFailedMarkChannelRead       = "Failed to mark channel read"
-	errMsgFailedResolveVisible        = "Failed to resolve visible channels"
-	errMsgFailedFetchServerUnread     = "Failed to fetch server unread status"
-	errMsgNoEncryptionKey             = "No encryption key available yet"
-	errMsgFailedDistributeKeys        = "Failed to distribute keys"
-	errMsgFailedStoreEncryptionKeys   = "Failed to store encryption keys"
-	errMsgFailedRotateKey             = "Failed to rotate key"
-	errMsgInitialKeyDistributionOnly  = "Initial channel key distribution is restricted to the channel creator"
-	errMsgInitialKeyDistributionBusy  = "Initial channel key distribution is incomplete"
+	// errMsgInvalidVersion answers a ?version= that is not a positive integer.
+	// Shared by all three key-fetch surfaces so they cannot drift apart -- a
+	// client that special-cased one wording would silently mishandle another.
+	errMsgInvalidVersion             = "Invalid version parameter"
+	errMsgFailedFetchPendingKeys     = "Failed to fetch pending key requests"
+	errMsgFailedFetchUnreadCounts    = "Failed to fetch unread counts"
+	errMsgFailedMarkServerRead       = "Failed to mark server read"
+	errMsgFailedMarkChannelRead      = "Failed to mark channel read"
+	errMsgFailedResolveVisible       = "Failed to resolve visible channels"
+	errMsgFailedFetchServerUnread    = "Failed to fetch server unread status"
+	errMsgNoEncryptionKey            = "No encryption key available yet"
+	errMsgFailedDistributeKeys       = "Failed to distribute keys"
+	errMsgFailedStoreEncryptionKeys  = "Failed to store encryption keys"
+	errMsgFailedRotateKey            = "Failed to rotate key"
+	errMsgInitialKeyDistributionOnly = "Initial channel key distribution is restricted to the channel creator"
+	errMsgInitialKeyDistributionBusy = "Initial channel key distribution is incomplete"
 	// errMsgAuthRequired matches the middleware's generic auth-failure body so
 	// an epoch-fence rejection inside a handler is indistinguishable from the
 	// middleware's own rejection (#2201).
@@ -1556,7 +1560,7 @@ func (h *Handler) GetChannelKeys(c *gin.Context) {
 				channelID, userID, version,
 			).Scan(&key.ID, &key.ChannelID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
 		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid version parameter"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidVersion})
 			return
 		}
 	} else {
@@ -2797,7 +2801,7 @@ func (h *Handler) getChannelKeyResponse(c *gin.Context, contextID, userID string
 	key, err := h.fetchChannelKey(contextID, userID, c.Query("version"))
 	if err == errInvalidVersion {
 		c.JSON(http.StatusBadRequest, e2eekeys.ErrorResponse{
-			Error: "Invalid version parameter",
+			Error: errMsgInvalidVersion,
 			Code:  e2eekeys.CodeInvalidRequest,
 			Kind:  e2eekeys.KindChannel,
 		})
@@ -2896,6 +2900,46 @@ type dmKey struct {
 	CreatedAt      string `json:"created_at"`
 }
 
+// fetchDMKey is the DM twin of fetchChannelKey, and exists because the DM
+// branch used to IGNORE ?version= entirely -- it always answered
+// ORDER BY key_version DESC LIMIT 1, i.e. HTTP 200 with the current key for
+// any epoch a caller named.
+//
+// Two things followed. Historical DM content stayed undecryptable after a
+// rotation, because a request for the epoch it was sealed under silently got
+// the current key instead. And a 200 for an epoch that does not exist let a
+// fabricated key_version -- attested by an uploader, reflected back by the
+// attachment download -- be cached and recorded as a real epoch on the client,
+// poisoning a monotonic rotation watermark that then suppressed every genuine
+// rotation for the session.
+//
+// Exact match, then, and sql.ErrNoRows for anything else: the caller's 404
+// path already handles a missing wrap correctly.
+func (h *Handler) fetchDMKey(conversationID, userID, versionStr string) (dmKey, error) {
+	var key dmKey
+	if versionStr != "" {
+		var version int
+		if _, scanErr := fmt.Sscanf(versionStr, "%d", &version); scanErr != nil || version <= 0 {
+			return key, errInvalidVersion
+		}
+		err := h.db.QueryRow(
+			`SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
+			 FROM dm_channel_keys
+			 WHERE conversation_id = $1 AND user_id = $2 AND key_version = $3`,
+			conversationID, userID, version,
+		).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
+		return key, err
+	}
+	err := h.db.QueryRow(
+		`SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
+		 FROM dm_channel_keys
+		 WHERE conversation_id = $1 AND user_id = $2
+		 ORDER BY key_version DESC LIMIT 1`,
+		conversationID, userID,
+	).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
+	return key, err
+}
+
 func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 	// Under E2EE-everywhere (#201) all DMs are encrypted; check membership/existence only.
 	var exists bool
@@ -2933,13 +2977,15 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 		return
 	}
 
-	var key dmKey
-	err = h.db.QueryRow(`
-		SELECT id, conversation_id, user_id, wrapped_key, key_version, created_at
-		FROM dm_channel_keys
-		WHERE conversation_id = $1 AND user_id = $2
-		ORDER BY key_version DESC LIMIT 1
-	`, contextID, userID).Scan(&key.ID, &key.ConversationID, &key.UserID, &key.WrappedKey, &key.KeyVersion, &key.CreatedAt)
+	key, err := h.fetchDMKey(contextID, userID, c.Query("version"))
+	if err == errInvalidVersion {
+		c.JSON(http.StatusBadRequest, e2eekeys.ErrorResponse{
+			Error: errMsgInvalidVersion,
+			Code:  e2eekeys.CodeInvalidRequest,
+			Kind:  e2eekeys.KindDM,
+		})
+		return
+	}
 
 	if err == sql.ErrNoRows {
 		// Auto-enroll caller into dm_pending_key_requests (#1023).

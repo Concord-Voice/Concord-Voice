@@ -60,6 +60,25 @@ const HANDLED_IMAGE_MIMES = new Set([
   'image/avif',
 ]);
 
+/** How many leading bytes `sniffHandledImage` needs.
+ *
+ *  `detect` reads magic bytes and, for ISO-BMFF, a brand at offset 8..12 — far
+ *  less than this. 64 KiB is deliberate headroom so the sniff never has to grow
+ *  a second read, and it is the ONLY plaintext this path touches for a file it
+ *  turns out not to handle. */
+export const SNIFF_BYTES = 65_536;
+
+/** Whether the leading bytes look like an image format this module strips.
+ *
+ *  Dispatch on THIS, never on the declared MIME type. A JPEG uploaded as
+ *  `application/octet-stream` must still be stripped — dispatching on the
+ *  declared type would silently stop stripping it, which is a privacy
+ *  regression against #2469 rather than a mere miscategorisation. */
+export function sniffHandledImage(head: Uint8Array): boolean {
+  const detected = detect(head);
+  return detected !== null && detected.strip !== null;
+}
+
 function detect(bytes: Uint8Array): { format: string; strip: Stripper | null } | null {
   if (startsWith(bytes, [0xff, 0xd8, 0xff])) {
     return { format: 'jpeg', strip: stripJpeg };

@@ -1401,15 +1401,37 @@ class E2EEService {
       throw err;
     }
 
+    // SERVER-AUTHORITATIVE EPOCH -- record what was SERVED, never what was
+    // ASKED FOR.
+    //
+    // `version` is attacker-reachable. It arrives from a client-attested
+    // key_version that no upload path validates: as `message.key_version` on
+    // the message path, and (since #2157 PR 2) as the X-File-Key-Version header
+    // an attachment download reflects back, which fires on passive scroll.
+    // Recording the request rather than the response let a fabricated epoch
+    // install the current CSK under a number no rotation ever produced, and
+    // drive the MONOTONIC rotation watermark below to an arbitrary value --
+    // after which every genuine rotation compares <= and is dropped, so the
+    // sender keeps encrypting under a CSK a revocation was supposed to retire.
+    // A PoC drove it to media teardown on the DM path.
+    //
+    // The DM branch is now exact-match (fetchDMKey), so a mismatch should no
+    // longer be reachable from our own server. This is what makes that
+    // unnecessary rather than what depends on it.
+    const servedVersion =
+      typeof data.key.key_version === 'number' && Number.isSafeInteger(data.key.key_version)
+        ? data.key.key_version
+        : version;
+
     // Cache in versioned cache (refetchAfterMalformed: 0 — validation passed)
     let versionMapForChannel = this.versionedKeyCache.get(channelId);
     if (!versionMapForChannel) {
       versionMapForChannel = new Map();
       this.versionedKeyCache.set(channelId, versionMapForChannel);
     }
-    versionMapForChannel.set(version, {
+    versionMapForChannel.set(servedVersion, {
       wrappedKey,
-      keyVersion: version,
+      keyVersion: servedVersion,
       lastUsed: Date.now(),
       refetchAfterMalformed: 0,
     });
@@ -1421,8 +1443,10 @@ class E2EEService {
       this.channelKeyCache.delete(channelId);
     }
 
-    // #1878: observe the fetched version — fires the rotation emitter on increase.
-    this.noteChannelVersion(channelId, version);
+    // #1878: observe the fetched version — fires the rotation emitter on
+    // increase. servedVersion, not version: see above. This is the watermark
+    // the poison targeted.
+    this.noteChannelVersion(channelId, servedVersion);
 
     const privateKey = await this.derivePrivateKey();
     this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);

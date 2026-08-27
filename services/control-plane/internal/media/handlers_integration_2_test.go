@@ -339,6 +339,10 @@ func TestUploadAttachmentWithValidKeyVersion(t *testing.T) {
 	owner := ts.createTestUser(t, "validkeyver")
 	serverID := ts.createTestServer(t, owner, "ValidKeyVer Server")
 	channelID := ts.createTestChannel(t, serverID, "validkv")
+	// Epoch 3 has to have been ISSUED. The attested epoch is now bounded by the
+	// context's real current epoch, so claiming 3 on a channel that never
+	// rotated is exactly what the gate refuses.
+	seedChannelKeyEpoch(t, ts.db, channelID, owner, 3)
 
 	body, ct := multipartBody(t, "file", fileEncryptedBin, []byte("cipher"), map[string]string{
 		keyChannelID:  channelID,

@@ -3,7 +3,8 @@ import { ChevronDown, ChevronUp, FileText, Loader2 } from 'lucide-react';
 import MarkdownContent from '../Markdown/MarkdownContent';
 import { apiFetch } from '../../services/apiClient';
 import { e2eeService } from '../../services/e2eeService';
-import { decryptFile, formatFileSize } from '../../utils/attachmentCrypto';
+import { formatFileSize } from '../../utils/attachmentCrypto';
+import { decryptAttachmentBlob, parseKeyVersionHeader } from '../../utils/attachmentChunkedCrypto';
 import {
   AttachmentTooLargeError,
   readBoundedBody,
@@ -78,12 +79,36 @@ async function loadOverflowMarkdown(fileId: string, channelId: string): Promise<
     // `file_size` is server-supplied metadata, and Content-Length is absent
     // under chunked transfer encoding and understates a gzipped body.
     const ciphertext = await readBoundedBody(response, MAX_DECRYPTABLE_ATTACHMENT_BYTES);
-    const channelKey = await e2eeService.getChannelKey(channelId);
-    const decrypted = new Uint8Array(await decryptFile(ciphertext, channelKey));
+    // Same epoch selection as AttachmentDisplay: a CSK rotation must not orphan
+    // an overflow document that is otherwise perfectly readable.
+    const keyVersion = parseKeyVersionHeader(response.headers.get('X-File-Key-Version'));
+    const channelKey =
+      keyVersion === null
+        ? await e2eeService.getChannelKey(channelId)
+        : await e2eeService.getChannelKeyByVersion(channelId, keyVersion);
+    // Format-aware: handles both the chunked v2 envelope and the legacy
+    // single-shot blob, dispatched deterministically before any key is used.
+    // The render ceiling is orders of magnitude below the download ceiling, so
+    // decrypting past it is work spent on bytes this component is about to
+    // discard. Passing the limit stops the loop one chunk after it is exceeded;
+    // the Blob is then a PREFIX, which is why the size check below still runs
+    // and still rejects.
+    const blob = await decryptAttachmentBlob(
+      new Uint8Array(ciphertext),
+      channelKey,
+      'text/markdown',
+      MAX_RENDERABLE_MD_BYTES
+    );
 
     // Render-cost gate, distinct from the download guard above: cheaper than
     // the full UTF-8 decode plus regex scan that follows.
-    if (decrypted.byteLength > MAX_RENDERABLE_MD_BYTES) return { kind: 'too-large' };
+    //
+    // Checked against the Blob BEFORE materialising it, where it used to run
+    // after — the gate now precedes the allocation it exists to avoid rather
+    // than following it.
+    if (blob.size > MAX_RENDERABLE_MD_BYTES) return { kind: 'too-large' };
+
+    const decrypted = new Uint8Array(await blob.arrayBuffer());
     if (!isRenderableMarkdown(decrypted)) return { kind: 'preview-unavailable' };
 
     return { kind: 'rendered', content: new TextDecoder('utf-8').decode(decrypted) };

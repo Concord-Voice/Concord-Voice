@@ -209,3 +209,52 @@ func TestServerCapabilitiesEndpoint_AuthStateIndependent(t *testing.T) {
 	assert.Equal(t, noAuth.Body.String(), withAuth.Body.String(),
 		"capabilities shape must not depend on auth state (#662 AC)")
 }
+
+// The chunked attachment upload capability (#2157 PR 2).
+//
+// This capability is the ONLY evidence the client has that the chunked session
+// routes exist. It is not derived from config and it is not a property of the
+// build -- the routes compile in unconditionally -- so nothing but the router's
+// own wiring can make it true, and nothing but these tests can stop it from
+// silently defaulting the wrong way.
+func TestGetCapabilities_ChunkedAttachmentUpload_DefaultsFalse(t *testing.T) {
+	// Fail-closed. A deployment without object storage registers no media routes
+	// at all, so a true default would advertise an endpoint that 404s.
+	w, c := newTestContext()
+	servercapabilities.NewHandler(&config.Config{InstanceType: "saas"}).GetCapabilities(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	features, ok := body["features"].(map[string]any)
+	require.True(t, ok, "features object missing")
+
+	// Present and false -- NOT absent. An old client that fails closed on a
+	// missing key and a new server that means "no" must look the same, but a
+	// deployment that means "no" should say so rather than stay silent.
+	got, present := features["chunkedAttachmentUpload"]
+	require.True(t, present, "capability key absent; the client reads it by this exact name")
+	assert.Equal(t, false, got)
+}
+
+func TestGetCapabilities_ChunkedAttachmentUpload_ReflectsWiring(t *testing.T) {
+	h := servercapabilities.NewHandler(&config.Config{InstanceType: "saas"})
+	h.SetChunkedAttachmentUpload(true)
+
+	w, c := newTestContext()
+	h.GetCapabilities(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	features, ok := body["features"].(map[string]any)
+	require.True(t, ok, "features object missing")
+
+	// The literal key matters as much as the value: the client reads
+	// serverCapabilities.features.chunkedAttachmentUpload and compares it to
+	// true, so a renamed field is indistinguishable from an absent capability
+	// and downgrades every client to the legacy path in silence.
+	assert.Equal(t, true, features["chunkedAttachmentUpload"])
+}

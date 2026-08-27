@@ -459,3 +459,35 @@ func TestPublicFriendCodeAvatarEncodedPath(t *testing.T) {
 		})
 	}
 }
+
+// Multipart upload: interface satisfaction only. This stub serves the public
+// friend-code avatar route, which never touches the attachment session.
+func (s *stubAvatarStore) NewMultipartUpload(_ context.Context, _, _ string) (string, error) {
+	return "", errStubAvatarStoreUnused
+}
+
+func (s *stubAvatarStore) PutObjectPart(
+	_ context.Context, _, _ string, _ int, _ io.Reader, _ int64,
+) (storage.ObjectPartInfo, error) {
+	return storage.ObjectPartInfo{}, errStubAvatarStoreUnused
+}
+
+func (s *stubAvatarStore) ListObjectParts(_ context.Context, _, _ string) ([]storage.ObjectPartInfo, error) {
+	return nil, errStubAvatarStoreUnused
+}
+
+func (s *stubAvatarStore) CompleteMultipartUpload(
+	_ context.Context, _, _ string, _ []storage.ObjectPartInfo,
+) error {
+	return errStubAvatarStoreUnused
+}
+
+func (s *stubAvatarStore) AbortMultipartUpload(_ context.Context, _, _ string) error {
+	return errStubAvatarStoreUnused
+}
+
+func (s *stubAvatarStore) ListIncompleteUploads(
+	_ context.Context, _ time.Time,
+) ([]storage.IncompleteUpload, error) {
+	return nil, errStubAvatarStoreUnused
+}
