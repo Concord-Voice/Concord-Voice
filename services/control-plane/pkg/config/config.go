@@ -167,9 +167,6 @@ type Config struct {
 	TURNSecret     string // Shared secret for HMAC ephemeral credentials
 	TURNRealm      string // TURN realm (e.g. "concordvoice.chat")
 
-	// Licensing
-	LicensingAuthorityURL string
-
 	// Client config (#155 Tier 2 + Tier 3)
 	ClientMinVersion string // Minimum client version allowed (e.g. "0.1.3"); empty = no enforcement
 	SpaURL           string // Remote SPA URL for Tier 3 hot updates (e.g. "https://app.concordvoice.chat/v1/"); empty = use bundled
@@ -357,7 +354,6 @@ func Load() (*Config, error) {
 		TURNServerHost:           getEnv("TURN_SERVER_HOST", ""),
 		TURNSecret:               getEnv("TURN_SECRET", ""),
 		TURNRealm:                getEnv("TURN_REALM", "localhost"),
-		LicensingAuthorityURL:    getEnv("LICENSING_AUTHORITY_URL", "http://localhost:8082"),
 		AllowedOrigins:           parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
 		ClientMinVersion:         getEnv("CLIENT_MIN_VERSION", ""),
 		SpaURL:                   getEnv("SPA_URL", ""),

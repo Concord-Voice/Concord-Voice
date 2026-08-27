@@ -146,7 +146,6 @@ REDIS_URL=redis://:concord_dev_redis@localhost:6379
 JWT_SECRET=your-secret-key
 NATS_URL=nats://localhost:4222
 MEDIA_PLANE_URL=http://localhost:3000
-LICENSING_AUTHORITY_URL=http://localhost:8082
 
 # TRUSTED_PROXY_CIDRS — Comma-separated IPv4/IPv6 CIDRs whose X-Forwarded-For
 # and X-Real-IP headers c.ClientIP() honors. REQUIRED in production (startup

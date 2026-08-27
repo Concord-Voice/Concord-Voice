@@ -332,7 +332,7 @@ See [.github/SECURITY.md](./.github/SECURITY.md) for full policy.
 **Self-Hosted:**
 
 - You control all data
-- Concord Voice receives no data from self-hosted instances (except license validation pings)
+- Concord Voice receives no data from self-hosted instances
 
 **Telemetry:**
 
@@ -425,8 +425,7 @@ Concord/
 ├── client/desktop/          # Electron desktop application
 ├── services/
 │   ├── control-plane/       # Go backend (auth, channels, billing)
-│   ├── media-plane/         # Node.js WebRTC SFU (voice/video)
-│   └── licensing-authority/ # Go licensing service (planned)
+│   └── media-plane/         # Node.js WebRTC SFU (voice/video)
 ├── docs/                    # Documentation
 ├── scripts/                 # Development scripts
 └── infrastructure/docker/   # Docker Compose configs
@@ -562,7 +561,7 @@ npm test
 
 ### How do I self-host Concord Voice?
 
-**Status:** Self-hosting installer is planned for Phase 3 (issue #210). Narrative deployment guide tracked at #819.
+**Status:** The self-hosting installer shipped in #1616 — see `[internal]selfhost-quickstart.md`. A versioned, verified public bundle is tracked at #2506, and air-gapped/offline distribution at #210 (v1.1.0). Narrative deployment guide tracked at #819.
 
 **Current workaround** (for developers):
 
