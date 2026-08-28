@@ -1,6 +1,11 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { Save, X, Search } from 'lucide-react';
-import { gifProvider, type GifResolved, type GifCategory } from '../../services/gifProvider';
+import { Save, X, Search, AlertTriangle } from 'lucide-react';
+import {
+  gifProvider,
+  type GifResolved,
+  type GifCategory,
+  type GifCategoryPreview,
+} from '../../services/gifProvider';
 import { useSavedGifsStore } from '../../stores/savedGifsStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { usePrivacyStore } from '../../stores/privacyStore';
@@ -23,7 +28,7 @@ const SEARCH_DEBOUNCE_MS = 300;
  *  need to see the animation to choose a GIF. Reduce Animations only affects
  *  inline chat embeds (GifEmbed), not the picker itself. See QA bug #571
  *  item #6A. */
-function GifMedia({ gif }: Readonly<{ gif: GifResolved }>) {
+function GifMedia({ gif }: Readonly<{ gif: GifCategoryPreview }>) {
   if (gif.animatedKind === 'video') {
     return (
       <video
@@ -101,9 +106,28 @@ function CategoryTile({
   );
 }
 
-/** Empty state shown when a tab has no content. */
+/** Empty state shown when a tab has no content. `<output>` rather than a div
+ *  with role="status": it carries the same implicit role, and the native
+ *  element is announced reliably across assistive tech where the ARIA role
+ *  alone is not (SonarQube S6819). The stylesheet already sets display:flex,
+ *  so the element default of inline does not apply. */
 function EmptyState({ message }: Readonly<{ message: string }>) {
-  return <div className="gif-picker-empty">{message}</div>;
+  return <output className="gif-picker-empty">{message}</output>;
+}
+
+/** Failure state. Distinguished from an empty tab by glyph, copy AND an
+ *  action — three non-colour signals, so it does not rely on colour alone
+ *  (WCAG 1.4.1). Deliberately not red. */
+function ErrorState({ message, onRetry }: Readonly<{ message: string; onRetry: () => void }>) {
+  return (
+    <output className="gif-picker-error">
+      <AlertTriangle size={20} aria-hidden="true" />
+      <span>{message}</span>
+      <button className="gif-picker-retry" onClick={onRetry}>
+        Try again
+      </button>
+    </output>
+  );
 }
 
 /** Render the body of the picker — depends on active tab + search state. */
@@ -117,6 +141,7 @@ function PickerBody({
   categories,
   onGifClick,
   onCategoryClick,
+  onRetry,
 }: Readonly<{
   loading: boolean;
   error: string | null;
@@ -126,28 +151,32 @@ function PickerBody({
   items: GifResolved[];
   categories: GifCategory[];
   onGifClick: (gif: GifResolved) => void;
-  onCategoryClick: (name: string) => void;
+  onCategoryClick: (query: string) => void;
+  onRetry: () => void;
 }>) {
-  if (loading) return <div className="gif-picker-loading">Loading…</div>;
-  if (error) return <EmptyState message={error} />;
+  if (loading) {
+    return <output className="gif-picker-loading">Loading…</output>;
+  }
+  if (error) return <ErrorState message={error} onRetry={onRetry} />;
 
   if (activeTab === 'categories' && !isSearching) {
-    if (categories.length === 0) return <EmptyState message="No categories available" />;
+    if (categories.length === 0) return <EmptyState message="No categories to show right now." />;
     return (
       <div className="gif-picker-grid">
         {categories.map((cat) => (
-          <CategoryTile key={cat.name} category={cat} onClick={() => onCategoryClick(cat.name)} />
+          <CategoryTile key={cat.query} category={cat} onClick={() => onCategoryClick(cat.query)} />
         ))}
       </div>
     );
   }
 
   if (items.length === 0) {
-    let msg = 'No GIFs';
+    let msg = 'No GIFs to show right now.';
     if (isSearching) msg = `No GIFs found for "${debouncedSearchTerm}"`;
-    else if (activeTab === 'saved') msg = 'No saved GIFs yet';
-    else if (activeTab === 'recent') msg = 'No recent GIFs';
-    else if (activeTab === 'trending') msg = 'No trending GIFs';
+    else if (activeTab === 'saved') msg = 'No saved GIFs yet.';
+    else if (activeTab === 'recent')
+      msg = "You haven't shared any GIFs yet. Send one to see it here.";
+    else if (activeTab === 'trending') msg = 'No trending GIFs to show right now.';
     return <EmptyState message={msg} />;
   }
 
@@ -189,6 +218,15 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   const [categories, setCategories] = useState<GifCategory[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Component-local retry counter. Bumping it re-runs the fetch effect; a
+  // transient, picker-scoped gesture does not warrant a store.
+  const [retryNonce, setRetryNonce] = useState(0);
+  // One-shot, Recent-specific force flag. It must NOT be derived from
+  // `retryNonce`: that counter only increments and is bumped by the retry on
+  // ANY tab, so `force: retryNonce > 0` would arm the identity-backoff bypass
+  // permanently after a single click anywhere in the picker — including on
+  // ordinary tab switches back to Recent. The fetch that uses it consumes it.
+  const forceRecentRef = useRef(false);
 
   const pickerRef = useRef<HTMLDialogElement>(null);
 
@@ -210,6 +248,13 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: clears items when starting a new fetch to avoid stale content flash; not a render loop
     setItems([]);
 
+    // Read-and-clear: exactly one fetch spends an explicit retry gesture.
+    const consumeForceRecent = () => {
+      const f = forceRecentRef.current;
+      forceRecentRef.current = false;
+      return f;
+    };
+
     const finish = (gifs: GifResolved[]) => {
       if (!cancelled) {
         setItems(gifs);
@@ -227,7 +272,7 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
       gifProvider
         .search({ q: debouncedSearchTerm, offset: 0, limit: PAGE_SIZE })
         .then((r) => finish(r.items))
-        .catch(() => fail('Search failed'));
+        .catch(() => fail("Couldn't load search results."));
       return () => {
         cancelled = true;
       };
@@ -237,12 +282,12 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
       gifProvider
         .trending({ offset: 0, limit: PAGE_SIZE })
         .then((r) => finish(r.items))
-        .catch(() => fail('Failed to load trending GIFs'));
+        .catch(() => fail("Couldn't load trending GIFs."));
     } else if (activeTab === 'recent') {
       gifProvider
-        .recent({ offset: 0, limit: PAGE_SIZE })
+        .recent({ offset: 0, limit: PAGE_SIZE, force: consumeForceRecent() })
         .then((r) => finish(r.items))
-        .catch(() => fail('Failed to load recent GIFs'));
+        .catch(() => fail("Couldn't load your recent GIFs."));
     } else if (activeTab === 'categories') {
       gifProvider
         .categories({})
@@ -253,36 +298,50 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
             setLoading(false);
           }
         })
-        .catch(() => fail('Failed to load categories'));
+        .catch(() => fail("Couldn't load categories."));
     } else if (activeTab === 'saved') {
       Promise.allSettled(savedGifSlugs.map((sg) => gifProvider.getBySlug(sg.slug)))
         .then((results) => {
+          // allSettled FULFILLS even when every request rejects, so the
+          // .catch() below never sees individual failures. Without this branch
+          // an all-failed load fell through to "No saved GIFs yet." — telling a
+          // user who has saved GIFs that they have none, the same
+          // failure-disguised-as-empty defect this PR fixes on the Recent tab.
+          // Guarded on length so a genuinely empty list stays an empty state.
+          if (results.length > 0 && results.every((r) => r.status === 'rejected')) {
+            fail("Couldn't load saved GIFs.");
+            return;
+          }
           const gifs: GifResolved[] = [];
           for (const r of results) {
             if (r.status === 'fulfilled') gifs.push(r.value);
           }
           finish(gifs);
         })
-        .catch(() => fail('Failed to load saved GIFs'));
+        .catch(() => fail("Couldn't load saved GIFs."));
     }
 
     return () => {
       cancelled = true;
     };
-  }, [activeTab, isSearching, debouncedSearchTerm, savedGifSlugs]);
+  }, [activeTab, isSearching, debouncedSearchTerm, savedGifSlugs, retryNonce]);
 
   const handleGifClick = useCallback(
     (gif: GifResolved) => {
-      // Fire-and-forget the share trigger (best practice, optional per ToS)
-      gifProvider.notifyShared?.(gif.slug).catch(() => {});
+      // Fire-and-forget. notifyShared never rejects and emits its own signal
+      // on every failure shape, so there is nothing to catch here.
+      void gifProvider.notifyShared?.(
+        gif.slug,
+        isSearching ? { q: debouncedSearchTerm } : undefined
+      );
       onSelect(gif.slug);
       onClose();
     },
-    [onSelect, onClose]
+    [onSelect, onClose, isSearching, debouncedSearchTerm]
   );
 
-  const handleCategoryClick = useCallback((name: string) => {
-    setSearchTerm(name);
+  const handleCategoryClick = useCallback((query: string) => {
+    setSearchTerm(query);
   }, []);
 
   // Click-outside-to-close
@@ -349,6 +408,7 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
             <button
               key={tab}
               className={`gif-picker-tab ${activeTab === tab && !isSearching ? 'active' : ''}`}
+              aria-pressed={activeTab === tab && !isSearching}
               onClick={() => {
                 setActiveTab(tab);
                 setSearchTerm('');
@@ -386,6 +446,11 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
           categories={categories}
           onGifClick={handleGifClick}
           onCategoryClick={handleCategoryClick}
+          onRetry={() => {
+            // Only a retry ON the Recent tab may clear the identity backoff.
+            if (activeTab === 'recent' && !isSearching) forceRecentRef.current = true;
+            setRetryNonce((n) => n + 1);
+          }}
         />
       </div>
 

@@ -256,41 +256,113 @@ describe('klipyProvider', () => {
     });
   });
 
-  describe('categories', () => {
-    it('returns categories with mapped previews', async () => {
-      categoriesMock.mockResolvedValue({
-        data: [
-          { name: 'Reactions', preview: mockMp4Item },
-          { name: 'Animals', preview: mockGifItem },
+  describe('categories mapping (A1)', () => {
+    // Copied from docs.klipy.com/gifs-api/gifs-categories-api. A fixture copied
+    // from the OLD code's assumed shape would pass against the bug.
+    const vendorShape = {
+      result: true,
+      data: {
+        locale: 'en_US',
+        categories: [
+          {
+            category: 'Reactions',
+            query: 'reaction',
+            preview_url: 'https://media.klipy.com/reactions.gif',
+          },
+          {
+            category: 'Animals',
+            query: 'cute animals',
+            preview_url: 'https://media.klipy.com/animals.mp4',
+          },
         ],
-      });
+      },
+    };
+
+    it('maps the documented vendor shape into GifCategory[]', async () => {
+      categoriesMock.mockResolvedValue(vendorShape);
       const cats = await klipyProvider.categories({});
+
       expect(cats).toHaveLength(2);
       expect(cats[0].name).toBe('Reactions');
-      expect(cats[0].preview.animatedKind).toBe('video');
-      expect(cats[1].name).toBe('Animals');
-      expect(cats[1].preview.animatedKind).toBe('image');
+      expect(cats[0].query).toBe('reaction');
     });
 
-    it('drops categories whose preview has no usable rendition', async () => {
+    it('routes every preview through the media proxy, never the raw CDN URL', async () => {
+      // C1: the single most likely way to fix this bug and ship an IP leak.
+      categoriesMock.mockResolvedValue(vendorShape);
+      const cats = await klipyProvider.categories({});
+
+      for (const cat of cats) {
+        expect(cat.preview.animatedUrl).toContain('/api/v1/klipy/media?url=');
+        expect(cat.preview.animatedUrl).not.toBe('https://media.klipy.com/reactions.gif');
+        expect(cat.preview.animatedUrl.startsWith(API_BASE)).toBe(true);
+      }
+    });
+
+    it('derives animatedKind from the preview_url extension, defaulting to image', async () => {
+      categoriesMock.mockResolvedValue(vendorShape);
+      const cats = await klipyProvider.categories({});
+
+      expect(cats[0].preview.animatedKind).toBe('image'); // .gif
+      expect(cats[1].preview.animatedKind).toBe('video'); // .mp4
+    });
+
+    it('DROPS a category whose preview_url is not proxy-eligible (C2 fail-closed)', async () => {
       categoriesMock.mockResolvedValue({
-        data: [
-          { name: 'Good', preview: mockMp4Item },
-          { name: 'Bad', preview: { slug: 'no-rendition' } },
-        ],
+        result: true,
+        data: {
+          locale: 'en_US',
+          categories: [
+            { category: 'Evil', query: 'evil', preview_url: 'https://attacker.example/x.gif' },
+            { category: 'Good', query: 'good', preview_url: 'https://media.klipy.com/g.gif' },
+          ],
+        },
       });
+
       const cats = await klipyProvider.categories({});
       expect(cats).toHaveLength(1);
       expect(cats[0].name).toBe('Good');
     });
 
-    it('drops categories with no name', async () => {
+    it('emits an observable diagnostic when every entry is dropped', async () => {
+      // Silence is exactly what let this bug live in production.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       categoriesMock.mockResolvedValue({
-        data: [
-          { name: '', preview: mockMp4Item },
-          { preview: mockMp4Item } as { preview: KlipyGifItem },
-          { name: 'Valid', preview: mockMp4Item },
-        ],
+        result: true,
+        data: {
+          locale: 'en_US',
+          categories: [
+            { category: 'Evil', query: 'e', preview_url: 'https://attacker.example/x.gif' },
+          ],
+        },
+      });
+
+      await klipyProvider.categories({});
+      expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('returns an empty array without warning when the vendor returns no categories', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      categoriesMock.mockResolvedValue({ result: true, data: { locale: 'en_US', categories: [] } });
+
+      expect(await klipyProvider.categories({})).toEqual([]);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('drops a category missing category, query, or preview_url', async () => {
+      categoriesMock.mockResolvedValue({
+        result: true,
+        data: {
+          locale: 'en_US',
+          categories: [
+            { category: '', query: 'q', preview_url: 'https://media.klipy.com/g.gif' },
+            { category: 'NoQuery', preview_url: 'https://media.klipy.com/g.gif' },
+            { category: 'NoPreview', query: 'q' },
+            { category: 'Valid', query: 'valid', preview_url: 'https://media.klipy.com/v.gif' },
+          ],
+        },
       });
       const cats = await klipyProvider.categories({});
       expect(cats).toHaveLength(1);
@@ -308,10 +380,15 @@ describe('klipyProvider', () => {
   });
 
   describe('share trigger and report', () => {
-    it('notifyShared forwards to the client', async () => {
+    it('notifyShared forwards to the client, carrying the search context', async () => {
       notifySharedMock.mockResolvedValue(undefined);
       await klipyProvider.notifyShared!('test-slug');
-      expect(notifySharedMock).toHaveBeenCalledWith('test-slug');
+      expect(notifySharedMock).toHaveBeenCalledWith('test-slug', undefined);
+
+      // The `ctx` bag must reach the client verbatim — dropping it here is how
+      // `q` would silently stop being forwarded to the share trigger (#2371 A2).
+      await klipyProvider.notifyShared!('test-slug', { q: 'happy dance' });
+      expect(notifySharedMock).toHaveBeenLastCalledWith('test-slug', { q: 'happy dance' });
     });
 
     it('report forwards to the client', async () => {
@@ -319,5 +396,39 @@ describe('klipyProvider', () => {
       await klipyProvider.report!('bad-slug');
       expect(reportMock).toHaveBeenCalledWith('bad-slug');
     });
+  });
+});
+
+describe('non-proxy-eligible rendition is observable (#2371 red-team H1)', () => {
+  it('warns, but still serves, when a rendition URL bypasses the media proxy', async () => {
+    // Deliberately NOT fail-closed: toCategory drops (a category is optional),
+    // this is the main GIF path where dropping would blank the picker. The CSP
+    // is the control; this makes an incomplete host allowlist diagnosable.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    trendingMock.mockResolvedValue({
+      data: [{ slug: 'ok-slug', file: { gif: { url: 'https://tracker.attacker.tld/pixel.gif' } } }],
+      has_more: false,
+    });
+
+    const res = await klipyProvider.trending({ offset: 0, limit: 25 });
+
+    expect(res.items).toHaveLength(1);
+    expect(warn).toHaveBeenCalled();
+    expect(JSON.stringify(warn.mock.calls)).toContain('tracker.attacker.tld');
+    // The raw vendor URL itself must not be logged — host only.
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('pixel.gif');
+    warn.mockRestore();
+  });
+
+  it('stays silent for a normal proxied rendition', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    trendingMock.mockResolvedValue({
+      data: [{ slug: 'ok-slug', file: { gif: { url: 'https://media.klipy.com/a.gif' } } }],
+      has_more: false,
+    });
+
+    await klipyProvider.trending({ offset: 0, limit: 25 });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

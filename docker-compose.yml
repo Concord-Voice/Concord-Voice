@@ -256,6 +256,7 @@ services:
       PURGE_RATE_LIMIT: ${PURGE_RATE_LIMIT:-5}
       PURGE_RATE_WINDOW_SEC: ${PURGE_RATE_WINDOW_SEC:-3600}
       KLIPY_API_KEY: ${KLIPY_API_KEY:-}
+      KLIPY_CUSTOMER_ID_KEY: ${KLIPY_CUSTOMER_ID_KEY:-}
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.19.0.0/16}
       # Activity History is deployed dormant. First activation is performed only
       # through the drained concord-ctl preflight; ordinary Compose starts must

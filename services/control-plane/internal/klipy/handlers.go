@@ -13,6 +13,11 @@
 // exposed to KLIPY's CDN. See the Media handler below and
 // klipyClient.ts#rewriteMediaUrl.
 //
+// KLIPY's share trigger takes customer_id and q in a request BODY. We accept
+// them as whitelisted query params and construct the upstream form body
+// server-side (proxyAPIForm) — a client request body is never read or
+// forwarded.
+//
 // Compliance notes:
 //   - We never modify API response bodies returned by KLIPY.
 //   - We never log slugs or search terms in the proxy routes (privacy promise).
@@ -30,6 +35,9 @@
 package klipy
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -61,6 +69,9 @@ const (
 	headerCacheControl = "Cache-Control"
 	errUpstreamDown    = "GIF service temporarily unavailable"
 	errUpstreamFailed  = "GIF service request failed"
+	// Shared by Recent, HideRecent, and Share — the customer id reaches all
+	// three as an untrusted path or query component.
+	errUnauthenticated = "authentication required"
 )
 
 // klipyAPIBase is the upstream base URL for KLIPY's API. Defined as a package
@@ -104,12 +115,27 @@ func NewHandler(cfg *config.Config, log *logger.Logger) *Handler {
 		client: &http.Client{
 			Timeout:   upstreamTimeout,
 			Transport: transport,
+			// Refuse every redirect hop. The JSON upstream is a FIXED base URL
+			// built from config, so a redirect is never part of that contract.
+			//
+			// This became load-bearing when Share started sending a real request
+			// body (#2371): on a 307/308 Go preserves the method and REPLAYS the
+			// body via GetBody, handing an upstream-chosen host both the
+			// server-constructed form (which carries the per-user customer_id)
+			// and a Referer whose path contains cfg.KlipyAPIKey. The dial-time
+			// egress guard does not help — a redirect target is a public address.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return errAPIRedirectBlocked
+			},
 		},
 		mediaClient: &http.Client{
 			Timeout:   mediaTimeout,
 			Transport: transport,
 			// Layer A (SSRF #1361): re-validate scheme+host on every redirect hop.
-			// mediaClient only — it is the sole user-supplied-URL surface.
+			// This is the sole user-supplied-URL surface, so it re-validates
+			// rather than refusing outright. The JSON api client above refuses
+			// every hop instead — its base URL is fixed, and since #2371 its
+			// requests carry a body that a redirect would replay off-path.
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 				return validateRedirectTarget(req)
 			},
@@ -124,6 +150,8 @@ func NewHandler(cfg *config.Config, log *logger.Logger) *Handler {
 var (
 	errEgressBlocked   = errors.New("klipy egress: destination IP not permitted")
 	errRedirectBlocked = errors.New("klipy egress: redirect target not permitted")
+	// errAPIRedirectBlocked refuses every redirect hop on the JSON API client.
+	errAPIRedirectBlocked = errors.New("klipy api: upstream redirect not permitted")
 )
 
 // cgnatPrefix is RFC6598 carrier-grade-NAT space (100.64.0.0/10), commonly used
@@ -210,9 +238,41 @@ func sanitizedNetErr(err error) string {
 
 // --- API endpoint proxies ---
 
+// derivedCustomerID returns the derived partition key for a client-supplied
+// nonce, or "" when the client supplied none.
+//
+// PRESENCE IS LOAD-BEARING — do not collapse this into customerIDFor. With
+// personalization off the renderer omits customer_id entirely, and
+// klipyClient.notifyShared records why: attaching one "would create a
+// PERSISTENT upstream write keyed to an id we promise is ephemeral". Deriving
+// from an absent value manufactures exactly that identifier and defeats the
+// opt-out from the server side, where the client cannot see it happen.
+//
+// The pre-derivation Share handler branched on presence for the sibling reason
+// filed as #2371 R4 (ValidateSlug("") returns true, so an absent param would
+// have been forwarded as `customer_id=`). The derivation dropped that branch;
+// this restores it for every personalized route at once.
+func (h *Handler) derivedCustomerID(c *gin.Context) string {
+	raw := c.Query("customer_id")
+	if raw == "" {
+		return ""
+	}
+	return h.customerIDFor(c, raw)
+}
+
+// proxyAPIGetPersonalized forwards a GET with the DERIVED customer id injected
+// and the client's raw value dropped from the whitelist. Safe to concatenate
+// unescaped: the derived value is hex.
+func (h *Handler) proxyAPIGetPersonalized(c *gin.Context, path string, allowedParams []string) {
+	if id := h.derivedCustomerID(c); id != "" {
+		path += "?customer_id=" + id
+	}
+	h.proxyAPIGet(c, path, allowedParams)
+}
+
 // Trending forwards GET /gifs/trending to KLIPY.
 func (h *Handler) Trending(c *gin.Context) {
-	h.proxyAPIGet(c, "/gifs/trending", []string{"page", "per_page", "customer_id", "locale", "format_filter"})
+	h.proxyAPIGetPersonalized(c, "/gifs/trending", []string{"page", "per_page", "locale", "format_filter"})
 }
 
 // Search forwards GET /gifs/search to KLIPY.
@@ -226,7 +286,7 @@ func (h *Handler) Search(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "q parameter exceeds maximum length"})
 		return
 	}
-	h.proxyAPIGet(c, "/gifs/search", []string{"q", "page", "per_page", "customer_id", "locale", "content_filter", "format_filter"})
+	h.proxyAPIGetPersonalized(c, "/gifs/search", []string{"q", "page", "per_page", "locale", "content_filter", "format_filter"})
 }
 
 // Categories forwards GET /gifs/categories to KLIPY.
@@ -236,9 +296,12 @@ func (h *Handler) Categories(c *gin.Context) {
 
 // Recent forwards GET /gifs/recent/{customer_id} to KLIPY.
 func (h *Handler) Recent(c *gin.Context) {
-	customerID := c.Param("customerID")
-	if !ValidateSlug(&customerID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid customer_id"})
+	// The :customerID route param is the caller's rotation nonce, not an
+	// identity — see customerIDFor. A caller supplying another user's value
+	// still reads only its own ledger.
+	customerID := h.customerIDFor(c, c.Param("customerID"))
+	if customerID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errUnauthenticated})
 		return
 	}
 	h.proxyAPIGet(c, "/gifs/recent/"+customerID, []string{"page", "per_page"})
@@ -246,27 +309,52 @@ func (h *Handler) Recent(c *gin.Context) {
 
 // HideRecent forwards DELETE /gifs/recent/{customer_id} to KLIPY.
 func (h *Handler) HideRecent(c *gin.Context) {
-	customerID := c.Param("customerID")
-	if !ValidateSlug(&customerID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid customer_id"})
+	// Same contract as Recent. This one WRITES, so trusting the param as an
+	// identity would have let any account clear any other account's recent
+	// list, not merely read it.
+	customerID := h.customerIDFor(c, c.Param("customerID"))
+	if customerID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errUnauthenticated})
 		return
 	}
-	h.proxyAPIRequest(c, http.MethodDelete, "/gifs/recent/"+customerID, nil)
+	h.proxyAPIForm(c, http.MethodDelete, "/gifs/recent/"+customerID, nil)
 }
 
 // Items forwards GET /gifs/items to KLIPY (used to resolve saved-tab slugs).
 func (h *Handler) Items(c *gin.Context) {
-	h.proxyAPIGet(c, "/gifs/items", []string{"slugs", "customer_id", "format_filter"})
+	h.proxyAPIGetPersonalized(c, "/gifs/items", []string{"slugs", "format_filter"})
 }
 
-// Share forwards POST /gifs/share/{slug} to KLIPY (optional analytics).
+// Share forwards POST /gifs/share/{slug} to KLIPY. The share trigger is what
+// populates KLIPY's per-customer recent ledger, so customer_id must reach it or
+// GET /gifs/recent/{customer_id} stays empty forever (#2371).
+//
+// Two whitelisted QUERY params in, a server-constructed form body out. No
+// client request body is ever accepted or forwarded.
 func (h *Handler) Share(c *gin.Context) {
 	slug := c.Param("slug")
 	if !ValidateSlug(&slug) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": SlugValidationError(&slug)})
 		return
 	}
-	h.proxyAPIRequest(c, http.MethodPost, "/gifs/share/"+slug, nil)
+
+	form := url.Values{}
+	// The client's customer_id is folded in as a nonce. Trusting it as an
+	// identity would let one account seed another account's Recent tab with
+	// GIFs of its choosing; manufacturing one when the client sent none would
+	// write a share the user opted out of. derivedCustomerID does both.
+	if id := h.derivedCustomerID(c); id != "" {
+		form.Set("customer_id", id)
+	}
+	if q := c.Query("q"); q != "" {
+		if len(q) > maxQueryLen {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "q parameter exceeds maximum length"})
+			return
+		}
+		form.Set("q", q)
+	}
+
+	h.proxyAPIForm(c, http.MethodPost, "/gifs/share/"+slug, form)
 }
 
 // Report forwards POST /gifs/report/{slug} to KLIPY.
@@ -276,7 +364,7 @@ func (h *Handler) Report(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": SlugValidationError(&slug)})
 		return
 	}
-	h.proxyAPIRequest(c, http.MethodPost, "/gifs/report/"+slug, nil)
+	h.proxyAPIForm(c, http.MethodPost, "/gifs/report/"+slug, nil)
 }
 
 // RandomID forwards GET /randomid to KLIPY (per-user opaque session ID).
@@ -301,9 +389,67 @@ func (h *Handler) RandomID(c *gin.Context) {
 //
 // Auth requirements match the rest of the klipy proxy routes (JWT-protected,
 // rate-limited via the same apiLimiter middleware in router.go).
+// customerIDFor derives KLIPY's partition key from the AUTHENTICATED user and
+// the client's value, which is treated as a rotation NONCE rather than as an
+// identity. Returns "" when there is no authenticated user; callers must fail
+// closed on that.
+//
+// Mixing the client value in rather than discarding it is deliberate. The
+// customer id is a user-facing privacy control (Settings > Content Safety
+// displays it and offers a Rotate button; with personalization OFF the client
+// rotates an ephemeral value every 30 minutes so KLIPY cannot correlate a user
+// over time). Deriving from the user id ALONE would close the security hole and
+// silently destroy that control, pinning every user to one permanent upstream
+// identifier — the opposite of what this proxy exists for.
+//
+// Keying the hash keeps both properties at once. The nonce is the caller's to
+// choose, so rotation and ephemerality work exactly as before; the user id is
+// not, so a caller can only ever address ledgers inside its OWN namespace. The
+// dangerous degree of freedom (whose ledger) is removed and the useful one
+// (which of my ledgers) is kept.
+//
+// KLIPY never mints customer_id — it treats the value as an opaque partition
+// key, and this handler used to hand out uuid.NewString(). The value was always
+// OURS to choose, so the safest thing it can be is one the client cannot
+// choose. Deriving removes the parameter from the trust boundary; an ownership
+// check would leave it trusted-by-default and one forgetful handler away from
+// the same bug.
+//
+// What that bug was: GET /gifs/recent/{id} proxied whatever id the caller put
+// in the path, so any authenticated account could read any other account's GIF
+// share history. It was dormant only because the ledger was structurally empty
+// for everyone — see the A2 fix in this same change, which is what fills it.
+//
+// The empty-user guard is not decoration. Every KLIPY route lives under
+// `protected`, so an unauthenticated request should be impossible; if that ever
+// stops being true, hashing the empty string would collapse EVERY caller onto
+// one shared derived ledger — a worse outcome than the bug being fixed.
+func (h *Handler) customerIDFor(c *gin.Context, nonce string) string {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		return ""
+	}
+	key := h.cfg.KlipyCustomerIDKey
+	if key == "" {
+		// Fall back to the API key. This cannot be a weak key: router.go
+		// registers the entire KLIPY route group only when KlipyAPIKey is
+		// non-empty, so an unkeyed derivation is unreachable rather than
+		// merely unlikely. The prefix keeps this domain-separated from the
+		// same key's use in upstream URL construction.
+		key = h.cfg.KlipyAPIKey
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte("klipy-customer-id|" + userID + "|" + nonce))
+	// 32 hex chars — inside MaxSlugLength and inside KLIPY's accepted charset.
+	return hex.EncodeToString(mac.Sum(nil))[:32]
+}
+
+// CustomerID mints a fresh random rotation nonce for the client to store and
+// send back. It is deliberately NOT the derived partition key: the value the
+// client holds is the one the user rotates, and it is never what reaches KLIPY
+// (customerIDFor keys it with the authenticated user first).
 func (h *Handler) CustomerID(c *gin.Context) {
-	id := uuid.NewString()
-	c.JSON(http.StatusOK, gin.H{"customer_id": id})
+	c.JSON(http.StatusOK, gin.H{"customer_id": uuid.NewString()})
 }
 
 // --- Media proxy ---
@@ -399,12 +545,35 @@ func (h *Handler) proxyAPIGet(c *gin.Context, path string, allowedParams []strin
 	h.forwardJSON(c, http.MethodGet, upstreamURL, nil)
 }
 
-// proxyAPIRequest is the same as proxyAPIGet but for non-GET methods.
-// No request body forwarding is supported in v1 — KLIPY's POST/DELETE endpoints
-// in our scope take all parameters in the URL.
-func (h *Handler) proxyAPIRequest(c *gin.Context, method, path string, _ io.Reader) {
-	upstreamURL := h.buildUpstreamURL(path, c, nil)
-	h.forwardJSON(c, method, upstreamURL, nil)
+// proxyAPIForm issues a non-GET upstream request whose body is built ENTIRELY
+// server-side from `form`. A client request body is never read and never
+// forwarded — taking url.Values rather than an io.Reader makes that structural
+// instead of a convention a later edit could quietly break (a reviewer can see
+// it at the call site).
+//
+// The same whitelisted values are duplicated onto the upstream query string.
+// KLIPY does not document which encoding its share endpoint reads, and a wrong
+// single guess fails SILENTLY — the upstream returns 200 {"result":true} either
+// way and the ledger stays empty, indistinguishable from the bug we are fixing.
+// Both copies are server-constructed, validated and bounded, so the marginal
+// exposure of sending both is zero. Narrow once the live shape is observed.
+//
+// Deliberately does NOT route through buildUpstreamURL: that helper's
+// sanitizeParam default branch passes unknown names through raw, which would
+// copy an unvalidated, unbounded value into the upstream URL.
+func (h *Handler) proxyAPIForm(c *gin.Context, method, path string, form url.Values) {
+	upstreamURL := fmt.Sprintf("%s/%s%s", klipyAPIBase, h.cfg.KlipyAPIKey, path)
+	var body io.Reader
+	if len(form) > 0 {
+		encoded := form.Encode()
+		sep := "?"
+		if strings.Contains(upstreamURL, "?") {
+			sep = "&"
+		}
+		upstreamURL += sep + encoded
+		body = strings.NewReader(encoded)
+	}
+	h.forwardJSON(c, method, upstreamURL, body)
 }
 
 // sanitizeParam normalizes a query param value for forwarding to KLIPY.
@@ -476,6 +645,11 @@ func (h *Handler) forwardJSON(c *gin.Context, method, upstreamURL string, body i
 		return
 	}
 	req.Header.Set("Accept", "application/json")
+	// A form body with no content type is the single most likely cause of a
+	// silent upstream no-op — KLIPY would 200 and ignore the payload.
+	if body != nil {
+		req.Header.Set(headerContentType, "application/x-www-form-urlencoded")
+	}
 
 	resp, err := h.client.Do(req) //nolint:gosec // upstreamURL from config base URL, not user input; dial-time IP egress guard (#1361)
 	if err != nil {

@@ -93,8 +93,15 @@ func TestNewHandlerWiresMediaCheckRedirect(t *testing.T) {
 	}
 	assert.NoError(t, h.mediaClient.CheckRedirect(mk("https://media.klipy.com/x"), nil))
 	assert.ErrorIs(t, h.mediaClient.CheckRedirect(mk("https://evil.example/x"), nil), errRedirectBlocked)
-	// The JSON client carries no CheckRedirect — it is covered by Layer C only.
-	assert.Nil(t, h.client.CheckRedirect)
+	// The JSON client REFUSES every redirect hop. It previously carried no
+	// CheckRedirect on the reasoning that Layer C covered it — that stopped
+	// being true in #2371, when Share began sending a server-constructed form
+	// body. On a 307 Go replays that body via GetBody to an upstream-chosen
+	// host, and Layer C cannot help because a redirect target is an ordinary
+	// public address. Its base URL is fixed, so no hop is ever legitimate.
+	require.NotNil(t, h.client.CheckRedirect)
+	assert.ErrorIs(t, h.client.CheckRedirect(mk("https://api.klipy.com/x"), nil), errAPIRedirectBlocked)
+	assert.ErrorIs(t, h.client.CheckRedirect(mk("https://evil.example/x"), nil), errAPIRedirectBlocked)
 }
 
 // --- Layer A end-to-end through the Media handler ---

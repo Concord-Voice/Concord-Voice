@@ -11,6 +11,11 @@ import "strings"
 // but we leave headroom for unusually long slugs without inviting abuse.
 const MaxSlugLength = 100
 
+// NOTE: the renderer carries a deliberately STRICTER counterpart,
+// isValidGifSlug in client/desktop/src/renderer/services/gifProvider/klipyClient.ts,
+// which rejects the empty string. The two answer different questions and must
+// NOT be reconciled — see #2580 and the #2371 design spec §2.1.
+
 // ValidateSlug returns true if the given slug is a valid KLIPY GIF slug.
 // Valid slugs are 1..MaxSlugLength characters of [a-zA-Z0-9-] only.
 // A nil pointer or empty string is treated as "no slug attached" and returns true.

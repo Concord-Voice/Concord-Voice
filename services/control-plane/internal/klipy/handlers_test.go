@@ -2,8 +2,10 @@ package klipy_test
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -29,6 +31,11 @@ const (
 
 	contentTypeHeader = "Content-Type"
 	mimeJSON          = "application/json"
+
+	// testUserHeader stands in for the auth middleware, which sets "user_id" on
+	// the gin context for every /klipy route (they live under `protected`).
+	// Varying it is how these tests model two different authenticated accounts.
+	testUserHeader = "X-Test-User-ID"
 )
 
 // newTestHandler returns a klipy.Handler whose upstream HTTP client points at
@@ -48,6 +55,14 @@ func newTestHandler(_ *testing.T) *klipy.Handler {
 
 func newRouter(h *klipy.Handler) *gin.Engine {
 	r := gin.New()
+	// Stand-in for middleware.RequireAuth, which is what puts "user_id" on the
+	// context in production. Without it every request is unauthenticated and
+	// the handlers fail closed, which is itself asserted below.
+	r.Use(func(c *gin.Context) {
+		if u := c.GetHeader(testUserHeader); u != "" {
+			c.Set("user_id", u)
+		}
+	})
 	r.GET("/klipy/gifs/trending", h.Trending)
 	r.GET("/klipy/gifs/search", h.Search)
 	r.GET("/klipy/gifs/categories", h.Categories)
@@ -62,19 +77,25 @@ func newRouter(h *klipy.Handler) *gin.Engine {
 	return r
 }
 
-// CustomerID generates a server-side UUID v4 — verify it returns a non-empty
-// customer_id without making any upstream KLIPY call.
-func TestCustomerIDReturnsUUID(t *testing.T) {
+// CustomerID mints a fresh random ROTATION NONCE for the client to store, not
+// the partition key that reaches KLIPY. Each call must yield a new value —
+// that is what makes the Rotate button in Settings actually rotate.
+func TestCustomerIDMintsAFreshNonce(t *testing.T) {
 	h := newTestHandler(t)
 	r := newRouter(h)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/klipy/customer-id", nil)
-	r.ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code)
-	body := w.Body.String()
-	assert.Contains(t, body, `"customer_id"`)
-	// UUID v4 length is 36 (8-4-4-4-12)
-	assert.Regexp(t, `"customer_id":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"`, body)
+
+	mint := func() string {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/customer-id", nil)
+		req.Header.Set(testUserHeader, "alice")
+		r.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+		return w.Body.String()
+	}
+
+	first := mint()
+	assert.Regexp(t, `"customer_id":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"`, first)
+	assert.NotEqual(t, first, mint(), "rotation returned the same nonce twice")
 }
 
 func TestSearchRequiresQ(t *testing.T) {
@@ -97,23 +118,36 @@ func TestSearchQTooLong(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "exceeds maximum length")
 }
 
-func TestRecentInvalidCustomerID(t *testing.T) {
-	h := newTestHandler(t)
-	r := newRouter(h)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", pathRecentBadSpace, nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "invalid customer_id")
+// A malformed :customerID used to earn a 400. It now earns nothing at all: the
+// param is discarded before it can be validated, so the payload cannot reach
+// upstream by construction rather than by a check remembering to run. The
+// safety property these two tests were written to hold is unchanged and now
+// rests on something stronger, so they assert the property, not the 400.
+func TestRecentDiscardsMalformedCustomerID(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", pathRecentBadSpace, nil)
+		req.Header.Set(testUserHeader, "some-user")
+		r.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.NotContains(t, lastUpstream.Path, "space")
+		assert.NotContains(t, lastUpstream.Path, "%20")
+	})
 }
 
-func TestHideRecentInvalidCustomerID(t *testing.T) {
-	h := newTestHandler(t)
-	r := newRouter(h)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("DELETE", pathRecentBadSpace, nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+func TestHideRecentDiscardsMalformedCustomerID(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("DELETE", pathRecentBadSpace, nil)
+		req.Header.Set(testUserHeader, "some-user")
+		r.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.NotContains(t, lastUpstream.Path, "space")
+	})
 }
 
 func TestShareInvalidSlug(t *testing.T) {
@@ -256,6 +290,20 @@ func TestNewHandler(t *testing.T) {
 // the package variables klipyAPIBase and allowedMediaHosts. They cover the
 // proxy success/error paths that the validation-only tests above can't reach.
 
+// capturedRequest records what the fake upstream actually received, so tests
+// can assert on the body and headers rather than only the status.
+type capturedRequest struct {
+	Method      string
+	Path        string
+	RawQuery    string
+	ContentType string
+	Body        string
+}
+
+// lastUpstream is written by the mock handler and read by the assertions.
+// Tests using it run sequentially within a single withMockUpstream closure.
+var lastUpstream *capturedRequest
+
 // withMockUpstream spins up an httptest TLS server (so the URL scheme is
 // https://, satisfying the production media-proxy validation), swaps it into
 // the package variables, and runs the test. State is restored at the end of
@@ -268,9 +316,11 @@ func withMockUpstream(t *testing.T, fn func(t *testing.T, h *klipy.Handler, r *g
 		// KLIPY's documented response shape.
 		switch {
 		case req.URL.Path == "/"+testAppKey+"/gifs/trending":
+			lastUpstream = &capturedRequest{Method: req.Method, Path: req.URL.Path, RawQuery: req.URL.RawQuery}
 			w.Header().Set(contentTypeHeader, mimeJSON)
 			_, _ = w.Write([]byte(`{"data":[{"slug":"trend-1"}],"has_more":false}`))
 		case req.URL.Path == "/"+testAppKey+"/gifs/search":
+			lastUpstream = &capturedRequest{Method: req.Method, Path: req.URL.Path, RawQuery: req.URL.RawQuery}
 			w.Header().Set(contentTypeHeader, mimeJSON)
 			_, _ = w.Write([]byte(`{"data":[{"slug":"search-1"}],"has_more":false}`))
 		case req.URL.Path == "/"+testAppKey+"/gifs/categories":
@@ -280,13 +330,27 @@ func withMockUpstream(t *testing.T, fn func(t *testing.T, h *klipy.Handler, r *g
 			w.Header().Set(contentTypeHeader, mimeJSON)
 			_, _ = w.Write([]byte(`{"data":{"random_id":"mock-id"}}`))
 		case req.URL.Path == "/"+testAppKey+"/gifs/items":
+			lastUpstream = &capturedRequest{Method: req.Method, Path: req.URL.Path, RawQuery: req.URL.RawQuery}
 			w.Header().Set(contentTypeHeader, mimeJSON)
 			_, _ = w.Write([]byte(`{"data":[]}`))
 		case strings.HasPrefix(req.URL.Path, "/"+testAppKey+"/gifs/share/"),
 			strings.HasPrefix(req.URL.Path, "/"+testAppKey+"/gifs/report/"):
+			raw, _ := io.ReadAll(req.Body)
+			lastUpstream = &capturedRequest{
+				Method:      req.Method,
+				Path:        req.URL.Path,
+				RawQuery:    req.URL.RawQuery,
+				ContentType: req.Header.Get("Content-Type"),
+				Body:        string(raw),
+			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
 		case strings.HasPrefix(req.URL.Path, "/"+testAppKey+"/gifs/recent/"):
+			lastUpstream = &capturedRequest{
+				Method:   req.Method,
+				Path:     req.URL.Path,
+				RawQuery: req.URL.RawQuery,
+			}
 			w.Header().Set(contentTypeHeader, mimeJSON)
 			_, _ = w.Write([]byte(`{"data":[],"has_more":false}`))
 		case req.URL.Path == "/upstream-500":
@@ -368,6 +432,7 @@ func TestProxyRecentHappyPath(t *testing.T) {
 	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/klipy/gifs/recent/abc123", nil)
+		req.Header.Set(testUserHeader, "happy-user")
 		r.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
 	})
@@ -404,8 +469,144 @@ func TestProxyHideRecentHappyPath(t *testing.T) {
 	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("DELETE", "/klipy/gifs/recent/abc123", nil)
+		req.Header.Set(testUserHeader, "happy-user")
 		r.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
+	})
+}
+
+// NOTE ON STYLE: this file has NO request helper. Every existing test builds
+// the request inline with httptest.NewRecorder() + httptest.NewRequest() +
+// r.ServeHTTP — see TestProxyCategoriesHappyPath (:347). Match that exactly.
+// NOTE ON ROUTES: newRouter mounts the group at /klipy, NOT /api/v1/klipy.
+
+func TestShareForwardsCustomerIDInBody(t *testing.T) {
+	// THE A2 GATE. This is the half of the fix we control and the half that
+	// regresses. "Share a GIF, then look at the Recent tab" is deliberately NOT
+	// the gate — vendor analytics ingestion latency is undocumented, so it has
+	// no failure semantics.
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		// Personalization ON is modelled by the client sending its nonce; with it
+		// OFF the renderer omits customer_id and the share is deliberately
+		// unattributed (see TestPersonalizedRoutesOmitCustomerIDWhenClientSendsNone).
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug?customer_id=stored-nonce", nil)
+		req.Header.Set(testUserHeader, "sharing-user")
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		// A customer_id must be ATTACHED (absent one, the ledger stays empty and
+		// A2 regresses) and must be the derived 32-hex key, not a client value.
+		assert.Regexp(t, `customer_id=[0-9a-f]{32}`, lastUpstream.Body)
+		assert.Equal(t, "application/x-www-form-urlencoded", lastUpstream.ContentType)
+		assert.Regexp(t, `customer_id=[0-9a-f]{32}`, lastUpstream.RawQuery)
+	})
+}
+
+func TestShareForwardsQ(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug?q=happy+dance", nil)
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.Contains(t, lastUpstream.Body, "q=happy+dance")
+	})
+}
+
+func TestShareOmitsAbsentParams(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug", nil)
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.Empty(t, lastUpstream.Body)
+		assert.NotContains(t, lastUpstream.RawQuery, "customer_id")
+	})
+}
+
+func TestShareRejectsEmptyCustomerID(t *testing.T) {
+	// R4 LOCK. ValidateSlug("") returns TRUE in Go. The natural implementation
+	//   cid := c.Query("customer_id"); if !ValidateSlug(&cid) { 400 }; form.Set(...)
+	// therefore ACCEPTS an absent param and forwards `customer_id=` upstream,
+	// reproducing A2 exactly behind a green happy-path test. Branch on presence
+	// FIRST. This must be a 200 with the param omitted — not a 400.
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug?customer_id=", nil)
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.NotContains(t, lastUpstream.Body, "customer_id=")
+		assert.NotContains(t, lastUpstream.RawQuery, "customer_id=")
+	})
+}
+
+func TestShareDiscardsClientCustomerIDPayload(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug?customer_id=..%2Fx", nil)
+		req.Header.Set(testUserHeader, "sharing-user")
+		r.ServeHTTP(w, req)
+
+		// Previously a 400. The traversal payload is now discarded unread, so
+		// the request succeeds and the payload still never reaches upstream —
+		// the same property, held by construction instead of by a check.
+		assert.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.NotContains(t, lastUpstream.Body, "..")
+		assert.NotContains(t, lastUpstream.RawQuery, "..")
+	})
+}
+
+func TestShareRejectsOversizeQ(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST",
+			"/klipy/gifs/share/good-slug?q="+strings.Repeat("a", 101), nil)
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Nil(t, lastUpstream)
+	})
+}
+
+func TestShareNeverForwardsClientBody(t *testing.T) {
+	// THE C4 LOCK. The url.Values signature makes "no client body forwarded"
+	// structural rather than conventional; this test is what keeps it true.
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug",
+			strings.NewReader(`{"evil":"payload"}`))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.NotContains(t, lastUpstream.Body, "evil")
+		assert.NotContains(t, lastUpstream.Body, "payload")
+	})
+}
+
+func TestShareAppKeyNotLeakedOnParamRejection(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug?customer_id=..%2Fx", nil)
+		r.ServeHTTP(w, req)
+
+		assert.NotContains(t, w.Body.String(), testAppKey)
 	})
 }
 
@@ -815,4 +1016,237 @@ func TestProxyMediaLogsUpstreamNetworkFailureWithoutLeakingURL(t *testing.T) {
 	assert.Contains(t, logOut, "host=127.0.0.1")
 	assert.NotContains(t, logOut, slug,
 		"PRIVACY VIOLATION: slug leaked into log output on network failure")
+}
+
+// TestShareRefusesUpstreamRedirect is a #2371 regression lock, and it is
+// deliberately NOT written inside withMockUpstream: that harness calls
+// SetHTTPClientForTest to swap in the httptest server's client, which carries
+// no CheckRedirect — a test written there would replace the very guard it is
+// meant to verify and pass vacuously.
+//
+// Before #2371 the proxy forwarded no request body, so following a redirect was
+// harmless. Share now sends a server-constructed form body, and on a 307 Go
+// preserves the method and replays that body via GetBody — handing an
+// upstream-chosen host the per-user customer_id, plus a Referer whose path
+// carries the KLIPY app key. The dial-time egress guard does not stop it: a
+// redirect target is an ordinary public address.
+func TestShareRefusesUpstreamRedirect(t *testing.T) {
+	// httptest binds loopback, which the production dial guard denies.
+	defer klipy.SetEgressGuardForTest(func(netip.Addr) bool { return false })()
+
+	var offPathHit bool
+	var offPathBody string
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		offPathHit = true
+		offPathBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer attacker.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/collect", http.StatusTemporaryRedirect)
+	}))
+	defer upstream.Close()
+
+	restoreBase := klipy.SetAPIBaseForTest(upstream.URL)
+	defer klipy.SetAPIBaseForTest(restoreBase)
+
+	r := newRouter(newTestHandler(t))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/klipy/gifs/share/good-slug?customer_id=abc-123", nil)
+	r.ServeHTTP(w, req)
+
+	assert.False(t, offPathHit, "a redirect must not deliver the request to an off-path host")
+	assert.Empty(t, offPathBody, "the server-constructed form body must never be replayed off-path")
+	assert.Equal(t, http.StatusBadGateway, w.Code, "a refused redirect surfaces as an upstream failure")
+	assert.NotContains(t, w.Body.String(), testAppKey, "the app key must not leak in the error body")
+}
+
+// TestShareEmptySlugIssuesNoUpstreamRequest locks a property that is currently
+// true by routing rather than by a guard, which is exactly why it is worth
+// pinning. ValidateSlug("") returns true, so if gin ever routed
+// /gifs/share/ to Share with an empty :slug, the handler would build
+// "/gifs/share/" and call upstream. It does not — the route 404s — but that
+// depends on gin's trailing-slash behaviour, not on anything this package
+// controls. Raised as a review finding and refuted by this test.
+func TestShareEmptySlugIssuesNoUpstreamRequest(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/klipy/gifs/share/", nil)
+		r.ServeHTTP(w, req)
+
+		assert.Nil(t, lastUpstream, "an empty slug must never reach the upstream")
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+}
+
+// --- customer_id is derived from the authenticated user, never accepted ------
+//
+// KLIPY treats customer_id as an opaque partition key and never mints it — the
+// CustomerID handler used to return uuid.NewString(), i.e. WE chose the value
+// all along. Because it is ours to choose, it is derived from the authenticated
+// user rather than supplied by the client, which removes it from the trust
+// boundary instead of adding an ownership check a future handler could forget.
+//
+// Without this, GET /gifs/recent/{id} proxied whatever id the caller typed, so
+// any authenticated account could read any other account's share history. That
+// was dormant while the recent ledger was structurally empty and went live the
+// moment this PR started populating it (#2371 review, Codex P1).
+
+func recentUpstreamPathFor(t *testing.T, r *gin.Engine, user, clientSuppliedID string) string {
+	t.Helper()
+	lastUpstream = nil
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/klipy/gifs/recent/"+clientSuppliedID, nil)
+	req.Header.Set(testUserHeader, user)
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotNil(t, lastUpstream, "no upstream request was made")
+	return lastUpstream.Path
+}
+
+func TestRecentIgnoresClientCustomerID(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		const victimID = "victimcustomeridvalue"
+		path := recentUpstreamPathFor(t, r, "attacker-user", victimID)
+		assert.NotContains(t, path, victimID,
+			"a client-supplied customer_id reached upstream: any authenticated "+
+				"account can read any other account's share history")
+	})
+}
+
+func TestRecentDerivesADistinctIDPerUser(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		const sameID = "identicalclientvalue"
+		attacker := recentUpstreamPathFor(t, r, "attacker-user", sameID)
+		victim := recentUpstreamPathFor(t, r, "victim-user", sameID)
+		assert.NotEqual(t, attacker, victim,
+			"two different users derived the same partition key — one shared ledger")
+	})
+}
+
+func TestRecentDerivedIDIsStableForOneUser(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		// Stability is what makes the ledger work at all: the id written by
+		// Share must be the id read back by Recent, across processes and
+		// restarts. A random or time-varying derivation would pass the
+		// isolation tests above and still leave the Recent tab permanently
+		// empty — which is defect A2 all over again. Stability is per (user,
+		// nonce): the SAME stored nonce must always resolve to the same ledger.
+		first := recentUpstreamPathFor(t, r, "steady-user", "stored-nonce")
+		second := recentUpstreamPathFor(t, r, "steady-user", "stored-nonce")
+		assert.Equal(t, first, second, "the derived id is not stable for one user")
+	})
+}
+
+func TestRecentFailsClosedWhenUnauthenticated(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		// No testUserHeader. In production the auth middleware makes this
+		// unreachable; the guard exists so that if it ever IS reachable, every
+		// caller does not silently collapse onto one shared derived ledger.
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/klipy/gifs/recent/anything", nil)
+		r.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Nil(t, lastUpstream, "an unauthenticated request reached upstream")
+	})
+}
+
+func TestShareSendsDerivedCustomerIDNotTheClientOne(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		lastUpstream = nil
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST",
+			"/klipy/gifs/share/good-slug?customer_id=attackerchosen", nil)
+		req.Header.Set(testUserHeader, "sharing-user")
+		r.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+		require.NotNil(t, lastUpstream)
+		assert.NotContains(t, lastUpstream.Body, "attackerchosen",
+			"the client chose the ledger its share was written into")
+		assert.Contains(t, lastUpstream.Body, "customer_id=",
+			"no customer_id was attached, so the recent ledger stays empty (A2)")
+	})
+}
+
+// The other half of the contract, and the reason the client's value is folded
+// in rather than discarded: the customer id is a user-facing PRIVACY control.
+// Settings > Content Safety displays it and offers Rotate, and with
+// personalization off the client rotates an ephemeral value every 30 minutes so
+// KLIPY cannot correlate a user over time. Deriving from the user id alone
+// would have closed the security hole and silently pinned every user to one
+// permanent upstream identifier instead.
+func TestRotatingTheNonceReachesADifferentLedger(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		before := recentUpstreamPathFor(t, r, "rotating-user", "nonce-before")
+		after := recentUpstreamPathFor(t, r, "rotating-user", "nonce-after")
+		assert.NotEqual(t, before, after,
+			"rotating the customer id had no effect upstream: the Rotate button "+
+				"and the 30-minute ephemeral rotation are both inert")
+	})
+}
+
+// --- absence is meaningful; every personalized route derives ----------------
+//
+// When personalization is OFF the renderer omits customer_id entirely, and
+// klipyClient.notifyShared says why: attaching it "would create a PERSISTENT
+// upstream write keyed to an id we promise is ephemeral". Deriving from an
+// absent value manufactures exactly that identifier and defeats the opt-out
+// from the server side. The pre-derivation Share handler branched on presence
+// for the sibling reason recorded as #2371 R4; the derivation dropped that
+// branch and these tests are what stop it being dropped again.
+
+func upstreamQueryFor(t *testing.T, r *gin.Engine, method, url string) string {
+	t.Helper()
+	lastUpstream = nil
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(method, url, nil)
+	req.Header.Set(testUserHeader, "some-user")
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotNil(t, lastUpstream, "no upstream request was made")
+	if lastUpstream.Body != "" {
+		return lastUpstream.RawQuery + "&" + lastUpstream.Body
+	}
+	return lastUpstream.RawQuery
+}
+
+func TestPersonalizedRoutesOmitCustomerIDWhenClientSendsNone(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		for _, tc := range []struct{ name, method, url string }{
+			{"share", "POST", "/klipy/gifs/share/good-slug"},
+			{"trending", "GET", "/klipy/gifs/trending"},
+			{"search", "GET", "/klipy/gifs/search?q=cats"},
+			{"items", "GET", "/klipy/gifs/items?slugs=a"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := upstreamQueryFor(t, r, tc.method, tc.url)
+				assert.NotContains(t, got, "customer_id",
+					"the server manufactured an identifier the client withheld")
+			})
+		}
+	})
+}
+
+func TestPersonalizedRoutesDeriveRatherThanForwardTheNonce(t *testing.T) {
+	withMockUpstream(t, func(t *testing.T, _ *klipy.Handler, r *gin.Engine) {
+		const nonce = "rawclientnoncevalue"
+		for _, tc := range []struct{ name, method, url string }{
+			{"share", "POST", "/klipy/gifs/share/good-slug?customer_id=" + nonce},
+			{"trending", "GET", "/klipy/gifs/trending?customer_id=" + nonce},
+			{"search", "GET", "/klipy/gifs/search?q=cats&customer_id=" + nonce},
+			{"items", "GET", "/klipy/gifs/items?slugs=a&customer_id=" + nonce},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := upstreamQueryFor(t, r, tc.method, tc.url)
+				assert.NotContains(t, got, nonce,
+					"the raw client nonce was forwarded to KLIPY verbatim")
+				assert.Regexp(t, `customer_id=[0-9a-f]{32}`, got,
+					"no derived customer_id was attached")
+			})
+		}
+	})
 }

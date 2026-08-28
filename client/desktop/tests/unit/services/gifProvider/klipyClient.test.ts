@@ -1,4 +1,10 @@
-import { klipyClient, rewriteMediaUrl } from '@/renderer/services/gifProvider/klipyClient';
+import {
+  klipyClient,
+  rewriteMediaUrl,
+  isValidGifSlug,
+  isValidCustomerId,
+  KlipyIdentityError,
+} from '@/renderer/services/gifProvider/klipyClient';
 import { API_BASE } from '@/renderer/config';
 import {
   resetRuntimeServerBase,
@@ -99,6 +105,134 @@ describe('klipyClient', () => {
       expect(idCalls).toHaveLength(0);
       const trendingUrl = apiFetchMock.mock.calls[0][0] as string;
       expect(trendingUrl).toContain('customer_id=pre-cached-id');
+    });
+
+    it('does not carry a customer_id FAILURE across a runtime server change', async () => {
+      // A 60s backoff recorded against the server the user just left would be
+      // inherited by the one they joined, so recent() throws KlipyIdentityError
+      // there even though that server's endpoint is healthy.
+      klipyClient.setPersonalizationEnabled(true);
+      let release!: (r: Response) => void;
+      apiFetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          })
+      );
+
+      const pending = klipyClient.getCustomerID();
+      setRuntimeServerBase('https://other-instance.example.com');
+      release(jsonResponse({ error: 'nope' }, 500));
+      await expect(pending).resolves.toBeNull();
+
+      // The new server must be free to try: a fresh request is issued rather
+      // than short-circuited by the previous server's backoff.
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ customer_id: 'fresh-id' }));
+      await expect(klipyClient.getCustomerID()).resolves.toBe('fresh-id');
+    });
+
+    it.each([
+      [400, 'client-bug'],
+      [429, 'backpressure'],
+      [500, 'upstream'],
+      [503, 'upstream'],
+    ])('classifies a %i share rejection as %s', async (status, expected) => {
+      // The comment above this classification named three classes while the
+      // code collapsed 429 into `upstream`, so the two drifted apart unnoticed.
+      // 429 is backpressure we deliberately do not retry; an operator
+      // aggregating on failureClass cannot tell that from a vendor outage
+      // unless the class says so.
+      klipyClient.setPersonalizationEnabled(false);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ error: 'no' }, status));
+
+      await klipyClient.notifyShared('good-slug');
+
+      // LAST matching call, not the first: console.warn accumulates across the
+      // it.each cases, so `find` can read a NEIGHBOURING case's call and assert
+      // against the wrong status. Caught when falsifying — collapsing the 429
+      // branch failed the 500 and 503 cases too, because they were reading the
+      // 429 case's entry rather than their own.
+      const calls = warn.mock.calls.filter((c) => String(c[0]).includes('upstream rejected'));
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[calls.length - 1][1]).toMatchObject({ status, failureClass: expected });
+      warn.mockRestore();
+    });
+
+    it('does not send a share to a server joined mid-flight', async () => {
+      // Rejecting the stale identifier is not enough: the SHARE itself — the
+      // slug and the search term in ctx.q — would still be POSTed to whichever
+      // server is current after the await. Unlike the earlier mid-flight test
+      // that had to be deleted for vacuity, this one asserts on the REQUEST
+      // COUNT, which discriminates regardless of what the continuation returns.
+      klipyClient.setPersonalizationEnabled(true);
+      let release!: (r: Response) => void;
+      apiFetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          })
+      );
+
+      const pending = klipyClient.notifyShared('good-slug', { q: 'private search term' });
+      setRuntimeServerBase('https://other-instance.example.com');
+      release(jsonResponse({ customer_id: 'minted-by-the-previous-server' }));
+      await pending;
+
+      const shareCalls = apiFetchMock.mock.calls.filter((c) =>
+        String(c[0]).includes('/gifs/share/')
+      );
+      expect(shareCalls).toHaveLength(0);
+    });
+
+    it('does not hand a caller on the new server the promise begun on the old one', async () => {
+      // The in-flight handle exists so concurrent callers share ONE request.
+      // It is only shareable within the selection it started under: once the
+      // stale-selection guard makes the old promise resolve null by design, a
+      // caller on the NEW server that joins it inherits that null — recent()
+      // reports an identity error and shares go unattributed on a server whose
+      // endpoint is perfectly healthy.
+      klipyClient.setPersonalizationEnabled(true);
+      let releaseA!: (r: Response) => void;
+      apiFetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            releaseA = resolve;
+          })
+      );
+
+      const onA = klipyClient.getCustomerID();
+      setRuntimeServerBase('https://server-b.example.com');
+
+      apiFetchMock.mockResolvedValueOnce(jsonResponse({ customer_id: 'minted-by-b' }));
+      const onB = klipyClient.getCustomerID();
+
+      releaseA(jsonResponse({ customer_id: 'minted-by-a' }));
+
+      await expect(onA).resolves.toBeNull();
+      await expect(onB).resolves.toBe('minted-by-b');
+    });
+
+    it('discards an in-flight customer_id when the runtime server changes', async () => {
+      // The state check that selects the server happens BEFORE the await; it
+      // says nothing about the world after it. Without the fence, a value
+      // minted by the server the user just left is cached and persisted
+      // against the server they just joined.
+      klipyClient.setPersonalizationEnabled(true);
+      let release!: (r: Response) => void;
+      apiFetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          })
+      );
+
+      const pending = klipyClient.getCustomerID();
+      setRuntimeServerBase('https://other-instance.example.com');
+      release(jsonResponse({ customer_id: 'minted-by-the-previous-server' }));
+
+      await expect(pending).resolves.toBeNull();
+      expect(localStorage.getItem('concord:klipy-customer-id')).toBeNull();
     });
 
     it('returns null and skips customer_id when /customer-id fails', async () => {
@@ -305,6 +439,173 @@ describe('klipyClient', () => {
       expect(methods.find((m) => m.toLowerCase().includes('media'))).toBeUndefined();
     });
   });
+
+  describe('report() slug guard (#2580, second sink)', () => {
+    it.each([['..'], ['../../users/me'], ['%2e%2e%2f'], ['a/b'], ['']])(
+      'issues ZERO requests for %s',
+      async (slug) => {
+        klipyClient.setPersonalizationEnabled(false);
+        apiFetchMock.mockResolvedValue(jsonResponse({}));
+        await expect(klipyClient.report(slug)).rejects.toThrow();
+        expect(apiFetchMock).not.toHaveBeenCalled();
+      }
+    );
+
+    it('still issues exactly one request for a valid slug', async () => {
+      klipyClient.setPersonalizationEnabled(false);
+      apiFetchMock.mockResolvedValue(jsonResponse({}));
+      await klipyClient.report('good-slug');
+      expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('notifyShared (A2 + #2580)', () => {
+    it('sends customer_id when personalization is ON', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      localStorage.setItem('concord:klipy-customer-id', 'abc-123');
+      apiFetchMock.mockResolvedValue(jsonResponse({ result: true }));
+
+      await klipyClient.notifyShared('good-slug');
+
+      expect(apiFetchMock).toHaveBeenCalledTimes(1);
+      const path = apiFetchMock.mock.calls[0][0] as string;
+      expect(path).toContain('/gifs/share/good-slug');
+      expect(path).toContain('customer_id=abc-123');
+    });
+
+    it('OMITS customer_id when personalization is OFF', async () => {
+      klipyClient.setPersonalizationEnabled(false);
+      apiFetchMock.mockResolvedValue(jsonResponse({ result: true }));
+
+      await klipyClient.notifyShared('good-slug');
+
+      expect(apiFetchMock).toHaveBeenCalledTimes(1);
+      expect(apiFetchMock.mock.calls[0][0] as string).not.toContain('customer_id');
+    });
+
+    it('forwards q when the send originated from a search', async () => {
+      klipyClient.setPersonalizationEnabled(false);
+      apiFetchMock.mockResolvedValue(jsonResponse({ result: true }));
+
+      await klipyClient.notifyShared('good-slug', { q: 'happy dance' });
+
+      expect(apiFetchMock.mock.calls[0][0] as string).toContain('q=happy+dance');
+    });
+
+    it.each([
+      ['..'],
+      ['../../users/me'],
+      ['%2e%2e%2f'],
+      ['a/b'],
+      ['a\\b'],
+      ['a?b'],
+      ['a#b'],
+      [''],
+      ['a'.repeat(101)],
+    ])('issues ZERO requests for the invalid slug %s', async (slug) => {
+      // Personalization ON is the strict case: an implementation that resolves
+      // customer_id BEFORE validating would issue one customer-id request here
+      // and fail AC9 on a technicality a PoC will find.
+      klipyClient.setPersonalizationEnabled(true);
+      apiFetchMock.mockResolvedValue(jsonResponse({ result: true }));
+
+      await klipyClient.notifyShared(slug);
+
+      expect(apiFetchMock).not.toHaveBeenCalled();
+    });
+
+    it('never rejects, and emits a signal, when the upstream fails', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      klipyClient.setPersonalizationEnabled(false);
+      apiFetchMock.mockResolvedValue(jsonResponse({ error: 'nope' }, 429));
+
+      await expect(klipyClient.notifyShared('good-slug')).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalled();
+      // The slug must never appear in the log line (observability symmetry).
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('good-slug');
+      warn.mockRestore();
+    });
+
+    it('never rejects when the transport itself throws', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      klipyClient.setPersonalizationEnabled(false);
+      apiFetchMock.mockRejectedValue(new Error('offline'));
+
+      await expect(klipyClient.notifyShared('good-slug')).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+    });
+  });
+
+  describe('recent() identity failures (A3)', () => {
+    it('THROWS when personalization is ON and the customer id cannot be resolved', async () => {
+      // Previously returned a fabricated { data: [], has_more: false } — a
+      // success shape indistinguishable from "you have no recents", which would
+      // mask the A2 fix during verification.
+      klipyClient.setPersonalizationEnabled(true);
+      apiFetchMock.mockResolvedValue(jsonResponse({ error: 'unauthorized' }, 401));
+
+      await expect(klipyClient.recent(1, 25)).rejects.toBeInstanceOf(KlipyIdentityError);
+    });
+
+    it('returns a legitimate empty when personalization is OFF', async () => {
+      // Not an error: the Recent tab is hidden in this mode.
+      klipyClient.setPersonalizationEnabled(false);
+      await expect(klipyClient.recent(1, 25)).resolves.toEqual({ data: [], has_more: false });
+      expect(apiFetchMock).not.toHaveBeenCalled();
+    });
+
+    it('force skips the customer-id failure backoff', async () => {
+      klipyClient.setPersonalizationEnabled(true);
+      apiFetchMock.mockResolvedValue(jsonResponse({ error: 'nope' }, 500));
+      await expect(klipyClient.recent(1, 25)).rejects.toBeInstanceOf(KlipyIdentityError);
+      const callsAfterFirst = apiFetchMock.mock.calls.length;
+
+      // Without force, the 60s TTL short-circuits and issues no new request.
+      await expect(klipyClient.recent(1, 25)).rejects.toBeInstanceOf(KlipyIdentityError);
+      expect(apiFetchMock.mock.calls.length).toBe(callsAfterFirst);
+
+      // With force, the backoff is cleared and the id fetch is retried.
+      await expect(klipyClient.recent(1, 25, { force: true })).rejects.toBeInstanceOf(
+        KlipyIdentityError
+      );
+      expect(apiFetchMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+    });
+  });
+});
+
+describe('isValidGifSlug (#2580)', () => {
+  it('accepts a well-formed slug', () => {
+    expect(isValidGifSlug('funny-cat-123')).toBe(true);
+    expect(isValidGifSlug('a')).toBe(true);
+    expect(isValidGifSlug('A'.repeat(100))).toBe(true);
+  });
+
+  // The empty string is the case where this DELIBERATELY DIVERGES from the Go
+  // ValidateSlug, which returns true for "" ("optional attached-slug field is
+  // well-formed"). Here the question is "may I interpolate this into a path?"
+  // and the answer for "" is no. A naive mirror of the Go function reopens A2.
+  it('rejects the empty string, unlike the Go ValidateSlug', () => {
+    expect(isValidGifSlug('')).toBe(false);
+  });
+
+  it.each([
+    ['dot segments', '../../users/me'],
+    ['single dot segment', '..'],
+    ['encoded dot segments', '%2e%2e%2f'],
+    ['forward slash', 'a/b'],
+    ['backslash', 'a\\b'],
+    ['query introducer', 'a?b=c'],
+    ['fragment introducer', 'a#b'],
+    ['unicode fraction slash', 'a⁄b'],
+    ['unicode fullwidth solidus', 'a／b'],
+    ['newline', 'a\nb'],
+    ['space', 'a b'],
+    ['underscore', 'a_b'],
+    ['oversized (101 chars)', 'a'.repeat(101)],
+  ])('rejects %s', (_label, slug) => {
+    expect(isValidGifSlug(slug)).toBe(false);
+  });
 });
 
 describe('rewriteMediaUrl', () => {
@@ -387,5 +688,78 @@ describe('rewriteMediaUrl', () => {
   it('handles URLs with query params', () => {
     const url = 'https://media.klipy.com/a.mp4?token=abc&size=hd';
     expect(rewriteMediaUrl(url)).toBe(proxy(url));
+  });
+});
+
+describe('customer id is untrusted input (#2371 red-team VULN-002)', () => {
+  // The stored id is NOT scoped per server: a hostile self-hosted instance can
+  // mint one, it persists, and it is then reused against the official API with
+  // the official bearer token. Same class as #2580, different sink.
+  const POISON = '../../../users/me/sessions';
+
+  it('rejects a path-traversal customer id', () => {
+    expect(isValidCustomerId(POISON)).toBe(false);
+    expect(isValidCustomerId('')).toBe(false);
+    expect(isValidCustomerId('a/b')).toBe(false);
+    expect(isValidCustomerId('7f3c9a10-2b4e-4d6f-9a01-1c2d3e4f5a6b')).toBe(true);
+  });
+
+  it('discards a poisoned stored id instead of interpolating it into the path', async () => {
+    localStorage.setItem('concord:klipy-customer-id', POISON);
+    klipyClient.setPersonalizationEnabled(true);
+    // Minting a fresh id must be what happens next, not reuse of the poison.
+    apiFetchMock.mockResolvedValue(jsonResponse({ customer_id: 'clean-id-123' }));
+
+    await klipyClient.recent(1, 25).catch(() => undefined);
+
+    const paths = apiFetchMock.mock.calls.map((c) => String(c[0]));
+    expect(paths.some((p) => p.includes('users/me/sessions'))).toBe(false);
+    expect(paths.some((p) => p.includes('..'))).toBe(false);
+    expect(localStorage.getItem('concord:klipy-customer-id')).not.toBe(POISON);
+  });
+
+  it('refuses to persist an ill-formed id handed back by the server', async () => {
+    klipyClient.setPersonalizationEnabled(true);
+    apiFetchMock.mockResolvedValue(jsonResponse({ customer_id: POISON }));
+
+    await klipyClient.recent(1, 25).catch(() => undefined);
+
+    expect(localStorage.getItem('concord:klipy-customer-id')).toBeNull();
+    const paths = apiFetchMock.mock.calls.map((c) => String(c[0]));
+    expect(paths.some((p) => p.includes('users/me/sessions'))).toBe(false);
+  });
+});
+
+describe('opting out mid-flight (Codex P1 — async continuation)', () => {
+  // A state check made BEFORE an await does not hold after it. The user can
+  // disable personalization while /customer-id is still in flight; the
+  // continuation must re-read the flag, not trust the value it captured.
+  // NOT TESTED HERE, deliberately, and the gap is real: the notifyShared
+  // equivalent of the case below cannot be staged in this harness.
+  // setPersonalizationEnabled(false) clears customerIdInFlight, so the
+  // continuation re-fetches and resolves null whether or not the post-await
+  // recheck exists — three staging attempts could not make the assertion
+  // discriminate. The recheck in notifyShared is therefore defensive and
+  // unverified by test; the recent() case below IS verified and covers the
+  // same class. Do not add a green test here without falsifying it first.
+
+  it('recent does not issue a request when personalization is disabled mid-flight', async () => {
+    klipyClient.setPersonalizationEnabled(true);
+    // Build the deferred BEFORE wiring the mock: assigning `release` inside the
+    // implementation makes it exist only once the mock is invoked.
+    let release!: (r: Response) => void;
+    const idInFlight = new Promise<Response>((res) => {
+      release = res;
+    });
+    apiFetchMock.mockImplementationOnce(() => idInFlight);
+    apiFetchMock.mockResolvedValue(jsonResponse({ data: [], has_more: false }));
+
+    const p = klipyClient.recent(1, 25);
+    klipyClient.setPersonalizationEnabled(false);
+    release(jsonResponse({ customer_id: 'abc-123' }));
+    await p.catch(() => undefined);
+
+    const paths = apiFetchMock.mock.calls.map((c) => String(c[0]));
+    expect(paths.some((path) => path.includes('/gifs/recent/'))).toBe(false);
   });
 });

@@ -6474,8 +6474,14 @@ paths:
       tags:
       - GIFs
       summary: Generate a customer ID
-      description: 'Generate a fresh opaque per-user identifier (UUID v4) for KLIPY personalization, server-side
+      description: 'Generate a fresh random rotation nonce (UUID v4) for KLIPY personalization, server-side
         — no upstream call.
+
+        This value is NOT the identifier KLIPY sees. The control-plane derives the upstream customer id
+        as an HMAC over the authenticated user and this nonce, so the client chooses which of its OWN
+        ledgers to use and can never address another user''s. Rotating the nonce (Settings > Content
+        Safety, or the 30-minute ephemeral rotation when personalization is off) selects a fresh,
+        upstream-unlinkable ledger.
 
         Rate limit: 30 requests per minute (per user).
 
@@ -6567,7 +6573,9 @@ paths:
       tags:
       - GIFs
       summary: List recently used GIFs
-      description: 'Proxy GET /gifs/recent/{customer_id} to KLIPY for the given opaque customer ID.
+      description: 'Proxy GET /gifs/recent/{customer_id} to KLIPY. The path value is a client-chosen
+        rotation NONCE, not an identity: the upstream customer id is derived as an HMAC over the
+        authenticated user and this value, so a caller can only ever read its own ledgers.
 
         Rate limit: 30 requests per minute (per user).
 
@@ -6598,8 +6606,9 @@ paths:
       tags:
       - GIFs
       summary: Clear recently used GIFs
-      description: 'Proxy DELETE /gifs/recent/{customer_id} to KLIPY, hiding the recent-GIFs history for
-        the customer ID.
+      description: 'Proxy DELETE /gifs/recent/{customer_id} to KLIPY, hiding the recent-GIFs history.
+        As with the GET, the path value is a rotation nonce keyed with the authenticated user, so a
+        caller can only ever clear its own ledgers.
 
         Rate limit: 30 requests per minute (per user).
 
@@ -6707,7 +6716,12 @@ paths:
       tags:
       - GIFs
       summary: Record a GIF share event
-      description: 'Proxy POST /gifs/share/{slug} to KLIPY (optional analytics); no request body.
+      description: 'Proxy POST /gifs/share/{slug} to KLIPY. The share trigger is what populates
+        KLIPY''s per-customer recent ledger read by GET /klipy/gifs/recent/{customer_id}.
+
+        No client request body is accepted; the upstream analytics body is constructed server-side from
+        the q query parameter and the derived customer id. The customer_id query parameter is folded
+        into that derivation as a nonce and is never forwarded verbatim.
 
         Rate limit: 30 requests per minute (per user).
 
@@ -6717,6 +6731,14 @@ paths:
       - BearerAuth: []
       parameters:
       - $ref: '#/components/parameters/KlipySlugPath'
+      - $ref: '#/components/parameters/KlipyCustomerIdQuery'
+      - name: q
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 100
+        description: Search term that led to this share, when the send originated from a search.
       responses:
         '200':
           description: KLIPY acknowledgement (upstream JSON forwarded verbatim)
@@ -14573,7 +14595,10 @@ components:
       required: false
       schema:
         type: string
-      description: Opaque per-user KLIPY personalization ID (from POST /klipy/customer-id)
+      description: 'Client-chosen rotation nonce (from POST /klipy/customer-id). Folded into an HMAC
+        with the authenticated user server-side; never forwarded to KLIPY verbatim. OMITTING it is
+        meaningful and is how personalization is declined: the server attaches no customer_id at all
+        rather than deriving one, so the request is unattributed upstream.'
     KlipyLocale:
       name: locale
       in: query
@@ -14595,7 +14620,9 @@ components:
       schema:
         type: string
         pattern: ^[a-zA-Z0-9-]{1,100}$
-      description: Opaque KLIPY customer ID (1-100 characters of [a-zA-Z0-9-])
+      description: 'Client-chosen rotation nonce, keyed server-side with the authenticated user before
+        it reaches KLIPY. The pattern describes what clients send; the server accepts any value because
+        it is hashed rather than interpolated, so a malformed one selects a useless ledger, not a 400.'
     KlipySlugPath:
       name: slug
       in: path

@@ -11,6 +11,13 @@
  * the same view") at the architectural level: the picker pulls from a single
  * `GifProvider` instance, so a multi-provider grid is impossible without first
  * adding new public surface area to this module.
+ *
+ * `GifCategory` is deliberately NOT a `GifResolved`: category items carry no
+ * slug (vendors return a curated preview, not a resolvable GIF reference), so
+ * `GifCategory.preview` is the narrower `GifCategoryPreview` shape — just the
+ * fields a category tile renders. `GifRecentOpts.force` clears a provider's
+ * internal identity-resolution backoff on an explicit user retry; it never
+ * bypasses rate limiting.
  */
 
 /** Vendor-agnostic GIF reference. The `slug` is opaque — only the active
@@ -60,15 +67,32 @@ export interface GifTrendingOpts {
 export interface GifRecentOpts {
   offset: number;
   limit: number;
+  /** Clear the client-side customer-id failure backoff before fetching. Set
+   *  only by an explicit user retry gesture; never bypasses rate limiting. */
+  force?: boolean;
 }
 
 export interface GifCategoryOpts {
   locale?: string;
 }
 
+/** The three fields a category tile actually renders.
+ *  Categories are NOT `GifResolved`: KLIPY categories carry no slug, and
+ *  fabricating a sentinel one would be a lie this module's own contract
+ *  propagates (`GifRef.slug` is documented as provider-resolvable). */
+export interface GifCategoryPreview {
+  animatedUrl: string;
+  animatedKind: 'video' | 'image';
+  stillUrl: string;
+}
+
 export interface GifCategory {
+  /** Display label shown on the tile. */
   name: string;
-  preview: GifResolved;
+  /** The search term to execute when the tile is clicked. Distinct from
+   *  `name` — vendors supply a curated query that differs from the label. */
+  query: string;
+  preview: GifCategoryPreview;
 }
 
 /** The contract every GIF vendor adapter must implement. */
@@ -100,8 +124,12 @@ export interface GifProvider {
   /** Fetch a single GIF by slug. Used by the Saved tab when rendering bookmarks
    *  and by `GifEmbed` to render a GIF in a chat message. */
   getBySlug(slug: string): Promise<GifResolved>;
-  /** Fire vendor-specific share/send tracking. May be a no-op for some providers. */
-  notifyShared?(slug: string): Promise<void>;
+  /** Fire vendor-specific share/send tracking. May be a no-op for some
+   *  providers. MUST NOT reject — callers do not gate the send on it.
+   *  `ctx.q` is the search term that led to this share, when there was one;
+   *  an options bag keeps this vendor-neutral where a bare `q: string` would
+   *  not. */
+  notifyShared?(slug: string, ctx?: { q?: string }): Promise<void>;
   /** Report inappropriate content to the vendor. */
   report?(slug: string): Promise<void>;
   /** Set whether to send the personalization customer_id to the vendor. */

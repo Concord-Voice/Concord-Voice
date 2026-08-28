@@ -125,11 +125,19 @@
 }
 
 .gif-picker-body {
-  flex: 1;
+  /* One deterministic height, so the picker's total size does not vary with
+     what is inside it (#2371 B). 360px because every populated tab already
+     clamped there, making the populated path pixel-identical — any other value
+     would move a number #2370 owns.
+
+     NO `flex: 1` here: it sets flex-basis: 0%, which resolves to `content`
+     against .gif-picker's indefinite height, so the declared height would stop
+     governing and this fix would silently no-op. Matches the shape
+     EmojiPicker.css already uses for .emoji-picker-grid-viewport. */
   overflow-y: auto;
   padding: 4px 10px;
-  min-height: 200px;
-  max-height: 360px;
+  height: 360px;
+  flex-shrink: 0;
 }
 
 .gif-picker-body::-webkit-scrollbar {
@@ -153,13 +161,48 @@
 }
 
 .gif-picker-loading,
-.gif-picker-empty {
+.gif-picker-empty,
+.gif-picker-error {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  height: 160px;
+  gap: 10px;
+  /* Fill the body rather than pinning 160px, which sat below the old
+     min-height and produced the collapse — on empty tabs AND on every tab
+     switch and initial open, since loading shared this rule. */
+  height: 100%;
+  padding: 0 16px;
   color: var(--text-muted, #777);
   font-size: 14px;
+  text-align: center;
+}
+
+/* Error is distinguished from empty by glyph + copy + action — three
+   non-colour signals (WCAG 1.4.1). Deliberately not red. */
+.gif-picker-error {
+  color: var(--text-secondary, #aaa);
+}
+
+.gif-picker-retry {
+  min-height: 28px;
+  padding: 4px 12px;
+  border: 1px solid var(--border-primary, #444);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary, #fff);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* 2.4.7 — the search input sets a bare `outline: none` with no replacement,
+   a live failure in a file this PR already edits (boy-scout). The retry button
+   is a new control. No other selector: the remaining focusable elements are
+   native and render the UA default ring. */
+.gif-picker-search input:focus-visible,
+.gif-picker-retry:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
 }
 
 /* Individual GIF tile in the grid */
@@ -282,6 +325,7 @@
 /* Reduce motion */
 .gif-picker.reduce-motion .gif-picker-tab,
 .gif-picker.reduce-motion .gif-tile,
+.gif-picker.reduce-motion .gif-picker-retry,
 .gif-picker.reduce-motion .gif-save-overlay {
   transition: none;
 }

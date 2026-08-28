@@ -254,6 +254,13 @@ type Config struct {
 	// /api/v1/klipy/* routes in internal/klipy/handlers.go. The renderer rewrites
 	// media URLs through /api/v1/klipy/media so KLIPY's CDN never sees per-user IPs.
 	KlipyAPIKey string
+	// KlipyCustomerIDKey keys the HMAC that derives KLIPY's per-user partition
+	// key from the authenticated user id (internal/klipy.customerIDFor).
+	// Optional: when empty the derivation falls back to KlipyAPIKey, which the
+	// whole KLIPY route group is already gated on, so the derivation is never
+	// unkeyed on a reachable path. Set it to decouple the two — rotating the
+	// API key then no longer resets every user's Recent tab.
+	KlipyCustomerIDKey string
 
 	// Client attestation (#677)
 	RequireClientAttestation bool          // Gate authenticated routes on signed-client attestation
@@ -393,6 +400,7 @@ func Load() (*Config, error) {
 		PurgeRateLimit:              getEnvInt("PURGE_RATE_LIMIT", 5),
 		PurgeRateWindowSec:          getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
 		KlipyAPIKey:                 getEnv("KLIPY_API_KEY", ""),
+		KlipyCustomerIDKey:          getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
 		GitHubFeedback: GitHubFeedbackConfig{
 			// TrimSpace both fields: a trailing newline on the PAT (the common
 			// copy-paste / secret-store artifact) corrupts the

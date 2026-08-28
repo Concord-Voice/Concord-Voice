@@ -21,7 +21,13 @@ import { klipyProvider } from './klipyProvider';
 import { usePrivacyStore } from '../../stores/privacyStore';
 
 export const gifProvider: GifProvider = klipyProvider;
-export type { GifProvider, GifResolved, GifSearchResult, GifCategory } from './types';
+export type {
+  GifProvider,
+  GifResolved,
+  GifSearchResult,
+  GifCategory,
+  GifCategoryPreview,
+} from './types';
 
 // Apply current settings immediately, then subscribe to future changes.
 // Note: KLIPY traffic is ALWAYS proxied through the control-plane now —

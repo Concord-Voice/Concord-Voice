@@ -1362,7 +1362,7 @@ describe('PrivacySecuritySection', () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() => expect(screen.getByText(/Click to load/)).toBeInTheDocument());
     expect(screen.getByText(/GIF picker results are not personalized/)).toBeInTheDocument();
-    expect(screen.getByText(/Ephemeral ID — rotates automatically/)).toBeInTheDocument();
+    expect(screen.getByText(/Ephemeral key — rotates automatically/)).toBeInTheDocument();
   });
 
   // ── Mode change modal ──────────────────────────────────────────────────

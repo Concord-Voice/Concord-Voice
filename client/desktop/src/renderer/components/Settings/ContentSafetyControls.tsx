@@ -11,14 +11,14 @@ function gifAutoLoadHint(enabled: boolean): string {
 
 function gifPersonalizationHint(enabled: boolean): string {
   return enabled
-    ? 'Concord sends a stable per-device ID to KLIPY so the GIF picker can show you personalized recent and trending results. The ID is not tied to your Concord account or any personally identifiable information.'
+    ? 'Concord sends a stable per-device ID to KLIPY so the GIF picker can show you personalized recent and trending results. Concord derives that ID with a server-held secret, so KLIPY cannot connect it to your Concord account or to any personally identifiable information.'
     : 'GIF picker results are not personalized. A rotating ephemeral ID is used so KLIPY cannot build a persistent profile. The Recent tab is hidden because it requires a stable ID to function.';
 }
 
 function personalizationIdHint(enabled: boolean): string {
   return enabled
-    ? 'Your stable per-device identifier sent to KLIPY. Rotating it clears your personalization history.'
-    : 'Ephemeral ID — rotates automatically every 30 minutes. Rotating manually generates a new one immediately.';
+    ? 'Your stable per-device personalization key. KLIPY never receives this value itself. Rotating it starts a fresh personalization history.'
+    : 'Ephemeral key — rotates automatically every 30 minutes. KLIPY never receives this value itself; rotating starts a fresh, unlinkable history immediately.';
 }
 
 const ContentSafetyControls = () => {

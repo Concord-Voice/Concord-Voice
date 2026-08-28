@@ -17,7 +17,10 @@
  * KLIPY requires a `customer_id` on trending/search requests. The value is an
  * opaque string we generate — KLIPY never sees PII.
  *
- * **Personalization ON (default: off):**
+ * **Personalization ON** (this is the DEFAULT — `privacy_settings.
+ * share_personalization_with_gif_provider` is `BOOLEAN NOT NULL DEFAULT TRUE`,
+ * migration 000056, and `privacyStore` initialises it to `true`. This heading
+ * previously read "default: off", which was wrong from the day it shipped):
  *   A stable UUID is generated server-side via `POST /api/v1/klipy/customer-id`,
  *   persisted in `localStorage`, and reused across sessions. This lets KLIPY
  *   personalise results and power the Recent tab. The user can manually rotate
@@ -30,12 +33,22 @@
  *   while preventing any persistent cross-session tracking profile.
  *
  * NOTE: Response shapes are written against the documented KLIPY API contract
- * (https://docs.klipy.com). The defensive `data ?? result` envelope handling
- * accounts for both shapes the docs and demos show.
+ * (https://docs.klipy.com) where available. Categories is CONFIRMED against
+ * docs.klipy.com/gifs-api/gifs-categories-api (2026-08-27): `data.categories[]`
+ * of `{ category, query, preview_url }`. The recent-items response body
+ * remains UNOBSERVED — the indexed docs give no body for
+ * `GET /gifs-recent-items-api-per-user` — so the defensive `data ?? result`
+ * envelope handling in `unwrapList` (klipyProvider.ts) stays in place for
+ * that endpoint and other still-unconfirmed shapes.
  */
 
 import { apiFetch } from '../apiClient';
-import { apiUrl } from '../runtimeServerBase';
+import {
+  apiUrl,
+  captureRuntimeServerSelection,
+  runtimeServerSelectionIsCurrent,
+  type RuntimeServerSelection,
+} from '../runtimeServerBase';
 
 const KLIPY_PROXY_BASE = '/api/v1/klipy';
 const CUSTOMER_ID_STORAGE_KEY = 'concord:klipy-customer-id';
@@ -76,6 +89,66 @@ export function rewriteMediaUrl(url: string | undefined): string | undefined {
     return url;
   }
 }
+
+/** Maximum accepted GIF slug length. Mirrors `MaxSlugLength` in
+ *  `services/control-plane/internal/klipy/validate.go`. */
+const MAX_GIF_SLUG_LENGTH = 100;
+
+/** Nonempty run of unreserved path characters. Excludes `/`, `\`, `.`, `?`,
+ *  `#`, whitespace, and every Unicode separator lookalike (U+2044, U+FF0F). */
+const GIF_SLUG_PATTERN = /^[A-Za-z0-9-]+$/;
+
+/**
+ * Is this vendor-supplied slug safe to interpolate into a request path?
+ *
+ * KLIPY slugs reach us from an untrusted third party and are interpolated into
+ * credentialed request paths. WHATWG URL normalisation collapses dot segments
+ * BEFORE the request leaves the renderer, so a poisoned slug retargets a
+ * different Concord route and the server-side guard never runs. That is why
+ * this exists and why it is not merely defence-in-depth (#2580).
+ *
+ * DELIBERATELY STRICTER than `ValidateSlug` in
+ * `services/control-plane/internal/klipy/validate.go`, which returns TRUE for
+ * the empty string because it answers a different question ("is this optional
+ * attached-slug field well-formed?"). Here the question is "may I interpolate
+ * this into a path?" and the empty string answers no. Do not "fix" the
+ * divergence — reconciling them reopens #2371 A2 behind a green test suite.
+ */
+/**
+ * Classify a rejected share so operators can aggregate on the reason.
+ *
+ * Three classes, not two: 400 is a bug on our side, 429 is backpressure we
+ * deliberately do not retry (the share is simply absent from Recent), and
+ * everything else is vendor-side. A named function rather than a nested
+ * ternary — typescript:S3358, and it reads better besides.
+ */
+function shareFailureClass(status: number): 'client-bug' | 'backpressure' | 'upstream' {
+  if (status === 400) return 'client-bug';
+  if (status === 429) return 'backpressure';
+  return 'upstream';
+}
+
+export function isValidGifSlug(slug: string): boolean {
+  if (typeof slug !== 'string' || slug.length === 0) return false;
+  if (slug.length > MAX_GIF_SLUG_LENGTH) return false;
+  return GIF_SLUG_PATTERN.test(slug);
+}
+
+/**
+ * Is this customer id safe to interpolate into a request path?
+ *
+ * Same grammar as a slug, deliberately: the control-plane mints these as UUIDs
+ * and already applies `ValidateSlug` to the `:customerID` route param, so any
+ * legitimate value is already `[A-Za-z0-9-]{1,100}`. Aliased rather than
+ * duplicated so the two can never drift.
+ *
+ * This exists because the stored id is NOT scoped per server. A hostile
+ * self-hosted instance can mint one, it persists in localStorage, and it is
+ * then reused against the official API with the official bearer token — so it
+ * is an untrusted value reaching a credentialed path, exactly the class #2580
+ * closed for slugs.
+ */
+export const isValidCustomerId = isValidGifSlug;
 
 /** A single rendition variant in a KLIPY response (one format at one quality). */
 export interface KlipyRendition {
@@ -134,24 +207,39 @@ export interface KlipyListResponse {
   meta?: { has_more?: boolean };
 }
 
+/** One category from GET /gifs/categories.
+ *  Confirmed against docs.klipy.com/gifs-api/gifs-categories-api on 2026-08-27:
+ *  the array lives at `data.categories`, the display name is `category` (not
+ *  `name`), and `preview_url` is a BARE URL STRING (not a rendition object).
+ *  The previous shape here was a guess and was wrong on all three counts. */
 export interface KlipyCategoryItem {
-  name: string;
-  preview?: KlipyGifItem;
-}
-
-export interface KlipyCategoriesPayload {
-  data?: KlipyCategoryItem[];
-  result?: KlipyCategoryItem[];
+  category: string;
+  query: string;
+  preview_url: string;
 }
 
 export interface KlipyCategoriesResponse {
-  result?: boolean | KlipyCategoryItem[];
-  data?: KlipyCategoryItem[] | KlipyCategoriesPayload;
+  result?: boolean;
+  data?: {
+    locale?: string;
+    categories?: KlipyCategoryItem[];
+  };
 }
 
 /** Response shape from POST /api/v1/klipy/customer-id (control-plane endpoint). */
 export interface KlipyCustomerIDResponse {
   customer_id?: string;
+}
+
+/** Thrown when personalization is ON but the stable customer id cannot be
+ *  resolved. Distinct from "you have no recents": the picker must be able to
+ *  tell an identity failure from a legitimate empty list, or an operator
+ *  verifying the recents fix cannot tell whether it worked. */
+export class KlipyIdentityError extends Error {
+  constructor() {
+    super('KLIPY: could not resolve a customer id for the recent list');
+    this.name = 'KlipyIdentityError';
+  }
 }
 
 class KlipyClient {
@@ -163,6 +251,8 @@ class KlipyClient {
   private customerIdFailureAt: number | null = null;
   /** Single in-flight customer-id promise so concurrent callers share one request. */
   private customerIdInFlight: Promise<string | null> | null = null;
+  /** The server selection the in-flight request was started under. */
+  private customerIdInFlightSelection: RuntimeServerSelection | null = null;
 
   // ── Personalization OFF: ephemeral UUID rotated every 30 minutes ──
   private ephemeralCustomerId: string | null = null;
@@ -182,6 +272,7 @@ class KlipyClient {
         // Generate a fresh ephemeral ID immediately.
         this.cachedCustomerId = null;
         this.customerIdInFlight = null;
+        this.customerIdInFlightSelection = null;
         this.customerIdFailureAt = null;
         this._refreshEphemeral();
       }
@@ -208,9 +299,13 @@ class KlipyClient {
       this.cachedCustomerId = null;
       this.customerIdFailureAt = null;
       this.customerIdInFlight = null;
+      this.customerIdInFlightSelection = null;
       localStorage.removeItem(CUSTOMER_ID_STORAGE_KEY);
-      // Kick off the fetch immediately and return the new ID.
-      const id = await this._fetchStableId();
+      // Kick off the fetch immediately and return the new ID. The selection is
+      // captured here for the same reason _getStableId captures one: the guard
+      // inside _fetchStableId must be keyed to the server this rotation was
+      // requested on, not to whatever is current when it resolves.
+      const id = await this._fetchStableId(captureRuntimeServerSelection());
       return id ?? crypto.randomUUID();
     } else {
       return this._refreshEphemeral();
@@ -223,6 +318,7 @@ class KlipyClient {
     this.cachedCustomerId = null;
     this.customerIdFailureAt = null;
     this.customerIdInFlight = null;
+    this.customerIdInFlightSelection = null;
     this._clearEphemeralTimer();
     this.ephemeralCustomerId = null;
   }
@@ -292,7 +388,12 @@ class KlipyClient {
     if (this.cachedCustomerId) return this.cachedCustomerId;
 
     const stored = localStorage.getItem(CUSTOMER_ID_STORAGE_KEY);
-    if (stored) {
+    if (stored && !isValidCustomerId(stored)) {
+      // Pre-existing poison self-heals rather than persisting forever: drop it
+      // and fall through to mint a fresh id.
+      console.warn('[gifProvider] customer-id: discarding an ill-formed stored id');
+      localStorage.removeItem(CUSTOMER_ID_STORAGE_KEY);
+    } else if (stored) {
       this.cachedCustomerId = stored;
       return stored;
     }
@@ -305,36 +406,83 @@ class KlipyClient {
       return null;
     }
 
-    if (this.customerIdInFlight) {
+    // The handle is shared so concurrent callers make ONE request, but it is
+    // only shareable WITHIN the selection it started under. Once the
+    // stale-selection guard makes a request begun on the previous server
+    // resolve null by design, a caller on the new server that joins it
+    // inherits that null — recent() reports an identity error and shares go
+    // unattributed against a server whose endpoint is perfectly healthy.
+    if (
+      this.customerIdInFlight &&
+      this.customerIdInFlightSelection &&
+      runtimeServerSelectionIsCurrent(this.customerIdInFlightSelection)
+    ) {
       return this.customerIdInFlight;
     }
 
-    this.customerIdInFlight = this._fetchStableId();
-    return this.customerIdInFlight;
+    const selection = captureRuntimeServerSelection();
+    const pending = this._fetchStableId(selection).finally(() => {
+      // Clear only OUR handle. A successor started under a newer selection
+      // must not be torn down by its predecessor settling afterwards.
+      if (this.customerIdInFlight === pending) {
+        this.customerIdInFlight = null;
+        this.customerIdInFlightSelection = null;
+      }
+    });
+    this.customerIdInFlight = pending;
+    this.customerIdInFlightSelection = selection;
+    return pending;
   }
 
-  private async _fetchStableId(): Promise<string | null> {
+  private async _fetchStableId(selection: RuntimeServerSelection): Promise<string | null> {
+    // frontend.md: async provider flows MUST fence every continuation on the
+    // runtime-server selection. Comparing the URL alone is not ABA-safe, which
+    // is why the selection carries an epoch. It is passed in rather than
+    // captured here so the caller can key the shared in-flight handle on the
+    // SAME selection this method fences against.
+    // The FAILURE state is fenced for the same reason as the success state, and
+    // it is the easier one to overlook: a 60-second backoff recorded against a
+    // server the user has already left is inherited by the one they joined, so
+    // recent() throws KlipyIdentityError there even though its endpoint is
+    // healthy. Every failure write in this method goes through here.
+    const markFailure = (): void => {
+      if (runtimeServerSelectionIsCurrent(selection)) {
+        this.customerIdFailureAt = Date.now();
+      }
+    };
     try {
       const res = await this.doFetch('/customer-id', { method: 'POST' });
       if (!res.ok) {
-        this.customerIdFailureAt = Date.now();
+        markFailure();
         return null;
       }
       const data = (await res.json()) as KlipyCustomerIDResponse;
       const id = data.customer_id ?? null;
+      if (id && !isValidCustomerId(id)) {
+        // A server-supplied id that cannot be safely interpolated is treated as
+        // a failure, not cached, and never written to localStorage.
+        console.warn('[gifProvider] customer-id: server returned an ill-formed id');
+        markFailure();
+        return null;
+      }
       if (id) {
+        if (!runtimeServerSelectionIsCurrent(selection)) {
+          // The user selected a different runtime server while this request was
+          // in flight. Caching and persisting now would carry the value minted
+          // by the previous server into the new one's session — a state check
+          // made BEFORE an await says nothing about the world after it.
+          return null;
+        }
         this.cachedCustomerId = id;
         this.customerIdFailureAt = null;
         localStorage.setItem(CUSTOMER_ID_STORAGE_KEY, id);
       } else {
-        this.customerIdFailureAt = Date.now();
+        markFailure();
       }
       return id;
     } catch {
-      this.customerIdFailureAt = Date.now();
+      markFailure();
       return null;
-    } finally {
-      this.customerIdInFlight = null;
     }
   }
 
@@ -378,17 +526,52 @@ class KlipyClient {
     return (await res.json()) as KlipyListResponse;
   }
 
-  async recent(page: number, perPage: number): Promise<KlipyListResponse> {
-    const customerId = await this.getCustomerID();
-    // Recent requires a stable customer_id — only available when personalization is on.
-    if (!this.personalizationEnabled || !customerId) {
+  /**
+   * Fetch the personalized recent-shares list. Throws `KlipyIdentityError`
+   * when personalization is ON but the customer id cannot be resolved — a
+   * fabricated `{ data: [], has_more: false }` success there would be
+   * indistinguishable from "you have no recents" and would mask the A2 fix
+   * during verification.
+   */
+  async recent(
+    page: number,
+    perPage: number,
+    opts?: { force?: boolean }
+  ): Promise<KlipyListResponse> {
+    // Personalization OFF is a legitimate empty — the tab is hidden in that
+    // state and there is no ledger to read.
+    if (!this.personalizationEnabled) {
       return { data: [], has_more: false };
     }
+
+    // An explicit user gesture is precisely the signal that should reset a
+    // client-side backoff heuristic. `force` clears ONLY the customer-id
+    // failure short-circuit; it never bypasses rate limiting.
+    if (opts?.force) {
+      this.customerIdFailureAt = null;
+    }
+
+    const customerId = await this.getCustomerID();
+    // Re-read the flag AFTER the await, as the original implementation did.
+    // Opting out while /customer-id is in flight must not send the stable
+    // identifier to the vendor; this is a legitimate empty, not an error.
+    if (!this.personalizationEnabled) {
+      return { data: [], has_more: false };
+    }
+    if (!customerId) {
+      throw new KlipyIdentityError();
+    }
+
     const params = new URLSearchParams({
       page: String(page),
       per_page: String(perPage),
     });
-    const res = await this.doFetch(`/gifs/recent/${customerId}?${params.toString()}`);
+    // encodeURIComponent as defence in depth: the value is validated above, and
+    // this keeps a future edit that reintroduces an unvalidated id from
+    // re-opening the path-interpolation class.
+    const res = await this.doFetch(
+      `/gifs/recent/${encodeURIComponent(customerId)}?${params.toString()}`
+    );
     if (!res.ok) throw new Error(`KLIPY recent failed: ${res.status}`);
     return (await res.json()) as KlipyListResponse;
   }
@@ -421,15 +604,89 @@ class KlipyClient {
     return items[0] ?? null;
   }
 
-  async notifyShared(slug: string): Promise<void> {
+  /**
+   * Fire KLIPY's share trigger. This is what POPULATES the per-customer recent
+   * ledger read by `/gifs/recent/{customer_id}` — without `customer_id` here,
+   * the Recent tab is structurally empty forever (#2371 A2).
+   *
+   * NEVER REJECTS. It is fire-and-forget from the composer and must not gate
+   * the send flow (#2580). But "never rejects" is not "never reports": every
+   * failure shape emits an observable signal, because a silent share failure
+   * means a permanently empty Recent tab with no way to tell.
+   *
+   * No retry: KLIPY does not document share-trigger idempotency, so a retry
+   * could double-count analytics. One share event per send.
+   */
+  async notifyShared(slug: string, ctx?: { q?: string }): Promise<void> {
+    // Validate FIRST, before any await. An implementation that resolves the
+    // customer id first issues one network request on a rejected slug and
+    // fails the "zero requests" criterion (#2580 AC9).
+    if (!isValidGifSlug(slug)) {
+      console.warn('[gifProvider] share: refused an invalid slug');
+      return;
+    }
+
     try {
-      await this.doFetch(`/gifs/share/${slug}`, { method: 'POST' });
+      // customer_id only under personalization ON. With it off the client uses
+      // an ephemeral UUID rotating every 30 minutes; attaching it to share
+      // would create a PERSISTENT upstream write keyed to an id we promise is
+      // ephemeral, where today only transient reads carry it. The Recent tab
+      // is hidden in that mode, so the ledger entry has no user-visible
+      // purpose. Share still fires — just unattributed.
+      // DEFENSIVE AND UNVERIFIED BY TEST — see the note in klipyClient.test.ts.
+      // The recent() equivalent is falsified and covers the same class; this
+      // one could not be staged, because disabling personalization clears the
+      // in-flight handle and the continuation resolves null either way.
+      //
+      // Re-read the flag AFTER the await. A check made before it does not hold
+      // after it: the user can disable personalization while /customer-id is
+      // still in flight, and attaching the resolved id then would create a
+      // PERSISTENT upstream ledger entry keyed to a user who has just opted
+      // out. Share still fires — just unattributed.
+      // Fence the whole continuation, not just the identifier. Rejecting a
+      // stale id still leaves the SHARE itself — the slug, and the search term
+      // in ctx.q — being POSTed to whichever server is current after the await.
+      // A user who switches instances mid-share would hand the query they typed
+      // on server A to server B.
+      const selection = captureRuntimeServerSelection();
+      let customerId: string | null = null;
+      if (this.personalizationEnabled) {
+        const resolved = await this.getCustomerID();
+        if (this.personalizationEnabled) customerId = resolved;
+      }
+      if (!runtimeServerSelectionIsCurrent(selection)) return;
+
+      const params = new URLSearchParams();
+      if (customerId) params.set('customer_id', customerId);
+      // `q` already reaches KLIPY via /gifs/search?q=, so forwarding it here
+      // leaks nothing new. handlers.go's promise is about LOGGING, not
+      // forwarding, and is unaffected.
+      if (ctx?.q) params.set('q', ctx.q);
+
+      const qs = params.toString();
+      const path = qs ? `/gifs/share/${slug}?${qs}` : `/gifs/share/${slug}`;
+      const res = await this.doFetch(path, { method: 'POST' });
+
+      if (!res.ok) {
+        // Never log the slug.
+        console.warn('[gifProvider] share: upstream rejected the trigger', {
+          status: res.status,
+          failureClass: shareFailureClass(res.status),
+        });
+      }
     } catch {
-      // Best-effort — never block on share-trigger failures
+      console.warn('[gifProvider] share: transport error reaching the share trigger');
     }
   }
 
+  /** Report inappropriate content. User-initiated, so a rejected slug throws
+   *  rather than failing silently — the caller needs to know it did nothing. */
   async report(slug: string): Promise<void> {
+    // Pre-await: a rejected slug must issue ZERO requests, including zero
+    // customer-id requests (#2580 AC9).
+    if (!isValidGifSlug(slug)) {
+      throw new Error('KLIPY report: refusing to send an invalid slug');
+    }
     await this.doFetch(`/gifs/report/${slug}`, { method: 'POST' });
   }
 }

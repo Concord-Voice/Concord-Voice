@@ -32,8 +32,10 @@ import type {
 import {
   klipyClient,
   rewriteMediaUrl,
+  isValidGifSlug,
   type KlipyGifItem,
   type KlipyListResponse,
+  type KlipyCategoryItem,
 } from './klipyClient';
 
 /** Translate a single KLIPY GIF item into the vendor-neutral resolved shape.
@@ -57,7 +59,11 @@ function pickRendition(
 }
 
 function toResolved(item: KlipyGifItem): GifResolved | null {
-  if (!item.slug) return null;
+  // Ingestion hygiene (#2580): drop poisoned slugs at the boundary so they
+  // never enter renderer state. This is hygiene, NOT the security boundary —
+  // `savedGifsStore` persists slugs, so a slug saved before this fix survives
+  // it and is stopped at the sink (`notifyShared`/`report`), not here.
+  if (!item.slug || !isValidGifSlug(item.slug)) return null;
 
   // Pick the best animated rendition: MP4 first (renders as <video>), then
   // WEBP/GIF (rendered as <img>). Default `image` covers both fallback cases
@@ -66,8 +72,31 @@ function toResolved(item: KlipyGifItem): GifResolved | null {
   const webp = pickRendition(item, 'webp');
   const gif = pickRendition(item, 'gif');
 
-  const animatedUrl = rewriteMediaUrl(mp4?.url ?? webp?.url ?? gif?.url ?? item.url);
+  const rawAnimated = mp4?.url ?? webp?.url ?? gif?.url ?? item.url;
+  const animatedUrl = rewriteMediaUrl(rawAnimated);
   if (!animatedUrl) return null;
+
+  // Observable, and deliberately NOT fail-closed — the asymmetry with
+  // `toCategory` is intentional. `rewriteMediaUrl` returns its input UNCHANGED
+  // for a non-KLIPY host, so an unchanged return means this URL would reach the
+  // CDN directly. `toCategory` drops in that case because a category is
+  // optional and the worst case is an empty tab. This is the MAIN GIF path,
+  // where dropping on an incomplete host allowlist would blank the whole picker
+  // rather than leak — a worse failure than the one being prevented.
+  //
+  // The renderer CSP (`img-src`/`media-src` in index.html) is the actual
+  // control here; this is reporting, so an incomplete allowlist is diagnosable
+  // instead of silent. Raised by the #2371 red-team pass as H1: mechanism
+  // confirmed, impact unproven (jsdom does not enforce CSP).
+  if (rawAnimated && animatedUrl === rawAnimated) {
+    let host = 'unparseable';
+    try {
+      host = new URL(rawAnimated).hostname;
+    } catch {
+      // keep the placeholder — never log the raw vendor URL
+    }
+    console.warn('[gifProvider] rendition URL is not proxy-eligible; serving unproxied', { host });
+  }
   const animatedKind: 'video' | 'image' = mp4?.url ? 'video' : 'image';
   let chosen: { url?: string; width?: number; height?: number } | undefined;
   if (mp4?.url) chosen = mp4;
@@ -86,6 +115,33 @@ function toResolved(item: KlipyGifItem): GifResolved | null {
     animatedUrl,
     animatedKind,
     stillUrl,
+  };
+}
+
+/** Map one KLIPY category into the vendor-neutral shape, or null to drop it.
+ *
+ *  `toResolved` cannot be reused: it opens `if (!item.slug) return null` and
+ *  categories carry no slug. Do NOT fabricate one to get through that guard.
+ *
+ *  Fail CLOSED on the preview (C2). `rewriteMediaUrl` returns its input
+ *  UNCHANGED for a non-KLIPY host, so an unchanged return means the URL would
+ *  reach the CDN directly and leak the user's IP. Drop the category. */
+function toCategory(item: KlipyCategoryItem): GifCategory | null {
+  if (!item?.category || !item.query || !item.preview_url) return null;
+
+  const proxied = rewriteMediaUrl(item.preview_url);
+  if (!proxied || proxied === item.preview_url) return null;
+
+  // Default to 'image': an .mp4 in an <img> renders nothing, so the default
+  // must be the safe one.
+  const animatedKind: 'video' | 'image' = /\.(mp4|webm)(\?|#|$)/i.test(item.preview_url)
+    ? 'video'
+    : 'image';
+
+  return {
+    name: item.category,
+    query: item.query,
+    preview: { animatedUrl: proxied, animatedKind, stillUrl: proxied },
   };
 }
 
@@ -112,6 +168,19 @@ function unwrapList(resp: KlipyListResponse): {
 
 function toSearchResult(resp: KlipyListResponse, page: number, perPage: number): GifSearchResult {
   const { items: raw, hasMore: rawHasMore } = unwrapList(resp);
+
+  // A4: the GET /gifs/recent response body is not in KLIPY's indexed docs, so
+  // unwrapList's envelope assumption is unproven for that endpoint. If a 200
+  // yields zero items but carries unrecognised top-level keys, say so rather
+  // than rendering a plausible empty state — that silence is what hid A1.
+  if (raw.length === 0 && resp && typeof resp === 'object') {
+    const known = new Set(['result', 'data', 'has_more', 'meta']);
+    const unknown = Object.keys(resp).filter((k) => !known.has(k));
+    if (unknown.length > 0) {
+      console.warn('[gifProvider] list response had unrecognised top-level keys', { unknown });
+    }
+  }
+
   const items = raw.map(toResolved).filter((g): g is GifResolved => g !== null);
   const hasMore = rawHasMore ?? raw.length >= perPage;
   return {
@@ -152,28 +221,28 @@ export const klipyProvider: GifProvider = {
 
   async recent(opts: GifRecentOpts): Promise<GifSearchResult> {
     const page = Math.floor(opts.offset / opts.limit) + 1;
-    const resp = await klipyClient.recent(page, opts.limit);
+    const resp = await klipyClient.recent(page, opts.limit, { force: opts.force });
     return toSearchResult(resp, page, opts.limit);
   },
 
   async categories(opts: GifCategoryOpts): Promise<GifCategory[]> {
     const resp = await klipyClient.categories(opts.locale);
-    // Same nested envelope as list responses: { data: { data: [...] } }.
-    let raw: { name: string; preview?: KlipyGifItem }[] = [];
-    if (resp.data && !Array.isArray(resp.data)) {
-      raw = resp.data.data ?? resp.data.result ?? [];
-    } else if (Array.isArray(resp.data)) {
-      raw = resp.data;
-    } else if (Array.isArray(resp.result)) {
-      raw = resp.result;
-    }
+    const raw = resp.data?.categories ?? [];
+
     const result: GifCategory[] = [];
-    for (const cat of raw) {
-      const preview = cat.preview ? toResolved(cat.preview) : null;
-      if (cat.name && preview) {
-        result.push({ name: cat.name, preview });
-      }
+    for (const item of raw) {
+      const cat = toCategory(item);
+      if (cat) result.push(cat);
     }
+
+    // Observable decode. A silent all-dropped mapping is exactly what let this
+    // bug survive in production — the tab rendered a plausible empty state.
+    if (raw.length > 0 && result.length === 0) {
+      console.warn('[gifProvider] categories: every entry was dropped during mapping', {
+        received: raw.length,
+      });
+    }
+
     return result;
   },
 
@@ -189,8 +258,8 @@ export const klipyProvider: GifProvider = {
     return resolved;
   },
 
-  async notifyShared(slug: string): Promise<void> {
-    await klipyClient.notifyShared(slug);
+  async notifyShared(slug: string, ctx?: { q?: string }): Promise<void> {
+    return klipyClient.notifyShared(slug, ctx);
   },
 
   async report(slug: string): Promise<void> {
