@@ -125,12 +125,49 @@ func TestCapturePresenceSnapshotSeedBoundsConnectedIDsAndRetainsViewer(t *testin
 
 	require.Len(t, seed.connectedIDs, wantLimit)
 	require.Len(t, seed.hidden, wantLimit)
+	assert.True(t, seed.truncated,
+		"the cap is the ONLY signal that connectedIDs is a proper subset of who is "+
+			"connected; without it the coverage computation cannot tell a cap-excluded "+
+			"sender from an offline one")
 	assert.Contains(t, seed.connectedIDs, viewerID,
 		"a bounded reconnect seed must always retain its connected viewer")
 	assert.Equal(t, statusDND, seed.hidden[viewerID])
 	for _, userID := range seed.connectedIDs {
 		assert.Equal(t, hub.hiddenPresence[userID], seed.hidden[userID])
 	}
+}
+
+// TestBasePresenceSnapshotExcludesNonAudience is the #47 snapshot leak lock,
+// migrated from the deleted TestSendPresenceSnapshotExcludesNonAudience (#1654).
+// It drives the live bootstrap path — capturePresenceSnapshotSeed +
+// loadBasePresenceSnapshot — rather than the legacy sendPresenceSnapshot wrapper
+// it used to call.
+func TestBasePresenceSnapshotExcludesNonAudience(t *testing.T) {
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(db, redisClient)
+
+	viewer := presenceTestUser(t, db)
+	friend := presenceTestUser(t, db)
+	stranger := presenceTestUser(t, db)
+	presenceTestFriendship(t, db, viewer, friend)
+
+	for _, userID := range []uuid.UUID{viewer, friend, stranger} {
+		client := &Client{ID: uuid.New(), UserID: userID, Send: make(chan []byte, 10)}
+		hub.clients[client.ID] = client
+		hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
+		require.NoError(t, redisClient.Set(
+			context.Background(), presence.StatusRedisKey(userID), statusOnline, time.Minute,
+		).Err())
+	}
+
+	seed := hub.capturePresenceSnapshotSeed(viewer)
+	base, err := hub.loadBasePresenceSnapshot(context.Background(), seed)
+
+	require.NoError(t, err)
+	assert.Contains(t, base, friend, "a friend must appear in the viewer's snapshot")
+	assert.NotContains(t, base, stranger,
+		"#47 leak: an unrelated user appeared in the viewer's snapshot")
 }
 
 func TestLoadBasePresenceSnapshot_UsesSenderOwnedInverseAudience(t *testing.T) {
@@ -545,12 +582,29 @@ func TestHubRun_ClientBootstrapKeepsRunResponsiveAndOrdersReplacementBeforeLive(
 	assert.Equal(t, statusOffline, richOnly["status"])
 	assert.Contains(t, richOnly, "rich_presence")
 
-	assert.Equal(t, "presence", readClientMsg(t, client)["type"], "buffered initial base state follows replacement")
-	assert.ElementsMatch(t, []interface{}{"bootstrap_run_probe", "rich_presence_update"}, []interface{}{
+	// Every remaining frame follows the replacement, which is the invariant this
+	// test is named for and which the read above already proved. Their order
+	// RELATIVE TO EACH OTHER is not a contract, and since #1654 it is not even
+	// deterministic: the base-presence frame is now produced asynchronously and
+	// applied by Run from presenceAudienceResults, so it races bootstrap_run_probe
+	// (globalBroadcast), rich_presence_update, and the post-bootstrap
+	// server_voice_counts. Measured over `-count=30`: presence inverts with
+	// rich_presence_update, and can also land after server_voice_counts when the
+	// audience query contends for the pool with the bootstrap's own reads.
+	//
+	// The replacement-before-live guarantee is untouched by that, and holds by
+	// construction rather than by timing: a live frame raised during bootstrap is
+	// buffered and replayed after the replacement, and one raised afterwards is
+	// enqueued directly, which is later still. Pinning a fixed interleaving here
+	// would be a latent flake wearing the costume of a stronger assertion.
+	assert.ElementsMatch(t, []interface{}{
+		"presence", "bootstrap_run_probe", "rich_presence_update", "server_voice_counts",
+	}, []interface{}{
 		readClientMsg(t, client)["type"],
 		readClientMsg(t, client)["type"],
-	})
-	assert.Equal(t, "server_voice_counts", readClientMsg(t, client)["type"], "voice counts must follow bootstrap")
+		readClientMsg(t, client)["type"],
+		readClientMsg(t, client)["type"],
+	}, "every live frame follows the replacement, in any order")
 }
 
 func TestHandleRegister_ActivitySnapshotFailureDisconnectsWithoutPartialReplacement(t *testing.T) {
@@ -1078,4 +1132,198 @@ func TestRunClientBootstrap_DeadlineDisconnectsWithoutEnqueue(t *testing.T) {
 
 	assert.True(t, disconnected)
 	assert.Empty(t, client.Send)
+}
+
+// TestClientSnapshotCoverageComesFromTheAuthorizedSnapshot locks the property
+// Codex named on PR #2975: the registration frontier's coverage set must be the
+// senders the snapshot ACTUALLY carried, not the seed's candidates.
+//
+// seed.connectedIDs is a pre-authorization candidate list —
+// capturePresenceSnapshotSeed enumerates connected users and stops at
+// presenceSnapshotConnectedLimit, then authorizeBasePresenceCandidates removes
+// the ones this viewer may not see. A coverage set derived from the seed would
+// mark a sender covered that the snapshot dropped, and the frontier would then
+// discard that sender's in-flight delta too, leaving the viewer rendering them
+// offline until an unrelated transition.
+//
+// This drives the revocation-at-publication path: the friendship is deleted
+// after the initial load and before publication, so the sender is in the seed
+// and NOT in the published snapshot — precisely the divergence under test.
+func TestClientSnapshotCoverageComesFromTheAuthorizedSnapshot(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewerID := insertCTUser(t, db, "covviewer")
+	senderID := insertCTUser(t, db, "covsender")
+	makeFriends(t, db, viewerID, senderID)
+	for _, userID := range []uuid.UUID{viewerID, senderID} {
+		require.NoError(t, hub.redis.Set(
+			context.Background(), "presence:"+userID.String(), statusOnline, time.Minute,
+		).Err())
+	}
+
+	initialLoadComplete := make(chan struct{})
+	releasePublication := make(chan struct{})
+	hub.activitySnapshot = func(context.Context, uuid.UUID) (presence.ActivitySnapshot, error) {
+		close(initialLoadComplete)
+		<-releasePublication
+		return make(presence.ActivitySnapshot), nil
+	}
+
+	client := &Client{UserID: viewerID, Send: make(chan []byte, 8), Hub: hub}
+	client.beginBootstrap()
+
+	// Seeded as a candidate — this is what a seed-derived coverage set would use.
+	require.True(t, client.snapshotCovered(senderID),
+		"before publication nothing is proven, so the frontier still filters")
+
+	done := make(chan struct{})
+	go func() {
+		hub.runClientBootstrap(context.Background(), client, presenceSnapshotSeed{
+			viewerID: viewerID, connectedIDs: []uuid.UUID{viewerID, senderID},
+			hidden: map[uuid.UUID]string{},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-initialLoadComplete:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial base presence load did not finish")
+	}
+	// Revoked between the initial load and publication, so re-authorization drops
+	// this sender from the snapshot even though the seed still names them.
+	_, err := db.Exec(`
+		DELETE FROM friendships
+		WHERE (requester_id = $1 AND addressee_id = $2)
+		   OR (requester_id = $2 AND addressee_id = $1)
+	`, viewerID, senderID)
+	require.NoError(t, err)
+	close(releasePublication)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bootstrap did not complete")
+	}
+
+	assert.False(t, client.snapshotCovered(senderID),
+		"the published snapshot did NOT carry this sender, so the frontier must not "+
+			"treat their in-flight delta as redundant — deriving coverage from the seed "+
+			"is exactly the bug this locks")
+	assert.True(t, client.snapshotCovered(viewerID),
+		"the viewer's own entry IS carried, so coverage must not be empty-by-accident")
+}
+
+// TestClientSnapshotOmittedIsNilWhenNothingWasDropped locks the memory property,
+// which is not decoration: the round-3 fix stored the full COVERAGE set and so
+// allocated up to presenceSnapshotConnectedLimit UUIDs per socket for its whole
+// lifetime — O(N^2) aggregate across a hub — while the design text still claimed
+// the common case was free. Codex caught the contradiction.
+//
+// Storing the COMPLEMENT restores the claim: on an ordinary hub every candidate is
+// published, nothing is omitted, and the client retains nil.
+func TestClientSnapshotOmittedIsNilWhenNothingWasDropped(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewerID := insertCTUser(t, db, "omitnilviewer")
+	senderID := insertCTUser(t, db, "omitnilsender")
+	makeFriends(t, db, viewerID, senderID)
+	for _, userID := range []uuid.UUID{viewerID, senderID} {
+		require.NoError(t, hub.redis.Set(
+			context.Background(), "presence:"+userID.String(), statusOnline, time.Minute,
+		).Err())
+	}
+	hub.activitySnapshot = func(context.Context, uuid.UUID) (presence.ActivitySnapshot, error) {
+		return make(presence.ActivitySnapshot), nil
+	}
+
+	client := &Client{UserID: viewerID, Send: make(chan []byte, 8), Hub: hub}
+	client.beginBootstrap()
+	hub.runClientBootstrap(context.Background(), client, presenceSnapshotSeed{
+		viewerID: viewerID, connectedIDs: []uuid.UUID{viewerID, senderID},
+		hidden: map[uuid.UUID]string{},
+	})
+
+	client.bootstrapMu.Lock()
+	omitted := client.presenceSnapshotOmitted
+	covered := client.presenceSnapshotCovered
+	client.bootstrapMu.Unlock()
+	assert.Nil(t, covered,
+		"an untruncated seed must not take the positive-coverage branch at all — that "+
+			"branch stores up to presenceSnapshotConnectedLimit UUIDs per socket")
+	assert.Nil(t, omitted,
+		"every candidate reached the published snapshot, so the client must retain "+
+			"nothing — this is the property that keeps the frontier's memory cost at zero "+
+			"on an ordinary hub")
+
+	assert.True(t, client.snapshotCovered(senderID),
+		"a nil omitted set must still mean COVERED, or the frontier stops filtering")
+}
+
+// TestTruncatedSeedCoverageIncludesCapExcludedSenders locks the fourth case of
+// snapshot coverage, which the complement alone cannot express — and which the
+// complement REOPENED after fixing the third.
+//
+// Coverage was computed as candidates MINUS published. That is only sound while
+// the candidate list IS the connected set. Above presenceSnapshotConnectedLimit
+// it is not: capturePresenceSnapshotSeed breaks at the cap, so a sender excluded
+// BY truncation is never in connectedIDs and therefore can never be subtracted
+// from it. The complement came back empty, snapshotCovered answered true, and the
+// frontier discarded that sender's in-flight delta — the viewer renders them
+// offline until an unrelated transition. That is the >512 defect the coverage set
+// was introduced to fix, reintroduced by inverting it.
+//
+// The case table needs four rows, not three. Rows 3 and 4 are indistinguishable
+// from connectedIDs alone, which is the whole reason truncated exists:
+//
+//	connected? in candidates? published? -> covered?
+//	yes        yes             yes          yes
+//	yes        yes             no           NO  (unauthorized)
+//	yes        NO              no           NO  (cut by the cap)   <- this test
+//	no         no              no           yes (absent means offline)
+//
+// It drives the real derivation in publishClientPresenceSnapshot. It must NOT set
+// presenceSnapshotOmitted/Covered directly: the frontier arm in
+// TestPresenceFrontierDropsDeltaDispatchedBeforeRegistration does inject one, and
+// that injection is exactly why it stayed green through this defect.
+func TestTruncatedSeedCoverageIncludesCapExcludedSenders(t *testing.T) {
+	hub, db := setupCustomTextHub(t)
+	viewerID := insertCTUser(t, db, "truncviewer")
+	// Authorized and connected, but BELOW the cap line — so absent from the seed.
+	excludedID := insertCTUser(t, db, "truncexcluded")
+	makeFriends(t, db, viewerID, excludedID)
+	for _, userID := range []uuid.UUID{viewerID, excludedID} {
+		require.NoError(t, hub.redis.Set(
+			context.Background(), "presence:"+userID.String(), statusOnline, time.Minute,
+		).Err())
+	}
+	hub.activitySnapshot = func(context.Context, uuid.UUID) (presence.ActivitySnapshot, error) {
+		return make(presence.ActivitySnapshot), nil
+	}
+
+	client := &Client{UserID: viewerID, Send: make(chan []byte, 8), Hub: hub}
+	client.beginBootstrap()
+	// Truncated: the viewer made the cut, excludedID did not. Constructed rather
+	// than captured from 513 live clients because the flag's own wiring to the cap
+	// is locked separately, in
+	// TestCapturePresenceSnapshotSeedBoundsConnectedIDsAndRetainsViewer.
+	hub.runClientBootstrap(context.Background(), client, presenceSnapshotSeed{
+		viewerID:     viewerID,
+		connectedIDs: []uuid.UUID{viewerID},
+		hidden:       map[uuid.UUID]string{},
+		truncated:    true,
+	})
+
+	assert.False(t, client.snapshotCovered(excludedID),
+		"a sender the cap excluded was never a candidate, so no complement can name "+
+			"them; the snapshot did not carry them and the frontier must not treat their "+
+			"delta as redundant")
+	assert.True(t, client.snapshotCovered(viewerID),
+		"the viewer WAS published, so positive coverage must not be empty-by-accident")
+
+	client.bootstrapMu.Lock()
+	omitted, covered := client.presenceSnapshotOmitted, client.presenceSnapshotCovered
+	client.bootstrapMu.Unlock()
+	assert.Nil(t, omitted, "a truncated seed must not take the complement branch")
+	assert.NotNil(t, covered, "coverage above the cap is carried positively")
+	assert.LessOrEqual(t, len(covered), presenceSnapshotConnectedLimit,
+		"positive coverage is bounded by the cap that forced it")
 }

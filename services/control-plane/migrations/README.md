@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000110)
+## Existing Migrations (000001–000113)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -220,6 +220,9 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000108 | reject_unissued_rotation_epochs | Reject old-replica wrapped-key writes for successor epochs without a recorded revocation (#2503) |
 | 000109 | reject_revoked_distribution_epochs | Reject new wrapped-key writes into already-revoked channel epochs (#2534) |
 | 000110 | tighten_subscription_source | Restrict subscriptions.source to code and stripe after the Kickstarter campaign closed unfunded (PR #2660) |
+| 000111 | add_active_pending_plans | Durable active-category Rich Presence reconciliation on a sibling rail to 000087 (#2448) |
+| 000112 | allow_friend_requests_from | Friend-request privacy gate enforced by a single constant-shape statement (#1240) |
+| 000113 | presence_audience_suppressed_metric | Admit presence_audience_suppressed_total into the closed operations metric catalog (#1654) |
 
 ## Troubleshooting
 

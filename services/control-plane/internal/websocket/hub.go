@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
@@ -58,7 +59,62 @@ const (
 	// sender-gate stripe.
 	richPresenceSuppressorSlots = 16
 	clientBootstrapTimeout      = 5 * time.Second
+	// Bounds concurrent base-presence audience queries (#1654). Sized 4, not 8:
+	// clientBootstrapConcurrency(8) + richPresenceSuppressorSlots(16) already
+	// reaches 24 of SetMaxOpenConns(25) (internal/database/postgres.go:29), and
+	// #2444 fires hidden-sender suppression on the same invisible/offline
+	// transitions that drive presence broadcasts — so a mass disconnect peaks
+	// both pools at once rather than independently. database/sql blocks at the
+	// ceiling, so over-subscription would surface as worker-deadline and then as
+	// fail-closed suppressed presence.
+	//
+	// The arithmetic, stated correctly because an earlier version of this comment
+	// got it wrong: peak demand OVER-SUBSCRIBES the pool and is meant to.
+	// clientBootstrapConcurrency(8) + richPresenceSuppressorSlots(16) = 24, plus
+	// these 4 async slots, plus ONE more during shutdown — broadcastPresenceToAll-
+	// Sync bypasses this semaphore, and shutdownClients runs its synchronous
+	// offline loop BEFORE presenceAudienceWg.Wait(), so acquired async workers are
+	// still querying alongside it. That is 8+16+4+1 = 29 against
+	// SetMaxOpenConns(25).
+	//
+	// 29 > 25 is not a defect: database/sql BLOCKS at the ceiling rather than
+	// erroring, so the excess costs latency, and the async path now retries. The
+	// cap is 4 to keep that queue short, not because 4 fits inside the ceiling —
+	// no value of it does while bootstrap and suppressors hold 24.
+	//
+	// Not env-tunable: an operator cannot see this budget.
+	presenceAudienceConcurrency = 4
+	presenceAudienceTimeout     = 5 * time.Second
+	// A failed audience query drops a frame that may be TERMINAL — a disconnected
+	// or newly-invisible user produces no later transition to repair it, so their
+	// audience renders them online for the rest of each viewer's session. That is
+	// the #47 leak shape reached through availability rather than authorization,
+	// so the query gets a bounded retry. Safe and idempotent because the retry
+	// carries its ORIGINAL generation: if a newer transition superseded it while
+	// it was failing, the fence discards it exactly as it would any stale result.
+	// Three attempts, not more: the failure this repairs is pool contention, which
+	// clears in hundreds of milliseconds or is not going to clear at all.
+	presenceAudienceMaxAttempts  = 3
+	presenceAudienceRetryBackoff = 250 * time.Millisecond
+
+	// presenceAudienceMaxHandoff bounds how long a computed audience may sit
+	// between the query returning and Run applying it. Under ordinary load the
+	// handoff is microseconds; this only trips under the Run backlog that made
+	// the window unbounded, which is precisely the widening this change
+	// introduced and #2992 is scoped to remove.
+	presenceAudienceMaxHandoff = 250 * time.Millisecond
 )
+
+// errPresenceHubStopping is returned when a queued audience worker abandons its
+// wait because the hub is shutting down. It is an abandonment, not a database
+// failure — Run has stopped consuming results, so nothing would be delivered
+// either way, and shutdownClients re-broadcasts offline synchronously.
+// errPresenceNoDatabase marks a worker that reached the query with no database.
+// Distinct from a query failure so the retry path can decline to re-dispatch: a
+// missing database is not transient, and retrying only re-fails in the same place.
+var errPresenceNoDatabase = errors.New("presence audience: hub has no database")
+
+var errPresenceHubStopping = errors.New("presence audience: hub is stopping")
 
 type presenceRecoveryState struct {
 	status  string
@@ -146,6 +202,42 @@ type Hub struct {
 	// sees offline. Run owns direct reads and write decisions; writes use
 	// mutex-owning helpers so off-loop bootstrap readers can hold h.mu.RLock.
 	hiddenPresence map[uuid.UUID]string
+
+	// Async base-presence audience computation (#1654). Only the DB query leaves
+	// the Run goroutine; generation, coalescing, the hiddenPresence read and the
+	// fan-out all stay on it.
+	//
+	// presenceGenCounter, presenceGeneration, presenceDispatchPending and
+	// presenceInFlight are Run-owned and deliberately UNLOCKED, mirroring
+	// onlineCountPending. Reading any of them from a worker goroutine is a data
+	// race that h.mu does not and will not cover.
+	presenceGenCounter      uint64
+	presenceGeneration      map[uuid.UUID]uint64
+	presenceDispatchPending map[uuid.UUID]pendingPresence
+	presenceInFlight        map[uuid.UUID]struct{}
+	presenceAudienceResults chan presenceAudienceResult
+
+	// presenceAuthzEpoch is bumped whenever the hub observes an event that can
+	// revoke presence-audience membership. Atomic rather than Run-owned: the
+	// bump arrives on a caller's goroutine and the read happens on a worker's.
+	presenceAuthzEpoch    atomic.Uint64
+	presenceAudienceSlots chan struct{}
+	// Joined by shutdownClients so hub-owned database work cannot outlive
+	// Shutdown and hold pool connections while cmd/server closes the database.
+	presenceAudienceWg sync.WaitGroup
+	// Test seam fired immediately before the presence-worker join in
+	// shutdownClients. It exists because the alternative — asserting that
+	// shutdownClients has NOT returned within some window — cannot distinguish
+	// "parked at the join" from "not yet scheduled", so deleting the join
+	// leaves such a test green on a loaded runner. Same idiom as the
+	// customText*BeforeEnqueue seams above.
+	presenceAudienceJoinReached func()
+
+	// Test/benchmark seam for the audience query. Nil uses the production
+	// presence.ComputePresenceAudience against h.db. Exists because h.db is a
+	// concrete *sql.DB, so a fake presence.DBTX cannot otherwise reach the hub,
+	// and a Run-occupancy benchmark driven by a real Postgres measures Postgres.
+	presenceAudienceComputer func(context.Context, uuid.UUID) (map[uuid.UUID]bool, error)
 
 	// Trusted visible status for connected users and whether fail-closed
 	// recovery is pending after a Redis write or read failure. Generic missing
@@ -357,6 +449,11 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		stopped:                  make(chan struct{}),
 		onlineCountPending:       make(map[uuid.UUID]bool),
 		clientBootstrapSlots:     make(chan struct{}, clientBootstrapConcurrency),
+		presenceGeneration:       make(map[uuid.UUID]uint64),
+		presenceDispatchPending:  make(map[uuid.UUID]pendingPresence),
+		presenceInFlight:         make(map[uuid.UUID]struct{}),
+		presenceAudienceResults:  make(chan presenceAudienceResult, 256),
+		presenceAudienceSlots:    make(chan struct{}, presenceAudienceConcurrency),
 		suppressorPending:        make(map[uuid.UUID]struct{}),
 		clientBootstrapTimeout:   clientBootstrapTimeout,
 	}
@@ -642,6 +739,9 @@ func (h *Hub) Run() {
 		case c := <-h.voiceCountCatchupResults:
 			h.applyVoiceCountCatchup(c)
 
+		case result := <-h.presenceAudienceResults:
+			h.applyPresenceAudience(result)
+
 		case <-h.done:
 			h.shutdownClients()
 			return
@@ -699,6 +799,23 @@ func (h *Hub) shutdownClients() {
 	// edge fires during unregister, after asyncWg.Wait()), so they are joined
 	// here (#2444).
 	h.suppressorWg.Wait()
+	// Presence audience workers are hub-scoped too (#1654). The h.done arm in
+	// computePresenceAudience only abandons workers still WAITING for a slot; one
+	// that already acquired a slot is inside runPresenceAudienceQuery, whose
+	// deadline is derived from context.Background(), so without this join up to
+	// presenceAudienceConcurrency queries outlive Shutdown by up to
+	// presenceAudienceTimeout — holding pool connections while cmd/server closes
+	// the database underneath them.
+	//
+	// Placement is load-bearing twice over. It must come AFTER the synchronous
+	// offline loop above, which is what actually delivers the final frames; and
+	// it is only safe because broadcastPresenceToAllSync bypasses the semaphore,
+	// so that loop cannot be waiting on a slot this join is waiting to be
+	// released.
+	if h.presenceAudienceJoinReached != nil {
+		h.presenceAudienceJoinReached()
+	}
+	h.presenceAudienceWg.Wait()
 	log.Printf("Hub shut down, closed %d client connections", len(clients))
 }
 
@@ -764,6 +881,14 @@ func (h *Hub) handleRegister(client *Client) {
 
 func (h *Hub) registerClient(client *Client) bool {
 	h.mu.Lock()
+
+	// Stamp the registration frontier BEFORE publishing into the maps, and while
+	// holding the same lock enqueuePresenceForAudience reads under. Ordering is
+	// the entire mechanism: a worker already in flight carries a generation at or
+	// below presenceGenCounter, so stamping first means every such delta is
+	// recognisably older than this client. Stamping after publication would leave
+	// a window in which the client is visible to a fan-out but has no frontier.
+	client.presenceDispatchSeq = h.presenceGenCounter
 
 	h.clients[client.ID] = client
 
@@ -905,22 +1030,6 @@ func (h *Hub) resolveVisibleStatus(ctx context.Context, uid, viewerID uuid.UUID)
 	}
 }
 
-func (h *Hub) sendPresenceSnapshot(client *Client) {
-	ctx := context.Background()
-	base, err := h.loadBasePresenceSnapshot(ctx, h.capturePresenceSnapshotSeed(client.UserID))
-	if err != nil {
-		log.Printf("[hub] failed to build base presence snapshot: %T", err)
-		return
-	}
-	data, err := marshalPresenceSnapshot(base, nil)
-	if err != nil {
-		log.Printf("Failed to marshal presence snapshot: %v", err)
-		return
-	}
-	client.enqueueOutboundBlocking(data)
-
-}
-
 func (h *Hub) sendVoiceCountsSnapshot(ctx context.Context, client *Client) {
 	if h.db == nil {
 		return
@@ -1039,6 +1148,14 @@ func (h *Hub) transitionUserOffline(ctx context.Context, userID uuid.UUID, allow
 	h.spawnRichPresenceSuppressionDuringShutdown(
 		userID, allowStopping, !fencePersisted && !offlinePersisted,
 	)
+	if allowStopping {
+		// Shutdown (shutdownClients): h.done is closed and Run is about to
+		// return, so nothing will drain presenceAudienceResults. Fan out inline
+		// or this final offline frame is lost. handleUnregister passes
+		// allowStopping = false and takes the async path.
+		h.broadcastPresenceToAllSync(userID, statusOffline, time.Now().Unix())
+		return
+	}
 	h.broadcastPresenceToAll(userID, statusOffline, time.Now().Unix())
 }
 
@@ -4148,39 +4265,418 @@ func (h *Hub) handleServerUpdate(msg IncomingMessage) {
 	}
 }
 
-// broadcastPresenceToAll sends userID's presence to that user's audience only —
-// accepted friends, optional friends-of-friends, and shared-server peers
-// (internal/presence.ComputePresenceAudience) — plus the sender's own connected
-// devices (self / multi-device sync). Base presence is NEVER fanned to
-// non-audience clients (#47: closes the base online-status leak).
-//
-// Non-self recipients receive one status (invisible is resolved to "offline"
-// by callers); the sender's own devices retain their hidden status for an
-// acknowledged self-state update.
-//
-// Concurrency: this runs on the hub Run goroutine and performs the (bounded,
-// indexed) audience query synchronously — consistent with the spec's on-demand
-// audience model and keeping all hub-map access race-free on the Run goroutine.
-// If presence churn makes this query a Run-loop latency concern, move the
-// computation off-goroutine with a connected-clients snapshot (follow-up).
-func (h *Hub) broadcastPresenceToAll(userID uuid.UUID, status string, timestamp int64) {
-	if h.db == nil {
-		// No DB (e.g. a unit-test hub exercising client-map cleanup only): the
-		// audience cannot be computed, so fail closed and skip the broadcast.
-		// Production always has a DB (NewHub requires it).
-		h.scheduleOnlineCountBroadcast(userID)
-		return
-	}
-	audience, err := presence.ComputePresenceAudience(context.Background(), h.db, userID)
-	if err != nil {
-		// Fail closed: never fan out base presence when the audience cannot be
-		// computed — no leak to unauthorized viewers.
-		log.Printf("[hub] presence audience computation failed for %s; suppressing broadcast: %v", sanitizeLogValue(userID.String()), err)
-		h.scheduleOnlineCountBroadcast(userID)
-		return
-	}
-	audience[userID] = true // the sender's own devices always receive (not a leak)
+// presenceAudienceResult carries one completed audience computation from an
+// async worker back to the Run goroutine (#1654). audience is a single-owner
+// handoff: produced by exactly one worker, thereafter read only by Run, so it
+// needs no lock and must not be retained by the worker after posting.
+type presenceAudienceResult struct {
+	userID     uuid.UUID
+	status     string
+	timestamp  int64
+	generation uint64
+	// attempt is 0 for a first dispatch and is incremented by
+	// retryPresenceAudience. It rides on the result rather than living in a
+	// Hub map so a superseded retry cannot leave a counter behind: the fence
+	// drops the whole result and the count goes with it.
+	attempt  uint8
+	audience map[uuid.UUID]bool
+	err      error
 
+	// authzEpoch is h.presenceAuthzEpoch as it stood when the audience query
+	// RETURNED. A revocation the hub observes after that point advances the
+	// counter, so a mismatch at apply means this audience may name a viewer who
+	// has since lost access (#2992, CWE-367).
+	authzEpoch uint64
+	// computedAt is when the query returned, NOT when the worker was spawned.
+	// The distinction is the whole point: it measures the HANDOFF — channel plus
+	// Run turn — which is the window this change widened, and excludes the query
+	// itself, which a slow database would otherwise make permanently stale.
+	computedAt time.Time
+}
+
+// pendingPresence is the latest superseding transition for a user who already
+// has an audience query in flight. It carries a value, not a bool, because the
+// re-dispatch must deliver the newest status rather than recompute one.
+type pendingPresence struct {
+	status    string
+	timestamp int64
+}
+
+// computePresenceAudience runs the audience query under one presenceAudienceSlots
+// slot. It is the only place the query leaves the Run goroutine.
+//
+// TWO SEPARATE BUDGETS, and they must stay separate. slotCtx bounds the wait FOR
+// a slot; presenceAudienceTimeout bounds the QUERY and is measured from
+// acquisition. A single deadline spanning both turns the semaphore into a
+// dropper under exactly the burst it exists to smooth: with 4 slots and a slow
+// database, every transition past roughly 4 x (timeout / query-latency) exhausts
+// its budget QUEUING, returns DeadlineExceeded without ever reaching the
+// database, and is then suppressed as though the query had failed.
+//
+// That is not a delay, it is a permanent loss. redialPresenceAudience re-dials
+// only when a NEWER transition is already pending, and the worst case —
+// handleUnregister's offline frame — has no newer transition by construction:
+// the user has disconnected. Their audience keeps rendering them online
+// indefinitely. Presence offline is a privacy state, so this is a privacy
+// defect, and it is one this async design introduced: the previous synchronous
+// path had neither a semaphore nor a deadline, so every transition eventually
+// fanned out.
+//
+// Leaving the queue wait unbounded is safe because every slot holder is bounded
+// by presenceAudienceTimeout, so the queue always drains. Waiting behind a
+// peer's query is not a database failure and must never be reported as one.
+//
+// A slot that cannot be acquired returns the context error and a nil audience —
+// never an empty map, which would read as a successful fan-out to nobody.
+func (h *Hub) computePresenceAudience(
+	slotCtx context.Context,
+	userID uuid.UUID,
+) (map[uuid.UUID]bool, error) {
+	select {
+	case h.presenceAudienceSlots <- struct{}{}:
+	case <-h.done:
+		// Shutdown: abandon the queue rather than hold a goroutine doing hub-owned
+		// database work past Run's exit and into dependency teardown. Nothing is
+		// lost by giving up here — Run has stopped consuming results, and
+		// shutdownClients re-broadcasts offline synchronously for every connected
+		// user.
+		return nil, errPresenceHubStopping
+	case <-slotCtx.Done():
+		return nil, fmt.Errorf("presence audience slot wait: %w", slotCtx.Err())
+	}
+	defer func() { <-h.presenceAudienceSlots }()
+
+	return h.runPresenceAudienceQuery(userID)
+}
+
+// runPresenceAudienceQuery performs the audience read under its OWN
+// presenceAudienceTimeout, deliberately derived from context.Background() rather
+// than from the caller's context.
+//
+// Deriving it from the caller would re-create, on the caller's side, exactly the
+// defect the slot/query split above removes: a caller that has already spent
+// part of a shared budget hands the query whatever is left. On the shutdown path
+// that is not hypothetical — broadcastPresenceToAllSync must bound its own wait,
+// so a four-second wait would leave the query one second and a five-second wait
+// would expire it immediately, suppressing the final offline frame that nothing
+// can ever repair.
+//
+// It is also the one place the presenceAudienceComputer seam is consulted, so
+// both the async and synchronous paths share a single query site and cannot
+// drift.
+func (h *Hub) runPresenceAudienceQuery(userID uuid.UUID) (map[uuid.UUID]bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), presenceAudienceTimeout)
+	defer cancel()
+	if h.presenceAudienceComputer != nil {
+		return h.presenceAudienceComputer(ctx, userID)
+	}
+	if h.db == nil {
+		// This runs on a SPAWNED GOROUTINE, so a nil dereference here does not fail
+		// one request -- it panics the whole process. The dispatch sites guard h.db,
+		// but redialPresenceAudience and retryPresenceAudience re-dispatch WITHOUT
+		// re-checking, so the guard is not where the read happens.
+		//
+		// An error keeps the fail-closed contract: an audience that could not be
+		// computed suppresses the broadcast (#47), which is what a missing database
+		// should mean.
+		return nil, errPresenceNoDatabase
+	}
+	audience, err := presence.ComputePresenceAudience(ctx, h.db, userID)
+	if err != nil {
+		return nil, fmt.Errorf("presence audience query: %w", err)
+	}
+	return audience, nil
+}
+
+// spawnPresenceAudienceWorker runs one audience computation off the Run
+// goroutine and posts the outcome back for Run to apply. It captures the result
+// channel and done channel by value first: the goroutine must never touch h's
+// Run-owned maps.
+//
+// The result is posted on EVERY outcome, success or error. Dropping an errored
+// result would leave the user permanently in presenceInFlight, and every later
+// transition for them would coalesce into a pending entry nothing ever re-dials.
+func (h *Hub) spawnPresenceAudienceWorker(
+	userID uuid.UUID,
+	status string,
+	timestamp int64,
+	generation uint64,
+) {
+	h.spawnPresenceAudienceAttempt(presenceAudienceResult{
+		userID:     userID,
+		status:     status,
+		timestamp:  timestamp,
+		generation: generation,
+	})
+}
+
+// spawnPresenceAudienceAttempt runs one attempt for the transition described by
+// seed, whose audience and err fields are ignored and overwritten. Attempts past
+// the first back off first — off the Run goroutine, so a retry storm against a
+// contended pool never costs Run a single turn.
+func (h *Hub) spawnPresenceAudienceAttempt(seed presenceAudienceResult) {
+	results := h.presenceAudienceResults
+	done := h.done
+	h.presenceAudienceWg.Add(1)
+	go func() {
+		defer h.presenceAudienceWg.Done()
+		result := seed
+		result.audience, result.err = nil, nil
+		if result.attempt > 0 {
+			select {
+			case <-time.After(presenceAudienceRetryBackoff * time.Duration(result.attempt)):
+			case <-done:
+				// Abandon rather than sleep into dependency teardown. Posting nothing is
+				// deliberate and matches the main send's own <-done arm: Run has stopped
+				// draining this channel, and shutdownClients re-broadcasts offline
+				// synchronously, which is what actually delivers the final frames.
+				return
+			}
+		}
+		// context.Background() deliberately: NO deadline on the wait for a slot.
+		// Every slot holder is bounded by presenceAudienceTimeout, so the queue
+		// always drains, and a transition that merely queued behind a peer must
+		// never be discarded as though the database had failed. See
+		// computePresenceAudience for why a shared budget loses offline frames
+		// permanently.
+		// The epoch is read BEFORE the query and computedAt AFTER it, and the split is
+		// the whole correctness argument — reading both afterwards makes the fence
+		// blind to precisely the revocations it most needs to catch.
+		//
+		// A revocation that commits DURING the reads bumps the counter while the query
+		// is still running. Load afterwards and you observe the POST-bump value, it
+		// equals the current epoch, and an audience built from the pre-revocation graph
+		// is delivered as proven. The query is the longest span in the window, so that
+		// is the majority of what the fence exists to cover. Loading first makes any
+		// bump concurrent with the query a MISMATCH, which is fail-closed.
+		// (CodeRabbit, PR #2997.)
+		//
+		// computedAt stays after the query because it measures the HANDOFF; moving it
+		// earlier would fold the query's own duration into a bound meant to exclude it.
+		result.authzEpoch = h.presenceAuthzEpoch.Load()
+		result.audience, result.err = h.computePresenceAudience(context.Background(), result.userID)
+		result.computedAt = time.Now()
+
+		select {
+		case results <- result:
+		case <-done:
+		}
+	}()
+}
+
+// applyPresenceAudience consumes one completed audience computation on the Run
+// goroutine (#1654). Run owns presenceGeneration, presenceInFlight,
+// presenceDispatchPending, hiddenPresence and the client maps, so every decision
+// here is made without a lock and without a stale read.
+//
+// The generation fence is an ORDERING guarantee, not a revocation guarantee: it
+// stops an `online` computed at T0 from landing after a later `offline` already
+// delivered. See the spec's §4.5 for why the revocation window does not widen in
+// the regime this change targets.
+// applyPresenceAudience runs on the Run goroutine. The fence gates DELIVERY; the
+// redial is UNCONDITIONAL, and the split between the two is the invariant most
+// likely to be broken by a later edit. deliverPresenceAudienceResult has four
+// early returns that all look terminal — only this function knows the redial
+// still has to run after every one of them. An early return added to the stale
+// branch below, or a redial moved inside the if, leaks this user's
+// presenceInFlight entry permanently: no later transition would dispatch again
+// and their presence would freeze at the last delivered frame. Keep the redial
+// on its own line, outside the fence.
+func (h *Hub) applyPresenceAudience(result presenceAudienceResult) {
+	if result.generation == h.presenceGeneration[result.userID] {
+		if h.retryPresenceAudience(result) {
+			// Still in flight under the SAME generation. Returning here keeps
+			// presenceInFlight set, which is what makes the retry invisible to the
+			// coalescer — a transition arriving mid-retry queues as pending exactly
+			// as it would mid-query, and supersedes the retry via the fence.
+			return
+		}
+		h.deliverPresenceAudienceResult(result)
+	}
+	h.redialPresenceAudience(result.userID)
+}
+
+// InvalidatePresenceAudiences tells the hub that something which can revoke
+// presence-audience membership has happened. Every audience already computed but
+// not yet applied is treated as unproven from this moment on: it is recomputed if
+// attempts remain, and suppressed if they do not.
+//
+// SCOPE, stated precisely because the gap is the interesting part. The revoking
+// writes dispatch POST-COMMIT (see internal/presencehook), so this bump lands
+// AFTER the write it describes. It therefore closes every case where the bump
+// reaches the hub before Run applies the result — which is the ordinary case, the
+// apply being one Run turn behind — and does NOT close the case where an apply
+// beats the bump. Closing that needs the revocation to fence the hub from inside
+// its own transaction, i.e. the credential-epoch pattern (durable column plus
+// Redis markers plus a guarded read), which is a different and much larger change.
+// presenceAudienceMaxHandoff bounds what this cannot order.
+func (h *Hub) InvalidatePresenceAudiences() {
+	h.presenceAuthzEpoch.Add(1)
+}
+
+// presenceAudienceUnproven reports whether a successful result may name a viewer
+// who has since lost access, by either of two independent tests: the hub observed
+// a revocation after the query returned, or the handoff outran its bound.
+//
+// An ERRORED result is never "unproven" — it carries no audience at all, and its
+// own retry path already owns it. Returning true for one would double-count the
+// attempt budget.
+func (h *Hub) presenceAudienceUnproven(result presenceAudienceResult) bool {
+	if result.err != nil || result.audience == nil {
+		return false
+	}
+	if result.authzEpoch != h.presenceAuthzEpoch.Load() {
+		return true
+	}
+	if result.computedAt.IsZero() {
+		// UNSTAMPED: the handoff cannot be measured, so this arm does not apply. The
+		// epoch arm above still does, and it is the arm carrying the authorization
+		// property -- the handoff bound only limits how long a PROVEN audience may
+		// sit before delivery.
+		//
+		// The first cut treated zero as infinitely stale, reasoning that a forgotten
+		// stamp should stall presence rather than silently disable half the fence.
+		// That was wrong about the consequence: an unproven result RE-DISPATCHES, so
+		// an unstamped one retries until its budget is gone -- and on a hub with no
+		// database that retry panicked the process from a spawned goroutine. A stall
+		// was never the failure mode on offer.
+		return false
+	}
+	return time.Since(result.computedAt) > presenceAudienceMaxHandoff
+}
+
+// retryPresenceAudience re-dispatches a still-current result whose query failed,
+// reporting whether it did. The caller has already established that the fence
+// accepts this result, so no pending-transition check is needed here: any newer
+// transition bumped the generation in broadcastPresenceToAll and this result
+// would have been dropped as stale before reaching us.
+func (h *Hub) retryPresenceAudience(result presenceAudienceResult) bool {
+	if errors.Is(result.err, errPresenceNoDatabase) {
+		// Not transient: re-dispatching lands on the same missing database.
+		return false
+	}
+	if errors.Is(result.err, errPresenceHubStopping) {
+		// The hub is going away and shutdownClients is already re-broadcasting
+		// offline synchronously.
+		return false
+	}
+	if result.err == nil && !h.presenceAudienceUnproven(result) {
+		// Nothing to repair and the audience is still proven.
+		return false
+	}
+	if uint(result.attempt)+1 >= presenceAudienceMaxAttempts {
+		return false
+	}
+	result.attempt++
+	h.spawnPresenceAudienceAttempt(result)
+	return true
+}
+
+// deliverPresenceAudienceResult fans out a current, successful result. An error
+// suppresses the broadcast entirely — never fan out base presence when the
+// audience could not be computed (#47).
+// countPresenceAudienceSuppressed records that base presence was NOT fanned out
+// because the sender's audience could not be computed.
+//
+// One counter for every suppression, with NO reason dimension. Splitting it by
+// cause — query error, exhausted retries, nil audience — would be a
+// privacy-decision discriminator of the kind observability.md principle 7
+// forbids, and the operator question this answers ("is presence being dropped,
+// and how often?") does not need the split. The log line beside each call site
+// already carries the cause for a human reading logs.
+//
+// Every call site runs on the Run goroutine; the atomic add is why it is safe to
+// do inline rather than scheduling it.
+func (h *Hub) countPresenceAudienceSuppressed() {
+	if h.opsCounter != nil {
+		h.opsCounter.Increment(opsmetrics.MetricPresenceAudienceSuppressedTotal)
+	}
+}
+
+func (h *Hub) deliverPresenceAudienceResult(result presenceAudienceResult) {
+	if errors.Is(result.err, errPresenceHubStopping) {
+		// An abandoned queue wait, not a database failure. Run can service this
+		// arm for several turns after close(h.done) because select chooses
+		// randomly among ready cases, so without this every graceful shutdown
+		// would emit misleading suppression errors.
+		return
+	}
+	if result.err != nil {
+		log.Printf("[hub] presence audience computation failed for %s; suppressing broadcast: %v",
+			sanitizeLogValue(result.userID.String()), result.err)
+		h.countPresenceAudienceSuppressed()
+		return
+	}
+	if result.audience == nil {
+		// Production cannot reach this: ComputePresenceAudience returns a non-nil
+		// map on every success path and nil only alongside an error. But
+		// presenceAudienceComputer is an injectable seam, and a (nil, nil) return
+		// would panic on the Run goroutine and take the whole hub down. Fail
+		// closed instead.
+		log.Printf("[hub] presence audience computation returned no audience for %s; suppressing broadcast",
+			sanitizeLogValue(result.userID.String()))
+		h.countPresenceAudienceSuppressed()
+		return
+	}
+	if h.presenceAudienceUnproven(result) {
+		// Reached only when the retry budget is exhausted. Suppressing is the
+		// fail-CLOSED half of the fence and is the whole reason the check is
+		// repeated here rather than living only in retryPresenceAudience: an
+		// exhausted retry falls through to this function, and delivering an
+		// unproven audience at that point would make the budget a fail-OPEN
+		// timer. A dropped presence frame self-heals on the next transition; a
+		// frame delivered to a revoked viewer does not.
+		log.Printf("[hub] presence audience for %s could not be re-proven; suppressing broadcast",
+			sanitizeLogValue(result.userID.String()))
+		// Counted like every other suppression. This drop is the one an operator
+		// most needs to see -- it means the revocation fence or the handoff bound
+		// is firing, which is a different condition from a database failure and is
+		// invisible in the logs at any useful aggregate. Omitting it here made the
+		// counter under-report exactly the behaviour #2992 introduced.
+		h.countPresenceAudienceSuppressed()
+		return
+	}
+	result.audience[result.userID] = true // the sender's own devices always receive (not a leak)
+	h.presenceFanout(result.userID, result.status, result.timestamp, result.audience, result.generation)
+}
+
+// redialPresenceAudience clears the completed dispatch and starts the superseding
+// one, if a transition arrived while the query was in flight. With nothing
+// pending the generation entry is deleted: the counter is hub-wide and monotonic,
+// so a later stale result reads 0 from the map and a re-added user reads a
+// strictly larger value — both mismatch, so deletion cannot resurrect a stale
+// delivery (no ABA).
+func (h *Hub) redialPresenceAudience(userID uuid.UUID) {
+	delete(h.presenceInFlight, userID)
+	pending, ok := h.presenceDispatchPending[userID]
+	if !ok {
+		delete(h.presenceGeneration, userID)
+		return
+	}
+	delete(h.presenceDispatchPending, userID)
+	h.presenceInFlight[userID] = struct{}{}
+	h.spawnPresenceAudienceWorker(userID, pending.status, pending.timestamp, h.presenceGeneration[userID])
+}
+
+// presenceFanout is the shared delivery tail, used by BOTH applyPresenceAudience
+// and the retained synchronous path (broadcastPresenceToAllSync) so the two can
+// never drift apart. Runs on the Run goroutine.
+//
+// h.hiddenPresence is read HERE rather than captured at dispatch: every writer
+// (setHiddenPresence, clearHiddenPresence, failClosedPresenceHeartbeat) takes
+// h.mu.Lock and every caller of those is on Run, so an on-Run read is both
+// simpler than seeding and strictly fresher — and it structurally avoids the
+// #2404 hazard class rather than managing it.
+//
+// Deliberately a separate function from enqueuePresenceForAudience, which sits at
+// gocognit 15 — the exact S3776 ceiling with zero headroom.
+func (h *Hub) presenceFanout(
+	userID uuid.UUID,
+	status string,
+	timestamp int64,
+	audience map[uuid.UUID]bool,
+	dispatchSeq uint64,
+) {
 	data, err := marshalPresenceFrame(userID, status, timestamp)
 	if err != nil {
 		log.Printf("Failed to marshal presence message: %v", err)
@@ -4194,11 +4690,141 @@ func (h *Hub) broadcastPresenceToAll(userID uuid.UUID, status string, timestamp 
 			return
 		}
 	}
-	h.enqueuePresenceForAudience(audience, userID, data, selfData)
+	h.enqueuePresenceForAudience(audience, userID, data, selfData, dispatchSeq)
+}
 
-	// Schedule a debounced recomputation of online counts for all servers
-	// the affected user belongs to (batches rapid presence changes).
+// broadcastPresenceToAll sends userID's presence to that user's audience only —
+// accepted friends, optional friends-of-friends, and shared-server peers
+// (internal/presence.ComputePresenceAudience) — plus the sender's own connected
+// devices (self / multi-device sync). Base presence is NEVER fanned to
+// non-audience clients (#47: closes the base online-status leak).
+//
+// Non-self recipients receive one status (invisible is resolved to "offline"
+// by callers); the sender's own devices retain their hidden status for an
+// acknowledged self-state update.
+//
+// Concurrency (#1654): this runs on the hub Run goroutine and NEVER blocks on
+// the database. It bumps a hub-wide monotonic generation, schedules the
+// online-count debounce, and hands the audience query to a bounded worker; the
+// result returns through presenceAudienceResults and is applied by
+// applyPresenceAudience, back on Run. Only the query is off-loop — the
+// hiddenPresence read, marshalling and fan-out all stay on Run.
+//
+// scheduleOnlineCountBroadcast is called HERE, in the synchronous prologue, on
+// every path. It mutates onlineCountPending and onlineCountTimer, which are
+// lock-free Run-owned state, and Run itself reads onlineCountTimer to arm its
+// select — so it must never move to the async side. Three existing tests assert
+// onlineCountPending synchronously on the line after the trigger and are the
+// acceptance test for this placement.
+//
+// Hoisting the schedule above the marshal step is behavior-identical on every
+// reachable path. broadcastPresenceToAll previously had five exits, of which the
+// two marshal-error exits did not schedule; those are unreachable, because
+// json.Marshal over OutgoingMessage{Type string, Data map[string]any{string,
+// string, int64}} has no channel, func, cyclic or NaN value that can fail. Even
+// if reached, the delta is one redundant schedule — idempotent, and its flush
+// recomputes from live hub state rather than from the presence frame.
+func (h *Hub) broadcastPresenceToAll(userID uuid.UUID, status string, timestamp int64) {
+	if h.presenceAudienceResults == nil {
+		// Struct-literal test hubs built without NewHub have no result channel,
+		// so nothing would ever apply an async result. Fail closed to the
+		// synchronous path rather than silently dropping presence.
+		h.broadcastPresenceToAllSync(userID, status, timestamp)
+		return
+	}
+	if h.db == nil {
+		// No DB (e.g. a unit-test hub exercising client-map cleanup only): the
+		// audience cannot be computed, so fail closed and skip the broadcast.
+		// Production always has a DB (NewHub requires it).
+		h.scheduleOnlineCountBroadcast(userID)
+		return
+	}
+
+	h.presenceGenCounter++
+	h.presenceGeneration[userID] = h.presenceGenCounter
 	h.scheduleOnlineCountBroadcast(userID)
+
+	if _, inFlight := h.presenceInFlight[userID]; inFlight {
+		// Coalesce: at most one outstanding query per user, so a reconnect storm
+		// spawns O(distinct users) goroutines rather than O(transitions). The
+		// superseded transition is one the generation fence would have dropped
+		// on arrival anyway.
+		h.presenceDispatchPending[userID] = pendingPresence{status: status, timestamp: timestamp}
+		return
+	}
+	h.presenceInFlight[userID] = struct{}{}
+	h.spawnPresenceAudienceWorker(userID, status, timestamp, h.presenceGenCounter)
+}
+
+// broadcastPresenceToAllSync is the pre-#1654 inline path, retained for exactly
+// two callers: shutdown (transitionUserOffline with allowStopping = true, where
+// Run is already exiting and nothing will drain the result channel) and
+// struct-literal test hubs with a nil result channel. It shares presenceFanout
+// with applyPresenceAudience so the synchronous and asynchronous paths cannot
+// drift.
+//
+// It is NOT reachable from any of the six Run call sites in normal operation. A
+// reviewer seeing a surviving synchronous audience query should read this comment
+// before concluding the issue was not fixed.
+func (h *Hub) broadcastPresenceToAllSync(userID uuid.UUID, status string, timestamp int64) {
+	h.scheduleOnlineCountBroadcast(userID)
+	if h.db == nil {
+		return
+	}
+	// Deliberately BYPASSES the presenceAudienceSlots semaphore, going straight
+	// to runPresenceAudienceQuery.
+	//
+	// The semaphore exists to bound concurrent database load from the ASYNC
+	// path. This path is reached only from shutdown (Run is exiting, so it is
+	// single-threaded and adds at most one concurrent query on top of the four
+	// async slots) and from struct-literal test hubs. Queuing here would buy
+	// nothing and cost the one thing that cannot be recovered: a slot wait would
+	// consume the budget of a frame that is TERMINAL by construction — the user
+	// has disconnected, so no later transition repairs a suppressed offline.
+	//
+	// It still shares the query site, and therefore the presenceAudienceComputer
+	// seam, with the async path, so the two cannot drift.
+	//
+	// It also does NOT retry, where the async path does, and that asymmetry is
+	// deliberate. A retry here would have to sleep inline on the shutdown
+	// goroutine, once per user, so a mass disconnect would multiply shutdown time
+	// by the number of connected users — trading a bounded frame loss for an
+	// unbounded shutdown stall.
+	//
+	// ACCEPTED RESIDUAL (Codex P1, PR #2975). shutdownClients runs this fan-out
+	// BEFORE it cancels client bootstraps, and database/sql charges connection
+	// acquisition to the query's context — so with the pool saturated by the 8
+	// bootstrap and 16 suppressor slots, presenceAudienceTimeout can expire on
+	// pool wait alone and suppress a terminal offline frame. The mechanism is
+	// real. The harm is not: this fan-out is process-local (there is no NATS
+	// fan-out on this path), and every possible recipient is unpublished and
+	// closeOutbound()-ed a few lines below, so a suppressed frame is one the
+	// receiving socket would have outlived by microseconds. Fixing it properly
+	// means cancelling bootstraps before the fan-out, which changes what a
+	// mid-bootstrap client buffers and is not worth the risk for this payoff.
+	//
+	// The generation bump below is not needed for correctness TODAY — shutdown is
+	// the only production caller and Run has already stopped applying results by
+	// then. It is here so the fence covers every writer structurally rather than
+	// by that argument: without it, a future caller reachable while Run is live
+	// could deliver a frame and leave an older in-flight async result still
+	// generation-current, which would then overwrite it. Nil-guarded because
+	// struct-literal test hubs reach this function with no maps allocated.
+	if h.presenceGeneration != nil {
+		h.presenceGenCounter++
+		h.presenceGeneration[userID] = h.presenceGenCounter
+	}
+	audience, err := h.runPresenceAudienceQuery(userID)
+	if err != nil {
+		// Fail closed: never fan out base presence when the audience cannot be
+		// computed — no leak to unauthorized viewers.
+		log.Printf("[hub] presence audience computation failed for %s; suppressing broadcast: %v",
+			sanitizeLogValue(userID.String()), err)
+		h.countPresenceAudienceSuppressed()
+		return
+	}
+	audience[userID] = true // the sender's own devices always receive (not a leak)
+	h.presenceFanout(userID, status, timestamp, audience, presenceDispatchSeqAlways)
 }
 
 func marshalPresenceFrame(userID uuid.UUID, status string, timestamp int64) ([]byte, error) {
@@ -4212,7 +4838,18 @@ func marshalPresenceFrame(userID uuid.UUID, status string, timestamp int64) ([]b
 	})
 }
 
-func (h *Hub) enqueuePresenceForAudience(audience map[uuid.UUID]bool, userID uuid.UUID, data, selfData []byte) {
+// presenceDispatchSeqAlways marks a fan-out that no registration frontier may
+// filter. broadcastPresenceToAllSync uses it: that path completes its fan-out
+// before returning, so no client can appear mid-flight and pre-#1654 delivery
+// semantics are preserved exactly.
+const presenceDispatchSeqAlways = ^uint64(0)
+
+func (h *Hub) enqueuePresenceForAudience(
+	audience map[uuid.UUID]bool,
+	userID uuid.UUID,
+	data, selfData []byte,
+	dispatchSeq uint64,
+) {
 	h.mu.RLock()
 	for viewerID := range audience {
 		if clientSet, ok := h.userClients[viewerID]; ok {
@@ -4222,7 +4859,7 @@ func (h *Hub) enqueuePresenceForAudience(audience map[uuid.UUID]bool, userID uui
 					if viewerID == userID {
 						message = selfData
 					}
-					h.enqueueBasePresence(client, message)
+					h.enqueueBasePresenceAt(client, userID, message, dispatchSeq)
 				}
 			}
 		}
@@ -4234,7 +4871,16 @@ func (h *Hub) enqueuePresenceForAudience(audience map[uuid.UUID]bool, userID uui
 // 500ms debounce timer (if not already running). When the timer fires, all
 // accumulated user IDs are flushed in a single batched DB+Redis query.
 //
-// Called from within the hub's Run goroutine, so no locking is needed.
+// MUST be called only from the hub's Run goroutine. onlineCountPending and
+// onlineCountTimer are lock-free Run-owned state, and Run itself reads
+// onlineCountTimer at the top of its select to arm the debounce arm — so a call
+// from any other goroutine is a data race on a pointer h.mu does not cover.
+//
+// #1654 deliberately keeps this in broadcastPresenceToAll's SYNCHRONOUS
+// prologue for exactly that reason; do not move it to applyPresenceAudience or
+// into the async worker. Three heartbeat tests assert onlineCountPending
+// synchronously on the line after the trigger and are the acceptance test for
+// this placement.
 func (h *Hub) scheduleOnlineCountBroadcast(userID uuid.UUID) {
 	h.onlineCountPending[userID] = true
 	if h.onlineCountTimer == nil {
@@ -4391,6 +5037,12 @@ func (h *Hub) setHiddenPresence(userID uuid.UUID, selfStatus string) {
 	h.hiddenPresence[userID] = selfStatus
 }
 
+// clearHiddenPresence must be paired with a broadcastPresenceToAll for the same
+// user on the same Run turn. Since #1654 the hiddenPresence read moved from
+// dispatch time to APPLY time, so an in-flight invisible self-frame reads this
+// map after it has been cleared: unpaired, that frame reaches the sender's own
+// devices as offline rather than invisible. Every current caller pairs; a new
+// one that does not must broadcast, not merely clear.
 func (h *Hub) clearHiddenPresence(userID uuid.UUID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

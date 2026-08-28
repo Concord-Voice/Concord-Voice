@@ -27,7 +27,7 @@ func TestCountersSnapshotIsClosedAndConcurrentSafe(t *testing.T) {
 	require.Equal(t, float64(800), snapshot[opsmetrics.MetricChannelMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricDMMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricMediaUploadsTotal])
-	require.Len(t, snapshot, 7)
+	require.Len(t, snapshot, 8)
 	for key := range snapshot {
 		definition, ok := opsmetrics.Definition(key)
 		require.True(t, ok)

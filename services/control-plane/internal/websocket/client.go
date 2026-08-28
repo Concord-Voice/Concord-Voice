@@ -64,6 +64,56 @@ type Client struct {
 	// User ID from JWT token
 	UserID uuid.UUID
 
+	// presenceDispatchSeq is this client's REGISTRATION FRONTIER: the value of
+	// Hub.presenceGenCounter at the moment the client was published into the hub
+	// maps. A base-presence delta whose generation is at or below it was
+	// dispatched before this client existed, so its content is already carried by
+	// the bootstrap snapshot and delivering it would be an out-of-order write on
+	// top of that snapshot.
+	//
+	// Written once, on the Run goroutine under Hub.mu, before publication; read
+	// under Hub.mu.RLock in enqueuePresenceForAudience. Never mutated after.
+	presenceDispatchSeq uint64
+
+	// EXACTLY ONE of presenceSnapshotOmitted / presenceSnapshotCovered is populated
+	// after publication, selected by whether the seed was truncated. Two sets rather
+	// than one because the complement is only meaningful when the candidate list IS
+	// the connected set: above presenceSnapshotConnectedLimit it is not, and a
+	// sender dropped BY truncation never appears in the candidates to be subtracted
+	// from — so a complement alone silently reports them covered. That is the >512
+	// defect this field was introduced to fix, reintroduced by inverting it.
+	//
+	// Both exist because capturePresenceSnapshotSeed stops at
+	// presenceSnapshotConnectedLimit (512) and omits the remainder fail-closed.
+	// Without coverage the registration frontier would drop an omitted sender's
+	// in-flight delta too, leaving the viewer rendering that friend offline until
+	// some later transition — trading an ordering defect for a delivery one at
+	// exactly the scale where it is hardest to notice.
+	//
+	// presenceSnapshotOmitted is the COMPLEMENT: senders that were snapshot
+	// candidates but did NOT reach the published snapshot, whether dropped by
+	// truncation at presenceSnapshotConnectedLimit or by authorization.
+	//
+	// Storing the complement rather than the coverage set is what keeps the common
+	// case free. On an ordinary hub every candidate is published, so this is EMPTY
+	// and stays nil. Retaining the coverage set instead allocated up to 512 UUIDs
+	// per socket for its whole lifetime — O(N^2) aggregate — which is what the
+	// round-3 fix accidentally introduced.
+	//
+	// Guarded by bootstrapMu. Nil until the snapshot is published, and nil
+	// thereafter whenever nothing was omitted. Used only when NOT truncated.
+	presenceSnapshotOmitted map[uuid.UUID]struct{}
+
+	// presenceSnapshotCovered is the PUBLISHED set, populated only when the seed was
+	// truncated — where the complement cannot be computed. Bounded by
+	// presenceSnapshotConnectedLimit, and allocated only on a hub above it.
+	// Guarded by bootstrapMu.
+	presenceSnapshotCovered map[uuid.UUID]struct{}
+
+	// presenceSnapshotPublished distinguishes "nothing omitted" from "no snapshot
+	// yet", which two nil maps cannot. Guarded by bootstrapMu.
+	presenceSnapshotPublished bool
+
 	// Username from database (set at connection time)
 	Username string
 
@@ -124,6 +174,58 @@ type Client struct {
 	bootstrapFailed   bool
 	bootstrapReplay   [][]byte
 	bootstrapLive     [][]byte
+}
+
+// setPresenceSnapshotCoverage records the senders the client's snapshot ACTUALLY
+// carried, taken from the finalized, re-authorized content rather than from the
+// seed.
+//
+// The distinction is the whole point. seed.connectedIDs is a pre-authorization
+// CANDIDATE list: capturePresenceSnapshotSeed enumerates connected users and
+// stops at presenceSnapshotConnectedLimit, and authorizeBasePresenceCandidates
+// then removes the ones this viewer may not see. Deriving coverage from the seed
+// therefore marks senders as covered that the snapshot dropped — for truncation
+// OR for authorization — and the registration frontier would discard their
+// in-flight deltas too, leaving the viewer rendering them offline until an
+// unrelated transition.
+//
+// Called on the bootstrap goroutine immediately before the snapshot is published,
+// so it is in place before completeClientBootstrap flushes the buffered live
+// frames that follow it.
+func (c *Client) setPresenceSnapshotCoverage(omitted, covered map[uuid.UUID]struct{}) {
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	c.presenceSnapshotOmitted = omitted
+	c.presenceSnapshotCovered = covered
+	c.presenceSnapshotPublished = true
+}
+
+// snapshotCovered reports whether this client's snapshot carried senderID.
+//
+// A nil set — no snapshot published yet — reports TRUE, i.e. the frontier still
+// filters. That preserves the ordering guarantee the frontier exists for during
+// the bootstrap window; the alternative (fail open) would reopen the very defect
+// being fixed for every delta racing the snapshot. It is safe in the direction
+// that matters: over-filtering shows a stale-offline peer, never a frame to
+// somebody unauthorized.
+//
+// Takes bootstrapMu, which introduces no new lock-ordering edge:
+// enqueuePresenceForAudience already holds Hub.mu.RLock while
+// enqueueBasePresence -> bufferBootstrapLive acquires this same mutex.
+func (c *Client) snapshotCovered(senderID uuid.UUID) bool {
+	c.bootstrapMu.Lock()
+	defer c.bootstrapMu.Unlock()
+	if !c.presenceSnapshotPublished {
+		return true
+	}
+	if c.presenceSnapshotCovered != nil {
+		// Truncated seed: the candidate list is not the connected set, so coverage
+		// can only be proven by membership in what was actually published.
+		_, covered := c.presenceSnapshotCovered[senderID]
+		return covered
+	}
+	_, omitted := c.presenceSnapshotOmitted[senderID]
+	return !omitted
 }
 
 func (c *Client) beginBootstrap() {

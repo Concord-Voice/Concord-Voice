@@ -18,7 +18,12 @@ import (
 type presenceSnapshotSeed struct {
 	viewerID     uuid.UUID
 	connectedIDs []uuid.UUID
-	hidden       map[uuid.UUID]string
+	// truncated is set when the connected set exceeded
+	// presenceSnapshotConnectedLimit, so connectedIDs is a PROPER SUBSET of who
+	// is connected. It is the one bit that tells the coverage computation whether
+	// "absent from connectedIDs" means "offline" or "cut by the cap".
+	truncated bool
+	hidden    map[uuid.UUID]string
 }
 
 // presenceSnapshotConnectedLimit bounds the only Run-loop work performed for
@@ -175,6 +180,7 @@ func (h *Hub) capturePresenceSnapshotSeed(viewerID uuid.UUID) presenceSnapshotSe
 			continue
 		}
 		if len(seed.connectedIDs) == presenceSnapshotConnectedLimit {
+			seed.truncated = true
 			break
 		}
 		appendConnected(userID)
@@ -430,7 +436,9 @@ func (h *Hub) completeClientPresenceBootstrap(
 	return h.completePreparedClientBootstrap(
 		client,
 		func(publish func([]byte) error) error {
-			return h.finalizeClientActivitySnapshot(ctx, client.UserID, seed, base, activity, publish)
+			return h.finalizeClientActivitySnapshot(
+				ctx, client.UserID, seed, base, activity, publish, client.setPresenceSnapshotCoverage,
+			)
 		},
 		func() error { return h.sendCustomTextSnapshot(ctx, client) },
 	)
@@ -443,9 +451,10 @@ func (h *Hub) finalizeClientActivitySnapshot(
 	base map[uuid.UUID]string,
 	activity presence.ActivitySnapshot,
 	publish func([]byte) error,
+	coverage func(omitted, covered map[uuid.UUID]struct{}),
 ) error {
 	publishActivity := func(finalized presence.ActivitySnapshot) error {
-		return h.publishClientPresenceSnapshot(ctx, seed, base, finalized, publish)
+		return h.publishClientPresenceSnapshot(ctx, seed, base, finalized, publish, coverage)
 	}
 	if h.activitySnapshotFinalize == nil {
 		return publishActivity(activity)
@@ -459,6 +468,14 @@ func (h *Hub) publishClientPresenceSnapshot(
 	base map[uuid.UUID]string,
 	activity presence.ActivitySnapshot,
 	publish func([]byte) error,
+	// coverage receives (omitted, covered) — exactly one is non-nil, chosen by
+	// whether the seed was truncated. Untruncated, the candidate list IS the
+	// connected set, so the complement (candidates minus published) names every
+	// uncovered sender and is empty on an ordinary hub. Truncated, it does not:
+	// a sender cut by the cap is absent from the candidates and so cannot be
+	// subtracted from them, so coverage is carried positively as the published
+	// set instead — bounded by the cap, and allocated only on a hub above it.
+	coverage func(omitted, covered map[uuid.UUID]struct{}),
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -474,6 +491,26 @@ func (h *Hub) publishClientPresenceSnapshot(
 	snapshot, err := marshalPresenceSnapshot(refreshedBase, activity)
 	if err != nil {
 		return err
+	}
+	// Before publish, so it is in place for the live frames flushed after it.
+	if seed.truncated {
+		covered := make(map[uuid.UUID]struct{}, len(refreshedBase))
+		for id := range refreshedBase {
+			covered[id] = struct{}{}
+		}
+		coverage(nil, covered)
+	} else {
+		var dropped map[uuid.UUID]struct{}
+		for _, id := range seed.connectedIDs {
+			if _, published := refreshedBase[id]; published {
+				continue
+			}
+			if dropped == nil {
+				dropped = make(map[uuid.UUID]struct{})
+			}
+			dropped[id] = struct{}{}
+		}
+		coverage(dropped, nil)
 	}
 	return publish(snapshot)
 }
@@ -572,6 +609,35 @@ func (h *Hub) failClientBootstrap(
 	if disconnectErr := h.disconnectPrivacyCriticalClient(client); disconnectErr != nil {
 		log.Printf("[hub] reconnect replacement disconnect failed: %T", disconnectErr)
 	}
+}
+
+// enqueueBasePresenceAt drops a base-presence delta that predates this client's
+// registration, and delivers anything newer.
+//
+// Moving the audience query off the Run goroutine opened a window between a
+// delta being DISPATCHED and being DELIVERED. A client registering inside that
+// window gets a bootstrap snapshot carrying the sender's current state, and
+// then receives the older in-flight delta on top of it — an out-of-order write
+// the pre-#1654 synchronous path could not produce, because it fanned out
+// before returning. Proven by TestPresenceFrontier* below.
+//
+// Dropping is safe in both directions: whatever the delta would have said is
+// already in the snapshot this client just received. The comparison is `<=`,
+// not `<`, because the frontier is the counter value at publication — a delta
+// carrying exactly that generation was dispatched before this client existed.
+func (h *Hub) enqueueBasePresenceAt(
+	client *Client,
+	senderID uuid.UUID,
+	data []byte,
+	dispatchSeq uint64,
+) {
+	// Both conditions are required. The frontier alone would also drop deltas for
+	// senders the snapshot OMITTED (above presenceSnapshotConnectedLimit), which
+	// would leave them rendered offline until a later transition.
+	if dispatchSeq <= client.presenceDispatchSeq && client.snapshotCovered(senderID) {
+		return
+	}
+	h.enqueueBasePresence(client, data)
 }
 
 func (h *Hub) enqueueBasePresence(client *Client, data []byte) {

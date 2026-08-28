@@ -15,6 +15,7 @@ type Counters struct {
 	channelMessages    atomic.Uint64
 	dmMessages         atomic.Uint64
 	snapshotRejections atomic.Uint64
+	presenceSuppressed atomic.Uint64
 	mediaUploads       atomic.Uint64
 
 	routesMu sync.RWMutex
@@ -45,6 +46,8 @@ func (c *Counters) Increment(key MetricKey) {
 		c.dmMessages.Add(1)
 	case MetricSnapshotRejectionsTotal:
 		c.snapshotRejections.Add(1)
+	case MetricPresenceAudienceSuppressedTotal:
+		c.presenceSuppressed.Add(1)
 	case MetricMediaUploadsTotal:
 		c.mediaUploads.Add(1)
 	}
@@ -56,13 +59,14 @@ func (c *Counters) Snapshot() map[MetricKey]float64 {
 		return nil
 	}
 	return map[MetricKey]float64{
-		MetricHTTPRequestsTotal:       float64(c.httpRequests.Load()),
-		MetricHTTPClientErrorsTotal:   float64(c.httpClientErrors.Load()),
-		MetricHTTPServerErrorsTotal:   float64(c.httpServerErrors.Load()),
-		MetricChannelMessagesTotal:    float64(c.channelMessages.Load()),
-		MetricDMMessagesTotal:         float64(c.dmMessages.Load()),
-		MetricSnapshotRejectionsTotal: float64(c.snapshotRejections.Load()),
-		MetricMediaUploadsTotal:       float64(c.mediaUploads.Load()),
+		MetricHTTPRequestsTotal:               float64(c.httpRequests.Load()),
+		MetricHTTPClientErrorsTotal:           float64(c.httpClientErrors.Load()),
+		MetricHTTPServerErrorsTotal:           float64(c.httpServerErrors.Load()),
+		MetricChannelMessagesTotal:            float64(c.channelMessages.Load()),
+		MetricDMMessagesTotal:                 float64(c.dmMessages.Load()),
+		MetricSnapshotRejectionsTotal:         float64(c.snapshotRejections.Load()),
+		MetricPresenceAudienceSuppressedTotal: float64(c.presenceSuppressed.Load()),
+		MetricMediaUploadsTotal:               float64(c.mediaUploads.Load()),
 	}
 }
 

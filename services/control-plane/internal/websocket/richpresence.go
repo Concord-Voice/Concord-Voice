@@ -104,6 +104,14 @@ func (h *Hub) DisconnectRichPresenceClients(
 	ctx context.Context,
 	recipients map[uuid.UUID]bool,
 ) error {
+	// This is the hub's one observation point for a revocation that has already
+	// COMMITTED: the graph-presence and membership rails both dispatch here
+	// post-commit, and the three relations a presence audience is built from
+	// (friends, friends-of-friends, server peers) are exactly the ones those rails
+	// hook. Bumping first, before any disconnect work, keeps the window this closes
+	// as wide as it can be — an in-flight audience computed against the pre-revocation
+	// graph is invalidated the moment we learn, not after the teardown loop (#2992).
+	h.InvalidatePresenceAudiences()
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	var disconnectErr error
@@ -127,6 +135,21 @@ func (h *Hub) DisconnectRichPresenceClients(
 // DisconnectAllRichPresenceClients closes every local client when the affected
 // audience cannot be determined safely.
 func (h *Hub) DisconnectAllRichPresenceClients(ctx context.Context) error {
+	// The SECOND observation point for a committed revocation, and it must bump
+	// too (#2992). This is the ESCALATION arm of the same rails that reach
+	// DisconnectRichPresenceClients -- graphpresence's reconciler falls back here
+	// when it cannot determine the affected audience -- so wiring only the
+	// targeted method left every escalated revocation invisible to the fence.
+	//
+	// The a-fortiori argument: this path fires precisely when the audience is
+	// UNKNOWN and the response is to close every local client. An in-flight
+	// audience computed under the pre-escalation graph is even less trustworthy
+	// here than on the targeted path, so if either one bumps, this one must.
+	//
+	// Found by Gitar on PR #2975, which filed it as a documentation gap in the
+	// design's rail inventory. It was a functional gap: the doc was describing a
+	// fence with a hole in it.
+	h.InvalidatePresenceAudiences()
 	return h.disconnectAllPrivacyCriticalClients(ctx)
 }
 

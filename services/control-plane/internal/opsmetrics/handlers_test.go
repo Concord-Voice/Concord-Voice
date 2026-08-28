@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -81,7 +82,7 @@ func TestAdminMetricsOpenAPICounterKeysMatchCatalog(t *testing.T) {
 		assert.Truef(t, exists, "counter metric %q missing from admin OpenAPI", definition.Key)
 	}
 	require.Len(t, documented, expectedCount)
-	assert.Contains(t, contents, "maxItems: 11\n          items:\n            $ref: '#/components/schemas/AdminCounterPoint'")
+	assert.Contains(t, contents, "maxItems: 12\n          items:\n            $ref: '#/components/schemas/AdminCounterPoint'")
 }
 
 func TestAdminMetricsOpenAPISeriesBoundsMatchHandlers(t *testing.T) {
@@ -450,4 +451,65 @@ func assertAdminMetricsError(
 func assertAdminMetricsPrivateNoStore(t *testing.T, response *httptest.ResponseRecorder) {
 	t.Helper()
 	assert.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+}
+
+// TestOpenAPIMetricBoundsMatchTheCatalog derives the schema's array bounds from
+// the Go catalog rather than pinning them as literals.
+//
+// The existing bound assertions are `assert.Contains(contents, "maxItems: 25")`
+// — a doc-pin. It is green whenever that string appears ANYWHERE in the file, so
+// it cannot see a bound going stale against the thing it is supposed to bound.
+// That is how AdminCurrentResponse.metrics kept maxItems 61 while the MetricKey
+// enum grew to 62: /metrics/current can emit one point per catalog key, so the
+// endpoint's own schema would have rejected a valid 62-item response. Caught by
+// CodeRabbit on PR #2988.
+//
+// Anchored to CatalogSize(), not to the enum, deliberately. Checking the spec
+// against ITSELF passes when both halves are stale together — and they drift
+// together precisely because a person adding a key edits the enum and forgets
+// the bound. The catalog is the source of truth the handler actually serves from.
+func TestOpenAPIMetricBoundsMatchTheCatalog(t *testing.T) {
+	contents := adminMetricsOpenAPI(t)
+
+	enumSize := func(name string) int {
+		t.Helper()
+		start := strings.Index(contents, "\n    "+name+":\n")
+		require.GreaterOrEqual(t, start, 0, "schema %s not found", name)
+		rest := contents[start+1:]
+		enum := strings.Index(rest, "enum:")
+		require.GreaterOrEqual(t, enum, 0, "%s has no enum", name)
+		n := 0
+		for _, line := range strings.Split(rest[enum:], "\n")[1:] {
+			if !strings.HasPrefix(strings.TrimSpace(line), "- ") {
+				break
+			}
+			n++
+		}
+		return n
+	}
+	boundAfter := func(schema, field string) int {
+		t.Helper()
+		start := strings.Index(contents, "\n    "+schema+":\n")
+		require.GreaterOrEqual(t, start, 0, "schema %s not found", schema)
+		rest := contents[start+1:]
+		f := strings.Index(rest, "\n        "+field+":\n")
+		require.GreaterOrEqual(t, f, 0, "%s has no %s property", schema, field)
+		m := strings.Index(rest[f:], "maxItems:")
+		require.GreaterOrEqual(t, m, 0, "%s.%s has no maxItems", schema, field)
+		var got int
+		_, err := fmt.Sscanf(strings.TrimSpace(strings.SplitN(rest[f+m:], "\n", 2)[0]), "maxItems: %d", &got)
+		require.NoError(t, err)
+		return got
+	}
+
+	size := CatalogSize()
+	require.Positive(t, size, "a zero catalog would make every assertion below vacuous")
+
+	assert.Equal(t, size, enumSize("MetricKey"),
+		"every catalog key must be expressible in the API, or a served metric is "+
+			"unrepresentable in the schema")
+	assert.Equal(t, size, boundAfter("AdminCurrentResponse", "metrics"),
+		"/metrics/current emits at most one point per catalog key, so a bound below "+
+			"CatalogSize() rejects a VALID response — this is the assertion the literal "+
+			"doc-pins above could not make")
 }

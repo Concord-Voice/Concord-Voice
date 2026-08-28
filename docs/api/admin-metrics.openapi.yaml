@@ -325,6 +325,7 @@ components:
         - channel_messages_total
         - dm_messages_total
         - ops_snapshot_rejections_total
+        - presence_audience_suppressed_total
         - registered_users_current
         - pending_registrations_current
         - users_online_current
@@ -361,6 +362,7 @@ components:
         - media_participant_hours_audio
         - media_participant_hours_webcam
         - media_participant_hours_screenshare
+        - presence_audience_suppressed_total
     MetricSource:
       type: string
       enum:
@@ -474,7 +476,10 @@ components:
           $ref: '#/components/schemas/NodeId'
         metrics:
           type: array
-          maxItems: 61
+          # MUST equal the number of MetricKey enum entries: /metrics/current can
+          # emit one point per catalog key, so a bound below the enum size rejects
+          # a valid response. Pinned by TestOpenAPIMetricBoundsMatchTheEnums.
+          maxItems: 62
           items:
             $ref: '#/components/schemas/AdminMetricPoint'
     AdminCounterPoint:
@@ -515,7 +520,7 @@ components:
           $ref: '#/components/schemas/NodeId'
         counters:
           type: array
-          maxItems: 11
+          maxItems: 12
           items:
             $ref: '#/components/schemas/AdminCounterPoint'
     AdminSeriesMetric:
