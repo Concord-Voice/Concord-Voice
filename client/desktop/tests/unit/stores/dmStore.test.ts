@@ -1919,7 +1919,13 @@ describe('dmStore', () => {
 
     it('openPersonalThread distributes E2EE key when key does not exist', async () => {
       // getChannelKey rejects (no existing key)
-      e2eeMock.getChannelKey.mockRejectedValue(new Error('NO_KEY'));
+      // A personal thread has one participant, so no peer can ever service a
+      // pending row and the server answers NO_KEY_YET with pending:false. That
+      // is the real absence shape — a bare Error('NO_KEY') is not something
+      // e2eeService emits, and mocking it hid that ensurePersonalThreadKey
+      // admitted distribution on ANY throw, including a WebCrypto unwrap
+      // failure against a key that does exist.
+      e2eeMock.getChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', false));
 
       // userStore needs to have user set for personal thread E2EE path
       const { useUserStore } = await import('@/renderer/stores/userStore');
@@ -2018,6 +2024,604 @@ describe('dmStore', () => {
           'key wrap failed'
         );
       });
+      consoleSpy.mockRestore();
+    });
+  });
+
+  // ── DM E2EE key distribution rate limiting (#1218) ────────────────────
+
+  describe('DM E2EE key distribution rate limiting (#1218)', () => {
+    let e2eeMock: {
+      isInitialized: boolean;
+      getChannelKey: ReturnType<typeof vi.fn>;
+      createChannelKeys: ReturnType<typeof vi.fn>;
+    };
+
+    beforeEach(async () => {
+      const mod = await import('@/renderer/services/e2eeService');
+      e2eeMock = mod.e2eeService as typeof e2eeMock;
+      e2eeMock.isInitialized = true;
+      e2eeMock.getChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', true));
+      e2eeMock.createChannelKeys.mockResolvedValue(new Map([['user-1', 'wrapped-key-1']]));
+    });
+
+    afterEach(async () => {
+      const mod = await import('@/renderer/services/e2eeService');
+      const mock = mod.e2eeService as typeof e2eeMock;
+      mock.isInitialized = false;
+      mock.getChannelKey.mockReset();
+      mock.createChannelKeys.mockReset();
+    });
+
+    function conversationResponse(id: string, peerUserId: string) {
+      return HttpResponse.json({
+        conversation: {
+          id,
+          is_group: false,
+          is_personal: false,
+          name: null,
+          participants: [
+            { user_id: 'user-1', username: 'alice' },
+            { user_id: peerUserId, username: 'peer' },
+          ],
+          last_message: null,
+          unread_count: 0,
+          created_at: '2025-01-01T00:00:00Z',
+        },
+      });
+    }
+
+    it('does not re-POST distribution while the conversation is rate limited', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-rl-1', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '45', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      await useDMStore.getState().openDM('user-2');
+
+      // Second attempt for the SAME conversation must be suppressed by the
+      // recorded per-conversation rate-limit deadline — the POST fires once.
+      expect(postedConvIds).toHaveLength(1);
+    });
+
+    it('does not suppress distribution for a different conversation', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, async ({ request }) => {
+          const body = (await request.json()) as { user_id: string };
+          const convId = body.user_id === 'user-2' ? 'conv-rl-a' : 'conv-rl-b';
+          return conversationResponse(convId, body.user_id);
+        }),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          const convId = params.convId as string;
+          postedConvIds.push(convId);
+          if (convId === 'conv-rl-a') {
+            return new HttpResponse(null, {
+              status: 429,
+              headers: { 'Retry-After': '45', 'X-RateLimit-Limit': '40' },
+            });
+          }
+          return HttpResponse.json({ distributed: 1 });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      await useDMStore.getState().openDM('user-3');
+
+      // Rate limiting a DM conversation must not affect an unrelated one —
+      // both conversations issue their own distribution POST.
+      expect(postedConvIds).toEqual(['conv-rl-a', 'conv-rl-b']);
+    });
+
+    // `Retry-After: 0` means "the window has already rolled, retry now". Both
+    // server responders build the header with int(ttl.Seconds()), which
+    // truncates a sub-second remaining TTL to 0, so this is emittable rather
+    // than hypothetical. Treating 0 as invalid installs a 60s local deadline
+    // and leaves the conversation without its key for a minute the server
+    // never asked for.
+    it('honors a zero-second Retry-After instead of falling back to 60s', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, async ({ request }) => {
+          const body = (await request.json()) as { user_id: string };
+          return conversationResponse('conv-rl-zero', body.user_id);
+        }),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '0', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+
+      // A zero deadline is already in the past, so the next attempt must go out.
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(2);
+    });
+    it('sends wrapped_key_versions so the server can run its freshness guard', async () => {
+      let sentBody: Record<string, unknown> | null = null;
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-versions', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, ({ params }) =>
+          HttpResponse.json({
+            public_key: 'mock-public-key',
+            key_version: params.userId === 'user-1' ? 3 : 7,
+          })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, async ({ request }) => {
+          sentBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ success: true });
+        })
+      );
+
+      e2eeMock.createChannelKeys.mockResolvedValue(
+        new Map([
+          ['user-1', 'wrapped-1'],
+          ['user-2', 'wrapped-2'],
+        ])
+      );
+
+      await useDMStore.getState().openDM('user-2');
+
+      // Without this field the server's recipientKeyFresh guard (#2420) takes
+      // its fail-open branch on every insert, so a wrap against a rotated
+      // identity key is stored with no self-heal row enqueued. GET
+      // /public-key already returns key_version; this store used to drop it.
+      expect(sentBody).not.toBeNull();
+      expect(sentBody!.wrapped_key_versions).toEqual({ 'user-1': 3, 'user-2': 7 });
+    });
+
+    it('omits wrapped_key_versions when the server supplies no key_version', async () => {
+      let sentBody: Record<string, unknown> | null = null;
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-noversions', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, async ({ request }) => {
+          sentBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ success: true });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+
+      // An older server that does not return key_version must keep working —
+      // the guard's documented legacy fail-open, not a client-side failure.
+      expect(sentBody).not.toBeNull();
+      expect(sentBody).not.toHaveProperty('wrapped_key_versions');
+    });
+
+    it('throws on a non-429 failure instead of reporting success', async () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-500', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(
+          `${API_BASE}/api/v1/e2ee/keys/:convId`,
+          () => new HttpResponse(null, { status: 500 })
+        )
+      );
+
+      await useDMStore.getState().openDM('user-2');
+
+      await vi.waitFor(() => {
+        expect(consoleSpy).toHaveBeenCalledWith(
+          'Failed to distribute E2EE key for DM:',
+          'Failed to distribute E2EE key for DM: 500'
+        );
+      });
+      consoleSpy.mockRestore();
+    });
+
+    it('does not record a deadline for an account torn down mid-request', async () => {
+      const postedConvIds: string[] = [];
+      let releaseResponse: (() => void) | null = null;
+      const held = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-teardown-race', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, async ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          // Hold the response open so the teardown below lands strictly
+          // between the request going out and its 429 coming back. That
+          // ordering is the whole finding — clearDMs() cannot cancel a
+          // continuation that is already awaiting.
+          if (postedConvIds.length === 1) await held;
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '600', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      const inFlight = useDMStore.getState().openDM('user-2');
+      await vi.waitFor(() => expect(postedConvIds).toHaveLength(1));
+
+      // Account switch / logout while the 429 is still in flight.
+      useDMStore.getState().clearDMs();
+      releaseResponse!();
+      await inFlight;
+
+      // The successor account opens the SAME conversation — reachable for real,
+      // because a group DM's id is shared by its participants. It must not
+      // inherit a window the previous account spent.
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(2);
+    });
+
+    it('abandons a distribution when the account changes during the key fetch', async () => {
+      const postedConvIds: string[] = [];
+      let releaseKeys: (() => void) | null = null;
+      const heldKeys = new Promise<void>((resolve) => {
+        releaseKeys = resolve;
+      });
+      let pkCalls = 0;
+      // Both participants are fetched concurrently via Promise.allSettled, so
+      // gate on a flag rather than a call count.
+      let holdingKeys = true;
+
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-early-teardown', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, async () => {
+          // Hold the PUBLIC-KEY fetch open, not the POST. This is the window the
+          // first teardown test missed: clearDMs() lands before
+          // distributeChannelKeys is even entered, so a generation captured
+          // inside that function would already read the SUCCESSOR's value,
+          // match at the write, and let the dead account install a deadline.
+          pkCalls += 1;
+          if (holdingKeys) await heldKeys;
+          return HttpResponse.json({ public_key: 'mock-public-key' });
+        }),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '600', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      const inFlight = useDMStore.getState().openDM('user-2');
+      await vi.waitFor(() => expect(pkCalls).toBeGreaterThan(0));
+
+      useDMStore.getState().clearDMs();
+      holdingKeys = false;
+      releaseKeys!();
+      await inFlight;
+
+      // The superseded operation must not have POSTed at all — it is a dead
+      // session's request, and refusing it also skips a CSK generation and an
+      // RSA wrap per participant.
+      expect(postedConvIds).toHaveLength(0);
+
+      // And the successor account is not suppressed by anything it left behind.
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+    });
+
+    it('skips the public-key fetch entirely while a deadline is active', async () => {
+      const postedConvIds: string[] = [];
+      let pkCalls = 0;
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-pk-budget', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () => {
+          pkCalls += 1;
+          return HttpResponse.json({ public_key: 'mock-public-key' });
+        }),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '600', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+      const pkAfterFirst = pkCalls;
+      expect(pkAfterFirst).toBeGreaterThan(0);
+
+      // GET /users/:id/public-key carries its own RateLimitByUser(30, 1m).
+      // Asserting only on the POST count would pass even while each suppressed
+      // reopen burned N of those 30 — which is what made three retries able to
+      // exhaust the budget that key wrapping needs once distribution reopens.
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+      expect(pkCalls).toBe(pkAfterFirst);
+    });
+
+    it('does not POST when the account changes during the RSA wrap', async () => {
+      const postedConvIds: string[] = [];
+      let releaseWrap: (() => void) | null = null;
+      const heldWrap = new Promise<void>((resolve) => {
+        releaseWrap = resolve;
+      });
+      let wrapCalls = 0;
+
+      // createChannelKeys awaits an RSA-OAEP wrap per recipient, so this is the
+      // widest await in the operation — and the one window neither earlier
+      // teardown test covers. apiFetch attaches whatever token is current when
+      // it is CALLED, so a POST that survives this window carries the previous
+      // account's wraps under the successor's credentials.
+      e2eeMock.createChannelKeys.mockImplementation(async () => {
+        wrapCalls += 1;
+        if (wrapCalls === 1) await heldWrap;
+        return new Map([['user-1', 'wrapped-key-1']]);
+      });
+
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-wrap-teardown', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return HttpResponse.json({ success: true });
+        })
+      );
+
+      const inFlight = useDMStore.getState().openDM('user-2');
+      await vi.waitFor(() => expect(wrapCalls).toBe(1));
+
+      useDMStore.getState().clearDMs();
+      releaseWrap!();
+      await inFlight;
+
+      expect(postedConvIds).toHaveLength(0);
+    });
+
+    it('scopes a route-wide 429 across conversations, not to one', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, async ({ request }) => {
+          const body = (await request.json()) as { user_id: string };
+          return conversationResponse(`conv-user-rl-${body.user_id}`, body.user_id);
+        }),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          // Limit 10 is the route's per-USER middleware, whose Redis key is
+          // built from the route PATTERN — so the budget is already spent for
+          // every context, not just this one.
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '600', 'X-RateLimit-Limit': '10' },
+          });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+
+      // A DIFFERENT conversation. Scoping the route-wide deadline to conv-1
+      // would let this one redo the public-key fetches, a fresh CSK, an RSA
+      // wrap per participant and the POST, purely to collect another 429.
+      await useDMStore.getState().openDM('user-3');
+      expect(postedConvIds).toHaveLength(1);
+    });
+
+    it('keeps a per-conversation 429 from suppressing other conversations', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, async ({ request }) => {
+          const body = (await request.json()) as { user_id: string };
+          return conversationResponse(`conv-scope-${body.user_id}`, body.user_id);
+        }),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '600', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      // The negative control for the test above: widening the per-conversation
+      // deadline into the route-wide one would pass that test and fail this.
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+
+      await useDMStore.getState().openDM('user-3');
+      expect(postedConvIds).toHaveLength(2);
+    });
+
+    it('does not self-block on a 429 that carries no rate-limit headers', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-edge-429', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          // The API is always Cloudflare-proxied, so an edge-issued 429 with
+          // neither X-RateLimit-Limit nor Retry-After is realistic. Installing
+          // a per-CONVERSATION deadline for it would be a scope guess about an
+          // error we never diagnosed.
+          return new HttpResponse(null, { status: 429 });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      await useDMStore.getState().openDM('user-2');
+
+      expect(postedConvIds).toHaveLength(2);
+    });
+
+    it('clears recorded deadlines on clearDMs so they cannot outlive an account', async () => {
+      const postedConvIds: string[] = [];
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations`, () =>
+          conversationResponse('conv-rl-reset', 'user-2')
+        ),
+        http.get(`${API_BASE}/api/v1/users/:userId/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key' })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, ({ params }) => {
+          postedConvIds.push(params.convId as string);
+          return new HttpResponse(null, {
+            status: 429,
+            headers: { 'Retry-After': '600', 'X-RateLimit-Limit': '40' },
+          });
+        })
+      );
+
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+
+      // Suppressed while the deadline stands.
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(1);
+
+      // The map is module-scope, so no set() reaches it and no store reset
+      // would have. gracefulReset() calls clearDMs() on every login-screen and
+      // reload transition — that is the account boundary it has to respect.
+      useDMStore.getState().clearDMs();
+
+      await useDMStore.getState().openDM('user-2');
+      expect(postedConvIds).toHaveLength(2);
+    });
+  });
+
+  // ── Personal-thread key-absence narrowing (#1218 review) ───────────────
+
+  describe('ensurePersonalThreadKey error narrowing', () => {
+    let e2eeMock: {
+      isInitialized: boolean;
+      getChannelKey: ReturnType<typeof vi.fn>;
+      createChannelKeys: ReturnType<typeof vi.fn>;
+    };
+
+    beforeEach(async () => {
+      const mod = await import('@/renderer/services/e2eeService');
+      e2eeMock = mod.e2eeService as typeof e2eeMock;
+      e2eeMock.isInitialized = true;
+      e2eeMock.createChannelKeys.mockResolvedValue(new Map([['user-1', 'wrapped-key-1']]));
+      // Load-bearing: ensurePersonalThreadKey returns early when no user is
+      // set, so without this every case below passes whether or not the
+      // narrowing works. The positive control is what surfaced that.
+      const { useUserStore } = await import('@/renderer/stores/userStore');
+      useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as never });
+      server.use(
+        http.post(`${API_BASE}/api/v1/dm/conversations/personal`, () =>
+          HttpResponse.json({
+            conversation: {
+              id: 'conv-personal-narrow',
+              is_group: false,
+              is_personal: true,
+              name: null,
+              participants: [{ user_id: 'user-1', username: 'alice' }],
+              last_message: null,
+              unread_count: 0,
+              created_at: '2025-01-01T00:00:00Z',
+            },
+          })
+        ),
+        http.get(`${API_BASE}/api/v1/users/user-1/public-key`, () =>
+          HttpResponse.json({ public_key: 'mock-public-key', key_version: 2 })
+        ),
+        http.post(`${API_BASE}/api/v1/e2ee/keys/:convId`, () =>
+          HttpResponse.json({ success: true })
+        )
+      );
+    });
+
+    afterEach(async () => {
+      const mod = await import('@/renderer/services/e2eeService');
+      const mock = mod.e2eeService as typeof e2eeMock;
+      mock.isInitialized = false;
+      mock.getChannelKey.mockReset();
+      mock.createChannelKeys.mockReset();
+    });
+
+    // NO_KEY_YET with pending:false is the REAL absence shape for a personal
+    // thread — one participant means no peer can service a pending row, and
+    // throwKeyFetchError defaults pending to false. Narrowing this path with
+    // isPendingKeyError (as ensureE2EEKey does) would therefore stop personal
+    // threads getting a first key at all. This is the positive control that
+    // keeps the negative cases below from passing for the wrong reason.
+    it('distributes when the key is genuinely absent', async () => {
+      e2eeMock.getChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', false));
+      await useDMStore.getState().openPersonalThread();
+      expect(e2eeMock.createChannelKeys).toHaveBeenCalled();
+    });
+
+    it.each([
+      ['NOT_MEMBER', new E2EEKeyUnavailableError('NOT_MEMBER', false)],
+      ['REVOKED_EPOCH', new E2EEKeyUnavailableError('REVOKED_EPOCH', false)],
+      ['MALFORMED_PAYLOAD', new E2EEKeyUnavailableError('MALFORMED_PAYLOAD', false)],
+      [
+        'a raw WebCrypto failure',
+        new Error('The operation failed for an operation-specific reason'),
+      ],
+    ])('does not distribute on %s', async (_label, thrown) => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      e2eeMock.getChannelKey.mockRejectedValue(thrown);
+
+      await useDMStore.getState().openPersonalThread();
+
+      // A bare `catch {}` admitted all of these. At an unchanged version the
+      // server then drops the insert via ON CONFLICT DO NOTHING and answers
+      // 200, so the loop never converged — it just respent the conversation's
+      // budget on every open, with nothing logged to say why.
+      expect(e2eeMock.createChannelKeys).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        'Personal thread key check failed:',
+        expect.anything()
+      );
       consoleSpy.mockRestore();
     });
   });

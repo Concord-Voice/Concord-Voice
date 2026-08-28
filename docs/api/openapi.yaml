@@ -3527,76 +3527,6 @@ paths:
                     type: boolean
                     description: Present (true) when the conversation exists but no key has been distributed
                       yet
-    post:
-      tags:
-      - DM
-      summary: Distribute DM encryption keys
-      description: 'Distribute wrapped E2EE keys to DM conversation participants. `wrapped_keys`
-        accepts at most 10 entries. The request body must not exceed 16 KiB.
-
-        Rate limit: 10 requests per minute (user-based).
-
-        '
-      operationId: distributeDMKeys
-      security:
-      - BearerAuth: []
-      parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-              - wrapped_keys
-              properties:
-                wrapped_keys:
-                  type: object
-                  maxProperties: 10
-                  additionalProperties:
-                    type: string
-                  description: Map of user_id → base64-encoded wrapped key
-                key_version:
-                  type: integer
-      responses:
-        '200':
-          description: Keys distributed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  distributed:
-                    type: integer
-        '400':
-          description: Invalid conversation ID or request body. If `wrapped_keys` exceeds 10 entries,
-            the error is `Too many wrapped keys`.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                error: Too many wrapped keys
-        '403':
-          description: Not a participant
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '413':
-          description: Request body exceeds 16 KiB
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                error: Request body too large
   /dm/conversations/{id}/members:
     post:
       tags:
@@ -5004,7 +4934,9 @@ paths:
       summary: Get wrapped key for a context
       description: 'Get the wrapped E2EE key for a channel or DM conversation.
 
-        Rate limit: 30 requests per minute (user-based).
+        Rate limit: 120 requests per minute (user-based). Deliberately generous —
+        every message decryption needs a key fetch once the client cache expires
+        or the user switches channel.
 
         '
       security:
@@ -5062,7 +4994,9 @@ paths:
         the same `key_fingerprint` (base64 SHA-256 of its CSK) on every batch or later
         rewrap; DM contexts ignore this field.
 
-        Rate limit: 10 requests per minute (user-based).
+        Rate limit: 10 requests per minute per user. A DM context additionally
+        carries 40 requests per minute per conversation, so several participants
+        cannot sum their individual budgets against one conversation.
 
         '
       security:
@@ -5143,6 +5077,33 @@ paths:
                 anyOf:
                 - $ref: '#/components/schemas/Error'
                 - $ref: '#/components/schemas/RevokedChannelKeyEpochError'
+        '429':
+          description: 'Rate limit exceeded. Two independent limits apply: 10 requests
+            per minute per user (all contexts), and — for a DM context — 40 requests
+            per minute per conversation. X-RateLimit-Limit distinguishes which one
+            responded.'
+          headers:
+            Retry-After:
+              description: Seconds until the window resets. May be 0 when the window
+                is rolling over within the current second.
+              schema:
+                type: integer
+            X-RateLimit-Limit:
+              description: Which limiter responded — 10 for the per-user route limit,
+                40 for the per-conversation DM limit.
+              schema:
+                type: integer
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+            X-RateLimit-Reset:
+              description: Unix timestamp at which the window resets.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateLimitError'
   /e2ee/keys/{context_id}/rewrap:
     post:
       tags:
@@ -15145,7 +15106,7 @@ components:
           example: Rate limit exceeded
         message:
           type: string
-          example: Key rotation limit reached. Try again in 23 hours 59 minutes.
+          example: Rate limit reached. Try again in 23 hours 59 minutes.
         retry_after:
           type: integer
           description: Seconds until the rate limit window resets

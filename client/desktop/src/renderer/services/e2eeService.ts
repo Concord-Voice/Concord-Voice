@@ -580,7 +580,14 @@ class E2EEService {
     const body = await safeJson<ErrorResponseShape>(res).catch((): ErrorResponseShape => ({}));
     this.assertCurrentKeyContext(sessionGeneration, channelId, channelGeneration);
     if (res.status === 429) {
-      const retryAfter = Number.parseInt(res.headers.get('Retry-After') || '30', 10);
+      // Number.isFinite is load-bearing, not defensive dressing. Retry-After
+      // is spec-legal as an HTTP-date, which parseInt turns into NaN — and
+      // `Date.now() + NaN` is NaN, for which `Date.now() < NaN` is always
+      // false. The guard would then be silently INERT rather than falling back
+      // to the default beside it. (#1218 review; dmStore's copy of this read
+      // carries the same check.)
+      const parsed = Number.parseInt(res.headers.get('Retry-After') ?? '', 10);
+      const retryAfter = Number.isFinite(parsed) && parsed >= 0 ? parsed : 30;
       this.rateLimitedUntil = Date.now() + retryAfter * 1000;
     }
     const code = body.code ?? 'NO_KEY_YET';
@@ -854,7 +861,9 @@ class E2EEService {
     });
 
     if (res.status === 429) {
-      const retryAfter = Number.parseInt(res.headers.get('Retry-After') ?? '60', 10);
+      // See throwKeyFetchError above for why the finite check matters.
+      const parsed = Number.parseInt(res.headers.get('Retry-After') ?? '', 10);
+      const retryAfter = Number.isFinite(parsed) && parsed >= 0 ? parsed : 60;
       this.rateLimitedUntil = Date.now() + retryAfter * 1000;
       return;
     }

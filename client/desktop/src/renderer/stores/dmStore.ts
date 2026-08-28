@@ -3,7 +3,7 @@ import { persist, devtools } from 'zustand/middleware';
 import { wrapStore } from '../utils/createStore';
 import { apiFetch } from '../services/apiClient';
 import { e2eeService } from '../services/e2eeService';
-import { isPendingKeyError } from '../services/e2eeErrors';
+import { E2EEKeyUnavailableError, isPendingKeyError } from '../services/e2eeErrors';
 import { removeScope } from '../services/searchService';
 import { errorMessage } from '../utils/redactError';
 import { useChatStore } from './chatStore';
@@ -119,42 +119,242 @@ function updateParticipantProfileInConversation(
 }
 
 /**
- * Fetch public keys for a list of user IDs, returning a Map of userId → publicKey.
- * Failures for individual users are silently skipped.
+ * Fetch public keys for a list of user IDs.
+ *
+ * `keys` maps userId → publicKey and `versions` maps userId → that key's
+ * `key_version`. The versions are what activate #2420's recipient-freshness
+ * guard: the server runs `recipientKeyFresh` only for recipients named in
+ * `wrapped_key_versions`, so omitting them makes every insert take the
+ * fail-open branch and a wrap against a since-rotated identity key is stored
+ * with no self-heal row enqueued. `GET /public-key` already returns the field
+ * and this function used to discard it.
+ *
+ * `missing` names the users whose fetch failed. A partial map is otherwise
+ * indistinguishable from a complete one, so a participant whose request 500'd
+ * silently gets no wrapped key and the distribution still reports success.
  */
-async function fetchParticipantPublicKeys(userIds: string[]): Promise<Map<string, string>> {
+interface ParticipantPublicKeys {
+  keys: Map<string, string>;
+  versions: Map<string, number>;
+  missing: string[];
+}
+
+async function fetchParticipantPublicKeys(userIds: string[]): Promise<ParticipantPublicKeys> {
   const results = await Promise.allSettled(
     userIds.map(async (userId) => {
       const pkRes = await apiFetch(`/api/v1/users/${userId}/public-key`);
-      if (!pkRes.ok) return null;
+      if (!pkRes.ok) return { userId, publicKey: null };
       const pkData = await pkRes.json();
-      return pkData.public_key ? { userId, publicKey: pkData.public_key as string } : null;
+      return {
+        userId,
+        publicKey: (pkData.public_key as string | undefined) ?? null,
+        keyVersion:
+          typeof pkData.key_version === 'number' && Number.isSafeInteger(pkData.key_version)
+            ? (pkData.key_version as number)
+            : undefined,
+      };
     })
   );
-  const memberKeys = new Map<string, string>();
-  for (const r of results) {
-    if (r.status === 'fulfilled' && r.value) {
-      memberKeys.set(r.value.userId, r.value.publicKey);
+  const keys = new Map<string, string>();
+  const versions = new Map<string, number>();
+  const missing: string[] = [];
+  for (const [i, r] of results.entries()) {
+    if (r.status === 'fulfilled' && r.value.publicKey) {
+      keys.set(r.value.userId, r.value.publicKey);
+      if (r.value.keyVersion !== undefined) versions.set(r.value.userId, r.value.keyVersion);
+    } else {
+      missing.push(r.status === 'fulfilled' ? r.value.userId : userIds[i]);
     }
   }
-  return memberKeys;
+  return { keys, versions, missing };
+}
+
+/**
+ * Two limiters answer on POST /e2ee/keys/:context_id and their scopes differ,
+ * so one deadline cannot serve both (#1218).
+ *
+ * The per-conversation limiter is keyed by conversation, and a shared scalar
+ * for it would suppress distribution for unrelated DMs. The route's per-user
+ * limiter is keyed on the route PATTERN, so its budget is spent across every
+ * context at once — recording that one per conversation under-suppresses: each
+ * further DM opened inside the same closed window repeats the public-key
+ * fetches, a fresh CSK, an RSA-OAEP wrap per participant and the POST, only to
+ * be refused again. Since the suppression check runs before any of that work,
+ * a correctly-scoped deadline is what avoids it.
+ *
+ * `X-RateLimit-Limit` is the only signal that distinguishes them.
+ */
+const distributionRateLimitedUntil = new Map<string, number>();
+let distributionRateLimitedUntilAll = 0;
+
+/**
+ * Bumped by `clearDMs()`. Clearing the two deadlines above cannot stop a
+ * distribution that is already awaiting its response: `apiFetch` returns any
+ * non-401 to its caller without consulting the auth lifecycle, so a 429 for the
+ * account that just logged out arrives AFTER the clear and its continuation
+ * repopulates what the clear emptied.
+ *
+ * That matters because a group DM's id is shared by its participants, so the
+ * successor account can legitimately open the very conversation the deadline
+ * was recorded under and be suppressed by a window it never spent. Capturing
+ * this generation on entry and re-checking it before the write is what makes
+ * the clear authoritative.
+ */
+let distributionLifecycleGeneration = 0;
+
+/**
+ * Mirrors `dmKeyDistributeLimit` in `internal/channels/handlers.go`. Compared as
+ * a string because that is what the header carries. A drift here is safe in one
+ * direction only: an unrecognised limit is treated as route-wide, which
+ * over-suppresses rather than letting a spent budget through.
+ */
+const DM_KEY_DISTRIBUTE_LIMIT_HEADER = '40';
+
+/**
+ * The moment before which distribution for `convId` is suppressed — the later
+ * of its own deadline and the route-wide one.
+ *
+ * Exposed to the callers deliberately. The check inside distributeChannelKeys
+ * runs AFTER they have already fetched every participant's public key, and that
+ * fetch has its own separate budget (RateLimitByUser 30/min on
+ * GET /users/:id/public-key). A 10-member group therefore spent 10 of those 30
+ * on each suppressed attempt, so three suppressed reopens exhausted the budget
+ * that key wrapping needs once the distribution window reopens — a suppression
+ * that made the recovery it was protecting harder.
+ */
+function distributionSuppressedUntil(convId: string): number {
+  return Math.max(distributionRateLimitedUntil.get(convId) ?? 0, distributionRateLimitedUntilAll);
+}
+
+/**
+ * Record the suppression deadline a 429 implies — if it is one this API issued,
+ * and if the account that made the request is still the current one.
+ *
+ * Written as guard clauses rather than nested conditions because each `return`
+ * is a distinct reason to record nothing, and stating them separately is what
+ * keeps the two scopes below readable.
+ */
+function recordDistributionRateLimit(convId: string, res: Response, generation: number): void {
+  // Both server responders set X-RateLimit-Limit. The API is always
+  // Cloudflare-proxied, so an edge-issued 429 carrying neither header is
+  // realistic — and self-blocking on an error we never diagnosed is worse than
+  // letting the throw propagate.
+  const limitHeader = res.headers.get('X-RateLimit-Limit');
+  if (limitHeader === null) return;
+
+  // A teardown while the request was in flight makes this the previous
+  // account's deadline; the successor must not inherit a window it never spent.
+  if (generation !== distributionLifecycleGeneration) return;
+
+  // Same Retry-After read as e2eeService's throwKeyFetchError.
+  //
+  // Zero is a VALID value meaning "the window has already rolled, retry now",
+  // and it is emittable rather than hypothetical: both server responders build
+  // the header with int(ttl.Seconds()), which truncates a sub-second remaining
+  // TTL to 0. Rejecting it would install a 60s local deadline the server never
+  // asked for and leave the conversation without its key for that minute. The
+  // fallback is therefore only for a missing, non-numeric or negative header.
+  const retryAfter = Number.parseInt(res.headers.get('Retry-After') || '', 10);
+  const seconds = Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : 60;
+  const deadline = Date.now() + seconds * 1000;
+
+  if (limitHeader === DM_KEY_DISTRIBUTE_LIMIT_HEADER) {
+    distributionRateLimitedUntil.set(convId, deadline);
+    return;
+  }
+  // The route's per-user budget is spent across every context at once, so
+  // scoping its deadline to one conversation would leave the next DM opened in
+  // the same window to redo the whole wrap-and-POST for another 429.
+  distributionRateLimitedUntilAll = deadline;
 }
 
 /**
  * Distribute wrapped E2EE channel keys to the server for the given conversation.
+ *
+ * Throws on failure, where it previously folded every non-ok response into a
+ * console.error and returned normally. Be precise about what that buys: both
+ * callers already wrap this in `try/catch { console.error }` and do nothing
+ * after it, so the throw changes no control flow today — the behavioural
+ * mechanism is entirely the per-conversation `Retry-After` deadline, which
+ * stops a rate-limited conversation from re-POSTing into the same closed
+ * window. The throw is what makes the deadline reachable and what will carry
+ * the failure if a caller ever needs to act on it.
+ *
+ * Recovery needs no new UI: the key is still missing, so `getChannelKey`
+ * answers NO_KEY_YET + pending, `throwKeyFetchError` fires `requestRewrap`,
+ * and a pending row is enrolled for a peer to fulfil. That last step does NOT
+ * apply to `ensurePersonalThreadKey`, whose conversation has exactly one
+ * participant and therefore no peer — there, recovery is the next conversation
+ * load after the deadline expires.
  */
 async function distributeChannelKeys(
   convId: string,
-  memberKeys: Map<string, string>
+  memberKeys: Map<string, string>,
+  memberKeyVersions: Map<string, number> | undefined,
+  /**
+   * The lifecycle generation captured when the ENCLOSING operation began, not
+   * when this function was entered. Capturing it here would be too late: the
+   * caller awaits `getChannelKey` and `fetchParticipantPublicKeys` first, and a
+   * `clearDMs()` during either of those already bumped the counter — so a local
+   * capture would read the SUCCESSOR's generation, match at the write, and let
+   * the previous account's 429 install a deadline the new account inherits.
+   * Required rather than defaulted so every call site has to decide.
+   */
+  generation: number
 ): Promise<void> {
+  // Cheapest and most decisive check first: if the account already changed
+  // while the caller was fetching keys, this whole operation belongs to a dead
+  // session. Refusing here also avoids a pointless CSK generation and an
+  // RSA-OAEP wrap per participant for a request that must not be recorded.
+  if (generation !== distributionLifecycleGeneration) {
+    throw new Error(`DM key distribution abandoned for ${convId}: account changed`);
+  }
+
+  if (Date.now() < distributionSuppressedUntil(convId)) {
+    // Distinct from the server-driven message below on purpose: identical
+    // strings made the two indistinguishable in the log, so a suppression
+    // could not be told from the 429 that caused it.
+    throw new Error(`DM key distribution suppressed by local deadline for ${convId}`);
+  }
+  if (distributionRateLimitedUntilAll !== 0) distributionRateLimitedUntilAll = 0;
+  // Evict the expired entry here rather than only on the next success. A
+  // conversation rate-limited once and then abandoned would otherwise keep its
+  // entry for the renderer's lifetime, and the map's boundedness would rest on
+  // the Date.now() guard making stale entries harmless rather than on there
+  // being none.
+  distributionRateLimitedUntil.delete(convId);
+
   const wrappedKeys = await e2eeService.createChannelKeys(memberKeys);
+  const body: {
+    wrapped_keys: Record<string, string>;
+    wrapped_key_versions?: Record<string, number>;
+  } = { wrapped_keys: Object.fromEntries(wrappedKeys) };
+  if (memberKeyVersions && memberKeyVersions.size > 0) {
+    body.wrapped_key_versions = Object.fromEntries(memberKeyVersions);
+  }
+  // Recheck after createChannelKeys, which awaits an RSA-OAEP wrap per
+  // recipient and is therefore a wide window. apiFetch attaches whatever access
+  // token is current at call time, so a teardown during that wrap would send
+  // the PREVIOUS account's participant snapshot under the SUCCESSOR's
+  // credentials — and in a group DM both accounts are participants, so the
+  // server would accept it and bill the successor's budget for it.
+  if (generation !== distributionLifecycleGeneration) {
+    throw new Error(`DM key distribution abandoned for ${convId}: account changed`);
+  }
+
   const distRes = await apiFetch(`/api/v1/e2ee/keys/${convId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ wrapped_keys: Object.fromEntries(wrappedKeys) }),
+    body: JSON.stringify(body),
   });
+
+  if (distRes.status === 429) {
+    recordDistributionRateLimit(convId, distRes, generation);
+    throw new Error(`DM key distribution rate limited for ${convId}`);
+  }
+
   if (!distRes.ok) {
-    console.error('Failed to distribute E2EE key for DM:', distRes.status);
+    throw new Error(`Failed to distribute E2EE key for DM: ${distRes.status}`);
   }
 }
 
@@ -165,6 +365,8 @@ async function distributeChannelKeys(
  */
 async function ensureE2EEKey(conv: DMConversation): Promise<void> {
   if (!e2eeService.isInitialized) return;
+  // Captured before the first await — see distributeChannelKeys' `generation`.
+  const generation = distributionLifecycleGeneration;
 
   let needsKeyDistribution = false;
   try {
@@ -176,10 +378,27 @@ async function ensureE2EEKey(conv: DMConversation): Promise<void> {
   if (!needsKeyDistribution) return;
 
   try {
-    const memberKeys = await fetchParticipantPublicKeys(conv.participants.map((p) => p.userId));
-    if (memberKeys.size === 0) return;
+    if (Date.now() < distributionSuppressedUntil(conv.id)) {
+      // Bail before the public-key fetch, not after it — see
+      // distributionSuppressedUntil for why that ordering is load-bearing.
+      return;
+    }
+    const { keys, versions, missing } = await fetchParticipantPublicKeys(
+      conv.participants.map((p) => p.userId)
+    );
+    if (missing.length > 0) {
+      // A dropped participant gets no wrapped key and the distribution still
+      // reports success, so without this the omission is unobservable.
+      console.warn(
+        `DM key distribution: no public key for ${missing.length} participant(s) in ${conv.id}`
+      );
+    }
+    if (keys.size === 0) {
+      console.error(`Failed to distribute E2EE key for DM ${conv.id}: no participant public keys`);
+      return;
+    }
 
-    await distributeChannelKeys(conv.id, memberKeys);
+    await distributeChannelKeys(conv.id, keys, versions, generation);
   } catch (err) {
     console.error('Failed to distribute E2EE key for DM:', errorMessage(err));
   }
@@ -192,26 +411,53 @@ async function ensureE2EEKey(conv: DMConversation): Promise<void> {
  */
 async function ensurePersonalThreadKey(conv: DMConversation): Promise<void> {
   if (!e2eeService.isInitialized) return;
+  // Captured before the first await — see distributeChannelKeys' `generation`.
+  const generation = distributionLifecycleGeneration;
 
-  let keyExists = false;
+  let needsKeyDistribution = false;
   try {
     await e2eeService.getChannelKey(conv.id);
-    keyExists = true;
-  } catch {
-    // Key not available
+  } catch (err) {
+    // Narrowed on the CODE, not on isPendingKeyError. That distinction is
+    // load-bearing: a personal thread has one participant, so no peer can ever
+    // service a pending row, and throwKeyFetchError defaults `pending` to
+    // false — so isPendingKeyError is false for exactly the keyless case this
+    // function exists to fix, and mirroring ensureE2EEKey here would stop
+    // personal threads getting a first key at all.
+    //
+    // What the narrowing does close is the bare `catch {}` this replaces,
+    // which let ANY failure — a 500, a dropped connection, a WebCrypto unwrap
+    // error, NOT_MEMBER, REVOKED_EPOCH — admit a fresh key generation and
+    // distribution POST. At an unchanged version the server drops that insert
+    // via ON CONFLICT DO NOTHING and answers 200, so it never converged: it
+    // just respent the conversation's budget on every open, undiagnosed.
+    needsKeyDistribution = err instanceof E2EEKeyUnavailableError && err.code === 'NO_KEY_YET';
+    if (!needsKeyDistribution) {
+      console.error('Personal thread key check failed:', errorMessage(err));
+    }
   }
 
-  if (keyExists) return;
+  if (!needsKeyDistribution) return;
 
   try {
     const userStore = await import('../stores/userStore');
     const userId = userStore.useUserStore.getState().user?.id;
     if (!userId) return;
 
-    const memberKeys = await fetchParticipantPublicKeys([userId]);
-    if (memberKeys.size === 0) return;
+    if (Date.now() < distributionSuppressedUntil(conv.id)) {
+      // Bail before the public-key fetch, not after it — see
+      // distributionSuppressedUntil for why that ordering is load-bearing.
+      return;
+    }
+    const { keys, versions } = await fetchParticipantPublicKeys([userId]);
+    if (keys.size === 0) {
+      console.error(
+        `Failed to distribute E2EE key for personal thread ${conv.id}: own public key unavailable`
+      );
+      return;
+    }
 
-    await distributeChannelKeys(conv.id, memberKeys);
+    await distributeChannelKeys(conv.id, keys, versions, generation);
   } catch (err) {
     console.error('Failed to distribute E2EE key for personal thread:', errorMessage(err));
   }
@@ -555,6 +801,15 @@ export const useDMStore = wrapStore(
 
           clearDMs: () => {
             conversationRefetchQueued = false;
+            // Module-scope, so `set()` cannot reach it and no store reset would
+            // have. gracefulReset() calls clearDMs() on every login-screen and
+            // reload transition, which is the account boundary this needs to
+            // respect — the same reasoning as clearFriendEligibilityCache()
+            // (#1241), folded in here rather than exported because this store
+            // already clears its other module state in this function.
+            distributionRateLimitedUntil.clear();
+            distributionRateLimitedUntilAll = 0;
+            distributionLifecycleGeneration++;
             for (const journal of conversationFetchJournals) journal.cleared = true;
             for (const conversation of get().conversations) {
               purgeConversationAccessState(conversation.id);

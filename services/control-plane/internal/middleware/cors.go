@@ -13,6 +13,11 @@ const (
 	RateLimitResetHeader = "X-RateLimit-Reset"
 	// RetryAfterHeader tells browser clients when a rate-limited request can retry.
 	RetryAfterHeader = "Retry-After"
+	// RateLimitLimitHeader names WHICH limiter answered, which a client needs in
+	// order to scope its retry: this API answers 429 from both a per-user route
+	// budget and per-resource budgets, and they have different blast radii.
+	// Non-safelisted, so a cross-origin renderer reads null without this.
+	RateLimitLimitHeader = "X-RateLimit-Limit"
 	// FileMimeTypeHeader carries an attachment's original MIME type. The body is
 	// opaque ciphertext, so this is the only place the real type survives.
 	FileMimeTypeHeader = "X-File-Mime-Type"
@@ -64,7 +69,8 @@ func setCORSHeaders(c *gin.Context, origin string) {
 	// carry metadata that only exists here because the body is ciphertext.
 	c.Writer.Header().Set("Access-Control-Expose-Headers",
 		SessionIssuedHeader+", "+SessionIDHeader+", "+RateLimitResetHeader+", "+
-			RetryAfterHeader+", "+FileMimeTypeHeader+", "+FileKeyVersionHeader)
+			RateLimitLimitHeader+", "+RetryAfterHeader+", "+FileMimeTypeHeader+", "+
+			FileKeyVersionHeader)
 	c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	c.Writer.Header().Set("Access-Control-Max-Age", "86400")
 }

@@ -357,6 +357,33 @@ describe('e2eeService', () => {
         e2eeService.getChannelKey('22222222-2222-2222-2222-222222222222')
       ).rejects.toBeInstanceOf(E2EEKeyUnavailableError);
     });
+
+    it('falls back instead of going inert on a non-numeric Retry-After', async () => {
+      // Retry-After is spec-legal as an HTTP-date. parseInt turns that into
+      // NaN, and the suppression was `Date.now() + NaN` = NaN — for which
+      // `Date.now() < NaN` is always false, so the guard did not fall back to
+      // its default, it silently stopped guarding (#1218 review).
+      mockApiFetch.mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT' }),
+        json: () => Promise.resolve({ error: 'rate limit', code: 'NO_KEY_YET', kind: 'channel' }),
+      } as unknown as Response);
+
+      await expect(
+        e2eeService.getChannelKey('33333333-3333-3333-3333-333333333333')
+      ).rejects.toBeInstanceOf(E2EEKeyUnavailableError);
+
+      const callsAfterFirst = mockApiFetch.mock.calls.length;
+      await expect(
+        e2eeService.getChannelKey('44444444-4444-4444-4444-444444444444')
+      ).rejects.toBeInstanceOf(E2EEKeyUnavailableError);
+
+      // The second call must be suppressed locally rather than reaching the
+      // network. Asserting on the throw alone would pass either way, since a
+      // real 429 throws the same typed error.
+      expect(mockApiFetch.mock.calls.length).toBe(callsAfterFirst);
+    });
   });
 
   describe('getChannelKeyByVersion envelope parsing', () => {

@@ -3,6 +3,7 @@ package channels_test
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -2322,4 +2323,52 @@ func TestGetUnifiedKeysDMHonoursTheVersionParameter(t *testing.T) {
 	// A malformed one is a 400, matching the channel branch.
 	w = get("?version=abc")
 	assert.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+}
+
+// TestRotateKeyLimitSurvivesUUIDRespelling is the third of the three limiters
+// the #1218 red-team pass proved bypassable by re-spelling the resource id.
+// DistributeUnifiedKeys and dm.RotateKey both carry a lock; this one did not,
+// so a future refactor could have silently re-opened the bypass on
+// ratelimit:channel_rotate alone.
+//
+// uuid.Parse accepts upper-case, hyphen-less and braced spellings, and
+// PostgreSQL's uuid_in accepts the same set — so before canonicalization each
+// spelling passed every gate against the same row while minting its own Redis
+// counter with a full budget.
+func TestRotateKeyLimitSurvivesUUIDRespelling(t *testing.T) {
+	ts, user, _, channelID := setupEncryptedChannel(t)
+	ctx := context.Background()
+
+	userRLKey := fmt.Sprintf("ratelimit:user:%s:POST:/api/v1/channels/:id/rotate-key", user.ID)
+	ts.Redis.Del(ctx, fmt.Sprintf(fmtRateLimitChannelKey, channelID))
+
+	// Spend the per-channel budget (10 per 24h) using the canonical spelling.
+	for i := 1; i <= 10; i++ {
+		w := ts.DoRequest("POST", pathChannelsPrefix+channelID+pathRotateKey, nil, testhelpers.AuthHeaders(user.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, fmt.Sprintf("call %d should succeed", i))
+	}
+
+	parsed := uuid.MustParse(channelID)
+	respellings := map[string]string{
+		"upper-case":  strings.ToUpper(channelID),
+		"hyphen-less": hex.EncodeToString(parsed[:]),
+		"braced":      "{" + channelID + "}",
+	}
+
+	for name, spelling := range respellings {
+		t.Run(name, func(t *testing.T) {
+			// Clear the per-USER budget before each attempt. Without this the
+			// route middleware answers 429 first and the test passes whether or
+			// not the per-channel limiter was bypassed — the exact vacuity that
+			// made the first draft of this class of test look green on two of
+			// three spellings.
+			ts.Redis.Del(ctx, userRLKey)
+
+			w := ts.DoRequest("POST", pathChannelsPrefix+spelling+pathRotateKey, nil, testhelpers.AuthHeaders(user.AccessToken))
+			require.Equal(t, http.StatusTooManyRequests, w.Code,
+				"a re-spelled channel id must share the canonical id's budget")
+			assert.Equal(t, "10", w.Header().Get("X-RateLimit-Limit"),
+				"the 429 must come from the per-CHANNEL limiter, not the per-user route middleware")
+		})
+	}
 }

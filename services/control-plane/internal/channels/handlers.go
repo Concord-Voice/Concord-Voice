@@ -32,26 +32,41 @@ const (
 	maxChannelWrappedKeysRequestBytes = 512 * 1_024
 	maxDMWrappedKeys                  = 10
 	maxDMWrappedKeysRequestBytes      = 16 * 1_024
-	maxEpochValidationEntries         = 500
-	maxEpochValidationRequestBytes    = 32 * 1_024
-	errMsgRequestBodyTooLarge         = "Request body too large"
-	errMsgTooManyWrappedKeys          = "Too many wrapped keys"
-	errMsgTooManyEpochs               = "Too many epochs"
-	errMsgInvalidServerID             = "Invalid server ID"
-	errMsgInvalidChannelID            = "Invalid channel ID"
-	errMsgInvalidRequestBody          = "Invalid request body"
-	errMsgInsufficientPerms           = "insufficient permissions"
-	errMsgForeignGroup                = "group_id does not belong to this server"
-	errMsgNotMemberOfServer           = "Not a member of this server"
-	errMsgChannelNotFound             = "Channel not found"
-	errMsgChannelNotFoundOrDenied     = "Channel not found or access denied"
-	errMsgFailedFetchChannel          = "Failed to fetch channel"
-	errMsgFailedFetchChannels         = "Failed to fetch channels"
-	errMsgFailedCreateChannel         = "Failed to create channel"
-	errMsgFailedUpdateChannel         = "Failed to update channel"
-	errMsgFailedDeleteChannel         = "Failed to delete channel"
-	errMsgFailedCheckMembership       = "Failed to check membership"
-	errMsgFailedFetchKeys             = "Failed to fetch keys"
+	// Per-conversation ceiling on DM key distribution (#1218). Sized by
+	// legitimate peer-fulfillment fan-out, not by attacker modelling:
+	// appendDMPendingRequests shows every key holder every non-self pending
+	// row, so an N-participant conversation emits up to (N/2)^2 POSTs per
+	// sweep — 25 at the 10-participant group cap (dm/handlers.go). 40 is
+	// 1.6x that. The window matches the client's own retry cadence
+	// (PENDING_KEY_RETRY_DELAY_MS = 60s) so a false trip self-heals on the
+	// next natural attempt rather than stranding key delivery.
+	//
+	// This bounds the MULTI-ACCOUNT aggregate, not a single actor: the route
+	// already caps one user at 10/min, so 40 is deliberately above any one
+	// caller's reach. A limit tight enough to bite a single attacker would
+	// break legitimate multi-holder recovery in a full group DM.
+	dmKeyDistributeLimit           = 40
+	dmKeyDistributeWindow          = time.Minute
+	maxEpochValidationEntries      = 500
+	maxEpochValidationRequestBytes = 32 * 1_024
+	errMsgRequestBodyTooLarge      = "Request body too large"
+	errMsgTooManyWrappedKeys       = "Too many wrapped keys"
+	errMsgTooManyEpochs            = "Too many epochs"
+	errMsgInvalidServerID          = "Invalid server ID"
+	errMsgInvalidChannelID         = "Invalid channel ID"
+	errMsgInvalidRequestBody       = "Invalid request body"
+	errMsgInsufficientPerms        = "insufficient permissions"
+	errMsgForeignGroup             = "group_id does not belong to this server"
+	errMsgNotMemberOfServer        = "Not a member of this server"
+	errMsgChannelNotFound          = "Channel not found"
+	errMsgChannelNotFoundOrDenied  = "Channel not found or access denied"
+	errMsgFailedFetchChannel       = "Failed to fetch channel"
+	errMsgFailedFetchChannels      = "Failed to fetch channels"
+	errMsgFailedCreateChannel      = "Failed to create channel"
+	errMsgFailedUpdateChannel      = "Failed to update channel"
+	errMsgFailedDeleteChannel      = "Failed to delete channel"
+	errMsgFailedCheckMembership    = "Failed to check membership"
+	errMsgFailedFetchKeys          = "Failed to fetch keys"
 	// errMsgInvalidVersion answers a ?version= that is not a positive integer.
 	// Shared by all three key-fetch surfaces so they cannot drift apart -- a
 	// client that special-cased one wording would silently mishandle another.
@@ -1718,12 +1733,27 @@ func (h *Handler) respondKeyDistError(c *gin.Context, err error) {
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
 }
 
+// callerHasChannelKey does not let its read error decide the answer, and unlike
+// the epoch resolver above (#1218) that is safe: a failed Scan leaves hasKey
+// false, so the caller is treated as NOT holding the key and the request is
+// denied. Failing closed is the whole point — do not copy this shape to a read
+// whose zero value would ADMIT something or stand in for a real value.
+//
+// It is logged rather than discarded because failing closed and reporting
+// nothing are different properties: a legitimate distributor refused by a
+// database fault sees the same bare 403 as an unauthorized one, and without
+// this line nothing anywhere records which it was.
 func (h *Handler) callerHasChannelKey(channelID, userID string) bool {
 	var hasKey bool
-	_ = h.db.QueryRow(
+	if err := h.db.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM channel_keys WHERE channel_id = $1 AND user_id = $2)`,
 		channelID, userID,
-	).Scan(&hasKey)
+	).Scan(&hasKey); err != nil {
+		h.log.Warn("channel key holder check failed; denying",
+			"channel_id", sanitizeID(channelID),
+			"user_id", sanitizeID(userID), "error", err)
+		return false
+	}
 	return hasKey
 }
 
@@ -3082,10 +3112,21 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 	userID := c.GetString("user_id")
 	contextID := c.Param("context_id")
 
-	if _, err := uuid.Parse(contextID); err != nil {
+	parsedContextID, parseErr := uuid.Parse(contextID)
+	if parseErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidContextID})
 		return
 	}
+	// Canonicalize before ANY downstream use (#1218 red-team). uuid.Parse accepts
+	// upper-case, hyphen-less, braced and urn: spellings, and PostgreSQL's uuid_in
+	// accepts the same set — so a re-spelled id passes the membership gate against
+	// the same row while minting its OWN per-conversation rate-limit counter with a
+	// full budget. A per-resource limiter keyed on raw path bytes therefore binds
+	// only clients that use the id the server handed out, which is every honest
+	// client and no attacker. Canonicalizing at the parse makes the Redis key, the
+	// SQL parameter, the log fields and the WS payload share one representation,
+	// closing the class rather than one payload.
+	contextID = parsedContextID.String()
 
 	// Don't parse the request body yet — route to channel or DM first.
 	// DistributeChannelKeys will parse the body itself; parsing here would
@@ -3135,8 +3176,49 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 			WHERE dc.id = $1
 		)
 	`, contextID, userID).Scan(&isDM)
-	if err != nil || !isDM {
+	if err != nil {
+		// Split from the !isDM arm deliberately. Folded together, a driver
+		// error answered an unlogged 404 — indistinguishable from a
+		// non-participant on the wire AND absent from the logs, so a dropped
+		// index or an exhausted pool presented as a flat 404 rate. The channel
+		// branch above already logs and 500s for this same class.
+		h.log.Error("Failed to check DM participation",
+			"context_id", sanitizeID(contextID),
+			"user_id", sanitizeID(userID),
+			"error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
+		return
+	}
+	if !isDM {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied})
+		return
+	}
+
+	// Per-conversation rate limit (#1218). Placement is load-bearing in both
+	// directions. It sits AFTER the membership check above, so a caller who is
+	// not a participant is refused before any Redis key exists — in front of
+	// that gate this would mint one key per attacker-chosen UUID, a
+	// key-flooding primitive strictly worse than the write pressure it bounds.
+	// It sits BEFORE the body parse, so a blocked request costs as little as
+	// possible. It must never become gin middleware, which runs before the
+	// handler and therefore on the wrong side of the gate; and it must stay
+	// outside distributeDMKeys, whose transaction opens with credepoch.GuardTx
+	// — a new early return after that fence would consult it and then discard
+	// it.
+	//
+	// The 250ms admission bound mirrors RotateKey's. IsRateLimited fails open
+	// on a Redis error, so without it a stalled Redis costs the ceiling AND
+	// holds the request for the full server timeout — two failures for one
+	// outage, where the design accepts only the first.
+	rateLimitKey := fmt.Sprintf("ratelimit:dm_key_distribute:%s", contextID)
+	admissionCtx, cancelAdmission := context.WithTimeout(c.Request.Context(), 250*time.Millisecond)
+	blocked, retryAfter := middleware.IsRateLimited(
+		admissionCtx, h.redis, rateLimitKey,
+		dmKeyDistributeLimit, dmKeyDistributeWindow,
+	)
+	cancelAdmission()
+	if blocked {
+		middleware.RespondRateLimited(c, retryAfter, dmKeyDistributeLimit)
 		return
 	}
 
@@ -3171,22 +3253,36 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 // fulfillment at a new version would break history decryption — the recovering
 // user would get a row tagged at a version no historical message references.
 // See PR #1080 / issue #1023.
-func (h *Handler) resolveTargetKeyVersionDM(conversationID string, explicitVersion *int) int {
+// A read failure FAILS CLOSED (#1218). Clamping to 1 on a driver error was the
+// one fallback this function's own contract forbids: for an established
+// conversation it stamps the wrapped key at a version no historical message
+// references — the exact history-decryption break described above — and answers
+// 200, so neither the distributor nor the recovering recipient learns anything
+// went wrong. A read error is indistinguishable from "brand-new conversation"
+// at this point, so the only safe reading is to refuse. The deleted
+// dm.resolveDMDistributionKeyVersion failed closed here; this is now the only
+// path that can.
+func (h *Handler) resolveTargetKeyVersionDM(conversationID string, explicitVersion *int) (int, error) {
 	if explicitVersion != nil && *explicitVersion > 0 {
-		return *explicitVersion
+		return *explicitVersion, nil
 	}
 	var v int
-	_ = h.db.QueryRow(
+	if err := h.db.QueryRow(
 		`SELECT COALESCE(MAX(key_version), 1) FROM dm_channel_keys WHERE conversation_id = $1`,
 		conversationID,
-	).Scan(&v)
-	if v == 0 {
-		// COALESCE returns 1 when MAX is NULL (no rows), but defend against
-		// Scan leaving v at its zero value on driver error — keep the
-		// invariant "version >= 1" by clamping.
-		v = 1
+	).Scan(&v); err != nil {
+		return 0, fmt.Errorf("resolve dm key version: %w", err)
 	}
-	return v
+	if v < 1 {
+		// COALESCE(MAX(...), 1) cannot yield < 1 over a column holding only
+		// values this service wrote, so arriving here means the row or the
+		// driver disagrees with that reasoning. Refuse rather than substitute:
+		// an unreachable branch that rejects is a backstop, an unreachable
+		// branch that substitutes is a latent breach of the same invariant the
+		// error return above exists to protect ([internal]rules/e2ee.md).
+		return 0, fmt.Errorf("resolve dm key version: non-positive epoch %d", v)
+	}
+	return v, nil
 }
 
 // distributeDMKeys mirrors distributeChannelKeysToMembers' guarded-transaction
@@ -3243,7 +3339,10 @@ func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberU
 }
 
 func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, conversationID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, explicitVersion *int) (int, error) {
-	keyVersion := h.resolveTargetKeyVersionDM(conversationID, explicitVersion)
+	keyVersion, err := h.resolveTargetKeyVersionDM(conversationID, explicitVersion)
+	if err != nil {
+		return 0, err
+	}
 
 	// #2201 review: request context, same rationale as distributeChannelKeysToMembers.
 	tx, err := h.db.BeginTx(ctx, nil)
@@ -3278,15 +3377,35 @@ func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, con
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit dm distribution tx: %w", err)
 	}
+	h.notifyDMKeyDistribution(conversationID, delivered)
+	return distributed, nil
+}
+
+// notifyDMKeyDistribution is the DM counterpart to notifyChannelKeyDistribution:
+// the post-commit half of a distribution, split out for the same reason its
+// sibling is. Keeping it inline left distributeDMKeys at exactly the S3776
+// cognitive-complexity threshold, so adding the error branch below — the one
+// thing this loop was missing — pushed it over.
+func (h *Handler) notifyDMKeyDistribution(conversationID string, delivered []string) {
 	for _, memberUserID := range delivered {
-		// Best-effort POST-commit cleanup — see distributeChannelKeysToMembers.
-		_, _ = h.db.Exec(
+		// Best-effort POST-commit cleanup — see distributeChannelKeysToMembers,
+		// which logs this same failure. This copy discarded it while citing
+		// that sibling, and the legacy DM route that DID log it is deleted by
+		// this PR, so the discard would have left the failure unreported
+		// everywhere. It is also self-amplifying: a pending row that outlives
+		// its own fulfilment keeps the recipient in appendDMPendingRequests, so
+		// every holder re-POSTs for them each sweep — against the per-conversation
+		// budget this PR adds.
+		if _, err := h.db.Exec(
 			`DELETE FROM dm_pending_key_requests WHERE conversation_id = $1 AND user_id = $2`,
 			conversationID, memberUserID,
-		)
+		); err != nil {
+			h.log.Warn("dm key distribution: delivered pending cleanup failed",
+				"conversation_id", sanitizeID(conversationID),
+				"user_id", sanitizeID(memberUserID), "error", err)
+		}
 		h.notifyKeyDelivered(conversationID, memberUserID)
 	}
-	return distributed, nil
 }
 
 // RotateKey handles manual seal & rotate for server channel E2EE.
@@ -3295,10 +3414,14 @@ func (h *Handler) RotateKey(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
 
-	if _, err := uuid.Parse(channelID); err != nil {
+	parsedChannelID, parseErr := uuid.Parse(channelID)
+	if parseErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidChannelID})
 		return
 	}
+	// Canonicalize before the per-resource limiter key is built — see
+	// DistributeUnifiedKeys for why (#1218 red-team).
+	channelID = parsedChannelID.String()
 
 	// Look up channel's server (all channels are encrypted under E2EE-everywhere #201).
 	var serverID string
@@ -3337,7 +3460,6 @@ func (h *Handler) RotateKey(c *gin.Context) {
 	}
 
 	// Per-resource rate limit: 10 rotations per 24h per channel.
-	// Subscription-tiered limits deferred to issue #603.
 	rateLimitKey := fmt.Sprintf("ratelimit:channel_rotate:%s", channelID)
 	var retryAfter time.Duration
 	admit := func(ctx context.Context) error {

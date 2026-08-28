@@ -2318,10 +2318,6 @@ func NewRouter(
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
 					dmHandler.GetKeys,
 				)
-				dmRoutes.POST(pathIDKeys,
-					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
-					dmHandler.DistributeKeys,
-				)
 
 				// DM voice call
 				dmRoutes.POST("/:id/voice/join",
@@ -2389,7 +2385,9 @@ func NewRouter(
 					dmHandler.DMHardUndeafen,
 				)
 
-				// Manual seal & rotate DM encryption key (5 per day per conversation)
+				// Manual seal & rotate DM encryption key.
+				// 10 per 24h per conversation, enforced in the handler;
+				// 5 requests/min per user, enforced here.
 				dmRoutes.POST("/:id/rotate-key",
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
 					dmHandler.RotateKey,

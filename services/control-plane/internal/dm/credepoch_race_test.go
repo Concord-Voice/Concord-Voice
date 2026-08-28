@@ -24,7 +24,7 @@ func TestCredEpochRace_DMKeyDistributionRejected(t *testing.T) {
 
 	stale := ts.SimulateStaleEpochWindow(t, alice.ID)
 
-	w := ts.DoRequest("POST", "/api/v1/dm/conversations/"+convID+"/keys", map[string]interface{}{
+	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+convID, map[string]interface{}{
 		"wrapped_keys": map[string]string{
 			alice.ID: "d3JhcHBlZC1rZXktYWxpY2U=",
 			bob.ID:   "d3JhcHBlZC1rZXktYm9i",
@@ -56,7 +56,7 @@ func TestDMKeyDistribution_GuardReadErrorFailsClosed(t *testing.T) {
 		}
 	})
 
-	w := ts.DoRequest("POST", "/api/v1/dm/conversations/"+convID+"/keys", map[string]interface{}{
+	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+convID, map[string]interface{}{
 		"wrapped_keys": map[string]string{bob.ID: "d3JhcHBlZC1rZXktYm9i"},
 		"key_version":  1,
 	}, testhelpers.AuthHeaders(alice.AccessToken))
@@ -83,7 +83,7 @@ func TestDMKeyDistribution_KeyVersionResolveErrorFailsClosed(t *testing.T) {
 
 	// No explicit key_version → the handler must read MAX(...) from the
 	// renamed table and fail closed with the generic 500.
-	w := ts.DoRequest("POST", "/api/v1/dm/conversations/"+convID+"/keys", map[string]interface{}{
+	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+convID, map[string]interface{}{
 		"wrapped_keys": map[string]string{bob.ID: "d3JhcHBlZC1rZXktYm9i"},
 	}, testhelpers.AuthHeaders(alice.AccessToken))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
@@ -107,7 +107,7 @@ func TestDMKeyDistribution_InsertErrorFailsBatch(t *testing.T) {
 
 	// Explicit key_version skips the resolve read; the guarded INSERT then
 	// hits the renamed table and the whole batch fails closed.
-	w := ts.DoRequest("POST", "/api/v1/dm/conversations/"+convID+"/keys", map[string]interface{}{
+	w := ts.DoRequest("POST", "/api/v1/e2ee/keys/"+convID, map[string]interface{}{
 		"wrapped_keys": map[string]string{bob.ID: "d3JhcHBlZC1rZXktYm9i"},
 		"key_version":  2,
 	}, testhelpers.AuthHeaders(alice.AccessToken))

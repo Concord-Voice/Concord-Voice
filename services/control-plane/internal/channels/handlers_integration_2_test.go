@@ -29,6 +29,17 @@ const (
 	pathValidateEpochs   = "/api/v1/e2ee/validate-epochs"
 	pathE2EEKeys         = "/api/v1/e2ee/keys/"
 	pathE2EEKeysZero     = pathE2EEKeys + zeroUUID
+
+	// fmtRateLimitDMDistribute is the per-conversation rate-limit Redis key
+	// the DM branch of DistributeUnifiedKeys is expected to apply (#1218), placed
+	// after the DM-membership check and before the body parse.
+	fmtRateLimitDMDistribute = "ratelimit:dm_key_distribute:%s"
+	// fmtUserRLKeyUnifiedDist is the route-level per-user rate-limit Redis key
+	// middleware.RateLimitByUser(redis, 10, 1*time.Minute) applies ahead of
+	// DistributeUnifiedKeys (router.go). NOTE the literal gin route pattern
+	// ":context_id" — rateLimitUserKey builds the key from c.FullPath(), never
+	// a substituted UUID.
+	fmtUserRLKeyUnifiedDist = "ratelimit:user:%s:POST:/api/v1/e2ee/keys/:context_id"
 )
 
 func doRawChunkedJSONRequest(
@@ -1391,6 +1402,10 @@ var renameTableStmts = map[string]struct {
 		rename: `ALTER TABLE server_members RENAME TO server_members_hidden_for_test`,
 		revert: `ALTER TABLE server_members_hidden_for_test RENAME TO server_members`,
 	},
+	"dm_pending_key_requests": {
+		rename: `ALTER TABLE dm_pending_key_requests RENAME TO dm_pending_key_requests_hidden_for_test`,
+		revert: `ALTER TABLE dm_pending_key_requests_hidden_for_test RENAME TO dm_pending_key_requests`,
+	},
 }
 
 // withRenamedTable temporarily renames a PostgreSQL table so the handler's
@@ -2041,6 +2056,349 @@ func TestDistributeUnifiedKeysDM_RecoveryAfterRotation(t *testing.T) {
 }
 
 // ===========================================================================
+// Distribute Unified Keys DM — ported legacy coverage (#1218)
+//
+// The following six tests port genuinely-unique coverage from the retired
+// POST /api/v1/dm/conversations/:id/keys route's TestDistributeKeys_* suite
+// (dm/handlers_test.go) onto this unified POST /api/v1/e2ee/keys/:context_id
+// route. Duplicates already covered by TestDistributeUnifiedKeysDM* above
+// were dropped rather than re-targeted; see the #1218 coverage-decision
+// table in the porting commit for the full disposition of all 19 legacy
+// tests bound to the removed route.
+// ===========================================================================
+
+// TestDistributeUnifiedKeysDM_AcceptsTrailingJSONWhitespace ports
+// TestDistributeKeys_AcceptsTrailingJSONWhitespace (dm/handlers_test.go).
+// bindStrictJSONBody (handlers.go:354) is shared by the channel and DM
+// branches of the unified route, but only its REJECT-trailing-content
+// branches were previously exercised on this route
+// (RejectsOversizedChunkedTrailingBodyBeforeDatabaseFanout,
+// RejectsSecondJSONDocumentBeforeDatabaseFanout above) — its ACCEPT branch
+// for pure trailing whitespace had no unified-route coverage.
+func TestDistributeUnifiedKeysDM_AcceptsTrailingJSONWhitespace(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmwhitespace1")
+	user2 := ts.CreateTestUser(t, "dmwhitespace2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	document := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}`, user2.ID, testhelpers.ValidCiphertext())
+	req := httptest.NewRequest(http.MethodPost, pathE2EEKeys+convID, strings.NewReader(document+" \n\t"))
+	req.Header = testhelpers.AuthHeaders(user1.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	ts.Router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, float64(1), body["distributed"])
+}
+
+// TestDistributeUnifiedKeysDM_NonParticipantGets404NoOracle ports
+// TestDistributeKeys_NotParticipant (dm/handlers_test.go), which asserted
+// 403 Forbidden for a non-participant on the legacy route. The unified route
+// has no separate participant check: a non-participant simply fails the
+// isDM EXISTS query (handlers.go:3130-3141) and falls into the SAME
+// errMsgContextNotFoundOrDenied 404 an unknown context yields — the
+// deliberate CV-CAN-005 no-oracle pattern already used for hidden channels
+// (TestDistributeUnifiedKeys_HiddenChannelNoViewNoOracle) and for the GET
+// path's EnvelopeShape_DM_NotMember above. This is a deliberate REDUCTION
+// in disclosure relative to the legacy 403, not a regression: 404 is the
+// correct behavior to lock in before the legacy 403 expectation is deleted.
+func TestDistributeUnifiedKeysDM_NonParticipantGets404NoOracle(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmnpuser1")
+	user2 := ts.CreateTestUser(t, "dmnpuser2")
+	outsider := ts.CreateTestUser(t, "dmnpoutsider")
+	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			user1.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(outsider.AccessToken))
+	assert.Equal(t, http.StatusNotFound, w.Code,
+		"a non-participant must get the same not-found the DM branch yields for an unknown context, not a 403 that would disclose the conversation exists")
+}
+
+// TestDistributeUnifiedKeysDM_InvalidRequestBody ports
+// TestDistributeKeys_InvalidRequestBody (dm/handlers_test.go): an empty
+// body fails DistributeChannelKeysRequest's `wrapped_keys` binding:"required"
+// tag, which bindStrictJSONBody maps to 400. No unified-route DM test
+// previously posted an empty body.
+func TestDistributeUnifiedKeysDM_InvalidRequestBody(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dminvbody1")
+	user2 := ts.CreateTestUser(t, "dminvbody2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestDistributeUnifiedKeysDM_DuplicateKeyVersionSkipped ports
+// TestDistributeKeys_DuplicateKeyVersionSkipped (dm/handlers_test.go): a
+// second distribution at the same explicit key_version is a no-op via
+// insertWrappedDMKeyTx's ON CONFLICT DO NOTHING (handlers.go:3198-3212).
+// TestDistributeChannelKeysDuplicate exercises the analogous CHANNEL
+// behavior, but through the non-unified pathChannelsPrefix+"/keys" route —
+// no unified-route DM test previously covered the duplicate-skip path.
+func TestDistributeUnifiedKeysDM_DuplicateKeyVersionSkipped(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmdupver1")
+	user2 := ts.CreateTestUser(t, "dmdupver2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			user2.ID: testhelpers.ValidCiphertext(),
+		},
+		"key_version": 1,
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	w = ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			user2.ID: testhelpers.ValidCiphertext(),
+		},
+		"key_version": 1,
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, float64(0), body["distributed"], "duplicate key_version should not be re-distributed")
+}
+
+// TestDistributeUnifiedKeysDM_InvalidMemberUUID ports
+// TestDistributeKeys_InvalidMemberUUID (dm/handlers_test.go): a non-UUID
+// map key is silently skipped in distributeDMKeys' member loop
+// (handlers.go:3264-3267: "if _, parseErr := uuid.Parse(memberUserID);
+// parseErr != nil { continue }"). No unified-route DM test previously
+// posted a non-UUID wrapped_keys key.
+func TestDistributeUnifiedKeysDM_InvalidMemberUUID(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmbaduuid1")
+	user2 := ts.CreateTestUser(t, "dmbaduuid2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			notAUUID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, float64(0), body["distributed"])
+}
+
+// TestDistributeUnifiedKeysDM_PendingDeleteErrorDoesNotFailDistribution
+// ports TestDistributeKeys_PendingDeleteError_DoesNotFailDistribution
+// (dm/handlers_test.go): the post-commit DELETE against
+// dm_pending_key_requests is best-effort, so a DELETE failure must not fail
+// the handler — the key row was already durably inserted before the DELETE
+// runs.
+//
+// The assertion ("distribution still succeeds despite the DELETE error")
+// holds on the unified route, but its MEANING narrows relative to the
+// legacy route: legacy's runGuardedDMKeyDistribution LOGS a Warn on this
+// failure (dm/handlers.go:1573-1575), while distributeDMKeys DISCARDS it
+// silently ("_, _ = h.db.Exec(...)", handlers.go:3283-3286). This test
+// locks in "still succeeds," not "still logs" — the unified route has no
+// log line to assert on here.
+func TestDistributeUnifiedKeysDM_PendingDeleteErrorDoesNotFailDistribution(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmpenddel1")
+	user2 := ts.CreateTestUser(t, "dmpenddel2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+
+	_, err := ts.DB.Exec(
+		`INSERT INTO dm_pending_key_requests (conversation_id, user_id) VALUES ($1, $2)`,
+		convID, user2.ID,
+	)
+	require.NoError(t, err, "failed to seed dm_pending_key_requests row")
+
+	withRenamedTable(t, ts, "dm_pending_key_requests", func() {
+		w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+			keyWrappedKeys: map[string]string{
+				user2.ID: testhelpers.ValidCiphertext(),
+			},
+			"key_version": 1,
+		}, testhelpers.AuthHeaders(user1.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code,
+			"post-commit DELETE-cleanup error must NOT fail the handler — key was already distributed")
+
+		var body map[string]interface{}
+		testhelpers.ParseJSON(t, w, &body)
+		assert.Equal(t, float64(1), body["distributed"],
+			"distributed count should reflect successful key insert despite cleanup failure")
+	})
+
+	var keyRowCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2`,
+		convID, user2.ID,
+	).Scan(&keyRowCount))
+	assert.Equal(t, 1, keyRowCount,
+		"dm_channel_keys should contain the wrapped key — insert succeeded before DELETE failure path")
+}
+
+// ===========================================================================
+// Distribute Unified Keys DM — per-conversation rate limit (#1218)
+//
+// These tests are RED against today's handler: no per-conversation limiter
+// exists yet in the DM branch of DistributeUnifiedKeys. They pin the future
+// behavior of a limiter keyed by fmtRateLimitDMDistribute, budget 40/60s,
+// placed after the DM-membership check and before the body parse, responding
+// via middleware.RespondRateLimited(c, retryAfter, 40).
+//
+// The route also carries middleware.RateLimitByUser(redis, 10, 1*time.Minute)
+// (router.go), which fires at request 11 for a SINGLE user. A naive test that
+// loops 41 requests as one user would go green on request 11 from that
+// per-user limiter and prove nothing about the per-conversation budget — see
+// seedGroupDMWithKeysForRateLimitTest below, which rotates callers across
+// five participants so no single user's per-user counter can exceed 10.
+// ===========================================================================
+
+// seedGroupDMWithKeysForRateLimitTest creates a group DM with five members,
+// seeds each with a DM channel key at version 1 (all "holding keys"), and
+// clears both the per-conversation rate-limit key and every member's
+// per-route per-user rate-limit key so the seeding itself — direct SQL here,
+// but defensive regardless of how a future refactor seeds — never eats into
+// the 40-request conversation budget the caller is about to exercise.
+func seedGroupDMWithKeysForRateLimitTest(t *testing.T, ts *testhelpers.TestServer) (convID string, members []testhelpers.TestUser) {
+	t.Helper()
+
+	members = make([]testhelpers.TestUser, 5)
+	memberIDs := make([]string, 5)
+	for i := range members {
+		members[i] = ts.CreateTestUser(t, fmt.Sprintf("dmratelimit%d", i))
+		memberIDs[i] = members[i].ID
+	}
+	convID = ts.CreateGroupDMConversation(t, memberIDs...)
+	for _, id := range memberIDs {
+		ts.SeedDMKey(t, convID, id, 1)
+	}
+
+	ctx := context.Background()
+	require.NoError(t, ts.Redis.Del(ctx, fmt.Sprintf(fmtRateLimitDMDistribute, convID)).Err())
+	for _, id := range memberIDs {
+		require.NoError(t, ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyUnifiedDist, id)).Err())
+	}
+
+	return convID, members
+}
+
+// distributeAsRotatingMember posts a minimal valid distribution request to
+// convID as members[i%len(members)], targeting the next member in rotation as
+// the wrapped-key recipient. Rotating the caller across five members keeps
+// every individual user's per-route counter at or below 9 across 41 calls
+// (41 = 5*8+1), strictly under the route's per-user budget of 10.
+func distributeAsRotatingMember(ts *testhelpers.TestServer, convID string, members []testhelpers.TestUser, i int) *httptest.ResponseRecorder {
+	caller := members[i%len(members)]
+	target := members[(i+1)%len(members)]
+	return ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			target.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+}
+
+// driveDMDistributionToBudget spends the first 40 requests of the
+// conversation's budget (asserting each succeeds) and returns the recorder
+// for the 41st, over-budget request — shared by both tests below so the
+// "drive to the limit" setup isn't duplicated.
+func driveDMDistributionToBudget(t *testing.T, ts *testhelpers.TestServer, convID string, members []testhelpers.TestUser) *httptest.ResponseRecorder {
+	t.Helper()
+	for i := 0; i < 40; i++ {
+		w := distributeAsRotatingMember(ts, convID, members, i)
+		require.Equal(t, http.StatusOK, w.Code, "request %d (of 40 within budget) should succeed, body: %s", i+1, w.Body.String())
+	}
+	return distributeAsRotatingMember(ts, convID, members, 40)
+}
+
+// TestDistributeUnifiedKeysDM_PerConversationLimit drives 41 requests against
+// one conversation, rotating the caller across five participants so no single
+// user's per-route counter (budget 10) can ever trip. The 41st request must
+// be blocked by the PER-CONVERSATION limit (budget 40), discriminated from
+// the per-user 429 by the X-RateLimit-Limit header value: the route
+// middleware emits "10" (middleware/ratelimit.go rateLimit()), the
+// conversation limiter must emit "40" (middleware.RespondRateLimited(c,
+// retryAfter, 40), middleware/resource_ratelimit.go:47).
+func TestDistributeUnifiedKeysDM_PerConversationLimit(t *testing.T) {
+	ts := setupTS(t)
+	convID, members := seedGroupDMWithKeysForRateLimitTest(t, ts)
+
+	w := driveDMDistributionToBudget(t, ts, convID, members)
+	assert.Equal(t, http.StatusTooManyRequests, w.Code, "the 41st request must be blocked by the per-conversation limit")
+	assert.Equal(t, "40", w.Header().Get("X-RateLimit-Limit"),
+		"a 429 with X-RateLimit-Limit=10 would mean the PER-USER route middleware blocked this, not the per-conversation limiter under test")
+}
+
+// TestDistributeUnifiedKeysDM_LimitIsPerConversation falsifies the limiter's
+// key scope in both directions: deleting only the per-user keys must NOT
+// un-block a conversation already at budget, and deleting only the
+// conversation key must un-block it immediately.
+func TestDistributeUnifiedKeysDM_LimitIsPerConversation(t *testing.T) {
+	ts := setupTS(t)
+	convID, members := seedGroupDMWithKeysForRateLimitTest(t, ts)
+
+	w := driveDMDistributionToBudget(t, ts, convID, members)
+	require.Equal(t, http.StatusTooManyRequests, w.Code, "conversation should be at budget before falsification")
+
+	ctx := context.Background()
+	for _, m := range members {
+		require.NoError(t, ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyUnifiedDist, m.ID)).Err())
+	}
+	w = distributeAsRotatingMember(ts, convID, members, 41)
+	assert.Equal(t, http.StatusTooManyRequests, w.Code,
+		"clearing only the per-user keys must NOT un-block the conversation — the conversation limiter is what is blocking this request")
+
+	require.NoError(t, ts.Redis.Del(ctx, fmt.Sprintf(fmtRateLimitDMDistribute, convID)).Err())
+	w = distributeAsRotatingMember(ts, convID, members, 42)
+	assert.Equal(t, http.StatusOK, w.Code,
+		"clearing only the conversation key must un-block the request, proving the conversation limiter — not something else — was the blocker")
+}
+
+// TestDistributeUnifiedKeysDM_NonParticipantMintsNoRateLimitKey is a
+// regression lock: the per-conversation limiter MUST sit after the
+// DM-membership check, never in front of it (e.g. as gin middleware, which
+// runs before any handler code). A limiter placed ahead of the membership
+// gate would let an authenticated non-participant mint one Redis key per
+// attacker-chosen conversation UUID — a key-flooding primitive strictly worse
+// than the write pressure the limiter exists to bound, since it costs the
+// attacker nothing but is billed to the rate-limit keyspace.
+//
+// This test asserts current (pre-limiter) behavior and MUST keep passing
+// after the limiter is implemented: nothing mints a fmtRateLimitDMDistribute
+// key for a context the caller was never a participant of.
+func TestDistributeUnifiedKeysDM_NonParticipantMintsNoRateLimitKey(t *testing.T) {
+	ts := setupTS(t)
+	outsider := ts.CreateTestUser(t, "dmratelimitoutsider")
+	unknownID := uuid.New().String()
+
+	w := ts.DoRequest("POST", pathE2EEKeys+unknownID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{
+			outsider.ID: testhelpers.ValidCiphertext(),
+		},
+	}, testhelpers.AuthHeaders(outsider.AccessToken))
+	require.Equal(t, http.StatusNotFound, w.Code, "a non-participant must get the same not-found an unknown context yields")
+
+	keys, err := ts.Redis.Keys(context.Background(), fmt.Sprintf(fmtRateLimitDMDistribute, unknownID)).Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys,
+		"the membership gate must run BEFORE any rate-limit key is minted — a pre-gate limiter would let an attacker mint one key per chosen UUID for free")
+}
+
+// ===========================================================================
 // Get Pending Key Requests — edge cases
 // ===========================================================================
 
@@ -2440,4 +2798,112 @@ func TestAutoEnrollAndRequestRewrapRaceConverge(t *testing.T) {
 	).Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
+}
+
+// A per-resource limiter keyed on the RAW path parameter is bypassable by
+// re-spelling the identifier (#1218 red-team). uuid.Parse accepts upper-case,
+// hyphen-less, braced and urn: forms, and PostgreSQL's uuid_in accepts the same
+// set — so the membership gate still passes on the same conversation row while
+// each spelling mints its own Redis counter with a full untouched budget. The
+// control would then bind only clients that use the canonical id the server
+// hands out, which is every honest client and no attacker.
+//
+// The fix is to canonicalize at the uuid.Parse the handler already performs, so
+// the Redis key, the SQL parameter, the log fields and the WS payload all share
+// one representation. This test drives the conversation to its budget and then
+// re-spells the id; a bypass would answer 200.
+func TestDistributeUnifiedKeysDM_LimitSurvivesUUIDRespelling(t *testing.T) {
+	ts := setupTS(t)
+	convID, members := seedGroupDMWithKeysForRateLimitTest(t, ts)
+
+	w := driveDMDistributionToBudget(t, ts, convID, members)
+	require.Equal(t, http.StatusTooManyRequests, w.Code,
+		"conversation must be at budget before the respelling attempt")
+
+	upper := strings.ToUpper(convID)
+	require.NotEqual(t, convID, upper, "fixture UUID must contain hex letters to re-spell")
+
+	for name, spelling := range map[string]string{
+		"upper-case":  upper,
+		"hyphen-less": strings.ReplaceAll(convID, "-", ""),
+		"braced":      "{" + convID + "}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			caller := members[0]
+			// driveDMDistributionToBudget already spent 9 of this caller's 10
+			// per-user requests. Clear that budget so the only limiter that can
+			// answer is the per-conversation one — otherwise a 429 from the
+			// per-user middleware makes the bypass look closed.
+			ts.Redis.Del(context.Background(), fmt.Sprintf(fmtUserRLKeyUnifiedDist, caller.ID))
+
+			got := ts.DoRequest("POST", pathE2EEKeys+spelling, map[string]interface{}{
+				keyWrappedKeys: map[string]string{members[1].ID: testhelpers.ValidCiphertext()},
+			}, testhelpers.AuthHeaders(caller.AccessToken))
+			assert.Equal(t, http.StatusTooManyRequests, got.Code,
+				"re-spelling the conversation id must not mint a second budget")
+			assert.Equal(t, "40", got.Header().Get("X-RateLimit-Limit"),
+				"a 429 reporting limit 10 would be the per-user middleware, not the per-conversation limiter under test")
+		})
+	}
+}
+
+// TestDistributeUnifiedKeysDM_LimiterPrecedesBodyParse locks the second half of
+// the placement invariant the handler comment calls load-bearing "in both
+// directions". The membership-gate side has its own lock
+// (_NonParticipantMintsNoRateLimitKey); this is the body-parse side.
+//
+// It is falsifiable in one move: put the limiter below bindStrictJSONBody and
+// an over-cap body returns 413 instead of 429, because the request is parsed
+// (and the oversized read paid for) before admission is even consulted.
+func TestDistributeUnifiedKeysDM_LimiterPrecedesBodyParse(t *testing.T) {
+	ts := setupTS(t)
+	convID, members := seedGroupDMWithKeysForRateLimitTest(t, ts)
+	ctx := context.Background()
+
+	blocked := driveDMDistributionToBudget(t, ts, convID, members)
+	require.Equal(t, http.StatusTooManyRequests, blocked.Code, "budget must be spent before the assertion below is meaningful")
+
+	caller := members[0]
+	ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyUnifiedDist, caller.ID))
+
+	// Comfortably past the 16 KiB DM body cap.
+	oversized := make(map[string]string, 64)
+	for i := 0; i < 64; i++ {
+		oversized[uuid.New().String()] = strings.Repeat("A", 512)
+	}
+
+	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: oversized,
+	}, testhelpers.AuthHeaders(caller.AccessToken))
+
+	assert.Equal(t, http.StatusTooManyRequests, w.Code,
+		"a rate-limited request must be refused BEFORE its body is parsed — a 413 here means the limiter moved below bindStrictJSONBody")
+	assert.Equal(t, "40", w.Header().Get("X-RateLimit-Limit"),
+		"and the refusal must come from the per-conversation limiter")
+}
+
+// TestDistributeUnifiedKeysDM_OutsiderOnRealConversationMintsNoKey closes a
+// scope gap in _NonParticipantMintsNoRateLimitKey, which probes an id matching
+// NO conversation and therefore proves "an unknown context mints no key" rather
+// than "an existing conversation with a non-participant caller mints no key".
+//
+// Both are one EXISTS today, so the weaker test passes. But a refactor that
+// splits existence from participation — a natural shape for distinguishing 404
+// from a pending state — could mint the key between the two checks and leave
+// that test green.
+func TestDistributeUnifiedKeysDM_OutsiderOnRealConversationMintsNoKey(t *testing.T) {
+	ts := setupTS(t)
+	convID, members := seedGroupDMWithKeysForRateLimitTest(t, ts)
+	outsider := ts.CreateTestUser(t, "dmrealconvoutsider")
+
+	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
+		keyWrappedKeys: map[string]string{members[0].ID: testhelpers.ValidCiphertext()},
+	}, testhelpers.AuthHeaders(outsider.AccessToken))
+	require.Equal(t, http.StatusNotFound, w.Code,
+		"a real conversation must be indistinguishable from an unknown one to a non-participant")
+
+	keys, err := ts.Redis.Keys(context.Background(), fmt.Sprintf(fmtRateLimitDMDistribute, convID)).Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys,
+		"an outsider's refused request must not spend or create the real conversation's budget")
 }

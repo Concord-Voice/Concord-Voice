@@ -68,11 +68,6 @@ const (
 	errMsgFailedRemoveEnforcement    = "Failed to remove enforcement"
 	errMsgTargetNotParticipant       = "Target is not a participant"
 	errMsgCannotUnmuteWhileDeafened  = "Cannot unmute while server-deafened — remove deafen first"
-	errMsgFailedDistributeKeys       = "Failed to distribute keys"
-	maxDMWrappedKeys                 = 10
-	maxDMWrappedKeysRequestBytes     = 16 * 1_024
-	errMsgRequestBodyTooLarge        = "Request body too large"
-	errMsgTooManyWrappedKeys         = "Too many wrapped keys"
 )
 
 // dm_privacy_level enum values (matches migration 000032_dm_privacy_level.up.sql).
@@ -1513,104 +1508,10 @@ func (h *Handler) GetKeys(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"key": key})
 }
 
-// DistributeKeysRequest represents wrapped keys for DM participants.
-type DistributeKeysRequest struct {
-	WrappedKeys map[string]string `json:"wrapped_keys" binding:"required"`
-	KeyVersion  *int              `json:"key_version,omitempty"`
-}
-
-// DistributeKeys stores wrapped channel keys for DM participants.
-// POST /dm/conversations/:id/keys
-func (h *Handler) DistributeKeys(c *gin.Context) {
-	userID := c.GetString("user_id")
-	convID := c.Param("id")
-
-	if _, err := uuid.Parse(convID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return
-	}
-
-	var req DistributeKeysRequest
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxDMWrappedKeysRequestBytes)
-	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": errMsgRequestBodyTooLarge})
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
-		return
-	}
-	body, ok := c.Get(gin.BodyBytesKey)
-	bodyBytes, bodyIsBytes := body.([]byte)
-	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
-		return
-	}
-	if len(req.WrappedKeys) > maxDMWrappedKeys {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgTooManyWrappedKeys})
-		return
-	}
-
-	if !h.isParticipant(convID, userID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
-		return
-	}
-
-	keyVersion, ok := h.resolveDMDistributionKeyVersion(c, convID, req.KeyVersion)
-	if !ok {
-		return
-	}
-
-	distributed, delivered, ok := h.runGuardedDMKeyDistribution(c, userID, convID, req.WrappedKeys, keyVersion)
-	if !ok {
-		return
-	}
-	for _, memberUserID := range delivered {
-		// Pending-request cleanup is best-effort POST-commit: the key row is
-		// already durable, and a failed DELETE inside the tx would poison the
-		// whole batch (25P02) for what is only retry-safe housekeeping.
-		if _, err := h.db.Exec(`DELETE FROM dm_pending_key_requests WHERE conversation_id = $1 AND user_id = $2`, convID, memberUserID); err != nil {
-			h.log.Warn("Failed to clear pending key request after distribution", "error", err, "conversation_id", convID, "user_id", memberUserID)
-		}
-		h.notifyDMKeyDelivered(convID, memberUserID)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"distributed": distributed})
-}
-
-// resolveDMDistributionKeyVersion determines the key version for a DM
-// distribution. CRITICAL: the fallback MUST be MAX (not MAX+1).
-// Peer-fulfillment wraps the EXISTING cached CSK, so the inserted row belongs
-// at the existing epoch — tagging it at MAX+1 would tie the wrap to a version
-// no historical message references, breaking decryption of history for the
-// recovering/onboarding user. Rotation paths pass an explicit key_version.
-// New conversations default to version 1. See #1023 / PR #1080.
-// On failure the HTTP response is written and ok=false is returned.
-func (h *Handler) resolveDMDistributionKeyVersion(c *gin.Context, convID string, explicit *int) (int, bool) {
-	if explicit != nil && *explicit > 0 {
-		return *explicit, true
-	}
-	keyVersion := 1
-	if err := h.db.QueryRow(`SELECT COALESCE(MAX(key_version), 1) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&keyVersion); err != nil {
-		h.log.Error("Failed to fetch DM key version", "error", err, "conversation_id", convID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
-		return 0, false
-	}
-	if keyVersion == 0 {
-		keyVersion = 1
-	}
-	return keyVersion, true
-}
-
-// runGuardedDMKeyDistribution writes wrapped keys inside ONE transaction
-// guarded by the distributor's credential epoch (#2201), so a request admitted
-// before a destructive key reset cannot recreate wrapped-key rows after it.
-// Notifications are the caller's post-commit responsibility. On failure the
-// respondGuardTxError discriminates an epoch-fence rejection (the generic 401)
-// from a store/lock read error (logged 500 with the caller's message) — a
-// transient DB failure is not "re-authenticate" (Codex #2397 review). Mirrors
-// messages.respondGuardTxError.
+// respondGuardTxError discriminates a credential-epoch fence rejection (#2201)
+// — answered with the generic 401 — from a store/lock read error, which is
+// logged and answered 500 with the caller's message. A transient DB failure is
+// not "re-authenticate" (Codex #2397 review). Mirrors messages.respondGuardTxError.
 func (h *Handler) respondGuardTxError(c *gin.Context, guardErr error, genericMsg string) {
 	if errors.Is(guardErr, credepoch.ErrEpochMismatch) || errors.Is(guardErr, credepoch.ErrBlocked) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
@@ -1620,101 +1521,20 @@ func (h *Handler) respondGuardTxError(c *gin.Context, guardErr error, genericMsg
 	c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
 }
 
-// HTTP response is written and ok=false is returned.
-func (h *Handler) runGuardedDMKeyDistribution(c *gin.Context, userID, convID string, wrappedKeys map[string]string, keyVersion int) (distributed int, delivered []string, ok bool) {
-	ctx := c.Request.Context()
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		h.log.Error("Failed to begin DM key distribution tx", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
-		return 0, nil, false
-	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback DM key distribution tx", "error", rbErr)
-		}
-	}()
-	if guardErr := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); guardErr != nil {
-		h.respondGuardTxError(c, guardErr, errMsgFailedDistributeKeys)
-		return 0, nil, false
-	}
-
-	for memberUserID, wrappedKey := range wrappedKeys {
-		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
-			continue
-		}
-		inserted, distErr := h.distributeKeyToMemberTx(ctx, tx, convID, memberUserID, wrappedKey, keyVersion)
-		if distErr != nil {
-			// A statement error poisons the PG tx (25P02); fail the batch.
-			h.log.Error("DM key distribution failed", "error", distErr, "conversation_id", convID)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
-			return 0, nil, false
-		}
-		if inserted {
-			delivered = append(delivered, memberUserID)
-			distributed++
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		h.log.Error("Failed to commit DM key distribution tx", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
-		return 0, nil, false
-	}
-	return distributed, delivered, true
-}
-
-// distributeKeyToMemberTx inserts one member's wrapped key inside the caller's
-// epoch-guarded transaction (#2201). The caller validates the member UUID;
-// notification is the caller's post-commit responsibility.
-func (h *Handler) distributeKeyToMemberTx(ctx context.Context, tx *sql.Tx, convID, memberUserID, wrappedKey string, keyVersion int) (bool, error) {
-	result, err := tx.ExecContext(ctx, `
-		INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (conversation_id, user_id, key_version) DO NOTHING
-	`, convID, memberUserID, wrappedKey, keyVersion)
-	if err != nil {
-		return false, fmt.Errorf("store dm key: %w", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("rows affected: %w", err)
-	}
-	if rowsAffected == 0 {
-		return false, nil
-	}
-
-	return true, nil
-}
-
-// notifyDMKeyDelivered emits the post-commit key_delivered signal.
-func (h *Handler) notifyDMKeyDelivered(convID, memberUserID string) {
-	if h.hub == nil {
-		return
-	}
-	recipientUUID, parseErr := uuid.Parse(memberUserID)
-	if parseErr != nil {
-		return
-	}
-	h.hub.BroadcastToUser(recipientUUID, websocket.OutgoingMessage{
-		Type: "key_delivered",
-		Data: map[string]interface{}{
-			"channel_id": convID,
-			"user_id":    memberUserID,
-		},
-	})
-}
-
 // RotateKey handles manual seal & rotate for DM forward secrecy.
 // POST /dm/conversations/:id/rotate-key
 func (h *Handler) RotateKey(c *gin.Context) {
 	userID := c.GetString("user_id")
 	convID := c.Param("id")
 
-	if _, err := uuid.Parse(convID); err != nil {
+	parsedConvID, parseErr := uuid.Parse(convID)
+	if parseErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
 		return
 	}
+	// Canonicalize before the per-resource limiter key is built — see
+	// channels.DistributeUnifiedKeys for why (#1218 red-team).
+	convID = parsedConvID.String()
 
 	if !h.isParticipant(convID, userID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
@@ -1722,7 +1542,6 @@ func (h *Handler) RotateKey(c *gin.Context) {
 	}
 
 	// Per-resource rate limit: 10 rotations per 24h per conversation.
-	// Subscription-tiered limits deferred to issue #603.
 	rateLimitKey := fmt.Sprintf("ratelimit:dm_rotate:%s", convID)
 	if blocked, retryAfter := middleware.IsRateLimited(c.Request.Context(), h.redis, rateLimitKey, 10, 24*time.Hour); blocked {
 		middleware.RespondRateLimited(c, retryAfter, 10)

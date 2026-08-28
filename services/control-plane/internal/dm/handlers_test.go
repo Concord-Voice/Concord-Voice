@@ -1696,448 +1696,31 @@ func TestGetKeys_ReturnsLatestVersion(t *testing.T) {
 	assert.Equal(t, float64(3), key["key_version"])
 }
 
-// ============================================================================
-// DistributeKeys Tests
-// ============================================================================
-
-func TestDistributeKeys_Success(t *testing.T) {
+// The legacy POST /dm/conversations/:id/keys was removed in #1218. It never had
+// a client caller anywhere in this repository's history, and its request struct
+// could not carry wrapped_key_versions — so it always took the fail-open branch
+// of #2420's recipient-freshness guard. Because RateLimitByUser keys its budget
+// on c.FullPath(), its existence also gave one user two independent 10/min
+// budgets over the same conversation. Distribution is now owned solely by
+// POST /api/v1/e2ee/keys/:context_id.
+func TestDistributeKeys_LegacyRouteRemoved(t *testing.T) {
 	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeys1")
-	user2 := ts.CreateTestUser(t, "distkeys2")
+	user1 := ts.CreateTestUser(t, "legacyroute1")
+	user2 := ts.CreateTestUser(t, "legacyroute2")
 	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
 	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
 
 	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user1.ID: "wrapped-key-for-user1",
-			user2.ID: "wrapped-key-for-user2",
-		},
+		"wrapped_keys": map[string]string{user2.ID: testhelpers.ValidCiphertext()},
 	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
 
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(2), body["distributed"])
-}
-
-func TestDistributeKeys_AcceptsTrailingJSONWhitespace(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeyspace1")
-	user2 := ts.CreateTestUser(t, "distkeyspace2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	document := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}`, user2.ID, testhelpers.ValidCiphertext())
-	req := httptest.NewRequest(
-		http.MethodPost,
-		pathDMConversationsPrefix+convID+"/keys",
-		strings.NewReader(document+" \n\t"),
-	)
-	req.Header = testhelpers.AuthHeaders(user1.AccessToken)
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	ts.Router.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusOK, w.Code)
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(1), body["distributed"])
-}
-
-func TestDistributeKeys_RejectsBodyOver16KiB(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeysize1")
-	user2 := ts.CreateTestUser(t, "distkeysize2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: strings.Repeat("x", 16*1024),
-		},
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
-	assert.Contains(t, w.Body.String(), "Request body too large")
-}
-
-func TestDistributeKeys_RejectsTrailingJSONBeforeDatabaseFanout(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeytrail1")
-	user2 := ts.CreateTestUser(t, "distkeytrail2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	_, err := ts.DB.Exec("ALTER TABLE dm_participants RENAME TO dm_participants_trailing_body_test")
-	require.NoError(t, err)
-	defer func() {
-		if _, revertErr := ts.DB.Exec("ALTER TABLE dm_participants_trailing_body_test RENAME TO dm_participants"); revertErr != nil {
-			t.Errorf("testhelpers: failed to revert dm_participants rename: %v", revertErr)
-		}
-	}()
-
-	document := fmt.Sprintf(`{"wrapped_keys":{%q:%q}}`, user2.ID, testhelpers.ValidCiphertext())
-	tests := []struct {
-		name       string
-		body       string
-		wantStatus int
-		wantError  string
-	}{
-		{"OversizedChunkedBody", document + `{}` + strings.Repeat(" ", 16*1024), http.StatusRequestEntityTooLarge, "Request body too large"},
-		{"SecondDocument", document + `{}`, http.StatusBadRequest, "Invalid request body"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, pathDMConversationsPrefix+convID+"/keys", strings.NewReader(test.body))
-			req.ContentLength = -1
-			req.TransferEncoding = []string{"chunked"}
-			req.Header = testhelpers.AuthHeaders(user1.AccessToken)
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-			ts.Router.ServeHTTP(w, req)
-
-			assert.Equal(t, test.wantStatus, w.Code)
-			assert.JSONEq(t, fmt.Sprintf(`{"error":%q}`, test.wantError), w.Body.String())
-		})
-	}
-}
-
-func TestDistributeKeys_RejectsMoreThan10WrappedKeysBeforeDatabaseFanout(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeycap1")
-	user2 := ts.CreateTestUser(t, "distkeycap2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	wrappedKeys := make(map[string]string, 11)
-	for i := range 11 {
-		wrappedKeys[fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)] = "k"
-	}
-
-	_, err := ts.DB.Exec("ALTER TABLE dm_participants RENAME TO dm_participants_limit_test")
-	require.NoError(t, err)
-	defer func() {
-		if _, revertErr := ts.DB.Exec("ALTER TABLE dm_participants_limit_test RENAME TO dm_participants"); revertErr != nil {
-			t.Errorf("testhelpers: failed to revert dm_participants rename: %v", revertErr)
-		}
-	}()
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": wrappedKeys,
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "Too many wrapped keys")
-}
-
-func TestDistributeKeys_WithExplicitVersion(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeyver1")
-	user2 := ts.CreateTestUser(t, "distkeyver2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	keyVersion := 5
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: "wrapped-key-v5",
-		},
-		"key_version": keyVersion,
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(1), body["distributed"])
-}
-
-func TestDistributeKeys_NotParticipant(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeysnp1")
-	user2 := ts.CreateTestUser(t, "distkeysnp2")
-	outsider := ts.CreateTestUser(t, "distkeysnp3")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user1.ID: wrappedKey,
-		},
-	}, testhelpers.AuthHeaders(outsider.AccessToken))
-	assert.Equal(t, http.StatusForbidden, w.Code)
-}
-
-func TestDistributeKeys_InvalidConversationID(t *testing.T) {
-	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "distkeysinv")
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+"not-a-uuid/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user.ID: wrappedKey,
-		},
-	}, testhelpers.AuthHeaders(user.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestDistributeKeys_InvalidRequestBody(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeysbad1")
-	user2 := ts.CreateTestUser(t, "distkeysbad2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestDistributeKeys_DuplicateKeyVersionSkipped(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeysdup1")
-	user2 := ts.CreateTestUser(t, "distkeysdup2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	// Distribute once
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: "wrapped-key-v1",
-		},
-		"key_version": 1,
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code)
-
-	// Distribute again with same version — ON CONFLICT DO NOTHING
-	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: "wrapped-key-v1-again",
-		},
-		"key_version": 1,
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(0), body["distributed"], "duplicate should not be distributed")
-}
-
-func TestDistributeKeys_InvalidMemberUUID(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeysbaduuid1")
-	user2 := ts.CreateTestUser(t, "distkeysbaduuid2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	// Invalid member UUID should be silently skipped
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			notAUUID: wrappedKey,
-		},
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(0), body["distributed"])
-}
-
-// TestDistributeKeys_NewConversationStartsAtVersion1 verifies that the legacy
-// DM key distribution endpoint defaults to version 1 for a brand-new
-// conversation with no existing keys.
-func TestDistributeKeys_NewConversationStartsAtVersion1(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "lgdmnew1")
-	user2 := ts.CreateTestUser(t, "lgdmnew2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: "wrapped-key-newconv",
-		},
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code)
-
-	var version int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT key_version FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2`,
-		convID, user2.ID,
-	).Scan(&version))
-	assert.Equal(t, 1, version,
-		"first key in a new conversation should be version 1, not MAX+1")
-}
-
-// TestDistributeKeys_PeerFulfillmentPreservesVersion is the legacy-endpoint
-// regression test for the same bug fixed on the unified endpoint
-// (PR #1080 / #1023). When the caller does NOT pass an explicit key_version,
-// the server must preserve the EXISTING key_version on peer fulfillment, not
-// stamp MAX+1.
-func TestDistributeKeys_PeerFulfillmentPreservesVersion(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "lgdmpfa")
-	user2 := ts.CreateTestUser(t, "lgdmpfb")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	// Seed user1 at version 1 (simulates established participant).
-	ts.SeedDMKey(t, convID, user1.ID, 1)
-
-	// user1 peer-fulfills the wrap for user2 with no explicit version.
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: "wrapped-key-peer",
-		},
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code)
-
-	var version int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT key_version FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2`,
-		convID, user2.ID,
-	).Scan(&version))
-	assert.Equal(t, 1, version,
-		"peer-fulfilled wrap on legacy endpoint must preserve existing key_version (1), not stamp MAX+1 (2)")
-}
-
-// TestDistributeKeys_KeyVersionQueryError_FailsClosed verifies that when the
-// keyVersion lookup query inside DistributeKeys errors (simulated here by
-// renaming dm_channel_keys so the SELECT returns "relation does not exist"),
-// the handler responds with HTTP 500 — i.e., fail-CLOSED — instead of silently
-// falling through to keyVersion=1 and stamping the wrong key epoch.
-//
-// This is the behavioral regression guard for the line-1349 errcheck fix.
-// Without the fix, a DB error here silently defaults keyVersion to 1, which
-// for an established conversation corrupts the E2EE key-epoch tracking
-// because peer-fulfillment is supposed to wrap the EXISTING cached CSK at
-// MAX, not stamp a wrong version-1 row (see #1023 / PR #1080 / spec D1).
-//
-// t.Cleanup runs in LIFO order, so the rename-back runs BEFORE the harness's
-// TruncateAllTables cleanup — TruncateAllTables sees the table back at its
-// original name and runs normally.
-func TestDistributeKeys_KeyVersionQueryError_FailsClosed(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeyverr1")
-	user2 := ts.CreateTestUser(t, "distkeyverr2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	// Rename dm_channel_keys so the COALESCE(MAX(key_version), 1) lookup
-	// inside DistributeKeys errors with "relation does not exist" — a
-	// non-nil error from Scan.
-	_, err := ts.DB.Exec("ALTER TABLE dm_channel_keys RENAME TO dm_channel_keys_dberrtest")
-	require.NoError(t, err, "failed to rename dm_channel_keys for fault injection")
-	t.Cleanup(func() {
-		// Surface rename-back failures explicitly — silently swallowing them
-		// would leave the table renamed for the rest of the package run, and
-		// every subsequent test would fail with confusing "relation does not
-		// exist" errors that don't point at this cleanup. t.Errorf (not
-		// t.Fatalf) marks the test failed but allows other cleanups to run.
-		if _, err := ts.DB.Exec("ALTER TABLE dm_channel_keys_dberrtest RENAME TO dm_channel_keys"); err != nil {
-			t.Errorf("cleanup: failed to rename dm_channel_keys back to original: %v", err)
-		}
-	})
-
-	// Request without explicit key_version forces the SELECT MAX path.
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: wrappedKey,
-		},
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusInternalServerError, w.Code,
-		"key_version query error must fail-CLOSED with 500, not silently stamp keyVersion=1")
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, "Failed to distribute keys", body["error"])
-}
-
-// TestDistributeKeys_PendingDeleteError_DoesNotFailDistribution verifies the
-// log-and-continue contract for the DELETE cleanup inside distributeKeyToMember
-// (handlers.go:1391). The cleanup is best-effort — the channel key was already
-// inserted into dm_channel_keys before the DELETE runs, so a cleanup failure
-// must NOT cause the handler to report distribution as failed.
-//
-// Setup: seed a pending-key-request row for the recipient. After the request,
-// that row should be DELETEd by distributeKeyToMember. If we rename
-// dm_pending_key_requests mid-test, the DELETE errors silently (pre-fix) or
-// logs a Warn (post-fix). Either way, the observable post-condition is:
-//   - HTTP 200 + distributed == 1 (key insert succeeded)
-//   - Seeded pending row still exists after rename-back
-//   - dm_channel_keys contains the wrapped key (insert happened before
-//     DELETE failure path)
-//
-// This is a COVERAGE test, not a TDD test — it passes both pre- and post-fix.
-// Its purpose is to exercise the new error-handling branch added by the fix
-// (so it counts toward the 80% new-code Quality Gate) and to lock in the
-// log-and-continue contract as a regression guard against future scope-creep
-// converting this to fail-CLOSED.
-//
-// Implicitly covers Site 3 (RowsAffected) on the HAPPY path: the INSERT
-// returns RowsAffected=1, the new (rowsAffected, err := ...) line executes
-// with err=nil, and the function falls through to the DELETE. Site 3's
-// ERROR branch is by-design untested per spec D3 (RowsAffected only errors
-// on driver-state corruption, not portably fault-injectable).
-func TestDistributeKeys_PendingDeleteError_DoesNotFailDistribution(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "distkeypend1")
-	user2 := ts.CreateTestUser(t, "distkeypend2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	// Seed a pending key request for user2 so the DELETE has a row to target.
-	_, err := ts.DB.Exec(
-		`INSERT INTO dm_pending_key_requests (conversation_id, user_id) VALUES ($1, $2)`,
-		convID, user2.ID,
-	)
-	require.NoError(t, err, "failed to seed dm_pending_key_requests row")
-
-	// Rename dm_pending_key_requests so the DELETE inside distributeKeyToMember
-	// errors with "relation does not exist".
-	_, err = ts.DB.Exec("ALTER TABLE dm_pending_key_requests RENAME TO dm_pending_key_requests_dberrtest")
-	require.NoError(t, err, "failed to rename dm_pending_key_requests for fault injection")
-	t.Cleanup(func() {
-		// See TestDistributeKeys_KeyVersionQueryError_FailsClosed cleanup
-		// comment: surface rename-back failures rather than silently swallow.
-		if _, err := ts.DB.Exec("ALTER TABLE dm_pending_key_requests_dberrtest RENAME TO dm_pending_key_requests"); err != nil {
-			t.Errorf("cleanup: failed to rename dm_pending_key_requests back to original: %v", err)
-		}
-	})
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+"/keys", map[string]interface{}{
-		"wrapped_keys": map[string]string{
-			user2.ID: wrappedKey,
-		},
-		"key_version": 1,
-	}, testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code,
-		"DELETE-cleanup error must NOT fail the handler — key was already distributed")
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(1), body["distributed"],
-		"distributed count should reflect successful key insert despite cleanup failure")
-
-	// Verify the key was actually inserted into dm_channel_keys — confirms the
-	// "insert happened before DELETE failure" sequencing rather than relying on
-	// distributed==1 as a proxy. If the INSERT had silently failed and the
-	// DELETE failure was the only path-error, distributed would still be 0,
-	// but a future regression could flip those semantics.
-	var keyRowCount int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2`,
-		convID, user2.ID,
-	).Scan(&keyRowCount))
-	assert.Equal(t, 1, keyRowCount,
-		"dm_channel_keys should contain the wrapped key — insert succeeded before DELETE failure path")
-
-	// Verify the seeded pending row STILL exists — proves the DELETE failed
-	// silently (pre-fix) or was logged-and-skipped (post-fix). Either way, the
-	// log-and-continue contract holds. NOTE: t.Cleanup runs LATER (after this
-	// test function returns), so at this assertion point the table is still
-	// renamed; we query the renamed name (dm_pending_key_requests_dberrtest).
-	var rowCount int
-	require.NoError(t, ts.DB.QueryRow(
-		`SELECT COUNT(*) FROM dm_pending_key_requests_dberrtest WHERE conversation_id = $1 AND user_id = $2`,
-		convID, user2.ID,
-	).Scan(&rowCount))
-	assert.Equal(t, 1, rowCount,
-		"seeded pending row should still exist (DELETE failed; cleanup is log-and-continue)")
+	// Not an exact 404: this path still has a registered GET, so the POST
+	// returns 404 only because gin's HandleMethodNotAllowed is off. Flipping
+	// that engine flag makes it a 405 and would red this test for a reason
+	// unrelated to what it asserts. What must hold is that the route does not
+	// SERVE the request.
+	assert.Contains(t, []int{http.StatusNotFound, http.StatusMethodNotAllowed}, w.Code,
+		"the legacy distribution route must no longer be registered")
 }
 
 // ============================================================================
@@ -5944,4 +5527,59 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_TierFromAuthenticatedUser(t *testi
 	me := testhelpers.JSONField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
 	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
+}
+
+// The per-conversation rotation limiter (10/24h) was keyed on the raw path
+// parameter, so re-spelling the conversation UUID minted a fresh counter with a
+// full budget (#1218 red-team, same class as the DM key-distribution limiter).
+// uuid.Parse accepts upper-case, hyphen-less and braced forms and PostgreSQL's
+// uuid_in accepts the same set, so every gate still passed against the same row.
+// The per-user limit is 5/min, so the bypass turned 10 rotations per day into
+// thousands. The handler now canonicalizes at its existing parse.
+func TestRotateKey_LimitSurvivesUUIDRespelling(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "rotrespell1")
+	user2 := ts.CreateTestUser(t, "rotrespell2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	ts.SeedDMKey(t, convID, user1.ID, 1)
+	ts.SeedDMKey(t, convID, user2.ID, 1)
+	ctx := context.Background()
+
+	// Spend the whole per-conversation rotation budget.
+	for i := 0; i < 10; i++ {
+		w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil,
+			testhelpers.AuthHeaders(user1.AccessToken))
+		require.Equal(t, http.StatusOK, w.Code, "rotation %d of 10 should be within budget", i+1)
+		// The route also caps 5/min per user; clear it so only the per-conversation
+		// limiter can answer, or this test proves the wrong limiter.
+		ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID))
+	}
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil,
+		testhelpers.AuthHeaders(user1.AccessToken))
+	require.Equal(t, http.StatusTooManyRequests, w.Code, "the 11th rotation must be blocked")
+
+	upper := strings.ToUpper(convID)
+	require.NotEqual(t, convID, upper, "fixture UUID must contain hex letters to re-spell")
+
+	for name, spelling := range map[string]string{
+		"upper-case":  upper,
+		"hyphen-less": strings.ReplaceAll(convID, "-", ""),
+		"braced":      "{" + convID + "}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID))
+			got := ts.DoRequest("POST", pathDMConversationsPrefix+spelling+pathRotateKey, nil,
+				testhelpers.AuthHeaders(user1.AccessToken))
+			assert.Equal(t, http.StatusTooManyRequests, got.Code,
+				"re-spelling the conversation id must not mint a second rotation budget")
+			// The Del above is a hand-written mirror of c.FullPath(); a route
+			// rename makes it a silent no-op and this test would then prove the
+			// per-user limiter instead. The header is the discriminator that
+			// turns that procedural guard into a mechanical one — 10 is the
+			// per-conversation budget, 5 the per-user one.
+			assert.Equal(t, "10", got.Header().Get("X-RateLimit-Limit"),
+				"the 429 must come from the per-conversation limiter")
+		})
+	}
 }

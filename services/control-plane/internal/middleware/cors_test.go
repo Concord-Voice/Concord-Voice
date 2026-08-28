@@ -47,8 +47,9 @@ func TestCORSAllowedOriginSetsHeaders(t *testing.T) {
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Attestation-Token")
 	assert.Equal(t,
 		middleware.SessionIssuedHeader+", "+middleware.SessionIDHeader+", "+
-			middleware.RateLimitResetHeader+", "+middleware.RetryAfterHeader+", "+
-			middleware.FileMimeTypeHeader+", "+middleware.FileKeyVersionHeader,
+			middleware.RateLimitResetHeader+", "+middleware.RateLimitLimitHeader+", "+
+			middleware.RetryAfterHeader+", "+middleware.FileMimeTypeHeader+", "+
+			middleware.FileKeyVersionHeader,
 		w.Header().Get("Access-Control-Expose-Headers"),
 	)
 
@@ -60,6 +61,20 @@ func TestCORSAllowedOriginSetsHeaders(t *testing.T) {
 	exposed := w.Header().Get("Access-Control-Expose-Headers")
 	assert.Contains(t, exposed, middleware.FileMimeTypeHeader)
 	assert.Contains(t, exposed, middleware.FileKeyVersionHeader)
+
+	// The two rate-limit headers a client must READ, named individually for the
+	// same reason. Setting a response header and exposing it are different
+	// things: both are non-safelisted, so a cross-origin renderer — the packaged
+	// app://concord origin and the remote SPA — reads null for anything missing
+	// from this list, with no error anywhere.
+	//
+	// X-RateLimit-Limit is the discriminator between this API's two 429 sources
+	// (a per-user route budget and a per-resource budget), which have different
+	// blast radii. Without it a client cannot tell them apart and cannot scope
+	// its retry, so #1218's DM key-distribution suppression silently never
+	// engages in production while passing every same-origin test.
+	assert.Contains(t, exposed, middleware.RateLimitLimitHeader)
+	assert.Contains(t, exposed, middleware.RetryAfterHeader)
 }
 
 func TestCORSEmptyOriginNoCORSHeaders(t *testing.T) {
