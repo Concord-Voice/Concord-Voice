@@ -18,18 +18,7 @@ tests/
 │   ├── handlers.ts                 # MSW v2 request handlers (auth, servers, channels, messages, users, members)
 │   └── server.ts                   # MSW setupServer()
 ├── unit/
-│   ├── stores/                     # 11 files — Zustand store tests
-│   │   ├── authStore.test.ts
-│   │   ├── chatStore.test.ts
-│   │   ├── serverStore.test.ts
-│   │   ├── channelStore.test.ts
-│   │   ├── memberStore.test.ts
-│   │   ├── unreadStore.test.ts
-│   │   ├── userStore.test.ts
-│   │   ├── userStore.changePassword.test.ts
-│   │   ├── settingsStore.test.ts
-│   │   ├── inviteStore.test.ts
-│   │   └── layoutStore.test.ts
+│   ├── stores/                     # Zustand tests; store-reset-coverage.test.ts guards resetAllStores() parity
 │   ├── components/                 # 39 files — React component tests
 │   │   ├── Auth/                   # AuthFlow, ConnectionSelector, InfoTooltip, LoadingSpinner, Login, PasswordStrength, Register, ServerInput
 │   │   ├── Chat/                   # ChatView, DeleteMessageModal, Message, MessageContextMenu, MessageInput, MessageInputContextMenu, MessageList, TypingIndicator

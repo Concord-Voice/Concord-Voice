@@ -34,7 +34,9 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/audioSettingsStore', () => ({}));
+vi.mock('@/renderer/stores/audioSettingsStore', () => ({
+  useAudioSettingsStore: vi.fn(),
+}));
 
 vi.mock('@/renderer/hooks/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn((key: string) => defaultSettings[key] ?? false),

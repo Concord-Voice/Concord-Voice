@@ -26,6 +26,38 @@ import { useChangelogStore } from '../../src/renderer/stores/changelogStore';
 import { useFriendOrgStore } from '../../src/renderer/stores/friendOrgStore';
 import { usePresenceOverrideStore } from '../../src/renderer/stores/presenceOverrideStore';
 import { useSettingsStore } from '../../src/renderer/stores/settingsStore';
+import { useAudioSettingsStore } from '../../src/renderer/stores/audioSettingsStore';
+import { useClientConfigStore } from '../../src/renderer/stores/clientConfigStore';
+import { useDraftMessageStore } from '../../src/renderer/stores/draftMessageStore';
+import { useDraftSettingsStore } from '../../src/renderer/stores/draftSettingsStore';
+import { useKeyboardShortcutStore } from '../../src/renderer/stores/keyboardShortcutStore';
+import { useLayoutStore } from '../../src/renderer/stores/layoutStore';
+import { useNotificationNavigationStore } from '../../src/renderer/stores/notificationNavigationStore';
+import { useNotificationStore } from '../../src/renderer/stores/notificationStore';
+import { useOsPermissionStore } from '../../src/renderer/stores/osPermissionStore';
+import { usePermissionStore } from '../../src/renderer/stores/permissionStore';
+import { useSettingsNavStore } from '../../src/renderer/stores/settingsNavStore';
+import { useSettingsOverlayStore } from '../../src/renderer/stores/settingsOverlayStore';
+import { useTTSSettingsStore } from '../../src/renderer/stores/ttsSettingsStore';
+import { useVideoSettingsStore } from '../../src/renderer/stores/videoSettingsStore';
+
+interface InitialStateStore<State> {
+  getInitialState(): State;
+  setState(state: State, replace: true): void;
+}
+
+function resetToInitialState<State>(store: InitialStateStore<State>): void {
+  const runtimeStore = store as Partial<InitialStateStore<State>> | undefined;
+  if (
+    !runtimeStore ||
+    typeof runtimeStore.getInitialState !== 'function' ||
+    typeof runtimeStore.setState !== 'function'
+  ) {
+    return;
+  }
+
+  runtimeStore.setState(runtimeStore.getInitialState(), true);
+}
 
 /**
  * Resets all Zustand stores to their initial state.
@@ -70,6 +102,20 @@ export function resetAllStores(): void {
   useFriendOrgStore.getState().reset();
   usePresenceOverrideStore.getState().reset();
   useChangelogStore.setState({ lastSeenVersion: null });
+  resetToInitialState(useAudioSettingsStore);
+  resetToInitialState(useClientConfigStore);
+  resetToInitialState(useDraftMessageStore);
+  useDraftSettingsStore.getState().teardown();
+  resetToInitialState(useKeyboardShortcutStore);
+  resetToInitialState(useLayoutStore);
+  resetToInitialState(useNotificationNavigationStore);
+  resetToInitialState(useNotificationStore);
+  resetToInitialState(useOsPermissionStore);
+  resetToInitialState(usePermissionStore);
+  resetToInitialState(useSettingsNavStore);
+  resetToInitialState(useSettingsOverlayStore);
+  resetToInitialState(useTTSSettingsStore);
+  resetToInitialState(useVideoSettingsStore);
 
   // Clear persisted state from localStorage AND sessionStorage
   // (pendingRegistrationStore persists to sessionStorage)
