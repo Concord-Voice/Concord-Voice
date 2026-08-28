@@ -232,7 +232,14 @@ const SettingsPage: React.FC = () => {
 
   // Draft settings lifecycle
   useDraftSettingsLifecycle();
-  const { apply, revert, hasPendingChanges, hwAccelChanged } = useDraftActions();
+  const {
+    apply,
+    revert,
+    hasPendingChanges,
+    hwAccelChanged,
+    contentProtectionApplying,
+    contentProtectionApplyFailed,
+  } = useDraftActions();
 
   // Blob animation state
   const [blobBouncing, setBlobBouncing] = useState(false);
@@ -357,6 +364,7 @@ const SettingsPage: React.FC = () => {
                   onClick={() => {
                     if (!hasPendingChanges) closeOverlay();
                   }}
+                  disabled={contentProtectionApplying}
                   onMouseEnter={() => {
                     if (hasPendingChanges) {
                       setBlobBouncing(true);
@@ -399,7 +407,7 @@ const SettingsPage: React.FC = () => {
                         onClick={() =>
                           item.enabled && startTransition(() => setActiveSection(item.id))
                         }
-                        disabled={!item.enabled}
+                        disabled={!item.enabled || contentProtectionApplying}
                       >
                         <span className="settings-nav-item-icon">{item.icon}</span>
                         {item.label}
@@ -418,6 +426,7 @@ const SettingsPage: React.FC = () => {
                                 onClick={() =>
                                   handleSubNavClick(item.id, sub.id, sub.focusControlId)
                                 }
+                                disabled={contentProtectionApplying}
                               >
                                 {sub.label}
                               </button>
@@ -442,11 +451,25 @@ const SettingsPage: React.FC = () => {
                       ? 'Settings have changed! Applying will restart the app.'
                       : 'Settings have changed! Would you like to apply?'}
                   </p>
+                  {contentProtectionApplyFailed && (
+                    <p className="settings-pending-blob-text" role="alert">
+                      Couldn’t apply screen-capture protection. Your change has not been saved. Try
+                      again.
+                    </p>
+                  )}
                   <div className="settings-pending-blob-actions">
-                    <button className="settings-pending-blob-apply" onClick={apply}>
+                    <button
+                      className="settings-pending-blob-apply"
+                      onClick={() => void apply()}
+                      disabled={contentProtectionApplying}
+                    >
                       {hwAccelChanged ? 'Apply & Restart' : 'Apply'}
                     </button>
-                    <button className="settings-pending-blob-revert" onClick={revert}>
+                    <button
+                      className="settings-pending-blob-revert"
+                      onClick={revert}
+                      disabled={contentProtectionApplying}
+                    >
                       Revert
                     </button>
                   </div>
@@ -458,6 +481,25 @@ const SettingsPage: React.FC = () => {
             <div
               ref={contentRef}
               className={`settings-content${isPending ? ' settings-content-loading' : ''}`}
+              inert={contentProtectionApplying}
+              onClickCapture={(event) => {
+                if (contentProtectionApplying) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }}
+              onChangeCapture={(event) => {
+                if (contentProtectionApplying) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }}
+              onKeyDownCapture={(event) => {
+                if (contentProtectionApplying) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }}
             >
               {/* Expand/Collapse All control (closes #297). Self-hides when
                   the active panel has no collapsible sections, so this row

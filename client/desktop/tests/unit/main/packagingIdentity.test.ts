@@ -12,6 +12,7 @@ import type { ForgeConfig } from '@electron-forge/shared-types';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ALLOWED_WINDOWS_PUBLISHERS } from '../../../src/shared/allowedWindowsPublishers';
+import { FuseVersion, FuseV1Options } from '@electron/fuses';
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -115,6 +116,19 @@ function expectLinuxIconConfig(icon: unknown) {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 describe('Packaging Identity (#382)', () => {
+  it('configures the five Electron hardening fuses', async () => {
+    const config = await loadForgeConfig();
+    const fuses = config.plugins?.find((plugin) => plugin.name === 'fuses') as
+      { fusesConfig?: unknown } | undefined;
+    expect(fuses?.fusesConfig).toEqual({
+      version: FuseVersion.V1,
+      [FuseV1Options.RunAsNode]: false,
+      [FuseV1Options.EnableNodeCliInspectArguments]: false,
+      [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
+      [FuseV1Options.OnlyLoadAppFromAsar]: true,
+      [FuseV1Options.EnableCookieEncryption]: true,
+    });
+  });
   describe('package.json', () => {
     it('has productName set to "Concord Voice" (display name with space)', () => {
       expect(pkgJson.productName).toBe(EXPECTED_DISPLAY_NAME);

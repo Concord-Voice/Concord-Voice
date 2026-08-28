@@ -33,12 +33,20 @@ import ActivityHistoryCard from './ActivityHistoryCard';
 import PresenceHistorySection from '../Profile/PresenceHistorySection';
 import ToggleSwitch from './ToggleSwitch';
 import PurgeFenceStepUpDialog from './PurgeFenceStepUpDialog';
+import {
+  setDraftContentProtection,
+  useDraftContentProtection,
+  useDraftContentProtectionApplying,
+  useDraftContentProtectionLoaded,
+} from '../../hooks/useDraftSettings';
 import './MFA.css';
 
 // #1354: the purge dead-end card navigates here by control id
 // (`settingsNavStore.requestFocus('privacy', 'requireAuthBeforePurge')`),
 // so the switch id and the label it points at are a cross-component contract.
 const PURGE_AUTH_LABEL_ID = 'requireAuthBeforePurge-label';
+const CONTENT_PROTECTION_LABEL_ID = 'contentProtection-label';
+const CONTENT_PROTECTION_HINT_ID = 'contentProtection-hint';
 
 interface Session {
   id: string;
@@ -670,6 +678,10 @@ const PrivacySecuritySection: React.FC = () => {
   const fetchPrivacy = usePrivacyStore((s) => s.fetchPrivacy);
   const updatePrivacy = usePrivacyStore((s) => s.updatePrivacy);
   const privacyLoaded = usePrivacyStore((s) => s.loaded);
+  const contentProtection = useDraftContentProtection();
+  const contentProtectionLoaded = useDraftContentProtectionLoaded();
+  const contentProtectionApplying = useDraftContentProtectionApplying();
+  const [contentProtectionPlatform, setContentProtectionPlatform] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
   const [activityHistoryControlsVisible, setActivityHistoryControlsVisible] = useState(false);
@@ -721,6 +733,21 @@ const PrivacySecuritySection: React.FC = () => {
   const [backupResetError, setBackupResetError] = useState('');
   const [backupResetLoading, setBackupResetLoading] = useState(false);
   const [backupResetCodes, setBackupResetCodes] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    void globalThis.electron
+      ?.getPlatform?.()
+      .then((platform) => {
+        if (mounted) setContentProtectionPlatform(platform);
+      })
+      .catch(() => {
+        if (mounted) setContentProtectionPlatform(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // SSO Security flags (issue #270). Hydrated on mount from
   // GET /users/me/security so the toggles reflect the actual server state
@@ -1451,12 +1478,44 @@ const PrivacySecuritySection: React.FC = () => {
       </div>
     );
 
+  const renderContentProtectionControl = () =>
+    contentProtectionLoaded &&
+    (contentProtectionPlatform === 'darwin' || contentProtectionPlatform === 'win32') && (
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <label
+            className="settings-row-label"
+            id={CONTENT_PROTECTION_LABEL_ID}
+            htmlFor="contentProtection"
+          >
+            Protect Concord windows from screen capture
+          </label>
+          <span className="settings-row-hint" id={CONTENT_PROTECTION_HINT_ID}>
+            When applied, Concord asks macOS or Windows to prevent its main and picture-in-picture
+            call windows from being captured. Your operating system may not block every capture
+            method.
+          </span>
+        </div>
+        <ToggleSwitch
+          id="contentProtection"
+          checked={contentProtection}
+          onChange={setDraftContentProtection}
+          disabled={contentProtectionApplying}
+          ariaLabelledBy={CONTENT_PROTECTION_LABEL_ID}
+          aria-describedby={CONTENT_PROTECTION_HINT_ID}
+          inputRole="switch"
+        />
+      </div>
+    );
+
   return (
     <>
       <CollapsibleSection id="section-privacy-settings" title="Privacy">
         <p className="settings-section-description">
           Control who can message you and how others can find you.
         </p>
+
+        {renderContentProtectionControl()}
 
         <DMPrivacyControls
           localDmLevel={localDmLevel}

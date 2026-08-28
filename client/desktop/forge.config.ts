@@ -6,6 +6,8 @@ import { MakerDMG } from '@electron-forge/maker-dmg';
 import { MakerDeb } from '@electron-forge/maker-deb';
 import { MakerRpm } from '@electron-forge/maker-rpm';
 import { MakerAppImage } from '@reforged/maker-appimage';
+import { FusesPlugin } from '@electron-forge/plugin-fuses';
+import { FuseVersion, FuseV1Options } from '@electron/fuses';
 import fs from 'fs';
 
 // macOS signing & notarization — active only when CI provides all required env vars.
@@ -296,6 +298,16 @@ const config: ForgeConfig = {
         categories: ['Network', 'Chat'],
         icon: linuxIconConfig(),
       },
+    }),
+  ],
+  plugins: [
+    new FusesPlugin({
+      version: FuseVersion.V1,
+      [FuseV1Options.RunAsNode]: false,
+      [FuseV1Options.EnableNodeCliInspectArguments]: false,
+      [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
+      [FuseV1Options.OnlyLoadAppFromAsar]: true,
+      [FuseV1Options.EnableCookieEncryption]: true,
     }),
   ],
 };

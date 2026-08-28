@@ -101,6 +101,9 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.invoke('app:getHardwareAcceleration') as Promise<boolean>,
   setHardwareAcceleration: (enabled: boolean) =>
     ipcRenderer.invoke('app:setHardwareAcceleration', enabled),
+  getContentProtection: () => ipcRenderer.invoke('app:getContentProtection') as Promise<boolean>,
+  setContentProtection: (enabled: boolean) =>
+    ipcRenderer.invoke('app:setContentProtection', enabled) as Promise<boolean>,
   relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
   quitApp: () => ipcRenderer.invoke('app:quit'),
 
@@ -533,6 +536,8 @@ export interface ElectronAPI {
   >;
   getHardwareAcceleration: () => Promise<boolean>;
   setHardwareAcceleration: (enabled: boolean) => Promise<void>;
+  getContentProtection: () => Promise<boolean>;
+  setContentProtection: (enabled: boolean) => Promise<boolean>;
   relaunchApp: () => Promise<void>;
   quitApp: () => Promise<void>;
   openPipWindow: (opts: {

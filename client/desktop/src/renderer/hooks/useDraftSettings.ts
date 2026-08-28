@@ -65,6 +65,24 @@ export function useDraftTtsSetting<K extends keyof DraftableTTSSettings>(
   );
 }
 
+export function useDraftContentProtection(): boolean {
+  return useDraftSettingsStore(
+    (s) => s.drafts.contentProtection ?? s.snapshot?.contentProtection ?? false
+  );
+}
+
+export function useDraftContentProtectionLoaded(): boolean {
+  return useDraftSettingsStore((s) => s.contentProtectionLoaded);
+}
+
+export function useDraftContentProtectionApplying(): boolean {
+  return useDraftSettingsStore((s) => s.contentProtectionApplying);
+}
+
+export function useDraftContentProtectionApplyFailed(): boolean {
+  return useDraftSettingsStore((s) => s.contentProtectionApplyFailed);
+}
+
 export function useDraftAppearance(): AppearanceSettings {
   return useStoreWithEqualityFn(
     useDraftSettingsStore,
@@ -102,6 +120,10 @@ export function setDraftTtsSetting<K extends keyof DraftableTTSSettings>(
   useDraftSettingsStore.getState().setTtsDraft(key, value);
 }
 
+export function setDraftContentProtection(enabled: boolean) {
+  useDraftSettingsStore.getState().setContentProtectionDraft(enabled);
+}
+
 export function setDraftAppearanceSetting<K extends keyof DraftableAppearanceSettings>(
   key: K,
   value: DraftableAppearanceSettings[K]
@@ -136,10 +158,20 @@ export function useDraftActions() {
       Object.keys(s.drafts.appearance).length > 0 ||
       Object.keys(s.drafts.audio).length > 0 ||
       Object.keys(s.drafts.video).length > 0 ||
-      Object.keys(s.drafts.tts).length > 0
+      Object.keys(s.drafts.tts).length > 0 ||
+      s.drafts.contentProtection !== undefined
   );
   const hwAccelChanged = useDraftSettingsStore((s) => 'hardwareAcceleration' in s.drafts.video);
-  return { apply, revert, hasPendingChanges, hwAccelChanged };
+  const contentProtectionApplying = useDraftSettingsStore((s) => s.contentProtectionApplying);
+  const contentProtectionApplyFailed = useDraftSettingsStore((s) => s.contentProtectionApplyFailed);
+  return {
+    apply,
+    revert,
+    hasPendingChanges,
+    hwAccelChanged,
+    contentProtectionApplying,
+    contentProtectionApplyFailed,
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, within, act } from '../../../test-utils';
 import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
 import { vi } from 'vitest';
 
 const mockApiFetch = vi.fn();
@@ -3591,6 +3592,84 @@ describe('PrivacySecuritySection — friend-request control awaits `loaded` (#12
     expect(within(group).getByText('Loading your setting…')).toBeInTheDocument();
     expect(
       within(group).queryByText('Anyone can send you a friend request.')
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe('PrivacySecuritySection — screen-capture protection (#2468)', () => {
+  const electron = () =>
+    window.electron as typeof window.electron & {
+      getPlatform: () => Promise<string>;
+      getContentProtection: () => Promise<boolean>;
+    };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    electron().getContentProtection = vi.fn().mockResolvedValue(false);
+    useDraftSettingsStore.getState().teardown();
+    useDraftSettingsStore.getState().initialize();
+  });
+
+  it.each(['darwin', 'win32'])(
+    'renders the accessible protection toggle on %s',
+    async (platform) => {
+      electron().getPlatform = vi.fn().mockResolvedValue(platform);
+      render(<PrivacySecuritySection />);
+
+      const toggle = await screen.findByRole('switch', {
+        name: 'Protect Concord windows from screen capture',
+      });
+      expect(toggle).not.toBeChecked();
+      expect(
+        screen.getByText(
+          'When applied, Concord asks macOS or Windows to prevent its main and picture-in-picture call windows from being captured. Your operating system may not block every capture method.'
+        )
+      ).toBeInTheDocument();
+      const hint = screen.getByText(
+        'When applied, Concord asks macOS or Windows to prevent its main and picture-in-picture call windows from being captured. Your operating system may not block every capture method.'
+      );
+      expect(toggle).toHaveAttribute('aria-describedby', hint.id);
+    }
+  );
+
+  it.each(['darwin', 'win32'])(
+    'keeps protection hidden on %s when the preload methods are unavailable',
+    async (platform) => {
+      electron().getPlatform = vi.fn().mockResolvedValue(platform);
+      const bridge = electron() as Record<string, unknown>;
+      const getContentProtection = bridge.getContentProtection;
+      const setContentProtection = bridge.setContentProtection;
+      delete bridge.getContentProtection;
+      delete bridge.setContentProtection;
+
+      try {
+        useDraftSettingsStore.getState().teardown();
+        useDraftSettingsStore.getState().initialize();
+        render(<PrivacySecuritySection />);
+        await act(async () => {
+          await Promise.resolve();
+        });
+
+        expect(
+          screen.queryByRole('switch', {
+            name: 'Protect Concord windows from screen capture',
+          })
+        ).not.toBeInTheDocument();
+      } finally {
+        bridge.getContentProtection = getContentProtection;
+        bridge.setContentProtection = setContentProtection;
+      }
+    }
+  );
+
+  it('does not render the protection toggle on Linux', async () => {
+    electron().getPlatform = vi.fn().mockResolvedValue('linux');
+    render(<PrivacySecuritySection />);
+    await screen.findByText('Privacy');
+    expect(
+      screen.queryByRole('switch', {
+        name: 'Protect Concord windows from screen capture',
+      })
     ).not.toBeInTheDocument();
   });
 });

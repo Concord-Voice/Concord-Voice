@@ -159,6 +159,61 @@ function readHwAccelPref(): boolean {
   }
 }
 
+const contentProtectionPrefPath = path.join(app.getPath('userData'), 'content-protection.json');
+const contentProtectionPrefTempPath = `${contentProtectionPrefPath}.${process.pid}.tmp`;
+
+type ContentProtectionPreference =
+  { enabled: boolean } | { enabled: boolean; previousEnabled: boolean; staged: true };
+
+function isContentProtectionPreference(value: unknown): value is ContentProtectionPreference {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (record.enabled === true || record.enabled === false) {
+    const keys = Object.keys(record);
+    if (keys.length === 1 && keys[0] === 'enabled') return true;
+    return (
+      record.staged === true &&
+      (record.previousEnabled === true || record.previousEnabled === false) &&
+      keys.length === 3 &&
+      keys.includes('enabled') &&
+      keys.includes('previousEnabled') &&
+      keys.includes('staged')
+    );
+  }
+  return false;
+}
+
+function readContentProtectionPref(): boolean {
+  try {
+    const data: unknown = JSON.parse(fs.readFileSync(contentProtectionPrefPath, 'utf-8'));
+    if (!isContentProtectionPreference(data)) return false;
+    return 'staged' in data && data.staged ? data.previousEnabled : data.enabled;
+  } catch {
+    return false;
+  }
+}
+
+function writeContentProtectionPref(preference: ContentProtectionPreference): boolean {
+  try {
+    fs.writeFileSync(contentProtectionPrefTempPath, JSON.stringify(preference), 'utf-8');
+    fs.renameSync(contentProtectionPrefTempPath, contentProtectionPrefPath);
+    return true;
+  } catch {
+    try {
+      fs.unlinkSync(contentProtectionPrefTempPath);
+    } catch {
+      // The failed temp file never becomes the preference authority.
+    }
+    return false;
+  }
+}
+
+function getContentProtectionWindows(): BrowserWindow[] {
+  const windows = mainWindow ? [mainWindow] : [];
+  for (const { window } of pipWindows.values()) windows.push(window);
+  return windows.filter((window) => !window.isDestroyed());
+}
+
 // Developer Mode preference (#TBD) — gates DevTools access in packaged builds.
 // MUST be removed before BETA release per security review.
 const devModePrefPath = path.join(app.getPath('userData'), 'developer-mode.json');
@@ -706,6 +761,7 @@ const createWindow = async (): Promise<void> => {
   // the saved bounds if window-state.json exists and the validator accepts
   // them; otherwise defaults to centered (x/y undefined → OS default placement).
   const savedState = loadWindowState();
+  const contentProtectionEnabled = readContentProtectionPref();
 
   mainWindow = new BrowserWindow({
     ...baseConfig,
@@ -714,6 +770,11 @@ const createWindow = async (): Promise<void> => {
     width: savedState.width,
     height: savedState.height,
   });
+  try {
+    mainWindow.setContentProtection(contentProtectionEnabled);
+  } catch {
+    console.warn('[ContentProtection] Failed to apply preference to main window');
+  }
   resetDeepLinkDelivery();
 
   if (savedState.isMaximized) {
@@ -1299,6 +1360,41 @@ ipcMain.handle('app:getHardwareAcceleration', () => readHwAccelPref());
 ipcMain.handle('app:setHardwareAcceleration', (event, enabled: boolean) => {
   if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return;
   fs.writeFileSync(hwAccelPrefPath, JSON.stringify({ enabled }), 'utf-8');
+});
+
+ipcMain.handle('app:getContentProtection', async (event) => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return false;
+  return readContentProtectionPref();
+});
+
+ipcMain.handle('app:setContentProtection', async (event, enabled: unknown): Promise<boolean> => {
+  if (!requireTrustedSender(event, getRemoteSpaBaseUrl()) || typeof enabled !== 'boolean') {
+    return false;
+  }
+
+  const previous = readContentProtectionPref();
+  if (!writeContentProtectionPref({ enabled, previousEnabled: previous, staged: true })) {
+    return false;
+  }
+
+  const updated: BrowserWindow[] = [];
+  try {
+    for (const window of getContentProtectionWindows()) {
+      window.setContentProtection(enabled);
+      updated.push(window);
+    }
+    if (!writeContentProtectionPref({ enabled })) throw new Error('content protection preference');
+    return true;
+  } catch {
+    for (const window of updated) {
+      try {
+        window.setContentProtection(previous);
+      } catch {
+        // Preserve rollback attempts for every previously updated window.
+      }
+    }
+    return false;
+  }
 });
 
 // Relaunch (for hardware acceleration toggle)
@@ -1970,6 +2066,7 @@ ipcMain.handle(
       return;
     }
 
+    const contentProtectionEnabled = readContentProtectionPref();
     const pip = new BrowserWindow({
       width: opts.width || 320,
       height: opts.height || 240,
@@ -1993,6 +2090,11 @@ ipcMain.handle(
       },
       backgroundColor: '#000',
     });
+    try {
+      pip.setContentProtection(contentProtectionEnabled);
+    } catch {
+      console.warn('[ContentProtection] Failed to apply preference to PiP window');
+    }
 
     // Load PiP route (hash-based routing)
     if (!app.isPackaged) {

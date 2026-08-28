@@ -1,4 +1,5 @@
 import { createStore } from '../utils/createStore';
+import { useDraftSettingsStore } from './draftSettingsStore';
 
 /**
  * Settings Overlay Store
@@ -12,6 +13,10 @@ import { createStore } from '../utils/createStore';
  */
 
 export type SettingsOverlayKind = 'app' | 'server';
+
+export function isSettingsOverlayDismissBlocked(open: SettingsOverlayKind | null): boolean {
+  return open === 'app' && useDraftSettingsStore.getState().contentProtectionApplying;
+}
 
 export interface SettingsOverlayPayload {
   /** Required when kind === 'server'. */
@@ -29,5 +34,11 @@ export const useSettingsOverlayStore = createStore<SettingsOverlayState>()((set)
   open: null,
   payload: null,
   openSettings: (kind, payload) => set({ open: kind, payload: payload ?? null }),
-  close: () => set({ open: null, payload: null }),
+  close: () =>
+    set((state) => {
+      if (isSettingsOverlayDismissBlocked(state.open)) {
+        return state;
+      }
+      return { open: null, payload: null };
+    }),
 }));

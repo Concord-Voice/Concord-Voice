@@ -53,6 +53,146 @@ beforeEach(() => {
 });
 
 describe('draftSettingsStore', () => {
+  describe('content protection draft lifecycle (#2468)', () => {
+    const getContentProtection = vi.fn<[], Promise<boolean>>();
+    const setContentProtection = vi.fn<[boolean], Promise<boolean>>();
+
+    beforeEach(() => {
+      getContentProtection.mockResolvedValue(false);
+      setContentProtection.mockResolvedValue(true);
+      Object.assign(globalThis.electron, { getContentProtection, setContentProtection });
+    });
+
+    it('hydrates the durable value and keeps toggling draft-only', async () => {
+      getContentProtection.mockResolvedValue(true);
+      useDraftSettingsStore.getState().initialize();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useDraftSettingsStore.getState().snapshot?.contentProtection).toBe(true);
+      useDraftSettingsStore.getState().setContentProtectionDraft(false);
+      expect(setContentProtection).not.toHaveBeenCalled();
+    });
+
+    it('merges pending hydration into the current snapshot after apply', async () => {
+      let resolveGetter: ((value: boolean) => void) | undefined;
+      const pendingGetter = new Promise<boolean>((resolve) => {
+        resolveGetter = resolve;
+      });
+      getContentProtection.mockReturnValueOnce(pendingGetter);
+
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setAudioDraft('inputVolume', 42);
+      await useDraftSettingsStore.getState().apply();
+
+      resolveGetter?.(true);
+      await pendingGetter;
+      await Promise.resolve();
+
+      const { snapshot, contentProtectionLoaded } = useDraftSettingsStore.getState();
+      expect(contentProtectionLoaded).toBe(true);
+      expect(snapshot?.audio.inputVolume).toBe(42);
+      expect(snapshot?.contentProtection).toBe(true);
+    });
+
+    it('keeps the control unavailable when an older shell lacks the bridge', () => {
+      Object.assign(globalThis.electron, {
+        getContentProtection: undefined,
+        setContentProtection: undefined,
+      });
+      useDraftSettingsStore.getState().initialize();
+      expect(useDraftSettingsStore.getState().contentProtectionLoaded).toBe(false);
+    });
+
+    it('reverts without IPC and retains a failed Apply draft', async () => {
+      useDraftSettingsStore.getState().initialize();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      useDraftSettingsStore.getState().setContentProtectionDraft(true);
+      setContentProtection.mockResolvedValue(false);
+      await useDraftSettingsStore.getState().apply();
+      expect(useDraftSettingsStore.getState().drafts.contentProtection).toBe(true);
+      expect(useDraftSettingsStore.getState().contentProtectionApplyFailed).toBe(true);
+      useDraftSettingsStore.getState().revert();
+      expect(setContentProtection).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears the draft after successful Apply', async () => {
+      useDraftSettingsStore.getState().initialize();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      useDraftSettingsStore.getState().setContentProtectionDraft(true);
+      await useDraftSettingsStore.getState().apply();
+      expect(setContentProtection).toHaveBeenCalledWith(true);
+      expect(useDraftSettingsStore.getState().drafts.contentProtection).toBeUndefined();
+    });
+
+    it('allows only one content protection apply at a time', async () => {
+      setContentProtection.mockClear();
+      let resolveSetter: ((value: boolean) => void) | undefined;
+      const pendingSetter = new Promise<boolean>((resolve) => {
+        resolveSetter = resolve;
+      });
+      setContentProtection.mockReturnValueOnce(pendingSetter);
+
+      useDraftSettingsStore.getState().initialize();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      useDraftSettingsStore.getState().setContentProtectionDraft(true);
+
+      const firstApply = useDraftSettingsStore.getState().apply();
+      const secondApply = useDraftSettingsStore.getState().apply();
+      expect(setContentProtection).toHaveBeenCalledTimes(1);
+
+      resolveSetter?.(true);
+      await Promise.all([firstApply, secondApply]);
+      expect(useDraftSettingsStore.getState().contentProtectionApplying).toBe(false);
+    });
+
+    it('clears applying when hydration replaces the snapshot during Apply', async () => {
+      let resolveGetter: ((value: boolean) => void) | undefined;
+      let resolveSetter: ((value: boolean) => void) | undefined;
+      const pendingGetter = new Promise<boolean>((resolve) => {
+        resolveGetter = resolve;
+      });
+      const pendingSetter = new Promise<boolean>((resolve) => {
+        resolveSetter = resolve;
+      });
+      getContentProtection.mockReturnValueOnce(pendingGetter);
+      setContentProtection.mockReturnValueOnce(pendingSetter);
+
+      useDraftSettingsStore.getState().initialize();
+      useDraftSettingsStore.getState().setContentProtectionDraft(true);
+      const applyPromise = useDraftSettingsStore.getState().apply();
+      expect(useDraftSettingsStore.getState().contentProtectionApplying).toBe(true);
+
+      resolveGetter?.(false);
+      await pendingGetter;
+      await Promise.resolve();
+      expect(useDraftSettingsStore.getState().contentProtectionLoaded).toBe(true);
+      expect(useDraftSettingsStore.getState().contentProtectionApplying).toBe(true);
+
+      resolveSetter?.(true);
+      await applyPromise;
+      expect(useDraftSettingsStore.getState().contentProtectionApplying).toBe(false);
+      expect(useDraftSettingsStore.getState().drafts.contentProtection).toBeUndefined();
+      expect(useDraftSettingsStore.getState().snapshot?.contentProtection).toBe(true);
+    });
+
+    it('fails closed when getter hydration rejects', async () => {
+      getContentProtection.mockRejectedValue(new Error('bridge unavailable'));
+      useDraftSettingsStore.getState().initialize();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useDraftSettingsStore.getState().contentProtectionLoaded).toBe(true);
+      expect(useDraftSettingsStore.getState().snapshot?.contentProtection).toBe(false);
+    });
+
+    it('retains the draft and clears applying when setter rejects', async () => {
+      useDraftSettingsStore.getState().initialize();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      useDraftSettingsStore.getState().setContentProtectionDraft(true);
+      setContentProtection.mockRejectedValue(new Error('bridge unavailable'));
+      await useDraftSettingsStore.getState().apply();
+      expect(useDraftSettingsStore.getState().contentProtectionApplying).toBe(false);
+      expect(useDraftSettingsStore.getState().drafts.contentProtection).toBe(true);
+      expect(useDraftSettingsStore.getState().contentProtectionApplyFailed).toBe(true);
+    });
+  });
   // ── Initial state ─────────────────────────────────────────────────────
 
   describe('initial state', () => {

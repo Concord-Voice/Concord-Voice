@@ -1,6 +1,9 @@
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
+import {
+  isSettingsOverlayDismissBlocked,
+  useSettingsOverlayStore,
+} from '../../stores/settingsOverlayStore';
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './SettingsOverlayHost.css';
 
@@ -69,7 +72,12 @@ const SettingsOverlayHost: React.FC = () => {
     if (!open) return;
     if (dialogCancelsOnEscape) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
+      if (
+        e.key === 'Escape' &&
+        !isSettingsOverlayDismissBlocked(useSettingsOverlayStore.getState().open)
+      ) {
+        close();
+      }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
@@ -82,15 +90,26 @@ const SettingsOverlayHost: React.FC = () => {
   useEffect(() => {
     const dlg = dialogRef.current;
     if (!dlg) return;
+    const dismissBlocked = () =>
+      isSettingsOverlayDismissBlocked(useSettingsOverlayStore.getState().open);
+    const handleCancel = (e: Event) => {
+      if (dismissBlocked()) e.preventDefault();
+    };
     const handleClose = () => {
-      if (open) close();
+      if (dismissBlocked()) {
+        dlg.showModal();
+        return;
+      }
+      if (useSettingsOverlayStore.getState().open) close();
     };
     const handleClick = (e: MouseEvent) => {
-      if (e.target === dlg) close();
+      if (e.target === dlg && !dismissBlocked()) close();
     };
+    dlg.addEventListener('cancel', handleCancel);
     dlg.addEventListener('close', handleClose);
     dlg.addEventListener('click', handleClick);
     return () => {
+      dlg.removeEventListener('cancel', handleCancel);
       dlg.removeEventListener('close', handleClose);
       dlg.removeEventListener('click', handleClick);
     };

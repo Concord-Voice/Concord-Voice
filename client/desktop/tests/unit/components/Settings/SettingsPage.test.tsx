@@ -561,3 +561,89 @@ describe('SettingsPage', () => {
     });
   });
 });
+
+describe('SettingsPage — content protection pending changes (#2468)', () => {
+  it('shows the shared Apply/Revert blob and awaits the content-protection IPC', async () => {
+    const electron = window.electron as typeof window.electron & {
+      getContentProtection: () => Promise<boolean>;
+      setContentProtection: (enabled: boolean) => Promise<boolean>;
+    };
+    electron.getPlatform = vi.fn().mockResolvedValue('darwin');
+    electron.getContentProtection = vi.fn().mockResolvedValue(false);
+    let resolveSetter: ((value: boolean) => void) | undefined;
+    electron.setContentProtection = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveSetter = resolve;
+        })
+    );
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText('Privacy & Security'));
+    const toggle = await screen.findByRole('switch', {
+      name: 'Protect Concord windows from screen capture',
+    });
+    fireEvent.click(toggle);
+    expect(
+      await screen.findByText('Settings have changed! Would you like to apply?')
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(electron.setContentProtection).toHaveBeenCalledWith(true);
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Appearance' })).toBeDisabled();
+    expect(document.querySelector('.settings-content')).toHaveAttribute('inert');
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+    expect(document.querySelector('.settings-nav-item.active')).toHaveTextContent(
+      'Privacy & Security'
+    );
+    resolveSetter?.(true);
+    await vi.waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument()
+    );
+  });
+
+  it('renders the exact alert when content-protection Apply fails', async () => {
+    const electron = window.electron as typeof window.electron & {
+      getContentProtection: () => Promise<boolean>;
+      setContentProtection: (enabled: boolean) => Promise<boolean>;
+    };
+    electron.getPlatform = vi.fn().mockResolvedValue('darwin');
+    electron.getContentProtection = vi.fn().mockResolvedValue(false);
+    electron.setContentProtection = vi.fn().mockResolvedValue(false);
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(
+      await screen.findByRole('switch', {
+        name: 'Protect Concord windows from screen capture',
+      })
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
+    const failure = await screen.findByText(
+      'Couldn’t apply screen-capture protection. Your change has not been saved. Try again.'
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+    expect(failure.closest('[role="alert"]')).toContainElement(failure);
+    expect(document.querySelector('.settings-nav-item.active')).toHaveTextContent('Appearance');
+    expect(
+      screen.queryByRole('switch', { name: 'Protect Concord windows from screen capture' })
+    ).toBeNull();
+  });
+
+  it('Revert clears a content-protection draft without calling IPC', async () => {
+    const electron = window.electron as typeof window.electron & {
+      getContentProtection: () => Promise<boolean>;
+      setContentProtection: (enabled: boolean) => Promise<boolean>;
+    };
+    electron.getPlatform = vi.fn().mockResolvedValue('darwin');
+    electron.getContentProtection = vi.fn().mockResolvedValue(false);
+    electron.setContentProtection = vi.fn().mockResolvedValue(true);
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText('Privacy & Security'));
+    fireEvent.click(
+      await screen.findByRole('switch', {
+        name: 'Protect Concord windows from screen capture',
+      })
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Revert' }));
+    expect(electron.setContentProtection).not.toHaveBeenCalled();
+  });
+});

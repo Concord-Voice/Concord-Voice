@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
 
 vi.mock('@/renderer/components/Settings/SettingsPage', async () => {
   const ReactModule = await import('react');
@@ -77,6 +78,7 @@ function getDialog(): HTMLDialogElement {
 describe('SettingsOverlayHost', () => {
   beforeEach(() => {
     resetAllStores();
+    useDraftSettingsStore.setState({ contentProtectionApplying: false });
     document.body.style.overflow = '';
     showModalOrder.length = 0;
   });
@@ -153,6 +155,42 @@ describe('SettingsOverlayHost', () => {
 
     const dlg = getDialog();
     fireEvent.click(dlg, { target: dlg });
+
+    expect(useSettingsOverlayStore.getState().open).toBeNull();
+  });
+
+  it('keeps app settings open while a content-protection apply is pending', async () => {
+    render(<SettingsOverlayHost />);
+    act(() => {
+      useSettingsOverlayStore.getState().openSettings('app');
+    });
+    await screen.findByTestId('mock-settings-page');
+
+    const dlg = getDialog();
+    // Set the store outside React's act boundary to exercise the native event
+    // listener before its passive effect can observe a rerender.
+    useDraftSettingsStore.setState({ contentProtectionApplying: true });
+    const cancel = new Event('cancel', { cancelable: true });
+    act(() => dlg.dispatchEvent(cancel));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(dlg, { target: dlg });
+    act(() => useSettingsOverlayStore.getState().close());
+    act(() => dlg.close());
+
+    expect(cancel.defaultPrevented).toBe(true);
+    expect(useSettingsOverlayStore.getState().open).toBe('app');
+    expect(dlg).toHaveAttribute('open');
+  });
+
+  it('still allows server settings to close while app content protection is applying', async () => {
+    render(<SettingsOverlayHost />);
+    act(() => {
+      useDraftSettingsStore.setState({ contentProtectionApplying: true });
+      useSettingsOverlayStore.getState().openSettings('server', { serverId: 'srv-42' });
+    });
+    await screen.findByTestId('mock-server-settings-page');
+
+    act(() => useSettingsOverlayStore.getState().close());
 
     expect(useSettingsOverlayStore.getState().open).toBeNull();
   });

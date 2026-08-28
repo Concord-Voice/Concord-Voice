@@ -27,6 +27,7 @@ const { mockMainWindow, mockWebContents, MockBrowserWindow } = vi.hoisted(() => 
     isDestroyed: vi.fn(() => false),
     restore: vi.fn(),
     setAlwaysOnTop: vi.fn(),
+    setContentProtection: vi.fn(),
     webContents: mockWebContents,
   };
   // Use mockImplementation (not mockReturnValue) — Vitest requires this for `new` calls
@@ -159,11 +160,16 @@ vi.mock('electron', () => ({
 
 vi.mock('node:fs', () => ({
   default: {
-    readFileSync: vi.fn(() => JSON.stringify({ enabled: true })),
+    readFileSync: vi.fn((filePath: string) =>
+      filePath.includes('content-protection.json')
+        ? JSON.stringify({ enabled: false })
+        : JSON.stringify({ enabled: true })
+    ),
     writeFileSync: vi.fn(),
     existsSync: vi.fn(() => false),
     statSync: vi.fn(() => ({ isDirectory: () => false })),
     renameSync: vi.fn(),
+    unlinkSync: vi.fn(),
   },
 }));
 
@@ -409,6 +415,18 @@ describe('main.ts', () => {
       expect(fs.readFileSync).toHaveBeenCalled();
     });
 
+    it('applies initial content protection before loading renderer content', () => {
+      const protectionOrder = mockMainWindow.setContentProtection.mock.invocationCallOrder[0];
+      const rendererLoadOrders = [
+        mockMainWindow.loadURL.mock.invocationCallOrder[0],
+        mockMainWindow.loadFile.mock.invocationCallOrder[0],
+      ].filter((order): order is number => order !== undefined);
+
+      expect(protectionOrder).toBeDefined();
+      expect(rendererLoadOrders.length).toBeGreaterThan(0);
+      expect(protectionOrder).toBeLessThan(Math.min(...rendererLoadOrders));
+    });
+
     it('appends accelerated video flags when hw accel enabled', async () => {
       const { app } = await import('electron');
       expect(app.commandLine.appendSwitch).toHaveBeenCalledWith(
@@ -457,6 +475,414 @@ describe('main.ts', () => {
   });
 
   describe('IPC: app info', () => {
+    it('registers content-protection getter and setter channels', () => {
+      expect(handlers.has('app:getContentProtection')).toBe(true);
+      expect(handlers.has('app:setContentProtection')).toBe(true);
+    });
+
+    it('returns false for absent or malformed content-protection preferences', async () => {
+      const fs = (await import('node:fs')).default;
+      (fs.readFileSync as Mock).mockImplementation(() => '{"enabled":"yes"}');
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+      (fs.readFileSync as Mock).mockImplementation(
+        () => '{"enabled":true,"previousEnabled":false,"staged":false}'
+      );
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? '{"enabled":false}' : '{"enabled":true}'
+      );
+    });
+
+    it('returns false when content-protection preferences cannot be read', async () => {
+      const fs = (await import('node:fs')).default;
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) => {
+        if (filePath.includes('content-protection.json')) throw new Error('unreadable');
+        return JSON.stringify({ enabled: true });
+      });
+
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : JSON.stringify({ enabled: true })
+      );
+    });
+
+    it('persists a trusted boolean before updating live windows', async () => {
+      const fs = (await import('node:fs')).default;
+      const pip = { isDestroyed: vi.fn(() => false), setContentProtection: vi.fn() };
+      Object.assign(pip, {
+        loadURL: vi.fn().mockResolvedValue(undefined),
+        on: vi.fn(),
+        focus: vi.fn(),
+        destroy: vi.fn(),
+      });
+      (MockBrowserWindow as Mock).mockImplementationOnce(function () {
+        return pip;
+      });
+      await handlers.get('pip:open')!(trustedIpcEvent, { id: 'content-protection-pip' });
+      (fs.writeFileSync as Mock).mockClear();
+      mockMainWindow.setContentProtection.mockClear();
+      pip.setContentProtection.mockClear();
+      const result = await handlers.get('app:setContentProtection')!(trustedIpcEvent, true);
+      expect(result).toBe(true);
+      expect(fs.writeFileSync).toHaveBeenNthCalledWith(
+        1,
+        expect.stringMatching(/content-protection\.json\.\d+\.tmp$/),
+        JSON.stringify({ enabled: true, previousEnabled: false, staged: true }),
+        'utf-8'
+      );
+      expect(fs.renameSync).toHaveBeenNthCalledWith(
+        1,
+        expect.stringMatching(/content-protection\.json\.\d+\.tmp$/),
+        expect.stringContaining('content-protection.json')
+      );
+      expect(fs.writeFileSync).toHaveBeenNthCalledWith(
+        2,
+        expect.stringMatching(/content-protection\.json\.\d+\.tmp$/),
+        JSON.stringify({ enabled: true }),
+        'utf-8'
+      );
+      expect(mockMainWindow.setContentProtection).toHaveBeenCalledWith(true);
+      expect(pip.setContentProtection).toHaveBeenCalledWith(true);
+      expect(fs.renameSync.mock.invocationCallOrder[0]).toBeLessThan(
+        mockMainWindow.setContentProtection.mock.invocationCallOrder[0]
+      );
+      expect(fs.renameSync.mock.invocationCallOrder[0]).toBeLessThan(
+        pip.setContentProtection.mock.invocationCallOrder[0]
+      );
+    });
+
+    it('canonicalizes the target value only after every live window accepts it', async () => {
+      const fs = (await import('node:fs')).default;
+      let durable = JSON.stringify({ enabled: false });
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+      );
+      let temporary = '';
+      (fs.writeFileSync as Mock).mockImplementation((_filePath: string, contents: string) => {
+        temporary = contents;
+      });
+      (fs.renameSync as Mock).mockImplementation(() => {
+        durable = temporary;
+      });
+
+      await expect(handlers.get('app:setContentProtection')!(trustedIpcEvent, true)).resolves.toBe(
+        true
+      );
+      expect(durable).toBe(JSON.stringify({ enabled: true }));
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(true);
+
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : '{"enabled":true}'
+      );
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+      (fs.renameSync as Mock).mockImplementation(() => undefined);
+    });
+
+    it('keeps the staged previous value durable when a native content-protection call fails', async () => {
+      const fs = (await import('node:fs')).default;
+      const pip = {
+        isDestroyed: vi.fn(() => false),
+        setContentProtection: vi.fn(),
+        loadURL: vi.fn().mockResolvedValue(undefined),
+        on: vi.fn(),
+        focus: vi.fn(),
+        destroy: vi.fn(),
+      };
+      (MockBrowserWindow as Mock).mockImplementationOnce(function () {
+        return pip;
+      });
+      await handlers.get('pip:open')!(trustedIpcEvent, { id: 'content-protection-rollback-pip' });
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+      mockMainWindow.setContentProtection.mockReset();
+      pip.setContentProtection.mockReset();
+      pip.setContentProtection.mockImplementation(() => {
+        throw new Error('native failure');
+      });
+      const result = await handlers.get('app:setContentProtection')!(trustedIpcEvent, true);
+      expect(result).toBe(false);
+      expect(mockMainWindow.setContentProtection).toHaveBeenLastCalledWith(false);
+      expect(fs.writeFileSync).toHaveBeenLastCalledWith(
+        expect.stringMatching(/content-protection\.json\.\d+\.tmp$/),
+        JSON.stringify({ enabled: true, previousEnabled: false, staged: true }),
+        'utf-8'
+      );
+    });
+
+    it('reads the old value from a staged record after native failure in either direction', async () => {
+      const fs = (await import('node:fs')).default;
+      let durable = JSON.stringify({ enabled: true });
+      let temporary = '';
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+      );
+      (fs.writeFileSync as Mock).mockImplementation((_filePath: string, contents: string) => {
+        temporary = contents;
+      });
+      (fs.renameSync as Mock).mockImplementation(() => {
+        durable = temporary;
+      });
+      mockMainWindow.setContentProtection.mockImplementationOnce(() => {
+        throw new Error('native failure');
+      });
+
+      await expect(handlers.get('app:setContentProtection')!(trustedIpcEvent, false)).resolves.toBe(
+        false
+      );
+      expect(durable).toBe(JSON.stringify({ enabled: false, previousEnabled: true, staged: true }));
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(true);
+
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : '{"enabled":true}'
+      );
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+      (fs.renameSync as Mock).mockImplementation(() => undefined);
+      mockMainWindow.setContentProtection.mockImplementation(() => undefined);
+    });
+
+    it('rolls back live windows and keeps the old value durable when canonicalization fails', async () => {
+      const fs = (await import('node:fs')).default;
+      let durable = JSON.stringify({ enabled: false });
+      let temporary = '';
+      let renames = 0;
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+      );
+      (fs.writeFileSync as Mock).mockImplementation((_filePath: string, contents: string) => {
+        temporary = contents;
+      });
+      (fs.renameSync as Mock).mockImplementation(() => {
+        renames += 1;
+        if (renames === 2) throw new Error('canonicalization failed');
+        durable = temporary;
+      });
+      mockMainWindow.setContentProtection.mockClear();
+
+      await expect(handlers.get('app:setContentProtection')!(trustedIpcEvent, true)).resolves.toBe(
+        false
+      );
+      expect(mockMainWindow.setContentProtection).toHaveBeenNthCalledWith(1, true);
+      expect(mockMainWindow.setContentProtection).toHaveBeenLastCalledWith(false);
+      expect(durable).toBe(JSON.stringify({ enabled: true, previousEnabled: false, staged: true }));
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : '{"enabled":true}'
+      );
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+      (fs.renameSync as Mock).mockImplementation(() => undefined);
+    });
+
+    it('preserves the previous enabled value when disabling cannot be canonicalized', async () => {
+      const fs = (await import('node:fs')).default;
+      let durable = JSON.stringify({ enabled: true });
+      let temporary = '';
+      let renames = 0;
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+      );
+      (fs.writeFileSync as Mock).mockImplementation((_filePath: string, contents: string) => {
+        temporary = contents;
+      });
+      (fs.renameSync as Mock).mockImplementation(() => {
+        renames += 1;
+        if (renames === 2) throw new Error('canonicalization failed');
+        durable = temporary;
+      });
+      mockMainWindow.setContentProtection.mockClear();
+
+      await expect(handlers.get('app:setContentProtection')!(trustedIpcEvent, false)).resolves.toBe(
+        false
+      );
+      expect(mockMainWindow.setContentProtection).toHaveBeenNthCalledWith(1, false);
+      expect(mockMainWindow.setContentProtection).toHaveBeenLastCalledWith(true);
+      expect(durable).toBe(JSON.stringify({ enabled: false, previousEnabled: true, staged: true }));
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(true);
+
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : '{"enabled":true}'
+      );
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+      (fs.renameSync as Mock).mockImplementation(() => undefined);
+      mockMainWindow.setContentProtection.mockImplementation(() => undefined);
+    });
+
+    it('keeps the staged destination authoritative when canonical temp write mutates then fails', async () => {
+      const fs = (await import('node:fs')).default;
+      let durable = JSON.stringify({ enabled: true });
+      let temporary = '';
+      let writes = 0;
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+      );
+      (fs.writeFileSync as Mock).mockImplementation((_filePath: string, contents: string) => {
+        temporary = contents;
+        writes += 1;
+        if (writes === 2) throw new Error('canonical temp write reached disk then failed');
+      });
+      (fs.renameSync as Mock).mockImplementation(() => {
+        durable = temporary;
+      });
+      mockMainWindow.setContentProtection.mockClear();
+
+      await expect(handlers.get('app:setContentProtection')!(trustedIpcEvent, false)).resolves.toBe(
+        false
+      );
+      expect(durable).toBe(JSON.stringify({ enabled: false, previousEnabled: true, staged: true }));
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(true);
+      expect(mockMainWindow.setContentProtection).toHaveBeenNthCalledWith(1, false);
+      expect(mockMainWindow.setContentProtection).toHaveBeenLastCalledWith(true);
+
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : '{"enabled":true}'
+      );
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+      (fs.renameSync as Mock).mockImplementation(() => undefined);
+      mockMainWindow.setContentProtection.mockImplementation(() => undefined);
+    });
+
+    it.each([
+      { previous: false, target: true },
+      { previous: true, target: false },
+    ])(
+      'keeps the existing authority when the staged temp write fails after mutation ($previous → $target)',
+      async ({ previous, target }) => {
+        const fs = (await import('node:fs')).default;
+        let durable = JSON.stringify({ enabled: previous });
+        let temporary = '';
+        (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+          filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+        );
+        (fs.writeFileSync as Mock).mockImplementation((_filePath: string, contents: string) => {
+          temporary = contents;
+          throw new Error('temp write reached disk then failed');
+        });
+        (fs.renameSync as Mock).mockClear();
+        mockMainWindow.setContentProtection.mockClear();
+
+        await expect(
+          handlers.get('app:setContentProtection')!(trustedIpcEvent, target)
+        ).resolves.toBe(false);
+        await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(
+          previous
+        );
+        expect(temporary).toBe(
+          JSON.stringify({ enabled: target, previousEnabled: previous, staged: true })
+        );
+        expect(fs.renameSync).not.toHaveBeenCalled();
+        expect(fs.unlinkSync).toHaveBeenCalledWith(
+          expect.stringMatching(/content-protection\.json\.\d+\.tmp$/)
+        );
+        expect(mockMainWindow.setContentProtection).not.toHaveBeenCalled();
+
+        (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+          filePath.includes('content-protection.json')
+            ? JSON.stringify({ enabled: false })
+            : '{"enabled":true}'
+        );
+        (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+        (fs.renameSync as Mock).mockImplementation(() => undefined);
+      }
+    );
+
+    it.each([
+      { previous: false, target: true },
+      { previous: true, target: false },
+    ])(
+      'keeps the existing authority when the staged rename fails ($previous → $target)',
+      async ({ previous, target }) => {
+        const fs = (await import('node:fs')).default;
+        let durable = JSON.stringify({ enabled: previous });
+        (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+          filePath.includes('content-protection.json') ? durable : JSON.stringify({ enabled: true })
+        );
+        (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+        (fs.renameSync as Mock).mockImplementation(() => {
+          throw new Error('rename failed');
+        });
+        mockMainWindow.setContentProtection.mockClear();
+
+        await expect(
+          handlers.get('app:setContentProtection')!(trustedIpcEvent, target)
+        ).resolves.toBe(false);
+        await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(
+          previous
+        );
+        expect(fs.unlinkSync).toHaveBeenCalledWith(
+          expect.stringMatching(/content-protection\.json\.\d+\.tmp$/)
+        );
+        expect(mockMainWindow.setContentProtection).not.toHaveBeenCalled();
+
+        (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+          filePath.includes('content-protection.json')
+            ? JSON.stringify({ enabled: false })
+            : '{"enabled":true}'
+        );
+        (fs.renameSync as Mock).mockImplementation(() => undefined);
+      }
+    );
+
+    it('applies a persisted enabled value to a new PiP before loading it', async () => {
+      const fs = (await import('node:fs')).default;
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json') ? '{"enabled":true}' : '{"enabled":true}'
+      );
+      const pip = {
+        isDestroyed: vi.fn(() => false),
+        setContentProtection: vi.fn(),
+        loadURL: vi.fn().mockResolvedValue(undefined),
+        on: vi.fn(),
+        focus: vi.fn(),
+        destroy: vi.fn(),
+      };
+      (MockBrowserWindow as Mock).mockImplementationOnce(function () {
+        return pip;
+      });
+      await handlers.get('pip:open')!(trustedIpcEvent, { id: 'content-protection-persisted-pip' });
+      expect(pip.setContentProtection).toHaveBeenCalledWith(true);
+      expect(pip.setContentProtection.mock.invocationCallOrder[0]).toBeLessThan(
+        pip.loadURL.mock.invocationCallOrder[0]
+      );
+    });
+
+    it('rejects an untrusted sender and non-boolean payload without side effects', async () => {
+      const fs = (await import('node:fs')).default;
+      (fs.writeFileSync as Mock).mockClear();
+      mockMainWindow.setContentProtection.mockClear();
+      await expect(handlers.get('app:setContentProtection')!(foreignIpcEvent, true)).resolves.toBe(
+        false
+      );
+      await expect(
+        handlers.get('app:setContentProtection')!(trustedIpcEvent, 'true')
+      ).resolves.toBe(false);
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+      expect(mockMainWindow.setContentProtection).not.toHaveBeenCalled();
+    });
+
+    it('returns false on a preference write failure without native calls', async () => {
+      const fs = (await import('node:fs')).default;
+      (fs.writeFileSync as Mock).mockImplementation(() => {
+        throw new Error('disk full');
+      });
+      mockMainWindow.setContentProtection.mockClear();
+      await expect(handlers.get('app:setContentProtection')!(trustedIpcEvent, true)).resolves.toBe(
+        false
+      );
+      expect(mockMainWindow.setContentProtection).not.toHaveBeenCalled();
+      (fs.writeFileSync as Mock).mockImplementation(() => undefined);
+    });
+
     it('app:getVersion returns version', async () => {
       const result = await handlers.get('app:getVersion')!();
       expect(result).toBe('1.0.0-test');

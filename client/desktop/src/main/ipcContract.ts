@@ -169,8 +169,13 @@
  *        The SERVER's spaIpcContract stays 19 — the channel is purely additive
  *        (v9/v10/v20/v21 precedent), and a shell without it simply never
  *        delivers the friend deep link.
+ * - v23: Content protection (#2468): app:getContentProtection and
+ *        app:setContentProtection expose the main-owned exact-boolean
+ *        preference. The setter persists before applying it to live windows
+ *        and rejects invalid or untrusted calls. The SERVER's spaIpcContract
+ *        stays 19 because these default-off channels are additive.
  */
-export const IPC_CONTRACT_VERSION = 22;
+export const IPC_CONTRACT_VERSION = 23;
 
 /**
  * Opaque main-process identity for one stored credential lifecycle.

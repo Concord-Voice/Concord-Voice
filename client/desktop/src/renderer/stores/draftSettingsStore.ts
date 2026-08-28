@@ -95,6 +95,7 @@ interface SettingsSnapshot {
   audio: DraftableAudioSettings;
   video: DraftableVideoSettings;
   tts: DraftableTTSSettings;
+  contentProtection: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +193,7 @@ function pushDraftsToStore(
   }
 }
 
-function takeSnapshot(): SettingsSnapshot {
+function takeSnapshot(contentProtection = false): SettingsSnapshot {
   const appearance = structuredClone(useSettingsStore.getState().appearance);
   const audioState = useAudioSettingsStore.getState();
   const videoState = useVideoSettingsStore.getState();
@@ -203,6 +204,7 @@ function takeSnapshot(): SettingsSnapshot {
     audio: pickKeys(audioState, AUDIO_DRAFTABLE_KEYS) as DraftableAudioSettings,
     video: pickKeys(videoState, VIDEO_DRAFTABLE_KEYS) as DraftableVideoSettings,
     tts: pickKeys(ttsState, TTS_DRAFTABLE_KEYS) as DraftableTTSSettings,
+    contentProtection,
   };
 }
 
@@ -228,6 +230,7 @@ interface DraftOverlays {
   audio: Partial<DraftableAudioSettings>;
   video: Partial<DraftableVideoSettings>;
   tts: Partial<DraftableTTSSettings>;
+  contentProtection?: boolean;
 }
 
 const emptyDrafts = (): DraftOverlays => ({
@@ -235,6 +238,7 @@ const emptyDrafts = (): DraftOverlays => ({
   audio: {},
   video: {},
   tts: {},
+  contentProtection: undefined,
 });
 
 interface DraftSettingsState {
@@ -244,6 +248,9 @@ interface DraftSettingsState {
   // Mode stashes — saved draft values for the inactive audio mode
   audioBasicStash: Partial<DraftableAudioSettings> | null;
   audioAdvancedStash: Partial<DraftableAudioSettings> | null;
+  contentProtectionLoaded: boolean;
+  contentProtectionApplyFailed: boolean;
+  contentProtectionApplying: boolean;
 
   // Lifecycle
   initialize: () => void;
@@ -266,6 +273,7 @@ interface DraftSettingsState {
     key: K,
     value: DraftableTTSSettings[K]
   ) => void;
+  setContentProtectionDraft: (enabled: boolean) => void;
 
   // Batch setter (for tier slider which sets 5 fields at once)
   batchSetAudioDrafts: (updates: Partial<DraftableAudioSettings>) => void;
@@ -274,29 +282,69 @@ interface DraftSettingsState {
   stashAndSwapAudioMode: (toAdvanced: boolean, qualityTier: AudioQualityTier) => void;
 
   // Actions
-  apply: () => void;
+  apply: () => Promise<void>;
   revert: () => void;
 }
+
+let lifecycleGeneration = 0;
 
 export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get) => ({
   snapshot: null,
   drafts: emptyDrafts(),
   audioBasicStash: null,
   audioAdvancedStash: null,
+  contentProtectionLoaded: false,
+  contentProtectionApplyFailed: false,
+  contentProtectionApplying: false,
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
   initialize: () => {
+    const generation = ++lifecycleGeneration;
     setSyncSuppressed(true);
+    const snapshot = takeSnapshot();
     set({
-      snapshot: takeSnapshot(),
+      snapshot,
       drafts: emptyDrafts(),
       audioBasicStash: null,
       audioAdvancedStash: null,
+      contentProtectionLoaded: false,
+      contentProtectionApplyFailed: false,
+      contentProtectionApplying: false,
     });
+
+    const getContentProtection = globalThis.electron?.getContentProtection;
+    if (!getContentProtection) return;
+
+    void getContentProtection()
+      .then((contentProtection) => {
+        set((state) => {
+          if (generation !== lifecycleGeneration || !state.snapshot) return state;
+          const drafts = { ...state.drafts };
+          const enabled = contentProtection === true;
+          if (drafts.contentProtection === enabled) {
+            delete drafts.contentProtection;
+          }
+          return {
+            snapshot: { ...state.snapshot, contentProtection: enabled },
+            drafts,
+            contentProtectionLoaded: true,
+          };
+        });
+      })
+      .catch(() => {
+        set((state) => {
+          if (generation !== lifecycleGeneration || !state.snapshot) return state;
+          return {
+            snapshot: { ...state.snapshot, contentProtection: false },
+            contentProtectionLoaded: true,
+          };
+        });
+      });
   },
 
   teardown: () => {
+    lifecycleGeneration += 1;
     // Restore appearance from snapshot if there are pending appearance drafts
     const { snapshot, drafts } = get();
     if (snapshot && Object.keys(drafts.appearance).length > 0) {
@@ -308,6 +356,9 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
       drafts: emptyDrafts(),
       audioBasicStash: null,
       audioAdvancedStash: null,
+      contentProtectionLoaded: false,
+      contentProtectionApplyFailed: false,
+      contentProtectionApplying: false,
     });
   },
 
@@ -387,6 +438,18 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
       return { drafts: { ...state.drafts, tts: newDrafts } };
     }),
 
+  setContentProtectionDraft: (enabled) =>
+    set((state) => {
+      if (!state.snapshot) return state;
+      const drafts = { ...state.drafts };
+      if (enabled === state.snapshot.contentProtection) {
+        delete drafts.contentProtection;
+      } else {
+        drafts.contentProtection = enabled;
+      }
+      return { drafts, contentProtectionApplyFailed: false };
+    }),
+
   batchSetAudioDrafts: (updates) =>
     set((state) => {
       if (!state.snapshot) return state;
@@ -447,9 +510,41 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
 
   // ── Apply ────────────────────────────────────────────────────────────────
 
-  apply: () => {
-    const { snapshot, drafts } = get();
+  apply: async () => {
+    if (get().contentProtectionApplying) return;
+    const generation = lifecycleGeneration;
+    let { snapshot, drafts } = get();
     if (!snapshot) return;
+
+    if (drafts.contentProtection !== undefined) {
+      const contentProtection = drafts.contentProtection;
+      set({ contentProtectionApplying: true, contentProtectionApplyFailed: false });
+      let applied = false;
+      try {
+        applied = (await globalThis.electron?.setContentProtection?.(contentProtection)) === true;
+      } catch {
+        applied = false;
+      }
+      if (generation !== lifecycleGeneration || !get().snapshot) return;
+      set({ contentProtectionApplying: false });
+      if (!applied) {
+        set({ contentProtectionApplyFailed: true });
+        return;
+      }
+
+      set((state) => {
+        if (!state.snapshot) return state;
+        const nextDrafts = { ...state.drafts };
+        delete nextDrafts.contentProtection;
+        return {
+          snapshot: { ...state.snapshot, contentProtection },
+          drafts: nextDrafts,
+          contentProtectionApplyFailed: false,
+        };
+      });
+      ({ snapshot, drafts } = get());
+      if (!snapshot) return;
+    }
 
     const willRestart = 'hardwareAcceleration' in drafts.video;
 
@@ -464,36 +559,30 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
     }
 
     // Audio — push to real store
-    if (Object.keys(drafts.audio).length > 0) {
-      pushDraftsToStore(
-        useAudioSettingsStore.getState() as unknown as Record<string, unknown>,
-        drafts.audio as Record<string, unknown>
-      );
-    }
+    pushDraftsToStore(
+      useAudioSettingsStore.getState() as unknown as Record<string, unknown>,
+      drafts.audio as Record<string, unknown>
+    );
 
     // Video — push to real store (except hardwareAcceleration IPC handled below)
-    if (Object.keys(drafts.video).length > 0) {
-      pushDraftsToStore(
-        useVideoSettingsStore.getState() as unknown as Record<string, unknown>,
-        drafts.video as Record<string, unknown>,
-        new Set(['hardwareAcceleration'])
-      );
-    }
+    pushDraftsToStore(
+      useVideoSettingsStore.getState() as unknown as Record<string, unknown>,
+      drafts.video as Record<string, unknown>,
+      new Set(['hardwareAcceleration'])
+    );
 
     // TTS — push to real store
-    if (Object.keys(drafts.tts).length > 0) {
-      pushDraftsToStore(
-        useTTSSettingsStore.getState() as unknown as Record<string, unknown>,
-        drafts.tts as Record<string, unknown>
-      );
-    }
+    pushDraftsToStore(
+      useTTSSettingsStore.getState() as unknown as Record<string, unknown>,
+      drafts.tts as Record<string, unknown>
+    );
 
     // Re-snapshot and clear drafts
     // Temporarily allow server sync to fire for appearance changes
     setSyncSuppressed(false);
 
     set({
-      snapshot: takeSnapshot(),
+      snapshot: takeSnapshot(snapshot.contentProtection),
       drafts: emptyDrafts(),
       // Keep mode stashes for future toggles
     });
@@ -526,6 +615,7 @@ export const useDraftSettingsStore = createStore<DraftSettingsState>()((set, get
       drafts: emptyDrafts(),
       audioBasicStash: null,
       audioAdvancedStash: null,
+      contentProtectionApplyFailed: false,
     });
   },
 }));

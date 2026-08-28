@@ -65,4 +65,14 @@ describe('preload sandbox contract (integration)', () => {
     // #2394
     expect(content).toContain('sso:abandonReservation');
   });
+
+  it('exposes only typed content-protection channels', () => {
+    const content = readFileSync(preloadPath, 'utf-8');
+    expect(content).toContain('app:getContentProtection');
+    expect(content).toContain('app:setContentProtection');
+    expect(content).toMatch(
+      /setContentProtection[\s\S]*ipcRenderer\.invoke\(['"]app:setContentProtection['"], enabled\)/
+    );
+    expect(content).not.toMatch(/exposeInMainWorld\([^,]+,\s*ipcRenderer\s*\)/);
+  });
 });
