@@ -116,6 +116,58 @@ function getCounterClass(charCount: number, limit: number): string {
   return 'counter';
 }
 
+function insertCappedText(
+  currentContent: string,
+  insertedText: string,
+  selectionStart: number,
+  selectionEnd: number,
+  maxChars: number
+): { content: string; cursorPosition: number } {
+  const combined =
+    currentContent.slice(0, selectionStart) + insertedText + currentContent.slice(selectionEnd);
+  const content = combined.length <= maxChars ? combined : combined.slice(0, maxChars);
+  return {
+    content,
+    cursorPosition: Math.min(selectionStart + insertedText.length, content.length),
+  };
+}
+
+function getCounterAnnouncement(charCount: number, maxLength: number): string {
+  const announceRatio = [...COUNTER_ANNOUNCE_RATIOS]
+    .reverse()
+    .find((ratio) => charCount >= Math.floor(maxLength * ratio));
+
+  if (announceRatio === 1) {
+    return `Message at the ${maxLength}-character limit. Longer messages send as a .md attachment.`;
+  }
+  if (announceRatio === 0.9) {
+    return `Approaching the ${maxLength}-character limit.`;
+  }
+  if (announceRatio === 0.75) {
+    return `Message has reached 75% of the ${maxLength}-character limit.`;
+  }
+  return '';
+}
+
+function getCtrlShortcutAction(
+  key: string,
+  modifiers: {
+    ctrlKey: boolean;
+    metaKey: boolean;
+    altKey: boolean;
+    shiftKey: boolean;
+  }
+): 'emoji' | 'gif' | undefined {
+  if (!modifiers.ctrlKey || modifiers.metaKey || modifiers.altKey || modifiers.shiftKey) {
+    return undefined;
+  }
+
+  const shortcut = key.toLowerCase();
+  if (shortcut === 'e') return 'emoji';
+  if (shortcut === 'g') return 'gif';
+  return undefined;
+}
+
 export interface MessageInputProps {
   onSendMessage: (
     content: string,
@@ -325,29 +377,26 @@ const MessageInput: React.FC<MessageInputProps> = ({
       if (!textarea) {
         // Fallback: just append
         setContent((prev) => {
-          const combined = prev + text;
-          return combined.length <= DOS_PROTECTION_LIMIT
-            ? combined
-            : combined.slice(0, DOS_PROTECTION_LIMIT);
+          return insertCappedText(prev, text, prev.length, prev.length, DOS_PROTECTION_LIMIT)
+            .content;
         });
         return;
       }
 
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
-      const before = content.slice(0, start);
-      const after = content.slice(end);
-      const combined = before + text + after;
-      const newContent =
-        combined.length <= DOS_PROTECTION_LIMIT
-          ? combined
-          : combined.slice(0, DOS_PROTECTION_LIMIT);
+      const { content: newContent, cursorPosition: newCursor } = insertCappedText(
+        content,
+        text,
+        start,
+        end,
+        DOS_PROTECTION_LIMIT
+      );
 
       setContent(newContent);
 
       // Restore cursor position after the pasted text
       requestAnimationFrame(() => {
-        const newCursor = Math.min(start + text.length, newContent.length);
         textarea.selectionStart = newCursor;
         textarea.selectionEnd = newCursor;
         textarea.focus();
@@ -361,10 +410,8 @@ const MessageInput: React.FC<MessageInputProps> = ({
       const textarea = textareaRef.current;
       if (!textarea) {
         setContent((prev) => {
-          const combined = prev + emoji;
-          return combined.length <= DOS_PROTECTION_LIMIT
-            ? combined
-            : combined.slice(0, DOS_PROTECTION_LIMIT);
+          return insertCappedText(prev, emoji, prev.length, prev.length, DOS_PROTECTION_LIMIT)
+            .content;
         });
         setShowEmojiPicker(false);
         return;
@@ -372,19 +419,18 @@ const MessageInput: React.FC<MessageInputProps> = ({
 
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
-      const before = content.slice(0, start);
-      const after = content.slice(end);
-      const combined = before + emoji + after;
-      const newContent =
-        combined.length <= DOS_PROTECTION_LIMIT
-          ? combined
-          : combined.slice(0, DOS_PROTECTION_LIMIT);
+      const { content: newContent, cursorPosition: newCursor } = insertCappedText(
+        content,
+        emoji,
+        start,
+        end,
+        DOS_PROTECTION_LIMIT
+      );
 
       setContent(newContent);
       setShowEmojiPicker(false);
 
       requestAnimationFrame(() => {
-        const newCursor = Math.min(start + emoji.length, newContent.length);
         textarea.selectionStart = newCursor;
         textarea.selectionEnd = newCursor;
         textarea.focus();
@@ -791,18 +837,21 @@ const MessageInput: React.FC<MessageInputProps> = ({
     // Meta/Alt/Shift) — this intentionally overrides the macOS readline Ctrl+E
     // ("move to end of line") in favor of the picker; End / Cmd+→ remain
     // available. Ctrl+G respects the gifsEnabled flag, mirroring the GIF button.
-    if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
-      const shortcut = e.key.toLowerCase();
-      if (shortcut === 'e') {
-        e.preventDefault();
-        toggleEmojiPicker();
-        return;
-      }
-      if (shortcut === 'g' && gifsEnabled) {
-        e.preventDefault();
-        toggleGifPicker();
-        return;
-      }
+    const shortcutAction = getCtrlShortcutAction(e.key, {
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      shiftKey: e.shiftKey,
+    });
+    if (shortcutAction === 'emoji') {
+      e.preventDefault();
+      toggleEmojiPicker();
+      return;
+    }
+    if (shortcutAction === 'gif' && gifsEnabled) {
+      e.preventDefault();
+      toggleGifPicker();
+      return;
     }
 
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -871,17 +920,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   // L7 (a11y U1): announce ONLY at 75% / 90% / at-limit thresholds. The message
   // is a function of the highest band CROSSED, so the aria-live text changes
   // (and re-announces) only on a band transition — never per keystroke.
-  const announceRatio = [...COUNTER_ANNOUNCE_RATIOS]
-    .reverse()
-    .find((r) => charCount >= Math.floor(maxLength * r));
-  let counterAnnouncement = '';
-  if (announceRatio === 1) {
-    counterAnnouncement = `Message at the ${maxLength}-character limit. Longer messages send as a .md attachment.`;
-  } else if (announceRatio === 0.9) {
-    counterAnnouncement = `Approaching the ${maxLength}-character limit.`;
-  } else if (announceRatio === 0.75) {
-    counterAnnouncement = `Message has reached 75% of the ${maxLength}-character limit.`;
-  }
+  const counterAnnouncement = getCounterAnnouncement(charCount, maxLength);
 
   return (
     <div className="message-input-container">

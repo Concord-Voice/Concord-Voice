@@ -3,12 +3,20 @@ import MessageInput from '@/renderer/components/Chat/MessageInput';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
 import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // Deterministic picker stubs: render a detectable node when shown, and provide
 // the #2071 preload named exports so MessageInput's mount preload resolves.
 vi.mock('@/renderer/components/EmojiPicker/LazyEmojiPicker', () => ({
-  default: () => <div data-testid="emoji-picker-open" />,
+  default: ({ onSelect }: { onSelect: (emoji: string) => void }) => (
+    <>
+      <div data-testid="emoji-picker-open" />
+      <button type="button" data-testid="emoji-picker-select" onClick={() => onSelect('🙂')}>
+        Select emoji
+      </button>
+    </>
+  ),
   preloadEmojiPicker: () => {},
 }));
 vi.mock('@/renderer/components/GifPicker/LazyGifPicker', () => ({
@@ -35,6 +43,7 @@ vi.mock('@/renderer/components/Chat/AttachmentUploadPreview', () => ({ default: 
 
 describe('MessageInput picker keyboard shortcuts (#1953)', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     usePermissionStore.setState({
       serverPermissions: {},
@@ -95,5 +104,39 @@ describe('MessageInput picker keyboard shortcuts (#1953)', () => {
     const { container } = renderInput();
     fireEvent.keyDown(ta(container), { key: 'E', ctrlKey: true, shiftKey: true });
     expect(container.querySelector('[data-testid="emoji-picker-open"]')).toBeNull();
+  });
+
+  it('Ctrl+Meta+E and Ctrl+Alt+E do not open the emoji picker', () => {
+    const { container } = renderInput();
+    const textarea = ta(container);
+    fireEvent.keyDown(textarea, { key: 'e', ctrlKey: true, metaKey: true });
+    expect(container.querySelector('[data-testid="emoji-picker-open"]')).toBeNull();
+    fireEvent.keyDown(textarea, { key: 'e', ctrlKey: true, altKey: true });
+    expect(container.querySelector('[data-testid="emoji-picker-open"]')).toBeNull();
+  });
+
+  it('replaces a middle selection with an emoji and restores the caret and focus', async () => {
+    const { container } = renderInput();
+    const textarea = ta(container);
+    fireEvent.change(textarea, { target: { value: 'hello world' } });
+    textarea.selectionStart = 2;
+    textarea.selectionEnd = 7;
+
+    fireEvent.keyDown(textarea, { key: 'e', ctrlKey: true });
+    fireEvent.click(container.querySelector('[data-testid="emoji-picker-select"]')!);
+
+    await vi.waitFor(() => {
+      expect(textarea).toHaveValue('he🙂orld');
+      expect(textarea.selectionStart).toBe(4);
+      expect(textarea.selectionEnd).toBe(4);
+      expect(textarea).toHaveFocus();
+    });
+  });
+
+  it('Ctrl+an unrelated key leaves pickers closed', () => {
+    const { container } = renderInput();
+    fireEvent.keyDown(ta(container), { key: 'x', ctrlKey: true });
+    expect(container.querySelector('[data-testid="emoji-picker-open"]')).toBeNull();
+    expect(container.querySelector('[data-testid="gif-picker-open"]')).toBeNull();
   });
 });

@@ -16,7 +16,15 @@ const mockSidebarProfiles = vi.hoisted(() => ({
 
 // Mock child components and stores that MessageInput depends on
 vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({
-  default: () => null,
+  default: ({ onPaste }: { onPaste: (text: string) => void }) => (
+    <button
+      type="button"
+      data-testid="context-paste"
+      onClick={() => onPaste('x'.repeat(1_048_577))}
+    >
+      Paste
+    </button>
+  ),
 }));
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
@@ -415,6 +423,18 @@ describe('MessageInput', () => {
     expect((textarea as HTMLTextAreaElement).value.length).toBeLessThanOrEqual(6);
   });
 
+  it('caps context-menu insertion at the DoS ceiling and clamps the cursor', async () => {
+    render(<MessageInput onSendMessage={onSendMessage} />);
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+
+    fireEvent.contextMenu(textarea, { clientX: 10, clientY: 10 });
+    fireEvent.click(screen.getByTestId('context-paste'));
+
+    await vi.waitFor(() => expect(textarea.value).toHaveLength(1_048_576));
+    expect(textarea.selectionStart).toBe(1_048_576);
+    expect(textarea.selectionEnd).toBe(1_048_576);
+  });
+
   // ── Typing indicator ──
 
   it('stops typing indicator when message is sent', async () => {
@@ -498,8 +518,7 @@ describe('MessageInput', () => {
     render(<MessageInput onSendMessage={onSendMessage} />);
     const inputBox = document.querySelector('.message-input-box');
     fireEvent.contextMenu(inputBox!);
-    // Context menu is mocked to return null, but the event should be handled
-    expect(inputBox).toBeInTheDocument();
+    expect(screen.getByTestId('context-paste')).toBeInTheDocument();
   });
 
   // ── Textarea aria label ──
