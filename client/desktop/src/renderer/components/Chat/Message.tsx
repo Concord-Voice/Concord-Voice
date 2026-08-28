@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { LockKeyhole, KeyRound } from 'lucide-react';
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
-import { useMemberStore } from '../../stores/memberStore';
-import { useDMStore } from '../../stores/dmStore';
+import { useMemberStore, type ServerMember } from '../../stores/memberStore';
+import { useDMStore, type DMParticipant } from '../../stores/dmStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useFriendOrgStore } from '../../stores/friendOrgStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
@@ -454,6 +454,52 @@ function MessageTextContent({
   );
 }
 
+function selectMentionMembers(
+  chatContext: ChatContextType,
+  members: ServerMember[],
+  dmParticipants: DMParticipant[]
+): Array<{ user_id: string; display_name?: string; username: string }> {
+  return chatContext === 'dm'
+    ? dmParticipants.map(({ userId, displayName, username }) => ({
+        user_id: userId,
+        display_name: displayName,
+        username,
+      }))
+    : members;
+}
+
+function getCurrentUserRoleIds(
+  isDM: boolean,
+  members: ServerMember[],
+  currentUserId: string
+): ReadonlySet<string> | undefined {
+  if (isDM) return undefined;
+  const currentMember = members.find((member) => member.user_id === currentUserId);
+  if (!currentMember?.roles.length) return undefined;
+  return new Set(currentMember.roles.map((role) => role.role_id));
+}
+
+function getMessageClassName(
+  isOwnMessage: boolean,
+  showAvatar: boolean,
+  pinnedAt: MessageWithStatus['pinned_at']
+): string {
+  return [
+    'message',
+    isOwnMessage && 'own-message',
+    !showAvatar && 'message-grouped',
+    pinnedAt && 'pinned',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+function getAttachmentMessageBody(
+  message: Pick<MessageWithStatus, 'pendingKeys' | 'decryptFailed' | 'content'>
+): string {
+  return message.pendingKeys || message.decryptFailed ? '' : message.content;
+}
+
 const Message: React.FC<MessageProps> = ({
   message,
   currentUserId,
@@ -501,23 +547,15 @@ const Message: React.FC<MessageProps> = ({
   const mentionLookup = useMemo(
     () =>
       buildMentionLookup(
-        isDM
-          ? dmParticipants.map(({ userId, displayName, username }) => ({
-              user_id: userId,
-              display_name: displayName,
-              username,
-            }))
-          : members,
+        selectMentionMembers(chatContext, members, dmParticipants),
         allServerRoles
       ),
-    [allServerRoles, dmParticipants, isDM, members]
+    [allServerRoles, chatContext, dmParticipants, members]
   );
-  const currentUserRoleIds = useMemo(() => {
-    if (isDM) return undefined;
-    const currentMember = members.find((m) => m.user_id === currentUserId);
-    if (!currentMember?.roles.length) return undefined;
-    return new Set(currentMember.roles.map((role) => role.role_id));
-  }, [currentUserId, isDM, members]);
+  const currentUserRoleIds = useMemo(
+    () => getCurrentUserRoleIds(isDM, members, currentUserId),
+    [currentUserId, isDM, members]
+  );
 
   const senderMember = isDM ? undefined : members.find((m) => m.user_id === message.user_id);
   const senderColors = resolveUserAccentColors(senderMember?.color_scheme);
@@ -581,14 +619,7 @@ const Message: React.FC<MessageProps> = ({
     [message.content, message.pendingKeys, message.decryptFailed]
   );
 
-  const messageClassName = [
-    'message',
-    isOwnMessage && 'own-message',
-    !showAvatar && 'message-grouped',
-    message.pinned_at && 'pinned',
-  ]
-    .filter(Boolean)
-    .join(' ');
+  const messageClassName = getMessageClassName(isOwnMessage, showAvatar, message.pinned_at);
 
   return (
     <article className={messageClassName} onContextMenu={handleContextMenu}>
@@ -647,7 +678,7 @@ const Message: React.FC<MessageProps> = ({
           <AttachmentDisplay
             attachments={message.attachments}
             channelId={message.channel_id}
-            messageBody={message.pendingKeys || message.decryptFailed ? '' : message.content}
+            messageBody={getAttachmentMessageBody(message)}
           />
         )}
 
