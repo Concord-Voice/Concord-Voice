@@ -22,7 +22,11 @@ import type {
   MetricKey,
   SeriesWindow,
 } from "./contracts";
-import { SERVICE_NAMES } from "./contracts";
+import {
+  ACCOUNT_ACTIVITY_METRIC_KEYS,
+  PRIMARY_METRIC_MAP,
+  SERVICE_NAMES,
+} from "./contracts";
 import {
   DEFAULT_THRESHOLDS,
   THRESHOLD_MAXIMUMS,
@@ -59,11 +63,40 @@ interface WorkspaceDefinition {
   label: string;
 }
 
+// Counts are DERIVED, never written by hand. A literal badge silently goes
+// stale the moment a workspace gains a metric — the rail then under-reports
+// what the page actually renders, and nothing fails (#2975).
+const COUNTERS_WORKSPACE_SIZE =
+  PRIMARY_METRIC_MAP.control.length +
+  PRIMARY_METRIC_MAP.mediaActivity.length +
+  PRIMARY_METRIC_MAP.mediaEgress.length +
+  PRIMARY_METRIC_MAP.participantHours.length;
+
 const WORKSPACES: readonly WorkspaceDefinition[] = [
-  { count: "4", icon: Gauge, id: "host", label: "Host Overview" },
-  { count: "7", icon: Server, id: "services", label: "Services" },
-  { count: "9", icon: Users, id: "users", label: "Users & Activity" },
-  { count: "20", icon: ListChecks, id: "counters", label: "Counters" },
+  {
+    count: String(PRIMARY_METRIC_MAP.hostOverview.length),
+    icon: Gauge,
+    id: "host",
+    label: "Host Overview",
+  },
+  {
+    count: String(SERVICE_NAMES.length),
+    icon: Server,
+    id: "services",
+    label: "Services",
+  },
+  {
+    count: String(ACCOUNT_ACTIVITY_METRIC_KEYS.length),
+    icon: Users,
+    id: "users",
+    label: "Users & Activity",
+  },
+  {
+    count: String(COUNTERS_WORKSPACE_SIZE),
+    icon: ListChecks,
+    id: "counters",
+    label: "Counters",
+  },
   { count: "1", icon: ChartLine, id: "series", label: "Time Series" },
   { count: "Live", icon: Activity, id: "changes", label: "Health & Changes" },
 ];

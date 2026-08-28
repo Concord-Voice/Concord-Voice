@@ -51,6 +51,7 @@ const METRIC_LABELS: Record<MetricKey, string> = {
   channel_messages_total: "Channel messages",
   dm_messages_total: "Direct messages",
   ops_snapshot_rejections_total: "Operations snapshot rejections",
+  presence_audience_suppressed_total: "Presence broadcast suppressions",
   registered_users_current: "Registered users",
   pending_registrations_current: "Pending registrations",
   users_online_current: "Users online",

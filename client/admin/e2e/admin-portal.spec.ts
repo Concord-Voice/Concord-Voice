@@ -12,6 +12,7 @@ import {
   ACCOUNT_ACTIVITY_METRIC_KEYS,
   COUNTER_METRIC_KEYS,
   METRIC_KEYS,
+  PRIMARY_METRIC_MAP,
   type AdminCountersResponse,
   type AdminCurrentResponse,
   type AdminSeriesResponse,
@@ -86,12 +87,14 @@ function metricDefinition(metricKey: MetricKey): {
       unit: "count",
     };
   }
+  // Membership, not a prefix list. The prefix form silently mis-typed any
+  // control key whose name did not start with one of five known stems, and the
+  // fixture then failed the WHOLE /current parse -- reproducing #2975's own
+  // symptom inside the test suite. PRIMARY_METRIC_MAP.control cannot drift.
   if (
-    metricKey.startsWith("http_") ||
-    metricKey.startsWith("websocket_") ||
-    metricKey.startsWith("channel_") ||
-    metricKey.startsWith("dm_") ||
-    metricKey.startsWith("ops_")
+    PRIMARY_METRIC_MAP.control.includes(
+      metricKey as (typeof PRIMARY_METRIC_MAP.control)[number],
+    )
   ) {
     const counter = COUNTER_METRIC_KEYS.includes(
       metricKey as (typeof COUNTER_METRIC_KEYS)[number],

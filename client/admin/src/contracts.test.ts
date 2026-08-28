@@ -26,7 +26,7 @@ describe("metric catalog", () => {
   it("assigns every fixed metric key to one primary home", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
-    expect(PRIMARY_METRIC_MAP.control).toHaveLength(7);
+    expect(PRIMARY_METRIC_MAP.control).toHaveLength(8);
     expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(7);
     expect(PRIMARY_METRIC_MAP.mediaEgress).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.participantHours).toHaveLength(3);
@@ -35,9 +35,9 @@ describe("metric catalog", () => {
     );
 
     const assigned = Object.values(PRIMARY_METRIC_MAP).flat();
-    expect(assigned).toHaveLength(61);
+    expect(assigned).toHaveLength(62);
     expect(new Set(assigned)).toEqual(new Set(METRIC_KEYS));
-    expect(COUNTER_METRIC_KEYS).toHaveLength(11);
+    expect(COUNTER_METRIC_KEYS).toHaveLength(12);
   });
 });
 
@@ -119,8 +119,10 @@ describe("parseCurrent", () => {
     duplicate.metrics[1] = clone(duplicate.metrics[0]);
     expect(() => parseCurrent(duplicate)).toThrow(ContractError);
 
+    // One PAST the cap, derived from the key list. A literal here silently
+    // stops testing the bound the moment the catalog grows past it (#2975).
     const oversized = currentFixture();
-    oversized.metrics = Array.from({ length: 62 }, () =>
+    oversized.metrics = Array.from({ length: METRIC_KEYS.length + 1 }, () =>
       clone(oversized.metrics[0]),
     );
     expect(() => parseCurrent(oversized)).toThrow(ContractError);
@@ -128,7 +130,7 @@ describe("parseCurrent", () => {
 });
 
 describe("parseCounters", () => {
-  it("accepts only the eleven fixed counter identifiers", () => {
+  it("accepts only the fixed counter identifiers", () => {
     expect(parseCounters(countersFixture())).toEqual(countersFixture());
 
     const gauge = countersFixture() as unknown as {
@@ -144,8 +146,9 @@ describe("parseCounters", () => {
     expect(() => parseCounters(duplicate)).toThrow(ContractError);
 
     const oversized = countersFixture();
-    oversized.counters = Array.from({ length: 12 }, () =>
-      clone(oversized.counters[0]),
+    oversized.counters = Array.from(
+      { length: COUNTER_METRIC_KEYS.length + 1 },
+      () => clone(oversized.counters[0]),
     );
     expect(() => parseCounters(oversized)).toThrow(ContractError);
   });

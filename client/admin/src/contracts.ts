@@ -56,6 +56,7 @@ const CONTROL_METRIC_KEYS = [
   "channel_messages_total",
   "dm_messages_total",
   "ops_snapshot_rejections_total",
+  "presence_audience_suppressed_total",
 ] as const;
 
 export const ACCOUNT_ACTIVITY_METRIC_KEYS = [
@@ -122,6 +123,7 @@ export const COUNTER_METRIC_KEYS = [
   "dm_messages_total",
   "media_uploads_total",
   "ops_snapshot_rejections_total",
+  "presence_audience_suppressed_total",
   "media_egress_cumulative_bytes",
   "media_participant_hours_audio",
   "media_participant_hours_webcam",
@@ -457,7 +459,10 @@ export function parseCurrent(value: unknown): AdminCurrentResponse {
   const response = record(value);
   exactKeys(response, ["node_id", "metrics"]);
   const metrics = unique(
-    array(response.metrics, 61).map(parseMetricPoint),
+    // Bound derived from the key list, never a literal: a hand-maintained cap
+    // silently becomes one-too-small the next time the catalog grows, and the
+    // resulting failure surfaces as a network-outage banner (#2975).
+    array(response.metrics, METRIC_KEYS.length).map(parseMetricPoint),
     (item) => item.metric_key,
   );
   return { node_id: nodeID(response.node_id), metrics };
@@ -467,19 +472,21 @@ export function parseCounters(value: unknown): AdminCountersResponse {
   const response = record(value);
   exactKeys(response, ["node_id", "counters"]);
   const counters = unique(
-    array(response.counters, 11).map((value): AdminCounterPoint => {
-      const point = parseMetricPoint(value);
-      if (
-        !counterMetricKeySet.has(point.metric_key) ||
-        point.kind !== "counter"
-      )
-        invalid();
-      return {
-        ...point,
-        metric_key: point.metric_key as CounterMetricKey,
-        kind: "counter",
-      };
-    }),
+    array(response.counters, COUNTER_METRIC_KEYS.length).map(
+      (value): AdminCounterPoint => {
+        const point = parseMetricPoint(value);
+        if (
+          !counterMetricKeySet.has(point.metric_key) ||
+          point.kind !== "counter"
+        )
+          invalid();
+        return {
+          ...point,
+          metric_key: point.metric_key as CounterMetricKey,
+          kind: "counter",
+        };
+      },
+    ),
     (item) => item.metric_key,
   );
   return { node_id: nodeID(response.node_id), counters };

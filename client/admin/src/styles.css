@@ -502,7 +502,11 @@ code,
   min-height: 40px;
   margin: 0 0 14px;
   padding: 9px 11px;
-  border-left: 3px solid var(--info);
+  /* Full hairline, not a 3px left rule: a colored side border above 1px on a
+     callout is a banned surface habit. border-color still carries the state,
+     so .resource-loading and .resource-error override it unchanged. */
+  border: 1px solid var(--info);
+  border-radius: var(--radius-base);
   background: rgb(125 189 255 / 7%);
   font-size: 13px;
 }
