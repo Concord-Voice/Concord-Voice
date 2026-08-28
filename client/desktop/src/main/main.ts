@@ -187,9 +187,33 @@ function isContentProtectionPreference(value: unknown): value is ContentProtecti
 function readContentProtectionPref(): boolean {
   try {
     const data: unknown = JSON.parse(fs.readFileSync(contentProtectionPrefPath, 'utf-8'));
-    if (!isContentProtectionPreference(data)) return false;
+    if (!isContentProtectionPreference(data)) {
+      // A file that parses but does not match the shape is the same event as an
+      // unreadable one — an enabled control silently going OFF — and it was the
+      // one path out of this function that still said nothing. No value is
+      // logged: the rejected object is attacker-adjacent user-writable content.
+      console.warn('[ContentProtection] preference has an unrecognized shape — treating as OFF');
+      return false;
+    }
     return 'staged' in data && data.staged ? data.previousEnabled : data.enabled;
-  } catch {
+  } catch (error) {
+    // ENOENT is the opt-in default: the preference was never set, and OFF is
+    // correct. Anything else — corrupt JSON, EACCES, a torn read — is a privacy
+    // control the user turned ON being silently turned OFF. Same return value,
+    // very different event, so only the second one is worth saying out loud.
+    //
+    // Log the errno CODE, never the message: Node builds fs error messages as
+    // `EACCES: permission denied, open '<full path>'`, and this path is under
+    // app.getPath('userData') — which on macOS and Windows contains the OS
+    // account name. The code carries every bit of the diagnostic value and none
+    // of the identity. (#2990 review, Codex P2.)
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code !== 'ENOENT') {
+      console.warn(
+        '[ContentProtection] preference unreadable — treating as OFF:',
+        code ?? 'unknown'
+      );
+    }
     return false;
   }
 }
@@ -206,6 +230,43 @@ function writeContentProtectionPref(preference: ContentProtectionPreference): bo
       // The failed temp file never becomes the preference authority.
     }
     return false;
+  }
+}
+
+// BrowserWindow.setContentProtection is macOS/Windows only; everywhere else the
+// call is a silent no-op that neither throws nor protects. Main owns this truth
+// so no caller is ever told a protection applied that did not. The renderer also
+// hides the toggle off-platform, but a UI gate is not the last line — the remote
+// SPA reaches this bridge directly, and an older build of it does not know.
+function contentProtectionSupported(): boolean {
+  return process.platform === 'darwin' || process.platform === 'win32';
+}
+
+// Applying at window creation cannot fail loudly — refusing to open the window
+// would be worse than an unprotected one. But the two directions are not
+// symmetric: failing to apply `false` leaves a window over-protected and
+// visible, while failing to apply `true` leaves it UNPROTECTED while the stored
+// preference says otherwise. Only the second is a privacy downgrade.
+function applyContentProtectionAtCreation(
+  window: BrowserWindow,
+  enabled: boolean,
+  label: string
+): void {
+  if (!contentProtectionSupported()) return;
+  try {
+    window.setContentProtection(enabled);
+  } catch (error) {
+    if (enabled) {
+      console.error(
+        `[ContentProtection] ${label} is UNPROTECTED — preference is ON but apply failed:`,
+        (error as Error).message
+      );
+    } else {
+      console.warn(
+        `[ContentProtection] failed to clear protection on ${label}:`,
+        (error as Error).message
+      );
+    }
   }
 }
 
@@ -1257,11 +1318,7 @@ const createWindow = async (): Promise<void> => {
     width: savedState.width,
     height: savedState.height,
   });
-  try {
-    mainWindow.setContentProtection(contentProtectionEnabled);
-  } catch {
-    console.warn('[ContentProtection] Failed to apply preference to main window');
-  }
+  applyContentProtectionAtCreation(mainWindow, contentProtectionEnabled, 'main window');
   resetDeepLinkDelivery();
 
   if (savedState.isMaximized) {
@@ -1851,6 +1908,9 @@ ipcMain.handle('app:setHardwareAcceleration', (event, enabled: boolean) => {
 
 ipcMain.handle('app:getContentProtection', async (event) => {
   if (!requireTrustedSender(event, getRemoteSpaBaseUrl())) return false;
+  // Off-platform the effective protection is OFF whatever the file says, so
+  // report the truth rather than a preference that cannot take effect.
+  if (!contentProtectionSupported()) return false;
   return readContentProtectionPref();
 });
 
@@ -1858,6 +1918,9 @@ ipcMain.handle('app:setContentProtection', async (event, enabled: unknown): Prom
   if (!requireTrustedSender(event, getRemoteSpaBaseUrl()) || typeof enabled !== 'boolean') {
     return false;
   }
+  // Reporting success for a no-op is the one outcome worse than refusing: it
+  // tells the caller a screen-capture protection is in force when nothing is.
+  if (!contentProtectionSupported()) return false;
 
   const previous = readContentProtectionPref();
   if (!writeContentProtectionPref({ enabled, previousEnabled: previous, staged: true })) {
@@ -2684,11 +2747,7 @@ ipcMain.handle(
       },
       backgroundColor: '#000',
     });
-    try {
-      pip.setContentProtection(contentProtectionEnabled);
-    } catch {
-      console.warn('[ContentProtection] Failed to apply preference to PiP window');
-    }
+    applyContentProtectionAtCreation(pip, contentProtectionEnabled, 'PiP window');
 
     // Load PiP route (hash-based routing)
     if (!app.isPackaged) {

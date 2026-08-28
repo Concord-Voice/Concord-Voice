@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll, beforeEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, type Mock } from 'vitest';
 import { deferred } from '../../helpers/deferred';
 
 // ── Hoisted mocks (available during vi.mock factory execution) ─────────
@@ -352,10 +352,31 @@ let dialogCallsAfterImport = -1;
 // #2354: the approval-prompt bucket is module-level state in the real (unmocked)
 // selfHostedCeremonyBudget, so without this every ceremony in this file spends from
 // one shared 10-minute window and later tests would throttle on earlier ones.
+// Content protection is macOS/Windows-only and main now refuses the call
+// elsewhere. The CI runner is `linux`, so without pinning a supported platform
+// every positive content-protection assertion here exercises the refusal path
+// instead of the behaviour it names — green on a macOS laptop, red on CI, and
+// silently vacuous if the refusal were ever removed. Tests that need a
+// different platform set it themselves and restore to 'darwin'.
+const REAL_PLATFORM = process.platform;
+function setPlatform(value: NodeJS.Platform): void {
+  Object.defineProperty(process, 'platform', { value, configurable: true });
+}
+
+// Pinned at MODULE scope, not just in beforeEach: createWindow runs inside
+// beforeAll, which fires before any beforeEach, so a per-test pin lands too
+// late for the window-creation path and that test alone stays red on CI.
+setPlatform('darwin');
+
 beforeEach(async () => {
+  setPlatform('darwin');
   const { _resetCeremonyBudgetForTesting } =
     await import('../../../src/main/selfHostedCeremonyBudget');
   _resetCeremonyBudgetForTesting();
+});
+
+afterEach(() => {
+  setPlatform(REAL_PLATFORM);
 });
 
 beforeAll(async () => {
@@ -507,6 +528,99 @@ describe('main.ts', () => {
           ? JSON.stringify({ enabled: false })
           : JSON.stringify({ enabled: true })
       );
+    });
+
+    it('stays silent for a never-set preference but warns when one is unreadable', async () => {
+      const fs = (await import('node:fs')).default;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // ENOENT is the opt-in default — OFF is correct and unremarkable.
+      const missing = Object.assign(new Error('missing'), { code: 'ENOENT' });
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) => {
+        if (filePath.includes('content-protection.json')) throw missing;
+        return JSON.stringify({ enabled: true });
+      });
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+
+      // Any other failure is an enabled privacy control silently going OFF.
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) => {
+        if (filePath.includes('content-protection.json'))
+          // A realistic Node fs message: it CONTAINS the userData path, so the
+          // no-path assertions below are load-bearing rather than trivially
+          // true. `new Error('denied')` would pass them even if main logged
+          // error.message verbatim. (#2990 review, CodeRabbit.)
+          throw Object.assign(
+            new Error(
+              "EACCES: permission denied, open '/Users/testuser/Library/Application Support/Concord Voice/content-protection.json'"
+            ),
+            { code: 'EACCES' }
+          );
+        return JSON.stringify({ enabled: true });
+      });
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('preference unreadable'), 'EACCES');
+      // The log must carry the errno code and nothing path-shaped: Node's fs
+      // message embeds the full userData path, which contains the OS account
+      // name on macOS and Windows.
+      const logged = warn.mock.calls.flat().join(' ');
+      expect(logged).not.toContain('/');
+      expect(logged).not.toContain('content-protection.json');
+
+      warn.mockRestore();
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : JSON.stringify({ enabled: true })
+      );
+    });
+
+    it('warns when the preference parses but has an unrecognized shape', async () => {
+      const fs = (await import('node:fs')).default;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // Parses fine, fails the shape guard — the one path out of the reader
+      // that used to return OFF in complete silence.
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? '{"enabled":true,"extra":1}'
+          : JSON.stringify({ enabled: true })
+      );
+      await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('unrecognized shape'));
+
+      // The rejected object is user-writable content and must not be echoed.
+      const logged = warn.mock.calls.flat().join(' ');
+      expect(logged).not.toContain('extra');
+
+      warn.mockRestore();
+      (fs.readFileSync as Mock).mockImplementation((filePath: string) =>
+        filePath.includes('content-protection.json')
+          ? JSON.stringify({ enabled: false })
+          : JSON.stringify({ enabled: true })
+      );
+    });
+
+    it('refuses to claim content protection on a platform that cannot enforce it', async () => {
+      const fs = (await import('node:fs')).default;
+      setPlatform('linux');
+      (fs.writeFileSync as Mock).mockClear();
+      mockMainWindow.setContentProtection.mockClear();
+      try {
+        // setContentProtection is a silent no-op off macOS/Windows. Returning
+        // true would tell the caller a screen-capture protection is in force.
+        await expect(
+          handlers.get('app:setContentProtection')!(trustedIpcEvent, true)
+        ).resolves.toBe(false);
+        expect(fs.writeFileSync).not.toHaveBeenCalled();
+        expect(mockMainWindow.setContentProtection).not.toHaveBeenCalled();
+
+        await expect(handlers.get('app:getContentProtection')!(trustedIpcEvent)).resolves.toBe(
+          false
+        );
+      } finally {
+        setPlatform('darwin');
+      }
     });
 
     it('persists a trusted boolean before updating live windows', async () => {
@@ -2354,11 +2468,12 @@ describe('main.ts', () => {
       (app.quit as Mock).mockClear();
       const windowAllClosed = appOnCallbacks.get('window-all-closed');
       expect(windowAllClosed).toBeDefined();
+      // Assert the non-macOS branch explicitly. Gating on the runner's own OS
+      // made this assertion silently vanish on a macOS laptop — the test named
+      // "quits on non-macOS" was the one platform where it checked nothing.
+      setPlatform('linux');
       windowAllClosed!();
-      // On non-darwin platforms, quit is called
-      if (process.platform !== 'darwin') {
-        expect(app.quit).toHaveBeenCalled();
-      }
+      expect(app.quit).toHaveBeenCalled();
     });
 
     it('proactive refresh callback sends to renderer', async () => {
