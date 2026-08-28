@@ -350,6 +350,32 @@ describe('GifPicker', () => {
     fireEvent.click(screen.getByText('Recent'));
     await waitFor(() => expect(recentMock).toHaveBeenCalled());
     expect(recentMock).toHaveBeenLastCalledWith(expect.objectContaining({ force: false }));
+
+    // POSITIVE CONTROL — without it the assertion above is an END STATE, and an
+    // end state is satisfied by TWO regressions that cancel: one arming
+    // forceRecentRef from a non-Recent retry (dropping the activeTab check at
+    // its assignment), another consuming it before recent() is called. Either
+    // alone fails the `force: false` above; together they restore it, and the
+    // test passes on broken code. Falsifying by breaking ONE guard does not
+    // reveal this — it only survives when both regress at once.
+    //
+    // Proving force can STILL be armed makes the second regression observable,
+    // so the pair can no longer hide inside each other. This deliberately
+    // overlaps 'a Recent retry forces exactly once, then reverts': a positive
+    // control has to live in the test it protects, because tests get split,
+    // reordered and run under `-t` filters that leave siblings behind.
+    recentMock.mockRejectedValue(new Error('identity'));
+    fireEvent.click(screen.getByText('Trending'));
+    await waitFor(() => expect(document.querySelector('.gif-tile')).not.toBeNull());
+    fireEvent.click(screen.getByText('Recent'));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument()
+    );
+    recentMock.mockResolvedValue({ items: [sampleVideoGif], hasMore: false });
+    fireEvent.click(screen.getByRole('button', { name: /try again/i }));
+    await waitFor(() =>
+      expect(recentMock).toHaveBeenLastCalledWith(expect.objectContaining({ force: true }))
+    );
   });
 
   it('a Recent retry forces exactly once, then reverts', async () => {
