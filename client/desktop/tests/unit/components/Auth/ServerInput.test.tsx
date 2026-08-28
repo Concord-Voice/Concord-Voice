@@ -369,7 +369,12 @@ describe('ServerInput', () => {
     fireEvent.click(screen.getByText('Connect to Server'));
 
     await waitFor(() => expect(screen.getByText(/was not added/i)).toBeInTheDocument());
-    expect(input).toHaveFocus();
+    // Focus is restored by a passive effect keyed on state.k (ServerInput.tsx),
+    // which is a DIFFERENT write from the note this waitFor gated on — so the
+    // gate establishes nothing about focus and the assertion loses the race
+    // under load. waitFor is correct here because the assertion is POSITIVE;
+    // tests.md bans only negative assertions inside it.
+    await waitFor(() => expect(input).toHaveFocus());
     expect(input).not.toHaveClass('error');
   });
 
@@ -396,7 +401,8 @@ describe('ServerInput', () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/can never connect/i)).not.toBeInTheDocument();
     expect(input).not.toHaveClass('error');
-    expect(input).toHaveFocus();
+    // Same passive-effect race as the decline case above.
+    await waitFor(() => expect(input).toHaveFocus());
     expect(mockOnConnect).not.toHaveBeenCalled();
   });
 
