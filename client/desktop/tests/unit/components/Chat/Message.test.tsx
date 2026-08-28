@@ -39,6 +39,7 @@ vi.mock('@/renderer/components/Chat/GifEmbed', () => ({
   default: ({ slug }: { slug: string }) => <div data-testid="gif-embed">{slug}</div>,
 }));
 import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useDMStore } from '@/renderer/stores/dmStore';
 import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
 import { usePermissionStore } from '@/renderer/stores/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -423,6 +424,50 @@ describe('Message', () => {
   });
 
   // ── Mention highlighting ──
+
+  // regression for #2368
+  it('resolves DM mention tokens from conversation participants', () => {
+    useDMStore.setState({
+      conversations: [
+        {
+          id: mockMessage.channel_id,
+          isGroup: false,
+          isPersonal: false,
+          name: null,
+          participants: [{ userId: 'user-2', username: 'testuser2', displayName: 'Test User 2' }],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: '2025-01-01T00:00:00Z',
+        },
+      ],
+    });
+
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Hey <@user-2>' }}
+        currentUserId="user-1"
+        chatContext="dm"
+        showAvatar={true}
+      />
+    );
+
+    expect(document.querySelector('.mention-highlight')).toHaveTextContent('@Test User 2');
+  });
+
+  it('keeps an unresolved DM mention token when its participant is unavailable', () => {
+    useDMStore.setState({ conversations: [] });
+
+    render(
+      <Message
+        message={{ ...mockMessage, content: 'Hey <@user-2>' }}
+        currentUserId="user-1"
+        chatContext="dm"
+        showAvatar={true}
+      />
+    );
+
+    expect(document.querySelector('.mention-highlight')).toHaveTextContent('<@user-2>');
+  });
 
   it('renders user mention tokens as highlighted spans', () => {
     useMemberStore.getState().addMember(mockMember2);

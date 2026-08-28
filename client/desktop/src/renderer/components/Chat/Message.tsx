@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { LockKeyhole, KeyRound } from 'lucide-react';
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
 import { useMemberStore } from '../../stores/memberStore';
+import { useDMStore } from '../../stores/dmStore';
 import { usePermissionStore } from '../../stores/permissionStore';
 import { useFriendOrgStore } from '../../stores/friendOrgStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
@@ -35,6 +36,7 @@ import './Message.css';
 // Stable empty references to avoid infinite re-renders when DM context skips server data
 const EMPTY_MEMBERS: never[] = [];
 const EMPTY_ROLES: Record<string, never[]> = {};
+const EMPTY_DM_PARTICIPANTS: never[] = [];
 
 export interface MessageProps {
   message: MessageWithStatus;
@@ -489,10 +491,26 @@ const Message: React.FC<MessageProps> = ({
   // re-render on unrelated server member/role store updates.
   const members = useMemberStore((state) => (isDM ? EMPTY_MEMBERS : state.members));
   const allServerRoles = usePermissionStore((state) => (isDM ? EMPTY_ROLES : state.serverRoles));
+  const dmParticipants = useDMStore((state) =>
+    isDM
+      ? (state.conversations.find((conversation) => conversation.id === message.channel_id)
+          ?.participants ?? EMPTY_DM_PARTICIPANTS)
+      : EMPTY_DM_PARTICIPANTS
+  );
 
   const mentionLookup = useMemo(
-    () => buildMentionLookup(members, allServerRoles),
-    [members, allServerRoles]
+    () =>
+      buildMentionLookup(
+        isDM
+          ? dmParticipants.map(({ userId, displayName, username }) => ({
+              user_id: userId,
+              display_name: displayName,
+              username,
+            }))
+          : members,
+        allServerRoles
+      ),
+    [allServerRoles, dmParticipants, isDM, members]
   );
   const currentUserRoleIds = useMemo(() => {
     if (isDM) return undefined;
