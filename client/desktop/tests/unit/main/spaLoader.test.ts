@@ -58,6 +58,77 @@ describe('spaLoader — defensive /api/v1/spa/ sentinel', () => {
     mockGetApiBase.mockReturnValue('https://api.concordvoice.chat');
   });
 
+  // CODEX P2 (#2363 round 3). The deadline used to end when HEADERS arrived: the
+  // timer was cleared as soon as net.fetch produced a Response, and the caller
+  // then awaited response.json() unbounded, with an AbortController that could no
+  // longer fire. A server answering promptly and then stalling the body hung SPA
+  // resolution forever — and broke DEEP_LINK_CARRY_MAX_AGE_MS, which budgets one
+  // attempt at CONFIG_TIMEOUT_MS.
+  it('bounds the BODY read, not just the headers, and keeps the timeout reason', async () => {
+    vi.useFakeTimers();
+    try {
+      mockNet.fetch.mockImplementation((_url: string, init: { signal: AbortSignal }) => {
+        // Headers land immediately; the body never resolves on its own and is
+        // only ever settled by the deadline's abort.
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            new Promise((_resolve, reject) => {
+              init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+            }),
+        });
+      });
+
+      const pending = resolveSpaSource();
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await pending;
+
+      expect(result.mode).toBe('bundled');
+      // The exact string matters: isUnexpectedBundled / isTransientRemoteFailure
+      // classify on it, so a bare AbortError here would silently reclassify every
+      // timeout as a non-transient failure.
+      expect(result.reason).toBe('config fetch failed: timeout after 5000ms');
+      expect(isTransientRemoteFailure(result.reason)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Same class as the config-body test above, third instance in this file.
+  // hashEntryHtml ran with NO timeout and NO signal, and captureSpaHash awaits it
+  // inside applySpaDecision — inside the deep-link carry wrapper — so a trickled
+  // entry document held deepLinkCarryDepth raised indefinitely after the
+  // successor document had already loaded.
+  it('bounds the entry-HTML hash read and degrades to null', async () => {
+    vi.useFakeTimers();
+    try {
+      // Deliberately NO `expect(init.signal).toBeDefined()` here. An assertion
+      // thrown inside the mock is caught by hashEntryHtml's own best-effort
+      // `catch`, which returns null — so the test would pass on the very tree
+      // that has no signal at all. The hang IS the signal: with nothing to abort
+      // it, arrayBuffer never settles and this test reaches its own timeout.
+      mockNet.fetch.mockImplementation((_url: string, init: { signal?: AbortSignal }) => {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          arrayBuffer: () =>
+            new Promise((_resolve, reject) => {
+              init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+            }),
+        });
+      });
+
+      const pending = hashEntryHtml('app://concord/index.html');
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // Best-effort by contract: a timeout costs an attestation hash, not a launch.
+      await expect(pending).resolves.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects spaUrl with /api/v1/spa/ pathname as poisoned sentinel', async () => {
     mockConfigResponse('https://api.concordvoice.chat/api/v1/spa/abc1234/index.html', 7);
     const result = await resolveSpaSource();

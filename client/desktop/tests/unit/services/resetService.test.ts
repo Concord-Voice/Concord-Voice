@@ -488,3 +488,116 @@ describe('resetService', () => {
     });
   });
 });
+
+// #2363. App replays a held deep link when `accessToken && emailVerified` next
+// become true, and that predicate is account-BLIND — so user A's invite, held
+// across a rememberMe refresh failure, would open for whoever signs in next.
+// gracefulReset is the renderer's own session teardown, so it announces the end
+// and App drops anything held for the session that just closed. This does NOT
+// touch click-invite-then-sign-in: that flow has no prior session, so this reset
+// never runs for it.
+describe('gracefulReset — deep-link session teardown (#2363)', () => {
+  it('announces the session end so a held invite cannot cross to the next sign-in', async () => {
+    const { gracefulReset } = await import('@/renderer/services/resetService');
+    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+    const seen: string[] = [];
+    const handler = (): void => {
+      seen.push('deep-link-session-ended');
+    };
+    globalThis.addEventListener('deep-link-session-ended', handler);
+    try {
+      gracefulReset();
+      expect(
+        seen,
+        'without this the held code outlives its session and opens for the next account'
+      ).toEqual(['deep-link-session-ended']);
+    } finally {
+      globalThis.removeEventListener('deep-link-session-ended', handler);
+    }
+  });
+
+  // The other half, and a P1 the first version got wrong. A cold start whose
+  // restoreSession() fails calls gracefulReset, and so does the
+  // ownerless-credential path — both with no access token, because nobody signed
+  // in. Announcing there erases the invite the user launched the app to accept.
+  it('stays silent when there was no session — the cold-start invite must survive', async () => {
+    const { gracefulReset } = await import('@/renderer/services/resetService');
+    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    useAuthStore.setState({ accessToken: null });
+    const forgetDeepLinks = vi.fn();
+    window.electron.forgetDeepLinks = forgetDeepLinks;
+    const seen: string[] = [];
+    const handler = (): void => {
+      seen.push('deep-link-session-ended');
+    };
+    globalThis.addEventListener('deep-link-session-ended', handler);
+    try {
+      gracefulReset();
+      expect(
+        seen,
+        'a login-side reset must not erase the invite the user is signing in to accept'
+      ).toEqual([]);
+      expect(
+        forgetDeepLinks,
+        'and it must not tell main to forget one either'
+      ).not.toHaveBeenCalled();
+    } finally {
+      globalThis.removeEventListener('deep-link-session-ended', handler);
+    }
+  });
+
+  // Codex P2 on PR #2967. Recovery B is a same-account RENDERER restart on a
+  // still-valid session: preflight reports tokenValid === 'ok' with an unstable
+  // renderer, and useConnectionRecovery calls softRestart() -> gracefulReset() ->
+  // location.reload(). The token is live there, so `accessToken !== null` answers
+  // "did a session exist" correctly and "is this session ending" WRONGLY.
+  //
+  // Before the forget, this path still worked: the event cleared App's copy, but
+  // main kept its own and resetDeepLinkDelivery re-queued it for the successor
+  // renderer. Forgetting removes the copy that recovery was relying on, so a
+  // transport blip silently eats a pending invite. #2199 recorded this exact
+  // shape for NSFW intent (see the top of this file); the deep-link fence walked
+  // into it, so the intent is now explicit at the call site rather than inferred.
+  it('softRestart preserves deep links — Recovery B restarts a renderer, it does not end a session', async () => {
+    const { softRestart } = await import('@/renderer/services/resetService');
+    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+    const forgetDeepLinks = vi.fn();
+    window.electron.forgetDeepLinks = forgetDeepLinks;
+    const seen: string[] = [];
+    const handler = (): void => {
+      seen.push('deep-link-session-ended');
+    };
+    globalThis.addEventListener('deep-link-session-ended', handler);
+    try {
+      softRestart();
+      expect(
+        forgetDeepLinks,
+        'a transport blip must not eat the invite the user is holding'
+      ).not.toHaveBeenCalled();
+      expect(seen, 'and it must not announce an ending that is not happening').toEqual([]);
+    } finally {
+      globalThis.removeEventListener('deep-link-session-ended', handler);
+    }
+  });
+
+  // The renderer event clears App's copy; MAIN holds its own, and on a rememberMe
+  // teardown nothing else tells it the session ended — clearTokens is not called
+  // there by design. Without this call a swap inside the carry window replayed
+  // user A's invite into user B's renderer (#2363).
+  it('tells main to forget too — the renderer fence alone is not sufficient', async () => {
+    const { gracefulReset } = await import('@/renderer/services/resetService');
+    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+    const forgetDeepLinks = vi.fn();
+    window.electron.forgetDeepLinks = forgetDeepLinks;
+
+    gracefulReset();
+
+    expect(
+      forgetDeepLinks,
+      "main keeps its own copy; clearing only the renderer's leaves it replayable"
+    ).toHaveBeenCalled();
+  });
+});

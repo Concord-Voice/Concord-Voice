@@ -140,6 +140,10 @@ vi.mock('../../../src/main/tokenManager', () => ({
   performRefresh: vi.fn(() => Promise.resolve({ status: 'ok', accessToken: 'a', sessionId: 's' })),
   performLogout: vi.fn(() => Promise.resolve()),
   clearTokens: vi.fn(),
+  // A real tokenManager always exports this, so a stub that omits it models a
+  // regression rather than any shipping shell. main.ts's deep-link owner fence
+  // reads it on the drain path, which ordinary window setup reaches (#2363).
+  getCredentialCustodyState: vi.fn(() => ({ credentialOwner: 41, pendingE2EEUnlock: false })),
   getCapabilities: vi.fn(() => ({ safeStorage: true, secureKeychain: true })),
   storeE2EEKeys: vi.fn(),
   restoreE2EEKeys: vi.fn(() => ({

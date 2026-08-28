@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeAll, beforeEach, type Mock } from 'vitest';
+import { deferred } from '../../helpers/deferred';
 
 // ── Hoisted mocks (available during vi.mock factory execution) ─────────
 
@@ -2757,6 +2758,1373 @@ describe('main.ts', () => {
       } finally {
         warn.mockRestore();
       }
+    });
+
+    // ── #2363: carry a delivered invite code across a main-initiated SPA swap ──
+    describe('main-initiated SPA swap carry (#2363)', () => {
+      // Not yet implemented in production: main.ts exports no primitive for
+      // arming the carry. Driving the real spa:reloadLatest handler cannot
+      // substitute — mockMainWindow.loadURL is a bare vi.fn that resolves
+      // without ever invoking the captured did-start-loading listener (see
+      // the harness above at :2094-2098 and the spa:reloadLatest coverage at
+      // :2860-2872, which asserts loadURL was called but never that reload
+      // fired). So this imports the not-yet-existing carryDeepLinkAcrossNextLoad
+      // export directly, per spec §8 Q1 / plan Task 1 step 5.
+      //
+      // Pre-fix this export does not exist. The guard lets the assertion run,
+      // so each test below fails on the OBSERVABLE (one send where two are
+      // expected, or vice versa) rather than on a missing symbol — a
+      // missing-symbol error reads like a falsification and is not one.
+      // Post-fix the guard is inert (the export exists and is called) and the
+      // assertion is the whole test.
+      async function armDeepLinkCarryForTest(): Promise<() => void> {
+        const mainModule = await import('../../../src/main/main');
+        const carry = (mainModule as unknown as { carryDeepLinkAcrossNextLoad?: () => unknown })
+          .carryDeepLinkAcrossNextLoad;
+        if (typeof carry !== 'function') return () => {};
+        const release = carry();
+        return typeof release === 'function' ? (release as () => void) : () => {};
+      }
+
+      it('re-delivers a spent invite code across a main-initiated SPA swap (regression for #2363)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        // Main initiates a source swap: arm the carry, then fire the real
+        // did-start-loading listener the window registers at main.ts:723.
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+      });
+
+      it('does NOT re-deliver a spent invite code across an ordinary reload (regression for #2363)', () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        simulateReload(); // carry NOT armed — an ordinary reload
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+      });
+
+      // INVERTED (CODEX P2, round 8). This originally asserted that
+      // auth:clearTokens forgets, and that was wrong: not one of its three
+      // renderer callers is unambiguously a logout. useSSOFlow.begin() calls it
+      // immediately BEFORE starting SSO, so forgetting there destroys an invite
+      // queued while the app was closed — the click-invite-then-sign-in flow,
+      // which is the primary path #2363 exists to repair. App.tsx's
+      // ownerless-credential rejection and gracefulReset's rememberMe path are
+      // login-side too. Real logout has auth:logout, which does forget, so
+      // narrowing costs nothing.
+      //
+      // The second handler to be wrongly read as a logout edge. The first was
+      // auth:clearTokensIfOwner, and the test below it is this one's twin.
+      // The one caller of auth:clearTokens that IS a logout: nuclearReset(), on a
+      // refresh failure with rememberMe === false. It reaches this handler through
+      // gracefulReset and never calls auth:logout, so without the opt-in user A's
+      // code survived into user B's session (CODEX P2, round 10).
+      it('auth:clearTokens forgets BY DEFAULT — an older SPA sends no argument (#2363)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        await handlers.get('auth:clearTokens')!({
+          senderFrame: { url: 'app://concord/index.html' },
+        });
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+      });
+
+      // The flag is renderer-supplied, so it is read strictly: anything that is
+      // not the literal `true` fails to opt out, and the forgetting default
+      // applies. Strictness points at the SAFE side — a malformed opt-out loses
+      // an invite, where a lenient one would carry a code across accounts.
+      it('auth:clearTokens treats a truthy-but-not-true keepDeepLinks as no (#2363)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        await handlers.get('auth:clearTokens')!(
+          { senderFrame: { url: 'app://concord/index.html' } },
+          { keepDeepLinks: 'yes' }
+        );
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+      });
+
+      it('auth:clearTokens does NOT forget when the caller opts out (#2363)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        await handlers.get('auth:clearTokens')!(
+          { senderFrame: { url: 'app://concord/index.html' } },
+          { keepDeepLinks: true }
+        );
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        // The invite survives an SSO-start token clear and is carried into the
+        // successor document, which is the whole point of the feature.
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+      });
+
+      // Companion fence for the path the app ACTUALLY takes on a user-initiated
+      // logout. userStore.logout() calls electron.logout() -> auth:logout ->
+      // performLogout(), which clears credentials inside tokenManager and never
+      // reaches the auth:clearTokens handler the case above drives. The same
+      // logout does reach it eventually, but only through nuclearReset()'s
+      // doubly-optional-chained `globalThis.electron?.clearTokens?.()`
+      // (resetService.ts) — a renderer-side call ordering that no main-process
+      // test can observe and that a refactor could drop with nothing going red.
+      // So spec §5.2 must hold at the auth:logout edge on its own, and this is
+      // what says so.
+      it('does not re-deliver a delivered code after auth:logout, even with the carry armed (fence for #2363 spec §5.2)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        await handlers.get('auth:logout')!(
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+          { accessToken: 'tok' }
+        );
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+      });
+
+      // Companion fence for the auth:clearTokensIfOwner edge (#2363). Every
+      // caller of this handler is login-side (aborted SSO, interrupted email
+      // verification, cancelled account-link/passphrase-setup, aborted login
+      // continuation, eager-unlock cleanup) — never logout — so unlike the two
+      // fences above it must NOT forget a deliverable code: a
+      // `concord://invite/CODE` queued before any window existed would
+      // otherwise be erased by an aborted SSO sign-in.
+      it('auth:clearTokensIfOwner does NOT forget a delivered invite code (regression for #2363)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        const cleared = await handlers.get('auth:clearTokensIfOwner')!(
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+          41
+        );
+        expect(cleared).toBe(true);
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        try {
+          simulateReload();
+        } finally {
+          releaseCarry();
+        }
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+      });
+
+      // Companion fence for #2363: forgetDeliveredDeepLinks must clear
+      // gate.held, not just gate.lastCode. resetDeepLinkDelivery re-queues
+      // WHATEVER is in gate.held on every reload, carried or not (see main.ts
+      // "for (const code of carried) queueDeepLink(...)" — unconditional), so
+      // an un-cleared held FIFO leaks into the very next ordinary reload after
+      // logout, no carry required. Advancing timers alone does not observe
+      // this (nothing re-arms the cancelled flush timer without a reload),
+      // which is why the reload below is load-bearing, not incidental.
+      it('auth:logout forgets codes still held in gate.held, not just the delivered one (regression for #2363)', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        vi.useFakeTimers();
+        try {
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // Inside the emit window: held back by the gate, not dropped.
+          const held = TEN_CODES.slice(0, 3);
+          for (const code of held) deliverDeepLink(`concord://invite/${code}`);
+
+          await handlers.get('auth:logout')!(
+            { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+            { accessToken: 'tok' }
+          );
+
+          // An ORDINARY reload — no carry armed. If `held` had survived the
+          // logout it would be re-queued here regardless, and the drain below
+          // would deliver it into what is meant to be a fresh session.
+          simulateReload();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 5);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // Companion fence for #2363: forgetDeliveredDeepLinks must run BEFORE
+      // performLogout's await, not after — performLogout clears credentials on
+      // its first line and then issues an unbounded network POST, so a forget
+      // placed after the await leaves a deliverable code exposed for the width
+      // of that request.
+      it('auth:logout forgets deep links BEFORE performLogout resolves, not after (regression for #2363)', async () => {
+        const { performLogout } = await import('../../../src/main/tokenManager');
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        const logoutPost = deferred<void>();
+        (performLogout as Mock).mockImplementationOnce(() => logoutPost.promise);
+
+        const handlerPromise = handlers.get('auth:logout')!(
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+          { accessToken: 'tok' }
+        );
+
+        // The POST is still in flight — the forget must already have run.
+        const releaseCarry = await armDeepLinkCarryForTest();
+        try {
+          simulateReload();
+        } finally {
+          releaseCarry();
+        }
+        signalInviteReady(rendererEvent);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        logoutPost.resolve();
+        await handlerPromise;
+      });
+
+      // ── Red-team regression guards (#2363 adversarial pass) ──────────────
+      // Three exploits were built against the carry as first written and are
+      // now closed. Each guard below pins ONE of those fixes. They are not
+      // redundant with the four tests above: those pin the FEATURE (a spent
+      // code is carried across a main-initiated swap and not across an
+      // ordinary reload, and never across a logout). These pin the BOUNDS
+      // that stop the same feature being turned against the user.
+
+      // F1. The carry re-queues the delivered code FIRST, into a queue whose
+      // overflow policy is drop-OLDEST at PENDING_DEEP_LINK_CAP — the same
+      // value as DEEP_LINK_HELD_MAX. That made the carried code the guaranteed
+      // eviction victim whenever a hostile page had filled gate.held: a web
+      // page firing 8 concord:// links deleted the invite the user actually
+      // clicked and put 8 attacker-chosen prefilled join modals in its place.
+      // The fix trims the oldest HELD codes instead. Delete this and that
+      // substitution comes back silently.
+      it('F1 (red-team): a hostile 8-code burst must NOT evict the carried invite — oldest HELD codes drop instead', async () => {
+        const { DEEP_LINK_HELD_MAX } = await import('../../../src/main/main');
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          // The user clicks a real invite: sent immediately, gate.lastCode = it.
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // A hostile page fills gate.held to capacity inside the emit window.
+          const burst = TEN_CODES.slice(0, DEEP_LINK_HELD_MAX);
+          for (const code of burst) deliverDeepLink(`concord://invite/${code}`);
+
+          // Main swaps the SPA source on its own initiative.
+          const releaseCarry = await armDeepLinkCarryForTest();
+          simulateReload();
+          releaseCarry();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * (DEEP_LINK_HELD_MAX + 4));
+
+          const afterSwap = sentOn('invite:received').slice(1);
+          // The code the user acted on survives, and arrives FIRST.
+          expect(afterSwap[0]).toBe(INVITE_CODE);
+          // Exactly one code was dropped, and it is the OLDEST HELD one.
+          expect(afterSwap).not.toContain(burst[0]);
+          expect(afterSwap).toEqual([INVITE_CODE, ...burst.slice(1)]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // F1 control. One code below DEEP_LINK_HELD_MAX nothing is trimmed at
+      // all. This is what isolates the cap as the cause rather than some other
+      // property of a burst — without it, a future change that dropped a held
+      // code unconditionally would still satisfy the guard above.
+      it('F1 CONTROL (red-team): a 7-code burst trims nothing — isolates DEEP_LINK_HELD_MAX as the cause', async () => {
+        const { DEEP_LINK_HELD_MAX } = await import('../../../src/main/main');
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          const burst = TEN_CODES.slice(0, DEEP_LINK_HELD_MAX - 1);
+          for (const code of burst) deliverDeepLink(`concord://invite/${code}`);
+
+          const releaseCarry = await armDeepLinkCarryForTest();
+          simulateReload();
+          releaseCarry();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * (DEEP_LINK_HELD_MAX + 4));
+
+          expect(sentOn('invite:received').slice(1)).toEqual([INVITE_CODE, ...burst]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // F2. The arming used to be a boolean that resetDeepLinkDelivery consumed
+      // on the FIRST reset. applySpaDecision awaits a navigation, and other
+      // navigations land in that window — a renderer location.reload(), a
+      // crash-reload, and applySpaDecision's OWN remote->cache->bundled
+      // fallback, which issues two loadURL calls inside one armed wrapper. Any
+      // of them spent the arming, so main's own swap carried nothing and #2363
+      // reproduced with no error and no log. This test is the one that catches
+      // a revert to a boolean: it asserts the arming SURVIVES a foreign reset.
+      it('F2 (red-team): an unrelated navigation inside the armed window must NOT spend the arming', async () => {
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // applySpaDecisionCarryingDeepLink has armed and is mid-await.
+          const releaseCarry = await armDeepLinkCarryForTest();
+
+          // A navigation main did NOT initiate lands first.
+          simulateReload();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+
+          // Main's own navigation finally starts. The arming must still be live.
+          simulateReload();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+          releaseCarry(); // applySpaDecision resolved; the wrapper's finally runs
+
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE, INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // F3. gate.lastCode is set at send time and main is never told the modal
+      // was closed, so the carry had no notion of CONSUMPTION: every later
+      // main-initiated swap re-presented an attacker-chosen prefilled join
+      // modal after an explicit decline, indefinitely and on a schedule
+      // (SPA_RETRY_DELAYS_MS, plus every "Load latest UI" click) an attacker
+      // can predict. DEEP_LINK_CARRY_MAX_AGE_MS encodes the recency condition
+      // the carry's own rationale always assumed. BOTH halves are asserted on
+      // purpose — a one-sided "is not re-presented" is satisfied by the carry
+      // being broken outright.
+      it('F3 (red-team): a code older than DEEP_LINK_CARRY_MAX_AGE_MS is NOT re-presented; a fresh one IS', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+
+        // Inside the window: the #2363 repair still works.
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          vi.advanceTimersByTime(DEEP_LINK_CARRY_MAX_AGE_MS - DEEP_LINK_EMIT_WINDOW_MS);
+          const releaseCarry = await armDeepLinkCarryForTest();
+          simulateReload();
+          releaseCarry();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+
+        // Outside the window: a dismissed invite stays dismissed.
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          vi.advanceTimersByTime(DEEP_LINK_CARRY_MAX_AGE_MS + DEEP_LINK_EMIT_WINDOW_MS);
+          const releaseCarry = await armDeepLinkCarryForTest();
+          simulateReload();
+          releaseCarry();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P1. The fence was a hand-picked 15 s documented as covering the
+      // cold-start retry schedule "with margin". It covered nothing: the delays
+      // are SEQUENTIAL and each attempt first awaits resolveSpaSource, so the
+      // second attempt's swap lands at 4 s + T + 10 s + T. The fence then
+      // declined the carry on the exact recovery path it exists to repair —
+      // silently, presenting as #2363 itself. This reds on any return to a
+      // literal: 15 s against a 24 s worst case.
+      it('CODEX P1 (red-team): the carry window exceeds the WORST-CASE cold-start retry schedule', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+        // From the shared module, never a mirrored literal: a mirror here would
+        // pass while production under-covered, which is the whole defect.
+        const { CONFIG_TIMEOUT_MS, SPA_RETRY_DELAYS_MS } =
+          await import('../../../src/main/spaTiming');
+
+        // Every BOUNDED step of the chain, not just the delays. The first retry
+        // is scheduled only after the initial applySpaDecision resolves, and each
+        // attempt schedules its successor only after its own does — and every
+        // applySpaDecision awaits a captureSpaHash bounded by the same timeout.
+        // So: one hash before the chain, then per attempt one config fetch AND
+        // one hash. Counting only the config fetches is what left the previous
+        // version of this fence short (CODEX P2, round 6).
+        const worstCase =
+          SPA_RETRY_DELAYS_MS.reduce((total, delay) => total + delay, 0) +
+          (2 * SPA_RETRY_DELAYS_MS.length + 1) * CONFIG_TIMEOUT_MS;
+
+        expect(DEEP_LINK_CARRY_MAX_AGE_MS).toBeGreaterThan(worstCase);
+      });
+
+      // The forget-only channel (#2363, v25). Every other edge that forgets also
+      // destroys credentials; a rememberMe teardown must forget WITHOUT doing so,
+      // because the disk tokens stay for the next launch to retry. Without it main
+      // kept the code alive across that teardown and a swap replayed user A's
+      // invite into user B's renderer.
+      it('deeplink:forget clears deliverable state without a credential clear', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        await handlers.get('deeplink:forget')!({
+          senderFrame: { url: 'app://concord/index.html' },
+        });
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          'the forgotten code must not survive into the successor document'
+        ).toEqual([INVITE_CODE]);
+      });
+
+      // Supervisor Q (2026-08-28): are the scheduled SPA retry and spa:reloadLatest
+      // two entry points to the same replay? Structurally they are ONE — both reach
+      // the carry only through applySpaDecisionCarryingDeepLink, so the forget
+      // zeroes the state both would read. What they can differ on is TIMING, and
+      // that is what this covers: the retry is already in flight (carry armed,
+      // applySpaDecision pending) when the refresh failure fires the forget. Its
+      // release token then lands AFTER the forget. The epoch advance in
+      // forgetDeliveredDeepLinks exists for exactly that token and had no test.
+      //
+      // The failure it prevents is a lost invite, not a leak: a stale token that
+      // still decrements drives the depth to -1, and the NEXT genuine swap arms it
+      // back to 0, where resetDeepLinkDelivery's `depth > 0` check declines to
+      // carry. So the assertion is on the swap AFTER the forget, not on the forget.
+      it('a carry token issued before the forget cannot disarm the swap after it', async () => {
+        const OTHER_CODE = 'ZZZZZZAC';
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        // The in-flight retry, armed while user A's code was still live.
+        const staleRelease = await armDeepLinkCarryForTest();
+
+        await handlers.get('deeplink:forget')!({
+          senderFrame: { url: 'app://concord/index.html' },
+        });
+        staleRelease();
+
+        // A later, unrelated swap — user B has signed in and clicked their own invite.
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${OTHER_CODE}`);
+        const liveRelease = await armDeepLinkCarryForTest();
+        simulateReload();
+        liveRelease();
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received').filter((code) => code === OTHER_CODE),
+          'a stale token that still decremented would leave the depth at -1, and this swap would decline to carry'
+        ).toEqual([OTHER_CODE, OTHER_CODE]);
+      });
+
+      // Codex P2 on PR #2967, and the reason deeplink:forget alone is not enough.
+      // spaLoader's version gate is deliberately one-directional -- it refuses an
+      // SPA NEWER than the shell and loads an older one indefinitely -- so a
+      // renderer built before contract 25 never calls the forget channel at all.
+      // On those SPAs a rememberMe refresh failure still leaves main holding user
+      // A's code, and a scheduled retry inside the 44 s carry window replays it
+      // into whoever signed in next.
+      //
+      // The fence is therefore MAIN-side and reads the credential store, which
+      // every SPA must go through regardless of its contract version: a code
+      // retained under owner A is not deliverable once a DIFFERENT owner is
+      // current. No renderer cooperation, so SPA age stops mattering.
+      it('does not deliver a code retained under one owner to a different owner', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        // The rememberMe refresh failure on an OLD SPA: no deeplink:forget call,
+        // and clearTokens is not called either, so main is told nothing at all.
+        // Then user B signs in -- storeRefreshToken mints the next owner.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          "user A's code must not reach user B's renderer, whatever the SPA's contract version"
+        ).toEqual([INVITE_CODE]);
+      });
+
+      // The positive control, and the flow the fence could most easily break.
+      // A code queued before anyone signed in belongs to NOBODY, and delivering it
+      // to the account that then signs in IS the feature (click invite -> sign in
+      // -> join). Its owner tag is null, so the fence must never fire for it.
+      it('still delivers a code queued before sign-in to the account that signs in', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        // Logged out, no window ready: the code sits in the pending queue.
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        expect(sentOn('invite:received')).toEqual([]);
+
+        // The user signs in; a fresh owner is minted.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          'an invite clicked while logged out is exactly what the user is signing in to accept'
+        ).toEqual([INVITE_CODE]);
+      });
+
+      // Each fence site below covers a delivery path the others do not reach.
+      // Written because a mutation sweep found both of them uncovered: dropping
+      // either fence left the suite green.
+
+      // flushDeepLinkGate calls sendDeepLink DIRECTLY (main.ts) — not through the
+      // drain, not through emitDeepLink — so a code sitting in gate.held when the
+      // window timer fires reaches the renderer on a path nothing else fences.
+      it('does not flush a held code to an owner that did not receive it', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        vi.useFakeTimers();
+        try {
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          // Inside the emit window, so this one is HELD rather than sent.
+          deliverDeepLink(`concord://invite/${TEN_CODES[9]}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          (getCredentialCustodyState as Mock).mockReturnValue({
+            credentialOwner: 42,
+            pendingE2EEUnlock: false,
+          });
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS);
+
+          expect(
+            sentOn('invite:received'),
+            'the held code belongs to the owner who clicked it, not to whoever the timer finds'
+          ).toEqual([INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // The arrival fence. Without it, noteDeepLinkOwner tags the whole retained
+      // set with the NEW owner as B's own click comes in, and the drain then sees
+      // a matching owner and hands A's queued codes over too — the fence
+      // disarming itself one call before it was needed.
+      it('a new owner clicking their own link does not inherit the previous owner queue', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        // Renderer not ready: A's code waits in the pending queue.
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        deliverDeepLink(`concord://invite/${TEN_CODES[9]}`);
+        signalInviteReady(rendererEvent);
+
+        expect(sentOn('invite:received'), "B gets B's invite and only B's invite").toEqual([
+          TEN_CODES[9],
+        ]);
+      });
+
+      // The current === null carve-out, which is a documented behaviour rather
+      // than a defensive default: an aborted SSO, a cancelled account-link and an
+      // interrupted email verification all clear credentials WITHOUT minting a
+      // successor. Those are login-side, and forgetting there deletes the invite
+      // the user is about to retry with ([internal]rules/electron.md).
+      it('keeps a queued code when credentials are cleared with no successor owner', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        // Credentials gone, nobody replaced them.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          'an aborted login must not delete the invite it was aborting in the middle of'
+        ).toEqual([INVITE_CODE]);
+      });
+
+      // noteDeepLinkOwner refuses to write a NULL tag, and that refusal is the
+      // fence's own laundering guard rather than a null-check for tidiness. A
+      // logged-out arrival is exempt from the fence by the tag-null carve-out, so
+      // if it also RESET the tag, it would hand user A's still-queued code the
+      // same exemption — and the next owner to sign in would receive both.
+      // Plausible on a shared machine: sign out, click a link, hand over the laptop.
+      it('a logged-out arrival does not launder the previous owner retained code', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        // Signed out — no owner at all.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        deliverDeepLink(`concord://invite/${TEN_CODES[9]}`);
+
+        // Someone else signs in.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          "a signed-out click must not re-open user A's retained code to the next account"
+        ).not.toContain(INVITE_CODE);
+      });
+
+      // Codex P2, main.ts:688. The tag-null carve-out is what lets a pre-login
+      // code reach whoever signs in -- but the tag was only ever written at OS
+      // ARRIVAL, so after that delivery it stayed null and the exemption never
+      // expired. The primary flow (click invite -> sign in -> join) therefore
+      // produced a permanently ownerless code: A receives it, and on a pre-v25
+      // SPA a later swap could still replay it to B. Delivery binds it now.
+      it('binds a pre-login code to the account that actually receives it', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        // User A signs in and receives it — the feature, and it must still work.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        signalInviteReady(rendererEvent);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        // A's session ends without telling main (old SPA), B signs in, swap.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 43,
+          pendingE2EEUnlock: false,
+        });
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          "once A has received it the code is A's, and the pre-login exemption is spent"
+        ).toEqual([INVITE_CODE]);
+      });
+
+      // Codex P2, main.ts:924. `handleInviteDeepLink` is NOT the only OS entry
+      // point: on Windows and Linux a protocol activation against a running app
+      // arrives as `second-instance` -> handleInviteDeepLinksFromArgv, which
+      // called queueDeepLink directly and so met neither the fence nor the bind.
+      //
+      // The DELIVERY bind already covers a code that gets DELIVERED, so the
+      // reproducing shape is the ARRIVAL fence — and the symptom is the opposite
+      // of the one reported. Without a fence at the argv arrival, B's code is
+      // queued while the tag is still A's, and the drain fence then fires once
+      // and forgets EVERYTHING pending: A's retained code AND B's own fresh
+      // click. B loses the invite they just opened. Confirmed by a positive
+      // control (drop B's arrival and the queue still drains to nothing), which
+      // is the only reason this was not read as a broken harness.
+      //
+      // The startup `process.argv` call shares this path deliberately and is
+      // unaffected: at cold start both the tag and the current owner are null,
+      // so the fence and the bind are each a no-op there.
+      it('fences an argv deep link from a second instance (Windows/Linux)', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        // Renderer not ready: A's code waits in the pending queue.
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        // B signs in and clicks their own link, which reaches the running app
+        // through second-instance rather than open-url.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        appOnCallbacks.get('second-instance')!({}, [
+          'concord.exe',
+          `concord://invite/${TEN_CODES[9]}`,
+        ]);
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          'an argv arrival is an OS arrival and must fence like any other'
+        ).toEqual([TEN_CODES[9]]);
+      });
+
+      // Codex P2, main.ts:621, and the round-15 test below with ONE step added:
+      // an unrelated reset between the re-click and the flood. That is the whole
+      // finding. Round 15 split `reservedCode` from `carriedCode` so a re-click
+      // keeps its exemption; the reset branch then read `carriedStillPending` --
+      // false *because carriedCode is null* -- and cleared the reservation of a
+      // code that was still queued, re-tying the two fields it had just split.
+      it('keeps the eviction reservation across a reset that carries nothing', async () => {
+        const { PENDING_DEEP_LINK_CAP } = await import('../../../src/main/main');
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+
+          // The re-click retires the carried marker and keeps the reservation.
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+          // An ordinary reload that carries nothing -- the step round 15 lacked.
+          simulateReload();
+
+          const SAFE = 'ABCDEFGHJKMNPQRS';
+          for (let i = 0; i < PENDING_DEEP_LINK_CAP; i += 1) {
+            deliverDeepLink(`concord://invite/ZZZZZZB${SAFE[i % SAFE.length]}`);
+          }
+
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 40);
+
+          const deliveries = sentOn('invite:received').filter((c) => c === INVITE_CODE);
+          expect(
+            deliveries.length,
+            'a reset that carries nothing must not spend a reservation whose code is still queued'
+          ).toBeGreaterThanOrEqual(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // Codex P2, main.ts:702, and a fair hit on the laundering test above: it
+      // asserts A's code is ABSENT and never that the fresh one SURVIVED.
+      //
+      // On a pre-v25 SPA the teardown leaves A's tag in place. A link clicked
+      // while logged out could not clear it -- noteDeepLinkOwner refuses to write
+      // null, deliberately -- so the fresh code joined A's queue under A's tag,
+      // and when B's credential was minted the drain fence swept the whole queue
+      // including the link the user had just opened.
+      //
+      // Arrival is the separating boundary, and it needs no per-entry ownership:
+      // at a logged-out arrival everything ALREADY queued belongs to the retained
+      // tag and the arriving code does not.
+      it('a logged-out arrival keeps its own code while discarding the retained owner queue', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        // A's session ends on an old SPA: nothing tells main, so the tag stays 41.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        deliverDeepLink(`concord://invite/${TEN_CODES[9]}`);
+
+        // B's credential is minted -- an SSO completion during a reload.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        signalInviteReady(rendererEvent);
+
+        const delivered = sentOn('invite:received');
+        expect(delivered, "A's retained code must still not cross").not.toContain(INVITE_CODE);
+        expect(
+          delivered,
+          'but the link the user clicked while logged out is the one they are signing in to accept'
+        ).toContain(TEN_CODES[9]);
+      });
+
+      // Codex P2, main.ts:713, and a fair hit on the delivery-bind test above:
+      // that test mints the owner BEFORE signalling readiness, which is not the
+      // order a cold start uses. App.tsx signals invite-readiness from a mount
+      // effect keyed on [isPipWindow] -- unconditionally, before anyone signs in
+      // -- and the authenticated replay that opens the modal is renderer-local
+      // and never calls back into main. So the real startup order delivers the
+      // code while the owner is still null, noteDeepLinkOwner declines to write,
+      // and the tag stays null forever: the delivery bind fixed a case that does
+      // not occur and left the one that does.
+      //
+      // Vacuity mode 7 -- sensitive to the mutation I imagined, blind to the
+      // ordering that actually ships.
+      it('binds a startup code when authentication later succeeds', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        // The REAL order: the renderer is ready before anyone has signed in.
+        signalInviteReady(rendererEvent);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        // A signs in. Main learns of it here and nowhere else -- the renderer's
+        // own replay into the modal is local and sends no IPC.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        await handlers.get('auth:storeRefreshToken')!(
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+          { refreshToken: 'tok', rememberMe: true, apiBase: 'http://localhost:8080' }
+        );
+
+        // A's teardown on an old SPA tells main nothing; B signs in; swap.
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 43,
+          pendingE2EEUnlock: false,
+        });
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          'a startup code the user signed in to accept belongs to that account afterwards'
+        ).toEqual([INVITE_CODE]);
+      });
+
+      // The fence must run BEFORE the bind at every auth point, or signing in
+      // ADOPTS the previous owner's retained queue instead of discarding it --
+      // turning the remedy for a cross-account replay into a cause of one.
+      it('a sign-in discards the previous owner queue rather than adopting it', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 41,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        // A's code waits in the queue; the renderer never became ready.
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        await handlers.get('auth:storeRefreshToken')!(
+          { sender: { id: 1 }, senderFrame: { url: 'app://concord/index.html' } },
+          { refreshToken: 'tok', rememberMe: true, apiBase: 'http://localhost:8080' }
+        );
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          "signing in must not adopt the previous account's queued codes"
+        ).toEqual([]);
+      });
+
+      // The restore path is the likelier of the two in practice: a remembered
+      // session at launch is exactly when a startup deep link is waiting.
+      it('binds a startup code when a remembered session is restored', async () => {
+        const { getCredentialCustodyState } = await import('../../../src/main/tokenManager');
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: null,
+          pendingE2EEUnlock: false,
+        });
+        resetDeepLinkState();
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+        signalInviteReady(rendererEvent);
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 42,
+          pendingE2EEUnlock: false,
+        });
+        await handlers.get('auth:restoreSession')!({
+          sender: { id: 1 },
+          senderFrame: { url: 'app://concord/index.html' },
+        });
+
+        (getCredentialCustodyState as Mock).mockReturnValue({
+          credentialOwner: 43,
+          pendingE2EEUnlock: false,
+        });
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        expect(
+          sentOn('invite:received'),
+          'a restored session owns the startup code it was launched with'
+        ).toEqual([INVITE_CODE]);
+      });
+
+      it('deeplink:forget rejects an untrusted sender frame', async () => {
+        resetDeepLinkState();
+        signalInviteReady(rendererEvent);
+        deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+        await handlers.get('deeplink:forget')!(foreignIpcEvent);
+
+        const releaseCarry = await armDeepLinkCarryForTest();
+        simulateReload();
+        releaseCarry();
+        signalInviteReady(rendererEvent);
+
+        // Refused, so the carry still works — a hostile frame cannot wipe a
+        // pending invite even though forgetting is the fail-safe direction.
+        expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+      });
+
+      // CODEX P2 (round 15). Round 14 refreshed the re-clicked code's clock and
+      // marker but left its single occurrence at index 0. Retiring the marker also
+      // retires the eviction reservation, so the entry was then the oldest AND
+      // unexempt — the next different link overflowed the cap and evicted the
+      // fresh re-click. The fix honoured the action and then threw it away.
+      // Moving the entry to the FIFO tail — the obvious remedy — does NOT work:
+      // at re-click time it is usually the only entry, so the move is a no-op and
+      // the later links still append after it. The reservation had to be split
+      // from the replay marker instead.
+      it('CODEX P2 (red-team): a refreshed re-click keeps its eviction reservation', async () => {
+        const { PENDING_DEEP_LINK_CAP } = await import('../../../src/main/main');
+        expect(PENDING_DEEP_LINK_CAP).toBeGreaterThan(0);
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+
+          // The user re-clicks the carried code while the successor is loading...
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+          // ...then enough different links arrive to overflow the cap.
+          const SAFE = 'ABCDEFGHJKMNPQRS';
+          for (let i = 0; i < PENDING_DEEP_LINK_CAP; i += 1) {
+            deliverDeepLink(`concord://invite/ZZZZZZB${SAFE[i % SAFE.length]}`);
+          }
+
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 40);
+
+          const deliveries = sentOn('invite:received').filter((c) => c === INVITE_CODE);
+          expect(
+            deliveries.length,
+            'the deliberate re-click must not be evicted as the oldest entry'
+          ).toBeGreaterThanOrEqual(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2 (round 14). An interaction between two earlier fixes, neither
+      // wrong alone. The pending-queue dedupe (round 11) discarded a duplicate of
+      // the carried code; the drain-time expiry (round 13) then dropped the stale
+      // original. Together, a user who re-opens the same link while the successor
+      // is still loading got NOTHING — both fences firing on the same code and
+      // cancelling each other out.
+      it('CODEX P2 (red-team): a re-click behind a queued carried code still opens', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // Carried and queued; the successor never signals ready.
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+
+          // The user opens the same link again, deliberately.
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+          // Long past the ORIGINAL delivery's window — the replay would expire.
+          vi.advanceTimersByTime(DEEP_LINK_CARRY_MAX_AGE_MS * 2);
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 4);
+
+          expect(
+            sentOn('invite:received'),
+            'the deliberate re-click must reach the renderer, not be eaten by the replay it queued behind'
+          ).toEqual([INVITE_CODE, INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2 (round 13). The age was checked where the code was QUEUED and
+      // never again. Pending-queue residence is unbounded — the successor
+      // renderer signals readiness when it is ready — so a stalled init left a
+      // carried code sitting in the queue and the drain replayed it on the
+      // strength of the marker alone. The fence passed once and was never asked
+      // again, which is how a dismissed invite reappears hours later.
+      it('CODEX P2 (red-team): a carried code that ages out IN the queue is not replayed', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // Carried well inside the window, so it is queued...
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+
+          // ...but the successor never signals ready until long after it expired.
+          vi.advanceTimersByTime(DEEP_LINK_CARRY_MAX_AGE_MS * 3);
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 4);
+
+          expect(
+            sentOn('invite:received'),
+            'a code that expired while queued must not be replayed on drain'
+          ).toEqual([INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2 (round 11). The reservation matched by VALUE, so every copy of
+      // the carried code was exempt. A page that knows that code — its own, if it
+      // fired the link that got carried — could fill the queue with duplicates,
+      // leaving a later legitimate link as the only non-reserved entry and thus
+      // the immediate eviction victim: suppression rather than substitution.
+      it('CODEX P2 (red-team): duplicates of the carried code cannot starve a later link', async () => {
+        const { PENDING_DEEP_LINK_CAP } = await import('../../../src/main/main');
+        expect(PENDING_DEEP_LINK_CAP).toBeGreaterThan(0);
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+
+          // Flood with copies of the CARRIED code, then one different, legitimate
+          // link that must not be the one thrown away.
+          for (let i = 0; i < PENDING_DEEP_LINK_CAP * 2; i += 1) {
+            deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          }
+          const LATER_CODE = 'ZZZZZZAB';
+          deliverDeepLink(`concord://invite/${LATER_CODE}`);
+
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 40);
+
+          const sent = sentOn('invite:received');
+          expect(sent, 'the carried invite still survives').toContain(INVITE_CODE);
+          expect(sent, 'and so does the later legitimate one').toContain(LATER_CODE);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2 (round 7). F1 reserved the carried code in the HOLD buffer and
+      // left the PENDING queue open — and the carried code is re-queued first, so
+      // it is the oldest entry and the guaranteed drop-oldest victim once the cap
+      // is exceeded while the successor document loads. Any page can fire that
+      // burst, so the carry silently hands the user the attacker's invites in
+      // place of their own: F1's exact defect, one queue over.
+      it('CODEX P2 (red-team): a burst during the successor load cannot evict the carried code', async () => {
+        const { PENDING_DEEP_LINK_CAP } = await import('../../../src/main/main');
+        // The import is load-bearing and was silently undefined once: `i < NaN`
+        // is false, so the burst never ran and this test passed on zero attacker
+        // links. Assert the fixture before using it.
+        expect(PENDING_DEEP_LINK_CAP).toBeGreaterThan(0);
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+
+          // The successor has NOT signalled ready, so everything queues behind
+          // the carried code. Overflow the cap several times over.
+          //
+          // Codes must be EXACTLY 8 chars from deepLink.ts's alphabet (no
+          // I/O/l/0/1). The first version of this burst used `ATTACKER00`-style
+          // strings, every one of which the parser rejected — so the burst never
+          // happened and the test passed against plain drop-oldest.
+          const SAFE = 'ABCDEFGHJKMNPQRS';
+          const burst = Array.from(
+            { length: PENDING_DEEP_LINK_CAP * 2 },
+            (_unused, i) => `ZZZZZZA${SAFE[i % SAFE.length]}`
+          );
+          for (const code of burst) deliverDeepLink(`concord://invite/${code}`);
+
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 40);
+
+          // COUNT, do not merely contain. The original pre-reload delivery is
+          // already in this list, so `toContain` is satisfied whether or not the
+          // carry survived — which is exactly how the first version of this test
+          // passed against plain drop-oldest.
+          const deliveries = sentOn('invite:received').filter((code) => code === INVITE_CODE);
+          expect(
+            deliveries.length,
+            "the user's own invite must be re-delivered after a burst it was queued before"
+          ).toBeGreaterThanOrEqual(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2 (round 6). Two main-owned swaps can overlap — the case the
+      // depth count exists for — and the SECOND reset sees lastCode === null
+      // because the first already cleared it. Clearing carriedCode there erased
+      // the replay marker and the clock for a code still sitting in the pending
+      // queue, so it drained as a "fresh" delivery and restarted its own window:
+      // the recency bound defeated for the third time, by its own repair.
+      it('CODEX P2 (red-team): a second reset before ready does not reset the carried clock', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // Two resets, both BEFORE the successor signals ready. The first
+          // carries; the second must not erase what the first recorded.
+          const releaseA = await armDeepLinkCarryForTest();
+          simulateReload();
+          const releaseB = await armDeepLinkCarryForTest();
+          simulateReload();
+          releaseA();
+          releaseB();
+
+          // The timing is the whole test. The code sits in the pending queue for
+          // most of the window, so the REPLAY is late while the ORIGINAL delivery
+          // is later still. A version that restarts the clock at drain time then
+          // measures from the replay and happily carries; one that keeps the
+          // original clock is already past the fence. Draining and asserting at
+          // the same instant — the first shape of this test — makes both versions
+          // decline, and passes on the bug.
+          const beforeDrain = Math.floor(DEEP_LINK_CARRY_MAX_AGE_MS * 0.8);
+          const afterDrain = Math.floor(DEEP_LINK_CARRY_MAX_AGE_MS * 0.4);
+
+          vi.advanceTimersByTime(beforeDrain);
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+          expect(
+            sentOn('invite:received'),
+            'the carried code must still reach the renderer, or this proves nothing'
+          ).toEqual([INVITE_CODE, INVITE_CODE]);
+
+          // 1.2x the window since FIRST delivery, but only 0.4x since the replay.
+          vi.advanceTimersByTime(afterDrain);
+          const releaseC = await armDeepLinkCarryForTest();
+          simulateReload();
+          releaseC();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2 (round 5). The first version of the replay test asked "is this
+      // the same code as last time", which conflated a REPLAY with a deliberate
+      // RE-CLICK. A user who dismisses an invite and then opens the same link
+      // again is making a fresh delivery; inheriting the old clock meant the new
+      // modal was born stale and would not survive a swap — the carry declining
+      // the very thing it exists to protect, one more time.
+      it('CODEX P2 (red-team): a deliberate re-click starts a NEW recency window', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // Long past the window: this code is stale and must not be carried...
+          vi.advanceTimersByTimeAsync(0);
+          vi.advanceTimersByTime(DEEP_LINK_CARRY_MAX_AGE_MS * 2);
+
+          // ...but the user opens the SAME link again, deliberately.
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+          expect(
+            sentOn('invite:received'),
+            'the re-click itself must reach the renderer, or this test proves nothing'
+          ).toEqual([INVITE_CODE, INVITE_CODE]);
+
+          const release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+
+          // The re-click is fresh, so the swap must carry it.
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE, INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      // CODEX P2. sendDeepLink refreshes gate.lastAt on EVERY delivery, a
+      // carry's own replay included, so measuring the fence off lastAt made it a
+      // SLIDING window: a dismissed attacker-supplied invite stayed eligible
+      // forever as long as main-initiated swaps ("Load latest UI" clicks) kept
+      // landing inside it. The clock must run from the FIRST delivery.
+      it('CODEX P2 (red-team): the recency window runs from FIRST delivery, not from the last carry', async () => {
+        const { DEEP_LINK_CARRY_MAX_AGE_MS } = await import('../../../src/main/main');
+
+        resetDeepLinkState();
+        vi.useFakeTimers();
+        try {
+          signalInviteReady(rendererEvent);
+          deliverDeepLink(`concord://invite/${INVITE_CODE}`);
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE]);
+
+          // Two hops, each well INSIDE the window on its own, together past it.
+          const hop = Math.floor(DEEP_LINK_CARRY_MAX_AGE_MS * 0.6);
+
+          vi.advanceTimersByTime(hop);
+          let release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+          // Positive control: the first carry is legitimate and MUST happen, or
+          // the assertion below would pass on a carry that is simply broken.
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+
+          vi.advanceTimersByTime(hop);
+          release = await armDeepLinkCarryForTest();
+          simulateReload();
+          release();
+          signalInviteReady(rendererEvent);
+          vi.advanceTimersByTime(DEEP_LINK_EMIT_WINDOW_MS * 2);
+          // 1.2x the window has elapsed since FIRST delivery. Off lastAt the
+          // replay would have restarted the clock and a third send would land.
+          expect(sentOn('invite:received')).toEqual([INVITE_CODE, INVITE_CODE]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
     });
   });
 

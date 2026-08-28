@@ -101,6 +101,7 @@ import {
   SPA_NO_CACHE_LOAD_OPTIONS,
   type SpaLoadDecision,
 } from './spaLoader';
+import { CONFIG_TIMEOUT_MS, SPA_RETRY_DELAYS_MS } from './spaTiming';
 import { handleCacheProtocolRequest } from './spaCache/cacheProtocol';
 import { getLiveDir } from './spaCache/cacheStore';
 import { populateCacheFromRemote } from './spaCache/populateCache';
@@ -306,7 +307,7 @@ const DEEP_LINK_KINDS: readonly DeepLinkKind[] = ['invite', 'friend'];
 // user actually clicked during cold start is evicted and silently never
 // delivered. Same reasoning the friend arm already applies at the edge, where
 // its WAF rule carries its own ref and counter.
-const PENDING_DEEP_LINK_CAP = 8;
+export const PENDING_DEEP_LINK_CAP = 8;
 const pendingDeepLinks: Record<DeepLinkKind, string[]> = { invite: [], friend: [] };
 
 // Delivery after renderer-ready is otherwise unbounded: a page the user merely
@@ -338,6 +339,49 @@ type DeepLinkEmitGate = {
   lastCode: string | null;
   /** When it was sent; 0 means nothing sent yet this renderer lifecycle. */
   lastAt: number;
+  /**
+   * When the code currently in flight was FIRST delivered to any document, on the
+   * MONOTONIC clock (`performance.now()`), not wall time. `Date.now()` moves under
+   * NTP correction, resume-time synchronisation and manual clock changes: a
+   * backward jump kept a dismissed invite eligible past the window, and a forward
+   * jump during cold-start recovery made a FRESH invite look expired and
+   * reproduced the delivery loss this fence exists to prevent (CODEX P2). The
+   * asymmetry decides the trade-off — a monotonic clock may not advance across
+   * system SUSPEND on every platform, so a laptop closed mid-window can resume
+   * with the code still eligible; that is the F3 direction, which still needs a
+   * main-owned swap and an explicit Join click, whereas the wall-clock failure
+   * silently discards a live invite. 0
+   * means nothing is in flight. Distinct from `lastAt` — which is wall time, used
+   * only by the 1-second emit window — and which EVERY delivery refreshes — a carry's replay included. Measuring the recency fence off
+   * `lastAt` made it a SLIDING window: each carry reset the clock, so a
+   * dismissed code stayed eligible forever as long as main-initiated swaps
+   * kept landing inside the window (CODEX P2).
+   */
+  originAt: number;
+  /**
+   * The code `resetDeepLinkDelivery` carried and that is awaiting its replay;
+   * null otherwise. It is what tells `sendDeepLink` that an incoming code is a
+   * REPLAY (clock keeps running) rather than a fresh send (clock restarts) —
+   * see there. NOT cleared unconditionally on reset: it survives a reset that
+   * carries nothing while its code is still in `pendingDeepLinks`, and is cleared
+   * once that code has drained or been evicted. An unconditional clear at reset
+   * start is exactly the defect that erased the marker for a still-queued code,
+   * which then drained as a fresh delivery and restarted its own window.
+   */
+  carriedCode: string | null;
+  /**
+   * The code exempt from `PENDING_DEEP_LINK_CAP` eviction, until it is delivered.
+   *
+   * SEPARATE from `carriedCode` on purpose (CODEX P2). They started as one field
+   * and answer different questions: `carriedCode` means "this queued entry is a
+   * REPLAY", which drives the clock preservation and the drain-time expiry;
+   * `reservedCode` means "this entry must not be the eviction victim". A
+   * deliberate re-click retires the replay marker — it is a fresh delivery, not an
+   * echo — but it must KEEP the reservation, or the fresh click becomes the oldest
+   * unexempt entry and the next link evicts it. One field could not express both,
+   * and collapsing them loses whichever property is not being thought about.
+   */
+  reservedCode: string | null;
   /** Codes held back by the window, oldest first; one is released per edge. */
   held: string[];
   timer: ReturnType<typeof setTimeout> | null;
@@ -347,9 +391,103 @@ type DeepLinkEmitGate = {
 export const DEEP_LINK_HELD_MAX = 8;
 
 const deepLinkEmitGates: Record<DeepLinkKind, DeepLinkEmitGate> = {
-  invite: { lastCode: null, lastAt: 0, held: [], timer: null },
-  friend: { lastCode: null, lastAt: 0, held: [], timer: null },
+  invite: {
+    lastCode: null,
+    lastAt: 0,
+    originAt: 0,
+    carriedCode: null,
+    reservedCode: null,
+    held: [],
+    timer: null,
+  },
+  friend: {
+    lastCode: null,
+    lastAt: 0,
+    originAt: 0,
+    carriedCode: null,
+    reservedCode: null,
+    held: [],
+    timer: null,
+  },
 };
+
+// A COUNT, not a boolean (#2363). Two main-owned swaps can overlap — a
+// `spa:reloadLatest` click can land while a background `scheduleSpaSourceRetry`
+// is still awaiting, and `applySpaDecision` itself navigates twice on its
+// remote->cache->bundled fallback. A boolean is spent by the FIRST reset inside
+// that await, so main's own navigation carried nothing and #2363 reproduced
+// silently, fail-open. The count is owned by applySpaDecisionCarryingDeepLink:
+// incremented on entry, released in its `finally`.
+//
+// The EPOCH is what makes the pairing structural rather than absorbed.
+// forgetDeliveredDeepLinks zeroes the depth while release closures from
+// still-in-flight swaps are outstanding; without the epoch a PRE-logout token
+// firing after a LATER swap armed would disarm that swap mid-await (A,B arm ->
+// logout -> A releases -> C arms -> B's stale release zeroes C). Fail-closed —
+// a repair is lost, nothing leaks — but a `Math.max` clamp there would absorb
+// broken pairing instead of preventing it, which is exactly the shape rejected
+// when the boolean became a count.
+let deepLinkCarryDepth = 0;
+let deepLinkCarryEpoch = 0;
+
+/**
+ * How recent a DELIVERED code must be for the carry to re-deliver it
+ * (RED-TEAM F3). The carry's own justification is "the modal is destroyed
+ * before the user could act on it" — a RECENCY condition the original
+ * implementation never encoded, so a code the user had already read and
+ * DISMISSED was re-presented by every later main-initiated swap, including a
+ * "Load latest UI" click minutes afterwards.
+ *
+ * DERIVED, not chosen (CODEX P1). A hand-picked 15 s was stated to cover the
+ * retry schedule "with margin" and did not cover it at all: the delays are
+ * SEQUENTIAL and each attempt first awaits resolveSpaSource, so the second
+ * attempt's swap lands at 4 s + T + 10 s + T where T is the config timeout —
+ * 24 s at worst and 14 s even when both fetches return instantly. The fence
+ * then declined the carry on the exact cold-start recovery it exists to
+ * repair, silently, presenting as the original bug. Deriving it means editing
+ * either input cannot silently re-open that gap.
+ *
+ * The budget covers the WHOLE chain, not only the delays (CODEX P2, round 6).
+ * `scheduleSpaSourceRetry` is first called AFTER the initial `applySpaDecision`
+ * resolves, and each attempt schedules its successor only after its own
+ * `applySpaDecision` resolves — and every `applySpaDecision` awaits a
+ * `captureSpaHash` bounded by the same CONFIG_TIMEOUT_MS. So each attempt costs
+ * up to TWO timeouts (one config fetch, one hash capture), plus one hash capture
+ * before the chain starts.
+ *
+ * BEST-EFFORT CEILING, not a proof: `window.loadURL` inside `applySpaDecision`
+ * has no deadline of its own, so a pathologically slow document load can still
+ * push a swap past this fence. Every step that CAN be bounded is counted here;
+ * the one that cannot is named rather than silently assumed to be fast.
+ */
+export const DEEP_LINK_CARRY_MAX_AGE_MS =
+  SPA_RETRY_DELAYS_MS.reduce((total, delay) => total + delay, 0) +
+  (2 * SPA_RETRY_DELAYS_MS.length + 1) * CONFIG_TIMEOUT_MS +
+  5_000;
+
+/**
+ * Arm the carry for the next renderer-lifecycle reset (#2363): the code this
+ * renderer has already been SENT is re-queued for its successor document
+ * instead of being discarded. Only a navigation MAIN itself initiates may arm
+ * it, and only via applySpaDecisionCarryingDeepLink, whose `finally` releases
+ * it even when applySpaDecision resolves without navigating at all.
+ *
+ * Returns its OWN release function — idempotent, and inert once
+ * forgetDeliveredDeepLinks has advanced the epoch (see `deepLinkCarryEpoch`).
+ * Every caller, including tests, must release.
+ */
+export function carryDeepLinkAcrossNextLoad(): () => void {
+  const epoch = deepLinkCarryEpoch;
+  deepLinkCarryDepth += 1;
+  let released = false;
+  return () => {
+    // A token from a superseded epoch has already been accounted for by the
+    // forget that advanced it; decrementing again would disarm a later swap.
+    if (released || epoch !== deepLinkCarryEpoch) return;
+    released = true;
+    deepLinkCarryDepth -= 1;
+  };
+}
 
 // Both readiness flags drop together at every renderer-lifecycle boundary
 // (window creation, reload, crash, close), and the emit gate resets with them:
@@ -368,20 +506,236 @@ const deepLinkEmitGates: Record<DeepLinkKind, DeepLinkEmitGate> = {
 // above, so each falls through emitDeepLink into the pending queue and the next
 // drain hands it to the new renderer. Snapshot before queueing — queueDeepLink
 // re-enters this module's state.
+//
+// A code that was already SENT is carried too, but ONLY when main itself
+// initiated the navigation (#2363). Discarding it is right for an ordinary
+// reload — the renderer consumed that code — and wrong for the two source swaps
+// main performs on its own initiative (scheduleSpaSourceRetry, spa:reloadLatest),
+// where the modal is destroyed before the user could act on it.
 function resetDeepLinkDelivery(): void {
+  // NO owner fence here, deliberately. It would be redundant: everything this
+  // re-queues lands in pendingDeepLinks and meets the fence in
+  // drainPendingDeepLinks before it can be delivered — measured by mutation,
+  // dropping either one alone leaves the cross-owner test green and dropping both
+  // turns it red. One fence per delivery path, not two per path.
   inviteRendererReady = false;
   friendRendererReady = false;
+  // Read ONCE for the whole reset, not per kind. NOT cleared here (RED-TEAM
+  // F2): the arming belongs to whichever applySpaDecisionCarryingDeepLink call
+  // took it out and is released by that call's `finally`. Clearing it on the
+  // first reset let an unrelated navigation inside the await spend it, so
+  // main's own navigation carried nothing. Leaving it armed for the whole
+  // window self-bounds — a second reset finds gate.lastCode === null unless a
+  // genuine new send happened in between.
+  //
+  // "Read once" scopes the ARMING, not the number of codes: the loop below
+  // applies this single reading to BOTH gates, so one navigation can re-deliver
+  // up to two codes — one invite and one friend, each on its own channel. That
+  // is intended (the kinds are independent and never share a queue or a gate);
+  // an earlier wording said "one navigation is one carry", which read as a
+  // one-code bound and was wrong.
+  const carry = deepLinkCarryDepth > 0;
+  for (const kind of DEEP_LINK_KINDS) resetDeepLinkGate(kind, carry);
+}
+
+/**
+ * The per-kind half of `resetDeepLinkDelivery`, lifted out to keep that function
+ * under the cognitive-complexity limit. `carry` is read ONCE by the caller and
+ * passed in, so both gates see the same reading — see there for why.
+ */
+function resetDeepLinkGate(kind: DeepLinkKind, carry: boolean): void {
+  const gate = deepLinkEmitGates[kind];
+  const delivered = gate.lastCode;
+  // RED-TEAM F3: only a code the user has NOT had a fair chance to act on.
+  // Measured from the FIRST delivery, never from the last (CODEX P2) — see
+  // `originAt`.
+  const deliveredAge = performance.now() - gate.originAt;
+  // TWO fences stop emitDeepLink's same-code collapse (`entry.code ===
+  // previous`) from swallowing the carried code, and NEITHER is covered by a
+  // test — reordering this block stays green — so keep both:
+  //   1. readiness is already false above, so the queueDeepLink calls below
+  //      cannot reach the window logic at all; the code lands in the pending
+  //      queue and the next drain emits it;
+  //   2. the gate is cleared BEFORE anything is re-queued, so a caller that
+  //      did reach the window sees `previous === null` and an unbounded
+  //      `waited`.
+  // A collapse here is silent — no send, no error, no log — and presents
+  // exactly as the bug this carry repairs.
+  gate.lastCode = null;
+  gate.lastAt = 0;
+  // NOT cleared unconditionally. A SECOND reset before the renderer signals
+  // ready — two main-owned swaps overlapping, which is the case the depth count
+  // exists for — sees `lastCode === null` because the FIRST reset cleared it,
+  // so it does not carry, and an unconditional clear here erased the marker and
+  // the clock for a code still sitting in the pending queue. That code then
+  // drained as a "fresh" delivery and restarted its own window, defeating the
+  // recency bound exactly as the two earlier versions of it did (CODEX P2).
+  // The marker is cleared below only when its code is no longer pending.
+  if (gate.timer !== null) {
+    clearTimeout(gate.timer);
+    gate.timer = null;
+  }
+  const carried = gate.held;
+  gate.held = [];
+  // The delivered code predates everything in `held`, so it re-queues first:
+  // oldest-first preserves the FIFO ordering documented above.
+  const carrying = carry && delivered !== null && deliveredAge <= DEEP_LINK_CARRY_MAX_AGE_MS;
+  // A carried code awaiting its replay keeps the clock and the marker alive
+  // across resets that carry nothing. Once it is gone from the queue — drained,
+  // or evicted at PENDING_DEEP_LINK_CAP — the marker must go too, or a much
+  // later genuine delivery of the same code would inherit a long-expired clock.
+  const carriedStillPending =
+    gate.carriedCode !== null && pendingDeepLinks[kind].includes(gate.carriedCode);
+  // Tracked SEPARATELY from carriedStillPending, because the two fields have
+  // different lifetimes and tying them was the bug (CODEX P2). queueDeepLink
+  // retires `carriedCode` on a re-click while deliberately KEEPING
+  // `reservedCode` — the entry is still one queued occurrence and still needs
+  // its eviction exemption. An intervening reset then found carriedStillPending
+  // false *because carriedCode was null*, and cleared the reservation of a code
+  // that was still queued; eight later links could evict the user's own fresh
+  // re-click as the oldest unreserved entry. A reservation ends when ITS code
+  // leaves the queue, not when some other marker is retired.
+  const reservedStillPending =
+    gate.reservedCode !== null && pendingDeepLinks[kind].includes(gate.reservedCode);
+  if (carrying) {
+    gate.carriedCode = delivered;
+    gate.reservedCode = delivered;
+    queueDeepLink({ kind, code: delivered });
+    // RED-TEAM F1: the carried code is the one the user ACTED ON, so it must
+    // not be the eviction victim. queueDeepLink drops the OLDEST at
+    // PENDING_DEEP_LINK_CAP and the delivered code is re-queued FIRST, which
+    // made it the guaranteed victim whenever a hostile page had filled `held`
+    // to DEEP_LINK_HELD_MAX — the carry destroying exactly the code it exists
+    // to preserve, and handing the user eight attacker-chosen prefilled join
+    // modals in its place. Trim the OLDEST HELD codes instead: same
+    // drop-oldest policy, applied to the codes the user did not act on.
+    const room = PENDING_DEEP_LINK_CAP - pendingDeepLinks[kind].length;
+    if (carried.length > room) {
+      const dropped = carried.length - room;
+      carried.splice(0, dropped);
+      // Never silently, and never the code itself — bearer material
+      // ([internal]rules/observability.md). Scope: this reports dropped HELD
+      // codes only. queueDeepLink's own drop-oldest at PENDING_DEEP_LINK_CAP
+      // (below) stays silent, so a full pending queue can still shed one
+      // without a line here — reachable only if the renderer never drained it.
+      console.warn(
+        `Deep-link carry preserved the delivered code for kind=${kind}; dropped ${dropped} older held code(s)`
+      );
+    }
+  } else if (!carriedStillPending) {
+    // No carry armed, nothing delivered, or the age fence declining — and no
+    // earlier carry still in flight. This code's life ends here, so the next
+    // delivery starts a fresh clock instead of inheriting a stale one and
+    // being refused on arrival.
+    gate.originAt = 0;
+    gate.carriedCode = null;
+    if (!reservedStillPending) gate.reservedCode = null;
+  }
+  for (const code of carried) queueDeepLink({ kind, code });
+}
+
+// #945 M4 ("a held code does not outlive its session") extended from the
+// renderer into main: the carry above can re-deliver a code AFTER the renderer's
+// accessToken -> null clear has already run, so main must forget it at the same
+// edge. Without this, user A's invite is re-delivered into user B's session by
+// the renderer-invokable spa:reloadLatest — see spec
+// [internal]specs/2026-08-27-2363-server-invite-repair-design.md §5.2.
+// Silent by construction: codes are bearer material, so nothing here logs one.
+//
+// EVERYTHING still deliverable goes, not just the carry: the delivered code, the
+// hold FIFO and its pending flush, and the pending queue. A code sitting in
+// gate.held at logout is the same cross-account replay bounded to the <=1s until
+// flushDeepLinkGate releases it, and gate.lastAt is a previous session's
+// timestamp — so after this the gates are indistinguishable from a fresh
+// process. Idempotent by construction, so the logout paths that reach it may
+// overlap freely.
+//
+// Reached from `auth:logout` and `auth:clearTokens` — the two owner-blind
+// credential-ending handlers — and nowhere else. NOT from
+// `auth:clearTokensIfOwner`, whose callers are all login-side (see there), and
+// NOT from a `rememberMe` refresh failure, which runs gracefulReset() WITHOUT
+// electron.clearTokens() (apiClient.ts) and so deliberately keeps deliverable
+// codes for the remembered session to resume with. The claim is "every LOGOUT
+// path forgets", never "every credential wipe forgets".
+// The credential owner that was current when main last accepted a deliverable
+// code, or null when none has arrived under a credential. `credentialGeneration`
+// (which this reads through getCredentialCustodyState) is stable across a
+// session's own token refreshes and advances only when a credential is MINTED or
+// CLEARED — so it means "which account", not "which token", which is exactly the
+// question here.
+let deepLinkOwner: CredentialOwner | null = null;
+
+// The main-side half of the teardown fence, and the half that does not care what
+// the renderer is. `deeplink:forget` (v25) needs an SPA new enough to call it,
+// and spaLoader loads an older one indefinitely by design; this reads the
+// credential store every SPA must go through regardless of contract version.
+//
+// Fires ONLY on a different NON-NULL owner, and both halves of that are
+// load-bearing carve-outs documented in [internal]rules/electron.md:
+//
+//   tag null    — the code was queued before anyone signed in. It belongs to
+//                 nobody, and handing it to the account that signs in next IS
+//                 the feature (click invite → sign in → join).
+//   current null— credentials are gone but no owner has replaced them: an
+//                 aborted SSO, a cancelled account-link, an interrupted email
+//                 verification. Those are login-side and must NOT forget, or the
+//                 retry lands with the invite silently missing.
+//
+// Called at the three delivery entry points rather than inside emitDeepLink,
+// because drainPendingDeepLinks takes a `queue.splice(0)` snapshot first: a
+// forget from inside the loop empties the live queue while the snapshot it is
+// iterating survives, and every retained code delivers anyway.
+function fenceDeepLinksOnOwnerChange(atArrival = false, known?: CredentialOwner | null): void {
+  // `known` lets a caller that has ALREADY read custody pass its reading in.
+  // auth:restoreSession is the one that must: it re-verifies the owner across an
+  // await for its own reasons, and an extra read here would both be redundant and
+  // change how many times it observes custody.
+  const current = known === undefined ? getCredentialCustodyState().credentialOwner : known;
+  if (deepLinkOwner === null || current === deepLinkOwner) return;
+  // `current === null` means credentials are gone with no successor. At a DRAIN
+  // or FLUSH that is the login-side carve-out above and the queue must survive.
+  // At an ARRIVAL it is separable without per-entry ownership, and separating it
+  // is required: on a pre-v25 SPA the teardown leaves A's tag in place, a link
+  // clicked while logged out cannot clear it (noteDeepLinkOwner refuses to write
+  // null, deliberately), so the fresh code joined A's queue under A's tag and the
+  // next owner change swept the link the user had just opened (CODEX P2).
+  //
+  // Arrival is the boundary that makes them distinguishable: everything ALREADY
+  // queued belongs to the retained tag, and the arriving code does not.
+  if (current === null && !atArrival) return;
+  forgetDeliveredDeepLinks();
+}
+
+// Claim the codes now in flight for whoever is signed in. Called at OS arrival
+// AND at delivery: arrival binds a code that will sit in the queue, delivery
+// spends the pre-login carve-out on the account that actually receives it.
+// Deliberately does not clear the tag when logged out — a pre-login code must
+// stay null-tagged so the carve-out above still applies to it at sign-in, and
+// resetting it would extend that exemption to a retained code (see the test).
+function noteDeepLinkOwner(known?: CredentialOwner | null): void {
+  const current = known === undefined ? getCredentialCustodyState().credentialOwner : known;
+  if (current !== null) deepLinkOwner = current;
+}
+
+function forgetDeliveredDeepLinks(): void {
+  deepLinkOwner = null;
+  // Advance BEFORE zeroing: outstanding release tokens are now stale and must
+  // no longer decrement (see carryDeepLinkAcrossNextLoad).
+  deepLinkCarryEpoch += 1;
+  deepLinkCarryDepth = 0;
   for (const kind of DEEP_LINK_KINDS) {
     const gate = deepLinkEmitGates[kind];
     gate.lastCode = null;
     gate.lastAt = 0;
+    gate.originAt = 0;
+    gate.carriedCode = null;
+    gate.reservedCode = null;
+    gate.held = [];
     if (gate.timer !== null) {
       clearTimeout(gate.timer);
       gate.timer = null;
     }
-    const carried = gate.held;
-    gate.held = [];
-    for (const code of carried) queueDeepLink({ kind, code });
+    pendingDeepLinks[kind].length = 0;
   }
 }
 
@@ -411,7 +765,34 @@ function registerInviteProtocolClient(): void {
 // and opens the SERVER-join modal with a friend code. On a second channel the
 // same SPA simply never subscribes and the deep link no-ops (#945, spec X1).
 function sendDeepLink(kind: DeepLinkKind, code: string): void {
+  // Bind the code to whoever is RECEIVING it, not only to whoever was signed in
+  // when it arrived. A code clicked before sign-in arrives ownerless on purpose
+  // — that carve-out is the click-invite-then-sign-in feature — but tagging it
+  // only at arrival left it ownerless FOREVER, so the exemption outlived the
+  // delivery that spent it and the primary flow produced a code any later
+  // account could still be handed (CODEX P2). No-op when nobody is signed in.
+  noteDeepLinkOwner();
   const gate = deepLinkEmitGates[kind];
+  // A carry REPLAYS a code whose origin clock must keep running; every OTHER
+  // delivery starts a fresh one (CODEX P2, twice). The replay is identified by
+  // `carriedCode`, which resetDeepLinkDelivery set for exactly the code it
+  // carried — not by "same code as last time", which was the first attempt and
+  // was wrong in a way that mattered: a user who dismisses an invite and then
+  // DELIBERATELY re-opens the same link is making a fresh delivery, and
+  // inheriting the old clock meant their new modal was already stale and would
+  // not be carried across a swap.
+  // Only when THIS code is the reserved one, mirroring the carriedCode check
+  // below. Clearing unconditionally meant a different code draining first — the
+  // reserved code plus a newer click both queued, readiness flipping — released
+  // the reservation before the reserved code was delivered, reopening the
+  // eviction window F1 and the round-11 dedupe exist to close (Gitar).
+  if (code === gate.reservedCode) gate.reservedCode = null;
+  if (code === gate.carriedCode) {
+    gate.carriedCode = null;
+  } else {
+    // Monotonic, deliberately — see `originAt`.
+    gate.originAt = performance.now();
+  }
   gate.lastCode = code;
   gate.lastAt = Date.now();
   if (kind === 'friend') {
@@ -423,6 +804,7 @@ function sendDeepLink(kind: DeepLinkKind, code: string): void {
 
 /** Window edge: deliver whatever the window held back, newest only. */
 function flushDeepLinkGate(kind: DeepLinkKind): void {
+  fenceDeepLinksOnOwnerChange();
   const gate = deepLinkEmitGates[kind];
   gate.timer = null;
   const code = gate.held.shift();
@@ -477,17 +859,80 @@ function emitDeepLink(entry: PendingDeepLink): boolean {
 function queueDeepLink(entry: PendingDeepLink): void {
   if (emitDeepLink(entry)) return;
   const queue = pendingDeepLinks[entry.kind];
+  // Collapse duplicates (CODEX P2). A second copy of a code already waiting adds
+  // nothing — it opens the same modal twice — and it multiplies the carried
+  // code's reservation below into as many exemptions as there are copies. A page
+  // that knows the carried code (its own, if it fired the link that got carried)
+  // could then fill every slot with duplicates, making any later LEGITIMATE link
+  // the only non-reserved entry and therefore the immediate eviction victim.
+  // With duplicates collapsed, at most one entry can ever match, so the
+  // reservation is exactly one occurrence by construction.
+  if (queue.includes(entry.code)) {
+    // ...with ONE exception: a duplicate of the CARRIED code is not a duplicate.
+    // The queued copy is a REPLAY awaiting delivery; this is the user deliberately
+    // opening the same link again. Dropping it silently and leaving the replay in
+    // place means the drain-time expiry can then discard the stale copy and the
+    // fresh click produces no modal at all — the two fences cancelling each other
+    // (CODEX P2). Retire the replay's identity and restart the clock instead: the
+    // single queue entry stays, but it is now a fresh delivery with its own window.
+    const gate = deepLinkEmitGates[entry.kind];
+    if (entry.code === gate.carriedCode) {
+      gate.carriedCode = null;
+      gate.originAt = performance.now();
+      // `reservedCode` deliberately SURVIVES. Retiring only the replay marker is
+      // what makes this a fresh delivery; retiring the reservation too would leave
+      // the fresh click as the oldest UNEXEMPT entry, and the next different link
+      // would evict it (CODEX P2). Moving it to the FIFO tail does not fix that —
+      // at this moment it is usually the queue's only entry, so the move is a
+      // no-op and the later links still append after it.
+    }
+    return;
+  }
   queue.push(entry.code);
-  while (queue.length > PENDING_DEEP_LINK_CAP) queue.shift();
+  // Drop-oldest at the cap, EXCEPT the carried code (RED-TEAM F1, second queue).
+  // F1 fixed this for the hold buffer and left the pending queue open: the
+  // carried code is re-queued FIRST, so it is the oldest entry and therefore the
+  // guaranteed eviction victim once eight links arrive while the successor
+  // document is still loading — a burst any page can fire, silently replacing
+  // the invite the swap existed to preserve with eight of the attacker's own.
+  // The reservation lasts until its first successor delivery, which is exactly
+  // when sendDeepLink clears carriedCode.
+  const carried = deepLinkEmitGates[entry.kind].reservedCode;
+  while (queue.length > PENDING_DEEP_LINK_CAP) {
+    const victim = queue.findIndex((code) => code !== carried);
+    // Every entry is the carried code (it can only be queued once, so this means
+    // the cap itself is 0 or the queue is a single reserved entry): drop the
+    // oldest rather than growing without bound.
+    queue.splice(victim === -1 ? 0 : victim, 1);
+  }
 }
 
 // Must FILTER, not blind-re-queue. This runs from three sites, and with per-kind
 // readiness flags a blind re-push of an unemittable entry re-enters the queue
 // within the same tick — forever.
 function drainPendingDeepLinks(): void {
+  // Before the splice below, never inside the loop — see fenceDeepLinksOnOwnerChange.
+  fenceDeepLinksOnOwnerChange();
   for (const kind of DEEP_LINK_KINDS) {
+    const gate = deepLinkEmitGates[kind];
     const queue = pendingDeepLinks[kind];
     for (const code of queue.splice(0)) {
+      // Re-check the CARRIED code's age here, not only where it was queued
+      // (CODEX P2). Queue residence is unbounded: the successor renderer signals
+      // readiness when it is ready, and a stalled initialisation can leave a
+      // carried code sitting here long past DEEP_LINK_CARRY_MAX_AGE_MS. Treating
+      // the marker as standing proof of freshness let a dismissed invite reappear
+      // hours later — the fence passing once and then never being asked again.
+      // Only the carried code is re-checked: an ordinary queued code is one the
+      // user just clicked and has never been shown.
+      if (
+        code === gate.carriedCode &&
+        performance.now() - gate.originAt > DEEP_LINK_CARRY_MAX_AGE_MS
+      ) {
+        gate.carriedCode = null;
+        gate.originAt = 0;
+        continue;
+      }
       if (!emitDeepLink({ kind, code })) queue.push(code);
     }
   }
@@ -498,6 +943,11 @@ function drainPendingDeepLinks(): void {
 function handleInviteDeepLink(raw: string | undefined, source: string): void {
   const result = normalizeInviteDeepLink(raw);
   if (result.ok) {
+    // The only place a code ENTERS main. queueDeepLink is not it — resetDeepLinkGate
+    // and flushDeepLinkGate both re-queue through it, and claiming ownership on a
+    // re-queue launders a retained code into whoever is signed in now.
+    fenceDeepLinksOnOwnerChange(true);
+    noteDeepLinkOwner();
     queueDeepLink({ kind: result.kind, code: result.code });
     return;
   }
@@ -509,6 +959,21 @@ function handleInviteDeepLink(raw: string | undefined, source: string): void {
 function handleInviteDeepLinksFromArgv(argv: readonly string[] | undefined, source: string): void {
   const result = extractInviteDeepLinkFromArgv(argv);
   if (result.ok) {
+    // The SECOND OS entry point, and it needs the same treatment as
+    // handleInviteDeepLink: on Windows and Linux a protocol activation against a
+    // running app arrives here via `second-instance`, not via `open-url`. Without
+    // the fence, a new owner's own click is queued under the PREVIOUS owner's tag
+    // and the drain fence then forgets the whole queue — including the link that
+    // user just opened (CODEX P2). The startup `process.argv` caller reaches this
+    // too and is unaffected: at cold start both the tag and the current owner are
+    // null, so each of these is a no-op there.
+    fenceDeepLinksOnOwnerChange(true);
+    // Redundant TODAY -- sendDeepLink's bind already covers a code that gets
+    // delivered, and dropping this line alone leaves the suite green. It stays
+    // for symmetry with the other OS entry point: an asymmetry here reads as a
+    // deliberate exemption, and it is the only thing that would keep argv bound
+    // if sendDeepLink's bind were ever narrowed.
+    noteDeepLinkOwner();
     queueDeepLink({ kind: result.kind, code: result.code });
   } else if (result.reason !== 'empty') {
     console.warn('[DeepLink] rejected deep link argv', 'source', source, 'reason', result.reason);
@@ -671,6 +1136,25 @@ async function applySpaDecision(
   return loadBundledFallback(window);
 }
 
+// ponytail: a wrapper rather than an exported arm/disarm pair — a caller that
+// armed the flag and then returned early would re-deliver a stale code on the
+// next unrelated load. The `finally` makes that unreachable at every PRODUCTION
+// call site; carryDeepLinkAcrossNextLoad is exported for the tests, so an
+// importer can still write the unbalanced form and must release itself. Covers
+// the paths where applySpaDecision resolves without navigating at all. Fail-closed
+// by construction: forgetting to disarm is not expressible at a call site.
+async function applySpaDecisionCarryingDeepLink(
+  window: BrowserWindow,
+  decision: SpaLoadDecision
+): Promise<SpaLoadOutcome> {
+  const releaseCarry = carryDeepLinkAcrossNextLoad();
+  try {
+    return await applySpaDecision(window, decision);
+  } finally {
+    releaseCarry();
+  }
+}
+
 // #1742 follow-up: the SPA-source decision is made once at launch with a 5s
 // config-fetch timeout (spaLoader CONFIG_TIMEOUT_MS) and no retry. A cold-start
 // network (DNS/TLS/CF edge not yet warm) loses that race and strands the client
@@ -680,7 +1164,8 @@ async function applySpaDecision(
 // switch to the remote SPA if it resolves. Bounded; stops on success or once
 // the delays are exhausted. The manual "Load latest UI" button (spa:reloadLatest)
 // remains the fallback. Mirrors the WebSocket onlineFallbackTimer pattern (#1768).
-const SPA_RETRY_DELAYS_MS = [4_000, 10_000];
+// (SPA_RETRY_DELAYS_MS is declared beside DEEP_LINK_CARRY_MAX_AGE_MS, which is
+// derived from it.)
 
 function scheduleSpaSourceRetry(window: BrowserWindow, attempt = 0): void {
   if (attempt >= SPA_RETRY_DELAYS_MS.length) return;
@@ -697,7 +1182,9 @@ function scheduleSpaSourceRetry(window: BrowserWindow, attempt = 0): void {
         // host reachable) while the remote SPA host itself is still down, in
         // which case applySpaDecision falls back to bundled. Only stop retrying
         // when we actually reached remote; otherwise keep retrying.
-        const mode = await applySpaDecision(window, decision);
+        // Main initiated this swap, so a code already delivered to the outgoing
+        // document is carried into its successor (#2363).
+        const mode = await applySpaDecisionCarryingDeepLink(window, decision);
         if (mode === 'remote') return;
       }
       scheduleSpaSourceRetry(window, attempt + 1);
@@ -1427,7 +1914,9 @@ ipcMain.handle('spa:reloadLatest', async (event) => {
   const before = getSpaHash();
   const decision = await resolveSpaSource();
   console.debug(`[SpaLoader/reload] ${decision.mode}: ${decision.reason}`);
-  const outcome = await applySpaDecision(mainWindow, decision);
+  // Main initiated this swap (the renderer only TRIGGERED it), so a code already
+  // delivered to the outgoing document is carried into its successor (#2363).
+  const outcome = await applySpaDecisionCarryingDeepLink(mainWindow, decision);
   // Collapse the internal 'cache' outcome to 'bundled' for the renderer-facing
   // IPC contract (#1870): the signed LKG cache is a local fallback origin, not a
   // remote SPA, and no renderer consumer distinguishes it — checkForUpdate's
@@ -1754,6 +2243,15 @@ ipcMain.handle('auth:storeRefreshToken', (event, data: unknown) => {
   }
 
   const credentialOwner = storeRefreshToken(data);
+  // Main learns of a sign-in HERE and, for a cold start, nowhere else. App.tsx
+  // signals invite-readiness from a mount effect before anyone has signed in, so
+  // a startup code is DELIVERED while the owner is still null and the renderer's
+  // later replay into the modal is local and sends no IPC back. Without this the
+  // tag stayed null for the life of the process and the pre-login exemption never
+  // expired (CODEX P2). Fence first: if a PREVIOUS owner's codes are still
+  // retained they must go rather than be adopted by whoever just signed in.
+  fenceDeepLinksOnOwnerChange();
+  noteDeepLinkOwner();
   // Clear any cached restore result so subsequent restoreSession calls
   // (e.g. after HMR or renderer reload) use the fresh token, not a stale
   // 'refresh_failed' from a previous attempt.
@@ -1886,6 +2384,19 @@ ipcMain.handle('auth:restoreSession', (event) => {
     if (restoreOwner === null) {
       return { status: 'refresh_failed' };
     }
+    // The other point at which main learns who is signed in — a remembered
+    // session restored at launch, where a startup deep link is likeliest of all.
+    // Same order as the login path: fence a previous owner's retained codes, then
+    // claim what remains.
+    //
+    // The FENCE half is unproven here and says so rather than pretending: at cold
+    // start the tag is null, so it is a no-op, and every path that would leave a
+    // previous owner's tag live before a restore also forgets. Dropping it alone
+    // leaves the suite green. It stays because the two auth points must behave
+    // identically — an asymmetry between them is a trap, and this is the ordering
+    // whose inverse is a cross-account leak on the login path (covered there).
+    fenceDeepLinksOnOwnerChange(false, restoreOwner);
+    noteDeepLinkOwner(restoreOwner);
     // Token restored from disk or main-process memory — refresh it to get a
     // fresh access token.
     const refreshResult = await performRefresh();
@@ -1963,16 +2474,89 @@ ipcMain.handle('auth:logout', async (event, data?: { accessToken?: string }) => 
     return rejectInvalidAuthPayload('auth:logout');
   }
 
+  // The renderer's real logout path is userStore.logout() -> electron.logout(),
+  // which lands HERE and never reaches the auth:clearTokens handler. It happens
+  // to reach it later, through nuclearReset()'s optional-chained
+  // `globalThis.electron?.clearTokens?.()` (resetService.ts) — a renderer-side
+  // call ordering that no main-process test can observe and that a refactor
+  // could drop silently. The §5.2 fence therefore holds at THIS edge on its own.
+  //
+  // BEFORE the await, not after: performLogout clears the credentials on its
+  // first line and only then issues an unbounded network POST, so anything after
+  // the await leaves the clear open for the width of that request.
+  forgetDeliveredDeepLinks();
   await performLogout(data?.accessToken);
   return undefined;
 });
 
-ipcMain.handle('auth:clearTokens', (event) => {
+ipcMain.handle('auth:clearTokens', (event, opts: unknown) => {
   if (!isTrustedAuthSender(event)) {
     return rejectUntrustedAuthSender('auth:clearTokens');
   }
 
+  // Renderer-supplied, so read strictly: only the exact literal `true` opts OUT,
+  // and anything else — absent, malformed, truthy-but-not-true — forgets.
+  //
+  // The default direction is load-bearing (CODEX P2, round 12). An OLDER SPA on
+  // this shell — spaLoader loads one indefinitely — predates this argument and
+  // sends nothing, so whatever "no argument" means is what those SPAs get. Keep
+  // by default would leave user A's delivered invite alive through a forced
+  // logout and replay it into user B's session; forget by default costs such an
+  // SPA an invite at SSO start, which the user recovers by clicking the link
+  // again. Lose an invite, never cross an account.
+  const keepDeepLinks =
+    typeof opts === 'object' &&
+    opts !== null &&
+    (opts as { keepDeepLinks?: unknown }).keepDeepLinks === true;
+
+  // Deliberately does NOT forget deep links (CODEX P2, round 8). This handler
+  // has three renderer callers and NOT ONE of them is unambiguously a logout:
+  //   - useSSOFlow.begin() calls it immediately BEFORE starting SSO, so
+  //     forgetting here destroys a `concord://invite/CODE` queued while the app
+  //     was closed — the click-invite-then-sign-in flow, which is the PRIMARY
+  //     path this whole change exists to repair;
+  //   - App.tsx's clearOwnerlessRestoredCredential rejects a restored credential
+  //     at cold start, after which the user logs in and should still get it;
+  //   - resetService.gracefulReset() reaches it on a rememberMe refresh failure,
+  //     which deliberately keeps codes for the resuming session.
+  // Real logout has its own handler, `auth:logout`, which forgets — so nothing
+  // is lost by narrowing this one. The claim is "every LOGOUT path forgets", and
+  // this is the second handler to have been wrongly read as one.
+  //
+  // `keepDeepLinks` is what the login-side callers pass: useSSOFlow before
+  // starting SSO, App.tsx rejecting an ownerless restored credential, and
+  // gracefulReset's shared clear (whose remembered-session path resumes). The one
+  // caller that does NOT pass it is `nuclearReset()` — a refresh failure with
+  // `rememberMe === false`, documented in resetService as "ends the authenticated
+  // lifecycle", which reaches this handler through gracefulReset and never calls
+  // `auth:logout`.
   clearTokens();
+  if (!keepDeepLinks) forgetDeliveredDeepLinks();
+  return undefined;
+});
+
+// FORGET-ONLY, and that is the whole reason it exists (#2363). Every other edge
+// that forgets also destroys credentials, and the one teardown that must forget
+// WITHOUT destroying them is a `rememberMe` refresh failure: the session has ended
+// and the user must re-authenticate, but the disk tokens stay so the next launch
+// can retry. `gracefulReset` had no way to say "the session ended" without also
+// saying "delete the credentials", so main kept `gate.lastCode` alive and a swap
+// inside the carry window replayed user A's invite into user B's renderer.
+//
+// The renderer-side `deep-link-session-ended` fence is necessary and NOT
+// sufficient: it clears the copy App holds, and main holds its own.
+//
+// Sender-fenced like the auth channels it sits beside. Forgetting is the fail-safe
+// direction — the worst a hostile caller achieves is losing its own pending invite
+// — but a renderer-reachable channel that mutates main's delivery state gets the
+// same guard as its neighbours regardless, rather than an argument for why it does
+// not need one.
+ipcMain.handle('deeplink:forget', (event) => {
+  if (!isTrustedAuthSender(event)) {
+    return rejectUntrustedAuthSender('deeplink:forget');
+  }
+
+  forgetDeliveredDeepLinks();
   return undefined;
 });
 
@@ -1984,6 +2568,16 @@ ipcMain.handle('auth:clearTokensIfOwner', (event, owner: unknown) => {
     return rejectInvalidAuthPayload('auth:clearTokensIfOwner');
   }
 
+  // Deliberately does NOT forget deep links, despite ending credentials.
+  // Every caller is LOGIN-side, not logout: aborted SSO (useSSOFlow), an
+  // interrupted email verification, a cancelled account-link or passphrase
+  // setup, an aborted login continuation (Login.tsx), and the eager-unlock
+  // re-persist cleanup. Forgetting here is exactly the asymmetry the deep-link
+  // rules warn against, and the loss is concrete: a `concord://invite/CODE`
+  // opened while the app was closed sits in `pendingDeepLinks` before any
+  // window exists — main holds the ONLY copy — so an SSO sign-in that aborts
+  // would erase it and the retry would land with the invite silently gone.
+  // That is #2363's own symptom on a new path.
   return clearTokensIfOwner(owner);
 });
 

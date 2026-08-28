@@ -25,8 +25,8 @@ import { getPersistedApiBase } from './tokenManager';
 import { setSpaHash, setSpaVersion } from './spaState';
 import { getBuildSha7 } from './buildInfo';
 import type { SpaFallbackKind } from '../shared/spaIpcTypes';
+import { CONFIG_TIMEOUT_MS } from './spaTiming';
 
-const CONFIG_TIMEOUT_MS = 5_000;
 const SPA_NO_CACHE_HEADERS = {
   'Cache-Control': 'no-cache',
   Pragma: 'no-cache',
@@ -59,13 +59,13 @@ export async function resolveSpaSource(): Promise<SpaLoadDecision> {
 
   try {
     const configUrl = `${apiBase}/api/v1/client/config?ipc=${IPC_CONTRACT_VERSION}`;
-    const response = await fetchWithTimeout(configUrl, CONFIG_TIMEOUT_MS);
+    const result = await fetchJsonWithTimeout<ClientConfigResponse>(configUrl, CONFIG_TIMEOUT_MS);
 
-    if (!response.ok) {
-      return { mode: 'bundled', reason: `config fetch returned ${response.status}` };
+    if (!result.ok) {
+      return { mode: 'bundled', reason: `config fetch returned ${result.status}` };
     }
 
-    const data = (await response.json()) as ClientConfigResponse;
+    const data = result.data as ClientConfigResponse;
 
     if (!data.spaUrl) {
       return { mode: 'bundled', reason: 'server has no spaUrl configured' };
@@ -120,29 +120,56 @@ export async function resolveSpaSource(): Promise<SpaLoadDecision> {
   }
 }
 
-/**
- * Fetch with a timeout using Electron's net module (respects proxy settings,
- * works before renderer loads, not subject to CORS).
- */
-function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
-  return new Promise((resolve, reject) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      controller.abort();
-      reject(new Error(`timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
+interface TimedJsonResult<T> {
+  ok: boolean;
+  status: number;
+  data: T | null;
+}
 
-    net
-      .fetch(url, { signal: controller.signal, headers: SPA_NO_CACHE_HEADERS, cache: 'no-store' })
-      .then((response) => {
-        clearTimeout(timer);
-        resolve(response);
-      })
-      .catch((err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-  });
+/**
+ * Fetch JSON under a deadline that spans the WHOLE operation — headers AND body
+ * — using Electron's net module (respects proxy settings, works before the
+ * renderer loads, not subject to CORS).
+ *
+ * The body read is inside the deadline deliberately (#2363, Codex). The earlier
+ * shape returned a `Response` and cleared its timer the moment `net.fetch`
+ * produced one, i.e. when HEADERS arrived; the caller then awaited
+ * `response.json()` with no deadline and an AbortController that could no longer
+ * fire. A server that answers promptly and then trickles or stalls the body hung
+ * SPA resolution indefinitely, and silently — nothing above this has a bound
+ * either. It also broke the arithmetic behind DEEP_LINK_CARRY_MAX_AGE_MS, which
+ * budgets one `resolveSpaSource` attempt at CONFIG_TIMEOUT_MS. This constant is a
+ * budget for producing a DECISION, not for producing headers.
+ *
+ * The `timedOut` flag preserves the `timeout after Nms` message across the abort:
+ * `isUnexpectedBundled` / `isTransientRemoteFailure` classify on that string, so
+ * letting a bare AbortError surface would silently reclassify every timeout.
+ */
+async function fetchJsonWithTimeout<T>(
+  url: string,
+  timeoutMs: number
+): Promise<TimedJsonResult<T>> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await net.fetch(url, {
+      signal: controller.signal,
+      headers: SPA_NO_CACHE_HEADERS,
+      cache: 'no-store',
+    });
+    if (!response.ok) return { ok: false, status: response.status, data: null };
+    return { ok: true, status: response.status, data: (await response.json()) as T };
+  } catch (err) {
+    if (timedOut) throw new Error(`timeout after ${timeoutMs}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -289,8 +316,27 @@ export async function captureSpaHash(
  * server-exposed build id.
  */
 export async function hashEntryHtml(url: string): Promise<string | null> {
+  // Bounded, headers AND body, for the same reason fetchJsonWithTimeout is
+  // (#2363, Codex). This ran with no timeout and no signal at all, so a trickled
+  // entry document stalled it forever — and `captureSpaHash` is awaited inside
+  // `applySpaDecision`, INSIDE the deep-link carry wrapper, so an unbounded tail
+  // here keeps `deepLinkCarryDepth` raised indefinitely after the successor
+  // document has already loaded and been replayed to.
+  //
+  // Reuses CONFIG_TIMEOUT_MS: same budget, same startup path, and a second
+  // constant would only invite the two to drift. Failure stays best-effort — the
+  // hash singletons keep their previous values and the SPA load is not
+  // interrupted — so a timeout costs an attestation hash, never a launch.
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, CONFIG_TIMEOUT_MS);
+
   try {
     const response = await net.fetch(url, {
+      signal: controller.signal,
       headers: SPA_NO_CACHE_HEADERS,
       cache: 'no-store',
     });
@@ -302,7 +348,12 @@ export async function hashEntryHtml(url: string): Promise<string | null> {
     return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
   } catch (err) {
     // Per [internal]rules/observability.md, never pass raw err to console.warn.
-    console.warn('[SpaLoader] entry HTML hash failed:', (err as Error).message);
+    console.warn(
+      '[SpaLoader] entry HTML hash failed:',
+      timedOut ? `timeout after ${CONFIG_TIMEOUT_MS}ms` : (err as Error).message
+    );
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }

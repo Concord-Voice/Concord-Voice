@@ -116,6 +116,14 @@ const ServerBar: React.FC<ServerBarProps> = ({ onOpenActionModal, onContextMenu 
     if (accessToken) fetchServers();
   }, [accessToken, fetchServers]);
 
+  // The conversation fetch that populates this badge lives in App.tsx, ABOVE the
+  // router. It was here first and that was wrong: `/app` and `/app/dms` each
+  // instantiate their own ServerBar, so a route change re-ran the mount effect,
+  // and dmStore QUEUES an overlapping fetch rather than collapsing it
+  // (queueConversationRefetchIfLoading sets a deferred flag; the in-flight
+  // request's `finally` then issues the queued one) — two sequential full-list
+  // GETs for one navigation (CODEX P2). Do not re-add a fetch here.
+
   // IDs of servers that are inside folders (excluded from top-level bar)
   const folderedIds = useMemo(() => {
     const set = new Set<string>();

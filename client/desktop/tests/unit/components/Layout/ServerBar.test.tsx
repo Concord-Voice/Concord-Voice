@@ -5,6 +5,8 @@ import { useLayoutStore } from '@/renderer/stores/layoutStore';
 import { useUnreadStore } from '@/renderer/stores/unreadStore';
 import { useDMStore, type DMConversation } from '@/renderer/stores/dmStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useAuthStore } from '@/renderer/stores/authStore';
+import { apiFetch } from '@/renderer/services/apiClient';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';
 import { vi } from 'vitest';
@@ -287,4 +289,13 @@ describe('ServerBar', () => {
       expect(pmButton.querySelector('.server-bar-badge')).toBeInTheDocument();
     });
   });
+
+  // ─── DM unread indicator is populated on mount, not only from the DM view
+  // (#2363) ──────────────────────────────────────────────────────────────
+  // Two #2363 tests lived here and are gone rather than moved. They asserted the
+  // badge appears after ServerBar's own mount fetch; the fetch is now in App.tsx
+  // (above the router — /app and /app/dms each build their own ServerBar, so the
+  // mount effect re-ran on every navigation, CODEX P2), and the badge behaviour
+  // they checked was already covered by the two PM-badge tests above. Deleting
+  // beat rewriting them into duplicates. The fetch is covered in App.test.tsx.
 });

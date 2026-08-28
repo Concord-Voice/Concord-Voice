@@ -220,13 +220,20 @@ describe('JoinServerModal', () => {
 
     expect(joinServer).toHaveBeenCalledWith('ABCDEFGH');
     expect(screen.getByText('Joined Concord Test!')).toBeInTheDocument();
-    expect(useServerStore.getState().servers[0]).toMatchObject({
-      id: 'server-1',
-      name: 'Concord Test',
-      role: 'member',
-      member_count: 0,
-      online_count: 0,
-    });
+    // The serverStore write moved into inviteStore.joinServer (#2363), and this
+    // test mocks joinServer out entirely (line 204) — so asserting the write here
+    // would be asserting a mocked collaborator's side effect rather than
+    // JoinServerModal's own contract. The coverage did not disappear, it moved and
+    // got stronger: inviteStore.test.ts T3a/T3b assert the write against the REAL
+    // action, and InviteEmbed.test.tsx T3d asserts it through the real UI path.
+    // What this test still owns is below: onSuccess receives the shaped server.
+    // ...and that the modal does NOT write the store itself. joinServer is mocked
+    // (line 204), so the modal is the only possible writer here — an empty store
+    // is the exact inverse of the deleted assertion, and it guards the deletion:
+    // re-adding useServerStore.getState().addServer(...) to handleJoin reds this.
+    // Asserted as store state rather than a spy so it reads as a layering
+    // contract, not a call-graph fact. regression for #2363.
+    expect(useServerStore.getState().servers).toEqual([]);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(800);

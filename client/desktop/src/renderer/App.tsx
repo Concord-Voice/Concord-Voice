@@ -153,7 +153,9 @@ async function clearOwnerlessRestoredCredential(
   electron: NonNullable<typeof globalThis.electron>
 ): Promise<void> {
   console.warn('[App] Session restore rejected: missing credential owner');
-  await (electron.clearTokens?.() ?? Promise.resolve()).catch((err) => {
+  // Login-side: the user lands logged out at cold start and signs in next, so
+  // a deep link queued before any window existed must survive (#2363).
+  await (electron.clearTokens?.({ keepDeepLinks: true }) ?? Promise.resolve()).catch((err) => {
     console.warn('Failed to clear ownerless restored credential:', errorMessage(err));
   });
   await runRecoveryModule(
@@ -417,6 +419,37 @@ function App() {
     globalThis.electron?.inviteRendererReady?.();
     return unsubscribe;
   }, [isPipWindow]);
+
+  // The replay predicate below is account-blind, so a code held across a session
+  // teardown would open for whoever signs in next (#2363). gracefulReset announces
+  // the teardown; drop anything held for the session that just ended.
+  useEffect(() => {
+    const handler = (): void => {
+      setDeepLinkInviteCode(null);
+      setIsDeepLinkInviteOpen(false);
+    };
+    globalThis.addEventListener('deep-link-session-ended', handler);
+    return () => globalThis.removeEventListener('deep-link-session-ended', handler);
+  }, []);
+
+  // The DM unread badge is computed from dmStore.conversations, and nothing
+  // populated it outside the DM view — a user who was offline when a DM (e.g. a
+  // server invite) arrived saw no badge and no cue to look (#2363).
+  //
+  // ponytail: mount + every accessToken rotation (rotateAuthCredentials rewrites
+  // it on each proactive refresh). It lives HERE, above <Routes>, and not on the
+  // ServerBar that renders the badge: `/app` and `/app/dms` each instantiate
+  // their own ServerBar, so a route change remounted it and dmStore QUEUES an
+  // overlapping fetch rather than collapsing it — two sequential full-list GETs
+  // for one navigation (CODEX P2). This component does not remount on
+  // navigation, so the trigger is exactly what it claims to be.
+  //
+  // Not a second call site for live updates: useWebSocketMessages already
+  // refetches on DM events.
+  useEffect(() => {
+    if (isPipWindow || !accessToken) return;
+    void useDMStore.getState().fetchConversations();
+  }, [isPipWindow, accessToken]);
 
   useEffect(() => {
     if (deepLinkInviteCode && accessToken && emailVerified) {

@@ -423,9 +423,13 @@ const ConversationList: React.FC<ConversationListProps> = ({
   >({});
   const decryptingRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
-    fetchConversations();
-  }, [fetchConversations]);
+  // No mount fetch here: ServerBar owns it (#2363). ServerBar renders in this
+  // view AND in the persistent chrome, so its mount coverage strictly contains
+  // this component's — and its effect re-runs on every accessToken rotation,
+  // where this one fired once, unauthenticated, if the token had not arrived.
+  // Keeping both cost TWO sequential full-list requests on every DM-view entry:
+  // the second caller does not no-op, it sets conversationRefetchQueued and the
+  // first request's `finally` immediately issues it (CODEX P2).
 
   const forgetPreview = useCallback((scope: string) => {
     decryptingRef.current.delete(scope);

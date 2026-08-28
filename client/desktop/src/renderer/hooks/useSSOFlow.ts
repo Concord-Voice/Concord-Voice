@@ -232,7 +232,10 @@ export function useSSOFlow(): { begin: (provider: SSOProvider) => Promise<void> 
       useMFAChallengeStore.getState().clearChallenge();
 
       try {
-        await globalThis.electron?.clearTokens?.();
+        // Login-side: this runs immediately BEFORE startSSOFlow, so a
+        // `concord://invite/CODE` queued while the app was closed must survive
+        // it — click-invite-then-sign-in is the flow #2363 exists to repair.
+        await globalThis.electron?.clearTokens?.({ keepDeepLinks: true });
         if (!reservationIsCurrent(reservationGeneration, serverSelection)) return;
 
         const result = await startSSOFlow(provider, serverSelection.apiBase);

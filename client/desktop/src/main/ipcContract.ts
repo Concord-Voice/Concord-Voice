@@ -174,8 +174,38 @@
  *        preference. The setter persists before applying it to live windows
  *        and rejects invalid or untrusted calls. The SERVER's spaIpcContract
  *        stays 19 because these default-off channels are additive.
+ * - v24: `auth:clearTokens` signature change (#2363): accepts an optional
+ *        `{ keepDeepLinks?: boolean }`. A SIGNATURE change, so it bumps —
+ *        the first draft added the argument without bumping, which this file's
+ *        own rule forbids.
+ *
+ *        The DEFAULT FORGETS, and login-side callers opt out. That direction is
+ *        the whole point. An older SPA on this shell calls `clearTokens()` with
+ *        no argument, and it must land on the SAFE side of the question: with a
+ *        keep-by-default it would leave user A's delivered invite alive through
+ *        a forced logout (`nuclearReset`, on a refresh failure with
+ *        `rememberMe === false`) and replay it into user B's session. Forgetting
+ *        by default costs an old SPA an invite at SSO start — the pre-#2363
+ *        behaviour, recoverable by clicking the link again — and costs a current
+ *        SPA nothing, because it sends the flag.
+ *
+ *        The SERVER's spaIpcContract stays 19: nothing here is required of the
+ *        SPA. An old SPA that never sends the flag is safe by construction,
+ *        which is precisely why the default was inverted rather than versioned
+ *        and left permissive.
+ * - v25: `deeplink:forget` (#2363): a renderer->main channel that forgets every
+ *        deliverable deep link WITHOUT touching credentials. Every other edge
+ *        that forgets also destroys them, and the one teardown that must not is a
+ *        `rememberMe` refresh failure — the session has ended, but the disk
+ *        tokens stay so the next launch can retry. Without this, main kept
+ *        `gate.lastCode` alive across that teardown and a source swap inside the
+ *        carry window replayed user A's invite into user B's renderer.
+ *
+ *        Sender-fenced like the auth channels beside it. The SERVER's
+ *        spaIpcContract stays 19: an older SPA simply never calls it, and the
+ *        pre-existing renderer-side fence still applies there.
  */
-export const IPC_CONTRACT_VERSION = 23;
+export const IPC_CONTRACT_VERSION = 25;
 
 /**
  * Opaque main-process identity for one stored credential lifecycle.

@@ -489,6 +489,39 @@ describe('App', () => {
     expect(useNotificationNavigationStore.getState().pendingNavigation).toBeNull();
   });
 
+  // CODEX P2 on PR #2967. This fetch was a mount effect on ServerBar, which
+  // /app and /app/dms each instantiate separately -- so every navigation re-ran
+  // it, and dmStore QUEUES an overlapping fetch rather than collapsing it
+  // (queueConversationRefetchIfLoading defers, and the in-flight request's
+  // `finally` then issues the queued one). Two sequential full-list GETs for one
+  // navigation. It belongs above the router, where App does not remount.
+  //
+  // Sensitive in both directions: MainView and DirectMessagesView are mocked in
+  // this file, so ServerBar never renders here -- put the effect back on it and
+  // the count is 0, not 2.
+  it('fetches DM conversations once per session, not once per route (regression for #2363)', async () => {
+    const fetchConversations = vi.fn(() => Promise.resolve());
+    useDMStore.setState({ fetchConversations });
+    authenticateUser();
+    render(<App />);
+
+    await waitFor(() => {
+      expect(fetchConversations).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      useNotificationNavigationStore.getState().setPendingNavigation({
+        type: 'dm',
+        targetId: 'dm-conv-1',
+      });
+    });
+
+    expect(
+      fetchConversations,
+      'a route change must not cost a second authenticated full-list request'
+    ).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps voice audio outputs mounted while viewing DMs', () => {
     authenticateUser();
     useVoiceStore.setState({

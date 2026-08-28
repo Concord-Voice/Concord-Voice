@@ -3,7 +3,6 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useInviteStore } from '../../stores/inviteStore';
-import { useServerStore } from '../../stores/serverStore';
 import { apiFetch } from '../../services/apiClient';
 import { ServerWithRole, InviteInfoResponse } from '../../types/server';
 import './JoinServerModal.css';
@@ -142,7 +141,6 @@ const JoinServerModal: React.FC<JoinServerModalProps> = ({
         member_count: 0,
         online_count: 0,
       };
-      useServerStore.getState().addServer(serverWithRole);
       setSuccessMessage(`Joined ${result.server.name}!`);
 
       setTimeout(() => {

@@ -155,7 +155,7 @@ contextBridge.exposeInMainWorld('electron', {
       mfaMethods?: string[];
       mfaRecoveryOnlyMethods?: string[];
     }>,
-  clearTokens: () => ipcRenderer.invoke('auth:clearTokens'),
+  clearTokens: (opts?: { keepDeepLinks?: boolean }) => ipcRenderer.invoke('auth:clearTokens', opts),
   clearTokensIfOwner: (owner: CredentialOwner) =>
     ipcRenderer.invoke('auth:clearTokensIfOwner', owner) as Promise<
       boolean | { status: 'rejected' }
@@ -220,6 +220,8 @@ contextBridge.exposeInMainWorld('electron', {
     };
   },
   inviteRendererReady: () => ipcRenderer.send('invite:renderer-ready'),
+  // Forget-only: ends a deep link's session without touching credentials (#2363).
+  forgetDeepLinks: () => ipcRenderer.invoke('deeplink:forget'),
 
   // Friend-code deep link (#945). Deliberately a SEPARATE channel from
   // 'invite:received' rather than a widened invite payload: an older SPA that
@@ -579,7 +581,7 @@ export interface ElectronAPI {
     mfaMethods?: string[];
     mfaRecoveryOnlyMethods?: string[];
   }>;
-  clearTokens: () => Promise<void>;
+  clearTokens: (opts?: { keepDeepLinks?: boolean }) => Promise<void>;
   clearTokensIfOwner: (owner: CredentialOwner) => Promise<boolean | { status: 'rejected' }>;
   logout: (data?: { accessToken?: string }) => Promise<void>;
   getAuthCapabilities: () => Promise<{ persistAvailable: boolean }>;
@@ -612,6 +614,7 @@ export interface ElectronAPI {
   onConfigFetchFailed: (callback: (data: SpaFallbackDiagnostic) => void) => () => void;
   onInviteReceived: (callback: (data: { code: string }) => void) => () => void;
   inviteRendererReady: () => void;
+  forgetDeepLinks: () => Promise<void>;
   onFriendCodeReceived: (callback: (data: { code: string }) => void) => () => void;
   friendRendererReady: () => void;
 

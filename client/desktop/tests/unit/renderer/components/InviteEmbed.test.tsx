@@ -4,6 +4,7 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/authStore';
+import { useServerStore } from '@/renderer/stores/serverStore';
 import { clearInvitePreviewCache } from '@/renderer/hooks/useInvitePreview';
 import { InviteEmbed } from '@/renderer/components/Chat/InviteEmbed';
 
@@ -67,6 +68,41 @@ describe('InviteEmbed', () => {
     const joinBtn = await screen.findByRole('button', { name: /join/i });
     fireEvent.click(joinBtn);
     await waitFor(() => expect(screen.getByText(/joined/i)).toBeInTheDocument());
+  });
+
+  // regression for #2363: InviteEmbed.tsx must NOT be edited to make this
+  // pass — reconciliation belongs in inviteStore.joinServer, not here.
+  it('T3d: adds the joined server to serverStore.servers on click', async () => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/invites/:code`, () => HttpResponse.json(validPreview)),
+      http.post(`${API_BASE}/api/v1/invites/join`, () =>
+        HttpResponse.json(
+          {
+            server: {
+              id: 'server-2363-embed',
+              name: 'Acme HQ',
+              owner_id: 'user-2',
+              allow_embedded_content: true,
+              created_at: '2025-01-01T00:00:00Z',
+              updated_at: '2025-01-01T00:00:00Z',
+            },
+            role: 'member',
+          },
+          { status: 200 }
+        )
+      )
+    );
+    render(<InviteEmbed code="GHJKMNPQ" />);
+    const joinBtn = await screen.findByRole('button', { name: /join/i });
+    fireEvent.click(joinBtn);
+
+    await waitFor(() => expect(screen.getByText(/joined/i)).toBeInTheDocument());
+
+    const ids = useServerStore.getState().servers.map((s) => s.id);
+    expect(
+      ids,
+      `serverStore.servers should contain id "server-2363-embed" after joining via InviteEmbed, got [${ids.join(', ')}]`
+    ).toContain('server-2363-embed');
   });
 
   it('shows an error when the join fails', async () => {

@@ -107,11 +107,16 @@ describe('ConversationList', () => {
     expect(screen.getByText('Personal Thread')).toBeInTheDocument();
   });
 
-  it('fetches conversations on mount', () => {
+  // Inverted deliberately (#2363). ServerBar owns the mount fetch now, and it
+  // renders in this view as well as the persistent chrome. Two mount sites cost
+  // TWO sequential full-list requests per DM-view entry, because an overlapping
+  // call queues a deferred refetch rather than collapsing. Restoring the effect
+  // here would reintroduce that silently, so assert its ABSENCE.
+  it('does not fetch conversations on mount — ServerBar owns that', () => {
     const mockFetch = vi.fn().mockResolvedValue(undefined);
     useDMStore.setState({ fetchConversations: mockFetch });
     render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
-    expect(mockFetch).toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('shows empty state when no conversations exist', () => {

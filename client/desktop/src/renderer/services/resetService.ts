@@ -92,7 +92,7 @@ export function recoveryReset(): void {
  *
  * NOT for same-account transport recovery — see recoveryReset() (#2199).
  */
-export function gracefulReset(): void {
+export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   resetPostLoginHydrationLifecycle();
 
   // Stop every account-bound watcher/timer before clearing its store. This also
@@ -181,6 +181,47 @@ export function gracefulReset(): void {
   localStorage.removeItem('concord-servers');
   localStorage.removeItem('concord-channels');
   localStorage.removeItem('concord:draft-messages');
+
+  // A deep link held in App's own state belongs to the session that is ending
+  // (#2363). App replays it when `accessToken && emailVerified` next become true,
+  // and that predicate is account-BLIND — so user A's invite, held across a
+  // rememberMe refresh failure, opens for whoever signs in next.
+  //
+  // Announced from gracefulReset rather than nuclearReset because the leak's
+  // reachable path is the REMEMBERED one: nuclearReset already ends the lifecycle
+  // and forgets in main, while gracefulReset deliberately preserves the session so
+  // it can resume — and preserving a session is not the same as preserving it for
+  // whoever signs in next. nuclearReset calls through here, so both are covered.
+  //
+  // GATED on there actually having been a session. The first version of this
+  // announced unconditionally on the reasoning that click-invite-then-sign-in has
+  // no prior session so the reset never runs for it. That was wrong in both of the
+  // ways it could be: a cold start whose `restoreSession()` fails calls
+  // gracefulReset (App.tsx's restore fallback), and so does the ownerless-credential
+  // path — which explicitly preserves MAIN's copy with `{ keepDeepLinks: true }` and
+  // would then have erased the renderer's, the two halves working against each
+  // other. Both run with `accessToken === null`, because nobody ever signed in.
+  //
+  // `handleRefreshFailure` calls this BEFORE `clearAccessToken()`, so a genuinely
+  // ended session still has its token here. Token present = a session existed and
+  // its codes must not cross; token absent = login-side, and the queued invite is
+  // exactly what the user is signing in to accept.
+  //
+  // The token answers "did a session exist", NOT "is this session ending", and
+  // ONE caller separates them: softRestart() reloads a still-valid same-account
+  // session on Recovery B, where preflight found the renderer unstable and the
+  // token fine. It opts out; every other caller is a real teardown and the
+  // DEFAULT forgets, so a future caller that ends a session lands on the safe
+  // side without knowing this flag exists — the same reasoning that inverted
+  // `auth:clearTokens`'s default in v24. Naming matches that channel on purpose.
+  if (opts?.keepDeepLinks !== true && useAuthStore.getState().accessToken !== null) {
+    globalThis.dispatchEvent(new CustomEvent('deep-link-session-ended'));
+    // The renderer event clears the copy App holds; main holds its own, and on a
+    // rememberMe teardown nothing else tells it the session ended — `clearTokens`
+    // is not called there, by design. Forget-only, so the disk tokens that let the
+    // next launch retry are untouched (#2363).
+    void globalThis.electron?.forgetDeepLinks?.();
+  }
 }
 
 /**
@@ -190,7 +231,12 @@ export function gracefulReset(): void {
  * remain untouched for Remember Me users.
  */
 export function softRestart(): void {
-  gracefulReset();
+  // Same account, same token, same session — only the DOCUMENT is being replaced.
+  // Main keeps its deliverable codes and resetDeepLinkDelivery re-queues them for
+  // the successor renderer, which is the behaviour a transport blip must not
+  // change. #2199 is the same lesson on NSFW intent; do not let a teardown fence
+  // reach this path (#2363).
+  gracefulReset({ keepDeepLinks: true });
   globalThis.location.reload();
 }
 
@@ -237,6 +283,18 @@ export function nuclearReset(): void {
   useAudioSettingsStore.getState().clearAllParticipantVolumes();
   useAudioSettingsStore.getState().clearAllScreenShareVolumes();
 
-  // Clear main process tokens (disk files + in-memory)
+  // Clear main process tokens (disk files + in-memory). NO `keepDeepLinks` opt-out:
+  // this reset ends the authenticated lifecycle, so main's default — forget — is
+  // the wanted behaviour, and a code delivered to this user must not survive into
+  // whoever signs in next (#2363).
+  //
+  // Exactly ONE call, and that matters more than it looks. An earlier shape kept
+  // deep links here and issued a SECOND, unflagged clear to do the forgetting.
+  // Main's `clearTokens()` resolves its target as
+  // `inMemoryApiBase || readActiveApiBase() || DEFAULT_PROFILE_API_BASE`, and the
+  // first call empties the in-memory base and deletes the active-profile pointer —
+  // so the second falls through to the DEFAULT profile and deletes a remembered
+  // SaaS session's credentials this logout never touched. Doubling the call is not
+  // idempotent; it changes WHICH profile is cleared (CODEX P2).
   globalThis.electron?.clearTokens?.();
 }

@@ -130,6 +130,88 @@ describe('serverStore', () => {
       expect(useServerStore.getState().servers.map((server) => server.id)).toEqual([mockServer.id]);
     });
 
+    // CODEX P2 (#2363 round 2). fetchServers commits a WHOLE-ARRAY replace, and a
+    // join is not a fetch — so a read that snapshotted membership before the join
+    // still passed the authoritativeness gate and deleted the row that was just
+    // added, reproducing both the missing-sidebar defect and the missing
+    // subscribe_server derived from the same array. ServerBar starts that GET on
+    // mount and on every token rotation, so the overlap is ordinary.
+    it('does not let a fetch that predates a join delete the joined server (#2363)', async () => {
+      const started = deferred();
+      const release = deferred();
+      useServerStore.setState({ servers: [] });
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, async () => {
+          started.resolve();
+          await release.promise;
+          // The snapshot the server had BEFORE the join: no joined server.
+          return HttpResponse.json({ servers: [mockServer] });
+        })
+      );
+
+      const staleFetch = useServerStore.getState().fetchServers();
+      await started.promise;
+
+      const joined = { ...mockServer, id: 'server-joined-mid-fetch', name: 'Joined Mid Fetch' };
+      useServerStore.getState().addServer(joined);
+      // Positive control: without this the assertion below could pass on a store
+      // that never received the join at all.
+      expect(useServerStore.getState().servers.map((s) => s.id)).toContain(joined.id);
+
+      release.resolve();
+      await staleFetch;
+
+      expect(
+        useServerStore.getState().servers.map((s) => s.id),
+        'a read that predates the join must not commit over it'
+      ).toContain(joined.id);
+    });
+
+    // CODEX P2 (#2363 round 4). The first shape of the fix above bumped
+    // serverFetchSequence, which retired the in-flight read entirely — so it
+    // skipped its PURGE as well as its commit, while its caller saw a resolved
+    // promise and a still-current guard. useConnectionRecovery would then
+    // announce `connection-recovered` with membership never refreshed, leaving a
+    // server the user was removed from during the outage visible and backfilling
+    // against it. Journalling the addition invalidates nothing, so the purge must
+    // still happen even when a join lands mid-flight.
+    it('still purges servers missing from a response when a join lands mid-fetch', async () => {
+      const started = deferred();
+      const release = deferred();
+      useServerStore.setState({ servers: [mockServer, mockServer2] });
+      useUnreadStore.getState().markServerUnread('server-1');
+      const removeServerChannelsSpy = vi.spyOn(useChannelStore.getState(), 'removeServerChannels');
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers`, async () => {
+          started.resolve();
+          await release.promise;
+          // server-1 was left during the outage; the response omits it.
+          return HttpResponse.json({ servers: [mockServer2] });
+        })
+      );
+
+      const inFlight = useServerStore.getState().fetchServers();
+      await started.promise;
+      const joined = { ...mockServer, id: 'server-joined-mid-purge', name: 'Joined Mid Purge' };
+      useServerStore.getState().addServer(joined);
+      release.resolve();
+      await inFlight;
+
+      const ids = useServerStore.getState().servers.map((s) => s.id);
+      expect(ids, 'the join must survive').toContain(joined.id);
+      expect(ids, 'the departed server must still be purged').not.toContain('server-1');
+      expect(removeServerChannelsSpy).toHaveBeenCalledWith('server-1');
+      expect(useUnreadStore.getState().serverUnreadSet.has('server-1')).toBe(false);
+      // The purge must read the COMMITTED list, not the response. Against the
+      // response the just-joined server counts as "missing" and has its channels
+      // and unread state torn down moments after the join — the same defect one
+      // layer down, and invisible to every membership assertion above.
+      expect(
+        removeServerChannelsSpy,
+        'the re-attached server must not be purged by the read that predates it'
+      ).not.toHaveBeenCalledWith(joined.id);
+    });
+
     it('does not let a stale concurrent fetch clobber a newer fetch (#2358 sequence guard)', async () => {
       // The #2329 dedup-bypass lets a guarded Recovery-A fetch run concurrently
       // with an in-flight unguarded fetch. The monotonic mySeq gate must let only

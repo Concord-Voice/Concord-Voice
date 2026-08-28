@@ -27,6 +27,13 @@ interface ServerState {
 
 interface ServerFetchJournal {
   removedIds: Set<string>;
+  /**
+   * Servers ADDED while this read was in flight. The response predates them, so
+   * a whole-array replace would delete them; the commit re-attaches any that the
+   * response does not already contain. Symmetric with `removedIds`, and for the
+   * same reason (#2363).
+   */
+  addedIds: Set<string>;
   cleared: boolean;
 }
 
@@ -87,7 +94,11 @@ const serverStore = create<ServerState>()(
         error: null,
 
         fetchServers: async (guard?: HydrationLifecycleGuard) => {
-          const journal: ServerFetchJournal = { removedIds: new Set(), cleared: false };
+          const journal: ServerFetchJournal = {
+            removedIds: new Set(),
+            addedIds: new Set(),
+            cleared: false,
+          };
           serverFetchJournals.add(journal);
           let mySeq = serverFetchSequence;
 
@@ -128,12 +139,24 @@ const serverStore = create<ServerState>()(
             const fetchedServers: ServerWithRole[] = (data.servers || []).filter(
               (server: ServerWithRole) => !journal.removedIds.has(server.id)
             );
-            purgeMissingServerState(get().servers, fetchedServers);
+            // Re-attach rows added while this read was in flight and absent from
+            // its response. Read from the CURRENT store rather than a copy taken
+            // at add time, so the row carries any later merge; the replace below
+            // has not happened yet, so it is still there.
+            const fetchedIds = new Set(fetchedServers.map((server) => server.id));
+            const readded = get().servers.filter(
+              (server) => journal.addedIds.has(server.id) && !fetchedIds.has(server.id)
+            );
+            const committed = [...readded, ...fetchedServers];
 
-            // Validate persisted activeServerId still exists in fetched list
-            const validActiveId = retainActiveServerId(get().activeServerId, fetchedServers);
+            // Purge and activeServerId both read the COMMITTED list, not the
+            // response — purging against the response would tear down the
+            // re-attached server's channels and unread state moments after a
+            // join, which is the same defect one layer down.
+            purgeMissingServerState(get().servers, committed);
+            const validActiveId = retainActiveServerId(get().activeServerId, committed);
 
-            set({ servers: fetchedServers, activeServerId: validActiveId });
+            set({ servers: committed, activeServerId: validActiveId });
           } catch (error) {
             // Only the authoritative fetch may surface its error; a superseded
             // fetch (an older concurrent fetch, or one whose session was switched
@@ -151,7 +174,66 @@ const serverStore = create<ServerState>()(
         },
 
         addServer: (server: ServerWithRole) => {
-          set((state) => ({ servers: [server, ...state.servers] }));
+          // Journal the addition into every in-flight read, exactly as
+          // `removeServer` journals a removal (#2363). `fetchServers` commits a
+          // whole-array replace, and a join is not a fetch — so a read that
+          // snapshotted membership first still passed the authoritativeness gate
+          // and deleted the row just added, reproducing this issue's own
+          // missing-sidebar and missing-`subscribe_server` defect until some
+          // later fetch ran. `ServerBar` starts that GET on mount and on every
+          // token rotation, so the overlap is ordinary rather than exotic.
+          //
+          // Journalled rather than invalidating those reads by bumping
+          // `serverFetchSequence` — the first shape of this fix. Invalidation
+          // ALSO skipped the fetch's purge, while its caller saw a resolved
+          // promise and a still-current guard: `useConnectionRecovery` would
+          // then announce `connection-recovered` with membership never
+          // refreshed, so a server the user was removed from during an outage
+          // stayed visible and backfill ran against it (#2329's exact defect,
+          // reintroduced sideways — Codex). Journalling invalidates nothing.
+          for (const journal of serverFetchJournals) journal.addedIds.add(server.id);
+          set((state) => {
+            const index = state.servers.findIndex((s) => s.id === server.id);
+            if (index === -1) return { servers: [server, ...state.servers] };
+            // Upsert, not clobber — as a BOUNDARY GUARD on a public store
+            // action, with no currently-reachable collision. Both earlier
+            // rationales for it were wrong and are recorded so they are not
+            // reinvented: a repeat join does not reach here (the control plane
+            // 409s an existing member before the insert, internal/invites/
+            // handlers.go checkBanAndMembership), and neither does a rehydrated
+            // row (`partialize` persists ONLY activeServerId, so `servers` never
+            // rehydrates). Today's two callers — joinServer and CreateServerModal
+            // — cannot collide either. What the guard buys is that `addServer`
+            // means "this server is in the list", so a third caller cannot
+            // reintroduce the duplicate `key={server.id}` at ServerList.tsx:78
+            // that an unconditional prepend allows. Cheap, and the alternative is
+            // an action whose correctness depends on its caller list.
+            // Merge, do not replace —
+            // an ABSENT key is already preserved by the spread, so the `??`
+            // below only guards a caller that passes an EXPLICIT
+            // `permissions: undefined` — which the optional field permits and
+            // no current caller does. Kept as a boundary guard, not because a
+            // live path needs it: today nothing in the renderer reads
+            // `servers[].permissions` (permission checks come from
+            // permissionStore), so clobbering it would not downgrade anything
+            // yet. `fetchServers` does populate the field, so a future reader
+            // could start depending on it (#2363).
+            const servers = [...state.servers];
+            servers[index] = {
+              ...servers[index],
+              ...server,
+              permissions: server.permissions ?? servers[index].permissions,
+              // joinServer fabricates 0/0 (JoinServerResponse carries only
+              // { server, role }), so on the UPDATE path the incoming counts are
+              // known-wrong and must never win. Pinned rather than merged with a
+              // non-zero heuristic, which would misread a server that genuinely
+              // has 0 online. Every OTHER field legitimately takes the fresh
+              // response — a repeat-join reply reflects current server state.
+              member_count: servers[index].member_count,
+              online_count: servers[index].online_count,
+            };
+            return { servers };
+          });
         },
 
         updateServer: (serverId: string, updates: Partial<ServerWithRole>) => {
