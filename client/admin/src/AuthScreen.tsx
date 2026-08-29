@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { ApiError, api } from "./api";
+import { ApiContractError, ApiError, api } from "./api";
 import { decodeRequestOptions, encodeAssertion } from "./webauthn";
 
 interface AuthScreenProps {
@@ -11,6 +11,12 @@ interface Ceremony {
   handle: string;
   options: PublicKeyCredentialRequestOptions;
 }
+
+// Shown when the server answered but sent a shape this console rejects.
+// Distinct from both the credential and the security-key messages on purpose:
+// blaming either would send the operator hunting the wrong fault (#3005).
+const UNREADABLE_RESPONSE =
+  "The server's response was not recognized. This console may be out of date.";
 
 export function AuthScreen({ onAuthenticated }: Readonly<AuthScreenProps>) {
   const [username, setUsername] = useState("");
@@ -57,7 +63,11 @@ export function AuthScreen({ onAuthenticated }: Readonly<AuthScreenProps>) {
         return;
       }
       setCeremony(null);
-      setError("Sign-in failed. Check your credentials and try again.");
+      setError(
+        cause instanceof ApiContractError
+          ? UNREADABLE_RESPONSE
+          : "Sign-in failed. Check your credentials and try again.",
+      );
     } finally {
       markBusy(false);
     }
@@ -78,7 +88,9 @@ export function AuthScreen({ onAuthenticated }: Readonly<AuthScreenProps>) {
       setCeremony(next);
       await runWebAuthn(next);
     } catch (cause) {
-      if (cause instanceof ApiError) {
+      if (cause instanceof ApiContractError) {
+        setError(UNREADABLE_RESPONSE);
+      } else if (cause instanceof ApiError) {
         setError("Sign-in failed. Check your credentials and try again.");
       } else {
         setError("Security-key challenge could not be used. Start again.");

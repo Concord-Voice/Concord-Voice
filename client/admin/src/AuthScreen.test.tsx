@@ -96,6 +96,60 @@ describe("AuthScreen", () => {
     expect(attempts).toBe(1);
   });
 
+  // #3005: a response the server delivered fine but whose SHAPE api.ts rejects
+  // is not a credential problem and not a security-key problem. Before this,
+  // exactKeys threw ApiError(0) and the operator was told the security-key
+  // challenge failed — sending them to the hardware for a schema mismatch.
+  // The WebAuthn leg has its own catch. Before #3005 a malformed /auth/webauthn
+  // response landed on "Sign-in failed. Check your credentials" — blaming the
+  // operator for a server/client schema mismatch after their key already
+  // succeeded.
+  it("reports an unrecognized webauthn response without blaming the credentials", async () => {
+    const credential = assertionCredential();
+    vi.spyOn(navigator.credentials, "get").mockResolvedValue(credential);
+    server.use(
+      http.post(`${base}/admin/api/v1/auth/password`, () =>
+        HttpResponse.json({
+          handle: "login-handle",
+          publicKey: { publicKey: requestOptions() },
+        }),
+      ),
+      http.post(`${base}/admin/api/v1/auth/webauthn`, () =>
+        HttpResponse.json({ status: "not-the-status-we-asked-for" }),
+      ),
+    );
+
+    render(<AuthScreen onAuthenticated={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("Username"), "operator");
+    await userEvent.type(screen.getByLabelText("Password"), "correct horse");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The server's response was not recognized. This console may be out of date.",
+    );
+    expect(alert).not.toHaveTextContent(/credentials|security.key/i);
+  });
+
+  it("reports an unrecognized response shape as neither a credential nor a key fault", async () => {
+    server.use(
+      http.post(`${base}/admin/api/v1/auth/password`, () =>
+        HttpResponse.json({ handle: "operator", unexpected: "field" }),
+      ),
+    );
+    render(<AuthScreen onAuthenticated={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("Username"), "operator");
+    await userEvent.type(screen.getByLabelText("Password"), "correct horse");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The server's response was not recognized. This console may be out of date.",
+    );
+    expect(alert).not.toHaveTextContent(/security.key|credentials/i);
+    expect(alert).not.toHaveTextContent(/correct horse|operator/i);
+  });
+
   it("handles malformed options, browser cancellation retry, null credential, and redemption failure", async () => {
     const get = vi.spyOn(navigator.credentials, "get");
     server.use(

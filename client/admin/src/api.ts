@@ -1,4 +1,5 @@
 import {
+  ContractError,
   parseCounters,
   parseCurrent,
   parseHealth,
@@ -96,14 +97,28 @@ async function request<T>(
   try {
     return parser(value);
   } catch (cause) {
-    if (cause instanceof ApiContractError) throw cause;
+    // A shape we REJECTED is not a transport failure. ContractError is thrown
+    // by the parsers in contracts.ts; without this it fell through to
+    // ApiError(0), which usePolling maps to the stale "live telemetry is
+    // unavailable" banner — so a client/server schema mismatch was reported as
+    // a dead backend while the server answered 200 (#3004). getSeries already
+    // threw ApiContractError for a mismatched key or window; this makes the
+    // parse path agree with it.
+    if (cause instanceof ApiContractError || cause instanceof ContractError) {
+      throw new ApiContractError();
+    }
     throw new ApiError(0, null);
   }
 }
 
+// These four validators run as the `parser` argument to request(), so throwing
+// ContractError lets request() classify them exactly as it classifies a
+// rejected metrics shape. Throwing ApiError(0) here instead would have left
+// api.ts classifying the SAME failure differently per endpoint — auth as a
+// transport failure, metrics as a contract failure.
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new ApiError(0, null);
+    throw new ContractError();
   }
   return value as Record<string, unknown>;
 }
@@ -118,13 +133,13 @@ function exactKeys(
     actual.length !== expected.length ||
     actual.some((key) => !expectedSet.has(key))
   ) {
-    throw new ApiError(0, null);
+    throw new ContractError();
   }
 }
 
 function nonEmptyString(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
-    throw new ApiError(0, null);
+    throw new ContractError();
   }
   return value;
 }
@@ -143,7 +158,7 @@ function statusResponse(expected: string): (value: unknown) => void {
   return (value) => {
     const data = record(value);
     exactKeys(data, ["status"]);
-    if (data.status !== expected) throw new ApiError(0, null);
+    if (data.status !== expected) throw new ContractError();
   };
 }
 

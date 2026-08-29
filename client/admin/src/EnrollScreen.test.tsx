@@ -124,6 +124,79 @@ describe("EnrollScreen", () => {
     },
   );
 
+  // #3005 companion to the AuthScreen case. This catch had no error binding at
+  // all, so every failure read "Check the invitation" — including one where the
+  // invitation was fine and the response shape was not.
+  // The finish leg has its own catch. The key already succeeded here, so
+  // "Check the invitation" and "Security-key challenge could not be used" are
+  // both wrong — only the response shape is (#3005).
+  it("reports an unrecognized enroll-finish response after the key succeeded", async () => {
+    history.replaceState(
+      null,
+      "",
+      "/admin/enroll?username=operator&token=enroll-secret",
+    );
+    vi.spyOn(navigator.credentials, "create").mockResolvedValue(
+      attestationCredential(),
+    );
+    server.use(
+      http.post(`${base}/admin/api/v1/enroll/begin`, () =>
+        HttpResponse.json({
+          handle: "enroll-handle",
+          publicKey: { publicKey: creationOptions() },
+        }),
+      ),
+      http.post(`${base}/admin/api/v1/enroll/finish`, () =>
+        HttpResponse.json({ status: "not-the-status-we-asked-for" }),
+      ),
+    );
+
+    render(<EnrollScreen onContinue={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("Password"), "correct horse");
+    await userEvent.type(
+      screen.getByLabelText("Credential name"),
+      "YubiKey primary",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Enroll security key" }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The server's response was not recognized. This console may be out of date.",
+    );
+    expect(alert).not.toHaveTextContent(/invitation|security.key/i);
+  });
+
+  it("reports an unrecognized response shape as neither an invitation nor a key fault", async () => {
+    history.replaceState(
+      null,
+      "",
+      "/admin/enroll?username=operator&token=enroll-secret",
+    );
+    server.use(
+      http.post(`${base}/admin/api/v1/enroll/begin`, () =>
+        HttpResponse.json({ handle: "enroll-handle", unexpected: "field" }),
+      ),
+    );
+    render(<EnrollScreen onContinue={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("Password"), "correct horse");
+    await userEvent.type(
+      screen.getByLabelText("Credential name"),
+      "YubiKey primary",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Enroll security key" }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The server's response was not recognized. This console may be out of date.",
+    );
+    expect(alert).not.toHaveTextContent(/invitation|security.key/i);
+    expect(alert).not.toHaveTextContent(/correct horse|enroll-secret/i);
+  });
+
   it("handles credential creation failure and null credentials", async () => {
     history.replaceState(
       null,

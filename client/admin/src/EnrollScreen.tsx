@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { ApiError, api } from "./api";
+import { ApiContractError, ApiError, api } from "./api";
 import { decodeCreationOptions, encodeAttestation } from "./webauthn";
 
 interface EnrollScreenProps {
@@ -28,6 +28,12 @@ function readInvite(): EnrollmentInvite {
   }
   return invite;
 }
+
+// Shown when the server answered but sent a shape this console rejects.
+// Distinct from both the invitation and the security-key messages on purpose:
+// blaming either would send the operator hunting the wrong fault (#3005).
+const UNREADABLE_RESPONSE =
+  "The server's response was not recognized. This console may be out of date.";
 
 export function EnrollScreen({ onContinue }: Readonly<EnrollScreenProps>) {
   const [invite] = useState(readInvite);
@@ -70,6 +76,11 @@ export function EnrollScreen({ onContinue }: Readonly<EnrollScreenProps>) {
         setError("Security key enrollment was canceled.");
         return;
       }
+      if (cause instanceof ApiContractError) {
+        setCeremony(null);
+        setError(UNREADABLE_RESPONSE);
+        return;
+      }
       if (cause instanceof ApiError) {
         setCeremony(null);
         setError("Enrollment failed. Check the invitation and try again.");
@@ -98,8 +109,12 @@ export function EnrollScreen({ onContinue }: Readonly<EnrollScreenProps>) {
       };
       setCeremony(next);
       await createCredential(next);
-    } catch {
-      setError("Enrollment failed. Check the invitation and try again.");
+    } catch (cause) {
+      setError(
+        cause instanceof ApiContractError
+          ? UNREADABLE_RESPONSE
+          : "Enrollment failed. Check the invitation and try again.",
+      );
       setBusy(false);
     }
   };
