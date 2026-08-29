@@ -2,7 +2,7 @@
 name: Feature Request
 about: Suggest a new feature or enhancement
 title: '[FEATURE] '
-labels: enhancement
+labels: ['type: feature']
 assignees: ''
 ---
 
@@ -23,7 +23,7 @@ assignees: ''
 - [ ] Control Plane (Authentication, API)
 - [ ] Media Plane (Voice, Video)
 - [ ] Desktop Client
-- [ ] Web Client
+- [ ] Admin Portal (client/admin)
 - [ ] Infrastructure/DevOps
 
 ## Priority

@@ -8,7 +8,7 @@ Concord Voice builds privacy- and security-critical software. We take vulnerabil
 | ------- | --------- |
 | 0.x.x   | Yes       |
 
-**Note:** Concord Voice is in active development toward v0.2.0-Beta, with v1.0 targeted for January 2027. Security updates are provided for the current development release.
+**Note:** Concord Voice ships continuously on the v0.2.x beta line (current release v0.2.41), with v1.0 targeted for January 2027. Security updates are provided for the current release.
 
 ## Reporting a Vulnerability
 
@@ -97,11 +97,11 @@ Concord Voice is engineered for defense in depth.
 - **Strong authentication:** TOTP multi-factor with backup codes, and WebAuthn/FIDO2 security keys and passkeys.
 - **Recovery circles:** social recovery for account access.
 - **Token theft detection:** device binding with machine-ID verification.
-- **Session security:** short-lived JWT access tokens (15 minutes) and HttpOnly refresh cookies (30 days, rolling).
+- **Session security:** short-lived JWT access tokens (15 minutes) and HttpOnly refresh cookies (30 days, rolling when Remember Me is enabled; otherwise a session cookie fixed to its original expiry).
 - **Access control:** role-based and scope-based permissions.
 - **Rate limiting:** Redis-backed, per-IP and per-user.
 - **Injection defenses:** parameterized queries throughout; validation at every request boundary.
-- **Transport security:** TLS 1.3 required in production, with perfect forward secrecy.
+- **Transport security:** TLS 1.2 and 1.3 in production (TLS 1.3 preferred), with perfect forward secrecy — every accepted cipher suite is ECDHE.
 - **Static and dynamic analysis in CI:** CodeQL, Semgrep, ESLint, OSV-Scanner, govulncheck, OpenSSF Scorecard, and an API DAST pass, with results published to GitHub Code Scanning. A subset are merge-gated by branch rulesets.
 - **Secret detection:** detect-secrets, TruffleHog, and gitleaks in pre-commit, plus a CI secret-scanning gate.
 - **Dependency scanning:** Dependabot alerts, `npm audit`, and Go vulnerability database checks.
@@ -117,7 +117,7 @@ Concord Voice is engineered for defense in depth.
 **Key exchange**
 
 - RSA-OAEP 4096-bit keys
-- Key derivation: PBKDF2, 600,000 iterations
+- Key derivation: Argon2id (t=3, m=64 MB, p=4) for accounts created since the Argon2id migration; PBKDF2 with 600,000 iterations retained for legacy accounts pending migration
 
 **Message encryption**
 
@@ -127,8 +127,8 @@ Concord Voice is engineered for defense in depth.
 
 **Transport**
 
-- TLS 1.3 required in production
-- Perfect forward secrecy
+- TLS 1.2 and 1.3 in production, TLS 1.3 preferred
+- Perfect forward secrecy — every accepted cipher suite is ECDHE
 
 **Password storage**
 
@@ -204,7 +204,7 @@ git log --grep="Co-Authored-By.*Claude" --all -- "<affected-file-pattern>"
 
 ## Security Audits
 
-**Last audit:** internal security audit, 2026-03-27 — covering multi-factor authentication and WebAuthn, role-based access control, CORS hardening, credential extraction defenses, token theft detection, device binding, and recovery circles.
+**Last full internal audit:** internal security audit, 2026-03-27 — covering multi-factor authentication and WebAuthn, role-based access control, CORS hardening, credential extraction defenses, token theft detection, device binding, and recovery circles. Automated security scanning runs continuously; see "Static and dynamic analysis in CI" above.
 
 **Next audit:** a formal third-party audit is planned ahead of the v1.0 release.
 

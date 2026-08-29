@@ -64,8 +64,20 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 | **notificationNavigationStore** | Notification click navigation targets                        | ❌                    | 2B    |
 | **savedGifsStore**              | User's saved/favourite GIFs (Klipy integration)              | ✅                    | 2B    |
 | **settingsOverlayStore**        | Settings panel open/close and active tab state               | ❌                    | 2B    |
+| **e2eeStore**                   | Reactive mirror of the `e2eeService` lifecycle               | ❌                    | 2B    |
+| **ssoStore**                    | In-flight SSO authentication state                           | ❌                    | 2B    |
+| **pendingRegistrationStore**    | Registration awaiting email verification                     | ✅ sessionStorage     | 2B    |
+| **updateStatusStore**           | Critical update-channel errors behind the security banner    | ❌                    | 2B    |
+| **notificationPrefsStore**      | Per-target mute preferences                                  | ❌ (server-side)      | 2B    |
+| **attestationFailureStore**     | Terminal client-attestation failure codes                    | ❌                    | 2B    |
+| **settingsNavStore**            | Settings left-nav section and deep-link target               | ❌                    | 2B    |
+| **subscriptionStore**           | Subscription entitlement capability set                      | ❌                    | 2B    |
+| **richPresenceStore**           | Rich Presence custom text status                             | ❌                    | 2B    |
+| **friendOrgStore**              | Friend categories (zero-knowledge organization blob)         | ❌                    | 2B    |
+| **changelogStore**              | Last-seen changelog version for the post-update modal        | ✅ localStorage       | 2B    |
+| **presenceOverrideStore**       | Custom Status recipient exceptions                           | ❌                    | 2B    |
 
-> **Current metrics:** See [[internal] Key Counts](../../..[internal]#key-counts)
+> **Current metrics:** See the "Key Counts" section of [[internal]](../../..[internal]).
 
 The inventory above is an architectural overview. The canonical store set lives in `src/renderer/stores/`.
 
@@ -401,19 +413,21 @@ const messages = store.messagesByChannel.get(channelId);
 const messages = useChatStore((state) => state.messagesByChannel.get(channelId) || []);
 ```
 
-**Best (custom equality function for complex objects):**
+**Best (shallow comparison for object selectors):**
 
 ```typescript
-import { shallow } from 'zustand/shallow';
+import { useShallow } from 'zustand/react/shallow';
 
 const { addMessage, updateMessage } = useChatStore(
-  (state) => ({
+  useShallow((state) => ({
     addMessage: state.addMessage,
     updateMessage: state.updateMessage,
-  }),
-  shallow
+  }))
 );
 ```
+
+Zustand 5 removed the two-argument equality-function overload. Wrap the selector in
+`useShallow` instead of passing `shallow` as a second argument.
 
 ---
 
@@ -539,7 +553,8 @@ describe('authStore', () => {
 });
 ```
 
-**Tests deferred to Issue #26 (Frontend Component Tests)**
+Store tests live in `client/desktop/tests/unit/stores/`. `store-reset-coverage.test.ts` guards
+`resetAllStores()` parity with the store inventory.
 
 ---
 
@@ -656,6 +671,4 @@ Normal user-initiated logout should call `userStore.logout()`, which requests ma
 
 **Maintained by:** Mark (Backend) + Michael (Frontend)
 
-<!-- audit-exempt: historical reference (v0.1.0-Alpha is a shipped versioned identifier) -->
-
-**Next Review:** Before v0.1.0-Alpha release
+**Next Review:** Before the v1.0.0 GA cut (milestone due 2027-01-01)

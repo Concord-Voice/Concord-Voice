@@ -4,110 +4,26 @@ Test suite for the Concord Voice Control Plane service (Go).
 
 ## Structure
 
+Every package under `internal/` carries `_test.go` files, and so do `pkg/config` and
+`pkg/logger`. Run `ls internal/` for the current package set, and
+`go test ./internal/<pkg>/...` to run one package. The shared test infrastructure is the
+only part worth enumerating here.
+
 ```
 internal/
-├── testhelpers/                    # Shared test infrastructure
-│   ├── testdb.go                   # SetupTestDB, TruncateAllTables, RunMigrations
-│   ├── testredis.go                # SetupTestRedis — delegates to redistest/
-│   ├── redistest/                  # Per-process Redis logical-DB allocator (#2680)
-│   ├── testserver.go               # TestServer with CreateTestUser/Server/Channel helpers
-│   └── fixtures.go                 # TestUser struct, E2EETestKeys, ValidCiphertext
-├── auth/
-│   ├── password_test.go            # Argon2id hashing, password strength validation
-│   ├── username_test.go            # Username validation, profanity filter, normalization
-│   ├── tokens_test.go              # JWT generation/validation, refresh tokens
-│   ├── ws_ticket_test.go           # WebSocket ticket generation/validation
-│   ├── verification_test.go        # Email verification logic
-│   ├── verification_unit_test.go   # Email verification unit tests
-│   ├── verification_integration_test.go  # Email verification integration
-│   ├── verification_integration_2_test.go
-│   ├── recovery_integration_test.go # Account recovery flows
-│   ├── handlers_integration_test.go # Register, login, refresh, logout HTTP tests
-│   └── handlers_integration_2_test.go
-├── channels/
-│   ├── handlers_test.go            # CRUD, unread tracking, E2EE key distribution
-│   ├── handlers_integration_2_test.go
-│   ├── groups_test.go              # Channel group unit tests
-│   └── groups_integration_test.go  # Channel group integration tests
-├── clientconfig/
-│   └── handlers_test.go            # Client configuration endpoint
-├── database/
-│   └── redis_test.go               # Redis connection and operations
-├── dm/
-│   └── handlers_test.go            # DM conversations, messages, voice
-├── email/
-│   └── service_test.go             # Email service
-├── friends/
-│   └── handlers_test.go            # Friend codes, requests, privacy
-├── media/
-│   ├── handlers_test.go            # Media upload/download
-│   ├── handlers_integration_2_test.go
-│   ├── cleanup_test.go             # Media cleanup
-│   ├── processing_test.go          # Media processing
-│   └── mock_store_test.go          # Mock storage for tests
-├── messages/
-│   ├── handlers_test.go            # Send/edit/delete, pagination, E2EE enforcement
-│   └── handlers_integration_2_test.go
-├── mfa/
-│   ├── handlers_test.go            # MFA setup, verify, disable
-│   ├── totp_test.go                # TOTP generation/validation
-│   └── challenge_test.go           # MFA challenge flow
-├── servers/
-│   ├── handlers_test.go            # CRUD, role-based access, membership
-│   └── handlers_integration_2_test.go
-├── members/
-│   ├── handlers_test.go            # Add/remove/update roles, kick, leave
-│   └── handlers_integration_test.go
-├── invites/
-│   ├── handlers_test.go            # Create/revoke/join, expiry, max uses
-│   └── handlers_integration_2_test.go
-├── models/
-│   └── user_test.go                # User model validation
-├── ownership/
-│   ├── handlers_test.go            # Ownership transfer
-│   └── handlers_integration_2_test.go
-├── rbac/
-│   ├── audit_test.go               # RBAC audit logging
-│   ├── cache_test.go               # Permission cache
-│   ├── handlers_integration_test.go # RBAC integration tests
-│   ├── middleware_test.go          # Permission middleware
-│   ├── permissions_integration_test.go
-│   ├── resolver_test.go            # Permission resolver
-│   ├── resolver_visibility_test.go # Visibility resolver
-│   └── types_test.go               # RBAC type tests
-├── users/
-│   ├── handlers_test.go            # Profile, preferences, password change, public keys
-│   └── handlers_integration_test.go
-├── sessions/
-│   ├── ip_test.go                  # IP masking (IPv4/IPv6)
-│   ├── handlers_test.go            # Session listing, revocation
-│   └── handlers_integration_test.go
-├── updates/
-│   └── handler_test.go             # Client update endpoint
-├── middleware/
-│   ├── middleware_test.go          # Auth required, rate limiting
-│   ├── auth_test.go                # Auth middleware
-│   ├── cors_test.go                # CORS middleware
-│   ├── ratelimit_test.go           # Rate limiting
-│   └── validate_headers_test.go    # Custom header validation
-├── voice/
-│   ├── handlers_test.go            # Voice coordination
-│   └── handlers_integration_2_test.go
-├── websocket/
-│   ├── hub_test.go                 # WebSocket hub
-│   ├── hub_epoch_test.go           # Key epoch enforcement
-│   ├── client_test.go              # WebSocket client
-│   ├── handler_test.go             # WebSocket handler
-│   ├── checkorigin_test.go         # Origin validation
-│   └── mentions_test.go            # @mention routing
-pkg/
-├── config/
-│   ├── config_test.go              # Config defaults, env overrides, validation
-│   ├── spa_live_test.go            # SPA live mode config
-│   └── turn_test.go                # TURN config
-└── logger/
-    └── logger_test.go              # Logger tests
+└── testhelpers/                    # Shared test infrastructure
+    ├── testdb.go                   # SetupTestDB, TruncateAllTables, RunMigrations
+    ├── testredis.go                # SetupTestRedis — delegates to redistest/
+    ├── redistest/                  # Per-process Redis logical-DB allocator (#2680)
+    ├── testserver.go               # TestServer with CreateTestUser/Server/Channel helpers
+    └── fixtures.go                 # TestUser struct, E2EETestKeys, ValidCiphertext
 ```
+
+Test files follow three naming conventions:
+
+- `*_test.go` — unit tests, no external services
+- `*_integration_test.go` — needs PostgreSQL and Redis
+- `mock_*_test.go` — in-package fakes
 
 **Backend test status:** CI reports current results.
 
@@ -155,9 +71,14 @@ go tool cover -html=coverage.out  # Open in browser
 **SetupTestServer(t)** — Creates a full test server with Gin router, Hub, DB, Redis, and JWT secret. It offers these convenience methods:
 - `CreateTestUser(t, username)` — Inserts user with pre-computed Argon2id hash (avoids ~100ms per user), generates JWT
 - `CreateTestServer(t, ownerID, name)` — Inserts server + owner membership
-- `CreateTestChannel(t, serverID, name, isEncrypted)` — Inserts channel
-- `AuthHeaders(userID)` — Returns `Authorization: Bearer <jwt>` header map
+- `CreateTestChannel(t, serverID, name)` — Inserts channel
+- `CreateTestUserUnverified(t, username)` — Inserts a user whose email is not verified
+- `CreateTestRole(t, serverID, name, position, permissions)` — Inserts a role
+- `CreateTestMessage(t, channelID, user, content)` — Inserts a message
 - `DoRequest(method, path, body, headers)` — HTTP request via `httptest.ResponseRecorder`
+
+`AuthHeaders(accessToken)` is a package-level function, not a `TestServer` method. It takes an
+access token and returns an `Authorization: Bearer <token>` header.
 
 **Fixtures** — `E2EETestKeys()` for structurally-valid test keys, `ValidCiphertext()` for base64-encoded data passing minimum AES-GCM size validation.
 

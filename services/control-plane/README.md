@@ -64,33 +64,7 @@ The control plane is responsible for:
 control-plane/
 ├── cmd/
 │   └── server/           # Application entry point (main.go)
-├── internal/
-│   ├── api/              # API router setup
-│   ├── auth/             # Authentication (Argon2id, JWT, sessions)
-│   ├── channels/         # Channel management and groups
-│   ├── clientconfig/     # Client configuration endpoint
-│   ├── database/         # Database connections and migrations
-│   ├── dm/               # Direct messaging system
-│   ├── email/            # Email verification service
-│   ├── friends/          # Friend codes and privacy
-│   ├── invites/          # Server invite system
-│   ├── media/            # Media file handling (MinIO/S3)
-│   ├── members/          # Server membership
-│   ├── messages/         # Message CRUD with E2EE enforcement
-│   ├── mfa/              # Multi-factor authentication (TOTP, WebAuthn)
-│   ├── middleware/        # Auth, rate limiting, CORS
-│   ├── models/           # Data models
-│   ├── ownership/        # Server ownership transfer
-│   ├── rbac/             # Role-based access control
-│   ├── servers/          # Server CRUD
-│   ├── sessions/         # Session management and device tracking
-│   ├── storage/          # Object storage abstraction
-│   ├── testhelpers/      # Shared test infrastructure
-│   ├── updates/          # Client update management
-│   ├── users/            # User profiles, preferences, privacy
-│   ├── voice/            # Voice coordination (NATS ↔ media-plane)
-│   ├── websocket/        # WebSocket hub (messaging, presence, DMs)
-│   └── klipy/            # Klipy GIF integration and privacy settings
+├── internal/             # 51 packages — see the groups below
 ├── pkg/
 │   ├── config/           # Configuration management
 │   └── logger/           # Structured logging
@@ -100,6 +74,19 @@ control-plane/
 ├── go.mod
 └── go.sum
 ```
+
+### `internal/` packages
+
+Run `ls internal/` for the current package set. The packages group as follows.
+
+- **HTTP surface** — `api` (router setup), `middleware` (auth, rate limiting, CORS), `models` (data models), `database` (connections and migrations), `clientconfig`, `servercapabilities` (pre-auth capability descriptor)
+- **Identity and access** — `auth` (Argon2id, JWT, sessions), `mfa` (TOTP, WebAuthn), `oauth` (SSO providers), `sessions` (device tracking), `stepup` (password/MFA step-up), `rbac`, `credepoch` (per-user credential-epoch fence), `age` (identity-blind age verification), `attestation` (client attestation)
+- **Servers and membership** — `servers`, `members`, `channels`, `invites`, `ownership`, `friends`
+- **Messaging** — `messages` (CRUD with E2EE enforcement), `dm`, `websocket` (hub: messaging, presence, DMs), `purge` (message-purge engine), `keyrotation` (channel session key rotation), `klipy` (GIF integration)
+- **Presence** — `presence` (audience authority), `activepresence`, `graphpresence`, `presencecapture`, `presencehistory` (Activity History), `presencehook`, `voicepresence`
+- **Media and storage** — `media` (file handling), `storage` (object storage abstraction), `voice` (NATS coordination with the media-plane)
+- **Accounts and commerce** — `users`, `privacy` (GDPR erasure), `notifications` (mute preferences), `subscriptions`, `entitlements`, `redemption` (redemption codes), `feedback`
+- **Operations** — `admin` (Admin/Operations console identity), `opsmetrics` (aggregate metric boundary), `updates` (client update management), `email`, `cfkv` (Cloudflare Workers KV client for SSO), `ingressbudget` (unauthenticated ingress admission control), `testhelpers`
 
 ## Development
 
@@ -247,7 +234,11 @@ GET/POST /api/v1/channels/:id/keys
 POST /api/v1/channels/:id/keys/rotate
 ```
 
-**OpenAPI-covered operations:** The two specs under `docs/api/` cover 260 public and 4 admin metrics operations. This is an explicit supported-contract inventory, not a count of every control-plane route registration.
+**OpenAPI-covered operations:** The two specs under `docs/api/` cover the public operations plus the admin
+metrics operations. This is an explicit supported-contract inventory, not a count of every control-plane
+route registration.
+
+> **Current metrics:** See the "Key Counts" section of [[internal]](../..[internal]).
 
 ### Testing
 
@@ -424,6 +415,6 @@ See `migrations/` for the full schema. Use `make migrate-version` to inspect the
 - [x] Token theft detection + MFA (#89) ✅ DONE
 - [x] Klipy GIF integration + privacy settings (#168–#172) ✅ DONE
 - [x] Server mute/deafen (#84 partial) ✅ DONE (migration 000054)
-- [ ] File uploads (S3 + CDN) — partially implemented (`media_files` table, MinIO storage)
-- [ ] Message search
+- [x] File uploads / attachments (chunked upload sessions, MinIO storage, entitlement-gated size caps) ✅ DONE
+- [x] Message search (client-side E2EE-native index + `/messages/bulk` backfill) ✅ DONE
 - [ ] Billing integration (Stripe)

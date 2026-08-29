@@ -14,7 +14,7 @@ Electron-based desktop application for Concord voice communication platform.
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 24.15+ (see `engines` in `package.json`)
 - npm 10+
 
 ### Setup
@@ -196,9 +196,9 @@ without the value produces an inert Google SSO (empty secret), not a failure.
 - [x] Server mute/deafen (migration 000054)
 - [x] Message reactions
 - [x] Reply/quote messages
-- [ ] File uploads, @mention tagging
+- [x] File uploads, @mention tagging
+- [x] System tray integration
+- [x] Auto-updates
+- [x] Native notifications
+- [x] Lazy loading and code splitting
 - [ ] Push-to-talk with global shortcuts
-- [ ] System tray integration
-- [ ] Auto-updates
-- [ ] Native notifications
-- [ ] Lazy loading and code splitting

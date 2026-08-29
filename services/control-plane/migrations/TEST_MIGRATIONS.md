@@ -78,8 +78,11 @@ Expected output:
 Checking migration version...
 Building migrate tool...
 ./bin/migrate -command=version
-Current version: 57 (clean)
+Current version: 113 (clean)
 ```
+
+The number is the highest migration in `migrations/`. Run `ls migrations/*.up.sql | tail -1` to
+confirm the current value. 113 was the latest when this document was written.
 
 #### Test Rollback
 ```bash
@@ -101,8 +104,10 @@ make migrate-version
 
 Expected output:
 ```
-Current version: 56 (clean)
+Current version: 112 (clean)
 ```
+
+The version is one lower than the value from the previous step.
 
 #### Re-apply Migration
 ```bash
@@ -122,7 +127,7 @@ Then run:
 -- List all tables
 \dt
 
--- Expected tables (40+ total, including):
+-- Expected tables (78+ total, including):
 -- users, user_keys, public_keys, refresh_tokens, user_preferences
 -- servers, channels, server_members, server_invites
 -- messages, channel_read_states, channel_keys, pending_key_requests
@@ -140,7 +145,7 @@ Then run:
 -- Check schema_migrations table
 SELECT * FROM schema_migrations;
 
--- Expected: version = 57, dirty = false
+-- Expected: version = the highest migration number in `migrations/`, dirty = false
 
 -- Verify users table structure
 \d users
@@ -174,13 +179,15 @@ Creating migration: add_test_field
 Building migrate tool...
 ./bin/migrate -command=create -name=add_test_field
 Created migration files:
-  - migrations/000004_add_test_field.up.sql
-  - migrations/000004_add_test_field.down.sql
+  - migrations/000114_add_test_field.up.sql
+  - migrations/000114_add_test_field.down.sql
 ```
+
+The number is the next one after the highest migration in `migrations/`.
 
 Verify files were created:
 ```bash
-ls -l migrations/000004_*
+ls -l migrations/000114_*
 ```
 
 ### 6. Test Server Startup with Auto-Migration
@@ -200,12 +207,12 @@ Migrations should run automatically before the server starts.
 
 Stop the server (Ctrl+C), then:
 
+Destroy the volume. This is the supported reset path — do not roll back more than 100 migrations
+one at a time.
+
 ```bash
-# Rollback all 57 migrations one by one (repeat 57 times)
-# Each `make migrate-down` rolls back 1 migration
-make migrate-down  # Rolls back to version 46
-make migrate-down  # Rolls back to version 45
-# ... (repeat until version 0)
+docker-compose down -v
+docker-compose up -d postgres
 
 # Verify
 make migrate-version
@@ -216,7 +223,8 @@ Expected:
 No migrations applied yet
 ```
 
-> **Tip:** For a full reset, use `docker-compose down -v` to destroy the volume instead of rolling back one-by-one.
+> **Note:** `make migrate-down` rolls back exactly one migration. Use it to test a single
+> migration pair, not to empty the database.
 
 ### 8. Verify Clean State
 

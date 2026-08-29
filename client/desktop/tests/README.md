@@ -6,59 +6,38 @@ Test files span unit, component, hook, service, shared, and E2E categories. CI r
 
 ## Structure
 
+The map below is one level deep. It shows where a test belongs, not what each directory holds.
+Run `ls tests/unit/` for the current set.
+
 ```text
 tests/
-├── setup.ts                        # Global test setup (jest-dom, crypto polyfill, window.electron mock)
-├── test-utils.tsx                  # Custom render() with BrowserRouter, re-exports Testing Library
-├── helpers/
-│   ├── store-helpers.ts            # resetAllStores() for all Zustand stores
-│   └── crypto-helpers.ts           # mockE2EEService() stubs
-├── mocks/
-│   ├── fixtures.ts                 # Typed mock data: mockUser, mockServer, mockChannel, mockMessage, mockMember
-│   ├── handlers.ts                 # MSW v2 request handlers (auth, servers, channels, messages, users, members)
-│   └── server.ts                   # MSW setupServer()
+├── setup.ts                # Global test setup (jest-dom, crypto polyfill, window.electron mock)
+├── test-utils.tsx          # Custom render() with BrowserRouter, re-exports Testing Library
+├── helpers/                # resetAllStores(), crypto stubs, WS/BroadcastChannel mocks, deferred
+├── mocks/                  # MSW v2 handlers, setupServer(), typed fixtures
+├── __mocks__/              # Vitest automock directory
+├── fixtures/               # Static test data
+├── integration/            # Cross-module tests (fan-out, pinning, preload sandbox contract)
 ├── unit/
-│   ├── stores/                     # Zustand tests; store-reset-coverage.test.ts guards resetAllStores() parity
-│   ├── components/                 # 39 files — React component tests
-│   │   ├── Auth/                   # AuthFlow, ConnectionSelector, InfoTooltip, LoadingSpinner, Login, PasswordStrength, Register, ServerInput
-│   │   ├── Chat/                   # ChatView, DeleteMessageModal, Message, MessageContextMenu, MessageInput, MessageInputContextMenu, MessageList, TypingIndicator
-│   │   ├── Channels/               # ChannelContextMenu, ChannelList, CreateChannelModal, DeleteChannelModal, EditChannelModal, ServerActionBar
-│   │   ├── Servers/                # CreateServerModal, DeleteServerModal, JoinServerModal, LeaveServerModal, ServerActionModal, ServerContextMenu, ServerList
-│   │   ├── Members/                # MemberContextMenu, MemberList, MemberProfileCard
-│   │   ├── Layout/                 # AppLayout, ChannelPanel, FolderBar, MemberFlexSpace, ServerBar
-│   │   ├── User/                   # UserPanel, UserPopover
-│   │   ├── Settings/               # SettingsPage, AccountSection (incl. My Profile forms), SettingsOverlayHost
-│   │   ├── Profile/                # ProfileInfoForm
-│   │   ├── MainView/               # MainView
-│   │   ├── ConnectionStatus/       # ConnectionStatus
-│   │   ├── ui/                     # ContextMenu, Modal
-│   │   └── App.test.tsx
-│   ├── hooks/                      # 4 files — Custom hook tests
-│   │   ├── useChannelSubscription.test.ts
-│   │   ├── useMessaging.test.ts
-│   │   ├── useResizablePanel.test.ts
-│   │   ├── useServerChannelSubscriptions.test.ts
-│   │   └── useWebSocket.test.ts
-│   ├── services/                   # 5 files — Service tests
-│   │   ├── apiClient.test.ts       # Auth header injection, 401 refresh retry, token clearing
-│   │   ├── e2eeService.test.ts     # Initialize, channel key caching, encrypt/decrypt
-│   │   ├── messageQueue.test.ts    # Enqueue, status transitions, max retries, queue limits
-│   │   ├── preferencesSync.test.ts
-│   │   └── websocketService.test.ts
-│   └── utils/
-│       └── crypto.test.ts          # Key derivation, key pair generation, wrap/unwrap, encrypt/decrypt (uses real Node webcrypto)
-└── e2e/                            # Playwright E2E tests
-    ├── helpers.ts                  # registerUser, loginUser, createServer, createChannel helpers
-    ├── activity-history.spec.ts
-    ├── auth.spec.ts
-    ├── bundled-fallback-login.spec.ts
-    ├── channels.spec.ts
-    ├── design-tokens.spec.ts
-    ├── invites.spec.ts
-    ├── messaging.spec.ts
-    ├── rich-presence-overrides.spec.ts
-    ├── servers.spec.ts
-    └── visual-regression.spec.ts
+│   ├── build/              # Build-config and packaging assertions
+│   ├── components/         # React component tests
+│   ├── functions/          # Cloudflare Worker function tests
+│   ├── hooks/              # Custom hook tests
+│   ├── main/               # Electron main-process tests
+│   ├── renderer/           # Renderer-side modules outside components/hooks/services
+│   ├── scripts/            # Repo script tests
+│   ├── services/           # Service-layer tests
+│   ├── shared/             # Code shared between main and renderer
+│   ├── stores/             # Zustand tests; store-reset-coverage.test.ts guards resetAllStores() parity
+│   ├── styles/             # Theme and CSS token tests
+│   ├── types/              # Type-level and schema tests
+│   ├── utils/              # Pure utility tests
+│   ├── workers/            # Web Worker tests
+│   ├── csp-allowlist.test.ts
+│   ├── csp-policy.test.ts
+│   ├── csp-prod-strip.test.ts
+│   └── no-sentry-imports.test.ts
+└── e2e/                    # Playwright E2E specs + helpers.ts
 ```
 
 ## Running Tests
@@ -120,8 +99,7 @@ Store tests call actions directly and assert state changes. MSW intercepts API c
 
 ### Known Limitations
 
-- `window.matchMedia` is unavailable in jsdom, so system theme tests must be skipped
-- `InviteToServerModal` causes OOM in jsdom, so the suite excludes it
+- jsdom does not implement `window.matchMedia`. Stub it in `beforeAll` — see `tests/unit/stores/settingsStore.extended.test.ts`
 - Components that fetch in `useEffect` on mount will override manually-set store state. Mock the fetch function or the API client
 
 ## CI/CD
@@ -132,14 +110,12 @@ Tests run in GitHub Actions via `.github/workflows/build.yml`, invoked via `work
 
 The 10 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e`. #1435 removed CI enforcement, because the signal was advisory-only and macOS visual baselines were flaky. See the historical playwright ADR-0011.
 
-- **Renderer-only specs** (`visual-regression`, `design-tokens`, `bundled-fallback-login`) — tagged with `{ tag: '@renderer-only' }`. Run on every PR. Need only the Vite dev server.
-- **Full-stack specs** (`auth`, `channels`, `invites`, `messaging`, `servers`) — untagged (default). Run ONLY when the PR also touches `services/control-plane/**` or migrations. Need a running backend (Postgres + Redis + control-plane).
+No Playwright CI job exists for the desktop client — that change deleted `playwright.yml`, so nothing below runs on a PR. The only Playwright in CI is the Admin Portal's own browser-test step in `build.yml` (`.github/workflows/build.yml:717-723`). The tags below still help a local run:
 
-The workflow uses `services:` blocks for Postgres and Redis. The control-plane Go binary starts via `go run ./cmd/server &`, conditionally on `dorny/paths-filter` output.
+- **Renderer-only specs** (`visual-regression`, `design-tokens`, `bundled-fallback-login`) — tagged with `{ tag: '@renderer-only' }`. Need only the Vite dev server.
+- **Full-stack specs** (`auth`, `channels`, `invites`, `messaging`, `servers`) — untagged (default). Need a running backend (Postgres + Redis + control-plane).
 
-**Visual-regression failure semantics:** non-blocking. A snapshot diff against the committed baseline posts a sticky PR comment with the diff artifact link. The workflow still exits 0 (green CI). Real test failures (assertion, timeout, navigation) exit 1 (red CI).
-
-**Re-baselining:** a one-shot bot-authored follow-up PR captures and commits the canonical Linux baselines after #1074 merges. The original Mac-captured `*-chromium-darwin.png` baselines remain in the tree until that PR merges. Until then, PRs see non-blocking drift comments from Mac→Linux subpixel rendering differences.
+The committed visual baselines are Mac-captured (`*-chromium-darwin.png` in `tests/e2e/visual-regression.spec.ts-snapshots/`). `visual-regression.spec.ts` therefore only produces meaningful diffs on macOS.
 
 To run e2e locally (renderer-only specs, no backend needed):
 

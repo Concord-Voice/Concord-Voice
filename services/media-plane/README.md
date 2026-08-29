@@ -48,20 +48,25 @@ An SFU (Selective Forwarding Unit) forwards media streams without decoding/encod
 media-plane/
 ├── src/
 │   ├── config/            # Configuration management
-│   ├── lib/
-│   │   ├── logger.ts      # Winston logger
-│   │   ├── mediasoup.ts   # Low-level mediasoup worker/router management
-│   │   ├── roomManager.ts # Room lifecycle, transports, producers, consumers
-│   │   ├── nats.ts        # NATS client for control-plane coordination
-│   │   └── redis.ts       # Redis state management
+│   ├── lib/               # 21 modules — see the groups below
 │   ├── middleware/
 │   │   └── auth.ts        # JWT + Socket.IO authentication middleware
-│   ├── types/             # TypeScript type definitions
 │   └── index.ts           # Application entry point (Socket.IO event handlers)
 ├── Dockerfile
 ├── package.json
 └── tsconfig.json
 ```
+
+### `src/lib/` modules
+
+Run `ls src/lib/` for the current set. The modules group as follows.
+
+- **Media core** — `mediasoup.ts` (worker/router management), `roomManager.ts` (room lifecycle, transports, producers, consumers), `activeSpeakerSet.ts`, `closeRecvTransport.ts`
+- **Layer governance** — `cameraLayerGovernor.ts`, `screenLayerGovernor.ts` (simulcast/SVC layer selection)
+- **Admission and abuse control** — `admissionGate.ts`, `originGate.ts`, `rateLimit.ts`, `enforcePermissions.ts`, `forceDisconnect.ts`
+- **Socket lifecycle** — `socketJoinLifecycle.ts`, `setDeafen.ts`, `setTestingStatus.ts`
+- **State and messaging** — `nats.ts` (control-plane coordination), `redis.ts` (shared state)
+- **Observability** — `logger.ts`, `mediaMetrics.ts`, `opsMetricsCatalog.ts`, `opsMetricsPublisher.ts`, `expressErrorHandler.ts`
 
 ## Development
 
@@ -147,14 +152,18 @@ MEDIASOUP_LOG_LEVEL=warn
 socket.emit('join-room', {
   roomId: string,
   rtpCapabilities,
-  mediaFrameCryptoVersion: 2,
+  mediaFrameCryptoVersion: 5,
 });
 // room-joined participants include { userId, username, isDeafened, isTesting, ... }
 ```
 
-`mediaFrameCryptoVersion: 2` is the AES-256-GCM media-frame format. The media
-plane rejects missing or legacy frame-format declarations. It keeps one
-room-wide value, so mixed AES-128/AES-256 clients cannot enter the same call.
+The media plane accepts versions 3, 4 and 5
+(`ACCEPTED_MEDIA_FRAME_CRYPTO_VERSIONS` in `src/lib/roomManager.ts:596`).
+Anything else — a missing value, or a legacy declaration such as `2` — is
+rejected at the admission gate. A room keeps one version for its lifetime, so a
+joiner that advertises a different one gets `CryptoVersionMismatchError`. The
+desktop client sends `5` (`MEDIA_E2EE_FRAME_CRYPTO_VERSION`,
+`client/desktop/src/renderer/services/mediaEncryption.ts:84`).
 
 **create-transport**
 
@@ -371,15 +380,15 @@ Key metrics to monitor:
 - [x] Redis state management
 - [x] Graceful shutdown with resource cleanup
 - [x] DM voice call support
+- [x] Simulcast + SVC layer governance for camera and screen
+- [x] Aggregate operations metrics (ADR-0030)
+- [x] TURN server integration — coturn deployed with TLS (PRs #576, #577)
 
 ## Future Enhancements
 
-- [x] TURN server integration — coturn deployed with TLS (PRs #576, #577)
 - [ ] Recording support
-- [ ] Simulcast for video
 - [ ] Bandwidth estimation and quality adaptation
 - [ ] Multi-instance horizontal scaling
-- [ ] Metrics and monitoring integration
 
 ## CI
 

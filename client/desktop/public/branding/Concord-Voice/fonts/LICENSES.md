@@ -74,7 +74,7 @@ Source: <https://fonts.google.com/specimen/Lato>
 
 Copyright © 2019 Abbie Gonzalez (<https://abbiecod.es>) — Reserved Font Name **"OpenDyslexic"**.
 
-OpenDyslexic is an open dyslexia-friendly typeface; weighted letter bottoms and distinct letterforms reduce the letter confusions (b/d/p/q, etc.) common for readers with dyslexia. Concord offers it in Settings ▸ Appearance ▸ Fonts (and it is the face applied by the forthcoming Accessibility ▸ Display "Enable Dyslexic Support" toggle, #1644). The current build is licensed under the **SIL Open Font License, Version 1.1** — earlier pre-0.3 builds used a Bitstream-Vera/CC-BY scheme and are NOT shipped here. See the full text below.
+OpenDyslexic is an open dyslexia-friendly typeface; weighted letter bottoms and distinct letterforms reduce the letter confusions (b/d/p/q, etc.) common for readers with dyslexia. Concord offers it in Settings ▸ Appearance ▸ Fonts (and it is the face applied by the Accessibility ▸ Display "Enable Dyslexic Support" toggle (#1644)). The current build is licensed under the **SIL Open Font License, Version 1.1** — earlier pre-0.3 builds used a Bitstream-Vera/CC-BY scheme and are NOT shipped here. See the full text below.
 
 Source: <https://github.com/antijingoist/opendyslexic>
 

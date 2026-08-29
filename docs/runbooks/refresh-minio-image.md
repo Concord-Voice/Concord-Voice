@@ -1,10 +1,23 @@
 # Concord MinIO Source Publication and Cutover Gate
 
-> **Status:** Phase 1 active, live cutover deferred
+> **Status:** Phase 1 complete; consumer pinned; Phase 2 live cutover still deferred
 > **Owner:** Concord Voice operations
-> **Last updated:** 2026-07-13
+> **Last updated:** 2026-08-28 (status corrected; body last revised 2026-07-13)
 > **Build record:**
 > [`infrastructure/docker/minio/SOURCE-BUILD.md`](../../infrastructure/docker/minio/SOURCE-BUILD.md)
+
+> ### Corrected 2026-08-28 — the consumer step already happened
+>
+> This runbook described updating the shared `docker-compose.yml` as forbidden during
+> Phase 1 and pending in Phase 2. It landed on **2026-07-14** in
+> [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226) —
+> one day after the body was last revised. `docker-compose.yml:126` pins
+> `ghcr.io/concord-voice/minio:RELEASE.2025-10-15T17-29-55Z@sha256:08e1ba1a…`, the exact
+> digest the "Current Fixed Release" table below records.
+>
+> The **live cutover** is genuinely still deferred: nothing here replaced the running
+> MinIO container on the production server. That half cannot be confirmed from the
+> repository — check the host.
 
 ## Purpose
 
@@ -12,10 +25,14 @@ This runbook governs Concord's unmodified upstream-source MinIO build,
 publication, and the safety gate for a later production cutover.
 
 Phase 1 publishes a reproducible runtime and its corresponding source. It does
-not change `docker-compose.yml`, replace a live container, or touch a data
-volume. Phase 2 starts only after the published digests exist. A separately
-reviewed, disposable rehearsal must also pass against the then-current
+not replace a live container or touch a data volume. Phase 2 starts only after
+the published digests exist.
+
+A separately reviewed, disposable rehearsal must also pass against the then-current
 deployment.
+
+**The `docker-compose.yml` clause is spent** — see the correction banner above. Read the
+remaining Phase 2 language as covering the live container only.
 
 The container is disposable. The data is not.
 
@@ -197,9 +214,13 @@ A logged-in pull is not anonymous-access evidence.
 
 ## 4. Shared Consumer and Future Servers
 
-Phase 2 updates the shared `docker-compose.yml` only after both public digest
-proofs pass. The MinIO service must use the exact Concord
-`tag@sha256:digest`, retain `pull_policy: missing`, and have no Docker Hub
+**Done.** The shared `docker-compose.yml` was updated after both public digest proofs
+passed, by [PR #2226](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2226) on
+2026-07-14. Verify with `grep -n 'image:.*minio' docker-compose.yml`: line 126 carries the
+exact Concord `tag@sha256:digest` with `pull_policy: missing` and no Docker Hub fallback.
+
+The requirements still stand for any future re-pin. The MinIO service must use the exact
+Concord `tag@sha256:digest`, retain `pull_policy: missing`, and have no Docker Hub
 fallback.
 
 That one shared reference is the contract for production, managed provisioning,
@@ -207,7 +228,10 @@ self-hosting, development, CI, and every future server. New servers pull the
 reviewed digest when it is absent. Existing servers pre-pull it before a
 targeted replacement.
 
-No Phase 1 PR may change the consumer or claim production CVE coverage.
+No Phase 1 **publish** PR may change the consumer or claim production CVE coverage. The
+consumer pin was a deliberate separate change (PR #2226), not a Phase 1 publish. The CVE
+half is unchanged and still binding: the pin alone gives no production CVE coverage,
+because the running container on the live server has not been replaced.
 
 ## 5. Phase 2 Live-Cutover Gate
 
@@ -287,6 +311,15 @@ stop. Do not improvise destructive recovery.
 | Runtime digest | `sha256:08e1ba1a7396036f40c57fed2dfabe687ca722d233576484a817a8908bee66c5` |
 | Source digest | `sha256:749db4d34817703406a32e6c416e262c632a7a43b0b106947387fbb3c9ed84bd` |
 
-Update this table only from a successful publisher workflow summary. The live
-server and shared Compose consumer remain unchanged until Concord separately
-authorizes, reviews, rehearses, and verifies Phase 2.
+Update this table only from a successful publisher workflow summary.
+
+**The shared Compose consumer no longer "remains unchanged" — it is pinned to the runtime
+digest above** (`docker-compose.yml:126`, PR #2226, 2026-07-14). What is still outstanding
+is the **live server**: replacing the running MinIO container on production requires
+Concord to separately authorize, review, rehearse, and verify Phase 2. That half is **not
+verified from the repository** — the repository cannot show which image a running container
+was started from. Check the host directly:
+
+```bash
+docker inspect concordvoice-minio --format '{{.Image}} {{.Config.Image}}'
+```

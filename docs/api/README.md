@@ -51,27 +51,51 @@ bound to those operation definitions rather than duplicating them here.
 
 ## Endpoint Groups
 
-| Tag | Endpoints | Auth |
-| --- | --- | --- |
-| Auth (public) | `/auth/{register,login,refresh,logout}` | Public (rate-limited) |
-| Auth (protected) | `/auth/ws-ticket` | Bearer + verified email |
-| Users | `/users/me`, `/users/me/keys`, `/users/me/password`, `/users/me/preferences`, `/users/{id}/public-key` | Bearer |
-| Sessions | `/sessions`, `/sessions/{id}` | Bearer |
-| Servers | `/servers`, `/servers/unread-status`, `/servers/{id}` | Bearer |
-| Channels | `/channels`, `/channels/{id}`, `/channels/{id}/{messages,read,keys}` | Bearer |
-| Messages | `/messages`, `/messages/{id}` | Bearer |
-| Members | `/servers/{id}/members`, `/servers/{id}/members/{userId}` | Bearer |
-| Invites | `/servers/{id}/invites`, `/invites/join`, `/invites/{code}` | Bearer |
-| E2EE | `/e2ee/pending-keys` | Bearer |
-| WebSocket | `/ws` | Ticket or Bearer |
-| MFA (public) | `/auth/mfa/{verify,email/send}` | Challenge token (from login) |
-| MFA (protected) | `/mfa/{status,totp/*,webauthn/*,backup-codes/*,trusted-devices/*,recovery-*}` | Bearer |
-| RBAC | `/servers/{id}/roles`, `/servers/{id}/roles/{roleId}` | Bearer |
-| DMs | `/dm/conversations`, `/dm/conversations/{id}/messages` | Bearer |
-| Friends | `/friends/codes` | Bearer |
-| Activity History | `/users/me/presence-history`, `/users/me/presence-history/settings` | Bearer; authenticated subject only |
-| Voice | `/voice/{join,leave,signal}` | Bearer |
-| Platform (public) | `/client/config`, `/server/capabilities` | Public (rate-limited) |
+The rows below are the OpenAPI **tags** declared in [openapi.yaml](./openapi.yaml),
+one row per tag, with representative paths. **This table is a hand-maintained
+orientation aid, not the inventory.** For the authoritative list, run the extractor:
+
+```bash
+scripts/api/extract-routes.py --list
+```
+
+It prints the union of supported operations from both surfaces and the
+`verify-openapi-coverage` CI job checks it against the router in both drift
+directions, so it cannot fall behind the way this table can.
+
+Counts as of 2026-08-28: 27 tags and 271 operations in `openapi.yaml`, plus 4
+`Admin Metrics` operations in `admin-metrics.openapi.yaml`.
+
+| Tag | Ops | Representative paths | Auth |
+| --- | ---: | --- | --- |
+| Auth | 24 | `/auth/{register,login,refresh,logout,ws-ticket}`, `/auth/register/*`, `/auth/recovery/*`, `/auth/sso/{provider}/*`, `/auth/mfa/{verify,email/send}` | Mixed — public (rate-limited), refresh cookie or `X-Refresh-Token`, MFA challenge token, Bearer for `ws-ticket` |
+| MFA | 34 | `/mfa/{status,totp/*,webauthn/*,backup-codes/*,trusted-devices/*,recovery-*,backup-email,email-sms/*}` | Bearer |
+| Users | 19 | `/users/me`, `/users/me/{keys,password,preferences,security,saved-gifs,sso-identities,friend-organization}`, `/users/search`, `/users/{user_id}/{profile,public-key,friend-request-eligibility}` | Bearer |
+| Sessions | 4 | `/sessions`, `/sessions/{id}`, `/sessions/{revoke-all,revocation-mode}` | Bearer |
+| Servers | 20 | `/servers`, `/servers/{id}`, `/servers/unread-status`, `/servers/{id}/{roles,roles/{role_id},roles/reorder,permissions,audit-log,entitlements,mute-states,transfer-ownership}`, `/ownership/reverse/{token}` | Bearer |
+| Members | 12 | `/servers/{id}/members`, `/servers/{id}/members/{userId}`, `/servers/{id}/bans`, `/servers/{id}/member-public-keys` | Bearer |
+| Invites | 7 | `/servers/{id}/invites`, `/invites/join`, `/invites/{code}`, `/invites/{code}/{icon,preview}` | Mixed — preview/icon public, the rest Bearer |
+| Channels | 13 | `/channels`, `/channels/{id}`, `/channels/{id}/{read,overrides}` | Bearer |
+| ChannelGroups | 8 | `/servers/{id}/channel-groups`, `/categories/{id}/overrides`, `/categories/{id}/overrides/{override_id}` | Bearer |
+| Messages | 13 | `/channels/{id}/messages`, `/channels/{id}/messages/bulk`, `/channels/{id}/pins`, `/messages/{id}` | Bearer |
+| DM | 27 | `/dm/conversations`, `/dm/conversations/{personal,group}`, `/dm/conversations/{id}`, `/dm/conversations/{id}/{messages,members,keys,read}` | Bearer |
+| Direct Messages | 2 | `/dm/conversations/{id}/members/{userId}` | Bearer — a stray tag spelling of `DM` in the spec, listed so the row count reconciles |
+| E2EE | 9 | `/e2ee/pending-keys`, `/channels/{id}/keys`, `/channels/{id}/rotate-key`, `/dm/conversations/{id}/rotate-key` | Bearer |
+| Voice | 24 | `/channels/{id}/voice/{join,participants,authorize-action}`, `/servers/{id}/voice/{userId}/{mute,deafen,move,disconnect,temp-access}`, `/dm/conversations/{id}/voice/{join,ring,decline,cancel,participants}` | Bearer |
+| Media | 17 | `/media/{file_id}`, `/media/{attachments,avatars,banners,server-icons,server-banners,dm-icons}/…`, `/media/upload/{avatar,banner,attachment,server-icon,server-banner,dm-icon}`, `/media/upload/attachment/session/*` (chunked upload, #2157) | Mixed — reads public where the asset is, uploads Bearer |
+| Friends | 6 | `/friends`, `/friends/request`, `/friends/request/{id}` | Bearer |
+| FriendCodes | 7 | `/friends/codes`, `/friends/codes/{code}`, `/friends/codes/{code}/{avatar,preview,claim}` | Mixed — preview/avatar public, the rest Bearer |
+| Presence | 8 | `/users/me/presence-history`, `/users/me/presence-history/settings` (Activity History), `/users/me/presence-overrides/{category}` (Custom Status) | Bearer; authenticated subject only |
+| Privacy | 3 | `/users/me/privacy`, `/privacy/erase-account` | Bearer |
+| Notifications | 2 | `/notifications/{mute,preferences}` | Bearer |
+| GIFs | 11 | `/klipy/gifs/{items,categories,trending}`, `/klipy/customer-id` | Bearer |
+| Age Verification | 2 | `/age/claim`, `/age/status` | Bearer + verified email |
+| Attestation | 3 | `/attestation/verify`, `/internal/attestation/publish/{binary,spa}` | Bearer |
+| Redemption | 2 | `/redeem`, `/admin/redemption/codes` | Bearer; the admin path additionally requires an admin token |
+| Feedback | 1 | `/feedback` | Bearer |
+| Platform | 5 | `/client/config`, `/server/capabilities`, `/entitlements`, `/subscriptions/me`, `/updates/{filename}` | Mixed — `client/config` and `server/capabilities` public (rate-limited), the rest Bearer |
+| WebSocket | 1 | `/ws` | Ticket or Bearer |
+| Admin Metrics | 4 | `/admin/api/v1/*` — see [admin-metrics.openapi.yaml](./admin-metrics.openapi.yaml) | Admin token |
 
 ## Base URL
 
@@ -145,7 +169,10 @@ Common status codes: `200 OK`, `201 Created`, `400 Bad Request`, `401 Unauthoriz
 
 ## Postman Collection
 
-Import the Postman collection from: `docs/api/Concord.postman_collection.json`
+There is no checked-in Postman collection. Both specs are OpenAPI 3.0.3 and Postman
+imports OpenAPI directly, so import [openapi.yaml](./openapi.yaml) (or
+[admin-metrics.openapi.yaml](./admin-metrics.openapi.yaml)) through
+**File → Import → OpenAPI**.
 
 ## Related Docs
 

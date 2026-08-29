@@ -73,6 +73,11 @@ WebSocket connections use **ticket-based authentication**:
 
 ### Client -> Server (Incoming)
 
+The hub dispatches 15 incoming frame types from the `switch msg.Type` in
+[`hub.go`](hub.go) (`handleIncoming`). That switch is canonical — read it before you add a
+client. The frames below are the full set. `connection_ready_probe` is documented separately
+under [Protocol Version 2 — Connection-Ready Barrier](#protocol-version-2--connection-ready-barrier).
+
 #### Subscribe to Channel
 ```json
 {
@@ -121,6 +126,84 @@ WebSocket connections use **ticket-based authentication**:
 {
   "type": "heartbeat",
   "data": {}
+}
+```
+
+#### Set Status (presence status level)
+```json
+{
+  "type": "set_status",
+  "data": {
+    "status": "online | dnd | invisible"
+  }
+}
+```
+
+#### Subscribe / Unsubscribe to Server
+```json
+{
+  "type": "subscribe_server",
+  "data": {
+    "server_id": "uuid-string"
+  }
+}
+```
+`unsubscribe_server` uses the same payload shape.
+
+#### Subscribe / Unsubscribe to DM Conversation
+```json
+{
+  "type": "subscribe_dm",
+  "data": {
+    "conversation_id": "uuid-string"
+  }
+}
+```
+`unsubscribe_dm` uses the same payload shape.
+
+#### Send DM Message
+```json
+{
+  "type": "dm_message",
+  "data": {
+    "conversation_id": "uuid-string",
+    "content": "base64 ciphertext",
+    "key_version": 3,
+    "nonce": "client-supplied ack correlator",
+    "attachment_ids": ["uuid-string"]
+  }
+}
+```
+The same E2EE rules as `message` apply. `attachment_ids` is optional and holds at most 5 entries.
+
+#### DM Typing Indicator
+```json
+{
+  "type": "dm_typing",
+  "data": {
+    "conversation_id": "uuid-string",
+    "is_typing": true
+  }
+}
+```
+
+#### Profile Update (refresh cached identity)
+```json
+{
+  "type": "profile_update",
+  "data": {}
+}
+```
+The hub re-reads `username`, `display_name` and `avatar_url` from the database and updates every
+connection this user holds. The client sends no fields.
+
+#### Server Update (broadcast server metadata change)
+```json
+{
+  "type": "server_update",
+  "data": {
+    "server_id": "uuid-string"
+  }
 }
 ```
 
@@ -301,8 +384,17 @@ the 30s heartbeat cadence, well under the idle threshold.
 
 ### Origin Checking
 
-- Currently allows all origins (development)
-- **TODO**: Restrict to allowed origins in production
+`h.upgrader.CheckOrigin` validates the request Origin against `ALLOWED_ORIGINS`
+(`handler.go:55-79`):
+
+- A missing Origin header is allowed — native apps, CLI tools, and Electron omit it
+- A `file:` origin is allowed for the packaged desktop renderer
+- The `null` pseudo-origin is rejected before the allowlist loop, so a wildcard cannot accept it
+- Every other origin must match an `ALLOWED_ORIGINS` entry exactly
+
+A literal `*` in the allowlist is honoured at runtime for dev and staging, but
+production startup fails closed on it (`pkg/config/config.go:859-868`,
+CV-CAN-014 / CWE-942).
 
 ### Message Validation
 
@@ -346,9 +438,11 @@ See [TEST_WEBSOCKET.html](TEST_WEBSOCKET.html) for a manual test client.
 ### Integration Testing
 
 ```bash
-# TODO: Add integration tests
 go test -v ./internal/websocket/...
 ```
+
+`hub_integration_test.go` is the integration entry point. It exercises the hub against a real
+PostgreSQL and Redis instance, so start those services before you run it.
 
 ## Implementation Status
 
@@ -358,7 +452,7 @@ go test -v ./internal/websocket/...
 - [x] Read receipts (channel read states) — ✅ Implemented (Phase 1B)
 - [x] Voice/video signaling — ✅ Implemented via NATS (Phase 1C)
 - [x] Ticket-based authentication — ✅ Implemented (replaces JWT-in-URL)
-- [ ] File upload support — Planned (Phase 2)
+- [x] File/attachment support — `attachment_ids` on message frames (max 5, UUID-validated, deduplicated)
 - [ ] Redis Pub/Sub for multi-instance — Planned (Phase 2+)
 - [ ] Reconnection with message recovery — Planned
 - [ ] Compression support — Planned

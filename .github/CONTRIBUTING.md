@@ -37,7 +37,7 @@ See [GETTING_STARTED.md](../docs/GETTING_STARTED.md) for detailed setup instruct
 ### Prerequisites
 
 - Node.js 24+
-- Go 1.26.2+
+- Go 1.26.6+ (the floor is `services/control-plane/go.mod`; CI resolves from it)
 - Python 3
 - pre-commit (`pip install pre-commit` or `brew install pre-commit`)
 - Docker Desktop
@@ -47,7 +47,7 @@ See [GETTING_STARTED.md](../docs/GETTING_STARTED.md) for detailed setup instruct
 ### Quick Start
 
 ```bash
-# MANDATORY: Install git hooks (uses Python pre-commit framework with 22 hooks)
+# MANDATORY: Install git hooks (uses the Python pre-commit framework)
 pip install pre-commit          # if not already installed
 ./scripts/install-git-hooks.sh
 
@@ -55,7 +55,7 @@ pip install pre-commit          # if not already installed
 ./scripts/concord-dev.sh up
 ```
 
-> **Note:** `install-git-hooks.sh` is **mandatory** for all contributors. It installs the Python `pre-commit` framework which runs 22 hooks on every commit (security scanning, linting, formatting, type checking, and commit message validation). Commits will be rejected without these hooks installed.
+> **Note:** `install-git-hooks.sh` is **mandatory** for all contributors. It installs the Python `pre-commit` framework which runs the configured hooks on every commit (security scanning, linting, formatting, type checking, and commit message validation). Commits will be rejected without these hooks installed.
 
 **Migration note for existing contributors:** Before the pre-commit framework was fully activated, a legacy bash hook was running at `.git/hooks/pre-commit`. If you cloned before this migration, your local checkout may still have the legacy hook installed. Run this once to reinstall:
 
@@ -99,6 +99,11 @@ footer
 - `refactor` - Code restructuring
 - `test` - Adding tests
 - `chore` - Maintenance
+- `perf` - Performance improvement
+- `ci` - CI/CD configuration
+- `revert` - Revert a previous commit
+
+Append `!` before the colon for a breaking change (`feat!: drop deprecated API`).
 
 **Examples:**
 
@@ -110,14 +115,14 @@ docs: update WebSocket API documentation
 
 ### Co-Authoring with AI
 
-When using AI assistance (Claude, Copilot, etc.), add co-author attribution:
+When using AI assistance (Claude, Copilot, etc.), add co-author attribution naming the tool and model, for example `Claude Opus 5 <noreply@anthropic.com>`:
 
 ```
 feat: implement new feature
 
 Implementation details here.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Co-Authored-By: <tool and model> <noreply@...>
 ```
 
 ## Pull Request Process
@@ -139,6 +144,10 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
    # Frontend tests
    cd client/desktop
    npm test
+
+   # Admin portal tests
+   cd client/admin
+   npm test
    ```
 
 3. **Lint your code**:
@@ -151,6 +160,10 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
    # Frontend (TypeScript/React)
    cd client/desktop
    npm run lint
+
+   # Admin portal
+   cd client/admin
+   npm run lint && npm run typecheck
    ```
 
 4. **Build successfully**:
@@ -160,6 +173,10 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
    go build ./cmd/server
 
    # Frontend
+   npm run build
+
+   # Admin portal
+   cd client/admin
    npm run build
    ```
 
@@ -197,7 +214,11 @@ We use `golangci-lint` with comprehensive checks for code quality and security. 
 - `staticcheck` - Advanced Go static analysis
 - `govet` - Official Go static analyzer
 - `revive` - Code quality and style
+- `unused` - Unused code detection
 - `ineffassign`, `misspell`, `unconvert`, `nakedret`, `prealloc` - Additional quality checks
+- `nilerr`, `asciicheck`, `bidichk`, `durationcheck` - Correctness and encoding checks
+
+That is 15 linters. `services/control-plane/.golangci.yml` is the source of truth, and it also carries one `gosec` exclusion (`G701`).
 
 **Installation:**
 
@@ -220,11 +241,11 @@ golangci-lint run --timeout=5m
 Go linting runs automatically on staged Go files before each commit. If linting fails, the commit will be blocked. Fix the issue — never bypass with `--no-verify`.
 
 **CI/CD:**
-All PRs must pass golangci-lint checks before merging. CI runs via `build.yml` on every PR, and pre-commit hooks run linting automatically on staged files locally.
+All PRs must pass golangci-lint checks before merging. CI runs via `pr-ci.yml` on every PR, and pre-commit hooks run linting automatically on staged files locally.
 
 ### TypeScript/React (Frontend)
 
-- Follow [Airbnb Style Guide](https://github.com/airbnb/javascript)
+- Lint config is `client/desktop/eslint.config.mjs` (typescript-eslint + @eslint-react, type-checked). Formatting is Prettier-owned (`client/desktop/.prettierrc`) — run `npm run lint` before pushing
 - Use TypeScript for all new code
 - Prefer functional components with hooks
 - Use explicit types (no `any`)
@@ -271,6 +292,21 @@ npm run test:e2e
 npm test -- --coverage
 ```
 
+### Admin Portal Tests
+
+```bash
+cd client/admin
+
+# Unit tests
+npm test
+
+# E2E tests
+npm run test:e2e
+
+# With coverage
+npm run test:coverage
+```
+
 ### Writing Tests
 
 - Write tests for new features
@@ -286,7 +322,7 @@ All contributions must pass the following quality gates before merge.
 
 ### Pre-commit Hooks (Local, Mandatory)
 
-22 hooks are configured in `.pre-commit-config.yaml` via the Python `pre-commit` framework. They run automatically on every commit.
+The hooks are configured in `.pre-commit-config.yaml` via the Python `pre-commit` framework. They run automatically on every commit.
 
 | Category   | Hooks                                                                                                                                                 |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -299,23 +335,37 @@ All contributions must pass the following quality gates before merge.
 
 ### CI: GitHub Actions (Mandatory)
 
-`build.yml` runs on every push to `main` and on **all PRs**. It executes parallel jobs:
+`pr-ci.yml` is the entry point for **all PRs**. `build.yml` has no direct trigger — it is
+`workflow_call`-only, invoked by `pr-ci.yml` (pull requests) and by `main-ci.yml` (push to `main`).
 
 ```text
-changes --> desktop (test + coverage + build)     --> sonarqube (scan)
-        --> control-plane (test + coverage + DB)   -->
-        --> media-plane (lint + typecheck)          -->
+ioc --> build (changes --> desktop        (test + coverage + build)
+                       --> control-plane  (test + coverage + DB)
+                       --> media-plane    (lint + typecheck)
+                       --> admin          (test + coverage + build))
+    --> sonar
 ```
 
-The SonarQube job downloads coverage artifacts from the parallel jobs and runs the scan.
+`pr-ci.yml` also runs the per-tool scanning workflows in parallel with `build`
+(`semgrep`, `eslint`, `codeql`, `govulncheck`, `secret-scanning`, `unit-smoke`,
+`static-guards`, `workflow-lint`, `dry-run-deploys`).
+
+The `sonar` job lives in `pr-ci.yml`, not in `build.yml`. It downloads coverage artifacts from the
+`build.yml` jobs and runs the scan.
 
 ### SonarQube Quality Gate (Mandatory)
 
 SonarQube Quality Gate is a **mandatory CI check on all PRs**. Requirements:
 
 - New code must meet **>= 80% test coverage**
-- No new bugs, vulnerabilities, or security hotspots
-- No excessive code duplication
+- New-code bug, vulnerability, and dependency (SCA) severity scores must each stay at or below 9
+- New-code code-smell severity score at or below 14
+- New-code duplicated-line density at or below 3%
+
+The active gate is `Sonar way for Agentic AI`, not the classic `Sonar way`. Its bug and
+vulnerability conditions are severity-weighted score thresholds, not absolutes — a single
+low-severity new bug does not fail the gate. The gate carries no security-hotspots-reviewed
+condition.
 
 If a pre-commit hook or CI check fails, fix the issue -- never bypass with `--no-verify`.
 
@@ -361,6 +411,6 @@ Contributors will be recognized in:
 
 - GitHub contributors list
 - Release notes
-- [internal] development log (for significant contributions)
+- `CHANGELOG.md` (for significant contributions)
 
 Thank you for contributing to Concord Voice!

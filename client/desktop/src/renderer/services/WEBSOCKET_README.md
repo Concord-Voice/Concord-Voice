@@ -281,6 +281,10 @@ Visual indicator of WebSocket connection state.
 
 ## Message Protocol
 
+The frame catalogue below is illustrative. `types/ws-events.ts` holds the canonical set —
+the zod discriminated union every inbound frame is validated against at the dispatch
+boundary. Read that file before you add or change a frame type.
+
 ### Client → Server
 
 **Subscribe to a channel:**
@@ -309,11 +313,16 @@ Visual indicator of WebSocket connection state.
   "type": "message",
   "data": {
     "channel_id": "uuid",
-    "content": "Hello world!",
+    "content": "<base64 ciphertext>",
+    "key_version": 3,
     "timestamp": 1234567890
   }
 }
 ```
+
+Encrypt through `useMessaging` before you send. `content` must already be ciphertext and
+`key_version` must be the epoch it was encrypted under. The server closes the connection with
+4400 on a frame that carries no `key_version`.
 
 **Send typing indicator:**
 ```json
@@ -563,7 +572,6 @@ console.log('Connected:', useChatStore.getState().isConnected);
 - [x] Offline message queue — ✅ Implemented via `messageQueue.ts`
 - [ ] No typing indicator debouncing (could spam server)
 - [x] Presence tracking UI — ✅ Implemented (online/offline indicators)
-- [ ] No audio/visual notification for new messages
 
 ### Phase 1C Enhancements (Complete)
 - [x] E2EE message encryption/decryption — ✅ Implemented
@@ -572,11 +580,11 @@ console.log('Connected:', useChatStore.getState().isConnected);
 - [x] Unread message badges — ✅ Implemented
 - [x] Voice/video signaling via NATS — ✅ Implemented (Media Plane)
 
-### Phase 2 Enhancements (Planned)
-- [ ] Message reactions (emoji)
-- [ ] Message threading/replies
-- [ ] File attachments
-- [ ] Message search
+### Phase 2 Enhancements
+- [x] Message reactions (emoji) — ✅ Implemented
+- [x] Message threading/replies — ✅ Implemented
+- [x] File attachments — ✅ Implemented
+- [x] Message search — ✅ Implemented
 - [ ] Push notifications
 
 ---
@@ -600,7 +608,7 @@ console.log('Connected:', useChatStore.getState().isConnected);
 - ✅ All messages validated for channel_id
 - ✅ User permissions checked on backend (channel membership)
 - ✅ E2EE message encryption/decryption implemented (Phase 1C)
-- ⚠️  No client-side message validation (trusts backend)
+- ✅ Every inbound frame is validated against `WebSocketEventSchema` (a zod 4 discriminated union in `types/ws-events.ts`) at the dispatch boundary (`websocketService.ts:780`) before any handler sees it. Unparseable frames are dropped, counted as a wire violation, and logged through `scrubZodIssues` so rejected-payload PII never reaches the log sink.
 
 ---
 
@@ -608,9 +616,9 @@ console.log('Connected:', useChatStore.getState().isConnected);
 
 - **#10** - Backend WebSocket Server Infrastructure ✅ Complete
 - **#20** - Frontend WebSocket Client Connection Manager ✅ Complete (this issue)
-- **#21** - WebSocket Message Handler 🔜 Next (partially complete)
-- **#22** - E2EE Message Encryption/Decryption 🔜 Phase 1C
-- **#23** - Presence UI Integration 🔜 Phase 1C
+- **#21** - WebSocket Message Handler ✅ Complete
+- **#22** - E2EE Message Encryption/Decryption ✅ Complete (Phase 1B)
+- **#23** - Presence UI Integration ✅ Complete (Phase 1B)
 - **#24** - State Management Consolidation ✅ Complete (Zustand)
 
 ---

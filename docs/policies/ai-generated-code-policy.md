@@ -3,7 +3,8 @@
 | Field          | Value                          |
 |----------------|--------------------------------|
 | Effective Date | 2026-04-03                     |
-| Version        | 1.0                            |
+| Last Reviewed  | 2026-08-28                     |
+| Version        | 1.1                            |
 | Review Cadence | Quarterly                      |
 | Owner          | Concord Voice LLC              |
 | Parent Issue   | #453 (AI Governance Framework) |
@@ -28,7 +29,7 @@ This policy applies to **all AI code generation tools** used in Concord Voice de
 
 | Tool | Role | Usage |
 |------|------|-------|
-| **Claude Code** (primary) | Anthropic Claude Opus 4.6 | CLI agent, IDE extensions |
+| **Claude Code** (primary) | Anthropic Claude — model version not pinned by this policy (see §6.1) | CLI agent, IDE extensions |
 | **GitHub Copilot** (secondary) | Code completion, PR review | IDE integration |
 | **OpenAI Codex** (tertiary) | Code generation tasks | As needed |
 
@@ -69,10 +70,16 @@ AI tools must **not** be used to:
 All AI-assisted commits must include a `Co-Authored-By` trailer identifying the AI tool used:
 
 ```
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Co-Authored-By: GitHub Copilot <noreply@github.com>
 Co-Authored-By: OpenAI Codex <noreply@openai.com>
 ```
+
+The model segment of the Claude trailer tracks the model actually in use and is **not**
+pinned by this policy — [`[internal]`](../..[internal]) carries the exact current string
+and this table follows it. Do not add a context-window suffix: `(1M context)` appears on
+1 of 113 Claude trailers in recent history, so mandating it would make the other 112
+non-compliant.
 
 ### 6.2 Accountability
 
@@ -101,7 +108,28 @@ preload/*       ipc*            tokenManager*
 password*       e2ee*
 ```
 
-These paths are defined in `CODEOWNERS` and enforced via GitHub branch protection rules.
+These paths are defined in [`CODEOWNERS`](../../CODEOWNERS), which routes each of them to `@Concord-Voice/security`. The org ruleset on `main` carries `require_code_owner_review: true`, so the routing is the whole mechanism behind the gate.
+
+> **🛑 The gate is declared but currently enforces nothing.** Measured 2026-08-28:
+> `gh api repos/Concord-Voice/Concord-Voice-Alpha/codeowners/errors --jq '.errors | length'`
+> returns **37**, every one reading *"Unknown owner … make sure the team
+> @Concord-Voice/security exists, is publicly visible, and has write access to the
+> repository."* GitHub ignores an unknown-owner rule, so no review is requested and
+> no PR is blocked — including a PR that touches the crypto, auth, MFA, RBAC, or
+> Electron preload/IPC paths listed above. The mandatory review gate this section
+> declares is therefore applied to no PR today.
+>
+> **Repair:** grant the `@Concord-Voice/security` team **write** access to the
+> repository (`pull` is not enough for CODEOWNERS resolution). Re-validate with the
+> command above and expect an empty `errors` array. See
+> [`branch-protection.md`](branch-protection.md) § Required Reviews for the same
+> measurement from the ruleset side, and
+> [`../ci/supply-chain-defense.md`](../ci/supply-chain-defense.md) §§5–6 for the
+> supply-chain procedures that depend on the same routing.
+>
+> Until the repair lands, the compensating control is the §7.2 scope-creep rule
+> below plus reviewer attention: a security-path PR is reviewed because a human
+> asked for it, not because the platform demanded it.
 
 ### 7.2 Scope Creep Rule
 
@@ -109,7 +137,7 @@ If AI-generated code introduces **new usage** of crypto, secrets, or auth APIs t
 
 ### 7.3 Activation
 
-Review gate enforcement via CODEOWNERS is deferred to post-org-migration (#448). The CODEOWNERS framework is in place and the paths above are documented; enforcement will activate once the org migration completes.
+The CODEOWNERS framework is in place and the paths above are written into it. Activation was originally deferred to a post-org-migration step tracked by #448; that issue closed **NOT_PLANNED** on 2026-04-15, and the repository now lives at `Concord-Voice/Concord-Voice-Alpha` regardless. The one thing still outstanding is the team's write access, per the notice in §7.1 — that, not a migration, is what activates the gate.
 
 ---
 
@@ -141,7 +169,7 @@ Reviews should confirm that authorized tools, data classification gates, and pro
 
 ## 10. Enforcement
 
-- **Technical controls**: Pre-commit hooks and CI quality gates automatically enforce Conventional Commit formatting, linting, test coverage, and secret scanning. Attribution (Co-Authored-By trailers) is a policy requirement verified during code review; automated enforcement is planned for Phase 4 (#458). These controls and review requirements must not be bypassed.
+- **Technical controls**: Pre-commit hooks and CI quality gates automatically enforce Conventional Commit formatting, linting, test coverage, and secret scanning. Attribution (Co-Authored-By trailers) is a policy requirement verified during code review. Automated enforcement is **unscheduled** — no issue tracks it. (#458, formerly cited here, closed **completed**; it produced [`agentic-ai-controls.md`](agentic-ai-controls.md) and never scoped attribution automation.) These controls and review requirements must not be bypassed.
 - **Policy violations**: Treated as security findings per `SECURITY.md` severity levels (Critical, High, Medium, Low).
 - **Remediation**: Violations, including missing required attribution identified during review, must be documented and remediated before the PR is merged. Repeat violations should trigger a review of developer onboarding and tooling configuration.
 

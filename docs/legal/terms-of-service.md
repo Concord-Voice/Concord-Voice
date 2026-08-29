@@ -2,12 +2,29 @@
 
 **Last Updated:** _[TO BE SET ON PUBLICATION]_
 
+> **Do not fill this in as part of an editorial change.** The date on a live Terms of
+> Service asserts when the *terms* changed, and users are bound by the version bearing it.
+> The published copy at `concordvoice.com/terms` is dated **June 5, 2026**; this canonical
+> file has never carried a real date. Setting one is a decision for whoever owns the terms,
+> taken together with the lockstep sync described below — not a documentation fix.
+> `client/desktop/tests/unit/components/Settings/AboutUpdateSection.test.tsx` pins this
+> placeholder, because the desktop client renders this file as in-app legal copy.
+
 > **Source-of-truth note.** This document is the canonical Terms of Service
 > for Concord Voice, maintained in the project repository for review and
 > version control. The published web version at
-> [www.concordvoice.com/terms](https://www.concordvoice.com/terms) should
-> mirror this document. If the two diverge, this document represents the
-> intended terms and the published web version should be updated to match.
+> [www.concordvoice.com/terms](https://www.concordvoice.com/terms) renders a
+> **synced duplicate, not a symlink**:
+> `concordvoice-com/src/legal/terms-of-service.md` is an ordinary file that a
+> person must copy across, so the two can drift and currently do. As of
+> 2026-08-28 the published copy is dated **June 5, 2026** and differs from
+> this document. If the two diverge, this document
+> represents the intended terms and the published web version must be updated
+> to match. Whoever merges a change to this file owns the lockstep sync into
+> the `concordvoice-com` repository. That repository's
+> `src/pages/terms.astro` carries a comment claiming the published page "can
+> never drift from source"; that comment is false and must be corrected in
+> the same lockstep change.
 
 ---
 
@@ -312,9 +329,15 @@ suspension of your rights to use the Services.
 
 ## 7. Subscriptions, Payment, and Free Trial
 
+Concord Voice does not currently offer paid subscriptions. The Services
+take no payment and make no charge of any kind. The terms in this section
+apply if and when Concord Voice makes paid subscriptions available, and
+not before.
+
 ### 7.1 Payment Methods
 
-We accept the following form of payment:
+When paid subscriptions become available, we will accept the following
+form of payment:
 
 - Stripe
 
@@ -339,22 +362,24 @@ person, per household, or per order.
 ### 7.2 Billing and Renewal
 
 Your subscription will continue and automatically renew unless cancelled.
-You consent to our charging your payment method on a recurring basis
-without requiring your prior approval for each recurring charge, until
-such time as you cancel the applicable order. The length of your billing
-cycle is monthly or annually, depending on the plan you select.
+When you place an order, you consent to our charging your payment method
+on a recurring basis without requiring your prior approval for each
+recurring charge, until such time as you cancel the applicable order. The
+length of your billing cycle is monthly or annually, depending on the
+plan you select.
 
 ### 7.3 Free Trial
 
-We offer a 30-day free trial to new users who register with the Services.
-The account will be charged according to the user's chosen subscription
-at the end of the free trial.
+When paid subscriptions become available, we will offer a 30-day free
+trial to new users who register with the Services. The account will then
+be charged according to the user's chosen subscription at the end of the
+free trial.
 
 ### 7.4 Cancellation
 
-All purchases are non-refundable. You can cancel your subscription at any
-time by logging into your account. Your cancellation will take effect at
-the end of the current paid term. If you have any questions or are
+All purchases will be non-refundable. You will be able to cancel your
+subscription at any time by logging into your account. Your cancellation
+will take effect at the end of the current paid term. If you have any questions or are
 unsatisfied with our Services, please email us at
 [contact-us@concordvoice.com](mailto:contact-us@concordvoice.com).
 
@@ -640,11 +665,16 @@ contact information with third parties for their marketing purposes.
 
 ### 12.3 SMS Text Messaging
 
-**Program description.** By opting in to receive text messages, you
+Concord Voice does not currently operate an SMS program. There is no SMS
+provider integration, and the Services refuse any attempt to enable SMS
+multi-factor authentication. The terms in this section apply if and when
+Concord Voice enables SMS multi-factor authentication, and not before.
+
+**Program description.** By opting in to receive text messages, you will
 expressly consent to receive text messages (SMS) to your mobile number.
-SMS use within Concord Voice is currently limited to multi-factor
-authentication codes. When you opt in to receiving text messages, it is
-associated with multi-factor authentication. You will receive as many
+SMS use within Concord Voice will be limited to multi-factor
+authentication codes. When you opt in to receiving text messages, it will
+be associated with multi-factor authentication. You will receive as many
 text messages as there are authentication requests for your account in
 which SMS is explicitly selected as the method of authentication.
 

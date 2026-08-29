@@ -2,6 +2,7 @@
 
 **Generated:** 2026-07-14
 **MinIO distribution addendum updated:** 2026-07-12
+**Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
 **Audit reference:** [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 
@@ -12,12 +13,17 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 394 third-party software components across its three
+Concord Voice distributes 398 third-party software components across its four
 CVSL application artifact families:
 
-- **59** Go modules in the control-plane runtime binary
-- **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
-- **148** npm packages in the media-plane production bundle
+- **59** Go modules linked into the control-plane runtime binary. The image that
+  carries that binary also ships the admin portal bundle below, so the image is
+  not Go-only.
+- **188** npm packages in the desktop client production bundle (plus Electron and its bundled components)
+- **147** npm packages in the media-plane production bundle
+- **4** npm packages in the admin portal production bundle (`client/admin`),
+  compiled by the `admin-ui-builder` stage and copied into the control-plane
+  runtime image at `/admin-ui` (`services/control-plane/Dockerfile:8,66`)
 
 (Counts exclude Concord Voice's own private packages — `@concordvoice/desktop`,
 `@concordvoice/media-plane` — and the local stub override
@@ -38,10 +44,10 @@ Application-dependency license distribution:
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | <1% | ✓ (attribution required) |
 
 No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
-copyleft / non-commercial dependency is linked into or bundled with the three
+copyleft / non-commercial dependency is linked into or bundled with the four
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 394-component count.
+recorded separately below; it is not part of the 398-component count.
 
 ## License Texts
 
@@ -69,6 +75,13 @@ cache, Electron credits at `about:credits` in the application). For
 projects that ship their own NOTICE file (Apache-2.0 § 4 requirement),
 that content is included with the project in its `node_modules` directory
 or Go module cache and is not duplicated here.
+
+**Exception — the admin portal bundle.** Only the compiled `dist` output is
+copied out of the `admin-ui-builder` stage, so that family's `node_modules`
+(and the license texts inside it) stay in the builder stage and never reach the
+runtime image. Attribution for those four packages therefore rests on the
+Admin Portal table in this file and the canonical SPDX URLs above, not on
+shipped `node_modules`.
 
 ## Separately Distributed MinIO Server
 
@@ -539,6 +552,28 @@ bundle (services/media-plane):
 
 ---
 
+## Admin Portal Production Dependencies
+
+The following npm packages are included in the admin portal production bundle
+(client/admin). The `admin-ui-builder` stage compiles them and the resulting
+`dist` is copied into the control-plane runtime image at `/admin-ui`
+(`services/control-plane/Dockerfile:8,66`), so they are distributed with that
+image even though the image's Go table above lists only linked Go modules.
+
+Versions here are resolved from `client/admin/package-lock.json` and are
+independent of the desktop client's lockfile. Three of the four rows carry a
+different version from the desktop row of the same name, so do not read either
+table as covering the other.
+
+| Package | Version | License | Repository |
+|---|---|---|---|
+| lucide-react | 1.31.0 | ISC | https://github.com/lucide-icons/lucide |
+| react | 19.2.8 | MIT | https://github.com/facebook/react |
+| react-dom | 19.2.8 | MIT | https://github.com/facebook/react |
+| scheduler | 0.27.0 | MIT | https://github.com/facebook/react |
+
+---
+
 ## Build-Time and Development Dependencies
 
 Additional npm and Go packages are used during development, build, test,
@@ -594,6 +629,9 @@ cd client/desktop && npx license-checker --production --csv --excludePackages "$
 
 # Media-plane (npm)
 cd services/media-plane && npx license-checker --production --csv --excludePackages "$EXCLUDES" > /tmp/media-licenses.csv
+
+# Admin portal (npm) -- bundled into the control-plane runtime image at /admin-ui
+cd client/admin && npx license-checker --production --csv --excludePackages "$EXCLUDES" > /tmp/admin-licenses.csv
 
 # Go control-plane (binary runtime modules)
 cd services/control-plane && go list -deps -e -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/server | sort -u

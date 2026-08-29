@@ -3,7 +3,7 @@
 This is the project-wide entry point for Concord Voice's test strategy. It explains the testing philosophy, the per-service tooling split, the coverage policy, and how to run tests locally. **[Per-service test docs](#per-service-test-docs) links the detailed documentation.** This file is the index, not a replacement for those.
 
 > Single source of truth for test conventions: [`[internal]rules/tests.md`](../[internal]rules/tests.md).
-> Canonical run commands also live in [`[internal]` → "Test & Lint Commands"](..[internal]).
+> This file is the canonical index for run commands.
 
 ## Philosophy
 
@@ -40,7 +40,7 @@ Shell/operational scripts have their own lightweight test convention (no framewo
 
 ## Running tests locally
 
-Canonical commands (from [`[internal]` → "Test & Lint Commands"](..[internal])):
+Canonical commands:
 
 ```bash
 # Backend (Go) — control-plane
@@ -72,4 +72,4 @@ See the desktop README's [CI/CD section](../client/desktop/tests/README.md#cicd)
 - [`services/control-plane/tests/README.md`](../services/control-plane/tests/README.md) — Go test layout across packages, `internal/testhelpers`, integration prerequisites and env vars.
 - [`scripts/tests/README.md`](../scripts/tests/README.md) — bash assertion convention for `scripts/concord-dev.sh` and deploy scripts.
 
-> **Gap:** `services/media-plane/` has tests (`services/media-plane/tests/`) but no per-service `README.md` yet. A separate issue tracks authoring it (out of scope for this overview).
+> **Gap:** [`services/media-plane/README.md`](../services/media-plane/README.md) exists but carries no testing section. The suite is `services/media-plane/tests/*.test.ts`. Run it with `npm test` from `services/media-plane/`.

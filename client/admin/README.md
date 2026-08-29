@@ -6,7 +6,7 @@ fixed read-only metrics API.
 
 ## Requirements
 
-- Node.js 24.x
+- Node.js 24.15+ (Node 26 is supported)
 - npm 10+
 
 ## Development

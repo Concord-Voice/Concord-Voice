@@ -34,6 +34,7 @@ desktop client connects to an older self-hosted server).
 | `features.maxMembersPerServer` | integer | Advisory ceiling. |
 | `features.entitlementMode` | string | `"saas"` or `"self-hosted-unlocked"` (derived from `instanceType`). On self-hosted, the control-plane entitlement resolver returns the maximal current entitlement set for every user. |
 | `features.activityHistorySupported` | boolean, optional | Emitted as `true` only when the cluster gate is enabled and the replica count was explicitly set to one. Otherwise omitted; the backend does not emit `false`. |
+| `features.chunkedAttachmentUpload` | boolean | Whether the chunked upload session routes are reachable on this deployment (#2157). Always emitted — deliberately not `omitempty`, because an explicit `false` is the useful answer when object storage or the session Redis is absent. Mirrors the route-registration condition exactly (`internal/api/router.go:816`). A server that predates the field omits it; the client's zero value is `false`, so it fails closed to the single-shot path. |
 | `policyVersion` | string | Bumped when the server policy set changes. |
 
 ### Activity History support state
@@ -53,7 +54,10 @@ ignore unknown fields, and new clients tolerate missing *optional* fields**. The
 rule covers additive fields only — the table above marks exactly one field optional,
 and the rest are always emitted. A client MUST NOT treat a missing
 `auth.mfaEnabled` or `features.e2eeEnforcedEverywhere` as a tolerable absence and
-degrade its posture; an absent non-optional field is a malformed response. Clients MUST validate
+degrade its posture; an absent non-optional field is a malformed response. The
+one exception is `features.chunkedAttachmentUpload`, which any server predating
+#2157 omits: a client reads that absence as `false` and keeps the single-shot
+upload path rather than calling the response malformed. Clients MUST validate
 at the boundary (zod per `[internal]rules/frontend.md`) and degrade gracefully rather
 than erroring on an unexpected shape. This is the single handshake that the
 self-hosted epic's SSO-suppression (#1619) and entitlement-unlock (#1620) children
@@ -71,7 +75,7 @@ GET /api/v1/server/capabilities
 
 ```json
 {
-  "server": { "name": "Concord Voice", "version": "0.2.0-Beta", "instanceType": "saas" },
+  "server": { "name": "Concord Voice", "version": "dev", "instanceType": "saas" },
   "auth": {
     "emailVerificationRequired": true,
     "mfaEnabled": true,
@@ -85,13 +89,14 @@ GET /api/v1/server/capabilities
     "e2eeEnforcedEverywhere": true,
     "maxMembersPerServer": 500,
     "entitlementMode": "saas",
-    "activityHistorySupported": true
+    "activityHistorySupported": true,
+    "chunkedAttachmentUpload": true
   },
   "policyVersion": "2026-06-01"
 }
 ```
 
-## Example — self-hosted instance (no SMTP, no SSO)
+## Example — self-hosted instance (no SMTP, no SSO, no object storage)
 
 ```json
 {
@@ -108,7 +113,8 @@ GET /api/v1/server/capabilities
     "voiceTiersSupported": false,
     "e2eeEnforcedEverywhere": true,
     "maxMembersPerServer": 500,
-    "entitlementMode": "self-hosted-unlocked"
+    "entitlementMode": "self-hosted-unlocked",
+    "chunkedAttachmentUpload": false
   },
   "policyVersion": "2026-06-01"
 }
@@ -119,7 +125,7 @@ GET /api/v1/server/capabilities
 | Env var | Default | Meaning |
 |---|---|---|
 | `INSTANCE_TYPE` | `saas` | `saas` or `self-hosted`. The self-hosted deploy sets `self-hosted`; unknown values normalize to `saas` before capabilities and entitlement resolution. |
-| `SERVER_VERSION` | `dev` | Advertised server version. The SaaS deploy pipeline sets the release tag. |
+| `SERVER_VERSION` | `dev` | Advertised server version. Sourced from the optional `vars.SERVER_VERSION` repository/environment variable and resolved to `dev` when unset (`provision-secrets.yml:499`). The variable is **currently unset, so production advertises `"dev"`** — the deploy pipeline does not stamp the release tag. |
 | `ACTIVITY_HISTORY_CLUSTER_ENABLED` | `false` | Activity History rollout gate. Support is advertised only when this is `true`. |
 | `CONTROL_PLANE_REPLICA_COUNT` | unset | Must be explicitly set to `1`, together with the enabled cluster gate, before Activity History support is advertised. Independently of that gate (#2178), any explicitly set value other than `1` now fails control-plane startup unconditionally — `validateControlPlaneReplicaCount()` rejects it regardless of environment or feature flags, because the WebSocket hub holds per-connection session state in process memory. Horizontal scaling is tracked in [#2757](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2757). |
 

@@ -3,9 +3,10 @@ name: Quarterly AI Security Review
 about: Scheduled quarterly review of AI tools, policies, and security controls
 title: '[AI-REVIEW] Q_ 20__ — Quarterly AI Security Review'
 labels:
-  - security
-  - 'theme: code-quality'
+  - 'risk: security'
+  - 'domain: developer-experience'
   - 'type: chore'
+  - 'area: tooling'
 assignees: ''
 ---
 
@@ -42,7 +43,7 @@ Reference: `docs/policies/mcp-server-policy.md`
 
 ## CVE Watchlist Update
 
-Reference: `docs/policies/cve-watchlist.md` (planned -- Phase 4, #458)
+Reference: `docs/policies/cve-watchlist.md`
 
 - [ ] Check for new CVEs in Claude Code
 - [ ] Check for new CVEs in GitHub Copilot
@@ -68,7 +69,7 @@ Reference: `docs/policies/cve-watchlist.md` (planned -- Phase 4, #458)
 - [ ] `docs/policies/ai-generated-code-policy.md` — still current?
 - [ ] `docs/policies/mcp-server-policy.md` — inventory accurate?
 - [ ] `[internal]` — retention requirements met?
-- [ ] `docs/policies/agentic-ai-controls.md` — risk tiers still appropriate? (planned -- Phase 4, #458)
+- [ ] `docs/policies/agentic-ai-controls.md` — risk tiers still appropriate?
 - [ ] `CODEOWNERS` — paths still cover all security-sensitive areas?
 
 ## Quality Gate Review

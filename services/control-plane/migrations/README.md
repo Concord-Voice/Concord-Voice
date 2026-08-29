@@ -255,12 +255,5 @@ DATABASE_URL=postgres://concord:concord_dev_password@localhost:5432/concord?sslm
 
 ## CI/CD Integration
 
-In production, migrations should run automatically before deploying new code:
-
-```yaml
-# .github/workflows/deploy.yml
-- name: Run migrations
-  run: |
-    cd services/control-plane
-    make migrate-up
-```
+Migrations run automatically when the control-plane server starts
+(`cmd/server/main.go`). No deploy workflow invokes `make migrate-up`.

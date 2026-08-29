@@ -28,7 +28,7 @@ A privacy-first, hybrid SaaS + self-hosted real-time communications platform —
 
 ## Overview
 
-Concord Voice combines a Go control plane, a mediasoup WebRTC SFU, and an Electron desktop client. Messages are end-to-end encrypted client-side (AES-256-GCM with RSA-OAEP 4096-bit key wrapping). Concord hosts identity, but accounts can connect to self-hosted servers. The roadmap targets v0.2.0-Beta (Phase 2 in flight) with v1.0.0 to follow.
+Concord Voice combines a Go control plane, a mediasoup WebRTC SFU, and an Electron desktop client. Messages are end-to-end encrypted client-side (AES-256-GCM with RSA-OAEP 4096-bit key wrapping). Concord hosts identity, but accounts can connect to self-hosted servers. The beta line ships continuously; the current target is the v1.0.0 GA release (January 2027).
 
 For the high-level system design, see **[docs/architecture.md](./docs/architecture.md)**.
 
@@ -81,12 +81,6 @@ Branch and commit conventions live in [CONTRIBUTING.md](./.github/CONTRIBUTING.m
 
 ---
 
-## Roadmap
-
-Long-term vision and phase scope live in **[ROADMAP.md](./ROADMAP.md)**.
-
----
-
 ## Security
 
 Concord Voice uses end-to-end encryption (AES-256-GCM + RSA-OAEP 4096), Argon2id password hashing, MFA/WebAuthn, RBAC/SBAC permissions, and OS-keychain-backed credential storage via Electron `safeStorage`.
@@ -118,7 +112,6 @@ See [LICENSE](./LICENSE) and [FAQ.md](./FAQ.md) for details.
 
 ## Documentation
 
-- **[ROADMAP.md](./ROADMAP.md)** — long-term vision and milestones
 - **[FAQ.md](./FAQ.md)** — licensing, security, development questions
 - **[docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md)** — setup guide
 - **[docs/architecture.md](./docs/architecture.md)** — system design, data flows
