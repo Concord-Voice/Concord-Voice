@@ -60,6 +60,61 @@ func TestUnregisteredFamiliesReportsAGap(t *testing.T) {
 	assert.Equal(t, []Family{FamilyBlock}, UnregisteredFamilies())
 }
 
+// RegisteredFamilies is the complement of UnregisteredFamilies, added so a
+// consumer's test can assert a property of EVERY family rather than of a
+// hand-written list (#2992 AC5).
+//
+// It is tested HERE, and not only through the graphpresence tests that consume
+// it, because Go attributes coverage to the package under test: an exported
+// function whose only caller lives in another package's tests reads as
+// completely uncovered, which is exactly what SonarCloud reported on PR #3015.
+func TestRegisteredFamiliesReturnsEveryDeclaredFamilyInOrder(t *testing.T) {
+	families := RegisteredFamilies()
+
+	require.Len(t, families, len(familyRegistry),
+		"every registry entry must appear exactly once")
+	assert.Equal(t, []Family{
+		FamilyFriendshipAccept,
+		FamilyFriendshipRemove,
+		FamilyBlock,
+		FamilyFriendsOfFriendsToggle,
+		FamilyMemberAdd,
+		FamilyMemberJoin,
+		FamilyMemberRemove,
+		FamilyMemberBan,
+	}, families,
+		"ascending order is part of the contract -- a consumer derives stable subtest "+
+			"names from it, so a map-iteration order would make those names flap")
+
+	// The two enumerators must PARTITION the enum. Asserting each half alone
+	// would let a family fall into both lists, or into neither.
+	assert.Equal(t, int(familyCount), len(families)+len(UnregisteredFamilies()),
+		"registered + unregistered must account for exactly the declared enum")
+}
+
+// The complement of TestUnregisteredFamiliesReportsAGap, sharing its
+// swap-and-restore: a family dropped from the registry must LEAVE this list as
+// well as entering the other one. Without this, RegisteredFamilies could return
+// the full enum regardless of the registry and both tests would still pass.
+func TestRegisteredFamiliesOmitsAGap(t *testing.T) {
+	original := familyRegistry
+	t.Cleanup(func() { familyRegistry = original })
+
+	reduced := make(map[Family]FamilyPolicy, len(original))
+	for family, policy := range original {
+		if family == FamilyBlock {
+			continue
+		}
+		reduced[family] = policy
+	}
+	familyRegistry = reduced
+
+	families := RegisteredFamilies()
+	assert.NotContains(t, families, FamilyBlock,
+		"a family with no registry entry must not be reported as registered")
+	assert.Len(t, families, len(original)-1)
+}
+
 // The membership families appended by #2447. The additive pair is the sharp
 // case: CanRevokeVisibility true would seed plan.viewers and tear down the
 // devices of the user who just joined.

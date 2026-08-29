@@ -154,6 +154,27 @@ func UnregisteredFamilies() []Family {
 	return missing
 }
 
+// RegisteredFamilies returns every family that HAS a registry entry, in
+// ascending order. Symmetric with UnregisteredFamilies and for the same reason:
+// it takes no arguments, so a caller cannot iterate a stale snapshot of the
+// enum.
+//
+// It exists so a test can assert a property of EVERY family rather than of a
+// hand-written list. A list is an INVENTORY -- append a ninth family and it
+// silently escapes every assertion while the suite stays green -- where this is
+// an INVARIANT: a new family is covered the moment it is registered. That is
+// what #2992's acceptance criterion 5 asks for ("every bracketed seam ... is
+// locked by a test").
+func RegisteredFamilies() []Family {
+	registered := make([]Family, 0, len(familyRegistry))
+	for value := Family(0); value < familyCount; value++ {
+		if _, ok := familyRegistry[value]; ok {
+			registered = append(registered, value)
+		}
+	}
+	return registered
+}
+
 // CanRevokeVisibility reads the family's declared FamilyPolicy answer on that
 // axis. The rationale for the answers — including why this is NOT the
 // "direction branch" [internal]rules/backend.md forbids for the #2445 RBAC

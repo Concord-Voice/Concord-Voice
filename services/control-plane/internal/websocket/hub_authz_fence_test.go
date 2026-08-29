@@ -1,6 +1,8 @@
 package websocket
 
 import (
+	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -202,4 +204,62 @@ func TestPresenceAuthzWatchdogNeverWritesTheFence(t *testing.T) {
 	assert.NotZero(t, openOf(h.presenceAuthzState.Load()),
 		"the fence must still be raised -- only the closer may lower it")
 	closer()
+}
+
+// The synchronous rail is a DELIBERATELY unbracketed exclusion, and #2992's
+// acceptance criterion 5 requires every such rail to be locked by a test rather
+// than merely described in a comment. broadcastPresenceToAllSync computes and
+// fans out inline: it builds no presenceAudienceResult and never reaches
+// presenceAudienceUnproven, so NEITHER fence arm applies to it.
+//
+// This pins that as an observable property rather than a claim. A raised
+// bracket suppresses every asynchronous delivery; the synchronous path must go
+// on delivering, so a change that starts consulting the fence here fails loudly
+// instead of quietly altering shutdown behaviour.
+//
+// It is a LOCK, not an endorsement. The rationale for the exclusion —
+// shutdown-only, process-local fan-out with no NATS leg, every recipient
+// closeOutbound()-ed moments later — lives on broadcastPresenceToAllSync.
+func TestBroadcastPresenceToAllSyncIgnoresTheAuthzFence(t *testing.T) {
+	viewerID, senderID := uuid.New(), uuid.New()
+
+	hub := NewHub(nil, nil)
+	// Non-nil so the path proceeds past its own nil-db guard; never queried,
+	// because presenceAudienceComputer intercepts first (the bench-test idiom).
+	hub.db = &sql.DB{}
+	hub.presenceAudienceComputer = func(context.Context, uuid.UUID) (map[uuid.UUID]bool, error) {
+		return map[uuid.UUID]bool{viewerID: true}, nil
+	}
+
+	viewer := &Client{ID: uuid.New(), UserID: viewerID, Send: make(chan []byte, 8), Hub: hub}
+	hub.clients[viewer.ID] = viewer
+	hub.userClients[viewerID] = map[uuid.UUID]bool{viewer.ID: true}
+	viewer.beginBootstrap()
+	require.True(t, hub.completeClientBootstrap(viewer, []byte(`{"type":"presence_snapshot"}`)))
+	drain := func() {
+		for len(viewer.Send) > 0 {
+			<-viewer.Send
+		}
+	}
+	drain()
+
+	// POSITIVE CONTROL, and it runs first on purpose. Without it, the assertion
+	// below ("still delivered under a raised fence") would pass just as happily
+	// against a path that delivers nothing at all.
+	hub.broadcastPresenceToAllSync(senderID, statusOffline, 1)
+	require.NotEmpty(t, viewer.Send,
+		"control: the synchronous path must deliver when nothing is revoking, or the "+
+			"assertion below proves nothing")
+	drain()
+
+	closer := hub.BeginAudienceRevocation()
+	defer closer()
+	require.NotZero(t, hub.PresenceAuthzOpenForTest(),
+		"precondition: the fence must actually be raised for this to mean anything")
+
+	hub.broadcastPresenceToAllSync(senderID, statusOffline, 1)
+	assert.NotEmpty(t, viewer.Send,
+		"the synchronous rail consults NEITHER fence arm, so a raised bracket must not "+
+			"suppress it. If this fails the exclusion has changed, and both "+
+			"broadcastPresenceToAllSync's comment and [internal]rules/backend.md are now wrong")
 }

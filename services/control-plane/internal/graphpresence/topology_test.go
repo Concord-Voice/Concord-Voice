@@ -1864,70 +1864,59 @@ func TestWithGatedTxBracketsARevokingFamilyAcrossTheTransaction(t *testing.T) {
 		"taking the bracket must not disconnect anyone — that is Abandon's job, not the fence's")
 }
 
-// Family scoping, driven off the boot-guarded registry rather than a hand list.
-// Bracketing an additive family would suppress presence for the highest-volume
-// graph traffic in exchange for nothing: an accept, an add and a join cannot
-// remove a viewer from any audience.
-func TestWithGatedTxSkipsTheBracketForAdditiveFamilies(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		family presencecapture.Family
-	}{
-		{"friendship accept", presencecapture.FamilyFriendshipAccept},
-		{"member add", presencecapture.FamilyMemberAdd},
-		{"member join", presencecapture.FamilyMemberJoin},
-	} {
-		family := tc.family
-		t.Run(tc.name, func(t *testing.T) {
-			policy, err := presencecapture.PolicyFor(family)
-			require.NoError(t, err)
-			require.False(t, policy.CanRevokeVisibility,
-				"registry precondition: this test is only meaningful for a non-revoking family")
+// The bracket decision, asserted for EVERY registered family rather than for a
+// hand-written list. This replaces the two tables that enumerated the additive
+// and revoking families separately (#2992 AC5): those were an INVENTORY -- a
+// ninth family escaped both while the suite stayed green -- and the criterion
+// asks for every bracketed seam to be locked. Driving the registry makes a new
+// family covered the moment it is registered, with its own declared policy
+// choosing which assertion applies.
+func TestWithGatedTxBracketDecisionMatchesEveryRegisteredFamily(t *testing.T) {
+	families := presencecapture.RegisteredFamilies()
+	require.NotEmpty(t, families,
+		"an empty registry would make every assertion in this loop vacuous")
+	require.Empty(t, presencecapture.UnregisteredFamilies(),
+		"a declared-but-unregistered family is invisible to this loop -- the boot guard "+
+			"already forbids one, so this is a precondition, not a second check")
 
-			trace := &callTrace{}
-			reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+	var revoking, additive int
+	for _, family := range families {
+		policy, err := presencecapture.PolicyFor(family)
+		require.NoError(t, err)
+		if policy.CanRevokeVisibility {
+			revoking++
+		} else {
+			additive++
+		}
 
-			require.NoError(t, reconciler.WithGatedTx(
-				context.Background(), subjectFor(family),
-				func(_ *sql.Tx) error { trace.record(stepWork); return nil },
-			))
+		// Named by ordinal, not by %s: Family is a uint8 with no String method,
+		// so a %s verb would render it as a control character.
+		t.Run(fmt.Sprintf("family_%d_can_revoke_%t", uint8(family), policy.CanRevokeVisibility),
+			func(t *testing.T) {
+				trace := &callTrace{}
+				reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
 
-			assert.Zero(t, fence.opens, "an additive family must not take the bracket")
-			assert.NotContains(t, trace.snapshot(), stepFenceOpen)
-		})
+				require.NoError(t, reconciler.WithGatedTx(
+					context.Background(), subjectFor(family),
+					func(_ *sql.Tx) error { trace.record(stepWork); return nil },
+				))
+
+				if policy.CanRevokeVisibility {
+					assert.Equal(t, 1, fence.opens, "a revoking family must bracket")
+					assert.Zero(t, fence.depth, "and must release it")
+					return
+				}
+				assert.Zero(t, fence.opens, "an additive family must not bracket")
+				assert.NotContains(t, trace.snapshot(), stepFenceOpen)
+			})
 	}
-}
 
-func TestWithGatedTxBracketsEveryRevokingFamily(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		family presencecapture.Family
-	}{
-		{"friendship remove", presencecapture.FamilyFriendshipRemove},
-		{"block", presencecapture.FamilyBlock},
-		{"friends-of-friends toggle", presencecapture.FamilyFriendsOfFriendsToggle},
-		{"member remove", presencecapture.FamilyMemberRemove},
-		{"member ban", presencecapture.FamilyMemberBan},
-	} {
-		family := tc.family
-		t.Run(tc.name, func(t *testing.T) {
-			policy, err := presencecapture.PolicyFor(family)
-			require.NoError(t, err)
-			require.True(t, policy.CanRevokeVisibility,
-				"registry precondition: this test is only meaningful for a revoking family")
-
-			trace := &callTrace{}
-			reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
-
-			require.NoError(t, reconciler.WithGatedTx(
-				context.Background(), subjectFor(family),
-				func(_ *sql.Tx) error { trace.record(stepWork); return nil },
-			))
-
-			assert.Equal(t, 1, fence.opens, "every CanRevokeVisibility family must bracket")
-			assert.Zero(t, fence.depth, "and must release it")
-		})
-	}
+	// Both arms must actually have run. A registry that happened to be all
+	// additive (or all revoking) would leave half this test unexercised while
+	// still reporting green -- the vacuity the hand-written tables at least made
+	// visible by naming their cases.
+	assert.Positive(t, revoking, "no revoking family ran: the bracket assertion never executed")
+	assert.Positive(t, additive, "no additive family ran: the skip assertion never executed")
 }
 
 // The fail-closed arm, and it is the ONLY branch in this change whose inversion
@@ -1967,6 +1956,24 @@ func TestWithGatedTxBracketsAnUnregisteredFamilyFailClosed(t *testing.T) {
 // The catastrophic mode is a LEAKED bracket: a permanently non-zero open count
 // suppresses base presence hub-wide, forever, and self-heals never. Cover every
 // terminal, including the two that do not go through work at all.
+//
+// #2992 AC4 also names ErrProbeStale, ErrCapturePending and ErrCaptureBound, and
+// they deliberately get NO arms here -- an arm per sentinel would re-test one
+// path with three error values, which is enumeration, not coverage. The bracket
+// is taken by `defer fence()()` as runInTx's first act, BEFORE BeginTx, so it
+// cannot observe which error came back. Every one of those sentinels is
+// therefore either:
+//
+//   - returned from work -- indistinguishable here from any other work error,
+//     covered by the "work returns an error" arm below; or
+//   - raised BEFORE runInTx is entered (the pre-transaction probe in
+//     internal/presencehook, or a capture bound rejected ahead of the
+//     transaction) -- in which case no bracket was ever taken and there is
+//     nothing to leak.
+//
+// Both directions are safe, and neither is made safer by a third table row. If
+// a future change moves the bracket AFTER BeginTx, this argument dies with it
+// and the sentinels need real arms.
 func TestWithGatedTxReleasesTheBracketOnEveryTerminal(t *testing.T) {
 	subject := subjectFor(presencecapture.FamilyFriendshipRemove)
 
