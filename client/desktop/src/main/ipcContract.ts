@@ -208,6 +208,39 @@
 export const IPC_CONTRACT_VERSION = 25;
 
 /**
+ * The oldest shell this repository's RENDERER actually runs on.
+ *
+ * NOT the same question as `IPC_CONTRACT_VERSION`, and the two must never be
+ * synced. That constant is a CAPABILITY — "this shell implements 25". This one
+ * is a DEMAND — "the deployed SPA needs at least 19". `deploy-spa.sh` publishes
+ * THIS value as `SPA_IPC_CONTRACT`, the control plane serves it as
+ * `spaIpcContract`, and `spaLoader.ts` drops any shell below it to its bundled
+ * renderer. So every point this number sits above the oldest installed shell is
+ * a client taken off the remote SPA.
+ *
+ * WHY IT LAGS BY SIX VERSIONS. Every surface added since v19 is feature-detected
+ * or optional-chained on the renderer side — `electron?.forgetDeepLinks?.()`,
+ * `if (typeof subscribe !== 'function') return`, `if (!getContentProtection)
+ * return`. A shell that lacks the channel loses the feature and nothing else.
+ * That is what makes the gap free: the headroom is earned by renderer code that
+ * degrades, not granted by an offset policy.
+ *
+ * RAISE THIS ONLY when the renderer genuinely cannot degrade — an unguarded call
+ * into a channel older shells do not implement, or a payload the renderer must
+ * receive to be correct. Adding a channel is NOT such a change; guarding the call
+ * is nearly always cheaper than the release this number's movement forces.
+ *
+ * Raising it obliges a client release carrying it, because a shell only reaches
+ * users in a build. `classify-release.sh` fails a PR that raises it without a
+ * version bump, and `deploy-spa.sh` refuses to publish a minimum no released
+ * shell satisfies. Do not "fix" either gate by pointing it back at
+ * IPC_CONTRACT_VERSION — that conflation is what took the entire installed base
+ * onto bundled renderers on 2026-08-28 (#2967 bumped the capability 23 -> 25,
+ * the deploy published 25 as the demand, and every client fell back).
+ */
+export const SPA_MIN_CONTRACT = 19;
+
+/**
  * Opaque main-process identity for one stored credential lifecycle.
  *
  * Renderers may retain and return this value for conditional operations, but
