@@ -1,0 +1,42 @@
+-- ADR-0038 / #2759: per-object storage backend placement.
+--
+-- MinIO is demoted from unconditional default: it remains the permanent
+-- self-host / dev / air-gapped backend and keeps ALL profile media
+-- (avatars/, server-icons/, dm-icons/) unconditionally, but stops being the
+-- SaaS default write target for the attachments/ prefix, which moves to
+-- Cloudflare R2. This column is how placement becomes per-object instead of
+-- a single global default. No object migrates as part of this change.
+--
+-- NULL is a permanent, meaningful value — not a "not yet backfilled" gap:
+--   * NULL means "the configured legacy backend" (MinIO, for every row
+--     written before this column existed and every row a pre-cutover
+--     replica writes after it). It is never backfilled to a literal value.
+--   * Nullable with no DEFAULT keeps this migration mixed-version safe
+--     during a rolling deploy: an old replica that has never heard of this
+--     column keeps inserting rows exactly as before, and they correctly
+--     read back as "legacy backend" once every replica is upgraded.
+--   * NULL is also the correct PERMANENT state for pre-cutover objects,
+--     not a transient one — do not add a backfill migration that stamps a
+--     literal value onto existing rows, and do not add a DEFAULT that would
+--     make new rows stop meaning "legacy" by omission.
+-- The next reader must not "fix" this into NOT NULL or add a DEFAULT.
+--
+-- Deliberately no CHECK constraint enumerating backend identifiers. The
+-- valid backend set is a boot-time registry in application code (ADR-0038
+-- anticipates adding EU and Indo-Pacific backends later); encoding it here
+-- would require a migration every time a backend is added.
+--
+-- Deliberately no index. The only anticipated read shape is "load this
+-- object's placement alongside its row," which rides the existing
+-- media_files primary-key lookup on `id` — a column read next to a
+-- primary-key-scoped row does not justify its own index. There is no
+-- identified query that scans/filters media_files by storage_backend alone
+-- (e.g. a bulk per-backend migration sweep would page by primary key with a
+-- WHERE filter, not seek via an index). Add one later if such a query
+-- appears, naming it at that time.
+--
+-- Adding a nullable column with no DEFAULT is a metadata-only change on
+-- PG16 (no table rewrite, no ACCESS EXCLUSIVE scan), so this is safe to run
+-- against the live table without CONCURRENTLY machinery.
+ALTER TABLE media_files
+    ADD COLUMN IF NOT EXISTS storage_backend TEXT;

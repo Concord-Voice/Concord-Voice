@@ -141,6 +141,51 @@ func (c CloudflareKVBridgeConfig) String() string {
 		c.AccountID, c.NamespaceID, len(c.APIToken))
 }
 
+// CloudflareR2Config holds the Cloudflare R2 credentials and destination for
+// the ATTACHMENT object-storage bucket (ADR-0038 — the SaaS write-default
+// migration off single-drive MinIO; tracked on a separate branch from this
+// change). Endpoint/Region/Bucket are non-secret destination LITERALS pinned
+// in docker-compose.production.yml — never sourced from an operator-writable
+// env var here, for the same reason backup-offsite.sh pins its own R2
+// account/bucket in reviewed source rather than reading them from
+// /opt/concord/.env: a concord-writable destination is a redirection channel
+// for a compromised host.
+//
+// AccessKeyID/SecretAccessKey are the ATTACHMENT-bucket credential
+// (CLOUDFLARE_R2_USEAST_ID / CLOUDFLARE_R2_USEAST_ID_KEY, Infisical
+// prod:/runtime, rotated on a 6-month cadence — Object Read+Write,
+// bucket-scoped). They are DISTINCT from the break-glass backup credential
+// (CLOUDFLARE_PROD_BACKUP_R2_ID/_KEY, consumed only by the off-site backup
+// tooling on the deploy host, never by this config) and from the
+// two account-scoped Cloudflare credential pairs, which are CI-only and must
+// never reach this host-bound rail.
+//
+// Fully optional-resolve today: the vendor backend is dormant (MinIO remains
+// the sole SaaS write target for attachments/), so this struct is loaded and
+// format-validated but not yet consumed by any storage client — the
+// storage_backend registry LANDED with ADR-0038 Wave B and reads this struct;
+// only the write-default flip is a later wave's scope.
+// Promote AccessKeyID/SecretAccessKey/Bucket to production-required
+// (config.go validate() guard + provision-secrets.yml required=true + compose
+// ${VAR:?...}) together, at the write-default flip to a non-minio backend —
+// not before.
+//
+// String() redacts both credential fields; Endpoint/Region/Bucket are
+// non-secret and logged in full.
+type CloudflareR2Config struct {
+	Endpoint        string // Pinned literal, e.g. "https://<account>.r2.cloudflarestorage.com"
+	Region          string
+	Bucket          string
+	AccessKeyID     string // #nosec G117 -- config field name, secret loaded from env
+	SecretAccessKey string // #nosec G101 -- config field name, secret loaded from env
+}
+
+// String redacts both R2 credential fields.
+func (c CloudflareR2Config) String() string {
+	return fmt.Sprintf("CloudflareR2Config{Endpoint:%q Region:%q Bucket:%q AccessKeyID:[REDACTED %d bytes] SecretAccessKey:[REDACTED %d bytes]}",
+		c.Endpoint, c.Region, c.Bucket, len(c.AccessKeyID), len(c.SecretAccessKey))
+}
+
 // Config holds all configuration for the application
 type Config struct {
 	Environment string
@@ -241,6 +286,23 @@ type Config struct {
 	StorageUseSSL    bool   // Use TLS for the storage connection
 	StorageBucket    string // Bucket name for media storage (e.g. "concord-media")
 	UploadMaxSize    int64  // Global max upload size in bytes (default 25 MB)
+
+	// CloudflareR2 holds the Cloudflare R2 attachment-bucket destination and
+	// credential (ADR-0038).
+	//
+	// WIRED, not merely loaded: AttachmentBackends() turns this into a
+	// candidate row and storage.NewRegistry builds a vendor client from it at
+	// boot, after which backend-aware reads, deletes and session sweeping all
+	// resolve through it. What remains dormant is narrower than "the backend"
+	// — it is the WRITE DEFAULT. Registry.AttachmentWriteBackendID returns the
+	// legacy id unconditionally, so every attachment is still written to
+	// MinIO and every existing row carries a NULL storage_backend that
+	// resolves to legacy. The flip is a later wave.
+	//
+	// In practice the whole struct also stays inert until an operator seeds
+	// the credential pair: AttachmentBackends() gates the candidate on it, so
+	// with no credential there is no registered backend at all.
+	CloudflareR2 CloudflareR2Config
 
 	// Message-purge engine (#1352). Lightweight compose-only tunables — NOT in
 	// validate()/provision-secrets.yml (won't fatal-exit, won't trip Class-1 drift).
@@ -396,11 +458,34 @@ func Load() (*Config, error) {
 		StorageUseSSL:               getEnvAlias("STORAGE_USE_SSL", "MINIO_USE_SSL", "false") == "true",
 		StorageBucket:               getEnvAlias("STORAGE_BUCKET", "MINIO_BUCKET", "concord-media"),
 		UploadMaxSize:               getEnvInt64("UPLOAD_MAX_SIZE", 25*1024*1024), // 25 MB default
-		PurgeMaxBatch:               getEnvInt("PURGE_MAX_BATCH", 5000),
-		PurgeRateLimit:              getEnvInt("PURGE_RATE_LIMIT", 5),
-		PurgeRateWindowSec:          getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
-		KlipyAPIKey:                 getEnv("KLIPY_API_KEY", ""),
-		KlipyCustomerIDKey:          getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
+		// Cloudflare R2 attachment-bucket credential (ADR-0038). Optional-
+		// resolve while the WRITE DEFAULT is still legacy — see
+		// CloudflareR2Config's doc comment and validateProduction() for the
+		// https://-only endpoint guard.
+		//
+		// Two different provenances share this block, and the distinction is
+		// the point. Endpoint/Region/Bucket are DEPLOYMENT-PINNED literals,
+		// written by hand into docker-compose.production.yml and reaching the
+		// process only because compose passes them through; they are read from
+		// the environment here but are not operator-writable state on the
+		// host. The credential pair IS ordinary runtime environment, resolved
+		// from Infisical, and it rotates. storage.newVendorClient additionally
+		// requires the endpoint's parsed host to match the ExpectedHostSuffix
+		// declared in pkg/config/object_backends.go, so a redirected endpoint
+		// fails closed rather than dialling. Empty here (dev and base compose
+		// never set them) leaves the backend unregistered.
+		CloudflareR2: CloudflareR2Config{
+			Endpoint:        getEnv("CLOUDFLARE_R2_USEAST_ENDPOINT", ""),
+			Region:          getEnv("CLOUDFLARE_R2_USEAST_REGION", "auto"),
+			Bucket:          getEnv("CLOUDFLARE_R2_USEAST_BUCKET", ""),
+			AccessKeyID:     getEnv("CLOUDFLARE_R2_USEAST_ID", ""),
+			SecretAccessKey: getEnv("CLOUDFLARE_R2_USEAST_ID_KEY", ""), // #nosec G101 -- env var name, not a secret
+		},
+		PurgeMaxBatch:      getEnvInt("PURGE_MAX_BATCH", 5000),
+		PurgeRateLimit:     getEnvInt("PURGE_RATE_LIMIT", 5),
+		PurgeRateWindowSec: getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
+		KlipyAPIKey:        getEnv("KLIPY_API_KEY", ""),
+		KlipyCustomerIDKey: getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
 		GitHubFeedback: GitHubFeedbackConfig{
 			// TrimSpace both fields: a trailing newline on the PAT (the common
 			// copy-paste / secret-store artifact) corrupts the
@@ -752,6 +837,177 @@ func invalidHSTSDirective(d string, seen map[string]bool) bool {
 	return hasVal && (name == "includesubdomains" || name == "preload")
 }
 
+// isASCIIDigits reports whether s is non-empty and made only of 0-9.
+//
+// url.Port() does NOT validate the port text — it returns whatever follows the
+// last colon once the host parses — so this is a real check, not a formality.
+func isASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isASCII reports whether s contains only single-byte code points.
+//
+// Extracted rather than inlined purely to keep storageHostname under the
+// go:S3776 cognitive-complexity ceiling of 15 — inline, the loop-plus-branch
+// took it to 17 and re-tripped the exact SonarCloud CRITICAL this PR had
+// already cleared once.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// storageHostname returns the hostname minio-go will actually DIAL for this
+// endpoint, or ok=false if the endpoint is not a plain host[:port].
+//
+// PARSED THE WAY THE CONSUMER PARSES IT, and that is the whole design. The
+// legacy endpoint is bare "host:port" (TLS rides STORAGE_USE_SSL separately),
+// but minio-go does not treat it as host:port -- getEndpointURL builds
+// "http://" + endpoint and dials url.Hostname(). A validator that splits the
+// string differently from the dialer can bless a host the dialer never uses.
+//
+// It did. The first version used net.SplitHostPort, which splits at the LAST
+// colon and does not validate the port text, so
+// "minio:9000@evil.example.com" yielded host="minio", err=nil -- classified
+// in-cluster, every guard satisfied -- while url.Parse read "minio:9000" as
+// USERINFO and minio-go dialed evil.example.com:80 in cleartext, carrying the
+// SigV4 credential. The guard did not merely miss the redirect; it certified
+// it. The Host round-trip below is what closes that class: url.Parse moves
+// everything before the "@" out of Host, so the remainder stops matching.
+func storageHostname(endpoint string) (string, bool) {
+	if endpoint == "" || strings.ContainsAny(endpoint, "/?#@\\ \t\r\n") {
+		return "", false
+	}
+	u, err := url.Parse("http://" + endpoint)
+	if err != nil || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	if !strings.EqualFold(u.Host, endpoint) {
+		return "", false
+	}
+	// REDUNDANT TODAY, AND KEPT DELIBERATELY. net/url already refuses a
+	// non-digit port — "http://minio:notaport" and "http://minio:0x50" both come
+	// back as parse errors and are caught by the err branch above, so no input
+	// currently reaches this return. Measured, not assumed: the rejection
+	// table's "non-numeric port" case still passes with this branch disabled.
+	//
+	// It stays because this function's founding defect was trusting ONE parser's
+	// notion of a host, and a second explicit check costs nothing. What it does
+	// NOT do is bound the value — "minio:99999999999" is all digits and passes
+	// both here and in net/url; the dial fails later, which is the right place.
+	if port := u.Port(); port != "" && !isASCIIDigits(port) {
+		return "", false
+	}
+	host := u.Hostname()
+
+	// ASCII ONLY, and this is the same bug class as the userinfo bypass above
+	// rather than defensive garnish. strings.ToLower applies Unicode SIMPLE
+	// case mapping, which folds U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE)
+	// to plain ASCII 'i' — so "mİnio" lowercases to exactly "minio", satisfies
+	// the allowlist, and round-trips EqualFold — while minio-go dials the
+	// distinct DNS label "mİnio". Validator and dialer disagree again, by a
+	// different route. The ContainsAny screen at the top cannot catch it:
+	// its set is ASCII, and an ASCII set never matches a UTF-8 continuation
+	// byte. Every legitimate value here — the compose service name, localhost,
+	// an IP literal — is ASCII, so refusing the rest costs nothing.
+	if !isASCII(host) {
+		return "", false
+	}
+
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" || strings.HasSuffix(host, ".") {
+		return "", false
+	}
+	return host, true
+}
+
+// saasApprovedStorageHost reports a destination a SAAS deployment is allowed to
+// name. It is deliberately much narrower than "somewhere private".
+//
+// SaaS ships one value and it is a NAME: docker-compose{,.production}.yml pin
+// STORAGE_ENDPOINT to "minio:9000", resolved on the compose network. So no bare
+// IP literal is ever a legitimate SaaS destination, and accepting a whole
+// address FAMILY here buys nothing while costing a great deal: every RFC1918
+// address passed placement, so an attacker who could rewrite /opt/concord/.env
+// only had to name a host inside the same VPC or overlay -- their own container
+// -- and the static credentials went to it in cleartext. "Private" is not
+// "ours". (Raised by CodeRabbit on PR #3007.)
+func saasApprovedStorageHost(host string) bool {
+	switch host {
+	case "minio", "localhost":
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// privateNetworkStorageHost reports a destination that cannot leave the
+// operator's own network, which is the ONLY condition under which plaintext
+// object storage is acceptable. Broader than the SaaS rule on purpose: a
+// self-hosted operator's MinIO may legitimately sit at an RFC1918 address.
+//
+// LINK-LOCAL IS EXCLUDED, and that is the point rather than an oversight.
+// 169.254.0.0/16 is autoconfiguration space, and 169.254.169.254 in particular
+// is the cloud instance-metadata endpoint on every major provider -- never a
+// deliberate storage host, and pointing the client at it is SSRF-shaped rather
+// than merely misconfigured. The earlier IsLinkLocalUnicast() term accepted it.
+func privateNetworkStorageHost(host string) bool {
+	switch host {
+	case "minio", "localhost":
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
+}
+
+// storageDestinationEscapesTheCluster reports a SaaS deployment whose legacy
+// object-storage endpoint points somewhere the container network cannot reach.
+//
+// Keyed on "not self-hosted" rather than "== saas" so an UNSET InstanceType is
+// held to the SaaS rule. Load() normalises to one of the two and compose
+// defaults INSTANCE_TYPE to "saas", so empty means SaaS everywhere it can
+// occur -- but an == comparison would let a Config that never went through
+// Load() skip the check, which is the wrong direction for a guard.
+// vendorEndpointIsPlaintext reports a CONFIGURED vendor endpoint that is not
+// https://. Empty is not an error -- the backend is dormant by default, so a
+// deployment that never sets it is the normal case, not a misconfiguration.
+func (c *Config) vendorEndpointIsPlaintext() bool {
+	return c.CloudflareR2.Endpoint != "" && !strings.HasPrefix(c.CloudflareR2.Endpoint, "https://")
+}
+
+func (c *Config) storageDestinationEscapesTheCluster() bool {
+	if c.InstanceType == InstanceTypeSelfHosted {
+		return false
+	}
+	host, ok := storageHostname(c.StorageEndpoint)
+	return !ok || !saasApprovedStorageHost(host)
+}
+
+// storageTravelsInTheClear reports an endpoint outside the container network
+// reached without TLS. STORAGE_USE_SSL defaults to "false", so this is the
+// combination you get by omission rather than by choice.
+func (c *Config) storageTravelsInTheClear() bool {
+	if c.StorageUseSSL {
+		return false
+	}
+	host, ok := storageHostname(c.StorageEndpoint)
+	return !ok || !privateNetworkStorageHost(host)
+}
+
 func (c *Config) validateProduction() error {
 	if c.Environment != "production" {
 		return nil
@@ -782,6 +1038,53 @@ func (c *Config) validateProduction() error {
 			"STORAGE_ENDPOINT (or MINIO_ENDPOINT alias) must be set in production."},
 		{c.StorageBucket == "",
 			"STORAGE_BUCKET (or MINIO_BUCKET alias) must be set in production."},
+		// The LEGACY object-storage destination, guarded for the same reason
+		// ADR-0038 pins the vendor one -- and with more at stake, because this
+		// is the backend that actually holds everything. Every pre-cutover
+		// attachment resolves here, and ALL profile media resolves here
+		// permanently and by design (see AttachmentBackends' doc comment: the
+		// server re-encodes avatars and icons, so unlike an E2EE attachment
+		// they are PLAINTEXT wherever they are stored).
+		//
+		// docker-compose.production.yml pins STORAGE_ENDPOINT to "minio:9000"
+		// as a reviewed literal, so the destination is already correct today.
+		// What was missing is any code-level assertion of it: an endpoint
+		// redirected through the environment was accepted with no check
+		// whatever, and the exfiltration would be silent because uploads
+		// simply succeed against the attacker's bucket.
+		//
+		// SaaS is held to the in-cluster form; a SELF-HOSTED operator may
+		// legitimately point at storage we know nothing about, so they are
+		// exempt from the placement rule and held to the TLS rule below
+		// instead.
+		// Keyed on "not self-hosted" rather than "== saas" so an UNSET value
+		// is held to the SaaS rule. Load() normalises to one of the two, and
+		// compose defaults INSTANCE_TYPE to "saas", so empty means SaaS
+		// everywhere it can occur -- but an == comparison would let a config
+		// that never went through Load() skip the check entirely, which is
+		// the wrong direction for a guard.
+		{c.storageDestinationEscapesTheCluster(),
+			"STORAGE_ENDPOINT must name an in-cluster host on a SaaS deployment (docker-compose.production.yml pins \"minio:9000\"). A destination reachable from outside the container network is an exfiltration channel for every attachment and all profile media."},
+		// Plaintext object storage is acceptable ONLY on the private container
+		// network. Once the destination leaves it, STORAGE_USE_SSL=false ships
+		// credentials and media in the clear -- and it defaults to "false",
+		// so the unsafe combination is the one you get by omission.
+		{c.storageTravelsInTheClear(),
+			"STORAGE_USE_SSL must be true when STORAGE_ENDPOINT is not an in-cluster host. Plaintext object storage is only acceptable over the private container network."},
+		// ADR-0038 — Cloudflare R2 attachment-bucket endpoint. TLS is
+		// mandatory and NOT configurable for this backend: unlike
+		// STORAGE_USE_SSL above (which exists only for the in-cluster MinIO
+		// dial), there is no *_USE_SSL escape hatch here. Fires only when an
+		// endpoint is actually configured — the backend is dormant by
+		// default (MinIO remains the SaaS write target; only
+		// docker-compose.production.yml sets this literal today), so an
+		// empty value is not an error. Do NOT add a required-in-production
+		// guard for Bucket/AccessKeyID/SecretAccessKey here yet — that
+		// promotion rides the write-default flip to a non-minio backend (a
+		// later wave's scope), together with provision-secrets.yml's
+		// required=true and compose's ${VAR:?...} form.
+		{c.vendorEndpointIsPlaintext(),
+			"CLOUDFLARE_R2_USEAST_ENDPOINT must use https:// — TLS is mandatory for the Cloudflare R2 attachment backend and there is no *_USE_SSL escape hatch."},
 		{invalidHSTSHeaderValue(c.HSTSHeaderValue),
 			"HSTS_HEADER_VALUE must be a valid STS policy containing exactly one decimal max-age directive when set, or be empty to use the built-in default."},
 		{len(c.TrustedProxyCIDRs) == 0,

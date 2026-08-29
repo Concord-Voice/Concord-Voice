@@ -3,7 +3,6 @@ package media
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
@@ -21,15 +20,15 @@ const (
 	// sessionSweepGrace is the margin past the hard TTL before an upload becomes
 	// sweepable.
 	sessionSweepGrace = 30 * time.Minute
-
-	// attachmentKeyPrefix scopes the sweep. ListMultipartUploads returns every
-	// incomplete upload in the bucket, and aborting one that belongs to another
-	// code path would destroy a stranger's in-flight write. Only the session
-	// path creates multipart uploads today, and this keeps that from becoming a
-	// silent dependency: a future multipart producer under a different prefix is
-	// simply not swept, and the bucket lifecycle rule still backstops it.
-	attachmentKeyPrefix = "attachments/"
 )
+
+// isRecognizedAttachmentKey (attachment_key.go) scopes the sweep.
+// ListMultipartUploads returns every incomplete upload in the bucket, and
+// aborting one that belongs to another code path would destroy a stranger's
+// in-flight write. Only the session path creates multipart uploads today, and
+// this keeps that from becoming a silent dependency: a future multipart
+// producer under a different prefix is simply not swept, and the bucket
+// lifecycle rule still backstops it.
 
 // sessionSweepMinAge is how old an incomplete upload must be before the sweeper
 // will abort it.
@@ -67,11 +66,24 @@ type SessionSweeper struct {
 	store  sweepStore
 	log    *logger.Logger
 	minAge time.Duration
+	// backend names which registered backend this sweeper covers, so a log
+	// line says WHICH bucket reported zero candidates. Empty for a caller
+	// that has only one store.
+	backend string
 }
 
 // NewSessionSweeper builds a sweeper over the given object store.
 func NewSessionSweeper(store sweepStore, log *logger.Logger) *SessionSweeper {
 	return &SessionSweeper{store: store, log: log, minAge: sessionSweepMinAge()}
+}
+
+// NewSessionSweeperForBackend is NewSessionSweeper with the backend recorded
+// for logging. Separate constructor rather than a changed signature: every
+// existing caller and test double keeps working unchanged.
+func NewSessionSweeperForBackend(store sweepStore, backend string, log *logger.Logger) *SessionSweeper {
+	s := NewSessionSweeper(store, log)
+	s.backend = backend
+	return s
 }
 
 // SweepResult reports what a sweep attempted, not only what it achieved.
@@ -104,7 +116,7 @@ func (s *SessionSweeper) SweepAbandoned(ctx context.Context) (SweepResult, error
 	}
 
 	for _, u := range uploads {
-		if !strings.HasPrefix(u.Key, attachmentKeyPrefix) {
+		if !isRecognizedAttachmentKey(u.Key) {
 			continue
 		}
 		res.Attempted++
@@ -141,11 +153,23 @@ func StartSessionSweepWorker(
 	log *logger.Logger,
 	interval time.Duration,
 ) {
-	sweeper := NewSessionSweeper(store, log)
+	StartSessionSweepWorkerForBackend(ctx, store, "", log, interval)
+}
+
+// StartSessionSweepWorkerForBackend is StartSessionSweepWorker with the
+// backend recorded on every log line it emits.
+func StartSessionSweepWorkerForBackend(
+	ctx context.Context,
+	store sweepStore,
+	backend string,
+	log *logger.Logger,
+	interval time.Duration,
+) {
+	sweeper := NewSessionSweeperForBackend(store, backend, log)
 	run := func(phase string) {
 		res, err := sweeper.SweepAbandoned(ctx)
 		if err != nil {
-			log.Error("attachment session sweep FAILED", "phase", phase, "error", err,
+			log.Error("attachment session sweep FAILED", "phase", phase, "backend", sweeper.backendLabel(), "error", err,
 				"attempted", res.Attempted, "failed", res.Failed)
 			return
 		}
@@ -154,7 +178,7 @@ func StartSessionSweepWorker(
 		// must not be the same silence.
 		if res.Attempted > 0 {
 			log.Info("attachment session sweep",
-				"phase", phase, "attempted", res.Attempted,
+				"phase", phase, "backend", sweeper.backendLabel(), "attempted", res.Attempted,
 				"reclaimed", res.Swept, "failed", res.Failed)
 		}
 	}
@@ -172,4 +196,106 @@ func StartSessionSweepWorker(
 			}
 		}
 	}()
+}
+
+// --- multi-backend sweeping (ADR-0038 action item 6) -----------------------
+
+// SweepBackendSource is the registry surface the multi-backend starter needs.
+// Declared at the consumer, mirroring StoreResolver/WriteRouter, so the test
+// double stays trivial.
+type SweepBackendSource interface {
+	BackendIDs() []storage.BackendID
+	Resolve(storage.BackendID) (*storage.Client, error)
+}
+
+// StartSessionSweepWorkers starts one sweep worker per REGISTERED backend.
+//
+// WHY THIS EXISTS AND WHY IT IS NOT DEFERRABLE. The sweeper derives its work
+// queue from the object store rather than from Redis, which is the property
+// that makes a total Redis loss unable to strand bytes. That guarantee is
+// per-STORE: a sweeper holding one client enumerates one bucket. Wire only the
+// legacy client and, the moment the Wave C write default moves, every chunked
+// session opened against the vendor is invisible to the sweep — its multipart
+// upload leaks with nothing erroring, because `Attempted` simply falls to zero
+// and the `Attempted > 0 && Swept == 0` alarm cannot fire on a batch that was
+// never enumerated. That failure is silent by construction, which is why the
+// fan-out lands with the registry rather than with the flip.
+//
+// A BACKEND THAT COULD NOT BE ENUMERATED IS LOGGED AS SUCH, and this is the
+// distinction ADR-0038 item 6 asks for explicitly: "a backend that returned
+// zero candidates MUST be distinguishable in the logs from one that was never
+// enumerated." Both are quiet in a naive implementation; only one of them is
+// fine.
+//
+// Returns the number of workers actually started, so a caller (and a test) can
+// tell "swept nothing" from "started nothing".
+func StartSessionSweepWorkers(
+	ctx context.Context,
+	registry SweepBackendSource,
+	log *logger.Logger,
+	interval time.Duration,
+) int {
+	targets := resolveSweepTargets(registry, log)
+	for _, t := range targets {
+		StartSessionSweepWorkerForBackend(ctx, t.store, t.backend, log, interval)
+	}
+	return len(targets)
+}
+
+// sweepTarget is one backend the sweeper will cover.
+type sweepTarget struct {
+	backend string
+	store   sweepStore
+}
+
+// resolveSweepTargets turns the registry into the set of backends to sweep,
+// logging each one it had to SKIP.
+//
+// Split out from StartSessionSweepWorkers so the fan-out decision is testable
+// without starting goroutines — the workers run a sweep immediately on start,
+// so a test of "which backends did we cover" would otherwise have to drive real
+// object-store calls to answer a question that is purely about enumeration.
+func resolveSweepTargets(registry SweepBackendSource, log *logger.Logger) []sweepTarget {
+	if registry == nil {
+		return nil
+	}
+	ids := registry.BackendIDs()
+
+	// A deployment with NO object storage at all still registers exactly one
+	// backend -- legacy -- and registers it UNAVAILABLE. That is a supported
+	// configuration (the same condition under which no media route is mounted),
+	// not a fault, and it must not shout on every boot. Distinguishing it here
+	// is what keeps the Error below meaningful: an unresolvable backend on a
+	// deployment that HAS storage is a bucket going unswept, which is exactly
+	// the thing worth waking someone for.
+	unconfigured := len(ids) == 1 && ids[0] == storage.LegacyBackendID
+
+	var targets []sweepTarget
+	for _, id := range ids {
+		client, err := registry.Resolve(id)
+		if err != nil || client == nil {
+			if unconfigured {
+				log.Info("attachment session sweep: object storage is not configured; nothing to sweep")
+				continue
+			}
+			// NOT the same as a clean sweep that found nothing. This backend's
+			// bucket goes unswept for as long as it stays unresolvable, so it
+			// gets its own alertable line rather than silence.
+			log.Error("attachment session sweep: backend NOT enumerated; its abandoned uploads are unreclaimed",
+				"backend", string(id), "error", err)
+			continue
+		}
+		targets = append(targets, sweepTarget{backend: string(id), store: client})
+	}
+	return targets
+}
+
+// backendLabel renders the sweeper's backend for a log field, keeping an
+// unlabelled single-store sweeper distinguishable from one covering the
+// legacy backend by name.
+func (s *SessionSweeper) backendLabel() string {
+	if s.backend == "" {
+		return "(unlabelled)"
+	}
+	return s.backend
 }

@@ -143,6 +143,13 @@ func runControlPlane() (runErr error) {
 		return err
 	}
 
+	// Boot-time object-storage backend registry (ADR-0038 / #2759). Placement
+	// is per object, so reads resolve the store from the media_files row
+	// rather than assuming this one client. NewRegistry cannot fail and never
+	// aborts boot: a non-legacy backend that will not construct registers as
+	// unavailable and fails closed only for the rows that name it.
+	storageRegistry := storage.NewRegistry(cfg, storageClient, log)
+
 	// Set Gin mode
 	if cfg.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -197,8 +204,10 @@ func runControlPlane() (runErr error) {
 				liveSpa,
 				log,
 				api.RouterDependencies{
-					OpsMetricsReader: adminMetricsRouterReader,
-					PresenceHistory:  presenceHistoryService,
+					OpsMetricsReader:   adminMetricsRouterReader,
+					PresenceHistory:    presenceHistoryService,
+					MediaStoreResolver: media.NewRegistryStoreResolver(storageRegistry),
+					MediaWriteRouter:   media.NewRegistryWriteRouter(storageRegistry),
 				},
 			)
 			if routerErr != nil {
@@ -288,11 +297,20 @@ func runControlPlane() (runErr error) {
 	// itself, so a total Redis loss cannot strand bytes. That guarantee is what
 	// lets the client-side paths be genuinely best-effort.
 	//
-	// Skipped when storage is unconfigured -- the same condition under which no
-	// media route is registered at all, so there is nothing to sweep.
-	if storageClient != nil {
-		media.StartSessionSweepWorker(cleanupCtx, storageClient, log, media.DefaultSessionSweepInterval)
-	}
+	// ONE WORKER PER REGISTERED BACKEND, not one over the legacy client
+	// (ADR-0038 action item 6). A sweeper holds a single store and therefore
+	// enumerates a single bucket; wiring only the legacy one would leave every
+	// vendor-resident abandoned upload unswept the moment the Wave C write
+	// default moves, and it would do so silently -- `Attempted` falls to zero
+	// and the all-aborts-failed alarm cannot fire on a batch nobody listed.
+	//
+	// No nil guard: storage.NewRegistry ALWAYS returns a non-nil registry (it
+	// registers a legacy entry even when there is no legacy client), so a
+	// `storageRegistry != nil` branch here would be dead code pretending to be
+	// a fallback. Unconfigured storage is handled inside, where the one
+	// registered-but-unavailable legacy backend is recognised and skipped
+	// quietly rather than logged as a fault.
+	media.StartSessionSweepWorkers(cleanupCtx, storageRegistry, log, media.DefaultSessionSweepInterval)
 
 	// Create HTTP server
 	srv := &http.Server{
@@ -584,6 +602,16 @@ func closeRedisClient(redisClient *redis.Client, log *logger.Logger) {
 	}
 }
 
+// initStorageClient builds the LEGACY object-storage client and only that one.
+//
+// Its retry-then-fatal-in-production behaviour is scoped to the legacy backend
+// by construction, and must stay that way (ADR-0038 / #2759): every deployment
+// depends on the legacy store for profile media and for the entire pre-cutover
+// attachment corpus, so refusing to boot without it is defensible. It is not
+// defensible for a vendor backend — an R2 outage or a credential problem there
+// would take down auth, messaging and voice over a store that holds no objects
+// this build has been told to read. Non-legacy backends are constructed by
+// storage.NewRegistry, which never fails and never aborts boot.
 func initStorageClient(cfg *config.Config, log *logger.Logger) (*storage.Client, error) {
 	if cfg.StorageEndpoint == "" {
 		log.Info("Object storage not configured (STORAGE_ENDPOINT/MINIO_ENDPOINT empty) — media endpoints disabled")

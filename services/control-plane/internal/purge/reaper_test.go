@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -50,14 +51,19 @@ func (f *fakeDeleter) DeleteObject(_ context.Context, key string) error {
 
 func TestReaper_EnqueueDrainsEveryKeyToDeleter(t *testing.T) {
 	fake := &fakeDeleter{seen: make(chan string, 8)}
-	r := NewReaper(failingDB(t), testLogger(), fake)
+	r := NewReaper(failingDB(t), testLogger(), media.NewDeleterResolver(nil, fake))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go r.StartWorker(ctx)
 
 	keys := []string{"attachments/a", "attachments/b", "attachments/c"}
-	r.EnqueueBlobDeletes(keys) // must not block
+	refs := make([]media.BlobRef, 0, len(keys))
+	for _, k := range keys {
+		// Nil backend == NULL storage_backend == the legacy backend.
+		refs = append(refs, media.BlobRef{Key: k})
+	}
+	r.EnqueueBlobDeletes(refs) // must not block
 
 	got := map[string]bool{}
 	timeout := time.After(5 * time.Second)
@@ -79,14 +85,14 @@ func TestReaper_EnqueueIsNonBlockingWhenQueueFull(t *testing.T) {
 	// promptly (drops overflow) instead of deadlocking the request path.
 	r := NewReaper(failingDB(t), testLogger(), nil)
 
-	keys := make([]string, blobQueueSize+128)
-	for i := range keys {
-		keys[i] = "attachments/overflow"
+	refs := make([]media.BlobRef, blobQueueSize+128)
+	for i := range refs {
+		refs[i] = media.BlobRef{Key: "attachments/overflow"}
 	}
 
 	done := make(chan struct{})
 	go func() {
-		r.EnqueueBlobDeletes(keys)
+		r.EnqueueBlobDeletes(refs)
 		close(done)
 	}()
 
@@ -100,7 +106,7 @@ func TestReaper_EnqueueIsNonBlockingWhenQueueFull(t *testing.T) {
 func TestReaper_EnqueueSkipsEmptyKeys(t *testing.T) {
 	r := NewReaper(failingDB(t), testLogger(), nil)
 	// Empty keys must never be enqueued (a "" storage key would be a bogus delete).
-	r.EnqueueBlobDeletes([]string{"", "", ""})
+	r.EnqueueBlobDeletes([]media.BlobRef{{}, {}, {}})
 	assert.Equal(t, 0, len(r.jobs), "empty keys should be skipped, not queued")
 }
 
@@ -133,6 +139,6 @@ func TestReaper_CollectStragglers_SurfacesQueryError(t *testing.T) {
 
 func TestReaper_SweepOnce_DoesNotPanicOnQueryError(t *testing.T) {
 	// sweepOnce swallows the error (best-effort) and must not panic.
-	r := NewReaper(failingDB(t), testLogger(), &fakeDeleter{})
+	r := NewReaper(failingDB(t), testLogger(), media.NewDeleterResolver(nil, &fakeDeleter{}))
 	r.sweepOnce(context.Background())
 }

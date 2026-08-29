@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -159,6 +160,40 @@ func attachIngressKey(sessionID string) string {
 // pointing at it and no process that will ever look.
 const orphanedObjectsKey = "attach_orphaned_objects"
 
+// orphanedObjectEntry encodes one queue entry as the PAIR that identifies the
+// object, not the bare key.
+//
+// A bare key is unambiguous only while exactly one backend exists. After the
+// Wave C write-default flip it names an object in an unstated bucket, and the
+// failure mode is silent: an S3 DELETE of a key that is absent from the target
+// bucket returns SUCCESS, so whoever eventually drains this list would record
+// a reclamation that never happened and leave the real blob behind forever.
+// This queue is the record of LAST resort -- no sweep can see a completed
+// object -- so an ambiguous entry defeats its whole purpose.
+//
+// Encoding is deliberately backward-compatible rather than versioned: the
+// legacy backend emits the bare key, byte-identical to every entry this queue
+// has ever held, because legacy is the only backend that has ever been written
+// to. Only a non-legacy backend -- impossible before the flip -- adds a
+// "<backend>\t" prefix. So no existing entry is orphaned and no migration is
+// needed; a reader splits on the first tab and treats a tab-less entry as
+// legacy, which is exactly what it is.
+func orphanedObjectEntry(backend, storageKey string) string {
+	if backend == "" {
+		return storageKey
+	}
+	return backend + "\t" + storageKey
+}
+
+// parseOrphanedObjectEntry is the inverse. Exported behaviour is pinned by
+// tests so a future drainer cannot quietly disagree with the writer.
+func parseOrphanedObjectEntry(entry string) (backend, storageKey string) {
+	if tab := strings.IndexByte(entry, '\t'); tab >= 0 {
+		return entry[:tab], entry[tab+1:]
+	}
+	return "", entry
+}
+
 // attachmentPartSize returns the exact on-the-wire length of upload part
 // `index` (0-based), derived purely from the arithmetic in
 // upload_session_sizing.go -- never from anything the client sent in-band.
@@ -242,6 +277,21 @@ type uploadSession struct {
 	plaintextBytes  int64
 	ciphertextBytes int64
 	createdAt       time.Time
+	// backend is the media_files.storage_backend value the session's multipart
+	// upload was OPENED against (ADR-0038 / #2759). Empty means the legacy
+	// backend -- the column stays NULL. It is persisted with the session
+	// precisely so a write-default flip mid-session cannot send later chunks,
+	// the commit, or the cancel to a backend that does not hold the upload.
+	backend string
+}
+
+// backendPtr renders the session's backend as a media_files.storage_backend
+// column value: nil for legacy, matching a NULL column.
+func (s *uploadSession) backendPtr() *string {
+	if s.backend == "" {
+		return nil
+	}
+	return &s.backend
 }
 
 func newUploadSessionID() (string, error) {
@@ -335,6 +385,7 @@ func decodeUploadSession(sessionID string, fields map[string]string) (*uploadSes
 		conversationID: fields["conversation_id"],
 		fileType:       FileType(fields["file_type"]),
 		mimeType:       fields["mime_type"],
+		backend:        fields["backend"],
 	}
 	if sess.fileID == "" || sess.storageKey == "" || sess.uploadID == "" {
 		return nil, errors.New("session record is missing its object-store identity")
@@ -393,11 +444,15 @@ func (h *Handler) discardSession(c *gin.Context, rdb *redis.Client, sess *upload
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
 	defer cancel()
 
-	if h.store != nil {
-		if err := h.store.AbortMultipartUpload(ctx, sess.storageKey, sess.uploadID); err != nil {
-			h.log.Error("Failed to abort abandoned multipart upload",
-				"error", err, "storage_key", sess.storageKey)
-		}
+	// Per-object: the multipart upload lives on the backend the session opened
+	// against, so aborting it on h.store would leave the real one dangling for
+	// the sweeper while reporting success.
+	if store, err := h.storeForRow(sess.backendPtr()); err != nil {
+		h.log.Error("Could not resolve the backend to abort an abandoned multipart upload",
+			"error", err, "storage_key", sess.storageKey)
+	} else if err := store.AbortMultipartUpload(ctx, sess.storageKey, sess.uploadID); err != nil {
+		h.log.Error("Failed to abort abandoned multipart upload",
+			"error", err, "storage_key", sess.storageKey)
 	}
 	h.dropSessionKeys(ctx, rdb, sess)
 }
@@ -472,8 +527,16 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 	if !ok {
 		return
 	}
-	store, ok := h.requireObjectStore(c)
+	store, backendID, ok := h.requireAttachmentWriteStore(c)
 	if !ok {
+		return
+	}
+
+	// Shared-disk occupancy gate (#2759 unit A1), legacy-only, checked once at
+	// session open rather than per chunk -- refusing here means no Redis
+	// budget/slot reservation and no multipart upload get created for a write
+	// that would only be refused later.
+	if !h.checkAttachmentDiskWatermark(c, backendID) {
 		return
 	}
 
@@ -512,7 +575,7 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 	}
 
 	fileID := uuid.New().String()
-	storageKey := fmt.Sprintf("attachments/%s", fileID)
+	storageKey := attachmentStorageKey(fileID)
 	uploadID, err := store.NewMultipartUpload(c.Request.Context(), storageKey, mimeOctetStream)
 	if err != nil {
 		rctx, cancel := compensationCtx(c)
@@ -530,7 +593,7 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 		fileType: normalizeFileType(req.FileType), mimeType: normalizeMimeType(req.MimeType),
 		keyVersion: req.KeyVersion, totalChunks: req.TotalChunks,
 		plaintextBytes: plaintextBytes, ciphertextBytes: req.DeclaredCiphertextBytes,
-		createdAt: time.Now(),
+		createdAt: time.Now(), backend: backendID,
 	}
 	if err := h.persistSession(c.Request.Context(), rdb, sess); err != nil {
 		h.discardSession(c, rdb, sess)
@@ -957,6 +1020,7 @@ func (h *Handler) persistSession(ctx context.Context, rdb *redis.Client, sess *u
 		"plaintext_bytes", sess.plaintextBytes,
 		"ciphertext_bytes", sess.ciphertextBytes,
 		"created_at", sess.createdAt.Unix(),
+		"backend", sess.backend,
 	).Err(); err != nil {
 		return fmt.Errorf("write session record: %w", err)
 	}
@@ -999,11 +1063,14 @@ func (h *Handler) PutUploadChunk(c *gin.Context) {
 	if !ok {
 		return
 	}
-	store, ok := h.requireObjectStore(c)
+	sess, ok := h.loadOwnedSession(c, rdb, userID)
 	if !ok {
 		return
 	}
-	sess, ok := h.loadOwnedSession(c, rdb, userID)
+	// Per-object, NOT the write default: this chunk belongs to a multipart
+	// upload already open on sess.backend, so a flip since session open must
+	// not redirect it.
+	store, ok := h.requireObjectStoreForRow(c, sess.backendPtr())
 	if !ok {
 		return
 	}
@@ -1182,11 +1249,12 @@ func (h *Handler) CommitUploadSession(c *gin.Context) {
 	if !ok {
 		return
 	}
-	store, ok := h.requireObjectStore(c)
+	sess, ok := h.loadOwnedSession(c, rdb, userID)
 	if !ok {
 		return
 	}
-	sess, ok := h.loadOwnedSession(c, rdb, userID)
+	// Per-object, for the same reason as PutUploadChunk.
+	store, ok := h.requireObjectStoreForRow(c, sess.backendPtr())
 	if !ok {
 		return
 	}
@@ -1225,6 +1293,7 @@ func (h *Handler) CommitUploadSession(c *gin.Context) {
 		fileID: sess.fileID, userID: userID, fileType: sess.fileType, mimeType: sess.mimeType,
 		storageKey: sess.storageKey, fileSize: sess.ciphertextBytes, keyVersion: sess.keyVersion,
 		channelID: sess.channelID, conversationID: sess.conversationID,
+		storageBackend: sess.backend,
 	}); err != nil {
 		h.abandonCommittedObject(c, rdb, sess)
 		if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
@@ -1288,14 +1357,27 @@ func reconcileParts(stored []storage.ObjectPartInfo, sess *uploadSession) ([]sto
 func (h *Handler) abandonCommittedObject(c *gin.Context, rdb *redis.Client, sess *uploadSession) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
 	defer cancel()
-	if err := h.store.DeleteObject(ctx, sess.storageKey); err != nil {
+	store, err := h.storeForRow(sess.backendPtr())
+	if err != nil {
+		// Unresolvable backend: the object cannot be deleted here at all, so go
+		// straight to the durable queue rather than losing the record.
+		h.log.Error("Orphaned attachment object could not be deleted; queued for retry",
+			"error", err, "storage_key", sess.storageKey)
+		if qErr := rdb.RPush(ctx, orphanedObjectsKey, orphanedObjectEntry(sess.backend, sess.storageKey)).Err(); qErr != nil {
+			h.log.Error("Orphaned attachment object is UNRECLAIMABLE: neither deleted nor queued",
+				"error", qErr, "storage_key", sess.storageKey)
+		}
+		h.dropSessionKeys(ctx, rdb, sess)
+		return
+	}
+	if err := store.DeleteObject(ctx, sess.storageKey); err != nil {
 		// A log line cannot be the whole remediation for an UNRECOVERABLE leak.
 		// No sweep covers a completed object, so without a durable record this
 		// blob is unreclaimable forever -- and the user, having received a 500,
 		// will retry and make a second one.
 		h.log.Error("Orphaned attachment object could not be deleted; queued for retry",
 			"error", err, "storage_key", sess.storageKey)
-		if qErr := rdb.RPush(ctx, orphanedObjectsKey, sess.storageKey).Err(); qErr != nil {
+		if qErr := rdb.RPush(ctx, orphanedObjectsKey, orphanedObjectEntry(sess.backend, sess.storageKey)).Err(); qErr != nil {
 			// Distinct, alertable message: "delete failed, queued" and
 			// "unreclaimable" are different operational events.
 			h.log.Error("Orphaned attachment object is UNRECLAIMABLE: neither deleted nor queued",
@@ -1361,15 +1443,19 @@ func (h *Handler) CancelUploadSession(c *gin.Context) {
 		return
 	}
 
-	if h.store != nil {
-		if err := h.store.AbortMultipartUpload(
-			c.Request.Context(), sess.storageKey, sess.uploadID); err != nil {
-			// Keep the session keys: the client can retry, and until then the
-			// object-store sweeper still owns the bytes.
-			h.log.Error("Failed to abort multipart upload", "error", err, "user_id", userID)
-			c.JSON(http.StatusBadGateway, gin.H{"error": errMsgObjectStoreFailed})
-			return
-		}
+	// Per-object, and fail CLOSED: an unresolvable backend must not report a
+	// successful cancel for an upload that is still open somewhere.
+	store, ok := h.requireObjectStoreForRow(c, sess.backendPtr())
+	if !ok {
+		return
+	}
+	if err := store.AbortMultipartUpload(
+		c.Request.Context(), sess.storageKey, sess.uploadID); err != nil {
+		// Keep the session keys: the client can retry, and until then the
+		// object-store sweeper still owns the bytes.
+		h.log.Error("Failed to abort multipart upload", "error", err, "user_id", userID)
+		c.JSON(http.StatusBadGateway, gin.H{"error": errMsgObjectStoreFailed})
+		return
 	}
 
 	h.dropSessionKeys(c.Request.Context(), rdb, sess)

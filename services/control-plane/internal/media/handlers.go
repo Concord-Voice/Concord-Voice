@@ -45,18 +45,22 @@ const (
 	errMsgFailedVerifyPerms   = "Failed to verify permissions"
 	errMsgInternalServer      = "Internal server error"
 	errMsgStorageUnavailable  = "Object storage unavailable"
-	purposeAvatar             = "avatar"
-	purposeBanner             = "banner"
-	purposeDMIcon             = "dm-icon"
-	purposeServerIcon         = "server-icon"
-	purposeServerBanner       = "server-banner"
-	errMsgInvalidImage        = "Failed to process image. Ensure the file is a valid image."
-	mimeOctetStream           = "application/octet-stream"
-	headerContentType         = "Content-Type"
-	headerCacheControl        = "Cache-Control"
-	cacheControlPublic        = "public, max-age=3600, must-revalidate"
-	cacheControlPublicShort   = "public, max-age=60, must-revalidate"
-	cacheControlPrivate       = "private, max-age=3600, must-revalidate"
+	// errMsgAttachmentStorageAtCapacity is returned with 507 Insufficient
+	// Storage when DiskWatermark.Check refuses a new attachment write
+	// (#2759 unit A1). SaaS-only -- see disk_watermark.go.
+	errMsgAttachmentStorageAtCapacity = "Attachment storage is temporarily full. Please try again shortly."
+	purposeAvatar                     = "avatar"
+	purposeBanner                     = "banner"
+	purposeDMIcon                     = "dm-icon"
+	purposeServerIcon                 = "server-icon"
+	purposeServerBanner               = "server-banner"
+	errMsgInvalidImage                = "Failed to process image. Ensure the file is a valid image."
+	mimeOctetStream                   = "application/octet-stream"
+	headerContentType                 = "Content-Type"
+	headerCacheControl                = "Cache-Control"
+	cacheControlPublic                = "public, max-age=3600, must-revalidate"
+	cacheControlPublicShort           = "public, max-age=60, must-revalidate"
+	cacheControlPrivate               = "private, max-age=3600, must-revalidate"
 )
 
 // ObjectStore defines the storage operations required by the media handler.
@@ -143,11 +147,34 @@ type Handler struct {
 	// Injected via SetSessionRedis rather than NewHandler so the constructor
 	// signature stays put; every session route answers 503 when it is nil.
 	sessionRedis *redis.Client
+	// diskWatermark gates NEW attachment writes on shared-disk occupancy
+	// (#2759 unit A1). Injected via SetDiskWatermark for the same reason as
+	// sessionRedis; a nil value allows every write (Check is nil-safe), which
+	// matches the other optional dependencies on this struct.
+	diskWatermark *DiskWatermark
+	// backends resolves a media_files.storage_backend value to the store that
+	// holds that row's object (ADR-0038 / #2759). Injected via
+	// SetStoreResolver; nil keeps legacy rows on the process-wide store and
+	// fails closed for everything else — see storeForRow in backend_store.go.
+	backends StoreResolver
+	// writeRouter resolves the store for a NEW write by the CALLER'S PURPOSE
+	// rather than by an existing row's column (ADR-0038 / #2759). Injected via
+	// SetWriteRouter; nil keeps every write on the process-wide store, which is
+	// exactly the pre-ADR-0038 behaviour — see write_routing.go.
+	writeRouter WriteRouter
 }
 
 // SetOpsCounter enables aggregate successful-upload counting.
 func (h *Handler) SetOpsCounter(counter interface{ Increment(opsmetrics.MetricKey) }) {
 	h.opsCounter = counter
+}
+
+// SetDiskWatermark wires the shared-disk occupancy gate for attachment
+// writes (#2759 unit A1). Mirrors SetOpsCounter/SetSessionRedis: an optional
+// dependency the handler works without (Check on a nil *DiskWatermark always
+// allows the write).
+func (h *Handler) SetDiskWatermark(watermark *DiskWatermark) {
+	h.diskWatermark = watermark
 }
 
 func (h *Handler) recordSuccessfulUpload() {
@@ -270,10 +297,17 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 	}
 
 	fileID := uuid.New().String()
-	storageKey := fmt.Sprintf("attachments/%s", fileID)
+	storageKey := attachmentStorageKey(fileID)
 
-	store, ok := h.requireObjectStore(c)
+	store, backendID, ok := h.requireAttachmentWriteStore(c)
 	if !ok {
+		return
+	}
+
+	// Shared-disk occupancy gate (#2759 unit A1), legacy-only. Tier-1 profile
+	// media (avatars/, server-icons/, dm-icons/) never calls this — only the
+	// two attachment-write paths do.
+	if !h.checkAttachmentDiskWatermark(c, backendID) {
 		return
 	}
 
@@ -287,6 +321,7 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 		fileID: fileID, userID: userID, fileType: fileType, mimeType: mimeType,
 		storageKey: storageKey, fileSize: header.Size, keyVersion: keyVersion,
 		channelID: channelID, conversationID: conversationID,
+		storageBackend: backendID,
 	}); err != nil {
 		// #2201 review: the metadata write can fail precisely BECAUSE the request
 		// context was canceled (client disconnect). Deleting the just-uploaded
@@ -321,10 +356,16 @@ func (h *Handler) UploadAttachment(c *gin.Context) {
 // DownloadAttachment proxies an E2EE attachment download through the control plane.
 // GET /api/v1/media/attachments/:file_id
 // Validates that the requesting user has access to the channel/conversation,
-// then streams the encrypted blob from MinIO to the client.
+// then streams the encrypted blob from the backend THAT ROW names to the client.
 //
 // This is a proxy (not a presigned URL redirect) because MinIO is only reachable
 // within the Docker network — clients cannot reach minio:9000 directly.
+//
+// Placement is per object (ADR-0038 / #2759): the store is resolved from
+// media_files.storage_backend, not from a single process-wide client. A NULL
+// column is the legacy backend — the permanent state of every pre-cutover
+// object — and an unrecognized value fails closed with 503 rather than being
+// read out of some other bucket.
 func (h *Handler) DownloadAttachment(c *gin.Context) {
 	userID := c.GetString("user_id")
 	fileID := c.Param("file_id")
@@ -341,12 +382,16 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	// NULLable: rows predating the client-attested epoch (#2832) carry none, and
 	// the client correctly falls back to the current key for those.
 	var keyVersion *int
+	// NULLable, permanently: NULL means the legacy backend (migration 000114
+	// is explicit that it is never backfilled), so this is not a gap to be
+	// closed — it is the value every pre-cutover object carries forever.
+	var storageBackend *string
 
-	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version
+	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version, storage_backend
 	          FROM media_files
 	          WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`
 	err := h.db.QueryRow(query, fileID).
-		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion)
+		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion, &storageBackend)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
 		return
@@ -360,8 +405,8 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 
-	// Stream the encrypted blob from MinIO to the client
-	store, ok := h.requireObjectStore(c)
+	// Stream the encrypted blob to the client from the backend this row names.
+	store, ok := h.requireObjectStoreForRow(c, storageBackend)
 	if !ok {
 		return
 	}
@@ -713,10 +758,14 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		return
 	}
 
-	// Verify ownership, tier 2 only, and get storage key
+	// Verify ownership, tier 2 only, and get the storage key AND its placement.
+	// The backend rides along on the row we are already reading (ADR-0038 /
+	// #2759 unit B2) — deleting from the wrong bucket would SUCCEED and erase
+	// nothing. NULLable permanently: NULL is the legacy backend.
 	var storageKey string
-	query := `SELECT storage_key FROM media_files WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL`
-	err := h.db.QueryRow(query, fileID, userID).Scan(&storageKey)
+	var storageBackend *string
+	query := `SELECT storage_key, storage_backend FROM media_files WHERE id = $1 AND uploader_id = $2 AND media_tier = 2 AND deleted_at IS NULL`
+	err := h.db.QueryRow(query, fileID, userID).Scan(&storageKey, &storageBackend)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
 		return
@@ -726,7 +775,10 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		return
 	}
 
-	store, ok := h.requireObjectStore(c)
+	// Resolve BEFORE the soft-delete and 503 if the row's backend is unknown:
+	// nothing is recorded, so the client retries against a state that never
+	// claimed the file was gone. Identical body to the unconfigured-store 503.
+	store, ok := h.requireObjectStoreForRow(c, storageBackend)
 	if !ok {
 		return
 	}
@@ -739,9 +791,16 @@ func (h *Handler) DeleteMedia(c *gin.Context) {
 		return
 	}
 
-	// Remove from object storage
+	// Remove from object storage. A failure here is a WARN rather than a 500
+	// because this row is tier 2 and now soft-deleted with blob_reaped_at still
+	// NULL, which makes it a straggler-sweep candidate — the sweep is the
+	// durable retry, and it resolves the same backend off the same row. That
+	// argument holds ONLY for tier 2: the sweep is bounded to media_tier = 2,
+	// which is why media.CleanupObject (tier 1, no retry behind it) refuses
+	// instead of warning.
 	if err := store.DeleteObject(c.Request.Context(), storageKey); err != nil {
-		h.log.Warn("Failed to delete object from storage (orphaned)", "error", err, "key", storageKey)
+		h.log.Warn("Failed to delete object from storage (orphaned, left for the straggler sweep)",
+			"error", err, "key", storageKey, "storage_backend", describeBackend(storageBackend))
 	}
 
 	h.log.Info("Media file deleted", "file_id", fileID, "user_id", userID)
@@ -789,7 +848,7 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 
 	storageKey := tier1StorageKey(purpose, userID, serverID, conversationID)
 
-	store, ok := h.requireObjectStore(c)
+	store, ok := h.requireTier1WriteStore(c)
 	if !ok {
 		return
 	}
@@ -1247,6 +1306,10 @@ type attachmentParams struct {
 	keyVersion     int
 	channelID      string
 	conversationID string
+	// storageBackend is the identifier of the backend the object was actually
+	// written to. EMPTY MEANS LEGACY and is persisted as NULL -- never write
+	// the literal "legacy" into the column (migration 000114's spelling).
+	storageBackend string
 }
 
 func createAttachmentRecord(h *Handler, c *gin.Context, p attachmentParams) error {
@@ -1277,11 +1340,15 @@ func createAttachmentRecord(h *Handler, c *gin.Context, p attachmentParams) erro
 
 	insertQuery := `
 		INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key,
-		                         key_version, channel_id, conversation_id, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+		                         key_version, channel_id, conversation_id, storage_backend, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
 	`
+	var backend interface{}
+	if p.storageBackend != "" {
+		backend = p.storageBackend
+	}
 	if _, err := tx.ExecContext(ctx, insertQuery, p.fileID, p.userID, string(p.fileType), MediaTierE2EE,
-		p.mimeType, p.fileSize, p.storageKey, p.keyVersion, chID, convID); err != nil {
+		p.mimeType, p.fileSize, p.storageKey, p.keyVersion, chID, convID, backend); err != nil {
 		return err
 	}
 	return tx.Commit()

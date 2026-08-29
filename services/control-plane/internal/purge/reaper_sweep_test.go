@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -135,7 +136,7 @@ func TestSweepOnce_ReapsOnlyEligibleStragglers(t *testing.T) {
 	live := seedMediaFile(t, db, uploader, channelID, nil)
 
 	store := &recordingDeleter{}
-	r := NewReaper(db, logger.NewWithWriter(io.Discard), store)
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), media.NewDeleterResolver(nil, store))
 	r.sweepOnce(context.Background())
 
 	assert.Contains(t, store.keys, eligible, "straggler past the grace window must be reaped")
@@ -163,7 +164,7 @@ func TestSweepOnce_AdvancesPastReapedRows(t *testing.T) {
 	second := seedMediaFile(t, db, uploader, channelID, &age)
 
 	store := &recordingDeleter{}
-	r := NewReaper(db, logger.NewWithWriter(io.Discard), store)
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), media.NewDeleterResolver(nil, store))
 
 	r.sweepOnce(context.Background())
 	require.Subset(t, store.keys, []string{first, second}, "both stragglers reaped")
@@ -225,7 +226,7 @@ func TestSweepOnce_IgnoresTier1Media(t *testing.T) {
 	orphan := seedMediaFile(t, db, uploader, channelID, &age)
 
 	store := &recordingDeleter{}
-	r := NewReaper(db, logger.NewWithWriter(io.Discard), store)
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), media.NewDeleterResolver(nil, store))
 	r.sweepOnce(context.Background())
 
 	assert.NotContains(t, store.keys, avatarKey,
@@ -255,8 +256,8 @@ func TestReapSweptBlob_LiveKeyGuard(t *testing.T) {
 	seedTier1MediaFile(t, db, uploader, nil)               // live, same key
 
 	store := &recordingDeleter{}
-	r := NewReaper(db, logger.NewWithWriter(io.Discard), store)
-	r.reapSweptBlob(context.Background(), sharedKey)
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), media.NewDeleterResolver(nil, store))
+	r.reapSweptBlob(context.Background(), media.BlobRef{Key: sharedKey})
 
 	assert.Empty(t, store.keys,
 		"must NOT delete an object a live row still points at, even when handed the key directly")
@@ -289,7 +290,7 @@ func TestSweepOnce_FailedDeleteIsRetriedNotMarked(t *testing.T) {
 	key := seedMediaFile(t, db, uploader, channelID, &age)
 
 	failing := &failingDeleter{}
-	r := NewReaper(db, logger.NewWithWriter(io.Discard), failing)
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), media.NewDeleterResolver(nil, failing))
 
 	r.sweepOnce(context.Background())
 	assert.Nil(t, reapedAt(t, db, key), "a failed delete must NOT be marked reaped")
@@ -307,10 +308,12 @@ func TestCollectStragglers_ReturnsKeys(t *testing.T) {
 	key := seedMediaFile(t, db, uploader, channelID, &age)
 
 	r := NewReaper(db, logger.NewWithWriter(io.Discard), nil)
-	keys, err := r.collectStragglers(context.Background())
+	refs, err := r.collectStragglers(context.Background())
 
 	require.NoError(t, err)
-	assert.Contains(t, keys, key)
+	// Backend is nil: the seeded row leaves storage_backend NULL, which is the
+	// legacy backend and the permanent value of every pre-cutover object.
+	assert.Contains(t, refs, media.BlobRef{Key: key})
 }
 
 // TestSweepOnce_ToleratesNilStore: dev/no-object-store must not panic — the metadata
@@ -358,4 +361,121 @@ func TestCollectStragglers_QueryErrorPropagates(t *testing.T) {
 	r := NewReaper(db, logger.NewWithWriter(io.Discard), nil)
 	_, err = r.collectStragglers(context.Background())
 	assert.Error(t, err)
+}
+
+// --- reapBlob: the WORKER path --------------------------------------------
+//
+// reapBlob is a different function from reapSweptBlob and had one uncovered
+// arm: mutating `if err != nil` on the ResolveDeleter result to a no-op left
+// the suite green, so nothing established that an unresolvable backend leaves
+// the row unmarked. That is the arm that matters most — marking a row whose
+// object was never deleted retires it from the straggler sweep permanently and
+// records a GDPR erasure that did not happen, with the only retry signal gone.
+//
+// The success case below is the positive control, and it is load-bearing for a
+// specific reason: markBlobReapedQuery is PAIR-keyed on (storage_key,
+// storage_backend). Without a control proving a NON-NULL backend row can be
+// marked at all, the two "must stay NULL" assertions would also pass if the
+// pair-key simply never matched — a vacuous green.
+
+// stubDeleterResolver is a media.DeleterResolver whose outcome the test picks,
+// so the resolver-error arm is reachable without a real registry.
+type stubDeleterResolver struct {
+	deleter media.ObjectDeleter
+	err     error
+}
+
+func (s stubDeleterResolver) ResolveDeleter(_ *string) (media.ObjectDeleter, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.deleter, nil
+}
+
+// seedBackendMediaFile seeds a soft-deleted attachment row and stamps its
+// storage_backend, returning the key.
+func seedBackendMediaFile(t *testing.T, db *sql.DB, uploader, channelID, backend string) string {
+	t.Helper()
+	age := stragglerGraceSeconds + 600
+	key := seedMediaFile(t, db, uploader, channelID, &age)
+	_, err := db.Exec(`UPDATE media_files SET storage_backend = $2 WHERE storage_key = $1`, key, backend)
+	require.NoError(t, err)
+	return key
+}
+
+// TestReapBlob_NonLegacyBackendSuccessMarksReaped — the positive control. It
+// proves the pair-keyed UPDATE matches a row carrying a non-NULL backend, so a
+// "stayed NULL" assertion below means the guard fired, not that the query missed.
+func TestReapBlob_NonLegacyBackendSuccessMarksReaped(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	channelID := seedAttachmentChannel(t, db, uploader)
+	key := seedBackendMediaFile(t, db, uploader, channelID, "r2-useast")
+
+	fake := &fakeDeleter{}
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), stubDeleterResolver{deleter: fake})
+
+	backend := "r2-useast"
+	r.reapBlob(context.Background(), media.BlobRef{Key: key, Backend: &backend})
+
+	assert.NotNil(t, reapedAt(t, db, key), "a successful delete on a non-legacy backend must be marked")
+	assert.Equal(t, []string{key}, fake.keys)
+}
+
+// TestReapBlob_UnresolvableBackendIsNotMarked — the arm the mutation exposed.
+// An unresolvable backend must delete nothing and mark nothing, leaving the row
+// a straggler-sweep candidate.
+func TestReapBlob_UnresolvableBackendIsNotMarked(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	channelID := seedAttachmentChannel(t, db, uploader)
+	key := seedBackendMediaFile(t, db, uploader, channelID, "r2-useast")
+
+	r := NewReaper(db, logger.NewWithWriter(io.Discard),
+		stubDeleterResolver{err: errors.New("unknown storage backend")})
+
+	backend := "r2-useast"
+	r.reapBlob(context.Background(), media.BlobRef{Key: key, Backend: &backend})
+
+	assert.Nil(t, reapedAt(t, db, key),
+		"an unresolvable backend must NOT be recorded as reaped — the object may still exist")
+}
+
+// TestReapBlob_FailedDeleteIsNotMarked — same fail-closed shape for a delete
+// that reached the store and failed.
+func TestReapBlob_FailedDeleteIsNotMarked(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	channelID := seedAttachmentChannel(t, db, uploader)
+	key := seedBackendMediaFile(t, db, uploader, channelID, "r2-useast")
+
+	failing := &failingDeleter{}
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), stubDeleterResolver{deleter: failing})
+
+	backend := "r2-useast"
+	r.reapBlob(context.Background(), media.BlobRef{Key: key, Backend: &backend})
+
+	assert.Nil(t, reapedAt(t, db, key), "a failed delete must NOT be marked reaped")
+	assert.Equal(t, 1, failing.calls)
+}
+
+// TestReapBlob_NoResolverRefusesARowThatNamesABackend — with no object storage
+// wired at all, a NULL row is safe to mark (nothing to leak) but a row naming a
+// backend is not: "there is nothing to delete" is no longer assertable.
+func TestReapBlob_NoResolverRefusesARowThatNamesABackend(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	channelID := seedAttachmentChannel(t, db, uploader)
+	named := seedBackendMediaFile(t, db, uploader, channelID, "r2-useast")
+	age := stragglerGraceSeconds + 600
+	nullRow := seedMediaFile(t, db, uploader, channelID, &age)
+
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), nil)
+
+	backend := "r2-useast"
+	r.reapBlob(context.Background(), media.BlobRef{Key: named, Backend: &backend})
+	assert.Nil(t, reapedAt(t, db, named), "a row naming a backend must not be marked with no resolver wired")
+
+	r.reapBlob(context.Background(), media.BlobRef{Key: nullRow})
+	assert.NotNil(t, reapedAt(t, db, nullRow), "a NULL row has no blob to leak and must be marked")
 }

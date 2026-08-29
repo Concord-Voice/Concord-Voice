@@ -33,60 +33,91 @@ const (
 // purged. Deletes happen off the request path via a bounded queue drained by
 // StartWorker; SweepStragglers is a periodic safety net for blobs orphaned by a
 // crash between the engine's metadata soft-delete commit and the worker draining.
+//
+// PLACEMENT IS PER OBJECT (ADR-0038 / #2759 unit B2). Every blob the reaper
+// touches carries the backend that holds it, resolved from the
+// media_files.storage_backend column of the SAME ROW the reaper already read —
+// never from a single process-wide client. See reapBlob for what a single-store
+// reaper silently destroys.
 type Reaper struct {
-	db    *sql.DB
-	log   *logger.Logger
-	store media.ObjectDeleter // may be nil (dev / no object store) — reapBlob tolerates it
-	jobs  chan string
+	db  *sql.DB
+	log *logger.Logger
+	// backends resolves a row's storage_backend to the store holding its object.
+	//
+	// A NIL resolver is an explicit statement by the embedder that this process
+	// has NO object storage at all — it is what preserves the old nil-store
+	// behaviour for dev and for tests. It is NOT reachable from cmd/server,
+	// which always constructs a registry, so a production deployment whose
+	// object storage is misconfigured fails closed and stays a retry candidate
+	// rather than quietly marking blobs reaped.
+	backends media.DeleterResolver
+	jobs     chan media.BlobRef
 }
 
 // NewReaper constructs a reaper with a bounded blob-delete queue.
-func NewReaper(db *sql.DB, log *logger.Logger, store media.ObjectDeleter) *Reaper {
+func NewReaper(db *sql.DB, log *logger.Logger, backends media.DeleterResolver) *Reaper {
 	return &Reaper{
-		db:    db,
-		log:   log,
-		store: store,
-		jobs:  make(chan string, blobQueueSize),
+		db:       db,
+		log:      log,
+		backends: backends,
+		jobs:     make(chan media.BlobRef, blobQueueSize),
 	}
 }
 
-// EnqueueBlobDeletes hands storage keys to the background worker. Non-blocking: if
-// the bounded buffer is full, the key is dropped (and logged) rather than stalling
-// the caller — SweepStragglers re-reaps any key the worker never drains.
+// EnqueueBlobDeletes hands blob references to the background worker. Non-blocking:
+// if the bounded buffer is full, the ref is dropped (and logged) rather than
+// stalling the caller — SweepStragglers re-reaps any blob the worker never drains.
 //
-// CONTRACT: callers may only enqueue keys that are unique per upload (today:
+// A ref carries the BACKEND as well as the key. Enqueueing a bare key would leave
+// the worker to guess at placement, and the wrong guess is not a failed delete but
+// a SUCCESSFUL one against the wrong bucket (see reapBlob).
+//
+// CONTRACT: callers may only enqueue refs that are unique per upload (today:
 // `attachments/<fileID>` from the engine's reap CTE). The worker deletes the object
 // unconditionally, WITHOUT the live-key guard reapSweptBlob applies — enqueueing a
 // DETERMINISTIC tier-1 key (`avatars/<userID>`, media.tier1StorageKey) would delete
 // an object a live row may still point at. Route any such key through the sweep.
-func (r *Reaper) EnqueueBlobDeletes(keys []string) {
-	for _, key := range keys {
-		if key == "" {
+func (r *Reaper) EnqueueBlobDeletes(refs []media.BlobRef) {
+	for _, ref := range refs {
+		if ref.Key == "" {
 			continue
 		}
 		select {
-		case r.jobs <- key:
+		case r.jobs <- ref:
 		default:
-			r.log.Warn("purge reaper: blob-delete queue full; dropping key for sweeper recovery", "key", key)
+			r.log.Warn("purge reaper: blob-delete queue full; dropping key for sweeper recovery",
+				"key", ref.Key, "storage_backend", ref.BackendLabel())
 		}
 	}
 }
 
-// StartWorker drains the queue, reaping one blob per key (best-effort, off the
+// StartWorker drains the queue, reaping one blob per ref (best-effort, off the
 // request path). Blocks until ctx is cancelled; run it in a goroutine.
 func (r *Reaper) StartWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case key := <-r.jobs:
-			r.reapBlob(ctx, key)
+		case ref := <-r.jobs:
+			r.reapBlob(ctx, ref)
 		}
 	}
 }
 
-// reapBlob deletes one object and, only on success, marks its media_files row
-// reaped so the sweep stops considering it.
+// reapBlob deletes one object from THE BACKEND ITS ROW NAMES and, only on
+// success, marks that row reaped so the sweep stops considering it.
+//
+// THE FAILURE THIS SHAPE EXISTS TO PREVENT. An S3 DELETE against a key that is
+// absent from the target bucket returns SUCCESS. So resolving the wrong store —
+// or resolving no store and deleting from the one process-wide client anyway —
+// does not fail: it returns nil, markReaped stamps blob_reaped_at, and the row
+// leaves the straggler sweep's candidate set (`blob_reaped_at IS NULL`)
+// PERMANENTLY while the object survives at the vendor. Postgres then records an
+// erasure that never happened on a path that carries account deletions (000059),
+// message purges (000090) and GDPR Article 17 requests, and the only retry
+// signal has been destroyed. An unresolvable backend therefore leaves the row
+// UNMARKED — the same fail-closed shape reapSweptBlob's live-key check already
+// uses, for the same reason: never record what you could not establish.
 //
 // This does NOT use media.CleanupObject, which is the wrong tool for the purge
 // path in two ways. (1) Its metadata UPDATE is guarded on `deleted_at IS NULL`,
@@ -95,21 +126,37 @@ func (r *Reaper) StartWorker(ctx context.Context) {
 // even when DeleteObject failed. Here a failed delete returns WITHOUT marking, so
 // the row stays a sweep candidate and is retried rather than being recorded as a
 // reap that never happened (which would leak the object forever).
-//
-// A nil store is dev/no-object-store: there is no blob to leak, so mark it reaped
-// rather than leaving the sweep to spin on it every tick.
-func (r *Reaper) reapBlob(ctx context.Context, key string) {
-	if r.store != nil {
-		if err := r.store.DeleteObject(ctx, key); err != nil {
-			r.log.Warn("purge reaper: blob delete failed; leaving unmarked for sweep retry",
-				"error", err, "key", key)
+func (r *Reaper) reapBlob(ctx context.Context, ref media.BlobRef) {
+	if r.backends == nil {
+		// No object storage in this process at all (dev / test). There is no
+		// blob to leak for a row that never named a backend, so mark it reaped
+		// rather than leaving the sweep to spin on it every tick. A row that
+		// DOES name one is a different claim entirely — refuse it, because
+		// "there is nothing to delete" is no longer something we can assert.
+		if ref.Backend != nil {
+			r.log.Error("purge reaper: row names a storage backend but no resolver is wired; leaving unmarked for sweep retry",
+				"key", ref.Key, "storage_backend", ref.BackendLabel())
 			return
 		}
+		r.markReaped(ctx, ref)
+		return
 	}
-	r.markReaped(ctx, key)
+
+	store, err := r.backends.ResolveDeleter(ref.Backend)
+	if err != nil {
+		r.log.Error("purge reaper: could not resolve the storage backend for a blob; leaving unmarked for sweep retry",
+			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+		return
+	}
+	if err := store.DeleteObject(ctx, ref.Key); err != nil {
+		r.log.Warn("purge reaper: blob delete failed; leaving unmarked for sweep retry",
+			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+		return
+	}
+	r.markReaped(ctx, ref)
 }
 
-// reapSweptBlob is reapBlob plus the live-key guard, for keys the SWEEP selected.
+// reapSweptBlob is reapBlob plus the live-key guard, for blobs the SWEEP selected.
 //
 // DEFENSE IN DEPTH. The sweep is bounded to media_tier = 2 (see stragglerSweepQuery),
 // where keys are per-upload unique, so no live row can share a swept key today and
@@ -128,30 +175,38 @@ func (r *Reaper) reapBlob(ctx context.Context, key string) {
 // inserting the new one — leaving an old soft-deleted row legitimately sharing
 // `avatars/<userID>` with the new LIVE row. Reaping that key would delete the user's
 // CURRENT avatar, so the sweep must never delete an object a live row still uses.
-func (r *Reaper) reapSweptBlob(ctx context.Context, key string) {
+//
+// The guard is PAIR-KEYED (see liveRowForKeyQuery) because "an object a live row
+// still uses" is a statement about (bucket, key), not about the key alone. A live
+// row on a DIFFERENT backend does not use THIS object, and blocking on it would
+// skip a delete that must happen — a leak in the direction the whole unit exists
+// to close. Pair-keying makes the guard exact in both directions rather than
+// merely conservative in one.
+func (r *Reaper) reapSweptBlob(ctx context.Context, ref media.BlobRef) {
 	var liveExists bool
-	if err := r.db.QueryRowContext(ctx, liveRowForKeyQuery, key).Scan(&liveExists); err != nil {
+	if err := r.db.QueryRowContext(ctx, liveRowForKeyQuery, ref.Key, ref.Backend).Scan(&liveExists); err != nil {
 		// Fail closed: neither delete nor mark, so the next tick retries. Never delete
 		// an object whose live-reference status could not be established.
 		r.log.Warn("purge reaper: live-key check failed; skipping reap for retry",
-			"error", err, "key", key)
+			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
 		return
 	}
 	if liveExists {
 		// The object belongs to a live row now. Mark the soft-deleted row so the sweep
 		// advances past it, but leave the object alone — it is in use.
-		r.markReaped(ctx, key)
+		r.markReaped(ctx, ref)
 		return
 	}
-	r.reapBlob(ctx, key)
+	r.reapBlob(ctx, ref)
 }
 
-// markReaped records that a key needs no further reaping. Best-effort: if the mark
+// markReaped records that a blob needs no further reaping. Best-effort: if the mark
 // does not land, the sweep re-issues an idempotent delete and retries it — a
 // redundant delete, never a leak.
-func (r *Reaper) markReaped(ctx context.Context, key string) {
-	if _, err := r.db.ExecContext(ctx, markBlobReapedQuery, key); err != nil {
-		r.log.Warn("purge reaper: failed to mark blob reaped", "error", err, "key", key)
+func (r *Reaper) markReaped(ctx context.Context, ref media.BlobRef) {
+	if _, err := r.db.ExecContext(ctx, markBlobReapedQuery, ref.Key, ref.Backend); err != nil {
+		r.log.Warn("purge reaper: failed to mark blob reaped",
+			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
 	}
 }
 
@@ -172,6 +227,10 @@ func (r *Reaper) markReaped(ctx context.Context, key string) {
 // purges are also unaffected — they reap through the queue; only this safety net
 // backs up. Upgrade path if it ever bites: a reap_attempts counter ordered
 // (attempts, deleted_at) so repeat failures sink instead of blocking the head.
+//
+// An unresolvable BACKEND now joins that same class: those rows also stay unmarked
+// and are retried every tick, which is the intended trade — a loud, bounded retry
+// loop in exchange for never recording an erasure that did not happen.
 func (r *Reaper) SweepStragglers(ctx context.Context) {
 	ticker := time.NewTicker(stragglerSweepInterval)
 	defer ticker.Stop()
@@ -185,23 +244,25 @@ func (r *Reaper) SweepStragglers(ctx context.Context) {
 	}
 }
 
-// sweepOnce runs a single straggler sweep: collect candidate keys, then reap each.
+// sweepOnce runs a single straggler sweep: collect candidate blobs, then reap each.
 // Best-effort — errors are logged, not returned. Re-reaping an already-deleted blob
 // is an idempotent no-op (DeleteObject is idempotent; the mark is guarded on
 // blob_reaped_at IS NULL).
 func (r *Reaper) sweepOnce(ctx context.Context) {
-	keys, err := r.collectStragglers(ctx)
+	refs, err := r.collectStragglers(ctx)
 	if err != nil {
 		r.log.Warn("purge reaper: straggler sweep failed", "error", err)
 		return
 	}
-	for _, key := range keys {
-		r.reapSweptBlob(ctx, key)
+	for _, ref := range refs {
+		r.reapSweptBlob(ctx, ref)
 	}
 }
 
-// collectStragglers reads the next stride of unreaped straggler storage keys.
-func (r *Reaper) collectStragglers(ctx context.Context) ([]string, error) {
+// collectStragglers reads the next stride of unreaped straggler blobs, each with
+// the backend its row names. The backend comes from the SAME ROW as the key, in
+// the same scan — the sweep never re-queries for placement it already selected.
+func (r *Reaper) collectStragglers(ctx context.Context) ([]media.BlobRef, error) {
 	rows, err := r.db.QueryContext(ctx, stragglerSweepQuery,
 		stragglerGraceSeconds, stragglerSweepLimit)
 	if err != nil {
@@ -209,23 +270,29 @@ func (r *Reaper) collectStragglers(ctx context.Context) ([]string, error) {
 	}
 	defer rows.Close() //nolint:errcheck
 
-	var keys []string
+	var refs []media.BlobRef
 	for rows.Next() {
 		var key string
-		if err := rows.Scan(&key); err != nil {
+		var backend sql.NullString
+		if err := rows.Scan(&key, &backend); err != nil {
 			return nil, fmt.Errorf("purge reaper: straggler scan: %w", err)
 		}
-		keys = append(keys, key)
+		refs = append(refs, media.NewBlobRef(key, backend))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("purge reaper: straggler iteration: %w", err)
 	}
-	return keys, nil
+	return refs, nil
 }
 
-// stragglerSweepQuery selects storage keys of soft-deleted media_files rows whose
-// blob is not yet reaped. $1 grace skips rows the worker is still expected to be
-// draining (do not race it); $2 is the per-tick stride.
+// stragglerSweepQuery selects the storage key AND BACKEND of soft-deleted
+// media_files rows whose blob is not yet reaped. $1 grace skips rows the worker is
+// still expected to be draining (do not race it); $2 is the per-tick stride.
+//
+// storage_backend rides along with storage_key deliberately: it is the placement of
+// the object being reaped, it is already on the row being selected, and reading it
+// here is what lets every downstream statement key on the PAIR without a second
+// query. NULL is the permanent value for every pre-cutover object.
 //
 // There is deliberately NO upper time bound. An earlier revision bounded the
 // look-back to 24h "so the scan stays cheap", which was wrong twice over, because
@@ -263,7 +330,7 @@ func (r *Reaper) collectStragglers(ctx context.Context) ([]string, error) {
 // Do NOT widen this to all tiers to "also clean up old avatars": tier-1 uploads write
 // the object BEFORE inserting the row (media/handlers.go PutObject → insertTier1Record),
 // so a sweep racing a re-upload would delete the live asset's object out from under it.
-const stragglerSweepQuery = `SELECT storage_key FROM media_files
+const stragglerSweepQuery = `SELECT storage_key, storage_backend FROM media_files
 	         WHERE deleted_at IS NOT NULL
 	           AND blob_reaped_at IS NULL
 	           AND media_tier = 2
@@ -279,10 +346,39 @@ const stragglerSweepQuery = `SELECT storage_key FROM media_files
 // being reaped (see reapBlob). Marking that live row would pre-stamp it reaped, and
 // when it is later soft-deleted the sweep would skip it — leaking its object. Only
 // already-soft-deleted rows may ever carry the marker.
+//
+// PAIR-KEYED on (storage_key, storage_backend). The marker asserts "the object this
+// row names is gone from the backend this row names", and one delete can only ever
+// support that claim for rows on the SAME backend. Keying on storage_key alone would
+// let a confirmed MinIO delete stamp a vendor-resident row that nobody touched — the
+// exact silent-erasure defect this unit closes, arriving by a second route.
+//
+// The pair-keying is a NARROWING, so it cannot weaken the `deleted_at IS NOT NULL`
+// property above: it can only ever match fewer rows, never a live one that the old
+// predicate excluded. Rows sharing the key on another backend are left unmarked and
+// stay sweep candidates, which is correct — their objects have not been deleted.
+//
+// `IS NOT DISTINCT FROM` (not `=`) because NULL is the permanent value of every
+// pre-cutover object and `storage_backend = NULL` is never true; the explicit
+// ::text cast removes any dependence on Postgres inferring a bare parameter's type.
 const markBlobReapedQuery = `UPDATE media_files SET blob_reaped_at = NOW()
-	         WHERE storage_key = $1 AND deleted_at IS NOT NULL AND blob_reaped_at IS NULL`
+	         WHERE storage_key = $1
+	           AND storage_backend IS NOT DISTINCT FROM $2::text
+	           AND deleted_at IS NOT NULL
+	           AND blob_reaped_at IS NULL`
 
 // liveRowForKeyQuery reports whether any LIVE (not soft-deleted) media_files row
-// still points at this storage_key — i.e. whether the object is still in use.
+// still points at this OBJECT — i.e. whether it is still in use.
+//
+// PAIR-KEYED for the same reason as markBlobReapedQuery, but note the direction is
+// the opposite one: this predicate BLOCKS a delete, so narrowing it lets more
+// deletes through. That is correct rather than permissive, because an object's
+// identity is (bucket, key): a live row on a different backend points at a
+// different object entirely, and refusing to delete ours on account of it would
+// leak an object the sweep had correctly selected. The property "never delete an
+// object a live row still uses" is preserved exactly — it is stated more precisely.
 const liveRowForKeyQuery = `SELECT EXISTS (
-	         SELECT 1 FROM media_files WHERE storage_key = $1 AND deleted_at IS NULL)`
+	         SELECT 1 FROM media_files
+	          WHERE storage_key = $1
+	            AND storage_backend IS NOT DISTINCT FROM $2::text
+	            AND deleted_at IS NULL)`

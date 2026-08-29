@@ -17,6 +17,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -87,6 +88,16 @@ func validateIdentifiers(s DeleteSpec) error {
 // deleteQueries are fixed per-store templates. PostgreSQL cannot bind table or
 // column identifiers, so validated DeleteSpec fields choose one of these static
 // statements while all runtime values remain parameters.
+//
+// The reap CTE returns storage_backend ALONGSIDE storage_key (ADR-0038 / #2759
+// unit B2): placement is per object, and the reaper must delete each blob from
+// the backend its row names rather than from one process-wide client. The two
+// arrays are aggregated in a SINGLE `reaped` CTE and read from that one row, so
+// they are index-aligned by construction — one Aggregate node consumes one tuple
+// stream, so both array_agg calls see the same rows in the same order. Two
+// separate `(SELECT array_agg(...) FROM reap)` subqueries would pair them only
+// by relying on a materialized CTE being rescanned in insertion order, which is
+// an implementation detail and not something a deletion path should rest on.
 var deleteQueries = map[string]string{
 	"messages": `
 WITH victims AS (
@@ -100,13 +111,19 @@ reap AS (
   UPDATE media_files SET deleted_at = NOW()
   WHERE id IN (SELECT file_id FROM message_attachments WHERE message_id IN (SELECT id FROM victims))
     AND deleted_at IS NULL
-  RETURNING storage_key
+  RETURNING storage_key, storage_backend
 ),
 del AS (
   DELETE FROM messages WHERE id IN (SELECT id FROM victims) RETURNING 1
+),
+reaped AS (
+  SELECT COALESCE(array_agg(storage_key), '{}') AS keys,
+         COALESCE(array_agg(storage_backend), '{}'::text[]) AS backends
+  FROM reap
 )
 SELECT (SELECT count(*) FROM del),
-       COALESCE((SELECT array_agg(storage_key) FROM reap), '{}')`,
+       (SELECT keys FROM reaped),
+       (SELECT backends FROM reaped)`,
 	"dm_messages": `
 WITH victims AS (
   SELECT id FROM dm_messages
@@ -119,13 +136,19 @@ reap AS (
   UPDATE media_files SET deleted_at = NOW()
   WHERE id IN (SELECT file_id FROM dm_message_attachments WHERE message_id IN (SELECT id FROM victims))
     AND deleted_at IS NULL
-  RETURNING storage_key
+  RETURNING storage_key, storage_backend
 ),
 del AS (
   DELETE FROM dm_messages WHERE id IN (SELECT id FROM victims) RETURNING 1
+),
+reaped AS (
+  SELECT COALESCE(array_agg(storage_key), '{}') AS keys,
+         COALESCE(array_agg(storage_backend), '{}'::text[]) AS backends
+  FROM reap
 )
 SELECT (SELECT count(*) FROM del),
-       COALESCE((SELECT array_agg(storage_key) FROM reap), '{}')`,
+       (SELECT keys FROM reaped),
+       (SELECT backends FROM reaped)`,
 }
 
 // Engine runs audit-first -> batched delete -> reap. Store-agnostic.
@@ -241,23 +264,24 @@ func (e *Engine) durableDeletedCount(ctx context.Context, purgeID string, fallba
 	return fallback
 }
 
-// deleteBatched runs the 3-CTE batched delete for one DeleteSpec until fewer than
+// deleteBatched runs the batched delete for one DeleteSpec until fewer than
 // maxBatch rows remain. Each batch is a single round-trip that soft-deletes the
 // victims' media_files, hard-deletes the message rows, and returns both the deleted
-// count and the reaped storage keys; the keys are handed to the background reaper.
+// count and the reaped blobs (key + backend); the blobs are handed to the
+// background reaper.
 func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds DeleteSpec) (int, error) {
 	q := deleteQueries[ds.MessagesTable]
 
 	total := 0
 	for {
-		affected, keys, err := e.deleteBatch(ctx, purgeID, q, p, ds)
+		affected, refs, err := e.deleteBatch(ctx, purgeID, q, p, ds)
 		if err != nil {
 			return total, err
 		}
 
 		// Best-effort, off the request path: the reaper drains these to object
-		// storage; a dropped/undrained key is recovered by the straggler sweeper.
-		e.reaper.EnqueueBlobDeletes(keys)
+		// storage; a dropped/undrained blob is recovered by the straggler sweeper.
+		e.reaper.EnqueueBlobDeletes(refs)
 		total += affected
 
 		if affected < e.maxBatch {
@@ -267,7 +291,7 @@ func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds D
 	return total, nil
 }
 
-func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan, ds DeleteSpec) (int, []string, error) {
+func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("purge: begin batch tx: %w", err)
@@ -280,10 +304,26 @@ func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan,
 
 	var affected int
 	var keys []string
-	// One row: deleted count + reaped storage keys. pq.Array scans the text[] result.
+	// Nullable per element: NULL is the legacy backend and the permanent value of
+	// every pre-cutover object, so this cannot scan into []string.
+	var backends []sql.NullString
+	// One row: deleted count + the reaped keys and their backends. pq.Array scans
+	// the text[] results; the NullString element type routes through pq's
+	// GenericArray, which honours sql.Scanner and therefore NULL elements.
 	if err := tx.QueryRowContext(ctx, query, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch).
-		Scan(&affected, pq.Array(&keys)); err != nil {
+		Scan(&affected, pq.Array(&keys), pq.Array(&backends)); err != nil {
 		return 0, nil, fmt.Errorf("purge: batch delete query: %w", err)
+	}
+	refs, err := blobRefs(keys, backends)
+	if err != nil {
+		// The soft-deletes in this batch are about to commit, so the rows are
+		// already straggler-sweep candidates. Drop the enqueue rather than reap
+		// a mispaired key against the wrong backend: the sweep re-reads both
+		// columns off the same row and recovers them. Loud, because this shape
+		// is not supposed to be reachable.
+		e.log.Error("purge: reaped key/backend arrays disagree; leaving these blobs to the straggler sweep",
+			"error", err, "purge_id", purgeID)
+		refs = nil
 	}
 	if affected > 0 {
 		if _, err := tx.ExecContext(ctx,
@@ -294,7 +334,29 @@ func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan,
 	if err := tx.Commit(); err != nil {
 		return 0, nil, fmt.Errorf("purge: commit batch tx: %w", err)
 	}
-	return affected, keys, nil
+	return affected, refs, nil
+}
+
+// blobRefs pairs the reaped storage keys with their backends.
+//
+// The two arrays come from one Aggregate node over one tuple stream, so they are
+// index-aligned by construction and a length mismatch is structurally impossible.
+// It is still checked, because the failure it would otherwise produce is the exact
+// one this unit exists to close: a key reaped against SOMEBODY ELSE'S backend
+// deletes nothing, returns success, and stamps blob_reaped_at on a row whose object
+// still exists.
+func blobRefs(keys []string, backends []sql.NullString) ([]media.BlobRef, error) {
+	if len(keys) != len(backends) {
+		return nil, fmt.Errorf("purge: reaped %d keys but %d backends", len(keys), len(backends))
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	refs := make([]media.BlobRef, 0, len(keys))
+	for i, key := range keys {
+		refs = append(refs, media.NewBlobRef(key, backends[i]))
+	}
+	return refs, nil
 }
 
 // writeAuditInProgress inserts the in_progress audit row and returns its id.

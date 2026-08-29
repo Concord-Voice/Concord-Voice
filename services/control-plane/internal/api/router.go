@@ -257,6 +257,19 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 type RouterDependencies struct {
 	OpsMetricsReader opsmetrics.Reader
 	PresenceHistory  *presencehistory.Service
+	// MediaStoreResolver resolves a media_files.storage_backend value to the
+	// object store holding that row's object (ADR-0038 / #2759). Typed as the
+	// media consumer interface rather than *storage.Registry so this package
+	// gains no storage import. Nil keeps legacy rows on `store` and fails
+	// closed for any other backend — see media.Handler.storeForRow.
+	MediaStoreResolver media.StoreResolver
+
+	// MediaWriteRouter resolves the object store for a NEW write by the
+	// caller's PURPOSE (ADR-0038 / #2759). Separate from MediaStoreResolver
+	// because a new object has no row to read a column from. Left nil by an
+	// embedder with no registry, in which case every write stays on the single
+	// process-wide store exactly as it did before ADR-0038.
+	MediaWriteRouter media.WriteRouter
 }
 
 // requirePresenceRecheckWired fails startup when the #2445 Rich Presence capture
@@ -501,6 +514,48 @@ func requireStepUpBudgetWired(log *logger.Logger, u *users.Handler) {
 	}
 }
 
+// wireMediaHandler injects the media handler's optional dependencies.
+//
+// Extracted from NewRouter rather than inlined, and the reason is mechanical:
+// each of these is injected through a setter guarded by its own nil check, so
+// the block contributes nested branch points to a function already sitting at
+// the cognitive-complexity ceiling. Adding the ADR-0038 write router put
+// NewRouter over it. Keeping the wiring here means the next optional
+// dependency is a local change instead of one that reds the quality gate.
+func wireMediaHandler(
+	handler *media.Handler,
+	redis *redis.Client,
+	cfg *config.Config,
+	log *logger.Logger,
+	opsCounters *opsmetrics.Counters,
+	dependencies RouterDependencies,
+) {
+	handler.SetOpsCounter(opsCounters)
+	// Backs the chunked attachment upload sessions (#2157 PR 2). Injected
+	// rather than passed to NewHandler so the constructor signature stays
+	// put; every session route answers 503 when this is nil.
+	handler.SetSessionRedis(redis)
+	// Shared-disk occupancy gate for attachment writes (#2759 unit A1).
+	// selfHosted comes from the existing InstanceType seam rather than a
+	// new flag: self-hosted/dev/air-gapped deployments only ever warn,
+	// they never refuse (MinIO is their sole, permanent backend).
+	handler.SetDiskWatermark(media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log))
+	// Per-object backend resolution for the attachment download path
+	// (ADR-0038 / #2759). Left nil by a caller that has no registry, in
+	// which case legacy rows still resolve to the process-wide store and
+	// every other backend fails closed rather than being read from the
+	// wrong bucket.
+	if dependencies.MediaStoreResolver != nil {
+		handler.SetStoreResolver(dependencies.MediaStoreResolver)
+	}
+	// Purpose-based write routing. Tier-1 writes are pinned to the legacy
+	// backend forever; tier-2 attachment writes follow the registry's
+	// current write default, which today IS legacy -- the flip is Wave C.
+	if dependencies.MediaWriteRouter != nil {
+		handler.SetWriteRouter(dependencies.MediaWriteRouter)
+	}
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	db *sql.DB,
@@ -675,7 +730,15 @@ func NewRouter(
 	// Message-purge engine (#1352): batched bulk delete + attachment reaper.
 	// The reaper's worker + straggler sweeper are process-lifetime background
 	// loops, started here like hub.Run above.
-	purgeReaper := purge.NewReaper(db, log, store)
+	//
+	// The reaper resolves each blob's backend per row (ADR-0038 / #2759 unit
+	// B2) rather than deleting everything against one client: an S3 DELETE of a
+	// key absent from the target bucket SUCCEEDS, so a single-store reaper would
+	// stamp blob_reaped_at on a vendor-resident object it never touched and drop
+	// that row out of the straggler sweep permanently. `store` is the fallback
+	// for an embedder with no registry; when MediaStoreResolver is wired the
+	// registry wins and reads and deletes resolve through the identical call.
+	purgeReaper := purge.NewReaper(db, log, media.NewDeleterResolver(dependencies.MediaStoreResolver, store))
 	purgeEngine := purge.NewEngine(db, log, purgeReaper, cfg.PurgeMaxBatch)
 	go purgeReaper.StartWorker(context.Background())
 	go purgeReaper.SweepStragglers(context.Background())
@@ -803,11 +866,7 @@ func NewRouter(
 	var mediaHandler *media.Handler
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
-		mediaHandler.SetOpsCounter(opsCounters)
-		// Backs the chunked attachment upload sessions (#2157 PR 2). Injected
-		// rather than passed to NewHandler so the constructor signature stays
-		// put; every session route answers 503 when this is nil.
-		mediaHandler.SetSessionRedis(redis)
+		wireMediaHandler(mediaHandler, redis, cfg, log, opsCounters, dependencies)
 		usersHandler.SetMediaStore(store)
 		serversHandler.SetMediaStore(store)
 	}

@@ -1380,6 +1380,134 @@ func TestCloudflareKVBridgeConfig_String_RedactsToken(t *testing.T) {
 	assert.Contains(t, output, "REDACTED")
 }
 
+// Cloudflare R2 attachment-bucket config tests (ADR-0038 / #2759).
+//
+// The vendor backend is dormant today — MinIO remains the SaaS write target
+// for attachments/ until the storage_backend registry and write-default flip
+// land — but the config struct is loaded, format-validated, and its String()
+// redaction must already hold, since a later wave promotes these fields to
+// required without another look at this file.
+
+func TestCloudflareR2Config_String_RedactsCredentials(t *testing.T) {
+	cfg := CloudflareR2Config{
+		Endpoint:        "https://abc123.r2.cloudflarestorage.com",
+		Region:          "auto",
+		Bucket:          "concord-attachments",
+		AccessKeyID:     "AKIAEXAMPLER2KEYID",         // #nosec G101 -- test fixture, not a real credential
+		SecretAccessKey: "super-secret-r2-access-key", // #nosec G101 -- test fixture, not a real credential
+	}
+
+	output := cfg.String()
+
+	assert.NotContains(t, output, "AKIAEXAMPLER2KEYID", "access key ID must never leak through String()")
+	assert.NotContains(t, output, "super-secret-r2-access-key", "secret access key must never leak through String()")
+	assert.Contains(t, output, "https://abc123.r2.cloudflarestorage.com", "endpoint is non-secret and should appear for diagnostics")
+	assert.Contains(t, output, "concord-attachments", "bucket is non-secret and should appear for diagnostics")
+	assert.Contains(t, output, "REDACTED")
+}
+
+func TestCloudflareR2Config_String_FormatV_DoesNotLeak(t *testing.T) {
+	cfg := CloudflareR2Config{
+		Endpoint:        "https://abc123.r2.cloudflarestorage.com",
+		AccessKeyID:     "AKIAEXAMPLER2KEYID",         // #nosec G101 -- test fixture, not a real credential
+		SecretAccessKey: "super-secret-r2-access-key", // #nosec G101 -- test fixture, not a real credential
+	}
+
+	// The point of a redacting String() method is that %+v on a Config
+	// containing this struct invokes it rather than printing raw fields.
+	out := fmt.Sprintf("%+v", cfg)
+
+	assert.NotContains(t, out, "AKIAEXAMPLER2KEYID")
+	assert.NotContains(t, out, "super-secret-r2-access-key")
+}
+
+func TestCloudflareR2Config_String_EmptyCredentialsReportZeroBytes(t *testing.T) {
+	// Dormant/unconfigured state: both credential fields are empty strings,
+	// not unset — String() must still render a byte count rather than
+	// panicking or omitting the field.
+	cfg := CloudflareR2Config{}
+
+	output := cfg.String()
+
+	assert.Contains(t, output, "AccessKeyID:[REDACTED 0 bytes]")
+	assert.Contains(t, output, "SecretAccessKey:[REDACTED 0 bytes]")
+}
+
+// TestLoad_CloudflareR2_DefaultsAreDormant pins the dormant-by-default state:
+// with none of the CLOUDFLARE_R2_USEAST_* vars set, Endpoint/Bucket/both
+// credential fields stay empty (the condition validateProduction's HTTPS
+// guard uses to skip the check entirely) and Region falls back to "auto".
+func TestLoad_CloudflareR2_DefaultsAreDormant(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("CLOUDFLARE_R2_USEAST_ENDPOINT", "")
+	t.Setenv("CLOUDFLARE_R2_USEAST_REGION", "")
+	t.Setenv("CLOUDFLARE_R2_USEAST_BUCKET", "")
+	t.Setenv("CLOUDFLARE_R2_USEAST_ID", "")
+	t.Setenv("CLOUDFLARE_R2_USEAST_ID_KEY", "")
+
+	cfg, err := Load()
+
+	require.NoError(t, err)
+	assert.Empty(t, cfg.CloudflareR2.Endpoint)
+	assert.Equal(t, "auto", cfg.CloudflareR2.Region, "REGION defaults to \"auto\" even when dormant")
+	assert.Empty(t, cfg.CloudflareR2.Bucket)
+	assert.Empty(t, cfg.CloudflareR2.AccessKeyID)
+	assert.Empty(t, cfg.CloudflareR2.SecretAccessKey)
+}
+
+func TestLoad_CloudflareR2_ReadsAllFieldsFromEnv(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("CLOUDFLARE_R2_USEAST_ENDPOINT", "https://abc123.r2.cloudflarestorage.com")
+	t.Setenv("CLOUDFLARE_R2_USEAST_REGION", "us-east-1")
+	t.Setenv("CLOUDFLARE_R2_USEAST_BUCKET", "concord-attachments")
+	t.Setenv("CLOUDFLARE_R2_USEAST_ID", "test-r2-access-key-id")
+	t.Setenv("CLOUDFLARE_R2_USEAST_ID_KEY", "test-r2-secret-access-key") // pragma: allowlist secret
+
+	cfg, err := Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, "https://abc123.r2.cloudflarestorage.com", cfg.CloudflareR2.Endpoint)
+	assert.Equal(t, "us-east-1", cfg.CloudflareR2.Region, "an explicit REGION overrides the \"auto\" default")
+	assert.Equal(t, "concord-attachments", cfg.CloudflareR2.Bucket)
+	assert.Equal(t, "test-r2-access-key-id", cfg.CloudflareR2.AccessKeyID)
+	assert.Equal(t, "test-r2-secret-access-key", cfg.CloudflareR2.SecretAccessKey) // pragma: allowlist secret
+}
+
+// TestValidateProductionCloudflareR2Endpoint pins the ADR-0038 TLS-mandatory
+// guard: unlike STORAGE_USE_SSL, there is no escape hatch for this backend.
+// The guard fires ONLY when an endpoint is actually configured — the dormant
+// zero-value state (exercised by validProductionConfig's zero-value
+// CloudflareR2 field) must keep passing production validation unmodified.
+func TestValidateProductionCloudflareR2Endpoint(t *testing.T) {
+	t.Run("dormant (empty endpoint) passes", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.CloudflareR2.Endpoint = ""
+		assert.NoError(t, cfg.validate())
+	})
+
+	t.Run("https endpoint passes", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.CloudflareR2.Endpoint = "https://abc123.r2.cloudflarestorage.com"
+		assert.NoError(t, cfg.validate())
+	})
+
+	t.Run("http endpoint is fatal", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.CloudflareR2.Endpoint = "http://abc123.r2.cloudflarestorage.com"
+		err := cfg.validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "CLOUDFLARE_R2_USEAST_ENDPOINT")
+	})
+
+	t.Run("schemeless endpoint is fatal", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.CloudflareR2.Endpoint = "abc123.r2.cloudflarestorage.com"
+		err := cfg.validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "CLOUDFLARE_R2_USEAST_ENDPOINT")
+	})
+}
+
 // TestStorageConfig_Precedence locks the #1611 STORAGE_* → MINIO_* alias seam:
 // STORAGE_* wins, MINIO_* is the fallback alias, and defaults apply when neither is set.
 func TestStorageConfig_Precedence(t *testing.T) {

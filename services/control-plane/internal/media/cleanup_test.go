@@ -145,3 +145,93 @@ func TestCleanupObjectAlreadyDeletedIsIdempotent(t *testing.T) {
 		CleanupObject(ctx, db, nil, log, storageKey)
 	})
 }
+
+// TestCleanupObjectRefusesNonLegacyBackend is the reason CleanupObject was
+// changed at all (ADR-0038 / #2759), and it had no test.
+//
+// This is the ONE placement decision in the codebase with no resolver behind
+// it: CleanupObject is reached from avatar/banner and server-icon replacement,
+// takes a bare ObjectDeleter, and uses isLegacyBackend as its sole guard. The
+// function's own contract states nothing retries behind it, so deleting from
+// the wrong bucket is unrecoverable — and an S3 DELETE of a key absent from the
+// target bucket returns SUCCESS, which would then soft-delete the row and
+// record an erasure that never happened.
+//
+// Both assertions are load-bearing: the object must not be deleted AND the row
+// must not be marked. Asserting only one leaves the other free to regress.
+func TestCleanupObjectRefusesNonLegacyBackend(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	log := logger.New("test")
+	ctx := context.Background()
+	storageKey := "test-media/" + uuid.New().String()
+
+	userID := uuid.New().String()
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		 VALUES ($1, $2, $3, 'hash', true, true)`,
+		userID, userID+"@test.concord.chat", "cleanupnl"+userID[:8],
+	)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, storage_backend)
+		 VALUES (gen_random_uuid(), $1, 'photo', 1, 'image/jpeg', 1024, $2, 'r2-useast')`,
+		userID, storageKey,
+	)
+	require.NoError(t, err)
+
+	store := &errDeleter{err: nil}
+	CleanupObject(ctx, db, store, log, storageKey)
+
+	assert.False(t, store.called,
+		"a vendor-resident object must NOT be deleted from the legacy store")
+
+	var deletedAt *time.Time
+	err = db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM media_files WHERE storage_key = $1`, storageKey).Scan(&deletedAt)
+	require.NoError(t, err)
+	assert.Nil(t, deletedAt,
+		"refusing to delete must also refuse to record the erasure")
+}
+
+// TestCleanupObjectProceedsForLegacyBackend is the positive control for the
+// test above: it proves the same seeding path CAN reach the delete-and-mark
+// outcome, so a "did not delete" assertion means the guard fired rather than
+// the fixture never getting that far.
+func TestCleanupObjectProceedsForLegacyBackend(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	log := logger.New("test")
+	ctx := context.Background()
+	storageKey := "test-media/" + uuid.New().String()
+
+	userID := uuid.New().String()
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		 VALUES ($1, $2, $3, 'hash', true, true)`,
+		userID, userID+"@test.concord.chat", "cleanuplg"+userID[:8],
+	)
+	require.NoError(t, err)
+
+	// storage_backend deliberately left NULL — the permanent legacy spelling.
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
+		 VALUES (gen_random_uuid(), $1, 'photo', 1, 'image/jpeg', 1024, $2)`,
+		userID, storageKey,
+	)
+	require.NoError(t, err)
+
+	store := &errDeleter{err: nil}
+	CleanupObject(ctx, db, store, log, storageKey)
+
+	assert.True(t, store.called, "a NULL-backend object is legacy and must be deleted")
+
+	var deletedAt *time.Time
+	err = db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM media_files WHERE storage_key = $1`, storageKey).Scan(&deletedAt)
+	require.NoError(t, err)
+	assert.NotNil(t, deletedAt)
+}

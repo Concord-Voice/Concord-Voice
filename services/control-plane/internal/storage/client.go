@@ -98,7 +98,14 @@ func s3Options(cfg *config.Config) *minio.Options {
 	}
 }
 
-// newS3Client builds the single S3-compatible (minio-go) client and ensures the bucket.
+// newS3Client builds the LEGACY S3-compatible (minio-go) client and ensures the bucket.
+//
+// It is no longer the only construction site: newVendorClient in registry.go
+// builds the non-legacy backends (ADR-0038 / #2759). That one deliberately
+// does NOT call ensureBucket — the bucket-scoped vendor credential cannot
+// create a bucket, and a boot-time round trip to a vendor would couple the
+// whole control plane's startup to that vendor's availability. Read its doc
+// comment before adding anything network-shaped to this constructor.
 func newS3Client(cfg *config.Config, log *logger.Logger) (*Client, error) {
 	// NewCore rather than New: Core embeds *Client (minio-go core.go:29-31), so
 	// every existing method here is promoted and compiles unchanged, while the
