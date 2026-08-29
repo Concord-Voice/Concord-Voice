@@ -24,6 +24,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
 
@@ -71,8 +72,8 @@ func deliverableActivePlanRail() *activepresence.Rail {
 		activepresence.NewReconciler(nil, nil, nil, nil, inertActiveDeliverer{}, nil), nil)
 }
 
-// fullyWiredErasureService is the erasure consumer with all THREE of its arms
-// attached. It is a builder rather than three inline calls because the unwire
+// fullyWiredErasureService is the erasure consumer with all FOUR of its arms
+// attached. It is a builder rather than four inline calls because the unwire
 // table below drops one arm at a time, and a case that dropped an arm from a
 // service missing another would prove nothing about the arm it names.
 func fullyWiredErasureService() *users.AccountService {
@@ -80,6 +81,7 @@ func fullyWiredErasureService() *users.AccountService {
 	service.SetGraphPresenceCapture(nopCapture{})
 	service.SetNATS(&natsclient.Client{})
 	service.SetActivePlanRail(deliverableActivePlanRail())
+	service.SetAudienceFence(websocket.NewHub(nil, nil))
 	return service
 }
 
@@ -160,6 +162,18 @@ func TestGraphPresenceGuardDetectsEachUnwiredConsumer(t *testing.T) {
 			fresh := &users.AccountService{}
 			fresh.SetGraphPresenceCapture(nopCapture{})
 			fresh.SetNATS(&natsclient.Client{})
+			fresh.SetAudienceFence(websocket.NewHub(nil, nil))
+			c.erasure = fresh
+		},
+		// #2992. Unwired, the erasure still runs and still dispatches its
+		// post-commit signal -- so this arm DEGRADES rather than breaking, unlike
+		// the drain above. What is lost is the ordering: the signal is bounded by
+		// dispatchQueueDepth times dispatchTimeout rather than by the write, which
+		// is precisely the residual #2992 exists to close. Silent, which is why it
+		// is guarded rather than warned about.
+		"erasure audience fence": func(c *graphPresenceConsumers) {
+			fresh := fullyWiredErasureService()
+			fresh.SetAudienceFence(nil)
 			c.erasure = fresh
 		},
 	}

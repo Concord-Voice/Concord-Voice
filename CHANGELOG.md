@@ -19,6 +19,7 @@ Invite links now arrive, open, and leave the server where you can see it. The GI
 
 ### Security
 
+- **Someone who has just lost access can no longer be shown that you are online** ([#3010](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3010)) — working out who is allowed to see your online status takes several trips to the database, and that answer could be worked out just before someone's access was taken away and then delivered just after it had gone. Blocking someone, removing a friend, leaving or being removed from a server, having a server deleted around you, and deleting your account were all affected. The answer is now discarded and worked out again whenever access was being changed while it was being calculated.
 - **Screen-capture protection no longer reports itself as on where it cannot be enforced** ([#2990](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2990)) — the setting can only be enforced on macOS and Windows. Elsewhere it was accepted, saved, and reported back as active while nothing was actually stopping a capture. It now answers honestly on every platform. A saved preference that cannot be read — a damaged or unreadable settings file, rather than one that was never written — is now treated as off and reported as such, instead of being quietly assumed.
 
 ## [0.2.41] — 2026-08-27

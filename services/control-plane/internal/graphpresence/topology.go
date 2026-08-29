@@ -105,22 +105,68 @@ func (r *Reconciler) WithGatedTx(
 		// saturate the stripe array.
 		return err
 	}
+	// #2992 family scoping. PolicyFor is the boot-guarded registry that already
+	// draws exactly this line, so there is no new axis and no hand-written list
+	// to drift out of sync: the additive families cannot remove a viewer from an
+	// audience, and bracketing them would suppress presence for the
+	// highest-volume graph traffic in exchange for nothing.
+	//
+	// FAIL CLOSED on a lookup error — bracket it. An unregistered family is
+	// unreachable in production (the UnregisteredFamilies boot guard), so the
+	// conservative branch costs nothing and cannot become the one that leaks.
+	//
+	// Resolved HERE rather than in runInTx because runInTx receives no Subject,
+	// and both call sites below pass the same value, so the choke-point property
+	// is preserved.
+	var fence func() func()
+	if r.disconnector != nil {
+		if policy, policyErr := presencecapture.PolicyFor(subject.Family); policyErr != nil ||
+			policy.CanRevokeVisibility {
+			fence = r.disconnector.BeginAudienceRevocation
+		}
+	}
+
 	if r.rail == nil || len(focal) == 0 {
 		// Unwired replica, or a subject with no focal sender. Both are the
 		// pre-PR-2 behaviour: a plain transaction with no gate held.
-		return r.runInTx(ctx, work)
+		return r.runInTx(ctx, fence, work)
 	}
 	return r.rail.WithSenders(ctx, focal, func() error {
-		return r.runInTx(ctx, work)
+		return r.runInTx(ctx, fence, work)
 	})
 }
 
 // runInTx opens the transaction and guarantees it is discarded unless work's
 // terminal already committed it. sql.ErrTxDone is the NORMAL successful path
 // here, because Complete owns the commit.
-func (r *Reconciler) runInTx(ctx context.Context, work func(tx *sql.Tx) error) (err error) {
+//
+// fence, when non-nil, brackets the whole transaction (#2992). Two positional
+// properties are load-bearing and both are easy to break silently:
+//
+//  1. It is acquired BEFORE BeginTx. A bracket taken after the transaction
+//     opens cannot order an audience query that started in between — which is
+//     the entire defect being closed.
+//  2. Its defer is registered BEFORE the rollback defer, so LIFO runs the
+//     closer LAST, after the transaction has actually resolved. Register it
+//     after and the fence drops while the transaction is still live.
+//
+// It lives here rather than around rail.WithSenders deliberately: the gate wait
+// is a Go channel with no timeout, and holding the fence across it would black
+// out presence for the duration of gate contention rather than for the
+// transaction. It is also outside both capture savepoints, so neither a
+// ROLLBACK TO SAVEPOINT nor a FailConservativeDegrade can undo it — an
+// in-memory atomic is not transactional, which here is the fail-closed
+// direction.
+func (r *Reconciler) runInTx(
+	ctx context.Context, fence func() func(), work func(tx *sql.Tx) error,
+) (err error) {
 	if r.db == nil {
 		return errors.New("graphpresence: WithGatedTx requires a database")
+	}
+	if fence != nil {
+		// Evaluates fence() now — taking the bracket — and defers the closer it
+		// returns. One line, correct ordering, and it survives a panic.
+		defer fence()()
 	}
 	tx, beginErr := r.db.BeginTx(ctx, nil)
 	if beginErr != nil {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -4147,7 +4148,7 @@ func TestPresenceAudienceSuppressionIsCounted(t *testing.T) {
 		result := presenceAudienceResult{
 			userID: user, status: statusOnline, generation: 1,
 			audience:   map[uuid.UUID]bool{uuid.New(): true},
-			authzEpoch: hub.presenceAuthzEpoch.Load(),
+			authzState: hub.presenceAuthzState.Load(),
 			computedAt: time.Now(),
 			attempt:    uint8(presenceAudienceMaxAttempts),
 		}
@@ -4352,32 +4353,85 @@ func TestPresenceFrontierDropsDeltaDispatchedBeforeRegistration(t *testing.T) {
 //     rail dispatch that follows it. The test issues the signal EXPLICITLY rather than
 //     driving a handler, so it locks the FENCE, not the wiring —
 //     TestDisconnectRichPresenceClientsInvalidatesAudiences locks the wiring.
-//   - "revoked without signal" — the RESIDUAL, asserted as a leak on purpose. An apply
-//     that beats the post-commit bump still delivers. Pinning it means the day someone
-//     closes it properly, this arm fails and forces the residual to be re-read rather
-//     than silently outliving its own documentation.
+//   - "revoked before the audience read" — the case a bare epoch CANNOT catch, and
+//     the arm this test exists for since #2992. The revoking transaction opens
+//     BEFORE the worker reads the fence, so its epoch bump is already folded into
+//     what the worker stored; only the in-flight open count can see it. Under the
+//     pre-#2992 fence this arm LEAKED, and it was pinned here as a documented
+//     residual for exactly that reason.
+//   - "revoked and committed before the query" — the positive control for the two
+//     above. The viewer must never be in the computed audience at all, so a fence
+//     that is simply stuck ON cannot satisfy this suite by suppressing everything.
 func TestRevokedViewerDoesNotReceivePresenceAfterAudienceComputation(t *testing.T) {
-	t.Run("control/authorized, no signal", func(t *testing.T) {
-		assert.Equal(t, []string{statusOnline}, revokedViewerCase(t, false, false),
+	t.Run("control/authorized, no revocation", func(t *testing.T) {
+		frames, inAudience := fencedRevocationCase(t, revokeNever)
+		require.True(t, inAudience, "control: the viewer must be in the computed audience")
+		assert.Equal(t, []string{statusOnline}, frames,
 			"CONTROL: with authorization intact this construction MUST deliver exactly "+
-				"one frame — if it does not, neither arm below proves anything")
+				"one frame — if it does not, no arm below proves anything")
 	})
-	t.Run("revoked with signal", func(t *testing.T) {
-		assert.Empty(t, revokedViewerCase(t, true, true),
-			"a viewer whose authorization was revoked between audience computation and "+
-				"enqueue must receive no presence frame for that sender (#2992, CWE-367)")
+
+	t.Run("revoked before the audience read", func(t *testing.T) {
+		frames, inAudience := fencedRevocationCase(t, revokeBeforeRead)
+		require.True(t, inAudience,
+			"positive control: the viewer must be IN the computed audience — the "+
+				"revoking transaction is still uncommitted while the query runs, so "+
+				"the query MUST still see the friendship, or this arm is measuring "+
+				"a missing row rather than the fence")
+		assert.Empty(t, frames,
+			"a revoking transaction that was already in flight when the worker read "+
+				"the fence makes the audience unproven, independent of when its "+
+				"post-commit dispatch lands (#2992, CWE-367). This arm is RED without "+
+				"the open-count half of presenceAuthzState")
 	})
-	t.Run("residual/revoked before the signal lands", func(t *testing.T) {
-		assert.Equal(t, []string{statusOnline}, revokedViewerCase(t, true, false),
-			"DOCUMENTED RESIDUAL, not an aspiration: the revoking write commits and only "+
-				"then dispatches, so an apply that beats the bump still delivers. If this "+
-				"arm ever goes empty the residual has been closed — update the scope note "+
-				"on InvalidatePresenceAudiences and #2992 rather than deleting this arm")
+
+	t.Run("revoked during the query", func(t *testing.T) {
+		frames, inAudience := fencedRevocationCase(t, revokeDuringQuery)
+		require.True(t, inAudience, "positive control: the viewer must be in the audience")
+		assert.Empty(t, frames,
+			"a revocation opening DURING the query bumps the epoch after the worker "+
+				"read it, so the epoch half catches this one (shipped in #2975)")
+	})
+
+	t.Run("revoked and committed before the query", func(t *testing.T) {
+		frames, inAudience := fencedRevocationCase(t, revokeBeforeQuery)
+		require.False(t, inAudience,
+			"the revocation committed before the query ran, so the viewer must never "+
+				"have been in the audience — if this is true the arm proves nothing "+
+				"about the fence")
+		assert.Empty(t, frames)
 	})
 }
 
-// revokedViewerCase returns the statuses delivered to the viewer for the sender.
-func revokedViewerCase(t *testing.T, revoke, signal bool) []string {
+// revocationTiming says WHEN the revoking transaction opens relative to the
+// audience query. This is the axis the fence orders, and the axis the previous
+// helper could not vary: it revoked with a bare autocommit Exec AFTER the result
+// was already drained, which touches no fence at all. Four arms that vary only
+// WHETHER a revocation and a signal happened can all be green while the ordering
+// they depend on is broken — see section 13.3.2 of the #1654 design.
+type revocationTiming int
+
+const (
+	revokeNever revocationTiming = iota
+	// revokeBeforeRead opens the transaction before broadcastPresenceToAll and
+	// commits it before apply. o < t_r: the open-count arm.
+	revokeBeforeRead
+	// revokeDuringQuery opens and commits inside the computer seam. o > t_r:
+	// the epoch arm.
+	revokeDuringQuery
+	// revokeBeforeQuery opens AND commits before the query runs at all. Nothing
+	// to prove — the audience is computed against the post-revocation graph.
+	revokeBeforeQuery
+)
+
+// fencedRevocationCase drives a REAL bracketed revoking transaction positioned
+// per timing, and returns the statuses delivered to the viewer plus whether the
+// viewer was in the computed audience.
+//
+// The bracket is taken directly rather than by driving a handler, matching this
+// file's existing division of labour: these arms lock the FENCE, and
+// TestDisconnectRichPresenceClientsInvalidatesAudiences locks the wiring.
+func fencedRevocationCase(t *testing.T, timing revocationTiming) ([]string, bool) {
 	t.Helper()
 	hub, db := setupCustomTextHub(t)
 	senderID := insertCTUser(t, db, "revoked_sender")
@@ -4395,7 +4449,81 @@ func revokedViewerCase(t *testing.T, revoke, signal bool) []string {
 		<-viewer.Send
 	}
 
-	// Dispatch: the audience is computed off Run against the CURRENT graph.
+	// revoke runs one bracketed transaction to completion: the bracket opens
+	// BEFORE BeginTx and closes after the terminal, exactly as runInTx does it.
+	//
+	// It returns its error rather than asserting, because the revokeDuringQuery
+	// arm calls it from INSIDE the computer seam -- which runs on a spawned
+	// goroutine. require.* there calls t.FailNow(), i.e. runtime.Goexit() off the
+	// test goroutine, which crashes the binary with a stack dump instead of
+	// failing the assertion. (Observed while falsifying this very test: the
+	// mutant "failed", but for that reason rather than the one under test, which
+	// would have made the falsification worthless.)
+	revoke := func() error {
+		closer := hub.BeginAudienceRevocation()
+		defer closer()
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			DELETE FROM friendships
+			WHERE (requester_id = $1 AND addressee_id = $2)
+			   OR (requester_id = $2 AND addressee_id = $1)
+		`, senderID, viewerID); err != nil {
+			return errors.Join(err, tx.Rollback())
+		}
+		return tx.Commit()
+	}
+
+	// openHeld opens the bracket and the transaction, deletes, and returns a
+	// finish func that commits and releases. Splitting them is what lets the
+	// transaction be IN FLIGHT while the worker reads the fence and runs its
+	// query -- the whole point of the revokeBeforeRead arm.
+	openHeld := func() func() {
+		closer := hub.BeginAudienceRevocation()
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		_, err = tx.Exec(`
+			DELETE FROM friendships
+			WHERE (requester_id = $1 AND addressee_id = $2)
+			   OR (requester_id = $2 AND addressee_id = $1)
+		`, senderID, viewerID)
+		require.NoError(t, err)
+		return func() {
+			require.NoError(t, tx.Commit())
+			closer()
+		}
+	}
+
+	// seamErr carries any failure from the in-seam revocation back to the test
+	// goroutine, where it can be asserted legally.
+	var seamErr error
+	var finish func()
+	switch timing {
+	case revokeBeforeQuery:
+		require.NoError(t, revoke())
+	case revokeBeforeRead:
+		finish = openHeld()
+	case revokeDuringQuery:
+		// Inside the computer seam: genuinely concurrent with the query, which is
+		// the only place a revocation can open AFTER the worker read the fence but
+		// BEFORE the result exists.
+		//
+		// sync.Once because an unproven result RE-DISPATCHES, so the seam runs
+		// again on every retry. Revoking once per attempt would open a second
+		// bracket against an already-deleted row and make the arm measure retry
+		// behaviour rather than ordering.
+		var once sync.Once
+		hub.presenceAudienceComputer = func(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]bool, error) {
+			audience, err := presence.ComputePresenceAudience(ctx, db, userID)
+			once.Do(func() { seamErr = revoke() })
+			return audience, err
+		}
+	case revokeNever:
+	}
+
+	// Dispatch: the audience is computed off Run.
 	hub.broadcastPresenceToAll(senderID, statusOnline, 1)
 
 	var result presenceAudienceResult
@@ -4404,22 +4532,12 @@ func revokedViewerCase(t *testing.T, revoke, signal bool) []string {
 	case <-time.After(5 * time.Second):
 		t.Fatal("audience computation did not complete")
 	}
+	require.NoError(t, seamErr, "the in-seam revocation must succeed or the case proves nothing")
 	require.NoError(t, result.err, "the audience query must succeed or the case proves nothing")
-	require.True(t, result.audience[viewerID],
-		"positive control: the viewer must be IN the computed audience, otherwise the "+
-			"revocation below is not what suppresses the frame")
+	inAudience := result.audience[viewerID]
 
-	// THE WINDOW.
-	if revoke {
-		_, err := db.Exec(`
-			DELETE FROM friendships
-			WHERE (requester_id = $1 AND addressee_id = $2)
-			   OR (requester_id = $2 AND addressee_id = $1)
-		`, senderID, viewerID)
-		require.NoError(t, err)
-	}
-	if signal {
-		hub.InvalidatePresenceAudiences()
+	if finish != nil {
+		finish()
 	}
 
 	hub.applyPresenceAudience(result)
@@ -4435,7 +4553,7 @@ func revokedViewerCase(t *testing.T, revoke, signal bool) []string {
 			delivered = append(delivered, presenceFrameStatus(t, frame))
 		}
 	}
-	return delivered
+	return delivered, inAudience
 }
 
 // TestDisconnectRichPresenceClientsInvalidatesAudiences locks the WIRING that the
@@ -4445,20 +4563,20 @@ func revokedViewerCase(t *testing.T, revoke, signal bool) []string {
 // test above still green, because they signal explicitly.
 func TestDisconnectRichPresenceClientsInvalidatesAudiences(t *testing.T) {
 	hub := NewHub(nil, nil)
-	before := hub.presenceAuthzEpoch.Load()
+	before := hub.presenceAuthzState.Load() >> presenceAuthzEpochShift
 	require.NoError(t, hub.DisconnectRichPresenceClients(context.Background(),
 		map[uuid.UUID]bool{uuid.New(): true}))
-	assert.Greater(t, hub.presenceAuthzEpoch.Load(), before,
+	assert.Greater(t, hub.presenceAuthzState.Load()>>presenceAuthzEpochShift, before,
 		"a committed revocation reaching the hub must invalidate in-flight audiences")
 
 	// It must fire even when the recipient set contains nobody connected: the
 	// audiences being invalidated belong to OTHER users, and gating the bump on
 	// there being someone to disconnect would silence it in exactly the case where
 	// the revoked viewer has already gone away.
-	empty := hub.presenceAuthzEpoch.Load()
+	empty := hub.presenceAuthzState.Load() >> presenceAuthzEpochShift
 	require.NoError(t, hub.DisconnectRichPresenceClients(context.Background(),
 		map[uuid.UUID]bool{}))
-	assert.Greater(t, hub.presenceAuthzEpoch.Load(), empty,
+	assert.Greater(t, hub.presenceAuthzState.Load()>>presenceAuthzEpochShift, empty,
 		"an empty recipient set still means a revocation committed")
 
 	// The ESCALATION arm is a SEPARATE hub method and was missed by the first
@@ -4467,9 +4585,9 @@ func TestDisconnectRichPresenceClientsInvalidatesAudiences(t *testing.T) {
 	// invisible to the fence while the targeted path was covered. Gitar caught it
 	// on PR #2975. Asserted here rather than in its own test so the two
 	// observation points cannot drift apart unnoticed.
-	esc := hub.presenceAuthzEpoch.Load()
+	esc := hub.presenceAuthzState.Load() >> presenceAuthzEpochShift
 	require.NoError(t, hub.DisconnectAllRichPresenceClients(context.Background()))
-	assert.Greater(t, hub.presenceAuthzEpoch.Load(), esc,
+	assert.Greater(t, hub.presenceAuthzState.Load()>>presenceAuthzEpochShift, esc,
 		"the escalation disconnect fires when the audience is UNKNOWN, so an in-flight "+
 			"audience is even less trustworthy here than on the targeted path")
 }
@@ -4561,7 +4679,7 @@ func TestPresenceAudienceWithNoComputedAtSkipsOnlyTheHandoffArm(t *testing.T) {
 	fresh := presenceAudienceResult{
 		userID:     uuid.New(),
 		audience:   map[uuid.UUID]bool{uuid.New(): true},
-		authzEpoch: hub.presenceAuthzEpoch.Load(),
+		authzState: hub.presenceAuthzState.Load(),
 		computedAt: time.Now(),
 	}
 	assert.False(t, hub.presenceAudienceUnproven(fresh),

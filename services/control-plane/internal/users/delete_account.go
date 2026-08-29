@@ -13,6 +13,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/google/uuid"
@@ -90,6 +91,18 @@ type AccountService struct {
 	// 23503 -- which is why the boot guard refuses to start without it.
 	activePlans ActivePlanDrain
 
+	// audienceFence brackets the erasure transaction so an in-flight presence
+	// audience computed against the pre-erasure graph cannot be delivered
+	// (#2992). nil means unwired: the erasure still runs and still dispatches
+	// its post-commit signal, but that signal is bounded by dispatchQueueDepth
+	// times dispatchTimeout rather than ordered against the write. The boot
+	// guard in router.go refuses to start unwired.
+	//
+	// This path cannot use graphpresence's choke point: it already holds the
+	// same sender-gate stripe (see the comment on the erasure capture below) and
+	// re-entering WithGatedTx would self-deadlock.
+	audienceFence *websocket.Hub
+
 	// nats fans the erasure clear out to every replica (#2447). The Hub closes
 	// only LOCAL clients, so without this a viewer on another replica keeps the
 	// erased principal's Custom Status indefinitely -- it carries no TTL and is
@@ -115,6 +128,18 @@ func (s *AccountService) SetActivitySettingsCleanupHandler(handler *Handler) {
 // SetChannelDeletedBroadcaster binds the post-commit incomplete-channel event.
 func (s *AccountService) SetChannelDeletedBroadcaster(broadcaster ChannelDeletedBroadcaster) {
 	s.channelDeleted = broadcaster
+}
+
+// SetAudienceFence binds the presence-audience revocation fence (#2992).
+func (s *AccountService) SetAudienceFence(hub *websocket.Hub) {
+	s.audienceFence = hub
+}
+
+// AudienceFenceWired reports whether the fence is bound, so the router's boot
+// guard can interrogate the service itself rather than trusting that the setter
+// call in buildPrivacyHandler still exists.
+func (s *AccountService) AudienceFenceWired() bool {
+	return s != nil && s.audienceFence != nil
 }
 
 // DeleteAccount first resumes any durable activity-policy cleanup while holding
@@ -172,6 +197,18 @@ func (s *AccountService) DeleteAccount(
 }
 
 func (s *AccountService) deleteAccount(ctx context.Context, userID string) error {
+	// #2992: bracket the whole transaction. The erasure cascades both friendships
+	// and server_members, so it revokes presence-audience membership for every
+	// surviving viewer. Complete's dispatch below is post-commit and cannot order
+	// an audience apply that beats it; this can.
+	//
+	// One statement, no branch: BeginAudienceRevocation guards its own nil
+	// receiver and s.audienceFence is a concrete *websocket.Hub, so the method
+	// call is legal on a nil pointer and yields an inert closer.
+	//
+	// The defer is function-scoped, so the bracket outlives the transaction and
+	// also covers Complete's post-commit dispatch. Deliberate; do not narrow it.
+	defer s.audienceFence.BeginAudienceRevocation()()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("delete account: begin tx: %w", err)

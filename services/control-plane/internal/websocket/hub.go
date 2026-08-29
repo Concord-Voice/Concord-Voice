@@ -103,6 +103,29 @@ const (
 	// the window unbounded, which is precisely the widening this change
 	// introduced and #2992 is scoped to remove.
 	presenceAudienceMaxHandoff = 250 * time.Millisecond
+
+	// presenceAuthzEpochShift and presenceAuthzOpenMask split presenceAuthzState
+	// into its two halves. 32 bits of in-flight count is absurdly generous — the
+	// real ceiling is the database connection pool — and 32 bits of epoch wraps
+	// only after 4e9 revocations, where a wrap is benign because the predicate
+	// tests INEQUALITY rather than ordering.
+	presenceAuthzEpochShift = 32
+	presenceAuthzOpenMask   = uint64(1)<<presenceAuthzEpochShift - 1
+
+	// presenceAuthzWatchdogInterval and presenceAuthzWatchdogEpisodes bound how
+	// long a continuously-raised fence can go unreported. While openCount is
+	// non-zero EVERY audience in the process is unprovable, so a bracket that
+	// never closes is a hub-wide presence blackout that self-heals never — and
+	// an operator cannot otherwise tell it apart from a database fault, because
+	// presence_audience_suppressed_total is deliberately scalar with no reason
+	// dimension (observability.md principle 7).
+	//
+	// Two minutes is far longer than any honest revoking transaction and short
+	// enough to page on. The report is LOG-ONLY by construction: see
+	// watchPresenceAuthzLevel for why a watchdog that RESET the count would be
+	// strictly worse than none.
+	presenceAuthzWatchdogInterval = 30 * time.Second
+	presenceAuthzWatchdogEpisodes = 4
 )
 
 // errPresenceHubStopping is returned when a queued audience worker abandons its
@@ -217,10 +240,26 @@ type Hub struct {
 	presenceInFlight        map[uuid.UUID]struct{}
 	presenceAudienceResults chan presenceAudienceResult
 
-	// presenceAuthzEpoch is bumped whenever the hub observes an event that can
-	// revoke presence-audience membership. Atomic rather than Run-owned: the
-	// bump arrives on a caller's goroutine and the read happens on a worker's.
-	presenceAuthzEpoch    atomic.Uint64
+	// presenceAuthzState packs two fields that MUST be read atomically together:
+	//
+	//   epoch     = state >> presenceAuthzEpochShift   monotonic; wraps benignly
+	//   openCount = state & presenceAuthzOpenMask      revoking txs in flight
+	//
+	// Atomic rather than Run-owned: the writes arrive on callers' goroutines and
+	// the read happens on a worker's.
+	//
+	// The epoch alone is EDGE-triggered — it answers "did a revocation happen",
+	// which cannot catch one that opened BEFORE the worker read, because by then
+	// that bump is already folded into the value the worker stored. That is the
+	// common case, not a corner: a gated revoking transaction routinely outlasts
+	// a three-round-trip audience query that holds no snapshot. openCount is
+	// LEVEL-triggered and answers "was one in flight when I looked" (#2992).
+	//
+	// One word, not two atomics. Two would require an unwritten, compiler-
+	// unenforced ordering convention — the writer must raise open before epoch,
+	// the reader must load epoch before open — and reversing either lets a
+	// revocation slip past both checks with no test necessarily failing.
+	presenceAuthzState    atomic.Uint64
 	presenceAudienceSlots chan struct{}
 	// Joined by shutdownClients so hub-owned database work cannot outlive
 	// Shutdown and hold pool connections while cmd/server closes the database.
@@ -668,6 +707,9 @@ func (h *Hub) startPendingRichPresenceSuppressions() {
 // Run starts the hub's main loop
 func (h *Hub) Run() {
 	defer close(h.stopped)
+	// Log-only, exits on h.done. Started here rather than in NewHub so a
+	// struct-literal test hub never spawns one (#2992).
+	go h.watchPresenceAuthzLevel()
 	for {
 		// nil channel is never selected; active only when a debounce timer is pending
 		var onlineCountC <-chan time.Time
@@ -3247,6 +3289,32 @@ func (h *Hub) IsUserOnline(userID uuid.UUID) bool {
 	return len(h.userClients[userID]) > 0
 }
 
+// PresenceAuthzStateForTest exposes the packed fence word so wiring locks in
+// other packages can assert on both halves. Test-only: production code moves
+// this value ONLY through InvalidatePresenceAudiences and
+// BeginAudienceRevocation, which are the two operations that keep the halves
+// coherent.
+func (h *Hub) PresenceAuthzStateForTest() uint64 {
+	return h.presenceAuthzState.Load()
+}
+
+// PresenceAuthzEpochForTest and PresenceAuthzOpenForTest decode the two halves
+// for assertions in other packages. They exist so no test outside this package
+// has to duplicate the shift/mask, which is this package's private business: a
+// duplicated copy does NOT fail loudly if the layout moves. Widen the shift to
+// 40 and a stale `>>32` copy still sees the epoch half grow and still reads a
+// balanced bracket's low half as zero -- it goes on passing while describing a
+// layout that no longer exists.
+func (h *Hub) PresenceAuthzEpochForTest() uint64 {
+	return h.presenceAuthzState.Load() >> presenceAuthzEpochShift
+}
+
+// PresenceAuthzOpenForTest returns the open-revocation count half. See
+// PresenceAuthzEpochForTest for why these are exported rather than duplicated.
+func (h *Hub) PresenceAuthzOpenForTest() uint64 {
+	return h.presenceAuthzState.Load() & presenceAuthzOpenMask
+}
+
 // MarkUserOnlineForTest registers a synthetic client so unit/integration
 // tests in OTHER packages (e.g. internal/dm) can make a user appear online
 // to IsUserOnline without a real WS upgrade. Test-only; not used in prod.
@@ -4282,11 +4350,20 @@ type presenceAudienceResult struct {
 	audience map[uuid.UUID]bool
 	err      error
 
-	// authzEpoch is h.presenceAuthzEpoch as it stood when the audience query
-	// RETURNED. A revocation the hub observes after that point advances the
-	// counter, so a mismatch at apply means this audience may name a viewer who
-	// has since lost access (#2992, CWE-367).
-	authzEpoch uint64
+	// authzState is h.presenceAuthzState as it stood when the audience query was
+	// ABOUT TO RUN. Both halves carry a distinct property:
+	//
+	//   epoch     — a revocation the hub observes AFTER this point advances it,
+	//               so a mismatch at apply means this audience may name a viewer
+	//               who has since lost access.
+	//   openCount — a revoking transaction was ALREADY in flight when we looked,
+	//               so the query may have read the pre-revocation graph and no
+	//               later bump can be relied on to say so.
+	//
+	// The second is the case a bare epoch cannot see, because by the time the
+	// worker reads, that revocation's open-bump is already folded into the value
+	// it just stored (#2992, CWE-367).
+	authzState uint64
 	// computedAt is when the query returned, NOT when the worker was spawned.
 	// The distinction is the whole point: it measures the HANDOFF — channel plus
 	// Run turn — which is the window this change widened, and excludes the query
@@ -4453,7 +4530,11 @@ func (h *Hub) spawnPresenceAudienceAttempt(seed presenceAudienceResult) {
 		//
 		// computedAt stays after the query because it measures the HANDOFF; moving it
 		// earlier would fold the query's own duration into a bound meant to exclude it.
-		result.authzEpoch = h.presenceAuthzEpoch.Load()
+		// The same load also captures openCount, which is what catches a revoking
+		// transaction that opened BEFORE this line. The epoch half structurally
+		// cannot: by the time we read, that open-bump is already folded into the
+		// value we just stored (#2992).
+		result.authzState = h.presenceAuthzState.Load()
 		result.audience, result.err = h.computePresenceAudience(context.Background(), result.userID)
 		result.computedAt = time.Now()
 
@@ -4501,22 +4582,128 @@ func (h *Hub) applyPresenceAudience(result presenceAudienceResult) {
 // not yet applied is treated as unproven from this moment on: it is recomputed if
 // attempts remain, and suppressed if they do not.
 //
-// SCOPE, stated precisely because the gap is the interesting part. The revoking
-// writes dispatch POST-COMMIT (see internal/presencehook), so this bump lands
-// AFTER the write it describes. It therefore closes every case where the bump
-// reaches the hub before Run applies the result — which is the ordinary case, the
-// apply being one Run turn behind — and does NOT close the case where an apply
-// beats the bump. Closing that needs the revocation to fence the hub from inside
-// its own transaction, i.e. the credential-epoch pattern (durable column plus
-// Redis markers plus a guarded read), which is a different and much larger change.
-// presenceAudienceMaxHandoff bounds what this cannot order.
+// SCOPE. This is the EDGE-triggered half of the fence: it records that a
+// revocation was observed. On its own it cannot catch a revocation that opened
+// BEFORE a worker read the state, because by then that bump is already folded
+// into the value the worker stored. BeginAudienceRevocation supplies the
+// LEVEL-triggered half for the revoking paths that can bracket themselves
+// (#2992).
+//
+// This remains the only fence available to the rails that own no transaction —
+// the voice, active-presence and voice-presence reactions — for which a post-hoc
+// bump is all a reaction can offer.
 func (h *Hub) InvalidatePresenceAudiences() {
-	h.presenceAuthzEpoch.Add(1)
+	h.presenceAuthzState.Add(1 << presenceAuthzEpochShift)
+}
+
+// BeginAudienceRevocation opens a revocation bracket and returns its closer.
+//
+// The caller MUST defer the closer immediately, and MUST register that defer
+// BEFORE any rollback defer so LIFO runs the closer LAST — after the transaction
+// has actually resolved. Holding the bracket across the whole transaction is the
+// point: it is what makes a concurrent audience query unprovable rather than
+// merely stale-and-undetected.
+//
+// The closer is sync.Once-wrapped because the decrement is Add(^uint64(0)),
+// which is -1 on the FULL 64-bit word: running it at openCount == 0 borrows out
+// of the epoch half, rewinding the epoch AND setting openCount to 0xFFFFFFFF —
+// a permanent hub-wide presence blackout. Once makes that unreachable.
+// The nil-receiver guard is what makes every call site safe, and the asymmetry
+// it closes is real: graphpresence
+// reaches this method through the Disconnector INTERFACE
+// (topology.go: `fence = r.disconnector.BeginAudienceRevocation`), where a
+// typed-nil *Hub satisfies `!= nil` and the concrete-pointer guard below can
+// never fire. Unreachable from today's router — websocket.NewHub never returns
+// nil — but the two nil-tolerant Disconnector uses beside it guard explicitly,
+// so without this the shapes disagree and a later refactor walks into it.
+// (@red-team, Phase 4.)
+func (h *Hub) BeginAudienceRevocation() func() {
+	if h == nil {
+		return func() {
+			// Deliberately empty: a nil receiver took no bracket, so there is
+			// nothing to lower. It must stay a no-op rather than decrement --
+			// Add(^uint64(0)) at openCount 0 borrows out of the epoch half and
+			// blacks out base presence hub-wide. Returning a callable closer
+			// rather than nil is what keeps every call site a single deferred
+			// call with no branch.
+		}
+	}
+	h.presenceAuthzState.Add(1<<presenceAuthzEpochShift | 1)
+	var once sync.Once
+	return func() {
+		once.Do(func() { h.presenceAuthzState.Add(^uint64(0)) })
+	}
+}
+
+// presenceAuthzWatchdogTick advances the episode counter for one observation and
+// reports whether THIS tick should emit. Pure, so the reporting rule is testable
+// without a two-minute wall clock.
+//
+// The equality test is the whole rule: one line per EPISODE, not one per tick. A
+// watchdog that logged on every raised tick would be its own amplification
+// primitive — the same reasoning that keeps the NATS ingress gates on aggregated
+// counters rather than per-message lines.
+func presenceAuthzWatchdogTick(raised bool, consecutive int) (int, bool) {
+	if !raised {
+		return 0, false
+	}
+	consecutive++
+	return consecutive, consecutive == presenceAuthzWatchdogEpisodes
+}
+
+// watchPresenceAuthzLevel reports a fence that has stayed raised across several
+// consecutive intervals.
+//
+// LOG-ONLY BY CONSTRUCTION, and that is a security property rather than a
+// simplification: a watchdog that RESET openCount would be a fail-open timer
+// bolted onto an authorization control — it would resume delivering presence to
+// viewers the fence had not yet cleared, which is the exact disclosure the fence
+// exists to prevent. It observes and never writes. If this ever fires, the fix is
+// upstream in whatever holds the bracket, never here.
+func (h *Hub) watchPresenceAuthzLevel() {
+	ticker := time.NewTicker(presenceAuthzWatchdogInterval)
+	defer ticker.Stop()
+	consecutive := 0
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-ticker.C:
+			raised := h.presenceAuthzState.Load()&presenceAuthzOpenMask != 0
+			var report bool
+			consecutive, report = presenceAuthzWatchdogTick(raised, consecutive)
+			if report {
+				// No user, server or channel identifier: the condition is
+				// process-wide and naming a participant would be both wrong and a
+				// privacy leak.
+				// (episodes-1), not episodes: N consecutive raised observations prove
+				// the fence was up across the N-1 gaps BETWEEN them. The first
+				// observation says nothing about how long it had already been raised.
+				log.Printf("[hub] presence authorization fence raised continuously for at least %s; "+
+					"base presence is suppressed hub-wide, failure_class=%q",
+					presenceAuthzWatchdogInterval*(presenceAuthzWatchdogEpisodes-1),
+					"presence_authz_fence_held")
+			}
+		}
+	}
 }
 
 // presenceAudienceUnproven reports whether a successful result may name a viewer
-// who has since lost access, by either of two independent tests: the hub observed
-// a revocation after the query returned, or the handoff outran its bound.
+// who has since lost access, by any of THREE independent tests:
+//
+//   - LEVEL: a revoking transaction was already in flight when the query was
+//     ABOUT TO RUN (openCount != 0 in the sampled state).
+//   - EDGE: the hub observed a revocation between that sample and now (the epoch
+//     half moved).
+//   - HANDOFF: a proven audience outran its freshness bound.
+//
+// The first two are the authorization arms; the third bounds staleness of an
+// audience that WAS authorized. "About to run" is deliberate and matches
+// presenceAudienceResult.authzState -- the state is sampled BEFORE
+// computePresenceAudience rather than after it returns, and that is exactly what
+// makes the level and edge arms exhaustive between them: the epoch is bumped at
+// bracket OPEN, so a bracket taken before the sample is caught by the level arm
+// and one taken after it is caught by the edge arm.
 //
 // An ERRORED result is never "unproven" — it carries no audience at all, and its
 // own retry path already owns it. Returning true for one would double-count the
@@ -4525,7 +4712,16 @@ func (h *Hub) presenceAudienceUnproven(result presenceAudienceResult) bool {
 	if result.err != nil || result.audience == nil {
 		return false
 	}
-	if result.authzEpoch != h.presenceAuthzEpoch.Load() {
+	if result.authzState&presenceAuthzOpenMask != 0 {
+		// LEVEL arm. A revoking transaction was already in flight when this query
+		// was about to run, so its statements may have read the pre-revocation
+		// graph — and NO later bump can be relied on to say so, because the
+		// post-commit dispatch is bounded only by dispatchQueueDepth (256) times
+		// dispatchTimeout (10s), not by presenceAudienceMaxHandoff.
+		return true
+	}
+	if result.authzState>>presenceAuthzEpochShift !=
+		h.presenceAuthzState.Load()>>presenceAuthzEpochShift {
 		return true
 	}
 	if result.computedAt.IsZero() {
@@ -4766,6 +4962,19 @@ func (h *Hub) broadcastPresenceToAll(userID uuid.UUID, status string, timestamp 
 // It is NOT reachable from any of the six Run call sites in normal operation. A
 // reviewer seeing a surviving synchronous audience query should read this comment
 // before concluding the issue was not fixed.
+//
+// #2992 SCOPE -- STATED, NOT FIXED. This path consults NEITHER arm of the
+// presence authorization fence: it computes and fans out inline, producing no
+// presenceAudienceResult and never reaching presenceAudienceUnproven. That is
+// unchanged from the epoch-only fence, so #2992 neither widens nor narrows it,
+// but the design's rail inventory did not name it and an unnamed rail gap is
+// what #2975 turned out to be. The exposure: during shutdown a terminal offline
+// frame can reach a viewer whose access a concurrent revocation just removed.
+// Accepted because the fan-out is process-local (there is no NATS leg here) and
+// every recipient is unpublished and closeOutbound()-ed a few lines below, so
+// the frame races a socket already going away -- the same argument the ACCEPTED
+// RESIDUAL above makes about a suppressed frame, in the opposite direction.
+// (@security-reviewer, PR #3010.)
 func (h *Hub) broadcastPresenceToAllSync(userID uuid.UUID, status string, timestamp int64) {
 	h.scheduleOnlineCountBroadcast(userID)
 	if h.db == nil {

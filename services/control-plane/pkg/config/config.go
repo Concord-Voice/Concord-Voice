@@ -552,7 +552,10 @@ func (c *Config) validateControlPlaneReplicaCount() error {
 			"CONTROL_PLANE_REPLICA_COUNT=%d is not supported: the control-plane WebSocket hub "+
 				"holds per-connection session state and channel interest maps in process memory, "+
 				"so a second replica silently drops cross-replica event fanout — members would "+
-				"see partial presence, typing, and message events with no error. Horizontal "+
+				"see partial presence, typing, and message events with no error. The "+
+				"presence-audience revocation fence (#2992) is likewise a process-local "+
+				"atomic, so a second replica is blind to the first's in-flight revocations "+
+				"and can deliver presence to a viewer who just lost access. Horizontal "+
 				"scaling requires externalized WebSocket session state (Redis interest maps + "+
 				"NATS broadcast) — tracked in #2757. Set CONTROL_PLANE_REPLICA_COUNT=1",
 			c.ControlPlaneReplicaCount)

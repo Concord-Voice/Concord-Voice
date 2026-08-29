@@ -311,6 +311,14 @@ func requirePresenceRecheckWired(
 // that same commit. There is no later recovery, and no error is raised anywhere.
 // An unwired erasure drain is louder but still wrong: the erasure hits migration
 // 000111's RESTRICT and fails with an opaque 23503.
+//
+// #2992 adds a FOURTH erasure arm, the presence-audience fence. Unwired, the
+// erasure still runs and still dispatches its post-commit signal — so this one
+// degrades rather than breaking — but that signal is bounded by
+// dispatchQueueDepth times dispatchTimeout rather than ordered against the
+// write, which is the whole gap #2992 closes. It is interrogated here for the
+// same reason as the others: SetAudienceFence lives on one line in
+// buildPrivacyHandler, and nothing else would notice its deletion.
 func graphPresenceWiringComplete(c graphPresenceConsumers) bool {
 	return c.friends.HasGraphPresenceCapture() &&
 		c.users.HasGraphPresenceCapture() &&
@@ -320,7 +328,8 @@ func graphPresenceWiringComplete(c graphPresenceConsumers) bool {
 		c.erasure.HasGraphPresenceCapture() &&
 		c.erasure.HasErasureClearPublisher() &&
 		c.dm.HasActivePlanRail() &&
-		c.erasure.HasActivePlanDrain()
+		c.erasure.HasActivePlanDrain() &&
+		c.erasure.AudienceFenceWired()
 }
 
 // graphPresenceConsumers groups the seven consumers the boot guard interrogates.

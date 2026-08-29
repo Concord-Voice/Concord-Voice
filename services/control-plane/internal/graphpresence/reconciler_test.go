@@ -50,6 +50,12 @@ func (f *fakeDisconnector) DisconnectAllRichPresenceClients(_ context.Context) e
 	return nil
 }
 
+// BeginAudienceRevocation satisfies Disconnector. This fake exists to observe
+// DISCONNECTS, and the #2992 bracket is orthogonal to every assertion it
+// carries, so the closer is inert. The fence's own behaviour is covered by
+// topology_test.go's fenceStub, which records into the ordering trace.
+func (f *fakeDisconnector) BeginAudienceRevocation() func() { return func() {} }
+
 func TestAbandonDisconnectsCapturedAudience(t *testing.T) {
 	d := &fakeDisconnector{}
 	r := New(nil, &fakeRefresher{}, d, nil, nil)
@@ -249,6 +255,12 @@ func (f *failingDisconnector) DisconnectAllRichPresenceClients(_ context.Context
 	return nil
 }
 
+// BeginAudienceRevocation satisfies Disconnector. This fake exists to observe
+// DISCONNECTS, and the #2992 bracket is orthogonal to every assertion it
+// carries, so the closer is inert. The fence's own behaviour is covered by
+// topology_test.go's fenceStub, which records into the ordering trace.
+func (f *failingDisconnector) BeginAudienceRevocation() func() { return func() {} }
+
 // ErrRecheckSenderNotCurrent is a documented BENIGN per-sender terminal: the
 // caller disconnects only that sender's captured viewers. Aborting the loop and
 // tearing down the union punished the healthy sender for the other's routine
@@ -345,6 +357,12 @@ func (d *ctxCapturingDisconnector) DisconnectAllRichPresenceClients(ctx context.
 	d.escalationCtx = ctx
 	return nil
 }
+
+// BeginAudienceRevocation satisfies Disconnector. This fake exists to observe
+// DISCONNECTS, and the #2992 bracket is orthogonal to every assertion it
+// carries, so the closer is inert. The fence's own behaviour is covered by
+// topology_test.go's fenceStub, which records into the ordering trace.
+func (d *ctxCapturingDisconnector) BeginAudienceRevocation() func() { return func() {} }
 
 // The escalation must NOT reuse the context the targeted disconnect exhausted.
 //

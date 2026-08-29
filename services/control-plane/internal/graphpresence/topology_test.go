@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,13 @@ const (
 	// trace so a test can prove Complete delegated the COMMIT rather than
 	// issuing its own alongside it.
 	stepCompleteTopologyBatch = "complete_topology_batch"
+
+	// The #2992 revocation bracket. It shares the trace with everything above
+	// because its correctness is entirely positional: open after the gate and
+	// before BeginTx, close after the transaction resolves and before the gate
+	// is released. Counting cannot express any of those.
+	stepFenceOpen  = "fence_open"
+	stepFenceClose = "fence_close"
 )
 
 type callTrace struct {
@@ -1749,4 +1757,309 @@ func TestCompleteWithANilPlanCommitsAndEnqueuesNothing(t *testing.T) {
 
 	assert.Contains(t, trace.snapshot(), stepCommit, "the caller's transaction must be committed")
 	assert.Empty(t, sink.plans, "a nil plan carries no C1 work to enqueue")
+}
+
+// ---------------------------------------------------------------------------
+// #2992 — the revocation bracket.
+// ---------------------------------------------------------------------------
+
+// fenceStub stands in for the Hub's authorization fence. It records into the
+// SHARED trace rather than counting, because what is under test is ORDER: the
+// bracket must open after the gate and before BeginTx, and close after the
+// transaction has resolved but before the gate is released. A counter cannot
+// tell any of those apart.
+type fenceStub struct {
+	trace *callTrace
+	opens int
+	// depth is sampled by the work closure to prove the bracket is HELD across
+	// the transaction rather than merely opened and dropped before it.
+	depth        int
+	depthAtWork  int
+	disconnected int
+}
+
+func (f *fenceStub) BeginAudienceRevocation() func() {
+	f.opens++
+	f.depth++
+	f.trace.record(stepFenceOpen)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.depth--
+			f.trace.record(stepFenceClose)
+		})
+	}
+}
+
+func (f *fenceStub) DisconnectRichPresenceClients(
+	_ context.Context, _ map[uuid.UUID]bool,
+) error {
+	f.disconnected++
+	return nil
+}
+
+func (f *fenceStub) DisconnectAllRichPresenceClients(_ context.Context) error {
+	f.disconnected++
+	return nil
+}
+
+var _ Disconnector = (*fenceStub)(nil)
+
+func fencedReconciler(t *testing.T, trace *callTrace, rail TopologyRail) (*Reconciler, *fenceStub) {
+	t.Helper()
+	fence := &fenceStub{trace: trace}
+	return &Reconciler{
+		db:           openTracedDB(t, gatedTxConnector{trace: trace}),
+		rail:         rail,
+		disconnector: fence,
+	}, fence
+}
+
+func subjectFor(family presencecapture.Family) presencecapture.Subject {
+	return presencecapture.Subject{
+		Family:      family,
+		Principal:   uuid.New(),
+		Counterpart: uuid.New(),
+	}
+}
+
+// The load-bearing ordering test. One slice comparison carries four separate
+// duties, each of which is a real defect if inverted:
+//
+//   - fence_open AFTER gate_acquire — a bracket hoisted above rail.WithSenders
+//     would be held across the Go-channel gate wait, blacking out presence for
+//     the duration of gate contention rather than for the transaction.
+//   - fence_open BEFORE begin_tx — the whole point. A bracket taken after the
+//     transaction opens cannot order a query that started in between.
+//   - fence_close AFTER the transaction resolved — the closer's defer must be
+//     registered BEFORE the rollback defer so LIFO runs it LAST. Register it
+//     after and the fence drops while the transaction is still live.
+//   - fence_close BEFORE gate_release — it lives inside runInTx, not outside.
+func TestWithGatedTxBracketsARevokingFamilyAcrossTheTransaction(t *testing.T) {
+	trace := &callTrace{}
+	rail := &railStub{trace: trace}
+	reconciler, fence := fencedReconciler(t, trace, rail)
+
+	err := reconciler.WithGatedTx(
+		context.Background(), subjectFor(presencecapture.FamilyFriendshipRemove),
+		func(_ *sql.Tx) error {
+			fence.depthAtWork = fence.depth
+			trace.record(stepWork)
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t,
+		[]string{
+			stepGateAcquire, stepFenceOpen, stepBeginTx, stepWork,
+			stepRollback, stepFenceClose, stepGateRelease,
+		},
+		trace.snapshot(),
+		"the fence must open inside the gate and before BeginTx, and close after the "+
+			"transaction resolves but before the gate is released")
+	assert.Equal(t, 1, fence.depthAtWork,
+		"the bracket must be HELD for the duration of the transaction, not opened and dropped before it")
+	assert.Zero(t, fence.disconnected,
+		"taking the bracket must not disconnect anyone — that is Abandon's job, not the fence's")
+}
+
+// Family scoping, driven off the boot-guarded registry rather than a hand list.
+// Bracketing an additive family would suppress presence for the highest-volume
+// graph traffic in exchange for nothing: an accept, an add and a join cannot
+// remove a viewer from any audience.
+func TestWithGatedTxSkipsTheBracketForAdditiveFamilies(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		family presencecapture.Family
+	}{
+		{"friendship accept", presencecapture.FamilyFriendshipAccept},
+		{"member add", presencecapture.FamilyMemberAdd},
+		{"member join", presencecapture.FamilyMemberJoin},
+	} {
+		family := tc.family
+		t.Run(tc.name, func(t *testing.T) {
+			policy, err := presencecapture.PolicyFor(family)
+			require.NoError(t, err)
+			require.False(t, policy.CanRevokeVisibility,
+				"registry precondition: this test is only meaningful for a non-revoking family")
+
+			trace := &callTrace{}
+			reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+
+			require.NoError(t, reconciler.WithGatedTx(
+				context.Background(), subjectFor(family),
+				func(_ *sql.Tx) error { trace.record(stepWork); return nil },
+			))
+
+			assert.Zero(t, fence.opens, "an additive family must not take the bracket")
+			assert.NotContains(t, trace.snapshot(), stepFenceOpen)
+		})
+	}
+}
+
+func TestWithGatedTxBracketsEveryRevokingFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		family presencecapture.Family
+	}{
+		{"friendship remove", presencecapture.FamilyFriendshipRemove},
+		{"block", presencecapture.FamilyBlock},
+		{"friends-of-friends toggle", presencecapture.FamilyFriendsOfFriendsToggle},
+		{"member remove", presencecapture.FamilyMemberRemove},
+		{"member ban", presencecapture.FamilyMemberBan},
+	} {
+		family := tc.family
+		t.Run(tc.name, func(t *testing.T) {
+			policy, err := presencecapture.PolicyFor(family)
+			require.NoError(t, err)
+			require.True(t, policy.CanRevokeVisibility,
+				"registry precondition: this test is only meaningful for a revoking family")
+
+			trace := &callTrace{}
+			reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+
+			require.NoError(t, reconciler.WithGatedTx(
+				context.Background(), subjectFor(family),
+				func(_ *sql.Tx) error { trace.record(stepWork); return nil },
+			))
+
+			assert.Equal(t, 1, fence.opens, "every CanRevokeVisibility family must bracket")
+			assert.Zero(t, fence.depth, "and must release it")
+		})
+	}
+}
+
+// The fail-closed arm, and it is the ONLY branch in this change whose inversion
+// converts the control from fail-closed to fail-open. WithGatedTx brackets when
+// the policy lookup ERRORS or the family can revoke:
+//
+//	if policy, policyErr := presencecapture.PolicyFor(subject.Family); policyErr != nil ||
+//		policy.CanRevokeVisibility {
+//
+// Every other test in this file drives a REGISTERED family, so deleting
+// `policyErr != nil ||` leaves all of them green -- an unregistered family is
+// the only input that reaches this branch at all. An unknown family is exactly
+// the case where we do NOT know the write is additive, so it must bracket.
+// (@security-reviewer, PR #3010.)
+func TestWithGatedTxBracketsAnUnregisteredFamilyFailClosed(t *testing.T) {
+	const unregistered = presencecapture.Family(200)
+
+	_, err := presencecapture.PolicyFor(unregistered)
+	require.Error(t, err,
+		"registry precondition: this family must be UNKNOWN to PolicyFor, or the "+
+			"test exercises the CanRevokeVisibility arm instead and proves nothing")
+
+	trace := &callTrace{}
+	reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+
+	require.NoError(t, reconciler.WithGatedTx(
+		context.Background(), subjectFor(unregistered),
+		func(_ *sql.Tx) error { trace.record(stepWork); return nil },
+	))
+
+	assert.Equal(t, 1, fence.opens,
+		"a family whose policy cannot be resolved must be bracketed -- failing OPEN "+
+			"here would silently disable the fence for any future unregistered family")
+	assert.Zero(t, fence.depth, "and the bracket must still be released")
+}
+
+// The catastrophic mode is a LEAKED bracket: a permanently non-zero open count
+// suppresses base presence hub-wide, forever, and self-heals never. Cover every
+// terminal, including the two that do not go through work at all.
+func TestWithGatedTxReleasesTheBracketOnEveryTerminal(t *testing.T) {
+	subject := subjectFor(presencecapture.FamilyFriendshipRemove)
+
+	t.Run("work returns an error", func(t *testing.T) {
+		trace := &callTrace{}
+		reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+		err := reconciler.WithGatedTx(context.Background(), subject,
+			func(_ *sql.Tx) error { return errors.New("boom") })
+		require.Error(t, err)
+		assert.Zero(t, fence.depth, "an error terminal must still release the bracket")
+	})
+
+	t.Run("work commits", func(t *testing.T) {
+		trace := &callTrace{}
+		reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+		require.NoError(t, reconciler.WithGatedTx(context.Background(), subject,
+			func(tx *sql.Tx) error { return tx.Commit() }))
+		assert.Zero(t, fence.depth, "the normal ErrTxDone path must still release")
+	})
+
+	t.Run("BeginTx fails", func(t *testing.T) {
+		trace := &callTrace{}
+		fence := &fenceStub{trace: trace}
+		reconciler := &Reconciler{
+			db: openTracedDB(t, gatedTxConnector{
+				trace: trace, beginErr: errors.New("begin refused"),
+			}),
+			rail:         &railStub{trace: trace},
+			disconnector: fence,
+		}
+		err := reconciler.WithGatedTx(context.Background(), subject,
+			func(_ *sql.Tx) error { return nil })
+		require.Error(t, err)
+		assert.Zero(t, fence.depth,
+			"a transaction that never opened must still release the bracket taken before it")
+	})
+
+	t.Run("work panics", func(t *testing.T) {
+		trace := &callTrace{}
+		reconciler, fence := fencedReconciler(t, trace, &railStub{trace: trace})
+		assert.Panics(t, func() {
+			_ = reconciler.WithGatedTx(context.Background(), subject,
+				func(_ *sql.Tx) error { panic("boom") })
+		})
+		assert.Zero(t, fence.depth,
+			"a panic must still release the bracket — defers run, and a leaked count "+
+				"is a permanent hub-wide presence blackout")
+	})
+}
+
+// An unwired disconnector is a replica without the hub. It must still run the
+// transaction: degrading to the pre-#2992 behaviour is correct, panicking is not.
+func TestWithGatedTxToleratesAnUnwiredFence(t *testing.T) {
+	trace := &callTrace{}
+	reconciler := &Reconciler{
+		db:   openTracedDB(t, gatedTxConnector{trace: trace}),
+		rail: &railStub{trace: trace},
+	}
+
+	require.NoError(t, reconciler.WithGatedTx(
+		context.Background(), subjectFor(presencecapture.FamilyFriendshipRemove),
+		func(_ *sql.Tx) error { trace.record(stepWork); return nil },
+	))
+	assert.NotContains(t, trace.snapshot(), stepFenceOpen)
+}
+
+// The three reaction rails own no audience-relation write, so there is no
+// transaction to bracket and they correctly keep only the post-hoc epoch bump
+// via DisconnectAllRichPresenceClients. "Deliberately not wired" and "forgotten"
+// look identical in a diff; this asserts the former.
+//
+// This is a source inventory lock, NOT a logic test — the repo distrusts
+// grep-shaped assertions as behavioural proof, and it is used here only to make
+// the enumeration in the design's section 4.4 self-defending. Its failure
+// message says what to do rather than what to assert.
+func TestReactionRailsDoNotTakeTheAudienceBracket(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"voice lifecycle", "../voice/nats.go"},
+		{"active category reconciler", "../activepresence/reconciler.go"},
+		{"voice presence executor", "../voicepresence/executor.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src, err := os.ReadFile(tc.path)
+			require.NoError(t, err, "the inventory must name a file that exists")
+			assert.NotContains(t, string(src), "BeginAuthzRevocation",
+				tc.path+" is a reaction to an anomaly, not a revoking write. If it has "+
+					"gained a bracket it now owns a transaction, and this case is the "+
+					"wrong answer — bracket it deliberately and delete this entry.")
+			assert.NotContains(t, string(src), "BeginAudienceRevocation",
+				tc.path+" must not take the fence directly either")
+		})
+	}
 }

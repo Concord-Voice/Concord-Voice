@@ -31,9 +31,21 @@ type ActivityRefresher interface {
 }
 
 // Disconnector is the fail-closed sink, implemented by *websocket.Hub.
+//
+// BeginAudienceRevocation sits on this interface rather than on a settable
+// field for two reasons. The Hub is ALREADY here — router.go passes it to New
+// as the disconnector — so there is nothing new to wire and no second
+// construction site to forget. And widening the interface breaks every fake at
+// COMPILE time, which forces an explicit answer at each one; a nil-able setter
+// is silently forgettable, and a fence nobody wired is a fence that does not
+// exist (#2992).
 type Disconnector interface {
 	DisconnectRichPresenceClients(ctx context.Context, recipients map[uuid.UUID]bool) error
 	DisconnectAllRichPresenceClients(ctx context.Context) error
+
+	// BeginAudienceRevocation opens a revocation bracket and returns its closer.
+	// The bracket must be held across the whole revoking transaction.
+	BeginAudienceRevocation() func()
 }
 
 // Reconciler implements presencecapture.GraphPresenceCapture.

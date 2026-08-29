@@ -604,6 +604,22 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 	// Lock order: users FIRST, then servers. This path's users set is empty, so
 	// the chain degenerates to `servers FOR UPDATE` alone — but the rule binds
 	// the moment #2448 adds a rail obligation, which is why it is stated here.
+	// #2992: bracket the whole transaction. Server delete cascades server_members,
+	// so it revokes presence-audience membership for every remaining member — and
+	// it takes no presencehook.Spec, so graphpresence's choke point never sees
+	// this transaction. disconnectServerAudience below is post-commit and cannot
+	// order an audience apply that beats it; this can.
+	//
+	// One statement, no branch: this handler is at gocognit 20 against a
+	// SonarQube S3776 ceiling of 15, so an `if h.hub != nil` here is not
+	// affordable. It is not needed either -- BeginAudienceRevocation guards its
+	// own nil receiver, and h.hub is a concrete *websocket.Hub, so invoking the
+	// method on a nil pointer is legal Go and yields an inert closer.
+	//
+	// The defer is function-scoped, so the bracket outlives the transaction and
+	// also covers the post-commit disconnectServerAudience. That is deliberate
+	// and conservative in the safe direction; do not narrow it to the tx.
+	defer h.hub.BeginAudienceRevocation()()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		h.log.Error(errMsgFailedDelete, "failure_class", "begin")

@@ -39,6 +39,12 @@ func (c *countingDisconnector) DisconnectAllRichPresenceClients(_ context.Contex
 	return nil
 }
 
+// BeginAudienceRevocation satisfies Disconnector. This fake exists to observe
+// DISCONNECTS, and the #2992 bracket is orthogonal to every assertion it
+// carries, so the closer is inert. The fence's own behaviour is covered by
+// topology_test.go's fenceStub, which records into the ordering trace.
+func (c *countingDisconnector) BeginAudienceRevocation() func() { return func() {} }
+
 func (c *countingDisconnector) timesAsked(id uuid.UUID) int {
 	n := 0
 	for _, call := range c.calls {

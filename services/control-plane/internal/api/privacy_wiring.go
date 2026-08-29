@@ -39,6 +39,11 @@ func buildPrivacyHandler(
 	// service itself rather than trusting that this line still exists.
 	account.SetGraphPresenceCapture(graphPresence)
 	account.SetNATS(natsClient)
+	// #2992: the erasure transaction brackets the presence-audience fence, so an
+	// audience computed against the pre-erasure graph cannot be delivered. Returned
+	// alongside the handler so the router's boot guard can interrogate the service
+	// itself rather than trusting that this line still exists.
+	account.SetAudienceFence(hub)
 	if hub != nil {
 		account.SetChannelDeletedBroadcaster(func(serverID, channelID string) {
 			serverUUID, err := uuid.Parse(serverID)

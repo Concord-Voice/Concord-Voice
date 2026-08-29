@@ -165,7 +165,10 @@ func UnregisteredFamilies() []Family {
 // consumer resolves PolicyFor once and reads the FamilyPolicy field: the
 // accepted-edge gate and the peripheral seed inside graphpresence's
 // CaptureInTx, plus planForBoundExceeded which it calls, all read
-// policy.CanRevokeVisibility from the single value step 1 resolved. The remaining callers are this package's own
+// policy.CanRevokeVisibility from the single value step 1 resolved. #2992 adds
+// a fourth: graphpresence's WithGatedTx resolves PolicyFor to decide whether a
+// revoking transaction takes the presence-audience bracket, and reads the same
+// field. The remaining callers are this package's own
 // capture_test.go and registry_test.go, and graphpresence's
 // review_regression_test.go reads PolicyFor for its preconditions rather than
 // this method. An earlier revision of this comment asserted the error branch

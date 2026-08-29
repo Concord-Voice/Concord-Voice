@@ -1052,6 +1052,12 @@ func (c *countingDisconnectorForTest) DisconnectAllRichPresenceClients(context.C
 	return nil
 }
 
+// BeginAudienceRevocation satisfies Disconnector. This fake exists to observe
+// DISCONNECTS, and the #2992 bracket is orthogonal to every assertion it
+// carries, so the closer is inert. The fence's own behaviour is covered by
+// topology_test.go's fenceStub, which records into the ordering trace.
+func (c *countingDisconnectorForTest) BeginAudienceRevocation() func() { return func() {} }
+
 // ─── the pre-mutation Custom Status audience (C2) ───────────────────────────
 
 // The bridge's HAPPY path resolves a REAL audience for an active sender, and
@@ -1648,6 +1654,12 @@ func (d *guardedDisconnector) DisconnectAllRichPresenceClients(context.Context) 
 	d.calls++
 	return nil
 }
+
+// BeginAudienceRevocation satisfies Disconnector. This fake exists to observe
+// DISCONNECTS, and the #2992 bracket is orthogonal to every assertion it
+// carries, so the closer is inert. The fence's own behaviour is covered by
+// topology_test.go's fenceStub, which records into the ordering trace.
+func (d *guardedDisconnector) BeginAudienceRevocation() func() { return func() {} }
 
 func (d *guardedDisconnector) count() int {
 	d.mu.Lock()
