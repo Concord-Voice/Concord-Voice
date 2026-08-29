@@ -24,20 +24,41 @@ import (
 // the retry signal that would have caught it has been destroyed. Message
 // purges (000090) run through that rail.
 //
-// ACCOUNT DELETION (000059) DOES NOT, and this file must not be read as if it
-// did. deleteAccount issues `DELETE FROM users WHERE id = $1` and holds no
-// reference to object storage of any kind; `media_files.uploader_id` is
-// `REFERENCES users(id) ON DELETE CASCADE` (migration 000042), so the rows are
-// HARD-deleted by the cascade and the objects are simply left on the backend.
-// Nothing reclaims them afterwards either — the straggler sweep selects from
-// media_files, and the rows it would need are the ones that just vanished.
+// ACCOUNT DELETION (000059) NOW REACHES THIS RAIL, but only for tier 2, and the
+// asymmetry is the thing to understand before editing either half.
 //
-// That makes the residue permanent rather than delayed, and it is worth stating
-// rather than implying away: GDPR Article 17 erasure is implemented AS account
-// deletion, so those bytes outlive the erasure meant to remove them. Closing it
-// needs a design this change does not carry — capture the BlobRefs inside the
-// deletion transaction before the cascade fires, or add a backend-side orphan
-// reaper that can work without a row to start from.
+// The problem it closes: `media_files.uploader_id` is `REFERENCES users(id) ON
+// DELETE CASCADE` (migration 000042), so `DELETE FROM users` HARD-deletes every
+// row the erased account uploaded. Those rows are the only handle the row-driven
+// reclaimers have — the straggler sweep selects FROM media_files — so the moment
+// they vanish the objects become unreachable to all of them at once. GDPR
+// Article 17 erasure is implemented AS account deletion, so the bytes outlived
+// the erasure meant to remove them, permanently rather than by delay.
+//
+// It is closed in TWO places because one mechanism could not cover both tiers:
+//
+//   - users.deleteAccountTx captures the blob refs under the user-row lock
+//     BEFORE the cascade, and users.reclaimErasedMedia discharges them after the
+//     commit. TIER 2 arrives here, through EnqueueBlobDeletes, whose
+//     per-upload-unique-key contract `attachments/<fileID>` satisfies. TIER 1
+//     does NOT and must not: its keys are deterministic per subject, exactly
+//     what that contract refuses, so it goes to media.ReclaimErasedTier1
+//     instead — and only for the two keys whose SUBJECT is the erased user (see
+//     ErasableTier1Keys; `server-icons/` and `dm-icons/` belong to subjects that
+//     outlive their uploader).
+//   - media.OrphanReaper recovers the history the capture cannot reach — every
+//     object stranded by an erasure that already happened, plus the
+//     soft-deleted-but-unreaped rows the same cascade destroys. It is TIER 2
+//     ONLY, and permanently so: proxyTier1Media serves profile media by key
+//     without reading media_files at all, so a row-less tier-1 object is not
+//     evidence of an orphan.
+//
+// WHAT REMAINS OPEN, stated rather than implied away: tier-1 profile media
+// stranded by an erasure that predates this change. It is PLAINTEXT (the server
+// decodes and re-encodes it in processTier1Image), and no sweep can find it,
+// because no reference index exists to reconcile a bucket listing against.
+// Recovering it is an operator job driven from users.avatar_url and its
+// siblings, not a reaper.
 //
 // Note the asymmetry with the read rail in backend_store.go: an unresolvable
 // backend there fails CLOSED (503 — the client is told nothing was served).

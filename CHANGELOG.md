@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Deleting your account now removes the files it uploaded, not only the record of them.
+
+### Security
+
+- **Deleting your account now removes the files you uploaded, not just the record of them** ([#3019](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3019)) — deleting an account removed every record of the files that account had uploaded, but left the files themselves in storage, and removing those records was the very thing that made the files impossible to find again. Nothing that reclaims storage could see them afterwards, so they stayed indefinitely. Your profile picture and banner are held unencrypted, because the server resizes them for you — so those in particular outlived the deletion meant to remove them. What needs removing is now noted before the account record goes, and deleted once the deletion has definitely gone through. A separate daily sweep reclaims attachments left behind by deletions that already happened. Profile pictures from those earlier deletions cannot be found automatically, and clearing them still needs to be done by hand — that has not happened yet.
+
 ## [0.2.42] — 2026-08-29
 
 Interface improvements reach you again without waiting for an app update. Invite links now arrive, open, and leave the server where you can see it, and the GIF picker's Categories and Recent tabs work for the first time. Someone who has just lost access can no longer be shown that you are online, and the screen-capture protection switch no longer reports itself as on where nothing is enforcing it.

@@ -107,3 +107,90 @@ func liveMediaBackend(ctx context.Context, db *sql.DB, storageKey string) (backe
 	}
 	return backend, true, nil
 }
+
+// --- account-erasure reclamation (#2759 follow-on) -------------------------
+
+// ErasableTier1Keys returns the tier-1 storage keys whose SUBJECT is this user,
+// and therefore the only tier-1 keys that become unreferenced when the user is
+// erased.
+//
+// THE OMISSION IS THE FEATURE. tier1StorageKey mints five shapes and only these
+// two are subject-scoped to a user. The other three -- `server-icons/<serverID>`,
+// `server-banners/<serverID>`, `dm-icons/<conversationID>` -- are scoped to a
+// SERVER or a CONVERSATION that outlives the person who uploaded them, and
+// media_files.uploader_id does not record ownership of those: setting a server
+// icon needs PermManageServer (a moderator, not necessarily the owner), and
+// insertTier1Record's `ON CONFLICT ... DO UPDATE SET uploader_id` REBINDS the
+// row to whoever changed the icon last. So an erasure driven by uploader_id
+// alone would delete the icon of a live server whose owner is untouched, and
+// because proxyTier1Media serves these by key without ever reading media_files,
+// nothing else would notice until the icon was gone.
+//
+// A future subject-scoped tier-1 purpose belongs here; a shared one never does.
+func ErasableTier1Keys(userID string) []string {
+	return []string{
+		tier1StorageKey(purposeAvatar, userID, "", ""),
+		tier1StorageKey(purposeBanner, userID, "", ""),
+	}
+}
+
+// ReclaimErasedTier1 deletes the profile-media objects an erased account's own
+// keys named.
+//
+// It does NOT route through CleanupObject, and the reason is timing rather than
+// preference. This runs POST-COMMIT, after the ON DELETE CASCADE has already
+// hard-deleted the rows, so CleanupObject's liveMediaBackend read would find
+// nothing every single time -- a guaranteed-empty query whose answer the caller
+// has already captured under the user-row lock. The placement check that read
+// exists to perform is done here instead, against the captured value, which is
+// the only place it can still be performed truthfully.
+//
+// Post-commit and not pre-: deleting the object first would leave a transaction
+// free to roll back onto an account whose avatar is already gone.
+func ReclaimErasedTier1(ctx context.Context, store ObjectDeleter, log *logger.Logger, refs []BlobRef) {
+	for _, ref := range refs {
+		if !isLegacyBackend(ref.Backend) {
+			// ADR-0038 pins ALL profile media to the legacy backend
+			// permanently, so this is an upstream violation rather than a case
+			// to handle. Deleting from `store` anyway would hit the wrong
+			// bucket and SUCCEED (an S3 DELETE of an absent key returns
+			// success), recording an erasure that did not happen with no retry
+			// behind it -- the straggler sweep is bounded to media_tier = 2.
+			log.Error("account erasure: refusing to reclaim profile media held by a non-legacy backend",
+				"storage_key", ref.Key, "storage_backend", ref.BackendLabel())
+			continue
+		}
+		if store == nil {
+			// No object storage in THIS process -- which is emphatically not
+			// "nothing was ever written". An earlier revision said that, and it
+			// was backwards: every ref here came from a LIVE media_files row
+			// (erasedMediaQuery), and a row exists only because some process
+			// successfully wrote the object. So the bytes are there, this
+			// replica cannot reach them, and nothing else will -- the straggler
+			// sweep and the orphan reaper are both media_tier = 2. That is a
+			// configuration fault causing permanent plaintext retention on a
+			// GDPR path, hence Error rather than Warn.
+			log.Error("account erasure: object storage is not configured; profile media NOT reclaimed and unrecoverable",
+				"storage_key", ref.Key)
+			continue
+		}
+		if err := store.DeleteObject(ctx, ref.Key); err != nil {
+			// ERROR, not Warn, and the severity is the finding: this is the one
+			// branch in this file with an IRREVERSIBLE consequence. The other
+			// three refusals above change nothing and leave the caller free to
+			// retry; this one has already lost the row, so no sweep will ever
+			// revisit the key -- the straggler sweep and the orphan reaper are
+			// both tier-2, because a row-less tier-1 object is indistinguishable
+			// from a live server icon. The bytes are plaintext and they stay.
+			//
+			// Review suggested also logging the erased user id, so an operator
+			// could reconcile the residue against users.avatar_url later. It is
+			// already there: every key this function can receive is
+			// `avatars/<userID>` or `banners/<userID>` by construction
+			// (ErasableTier1Keys), so the id IS the key's suffix. Threading the
+			// subject through the reclaimer signature would duplicate it.
+			log.Error("account erasure: failed to delete profile media object; PLAINTEXT bytes remain and nothing will retry",
+				"error", err, "storage_key", ref.Key)
+		}
+	}
+}

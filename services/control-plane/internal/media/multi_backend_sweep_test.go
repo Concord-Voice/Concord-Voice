@@ -47,7 +47,7 @@ func sweepTestLogger() *logger.Logger { return logger.NewWithWriter(discardWrite
 func TestResolveSweepTargets_CoversEveryRegisteredBackend(t *testing.T) {
 	reg := &fakeSweepRegistry{ids: []storage.BackendID{storage.LegacyBackendID, "r2-useast", "r2-eu"}}
 
-	targets := resolveSweepTargets(reg, sweepTestLogger())
+	targets := resolveSweepTargets(reg, "attachment session sweep", sweepTestLogger())
 
 	require.Len(t, targets, 3, "every registered backend must be swept, not just the legacy one")
 	assert.Equal(t,
@@ -68,7 +68,7 @@ func TestResolveSweepTargets_SkipsUnresolvableButKeepsTheRest(t *testing.T) {
 		broken: map[storage.BackendID]bool{"r2-useast": true},
 	}
 
-	targets := resolveSweepTargets(reg, sweepTestLogger())
+	targets := resolveSweepTargets(reg, "attachment session sweep", sweepTestLogger())
 
 	require.Len(t, targets, 1)
 	assert.Equal(t, string(storage.LegacyBackendID), targets[0].backend)
@@ -81,7 +81,7 @@ func TestResolveSweepTargets_SkipsUnresolvableButKeepsTheRest(t *testing.T) {
 // registry must not panic; StartSessionSweepWorkers falls back to the single
 // legacy worker at the call site.
 func TestResolveSweepTargets_NilRegistryYieldsNothing(t *testing.T) {
-	assert.Nil(t, resolveSweepTargets(nil, sweepTestLogger()))
+	assert.Nil(t, resolveSweepTargets(nil, "attachment session sweep", sweepTestLogger()))
 	assert.Zero(t, StartSessionSweepWorkers(t.Context(), nil, sweepTestLogger(), 0))
 }
 
@@ -162,7 +162,7 @@ func TestResolveSweepTargets_UnconfiguredStorageIsQuiet(t *testing.T) {
 		broken: map[storage.BackendID]bool{storage.LegacyBackendID: true},
 	}
 
-	targets := resolveSweepTargets(reg, logger.NewWithWriter(&buf))
+	targets := resolveSweepTargets(reg, "attachment session sweep", logger.NewWithWriter(&buf))
 
 	assert.Empty(t, targets, "there is nothing to sweep without object storage")
 	assert.NotContains(t, buf.String(), "level=ERROR",
@@ -182,10 +182,31 @@ func TestResolveSweepTargets_UnavailableVendorStillErrors(t *testing.T) {
 		broken: map[storage.BackendID]bool{"r2-useast": true},
 	}
 
-	targets := resolveSweepTargets(reg, logger.NewWithWriter(&buf))
+	targets := resolveSweepTargets(reg, "attachment session sweep", logger.NewWithWriter(&buf))
 
 	require.Len(t, targets, 1)
 	assert.Contains(t, buf.String(), "level=ERROR",
 		"a real backend that cannot be enumerated is still a fault worth alerting on")
 	assert.Contains(t, buf.String(), "r2-useast")
+}
+
+// TestResolveSweepTargets_NamesTheCallingSweep pins the sweepName parameter to
+// the log output. Two sweepers share this resolver -- the session sweeper and
+// the tier-2 orphan reaper -- and before the parameter existed an orphan-sweep
+// enumeration failure reported itself as "attachment session sweep: ... its
+// abandoned uploads are unreclaimed", naming the wrong worker AND the wrong
+// failure. Without this test the parameter can be threaded, ignored, and never
+// missed, because every other assertion here passes either way.
+func TestResolveSweepTargets_NamesTheCallingSweep(t *testing.T) {
+	var buf bytes.Buffer
+	reg := &fakeSweepRegistry{
+		ids:    []storage.BackendID{storage.LegacyBackendID, "r2-useast"},
+		broken: map[storage.BackendID]bool{"r2-useast": true},
+	}
+
+	resolveSweepTargets(reg, "attachment orphan sweep", logger.NewWithWriter(&buf))
+
+	assert.Contains(t, buf.String(), "attachment orphan sweep: backend NOT enumerated")
+	assert.NotContains(t, buf.String(), "attachment session sweep",
+		"a resolver called by the orphan reaper must not attribute its failure to the session sweeper")
 }

@@ -143,6 +143,24 @@ func runControlPlane() (runErr error) {
 		return err
 	}
 
+	// TYPED NIL STOPS HERE. initStorageClient returns a nil *storage.Client when
+	// object storage is unconfigured, and NewRouter's parameter is the
+	// media.ObjectStore INTERFACE -- so passing the concrete pointer directly
+	// produces a NON-NIL interface holding a nil pointer, and every downstream
+	// `store == nil` guard silently becomes dead code. That is not theoretical:
+	// it made router.go's "media endpoints disabled" branch and
+	// media.ReclaimErasedTier1's "object storage is not configured" branch both
+	// unreachable, turning the latter into a nil dereference on the GDPR
+	// erasure path -- POST-COMMIT, so the account is already gone and the
+	// handler's own revokeAccessTokens never runs, leaving live access tokens
+	// against an erased account (found by three independent reviewers on
+	// PR #3019).
+	//
+	// Converting once, here at the boundary, is what makes those guards mean
+	// what they say. Do NOT pass storageClient directly to an interface
+	// parameter again; the compiler cannot catch it.
+	mediaStore := mediaObjectStore(storageClient)
+
 	// Boot-time object-storage backend registry (ADR-0038 / #2759). Placement
 	// is per object, so reads resolve the store from the media_files row
 	// rather than assuming this one client. NewRegistry cannot fail and never
@@ -199,7 +217,7 @@ func runControlPlane() (runErr error) {
 				closePresence, activePlans, routerErr := api.NewRouter(
 				db,
 				redisClient,
-				storageClient,
+				mediaStore,
 				cfg,
 				liveSpa,
 				log,
@@ -311,6 +329,22 @@ func runControlPlane() (runErr error) {
 	// registered-but-unavailable legacy backend is recognised and skipped
 	// quietly rather than logged as a fault.
 	media.StartSessionSweepWorkers(cleanupCtx, storageRegistry, log, media.DefaultSessionSweepInterval)
+
+	// Tier-2 orphan reclamation (#2759 follow-on). A SIBLING of the sweeper
+	// above, not a duplicate: that one aborts INCOMPLETE multipart uploads,
+	// this one deletes COMPLETED objects that no media_files row claims.
+	//
+	// It is the only reclamation path in this service that can start without a
+	// row. Every other one -- the purge engine's queue, the straggler sweep,
+	// CleanupObject -- begins from media_files, and an account erasure
+	// hard-deletes those rows through ON DELETE CASCADE, so historical residue
+	// is invisible to all of them at once. The erasure capture in
+	// users.deleteAccountTx closes that going forward; this recovers the past.
+	//
+	// TIER 2 ONLY, permanently. See the header of internal/media/orphan_reaper.go
+	// for why widening the prefix to tier-1 profile media would blank live
+	// server and group-DM icons across the estate.
+	media.StartOrphanSweepWorkers(cleanupCtx, db, storageRegistry, log, media.DefaultOrphanSweepInterval)
 
 	// Create HTTP server
 	srv := &http.Server{
@@ -612,6 +646,21 @@ func closeRedisClient(redisClient *redis.Client, log *logger.Logger) {
 // would take down auth, messaging and voice over a store that holds no objects
 // this build has been told to read. Non-legacy backends are constructed by
 // storage.NewRegistry, which never fails and never aborts boot.
+// mediaObjectStore converts the concrete storage client into the interface
+// NewRouter takes, WITHOUT producing a typed nil.
+//
+// Extracted rather than written inline so the conversion is testable: it is one
+// `if` whose absence is invisible at the call site and silently re-arms the
+// dead-guard class described above. A test that constructs the nil case and
+// asserts `got == nil` fails the moment someone "simplifies" this back to a
+// direct assignment.
+func mediaObjectStore(client *storage.Client) media.ObjectStore {
+	if client == nil {
+		return nil
+	}
+	return client
+}
+
 func initStorageClient(cfg *config.Config, log *logger.Logger) (*storage.Client, error) {
 	if cfg.StorageEndpoint == "" {
 		log.Info("Object storage not configured (STORAGE_ENDPOINT/MINIO_ENDPOINT empty) — media endpoints disabled")

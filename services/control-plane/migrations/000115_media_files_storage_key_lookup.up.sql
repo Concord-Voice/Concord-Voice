@@ -1,0 +1,30 @@
+-- Orphan-reaper lookup index (#2759 follow-on; account-erasure media residue).
+--
+-- WHY THIS INDEX AND NOT THE EXISTING ONE. media_files already carries
+-- idx_media_files_storage_key, but it is PARTIAL (`WHERE deleted_at IS NULL`)
+-- and UNIQUE. The tier-2 orphan reaper asks a question that index structurally
+-- cannot answer: "does ANY row -- live, soft-deleted, or already reaped --
+-- claim this (storage_key, storage_backend) pair?" A partial index is unusable
+-- for a predicate that must also see rows outside its own WHERE clause, so
+-- without this the reaper sequentially scans media_files once per listed batch.
+--
+-- This is the query migration 000114 said to add an index for "later ... naming
+-- it at that time". This is that time, and this is that query.
+--
+-- PAIR-KEYED, matching every other statement on the delete rail. "An object a
+-- row claims" is a statement about (bucket, key), not about the key alone: two
+-- rows may carry the same storage_key on different backends and those are two
+-- distinct objects. A key-only index would answer the wrong question and spare
+-- a genuine orphan because its key exists on some other backend.
+--
+-- NOT UNIQUE. Soft-deleted rows may freely share a storage_key with the live
+-- row that replaced them (tier-1 keys are deterministic per subject), which is
+-- exactly why the existing unique index had to be partial.
+--
+-- NOTE: golang-migrate runs each migration file inside a transaction, so
+-- CREATE INDEX CONCURRENTLY cannot be used here (it is forbidden inside a
+-- transaction block). Follow the 000067 precedent: for a large production
+-- media_files table, create this index by hand with CONCURRENTLY before running
+-- the migration -- IF NOT EXISTS below then makes this a no-op.
+CREATE INDEX IF NOT EXISTS idx_media_files_storage_key_all
+    ON media_files (storage_key, storage_backend);

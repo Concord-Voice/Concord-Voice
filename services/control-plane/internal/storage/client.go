@@ -468,3 +468,80 @@ func nextUploadMarkers(curKey, curID, nextKey, nextID string) (string, string, e
 	}
 	return nextKey, nextID, nil
 }
+
+// StoredObject is one object present in the bucket, as reported by a listing.
+//
+// LastModified is the field the orphan reaper's write-race margin is measured
+// against. Both attachment write paths put the OBJECT down before they insert
+// its media_files ROW, so an object younger than the margin may simply be one
+// whose row is still moments away.
+type StoredObject struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
+
+// ListObjects reports every object under prefix that was last modified before
+// olderThan.
+//
+// The age filter is applied HERE rather than left to the caller so that no
+// consumer can accidentally receive a freshly written object. It is the only
+// thing standing between the orphan reaper and the put-then-insert window in
+// both attachment write paths, and a filter a caller must remember to apply is
+// one a caller will eventually forget.
+//
+// `c.minio.Client.ListObjects` (not `c.minio.ListObjects`) for the reason the
+// NOTE above PutObject gives: Core shadows the promoted high-level method with
+// a lower-level form. The SDK paginates the returned channel internally.
+func (c *Client) ListObjects(
+	ctx context.Context, prefix string, olderThan time.Time,
+) ([]StoredObject, error) {
+	var out []StoredObject
+	for info := range c.minio.Client.ListObjects(ctx, c.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	}) {
+		if info.Err != nil {
+			// Return rather than continue. A partial listing presented as a
+			// complete one is the dangerous shape here: the orphan reaper's
+			// whole premise is "the bucket holds this and the database does
+			// not", and a truncated bucket side turns that into a wrong answer
+			// in the safe direction today and an unnoticed blind spot forever.
+			return nil, fmt.Errorf("storage: failed to list objects under %q: %w", prefix, info.Err)
+		}
+		obj, ok := storedObjectBefore(info.Key, info.Size, info.LastModified, olderThan)
+		if !ok {
+			continue
+		}
+		out = append(out, obj)
+	}
+	return out, nil
+}
+
+// storedObjectBefore decides whether one listed object is old enough to be a
+// candidate, and converts it.
+//
+// Split out of ListObjects because it is the only part of that method that
+// makes a DECISION -- and the decision is the orphan reaper's write-race
+// margin, the single thing standing between it and the put-then-insert window
+// in both attachment write paths. The SDK call wrapped around it is thin
+// plumbing, exercised at the consumer through fakes like every other method
+// here; this is not, and a bucket should not be required to test it.
+//
+// The boundary is EXCLUSIVE and deliberately so: an object whose timestamp
+// equals the cutoff is kept, not swept. At the margin the conservative answer
+// is to wait another interval, because being early here deletes an object whose
+// row is still moments away.
+//
+// A ZERO timestamp is REJECTED rather than treated as ancient. `time.Time{}`
+// predates every cutoff, so a bare `Before` test admits an object carrying no
+// LastModified at all -- bypassing the margin entirely, on a delete path, for
+// the one input that tells us least. That is the wrong direction for a guard
+// whose entire job is failing closed, so a missing timestamp waits for a
+// listing that supplies one (PR #3019 review).
+func storedObjectBefore(key string, size int64, lastModified, olderThan time.Time) (StoredObject, bool) {
+	if lastModified.IsZero() || !lastModified.Before(olderThan) {
+		return StoredObject{}, false
+	}
+	return StoredObject{Key: key, Size: size, LastModified: lastModified}, true
+}

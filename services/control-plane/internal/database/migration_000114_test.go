@@ -40,21 +40,42 @@ func TestMigration000114_ColumnIsNullableTextNoDefault(t *testing.T) {
 		"no DEFAULT: a default would silently redefine what an omitted column means for new rows written by an old replica")
 }
 
-// TestMigration000114_NoIndexOnStorageBackend locks the documented decision to
-// omit an index: the only anticipated read rides the existing primary-key
-// lookup on media_files.id. If a later change adds one without naming a query
-// that needs it, this test is the tripwire.
-func TestMigration000114_NoIndexOnStorageBackend(t *testing.T) {
+// TestMigration000114_StorageBackendIndexesAreNamed is the successor to
+// 000114's original no-index assertion, and the change of shape is the point.
+//
+// 000114 asserted ZERO indexes mentioning storage_backend, on the documented
+// grounds that no identified query scanned or filtered by it — while inviting
+// exactly one future change: "add an index only when one appears, and name it
+// then." Migration 000115 is that change. The tier-2 orphan reaper asks whether
+// ANY row claims a (storage_key, storage_backend) pair, live or soft-deleted,
+// which the partial idx_media_files_storage_key structurally cannot answer.
+//
+// So the tripwire is now an ALLOWLIST rather than a zero-count. It keeps doing
+// the original job — a speculative index still fails here — while recording the
+// one query that earned its place. Widening this list requires naming the query,
+// same as before.
+func TestMigration000114_StorageBackendIndexesAreNamed(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()
 
-	var count int
-	require.NoError(t, db.QueryRow(`
-		SELECT COUNT(*) FROM pg_indexes
-		WHERE tablename = 'media_files' AND indexdef ILIKE '%storage_backend%'`,
-	).Scan(&count))
-	assert.Zero(t, count,
-		"no identified query scans/filters media_files by storage_backend alone; add an index only when one appears, and name it then")
+	rows, err := db.Query(`
+		SELECT indexname FROM pg_indexes
+		WHERE tablename = 'media_files' AND indexdef ILIKE '%storage_backend%'
+		ORDER BY indexname`)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		names = append(names, name)
+	}
+	require.NoError(t, rows.Err())
+
+	assert.Equal(t, []string{"idx_media_files_storage_key_all"}, names,
+		"every index on storage_backend must name the query that needs it; "+
+			"idx_media_files_storage_key_all serves the orphan reaper's pair-keyed claim check (000115)")
 }
 
 // TestMigration000114_InsertWithoutStorageBackendReadsBackNull models an old

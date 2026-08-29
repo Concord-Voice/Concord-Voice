@@ -235,17 +235,31 @@ func StartSessionSweepWorkers(
 	log *logger.Logger,
 	interval time.Duration,
 ) int {
-	targets := resolveSweepTargets(registry, log)
+	targets := resolveSweepTargets(registry, "attachment session sweep", log)
 	for _, t := range targets {
 		StartSessionSweepWorkerForBackend(ctx, t.store, t.backend, log, interval)
 	}
 	return len(targets)
 }
 
-// sweepTarget is one backend the sweeper will cover.
+// sweepTarget is one backend a sweeper will cover.
+//
+// store is the CONCRETE *storage.Client rather than the sweepStore interface.
+//
+// An earlier revision justified this by claiming the alternative forces a type
+// assertion. It does not -- `interface { sweepStore; orphanStore }` is satisfied
+// implicitly by *storage.Client and needs no assertion at all. The honest reason
+// is simpler: resolveSweepTargets produces a concrete client, and a struct field
+// shared by two consumers is the wrong place to express either one's method
+// needs. Each sweeper still takes its own narrow interface at its constructor,
+// which is where the test doubles live.
+//
+// It also strengthens nil-safety: resolveSweepTargets checks `client == nil` on
+// the concrete pointer before appending, so no typed nil can reach either
+// sweeper through a target.
 type sweepTarget struct {
 	backend string
-	store   sweepStore
+	store   *storage.Client
 }
 
 // resolveSweepTargets turns the registry into the set of backends to sweep,
@@ -255,7 +269,13 @@ type sweepTarget struct {
 // without starting goroutines — the workers run a sweep immediately on start,
 // so a test of "which backends did we cover" would otherwise have to drive real
 // object-store calls to answer a question that is purely about enumeration.
-func resolveSweepTargets(registry SweepBackendSource, log *logger.Logger) []sweepTarget {
+// sweepName prefixes every line this emits. It is a PARAMETER rather than the
+// hardcoded "attachment session sweep" it started as, because two sweepers now
+// share this resolver -- the session sweeper and the tier-2 orphan reaper -- and
+// an unenumerated backend means something different to each. Reporting "its
+// abandoned uploads are unreclaimed" for a bucket the ORPHAN reaper could not
+// list names the wrong failure and points the operator at the wrong worker.
+func resolveSweepTargets(registry SweepBackendSource, sweepName string, log *logger.Logger) []sweepTarget {
 	if registry == nil {
 		return nil
 	}
@@ -275,13 +295,13 @@ func resolveSweepTargets(registry SweepBackendSource, log *logger.Logger) []swee
 		client, err := registry.Resolve(id)
 		if err != nil || client == nil {
 			if unconfigured {
-				log.Info("attachment session sweep: object storage is not configured; nothing to sweep")
+				log.Info(sweepName + ": object storage is not configured; nothing to sweep")
 				continue
 			}
 			// NOT the same as a clean sweep that found nothing. This backend's
 			// bucket goes unswept for as long as it stays unresolvable, so it
 			// gets its own alertable line rather than silence.
-			log.Error("attachment session sweep: backend NOT enumerated; its abandoned uploads are unreclaimed",
+			log.Error(sweepName+": backend NOT enumerated; its bucket is unreclaimed",
 				"backend", string(id), "error", err)
 			continue
 		}

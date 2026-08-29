@@ -1087,6 +1087,28 @@ keys, memberships, messages, and DM data are removed atomically — strictly
 stronger than the soft-revoke in `ChangePassword` (no token residue). A
 NULL-`user_id` audit row is written to `account_deletions`.
 
+**Object storage is reclaimed by a capture, because the cascade destroys the
+only handle to it.** `media_files.uploader_id` is also `ON DELETE CASCADE`, so
+the same statement that erases the account removes every row naming the objects
+that account uploaded — and every reclamation path in the service starts *from*
+a row (the purge queue, `SweepStragglers`, `CleanupObject`). Erasure is how GDPR
+Article 17 is implemented here, so those bytes used to outlive the erasure meant
+to remove them. `deleteAccountTx` therefore captures the `BlobRef` set under the
+user-row lock **before both deletes** — ahead of `deleteIncompleteChannelsTx`
+too, since `media_files.channel_id` cascades as well — and `reclaimErasedMedia`
+discharges it after the commit on a context detached from the request.
+
+The capture is deliberately **narrow**, and the narrowing is a safety property
+rather than an optimisation: `proxyTier1Media` serves profile media by key
+without ever reading `media_files`, so a `server-icons/` row's `uploader_id`
+does not denote ownership of the object. It admits tier 2 plus exactly
+`avatars/<userID>` and `banners/<userID>` (`media.ErasableTier1Keys`); a capture
+keyed on `uploader_id` alone would blank a live server's icon. Residue from
+erasures that predate the capture is recovered by `media.OrphanReaper`, a daily
+bucket-listing sweep scoped permanently to `attachments/` — tier-1 only ever
+shrinks by capture, never by reaper. See
+[ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md).
+
 ### Runtime Client Configuration
 
 The desktop client discovers its runtime config — it is **not** hardcoded. `clientConfigService.ts` polls the public (pre-auth) `GET /api/v1/client/config` (`internal/clientconfig`) every ~5 minutes for: `minVersion` (a client-gate enforced regardless of auth state), server-toggled `featureFlags` (currently `gifsEnabled` only — the inert `voice`/`video`/`e2ee` members were removed under #1649), the **media-plane URL**, **TURN** host/realm, the `spaUrl`, and `spaIpcContract`. This is how the media-plane and TURN endpoints reach the client. The `gifsEnabled` flag mirrors the server-side `KLIPY_API_KEY` gate.
@@ -1258,7 +1280,7 @@ These describe intended future work, **not** current architecture. This section 
 - **`messages`-table partitioning** — declarative hash-partitioning by `channel_id` is specified but deliberately **not** implemented. Concrete trigger criteria gate it: query p99 > 100ms, any channel > 100k messages, or > 10M rows with observed bloat. Earliest candidate: v1.2.0.
 - **Performance SLOs** — Concord publishes no formal latency or capacity targets yet. Measure figures before documenting them. The previous version of this section carried aspirational numbers that nobody ever instrumented.
 - **Enterprise SSO** (LDAP, SAML 2.0) and additional disaster-recovery automation are later-release work.
-- **Demoted-MinIO attachment placement** ([ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md)) — accepted, not yet implemented. Today `STORAGE_BACKEND` selects one backend per process for every object (ADR-0024). The accepted design instead resolves storage **per object**, via a planned `media_files.storage_backend` column (migration `000113`, not yet applied): new SaaS attachments would land at a managed vendor (Cloudflare R2), while every attachment written before the cutover and all profile media (`avatars/`, `server-icons/`, `dm-icons/`) stay on MinIO permanently. MinIO remains the only backend for self-hosted, dev, and the #210 air-gapped bundle. Delivery stays proxied through the control plane either way — this ADR does not ship presigned-direct. The column, the boot-time backend registry, and the write-default flip are tracked as follow-on issues; no object has moved and no per-object resolution exists in code yet.
+- **Vendor write-default flip for attachments** ([ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md)) — the *mechanism* shipped; the *cutover* has not. Per-object placement is live: `media_files.storage_backend` exists (migration `000114`), `internal/media/backend_store.go` resolves the store per row on the read, delete, and write rails, and the boot-time backend registry is wired. What remains is the flip itself — `AttachmentWriteBackendID()` still returns `storage.LegacyBackendID` unconditionally, so every new object lands on MinIO and the vendor (Cloudflare R2) rows stay dormant. Profile media (`avatars/`, `banners/`, `server-icons/`, `server-banners/`, `dm-icons/`) is MinIO-resident **permanently** regardless, because the server decodes and re-encodes it and therefore holds it as plaintext wherever it lands. MinIO remains the only backend for self-hosted, dev, and the #210 air-gapped bundle, and delivery stays proxied through the control plane either way — this ADR does not ship presigned-direct.
 
 ## Next Steps
 

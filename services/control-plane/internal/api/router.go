@@ -891,6 +891,19 @@ func NewRouter(
 	// until buildPrivacyHandler returns on the line above.
 	accountService.SetActivePlanRail(activePlanRail)
 
+	// The erasure's object-storage reclamation (#2759 follow-on). This closure
+	// is the whole wiring, and it lives here because this is the one scope
+	// holding BOTH halves: `store` (the legacy tier-1 client) and `purgeReaper`.
+	//
+	// The two legs are not interchangeable. Tier-2 keys are per-upload unique,
+	// which is exactly what EnqueueBlobDeletes' contract demands. Tier-1 keys
+	// are deterministic per subject, which is exactly what it refuses -- so
+	// routing tier-1 through the queue would delete an object a live row may
+	// still point at. See media.ErasableTier1Keys for the narrowing that makes
+	// the tier-1 set safe in the first place.
+	accountService.SetErasedMediaReclaimer(
+		newErasedMediaReclaimer(store, purgeReaper.EnqueueBlobDeletes, log))
+
 	// Runs here, not beside the other wiring: accountService is the last #2447
 	// consumer and is constructed on the line above.
 	requireGraphPresenceCaptureWired(
