@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-Invite links now arrive, open, and leave the server where you can see it. The GIF picker's Categories and Recent tabs work for the first time. And the screen-capture protection switch no longer reports itself as on where nothing is enforcing it.
+## [0.2.42] — 2026-08-29
+
+Interface improvements reach you again without waiting for an app update. Invite links now arrive, open, and leave the server where you can see it, and the GIF picker's Categories and Recent tabs work for the first time. Someone who has just lost access can no longer be shown that you are online, and the screen-capture protection switch no longer reports itself as on where nothing is enforcing it.
 
 ### Fixed
 
