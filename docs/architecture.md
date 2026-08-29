@@ -1196,6 +1196,7 @@ sequenceDiagram
 ### Data Privacy
 
 - **No third-party telemetry or tracing pipeline.** The narrow internal operations-metrics path stores only fixed aggregate scalars under ADR-0030 (see [Logging Discipline](#logging-discipline)).
+- **Planned: Cloudflare R2 custody of new SaaS attachments** ([ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md), accepted, not yet implemented — see Planned / Not Yet Implemented below). New attachments are encrypted client-side before upload, so their contents stay unreadable to the storage vendor; R2 would hold only object count, size, upload timing, and a bucket key whose server-identifying segment is a keyed one-way transform (`HMAC-SHA256` over a secret pepper, truncated) — it hides the underlying server or conversation identifier from the vendor while still preserving grouping, because the transform is deterministic. Downloads stay proxied through the control plane, never a direct vendor URL. This does not newly expose fetches to observation: Cloudflare already observes client IP, `file_id` in cleartext, size, and timing on every attachment download **today**, because `api.concordvoice.chat` is Cloudflare-proxied — the planned change hides content from the storage vendor, not from Cloudflare.
 - No voice-content retention (the SFU forwards and never records, and frames are E2EE end-to-end).
 - E2EE-everywhere: the server stores only ciphertext for messages, DMs, and synced user-state blobs (preferences, saved GIFs).
 - **GDPR Article 17 erasure** is implemented (`POST /api/v1/privacy/erase-account`, atomic cascade).
@@ -1243,7 +1244,7 @@ Concord/
 | Database       | PostgreSQL 16                           | Relational + JSONB, mature, declarative partitioning available      |
 | Cache          | Redis 7 (server, node-redis 6.x client) | Sessions, presence, RBAC cache, rate limiting, voice room state     |
 | Messaging      | NATS 2.x                                | Lightweight inter-service voice events                              |
-| Object storage | MinIO / S3                              | Avatars, banners, attachments (tiered: server-readable vs E2EE; image metadata stripped on both tiers — see Image metadata handling) |
+| Object storage | MinIO / S3                              | Avatars, banners, attachments (tiered: server-readable vs E2EE; image metadata stripped on both tiers — see Image metadata handling). Backend selected per-process by `STORAGE_BACKEND` (`minio` default) — [ADR-0024](adr/0024-object-storage-minio-s3-seam.md). MinIO's role as the SaaS attachment default is planned to narrow — see Planned / Not Yet Implemented and [ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md). |
 | SPA serving    | Cloudflare Pages                        | Atomic deploys, decoupled from the control plane (ADR-0015)         |
 | Auth           | JWT + HttpOnly refresh                  | Stateless access, revocable refresh                                 |
 | GIF search     | Klipy (privacy proxy)                   | Tenant key + SSRF-guarded server-side proxy. No direct client calls |
@@ -1257,6 +1258,7 @@ These describe intended future work, **not** current architecture. This section 
 - **`messages`-table partitioning** — declarative hash-partitioning by `channel_id` is specified but deliberately **not** implemented. Concrete trigger criteria gate it: query p99 > 100ms, any channel > 100k messages, or > 10M rows with observed bloat. Earliest candidate: v1.2.0.
 - **Performance SLOs** — Concord publishes no formal latency or capacity targets yet. Measure figures before documenting them. The previous version of this section carried aspirational numbers that nobody ever instrumented.
 - **Enterprise SSO** (LDAP, SAML 2.0) and additional disaster-recovery automation are later-release work.
+- **Demoted-MinIO attachment placement** ([ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md)) — accepted, not yet implemented. Today `STORAGE_BACKEND` selects one backend per process for every object (ADR-0024). The accepted design instead resolves storage **per object**, via a planned `media_files.storage_backend` column (migration `000113`, not yet applied): new SaaS attachments would land at a managed vendor (Cloudflare R2), while every attachment written before the cutover and all profile media (`avatars/`, `server-icons/`, `dm-icons/`) stay on MinIO permanently. MinIO remains the only backend for self-hosted, dev, and the #210 air-gapped bundle. Delivery stays proxied through the control plane either way — this ADR does not ship presigned-direct. The column, the boot-time backend registry, and the write-default flip are tracked as follow-on issues; no object has moved and no per-object resolution exists in code yet.
 
 ## Next Steps
 
