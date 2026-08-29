@@ -284,11 +284,23 @@ E2EE means your messages are encrypted on your device before being sent. Only yo
 
 ### Can Concord Voice read my messages?
 
-**For E2EE messages:** No. Messages are encrypted on your device with the recipient's public key. Concord Voice servers only see encrypted ciphertext.
+No. Every message is encrypted on your device before it is sent, and the servers
+only ever hold ciphertext. This is not a setting you can turn off, and there is
+no server — hosted or self-hosted — that stores your messages in plaintext.
 
-**For non-E2EE messages:** Yes, technically. If you join a non-E2EE server (self-hosted or opted-out), messages are stored in plaintext and server admins can access them.
+Encryption used to be a per-server and per-user option. It is not any more.
+Migrations 000062, 000068 and 000073 removed the last opt-out columns, and a
+channel cannot be created without wrapped keys, so a plaintext conversation has
+no way to exist.
 
-**Recommendation:** Always use E2EE for private conversations.
+What a server operator can still see is the metadata the service needs to
+deliver a message: who is in a conversation, and when a message was sent.
+
+One limit worth stating plainly: deleting a message removes it from the live
+service, but ciphertext already captured in an operator's backups can persist
+there until those backups age out. It stays encrypted, and the operator still
+cannot read it. Backup retention and restoration are separate operator
+obligations — see the [Privacy Policy](./docs/privacy-policy.md).
 
 ---
 

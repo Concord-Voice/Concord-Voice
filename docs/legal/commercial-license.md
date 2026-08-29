@@ -79,11 +79,19 @@ compliance requirements without trusting a third party with your data.
 
 ### Federal-readiness
 
-Concord Voice's Andromeda initiative has delivered DISA STIG hardening
-and FIPS 140-3 cryptographic module compliance ([epic #692](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/692),
-closed). Additional federal-ready capabilities — including post-quantum
-cryptography hybrid handshake support — are under consideration for the
-v1.1.0 release.
+Concord Voice makes **no** federal-compliance claim. There is no DISA STIG
+hardening, no FIPS 140-3 validated cryptographic module, and no FedRAMP
+authorization. The epic that scoped this work
+([#692](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/692), with
+children [#700](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/700)
+and [#701](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/701)) was
+closed as **not planned** on 2026-05-14 without being built. The recorded reason:
+*"Federal/DoD compliance scope removed from current planning — no active customer
+driver … Reopen if a federal customer commit materializes."*
+
+If federal readiness is a requirement for your deployment, contact us before
+you buy. The scope can be reopened against a committed customer, but nothing in
+this program should be read as delivering it today.
 
 Public-sector customers may require additional security attestations
 (FedRAMP, StateRAMP, etc.). Sole-source justification and
