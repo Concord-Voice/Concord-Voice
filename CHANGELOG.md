@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.43] — 2026-08-30
+
 The app can reach the servers again after a certificate change locked every installed copy out. Switching between the app and the web version no longer leaves one of them unable to load your servers. Deleting your account now removes the files it uploaded, not only the record of them.
 
 ### Changed
