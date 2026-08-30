@@ -1,10 +1,10 @@
 import { renderHook } from '@testing-library/react';
-import { useChannelSubscription } from '@/renderer/hooks/useChannelSubscription';
+import { useChannelSubscription } from '@/renderer/hooks/messaging/useChannelSubscription';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import {
   __resetPendingUnsubscribes,
   UNSUBSCRIBE_DELAY_MS,
-} from '@/renderer/hooks/useDMSubscription';
+} from '@/renderer/hooks/messaging/useDMSubscription';
 
 // Mock websocketService
 const mockSubscribe = vi.fn();

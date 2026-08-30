@@ -16,7 +16,7 @@ vi.mock('@/renderer/components/Auth/LoadingSpinner', () => ({
 }));
 
 // NsfwContentGate (the sibling section in AccountSection) reads age status.
-vi.mock('@/renderer/hooks/useAgeStatus', () => ({
+vi.mock('@/renderer/hooks/ui/useAgeStatus', () => ({
   useAgeStatus: () => ({ state: 'unverified' }),
 }));
 

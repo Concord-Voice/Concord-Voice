@@ -37,7 +37,7 @@ vi.mock('@/renderer/spaSelfHealClient', () => ({
   triggerChunkSelfHeal: (...args: unknown[]) => mockTriggerChunkSelfHeal(...args),
 }));
 
-import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
+import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecovery';
 
 beforeEach(() => {
   vi.clearAllMocks();

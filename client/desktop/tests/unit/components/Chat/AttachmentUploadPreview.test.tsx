@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
 import AttachmentUploadPreview from '@/renderer/components/Chat/AttachmentUploadPreview';
-import type { FileUploadState } from '@/renderer/hooks/useFileUpload';
+import type { FileUploadState } from '@/renderer/hooks/messaging/useFileUpload';
 
 function createFileEntry(
   name: string,

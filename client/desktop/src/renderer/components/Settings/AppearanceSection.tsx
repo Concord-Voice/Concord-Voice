@@ -1,6 +1,6 @@
 import React from 'react';
 import type { AppearanceSettings, CustomColors } from '../../stores/ui/settingsStore';
-import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/useDraftSettings';
+import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/ui/useDraftSettings';
 import { useLayoutStore } from '../../stores/ui/layoutStore';
 import { isValidHex } from '../../utils/colorUtils';
 import CollapsibleSection from './CollapsibleSection';

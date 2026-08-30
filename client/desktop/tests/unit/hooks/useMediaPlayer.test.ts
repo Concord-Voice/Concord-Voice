@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useMediaPlayer } from '@/renderer/hooks/useMediaPlayer';
+import { useMediaPlayer } from '@/renderer/hooks/voice/useMediaPlayer';
 
 class FakeMedia extends EventTarget {
   paused = true;

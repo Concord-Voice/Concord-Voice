@@ -16,7 +16,7 @@ let mockResults: Array<{
 let mockIsSearching = false;
 let mockProgress: { checked: number; total: number | null } | null = null;
 
-vi.mock('@/renderer/hooks/useChannelSearch', () => ({
+vi.mock('@/renderer/hooks/messaging/useChannelSearch', () => ({
   useChannelSearch: () => ({
     results: mockResults,
     isSearching: mockIsSearching,

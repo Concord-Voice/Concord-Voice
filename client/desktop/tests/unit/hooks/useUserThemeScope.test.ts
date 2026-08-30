@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useUserThemeScope } from '@/renderer/hooks/useUserThemeScope';
+import { useUserThemeScope } from '@/renderer/hooks/ui/useUserThemeScope';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 
 describe('useUserThemeScope', () => {

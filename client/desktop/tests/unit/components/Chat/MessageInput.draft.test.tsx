@@ -16,7 +16,7 @@ let mockInitialDraft:
     }
   | undefined;
 
-vi.mock('@/renderer/hooks/useDraftMessage', () => ({
+vi.mock('@/renderer/hooks/messaging/useDraftMessage', () => ({
   useDraftMessage: vi.fn(() => ({
     initialDraft: mockInitialDraft,
     saveDraft: mockSaveDraft,
@@ -24,7 +24,7 @@ vi.mock('@/renderer/hooks/useDraftMessage', () => ({
   })),
 }));
 
-vi.mock('@/renderer/hooks/useFileUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],
     addFiles: vi.fn(),

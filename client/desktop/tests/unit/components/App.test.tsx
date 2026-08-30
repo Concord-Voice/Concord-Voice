@@ -41,7 +41,7 @@ vi.mock('@/renderer/components/Voice/PipWindow', () => ({
 vi.mock('@/renderer/components/Voice/ParticipantGrid', () => ({
   AudioOutputs: () => <div data-testid="audio-outputs" />,
 }));
-vi.mock('@/renderer/hooks/useWebSocket', () => ({
+vi.mock('@/renderer/hooks/messaging/useWebSocket', () => ({
   useWebSocket: vi.fn(),
 }));
 vi.mock('@/renderer/components/ui/ConnectionLostOverlay', () => ({

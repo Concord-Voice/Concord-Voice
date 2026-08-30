@@ -97,12 +97,12 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
 }));
 
 // Mock hooks
-vi.mock('@/renderer/hooks/useChannelSubscription', () => ({
+vi.mock('@/renderer/hooks/messaging/useChannelSubscription', () => ({
   useChannelSubscription: vi.fn(),
 }));
 
 const mockSendMsg = vi.fn();
-vi.mock('@/renderer/hooks/useMessaging', () => ({
+vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
   useMessaging: () => ({
     sendMessage: mockSendMsg,
     markDelivered: vi.fn(),

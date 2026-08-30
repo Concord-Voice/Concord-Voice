@@ -48,7 +48,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
   },
 }));
 
-import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { createMockWsService } from '../../helpers/wsServiceMock';
 

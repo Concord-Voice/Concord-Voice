@@ -52,7 +52,7 @@ vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftVideoSetting: vi.fn((key: string) => defaultVideoSettings[key] ?? false),
   setDraftVideoSetting: mockSetDraftVideoSetting,
 }));
@@ -61,7 +61,7 @@ vi.mock('@/renderer/hooks/useDraftSettings', () => ({
 // so grant unbounded (native, -1) premium video caps (#1301 / split axes #1602) —
 // the lock variants (L2/L5/L6) must not clamp the option lists here. Lock
 // behaviour is covered in VideoConfigSection.premium.test.tsx.
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector({
       streamMaxHeight: -1,
@@ -128,7 +128,7 @@ import { render, screen, fireEvent } from '../../../test-utils';
 import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSection';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
-import { useDraftVideoSetting } from '@/renderer/hooks/useDraftSettings';
+import { useDraftVideoSetting } from '@/renderer/hooks/ui/useDraftSettings';
 import { getCodecInfo } from '@/renderer/services/mediaCapabilities';
 
 // ─── Test codec data ────────────────────────────────────────────────────────

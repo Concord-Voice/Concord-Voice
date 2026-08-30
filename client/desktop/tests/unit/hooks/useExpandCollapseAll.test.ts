@@ -1,6 +1,6 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useRef, useEffect } from 'react';
-import { useExpandCollapseAll } from '@/renderer/hooks/useExpandCollapseAll';
+import { useExpandCollapseAll } from '@/renderer/hooks/ui/useExpandCollapseAll';
 
 /**
  * Test harness: render the hook against a container DOM node we control,

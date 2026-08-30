@@ -39,7 +39,7 @@ vi.mock('@/renderer/components/Voice/useVoiceMagnification', () => ({
 }));
 
 const mockUseGridLayout = vi.fn(() => ({ tileWidth: 300, tileHeight: 169, columns: 3 }));
-vi.mock('@/renderer/hooks/useGridLayout', () => ({
+vi.mock('@/renderer/hooks/ui/useGridLayout', () => ({
   useGridLayout: (...args: unknown[]) => mockUseGridLayout(...args),
 }));
 

@@ -6,9 +6,9 @@ import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useTTSSettingsStore } from '../../stores/audio/ttsSettingsStore';
-import { useMessageFetch } from '../../hooks/useMessageFetch';
-import { useChatController } from '../../hooks/useChatController';
-import { useVoiceTextChatTarget } from '../../hooks/useVoiceTextChatTarget';
+import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
+import { useChatController } from '../../hooks/messaging/useChatController';
+import { useVoiceTextChatTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 import './VoiceTextChat.css';
 
 const VoiceTextChat: React.FC = () => {

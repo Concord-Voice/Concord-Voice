@@ -65,7 +65,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   }),
 }));
 
-import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
 import { notificationSoundService } from '@/renderer/services/notificationSoundService';
 import { createMockWsService } from '../../helpers/wsServiceMock';

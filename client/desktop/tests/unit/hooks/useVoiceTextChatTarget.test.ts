@@ -9,14 +9,14 @@ import { useServerStore } from '@/renderer/stores/chat/serverStore';
 
 const mockChannelSub = vi.fn();
 const mockDMSub = vi.fn();
-vi.mock('@/renderer/hooks/useChannelSubscription', () => ({
+vi.mock('@/renderer/hooks/messaging/useChannelSubscription', () => ({
   useChannelSubscription: (id: string | null) => mockChannelSub(id),
 }));
-vi.mock('@/renderer/hooks/useDMSubscription', () => ({
+vi.mock('@/renderer/hooks/messaging/useDMSubscription', () => ({
   useDMSubscription: (id: string | null) => mockDMSub(id),
 }));
 
-import { useVoiceTextChatTarget } from '@/renderer/hooks/useVoiceTextChatTarget';
+import { useVoiceTextChatTarget } from '@/renderer/hooks/voice/useVoiceTextChatTarget';
 
 const linkedTextChannel = {
   id: 'text-1',

@@ -1,6 +1,6 @@
 import { renderHook, act } from '@testing-library/react';
 import { vi } from 'vitest';
-import { useImageUpload } from '@/renderer/hooks/useImageUpload';
+import { useImageUpload } from '@/renderer/hooks/messaging/useImageUpload';
 import { FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
 import {
   MACH_ICON_SIZE,

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useUserStore, UpdateProfileData } from '../../stores/auth/userStore';
-import { useImageUpload } from '../../hooks/useImageUpload';
-import { useEntitlement } from '../../hooks/useEntitlement';
+import { useImageUpload } from '../../hooks/messaging/useImageUpload';
+import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { formatFileSize } from '../../utils/attachmentCrypto';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';

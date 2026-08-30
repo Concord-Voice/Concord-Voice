@@ -8,7 +8,7 @@ const appearanceState: Record<string, unknown> = {
   customColors: null,
 };
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAppearance: vi.fn(() => appearanceState),
   setDraftAppearanceSetting: (...args: unknown[]) => mockSetDraftAppearanceSetting(...args),
 }));

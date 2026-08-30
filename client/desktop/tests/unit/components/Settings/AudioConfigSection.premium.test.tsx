@@ -44,7 +44,7 @@ vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
   ),
 }));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn(() => false),
   setDraftAudioSetting: vi.fn(),
   batchSetAudioDrafts: vi.fn(),
@@ -63,7 +63,7 @@ function freeEntitlement() {
     ...entitlementOverrides,
   };
 }
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector(freeEntitlement())
   ),

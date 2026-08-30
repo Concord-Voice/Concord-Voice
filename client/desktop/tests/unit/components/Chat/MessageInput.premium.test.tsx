@@ -17,7 +17,7 @@ let mockUploadFiles: Array<{ file: File; progress: number; status: 'pending' }> 
 const mockRemoveFile = vi.fn((index: number) => {
   mockUploadFiles = mockUploadFiles.filter((_, i) => i !== index);
 });
-vi.mock('@/renderer/hooks/useFileUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useFileUpload', () => ({
   useFileUpload: () => ({
     files: mockUploadFiles,
     addFiles: mockAddFiles,
@@ -47,7 +47,7 @@ function freeEntitlement() {
     ...entitlementOverrides,
   };
 }
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector(freeEntitlement())
   ),

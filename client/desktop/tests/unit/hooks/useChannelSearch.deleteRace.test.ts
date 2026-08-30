@@ -22,7 +22,10 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { processBackfillMessage, useChannelSearch } from '@/renderer/hooks/useChannelSearch';
+import {
+  processBackfillMessage,
+  useChannelSearch,
+} from '@/renderer/hooks/messaging/useChannelSearch';
 import { deferred } from '../../helpers/deferred';
 import {
   beginSearchBackfill,

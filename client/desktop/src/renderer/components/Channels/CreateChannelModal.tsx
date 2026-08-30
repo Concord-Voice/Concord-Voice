@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useFormState } from '../../hooks/useFormState';
+import { useFormState } from '../../hooks/ui/useFormState';
 import { NAME_MAX, validateChannelName, getChannelTypeIcon } from '../../utils/channelHelpers';
 import ChannelEmojiField from './ChannelEmojiField';
 import Modal from '../ui/Modal';

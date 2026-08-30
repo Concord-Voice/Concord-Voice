@@ -3,7 +3,7 @@ import PasswordStrength from './PasswordStrength';
 import InfoTooltip from './InfoTooltip';
 import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
-import { useSSOFlow } from '../../hooks/useSSOFlow';
+import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { ensureMachineId } from '../../services/apiClient';
 import { apiUrl } from '../../services/runtimeServerBase';

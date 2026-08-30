@@ -18,7 +18,7 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({
 vi.mock('@/renderer/stores/ui/layoutStore', () => ({
   useLayoutStore: () => false,
 }));
-vi.mock('@/renderer/hooks/useFileUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],
     addFiles: vi.fn(),
@@ -29,7 +29,7 @@ vi.mock('@/renderer/hooks/useFileUpload', () => ({
     hasFiles: false,
   }),
 }));
-vi.mock('@/renderer/hooks/useDraftMessage', () => ({
+vi.mock('@/renderer/hooks/messaging/useDraftMessage', () => ({
   useDraftMessage: () => ({
     initialDraft: undefined,
     saveDraft: vi.fn(),

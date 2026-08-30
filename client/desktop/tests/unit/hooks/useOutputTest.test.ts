@@ -19,7 +19,7 @@ vi.mock('@/renderer/services/voiceService', () => ({
   },
 }));
 
-import { useOutputTest } from '@/renderer/hooks/useOutputTest';
+import { useOutputTest } from '@/renderer/hooks/device/useOutputTest';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { voiceService } from '@/renderer/services/voiceService';
 

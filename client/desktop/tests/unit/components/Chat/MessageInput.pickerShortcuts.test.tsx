@@ -28,7 +28,7 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
 vi.mock('@/renderer/stores/ui/layoutStore', () => ({ useLayoutStore: () => false }));
-vi.mock('@/renderer/hooks/useFileUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],
     addFiles: vi.fn(),

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useLaunchReset } from '@/renderer/hooks/useLaunchReset';
+import { useLaunchReset } from '@/renderer/hooks/ui/useLaunchReset';
 import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,

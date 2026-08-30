@@ -10,7 +10,7 @@ vi.mock('react-router', async (importOriginal) => ({
 }));
 
 const mockSend = vi.fn();
-vi.mock('@/renderer/hooks/useSendInviteToFriend', () => ({
+vi.mock('@/renderer/hooks/messaging/useSendInviteToFriend', () => ({
   useSendInviteToFriend: () => ({ send: mockSend }),
 }));
 

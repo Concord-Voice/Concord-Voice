@@ -5,7 +5,7 @@ import {
   useFileUpload,
   validateFiles,
   type AttachmentRejection,
-} from '@/renderer/hooks/useFileUpload';
+} from '@/renderer/hooks/messaging/useFileUpload';
 import {
   FREE_ATTACHMENT_BYTES,
   PREMIUM_ATTACHMENT_BYTES,

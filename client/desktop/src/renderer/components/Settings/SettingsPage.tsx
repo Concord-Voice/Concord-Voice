@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useTransition, useCallback } from 'react';
-import { useDraftSettingsLifecycle, useDraftActions } from '../../hooks/useDraftSettings';
-import { useSectionObserver } from '../../hooks/useSectionObserver';
+import { useDraftSettingsLifecycle, useDraftActions } from '../../hooks/ui/useDraftSettings';
+import { useSectionObserver } from '../../hooks/ui/useSectionObserver';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { useSettingsNavStore, type SettingsSection } from '../../stores/ui/settingsNavStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';

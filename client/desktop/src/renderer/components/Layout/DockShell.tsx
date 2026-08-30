@@ -9,7 +9,7 @@ import React, {
   useState,
 } from 'react';
 import { ChevronLeft, ChevronRight, Pin } from 'lucide-react';
-import { useResizablePanel } from '../../hooks/useResizablePanel';
+import { useResizablePanel } from '../../hooks/ui/useResizablePanel';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import {
   LEFT_SIDEBAR_MAX_WIDTH,

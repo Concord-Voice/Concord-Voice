@@ -11,7 +11,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 import { apiFetch } from '@/renderer/services/apiClient';
-import { useDNDTransitionRefresh } from '@/renderer/hooks/useDNDTransitionRefresh';
+import { useDNDTransitionRefresh } from '@/renderer/hooks/messaging/useDNDTransitionRefresh';
 
 const mockApiFetch = vi.mocked(apiFetch);
 const SERVER_ID = 'server-1';

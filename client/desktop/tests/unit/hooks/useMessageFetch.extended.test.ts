@@ -38,7 +38,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { useMessageFetch } from '@/renderer/hooks/useMessageFetch';
+import { useMessageFetch } from '@/renderer/hooks/messaging/useMessageFetch';
 
 function mockFetchResponse(messages: MessageWithStatus[], ok = true) {
   const response = { ok, status: ok ? 200 : 500 };

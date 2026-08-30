@@ -20,8 +20,8 @@ import {
   useDMSubscription,
   __resetPendingUnsubscribes,
   UNSUBSCRIBE_DELAY_MS,
-} from '@/renderer/hooks/useDMSubscription';
-import { useChannelSubscription } from '@/renderer/hooks/useChannelSubscription';
+} from '@/renderer/hooks/messaging/useDMSubscription';
+import { useChannelSubscription } from '@/renderer/hooks/messaging/useChannelSubscription';
 
 beforeEach(() => {
   vi.clearAllMocks();

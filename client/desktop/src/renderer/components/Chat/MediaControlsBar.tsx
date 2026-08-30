@@ -1,6 +1,6 @@
 import React from 'react';
 import { Play, Pause, Volume2, VolumeX, Maximize, PictureInPicture2 } from 'lucide-react';
-import type { MediaPlayerState, MediaPlayerActions } from '../../hooks/useMediaPlayer';
+import type { MediaPlayerState, MediaPlayerActions } from '../../hooks/voice/useMediaPlayer';
 import { formatMediaTime } from '../../utils/formatMediaTime';
 
 interface MediaControlsBarProps {

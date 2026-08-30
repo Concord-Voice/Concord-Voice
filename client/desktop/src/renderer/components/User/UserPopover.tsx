@@ -7,7 +7,7 @@ import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { UserProfile, useUserStore } from '../../stores/auth/userStore';
 import { useMemberStore, PresenceStatus } from '../../stores/chat/memberStore';
 import { getWebSocketService } from '../../services/websocketService';
-import { useUserThemeScope } from '../../hooks/useUserThemeScope';
+import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import './UserPopover.css';
 

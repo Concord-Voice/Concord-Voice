@@ -4,7 +4,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { useSendInviteToFriend } from '@/renderer/hooks/useSendInviteToFriend';
+import { useSendInviteToFriend } from '@/renderer/hooks/messaging/useSendInviteToFriend';
 import type { Friend } from '@/renderer/stores/chat/friendStore';
 
 const mockSend = vi.fn(() => 'client-msg-1');

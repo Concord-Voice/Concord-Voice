@@ -66,7 +66,7 @@ import {
   resolveMessagesFromStore,
   BACKFILL_BATCH_SIZE,
   DEBOUNCE_MS,
-} from '@/renderer/hooks/useChannelSearch';
+} from '@/renderer/hooks/messaging/useChannelSearch';
 
 // Helper: mock a successful bulk fetch response
 function mockBulkResponse(messages: MessageWithUser[], ok = true) {

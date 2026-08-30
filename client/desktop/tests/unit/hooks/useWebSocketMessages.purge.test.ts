@@ -60,7 +60,7 @@ vi.mock('@/renderer/services/searchService', () => ({
   removeScope: vi.fn(),
 }));
 
-import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyHandler = (...args: any[]) => void;

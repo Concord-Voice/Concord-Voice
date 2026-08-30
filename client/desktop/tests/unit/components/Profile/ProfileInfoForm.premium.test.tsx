@@ -29,7 +29,7 @@ function makeImageUploadStub(handleChange: ReturnType<typeof vi.fn>) {
   };
 }
 let imageUploadCalls = 0;
-vi.mock('@/renderer/hooks/useImageUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useImageUpload', () => ({
   useImageUpload: vi.fn(() => {
     // First call in the component is the avatar, second is the header.
     const stub =
@@ -51,7 +51,7 @@ function freeEntitlement() {
     ...entitlementOverrides,
   };
 }
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector(freeEntitlement())
   ),

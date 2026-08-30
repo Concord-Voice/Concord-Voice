@@ -45,7 +45,7 @@ const mockRemoveFile = vi.fn();
 const mockClearFiles = vi.fn();
 const mockUploadAll = vi.fn().mockResolvedValue({ ids: [], summaries: [] });
 const uploadMockOverrides: { hasFiles?: boolean; isUploading?: boolean; files?: unknown[] } = {};
-vi.mock('@/renderer/hooks/useFileUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useFileUpload', () => ({
   useFileUpload: () => ({
     files: uploadMockOverrides.files ?? [],
     addFiles: mockAddFiles,

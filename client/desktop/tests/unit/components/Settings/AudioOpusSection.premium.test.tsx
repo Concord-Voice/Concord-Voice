@@ -38,7 +38,7 @@ vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
   useAudioSettingsStore: vi.fn(),
 }));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn((key: string) => defaultSettings[key] ?? false),
   setDraftAudioSetting: (...args: unknown[]) => mockSetDraftAudioSetting(...args),
 }));
@@ -52,7 +52,7 @@ const entitlementOverrides: Record<string, unknown> = {};
 function freeEntitlement() {
   return { allowMusicMode: false, minPtimeMs: 20, ...entitlementOverrides };
 }
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector(freeEntitlement())
   ),

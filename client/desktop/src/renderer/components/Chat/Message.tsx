@@ -27,7 +27,7 @@ import AttachmentDisplay from './AttachmentDisplay';
 import GifEmbed from './GifEmbed';
 import { InviteEmbed } from './InviteEmbed';
 import { messageInviteCodes } from '@/renderer/utils/inviteUrl';
-import { useMessageProfileCard } from '../../hooks/useMessageProfileCard';
+import { useMessageProfileCard } from '../../hooks/messaging/useMessageProfileCard';
 import MessageProfileCardHost from './MessageProfileCardHost';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';

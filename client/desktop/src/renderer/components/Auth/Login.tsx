@@ -37,7 +37,7 @@ import MFAMethodPicker, {
 } from './MFAMethodPicker';
 import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
-import { useSSOFlow } from '../../hooks/useSSOFlow';
+import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { useSSOStore } from '../../stores/auth/ssoStore';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
 import { Eye, EyeOff } from 'lucide-react';

@@ -643,7 +643,7 @@ Normal user-initiated logout should call `userStore.logout()`, which requests ma
 ## Related Documentation
 
 - [Zustand Official Docs](https://github.com/pmndrs/zustand)
-- [WebSocket Integration](../src/renderer/hooks/useWebSocket.ts)
+- [WebSocket Integration](../src/renderer/hooks/messaging/useWebSocket.ts)
 - [Message Queue](../src/renderer/services/messageQueue.ts)
 - [E2EE Service](../src/renderer/services/e2eeService.ts)
 

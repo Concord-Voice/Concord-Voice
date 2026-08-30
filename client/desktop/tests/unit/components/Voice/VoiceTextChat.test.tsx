@@ -10,20 +10,20 @@ import { mockUser } from '../../../mocks/fixtures';
 import { vi } from 'vitest';
 
 // ── Hooks mocks ──────────────────────────────────────────────────────────────
-vi.mock('@/renderer/hooks/useChannelSubscription', () => ({
+vi.mock('@/renderer/hooks/messaging/useChannelSubscription', () => ({
   useChannelSubscription: vi.fn(),
 }));
 
-vi.mock('@/renderer/hooks/useDMSubscription', () => ({
+vi.mock('@/renderer/hooks/messaging/useDMSubscription', () => ({
   useDMSubscription: vi.fn(),
 }));
 
 const mockSendMessage = vi.fn();
-vi.mock('@/renderer/hooks/useMessaging', () => ({
+vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
   useMessaging: vi.fn(() => ({ sendMessage: mockSendMessage })),
 }));
 
-vi.mock('@/renderer/hooks/useMessageFetch', () => ({
+vi.mock('@/renderer/hooks/messaging/useMessageFetch', () => ({
   useMessageFetch: vi.fn(() => ({
     messages: [],
     isLoading: false,
@@ -236,7 +236,7 @@ describe('VoiceTextChat', () => {
   // ── Error display ────────────────────────────────────────────────────────
 
   it('displays error when useMessageFetch returns error', async () => {
-    const { useMessageFetch } = await import('@/renderer/hooks/useMessageFetch');
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
     (useMessageFetch as ReturnType<typeof vi.fn>).mockReturnValue({
       messages: [],
       isLoading: false,

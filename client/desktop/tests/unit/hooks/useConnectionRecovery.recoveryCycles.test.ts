@@ -110,8 +110,8 @@ vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
   resetPostLoginHydrationLifecycle: vi.fn(),
 }));
 
-import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
-import { useMessageFetch } from '@/renderer/hooks/useMessageFetch';
+import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecovery';
+import { useMessageFetch } from '@/renderer/hooks/messaging/useMessageFetch';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { isHydrationLifecycleCurrent } from '@/renderer/services/postLoginHydrationLifecycle';

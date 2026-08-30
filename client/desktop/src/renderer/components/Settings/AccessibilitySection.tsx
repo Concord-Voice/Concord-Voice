@@ -4,7 +4,7 @@ import {
   setDraftTtsSetting,
   useDraftAppearance,
   setDraftAppearanceSetting,
-} from '../../hooks/useDraftSettings';
+} from '../../hooks/ui/useDraftSettings';
 import { UI_SCALE_MIN, UI_SCALE_MAX, type AppearanceSettings } from '../../stores/ui/settingsStore';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
 import { useRef } from 'react';
-import { useDialogSync } from '@/renderer/hooks/useDialogSync';
+import { useDialogSync } from '@/renderer/hooks/ui/useDialogSync';
 
 function Harness({ open, onRef }: { open: boolean; onRef: (el: HTMLDialogElement) => void }) {
   const dialogRef = useRef<HTMLDialogElement>(null);

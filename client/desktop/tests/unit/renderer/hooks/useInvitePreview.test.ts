@@ -4,7 +4,10 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
-import { useInvitePreview, clearInvitePreviewCache } from '@/renderer/hooks/useInvitePreview';
+import {
+  useInvitePreview,
+  clearInvitePreviewCache,
+} from '@/renderer/hooks/messaging/useInvitePreview';
 
 const API_BASE = 'http://localhost:8080';
 
@@ -37,6 +40,40 @@ describe('useInvitePreview', () => {
     if (result.current.status === 'ready') {
       expect(result.current.info.server_name).toBe('Acme');
     }
+  });
+
+  it('shows loading immediately when the invite code changes', async () => {
+    let resolveB!: () => void;
+    const bPending = new Promise<void>((resolve) => {
+      resolveB = resolve;
+    });
+    server.use(
+      http.get(`${API_BASE}/api/v1/invites/:code`, async ({ params }) => {
+        if (params.code === 'BBBBMNPQ') await bPending;
+        return HttpResponse.json({
+          server_name: params.code === 'AAAAMNPQ' ? 'A' : 'B',
+          server_icon: null,
+          server_banner: null,
+          member_count: 1,
+          valid: true,
+        });
+      })
+    );
+
+    const { result, rerender } = renderHook(
+      ({ code }: { code: string }) => useInvitePreview(code),
+      { initialProps: { code: 'AAAAMNPQ' } }
+    );
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    rerender({ code: 'BBBBMNPQ' });
+    expect(result.current.status).toBe('loading');
+
+    resolveB();
+    await waitFor(() => {
+      expect(result.current.status).toBe('ready');
+      if (result.current.status === 'ready') expect(result.current.info.server_name).toBe('B');
+    });
   });
 
   it('marks valid:false invites as invalid', async () => {

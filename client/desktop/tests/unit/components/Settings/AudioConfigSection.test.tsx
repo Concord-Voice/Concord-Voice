@@ -92,7 +92,7 @@ vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
   ),
 }));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn((key: string) => defaultAudioSettings[key] ?? false),
   setDraftAudioSetting: vi.fn(),
   batchSetAudioDrafts: vi.fn(),
@@ -117,7 +117,7 @@ import AudioConfigSection from '@/renderer/components/Settings/AudioConfigSectio
 /** Override useDraftAudioSetting with custom settings for a single test. */
 async function overrideDraftSettings(overrides: Record<string, unknown>) {
   const merged = { ...defaultAudioSettings, ...overrides };
-  const { useDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+  const { useDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
   (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
     (key: string) => merged[key] ?? false
   );
@@ -167,7 +167,7 @@ describe('AudioConfigSection', () => {
     ).getState.mockReturnValue({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode });
 
     const { useDraftAudioSetting, useStashAndSwapAudioMode } =
-      await import('@/renderer/hooks/useDraftSettings');
+      await import('@/renderer/hooks/ui/useDraftSettings');
     (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
       (key: string) => defaultAudioSettings[key] ?? false
     );
@@ -268,7 +268,7 @@ describe('AudioConfigSection', () => {
   // ===== 3. handleTierSlider =====
 
   it('calls setQualityTier and batchSetAudioDrafts in basic mode when slider changes', async () => {
-    const { batchSetAudioDrafts } = await import('@/renderer/hooks/useDraftSettings');
+    const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const slider = document.querySelector('.settings-tier-slider') as HTMLInputElement;
     fireEvent.change(slider, { target: { value: '0' } });
@@ -285,7 +285,7 @@ describe('AudioConfigSection', () => {
 
   it('calls setQualityTier but NOT batchSetAudioDrafts in advanced mode when slider changes', async () => {
     await enableAdvancedMode();
-    const { batchSetAudioDrafts } = await import('@/renderer/hooks/useDraftSettings');
+    const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const slider = document.querySelector('.settings-tier-slider') as HTMLInputElement;
     fireEvent.change(slider, { target: { value: '2' } });
@@ -294,7 +294,7 @@ describe('AudioConfigSection', () => {
   });
 
   it('ignores NaN slider value', async () => {
-    const { batchSetAudioDrafts } = await import('@/renderer/hooks/useDraftSettings');
+    const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const slider = document.querySelector('.settings-tier-slider') as HTMLInputElement;
     // NaN fails the >= 0 guard, so neither setQualityTier nor batchSetAudioDrafts is called
@@ -323,7 +323,7 @@ describe('AudioConfigSection', () => {
   // ===== 5. Tier label onClick =====
 
   it('sets quality tier when clicking a tier label in basic mode', async () => {
-    const { batchSetAudioDrafts } = await import('@/renderer/hooks/useDraftSettings');
+    const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     fireEvent.click(screen.getByText('High'));
     expect(mockSetQualityTier).toHaveBeenCalledWith('high');
@@ -332,7 +332,7 @@ describe('AudioConfigSection', () => {
 
   it('sets quality tier without batching drafts in advanced mode', async () => {
     await enableAdvancedMode();
-    const { batchSetAudioDrafts } = await import('@/renderer/hooks/useDraftSettings');
+    const { batchSetAudioDrafts } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     fireEvent.click(screen.getByText('Low'));
     expect(mockSetQualityTier).toHaveBeenCalledWith('low');
@@ -482,7 +482,7 @@ describe('AudioConfigSection', () => {
   });
 
   it('calls setDraftAudioSetting to toggle noise gate mode', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     // The noise gate toggle is the 4th checkbox (after noise, echo, agc)
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
@@ -492,7 +492,7 @@ describe('AudioConfigSection', () => {
 
   it('calls setDraftAudioSetting when gate threshold slider changes', async () => {
     await overrideDraftSettings({ noiseGateMode: 'manual', noiseGateLevel: -50 });
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const sliders = document.querySelectorAll('.settings-slider');
     expect(sliders.length).toBeGreaterThanOrEqual(1);
@@ -568,7 +568,7 @@ describe('AudioConfigSection', () => {
   });
 
   it('calls setDraftAudioSetting when quiet boost toggle is clicked', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     // Quiet boost toggle is the 5th checkbox (noise, echo, agc, gate, boost)
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
@@ -578,7 +578,7 @@ describe('AudioConfigSection', () => {
 
   it('calls setDraftAudioSetting when boost threshold slider changes', async () => {
     await overrideDraftSettings({ quietBoost: true, quietBoostThreshold: -38 });
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const sliders = document.querySelectorAll('.settings-slider');
     expect(sliders.length).toBeGreaterThanOrEqual(1);
@@ -640,7 +640,7 @@ describe('AudioConfigSection', () => {
   // ===== 15. Toggle onChange handlers =====
 
   it('calls setDraftAudioSetting for noise cancellation toggle', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
     // Uncheck noise cancellation (index 0)
@@ -649,7 +649,7 @@ describe('AudioConfigSection', () => {
   });
 
   it('calls setDraftAudioSetting for echo cancellation toggle', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
     // Uncheck echo cancellation (index 1)
@@ -658,7 +658,7 @@ describe('AudioConfigSection', () => {
   });
 
   it('calls setDraftAudioSetting for auto gain control toggle', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
     // Uncheck auto gain control (index 2)
@@ -668,7 +668,7 @@ describe('AudioConfigSection', () => {
 
   it('does not call setDraftAudioSetting for processing toggles when musicMode is true', async () => {
     await overrideDraftSettings({ musicMode: true });
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<AudioConfigSection />);
     const checkboxes = document.querySelectorAll('input[type="checkbox"]');
     // Attempt to click noise cancellation toggle (disabled)

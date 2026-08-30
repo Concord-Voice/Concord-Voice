@@ -82,7 +82,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 // sso_token, rather than leaving the user re-submitting an expired one. The mock
 // returns a resolved promise so an awaited-or-.catch'd onClick never rejects.
 const mockBegin = vi.hoisted(() => vi.fn(() => Promise.resolve()));
-vi.mock('@/renderer/hooks/useSSOFlow', () => ({
+vi.mock('@/renderer/hooks/ui/useSSOFlow', () => ({
   useSSOFlow: () => ({ begin: mockBegin }),
 }));
 

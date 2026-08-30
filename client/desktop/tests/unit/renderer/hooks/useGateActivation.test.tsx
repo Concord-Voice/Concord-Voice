@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useGateActivation } from '@/renderer/hooks/useGateActivation';
+import { useGateActivation } from '@/renderer/hooks/ui/useGateActivation';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 

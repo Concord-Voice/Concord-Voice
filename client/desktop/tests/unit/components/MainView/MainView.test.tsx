@@ -162,7 +162,7 @@ vi.mock('@/renderer/components/ConnectionStatus/ConnectionStatus', () => ({
     </div>
   ),
 }));
-vi.mock('@/renderer/hooks/useServerChannelSubscriptions', () => ({
+vi.mock('@/renderer/hooks/messaging/useServerChannelSubscriptions', () => ({
   useServerChannelSubscriptions: vi.fn(),
 }));
 

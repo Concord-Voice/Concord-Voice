@@ -59,7 +59,7 @@ vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftVideoSetting: vi.fn((key: string) => defaultVideoSettings[key] ?? false),
   setDraftVideoSetting: mockSetDraftVideoSetting,
 }));
@@ -95,7 +95,7 @@ function freeEntitlement() {
     ...entitlementOverrides,
   };
 }
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector(freeEntitlement())
   ),

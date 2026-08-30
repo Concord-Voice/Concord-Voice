@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '../../test-utils';
-import { useMessageProfileCard } from '@/renderer/hooks/useMessageProfileCard';
+import { useMessageProfileCard } from '@/renderer/hooks/messaging/useMessageProfileCard';
 import MessageProfileCardHost from '@/renderer/components/Chat/MessageProfileCardHost';
 import type { MessageWithStatus, ChatContextType } from '@/renderer/types/chat';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';

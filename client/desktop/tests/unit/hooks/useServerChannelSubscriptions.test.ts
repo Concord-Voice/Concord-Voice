@@ -22,7 +22,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 
-import { useServerChannelSubscriptions } from '@/renderer/hooks/useServerChannelSubscriptions';
+import { useServerChannelSubscriptions } from '@/renderer/hooks/messaging/useServerChannelSubscriptions';
 
 describe('useServerChannelSubscriptions', () => {
   beforeEach(() => {

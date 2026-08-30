@@ -138,7 +138,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
 
-import { useWebSocket } from '@/renderer/hooks/useWebSocket';
+import { useWebSocket } from '@/renderer/hooks/messaging/useWebSocket';
 
 interface EpochRevocation {
   channel_id: string;

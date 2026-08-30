@@ -7,8 +7,8 @@ import RoleEditorPanel from './RoleEditorPanel';
 import MemberListPanel from './MemberListPanel';
 import IconUploadArea from './IconUploadArea';
 import BannerUploadArea from './BannerUploadArea';
-import { useImageUpload } from '../../hooks/useImageUpload';
-import { useSectionObserver } from '../../hooks/useSectionObserver';
+import { useImageUpload } from '../../hooks/messaging/useImageUpload';
+import { useSectionObserver } from '../../hooks/ui/useSectionObserver';
 import {
   maxServerIconSizeForTier,
   maxServerBannerSizeForTier,

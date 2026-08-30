@@ -5,7 +5,7 @@ import { useFriendStore } from '../../stores/chat/friendStore';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/apiClient';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
-import { useUserThemeScope } from '../../hooks/useUserThemeScope';
+import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import './DMProfileModal.css';
 
 export interface DMProfileModalProps {

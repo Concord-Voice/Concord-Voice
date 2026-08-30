@@ -1,5 +1,5 @@
 import React from 'react';
-import { useSubscription } from '../../../hooks/useSubscription';
+import { useSubscription } from '../../../hooks/ui/useSubscription';
 import PlanCard from './PlanCard';
 import FeatureGrid from './FeatureGrid';
 import RedeemCodeForm from './RedeemCodeForm';

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useSSOFlow } from '@/renderer/hooks/useSSOFlow';
+import { useSSOFlow } from '@/renderer/hooks/ui/useSSOFlow';
 import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';

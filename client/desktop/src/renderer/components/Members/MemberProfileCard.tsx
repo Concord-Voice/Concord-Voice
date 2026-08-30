@@ -4,9 +4,9 @@ import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
-import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/useUserThemeScope';
+import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import SendFriendRequestButton from './SendFriendRequestButton';
-import { useFriendRequestState } from '../../hooks/useFriendRequestState';
+import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
 import './MemberProfileCard.css';
 
 /** Flexible member shape that works for both ServerMembers and Friends */

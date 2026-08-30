@@ -10,9 +10,9 @@ import {
   setDraftAudioSetting,
   batchSetAudioDrafts,
   useStashAndSwapAudioMode,
-} from '../../hooks/useDraftSettings';
-import { useEntitlement } from '../../hooks/useEntitlement';
-import { useGateActivation } from '../../hooks/useGateActivation';
+} from '../../hooks/ui/useDraftSettings';
+import { useEntitlement } from '../../hooks/ui/useEntitlement';
+import { useGateActivation } from '../../hooks/ui/useGateActivation';
 import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';

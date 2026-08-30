@@ -1,6 +1,6 @@
 import React, { useId } from 'react';
 import type { AppearanceSettings } from '../../stores/ui/settingsStore';
-import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/useDraftSettings';
+import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/ui/useDraftSettings';
 import {
   resolveEffectiveFont,
   themeBundledFontFor,

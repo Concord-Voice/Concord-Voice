@@ -181,7 +181,7 @@ const { addMessage } = useChatStore();
 
 ---
 
-### 3. useWebSocket Hook (`hooks/useWebSocket.ts`)
+### 3. useWebSocket Hook (`hooks/messaging/useWebSocket.ts`)
 
 React hook that bridges `websocketService` with `chatStore`.
 
@@ -201,7 +201,7 @@ React hook that bridges `websocketService` with `chatStore`.
 **Usage:**
 
 ```typescript
-import { useWebSocket } from '../hooks/useWebSocket';
+import { useWebSocket } from '../hooks/messaging/useWebSocket';
 
 function MyComponent() {
   const { subscribe, unsubscribe, sendTyping } = useWebSocket();
@@ -228,7 +228,7 @@ via `e2eeService` and stamps the `key_version` the server requires, and it is
 fail-closed: if encryption fails, nothing is sent.
 
 ```typescript
-import { useMessaging } from '../hooks/useMessaging';
+import { useMessaging } from '../hooks/messaging/useMessaging';
 
 function Composer({ channelId, username }: { channelId: string; username: string }) {
   const messaging = useMessaging();
@@ -249,14 +249,14 @@ them.
 
 ---
 
-### 4. useChannelSubscription Hook (`hooks/useChannelSubscription.ts`)
+### 4. useChannelSubscription Hook (`hooks/messaging/useChannelSubscription.ts`)
 
 Convenience hook for automatic channel subscription management.
 
 **Usage:**
 
 ```typescript
-import { useChannelSubscription } from '../hooks/useChannelSubscription';
+import { useChannelSubscription } from '../hooks/messaging/useChannelSubscription';
 
 function ChannelView({ channelId }: { channelId: string }) {
   const { isSubscribed } = useChannelSubscription(channelId);

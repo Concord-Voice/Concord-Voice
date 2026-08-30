@@ -38,7 +38,7 @@ import {
   useDraftContentProtection,
   useDraftContentProtectionApplying,
   useDraftContentProtectionLoaded,
-} from '../../hooks/useDraftSettings';
+} from '../../hooks/ui/useDraftSettings';
 import './MFA.css';
 
 // #1354: the purge dead-end card navigates here by control id

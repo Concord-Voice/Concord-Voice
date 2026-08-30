@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { openSubscriptionPage } from '../../utils/openSubscriptionPage';
-import { useDialogSync } from '../../hooks/useDialogSync';
+import { useDialogSync } from '../../hooks/ui/useDialogSync';
 import './SubscriptionResetModal.css';
 
 // Mirror SyntaxHelpModal's environment probe: jsdom implements <dialog> but does

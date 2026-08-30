@@ -66,7 +66,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
+import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecovery';
 
 beforeEach(() => {
   vi.clearAllMocks();

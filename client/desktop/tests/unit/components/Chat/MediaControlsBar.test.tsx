@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import MediaControlsBar from '@/renderer/components/Chat/MediaControlsBar';
-import type { MediaPlayerState, MediaPlayerActions } from '@/renderer/hooks/useMediaPlayer';
+import type { MediaPlayerState, MediaPlayerActions } from '@/renderer/hooks/voice/useMediaPlayer';
 
 function makeState(over: Partial<MediaPlayerState> = {}): MediaPlayerState {
   return {

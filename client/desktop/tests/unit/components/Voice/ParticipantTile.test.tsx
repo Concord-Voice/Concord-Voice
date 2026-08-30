@@ -10,7 +10,7 @@ vi.mock('@/renderer/components/ui/EnforcementMenuItems.css', () => ({}));
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({}),
 }));
-vi.mock('@/renderer/hooks/useUserThemeScope', () => ({
+vi.mock('@/renderer/hooks/ui/useUserThemeScope', () => ({
   useUserThemeScope: () => ({ scopeProps: { style: {} } }),
 }));
 

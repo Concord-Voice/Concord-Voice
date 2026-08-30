@@ -7,8 +7,8 @@ import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProf
 import { useVoiceStore, type VoiceParticipant } from '../../stores/voice/voiceStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
-import { useUserThemeScope } from '../../hooks/useUserThemeScope';
-import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
+import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
+import { useRenderStateReporter } from '../../hooks/voice/useRenderStateReporter';
 import './ParticipantTile.css';
 
 interface ParticipantTileProps {

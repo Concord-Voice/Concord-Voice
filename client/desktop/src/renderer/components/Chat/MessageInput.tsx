@@ -17,9 +17,9 @@ import {
 } from '../../stores/ui/layoutStore';
 import { buildAddendum, encodeMentionMeta, type ParsedMention } from '../../utils/mentions';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
-import { useFileUpload, type AttachmentRejection } from '../../hooks/useFileUpload';
-import { useDraftMessage } from '../../hooks/useDraftMessage';
-import { useEntitlement } from '../../hooks/useEntitlement';
+import { useFileUpload, type AttachmentRejection } from '../../hooks/messaging/useFileUpload';
+import { useDraftMessage } from '../../hooks/messaging/useDraftMessage';
+import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useInviteStore } from '../../stores/chat/inviteStore';

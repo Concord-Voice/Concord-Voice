@@ -6,7 +6,7 @@ import { vi } from 'vitest';
 const mockSetDraftTtsSetting = vi.fn();
 const mockSetDraftAppearanceSetting = vi.fn();
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftTtsSetting: vi.fn((key: string) => {
     const defaults: Record<string, unknown> = {
       ttsEnabled: false,
@@ -197,7 +197,7 @@ describe('AccessibilitySection', () => {
   });
 
   it('shows enabled hint when TTS is on', async () => {
-    const { useDraftTtsSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { useDraftTtsSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     (useDraftTtsSetting as ReturnType<typeof vi.fn>).mockImplementation((key: string) => {
       if (key === 'ttsEnabled') return true;
       if (key === 'ttsVoice') return '';
@@ -248,7 +248,7 @@ describe('AccessibilitySection', () => {
   });
 
   it('shows currently selected voice name in hint', async () => {
-    const { useDraftTtsSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { useDraftTtsSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     (useDraftTtsSetting as ReturnType<typeof vi.fn>).mockImplementation((key: string) => {
       if (key === 'ttsEnabled') return false;
       if (key === 'ttsVoice') return 'en-US-Standard';
@@ -391,7 +391,7 @@ describe('AccessibilitySection', () => {
   });
 
   it('warns when preview volume is muted by the TTS volume slider', async () => {
-    const { useDraftTtsSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { useDraftTtsSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     (useDraftTtsSetting as ReturnType<typeof vi.fn>).mockImplementation((key: string) => {
       if (key === 'ttsEnabled') return false;
       if (key === 'ttsVoice') return '';

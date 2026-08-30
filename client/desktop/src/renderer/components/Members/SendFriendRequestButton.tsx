@@ -1,5 +1,5 @@
 import React from 'react';
-import { useFriendRequestState } from '../../hooks/useFriendRequestState';
+import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
 import './sendFriendRequestButton.css';
 
 interface SendFriendRequestButtonProps {

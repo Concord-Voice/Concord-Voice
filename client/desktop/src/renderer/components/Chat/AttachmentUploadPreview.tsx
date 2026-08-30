@@ -1,6 +1,6 @@
 import React from 'react';
 import { X, FileText, Film, Music, File } from 'lucide-react';
-import type { FileUploadState } from '../../hooks/useFileUpload';
+import type { FileUploadState } from '../../hooks/messaging/useFileUpload';
 import { classifyFileType, formatFileSize } from '../../utils/attachmentCrypto';
 import './AttachmentUploadPreview.css';
 

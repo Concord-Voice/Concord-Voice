@@ -129,13 +129,13 @@ vi.mock('@/renderer/components/DirectMessages/GroupInfoPanel', () => ({
 }));
 
 // Mock hooks
-vi.mock('@/renderer/hooks/useDMSubscription', () => ({
+vi.mock('@/renderer/hooks/messaging/useDMSubscription', () => ({
   useDMSubscription: vi.fn(),
 }));
 
 const mockSendMessage = vi.fn();
 const mockSendDMMessage = vi.fn();
-vi.mock('@/renderer/hooks/useMessaging', () => ({
+vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
   useMessaging: vi.fn(() => ({
     sendMessage: mockSendMessage,
     sendDMMessage: mockSendDMMessage,

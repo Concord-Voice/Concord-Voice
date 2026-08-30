@@ -1,5 +1,5 @@
 import { renderHook, act } from '@testing-library/react';
-import { useChatController } from '@/renderer/hooks/useChatController';
+import { useChatController } from '@/renderer/hooks/messaging/useChatController';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
@@ -49,7 +49,7 @@ const mockMessagingSendDMMessage = vi.fn(() => 'client-msg-1');
 const mockMarkDelivered = vi.fn();
 const mockMessagingSendTyping = vi.fn();
 
-vi.mock('@/renderer/hooks/useMessaging', () => ({
+vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
   useMessaging: () => ({
     sendMessage: mockMessagingSendMessage,
     sendDMMessage: mockMessagingSendDMMessage,

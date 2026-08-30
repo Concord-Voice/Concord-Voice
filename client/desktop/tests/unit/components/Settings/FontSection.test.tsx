@@ -9,7 +9,7 @@ let mockAppFont = 'default';
 let mockColorScheme = 'concord';
 let mockDyslexicSupport = false;
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAppearance: vi.fn(() => ({
     theme: 'dark',
     colorScheme: mockColorScheme,

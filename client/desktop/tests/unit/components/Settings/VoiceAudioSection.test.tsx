@@ -83,7 +83,7 @@ vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   ),
   VIDEO_QUALITY_PRESETS: {},
 }));
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn(
     (key: string) =>
       ({
@@ -130,7 +130,7 @@ vi.mock('@/renderer/hooks/useDraftSettings', () => ({
 }));
 const mockStartTest = vi.fn();
 const mockStopTest = vi.fn();
-vi.mock('@/renderer/hooks/useMicTest', () => ({
+vi.mock('@/renderer/hooks/device/useMicTest', () => ({
   useMicTest: vi.fn(() => ({
     isTesting: false,
     dbfsLevel: -80,
@@ -226,7 +226,7 @@ describe('VoiceAudioSection', () => {
     expect(screen.getByText('Output Volume')).toBeInTheDocument();
   });
   it('calls setDraftAudioSetting on input volume change', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<VoiceAudioSection />);
     fireEvent.change(document.querySelectorAll('.settings-volume-slider')[0], {
       target: { value: '150' },
@@ -234,7 +234,7 @@ describe('VoiceAudioSection', () => {
     expect(setDraftAudioSetting).toHaveBeenCalledWith('inputVolume', 150);
   });
   it('calls setDraftAudioSetting on output volume change', async () => {
-    const { setDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { setDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     render(<VoiceAudioSection />);
     fireEvent.change(document.querySelectorAll('.settings-volume-slider')[1], {
       target: { value: '80' },
@@ -252,7 +252,7 @@ describe('VoiceAudioSection', () => {
     expect(mockStartTest).toHaveBeenCalled();
   });
   it('shows Stop Testing when mic test active', async () => {
-    const { useMicTest } = await import('@/renderer/hooks/useMicTest');
+    const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
       isTesting: true,
       dbfsLevel: -40,
@@ -264,7 +264,7 @@ describe('VoiceAudioSection', () => {
     expect(screen.getByText('Stop Testing')).toBeInTheDocument();
   });
   it('shows meter when mic test active', async () => {
-    const { useMicTest } = await import('@/renderer/hooks/useMicTest');
+    const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
       isTesting: true,
       dbfsLevel: -40,
@@ -276,7 +276,7 @@ describe('VoiceAudioSection', () => {
     expect(document.querySelector('.settings-mic-meter-container')).toBeInTheDocument();
   });
   it('shows mic test error', async () => {
-    const { useMicTest } = await import('@/renderer/hooks/useMicTest');
+    const { useMicTest } = await import('@/renderer/hooks/device/useMicTest');
     (useMicTest as ReturnType<typeof vi.fn>).mockReturnValue({
       isTesting: false,
       dbfsLevel: -80,
@@ -598,7 +598,7 @@ describe('VoiceAudioSection', () => {
   // ===== AudioConfigSection: Noise gate manual mode =====
 
   it('shows gate threshold slider when noise gate is manual', async () => {
-    const { useDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { useDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
       (key: string) =>
         ({
@@ -630,7 +630,7 @@ describe('VoiceAudioSection', () => {
   // ===== AudioConfigSection: Quiet boost enabled =====
 
   it('shows boost threshold slider when quiet boost is enabled', async () => {
-    const { useDraftAudioSetting } = await import('@/renderer/hooks/useDraftSettings');
+    const { useDraftAudioSetting } = await import('@/renderer/hooks/ui/useDraftSettings');
     (useDraftAudioSetting as ReturnType<typeof vi.fn>).mockImplementation(
       (key: string) =>
         ({

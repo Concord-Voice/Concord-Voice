@@ -13,8 +13,8 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
-import { useSubscription } from '@/renderer/hooks/useSubscription';
-import type { SubscriptionSource } from '@/renderer/hooks/useSubscription';
+import { useSubscription } from '@/renderer/hooks/ui/useSubscription';
+import type { SubscriptionSource } from '@/renderer/hooks/ui/useSubscription';
 
 const API_BASE = 'http://localhost:8080';
 const STATUS_PATH = `${API_BASE}/api/v1/subscriptions/me`;

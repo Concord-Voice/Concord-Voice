@@ -67,7 +67,7 @@ vi.mock('@/renderer/services/resetService', () => ({
   softRestart: vi.fn(),
 }));
 
-import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
+import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecovery';
 import { gracefulReset, recoveryReset } from '@/renderer/services/resetService';
 import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
 import { useUserStore } from '@/renderer/stores/auth/userStore';

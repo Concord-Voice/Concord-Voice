@@ -10,8 +10,8 @@ import { useSettingsStore, type AppearanceSettings } from '../../stores/ui/setti
 import ParticipantTile from './ParticipantTile';
 import ShareTunePill from './ShareTunePill';
 import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';
-import { useGridLayout } from '../../hooks/useGridLayout';
-import { useScreenTileVideo } from '../../hooks/useScreenTileVideo';
+import { useGridLayout } from '../../hooks/ui/useGridLayout';
+import { useScreenTileVideo } from '../../hooks/voice/useScreenTileVideo';
 import { errorMessage } from '../../utils/redactError';
 import './ParticipantGrid.css';
 

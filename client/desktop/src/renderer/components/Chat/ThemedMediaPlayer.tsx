@@ -1,5 +1,5 @@
 import React, { useRef, useEffect } from 'react';
-import { useMediaPlayer } from '../../hooks/useMediaPlayer';
+import { useMediaPlayer } from '../../hooks/voice/useMediaPlayer';
 import MediaControlsBar from './MediaControlsBar';
 import './ThemedMediaPlayer.css';
 

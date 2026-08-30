@@ -2,11 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
 
 const useRenderStateReporterMock = vi.fn();
-vi.mock('../../../src/renderer/hooks/useRenderStateReporter', () => ({
+vi.mock('../../../src/renderer/hooks/voice/useRenderStateReporter', () => ({
   useRenderStateReporter: (opts: unknown) => useRenderStateReporterMock(opts),
 }));
 
-import { useScreenTileVideo } from '@/renderer/hooks/useScreenTileVideo';
+import { useScreenTileVideo } from '@/renderer/hooks/voice/useScreenTileVideo';
 
 function Harness({
   sharerUserId,

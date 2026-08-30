@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useUpdateErrorListener } from '../../../src/renderer/hooks/useUpdateErrorListener';
+import { useUpdateErrorListener } from '../../../src/renderer/hooks/ui/useUpdateErrorListener';
 import { useUpdateStatusStore } from '../../../src/renderer/stores/ui/updateStatusStore';
 
 type UpdateErrorPayload = {

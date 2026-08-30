@@ -59,7 +59,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
     .mockResolvedValue({ ok: true, json: () => Promise.resolve({ participants: [] }) }),
 }));
 
-import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
 import { createMockWsService } from '../../helpers/wsServiceMock';
 import {
   desktopNotificationService,

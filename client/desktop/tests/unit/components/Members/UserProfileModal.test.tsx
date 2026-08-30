@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor, createEvent } from '../../../test-u
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/Members/UserProfileModal.css', () => ({}));
-vi.mock('@/renderer/hooks/useUserThemeScope', () => ({
+vi.mock('@/renderer/hooks/ui/useUserThemeScope', () => ({
   useUserThemeScope: () => ({ scopeProps: { style: {} } }),
 }));
 

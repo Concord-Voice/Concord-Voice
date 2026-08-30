@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useCallback, useId } from 'react';
 import { ChevronLeft, ChevronRight, PictureInPicture2, LayoutGrid, Focus } from 'lucide-react';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
-import { useRenderStateReporter } from '../../hooks/useRenderStateReporter';
+import { useRenderStateReporter } from '../../hooks/voice/useRenderStateReporter';
 import type { RemoteVideoRole } from '../../services/remoteVideoLayerPolicy';
 import { ScreenShareAudioControls } from './ScreenShareAudioControls';
 import './VoiceStage.css';

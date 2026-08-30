@@ -1,5 +1,5 @@
 import { renderHook, act } from '@testing-library/react';
-import { computeGridLayout, useGridLayout } from '@/renderer/hooks/useGridLayout';
+import { computeGridLayout, useGridLayout } from '@/renderer/hooks/ui/useGridLayout';
 
 // ── ResizeObserver mock ────────────────────────────────────────────────────────
 

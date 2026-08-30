@@ -2,7 +2,7 @@ import React from 'react';
 import MemberProfileCard from '../Members/MemberProfileCard';
 import UserProfileModal from '../Members/UserProfileModal';
 import { useMemberStore } from '../../stores/chat/memberStore';
-import type { UseMessageProfileCardResult } from '../../hooks/useMessageProfileCard';
+import type { UseMessageProfileCardResult } from '../../hooks/messaging/useMessageProfileCard';
 
 interface MessageProfileCardHostProps {
   /**

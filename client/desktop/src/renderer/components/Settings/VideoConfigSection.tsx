@@ -23,10 +23,10 @@ import {
   canonicalRouterCodecKey,
 } from './codecMetadata';
 import { castingCopy } from './castingCopy';
-import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraftSettings';
-import { useEntitlement } from '../../hooks/useEntitlement';
+import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/ui/useDraftSettings';
+import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
-import { useGateActivation } from '../../hooks/useGateActivation';
+import { useGateActivation } from '../../hooks/ui/useGateActivation';
 import { nativeExceedsFree } from '../../utils/nativeExceedsFree';
 import {
   videoLimitsFromEntitlement,

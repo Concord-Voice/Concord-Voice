@@ -32,7 +32,7 @@ vi.mock('@/renderer/components/GifPicker/LazyGifPicker', () => ({
 vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({ default: () => null }));
 vi.mock('@/renderer/components/User/UserPanel', () => ({ default: () => <div /> }));
 vi.mock('@/renderer/stores/ui/layoutStore', () => ({ useLayoutStore: () => false }));
-vi.mock('@/renderer/hooks/useFileUpload', () => ({
+vi.mock('@/renderer/hooks/messaging/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],
     addFiles: vi.fn(),

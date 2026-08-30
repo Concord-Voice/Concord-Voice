@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { useFormState } from '../../hooks/useFormState';
-import { useImageUpload } from '../../hooks/useImageUpload';
+import { useFormState } from '../../hooks/ui/useFormState';
+import { useImageUpload } from '../../hooks/messaging/useImageUpload';
 import Modal from '../ui/Modal';
 import ImageCropEditor from '../ui/ImageCropEditor';
 import IconUploadArea from './IconUploadArea';

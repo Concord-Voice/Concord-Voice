@@ -61,7 +61,7 @@ vi.mock('../../../src/renderer/stores/voice/voiceStore', () => ({
   },
 }));
 
-import { useKeyboardShortcuts } from '../../../src/renderer/hooks/useKeyboardShortcuts';
+import { useKeyboardShortcuts } from '../../../src/renderer/hooks/ui/useKeyboardShortcuts';
 // NOT mocked: unread navigation resolves mutes through the real prefs store,
 // so we drive it via setMute/clearAll to exercise the mute-aware skip.
 import { useNotificationPrefsStore } from '../../../src/renderer/stores/ui/notificationPrefsStore';

@@ -1,5 +1,5 @@
 import { renderHook, act } from '@testing-library/react';
-import { useImageUpload } from '@/renderer/hooks/useImageUpload';
+import { useImageUpload } from '@/renderer/hooks/messaging/useImageUpload';
 import { API_BASE } from '@/renderer/config';
 import { vi } from 'vitest';
 

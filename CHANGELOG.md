@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An invite preview no longer reuses details from a different invite while loading** ([#3037](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3037)) — preview results are now kept with the invite code they describe, so changing codes shows a loading state until the new details arrive.
+
 ## [0.2.43] — 2026-08-30
 
 The app can reach the servers again after a certificate change locked every installed copy out. Switching between the app and the web version no longer leaves one of them unable to load your servers. Deleting your account now removes the files it uploaded, not only the record of them.

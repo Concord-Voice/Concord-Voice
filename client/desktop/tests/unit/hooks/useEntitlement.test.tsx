@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useEntitlement } from '../../../src/renderer/hooks/useEntitlement';
+import { useEntitlement } from '../../../src/renderer/hooks/ui/useEntitlement';
 import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,

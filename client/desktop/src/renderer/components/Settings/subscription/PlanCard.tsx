@@ -1,5 +1,5 @@
 import React from 'react';
-import type { SubscriptionInfo } from '../../../hooks/useSubscription';
+import type { SubscriptionInfo } from '../../../hooks/ui/useSubscription';
 import { tierDisplayName, sourceDisplay, formatExpiry } from '../subscription/subscriptionCopy';
 
 interface PlanCardProps {

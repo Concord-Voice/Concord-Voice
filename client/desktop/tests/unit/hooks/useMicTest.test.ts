@@ -60,7 +60,7 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 import { ensureOsPermission } from '@/renderer/stores/voice/osPermissionStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
-import { useMicTest } from '@/renderer/hooks/useMicTest';
+import { useMicTest } from '@/renderer/hooks/device/useMicTest';
 import { voiceService } from '@/renderer/services/voiceService';
 
 // Build a comprehensive mock audio pipeline

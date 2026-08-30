@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import AttachmentNotice from '@/renderer/components/Chat/AttachmentNotice';
-import type { AttachmentRejection } from '@/renderer/hooks/useFileUpload';
+import type { AttachmentRejection } from '@/renderer/hooks/messaging/useFileUpload';
 import { MAX_ATTACHMENTS } from '@/renderer/utils/attachmentCrypto';
 import {
   FREE_ATTACHMENT_BYTES,

@@ -7,7 +7,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   }),
 }));
 
-import { useCameraTest } from '@/renderer/hooks/useCameraTest';
+import { useCameraTest } from '@/renderer/hooks/device/useCameraTest';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 const mockTrackStop = vi.fn();

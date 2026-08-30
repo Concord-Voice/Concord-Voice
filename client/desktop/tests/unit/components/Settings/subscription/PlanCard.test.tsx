@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { render, screen } from '../../../../test-utils';
 import { resetAllStores } from '../../../../helpers/store-helpers';
 import PlanCard from '@/renderer/components/Settings/subscription/PlanCard';
-import type { SubscriptionInfo } from '@/renderer/hooks/useSubscription';
+import type { SubscriptionInfo } from '@/renderer/hooks/ui/useSubscription';
 
 function info(overrides: Partial<SubscriptionInfo> = {}): SubscriptionInfo {
   return {

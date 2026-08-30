@@ -66,7 +66,7 @@ vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
 // Mock useSSOFlow so we can assert the SSOButton wiring without exercising
 // the full loopback flow. The actual flow is covered in ssoService.test.ts.
 const beginSSOMock = vi.fn();
-vi.mock('@/renderer/hooks/useSSOFlow', () => ({
+vi.mock('@/renderer/hooks/ui/useSSOFlow', () => ({
   useSSOFlow: () => ({ begin: beginSSOMock }),
 }));
 

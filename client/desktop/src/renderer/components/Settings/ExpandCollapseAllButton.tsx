@@ -1,5 +1,5 @@
 import React, { type RefObject } from 'react';
-import { useExpandCollapseAll } from '../../hooks/useExpandCollapseAll';
+import { useExpandCollapseAll } from '../../hooks/ui/useExpandCollapseAll';
 
 interface ExpandCollapseAllButtonProps {
   /**

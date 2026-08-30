@@ -3,7 +3,7 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/apiClient';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
-import { useUserThemeScope } from '../../hooks/useUserThemeScope';
+import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import './UserProfileModal.css';
 
 interface UserProfileModalProps {

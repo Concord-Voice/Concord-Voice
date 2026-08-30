@@ -1,6 +1,6 @@
 import React from 'react';
 import PremiumChip from './PremiumChip';
-import { useGateActivation } from '../../hooks/useGateActivation';
+import { useGateActivation } from '../../hooks/ui/useGateActivation';
 import type { SubscriptionDeepLink } from '../../utils/openSubscriptionPage';
 import './PremiumGate.css';
 

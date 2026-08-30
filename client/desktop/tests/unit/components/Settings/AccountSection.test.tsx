@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
-vi.mock('@/renderer/hooks/useAgeStatus', () => ({
+vi.mock('@/renderer/hooks/ui/useAgeStatus', () => ({
   useAgeStatus: () => ({ state: 'unverified' }),
 }));
 

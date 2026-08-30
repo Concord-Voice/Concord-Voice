@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, userEvent } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import type { AgeStatus } from '@/renderer/hooks/useAgeStatus';
+import type { AgeStatus } from '@/renderer/hooks/ui/useAgeStatus';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 
 const { mockSubmit, ageStatusRef } = vi.hoisted(() => ({
@@ -19,7 +19,7 @@ const { mockSubmit, ageStatusRef } = vi.hoisted(() => ({
 vi.mock('@/renderer/services/ageClaim/ageClaimService', () => ({
   submitSignedAgeClaim: (input: unknown) => mockSubmit(input),
 }));
-vi.mock('@/renderer/hooks/useAgeStatus', () => ({
+vi.mock('@/renderer/hooks/ui/useAgeStatus', () => ({
   useAgeStatus: () => ageStatusRef.current,
 }));
 

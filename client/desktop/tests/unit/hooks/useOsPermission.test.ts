@@ -5,7 +5,7 @@ import {
   type OsPermissionStatus,
   type OsPermissionType,
 } from '@/renderer/stores/voice/osPermissionStore';
-import { useOsPermission } from '@/renderer/hooks/useOsPermission';
+import { useOsPermission } from '@/renderer/hooks/device/useOsPermission';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Reset store state before each test

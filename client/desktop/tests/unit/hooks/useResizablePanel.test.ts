@@ -1,6 +1,6 @@
 import React from 'react';
 import { act, renderHook } from '@testing-library/react';
-import { useResizablePanel } from '@/renderer/hooks/useResizablePanel';
+import { useResizablePanel } from '@/renderer/hooks/ui/useResizablePanel';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('useResizablePanel', () => {

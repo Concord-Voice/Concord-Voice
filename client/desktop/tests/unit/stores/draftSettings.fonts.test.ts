@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
-import { setDraftAppearanceSetting } from '@/renderer/hooks/useDraftSettings';
+import { setDraftAppearanceSetting } from '@/renderer/hooks/ui/useDraftSettings';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Integration: the draft layer write-throughs via callSetter → setAppFont, and Revert

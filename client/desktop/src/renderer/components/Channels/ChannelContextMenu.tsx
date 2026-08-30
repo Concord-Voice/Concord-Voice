@@ -11,7 +11,7 @@ import {
   hasPermission,
 } from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
-import { useRotateKey } from '../../hooks/useRotateKey';
+import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { Channel } from '../../types/chat';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';

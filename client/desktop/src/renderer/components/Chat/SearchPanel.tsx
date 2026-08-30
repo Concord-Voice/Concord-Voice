@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { X, Search } from 'lucide-react';
-import { useChannelSearch } from '../../hooks/useChannelSearch';
+import { useChannelSearch } from '../../hooks/messaging/useChannelSearch';
 import type { MessageWithStatus } from '../../types/chat';
 import './SearchPanel.css';
 

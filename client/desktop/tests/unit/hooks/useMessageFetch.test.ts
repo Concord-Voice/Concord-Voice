@@ -37,7 +37,10 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { reconcileFetchedMessages, useMessageFetch } from '@/renderer/hooks/useMessageFetch';
+import {
+  reconcileFetchedMessages,
+  useMessageFetch,
+} from '@/renderer/hooks/messaging/useMessageFetch';
 
 // Helper: build a mock API response
 function mockFetchResponse(messages: MessageWithStatus[], ok = true) {

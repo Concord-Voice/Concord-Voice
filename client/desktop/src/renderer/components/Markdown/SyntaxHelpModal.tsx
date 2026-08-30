@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
-import { useEntitlement } from '../../hooks/useEntitlement';
-import { useDialogSync } from '../../hooks/useDialogSync';
+import { useEntitlement } from '../../hooks/ui/useEntitlement';
+import { useDialogSync } from '../../hooks/ui/useDialogSync';
 import { clampMessageCharsForTier } from '../../utils/entitlementLimits';
 import './SyntaxHelpModal.css';
 

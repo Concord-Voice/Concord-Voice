@@ -2,7 +2,7 @@ import React from 'react';
 import { Eraser } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
-import { useRotateKey } from '../../hooks/useRotateKey';
+import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import { apiFetch } from '../../services/apiClient';

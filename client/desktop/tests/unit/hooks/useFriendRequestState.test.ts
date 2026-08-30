@@ -1,5 +1,5 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
-import { useFriendRequestState } from '@/renderer/hooks/useFriendRequestState';
+import { useFriendRequestState } from '@/renderer/hooks/messaging/useFriendRequestState';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import {
   useFriendStore,

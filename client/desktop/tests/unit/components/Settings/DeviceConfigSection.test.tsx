@@ -19,7 +19,7 @@ let cameraTestState = {
   stopTest: vi.fn(),
 };
 
-vi.mock('@/renderer/hooks/useMicTest', () => ({
+vi.mock('@/renderer/hooks/device/useMicTest', () => ({
   useMicTest: () => ({
     isTesting: false,
     dbfsLevel: -Infinity,
@@ -29,11 +29,11 @@ vi.mock('@/renderer/hooks/useMicTest', () => ({
   }),
 }));
 
-vi.mock('@/renderer/hooks/useOutputTest', () => ({
+vi.mock('@/renderer/hooks/device/useOutputTest', () => ({
   useOutputTest: () => outputTestState,
 }));
 
-vi.mock('@/renderer/hooks/useCameraTest', () => ({
+vi.mock('@/renderer/hooks/device/useCameraTest', () => ({
   useCameraTest: () => cameraTestState,
 }));
 
@@ -47,7 +47,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   ),
 }));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn(() => 100),
   setDraftAudioSetting: vi.fn(),
 }));

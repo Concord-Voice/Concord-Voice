@@ -33,7 +33,7 @@ import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
 } from '../../services/runtimeServerBase';
-import { useSSOFlow } from '../../hooks/useSSOFlow';
+import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
 import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2eeErrors';

@@ -1,10 +1,10 @@
 import React, { useEffect, useRef } from 'react';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import DeviceSelector from '../Voice/DeviceSelector';
-import { useMicTest } from '../../hooks/useMicTest';
-import { useOutputTest } from '../../hooks/useOutputTest';
-import { useCameraTest } from '../../hooks/useCameraTest';
-import { useDraftAudioSetting, setDraftAudioSetting } from '../../hooks/useDraftSettings';
+import { useMicTest } from '../../hooks/device/useMicTest';
+import { useOutputTest } from '../../hooks/device/useOutputTest';
+import { useCameraTest } from '../../hooks/device/useCameraTest';
+import { useDraftAudioSetting, setDraftAudioSetting } from '../../hooks/ui/useDraftSettings';
 import CollapsibleSection from './CollapsibleSection';
 
 const DeviceConfigSection: React.FC = () => {

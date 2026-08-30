@@ -46,7 +46,7 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
   },
 }));
 
-import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
 import { createMockWsService } from '../helpers/wsServiceMock';
 
 beforeEach(() => {

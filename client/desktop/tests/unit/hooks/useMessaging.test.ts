@@ -1,5 +1,5 @@
 import { renderHook, act } from '@testing-library/react';
-import { useMessaging } from '@/renderer/hooks/useMessaging';
+import { useMessaging } from '@/renderer/hooks/messaging/useMessaging';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';

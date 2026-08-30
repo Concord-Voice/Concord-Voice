@@ -41,7 +41,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
 
 vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({}));
 
-vi.mock('@/renderer/hooks/useDraftSettings', () => ({
+vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn((key: string) => defaultSettings[key] ?? false),
   setDraftAudioSetting: (...args: unknown[]) => mockSetDraftAudioSetting(...args),
 }));
@@ -50,7 +50,7 @@ vi.mock('@/renderer/hooks/useDraftSettings', () => ({
 // premium entitlements the lock variants gate (#1301): allowMusicMode (L3) and
 // a low minPtimeMs so the 10 ms frame-size option is NOT locked (L2). The lock
 // affordances themselves are covered in AudioOpusSection.premium.test.tsx.
-vi.mock('@/renderer/hooks/useEntitlement', () => ({
+vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   useEntitlement: vi.fn((selector: (e: Record<string, unknown>) => unknown) =>
     selector({ allowMusicMode: true, minPtimeMs: 10 })
   ),
@@ -89,7 +89,7 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
 // ── Imports (after mocks) ───────────────────────────────────────────────
 
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useDraftAudioSetting } from '@/renderer/hooks/useDraftSettings';
+import { useDraftAudioSetting } from '@/renderer/hooks/ui/useDraftSettings';
 import AudioOpusSection, {
   frameSizeHint,
   qosPriorityHint,

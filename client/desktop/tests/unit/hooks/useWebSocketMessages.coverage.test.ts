@@ -93,7 +93,7 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
   },
 }));
 
-import { useWebSocketMessages } from '@/renderer/hooks/useWebSocketMessages';
+import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
 import { speak as ttsSpeak } from '@/renderer/services/ttsService';
 import { createMockWsService, requireHandler } from '../../helpers/wsServiceMock';
 import { deferred } from '../../helpers/deferred';

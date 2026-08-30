@@ -1,5 +1,5 @@
 import { renderHook, act } from '@testing-library/react';
-import { useWebSocket } from '@/renderer/hooks/useWebSocket';
+import { useWebSocket } from '@/renderer/hooks/messaging/useWebSocket';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';

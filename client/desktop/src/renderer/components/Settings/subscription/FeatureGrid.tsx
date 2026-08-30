@@ -1,5 +1,5 @@
 import React from 'react';
-import { useEntitlement } from '../../../hooks/useEntitlement';
+import { useEntitlement } from '../../../hooks/ui/useEntitlement';
 import type { Entitlement } from '../../../stores/auth/subscriptionStore';
 
 // The Supersonic (premium) feature list — entitlement-backed premium

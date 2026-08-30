@@ -30,7 +30,7 @@ class CaptureRO {
   disconnect = roDisconnect;
 }
 
-import { useRenderStateReporter } from '../../../src/renderer/hooks/useRenderStateReporter';
+import { useRenderStateReporter } from '../../../src/renderer/hooks/voice/useRenderStateReporter';
 
 function setVisibility(state: 'visible' | 'hidden') {
   Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
