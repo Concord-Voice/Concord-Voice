@@ -496,6 +496,11 @@ func TestHub_FailClosedRegisterSpawnsSuppressor(t *testing.T) {
 	}
 
 	hub.handleRegister(client)
+	t.Cleanup(func() {
+		client.cancelBootstrap()
+		client.asyncCancel()
+		client.asyncWg.Wait()
+	})
 	hub.drainSuppressors()
 
 	assert.EqualValues(t, 1, atomic.LoadInt32(&calls),
