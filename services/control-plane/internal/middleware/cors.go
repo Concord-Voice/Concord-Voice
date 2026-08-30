@@ -36,6 +36,16 @@ const (
 // iframes, data: URLs) is never reflected to prevent credential leaks.
 func CORS(allowedOrigins []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Access-Control-Allow-Origin below is REFLECTED, so Origin has to be part
+		// of the cache key — otherwise a cache serves one origin's ACAO to another
+		// (#3025: a client cached app://concord and was then blocked at
+		// spa.concordvoice.chat). Unconditional, and ahead of the branch on purpose:
+		// it must cover the deny path and the OPTIONS abort too, because several
+		// CORS-covered endpoints send Cache-Control: public, so a cached header-LESS
+		// response is the same defect inverted. Add, not Set — an upstream Vary must
+		// survive; only Origin varies here, the other CORS headers are constant.
+		c.Writer.Header().Add("Vary", "Origin")
+
 		origin := c.Request.Header.Get("Origin")
 
 		if origin != "" && origin != "null" && isOriginAllowed(origin, allowedOrigins) {
