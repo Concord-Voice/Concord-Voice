@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import ContentSafetyControls from '@/renderer/components/Settings/ContentSafetyControls';
 
-vi.mock('@/renderer/services/gifProvider/klipyClient', () => ({
+vi.mock('@/renderer/services/messaging/gifProvider/klipyClient', () => ({
   klipyClient: {
     getCurrentCustomerId: vi.fn(() => null),
     rotateCustomerId: vi.fn(() => Promise.resolve('mock-rotated-id')),

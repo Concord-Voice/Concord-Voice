@@ -7,8 +7,8 @@ import {
   deriveSharedSecret,
   encryptWithSharedSecret,
 } from '../../utils/crypto';
-import { e2eeService } from '../../services/e2eeService';
-import { apiFetch } from '../../services/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { apiFetch } from '../../services/system/apiClient';
 
 interface SocialRecoveryApprovalProps {
   requestId: string;

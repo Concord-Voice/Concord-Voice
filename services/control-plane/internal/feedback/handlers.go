@@ -155,7 +155,7 @@ func (h *Handler) Submit(c *gin.Context) {
 
 	// Defense-in-depth PII re-sanitization. The threat model is a
 	// compromised client that bypasses the renderer-side scrub at
-	// services/logBufferService.ts — the server is the LAST line before
+	// services/system/logBufferService.ts — the server is the LAST line before
 	// content reaches a public-ish GitHub issue, so every free-text
 	// string the client sends gets scrubbed here, not just Logs.
 	// (Gitar / @security-reviewer finding, PR #1547.)

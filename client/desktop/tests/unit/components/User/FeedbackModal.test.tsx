@@ -9,7 +9,7 @@ vi.mock('@/renderer/stores/ui/connectionStore', () => ({
 
 // Mock apiClient — both apiFetch and safeJson
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: async <T,>(res: Response): Promise<T> => (await res.json()) as T,
 }));

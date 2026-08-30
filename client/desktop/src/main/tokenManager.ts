@@ -27,7 +27,7 @@ import {
 // ─── Module State (never leaves this process) ────────────────────────
 
 // Main-process-local shape of the persisted E2EE key material. Structural mirror
-// of the renderer's `E2EESessionKeys` (renderer/services/e2eeService.ts); the two
+// of the renderer's `E2EESessionKeys` (renderer/services/e2ee/e2eeService.ts); the two
 // meet at the `auth:storeE2EEKeys` IPC boundary by structural (JSON) compatibility,
 // so the type is intentionally NOT shared — keeping main and renderer type domains
 // decoupled. Keep the two shapes in sync if either gains a field.

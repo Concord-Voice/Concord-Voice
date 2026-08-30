@@ -5,7 +5,7 @@ import type { MessageWithUser } from '@/renderer/types/chat';
 
 const mockGetPins = vi.fn();
 const mockUnpinMessage = vi.fn();
-vi.mock('@/renderer/services/pinService', () => ({
+vi.mock('@/renderer/services/messaging/pinService', () => ({
   getPins: (...args: unknown[]) => mockGetPins(...args),
   unpinMessage: (...args: unknown[]) => mockUnpinMessage(...args),
   getChannelPins: (...args: unknown[]) => mockGetPins(...args),
@@ -18,7 +18,7 @@ const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
 const mockOperationGuard = { assertCurrent: vi.fn() };
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     createChannelOperationGuard: vi.fn(() => mockOperationGuard),
@@ -31,7 +31,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 async function setE2EEInitialized(value: boolean) {
-  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   Object.defineProperty(e2eeService, 'isInitialized', { value, writable: true });
 }
 

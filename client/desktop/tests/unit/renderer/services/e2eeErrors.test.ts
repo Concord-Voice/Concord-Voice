@@ -4,7 +4,7 @@ import {
   isPendingKeyError,
   classifyError,
   type E2EEKeyErrorCode,
-} from '@/renderer/services/e2eeErrors';
+} from '@/renderer/services/e2ee/e2eeErrors';
 
 describe('E2EEKeyUnavailableError', () => {
   it('carries code and pending flag', () => {

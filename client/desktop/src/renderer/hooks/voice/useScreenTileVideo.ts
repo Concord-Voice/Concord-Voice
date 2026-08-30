@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef } from 'react';
-import type { RemoteVideoRole } from '../../services/remoteVideoLayerPolicy';
+import type { RemoteVideoRole } from '../../services/voice/remoteVideoLayerPolicy';
 import { useRenderStateReporter } from './useRenderStateReporter';
 
 export interface UseScreenTileVideoOptions {

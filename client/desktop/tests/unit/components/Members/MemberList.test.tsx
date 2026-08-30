@@ -5,7 +5,7 @@ import { render, screen, fireEvent, act, userEvent, within } from '../../../test
 // mockResolvedValueOnce queued for the ban/kick call under test, so the failure
 // path silently gets the generic success response instead. Mock the service so
 // these tests exercise ban/kick, not the privacy gate.
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   fetchEligibility: vi.fn().mockResolvedValue('eligible'),
   peekEligibility: vi.fn().mockReturnValue('eligible'),
   prefetchEligibility: vi.fn(),
@@ -25,7 +25,7 @@ import MemberList from '@/renderer/components/Members/MemberList';
 // Mock apiFetch to control member loading
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
   API_BASE: 'http://localhost:8080',

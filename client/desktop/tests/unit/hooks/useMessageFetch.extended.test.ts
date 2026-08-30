@@ -3,13 +3,13 @@ import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
-import { removeMessage } from '@/renderer/services/searchService';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
+import { removeMessage } from '@/renderer/services/messaging/searchService';
 
 // Mock apiFetch and safeJson
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
 }));
@@ -24,7 +24,7 @@ const mockDecryptForChannelWithVersion = vi.fn();
 const mockOperationGuard = { assertCurrent: vi.fn() };
 const mockCreateChannelOperationGuard = vi.fn(() => mockOperationGuard);
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return mockIsInitialized;

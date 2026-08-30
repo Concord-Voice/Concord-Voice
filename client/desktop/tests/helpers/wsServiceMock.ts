@@ -1,5 +1,5 @@
 import { vi } from 'vitest';
-import type { ConnectionInfo } from '@/renderer/services/websocketService';
+import type { ConnectionInfo } from '@/renderer/services/messaging/websocketService';
 
 /**
  * Signature for a handler captured by {@link createMockWsService}.

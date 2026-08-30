@@ -5,8 +5,8 @@ import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
 import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
-import { apiFetch } from '../../services/apiClient';
-import { initiateDMCall } from '../../services/voiceService/callStateMachine';
+import { apiFetch } from '../../services/system/apiClient';
+import { initiateDMCall } from '../../services/voice/voiceService/callStateMachine';
 
 interface DMConversationContextMenuProps {
   conversation: DMConversation;

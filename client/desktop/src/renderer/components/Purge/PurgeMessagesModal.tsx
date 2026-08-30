@@ -12,7 +12,7 @@ import {
   type PurgeResult as PurgeOutcome,
   type StepUpPurgeResult,
   type TerminalPurgeResult,
-} from '../../services/purgeApi';
+} from '../../services/messaging/purgeApi';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';

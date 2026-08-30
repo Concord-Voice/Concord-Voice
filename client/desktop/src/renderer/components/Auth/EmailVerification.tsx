@@ -3,12 +3,12 @@ import TOTPInput from './TOTPInput';
 import LoadingSpinner from './LoadingSpinner';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { usePendingRegistrationStore } from '../../stores/auth/pendingRegistrationStore';
-import { revokeAbortedSession } from '../../services/apiClient';
+import { revokeAbortedSession } from '../../services/system/apiClient';
 import {
   apiUrl,
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import './EmailVerification.css';
 import './TOTPInput.css';

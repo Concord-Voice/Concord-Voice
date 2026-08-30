@@ -9,7 +9,7 @@ import { useAuthStore } from '../../../src/renderer/stores/auth/authStore';
 import { useAttestationFailureStore } from '../../../src/renderer/stores/auth/attestationFailureStore';
 import { useClientConfigStore } from '../../../src/renderer/stores/ui/clientConfigStore';
 import { resetAllStores } from '../../helpers/store-helpers';
-import type { ChangelogSection } from '../../../src/renderer/services/changelog';
+import type { ChangelogSection } from '../../../src/renderer/services/system/changelog';
 
 // jsdom has no <dialog>.showModal — spy it like SubscriptionResetModal.test.tsx does.
 beforeEach(() => {

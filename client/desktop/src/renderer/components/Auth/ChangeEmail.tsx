@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { usePendingRegistrationStore } from '../../stores/auth/pendingRegistrationStore';
-import { apiUrl } from '../../services/runtimeServerBase';
+import { apiUrl } from '../../services/system/runtimeServerBase';
 import './ChangeEmail.css';
 
 interface Props {

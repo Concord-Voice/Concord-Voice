@@ -51,7 +51,7 @@ vi.mock('@/renderer/components/Voice/ParticipantGrid.css', () => ({}));
 // it, so this is inert for the AudioOutputs / avatar-grid tests.
 const setRemoteVideoRenderState = vi.fn();
 const removeRemoteVideoTile = vi.fn();
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { setRemoteVideoRenderState, removeRemoteVideoTile },
 }));
 

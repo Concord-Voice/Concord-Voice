@@ -4,13 +4,13 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 // `safeJson` as ESM named bindings, which vi.spyOn cannot reassign at the
 // namespace level — the repo convention (see userStore.changePassword.test.ts)
 // is a hoisted vi.mock factory driven via vi.mocked(...).
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: vi.fn(),
 }));
 
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
-import { apiFetch, safeJson } from '@/renderer/services/apiClient';
+import { apiFetch, safeJson } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = vi.mocked(apiFetch);
 const mockSafeJson = vi.mocked(safeJson);

@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import SSOEagerUnlock from '@/renderer/components/Auth/SSOEagerUnlock';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -25,7 +25,7 @@ const { mockSessionKeys, mockInitializationReceipt } = vi.hoisted(() => {
   };
 });
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     initialize: (...args: unknown[]) => mockE2eeInitialize(...args),
     captureTeardownEpoch: vi.fn().mockReturnValue(0),
@@ -39,8 +39,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 // Partial-mock apiClient: keep the real apiFetch/safeJson the component uses for
 // /users/me/keys, but stub revokeAbortedSession so we can assert it fires on a
 // teardown-abort without a real /auth/logout round-trip (PR #2337).
-vi.mock('@/renderer/services/apiClient', async (orig) => ({
-  ...(await orig<typeof import('@/renderer/services/apiClient')>()),
+vi.mock('@/renderer/services/system/apiClient', async (orig) => ({
+  ...(await orig<typeof import('@/renderer/services/system/apiClient')>()),
   revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -128,7 +128,7 @@ describe('SSOEagerUnlock', () => {
     // initialize() reject with the typed E2EEInitTeardownError. That is a
     // dead-session signal, NOT a wrong passphrase: it must not increment the
     // lockout counter or render "Incorrect passphrase".
-    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2ee/e2eeErrors');
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -151,12 +151,12 @@ describe('SSOEagerUnlock', () => {
     });
     expect(screen.queryByText(/incorrect passphrase/i)).not.toBeInTheDocument();
     expect(onUnlock).not.toHaveBeenCalled();
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     expect(revokeAbortedSession).toHaveBeenCalled();
   });
 
   it('does NOT admit when a teardown lands after initialize resolves (pre-admit check, PR #2337)', async () => {
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(true);
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -184,7 +184,7 @@ describe('SSOEagerUnlock', () => {
     // Auth ownership can be lost at a different await boundary than key
     // teardown. This synthetic token-only clear leaves the epoch unchanged,
     // so the token-lifecycle admit gate must catch the loss before onUnlock().
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     useAuthStore.getState().setAccessToken('sso-token-A'); // SSO session: token, no session ID
     mockE2eeInitialize.mockImplementationOnce(async () => {
       // The token-only clear lands while init/persist is in flight.
@@ -218,7 +218,7 @@ describe('SSOEagerUnlock', () => {
     // process. On a !rememberMe (nuclear) teardown the abort wipes again; on
     // a rememberMe (graceful) teardown the disk state is deliberately
     // preserved for next-launch restore (#1768) and must NOT be touched.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const runAttempt = async () => {
       useAuthStore.getState().beginAuthLifecycle('sso-token-A', 'sso-session-A');
       useE2EEStore.getState().setNeedsSSOUnlock(true, 41);
@@ -264,7 +264,7 @@ describe('SSOEagerUnlock', () => {
     // A token-only teardown during the fetch/parse leaves an EMPTY store. The
     // post-fetch re-capture must not adopt {null, null} — that would make the
     // ownership gate vacuously pass (null === null) and admit a dead session.
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     useAuthStore.getState().setAccessToken('sso-token-A');
     mockE2eeInitialize.mockResolvedValueOnce(undefined);
     mockFetch.mockResolvedValueOnce({

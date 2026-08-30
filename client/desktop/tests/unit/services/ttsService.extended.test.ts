@@ -33,7 +33,7 @@ Object.defineProperty(window, 'speechSynthesis', {
   writable: true,
 });
 
-import { speak, stop, getVoices, isSpeaking } from '@/renderer/services/ttsService';
+import { speak, stop, getVoices, isSpeaking } from '@/renderer/services/system/ttsService';
 
 beforeEach(() => {
   vi.clearAllMocks();

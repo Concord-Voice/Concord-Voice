@@ -11,7 +11,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   }),
 }));
 
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     beginTestSuspension: vi.fn(),
     endTestSuspension: vi.fn(),
@@ -21,7 +21,7 @@ vi.mock('@/renderer/services/voiceService', () => ({
 
 import { useOutputTest } from '@/renderer/hooks/device/useOutputTest';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
-import { voiceService } from '@/renderer/services/voiceService';
+import { voiceService } from '@/renderer/services/voice/voiceService';
 
 let mockSetSinkId: ReturnType<typeof vi.fn>;
 let mockPlay: ReturnType<typeof vi.fn>;

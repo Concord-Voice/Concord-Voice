@@ -1,8 +1,12 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/auth/mfaChallengeStore';
-import { ensureMachineId, safeJson } from '../../services/apiClient';
-import { apiUrl, captureRuntimeServerSelection } from '../../services/runtimeServerBase';
-import { completeSSOMFA, SSOServiceError, abandonSSOReservation } from '../../services/ssoService';
+import { ensureMachineId, safeJson } from '../../services/system/apiClient';
+import { apiUrl, captureRuntimeServerSelection } from '../../services/system/runtimeServerBase';
+import {
+  completeSSOMFA,
+  SSOServiceError,
+  abandonSSOReservation,
+} from '../../services/system/ssoService';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import WebAuthnPrompt from './WebAuthnPrompt';

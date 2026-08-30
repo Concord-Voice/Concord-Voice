@@ -6,11 +6,11 @@ import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import { useDNDTransitionRefresh } from '@/renderer/hooks/messaging/useDNDTransitionRefresh';
 
 const mockApiFetch = vi.mocked(apiFetch);

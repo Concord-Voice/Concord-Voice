@@ -7,7 +7,7 @@ import {
   resolveCameraScalabilityMode,
   type CameraLayeringPriority,
   type CastingEligibility,
-} from '../../../src/renderer/services/cameraLayering';
+} from '../../../src/renderer/services/voice/cameraLayering';
 
 function codec(mimeType: string): mediasoupTypes.RtpCodecCapability {
   return {

@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { X } from 'lucide-react';
-import { getPins, unpinMessage } from '../../services/pinService';
+import { getPins, unpinMessage } from '../../services/messaging/pinService';
 import { PinContent, decryptPins, type DecryptedPin } from '../Chat/pinnedMessageUtils';
 import '../Chat/PinnedMessagesPanel.css';
 

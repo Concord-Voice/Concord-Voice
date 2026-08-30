@@ -7,7 +7,7 @@ const mockUnsubscribeDM = vi.fn();
 const mockSubscribeChannel = vi.fn();
 const mockUnsubscribeChannel = vi.fn();
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     subscribeDM: mockSubscribeDM,
     unsubscribeDM: mockUnsubscribeDM,

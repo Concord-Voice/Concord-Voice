@@ -7,7 +7,7 @@ import type { MessageWithStatus } from '@/renderer/types/chat';
 // Mock apiFetch and safeJson
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
 }));
@@ -22,7 +22,7 @@ const mockInvalidateChannelKey = vi.fn();
 const mockOperationGuard = { assertCurrent: vi.fn() };
 const mockCreateChannelOperationGuard = vi.fn(() => mockOperationGuard);
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return true;

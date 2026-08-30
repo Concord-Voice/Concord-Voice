@@ -1,7 +1,11 @@
 // client/desktop/tests/unit/services/av1ObuParser.test.ts
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { parseAv1Obus, AV1_OBU_FRAME, AV1_OBU_TILE_GROUP } from '@/renderer/services/av1ObuParser';
+import {
+  parseAv1Obus,
+  AV1_OBU_FRAME,
+  AV1_OBU_TILE_GROUP,
+} from '@/renderer/services/e2ee/av1ObuParser';
 
 /** Build a single low-overhead OBU: header + optional ext + leb128 size + payload. */
 function obu(opts: {

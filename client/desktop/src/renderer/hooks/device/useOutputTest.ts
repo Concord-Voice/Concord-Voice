@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
-import { voiceService } from '../../services/voiceService';
+import { voiceService } from '../../services/voice/voiceService';
 
 interface UseOutputTestReturn {
   isTesting: boolean;

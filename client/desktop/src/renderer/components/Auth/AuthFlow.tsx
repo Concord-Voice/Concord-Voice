@@ -5,8 +5,11 @@ import { useAuthStore } from '../../stores/auth/authStore';
 import { useUserStore, UserProfile } from '../../stores/auth/userStore';
 import { usePendingRegistrationStore } from '../../stores/auth/pendingRegistrationStore';
 import { useSSOStore } from '../../stores/auth/ssoStore';
-import { clientConfigService } from '../../services/clientConfigService';
-import { resetRuntimeServerBase, setRuntimeServerBase } from '../../services/runtimeServerBase';
+import { clientConfigService } from '../../services/system/clientConfigService';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '../../services/system/runtimeServerBase';
 import ConnectionSelector from './ConnectionSelector';
 import ServerInput from './ServerInput';
 import Register from './Register';

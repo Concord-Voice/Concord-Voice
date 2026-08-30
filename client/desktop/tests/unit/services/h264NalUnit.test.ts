@@ -5,7 +5,7 @@ import {
   parseH264AnnexB,
   stuffH264Bytes,
   unstuffH264Bytes,
-} from '@/renderer/services/h264NalUnit';
+} from '@/renderer/services/e2ee/h264NalUnit';
 
 function concat(...parts: Uint8Array[]): Uint8Array {
   const length = parts.reduce((total, part) => total + part.length, 0);

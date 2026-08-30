@@ -8,14 +8,14 @@ import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { apiFetch } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
+import { apiFetch } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import { useAuthStore } from '../../stores/auth/authStore';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import { Channel } from '../../types/chat';
 import './CreateChannelModal.css';
 

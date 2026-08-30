@@ -6,7 +6,7 @@ import { vi } from 'vitest';
 
 // Mock apiFetch — controllable per test
 const mockApiFetch = vi.fn().mockResolvedValue({ ok: false });
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   API_BASE: 'http://localhost:8080',
 }));

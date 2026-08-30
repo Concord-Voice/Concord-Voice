@@ -15,7 +15,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
 }));
 
 // Mock e2eeService
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getWrappingKey: vi.fn().mockReturnValue('mock-wrapping-key'),
     getWrappedPrivateKey: vi.fn().mockReturnValue('bW9jay1kYXRh'),
@@ -24,7 +24,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 
 // Mock apiFetch
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   API_BASE: 'http://localhost:8080',
 }));
@@ -46,7 +46,7 @@ Object.defineProperty(globalThis, 'crypto', {
 });
 
 import RecoveryApprovalModal from '@/renderer/components/Auth/RecoveryApprovalModal';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
 describe('RecoveryApprovalModal', () => {
   const defaultProps = {

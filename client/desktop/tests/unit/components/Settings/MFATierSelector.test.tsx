@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import { vi } from 'vitest';
 
 // ── Service mock ─────────────────────────────────────────────────────────────
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     json: async () => ({}),
   }),

@@ -64,7 +64,7 @@ vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   setDraftVideoSetting: mockSetDraftVideoSetting,
 }));
 
-vi.mock('@/renderer/services/mediaCapabilities', () => ({
+vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   codecKey: vi.fn(() => 'video/vp8/default'),
   codecKeyMime: vi.fn((key: string) => key),
   getCodecInfo: vi.fn(() => ({

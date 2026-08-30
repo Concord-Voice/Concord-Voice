@@ -16,7 +16,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
-import { resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
+import { resetRuntimeServerBase } from '@/renderer/services/system/runtimeServerBase';
 
 // Observe every session-teardown side effect through apiClient's configured
 // composition-root reset callbacks.
@@ -29,8 +29,11 @@ vi.stubGlobal('fetch', mockFetch);
 
 // REAL apiFetch (not mocked) — this is the surface the KLIPY proxy shares with
 // authoritative API calls, and where the teardown-on-401 lives.
-import { _resetRefreshState, configureRefreshFailureReset } from '@/renderer/services/apiClient';
-import { klipyClient } from '@/renderer/services/gifProvider/klipyClient';
+import {
+  _resetRefreshState,
+  configureRefreshFailureReset,
+} from '@/renderer/services/system/apiClient';
+import { klipyClient } from '@/renderer/services/messaging/gifProvider/klipyClient';
 
 function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {

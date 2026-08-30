@@ -1,7 +1,7 @@
 import {
   preferencesSyncService,
   type PreferencesSyncDeps,
-} from '@/renderer/services/preferencesSync';
+} from '@/renderer/services/system/preferencesSync';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import {
   LEGACY_COLLAPSED_WIDTH,
@@ -19,7 +19,7 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 const API_BASE = 'http://localhost:8080';
 
 // Mock e2eeService
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn().mockResolvedValue('encrypted-blob'),
@@ -27,7 +27,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
 /** Reset the singleton's DI deps so init() can be called again in each test. */
 function resetSyncServiceDeps() {

@@ -1,5 +1,5 @@
 import React from 'react';
-import type { PurgeContext, TerminalPurgeResult } from '../../services/purgeApi';
+import type { PurgeContext, TerminalPurgeResult } from '../../services/messaging/purgeApi';
 
 interface PurgeResultProps {
   context: PurgeContext;

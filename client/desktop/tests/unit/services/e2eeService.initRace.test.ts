@@ -17,7 +17,7 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // e2eeService imports apiFetch/safeJson; resetService imports stopProactiveRefresh.
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: vi.fn(),
   API_BASE: 'http://localhost:8080',
@@ -27,26 +27,26 @@ vi.mock('@/renderer/services/apiClient', () => ({
 
 // gracefulReset() stops these account-bound watchers — stub them so the reset
 // is a pure in-memory state operation with no timers/network in the test.
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { stopWatching: vi.fn(), pushPreferences: vi.fn() },
 }));
-vi.mock('@/renderer/services/savedGifsSync', () => ({
+vi.mock('@/renderer/services/system/savedGifsSync', () => ({
   savedGifsSyncService: { stopWatching: vi.fn() },
 }));
-vi.mock('@/renderer/services/friendOrgSync', () => ({
+vi.mock('@/renderer/services/system/friendOrgSync', () => ({
   friendOrgSyncService: { stopWatching: vi.fn() },
 }));
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: { reset: vi.fn() },
 }));
-vi.mock('@/renderer/services/notificationPrefsService', () => ({
+vi.mock('@/renderer/services/system/notificationPrefsService', () => ({
   stopExpirySweep: vi.fn(),
 }));
 
 // Real e2eeService, real resetService, real crypto — the race is genuine.
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { E2EEInitTeardownError } from '@/renderer/services/e2eeErrors';
-import { nuclearReset, recoveryReset } from '@/renderer/services/resetService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { E2EEInitTeardownError } from '@/renderer/services/e2ee/e2eeErrors';
+import { nuclearReset, recoveryReset } from '@/renderer/services/system/resetService';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { generateRegistrationKeys } from '@/renderer/utils/crypto';
 import { resetAllStores } from '../../helpers/store-helpers';

@@ -468,7 +468,7 @@ export const useAuthStore = createStore<AuthState>()((set) => ({
 
 ```typescript
 // userStore.logout() delegates the final cross-store wipe to resetService.
-const { nuclearReset } = await import('../../services/resetService');
+const { nuclearReset } = await import('../../services/system/resetService');
 nuclearReset();
 ```
 
@@ -504,7 +504,7 @@ export const useChatStore = create<ChatState>()(/* ... */);
 // userStore coordinates logout, then delegates the complete wipe.
 logout: async () => {
   // ...stop sync and request main-process logout
-  const { nuclearReset } = await import('../../services/resetService');
+  const { nuclearReset } = await import('../../services/system/resetService');
   nuclearReset();
 };
 ```
@@ -601,7 +601,7 @@ const complexFeatureStore = configureStore({
 **A:** Use the centralized reset path so renderer state and main-process credentials are cleared together:
 
 ```typescript
-const { nuclearReset } = await import('../services/resetService');
+const { nuclearReset } = await import('../services/system/resetService');
 nuclearReset();
 ```
 
@@ -644,8 +644,8 @@ Normal user-initiated logout should call `userStore.logout()`, which requests ma
 
 - [Zustand Official Docs](https://github.com/pmndrs/zustand)
 - [WebSocket Integration](../src/renderer/hooks/messaging/useWebSocket.ts)
-- [Message Queue](../src/renderer/services/messageQueue.ts)
-- [E2EE Service](../src/renderer/services/e2eeService.ts)
+- [Message Queue](../src/renderer/services/messaging/messageQueue.ts)
+- [E2EE Service](../src/renderer/services/e2ee/e2eeService.ts)
 
 ---
 

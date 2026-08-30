@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { types as mediasoupTypes } from 'mediasoup-client';
-import * as codecSelection from '../../../src/renderer/services/voiceCodecSelection';
+import * as codecSelection from '../../../src/renderer/services/voice/voiceCodecSelection';
 import {
   buildCodecCandidates,
   buildCodecCascade,
@@ -11,7 +11,7 @@ import {
   isCodecKeyInFloor,
   selectCodecFromCascade,
   type CodecLookup,
-} from '../../../src/renderer/services/voiceCodecSelection';
+} from '../../../src/renderer/services/voice/voiceCodecSelection';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 

@@ -3,7 +3,7 @@ import ToggleSwitch from './ToggleSwitch';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import RecoveryApprovalModal from '../Auth/RecoveryApprovalModal';
 import RecoveryCircle from './RecoveryCircle';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 
 export interface WebAuthnCredential {
   id: string;

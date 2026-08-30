@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { apiFetch, safeJson } from '../../../services/apiClient';
+import { apiFetch, safeJson } from '../../../services/system/apiClient';
 import { useSubscriptionStore } from '../../../stores/auth/subscriptionStore';
 import { easterEggMessage, type RedeemResult } from './redeemEasterEgg';
 

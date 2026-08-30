@@ -1,6 +1,6 @@
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
-import { configureRefreshFailureReset } from '@/renderer/services/apiClient';
+import { configureRefreshFailureReset } from '@/renderer/services/system/apiClient';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';

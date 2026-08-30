@@ -2,9 +2,9 @@ import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
 import { Channel, ChannelGroup } from '../../types/chat';
-import { apiFetch } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
-import { removeScope } from '../../services/searchService';
+import { apiFetch } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { removeScope } from '../../services/messaging/searchService';
 import { useChatStore } from './chatStore';
 import { useUnreadStore } from './unreadStore';
 

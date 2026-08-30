@@ -12,7 +12,7 @@
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useDMStore, type DMParticipant } from '../../stores/chat/dmStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { cancelOutgoingCall } from '../../services/voiceService/callStateMachine';
+import { cancelOutgoingCall } from '../../services/voice/voiceService/callStateMachine';
 import { peerName } from '../../utils/dm';
 import './OutgoingCallModal.css';
 

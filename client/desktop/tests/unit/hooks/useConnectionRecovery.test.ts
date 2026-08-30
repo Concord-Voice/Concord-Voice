@@ -16,7 +16,7 @@ const mockWsService = {
   getState: mockGetState,
 };
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => mockWsService,
   ConnectionState: {
     DISCONNECTED: 'DISCONNECTED',
@@ -26,7 +26,7 @@ vi.mock('@/renderer/services/websocketService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     validateEpochs: vi.fn(),
     isInitialized: true,
@@ -34,11 +34,11 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/postLoginHydration', () => ({
+vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   hydratePostLogin: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
+vi.mock('@/renderer/services/system/postLoginHydrationLifecycle', () => ({
   beginPostLoginHydrationGuard: vi.fn(() => ({
     signal: new AbortController().signal,
     isCurrent: () => true,
@@ -47,11 +47,11 @@ vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
   resetPostLoginHydrationLifecycle: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { emergencyCleanup: vi.fn(), joinChannel: vi.fn().mockResolvedValue(undefined) },
 }));
 
-vi.mock('@/renderer/services/recoveryService', () => ({
+vi.mock('@/renderer/services/system/recoveryService', () => ({
   runPreflight: vi.fn().mockResolvedValue({
     internet: 'ok',
     serverReachable: 'ok',
@@ -61,17 +61,17 @@ vi.mock('@/renderer/services/recoveryService', () => ({
   }),
 }));
 
-vi.mock('@/renderer/services/resetService', () => ({
+vi.mock('@/renderer/services/system/resetService', () => ({
   gracefulReset: vi.fn(),
   recoveryReset: vi.fn(),
   softRestart: vi.fn(),
 }));
 
 import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecovery';
-import { gracefulReset, recoveryReset } from '@/renderer/services/resetService';
-import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
+import { gracefulReset, recoveryReset } from '@/renderer/services/system/resetService';
+import { hydratePostLogin } from '@/renderer/services/system/postLoginHydration';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { voiceService } from '@/renderer/services/voiceService';
+import { voiceService } from '@/renderer/services/voice/voiceService';
 
 beforeEach(() => {
   vi.clearAllMocks();

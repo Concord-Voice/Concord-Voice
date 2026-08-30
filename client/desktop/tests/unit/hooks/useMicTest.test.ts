@@ -45,7 +45,7 @@ vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   }),
 }));
 
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     beginTestSuspension: vi.fn(),
     endTestSuspension: vi.fn(),
@@ -61,7 +61,7 @@ import { ensureOsPermission } from '@/renderer/stores/voice/osPermissionStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useMicTest } from '@/renderer/hooks/device/useMicTest';
-import { voiceService } from '@/renderer/services/voiceService';
+import { voiceService } from '@/renderer/services/voice/voiceService';
 
 // Build a comprehensive mock audio pipeline
 const mockTrackStop = vi.fn();

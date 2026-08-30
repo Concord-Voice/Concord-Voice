@@ -74,16 +74,16 @@ vi.mock('@/renderer/components/Auth/SSOEagerUnlock', () => ({
     </div>
   ),
 }));
-vi.mock('@/renderer/services/clientConfigService', () => ({
+vi.mock('@/renderer/services/system/clientConfigService', () => ({
   clientConfigService: { start: vi.fn(), stop: vi.fn() },
 }));
-vi.mock('@/renderer/services/mediaCapabilities', () => ({
+vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   detectCodecCapabilities: vi.fn().mockResolvedValue({}),
   prewarmWebRTC: vi.fn(),
 }));
 
 const mockClearBadge = vi.fn();
-vi.mock('@/renderer/services/desktopNotificationService', () => ({
+vi.mock('@/renderer/services/system/desktopNotificationService', () => ({
   desktopNotificationService: {
     clearBadge: (...args: unknown[]) => mockClearBadge(...args),
   },
@@ -92,16 +92,16 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
 const mockMarkRendererCrashed = vi.fn().mockResolvedValue(undefined);
 const mockSoftRestart = vi.fn().mockResolvedValue(undefined);
 const mockGracefulReset = vi.fn();
-vi.mock('@/renderer/services/recoveryService', () => ({
+vi.mock('@/renderer/services/system/recoveryService', () => ({
   markRendererCrashed: (...args: unknown[]) => mockMarkRendererCrashed(...args),
 }));
-vi.mock('@/renderer/services/resetService', () => ({
+vi.mock('@/renderer/services/system/resetService', () => ({
   softRestart: (...args: unknown[]) => mockSoftRestart(...args),
   gracefulReset: (...args: unknown[]) => mockGracefulReset(...args),
 }));
 
 const mockInitializeFromStoredKeys = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     initializeFromStoredKeys: (...args: unknown[]) => mockInitializeFromStoredKeys(...args),
@@ -112,28 +112,28 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     init: vi.fn(),
     startWatching: vi.fn(),
     fetchAndApply: vi.fn().mockResolvedValue(undefined),
   },
 }));
-vi.mock('@/renderer/services/savedGifsSync', () => ({
+vi.mock('@/renderer/services/system/savedGifsSync', () => ({
   savedGifsSyncService: {
     startWatching: vi.fn(),
     fetchAndApply: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
-// #1785: App.tsx side-effect-imports `services/gifProvider`, whose module body
+// #1785: App.tsx side-effect-imports `services/messaging/gifProvider`, whose module body
 // applies the stored privacy preference to the active provider. Mock the
 // provider so importing App does no real KLIPY work, and record the calls in a
 // plain array rather than a vi.fn() — the wiring fires once at module-import
 // time (below), which is BEFORE this suite's beforeEach runs, so a spy would be
 // wiped by vi.clearAllMocks() before any test could read it.
 const klipyPersonalizationCalls = vi.hoisted(() => [] as boolean[]);
-vi.mock('@/renderer/services/gifProvider/klipyProvider', () => ({
+vi.mock('@/renderer/services/messaging/gifProvider/klipyProvider', () => ({
   klipyProvider: {
     name: 'KLIPY',
     searchPlaceholder: 'Search KLIPY',
@@ -152,7 +152,7 @@ vi.mock('@/renderer/services/gifProvider/klipyProvider', () => ({
 }));
 
 const mockHydratePostLogin = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/postLoginHydration', () => ({
+vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   hydratePostLogin: (...args: unknown[]) => mockHydratePostLogin(...args),
 }));
 
@@ -758,7 +758,7 @@ describe('extractInviteCodes — friend links (#945)', () => {
 
 describe('KLIPY personalization wiring (#1785)', () => {
   it('applies the personalization preference eagerly when App is imported, with no GIF surface mounted', () => {
-    // App.tsx carries a side-effect `import './services/gifProvider'`. That
+    // App.tsx carries a side-effect `import './services/messaging/gifProvider'`. That
     // module owns the personalization wiring and applies the stored preference
     // on evaluation. Nothing here mounts GifPicker or GifEmbed — and that is
     // precisely the case that matters: Settings > Content Safety reads
@@ -766,7 +766,7 @@ describe('KLIPY personalization wiring (#1785)', () => {
     // user who has never opened the picker.
     //
     // Falsifier: drop the side-effect import from App.tsx and this fails.
-    // Every other route into services/gifProvider is mocked out in this file
+    // Every other route into services/messaging/gifProvider is mocked out in this file
     // (MainView, DirectMessagesView, SettingsPage, savedGifsSync), so App.tsx
     // is the only importer left.
     expect(klipyPersonalizationCalls.length).toBeGreaterThan(0);

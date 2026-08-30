@@ -10,14 +10,14 @@ import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';
 
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   // Defaults matter: a bare vi.fn() returns undefined and the hook does
   // fetchEligibility(id).then(...), which would throw for every test in this
   // file rather than only the ones that care about eligibility.
   fetchEligibility: vi.fn().mockResolvedValue('eligible'),
   peekEligibility: vi.fn().mockReturnValue('eligible'),
 }));
-import { fetchEligibility, peekEligibility } from '@/renderer/services/friendEligibility';
+import { fetchEligibility, peekEligibility } from '@/renderer/services/system/friendEligibility';
 const mockFetchEligibility = fetchEligibility as ReturnType<typeof vi.fn>;
 const mockPeekEligibility = peekEligibility as ReturnType<typeof vi.fn>;
 

@@ -9,7 +9,7 @@
  */
 
 import { useEffect } from 'react';
-import { getWebSocketService } from '../../services/websocketService';
+import { getWebSocketService } from '../../services/messaging/websocketService';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { pendingUnsubscribes, UNSUBSCRIBE_DELAY_MS } from './useDMSubscription';
 

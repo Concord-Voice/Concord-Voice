@@ -1,5 +1,5 @@
 import { http, HttpResponse } from 'msw';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -11,7 +11,7 @@ const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn(),
@@ -19,7 +19,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { deferred } from '../../helpers/deferred';
 
 function remotePreference(version: number, encryptedData = 'remote-ciphertext') {

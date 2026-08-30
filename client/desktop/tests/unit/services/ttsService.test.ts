@@ -42,7 +42,7 @@ import {
   isSpeaking,
   preview,
   TTS_PREVIEW_TEXT,
-} from '@/renderer/services/ttsService';
+} from '@/renderer/services/system/ttsService';
 
 beforeEach(() => {
   vi.clearAllMocks();

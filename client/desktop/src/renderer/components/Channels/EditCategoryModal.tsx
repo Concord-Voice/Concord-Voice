@@ -3,7 +3,7 @@ import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { ChannelGroup } from '../../types/chat';
 import './CreateChannelModal.css';
 

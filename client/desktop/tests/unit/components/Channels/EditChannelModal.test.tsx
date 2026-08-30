@@ -4,7 +4,7 @@ import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { mockChannel, mockServer } from '../../../mocks/fixtures';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
@@ -12,7 +12,7 @@ vi.mock('emoji-picker-react', () => ({
   default: () => <div data-testid="emoji-picker" />,
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import EditChannelModal from '@/renderer/components/Channels/EditChannelModal';
 
 const mockedApiFetch = vi.mocked(apiFetch);

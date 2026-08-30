@@ -1,6 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing voiceService
@@ -96,12 +96,12 @@ vi.mock('socket.io-client', () => ({
 
 // --- apiClient ---
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 
 // --- e2eeService ---
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
     getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
@@ -114,7 +114,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 // --- mediaEncryption ---
-vi.mock('@/renderer/services/mediaEncryption', () => ({
+vi.mock('@/renderer/services/e2ee/mediaEncryption', () => ({
   // The mock mirrors the live constant so the join-version assertion
   // (sender advertises === ack confirms) stays self-consistent.
   MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
@@ -281,8 +281,9 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
-const { voiceService } = await import('@/renderer/services/voiceService');
-const { handleCallInvited } = await import('@/renderer/services/voiceService/callStateMachine');
+const { voiceService } = await import('@/renderer/services/voice/voiceService');
+const { handleCallInvited } =
+  await import('@/renderer/services/voice/voiceService/callStateMachine');
 
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -4685,7 +4686,7 @@ describe('VoiceService', () => {
   describe('E2EE initEncryption', () => {
     it('retries on failure with backoff', async () => {
       // Make the atomic key-material fetch fail a few times then succeed.
-      const { e2eeService: mockE2ee } = await import('@/renderer/services/e2eeService');
+      const { e2eeService: mockE2ee } = await import('@/renderer/services/e2ee/e2eeService');
       vi.mocked(mockE2ee.getChannelKeyMaterial)
         .mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true))
         .mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true))

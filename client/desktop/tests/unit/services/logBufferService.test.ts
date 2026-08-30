@@ -6,7 +6,7 @@ import {
   install,
   sanitize,
   uninstall,
-} from '@/renderer/services/logBufferService';
+} from '@/renderer/services/system/logBufferService';
 
 describe('logBufferService', () => {
   beforeEach(() => {

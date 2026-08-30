@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
-import type { CodecCapability, GpuInfo } from '../../services/mediaCapabilities';
+import type { CodecCapability, GpuInfo } from '../../services/voice/mediaCapabilities';
 
 // ---------------------------------------------------------------------------
 // Video quality presets

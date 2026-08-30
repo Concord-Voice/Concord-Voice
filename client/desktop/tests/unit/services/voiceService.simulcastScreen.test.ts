@@ -11,7 +11,7 @@
  *   Simulcast stays server-gated on `screenLayeringEnabled`.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { voiceService } from '@/renderer/services/voiceService';
+import { voiceService } from '@/renderer/services/voice/voiceService';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 

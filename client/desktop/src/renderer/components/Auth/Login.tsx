@@ -5,13 +5,13 @@ import {
   e2eeService,
   type E2EEInitializationGuard,
   type E2EEInitializationReceipt,
-} from '../../services/e2eeService';
-import { E2EEInitTeardownError } from '../../services/e2eeErrors';
+} from '../../services/e2ee/e2eeService';
+import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { parseContinuationPair, type ContinuationPair } from '../../utils/continuationPair';
-import { hydratePostLogin } from '../../services/postLoginHydration';
-import { beginPostLoginHydrationGuard } from '../../services/postLoginHydrationLifecycle';
+import { hydratePostLogin } from '../../services/system/postLoginHydration';
+import { beginPostLoginHydrationGuard } from '../../services/system/postLoginHydrationLifecycle';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import {
@@ -19,12 +19,12 @@ import {
   ensureMachineId,
   revokeAbortedSession,
   type AbortedSessionRef,
-} from '../../services/apiClient';
+} from '../../services/system/apiClient';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import type { UserProfile } from '../../stores/auth/userStore';
 import TOTPInput from './TOTPInput';

@@ -14,17 +14,17 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { getWebSocketService, ConnectionState } from '../../services/websocketService';
-import { getMessageQueue, type QueuedMessage } from '../../services/messageQueue';
-import { e2eeService } from '../../services/e2eeService';
-import { classifyError } from '../../services/e2eeErrors';
+import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';
+import { getMessageQueue, type QueuedMessage } from '../../services/messaging/messageQueue';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { classifyError } from '../../services/e2ee/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import type { MessageWithStatus } from '../../types/chat';
 import {
   sendDMMessage as sendDMMessageImpl,
   wrapContentWithGifSlug,
   type SendMessageOptions,
-} from '../../services/dmMessageSender';
+} from '../../services/messaging/dmMessageSender';
 
 /** Encrypt a queued message's content (with optional gif_slug) for an E2EE channel.
  *  Returns the ciphertext + key version, throws on failure. */

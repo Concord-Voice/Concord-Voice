@@ -19,11 +19,11 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     playLoop: vi.fn(),
     stopLoop: vi.fn(),
@@ -33,19 +33,19 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     joinChannel: vi.fn(),
   },
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
-import { notificationSoundService } from '@/renderer/services/notificationSoundService';
-import { voiceService } from '@/renderer/services/voiceService';
+import { apiFetch } from '@/renderer/services/system/apiClient';
+import { notificationSoundService } from '@/renderer/services/system/notificationSoundService';
+import { voiceService } from '@/renderer/services/voice/voiceService';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import type { DMConversation } from '@/renderer/stores/chat/dmStore';
-import type { CallState } from '@/renderer/services/voiceService/callStateMachine';
+import type { CallState } from '@/renderer/services/voice/voiceService/callStateMachine';
 import { deferred } from '../../../helpers/deferred';
 
 import {
@@ -57,7 +57,7 @@ import {
   handleCallCanceled,
   handleCallDeclined,
   handleCallTimedOut,
-} from '@/renderer/services/voiceService/callStateMachine';
+} from '@/renderer/services/voice/voiceService/callStateMachine';
 
 const mockApiFetch = vi.mocked(apiFetch);
 const mockPlayLoop = vi.mocked(notificationSoundService.playLoop);

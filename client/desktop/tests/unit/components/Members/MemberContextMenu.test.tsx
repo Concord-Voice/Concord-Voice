@@ -5,12 +5,12 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
-import { apiFetch, safeJson } from '@/renderer/services/apiClient';
+import { apiFetch, safeJson } from '@/renderer/services/system/apiClient';
 import { ADMIN_PERMISSIONS, BASE_PERMISSIONS, TIMEOUT_MEMBERS } from '@/renderer/utils/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: vi.fn(),
 }));

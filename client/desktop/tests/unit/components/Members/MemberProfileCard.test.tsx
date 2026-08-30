@@ -3,7 +3,7 @@ import MemberProfileCard from '@/renderer/components/Members/MemberProfileCard';
 import { mockMember } from '../../../mocks/fixtures';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
-import { fetchEligibility, peekEligibility } from '@/renderer/services/friendEligibility';
+import { fetchEligibility, peekEligibility } from '@/renderer/services/system/friendEligibility';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // #1241: the affordance is now gated on server eligibility. Most of these tests
@@ -13,7 +13,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 //
 // The defaults are load-bearing: a bare vi.fn() returns undefined, and the hook
 // does fetchEligibility(id).then(...), which would throw in every test here.
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   fetchEligibility: vi.fn().mockResolvedValue('eligible'),
   peekEligibility: vi.fn().mockReturnValue('eligible'),
 }));

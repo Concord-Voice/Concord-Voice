@@ -29,7 +29,7 @@ vi.mock('@/renderer/components/Voice/VoiceTextChat', () => ({
 
 // ── Service mock (dynamic import inside handleJoin) ────────────────────────────
 const mockJoinChannel = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { joinChannel: mockJoinChannel },
 }));
 

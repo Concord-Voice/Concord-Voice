@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { WebSocketService } from '@/renderer/services/websocketService';
+import { WebSocketService } from '@/renderer/services/messaging/websocketService';
 import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 

@@ -31,12 +31,12 @@ import LoadingSpinner from './LoadingSpinner';
 import { useSSOStore } from '../../stores/auth/ssoStore';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
-import { completeSSOLink, abandonSSOReservation } from '../../services/ssoService';
-import { revokeAbortedSession, type AbortedSessionRef } from '../../services/apiClient';
+import { completeSSOLink, abandonSSOReservation } from '../../services/system/ssoService';
+import { revokeAbortedSession, type AbortedSessionRef } from '../../services/system/apiClient';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import './SSOAccountLinkConfirm.css';
 

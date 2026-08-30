@@ -4,18 +4,18 @@ import {
   isValidGifSlug,
   isValidCustomerId,
   KlipyIdentityError,
-} from '@/renderer/services/gifProvider/klipyClient';
+} from '@/renderer/services/messaging/gifProvider/klipyClient';
 import { API_BASE } from '@/renderer/config';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // All KLIPY traffic now goes through the control-plane proxy via apiFetch.
 // There is no longer a "direct mode" — the renderer never speaks to api.klipy.com.
 const apiFetchMock = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => apiFetchMock(...args),
 }));
 

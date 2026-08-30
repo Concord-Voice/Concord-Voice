@@ -38,7 +38,7 @@ const mockDecryptForChannelWithVersion = vi.fn();
 const mockIndexMessage = vi.fn();
 const mockRemoveMessage = vi.fn();
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
@@ -49,16 +49,16 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({
+vi.mock('@/renderer/services/system/ttsService', () => ({
   speak: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
 const mockNotificationPlay = vi.fn();
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: (...args: unknown[]) => mockNotificationPlay(...args),
     playLoop: vi.fn(),
@@ -69,14 +69,14 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ participants: [] }),
   }),
 }));
 
-vi.mock('@/renderer/services/searchService', () => ({
+vi.mock('@/renderer/services/messaging/searchService', () => ({
   indexMessage: (...args: unknown[]) => mockIndexMessage(...args),
   removeMessage: (...args: unknown[]) => mockRemoveMessage(...args),
   removeScope: vi.fn(),
@@ -85,7 +85,7 @@ vi.mock('@/renderer/services/searchService', () => ({
 const mockShouldNotify = vi.fn().mockReturnValue(false);
 const mockNotify = vi.fn();
 const mockIncrementBadge = vi.fn();
-vi.mock('@/renderer/services/desktopNotificationService', () => ({
+vi.mock('@/renderer/services/system/desktopNotificationService', () => ({
   desktopNotificationService: {
     shouldNotify: (...args: unknown[]) => mockShouldNotify(...args),
     notify: (...args: unknown[]) => mockNotify(...args),
@@ -94,7 +94,7 @@ vi.mock('@/renderer/services/desktopNotificationService', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
-import { speak as ttsSpeak } from '@/renderer/services/ttsService';
+import { speak as ttsSpeak } from '@/renderer/services/system/ttsService';
 import { createMockWsService, requireHandler } from '../../helpers/wsServiceMock';
 import { deferred } from '../../helpers/deferred';
 
@@ -2549,7 +2549,7 @@ describe('useWebSocketMessages — coverage boost', () => {
   describe('key_needed — E2EE not initialized branch', () => {
     it('ignores key_needed when E2EE is not initialized', async () => {
       // Temporarily override e2eeService.isInitialized
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       const original = e2eeService.isInitialized;
       Object.defineProperty(e2eeService, 'isInitialized', { value: false, writable: true });
 
@@ -3225,7 +3225,7 @@ describe('useWebSocketMessages — coverage boost', () => {
   describe('voice_state_update — scheduleVoiceRefetch', () => {
     it('calls apiFetch after debounce on joined action', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
 
       const { handler } = setupHandler('voice_state_update');
 
@@ -3258,7 +3258,7 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('calls apiFetch after debounce on left action', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
 
       const { handler } = setupHandler('voice_state_update');
 
@@ -3290,7 +3290,7 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('maps server_muted and server_deafened fields from API response', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
       (mockApiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         ok: true,
         json: () =>
@@ -3353,7 +3353,7 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('coalesces rapid bursts into a single API call', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
       (mockApiFetch as ReturnType<typeof vi.fn>).mockClear();
 
       const { handler } = setupHandler('voice_state_update');
@@ -3388,7 +3388,7 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('handles API fetch failure gracefully', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
       (mockApiFetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('Network error'));
 
       const { handler } = setupHandler('voice_state_update');
@@ -3417,7 +3417,7 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('handles non-ok API response gracefully', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
       (mockApiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         ok: false,
         status: 500,
@@ -3450,7 +3450,7 @@ describe('useWebSocketMessages — coverage boost', () => {
 
     it('does not schedule refetch for non-joined/left actions', async () => {
       vi.useFakeTimers();
-      const { apiFetch: mockApiFetch } = await import('@/renderer/services/apiClient');
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
       (mockApiFetch as ReturnType<typeof vi.fn>).mockClear();
 
       const { handler } = setupHandler('voice_state_update');

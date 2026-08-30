@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { presenceOverrideSyncService } from '../../services/presenceOverrideSync';
+import { presenceOverrideSyncService } from '../../services/system/presenceOverrideSync';
 import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { usePresenceOverrideStore } from '../../stores/ui/presenceOverrideStore';
 import { comparePresenceOverrideUserIds } from '../../utils/presenceOverrides';

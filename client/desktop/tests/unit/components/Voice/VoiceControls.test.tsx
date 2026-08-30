@@ -15,7 +15,7 @@ const mockLeaveChannel = vi.fn().mockResolvedValue(undefined);
 const mockTuneInAll = vi.fn().mockResolvedValue(undefined);
 const mockTuneOutAll = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     toggleMute: mockToggleMute,
     toggleDeafen: mockToggleDeafen,

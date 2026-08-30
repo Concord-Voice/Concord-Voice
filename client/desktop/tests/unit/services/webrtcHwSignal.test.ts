@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   extractWebrtcHwSignal,
   shouldReselectForHwDowngrade,
-} from '@/renderer/services/webrtcHwSignal';
+} from '@/renderer/services/voice/webrtcHwSignal';
 
 /** Build a Map that satisfies the RTCStatsReport (ReadonlyMap) shape for the helper. */
 const report = (entries: Record<string, unknown>[]): RTCStatsReport =>

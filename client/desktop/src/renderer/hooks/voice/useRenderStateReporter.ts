@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import type { RemoteVideoRole } from '../../services/remoteVideoLayerPolicy';
+import type { RemoteVideoRole } from '../../services/voice/remoteVideoLayerPolicy';
 
 /** The source-tagged render surface a report targets. Camera and screen keep
  *  independent receiver-demand maps + server gates (#1924). */
@@ -117,7 +117,7 @@ export function useRenderStateReporter({
             report();
           });
     resizeObserver?.observe(el);
-    void import('../../services/voiceService')
+    void import('../../services/voice/voiceService')
       .then((m) => {
         if (disposed) return;
         const candidate = m.voiceService as Partial<RenderStateReporterService>;

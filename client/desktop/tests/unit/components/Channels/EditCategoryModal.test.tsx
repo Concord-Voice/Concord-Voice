@@ -6,11 +6,11 @@ import { mockServer } from '../../../mocks/fixtures';
 import type { ChannelGroup } from '@/renderer/types/chat';
 
 // Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import EditCategoryModal from '@/renderer/components/Channels/EditCategoryModal';
 
 const mockedApiFetch = vi.mocked(apiFetch);

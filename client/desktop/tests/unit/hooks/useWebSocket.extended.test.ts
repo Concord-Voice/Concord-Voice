@@ -13,7 +13,7 @@ import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Capture registered handlers so we can invoke them in tests
@@ -54,7 +54,7 @@ const mockWsService = {
   setAggressiveReconnect: vi.fn(),
 };
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => mockWsService,
   ConnectionState: {
     DISCONNECTED: 'disconnected',
@@ -101,7 +101,7 @@ const mockCreateChannelRotationGuard = vi.fn(() => {
     },
   };
 });
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     processPendingKeyRequests: vi.fn().mockResolvedValue(undefined),
@@ -116,11 +116,11 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: vi.fn(),
     playLoop: vi.fn(),
@@ -133,7 +133,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
 
 // Mock apiFetch for validate-epochs
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
@@ -216,7 +216,7 @@ beforeEach(async () => {
   mockGetCurrentKeyVersion.mockReturnValue(0);
   mockApiFetch.mockReset();
   mockApiFetch.mockResolvedValue(defaultApiResponse());
-  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   (e2eeService as unknown as { isInitialized: boolean }).isInitialized = false;
 });
 
@@ -330,7 +330,7 @@ describe('useWebSocket — extended', () => {
   describe('epoch validation batching', () => {
     async function renderInitializedHook() {
       useAuthStore.getState().setAccessToken('test-token');
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
       return renderHook(() => useWebSocket());
     }
@@ -378,7 +378,7 @@ describe('useWebSocket — extended', () => {
 
       triggerEpochValidation();
 
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       await waitFor(() => {
         expect(useChannelStore.getState().channels).toEqual([]);
         expect(e2eeService.revokeChannelAccess).toHaveBeenCalledWith(channel.id);
@@ -404,7 +404,7 @@ describe('useWebSocket — extended', () => {
         )
       );
       const hook = await renderInitializedHook();
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
 
       triggerEpochValidation();
 
@@ -686,7 +686,7 @@ describe('useWebSocket — extended', () => {
       renderHook(() => useWebSocket());
 
       // Mock e2eeService as initialized
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as any).isInitialized = true;
 
       // Add a channel for the rotation coordinator to find
@@ -741,7 +741,7 @@ describe('useWebSocket — extended', () => {
       useAuthStore.getState().setAccessToken('test-token');
       vi.useFakeTimers();
       const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
       useChannelStore.getState().addChannel({
         id: 'ch-rotate-a',
@@ -809,7 +809,7 @@ describe('useWebSocket — extended', () => {
       useAuthStore.getState().setAccessToken('test-token');
       vi.useFakeTimers();
       const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
       useChannelStore.getState().addChannel({
         id: 'ch-invalidate-before-rotation',
@@ -863,7 +863,7 @@ describe('useWebSocket — extended', () => {
         useAuthStore.getState().setAccessToken('test-token');
         vi.useFakeTimers();
         const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-        const { e2eeService } = await import('@/renderer/services/e2eeService');
+        const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
         (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
         useChannelStore.getState().addChannel({
           id: 'ch-stale-e2ee',
@@ -909,7 +909,7 @@ describe('useWebSocket — extended', () => {
       vi.useFakeTimers();
       const random = vi.spyOn(Math, 'random').mockReturnValue(0);
       const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
       useChannelStore.getState().addChannel({
         id: 'ch-complete-rotation',
@@ -963,7 +963,7 @@ describe('useWebSocket — extended', () => {
       useAuthStore.getState().setAccessToken('test-token');
       vi.useFakeTimers();
       const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
       useChannelStore.getState().addChannel({
         id: 'ch-stale-auth',
@@ -999,7 +999,7 @@ describe('useWebSocket — extended', () => {
       useAuthStore.getState().setAccessToken('test-token');
       vi.useFakeTimers();
       const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-      const { e2eeService } = await import('@/renderer/services/e2eeService');
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
       (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
       useChannelStore.getState().addChannel({
         id: 'ch-stale-server',

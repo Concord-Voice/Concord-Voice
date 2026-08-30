@@ -1,12 +1,12 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // Mock apiClient to prevent real HTTP calls (mirrors resetService.test.ts)
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   stopProactiveRefresh: vi.fn(),
   refreshAccessToken: vi.fn(),
 }));
 
-import { nuclearReset } from '@/renderer/services/resetService';
+import { nuclearReset } from '@/renderer/services/system/resetService';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';

@@ -5,9 +5,9 @@ import {
   _resetRefreshState,
   apiFetch,
   configureRefreshFailureReset,
-} from '@/renderer/services/apiClient';
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
+} from '@/renderer/services/system/apiClient';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { gracefulReset, nuclearReset } from '@/renderer/services/system/resetService';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';

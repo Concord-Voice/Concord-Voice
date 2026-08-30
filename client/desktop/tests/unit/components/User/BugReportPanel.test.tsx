@@ -1,17 +1,17 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 import BugReportPanel from '@/renderer/components/User/BugReportPanel';
-import type { SystemInfo } from '@/renderer/services/systemInfoService';
+import type { SystemInfo } from '@/renderer/services/system/systemInfoService';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
 const mockCollect = vi.fn();
-vi.mock('@/renderer/services/systemInfoService', () => ({
+vi.mock('@/renderer/services/system/systemInfoService', () => ({
   collect: () => mockCollect(),
 }));
 
 const mockGetEntries = vi.fn(() => []);
 const mockFormatEntries = vi.fn(() => '2026-06-16T00:00:00Z  [warn]  sample sanitized log');
-vi.mock('@/renderer/services/logBufferService', () => ({
+vi.mock('@/renderer/services/system/logBufferService', () => ({
   getEntries: () => mockGetEntries(),
   formatEntries: () => mockFormatEntries(),
 }));

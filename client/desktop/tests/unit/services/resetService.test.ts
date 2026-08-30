@@ -3,37 +3,37 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 const resetOrder = vi.hoisted(() => [] as string[]);
 
 // Mock apiClient to prevent real HTTP calls
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   stopProactiveRefresh: vi.fn(),
   refreshAccessToken: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     stopWatching: vi.fn(() => resetOrder.push('preferences-sync-stop')),
     pushPreferences: vi.fn(),
   },
 }));
 
-vi.mock('@/renderer/services/savedGifsSync', () => ({
+vi.mock('@/renderer/services/system/savedGifsSync', () => ({
   savedGifsSyncService: {
     stopWatching: vi.fn(() => resetOrder.push('saved-gifs-sync-stop')),
   },
 }));
 
-vi.mock('@/renderer/services/friendOrgSync', () => ({
+vi.mock('@/renderer/services/system/friendOrgSync', () => ({
   friendOrgSyncService: {
     stopWatching: vi.fn(() => resetOrder.push('friend-sync-stop')),
   },
 }));
 
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: {
     reset: vi.fn(),
   },
 }));
 
-vi.mock('@/renderer/services/notificationPrefsService', () => ({
+vi.mock('@/renderer/services/system/notificationPrefsService', () => ({
   stopExpirySweep: vi.fn(() => resetOrder.push('notification-sweep-stop')),
 }));
 
@@ -41,11 +41,11 @@ vi.mock('@/renderer/services/notificationPrefsService', () => ({
 // only thing that clears it on an account transition is resetService's explicit
 // call. Spy on it so the REGISTRATION is verified here — the clear function's
 // own behaviour is covered in friendEligibility.test.ts.
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   clearFriendEligibilityCache: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     fencePendingOperations: vi.fn(),
     clearKeys: vi.fn(),
@@ -56,7 +56,11 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { gracefulReset, nuclearReset, recoveryReset } from '@/renderer/services/resetService';
+import {
+  gracefulReset,
+  nuclearReset,
+  recoveryReset,
+} from '@/renderer/services/system/resetService';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
@@ -71,15 +75,15 @@ import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
-import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
-import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
-import { stopExpirySweep } from '@/renderer/services/notificationPrefsService';
-import { clearFriendEligibilityCache } from '@/renderer/services/friendEligibility';
-import { stopProactiveRefresh } from '@/renderer/services/apiClient';
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/system/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/system/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
+import { stopExpirySweep } from '@/renderer/services/system/notificationPrefsService';
+import { clearFriendEligibilityCache } from '@/renderer/services/system/friendEligibility';
+import { stopProactiveRefresh } from '@/renderer/services/system/apiClient';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/messaging/searchService';
 import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
@@ -531,7 +535,7 @@ describe('resetService', () => {
 // never runs for it.
 describe('gracefulReset — deep-link session teardown (#2363)', () => {
   it('announces the session end so a held invite cannot cross to the next sign-in', async () => {
-    const { gracefulReset } = await import('@/renderer/services/resetService');
+    const { gracefulReset } = await import('@/renderer/services/system/resetService');
     const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
     const seen: string[] = [];
@@ -555,7 +559,7 @@ describe('gracefulReset — deep-link session teardown (#2363)', () => {
   // ownerless-credential path — both with no access token, because nobody signed
   // in. Announcing there erases the invite the user launched the app to accept.
   it('stays silent when there was no session — the cold-start invite must survive', async () => {
-    const { gracefulReset } = await import('@/renderer/services/resetService');
+    const { gracefulReset } = await import('@/renderer/services/system/resetService');
     const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.setState({ accessToken: null });
     const forgetDeepLinks = vi.fn();
@@ -593,7 +597,7 @@ describe('gracefulReset — deep-link session teardown (#2363)', () => {
   // shape for NSFW intent (see the top of this file); the deep-link fence walked
   // into it, so the intent is now explicit at the call site rather than inferred.
   it('softRestart preserves deep links — Recovery B restarts a renderer, it does not end a session', async () => {
-    const { softRestart } = await import('@/renderer/services/resetService');
+    const { softRestart } = await import('@/renderer/services/system/resetService');
     const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
     const forgetDeepLinks = vi.fn();
@@ -620,7 +624,7 @@ describe('gracefulReset — deep-link session teardown (#2363)', () => {
   // there by design. Without this call a swap inside the carry window replayed
   // user A's invite into user B's renderer (#2363).
   it('tells main to forget too — the renderer fence alone is not sufficient', async () => {
-    const { gracefulReset } = await import('@/renderer/services/resetService');
+    const { gracefulReset } = await import('@/renderer/services/system/resetService');
     const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
     const forgetDeepLinks = vi.fn();

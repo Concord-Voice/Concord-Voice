@@ -43,7 +43,7 @@ const ShareTunePill: React.FC<ShareTunePillProps> = ({
     // aria-disabled (unlike disabled) does not block activation — guard here.
     if (blocked) return;
     try {
-      const { voiceService } = await import('../../services/voiceService');
+      const { voiceService } = await import('../../services/voice/voiceService');
       if (tunedIn) {
         await voiceService.tuneOutOfScreenShare(share.producerId, { suppressAutoTune: true });
       } else {

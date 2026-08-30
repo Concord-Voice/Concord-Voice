@@ -5,7 +5,7 @@ import {
   buildCanonicalBytes,
   validateAgeClaim,
   type AgeClaim,
-} from '@/renderer/services/ageClaim/canonicalAgeClaim';
+} from '@/renderer/services/system/ageClaim/canonicalAgeClaim';
 
 // The A↔B parity fixture shipped by #1623 (server-owned single source of truth).
 // Read via node:fs (NOT an import) so Vite's server.fs.allow does not apply.

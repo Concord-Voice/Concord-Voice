@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   uploadAttachmentChunked,
   type UploadSessionContext,
-} from '@/renderer/services/attachmentUploadSession';
+} from '@/renderer/services/messaging/attachmentUploadSession';
 import {
   CHUNK_PLAINTEXT_BYTES,
   ENVELOPE_HEADER_BYTES,
@@ -10,7 +10,7 @@ import {
 } from '@/renderer/utils/attachmentChunkedCrypto';
 
 const apiFetch = vi.hoisted(() => vi.fn());
-vi.mock('@/renderer/services/apiClient', () => ({ apiFetch }));
+vi.mock('@/renderer/services/system/apiClient', () => ({ apiFetch }));
 
 const aesKey = () =>
   crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);

@@ -20,16 +20,16 @@ import {
   type SSOProvider,
   type SSOResult,
   type SSOCompletionResult,
-} from '../../services/ssoService';
+} from '../../services/system/ssoService';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useMFAChallengeStore, type MFAChallengeResult } from '../../stores/auth/mfaChallengeStore';
-import { revokeAbortedSession } from '../../services/apiClient';
+import { revokeAbortedSession } from '../../services/system/apiClient';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import type { CredentialOwner } from '../../../main/ipcContract';
 
 function reservationIsCurrent(

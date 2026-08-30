@@ -4,9 +4,9 @@ import { HashRouter } from 'react-router';
 import App from './App';
 import { installSelfHealHandlers } from './spaSelfHealClient';
 import { ModalProvider } from './components/ui/ModalContext';
-import { configureRefreshFailureReset } from './services/apiClient';
-import { install as installLogBuffer } from './services/logBufferService';
-import { gracefulReset, nuclearReset } from './services/resetService';
+import { configureRefreshFailureReset } from './services/system/apiClient';
+import { install as installLogBuffer } from './services/system/logBufferService';
+import { gracefulReset, nuclearReset } from './services/system/resetService';
 import './styles/index.css';
 // Pride scheme rainbow flourishes — scoped to [data-scheme='pride'], imported
 // after index.css so its overrides win source-order ties (experiment/theme).

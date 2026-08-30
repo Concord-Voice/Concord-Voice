@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from
 import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { purgeMessages } from '@/renderer/services/purgeApi';
+import { purgeMessages } from '@/renderer/services/messaging/purgeApi';
 
 const CHANNEL = '11111111-1111-4111-8111-111111111111';
 const CONVERSATION = '44444444-4444-4444-8444-444444444444';

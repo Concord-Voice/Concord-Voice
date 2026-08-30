@@ -1,11 +1,11 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,
-} from '../../services/postLoginHydrationLifecycle';
+} from '../../services/system/postLoginHydrationLifecycle';
 import { errorMessage } from '../../utils/redactError';
 import type { PresenceStatus } from './memberStore';
 

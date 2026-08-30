@@ -3,7 +3,7 @@ import ImageCropEditor from '@/renderer/components/ui/ImageCropEditor';
 import { vi, type Mock } from 'vitest';
 
 // Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
@@ -170,7 +170,7 @@ describe('ImageCropEditor', () => {
   });
 
   it('uploads to object storage when upload config provided', async () => {
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     (apiFetch as Mock).mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ url: '/api/v1/media/avatars/123' }),
@@ -278,7 +278,7 @@ describe('ImageCropEditor', () => {
   });
 
   it('shows upload error on failure', async () => {
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     (apiFetch as Mock).mockResolvedValue({
       ok: false,
       json: () => Promise.resolve({ error: 'File too large' }),

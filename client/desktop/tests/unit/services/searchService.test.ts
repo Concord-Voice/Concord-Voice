@@ -13,7 +13,7 @@ import {
   getIndexStats,
   isIndexed,
   subscribeSearchScopeInvalidations,
-} from '@/renderer/services/searchService';
+} from '@/renderer/services/messaging/searchService';
 
 describe('searchService', () => {
   beforeEach(() => {

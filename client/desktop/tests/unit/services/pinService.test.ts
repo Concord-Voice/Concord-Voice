@@ -1,12 +1,17 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { pinMessage, unpinMessage, getChannelPins, getPins } from '@/renderer/services/pinService';
+import {
+  pinMessage,
+  unpinMessage,
+  getChannelPins,
+  getPins,
+} from '@/renderer/services/messaging/pinService';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: vi.fn(),
 }));
 
-import { apiFetch, safeJson } from '@/renderer/services/apiClient';
+import { apiFetch, safeJson } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 const mockSafeJson = safeJson as ReturnType<typeof vi.fn>;

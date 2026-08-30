@@ -12,7 +12,7 @@ import { useDMStore } from '../../stores/chat/dmStore';
 import {
   acceptIncomingCall,
   declineIncomingCall,
-} from '../../services/voiceService/callStateMachine';
+} from '../../services/voice/voiceService/callStateMachine';
 import './IncomingCallBanner.css';
 
 export function IncomingCallBanner() {

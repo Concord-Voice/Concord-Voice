@@ -14,7 +14,7 @@
  * The Settings UI that invokes this client is tracked separately in #661.
  */
 
-import { apiFetch } from '../services/apiClient';
+import { apiFetch } from '../services/system/apiClient';
 
 export class PrivacyApiError extends Error {
   public readonly status: number;

@@ -16,12 +16,12 @@ import { useUserStore } from '../../stores/auth/userStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { PIN_MESSAGES } from '../../utils/permissions';
 import { useMessaging } from './useMessaging';
-import { pinMessage, unpinMessage } from '../../services/pinService';
-import { getWebSocketService, ConnectionState } from '../../services/websocketService';
-import { apiFetch, safeJson } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
-import { indexMessage, removeMessage } from '../../services/searchService';
-import { wrapContentWithGifSlug } from '../../services/dmMessageSender';
+import { pinMessage, unpinMessage } from '../../services/messaging/pinService';
+import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { indexMessage, removeMessage } from '../../services/messaging/searchService';
+import { wrapContentWithGifSlug } from '../../services/messaging/dmMessageSender';
 import type {
   ChatContext,
   ChatContextType,

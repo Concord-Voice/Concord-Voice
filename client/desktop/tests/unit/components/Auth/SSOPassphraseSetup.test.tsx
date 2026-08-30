@@ -4,16 +4,16 @@ import SSOPassphraseSetup from '@/renderer/components/Auth/SSOPassphraseSetup';
 import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Stub server-session cleanup so abort-path behavior is directly assertable.
-vi.mock('@/renderer/services/apiClient', async (orig) => ({
-  ...(await orig<typeof import('@/renderer/services/apiClient')>()),
+vi.mock('@/renderer/services/system/apiClient', async (orig) => ({
+  ...(await orig<typeof import('@/renderer/services/system/apiClient')>()),
   revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -47,7 +47,7 @@ const e2eeState = vi.hoisted(() => ({
     wrappedPrivateKeyBase64: 'wpk', // pragma: allowlist secret
   },
 }));
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn(async () => {
       e2eeState.initialized = true;
@@ -283,7 +283,7 @@ describe('SSOPassphraseSetup', () => {
     setRuntimeServerBase('https://server-b.example');
     resolveResponse(okRegistrationResult());
 
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
     expect(revokeAbortedSession).toHaveBeenCalledWith({
       accessToken: 'access-xyz',
@@ -307,7 +307,7 @@ describe('SSOPassphraseSetup', () => {
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
 
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
     expect(clearTokensIfOwner).toHaveBeenCalledWith(71);
     expect(e2eeService.initialize).not.toHaveBeenCalled();
@@ -332,7 +332,7 @@ describe('SSOPassphraseSetup', () => {
     render(<SSOPassphraseSetup />);
     fillAndSubmit();
 
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
     expect(e2eeService.clearKeys).not.toHaveBeenCalled();
     expect(storeE2EEKeysIfOwner).not.toHaveBeenCalled();
@@ -406,7 +406,7 @@ describe('SSOPassphraseSetup', () => {
     // A logout-class teardown landing after the teardown epoch is captured
     // makes initialize() reject with the typed E2EEInitTeardownError. Admission
     // is deliberately deferred until setup finishes, so no token is published.
-    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2ee/e2eeErrors');
     let rejectInit: (e: unknown) => void = () => {};
     vi.mocked(e2eeService.initialize).mockReturnValueOnce(
       new Promise<void>((_, reject) => {
@@ -431,7 +431,7 @@ describe('SSOPassphraseSetup', () => {
     // The admit path (phase 'idle') is never reached.
     expect(useSSOStore.getState().state.phase).not.toBe('idle');
     // The freshly-issued server session (HttpOnly refresh cookie + row) is revoked.
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     expect(revokeAbortedSession).toHaveBeenCalled();
     expect(clearTokensIfOwner).toHaveBeenCalledWith(71);
   });
@@ -443,8 +443,8 @@ describe('SSOPassphraseSetup', () => {
     // 'idle' with rejected credentials.
     const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     const { useSSOStore } = await import('@/renderer/stores/auth/ssoStore');
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     // The token-only clear lands while init/persist is in flight.
     vi.mocked(e2eeService.initialize).mockImplementationOnce(async () => {
       useAuthStore.getState().clearAccessToken();
@@ -465,8 +465,8 @@ describe('SSOPassphraseSetup', () => {
     // aborted flow's own token is stripped, never the successor's — pre-fix
     // the unconditional clearAccessToken logged the NEW session out of the
     // renderer even though the revoke helper correctly declined it.
-    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2ee/e2eeErrors');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     vi.mocked(revokeAbortedSession).mockImplementationOnce(async () => {
       // The successor login lands while the revoke is in flight.
       useAuthStore.getState().setAccessToken('successor-token');

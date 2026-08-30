@@ -2,7 +2,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // Mock all external dependencies before importing the store
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   // #2415: changePassword warms the per-origin machine-id cache before the
   // rotating POST, because apiFetch reads it SYNCHRONOUSLY and a session-restore
@@ -11,12 +11,12 @@ vi.mock('@/renderer/services/apiClient', () => ({
   ensureMachineId: vi.fn().mockResolvedValue('test-machine-id'),
 }));
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({ disconnect: vi.fn(), sendProfileUpdate: vi.fn() }),
   ConnectionState: { CONNECTED: 'connected', DISCONNECTED: 'disconnected' },
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     clearKeys: vi.fn(),
     isInitialized: false,
@@ -30,14 +30,14 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 // changePassword fails closed via nuclearReset when the new keyset is torn down after the
 // server-side change already committed (#2333 salvage).
 const mockNuclearReset = vi.fn();
-vi.mock('@/renderer/services/resetService', () => ({
+vi.mock('@/renderer/services/system/resetService', () => ({
   nuclearReset: (...args: unknown[]) => mockNuclearReset(...args),
   gracefulReset: vi.fn(),
   recoveryReset: vi.fn(),
   softRestart: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     stopWatching: vi.fn(),
     startWatching: vi.fn(),
@@ -45,21 +45,21 @@ vi.mock('@/renderer/services/preferencesSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/savedGifsSync', () => ({
+vi.mock('@/renderer/services/system/savedGifsSync', () => ({
   savedGifsSyncService: {
     stopWatching: vi.fn(),
     startWatching: vi.fn(),
   },
 }));
 
-vi.mock('@/renderer/services/friendOrgSync', () => ({
+vi.mock('@/renderer/services/system/friendOrgSync', () => ({
   friendOrgSyncService: {
     stopWatching: vi.fn(),
     startWatching: vi.fn(),
   },
 }));
 
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: {
     reset: vi.fn(),
     fetchAndApply: vi.fn().mockResolvedValue(true),
@@ -71,7 +71,7 @@ vi.mock('@/renderer/services/presenceOverrideSync', () => ({
 // covers wire behavior); default every domain to authoritative absence.
 const mockFetchBlobRowForRotation = vi.fn();
 const mockPushEncryptedBlob = vi.fn();
-vi.mock('@/renderer/services/e2eeBlobTransport', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeBlobTransport', () => ({
   fetchBlobRowForRotation: (...args: unknown[]) => mockFetchBlobRowForRotation(...args),
   pushEncryptedBlob: (...args: unknown[]) => mockPushEncryptedBlob(...args),
 }));
@@ -91,14 +91,14 @@ vi.mock('@/renderer/utils/crypto', () => ({
 
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
-import { ensureMachineId } from '@/renderer/services/apiClient';
-import { E2EEInitTeardownError } from '@/renderer/services/e2eeErrors';
-import { apiFetch } from '@/renderer/services/apiClient';
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
-import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
-import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { ensureMachineId } from '@/renderer/services/system/apiClient';
+import { E2EEInitTeardownError } from '@/renderer/services/e2ee/e2eeErrors';
+import { apiFetch } from '@/renderer/services/system/apiClient';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/system/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/system/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
 import {
   derivePreferencesKeyArgon2id,
   encryptBlob,

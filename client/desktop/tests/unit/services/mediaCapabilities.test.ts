@@ -9,7 +9,7 @@ import {
   clearCapabilitiesCache,
   prewarmWebRTC,
   type CodecCapability,
-} from '@/renderer/services/mediaCapabilities';
+} from '@/renderer/services/voice/mediaCapabilities';
 
 // parseProfile is not exported, so we test it indirectly via detectCodecCapabilities.
 // However codecKey, codecKeyMime, getCodecInfo are directly testable.

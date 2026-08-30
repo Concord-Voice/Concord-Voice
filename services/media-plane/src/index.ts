@@ -637,7 +637,7 @@ async function main() {
     // 256 KB. Measured against production 2026-08-19: the largest inbound
     // frame is `update-rtp-capabilities` at 4,505 B. `join-room` does NOT
     // carry rtpCapabilities — it sends `undefined` and the client emits them
-    // after `device.load` (client/desktop/src/renderer/services/
+    // after `device.load` (client/desktop/src/renderer/services/voice/
     // voiceService.ts:2950), so join-room measures 94 B. The largest
     // `produce` frame is 1,933 B (screen simulcast). That is ~58x headroom
     // while cutting the 1 MB default 4x. NOTE: exceeding this CLOSES THE

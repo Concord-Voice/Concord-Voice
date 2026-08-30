@@ -12,7 +12,7 @@ const mockDecryptForChannelWithVersion = vi.fn();
 const mockOperationGuard = { assertCurrent: vi.fn() };
 const mockCreateChannelOperationGuard = vi.fn(() => mockOperationGuard);
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     createChannelOperationGuard: (...args: unknown[]) => mockCreateChannelOperationGuard(...args),
@@ -60,7 +60,7 @@ import {
 } from '@/renderer/components/Chat/pinnedMessageUtils';
 
 async function setE2EEInitialized(value: boolean) {
-  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   Object.defineProperty(e2eeService, 'isInitialized', { value, writable: true });
 }
 

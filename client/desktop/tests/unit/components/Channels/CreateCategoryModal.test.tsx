@@ -5,11 +5,11 @@ import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { mockServer } from '../../../mocks/fixtures';
 
 // Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import CreateCategoryModal from '@/renderer/components/Channels/CreateCategoryModal';
 
 const mockedApiFetch = vi.mocked(apiFetch);

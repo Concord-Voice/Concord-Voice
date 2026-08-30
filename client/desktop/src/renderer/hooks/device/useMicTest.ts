@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { ensureOsPermission } from '../../stores/voice/osPermissionStore';
-import { voiceService } from '../../services/voiceService';
+import { voiceService } from '../../services/voice/voiceService';
 
 interface UseMicTestReturn {
   isTesting: boolean;

@@ -3,10 +3,10 @@ import {
   peekEligibility,
   prefetchEligibility,
   clearFriendEligibilityCache,
-} from '@/renderer/services/friendEligibility';
+} from '@/renderer/services/system/friendEligibility';
 
-vi.mock('@/renderer/services/apiClient', () => ({ apiFetch: vi.fn() }));
-import { apiFetch } from '@/renderer/services/apiClient';
+vi.mock('@/renderer/services/system/apiClient', () => ({ apiFetch: vi.fn() }));
+import { apiFetch } from '@/renderer/services/system/apiClient';
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
 const ok = (eligible: boolean) =>

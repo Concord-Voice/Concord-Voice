@@ -4,13 +4,13 @@ import { vi } from 'vitest';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import {
   getApiBase,
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 
 // Mock global fetch
 const mockFetch = vi.fn();
@@ -44,7 +44,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
   exportPublicKey: vi.fn().mockResolvedValue('mock-public-key'),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn().mockResolvedValue(mockE2EEInitializationReceipt),
     clearKeys: mockE2EEClearKeys,
@@ -59,7 +59,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     init: vi.fn(),
     startWatching: vi.fn(),
@@ -67,7 +67,7 @@ vi.mock('@/renderer/services/preferencesSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
   apiFetch: vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }),
   ensureMachineId: vi.fn().mockResolvedValue('mock-machine-id'),
@@ -376,8 +376,8 @@ describe('Login', () => {
     // initialize() rejects with the typed teardown error. Login must abort:
     // never store the refresh token, never call onSuccess, and never route the
     // teardown into the consented key-reset prompt.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
-    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2ee/e2eeErrors');
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
     const storeRefreshToken = vi.fn().mockResolvedValue(41);
     Object.defineProperty(globalThis, 'electron', {
@@ -405,13 +405,13 @@ describe('Login', () => {
     expect(screen.queryByText(/reset encryption keys/i)).not.toBeInTheDocument();
     // The server session established by /auth/login (cookie already set) is
     // revoked so the long-lived refresh credential can't outlive the abort.
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     expect(revokeAbortedSession).toHaveBeenCalled();
   });
 
   it('clears old-origin material and revokes when the server changes during login completion', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
-    const { preferencesSyncService } = await import('@/renderer/services/preferencesSync');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
+    const { preferencesSyncService } = await import('@/renderer/services/system/preferencesSync');
     const requestApiBase = 'https://login-origin.example';
     setRuntimeServerBase(requestApiBase);
     let finishUnwrap: () => void = () => {
@@ -464,7 +464,7 @@ describe('Login', () => {
     // The fence inside initialize() covers only the span up to the key commit.
     // A teardown during the later token-store / persist / hydrate awaits must
     // be caught by the pre-admit wasTornDownSince() checks — never onSuccess.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValue(true);
     const storeRefreshToken = vi.fn().mockResolvedValue(41);
     Object.defineProperty(globalThis, 'electron', {
@@ -495,7 +495,7 @@ describe('Login', () => {
     // unconditionally re-published the torn-down token and the final abort
     // check left it resident — routing treated the user as authenticated
     // with E2EE cleared.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const notice = 'Your session ended before sign-in could finish. Please sign in again.';
     vi.mocked(e2eeService.wasTornDownSince)
       .mockReturnValueOnce(false) // pre-admit check #1 passes
@@ -564,7 +564,7 @@ describe('Login', () => {
     // If a rapid retry established a NEW session while this flow was
     // unwinding, the stale abort must not clear the successor's token and
     // must not stage a login notice for a user who is already in the app.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const notice = 'Your session ended before sign-in could finish. Please sign in again.';
     vi.mocked(e2eeService.wasTornDownSince).mockReturnValueOnce(false).mockReturnValue(true);
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
@@ -600,7 +600,7 @@ describe('Login', () => {
     // The backend rotates both A1 -> A2 and S1 -> S2. The client lifecycle
     // generation remains stable across that validated refresh, so Login must
     // admit without mistaking S2 for a successor account.
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const storeRefreshToken = vi.fn().mockImplementation(async () => {
       const auth = useAuthStore.getState();
       expect(
@@ -683,8 +683,8 @@ describe('Login', () => {
   });
 
   it('stops old refresh/E2EE persistence when a same-origin successor wins before side effects', async () => {
-    const { preferencesSyncService } = await import('@/renderer/services/preferencesSync');
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { preferencesSyncService } = await import('@/renderer/services/system/preferencesSync');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     let finishUnwrap: () => void = () => {
       throw new Error('Unwrap resolver was not initialized.');
     };
@@ -738,9 +738,9 @@ describe('Login', () => {
     // error after the reset PUT succeeded. Pre-fix its catch only cleared the
     // renderer token and rethrew — bypassing the revocation sites — so the
     // login's refresh-token row + HttpOnly cookie outlived the teardown.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
-    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2ee/e2eeErrors');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('unwrap failed'));
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
     mockFetch.mockResolvedValueOnce({
@@ -802,8 +802,8 @@ describe('Login', () => {
     // the teardown also cleared the token, bouncing the user to a FRESH Login.
     // The abort therefore stages authStore.loginNotice, which the next mount
     // seeds into its error banner and consumes (renders exactly once).
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
-    const { E2EEInitTeardownError } = await import('@/renderer/services/e2eeErrors');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    const { E2EEInitTeardownError } = await import('@/renderer/services/e2ee/e2eeErrors');
     const notice = 'Your session ended before sign-in could finish. Please sign in again.';
     vi.mocked(e2eeService.initialize).mockRejectedValueOnce(new E2EEInitTeardownError());
     mockFetch.mockResolvedValueOnce({
@@ -927,7 +927,8 @@ describe('Login', () => {
   });
 
   it('fails closed before publishing auth when the login payload is malformed', async () => {
-    const { ensureMachineId, revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { ensureMachineId, revokeAbortedSession } =
+      await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://login-origin.example';
     setRuntimeServerBase(requestApiBase);
     const malformedPayload = makeLoginResponse({
@@ -983,7 +984,7 @@ describe('Login', () => {
   });
 
   it('revokes a successful login response missing required session lineage', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const { session_id: _sessionID, ...malformedPayload } = makeLoginResponse();
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify(malformedPayload), {
@@ -1012,7 +1013,7 @@ describe('Login', () => {
   });
 
   it('prefers the authoritative session header when a malformed body disagrees', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const malformedPayload = makeLoginResponse({ refresh_token: null });
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify(malformedPayload), {
@@ -1043,7 +1044,7 @@ describe('Login', () => {
   });
 
   it('aborts before credential dispatch when the server changes during safe-storage permission', async () => {
-    const { ensureMachineId } = await import('@/renderer/services/apiClient');
+    const { ensureMachineId } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://login-origin.example';
     setRuntimeServerBase(requestApiBase);
     let resolvePermission: (status: 'granted') => void = () => {
@@ -1076,7 +1077,7 @@ describe('Login', () => {
   });
 
   it('rejects an A-to-B-to-A server change while machine-ID lookup is pending', async () => {
-    const { ensureMachineId } = await import('@/renderer/services/apiClient');
+    const { ensureMachineId } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://login-origin.example';
     setRuntimeServerBase(requestApiBase);
     let resolveMachineId: (machineId: string) => void = () => {
@@ -1110,7 +1111,7 @@ describe('Login', () => {
   });
 
   it('does not revoke an unmarked undecodable 2xx initial login response', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     mockFetch.mockResolvedValueOnce({
       ok: true,
       headers: new Headers(),
@@ -1133,7 +1134,7 @@ describe('Login', () => {
   });
 
   it('revokes a header-identified cookie session when a direct login response is undecodable', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     mockFetch.mockResolvedValueOnce({
       ok: true,
       headers: new Headers({
@@ -1289,7 +1290,7 @@ describe('Login', () => {
 
   it('shows the recovery prompt (no silent PUT) when unwrapLoginKeys fails', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     (apiFetch as ReturnType<typeof vi.fn>).mockClear();
 
     // checkPermission: 'granted' is load-bearing — a prior test
@@ -1330,7 +1331,7 @@ describe('Login', () => {
 
   it('resets keys with public_key + acknowledge_data_loss when the user confirms', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
       json: async () => ({}),
@@ -1380,7 +1381,7 @@ describe('Login', () => {
 
   it('prompts for an MFA code when the reset requires it, then resets with the code', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     // First reset attempt (no code) → 403 mfa_required; retry (with code) → ok.
     (apiFetch as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({
@@ -1434,7 +1435,7 @@ describe('Login', () => {
 
   it('does not reset keys when the user cancels recovery', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     (apiFetch as ReturnType<typeof vi.fn>).mockClear();
 
     // Heal the rejecting checkPermission a prior test leaves behind (see the
@@ -1468,7 +1469,7 @@ describe('Login', () => {
 
   it('clears the access token when the reset PUT fails (no half-authenticated state)', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     // The reset PUT fails — the early-set token must NOT survive.
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: false,
@@ -1508,7 +1509,7 @@ describe('Login', () => {
 
   it('persists the CONTINUATION refresh token after key recovery, never the revoked login token', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     // The reset PUT's 2xx body carries the continuation pair. ReplaceMyKeys
     // revoked every refresh token for this user — including the one this login
     // just minted — so persisting `mock-refresh` would store a dead token and
@@ -1570,7 +1571,7 @@ describe('Login', () => {
     // post-reset abort revokes NOTHING and leaves the continuation session
     // authenticated on the server.
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch, revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { apiFetch, revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -1627,7 +1628,7 @@ describe('Login', () => {
   // continuation credentials and must never carry the dead login pair.
   it('revokes the CONTINUATION session when an abort lands before adoption used to complete', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch, revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { apiFetch, revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const loginApiBase = getApiBase();
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
@@ -1697,7 +1698,7 @@ describe('Login', () => {
 
   it('fails closed with an explanation when the reset commits without a continuation pair', async () => {
     mockUnwrapLoginKeys.mockRejectedValueOnce(new Error('corrupt key'));
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     // A 2xx carrying no continuation fields is a DELIBERATE server outcome (a
     // concurrent destructive flow advanced the credential epoch), never a
     // transport error and never retried.
@@ -1771,7 +1772,7 @@ describe('Login', () => {
   });
 
   it('does not revoke a decoded unmarked malformed initial MFA challenge', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     mockFetch.mockResolvedValueOnce({
       ok: true,
       headers: new Headers(),
@@ -1792,7 +1793,7 @@ describe('Login', () => {
   });
 
   it('revokes an MFA session whose successful completion payload is malformed', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://mfa-origin.example';
     setRuntimeServerBase(requestApiBase);
     const malformedPayload = makeLoginResponse({
@@ -1856,7 +1857,7 @@ describe('Login', () => {
   });
 
   it('revokes the header-identified MFA session when a successful completion body is undecodable', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     mockFetch
       .mockResolvedValueOnce({
         ok: true,
@@ -2130,7 +2131,7 @@ describe('Login', () => {
   // ── PreferencesSync init flow ───────────────────────────────────────
 
   it('calls preferencesSyncService.init() on successful login', async () => {
-    const { preferencesSyncService } = await import('@/renderer/services/preferencesSync');
+    const { preferencesSyncService } = await import('@/renderer/services/system/preferencesSync');
 
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -2149,7 +2150,7 @@ describe('Login', () => {
   });
 
   it('calls preferencesSyncService.startWatching() after init on login', async () => {
-    const { preferencesSyncService } = await import('@/renderer/services/preferencesSync');
+    const { preferencesSyncService } = await import('@/renderer/services/system/preferencesSync');
 
     mockFetch.mockResolvedValueOnce({
       ok: true,

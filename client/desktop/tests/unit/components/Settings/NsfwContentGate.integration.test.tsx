@@ -10,7 +10,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 const { mockE2EE } = vi.hoisted(() => ({
   mockE2EE: { isInitialized: true, signAgeClaim: vi.fn().mockResolvedValue('mockSigB64') },
 }));
-vi.mock('@/renderer/services/e2eeService', () => ({ e2eeService: mockE2EE }));
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({ e2eeService: mockE2EE }));
 
 import NsfwContentGate from '@/renderer/components/Settings/NsfwContentGate';
 import { useUserStore } from '@/renderer/stores/auth/userStore';

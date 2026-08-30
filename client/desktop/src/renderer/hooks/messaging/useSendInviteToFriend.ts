@@ -3,8 +3,8 @@ import { useInviteStore } from '../../stores/chat/inviteStore';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { buildInviteUrl } from '../../utils/inviteUrl';
-import { sendDMMessage } from '../../services/dmMessageSender';
-import { e2eeService } from '../../services/e2eeService';
+import { sendDMMessage } from '../../services/messaging/dmMessageSender';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import type { Friend } from '../../stores/chat/friendStore';
 
 export type SendInviteResult =

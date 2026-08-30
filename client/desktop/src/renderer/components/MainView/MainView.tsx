@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
-import { PipSignalingProxy } from '../../services/pipSignalingProxy';
+import { PipSignalingProxy } from '../../services/voice/pipSignalingProxy';
 import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
 import ChannelList from '../Channels/ChannelList';
 import ServerActionBar from '../Channels/ServerActionBar';
@@ -114,9 +114,9 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
     let proxy: PipSignalingProxy | null = null;
     // Capture voiceService ref synchronously for cleanup (avoids async race)
     let capturedVoiceService:
-      (typeof import('../../services/voiceService'))['voiceService'] | null = null;
+      (typeof import('../../services/voice/voiceService'))['voiceService'] | null = null;
 
-    import('../../services/voiceService')
+    import('../../services/voice/voiceService')
       .then(({ voiceService }) => {
         if (cancelled) return;
         capturedVoiceService = voiceService;

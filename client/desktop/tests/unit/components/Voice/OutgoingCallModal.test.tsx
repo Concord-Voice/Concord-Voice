@@ -18,7 +18,7 @@ vi.mock('@/renderer/components/Voice/OutgoingCallModal.css', () => ({}));
 // Mock returns a resolved Promise so the click-handler `.catch(...)` chain
 // (added per Copilot #1231 C11) doesn't TypeError on undefined.
 const mockCancel = vi.fn(() => Promise.resolve());
-vi.mock('@/renderer/services/voiceService/callStateMachine', () => ({
+vi.mock('@/renderer/services/voice/voiceService/callStateMachine', () => ({
   cancelOutgoingCall: () => mockCancel(),
 }));
 

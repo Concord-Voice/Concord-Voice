@@ -14,7 +14,7 @@ const mockApiFetch = vi.fn().mockResolvedValue({
   ok: true,
   json: async () => ({ messages: [] }),
 });
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
   API_BASE: 'http://localhost:8080',
@@ -28,7 +28,7 @@ const mockPinMessage = vi.fn().mockResolvedValue({
 });
 const mockUnpinMessage = vi.fn().mockResolvedValue({ message_id: 'msg-1' });
 const mockGetChannelPins = vi.fn().mockResolvedValue([]);
-vi.mock('@/renderer/services/pinService', () => ({
+vi.mock('@/renderer/services/messaging/pinService', () => ({
   pinMessage: (...args: unknown[]) => mockPinMessage(...args),
   unpinMessage: (...args: unknown[]) => mockUnpinMessage(...args),
   getChannelPins: (...args: unknown[]) => mockGetChannelPins(...args),
@@ -112,7 +112,7 @@ vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
   }),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),

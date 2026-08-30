@@ -2,9 +2,9 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import JoinServerModal from '@/renderer/components/Servers/JoinServerModal';
 import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 

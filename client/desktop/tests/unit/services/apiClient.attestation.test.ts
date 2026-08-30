@@ -26,7 +26,7 @@ import {
   _resetRefreshState,
   ensureMachineId,
   configureRefreshFailureReset,
-} from '@/renderer/services/apiClient';
+} from '@/renderer/services/system/apiClient';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

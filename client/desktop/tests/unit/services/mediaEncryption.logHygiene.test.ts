@@ -12,9 +12,9 @@ import { resolve } from 'node:path';
  * ESLint AST rule for no-raw-err-to-console — same discipline, different scope).
  */
 const CRYPTO_SOURCES = [
-  'src/renderer/services/mediaEncryption.ts',
-  'src/renderer/services/mediaFrameMiniHeader.ts',
-  'src/renderer/services/av1ObuParser.ts',
+  'src/renderer/services/e2ee/mediaEncryption.ts',
+  'src/renderer/services/e2ee/mediaFrameMiniHeader.ts',
+  'src/renderer/services/e2ee/av1ObuParser.ts',
 ];
 
 // Forbidden value-name patterns inside any console.* / log() call argument list.

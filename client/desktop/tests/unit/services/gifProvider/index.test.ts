@@ -5,7 +5,7 @@ import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 // any actual KLIPY work.
 const setPersonalizationEnabledMock = vi.fn();
 
-vi.mock('@/renderer/services/gifProvider/klipyProvider', () => ({
+vi.mock('@/renderer/services/messaging/gifProvider/klipyProvider', () => ({
   klipyProvider: {
     name: 'KLIPY',
     searchPlaceholder: 'Search KLIPY',
@@ -28,7 +28,7 @@ describe('gifProvider index', () => {
   });
 
   it('exports the active provider', async () => {
-    const { gifProvider } = await import('@/renderer/services/gifProvider');
+    const { gifProvider } = await import('@/renderer/services/messaging/gifProvider');
     expect(gifProvider).toBeDefined();
     expect(gifProvider.name).toBe('KLIPY');
   });
@@ -44,13 +44,13 @@ describe('gifProvider index', () => {
     });
     // Re-import to trigger the module-level subscribe
     vi.resetModules();
-    await import('@/renderer/services/gifProvider');
+    await import('@/renderer/services/messaging/gifProvider');
     expect(setPersonalizationEnabledMock).toHaveBeenCalledWith(false);
   });
 
   it('forwards subsequent privacy store updates to the provider', async () => {
     vi.resetModules();
-    await import('@/renderer/services/gifProvider');
+    await import('@/renderer/services/messaging/gifProvider');
     setPersonalizationEnabledMock.mockClear();
     // Trigger a store update
     usePrivacyStore.setState({

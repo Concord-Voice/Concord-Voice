@@ -105,7 +105,7 @@ const StreamBar: React.FC<{ height: number }> = ({ height }) => {
               onSelect={() => setDominantScreenShare(producerId)}
               onTuneOut={() => {
                 // Import voiceService lazily to avoid circular dependency
-                import('../../services/voiceService').then(({ voiceService }) => {
+                import('../../services/voice/voiceService').then(({ voiceService }) => {
                   voiceService.tuneOutOfScreenShare(producerId, { suppressAutoTune: true });
                 });
               }}

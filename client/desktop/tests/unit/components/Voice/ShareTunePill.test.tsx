@@ -8,7 +8,7 @@ vi.mock('@/renderer/components/Voice/ShareTunePill.css', () => ({}));
 // voiceService is imported dynamically inside the click handler — mock the module
 const mockTuneIn = vi.fn().mockResolvedValue(undefined);
 const mockTuneOut = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     tuneInToScreenShare: (...args: unknown[]) => mockTuneIn(...args),
     tuneOutOfScreenShare: (...args: unknown[]) => mockTuneOut(...args),

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import * as richPresenceModule from '@/renderer/stores/ui/richPresenceStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
-import { WebSocketService } from '@/renderer/services/websocketService';
+import { WebSocketService } from '@/renderer/services/messaging/websocketService';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('richPresenceStore', () => {

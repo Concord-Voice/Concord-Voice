@@ -16,17 +16,17 @@ import {
   arrayBufferToBase64,
 } from '@/renderer/utils/crypto';
 
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 
 // Mock apiFetch for channel key fetching
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
   API_BASE: 'http://localhost:8080',
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import { deferred } from '../../helpers/deferred';
 const mockApiFetch = vi.mocked(apiFetch);
 

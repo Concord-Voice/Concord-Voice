@@ -1,16 +1,16 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { MediaEncryption } from '../../../src/renderer/services/mediaEncryption';
+import type { MediaEncryption } from '../../../src/renderer/services/e2ee/mediaEncryption';
 import {
   FrameKeyMissError,
   MediaEncryption as MediaEncryptionClass,
-} from '../../../src/renderer/services/mediaEncryption';
+} from '../../../src/renderer/services/e2ee/mediaEncryption';
 import {
   applyLegacyDecryptPipeline,
   type DecryptRecoveryCallbacks,
   type InsertableStreamsReceiver,
   shouldRequestFrameKey,
-} from '../../../src/renderer/services/voiceE2eeTransforms';
+} from '../../../src/renderer/services/e2ee/voiceE2eeTransforms';
 
 // ─── Mock Helpers ────────────────────────────────────────────────────
 
@@ -676,7 +676,7 @@ import { resolve } from 'node:path';
 describe('#1895 diagnostics removed (rig out of pass-through)', () => {
   it('voiceE2eeTransforms.ts has no AV1_PASSTHROUGH_DIAG / parseAv1Obus / fnv1a32Hex', () => {
     const src = readFileSync(
-      resolve(__dirname, '../../../src/renderer/services/voiceE2eeTransforms.ts'),
+      resolve(__dirname, '../../../src/renderer/services/e2ee/voiceE2eeTransforms.ts'),
       'utf8'
     );
     expect(src).not.toMatch(/AV1_PASSTHROUGH_DIAG/);
@@ -685,7 +685,7 @@ describe('#1895 diagnostics removed (rig out of pass-through)', () => {
   });
   it('voiceService.ts has E2EE_VERBOSE=false and no passthrough diagnostic', () => {
     const src = readFileSync(
-      resolve(__dirname, '../../../src/renderer/services/voiceService.ts'),
+      resolve(__dirname, '../../../src/renderer/services/voice/voiceService.ts'),
       'utf8'
     );
     expect(src).toMatch(/const E2EE_VERBOSE = false/);

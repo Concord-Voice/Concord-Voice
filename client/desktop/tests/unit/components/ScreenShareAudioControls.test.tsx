@@ -4,7 +4,7 @@ import { ScreenShareAudioControls } from '@/renderer/components/Voice/ScreenShar
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { voiceService } from '@/renderer/services/voiceService';
+import { voiceService } from '@/renderer/services/voice/voiceService';
 
 /** Mark the local viewer as server-deafened (moderator-enforced). */
 function setLocalServerDeafened(deafened: boolean): void {

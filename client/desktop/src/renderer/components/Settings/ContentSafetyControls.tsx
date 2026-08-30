@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ToggleSwitch from './ToggleSwitch';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
-import { klipyClient } from '../../services/gifProvider/klipyClient';
+import { klipyClient } from '../../services/messaging/gifProvider/klipyClient';
 
 function gifAutoLoadHint(enabled: boolean): string {
   return enabled

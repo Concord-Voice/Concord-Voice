@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 
 // DM Privacy Levels:
 // 0 = Off (no DMs at all)
@@ -163,7 +163,7 @@ export type PurgeFenceDisableResult = { kind: 'accepted' } | PrivacyUpdateRefusa
  * The two boolean flags are the intended contract and are matched first. The
  * two string comparisons below are NOT: they match human-readable prose from
  * `internal/stepup`, which carries no machine-readable discriminator — the same
- * known brittleness `services/purgeApi.ts` documents, kept byte-identical on
+ * known brittleness `services/messaging/purgeApi.ts` documents, kept byte-identical on
  * purpose so both clients degrade the same way. Rewording either server string
  * downgrades a per-field error to the generic banner; nothing is misreported.
  */
@@ -238,7 +238,7 @@ export class PrivacyUpdateError extends Error {
  *    token refresh.
  *
  * This is the same remedy as the generation fence in
- * `services/friendEligibility.ts`. Any handler that writes `settings` must take
+ * `services/system/friendEligibility.ts`. Any handler that writes `settings` must take
  * a ticket BEFORE its await and gate the write on it.
  */
 let privacyIdentity = 0;

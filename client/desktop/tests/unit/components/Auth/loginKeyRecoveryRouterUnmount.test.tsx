@@ -27,9 +27,9 @@ import Login from '@/renderer/components/Auth/Login';
 import { ModalProvider } from '@/renderer/components/ui/ModalContext';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
+import { resetRuntimeServerBase } from '@/renderer/services/system/runtimeServerBase';
 import { isE2EEUnlockPending } from '@/renderer/utils/authAdmissionGate';
 
 const mockFetch = vi.fn();
@@ -61,7 +61,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
   exportPublicKey: vi.fn().mockResolvedValue('mock-public-key'),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn().mockResolvedValue(undefined),
     clearKeys: mockE2EEClearKeys,
@@ -77,7 +77,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     init: vi.fn(),
     startWatching: vi.fn(),
@@ -85,7 +85,7 @@ vi.mock('@/renderer/services/preferencesSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
   apiFetch: vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }),
   ensureMachineId: vi.fn().mockResolvedValue('mock-machine-id'),

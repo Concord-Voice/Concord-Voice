@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, FileText, Loader2 } from 'lucide-react';
 import MarkdownContent from '../Markdown/MarkdownContent';
-import { apiFetch } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
+import { apiFetch } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import { formatFileSize } from '../../utils/attachmentCrypto';
 import { decryptAttachmentBlob, parseKeyVersionHeader } from '../../utils/attachmentChunkedCrypto';
 import {

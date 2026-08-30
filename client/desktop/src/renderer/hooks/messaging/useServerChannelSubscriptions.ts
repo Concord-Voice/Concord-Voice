@@ -13,14 +13,14 @@ import { useServerStore } from '../../stores/chat/serverStore';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
-import { getWebSocketService } from '../../services/websocketService';
+import { getWebSocketService } from '../../services/messaging/websocketService';
 import {
   useNotificationPrefsStore,
   hasUnmutedChannel,
   isChannelMutedInMaps,
   isEntryCurrentlyMuted,
 } from '../../stores/ui/notificationPrefsStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { errorMessage } from '../../utils/redactError';
 
 export function useServerChannelSubscriptions() {

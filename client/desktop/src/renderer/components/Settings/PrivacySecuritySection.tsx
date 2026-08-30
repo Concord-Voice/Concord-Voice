@@ -9,7 +9,7 @@ import {
   type PrivacySettings,
 } from '../../stores/ui/privacyStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
-import { apiFetch, API_BASE } from '../../services/apiClient';
+import { apiFetch, API_BASE } from '../../services/system/apiClient';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
 import MFATierSelector, { WebAuthnCredential } from './MFATierSelector';

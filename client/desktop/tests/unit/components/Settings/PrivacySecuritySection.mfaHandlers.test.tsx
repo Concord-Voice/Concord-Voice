@@ -41,7 +41,7 @@ const mockSecurityGetFetch = vi.fn(async () => ({
   json: async () => ({ password_login_disabled: false, trust_sso_security: false }),
   text: async () => JSON.stringify({ password_login_disabled: false, trust_sso_security: false }),
 }));
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => {
     const [path, init] = args;
     const method = (init as RequestInit | undefined)?.method ?? 'GET';
@@ -99,7 +99,7 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
     })
   ),
 }));
-vi.mock('@/renderer/services/gifProvider/klipyClient', () => ({
+vi.mock('@/renderer/services/messaging/gifProvider/klipyClient', () => ({
   klipyClient: {
     getCurrentCustomerId: vi.fn(() => 'mock-customer-id-123'),
     rotateCustomerId: vi.fn(() => Promise.resolve('mock-rotated-id-456')),

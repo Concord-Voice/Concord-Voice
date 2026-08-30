@@ -17,8 +17,8 @@ import {
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { Permissions, hasPermission, MOVE_MEMBERS } from '../../utils/permissions';
-import { apiFetch } from '../../services/apiClient';
-import { moveVoiceParticipant } from '../../services/voiceParticipantApi';
+import { apiFetch } from '../../services/system/apiClient';
+import { moveVoiceParticipant } from '../../services/voice/voiceParticipantApi';
 import { Channel, ChannelGroup } from '../../types/chat';
 import { useUserStore } from '../../stores/auth/userStore';
 import ChannelItem, { type VoiceMemberInfo } from './ChannelItem';

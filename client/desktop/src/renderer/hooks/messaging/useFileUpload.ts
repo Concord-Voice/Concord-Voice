@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { apiFetch, safeJson } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import {
   encryptFile,
   classifyFileType,
@@ -20,7 +20,7 @@ import {
   uploadAttachmentChunked,
   abandonSessionOnUnload,
   UploadAbortedError,
-} from '../../services/attachmentUploadSession';
+} from '../../services/messaging/attachmentUploadSession';
 import { CHUNK_PLAINTEXT_BYTES } from '../../utils/attachmentChunkedCrypto';
 import type { AttachmentSummary } from '../../types/chat';
 

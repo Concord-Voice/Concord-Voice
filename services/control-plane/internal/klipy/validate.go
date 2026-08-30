@@ -12,7 +12,7 @@ import "strings"
 const MaxSlugLength = 100
 
 // NOTE: the renderer carries a deliberately STRICTER counterpart,
-// isValidGifSlug in client/desktop/src/renderer/services/gifProvider/klipyClient.ts,
+// isValidGifSlug in client/desktop/src/renderer/services/messaging/gifProvider/klipyClient.ts,
 // which rejects the empty string. The two answer different questions and must
 // NOT be reconciled — see #2580 and the #2371 design spec §2.1.
 

@@ -1,6 +1,6 @@
 import { MicOff, HeadphoneOff, Lock } from 'lucide-react';
 import ContextMenu from './ContextMenu';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { errorMessage } from '../../utils/redactError';
 import './EnforcementMenuItems.css';
 

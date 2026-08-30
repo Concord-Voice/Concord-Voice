@@ -9,7 +9,7 @@ import { mockUser } from '../../../mocks/fixtures';
 
 // Mock websocketService
 const mockSendSetStatus = vi.fn();
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     sendSetStatus: mockSendSetStatus,
   }),

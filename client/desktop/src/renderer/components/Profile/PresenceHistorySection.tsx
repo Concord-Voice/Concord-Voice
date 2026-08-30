@@ -7,14 +7,14 @@ import {
   type ReactNode,
 } from 'react';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
-import { clientConfigService } from '../../services/clientConfigService';
+import { clientConfigService } from '../../services/system/clientConfigService';
 import {
   getPresenceHistoryPage,
   getPresenceHistorySettings,
   PresenceHistoryRequestError,
   type PresenceHistoryItem,
   type PresenceHistorySettings,
-} from '../../services/presenceHistoryService';
+} from '../../services/system/presenceHistoryService';
 import './PresenceHistorySection.css';
 
 export interface PresenceHistorySectionProps {

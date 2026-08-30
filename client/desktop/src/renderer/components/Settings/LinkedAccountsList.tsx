@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 import './LinkedAccountsList.css';
 
 interface SSOIdentity {

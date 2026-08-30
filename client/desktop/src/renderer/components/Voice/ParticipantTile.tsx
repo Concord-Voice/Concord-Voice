@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useMemo, useState, useId } from 'react';
-import { prefetchEligibility } from '../../services/friendEligibility';
+import { prefetchEligibility } from '../../services/system/friendEligibility';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { MicOff, HeadphoneOff, Lock, Monitor, MoreVertical, Wrench } from 'lucide-react';
 import { VoiceParticipantContextMenu } from './VoiceParticipantContextMenu';

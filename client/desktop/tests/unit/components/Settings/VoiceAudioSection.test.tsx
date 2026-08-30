@@ -144,7 +144,7 @@ vi.mock('@/renderer/components/Voice/DeviceSelector', () => ({
     <div data-testid={`device-selector-${kind}`}>DeviceSelector</div>
   ),
 }));
-vi.mock('@/renderer/services/mediaCapabilities', () => ({
+vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   codecKey: vi.fn(),
   codecKeyMime: vi.fn(),
   getCodecInfo: vi.fn(),

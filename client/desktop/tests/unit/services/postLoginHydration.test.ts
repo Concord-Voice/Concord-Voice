@@ -4,7 +4,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 // repo convention (see subscriptionStore.test.ts) is a hoisted vi.mock factory
 // driven via vi.mocked(...), because the unit imports these as ESM named
 // bindings that vi.spyOn cannot reassign at the namespace level.
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     init: vi.fn(),
     startWatching: vi.fn(),
@@ -13,7 +13,7 @@ vi.mock('@/renderer/services/preferencesSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/savedGifsSync', () => ({
+vi.mock('@/renderer/services/system/savedGifsSync', () => ({
   savedGifsSyncService: {
     startWatching: vi.fn(),
     stopWatching: vi.fn(),
@@ -21,7 +21,7 @@ vi.mock('@/renderer/services/savedGifsSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/friendOrgSync', () => ({
+vi.mock('@/renderer/services/system/friendOrgSync', () => ({
   friendOrgSyncService: {
     startWatching: vi.fn(),
     stopWatching: vi.fn(),
@@ -29,14 +29,14 @@ vi.mock('@/renderer/services/friendOrgSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: {
     fetchAndApply: vi.fn().mockResolvedValue(true),
     reset: vi.fn(),
   },
 }));
 
-vi.mock('@/renderer/services/notificationPrefsService', () => ({
+vi.mock('@/renderer/services/system/notificationPrefsService', () => ({
   tryHydrateNotificationPrefs: vi.fn().mockResolvedValue(undefined),
   stopExpirySweep: vi.fn(),
 }));
@@ -51,13 +51,16 @@ vi.mock('@/renderer/stores/auth/subscriptionStore', () => {
   };
 });
 
-import { hydratePostLogin, buildPreferencesSyncDeps } from '@/renderer/services/postLoginHydration';
-import { gracefulReset } from '@/renderer/services/resetService';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
-import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
-import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
-import { tryHydrateNotificationPrefs } from '@/renderer/services/notificationPrefsService';
+import {
+  hydratePostLogin,
+  buildPreferencesSyncDeps,
+} from '@/renderer/services/system/postLoginHydration';
+import { gracefulReset } from '@/renderer/services/system/resetService';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/system/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/system/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
+import { tryHydrateNotificationPrefs } from '@/renderer/services/system/notificationPrefsService';
 import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import { useLayoutStore, type SidebarProfiles } from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';

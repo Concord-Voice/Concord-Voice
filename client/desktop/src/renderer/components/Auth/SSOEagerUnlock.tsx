@@ -33,14 +33,14 @@ import {
   safeJson,
   revokeAbortedSession,
   captureAuthSession,
-} from '../../services/apiClient';
+} from '../../services/system/apiClient';
 import { type KeyDerivationAlgorithm } from '../../utils/crypto';
-import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2eeService';
-import { E2EEInitTeardownError } from '../../services/e2eeErrors';
+import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2ee/e2eeService';
+import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';

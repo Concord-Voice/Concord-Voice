@@ -1,6 +1,6 @@
 import React, { useCallback, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 import BugReportPanel from './BugReportPanel';
 import FeatureRequestPanel from './FeatureRequestPanel';
 import { type FeedbackMode, type FeedbackSubmission } from './feedbackTypes';

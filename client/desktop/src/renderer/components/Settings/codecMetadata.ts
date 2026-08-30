@@ -10,7 +10,7 @@
  *      the codec select.
  */
 
-import { h264ProfileClass, type H264ProfileClass } from '../../services/voiceCodecSelection';
+import { h264ProfileClass, type H264ProfileClass } from '../../services/voice/voiceCodecSelection';
 
 // ---------------------------------------------------------------------------
 // H.264 profile-level-id → human label

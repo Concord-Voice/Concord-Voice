@@ -2,7 +2,7 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   API_BASE: 'http://localhost:8080',
 }));

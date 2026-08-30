@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useId, useRef, useMemo } from 'react';
-import { prefetchEligibility } from '../../services/friendEligibility';
+import { prefetchEligibility } from '../../services/system/friendEligibility';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useMemberStore, ServerMember, PresenceStatus } from '../../stores/chat/memberStore';

@@ -14,7 +14,7 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // Isolate the component from the signing service — this test exercises the READ/rehydrate
 // path, never submit. The hook under test (useAgeStatus) stays REAL.
-vi.mock('@/renderer/services/ageClaim/ageClaimService', () => ({
+vi.mock('@/renderer/services/system/ageClaim/ageClaimService', () => ({
   submitSignedAgeClaim: vi.fn(),
 }));
 

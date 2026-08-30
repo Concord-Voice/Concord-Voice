@@ -7,7 +7,7 @@ import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock side-effecting services so the hook mounts cleanly (mirrors the
 // harness in useWebSocketMessages.richPresence.test.ts).
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
     hasKey: vi.fn().mockReturnValue(false),
@@ -16,23 +16,23 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({
+vi.mock('@/renderer/services/system/ttsService', () => ({
   speak: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: { handleRemoteUpdate: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: vi.fn(),
     playLoop: vi.fn(),
@@ -44,7 +44,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import { createMockWsService, requireHandler } from '../../helpers/wsServiceMock';
 
 const ACTIVE_SERVER = '11111111-1111-4111-8111-111111111111';

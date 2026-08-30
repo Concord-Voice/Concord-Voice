@@ -5,7 +5,7 @@ import {
   ACTIVITY_HISTORY_RETENTION_DAYS,
   type ActivityHistoryRetentionDays,
   type PresenceHistoryRequiredConsent,
-} from '../../services/presenceHistoryService';
+} from '../../services/system/presenceHistoryService';
 import './ActivityHistory.css';
 
 export interface ActivityHistoryConsentSelection {

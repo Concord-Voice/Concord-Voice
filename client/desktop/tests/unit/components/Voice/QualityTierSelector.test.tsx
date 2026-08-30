@@ -8,7 +8,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 
 const mockSetQualityTier = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { setQualityTier: (...args: unknown[]) => mockSetQualityTier(...args) },
 }));
 

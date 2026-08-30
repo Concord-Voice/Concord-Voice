@@ -261,7 +261,7 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
     if (hasJoinedRef.current) return;
     hasJoinedRef.current = true;
     try {
-      const { voiceService } = await import('../../services/voiceService');
+      const { voiceService } = await import('../../services/voice/voiceService');
       await voiceService.joinChannel(channelId);
     } catch {
       hasJoinedRef.current = false;

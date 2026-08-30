@@ -67,7 +67,7 @@ function deafenTitle(serverDeafened: boolean, selfDeafened: boolean): string {
 
 /** Lazily import and return the voice service. */
 async function getVoiceService() {
-  const { voiceService } = await import('../../services/voiceService');
+  const { voiceService } = await import('../../services/voice/voiceService');
   return voiceService;
 }
 
@@ -247,7 +247,7 @@ const StreamControls: React.FC<{ context: 'voiceView' | 'persistent' }> = ({ con
 
   const handleTuneEverywhere = useCallback(async () => {
     try {
-      const { voiceService } = await import('../../services/voiceService');
+      const { voiceService } = await import('../../services/voice/voiceService');
       if (canTuneInMore) {
         await voiceService.tuneInAllScreenShares();
       } else {

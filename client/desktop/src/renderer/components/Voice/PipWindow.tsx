@@ -16,8 +16,8 @@ import {
   PhoneOff,
 } from 'lucide-react';
 import type { VoiceParticipant } from '../../stores/voice/voiceStore';
-import type { AnyPipBroadcast, VoiceStateResult } from '../../services/pipSignalingTypes';
-import { PipVoiceClient } from '../../services/pipVoiceClient';
+import type { AnyPipBroadcast, VoiceStateResult } from '../../services/voice/pipSignalingTypes';
+import { PipVoiceClient } from '../../services/voice/pipVoiceClient';
 import ParticipantTile from './ParticipantTile';
 import { useVoiceMagnification } from './useVoiceMagnification';
 import './PipWindow.css';

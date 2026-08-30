@@ -14,7 +14,7 @@ import { errorMessage } from '../../utils/redactError';
 import {
   moveVoiceParticipant,
   disconnectVoiceParticipant,
-} from '../../services/voiceParticipantApi';
+} from '../../services/voice/voiceParticipantApi';
 import './VoiceParticipantContextMenu.css';
 
 /**

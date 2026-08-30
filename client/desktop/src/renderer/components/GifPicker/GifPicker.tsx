@@ -5,7 +5,7 @@ import {
   type GifResolved,
   type GifCategory,
   type GifCategoryPreview,
-} from '../../services/gifProvider';
+} from '../../services/messaging/gifProvider';
 import { useSavedGifsStore } from '../../stores/chat/savedGifsStore';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';

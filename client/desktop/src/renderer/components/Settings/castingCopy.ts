@@ -1,4 +1,4 @@
-import { castingKindForCodec, type CameraLayeringKind } from '../../services/cameraLayering';
+import { castingKindForCodec, type CameraLayeringKind } from '../../services/voice/cameraLayering';
 
 /**
  * Dynamic helper copy for the SVC / Simulcast casting toggles (#1921). Pure function

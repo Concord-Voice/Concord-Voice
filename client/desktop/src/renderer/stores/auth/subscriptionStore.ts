@@ -1,10 +1,10 @@
 import { createStore } from '../../utils/createStore';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { EntitlementsChangedSchema, type EntitlementsChangedPayload } from '../../types/ws-events';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,
-} from '../../services/postLoginHydrationLifecycle';
+} from '../../services/system/postLoginHydrationLifecycle';
 
 // The store holds the entitlement capability set. The wire type (validated at
 // the WS dispatch boundary) IS the store type — no transform needed.

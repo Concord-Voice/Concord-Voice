@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { render, screen, userEvent, waitFor } from '../../../test-utils';
 import ActivityHistoryConsentModal from '@/renderer/components/Settings/ActivityHistoryConsentModal';
-import type { PresenceHistoryRequiredConsent } from '@/renderer/services/presenceHistoryService';
+import type { PresenceHistoryRequiredConsent } from '@/renderer/services/system/presenceHistoryService';
 import { vi } from 'vitest';
 
 const FIRST_HASH = 'a'.repeat(64);

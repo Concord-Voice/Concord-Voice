@@ -3,12 +3,12 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
 import { server as mswServer } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';
 import PresenceSettingsSection from '@/renderer/components/Settings/PresenceSettingsSection';
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn().mockResolvedValue('encrypted-exceptions'),

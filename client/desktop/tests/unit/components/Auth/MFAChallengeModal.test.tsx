@@ -4,7 +4,7 @@ import {
   useMFAChallengeStore,
   type MFAChallengeResult,
 } from '@/renderer/stores/auth/mfaChallengeStore';
-import { completeSSOMFA, abandonSSOReservation } from '@/renderer/services/ssoService';
+import { completeSSOMFA, abandonSSOReservation } from '@/renderer/services/system/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
@@ -15,15 +15,15 @@ vi.stubGlobal('fetch', mockFetch);
 // SSOServiceError class so the modal's error-branch instanceof check works.
 // #2394 adds abandonSSOReservation to the same partial mock so the Cancel
 // purpose-gate can be observed without an Electron bridge.
-vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/services/ssoService')>();
+vi.mock('@/renderer/services/system/ssoService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/system/ssoService')>();
   return { ...actual, completeSSOMFA: vi.fn(), abandonSSOReservation: vi.fn() };
 });
 
 // safeJson is mocked as a transparent passthrough so existing fetch mocks
 // (which only set ok / json / status) continue to work without supplying
 // Content-Type headers. The real safeJson is exercised by apiClient tests.
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
   ensureMachineId: vi.fn().mockResolvedValue('mock-machine-id'),
   safeJson: async <T,>(res: { json: () => Promise<T> }): Promise<T> => res.json(),
@@ -219,8 +219,8 @@ describe('MFAChallengeModal', () => {
 
   it('keeps the SSO modal open and shows the error_code when completeSSOMFA rejects (#2424)', async () => {
     const { SSOServiceError } = await vi.importActual<
-      typeof import('@/renderer/services/ssoService')
-    >('@/renderer/services/ssoService');
+      typeof import('@/renderer/services/system/ssoService')
+    >('@/renderer/services/system/ssoService');
     vi.mocked(completeSSOMFA).mockRejectedValueOnce(
       new SSOServiceError(401, 'sso_complete_mfa_failed_401', { error_code: 'mfa_code_invalid' })
     );

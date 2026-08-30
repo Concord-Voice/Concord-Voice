@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { split } from '../../utils/shamir';
 import { base64ToArrayBuffer, arrayBufferToBase64 } from '../../utils/crypto';
-import { e2eeService } from '../../services/e2eeService';
-import { apiFetch } from '../../services/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { apiFetch } from '../../services/system/apiClient';
 import { useFriendStore, Friend } from '../../stores/chat/friendStore';
 
 interface RecoveryCircleProps {

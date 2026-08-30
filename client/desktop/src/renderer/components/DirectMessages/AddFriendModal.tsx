@@ -6,7 +6,7 @@ import {
   type SearchResult,
 } from '../../stores/chat/friendStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import Modal from '../ui/Modal';
 import { errorMessage } from '../../utils/redactError';
 import CustomSelect from '../ui/CustomSelect';

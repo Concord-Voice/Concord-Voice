@@ -73,13 +73,13 @@ function PhaseContent({
 
     // Wrap dynamic imports so a chunk-load failure doesn't silently no-op
     // the Retry button — exactly the UX pathology this PR is fixing.
-    let getWebSocketService: typeof import('../../services/websocketService').getWebSocketService;
+    let getWebSocketService: typeof import('../../services/messaging/websocketService').getWebSocketService;
     let useAuthStoreImport: typeof import('../../stores/auth/authStore').useAuthStore;
-    let runPreflight: typeof import('../../services/recoveryService').runPreflight;
+    let runPreflight: typeof import('../../services/system/recoveryService').runPreflight;
     try {
-      ({ getWebSocketService } = await import('../../services/websocketService'));
+      ({ getWebSocketService } = await import('../../services/messaging/websocketService'));
       ({ useAuthStore: useAuthStoreImport } = await import('../../stores/auth/authStore'));
-      ({ runPreflight } = await import('../../services/recoveryService'));
+      ({ runPreflight } = await import('../../services/system/recoveryService'));
     } catch {
       store.incrementRecoveryAttempts();
       store.enterFatal();
@@ -134,7 +134,7 @@ function PhaseContent({
     // sibling handleRetry was guarded, this was not). runRecoveryModule degrades
     // to self-heal on failure.
     await runRecoveryModule(
-      () => import('../../services/resetService'),
+      () => import('../../services/system/resetService'),
       (m) => m.softRestart(),
       'softRestart'
     );

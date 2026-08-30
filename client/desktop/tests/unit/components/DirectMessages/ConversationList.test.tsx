@@ -15,7 +15,7 @@ import { vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock e2eeService
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
@@ -28,7 +28,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 import ConversationList from '@/renderer/components/DirectMessages/ConversationList';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import ContextMenuProvider from '@/renderer/components/ui/ContextMenuProvider';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
 const makeConversation = (overrides: Partial<DMConversation> = {}): DMConversation => ({
   id: 'conv-1',

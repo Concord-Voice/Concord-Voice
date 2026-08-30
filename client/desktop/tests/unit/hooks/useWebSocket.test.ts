@@ -7,7 +7,7 @@ import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
-import { ConnectionState } from '@/renderer/services/websocketService';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Capture registered handlers so we can invoke them in tests
@@ -42,7 +42,7 @@ const mockWsService = {
   sendTypingIndicator: vi.fn(),
 };
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => mockWsService,
   ConnectionState: {
     DISCONNECTED: 'disconnected',
@@ -53,7 +53,7 @@ vi.mock('@/renderer/services/websocketService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     processPendingKeyRequests: vi.fn().mockResolvedValue(undefined),
@@ -63,7 +63,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     fetchAndApply: vi.fn(),
   },

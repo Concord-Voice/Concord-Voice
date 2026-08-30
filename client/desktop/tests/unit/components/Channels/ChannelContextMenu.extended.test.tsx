@@ -9,7 +9,7 @@ import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMen
 import type { Channel } from '@/renderer/types/chat';
 
 // Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({ ok: true }),
 }));
 

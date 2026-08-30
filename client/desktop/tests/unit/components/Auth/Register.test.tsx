@@ -4,9 +4,9 @@ import { vi } from 'vitest';
 import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { generateRegistrationKeys } from '@/renderer/utils/crypto';
-import { abandonSSOReservation } from '@/renderer/services/ssoService';
+import { abandonSSOReservation } from '@/renderer/services/system/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch
@@ -35,7 +35,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
 // persist (getSessionKeys → null after clearKeys, so the persist block no-ops).
 // `e2eeState` is reset per test in beforeEach.
 const e2eeState = vi.hoisted(() => ({ initialized: false }));
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     initialize: vi.fn(async () => {
       e2eeState.initialized = true;
@@ -58,8 +58,8 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 // #2394: partial-mock ssoService so the pre-submit reservation release can be
 // observed. Only abandonSSOReservation is replaced — the rest of the module is
 // real, so nothing else in this suite changes behavior.
-vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/services/ssoService')>();
+vi.mock('@/renderer/services/system/ssoService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/system/ssoService')>();
   return { ...actual, abandonSSOReservation: vi.fn().mockResolvedValue(true) };
 });
 

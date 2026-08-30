@@ -1,5 +1,5 @@
 import { createStore } from '../../utils/createStore';
-import type { CallState } from '../../services/voiceService/callStateMachine';
+import type { CallState } from '../../services/voice/voiceService/callStateMachine';
 
 // ---------------------------------------------------------------------------
 // Persisted device settings (per-machine via localStorage)

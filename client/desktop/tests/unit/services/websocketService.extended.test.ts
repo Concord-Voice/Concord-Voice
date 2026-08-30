@@ -5,7 +5,7 @@
  * the resubscription on reconnect flow.
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { WebSocketService, ConnectionState } from '@/renderer/services/websocketService';
+import { WebSocketService, ConnectionState } from '@/renderer/services/messaging/websocketService';
 
 // Mock WebSocket
 class MockWebSocket {

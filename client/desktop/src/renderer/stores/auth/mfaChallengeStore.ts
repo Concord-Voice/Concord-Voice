@@ -1,7 +1,7 @@
 import { createStore } from '../../utils/createStore';
 import type { UserProfile } from './userStore';
 import type { CredentialOwner } from '../../../main/ipcContract';
-import type { SSOCompletionResult, SSOProvider } from '../../services/ssoService';
+import type { SSOCompletionResult, SSOProvider } from '../../services/system/ssoService';
 
 /**
  * Purpose discriminates which interceptor / flow is awaiting the MFA result.

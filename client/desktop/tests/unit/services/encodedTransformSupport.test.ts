@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveEncodedTransformSupport } from '@/renderer/services/encodedTransformSupport';
+import { resolveEncodedTransformSupport } from '@/renderer/services/e2ee/encodedTransformSupport';
 
 describe('resolveEncodedTransformSupport', () => {
   it('prefers RTCRtpScriptTransform when both transform APIs are present', () => {

@@ -12,7 +12,7 @@
  */
 
 import { createStore } from '../../utils/createStore';
-import type { SSOProvider } from '../../services/ssoService';
+import type { SSOProvider } from '../../services/system/ssoService';
 
 export type SSOState =
   | { phase: 'idle' }

@@ -3,7 +3,7 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import type { DMParticipant, DMConversation } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import './DMProfileModal.css';

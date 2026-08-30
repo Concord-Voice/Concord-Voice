@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ImageOff } from 'lucide-react';
-import { gifProvider, type GifResolved } from '../../services/gifProvider';
+import { gifProvider, type GifResolved } from '../../services/messaging/gifProvider';
 import './GifEmbed.css';
 
 interface GifEmbedProps {

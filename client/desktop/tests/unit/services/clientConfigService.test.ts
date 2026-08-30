@@ -4,11 +4,11 @@ import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = vi.mocked(apiFetch);
 const mockSpaCheckForUpdate = vi.fn();
@@ -49,7 +49,7 @@ async function flushFetchPath(): Promise<void> {
 }
 
 // Import after mocking
-import { clientConfigService } from '@/renderer/services/clientConfigService';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
 import { deferred } from '../../helpers/deferred';
 
 beforeEach(() => {

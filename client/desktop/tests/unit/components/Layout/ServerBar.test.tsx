@@ -6,13 +6,13 @@ import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';
 import { vi } from 'vitest';
 
 // Mock apiClient to prevent real API calls from fetchServers useEffect
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve([]),

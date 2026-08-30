@@ -30,7 +30,7 @@ const mockWsService = {
   getState: vi.fn().mockReturnValue('CONNECTED'),
 };
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => mockWsService,
   ConnectionState: {
     DISCONNECTED: 'DISCONNECTED',
@@ -44,7 +44,7 @@ const fencePendingOperations = vi.fn();
 const messageOperationGuard = { assertCurrent: vi.fn() };
 const getChannelKey = vi.fn().mockResolvedValue(null);
 const decryptForChannel = vi.fn(async (_channelId: string, ciphertext: string) => ciphertext);
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     fencePendingOperations: () => fencePendingOperations(),
     clearKeys: vi.fn(),
@@ -81,27 +81,27 @@ const messageFetchCount = () =>
 
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   stopProactiveRefresh: vi.fn(),
   refreshAccessToken: vi.fn(),
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
 }));
 
-vi.mock('@/renderer/services/recoveryService', () => ({
+vi.mock('@/renderer/services/system/recoveryService', () => ({
   runPreflight: vi.fn(),
   clearCrashFlag: vi.fn(),
 }));
 
 const hydrateCalls = vi.fn();
-vi.mock('@/renderer/services/postLoginHydration', () => ({
+vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   hydratePostLogin: () => {
     hydrateCalls();
     return Promise.resolve();
   },
 }));
 
-vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
+vi.mock('@/renderer/services/system/postLoginHydrationLifecycle', () => ({
   beginPostLoginHydrationGuard: vi.fn(() => ({
     signal: new AbortController().signal,
     isCurrent: () => true,
@@ -113,8 +113,8 @@ vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
 import { useConnectionRecovery } from '@/renderer/hooks/voice/useConnectionRecovery';
 import { useMessageFetch } from '@/renderer/hooks/messaging/useMessageFetch';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { isHydrationLifecycleCurrent } from '@/renderer/services/postLoginHydrationLifecycle';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { isHydrationLifecycleCurrent } from '@/renderer/services/system/postLoginHydrationLifecycle';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockMessage, mockMessage2 } from '../../mocks/fixtures';
 

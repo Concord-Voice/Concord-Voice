@@ -10,7 +10,7 @@ import {
 const mockSubscribe = vi.fn();
 const mockUnsubscribe = vi.fn();
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     subscribe: mockSubscribe,
     unsubscribe: mockUnsubscribe,

@@ -10,7 +10,7 @@ const mockWsService = {
   getState: mockGetState,
 };
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => mockWsService,
   ConnectionState: {
     DISCONNECTED: 'DISCONNECTED',
@@ -20,14 +20,14 @@ vi.mock('@/renderer/services/websocketService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({ e2eeService: { isInitialized: false } }));
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({ e2eeService: { isInitialized: false } }));
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { emergencyCleanup: vi.fn() },
 }));
 
 // The recoveryService chunk fails to load — a stale SPA chunk after a Pages
 // redeploy, fetched on-demand during preflight (the origin-502-storm scenario).
-vi.mock('@/renderer/services/recoveryService', () => {
+vi.mock('@/renderer/services/system/recoveryService', () => {
   throw new Error('Failed to fetch dynamically imported module: recoveryService-abc123.js');
 });
 

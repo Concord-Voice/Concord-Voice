@@ -99,14 +99,14 @@ vi.mock('@/renderer/components/Voice/PersistentVoiceBar', () => ({
 vi.mock('@/renderer/components/Voice/VoiceTextChat', () => ({
   default: () => <div data-testid="voice-text-chat">VoiceTextChat</div>,
 }));
-vi.mock('@/renderer/services/pipSignalingProxy', () => ({
+vi.mock('@/renderer/services/voice/pipSignalingProxy', () => ({
   // Regular function (not arrow) so `new PipSignalingProxy(...)` works.
   // Returns the mock object so proxy.dispose() is callable.
   PipSignalingProxy: vi.fn(function MockPipProxy() {
     return { dispose: vi.fn(), onPipClosed: vi.fn() };
   }),
 }));
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {},
 }));
 
@@ -305,7 +305,7 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({ default: () => null }))
 
 // ── API mock ───────────────────────────────────────────────────────────────────
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }),
   API_BASE: 'http://localhost:8080',
 }));

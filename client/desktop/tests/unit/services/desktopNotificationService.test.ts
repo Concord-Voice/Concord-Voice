@@ -51,7 +51,7 @@ if (globalThis.electron) {
 
 // Import after mocking
 const { desktopNotificationService } =
-  await import('../../../src/renderer/services/desktopNotificationService');
+  await import('../../../src/renderer/services/system/desktopNotificationService');
 
 describe('DesktopNotificationService', () => {
   beforeEach(() => {

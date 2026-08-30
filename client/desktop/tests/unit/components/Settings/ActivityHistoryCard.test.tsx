@@ -7,8 +7,8 @@ import {
   patchPresenceHistorySettings,
   PresenceHistoryRequestError,
   type PresenceHistorySettings,
-} from '@/renderer/services/presenceHistoryService';
-import { clientConfigService } from '@/renderer/services/clientConfigService';
+} from '@/renderer/services/system/presenceHistoryService';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
@@ -17,9 +17,9 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { vi } from 'vitest';
 import { deferred } from '../../../helpers/deferred';
 
-vi.mock('@/renderer/services/presenceHistoryService', async (importOriginal) => {
+vi.mock('@/renderer/services/system/presenceHistoryService', async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import('@/renderer/services/presenceHistoryService')>();
+    await importOriginal<typeof import('@/renderer/services/system/presenceHistoryService')>();
   return {
     ...actual,
     getPresenceHistorySettings: vi.fn(),
@@ -28,7 +28,7 @@ vi.mock('@/renderer/services/presenceHistoryService', async (importOriginal) => 
   };
 });
 
-vi.mock('@/renderer/services/clientConfigService', () => ({
+vi.mock('@/renderer/services/system/clientConfigService', () => ({
   clientConfigService: {
     refreshServerCapabilities: vi.fn().mockResolvedValue(undefined),
   },

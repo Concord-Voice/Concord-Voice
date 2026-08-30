@@ -6,12 +6,12 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 // the session's preference pull on that 401. (The precipitating 401's exact
 // server-side cause is unpinned — see the prefs-401 finding.)
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/services/apiClient')>();
+vi.mock('@/renderer/services/system/apiClient', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/system/apiClient')>();
   return { ...actual, apiFetch: (...args: unknown[]) => mockApiFetch(...args) };
 });
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn().mockResolvedValue('enc'),
@@ -19,7 +19,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
 
 function initStubDeps() {
   (preferencesSyncService as unknown as { deps: unknown }).deps = null;

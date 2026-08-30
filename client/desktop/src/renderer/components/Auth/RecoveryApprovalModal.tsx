@@ -7,8 +7,8 @@ import {
   encryptWithSharedSecret,
   base64ToArrayBuffer,
 } from '../../utils/crypto';
-import { e2eeService } from '../../services/e2eeService';
-import { apiFetch } from '../../services/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { apiFetch } from '../../services/system/apiClient';
 
 interface RecoveryApprovalModalProps {
   requestId: string;

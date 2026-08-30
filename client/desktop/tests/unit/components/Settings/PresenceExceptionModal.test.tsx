@@ -2,7 +2,7 @@ import React, { useRef, useState } from 'react';
 import { act, fireEvent, render, screen, userEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PresenceExceptionModal from '@/renderer/components/Settings/PresenceExceptionModal';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
 import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';

@@ -6,7 +6,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { server } from '../../../mocks/server';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
-import { clientConfigService } from '@/renderer/services/clientConfigService';
+import { clientConfigService } from '@/renderer/services/system/clientConfigService';
 import PresenceHistorySection from '@/renderer/components/Profile/PresenceHistorySection';
 import { deferred } from '../../../helpers/deferred';
 

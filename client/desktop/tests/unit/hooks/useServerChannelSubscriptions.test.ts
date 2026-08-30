@@ -9,7 +9,7 @@ import { mockServer, mockServer2 } from '../../mocks/fixtures';
 // Mock websocketService
 const mockSubscribeServer = vi.fn();
 const mockUnsubscribeServer = vi.fn();
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     subscribeServer: mockSubscribeServer,
     unsubscribeServer: mockUnsubscribeServer,
@@ -18,7 +18,7 @@ vi.mock('@/renderer/services/websocketService', () => ({
 
 // Mock apiFetch
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 

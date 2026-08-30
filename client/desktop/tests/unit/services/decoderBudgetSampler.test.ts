@@ -4,7 +4,7 @@ import {
   DecoderBudgetSampler,
   selectInboundVideoDecoderReport,
   type DecoderBudgetResult,
-} from '@/renderer/services/decoderBudgetSampler';
+} from '@/renderer/services/voice/decoderBudgetSampler';
 
 interface Cursor {
   totalDecodeTime: number;

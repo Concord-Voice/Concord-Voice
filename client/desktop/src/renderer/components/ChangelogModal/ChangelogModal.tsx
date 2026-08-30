@@ -11,7 +11,7 @@ import {
   compareSemver,
   decideChangelogAction,
   type ChangelogSection,
-} from '../../services/changelog';
+} from '../../services/system/changelog';
 import { useChangelogStore } from '../../stores/ui/changelogStore';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';

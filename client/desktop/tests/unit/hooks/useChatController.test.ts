@@ -6,13 +6,13 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { PIN_MESSAGES } from '@/renderer/utils/permissions';
 import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { ConnectionState } from '@/renderer/services/websocketService';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import {
   clearIndex,
   indexMessage,
   removeMessage,
   searchMessages,
-} from '@/renderer/services/searchService';
+} from '@/renderer/services/messaging/searchService';
 import type { ChatContext, MessageWithStatus } from '@/renderer/types/chat';
 import { deferred } from '../../helpers/deferred';
 
@@ -25,7 +25,7 @@ const mockSendTypingIndicator = vi.fn();
 const mockSendDMTypingIndicator = vi.fn();
 const mockWsGetState = vi.fn(() => ConnectionState.CONNECTED);
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     sendMessage: mockSendMessage,
     sendDMMessage: mockSendDMMessage,
@@ -63,7 +63,7 @@ vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
 // API client
 const mockApiFetch = vi.fn();
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (res: Response) => res.json(),
 }));
@@ -75,7 +75,7 @@ const mockGetCurrentKeyVersion = vi.fn(() => 1);
 const mockInvalidateChannelKey = vi.fn();
 let mockE2EEIsInitialized = true;
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
     encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
@@ -91,13 +91,13 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 const mockPinMessage = vi.fn().mockResolvedValue({});
 const mockUnpinMessage = vi.fn().mockResolvedValue({});
 
-vi.mock('@/renderer/services/pinService', () => ({
+vi.mock('@/renderer/services/messaging/pinService', () => ({
   pinMessage: (...args: unknown[]) => mockPinMessage(...args),
   unpinMessage: (...args: unknown[]) => mockUnpinMessage(...args),
 }));
 
 // Message queue (needed by useMessaging mock setup but not directly tested here)
-vi.mock('@/renderer/services/messageQueue', () => ({
+vi.mock('@/renderer/services/messaging/messageQueue', () => ({
   getMessageQueue: () => ({
     enqueue: vi.fn(() => 'client-msg-1'),
     markAsSent: vi.fn(),

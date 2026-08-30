@@ -8,12 +8,12 @@ import { useSendInviteToFriend } from '@/renderer/hooks/messaging/useSendInviteT
 import type { Friend } from '@/renderer/stores/chat/friendStore';
 
 const mockSend = vi.fn(() => 'client-msg-1');
-vi.mock('@/renderer/services/dmMessageSender', () => ({
+vi.mock('@/renderer/services/messaging/dmMessageSender', () => ({
   sendDMMessage: (...args: unknown[]) => mockSend(...args),
 }));
 
 let mockInitialized = true;
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return mockInitialized;

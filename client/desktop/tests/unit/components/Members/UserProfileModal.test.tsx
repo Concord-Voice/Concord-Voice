@@ -9,7 +9,7 @@ vi.mock('@/renderer/hooks/ui/useUserThemeScope', () => ({
 
 // Mock apiFetch
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 

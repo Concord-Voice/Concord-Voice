@@ -8,13 +8,13 @@ import {
 } from '@/renderer/stores/chat/friendStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   fetchEligibility: vi.fn(),
   peekEligibility: vi.fn(),
 }));
@@ -22,7 +22,7 @@ import {
   fetchEligibility,
   peekEligibility,
   type EligibilityVerdict,
-} from '@/renderer/services/friendEligibility';
+} from '@/renderer/services/system/friendEligibility';
 const mockFetchEligibility = fetchEligibility as ReturnType<typeof vi.fn>;
 const mockPeekEligibility = peekEligibility as ReturnType<typeof vi.fn>;
 

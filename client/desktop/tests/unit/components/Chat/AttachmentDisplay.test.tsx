@@ -34,14 +34,14 @@ vi.mock('@/renderer/components/Chat/OverflowMarkdownAttachment', () => ({
 
 // Mock apiClient
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 
 // Mock e2eeService
 const mockGetChannelKey = vi.fn();
 const mockGetChannelKeyByVersion = vi.fn();
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return true;

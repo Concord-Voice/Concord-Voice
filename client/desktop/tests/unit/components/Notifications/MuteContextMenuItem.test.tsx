@@ -9,10 +9,10 @@ import MuteContextMenuItem from '@/renderer/components/Notifications/MuteContext
 // reuses the store directly so the optimistic-update behavior the real
 // service implements is preserved — tests then assert on the store rather
 // than on whether the mock was called with the right args.
-vi.mock('@/renderer/services/notificationPrefsService', async () => {
+vi.mock('@/renderer/services/system/notificationPrefsService', async () => {
   const actual = await vi.importActual<
-    typeof import('@/renderer/services/notificationPrefsService')
-  >('@/renderer/services/notificationPrefsService');
+    typeof import('@/renderer/services/system/notificationPrefsService')
+  >('@/renderer/services/system/notificationPrefsService');
   return {
     ...actual,
     setMutePreference: vi.fn(
@@ -28,7 +28,7 @@ vi.mock('@/renderer/services/notificationPrefsService', async () => {
   };
 });
 
-import { setMutePreference } from '@/renderer/services/notificationPrefsService';
+import { setMutePreference } from '@/renderer/services/system/notificationPrefsService';
 
 const TARGET_ID = '11111111-1111-1111-1111-111111111111';
 

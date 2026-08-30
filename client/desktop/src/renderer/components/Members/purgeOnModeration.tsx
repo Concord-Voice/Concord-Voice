@@ -1,5 +1,5 @@
 import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 
 /**
  * The kick/ban purge opt-in (#1354), shared by the two surfaces that can ban or
@@ -114,7 +114,7 @@ export function PurgeMessagesOptIn({
  * region rather than to the modal.
  *
  * `alsoPurge` rather than `purgeMessages`: the latter is the name of the purge
- * service function exported from `services/purgeApi.ts`, and this module — or
+ * service function exported from `services/messaging/purgeApi.ts`, and this module — or
  * either of its two callers — importing it would shadow the parameter.
  */
 export async function moderateMember(

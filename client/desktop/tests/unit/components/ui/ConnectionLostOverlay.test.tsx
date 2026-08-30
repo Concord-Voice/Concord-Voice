@@ -20,15 +20,15 @@ const mockGetWebSocketService = vi.fn(() => ({
   connect: mockConnect,
 }));
 
-vi.mock('@/renderer/services/recoveryService', () => ({
+vi.mock('@/renderer/services/system/recoveryService', () => ({
   runPreflight: (...args: unknown[]) => mockRunPreflight(...args),
 }));
 
-vi.mock('@/renderer/services/resetService', () => ({
+vi.mock('@/renderer/services/system/resetService', () => ({
   softRestart: (...args: unknown[]) => mockSoftRestart(...args),
 }));
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: (...args: unknown[]) => mockGetWebSocketService(...args),
 }));
 

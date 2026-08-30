@@ -19,7 +19,7 @@ import { vi } from 'vitest';
 import type { Channel, ChannelGroup } from '@/renderer/types/chat';
 
 // Mock apiFetch to prevent real API calls
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({ ok: true }),
   API_BASE: 'http://localhost:3001',
 }));

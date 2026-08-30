@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { voiceService } from '../../../src/renderer/services/voiceService';
+import { voiceService } from '../../../src/renderer/services/voice/voiceService';
 import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 
@@ -8,7 +8,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 // pauseLocalDecode → consumer.pause(). See voiceService.visibility.test.ts for
 // the same singleton-seeding pattern (#1541).
 
-vi.mock('../../../src/renderer/services/notificationSoundService', () => ({
+vi.mock('../../../src/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: { play: vi.fn() },
 }));
 

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Modal from './Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import './ImageCropEditor.css';
 
 /** Configuration for uploading the cropped image to object storage. */

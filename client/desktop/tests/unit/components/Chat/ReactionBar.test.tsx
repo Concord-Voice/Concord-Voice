@@ -5,7 +5,7 @@ import { vi } from 'vitest';
 import type { ReactionSummary } from '@/renderer/types/chat';
 
 // Mock the reaction service
-vi.mock('@/renderer/services/reactionService', () => ({
+vi.mock('@/renderer/services/messaging/reactionService', () => ({
   toggleReaction: vi.fn(() => Promise.resolve({ action: 'added' })),
 }));
 
@@ -56,7 +56,7 @@ describe('ReactionBar', () => {
   });
 
   it('calls toggleReaction on chip click', async () => {
-    const { toggleReaction } = await import('@/renderer/services/reactionService');
+    const { toggleReaction } = await import('@/renderer/services/messaging/reactionService');
     render(<ReactionBar messageId="msg-1" reactions={reactions} />);
 
     const chip = screen.getByText('👍').closest('.reaction-chip') as HTMLElement;
@@ -78,7 +78,7 @@ describe('ReactionBar', () => {
   });
 
   it('calls toggleReaction when emoji selected from picker', async () => {
-    const { toggleReaction } = await import('@/renderer/services/reactionService');
+    const { toggleReaction } = await import('@/renderer/services/messaging/reactionService');
     render(<ReactionBar messageId="msg-1" reactions={reactions} />);
 
     fireEvent.click(screen.getByLabelText('Add reaction'));

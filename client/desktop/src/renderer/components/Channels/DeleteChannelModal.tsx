@@ -1,7 +1,7 @@
 import React from 'react';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import { useChannelStore } from '../../stores/chat/channelStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { Channel } from '../../types/chat';
 
 interface DeleteChannelModalProps {

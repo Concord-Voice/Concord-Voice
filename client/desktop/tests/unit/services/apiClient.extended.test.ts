@@ -21,7 +21,7 @@ const {
   stopProactiveRefresh,
   _resetRefreshState,
   configureRefreshFailureReset,
-} = await import('@/renderer/services/apiClient');
+} = await import('@/renderer/services/system/apiClient');
 
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();

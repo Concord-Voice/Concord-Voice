@@ -16,7 +16,7 @@ import { mockChannel } from '../../../mocks/fixtures';
 // Mock the voice-participant API client to assert calls without network.
 const mockMove = vi.fn().mockResolvedValue({ ok: true });
 const mockDisconnect = vi.fn().mockResolvedValue({ ok: true });
-vi.mock('@/renderer/services/voiceParticipantApi', () => ({
+vi.mock('@/renderer/services/voice/voiceParticipantApi', () => ({
   moveVoiceParticipant: (...args: unknown[]) => mockMove(...args),
   disconnectVoiceParticipant: (...args: unknown[]) => mockDisconnect(...args),
 }));
@@ -29,7 +29,7 @@ vi.mock('@/renderer/services/voiceParticipantApi', () => ({
 // bare vi.fn() returns undefined, and `fetchEligibility` is `.then`-ed by the
 // hook, so an undefined default throws.
 const mockPeekEligibility = vi.fn().mockReturnValue('eligible');
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   fetchEligibility: vi.fn().mockResolvedValue('eligible'),
   peekEligibility: (userId: string) => mockPeekEligibility(userId),
   prefetchEligibility: vi.fn(),

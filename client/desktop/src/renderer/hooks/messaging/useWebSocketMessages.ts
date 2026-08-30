@@ -14,22 +14,22 @@ import { useMemberStore } from '../../stores/chat/memberStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
-import { getWebSocketService, ConnectionState } from '../../services/websocketService';
+import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';
 import {
   handleCallInvited,
   handleCallCanceled,
   handleCallDeclined,
   handleCallTimedOut,
-} from '../../services/voiceService/callStateMachine';
-import { voiceService } from '../../services/voiceService';
+} from '../../services/voice/voiceService/callStateMachine';
+import { voiceService } from '../../services/voice/voiceService';
 import type { PresenceSnapshotPayload, WebSocketEvent } from '../../types/ws-events';
-import { e2eeService } from '../../services/e2eeService';
-import { isPendingKeyError } from '../../services/e2eeErrors';
-import { preferencesSyncService } from '../../services/preferencesSync';
-import { savedGifsSyncService } from '../../services/savedGifsSync';
-import { friendOrgSyncService } from '../../services/friendOrgSync';
-import { presenceOverrideSyncService } from '../../services/presenceOverrideSync';
-import { apiFetch } from '../../services/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { isPendingKeyError } from '../../services/e2ee/e2eeErrors';
+import { preferencesSyncService } from '../../services/system/preferencesSync';
+import { savedGifsSyncService } from '../../services/system/savedGifsSync';
+import { friendOrgSyncService } from '../../services/system/friendOrgSync';
+import { presenceOverrideSyncService } from '../../services/system/presenceOverrideSync';
+import { apiFetch } from '../../services/system/apiClient';
 import { useVoiceStore, channelVoiceMemberFromApi } from '../../stores/voice/voiceStore';
 import { useConnectionStore } from '../../stores/ui/connectionStore';
 import { useDMStore } from '../../stores/chat/dmStore';
@@ -37,8 +37,8 @@ import { useFriendStore } from '../../stores/chat/friendStore';
 import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { useRichPresenceStore, type OtherPresenceByUser } from '../../stores/ui/richPresenceStore';
-import { speak as ttsSpeak } from '../../services/ttsService';
-import { notificationSoundService } from '../../services/notificationSoundService';
+import { speak as ttsSpeak } from '../../services/system/ttsService';
+import { notificationSoundService } from '../../services/system/notificationSoundService';
 import {
   isChannelMuted,
   isDMMuted,
@@ -59,14 +59,14 @@ import {
 function isDoNotDisturb(): boolean {
   return useMemberStore.getState().selfStatus === 'dnd';
 }
-import { indexMessage, removeMessage, removeScope } from '../../services/searchService';
+import { indexMessage, removeMessage, removeScope } from '../../services/messaging/searchService';
 import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
 import { formatMessagePreview } from '../../utils/messagePreview';
 import { summarizeWsServerError } from '../../utils/wsDiagnostics';
 import {
   desktopNotificationService,
   type NotificationType,
-} from '../../services/desktopNotificationService';
+} from '../../services/system/desktopNotificationService';
 
 type ChannelMessagePayload = Extract<WebSocketEvent, { type: 'message' }>['data'];
 type DMMessagePayload = Extract<WebSocketEvent, { type: 'dm_message' }>['data'];
@@ -944,7 +944,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // Message handler
     const unsubMessage = wsService.on('message', (msg) => {
       // msg.data is narrowed to MessagePayload (validated at the dispatch
-      // boundary via zod — see services/websocketService.ts handleMessage).
+      // boundary via zod — see services/messaging/websocketService.ts handleMessage).
       // channel_id and user_id are schema-required UUIDs, so the PR #704
       // hand-written runtime guards are now structurally guaranteed.
       const data = msg.data;
@@ -2346,7 +2346,7 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     });
 
     // ── DM voice call ring handlers (#1209 plan task E3) ─────────────────
-    // Each handler is implemented in services/voiceService/callStateMachine.ts
+    // Each handler is implemented in services/voice/voiceService/callStateMachine.ts
     // (Task E2); this hook just wires the dispatch boundary. Payloads are
     // schema-validated upstream in websocketService.handleMessage per
     // [internal]rules/frontend.md "WebSocket payload validation" — handlers

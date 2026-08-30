@@ -9,11 +9,11 @@ import {
 } from '@/renderer/utils/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 

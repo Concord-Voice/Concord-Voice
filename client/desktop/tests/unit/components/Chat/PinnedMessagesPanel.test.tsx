@@ -8,7 +8,7 @@ import type { MessageWithUser } from '@/renderer/types/chat';
 // Mock pin service
 const mockGetChannelPins = vi.fn();
 const mockUnpinMessage = vi.fn();
-vi.mock('@/renderer/services/pinService', () => ({
+vi.mock('@/renderer/services/messaging/pinService', () => ({
   getChannelPins: (...args: unknown[]) => mockGetChannelPins(...args),
   unpinMessage: (...args: unknown[]) => mockUnpinMessage(...args),
 }));
@@ -21,7 +21,7 @@ const mockGetChannelKeyByVersion = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
 const mockOperationGuard = { assertCurrent: vi.fn() };
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     createChannelOperationGuard: vi.fn(() => mockOperationGuard),
@@ -60,7 +60,7 @@ const mockPins: MessageWithUser[] = [
 ];
 
 async function enableE2EE() {
-  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   Object.defineProperty(e2eeService, 'isInitialized', { value: true, writable: true });
 }
 
@@ -76,7 +76,7 @@ describe('PinnedMessagesPanel', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     // Reset isInitialized to false before each test (enableE2EE persists via defineProperty)
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     Object.defineProperty(e2eeService, 'isInitialized', { value: false, writable: true });
     mockGetChannelPins.mockResolvedValue(mockPins);
     mockUnpinMessage.mockResolvedValue({ message_id: 'pin-1' });

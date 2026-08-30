@@ -4,9 +4,13 @@
  * and the getMessageQueue singleton.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { MessageQueue, MessageStatus, getMessageQueue } from '@/renderer/services/messageQueue';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import {
+  MessageQueue,
+  MessageStatus,
+  getMessageQueue,
+} from '@/renderer/services/messaging/messageQueue';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
 describe('MessageQueue — extended', () => {
   let queue: MessageQueue;

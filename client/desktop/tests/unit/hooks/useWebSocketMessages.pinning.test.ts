@@ -7,7 +7,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel, mockMessage } from '../../mocks/fixtures';
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
     hasKey: vi.fn().mockReturnValue(false),
@@ -17,17 +17,17 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({ speak: vi.fn() }));
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/ttsService', () => ({ speak: vi.fn() }));
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ participants: [] }),
   }),
 }));
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: vi.fn(),
     playLoop: vi.fn(),

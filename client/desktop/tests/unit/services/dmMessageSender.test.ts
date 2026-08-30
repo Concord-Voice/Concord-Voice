@@ -1,15 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { sendDMMessage } from '@/renderer/services/dmMessageSender';
+import { sendDMMessage } from '@/renderer/services/messaging/dmMessageSender';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { mockUser } from '../../mocks/fixtures';
-import { ConnectionState } from '@/renderer/services/websocketService';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 
 const mockSendDMMessage = vi.fn();
 const mockGetState = vi.fn(() => ConnectionState.CONNECTED);
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     sendDMMessage: mockSendDMMessage,
     getState: mockGetState,
@@ -27,7 +27,7 @@ const mockRemove = vi.fn();
 const mockMarkAsFailed = vi.fn();
 const mockMarkAsTerminallyFailed = vi.fn();
 
-vi.mock('@/renderer/services/messageQueue', () => ({
+vi.mock('@/renderer/services/messaging/messageQueue', () => ({
   getMessageQueue: () => ({
     enqueue: mockEnqueue,
     markAsSent: mockMarkAsSent,
@@ -38,7 +38,7 @@ vi.mock('@/renderer/services/messageQueue', () => ({
 }));
 
 const mockEncryptForChannel = vi.fn();
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
     getCurrentKeyVersion: () => undefined,

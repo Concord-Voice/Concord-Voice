@@ -9,7 +9,7 @@ const { mockInit, mockDestroy, mockRegisterHandler } = vi.hoisted(() => ({
   mockRegisterHandler: vi.fn(),
 }));
 
-vi.mock('../../../src/renderer/services/keyboardShortcutService', () => ({
+vi.mock('../../../src/renderer/services/system/keyboardShortcutService', () => ({
   keyboardShortcutService: {
     init: mockInit,
     destroy: mockDestroy,

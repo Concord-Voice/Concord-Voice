@@ -21,7 +21,7 @@ vi.stubGlobal('Audio', MockAudio);
 
 // Import after mocking
 const { notificationSoundService } =
-  await import('../../../src/renderer/services/notificationSoundService');
+  await import('../../../src/renderer/services/system/notificationSoundService');
 
 describe('NotificationSoundService', () => {
   beforeEach(() => {

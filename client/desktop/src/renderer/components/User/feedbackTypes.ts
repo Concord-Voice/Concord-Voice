@@ -1,4 +1,4 @@
-import { type SystemInfo } from '../../services/systemInfoService';
+import { type SystemInfo } from '../../services/system/systemInfoService';
 
 /**
  * Shared feedback type contracts (#158 infra, consumed by #159 bug panel and

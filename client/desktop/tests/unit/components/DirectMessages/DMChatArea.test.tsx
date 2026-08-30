@@ -13,7 +13,7 @@ const mockApiFetch = vi.fn().mockResolvedValue({
   ok: true,
   json: async () => ({ messages: [] }),
 });
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
   API_BASE: 'http://localhost:8080',
@@ -149,7 +149,7 @@ vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
 const mockGetPins = vi.fn().mockResolvedValue([]);
 const mockPinMessage = vi.fn().mockResolvedValue({});
 const mockUnpinMessage = vi.fn().mockResolvedValue({});
-vi.mock('@/renderer/services/pinService', () => ({
+vi.mock('@/renderer/services/messaging/pinService', () => ({
   pinMessage: (...args: unknown[]) => mockPinMessage(...args),
   unpinMessage: (...args: unknown[]) => mockUnpinMessage(...args),
   getPins: (...args: unknown[]) => mockGetPins(...args),
@@ -161,7 +161,7 @@ const mockEncryptForChannelWithVersion = vi.fn().mockResolvedValue({
   keyVersion: 2,
 });
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     createChannelOperationGuard: vi.fn(() => ({ assertCurrent: vi.fn() })),
@@ -176,13 +176,13 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 // Mock voiceService — the "Join voice call" affordance (#1219 R5) calls
 // voiceService.joinChannel on click.
 const mockJoinChannel = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     joinChannel: (...args: unknown[]) => mockJoinChannel(...args),
   },
 }));
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: vi.fn().mockReturnValue({
     getState: vi.fn().mockReturnValue('disconnected'),
     sendMessage: vi.fn(),
@@ -200,7 +200,7 @@ vi.mock('@/renderer/services/websocketService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/messageQueue', () => ({
+vi.mock('@/renderer/services/messaging/messageQueue', () => ({
   getMessageQueue: vi.fn().mockReturnValue({
     enqueue: vi.fn().mockReturnValue('client-msg-1'),
     markAsSent: vi.fn(),
@@ -813,7 +813,7 @@ describe('DMChatArea', () => {
   });
 
   it('does not send message when no thread is selected', async () => {
-    const { getMessageQueue } = await import('@/renderer/services/messageQueue');
+    const { getMessageQueue } = await import('@/renderer/services/messaging/messageQueue');
     const mockQueue = getMessageQueue({}) as ReturnType<typeof getMessageQueue>;
 
     // Render with a thread first to get the input, then we need to test null guard

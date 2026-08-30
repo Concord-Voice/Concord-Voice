@@ -18,7 +18,7 @@ vi.mock('@/renderer/components/Markdown/MarkdownContent', () => ({
 }));
 
 // Mock the e2eeService with controllable getChannelKey
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn(),
     decryptForChannel: vi.fn(),
@@ -63,7 +63,7 @@ const sampleAttachment: AttachmentSummary = {
 
 async function setupDecryptFile(plaintextString: string) {
   const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
-  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   const mockKey = {} as CryptoKey;
   (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue(mockKey);
   (decryptFile as ReturnType<typeof vi.fn>).mockResolvedValue(enc.encode(plaintextString).buffer);
@@ -102,7 +102,7 @@ describe('OverflowMarkdownAttachment', () => {
   // 2. Loading state appears after clicking Expand
   // -------------------------------------------------------------------------
   it('shows a loading spinner after clicking Expand', async () => {
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     // getChannelKey never resolves → component stays in loading state
     (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockReturnValue(
       new Promise(() => {
@@ -237,7 +237,7 @@ describe('OverflowMarkdownAttachment', () => {
   // -------------------------------------------------------------------------
   it('memoizes decrypted content — re-expand after collapse does not re-decrypt', async () => {
     const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const mockKey = {} as CryptoKey;
     const decryptSpy = vi.fn().mockResolvedValue(enc.encode('full content').buffer as ArrayBuffer);
     (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue(mockKey);
@@ -282,7 +282,7 @@ describe('OverflowMarkdownAttachment', () => {
   // 7. Unmount during in-flight expand does not trigger setState warnings
   // -------------------------------------------------------------------------
   it('does not setState after unmount during in-flight expand', async () => {
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
 
     // Mock getChannelKey to resolve (so fetch completes) but decryptFile to hang forever
@@ -397,7 +397,7 @@ describe('OverflowMarkdownAttachment', () => {
   // -------------------------------------------------------------------------
   it('focuses the Collapse button after entering rendered state', async () => {
     const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const mockKey = {} as CryptoKey;
     (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue(mockKey);
     (decryptFile as ReturnType<typeof vi.fn>).mockResolvedValue(

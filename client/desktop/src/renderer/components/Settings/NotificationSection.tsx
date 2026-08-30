@@ -9,7 +9,7 @@ import CollapsibleSection from './CollapsibleSection';
 import {
   notificationSoundService,
   type NotificationSoundType,
-} from '../../services/notificationSoundService';
+} from '../../services/system/notificationSoundService';
 
 const SOUND_PREVIEW_DEBOUNCE_MS = 200;
 

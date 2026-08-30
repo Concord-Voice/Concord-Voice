@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import CategoryManagerPanel from '../DirectMessages/CategoryManagerPanel';

@@ -7,11 +7,11 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { mockServer, mockChannel, mockUser } from '../../../mocks/fixtures';
 
 // Mock apiFetch to avoid timing issues in jsdom
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     createChannelKeys: vi.fn(),
@@ -25,8 +25,8 @@ vi.mock('emoji-picker-react', () => ({
   default: () => <div data-testid="emoji-picker" />,
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { apiFetch } from '@/renderer/services/system/apiClient';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import CreateChannelModal from '@/renderer/components/Channels/CreateChannelModal';
 
 const mockedApiFetch = vi.mocked(apiFetch);

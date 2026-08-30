@@ -9,7 +9,7 @@ import {
   getPresenceHistorySettings,
   patchPresenceHistorySettings,
   type PresenceHistorySettingsMutation,
-} from '@/renderer/services/presenceHistoryService';
+} from '@/renderer/services/system/presenceHistoryService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 

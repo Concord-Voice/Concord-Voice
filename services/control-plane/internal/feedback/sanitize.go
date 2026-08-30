@@ -4,7 +4,7 @@
 // posted to a dedicated feedback repo on GitHub via the REST issues API.
 //
 // This file implements server-side PII re-sanitization. The client also
-// scrubs at capture time (client/desktop/src/renderer/services/logBufferService.ts),
+// scrubs at capture time (client/desktop/src/renderer/services/system/logBufferService.ts),
 // but defense-in-depth dictates a second pass here — the server is the last
 // line before a public-ish GitHub issue is created. A compromised client
 // could submit unscrubbed bytes; this pass denies that.

@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { Smile } from 'lucide-react';
 import type { ReactionSummary } from '../../types/chat';
-import { toggleReaction } from '../../services/reactionService';
+import { toggleReaction } from '../../services/messaging/reactionService';
 import LazyEmojiPicker from '../EmojiPicker/LazyEmojiPicker';
 import './ReactionBar.css';
 

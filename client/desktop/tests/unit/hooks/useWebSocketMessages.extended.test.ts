@@ -20,7 +20,7 @@ import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 
 // Mock services
 const mockInvalidateChannelKey = vi.fn();
@@ -28,7 +28,7 @@ const mockProcessPendingKeyRequests = vi.fn().mockResolvedValue(undefined);
 const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     invalidateChannelKey: (...args: unknown[]) => mockInvalidateChannelKey(...args),
@@ -39,15 +39,15 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({
+vi.mock('@/renderer/services/system/ttsService', () => ({
   speak: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: vi.fn(),
     playLoop: vi.fn(),
@@ -58,7 +58,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ participants: [] }),
@@ -66,8 +66,8 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
-import { notificationSoundService } from '@/renderer/services/notificationSoundService';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
+import { notificationSoundService } from '@/renderer/services/system/notificationSoundService';
 import { createMockWsService } from '../../helpers/wsServiceMock';
 
 // Build a mock wsService with on() that captures handlers

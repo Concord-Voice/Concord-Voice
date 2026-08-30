@@ -5,7 +5,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 vi.mock('@/renderer/components/ui/EnforcementMenuItems.css', () => ({}));
 
 const mockApiFetch = vi.fn().mockResolvedValue({});
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 

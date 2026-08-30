@@ -9,7 +9,7 @@ import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
@@ -27,7 +27,7 @@ import {
   ensureMachineId,
   revokeAbortedSession,
   configureRefreshFailureReset,
-} from '@/renderer/services/apiClient';
+} from '@/renderer/services/system/apiClient';
 
 describe('apiClient', () => {
   beforeEach(() => {

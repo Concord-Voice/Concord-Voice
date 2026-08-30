@@ -7,7 +7,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
 }));
 

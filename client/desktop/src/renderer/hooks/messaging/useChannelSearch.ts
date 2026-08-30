@@ -9,8 +9,8 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useChatStore } from '../../stores/chat/chatStore';
-import { apiFetch, safeJson } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import {
   searchMessages,
   searchMessagesMultiScope,
@@ -21,7 +21,7 @@ import {
   subscribeSearchResultInvalidations,
   subscribeSearchScopeInvalidations,
   type SearchBackfillGuard,
-} from '../../services/searchService';
+} from '../../services/messaging/searchService';
 import type { MessageWithStatus, MessageWithUser } from '../../types/chat';
 import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
 

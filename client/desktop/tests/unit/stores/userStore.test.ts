@@ -3,7 +3,7 @@ import { http, HttpResponse } from 'msw';
 const API_BASE = 'http://localhost:8080';
 const logoutOrder = vi.hoisted(() => [] as string[]);
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     disconnect: vi.fn(() => logoutOrder.push('websocket-disconnect')),
     sendProfileUpdate: vi.fn(),
@@ -11,7 +11,7 @@ vi.mock('@/renderer/services/websocketService', () => ({
   ConnectionState: { CONNECTED: 'connected', DISCONNECTED: 'disconnected' },
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     clearKeys: vi.fn(() => logoutOrder.push('e2ee-clear')),
     isInitialized: false,
@@ -19,7 +19,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: {
     init: vi.fn(),
     startWatching: vi.fn(),
@@ -29,7 +29,7 @@ vi.mock('@/renderer/services/preferencesSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/savedGifsSync', () => ({
+vi.mock('@/renderer/services/system/savedGifsSync', () => ({
   savedGifsSyncService: {
     startWatching: vi.fn(),
     stopWatching: vi.fn(() => logoutOrder.push('saved-gifs-stop')),
@@ -37,7 +37,7 @@ vi.mock('@/renderer/services/savedGifsSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/friendOrgSync', () => ({
+vi.mock('@/renderer/services/system/friendOrgSync', () => ({
   friendOrgSyncService: {
     startWatching: vi.fn(),
     stopWatching: vi.fn(() => logoutOrder.push('friend-org-stop')),
@@ -45,14 +45,14 @@ vi.mock('@/renderer/services/friendOrgSync', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: {
     reset: vi.fn(() => logoutOrder.push('presence-override-reset')),
     fetchAndApply: vi.fn().mockResolvedValue(true),
   },
 }));
 
-vi.mock('@/renderer/services/resetService', () => ({
+vi.mock('@/renderer/services/system/resetService', () => ({
   gracefulReset: vi.fn(),
   nuclearReset: vi.fn(),
 }));
@@ -67,15 +67,15 @@ vi.mock('@/renderer/stores/ui/colorSyncSuppression', () => ({
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { setSyncSuppressed } from '@/renderer/stores/ui/colorSyncSuppression';
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
-import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
-import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
-import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
-import { configureRefreshFailureReset } from '@/renderer/services/apiClient';
-import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
-import { beginPostLoginHydrationGuard } from '@/renderer/services/postLoginHydrationLifecycle';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
+import { savedGifsSyncService } from '@/renderer/services/system/savedGifsSync';
+import { friendOrgSyncService } from '@/renderer/services/system/friendOrgSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
+import { gracefulReset, nuclearReset } from '@/renderer/services/system/resetService';
+import { configureRefreshFailureReset } from '@/renderer/services/system/apiClient';
+import { hydratePostLogin } from '@/renderer/services/system/postLoginHydration';
+import { beginPostLoginHydrationGuard } from '@/renderer/services/system/postLoginHydrationLifecycle';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockUser } from '../../mocks/fixtures';
 import { server } from '../../mocks/server';

@@ -1,25 +1,25 @@
 // @vitest-environment node
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { parseAv1Obus as parseAv1ObusForTest } from '@/renderer/services/av1ObuParser';
+import { parseAv1Obus as parseAv1ObusForTest } from '@/renderer/services/e2ee/av1ObuParser';
 import {
   MEDIA_FRAME_MINI_HEADER_SIZE,
   decodeMediaFrameMiniHeader as decodeMediaFrameMiniHeaderForTest,
-} from '@/renderer/services/mediaFrameMiniHeader';
+} from '@/renderer/services/e2ee/mediaFrameMiniHeader';
 import {
   findH264SlicePrefixLength,
   parseH264AnnexB,
   stuffH264Bytes,
   unstuffH264Bytes,
-} from '@/renderer/services/h264NalUnit';
+} from '@/renderer/services/e2ee/h264NalUnit';
 
 // MediaEncryption is the default export-less class — import directly
-let MediaEncryption: typeof import('@/renderer/services/mediaEncryption').MediaEncryption;
-let deriveFrameKey: typeof import('@/renderer/services/mediaEncryption').deriveFrameKey;
-let ratchetKey: typeof import('@/renderer/services/mediaEncryption').ratchetKey;
-let FrameKeyMissError: typeof import('@/renderer/services/mediaEncryption').FrameKeyMissError;
+let MediaEncryption: typeof import('@/renderer/services/e2ee/mediaEncryption').MediaEncryption;
+let deriveFrameKey: typeof import('@/renderer/services/e2ee/mediaEncryption').deriveFrameKey;
+let ratchetKey: typeof import('@/renderer/services/e2ee/mediaEncryption').ratchetKey;
+let FrameKeyMissError: typeof import('@/renderer/services/e2ee/mediaEncryption').FrameKeyMissError;
 
 beforeEach(async () => {
-  const mod = await import('@/renderer/services/mediaEncryption');
+  const mod = await import('@/renderer/services/e2ee/mediaEncryption');
   MediaEncryption = mod.MediaEncryption;
   deriveFrameKey = mod.deriveFrameKey;
   ratchetKey = mod.ratchetKey;
@@ -949,7 +949,7 @@ describe('version-keyed frame trailer (introduced in v3 by #1878)', () => {
 
 describe('v5 whole-frame (VP9/VP8/Opus unchanged behavior, version-stamped)', () => {
   it('advertises crypto version 5', async () => {
-    const mod = await import('@/renderer/services/mediaEncryption');
+    const mod = await import('@/renderer/services/e2ee/mediaEncryption');
     expect(mod.MEDIA_E2EE_FRAME_CRYPTO_VERSION).toBe(5);
   });
 

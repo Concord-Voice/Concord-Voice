@@ -4,11 +4,11 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
 import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { API_BASE } from '@/renderer/config';
-import { getApiBase, resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
+import { getApiBase, resetRuntimeServerBase } from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 const resetAndRefreshRuntimeServerMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
-vi.mock('@/renderer/services/clientConfigService', () => ({
+vi.mock('@/renderer/services/system/clientConfigService', () => ({
   clientConfigService: {
     resetAndRefreshRuntimeServer: resetAndRefreshRuntimeServerMock,
   },

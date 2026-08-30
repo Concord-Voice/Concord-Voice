@@ -25,7 +25,7 @@ const mockGetConsumerIdBySource = vi.fn().mockReturnValue(null);
 const mockReportPreferredLayers = vi.fn().mockResolvedValue(undefined);
 let mockOnStateUpdate: ((msg: any) => void) | null = null;
 
-vi.mock('@/renderer/services/pipVoiceClient', () => ({
+vi.mock('@/renderer/services/voice/pipVoiceClient', () => ({
   PipVoiceClient: vi.fn().mockImplementation(function (this: any) {
     this.init = mockInit;
     this.dispose = mockDispose;

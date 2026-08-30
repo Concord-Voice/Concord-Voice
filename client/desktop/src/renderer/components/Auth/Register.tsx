@@ -5,12 +5,12 @@ import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
-import { ensureMachineId } from '../../services/apiClient';
-import { apiUrl } from '../../services/runtimeServerBase';
-import { e2eeService } from '../../services/e2eeService';
+import { ensureMachineId } from '../../services/system/apiClient';
+import { apiUrl } from '../../services/system/runtimeServerBase';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
-import { abandonSSOReservation } from '../../services/ssoService';
+import { abandonSSOReservation } from '../../services/system/ssoService';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import {
   usePendingRegistrationStore,

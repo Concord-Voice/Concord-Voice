@@ -75,7 +75,7 @@ vi.mock('@/renderer/hooks/ui/useEntitlement', () => ({
   ),
 }));
 
-vi.mock('@/renderer/services/mediaCapabilities', () => ({
+vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   codecKey: vi.fn((c: { mimeType: string; profileId?: string | null }) =>
     c.profileId ? `${c.mimeType}:${c.profileId}` : c.mimeType
   ),
@@ -129,7 +129,7 @@ import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSectio
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useDraftVideoSetting } from '@/renderer/hooks/ui/useDraftSettings';
-import { getCodecInfo } from '@/renderer/services/mediaCapabilities';
+import { getCodecInfo } from '@/renderer/services/voice/mediaCapabilities';
 
 // ─── Test codec data ────────────────────────────────────────────────────────
 

@@ -8,7 +8,7 @@ import {
   encodeObuMiniHeader,
   decodeObuMiniHeader,
   buildObuIv,
-} from '@/renderer/services/mediaFrameMiniHeader';
+} from '@/renderer/services/e2ee/mediaFrameMiniHeader';
 
 describe('mediaFrameMiniHeader', () => {
   it('exposes codec-neutral aliases without changing the 22-byte layout', () => {

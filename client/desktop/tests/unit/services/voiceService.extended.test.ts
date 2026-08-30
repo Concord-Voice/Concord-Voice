@@ -7,7 +7,7 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing voiceService
@@ -81,7 +81,7 @@ vi.mock('socket.io-client', () => ({
 
 // --- apiClient ---
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 
@@ -91,7 +91,7 @@ const mockInvalidateChannelKey = vi.fn();
 const mockGetChannelKeyVersion = vi.fn().mockReturnValue(0);
 const mockGetChannelKeyByVersion = vi.fn().mockResolvedValue({} as CryptoKey);
 const mockOnKeyRotation = vi.fn().mockReturnValue(() => {});
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: (...args: unknown[]) => mockGetChannelKey(...args),
     getChannelKeyMaterial: async (...args: unknown[]) => ({
@@ -118,7 +118,7 @@ const mockAddDecryptKeyAtVersion = vi.fn().mockResolvedValue(undefined);
 const mockDebouncedRotateKeys = vi.fn();
 const mockCatchUpToEpoch = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('@/renderer/services/mediaEncryption', () => ({
+vi.mock('@/renderer/services/e2ee/mediaEncryption', () => ({
   // Mirror the live media-frame crypto version so the join-version self-check
   // (advertise === ack) stays consistent with production.
   MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
@@ -289,7 +289,7 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
-const { voiceService } = await import('@/renderer/services/voiceService');
+const { voiceService } = await import('@/renderer/services/voice/voiceService');
 
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -1710,7 +1710,7 @@ describe('VoiceService Extended', () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
       // Manually set encryption state for the test
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       mockGetCurrentKeyId.mockReturnValue(2);
 
@@ -1723,7 +1723,7 @@ describe('VoiceService Extended', () => {
     it('pre-installs participant decrypt keys for the server epoch before catch-up', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       useVoiceStore.getState().addParticipant({
         userId: 'user-2',
@@ -2424,7 +2424,7 @@ describe('VoiceService Extended', () => {
     it('delegates to mediaEncryption on legacy path', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
 
       svc.debouncedRotateE2EEKeys();
@@ -2453,7 +2453,7 @@ describe('VoiceService Extended', () => {
     it('retries on failure and returns true on success', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
 
       const result = await svc.addDecryptKeyForUser('channel-1', 'u2');
@@ -2464,7 +2464,7 @@ describe('VoiceService Extended', () => {
     it('returns false after all retries exhausted', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       mockGetChannelKey.mockRejectedValue(new Error('key unavailable'));
 
@@ -2484,7 +2484,7 @@ describe('VoiceService Extended', () => {
     it('throws when epoch exceeds ratchet limit', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       mockGetCurrentKeyId.mockReturnValue(101);
 
@@ -2510,7 +2510,7 @@ describe('VoiceService Extended', () => {
     it('handles rotationComplete message', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
 
       svc.handleWorkerMessage({ type: 'rotationComplete', newKeyId: 5 });
@@ -2520,7 +2520,7 @@ describe('VoiceService Extended', () => {
     it('handles requestRecovery message', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       useVoiceStore.getState().setActiveChannel('ch1', 'General', 'srv1');
 
@@ -3044,7 +3044,7 @@ describe('VoiceService Extended', () => {
     it('destroys mediaEncryption', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       svc.cleanupTimersAndE2EE();
       expect(mockMediaEncryptionDestroy).toHaveBeenCalled();
@@ -3266,7 +3266,7 @@ describe('VoiceService Extended', () => {
     it('adds decrypt key and rotates keys', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       useVoiceStore.getState().setActiveChannel('channel-1', 'General', 'server-1');
 
@@ -3286,7 +3286,7 @@ describe('VoiceService Extended', () => {
     it('pre-installs the joining participant decrypt key for the next epoch before rotation', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       useVoiceStore.getState().setActiveChannel('channel-1', 'General', 'server-1');
       mockGetCurrentKeyId.mockReturnValue(2);
@@ -3306,7 +3306,7 @@ describe('VoiceService Extended', () => {
     it('uses the server epoch from user-joined when pre-installing the participant key', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       useVoiceStore.getState().setActiveChannel('channel-1', 'General', 'server-1');
       mockGetCurrentKeyId.mockReturnValue(2);
@@ -3329,7 +3329,7 @@ describe('VoiceService Extended', () => {
     it('removes participant and rotates keys', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
 
       useVoiceStore.getState().addParticipant({
@@ -3354,7 +3354,7 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
       const workerPostMessage = vi.fn();
       svc.e2eeWorker = { postMessage: workerPostMessage, terminate: vi.fn() };
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       mockGetCurrentKeyId.mockReturnValue(1);
 
@@ -3396,7 +3396,7 @@ describe('VoiceService Extended', () => {
       const svc = voiceService as any;
       const workerPostMessage = vi.fn();
       svc.e2eeWorker = { postMessage: workerPostMessage, terminate: vi.fn() };
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       mockGetCurrentKeyId.mockReturnValue(4);
 
@@ -3434,7 +3434,7 @@ describe('VoiceService Extended', () => {
     it('logs authoritative leave epoch catch-up failures', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
       mockGetCurrentKeyId.mockReturnValue(1);
       mockCatchUpToEpoch.mockRejectedValueOnce(new Error('catch-up failed'));
@@ -3472,7 +3472,7 @@ describe('VoiceService Extended', () => {
     it('ensures decrypt key before consuming', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
-      const { MediaEncryption } = await import('@/renderer/services/mediaEncryption');
+      const { MediaEncryption } = await import('@/renderer/services/e2ee/mediaEncryption');
       svc.mediaEncryption = new MediaEncryption();
 
       useVoiceStore.getState().addParticipant({

@@ -15,17 +15,17 @@ const { mockApiFetch, mockUser, mockE2EE } = vi.hoisted(() => ({
   mockE2EE: { isInitialized: true, signAgeClaim: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (path: string, init?: RequestInit) => mockApiFetch(path, init),
 }));
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: mockE2EE,
 }));
 vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: { getState: () => mockUser },
 }));
 
-import { submitSignedAgeClaim } from '@/renderer/services/ageClaim/ageClaimService';
+import { submitSignedAgeClaim } from '@/renderer/services/system/ageClaim/ageClaimService';
 
 const USER_ID = '11111111-1111-4111-8111-111111111111';
 const BIRTH_YEAR = 2008;

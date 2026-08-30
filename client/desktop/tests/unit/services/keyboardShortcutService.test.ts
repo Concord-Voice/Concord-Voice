@@ -11,7 +11,7 @@ vi.mock('../../../src/renderer/stores/ui/keyboardShortcutStore', () => ({
 
 // Import after mocking
 const { keyboardShortcutService } =
-  await import('../../../src/renderer/services/keyboardShortcutService');
+  await import('../../../src/renderer/services/system/keyboardShortcutService');
 
 /** Helper to build a shortcut definition for tests */
 function makeShortcut(overrides: Partial<ShortcutDefinition> = {}): ShortcutDefinition {

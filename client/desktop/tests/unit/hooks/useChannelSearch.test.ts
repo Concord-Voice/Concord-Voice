@@ -7,7 +7,7 @@ import type { MessageWithStatus, MessageWithUser } from '@/renderer/types/chat';
 // Mock apiFetch and safeJson
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
 }));
@@ -17,7 +17,7 @@ const mockDecryptForChannel = vi.fn();
 const mockDecryptForChannelWithVersion = vi.fn();
 let mockE2eeInitialized = true;
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return mockE2eeInitialized;
@@ -45,7 +45,7 @@ const mockSubscribeScopeInvalidations = vi.fn((listener: (scope: string | null) 
   return vi.fn();
 });
 
-vi.mock('@/renderer/services/searchService', () => ({
+vi.mock('@/renderer/services/messaging/searchService', () => ({
   searchMessages: (...args: unknown[]) => mockSearchMessages(...args),
   searchMessagesMultiScope: (...args: unknown[]) => mockSearchMessagesMultiScope(...args),
   indexMessage: (...args: unknown[]) => mockIndexMessage(...args),

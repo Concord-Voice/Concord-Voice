@@ -19,7 +19,7 @@ const { setRemoteVideoRenderState, removeRemoteVideoTile } = vi.hoisted(() => ({
   setRemoteVideoRenderState: vi.fn(),
   removeRemoteVideoTile: vi.fn(),
 }));
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { setRemoteVideoRenderState, removeRemoteVideoTile },
 }));
 

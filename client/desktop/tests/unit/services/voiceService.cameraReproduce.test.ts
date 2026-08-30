@@ -64,11 +64,11 @@ vi.mock('socket.io-client', () => ({
   io: vi.fn().mockReturnValue(mockSocket),
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
     getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
@@ -79,7 +79,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/mediaEncryption', () => ({
+vi.mock('@/renderer/services/e2ee/mediaEncryption', () => ({
   MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
     init = vi.fn().mockResolvedValue(undefined);
@@ -147,7 +147,7 @@ Object.defineProperty(navigator, 'mediaDevices', {
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
-const { voiceService } = await import('@/renderer/services/voiceService');
+const { voiceService } = await import('@/renderer/services/voice/voiceService');
 
 // ---------------------------------------------------------------------------
 // mediasoup-FAITHFUL mock factories

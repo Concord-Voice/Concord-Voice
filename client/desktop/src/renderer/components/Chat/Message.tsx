@@ -12,7 +12,7 @@ import ReactionBar from './ReactionBar';
 import ReplyPreviewBar from './ReplyPreviewBar';
 import MessageContextMenu from './MessageContextMenu';
 import LazyEmojiPicker from '../EmojiPicker/LazyEmojiPicker';
-import { toggleReaction } from '../../services/reactionService';
+import { toggleReaction } from '../../services/messaging/reactionService';
 import DeleteMessageModal from './DeleteMessageModal';
 import {
   getEmojiOnlyCount,

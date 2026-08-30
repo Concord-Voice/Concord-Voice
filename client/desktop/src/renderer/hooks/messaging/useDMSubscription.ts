@@ -5,7 +5,7 @@
  */
 
 import { useEffect } from 'react';
-import { getWebSocketService } from '../../services/websocketService';
+import { getWebSocketService } from '../../services/messaging/websocketService';
 import { useChatStore } from '../../stores/chat/chatStore';
 
 /**

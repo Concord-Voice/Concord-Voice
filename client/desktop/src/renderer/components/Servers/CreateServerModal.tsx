@@ -7,7 +7,7 @@ import IconUploadArea from './IconUploadArea';
 import BannerUploadArea from './BannerUploadArea';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useServerStore } from '../../stores/chat/serverStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { ServerWithRole } from '../../types/server';
 import {
   MAX_ICON_SIZE,

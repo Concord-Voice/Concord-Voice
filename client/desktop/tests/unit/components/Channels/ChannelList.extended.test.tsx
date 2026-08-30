@@ -15,7 +15,7 @@ import { mockChannel } from '../../../mocks/fixtures';
 import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';
 import type { Channel, ChannelGroup } from '@/renderer/types/chat';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }),
   API_BASE: 'http://localhost:3001',
 }));

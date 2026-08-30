@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { collect } from '@/renderer/services/systemInfoService';
+import { collect } from '@/renderer/services/system/systemInfoService';
 
 // Mock connection store before importing it via the service.
 vi.mock('@/renderer/stores/ui/connectionStore', () => ({

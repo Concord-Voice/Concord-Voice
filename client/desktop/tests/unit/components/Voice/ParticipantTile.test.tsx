@@ -7,7 +7,7 @@ vi.mock('@/renderer/components/Voice/ParticipantTile.css', () => ({}));
 vi.mock('@/renderer/components/Voice/ParticipantVolumeRow.css', () => ({}));
 vi.mock('@/renderer/components/ui/ContextMenu.css', () => ({}));
 vi.mock('@/renderer/components/ui/EnforcementMenuItems.css', () => ({}));
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({}),
 }));
 vi.mock('@/renderer/hooks/ui/useUserThemeScope', () => ({

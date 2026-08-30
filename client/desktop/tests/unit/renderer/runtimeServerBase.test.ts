@@ -11,7 +11,7 @@ import {
   resetRuntimeServerBase,
   runtimeServerSelectionIsCurrent,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 
 describe('runtimeServerBase', () => {

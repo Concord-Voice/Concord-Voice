@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Download, FileText, Film, Music, File, Loader2, Maximize2 } from 'lucide-react';
-import { apiFetch } from '../../services/apiClient';
-import { e2eeService } from '../../services/e2eeService';
+import { apiFetch } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import {
   parseKeyVersionHeader,
   AttachmentKeyEpochError,

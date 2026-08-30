@@ -7,7 +7,7 @@ import { vi } from 'vitest';
 
 // ── Service mock ─────────────────────────────────────────────────────────────
 const mockTuneOut = vi.fn();
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: {
     tuneOutOfScreenShare: mockTuneOut,
   },

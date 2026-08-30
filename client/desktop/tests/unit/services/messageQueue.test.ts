@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { MessageQueue, MessageStatus } from '@/renderer/services/messageQueue';
+import { MessageQueue, MessageStatus } from '@/renderer/services/messaging/messageQueue';
 
 describe('MessageQueue', () => {
   let queue: MessageQueue;

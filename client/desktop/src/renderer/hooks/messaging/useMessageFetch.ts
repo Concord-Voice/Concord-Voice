@@ -1,10 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useChatStore } from '../../stores/chat/chatStore';
-import { apiFetch, safeJson } from '../../services/apiClient';
-import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2eeService';
-import { isPendingKeyError } from '../../services/e2eeErrors';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
+import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2ee/e2eeService';
+import { isPendingKeyError } from '../../services/e2ee/e2eeErrors';
 import type { MessageWithStatus } from '../../types/chat';
-import { indexMessages, subscribeSearchResultInvalidations } from '../../services/searchService';
+import {
+  indexMessages,
+  subscribeSearchResultInvalidations,
+} from '../../services/messaging/searchService';
 import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
 
 const DEFAULT_LIMIT = 50;

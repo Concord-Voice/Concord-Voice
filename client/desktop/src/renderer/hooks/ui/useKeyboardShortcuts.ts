@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { keyboardShortcutService } from '../../services/keyboardShortcutService';
+import { keyboardShortcutService } from '../../services/system/keyboardShortcutService';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { useKeyboardShortcutStore } from '../../stores/ui/keyboardShortcutStore';
 import { useChannelStore } from '../../stores/chat/channelStore';

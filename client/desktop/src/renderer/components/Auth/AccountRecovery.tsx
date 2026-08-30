@@ -11,7 +11,7 @@ import {
   deriveSharedSecret,
   decryptWithSharedSecret,
 } from '../../utils/crypto';
-import { apiUrl } from '../../services/runtimeServerBase';
+import { apiUrl } from '../../services/system/runtimeServerBase';
 import { assertValidUUID, isValidUUID } from '../../utils/uuid';
 import LoadingSpinner from './LoadingSpinner';
 import './Login.css';

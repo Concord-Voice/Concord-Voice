@@ -39,7 +39,7 @@ const mockPresenceGetFetch = vi.fn(async () => ({
   json: async () => ({ custom_text_tier: 0, custom_text: '', custom_text_emoji: '' }),
   text: async () => JSON.stringify({ custom_text_tier: 0, custom_text: '', custom_text_emoji: '' }),
 }));
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => {
     // Short-circuit LinkedAccountsList's GET and the hydration GET so they
     // don't consume entries from the existing FIFO `mockResolvedValueOnce`
@@ -121,7 +121,7 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
     })
   ),
 }));
-vi.mock('@/renderer/services/gifProvider/klipyClient', () => ({
+vi.mock('@/renderer/services/messaging/gifProvider/klipyClient', () => ({
   klipyClient: {
     getCurrentCustomerId: vi.fn(() => 'mock-customer-id-123'),
     rotateCustomerId: vi.fn(() => Promise.resolve('mock-rotated-id-456')),

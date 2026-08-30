@@ -7,12 +7,12 @@ const mockDecryptForChannel = vi.fn();
 const mockApiFetch = vi.fn();
 const mockSafeJson = vi.fn();
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (...args: unknown[]) => mockSafeJson(...args),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return true;
@@ -35,7 +35,7 @@ import {
   removeMessage,
   removeScope,
   searchMessages,
-} from '@/renderer/services/searchService';
+} from '@/renderer/services/messaging/searchService';
 
 function makeMessage(): MessageWithUser {
   return {

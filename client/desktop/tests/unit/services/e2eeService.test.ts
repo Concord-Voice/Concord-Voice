@@ -5,20 +5,20 @@ import {
   generateChannelKey,
   wrapChannelKey,
 } from '@/renderer/utils/crypto';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 
 // Test the singleton and clear between tests
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
 // Mock apiFetch for channel key fetching
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
   API_BASE: 'http://localhost:8080',
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 const mockApiFetch = vi.mocked(apiFetch);
 
 describe('e2eeService', () => {

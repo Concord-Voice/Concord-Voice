@@ -16,7 +16,7 @@ const { mockSubmit, ageStatusRef } = vi.hoisted(() => ({
 // module and stays REAL so the outcome-branch logic is exercised end-to-end. The
 // useAgeStatus hook has its own MSW-backed tests; the rehydrate path is covered
 // end-to-end in NsfwContentGate.verifiedStatePersists.test.tsx (#1763).
-vi.mock('@/renderer/services/ageClaim/ageClaimService', () => ({
+vi.mock('@/renderer/services/system/ageClaim/ageClaimService', () => ({
   submitSignedAgeClaim: (input: unknown) => mockSubmit(input),
 }));
 vi.mock('@/renderer/hooks/ui/useAgeStatus', () => ({

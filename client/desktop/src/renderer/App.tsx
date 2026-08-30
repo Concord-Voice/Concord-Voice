@@ -34,9 +34,9 @@ import { useOsPermissionStore, type OsPermissionType } from './stores/voice/osPe
 import { useWebSocket } from './hooks/messaging/useWebSocket';
 import { useLaunchReset } from './hooks/ui/useLaunchReset';
 import SubscriptionResetModal from './components/Settings/SubscriptionResetModal';
-import { e2eeService } from './services/e2eeService';
-import { E2EEInitTeardownError } from './services/e2eeErrors';
-import { hydratePostLogin } from './services/postLoginHydration';
+import { e2eeService } from './services/e2ee/e2eeService';
+import { E2EEInitTeardownError } from './services/e2ee/e2eeErrors';
+import { hydratePostLogin } from './services/system/postLoginHydration';
 import { usePrivacyStore } from './stores/ui/privacyStore';
 // Side-effect import: this module owns the KLIPY personalization wiring —
 // it applies the privacy preference to the provider singleton and keeps it
@@ -44,15 +44,15 @@ import { usePrivacyStore } from './stores/ui/privacyStore';
 // this component) makes the wiring eager at app load, so surfaces that read
 // klipyClient directly — e.g. Settings > Content Safety — see the correct
 // state even when no GIF picker or embed has ever mounted.
-import './services/gifProvider';
-import { clientConfigService } from './services/clientConfigService';
-import { detectCodecCapabilities, prewarmWebRTC } from './services/mediaCapabilities';
+import './services/messaging/gifProvider';
+import { clientConfigService } from './services/system/clientConfigService';
+import { detectCodecCapabilities, prewarmWebRTC } from './services/voice/mediaCapabilities';
 import { useNotificationNavigationStore } from './stores/ui/notificationNavigationStore';
 import { useServerStore } from './stores/chat/serverStore';
 import { useChannelStore } from './stores/chat/channelStore';
 import { useDMStore } from './stores/chat/dmStore';
 import { useVoiceStore } from './stores/voice/voiceStore';
-import { desktopNotificationService } from './services/desktopNotificationService';
+import { desktopNotificationService } from './services/system/desktopNotificationService';
 import { usePendingRegistrationStore } from './stores/auth/pendingRegistrationStore';
 // resetService is eagerly registered by main.tsx; local dynamic imports resolve
 // from that loaded module while avoiding direct feature-module cycles.
@@ -109,12 +109,12 @@ export function AuthFallback() {
 
 /** Soft-restart on fatal render crash — preserves session, avoids nuclear reset. */
 export function handleAppRootError() {
-  import('./services/recoveryService')
+  import('./services/system/recoveryService')
     .then((m) => m.markRendererCrashed())
     .catch((err) => {
       console.error('[App] Failed to mark renderer crashed:', errorMessage(err));
     });
-  import('./services/resetService')
+  import('./services/system/resetService')
     .then((m) => m.softRestart())
     .catch((err) => {
       console.error('[App] Failed to soft-restart, forcing reload:', errorMessage(err));
@@ -159,7 +159,7 @@ async function clearOwnerlessRestoredCredential(
     console.warn('Failed to clear ownerless restored credential:', errorMessage(err));
   });
   await runRecoveryModule(
-    () => import('./services/resetService'),
+    () => import('./services/system/resetService'),
     (m) => m.gracefulReset(),
     'gracefulReset'
   );
@@ -263,7 +263,7 @@ function AuthenticatedLayout() {
   }, []);
 
   // Fetch privacy settings on login. The KLIPY personalization preference is
-  // applied by services/gifProvider (side-effect import above), which owns that
+  // applied by services/messaging/gifProvider (side-effect import above), which owns that
   // wiring and stays subscribed to the privacy store.
   useEffect(() => {
     if (!accessToken) return;
@@ -592,7 +592,7 @@ function App() {
         // If the user logs in fresh, new tokens overwrite the old files anyway.
         console.warn('[App] Session restore failed:', result.status);
         await runRecoveryModule(
-          () => import('./services/resetService'),
+          () => import('./services/system/resetService'),
           (m) => m.gracefulReset(),
           'gracefulReset'
         );

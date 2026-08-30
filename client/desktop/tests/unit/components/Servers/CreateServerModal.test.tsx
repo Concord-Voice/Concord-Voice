@@ -3,11 +3,11 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 
 // Mock apiFetch to avoid MSW timing issues in jsdom
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import CreateServerModal from '@/renderer/components/Servers/CreateServerModal';
 
 const mockedApiFetch = vi.mocked(apiFetch);

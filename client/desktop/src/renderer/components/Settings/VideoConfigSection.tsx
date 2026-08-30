@@ -7,14 +7,18 @@ import {
   type DegradationPreference,
   type VideoPriority,
 } from '../../stores/voice/videoSettingsStore';
-import { codecKey, getCodecInfo, type CodecCapability } from '../../services/mediaCapabilities';
+import {
+  codecKey,
+  getCodecInfo,
+  type CodecCapability,
+} from '../../services/voice/mediaCapabilities';
 import {
   buildCodecCandidates,
   codecPriority,
   isCodecKeyInFloor,
   selectCodecCandidate,
   type SelectedCodecCandidate,
-} from '../../services/voiceCodecSelection';
+} from '../../services/voice/voiceCodecSelection';
 import {
   humanizeProfileLabel,
   getCodecMetadata,

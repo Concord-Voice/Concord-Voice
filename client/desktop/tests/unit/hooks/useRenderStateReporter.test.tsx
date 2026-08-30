@@ -3,7 +3,7 @@ import { renderHook, waitFor, cleanup } from '@testing-library/react';
 
 const setRemoteVideoRenderState = vi.fn();
 const removeRemoteVideoTile = vi.fn();
-vi.mock('../../../src/renderer/services/voiceService', () => ({
+vi.mock('../../../src/renderer/services/voice/voiceService', () => ({
   voiceService: { setRemoteVideoRenderState, removeRemoteVideoTile },
 }));
 

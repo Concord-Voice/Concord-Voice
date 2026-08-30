@@ -5,7 +5,7 @@ import { vi, describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } 
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
-import { resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
+import { resetRuntimeServerBase } from '@/renderer/services/system/runtimeServerBase';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
 
@@ -14,7 +14,7 @@ const API_BASE = 'http://localhost:8080';
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn().mockResolvedValue('encrypted-preferences'),
@@ -22,8 +22,11 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { _resetRefreshState, configureRefreshFailureReset } from '@/renderer/services/apiClient';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
+import {
+  _resetRefreshState,
+  configureRefreshFailureReset,
+} from '@/renderer/services/system/apiClient';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
 
 function initStubDeps(): void {
   (preferencesSyncService as unknown as { deps: unknown }).deps = null;

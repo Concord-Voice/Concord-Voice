@@ -13,10 +13,10 @@
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
-vi.mock('@/renderer/services/apiClient', () => ({ apiFetch: vi.fn() }));
+vi.mock('@/renderer/services/system/apiClient', () => ({ apiFetch: vi.fn() }));
 
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
 

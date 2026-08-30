@@ -2,7 +2,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // Mock apiClient BEFORE importing anything that pulls in the service so the
 // service-side `import { apiFetch } from './apiClient'` resolves to the mock.
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   // safeJson is used by the service to drain response bodies — return a noop
   // that the service can await without hitting the real fetch Response API.
@@ -14,7 +14,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   }),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 import {
   hydrateNotificationPreferences,
   setMutePreference,
@@ -23,7 +23,7 @@ import {
   stopExpirySweep,
   tryHydrateNotificationPrefs,
   MUTE_DURATION_LABELS,
-} from '@/renderer/services/notificationPrefsService';
+} from '@/renderer/services/system/notificationPrefsService';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 

@@ -71,7 +71,7 @@ vi.mock('mediasoup-client', () => ({
 
 // ── Import after mocks ──────────────────────────────────────────────────
 
-import { PipVoiceClient } from '@/renderer/services/pipVoiceClient';
+import { PipVoiceClient } from '@/renderer/services/voice/pipVoiceClient';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 

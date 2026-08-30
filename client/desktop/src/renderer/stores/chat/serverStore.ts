@@ -2,11 +2,11 @@ import { create } from 'zustand';
 import { persist, devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
 import { ServerWithRole } from '../../types/server';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,
-} from '../../services/postLoginHydrationLifecycle';
+} from '../../services/system/postLoginHydrationLifecycle';
 import { useChannelStore } from './channelStore';
 import { useUnreadStore } from './unreadStore';
 

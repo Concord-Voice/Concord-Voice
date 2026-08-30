@@ -7,7 +7,7 @@ import CustomSelect from '../ui/CustomSelect';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useServerStore } from '../../stores/chat/serverStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import ChannelAudioQualitySlider from './ChannelAudioQualitySlider';
 import { Channel } from '../../types/chat';
 import './CreateChannelModal.css';

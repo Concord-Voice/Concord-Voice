@@ -4,7 +4,7 @@ import {
   compareSemver,
   sectionsBetween,
   decideChangelogAction,
-} from '../../../src/renderer/services/changelog';
+} from '../../../src/renderer/services/system/changelog';
 
 const FIXTURE = `# Changelog
 

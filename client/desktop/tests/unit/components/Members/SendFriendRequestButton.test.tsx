@@ -8,7 +8,7 @@ import {
 } from '@/renderer/stores/chat/friendStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   // friendStore.sendRequest reads error bodies via safeJson — provide a
   // light real-ish impl so the error-path test surfaces the API's message.
@@ -17,12 +17,12 @@ vi.mock('@/renderer/services/apiClient', () => ({
 // #1241: the affordance is now gated on server eligibility. These tests are
 // about rendering and sending, not about the gate (which has its own suite in
 // tests/unit/hooks/useFriendRequestState.test.ts), so pin an eligible verdict.
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   fetchEligibility: vi.fn().mockResolvedValue('eligible'),
   peekEligibility: vi.fn().mockReturnValue('eligible'),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
 const SELF_ID = 'self-1';

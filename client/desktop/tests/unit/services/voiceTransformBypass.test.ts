@@ -5,7 +5,7 @@ import {
   BYPASS_PROBE_MAX_ATTEMPTS,
   buildDecryptCreationAttach,
   decideBypassProbeAction,
-} from '../../../src/renderer/services/voiceTransformBypass';
+} from '../../../src/renderer/services/e2ee/voiceTransformBypass';
 
 describe('decideBypassProbeAction', () => {
   it('verifies when any frame entered the transform, regardless of packets', () => {

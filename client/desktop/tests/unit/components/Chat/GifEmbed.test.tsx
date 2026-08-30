@@ -37,7 +37,7 @@ const mockResolvedImage = {
 };
 
 const getBySlugMock = vi.fn();
-vi.mock('@/renderer/services/gifProvider', () => ({
+vi.mock('@/renderer/services/messaging/gifProvider', () => ({
   gifProvider: {
     name: 'KLIPY',
     searchPlaceholder: 'Search KLIPY',

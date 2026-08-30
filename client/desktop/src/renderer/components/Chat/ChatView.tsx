@@ -4,7 +4,7 @@ import MessageInput from './MessageInput';
 import TypingIndicator from './TypingIndicator';
 import PinnedMessagesPanel from './PinnedMessagesPanel';
 import SearchPanel from './SearchPanel';
-import { pinMessage, unpinMessage, getChannelPins } from '../../services/pinService';
+import { pinMessage, unpinMessage, getChannelPins } from '../../services/messaging/pinService';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useChannelSubscription } from '../../hooks/messaging/useChannelSubscription';

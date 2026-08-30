@@ -10,13 +10,13 @@ import { ADMIN_PERMISSIONS, BASE_PERMISSIONS, MOVE_MEMBERS } from '@/renderer/ut
 import { vi } from 'vitest';
 import type { Channel } from '@/renderer/types/chat';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({ ok: true }),
   API_BASE: 'http://localhost:3001',
 }));
 
 const mockMove = vi.fn().mockResolvedValue({ ok: true });
-vi.mock('@/renderer/services/voiceParticipantApi', () => ({
+vi.mock('@/renderer/services/voice/voiceParticipantApi', () => ({
   moveVoiceParticipant: (...args: unknown[]) => mockMove(...args),
   disconnectVoiceParticipant: vi.fn(),
 }));

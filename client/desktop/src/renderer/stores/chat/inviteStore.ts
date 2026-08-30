@@ -8,11 +8,11 @@ import {
   InviteInfoResponse,
   ServerWithRole,
 } from '../../types/server';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import {
   captureAuthLifecycle,
   isSameAuthLifecycle,
-} from '../../services/postLoginHydrationLifecycle';
+} from '../../services/system/postLoginHydrationLifecycle';
 import { useServerStore } from './serverStore';
 
 export type { InviteInfoResponse };

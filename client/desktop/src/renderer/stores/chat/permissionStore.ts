@@ -4,7 +4,7 @@
  */
 
 import { createStore } from '../../utils/createStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import {
   Role,
   type ReorderOutcome,

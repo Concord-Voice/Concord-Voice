@@ -73,7 +73,7 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 
 const mockPlayPreview = vi.fn();
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     playPreview: (...args: unknown[]) => mockPlayPreview(...args),
   },

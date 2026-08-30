@@ -4,7 +4,7 @@
  * decryption failure recovery, and the schedulePush echo guard.
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { preferencesSyncService } from '@/renderer/services/preferencesSync';
+import { preferencesSyncService } from '@/renderer/services/system/preferencesSync';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -15,7 +15,7 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 const API_BASE = 'http://localhost:8080';
 
 // Mock e2eeService
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn().mockResolvedValue('encrypted-blob'),
@@ -23,7 +23,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
 /** Reset the singleton's DI deps so init() can be called again in each test. */
 function resetSyncServiceDeps() {

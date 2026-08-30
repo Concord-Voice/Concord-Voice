@@ -5,13 +5,13 @@ import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { ConnectionState } from '@/renderer/services/websocketService';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 
 // Mock side-effecting services so the hook mounts cleanly (mirrors the
 // harness in useWebSocketMessages.test.ts).
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
     hasKey: vi.fn().mockReturnValue(false),
@@ -20,26 +20,26 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({
+vi.mock('@/renderer/services/system/ttsService', () => ({
   speak: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/presenceOverrideSync', () => ({
+vi.mock('@/renderer/services/system/presenceOverrideSync', () => ({
   presenceOverrideSyncService: { handleRemoteUpdate: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ participants: [] }),
   }),
 }));
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: vi.fn(),
     playLoop: vi.fn(),
@@ -51,7 +51,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
 }));
 
 import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMessages';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
 import { createMockWsService } from '../../helpers/wsServiceMock';
 
 beforeEach(() => {

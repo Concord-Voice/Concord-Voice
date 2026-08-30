@@ -19,7 +19,7 @@ vi.mock('@/renderer/components/Voice/IncomingCallBanner.css', () => ({}));
 const mockAccept = vi.fn(() => Promise.resolve());
 const mockDecline = vi.fn(() => Promise.resolve());
 
-vi.mock('@/renderer/services/voiceService/callStateMachine', () => ({
+vi.mock('@/renderer/services/voice/voiceService/callStateMachine', () => ({
   acceptIncomingCall: () => mockAccept(),
   declineIncomingCall: () => mockDecline(),
 }));

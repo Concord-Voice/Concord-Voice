@@ -16,13 +16,13 @@ import { useEffect, useCallback, useRef } from 'react';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
-import { getWebSocketService, ConnectionState } from '../../services/websocketService';
-import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2eeService';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';
+import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2ee/e2eeService';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import { useConnectionRecovery } from '../voice/useConnectionRecovery';
 import { useWebSocketMessages } from './useWebSocketMessages';
 

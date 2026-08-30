@@ -66,7 +66,7 @@ vi.mock('socket.io-client', () => ({
 }));
 
 // --- apiClient ---
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
@@ -88,7 +88,7 @@ const { e2eeMockState, fakeCsk } = vi.hoisted(() => ({
   fakeCsk: { __csk: true } as unknown as CryptoKey,
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(fakeCsk),
     getChannelKeyMaterial: vi.fn(() => {
@@ -129,7 +129,7 @@ const { mediaEncryptionInstances } = vi.hoisted(() => ({
   }>,
 }));
 
-vi.mock('@/renderer/services/mediaEncryption', () => {
+vi.mock('@/renderer/services/e2ee/mediaEncryption', () => {
   class MockMediaEncryption {
     keyVersion = 0;
     setKeyVersion = vi.fn((v: number) => {
@@ -177,10 +177,10 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 // ---------------------------------------------------------------------------
 // Import AFTER mocks
 // ---------------------------------------------------------------------------
-const { voiceService } = await import('@/renderer/services/voiceService');
-const { e2eeService: mockedE2EEService } = await import('@/renderer/services/e2eeService');
+const { voiceService } = await import('@/renderer/services/voice/voiceService');
+const { e2eeService: mockedE2EEService } = await import('@/renderer/services/e2ee/e2eeService');
 const { deriveFrameKey: mockedDeriveFrameKey } =
-  await import('@/renderer/services/mediaEncryption');
+  await import('@/renderer/services/e2ee/mediaEncryption');
 const { useUserStore } = await import('@/renderer/stores/auth/userStore');
 const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
 
@@ -291,7 +291,7 @@ describe('voiceService E2EE sender re-base (#1878 Task 5)', () => {
     });
     (mockedE2EEService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValueOnce(staleCsk);
     (mockedE2EEService.getChannelKeyVersion as ReturnType<typeof vi.fn>).mockReturnValueOnce(9);
-    const { deriveFrameKey } = await import('@/renderer/services/mediaEncryption');
+    const { deriveFrameKey } = await import('@/renderer/services/e2ee/mediaEncryption');
 
     await svc.initEncryptionCore(CHANNEL, 0);
 
@@ -446,7 +446,7 @@ describe('voiceService E2EE sender re-base (#1878 Task 5)', () => {
     const enc = latestEncryption();
 
     // Make the next by-version fetch reject.
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
       new Error('pending-404')
     );
@@ -466,7 +466,7 @@ describe('voiceService E2EE sender re-base (#1878 Task 5)', () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
     const enc = latestEncryption();
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const fetchVersion = e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>;
     fetchVersion
       .mockRejectedValueOnce(new Error('transient network failure'))
@@ -488,7 +488,7 @@ describe('voiceService E2EE sender re-base (#1878 Task 5)', () => {
     vi.useFakeTimers();
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const fetchVersion = e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>;
     for (let attempt = 0; attempt < 4; attempt++) {
       fetchVersion.mockRejectedValueOnce(new Error('transient network failure'));
@@ -552,8 +552,8 @@ describe('voiceService E2EE sender re-base (#1878 Task 5)', () => {
   it('does not retry a terminal membership response before tearing down', async () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
-    const { E2EEKeyUnavailableError } = await import('@/renderer/services/e2eeErrors');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    const { E2EEKeyUnavailableError } = await import('@/renderer/services/e2ee/e2eeErrors');
     const fetchVersion = e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>;
     fetchVersion.mockRejectedValueOnce(new E2EEKeyUnavailableError('NOT_MEMBER', false));
     const emergencyCleanup = vi.spyOn(svc, 'emergencyCleanup').mockImplementation(() => {});
@@ -903,7 +903,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
     const oldEncryption = latestEncryption();
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     let resolveOldChannelKey!: (material: { channelKey: CryptoKey; keyVersion: number }) => void;
     const oldMaterial = new Promise<{ channelKey: CryptoKey; keyVersion: number }>((resolve) => {
       resolveOldChannelKey = resolve;
@@ -930,7 +930,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
     vi.useFakeTimers();
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     let resolveOldMaterial!: (material: { channelKey: CryptoKey; keyVersion: number }) => void;
     (e2eeService.getChannelKeyMaterial as ReturnType<typeof vi.fn>).mockReturnValueOnce(
       new Promise<{ channelKey: CryptoKey; keyVersion: number }>((resolve) => {
@@ -984,7 +984,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
     const encryption = latestEncryption();
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     (e2eeService.getChannelKeyMaterial as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       channelKey: fakeCsk,
       keyVersion: 7,
@@ -1048,7 +1048,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
     await svc.initEncryptionCore(CHANNEL, 0);
     const enc = latestEncryption();
     workerPostMessage.mockClear();
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockClear();
 
     svc.provisionFrameKey(CHANNEL, 'sender-9', 7, 2);
@@ -1069,7 +1069,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
   it('the legacy requestFrameKey recovery callback routes through provisionFrameKey', async () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockClear();
 
     const cbs = svc.decryptRecoveryCallbacks();
@@ -1081,7 +1081,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
     const enc = latestEncryption();
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
       new Error('403 not a member')
     );
@@ -1100,7 +1100,7 @@ describe('voiceService #1895 — legacy-path frame-key provisioning', () => {
   it('the worker requestFrameKey IPC message provisions via the shared path', async () => {
     e2eeMockState.channelKeyVersion = 5;
     await svc.initEncryptionCore(CHANNEL, 0);
-    const { e2eeService } = await import('@/renderer/services/e2eeService');
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     (e2eeService.getChannelKeyByVersion as ReturnType<typeof vi.fn>).mockClear();
 
     svc.handleWorkerMessage({

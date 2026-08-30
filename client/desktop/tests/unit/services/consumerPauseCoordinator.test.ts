@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   ConsumerPauseCoordinator,
   type PauseEffects,
-} from '../../../src/renderer/services/consumerPauseCoordinator';
+} from '../../../src/renderer/services/voice/consumerPauseCoordinator';
 
 function makeEffects() {
   return {

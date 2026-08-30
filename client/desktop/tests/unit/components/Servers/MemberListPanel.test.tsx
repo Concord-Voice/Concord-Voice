@@ -4,7 +4,7 @@ import MemberListPanel from '@/renderer/components/Servers/MemberListPanel';
 import { vi } from 'vitest';
 import type { ServerMember } from '@/renderer/stores/chat/memberStore';
 import type { Role } from '@/renderer/types/server';
-import { prefetchEligibility } from '@/renderer/services/friendEligibility';
+import { prefetchEligibility } from '@/renderer/services/system/friendEligibility';
 
 // Mock heavy child dependencies so right-click surfaces a simple test double
 vi.mock('@/renderer/components/Members/MemberContextMenu', () => ({
@@ -47,13 +47,13 @@ vi.mock('@/renderer/components/ui/ConfirmActionModal', () => ({
     isOpen ? <div data-testid="confirm-modal">{title}</div> : null,
 }));
 
-vi.mock('@/renderer/services/friendEligibility', () => ({
+vi.mock('@/renderer/services/system/friendEligibility', () => ({
   prefetchEligibility: vi.fn(),
   peekEligibility: vi.fn(() => 'pending'),
   fetchEligibility: vi.fn(async () => 'unknown'),
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: vi.fn(),
   API_BASE: 'http://localhost:8080',

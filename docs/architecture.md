@@ -653,7 +653,7 @@ The `resume-producer` / `resume-consumer` handlers enforce `server_muted` / `ser
 
 #### Media E2EE (frame encryption)
 
-Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates _at_ the SFU). Implementation: `client/desktop/src/renderer/services/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
+Voice and **video frames are end-to-end encrypted above the SFU** — the media plane never sees plaintext media. This is a separate layer from transport DTLS-SRTP (which terminates _at_ the SFU). Implementation: `client/desktop/src/renderer/services/e2ee/mediaEncryption.ts` (+ `voiceE2eeTransforms.ts`):
 
 - **Cipher/transform path:** per-frame **AES-256-GCM** runs before frames leave the sender. Every outbound producer attaches encryption synchronously through mediasoup-client's `onRtpSender` callback, before offer creation and server-side producer signaling. Setup failure aborts publish and cleans up the owning source. `encodedTransformSupport.ts` prefers `RTCRtpScriptTransform` (Web Worker) whenever present and falls back to `createEncodedStreams` (main thread) only when the Worker API is absent. The mediasoup-client `encodedInsertableStreams` transport option is set only for that legacy fallback. Neither transform API means media initialization fails closed.
 - **Frame keys:** derived `HKDF-SHA256(channelCSK, salt="concord-voice-e2ee", info=senderUserId)` from the **same channel CSK** used for text messages — so media encryption shares the `channel_keys` / `key_revocations` epoch ledger and rotates on member join/leave (with a short overlap window), and ratchets via `HKDF(oldKey, "concord-e2ee-ratchet")`.
@@ -753,7 +753,7 @@ sequenceDiagram
     B->>B: e2eeService.decryptForChannel(channel_id, ciphertext) → plaintext
 ```
 
-> **Client-side dispatch validation (PR #1184, closes #709).** Every inbound envelope is validated by `WebSocketEventSchema` (a zod 4 discriminated union over `type`) before any per-handler dispatch in `client/desktop/src/renderer/services/websocketService.ts`. Failed envelopes are dropped with a PII-scrubbed structural log (`scrubZodIssues`) and `connectionStore.wireViolationCount` is incremented. Handlers in `useWebSocketMessages.ts` operate on already-narrowed payloads. The `isInitialized` guard on `e2eeService` makes decryption fail-closed (render-as-error) when keys are not ready, and never leaks ciphertext.
+> **Client-side dispatch validation (PR #1184, closes #709).** Every inbound envelope is validated by `WebSocketEventSchema` (a zod 4 discriminated union over `type`) before any per-handler dispatch in `client/desktop/src/renderer/services/messaging/websocketService.ts`. Failed envelopes are dropped with a PII-scrubbed structural log (`scrubZodIssues`) and `connectionStore.wireViolationCount` is incremented. Handlers in `useWebSocketMessages.ts` operate on already-narrowed payloads. The `isInitialized` guard on `e2eeService` makes decryption fail-closed (render-as-error) when keys are not ready, and never leaks ciphertext.
 
 `encryptForChannelWithVersion` encrypts edited channel and DM content. It returns the ciphertext and the exact epoch it selected before asynchronous WebCrypto work yields. The renderer sends that pair to the REST edit endpoint. A `409 epoch_revoked` response invalidates the cached channel key and permits one re-encryption attempt. Missing, zero, or repeatedly revoked epochs fail closed.
 

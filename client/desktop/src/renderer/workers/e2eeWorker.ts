@@ -9,7 +9,7 @@
  * triggers an `rtctransform` event here with { readable, writable } streams.
  */
 
-import { MediaEncryption, type FrameKeyMissError } from '../services/mediaEncryption';
+import { MediaEncryption, type FrameKeyMissError } from '../services/e2ee/mediaEncryption';
 import type {
   CodecFamily,
   E2EEWorkerMessage,

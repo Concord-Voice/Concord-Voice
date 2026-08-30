@@ -30,7 +30,7 @@ export function createMockE2EEService() {
 /**
  * Factory for the e2eeService vi.mock() callback.
  * Usage:
- *   vi.mock('../../src/renderer/services/e2eeService', () => mockE2EEModule());
+ *   vi.mock('../../src/renderer/services/e2ee/e2eeService', () => mockE2EEModule());
  */
 export function mockE2EEModule() {
   const mock = createMockE2EEService();

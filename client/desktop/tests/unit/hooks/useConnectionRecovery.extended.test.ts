@@ -19,7 +19,7 @@ const mockWsService = {
   getState: mockGetState,
 };
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => mockWsService,
   ConnectionState: {
     DISCONNECTED: 'DISCONNECTED',
@@ -31,12 +31,12 @@ vi.mock('@/renderer/services/websocketService', () => ({
 
 const mockEmergencyCleanup = vi.fn();
 const mockJoinChannel = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/voiceService', () => ({
+vi.mock('@/renderer/services/voice/voiceService', () => ({
   voiceService: { emergencyCleanup: mockEmergencyCleanup, joinChannel: mockJoinChannel },
 }));
 
 const mockRunPreflight = vi.fn();
-vi.mock('@/renderer/services/recoveryService', () => ({
+vi.mock('@/renderer/services/system/recoveryService', () => ({
   runPreflight: (...args: unknown[]) => mockRunPreflight(...args),
   clearCrashFlag: vi.fn(),
 }));
@@ -44,20 +44,20 @@ vi.mock('@/renderer/services/recoveryService', () => ({
 const mockSoftRestart = vi.fn();
 const mockGracefulReset = vi.fn();
 const mockRecoveryReset = vi.fn();
-vi.mock('@/renderer/services/resetService', () => ({
+vi.mock('@/renderer/services/system/resetService', () => ({
   softRestart: (...args: unknown[]) => mockSoftRestart(...args),
   gracefulReset: (...args: unknown[]) => mockGracefulReset(...args),
   recoveryReset: (...args: unknown[]) => mockRecoveryReset(...args),
 }));
 
 const mockHydratePostLogin = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/postLoginHydration', () => ({
+vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   hydratePostLogin: (...args: unknown[]) => mockHydratePostLogin(...args),
 }));
 
 const mockIsInitialized = { value: false };
 const mockProcessPendingKeyRequests = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     get isInitialized() {
       return mockIsInitialized.value;

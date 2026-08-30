@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { X } from 'lucide-react';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { useDMStore } from '../../stores/chat/dmStore';
 import './DirectMessages.css';
 

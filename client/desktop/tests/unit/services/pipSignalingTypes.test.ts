@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateRequestId } from '@/renderer/services/pipSignalingTypes';
+import { generateRequestId } from '@/renderer/services/voice/pipSignalingTypes';
 
 describe('pipSignalingTypes', () => {
   describe('generateRequestId', () => {

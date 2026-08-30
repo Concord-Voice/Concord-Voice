@@ -4,9 +4,9 @@ import { createStore } from '../../utils/createStore';
 // re-export keeps that contract working without touching import sites.
 // DiagnosticResults is also used locally (in ConnectionState), so it needs
 // the two-step import + export. CheckResult is a pure re-export.
-import type { DiagnosticResults } from '../../services/recoveryService';
+import type { DiagnosticResults } from '../../services/system/recoveryService';
 export type { DiagnosticResults };
-export type { CheckResult } from '../../services/recoveryService';
+export type { CheckResult } from '../../services/system/recoveryService';
 
 export type RecoveryPhase =
   | 'stable' // Normal operation

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { submitSignedAgeClaim } from '../../services/ageClaim/ageClaimService';
-import { type AgeSignal } from '../../services/ageClaim/evaluateAge';
+import { submitSignedAgeClaim } from '../../services/system/ageClaim/ageClaimService';
+import { type AgeSignal } from '../../services/system/ageClaim/evaluateAge';
 import { useAgeStatus } from '../../hooks/ui/useAgeStatus';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import ToggleSwitch from './ToggleSwitch';

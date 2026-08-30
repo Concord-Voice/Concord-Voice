@@ -27,16 +27,16 @@ import LoadingSpinner from './LoadingSpinner';
 import { useSSOStore } from '../../stores/auth/ssoStore';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
-import { completeSSORegistration, SSOServiceError } from '../../services/ssoService';
-import { revokeAbortedSession, type AbortedSessionRef } from '../../services/apiClient';
+import { completeSSORegistration, SSOServiceError } from '../../services/system/ssoService';
+import { revokeAbortedSession, type AbortedSessionRef } from '../../services/system/apiClient';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
-import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2eeService';
-import { E2EEInitTeardownError } from '../../services/e2eeErrors';
+import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2ee/e2eeService';
+import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import type { CredentialOwner } from '../../../main/ipcContract';

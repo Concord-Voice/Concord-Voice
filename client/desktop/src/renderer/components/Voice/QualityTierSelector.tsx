@@ -26,7 +26,7 @@ const QualityTierSelector: React.FC = () => {
     if (config.premium) {
       // Deferred: see #601 — requires subscription system (#211)
     }
-    const { voiceService } = await import('../../services/voiceService');
+    const { voiceService } = await import('../../services/voice/voiceService');
     await voiceService.setQualityTier(tier);
   };
 

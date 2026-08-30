@@ -6,7 +6,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/ui/ShortcutOverlay.css', () => ({}));
 
-vi.mock('@/renderer/services/keyboardShortcutService', () => ({
+vi.mock('@/renderer/services/system/keyboardShortcutService', () => ({
   keyboardShortcutService: { isMacPlatform: false },
 }));
 

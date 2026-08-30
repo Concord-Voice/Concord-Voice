@@ -1,4 +1,4 @@
-import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
+import { friendOrgSyncService } from '@/renderer/services/system/friendOrgSync';
 import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -7,7 +7,7 @@ import { http, HttpResponse } from 'msw';
 
 const API_BASE = 'http://localhost:8080';
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     encryptPreferences: vi.fn().mockResolvedValue('encrypted-blob'),
@@ -15,7 +15,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { deferred } from '../../helpers/deferred';
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));

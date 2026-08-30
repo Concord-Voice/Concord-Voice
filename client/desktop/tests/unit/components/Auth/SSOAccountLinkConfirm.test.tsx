@@ -1,25 +1,25 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import SSOAccountLinkConfirm from '@/renderer/components/Auth/SSOAccountLinkConfirm';
-import { abandonSSOReservation } from '@/renderer/services/ssoService';
+import { abandonSSOReservation } from '@/renderer/services/system/ssoService';
 import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
-vi.mock('@/renderer/services/apiClient', async (orig) => ({
-  ...(await orig<typeof import('@/renderer/services/apiClient')>()),
+vi.mock('@/renderer/services/system/apiClient', async (orig) => ({
+  ...(await orig<typeof import('@/renderer/services/system/apiClient')>()),
   revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
 }));
 
 // #2394: replace only abandonSSOReservation. completeSSOLink stays real so the
 // existing tests keep asserting against the electron sso.completeLink bridge.
-vi.mock('@/renderer/services/ssoService', async (orig) => ({
-  ...(await orig<typeof import('@/renderer/services/ssoService')>()),
+vi.mock('@/renderer/services/system/ssoService', async (orig) => ({
+  ...(await orig<typeof import('@/renderer/services/system/ssoService')>()),
   abandonSSOReservation: vi.fn().mockResolvedValue(true),
 }));
 
@@ -127,7 +127,7 @@ describe('SSOAccountLinkConfirm', () => {
     setRuntimeServerBase('http://localhost:8080');
     resolveResponse(linkedSessionResponse);
 
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     await waitFor(() => expect(revokeAbortedSession).toHaveBeenCalledTimes(1));
     expect(revokeAbortedSession).toHaveBeenCalledWith({
       accessToken: 'linked-token',

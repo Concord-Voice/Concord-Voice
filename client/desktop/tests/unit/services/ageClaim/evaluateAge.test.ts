@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateAge, type AgeSignal } from '@/renderer/services/ageClaim/evaluateAge';
+import { evaluateAge, type AgeSignal } from '@/renderer/services/system/ageClaim/evaluateAge';
 
 const NOW = new Date(Date.UTC(2026, 5, 19)); // 2026-06-19
 

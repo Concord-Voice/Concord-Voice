@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeRemoteVideoLayerRequest } from '../../../src/renderer/services/remoteVideoLayerPolicy';
+import { computeRemoteVideoLayerRequest } from '../../../src/renderer/services/voice/remoteVideoLayerPolicy';
 
 describe('computeRemoteVideoLayerRequest', () => {
   it('pauses hidden tiles by returning visible false with low layers', () => {

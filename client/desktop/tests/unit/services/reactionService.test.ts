@@ -1,13 +1,13 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { toggleReaction, getReactions } from '@/renderer/services/reactionService';
+import { toggleReaction, getReactions } from '@/renderer/services/messaging/reactionService';
 
 // Mock apiClient
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: vi.fn(),
 }));
 
-import { apiFetch, safeJson } from '@/renderer/services/apiClient';
+import { apiFetch, safeJson } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 const mockSafeJson = safeJson as ReturnType<typeof vi.fn>;

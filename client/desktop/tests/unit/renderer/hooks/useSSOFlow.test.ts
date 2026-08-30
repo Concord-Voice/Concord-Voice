@@ -9,21 +9,21 @@ import {
   getApiBase,
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock the service so we drive the hook through every SSOResult shape
 // without exercising the network or window.electron loopback.
-vi.mock('@/renderer/services/ssoService', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/services/ssoService')>();
+vi.mock('@/renderer/services/system/ssoService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/system/ssoService')>();
   return {
     ...actual,
     startSSOFlow: vi.fn(),
   };
 });
 
-vi.mock('@/renderer/services/apiClient', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/services/apiClient')>();
+vi.mock('@/renderer/services/system/apiClient', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/services/system/apiClient')>();
   return {
     ...actual,
     revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
@@ -31,13 +31,13 @@ vi.mock('@/renderer/services/apiClient', async (importOriginal) => {
 });
 
 // SSO must defer the shared hydration helper until App's E2EE unlock boundary.
-vi.mock('@/renderer/services/postLoginHydration', () => ({
+vi.mock('@/renderer/services/system/postLoginHydration', () => ({
   hydratePostLogin: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { startSSOFlow, type SSOResult } from '@/renderer/services/ssoService';
-import { revokeAbortedSession } from '@/renderer/services/apiClient';
-import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
+import { startSSOFlow, type SSOResult } from '@/renderer/services/system/ssoService';
+import { revokeAbortedSession } from '@/renderer/services/system/apiClient';
+import { hydratePostLogin } from '@/renderer/services/system/postLoginHydration';
 import { deferred } from '../../../helpers/deferred';
 const mockedStartSSOFlow = startSSOFlow as unknown as ReturnType<typeof vi.fn>;
 const mockedRevokeAbortedSession = vi.mocked(revokeAbortedSession);

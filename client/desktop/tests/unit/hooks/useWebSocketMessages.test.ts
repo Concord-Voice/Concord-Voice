@@ -7,12 +7,12 @@ import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
-import { ConnectionState } from '@/renderer/services/websocketService';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 
 // Mock e2eeService and ttsService to prevent side effects
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     decryptMessage: vi.fn((content: string) => Promise.resolve(content)),
     hasKey: vi.fn().mockReturnValue(false),
@@ -21,15 +21,15 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({
+vi.mock('@/renderer/services/system/ttsService', () => ({
   speak: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ participants: [] }),
@@ -41,7 +41,7 @@ const mockPlayLoop = vi.fn();
 const mockStopLoop = vi.fn();
 const mockStopAllLoops = vi.fn();
 const mockIsLooping = vi.fn().mockReturnValue(false);
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: (...args: unknown[]) => mockPlay(...args),
     playLoop: (...args: unknown[]) => mockPlayLoop(...args),
@@ -186,7 +186,7 @@ describe('useWebSocketMessages', () => {
   // covered in-handler defensive guards added by #667 (PR #704) for
   // malformed server-sent payloads. Those guards were intentionally
   // removed when payload validation moved to the dispatch boundary
-  // (services/websocketService.handleMessage zod safeParse). Equivalent
+  // (services/messaging/websocketService.handleMessage zod safeParse). Equivalent
   // coverage now lives in tests/unit/services/websocketService.dispatch.test.ts,
   // which tests schema-invalid payload rejection BEFORE handlers run.
   // The deleted tests bypassed dispatch by calling handlers directly,

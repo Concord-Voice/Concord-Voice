@@ -2,11 +2,11 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import DMConversationContextMenu from '@/renderer/components/DirectMessages/DMConversationContextMenu';
 import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 

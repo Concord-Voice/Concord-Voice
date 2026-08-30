@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 
 // Durable age-verification status for the NSFW gate's mount-time short-circuit (#1763).
 // The verified OUTCOME lives server-side in age_verification_records (written by

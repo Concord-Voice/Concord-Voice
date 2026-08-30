@@ -33,14 +33,14 @@ import {
   exportChannelKey,
 } from '@/renderer/utils/crypto';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
-import { e2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
   API_BASE: 'http://localhost:8080',
 }));
-import { apiFetch } from '@/renderer/services/apiClient';
+import { apiFetch } from '@/renderer/services/system/apiClient';
 const mockApiFetch = vi.mocked(apiFetch);
 
 const FORGED_EPOCH = 2147483647; // int32 max — accepted by key_version >= 1

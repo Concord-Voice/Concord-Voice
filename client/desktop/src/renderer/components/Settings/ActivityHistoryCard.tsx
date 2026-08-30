@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { clientConfigService } from '../../services/clientConfigService';
+import { clientConfigService } from '../../services/system/clientConfigService';
 import {
   ACTIVITY_HISTORY_RETENTION_DAYS,
   deletePresenceHistory,
@@ -8,7 +8,7 @@ import {
   PresenceHistoryRequestError,
   type ActivityHistoryRetentionDays,
   type PresenceHistorySettings,
-} from '../../services/presenceHistoryService';
+} from '../../services/system/presenceHistoryService';
 import { useAuthStore } from '../../stores/auth/authStore';
 import {
   useClientConfigStore,

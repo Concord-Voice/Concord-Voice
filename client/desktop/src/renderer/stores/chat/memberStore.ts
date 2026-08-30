@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import type { MemberRoleInfo } from '../../types/server';
 
 export type PresenceStatus = 'online' | 'offline' | 'dnd' | 'invisible';

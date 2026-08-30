@@ -6,8 +6,8 @@
  */
 
 import { useCallback } from 'react';
-import { ConnectionState, getWebSocketService } from '../../services/websocketService';
-import { e2eeService } from '../../services/e2eeService';
+import { ConnectionState, getWebSocketService } from '../../services/messaging/websocketService';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import { useConnectionStore } from '../../stores/ui/connectionStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
@@ -15,11 +15,11 @@ import { useMemberStore } from '../../stores/chat/memberStore';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import { runRecoveryModule } from '../../utils/runRecoveryModule';
-import { hydratePostLogin } from '../../services/postLoginHydration';
+import { hydratePostLogin } from '../../services/system/postLoginHydration';
 import {
   beginPostLoginHydrationGuard,
   isHydrationLifecycleCurrent,
-} from '../../services/postLoginHydrationLifecycle';
+} from '../../services/system/postLoginHydrationLifecycle';
 
 /** Run preflight diagnostics after grace period expires and route to the appropriate recovery path. */
 async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocketService>) {
@@ -73,7 +73,7 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
     store.setLastVoiceChannelId(voiceState.activeChannelId);
   }
   if (voiceState.connectionState !== 'disconnected') {
-    import('../../services/voiceService')
+    import('../../services/voice/voiceService')
       .then(({ voiceService }) => {
         if (useVoiceStore.getState().connectionState !== 'disconnected') {
           voiceService.emergencyCleanup();
@@ -99,7 +99,7 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
   // exactly what self-heal is for. The nested resetService import is guarded
   // the same way.
   await runRecoveryModule(
-    () => import('../../services/recoveryService'),
+    () => import('../../services/system/recoveryService'),
     async ({ runPreflight }) => {
       const diag = await runPreflight();
       store.setDiagnostics(diag);
@@ -117,7 +117,7 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
       if (diag.tokenValid === 'ok' && diag.rendererStable !== 'ok') {
         store.enterRecoveryB();
         await runRecoveryModule(
-          () => import('../../services/resetService'),
+          () => import('../../services/system/resetService'),
           (m) => m.softRestart(),
           'softRestart'
         );
@@ -131,7 +131,7 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
 
       store.enterRecoveryB();
       await runRecoveryModule(
-        () => import('../../services/resetService'),
+        () => import('../../services/system/resetService'),
         (m) => m.softRestart(),
         'softRestart'
       );
@@ -184,7 +184,7 @@ function handleReconnected(
     // stale-chunk import failure and triggers self-heal), so this cannot
     // surface as the Uncaught (in promise) seen in the origin-502-storm logs.
     runRecoveryModule(
-      () => import('../../services/resetService'),
+      () => import('../../services/system/resetService'),
       async (m) => {
         // Same account, same token — fence in-flight E2EE work and clear NOTHING.
         // gracefulReset() here destroyed drafts, the outbound MessageQueue, and the
@@ -217,7 +217,7 @@ function handleReconnected(
     );
     useConnectionStore.getState().reset();
     runRecoveryModule(
-      () => import('../../services/recoveryService'),
+      () => import('../../services/system/recoveryService'),
       (m) => m.clearCrashFlag(),
       'clearCrashFlag'
     );
@@ -228,7 +228,7 @@ function handleReconnected(
     // only after a genuine sustained outage. reset() above already cleared the
     // stash, so a second reconnect cannot double-join.
     if (lastVoiceId) {
-      import('../../services/voiceService')
+      import('../../services/voice/voiceService')
         .then(({ voiceService }) => voiceService.joinChannel(lastVoiceId))
         .catch(() => {
           /* voice module not available */

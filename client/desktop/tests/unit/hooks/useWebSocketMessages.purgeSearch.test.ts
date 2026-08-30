@@ -23,11 +23,11 @@ import {
   indexMessage,
   searchMessages,
   subscribeSearchScopeInvalidations,
-} from '@/renderer/services/searchService';
+} from '@/renderer/services/messaging/searchService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     invalidateChannelKey: vi.fn(),
@@ -38,13 +38,13 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/ttsService', () => ({ speak: vi.fn() }));
+vi.mock('@/renderer/services/system/ttsService', () => ({ speak: vi.fn() }));
 
-vi.mock('@/renderer/services/preferencesSync', () => ({
+vi.mock('@/renderer/services/system/preferencesSync', () => ({
   preferencesSyncService: { fetchAndApply: vi.fn() },
 }));
 
-vi.mock('@/renderer/services/notificationSoundService', () => ({
+vi.mock('@/renderer/services/system/notificationSoundService', () => ({
   notificationSoundService: {
     play: vi.fn(),
     playLoop: vi.fn(),
@@ -55,7 +55,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ participants: [] }),

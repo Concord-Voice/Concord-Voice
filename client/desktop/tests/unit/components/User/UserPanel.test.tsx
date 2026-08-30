@@ -55,7 +55,7 @@ vi.mock('@/renderer/components/User/CustomStatusPopover', () => ({
 }));
 
 // Mock apiFetch
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: async () => ({ user: {} }),

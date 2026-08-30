@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PresenceExceptions from '@/renderer/components/Settings/PresenceExceptions';
-import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
+import { presenceOverrideSyncService } from '@/renderer/services/system/presenceOverrideSync';
 import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { deferred } from '../../../helpers/deferred';

@@ -7,7 +7,7 @@ import { mockUser } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock apiFetch for session fetching
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: async () => ({ sessions: [], past_sessions: [] }),
@@ -288,7 +288,7 @@ describe('SettingsPage', () => {
   });
 
   it('renders sessions after loading', async () => {
-    const { apiFetch } = await import('@/renderer/services/apiClient');
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       json: async () => ({

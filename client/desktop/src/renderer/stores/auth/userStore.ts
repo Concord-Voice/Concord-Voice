@@ -2,19 +2,19 @@ import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
 import { useAuthStore } from './authStore';
-import { apiFetch, ensureMachineId } from '../../services/apiClient';
+import { apiFetch, ensureMachineId } from '../../services/system/apiClient';
 import { errorMessage } from '../../utils/redactError';
-import { getWebSocketService } from '../../services/websocketService';
-import { e2eeService } from '../../services/e2eeService';
-import { E2EEInitTeardownError } from '../../services/e2eeErrors';
-import { preferencesSyncService } from '../../services/preferencesSync';
-import { savedGifsSyncService } from '../../services/savedGifsSync';
-import { friendOrgSyncService } from '../../services/friendOrgSync';
-import { presenceOverrideSyncService } from '../../services/presenceOverrideSync';
-import { stopExpirySweep } from '../../services/notificationPrefsService';
+import { getWebSocketService } from '../../services/messaging/websocketService';
+import { e2eeService } from '../../services/e2ee/e2eeService';
+import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
+import { preferencesSyncService } from '../../services/system/preferencesSync';
+import { savedGifsSyncService } from '../../services/system/savedGifsSync';
+import { friendOrgSyncService } from '../../services/system/friendOrgSync';
+import { presenceOverrideSyncService } from '../../services/system/presenceOverrideSync';
+import { stopExpirySweep } from '../../services/system/notificationPrefsService';
 import { useNotificationPrefsStore } from '../ui/notificationPrefsStore';
 import { usePresenceOverrideStore } from '../ui/presenceOverrideStore';
-import { fetchBlobRowForRotation } from '../../services/e2eeBlobTransport';
+import { fetchBlobRowForRotation } from '../../services/e2ee/e2eeBlobTransport';
 import { setSyncSuppressed } from '../ui/colorSyncSuppression';
 import {
   deriveKeyFromPassword,
@@ -33,14 +33,14 @@ import {
   isHydrationLifecycleCurrent,
   resetPostLoginHydrationLifecycle,
   type HydrationLifecycleGuard,
-} from '../../services/postLoginHydrationLifecycle';
+} from '../../services/system/postLoginHydrationLifecycle';
 import { parseContinuationPair, type ContinuationPair } from '../../utils/continuationPair';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
-} from '../../services/runtimeServerBase';
+} from '../../services/system/runtimeServerBase';
 import type { CredentialOwner } from '../../../main/ipcContract';
 
 export interface UserProfile {
@@ -921,7 +921,7 @@ export const useUserStore = wrapStore(
           }
 
           // Nuclear reset: login screen will appear, so wipe everything
-          const { nuclearReset } = await import('../../services/resetService');
+          const { nuclearReset } = await import('../../services/system/resetService');
           nuclearReset();
         },
 
@@ -1068,7 +1068,7 @@ export const useUserStore = wrapStore(
             // lifecycle synchronously with no window for a newer login to slip in (which
             // would otherwise get its notice clobbered). The dynamic import is required —
             // resetService imports userStore, so a static import would cycle (coderabbit).
-            const { nuclearReset } = await import('../../services/resetService');
+            const { nuclearReset } = await import('../../services/system/resetService');
 
             const newWrappedKeyBase64 = arrayBufferToBase64(newWrappedKey);
             const newSaltBase64 = arrayBufferToBase64(newSalt.buffer as ArrayBuffer);

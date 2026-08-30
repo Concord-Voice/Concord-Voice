@@ -45,12 +45,12 @@ vi.mock('socket.io-client', () => ({
 
 // --- apiClient ---
 const mockApiFetch = vi.fn();
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 
 // --- e2eeService ---
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn().mockResolvedValue(null),
     getChannelKeyMaterial: vi.fn().mockResolvedValue({ channelKey: null, keyVersion: 0 }),
@@ -63,7 +63,7 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 // --- mediaEncryption ---
-vi.mock('@/renderer/services/mediaEncryption', () => ({
+vi.mock('@/renderer/services/e2ee/mediaEncryption', () => ({
   // Mirror the live wire version so this focused suite cannot silently pin stale crypto.
   MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
@@ -191,7 +191,7 @@ Object.defineProperty(navigator, 'mediaDevices', {
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
-const { voiceService } = await import('@/renderer/services/voiceService');
+const { voiceService } = await import('@/renderer/services/voice/voiceService');
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';

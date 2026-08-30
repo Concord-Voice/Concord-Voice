@@ -16,7 +16,7 @@ import ContextMenu from '../ui/ContextMenu';
 import { errorMessage } from '../../utils/redactError';
 import { EnforcementMenuItems } from '../ui/EnforcementMenuItems';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
-import { apiFetch, safeJson } from '../../services/apiClient';
+import { apiFetch, safeJson } from '../../services/system/apiClient';
 
 const TIMEOUT_DURATIONS = [
   { label: '1 minute', seconds: 60 },

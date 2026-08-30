@@ -5,8 +5,8 @@ import {
 } from '@/renderer/stores/chat/dmStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
-import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
-import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
+import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/messaging/searchService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { mockMessage } from '../../mocks/fixtures';
@@ -15,7 +15,7 @@ import { deferred } from '../../helpers/deferred';
 
 const mockInvalidateChannelKey = vi.fn();
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: false,
     getChannelKey: vi.fn(),
@@ -1836,7 +1836,7 @@ describe('dmStore', () => {
     };
 
     beforeEach(async () => {
-      const mod = await import('@/renderer/services/e2eeService');
+      const mod = await import('@/renderer/services/e2ee/e2eeService');
       e2eeMock = mod.e2eeService as typeof e2eeMock;
       e2eeMock.isInitialized = true;
       e2eeMock.getChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', true));
@@ -1849,7 +1849,7 @@ describe('dmStore', () => {
     });
 
     afterEach(async () => {
-      const mod = await import('@/renderer/services/e2eeService');
+      const mod = await import('@/renderer/services/e2ee/e2eeService');
       const mock = mod.e2eeService as typeof e2eeMock;
       mock.isInitialized = false;
       mock.getChannelKey.mockReset();
@@ -2042,7 +2042,7 @@ describe('dmStore', () => {
     };
 
     beforeEach(async () => {
-      const mod = await import('@/renderer/services/e2eeService');
+      const mod = await import('@/renderer/services/e2ee/e2eeService');
       e2eeMock = mod.e2eeService as typeof e2eeMock;
       e2eeMock.isInitialized = true;
       e2eeMock.getChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', true));
@@ -2050,7 +2050,7 @@ describe('dmStore', () => {
     });
 
     afterEach(async () => {
-      const mod = await import('@/renderer/services/e2eeService');
+      const mod = await import('@/renderer/services/e2ee/e2eeService');
       const mock = mod.e2eeService as typeof e2eeMock;
       mock.isInitialized = false;
       mock.getChannelKey.mockReset();
@@ -2550,7 +2550,7 @@ describe('dmStore', () => {
     };
 
     beforeEach(async () => {
-      const mod = await import('@/renderer/services/e2eeService');
+      const mod = await import('@/renderer/services/e2ee/e2eeService');
       e2eeMock = mod.e2eeService as typeof e2eeMock;
       e2eeMock.isInitialized = true;
       e2eeMock.createChannelKeys.mockResolvedValue(new Map([['user-1', 'wrapped-key-1']]));
@@ -2584,7 +2584,7 @@ describe('dmStore', () => {
     });
 
     afterEach(async () => {
-      const mod = await import('@/renderer/services/e2eeService');
+      const mod = await import('@/renderer/services/e2ee/e2eeService');
       const mock = mod.e2eeService as typeof e2eeMock;
       mock.isInitialized = false;
       mock.getChannelKey.mockReset();

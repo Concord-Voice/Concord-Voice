@@ -5,7 +5,7 @@ import { vi } from 'vitest';
 
 const mockApiFetch = vi.fn();
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
 }));
 
@@ -27,7 +27,7 @@ vi.mock('@/renderer/utils/crypto', () => ({
   }),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getWrappingKey: vi.fn().mockReturnValue('mock-wrapping-key'),
     getWrappedPrivateKey: vi.fn().mockReturnValue('mock-wrapped-private-key'),
@@ -122,7 +122,7 @@ vi.mock('@/renderer/components/Settings/RecoveryKeyDisplay', () => ({
   ),
 }));
 
-import { e2eeService as mockE2eeService } from '@/renderer/services/e2eeService';
+import { e2eeService as mockE2eeService } from '@/renderer/services/e2ee/e2eeService';
 import MFASetup from '@/renderer/components/Settings/MFASetup';
 
 describe('MFASetup', () => {

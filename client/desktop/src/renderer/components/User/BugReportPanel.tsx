@@ -1,6 +1,6 @@
 import React, { useCallback, useId, useRef, useState } from 'react';
-import { collect as collectSystemInfo } from '../../services/systemInfoService';
-import { formatEntries, getEntries } from '../../services/logBufferService';
+import { collect as collectSystemInfo } from '../../services/system/systemInfoService';
+import { formatEntries, getEntries } from '../../services/system/logBufferService';
 import { pseudonymizeLogUuids } from '../../utils/pseudonymizeLogUuids';
 import { type FeedbackDiagnostics, type FeedbackSubmission } from './feedbackTypes';
 import DiagnosticsPreviewModal from './DiagnosticsPreviewModal';

@@ -10,7 +10,7 @@ import {
   MUTE_DURATION_LABELS,
   type MuteDuration,
   type MuteTargetType,
-} from '../../services/notificationPrefsService';
+} from '../../services/system/notificationPrefsService';
 import { errorMessage } from '../../utils/redactError';
 
 /* ------------------------------------------------------------------ */

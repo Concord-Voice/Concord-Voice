@@ -4,7 +4,7 @@ import { useServerStore } from '../../stores/chat/serverStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
 import { hasUnmutedChannel } from '../../stores/ui/notificationPrefsStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { errorMessage } from '../../utils/redactError';
 
 /**

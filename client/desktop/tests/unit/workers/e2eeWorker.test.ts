@@ -6,7 +6,7 @@ const { mockDecryptFrame, mockEncryptFrame } = vi.hoisted(() => ({
   mockEncryptFrame: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/mediaEncryption', () => ({
+vi.mock('@/renderer/services/e2ee/mediaEncryption', () => ({
   MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class {
     initFromKey = vi.fn();

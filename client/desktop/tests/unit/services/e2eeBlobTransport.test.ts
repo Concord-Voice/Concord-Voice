@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     isInitialized: true,
     decryptPreferences: vi.fn(),
@@ -12,9 +12,12 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-import { apiFetch } from '@/renderer/services/apiClient';
-import { e2eeService } from '@/renderer/services/e2eeService';
-import { fetchBlobRowForRotation, fetchEncryptedBlob } from '@/renderer/services/e2eeBlobTransport';
+import { apiFetch } from '@/renderer/services/system/apiClient';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import {
+  fetchBlobRowForRotation,
+  fetchEncryptedBlob,
+} from '@/renderer/services/e2ee/e2eeBlobTransport';
 
 const mockApiFetch = vi.mocked(apiFetch);
 

@@ -18,7 +18,7 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { PIN_MESSAGES } from '@/renderer/utils/permissions';
 import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { ConnectionState } from '@/renderer/services/websocketService';
+import { ConnectionState } from '@/renderer/services/messaging/websocketService';
 import type { ChatContext } from '@/renderer/types/chat';
 
 // --- Mocks ---
@@ -29,7 +29,7 @@ const mockSendTypingIndicator = vi.fn();
 const mockSendDMTypingIndicator = vi.fn();
 const mockWsGetState = vi.fn(() => ConnectionState.CONNECTED);
 
-vi.mock('@/renderer/services/websocketService', () => ({
+vi.mock('@/renderer/services/messaging/websocketService', () => ({
   getWebSocketService: () => ({
     sendMessage: mockSendMessage,
     sendDMMessage: mockSendDMMessage,
@@ -63,7 +63,7 @@ vi.mock('@/renderer/hooks/messaging/useMessaging', () => ({
 
 const mockApiFetch = vi.fn();
 
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
   safeJson: (res: Response) => res.json(),
 }));
@@ -75,7 +75,7 @@ const mockEncryptForChannelWithVersion = vi.fn().mockResolvedValue({
   keyVersion: 2,
 });
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     encryptForChannel: (...args: unknown[]) => mockEncryptForChannel(...args),
     encryptForChannelWithVersion: (...args: unknown[]) => mockEncryptForChannelWithVersion(...args),
@@ -84,12 +84,12 @@ vi.mock('@/renderer/services/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/services/pinService', () => ({
+vi.mock('@/renderer/services/messaging/pinService', () => ({
   pinMessage: vi.fn().mockResolvedValue({}),
   unpinMessage: vi.fn().mockResolvedValue({}),
 }));
 
-vi.mock('@/renderer/services/messageQueue', () => ({
+vi.mock('@/renderer/services/messaging/messageQueue', () => ({
   getMessageQueue: () => ({
     enqueue: vi.fn(() => 'client-msg-1'),
     markAsSent: vi.fn(),

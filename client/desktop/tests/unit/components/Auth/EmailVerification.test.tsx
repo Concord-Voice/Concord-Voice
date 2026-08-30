@@ -6,7 +6,7 @@ import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegis
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock fetch
@@ -14,7 +14,7 @@ const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
 // Keep aborted-session cleanup observable without issuing a second network request.
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   revokeAbortedSession: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -164,7 +164,7 @@ describe('EmailVerification', () => {
   });
 
   it('keeps origin B credentials when B persists before A token storage resolves', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://origin-a.example';
     const originAOwner = 101;
     const originBOwner = 202;
@@ -226,7 +226,7 @@ describe('EmailVerification', () => {
   });
 
   it('clears persisted origin A tokens by owner when the server switches', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://origin-a.example';
     const originAOwner = 101;
     setRuntimeServerBase(requestApiBase);
@@ -261,7 +261,7 @@ describe('EmailVerification', () => {
   });
 
   it('does not persist A after switching to B while the confirmation response is pending', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://origin-a.example';
     setRuntimeServerBase(requestApiBase);
 
@@ -303,7 +303,7 @@ describe('EmailVerification', () => {
   });
 
   it('rejects an A to B to A selection cycle while token persistence is pending', async () => {
-    const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
+    const { revokeAbortedSession } = await import('@/renderer/services/system/apiClient');
     const requestApiBase = 'https://origin-a.example';
     const originAOwner = 101;
     setRuntimeServerBase(requestApiBase);

@@ -14,7 +14,7 @@ import {
   getVoices as getTTSVoices,
   preview as previewTTS,
   stop as stopTTS,
-} from '../../services/ttsService';
+} from '../../services/system/ttsService';
 
 const fontSizes: { value: AppearanceSettings['fontSize']; label: string }[] = [
   { value: 'small', label: 'Small' },

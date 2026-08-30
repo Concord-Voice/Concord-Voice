@@ -10,7 +10,7 @@ import {
   Permissions,
   hasPermission,
 } from '../../utils/permissions';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { Channel } from '../../types/chat';
 import ContextMenu from '../ui/ContextMenu';

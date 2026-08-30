@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { voiceService } from '../../../src/renderer/services/voiceService';
+import { voiceService } from '../../../src/renderer/services/voice/voiceService';
 
 /** Reach into the singleton to seed a fake camera consumer + meta and a socket spy. */
 function seedCameraConsumer(svc: any, consumerId: string, userId: string) {

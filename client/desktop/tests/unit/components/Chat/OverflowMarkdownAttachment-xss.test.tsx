@@ -22,7 +22,7 @@ import { setupServer } from 'msw/node';
 // Module-level mocks — only crypto/network layers; MarkdownContent is real.
 // ---------------------------------------------------------------------------
 
-vi.mock('@/renderer/services/e2eeService', () => ({
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   e2eeService: {
     getChannelKey: vi.fn(),
     decryptForChannel: vi.fn(),
@@ -84,7 +84,7 @@ const enc = new TextEncoder();
 
 async function setupDecryptFile(plaintextString: string) {
   const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
-  const { e2eeService } = await import('@/renderer/services/e2eeService');
+  const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue({} as CryptoKey);
   (decryptFile as ReturnType<typeof vi.fn>).mockResolvedValue(enc.encode(plaintextString).buffer);
 }

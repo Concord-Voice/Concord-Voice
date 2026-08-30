@@ -3,7 +3,7 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useInviteStore } from '../../stores/chat/inviteStore';
-import { apiFetch } from '../../services/apiClient';
+import { apiFetch } from '../../services/system/apiClient';
 import { ServerWithRole, InviteInfoResponse } from '../../types/server';
 import './JoinServerModal.css';
 

@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // Mock dependencies before importing
-vi.mock('@/renderer/services/apiClient', () => ({
+vi.mock('@/renderer/services/system/apiClient', () => ({
   refreshAccessToken: vi.fn(),
 }));
 
@@ -9,8 +9,8 @@ import {
   runPreflight,
   markRendererCrashed,
   clearCrashFlag,
-} from '@/renderer/services/recoveryService';
-import { refreshAccessToken } from '@/renderer/services/apiClient';
+} from '@/renderer/services/system/recoveryService';
+import { refreshAccessToken } from '@/renderer/services/system/apiClient';
 
 const mockRefresh = vi.mocked(refreshAccessToken);
 

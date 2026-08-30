@@ -3,11 +3,11 @@ import {
   ConnectionState,
   fullJitter,
   getWebSocketService,
-} from '@/renderer/services/websocketService';
+} from '@/renderer/services/messaging/websocketService';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
-} from '@/renderer/services/runtimeServerBase';
+} from '@/renderer/services/system/runtimeServerBase';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // Mock WebSocket

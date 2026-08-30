@@ -5,7 +5,7 @@ import {
   fetchEligibility,
   peekEligibility,
   type EligibilityVerdict,
-} from '../../services/friendEligibility';
+} from '../../services/system/friendEligibility';
 
 /**
  * Lifecycle of an in-flight "Send Friend Request" action. `sent` is a transient
