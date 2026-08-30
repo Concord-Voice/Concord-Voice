@@ -8,8 +8,7 @@
  *   1. Persisted apiBase from tokenManager metadata (written at first login,
  *      survives restarts) — authoritative when present because it is the
  *      exact base the renderer authenticated against.
- *   2. Packaged builds: the production SaaS endpoint — the same host the
- *      electron-updater feed pins (updatePinningConfig.ts).
+ *   2. Packaged builds: the production SaaS endpoint (single-tenant SaaS).
  *   3. Dev (unpackaged): CONCORD_DEV_API_BASE env override, else the local
  *      control plane on :8080 (mirrors the renderer config.ts default).
  *
@@ -23,8 +22,9 @@ import { app } from 'electron';
 import { getPersistedApiBase } from './tokenManager';
 
 // Exported so the auth-IPC apiBase guard (main.ts `isValidApiBase`) can pin the
-// renderer-supplied apiBase to this same single-tenant origin in packaged builds
-// — the host the updater already TLS-pins (updatePinningConfig.ts).
+// renderer-supplied apiBase to this same single-tenant origin in packaged builds.
+// This is an ORIGIN allowlist, not TLS pinning — see main.ts for why the API
+// host carries no certificate pin.
 export const PRODUCTION_API_BASE = 'https://api.concordvoice.chat';
 const DEV_API_BASE = 'http://localhost:8080';
 

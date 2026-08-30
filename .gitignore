@@ -234,12 +234,6 @@ config.production.json
 *.pem
 aws-exports.js
 
-# Track cert-pinning test fixtures (issue #658). Negation must come AFTER
-# every *.pem rule above (gitignore applies later rules last). These are
-# synthetic self-signed PEMs with zero production value — regenerated via
-# client/desktop/tests/fixtures/pinning/generate.mjs for deterministic tests.
-!client/desktop/tests/fixtures/pinning/*.pem
-
 # Google Cloud
 *-key.json
 gcloud-service-key.json

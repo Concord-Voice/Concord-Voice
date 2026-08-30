@@ -48,7 +48,7 @@ This document describes which of those properties each platform verifies, and ho
 - **CI verification:** the signing step self-verifies each `.sig` against the committed public key (a signing-key/bundled-key mismatch tripwire), and the existing `required_assets` asset-set gate hard-fails the release if any of the six Linux `.sig` files are missing — so an unsigned Linux Release cannot publish.
 - **Install-time:** inside `safeQuitAndInstall()` on Linux, the client fetches `<artifact>.sig` from the static public recovery feed (`https://github.com/Concord-Voice/Concord-Voice/releases/latest/download`) and verifies it over the downloaded artifact bytes with one native `crypto.verify(null, …)` call against the bundled public key (`client/desktop/src/main/linuxUpdatePublicKey.ts`, via `client/desktop/src/main/verifyLinuxSignature.ts`). The verify is **fail-closed**: the only path to install is `verify → true`; a missing artifact, a non-2xx `.sig` fetch, a signature not exactly 64 bytes, a `verify → false`, or any thrown exception refuses the install (identical install boundary in every case). The *message* distinguishes the cause: only a cryptographic `verify → false` — the one outcome that is genuine evidence of an altered artifact — surfaces the `signature-failure` security banner; availability failures (network/IO error, a missing or malformed `.sig`) refuse with a retryable non-security "couldn't verify right now" message instead, so a transient blip does not cry wolf and erode the banner's credibility. An attacker who strips/blocks the `.sig` lands in the availability path and still cannot install. electron-updater still cross-checks the `latest-linux.yml` SHA-512 at download (#644); the Ed25519 signature is the layer that defends a manifest the attacker controls.
 
-**What the user is trusting on Linux:** the bundled Ed25519 public key. **This is the SOLE trust anchor** — it holds even with no API-host TLS pinning, because an attacker who controls the public recovery feed controls both the artifact and its `.sig` but cannot forge a signature without the private key. TLS-layer API pinning (#658, below) is defense-in-depth for the API host, not load-bearing for this guarantee.
+**What the user is trusting on Linux:** the bundled Ed25519 public key. **This is the SOLE trust anchor** — it holds even with no API-host TLS pinning, because an attacker who controls the public recovery feed controls both the artifact and its `.sig` but cannot forge a signature without the private key. TLS-layer API pinning (#658) was defense-in-depth for the API host and was never load-bearing for this guarantee; it has since been removed (see below).
 
 **What this defends:** a forged or tampered Linux update artifact served from a compromised feed (`/opt/concord/releases/`), a compromised GitHub Release, the public mirror, or an on-path attacker.
 
@@ -59,34 +59,15 @@ This document describes which of those properties each platform verifies, and ho
 
 **Key rotation** requires shipping a new client build (the trust anchor is bundled, not fetched). See [`[internal]refresh-linux-update-key.md`](../runbooks/refresh-linux-update-key.md).
 
-### TLS-layer API pinning (#658)
+### API-host TLS trust (#658 removed)
 
-On **all platforms**, HTTPS connections to `api.concordvoice.chat` are additionally pinned at the TLS layer via SPKI SHA-256 of the server's leaf certificate. This closes the rogue-cert MITM gap described in §API-host trust boundary below. Since #1981, packaged binary auto-updates use the public GitHub recovery feed instead, so an API-host pin mismatch no longer strands the only automatic update path.
+`api.concordvoice.chat` is **not** certificate-pinned. HTTPS to the API uses Chromium's default validation — publicly-trusted CA chain plus Certificate Transparency — the same anchor the browser SPA and the update feed rely on.
 
-**How it works:**
+The pin was removed after five fleet-wide outages between 2026-04 and 2026-08. It matched the leaf SPKI against values baked into the binary, on the premise that Concord uploaded its own origin keypair to Cloudflare via the Custom SSL Certificates API. That endpoint is Business/Enterprise-only and this account is on Pro, so the upload never ran: Cloudflare served a *managed* edge certificate it rotated on its own schedule with a new keypair, and every rotation locked the entire installed base out with `net::ERR_FAILED` until a new binary shipped. No server-side remedy exists, because the rejection happens client-side before the request leaves the machine.
 
-- `client/desktop/src/main/main.ts` installs a `Session.setCertificateVerifyProc` handler inside `app.whenReady()`. The handler is a pure function in `client/desktop/src/main/updatePinning.ts` configured from `updatePinningConfig.ts`.
-- For the pinned hostname (`api.concordvoice.chat`), the handler computes SPKI SHA-256 of the leaf cert's `SubjectPublicKeyInfo` and compares against a primary+fallback pin pair. Dual-pin enables non-emergency rotation.
-- For non-pinned hostnames (self-hosted deployments, staging, localhost), the handler returns `callback(-3)` — Chromium's default cert validation applies, system CA trust works normally.
-- When both pins miss, the handler returns `callback(-2)` (explicit reject) and the renderer shows `UpdateSecurityBanner` directing the user to reinstall from GitHub Releases.
+**This does not weaken the update trust anchors.** They never depended on it — see the Linux note above: the bundled Ed25519 key "holds even with no API-host TLS pinning". The Windows anchor is artifact-level Authenticode verification (#2020). Both are unchanged.
 
-**Why this matters:** A rogue cert obtained from a different public CA for the same CN would pass Chromium's default validation (it chains to a trusted root). It would NOT pass the SPKI pin because the attacker doesn't have Concord's private key. The pin is the only anchor that binds TLS trust to Concord's own keypair.
-
-**Operational contract:**
-
-- Concord obtains the TLS cert via Let's Encrypt on the origin (certbot with `--reuse-key`) and uploads it to CloudFlare via `[internal]upload-cert-to-cloudflare.sh` (a certbot renewal hook). CloudFlare serves the uploaded cert at its edge, preserving the SPKI that clients pin.
-- `--reuse-key` is load-bearing: without it, every 90-day renewal would generate a new keypair, the SPKI would change, and every pinned client would hard-fail on next update check.
-- Rotation (deliberate keypair rotation for compromise or cadence) follows the dual-pin runbook procedure (`[internal]`).
-- Observability: the current verify proc is wired to `console`, and `updatePinning.ts` emits plain string log lines for pinning events. Operators should expect plain-text console output for fallback-pin usage and pin mismatches; there are currently no structured `category` / `outcome` fields, no `fingerprint` array, and no built-in deduplication.
-
-**Implementation references:**
-
-- Module: [`client/desktop/src/main/updatePinning.ts`](../../client/desktop/src/main/updatePinning.ts)
-- Config: [`client/desktop/src/main/updatePinningConfig.ts`](../../client/desktop/src/main/updatePinningConfig.ts)
-- Wiring: [`client/desktop/src/main/main.ts`](../../client/desktop/src/main/main.ts) (inside `app.whenReady()`)
-- Banner: [`client/desktop/src/renderer/components/Updates/UpdateSecurityBanner.tsx`](../../client/desktop/src/renderer/components/Updates/UpdateSecurityBanner.tsx)
-- Design spec: [`[internal]specs/2026-04-20-658-updater-feed-cert-pin-design.md`](../superpowers/specs/2026-04-20-658-updater-feed-cert-pin-design.md)
-- Rotation runbook: [`[internal]`](update-cert-pinning-runbook.md)
+**Rogue-cert MITM** is currently unmitigated for the API host. The intended control is out-of-band Certificate Transparency monitoring, which alerts an operator rather than bricking every client — it is **not yet implemented** (see the linked trust model). Re-pinning is safe only against a keypair Concord controls end to end; the conditions are enumerated in [`api-tls-trust-model.md`](api-tls-trust-model.md).
 
 ## API-host trust boundary
 

@@ -80,8 +80,6 @@ import {
   getUpdateLogger,
   getUpdateLogPath,
 } from './updater';
-import { createPinningVerifyProc } from './updatePinning';
-import { PIN_CONFIG } from './updatePinningConfig';
 import { getBuildTag } from './buildInfo';
 import {
   checkUpdateSentinel,
@@ -1550,18 +1548,23 @@ app.whenReady().then(async () => {
     return ['camera', 'microphone', 'speaker', 'hid'].includes(details.deviceType ?? '');
   });
 
-  // API-host TLS cert pinning (#658). Installs a hostname-gated verify proc
-  // on the DEFAULT session: pinned SaaS hosts (api.concordvoice.chat) enforce
-  // SPKI SHA-256 matching against PIN_CONFIG; all other hosts defer to
-  // Chromium's default validation. NOTE: electron-updater traffic rides its
-  // own 'electron-updater' session partition and is NOT covered by this
-  // proc; post-#1981 the update feed (github.com) is intentionally unpinned —
-  // the Windows update trust anchor is artifact-level Authenticode
-  // verification (publisherName + the #644 issuer-pin hook), not feed TLS
-  // (#2020). See:
-  //   [internal]specs/2026-04-20-658-updater-feed-cert-pin-design.md
-  //   [internal]
-  session.defaultSession.setCertificateVerifyProc(createPinningVerifyProc(PIN_CONFIG, console));
+  // NO TLS certificate pinning on api.concordvoice.chat — deliberate, do not
+  // re-add (#658 reverted). Cloudflare serves that host from a MANAGED edge
+  // certificate that it rotates on its own schedule with a NEW keypair. The pin
+  // design assumed Concord uploaded its own origin keypair via Cloudflare's
+  // Custom SSL Certificates API; that endpoint is Business/Enterprise-only and
+  // this account is on Pro, so the upload never ran even once. Every rotation
+  // therefore locked the ENTIRE installed base out of the API with
+  // net::ERR_FAILED, with no server-side remedy possible because the rejection
+  // happens client-side before the request leaves the machine. That is five
+  // fleet outages between 2026-04 and 2026-08, and zero detections.
+  //
+  // API TLS now uses Chromium's default validation (public CA + Certificate
+  // Transparency) — the same anchor the browser SPA at spa.concordvoice.chat
+  // and the deliberately-unpinned update feed (#2020) already rely on.
+  // Mis-issuance is caught out-of-band by CT monitoring, which alerts instead
+  // of bricking the fleet. Only ever pin a keypair Concord controls end to end.
+  // See docs/policies/api-tls-trust-model.md.
 
   // HID device selection: auto-select for WebAuthn hardware security keys
   session.defaultSession.on('select-hid-device', (event, details, callback) => {

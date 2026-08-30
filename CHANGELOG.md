@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-Deleting your account now removes the files it uploaded, not only the record of them.
+The app can reach the servers again after a certificate change locked every installed copy out. Deleting your account now removes the files it uploaded, not only the record of them.
+
+### Fixed
+
+- **The app can reach the servers again** — every installed copy stopped being able to reach the servers, showing "failed to fetch" when signing in, while the same account worked normally in a web browser on the same machine and on the same network. The app carried its own copy of the server's certificate details and refused to connect to anything that did not match. That certificate is replaced by our hosting provider on its own schedule, and we can neither control nor predict when — so every replacement locked everyone out until a new version of the app was built and installed. That has now happened five times. Nothing could be fixed from our side while it was happening, because the refusal took place on your own machine before any request was sent. The app now checks the certificate the same way your web browser does, which is what the web version has always done. Unexpected certificates are watched for separately, so a genuine problem raises an alert instead of locking everyone out.
 
 ### Security
 
