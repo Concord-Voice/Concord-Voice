@@ -105,10 +105,11 @@ func (b ObjectBackend) String() string {
 //
 // The CREDENTIAL PAIR is the gate, not the destination literals, and that is a
 // deliberate reading of the current deployment: docker-compose.production.yml
-// already pins CLOUDFLARE_R2_USEAST_ENDPOINT/_BUCKET (unfilled placeholders
-// today), while the credential pair resolves from Infisical with a `:-` empty
-// default and stays empty until the flip. Keying on the destination would
-// therefore register a live entry for a bucket nobody can authenticate to. An
+// pins CLOUDFLARE_R2_USEAST_ENDPOINT/_BUCKET as REAL literals, while the
+// credential pair resolves from Infisical through a `:-` empty default and may
+// or may not be populated on a given host — self-host never populates it.
+// Keying on the destination would therefore register a live entry for a bucket
+// nobody can authenticate to. An
 // operator supplying the credential is the one unambiguous expression of "this
 // backend is real"; a destination that is then missing or malformed is a
 // misconfiguration the registry reports as UNAVAILABLE rather than silently

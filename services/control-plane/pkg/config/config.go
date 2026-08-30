@@ -160,15 +160,24 @@ func (c CloudflareKVBridgeConfig) String() string {
 // two account-scoped Cloudflare credential pairs, which are CI-only and must
 // never reach this host-bound rail.
 //
-// Fully optional-resolve today: the vendor backend is dormant (MinIO remains
-// the sole SaaS write target for attachments/), so this struct is loaded and
-// format-validated but not yet consumed by any storage client — the
-// storage_backend registry LANDED with ADR-0038 Wave B and reads this struct;
-// only the write-default flip is a later wave's scope.
-// Promote AccessKeyID/SecretAccessKey/Bucket to production-required
-// (config.go validate() guard + provision-secrets.yml required=true + compose
-// ${VAR:?...}) together, at the write-default flip to a non-minio backend —
-// not before.
+// Fully optional-resolve today: MinIO remains the sole SaaS WRITE target for
+// attachments/, so what is dormant is the write DEFAULT -- not this struct. The
+// storage_backend registry landed with ADR-0038 Wave B and does read it:
+// AttachmentBackends() gates each candidate on the credential pair, and
+// storage.NewRegistry builds a vendor client from a seeded pair at boot, after
+// which backend-aware reads, deletes and BOTH sweepers resolve through it. Only
+// the write-default flip is a later wave's scope. (An earlier revision of this
+// comment said the struct was "not yet consumed by any storage client" and then
+// contradicted itself in the next clause.)
+// Promote AccessKeyID/SecretAccessKey/Bucket to production-required at the
+// write-default flip (ADR-0038 action item 8) — not before, and NOT via a
+// compose fail-loud interpolation: that form has no conditional variant and
+// would break self-host and every deploy on merge (ADR-0038 § Parameters (c),
+// Correction 2026-08-29). The promotion is provision-secrets.yml's
+// required=true plus an application-layer assertion whose site item 8 chooses.
+// The predicate is "write default != legacy", NOT "!= minio" — minio is a
+// STORAGE_BACKEND vendor value, not a registry backend id, and reading it
+// literally would demand this credential from every self-hoster on s3 or b2.
 //
 // String() redacts both credential fields; Endpoint/Region/Bucket are
 // non-secret and logged in full.
@@ -1080,9 +1089,13 @@ func (c *Config) validateProduction() error {
 		// docker-compose.production.yml sets this literal today), so an
 		// empty value is not an error. Do NOT add a required-in-production
 		// guard for Bucket/AccessKeyID/SecretAccessKey here yet — that
-		// promotion rides the write-default flip to a non-minio backend (a
-		// later wave's scope), together with provision-secrets.yml's
-		// required=true and compose's ${VAR:?...} form.
+		// promotion rides the write-default flip (ADR-0038 action item 8),
+		// together with provision-secrets.yml's required=true. It is NOT
+		// paired with a compose fail-loud form: that limb was struck as wrong
+		// (ADR-0038 § Parameters (c), Correction 2026-08-29). Whether the guard
+		// can live in this function at all depends on item 8 wiring the write
+		// default to configuration; today it cannot, because internal/storage
+		// imports this package and not the reverse.
 		{c.vendorEndpointIsPlaintext(),
 			"CLOUDFLARE_R2_USEAST_ENDPOINT must use https:// — TLS is mandatory for the Cloudflare R2 attachment backend and there is no *_USE_SSL escape hatch."},
 		{invalidHSTSHeaderValue(c.HSTSHeaderValue),
