@@ -34,6 +34,42 @@ const header = (over: Partial<AttachmentEnvelopeHeader> = {}): AttachmentEnvelop
   ...over,
 });
 
+describe('envelope version rollout', () => {
+  it('keeps new writes on v2 until envelope support is negotiated', () => {
+    expect(newEnvelopeHeader(1).version).toBe(2);
+    expect(newEnvelopeHeader(CHUNK_PLAINTEXT_BYTES).totalChunks).toBe(1);
+    expect(newEnvelopeHeader(CHUNK_PLAINTEXT_BYTES + 1).totalChunks).toBe(2);
+  });
+
+  it('binds v3 to the CVA3 AAD domain', () => {
+    const aad = buildChunkAad(header({ version: 3 }), 0);
+    expect(Array.from(aad.slice(0, 4))).toEqual([0x43, 0x56, 0x41, 0x33]);
+  });
+
+  it('reserves the header bytes in chunk zero so non-trailing parts are uniform', async () => {
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, [
+      'encrypt',
+      'decrypt',
+    ]);
+    const plaintext = new Uint8Array(CHUNK_PLAINTEXT_BYTES * 2 + 1);
+    const h = header({
+      version: 3,
+      totalChunks: totalChunksFor(plaintext.byteLength, 3),
+    });
+    const source = bufferChunkSource(plaintext);
+    const first = await buildUploadPart(source, key, h, 0);
+    const second = await buildUploadPart(source, key, h, 1);
+    expect(first.byteLength).toBe(8_388_636);
+    expect(second.byteLength).toBe(8_388_636);
+  });
+
+  it('agrees with the v3 arithmetic at the 512 MiB ceiling', () => {
+    const plaintext = 512 * 1024 * 1024;
+    expect(totalChunksFor(plaintext, 3)).toBe(65);
+    expect(expectedBlobLength(plaintext, 3)).toBe(plaintext + 28 + 28 * 65);
+  });
+});
+
 describe('envelope header', () => {
   it('round-trips every field', () => {
     const h = header();
@@ -153,14 +189,14 @@ describe('AAD', () => {
 
 describe('size arithmetic', () => {
   it('computes chunk counts at the boundaries', () => {
-    expect(totalChunksFor(1)).toBe(1);
-    expect(totalChunksFor(CHUNK_PLAINTEXT_BYTES)).toBe(1);
-    expect(totalChunksFor(CHUNK_PLAINTEXT_BYTES + 1)).toBe(2);
-    expect(totalChunksFor(268_435_456)).toBe(32);
+    expect(totalChunksFor(1, 2)).toBe(1);
+    expect(totalChunksFor(CHUNK_PLAINTEXT_BYTES, 2)).toBe(1);
+    expect(totalChunksFor(CHUNK_PLAINTEXT_BYTES + 1, 2)).toBe(2);
+    expect(totalChunksFor(268_435_456, 2)).toBe(32);
   });
 
   it('matches the normative length identity at the premium ceiling', () => {
-    expect(expectedBlobLength(268_435_456)).toBe(268_435_456 + 28 + 28 * 32);
+    expect(expectedBlobLength(268_435_456, 2)).toBe(268_435_456 + 28 + 28 * 32);
   });
 
   it('rejects a zero-length plaintext', () => {
@@ -187,6 +223,8 @@ describe('buildUploadPart', () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES + 100);
     const h = newEnvelopeHeader(pt.byteLength);
+    h.version = 2;
+    h.totalChunks = totalChunksFor(pt.byteLength, 2);
     expect(h.totalChunks).toBe(2);
 
     const src = bufferChunkSource(pt);
@@ -207,6 +245,8 @@ describe('buildUploadPart', () => {
     const key = await aesKey();
     const pt = filled(1024);
     const h = newEnvelopeHeader(pt.byteLength);
+    h.version = 2;
+    h.totalChunks = totalChunksFor(pt.byteLength, 2);
     const src = bufferChunkSource(pt);
     const a = await buildUploadPart(src, key, h, 0);
     const b = await buildUploadPart(src, key, h, 0);
@@ -233,6 +273,8 @@ describe('buildUploadPart', () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES + 10);
     const h = newEnvelopeHeader(pt.byteLength);
+    h.version = 2;
+    h.totalChunks = totalChunksFor(pt.byteLength, 2);
     const p1 = await buildUploadPart(bufferChunkSource(pt), key, h, 1);
     const iv = p1.slice(0, 12);
     const body = p1.slice(12);
@@ -318,9 +360,11 @@ const concat = (...parts: Uint8Array[]): Uint8Array<ArrayBuffer> => {
   return out;
 };
 
-/** Seal a whole plaintext as a v2 blob, the way the upload session assembles it. */
-const sealV2 = async (key: CryptoKey, pt: Uint8Array) => {
+/** Seal a whole plaintext as a chunked blob, the way the upload session assembles it. */
+const sealEnvelope = async (key: CryptoKey, pt: Uint8Array, version: 2 | 3 = 2) => {
   const header = newEnvelopeHeader(pt.byteLength);
+  header.version = version;
+  header.totalChunks = totalChunksFor(pt.byteLength, version);
   const src = bufferChunkSource(pt);
   const parts: Uint8Array[] = [];
   for (let i = 0; i < header.totalChunks; i++)
@@ -334,7 +378,7 @@ describe('deterministic dispatch', () => {
   it('routes a v2 blob to v2 and a legacy blob to legacy', async () => {
     const key = await aesKey();
     const pt = filled(4096);
-    const { blob } = await sealV2(key, pt);
+    const { blob } = await sealEnvelope(key, pt);
     expect(classifyEnvelope(blob.subarray(0, ENVELOPE_HEADER_BYTES), blob.byteLength).kind).toBe(
       'v2'
     );
@@ -349,7 +393,7 @@ describe('deterministic dispatch', () => {
     // A truncation large enough to change the implied chunk count is
     // arithmetically visible, so the blob stops being recognisable as ours.
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES * 2));
+    const { blob } = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES * 2));
     const gutted = blob.subarray(0, ENVELOPE_HEADER_BYTES + 1024);
     expect(
       classifyEnvelope(gutted.subarray(0, ENVELOPE_HEADER_BYTES), gutted.byteLength).kind
@@ -361,7 +405,7 @@ describe('deterministic dispatch', () => {
     // see this. GCM is the backstop, and that is the correct division of labour:
     // arithmetic decides WHICH parser runs, the tag decides whether it is valid.
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     const truncated = blob.subarray(0, blob.byteLength - 1);
     expect(
       classifyEnvelope(truncated.subarray(0, ENVELOPE_HEADER_BYTES), truncated.byteLength).kind
@@ -374,17 +418,33 @@ describe('deterministic dispatch', () => {
   it('round-trips a v2 blob across a chunk boundary', async () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES + 12345);
-    const { blob } = await sealV2(key, pt);
+    const { blob } = await sealEnvelope(key, pt);
     const out = await bytesOf(await decryptAttachmentBlob(blob, key, 'application/pdf'));
     expect(out.byteLength).toBe(pt.byteLength);
     expect(Array.from(out.slice(0, 64))).toEqual(Array.from(pt.slice(0, 64)));
     expect(Array.from(out.slice(-64))).toEqual(Array.from(pt.slice(-64)));
   }, 20000);
 
+  it('round-trips a v3 blob across the chunk-zero boundary and rejects a version rewrite', async () => {
+    const key = await aesKey();
+    const pt = filled(CHUNK_PLAINTEXT_BYTES + 1);
+    const { blob } = await sealEnvelope(key, pt, 3);
+    const out = await bytesOf(await decryptAttachmentBlob(blob, key, 'application/pdf'));
+    expect(out.byteLength).toBe(pt.byteLength);
+    expect(Array.from(out.slice(0, 64))).toEqual(Array.from(pt.slice(0, 64)));
+    expect(Array.from(out.slice(-64))).toEqual(Array.from(pt.slice(-64)));
+
+    const tampered = blob.slice();
+    tampered[2] = 2;
+    await expect(decryptAttachmentBlob(tampered, key, 'application/pdf')).rejects.toThrow(
+      AttachmentIntegrityError
+    );
+  }, 20000);
+
   it('round-trips a single-chunk v2 blob', async () => {
     const key = await aesKey();
     const pt = filled(1000);
-    const { blob } = await sealV2(key, pt);
+    const { blob } = await sealEnvelope(key, pt);
     const out = await bytesOf(await decryptAttachmentBlob(blob, key, 'image/png'));
     expect(Array.from(out)).toEqual(Array.from(pt));
   });
@@ -402,7 +462,7 @@ describe('deterministic dispatch', () => {
 describe('the AAD negative matrix — one case per bound field', () => {
   it('rejects reordered chunks', async () => {
     const key = await aesKey();
-    const { blob, header } = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES * 2));
+    const { blob, header } = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES * 2));
     const c0 = ENVELOPE_HEADER_BYTES;
     const c1 = c0 + 12 + header.chunkSize + 16;
     const swapped = concat(blob.subarray(0, c0), blob.subarray(c1), blob.subarray(c0, c1));
@@ -413,7 +473,7 @@ describe('the AAD negative matrix — one case per bound field', () => {
 
   it('rejects truncation even when totalChunks is rewritten to match', async () => {
     const key = await aesKey();
-    const { blob, header } = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES * 2));
+    const { blob, header } = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES * 2));
     const keep = ENVELOPE_HEADER_BYTES + 12 + header.chunkSize + 16;
     const cut = blob.slice(0, keep);
     new DataView(cut.buffer).setUint32(8, 1, false); // totalChunks 2 -> 1
@@ -429,8 +489,8 @@ describe('the AAD negative matrix — one case per bound field', () => {
 
   it('rejects a cross-file splice', async () => {
     const key = await aesKey();
-    const a = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES * 2, 3));
-    const b = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES * 2, 9));
+    const a = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES * 2, 3));
+    const b = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES * 2, 9));
     const c1 = ENVELOPE_HEADER_BYTES + 12 + a.header.chunkSize + 16;
     const spliced = concat(a.blob.subarray(0, c1), b.blob.subarray(c1));
     await expect(decryptAttachmentBlob(spliced, key, 'application/pdf')).rejects.toThrow(
@@ -438,19 +498,19 @@ describe('the AAD negative matrix — one case per bound field', () => {
     );
   }, 30000);
 
-  it('rejects a tampered version byte as unsupported, not as corrupt', async () => {
+  it('rejects a tampered version byte as an integrity failure', async () => {
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     const t = blob.slice();
     t[2] = 3;
     await expect(decryptAttachmentBlob(t, key, 'application/pdf')).rejects.toThrow(
-      UnsupportedAttachmentFormatError
+      AttachmentIntegrityError
     );
   });
 
   it('rejects a tampered flags byte', async () => {
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     const t = blob.slice();
     t[3] = 0x80;
     await expect(decryptAttachmentBlob(t, key, 'application/pdf')).rejects.toThrow(
@@ -460,7 +520,7 @@ describe('the AAD negative matrix — one case per bound field', () => {
 
   it('rejects a tampered fileNonce', async () => {
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     const t = blob.slice();
     t[12] ^= 0xff;
     await expect(decryptAttachmentBlob(t, key, 'application/pdf')).rejects.toThrow(
@@ -470,7 +530,7 @@ describe('the AAD negative matrix — one case per bound field', () => {
 
   it('rejects a tampered chunkSize as unsupported', async () => {
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     const t = blob.slice();
     new DataView(t.buffer).setUint32(4, 1_048_576, false);
     await expect(decryptAttachmentBlob(t, key, 'application/pdf')).rejects.toThrow(
@@ -480,7 +540,7 @@ describe('the AAD negative matrix — one case per bound field', () => {
 
   it('names the failing chunk without leaking plaintext', async () => {
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     const t = blob.slice();
     t[t.byteLength - 1] ^= 0xff; // corrupt the tag
     await expect(decryptAttachmentBlob(t, key, 'application/pdf')).rejects.toThrow(
@@ -538,7 +598,7 @@ describe('decryptAttachmentBlob — bounded plaintext residency', () => {
     // that may be 256 MiB. Decrypting the rest produces bytes the caller is
     // about to discard.
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES + 4096));
+    const { blob } = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES + 4096));
 
     const capped = await decryptAttachmentBlob(blob, key, 'text/markdown', 1);
 
@@ -556,7 +616,7 @@ describe('decryptAttachmentBlob — bounded plaintext residency', () => {
     // `>` are a matched pair and nothing tested the pairing.
     const key = await aesKey();
     const total = CHUNK_PLAINTEXT_BYTES + 4096;
-    const { blob } = await sealV2(key, filled(total));
+    const { blob } = await sealEnvelope(key, filled(total));
 
     const capped = await decryptAttachmentBlob(blob, key, 'text/markdown', CHUNK_PLAINTEXT_BYTES);
 
@@ -573,7 +633,7 @@ describe('decryptAttachmentBlob — bounded plaintext residency', () => {
     // applied one. Falsification caught exactly that.
     const key = await aesKey();
     const total = CHUNK_PLAINTEXT_BYTES + 4096;
-    const { blob } = await sealV2(key, filled(total));
+    const { blob } = await sealEnvelope(key, filled(total));
 
     const whole = await decryptAttachmentBlob(blob, key, 'application/octet-stream');
 
@@ -585,7 +645,7 @@ describe('decryptAttachmentBlob — bounded plaintext residency', () => {
     // the cap is still GCM-verified, so tampering fails even when the caller
     // only wants a prefix.
     const key = await aesKey();
-    const { blob } = await sealV2(key, filled(4096));
+    const { blob } = await sealEnvelope(key, filled(4096));
     blob[ENVELOPE_HEADER_BYTES + AES_GCM_IV_LENGTH + 5] ^= 0xff;
 
     await expect(decryptAttachmentBlob(blob, key, 'text/markdown', 1)).rejects.toThrow(
@@ -600,7 +660,7 @@ describe('what a decrypt failure is ALLOWED to accuse the file of', () => {
     // Two chunks, so a truncation can break the length arithmetic. A ONE-chunk
     // blob cannot: any truncation that leaves a body still rounds to 1 chunk,
     // so it stays v2 and already fails as an integrity error.
-    const { blob } = await sealV2(key, filled(CHUNK_PLAINTEXT_BYTES + 1));
+    const { blob } = await sealEnvelope(key, filled(CHUNK_PLAINTEXT_BYTES + 1));
 
     // The arithmetic IS the discriminator, so a damaged v2 blob does not fail
     // as v2 -- it falls through to the LEGACY path, where the legacy AAD
@@ -632,7 +692,7 @@ describe('what a decrypt failure is ALLOWED to accuse the file of', () => {
       'encrypt',
     ]);
     const good = await aesKey();
-    const { blob } = await sealV2(good, filled(64));
+    const { blob } = await sealEnvelope(good, filled(64));
 
     const err = await decryptAttachmentBlob(blob, encryptOnly, 'image/png').then(
       () => null,
@@ -643,7 +703,7 @@ describe('what a decrypt failure is ALLOWED to accuse the file of', () => {
   });
 
   it('keeps the underlying rejection as `cause` on the integrity error', async () => {
-    const { blob } = await sealV2(await aesKey(), filled(64));
+    const { blob } = await sealEnvelope(await aesKey(), filled(64));
     const err = await decryptAttachmentBlob(blob, await aesKey(), 'image/png').then(
       () => null,
       (e: unknown) => e

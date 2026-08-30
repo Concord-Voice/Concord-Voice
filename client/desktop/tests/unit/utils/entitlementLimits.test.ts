@@ -21,13 +21,13 @@ describe('attachment limit constants', () => {
     expect(PREMIUM_ATTACHMENT_BYTES).not.toBe(536_870_912);
   });
 
-  it('the download guard is derived from the v2 envelope, not a multipart guess', () => {
+  it('the download guard is derived from the largest readable envelope, not a multipart guess', () => {
     // Was PREMIUM + 4096, with a comment claiming the 4096 mirrored the server's
     // multipart-header allowance. That derivation is wrong for this format: the
-    // guard must admit a maximum-size v2 blob, whose overhead is the 28-byte
-    // header plus 28 bytes per chunk.
-    expect(MAX_DECRYPTABLE_ATTACHMENT_BYTES).toBe(268_435_456 + 28 + 28 * 32);
-    expect(MAX_DECRYPTABLE_ATTACHMENT_BYTES).toBe(268_436_380);
+    // guard must admit a maximum-size v3 blob, whose overhead is the 28-byte
+    // header plus 28 bytes for each of its 33 chunks.
+    expect(MAX_DECRYPTABLE_ATTACHMENT_BYTES).toBe(268_435_456 + 28 + 28 * 33);
+    expect(MAX_DECRYPTABLE_ATTACHMENT_BYTES).toBe(268_436_408);
   });
 
   it('still admits a maximum-size LEGACY blob', () => {

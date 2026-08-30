@@ -198,16 +198,22 @@ func parseOrphanedObjectEntry(entry string) (backend, storageKey string) {
 // `index` (0-based), derived purely from the arithmetic in
 // upload_session_sizing.go -- never from anything the client sent in-band.
 //
-// Part 0 carries the 28-byte envelope header because S3 multipart exempts only
-// the LAST part from its 5 MiB minimum, so the header cannot be a part of its
-// own. Every part is IV + ciphertext + tag for one chunk; the final chunk holds
-// the remainder.
-func attachmentPartSize(index, totalChunks, plaintextBytes int64) int64 {
-	chunkPlaintext := AttachmentChunkPlaintextBytes
-	if index == totalChunks-1 {
-		chunkPlaintext = plaintextBytes - (totalChunks-1)*AttachmentChunkPlaintextBytes
-	}
-	size := AttachmentChunkOverheadBytes + chunkPlaintext
+// Part 0 carries the 28-byte envelope header because multipart exempts only the
+// LAST part from its 5 MiB minimum, so the header cannot be a part of its own.
+// Every part is IV + ciphertext + tag for one chunk; the final chunk holds the
+// remainder.
+//
+// WHAT THE VERSION BUYS. Under v2 that header is pure ADDITION, so part 0 is 28
+// bytes larger than every other non-trailing part. S3 and MinIO allow that;
+// Cloudflare R2 does not -- error 10048 / InvalidPart, "All non-trailing parts
+// must have the same size" -- so any attachment needing >= 3 parts (plaintext
+// over 16 MiB) is unuploadable there. v3 pays for the header out of chunk 0's
+// PLAINTEXT budget instead, which makes every non-trailing part identical while
+// leaving the total length identity untouched.
+func attachmentPartSize(index, totalChunks, plaintextBytes int64, versions ...EnvelopeVersion) int64 {
+	version := envelopeVersionOrDefault(versions)
+	size := AttachmentChunkOverheadBytes +
+		chunkPlaintextAt(version, index, totalChunks, plaintextBytes)
 	if index == 0 {
 		size += AttachmentEnvelopeHeaderBytes
 	}
@@ -273,6 +279,7 @@ type uploadSession struct {
 	fileType        FileType
 	mimeType        string
 	keyVersion      int
+	envelopeVersion EnvelopeVersion
 	totalChunks     int64
 	plaintextBytes  int64
 	ciphertextBytes int64
@@ -427,6 +434,26 @@ func decodeUploadSession(sessionID string, fields map[string]string) (*uploadSes
 	}
 	sess.keyVersion = keyVersion
 
+	// ABSENT means v2, and this is a rolling-deploy requirement rather than a
+	// convenience: a session opened by the previous build carries no
+	// envelope_version field at all, and its parts are v2-shaped. Failing to
+	// decode it -- or decoding it as the new default -- would reject every
+	// remaining chunk of an upload that is already half done.
+	//
+	// A PRESENT but unrecognised value fails closed: the record then describes
+	// geometry this build cannot size, and sizing it wrong is how a part lands
+	// at the wrong length.
+	sess.envelopeVersion = EnvelopeVersionDefault
+	if raw := fields["envelope_version"]; raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("session field envelope_version: %w", err)
+		}
+		if sess.envelopeVersion = EnvelopeVersion(v); !sess.envelopeVersion.Valid() {
+			return nil, fmt.Errorf("session field envelope_version out of range: %d", v)
+		}
+	}
+
 	createdAt, err := strconv.ParseInt(fields["created_at"], 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("session field created_at: %w", err)
@@ -484,14 +511,18 @@ func touchSession(ctx context.Context, rdb *redis.Client, sessionID string) erro
 // --- init -----------------------------------------------------------------
 
 type initUploadSessionRequest struct {
-	ChannelID               string `json:"channel_id"`
-	ConversationID          string `json:"conversation_id"`
-	KeyVersion              int    `json:"key_version"`
-	FileType                string `json:"file_type"`
-	MimeType                string `json:"mime_type"`
-	ChunkSize               int64  `json:"chunk_size"`
-	TotalChunks             int64  `json:"total_chunks"`
-	DeclaredCiphertextBytes int64  `json:"declared_ciphertext_bytes"`
+	ChannelID      string `json:"channel_id"`
+	ConversationID string `json:"conversation_id"`
+	KeyVersion     int    `json:"key_version"`
+	FileType       string `json:"file_type"`
+	MimeType       string `json:"mime_type"`
+	// EnvelopeVersion is OPTIONAL, and absent (zero) means v2 -- see
+	// NormalizeEnvelopeVersion. A client predating the uniform-part-geometry
+	// change sends no field and keeps working unchanged.
+	EnvelopeVersion         int   `json:"envelope_version"`
+	ChunkSize               int64 `json:"chunk_size"`
+	TotalChunks             int64 `json:"total_chunks"`
+	DeclaredCiphertextBytes int64 `json:"declared_ciphertext_bytes"`
 }
 
 // InitUploadSession opens a chunked attachment upload session.
@@ -518,7 +549,7 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 		return
 	}
 
-	plaintextBytes, ok := validateInitArithmetic(c, &req)
+	envelopeVersion, plaintextBytes, ok := validateInitArithmetic(c, &req)
 	if !ok {
 		return
 	}
@@ -591,7 +622,8 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 		id: sessionID, userID: userID, fileID: fileID, storageKey: storageKey,
 		uploadID: uploadID, channelID: req.ChannelID, conversationID: req.ConversationID,
 		fileType: normalizeFileType(req.FileType), mimeType: normalizeMimeType(req.MimeType),
-		keyVersion: req.KeyVersion, totalChunks: req.TotalChunks,
+		keyVersion: req.KeyVersion, envelopeVersion: envelopeVersion,
+		totalChunks:    req.TotalChunks,
 		plaintextBytes: plaintextBytes, ciphertextBytes: req.DeclaredCiphertextBytes,
 		createdAt: time.Now(), backend: backendID,
 	}
@@ -618,21 +650,35 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 }
 
 // validateInitArithmetic checks everything about the declared envelope that can
-// be checked without touching a database, and returns the plaintext size the
-// client will actually send.
-func validateInitArithmetic(c *gin.Context, req *initUploadSessionRequest) (int64, bool) {
+// be checked without touching a database, and returns the wire format plus the
+// plaintext size the client will actually send.
+func validateInitArithmetic(
+	c *gin.Context, req *initUploadSessionRequest,
+) (EnvelopeVersion, int64, bool) {
 	if req.ChannelID == "" && req.ConversationID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Either channel_id or conversation_id is required for attachments"})
-		return 0, false
+		return 0, 0, false
 	}
 	if req.ChannelID != "" && req.ConversationID != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Exactly one of channel_id or conversation_id must be provided"})
-		return 0, false
+		return 0, 0, false
 	}
 	// #2843: the epoch is sender-attested, never invented by the server.
 	if req.KeyVersion < 1 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgKeyVersionRequired})
-		return 0, false
+		return 0, 0, false
+	}
+	// The accepted set is CLOSED. Absent (zero) is v2 so an older client keeps
+	// working; anything else outside {2, 3} is a format whose part geometry this
+	// server cannot derive, and admitting it would mean sizing its parts by
+	// guess.
+	envelopeVersion, ok := NormalizeEnvelopeVersion(req.EnvelopeVersion)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             fmt.Sprintf("envelope_version must be %d or %d", EnvelopeVersionV2, EnvelopeVersionV3),
+			"envelope_versions": []EnvelopeVersion{EnvelopeVersionV2, EnvelopeVersionV3},
+		})
+		return 0, 0, false
 	}
 	// chunk_size is an allowlist, not a sizing input. It exists so the value is
 	// bound into every chunk's AAD; a client that disagrees with the compile-time
@@ -642,7 +688,7 @@ func validateInitArithmetic(c *gin.Context, req *initUploadSessionRequest) (int6
 			"error":      fmt.Sprintf("chunk_size must be %d", AttachmentChunkPlaintextBytes),
 			"chunk_size": AttachmentChunkPlaintextBytes,
 		})
-		return 0, false
+		return 0, 0, false
 	}
 	// mime_type reaches a VARCHAR(100) column at commit. Unvalidated, an
 	// over-long value survived the entire upload and failed at the INSERT --
@@ -654,23 +700,26 @@ func validateInitArithmetic(c *gin.Context, req *initUploadSessionRequest) (int6
 			"error":    fmt.Sprintf("mime_type must be at most %d characters", maxMimeTypeLen),
 			"max_size": maxMimeTypeLen,
 		})
-		return 0, false
+		return 0, 0, false
 	}
 	if req.TotalChunks < 1 || req.TotalChunks > maxMultipartParts {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":      fmt.Sprintf("total_chunks must be between 1 and %d", maxMultipartParts),
 			"max_chunks": maxMultipartParts,
 		})
-		return 0, false
+		return 0, 0, false
 	}
 	// total_chunks is client-supplied and therefore untrusted: ChunkedPlaintextBytes
-	// verifies it against the arithmetic rather than believing it.
-	plaintextBytes, err := ChunkedPlaintextBytes(req.DeclaredCiphertextBytes, req.TotalChunks)
+	// verifies it against the arithmetic rather than believing it -- under the
+	// version the client declared, so a v3 client cannot be measured with v2
+	// geometry or the reverse.
+	plaintextBytes, err := ChunkedPlaintextBytes(
+		req.DeclaredCiphertextBytes, req.TotalChunks, envelopeVersion)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Declared attachment size is inconsistent"})
-		return 0, false
+		return 0, 0, false
 	}
-	return plaintextBytes, true
+	return envelopeVersion, plaintextBytes, true
 }
 
 func normalizeFileType(raw string) FileType {
@@ -1016,6 +1065,7 @@ func (h *Handler) persistSession(ctx context.Context, rdb *redis.Client, sess *u
 		"file_type", string(sess.fileType),
 		"mime_type", sess.mimeType,
 		"key_version", sess.keyVersion,
+		"envelope_version", int(sess.envelopeVersion),
 		"total_chunks", sess.totalChunks,
 		"plaintext_bytes", sess.plaintextBytes,
 		"ciphertext_bytes", sess.ciphertextBytes,
@@ -1099,7 +1149,8 @@ func (h *Handler) PutUploadChunk(c *gin.Context) {
 	// The expected length is pure arithmetic over the session's declared sizes.
 	// Nothing about the bytes themselves is inspected -- the server never parses
 	// the v2 header.
-	expected := attachmentPartSize(index, sess.totalChunks, sess.plaintextBytes)
+	expected := attachmentPartSize(
+		index, sess.totalChunks, sess.plaintextBytes, sess.envelopeVersion)
 
 	// MaxBytesReader BEFORE any read of the body, and before the Content-Length
 	// checks below, so a lying Content-Length still cannot make the server read
@@ -1339,7 +1390,8 @@ func reconcileParts(stored []storage.ObjectPartInfo, sess *uploadSession) ([]sto
 	complete := make([]storage.ObjectPartInfo, 0, sess.totalChunks)
 	missing := make([]int64, 0)
 	for index := int64(0); index < sess.totalChunks; index++ {
-		want := attachmentPartSize(index, sess.totalChunks, sess.plaintextBytes)
+		want := attachmentPartSize(
+			index, sess.totalChunks, sess.plaintextBytes, sess.envelopeVersion)
 		part, present := byNumber[int(index)+1]
 		if !present || part.Size != want {
 			missing = append(missing, index)

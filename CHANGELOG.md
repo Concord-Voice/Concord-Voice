@@ -15,6 +15,7 @@ Concord Voice keeps voice-channel and private-call activity current internally, 
 ### Fixed
 
 - **An invite preview no longer reuses details from a different invite while loading** ([#3037](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3037)) — preview results are now kept with the invite code they describe, so changing codes shows a loading state until the new details arrive.
+- **Prepared large encrypted attachments for consistently sized upload pieces** ([#3039](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3039)) — the client and server now understand a new attachment format that reserves room for the header inside the first piece, while retaining the existing write format until compatible server and client versions can be negotiated. Attachments already stored in the older format still open normally.
 
 ## [0.2.43] — 2026-08-30
 

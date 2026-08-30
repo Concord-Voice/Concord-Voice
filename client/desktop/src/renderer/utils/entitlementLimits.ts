@@ -1,8 +1,9 @@
 import { formatFileSize } from './attachmentCrypto';
 import {
-  CHUNK_PLAINTEXT_BYTES,
   CHUNK_OVERHEAD_BYTES,
   ENVELOPE_HEADER_BYTES,
+  ENVELOPE_VERSION_V3,
+  totalChunksFor,
 } from './attachmentChunkedCrypto';
 
 export const FREE_MESSAGE_CHARS = 5120;
@@ -54,9 +55,17 @@ export const IMAGE_STRIP_MAX_BYTES = 134_217_728;
 
 /** Download-side guard.
  *
- *  Derived, never a magic number. It must admit a maximum-size v2 envelope:
- *  the 28-byte per-file header plus 28 bytes (IV + tag) per chunk. At the
- *  premium ceiling that is 28 + 28*32 = 924 bytes of overhead.
+ *  Derived, never a magic number. It must admit a maximum-size envelope of the
+ *  LARGEST format this build can read: the 28-byte per-file header plus 28 bytes
+ *  (IV + tag) per chunk.
+ *
+ *  DERIVED FROM v3, AND THE VERSION IS LOAD-BEARING. v3 gives 28 bytes of chunk
+ *  0's plaintext to the header, and the premium ceiling is an exact multiple of
+ *  the chunk size -- so those 28 bytes spill into a whole extra chunk: 33 chunks
+ *  (952 bytes of overhead) where v2 needs 32 (924). Sized to v2 this guard is 28
+ *  bytes short, and `readBoundedBody` CANCELS the transfer the moment the body
+ *  passes it, so a maximum-size premium attachment becomes undownloadable. Both
+ *  counts are pinned server-side by TestPremiumCeilingChunkCountsPerVersion.
  *
  *  The previous value was PREMIUM + 4096, with a comment claiming the 4096
  *  mirrored the server's multipart-header allowance. That derivation is wrong
@@ -71,7 +80,7 @@ export const IMAGE_STRIP_MAX_BYTES = 134_217_728;
 export const MAX_DECRYPTABLE_ATTACHMENT_BYTES =
   PREMIUM_ATTACHMENT_BYTES +
   ENVELOPE_HEADER_BYTES +
-  CHUNK_OVERHEAD_BYTES * Math.ceil(PREMIUM_ATTACHMENT_BYTES / CHUNK_PLAINTEXT_BYTES);
+  CHUNK_OVERHEAD_BYTES * totalChunksFor(PREMIUM_ATTACHMENT_BYTES, ENVELOPE_VERSION_V3);
 
 export function clampMessageCharsForTier(tier: string, value: number): number {
   const ceiling = tier === 'premium' ? PREMIUM_MESSAGE_CHARS : FREE_MESSAGE_CHARS;

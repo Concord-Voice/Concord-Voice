@@ -7370,6 +7370,16 @@ paths:
                   - file
                 mime_type:
                   type: string
+                envelope_version:
+                  type: integer
+                  enum:
+                  - 0
+                  - 2
+                  - 3
+                  default: 2
+                  description: >-
+                    Chunked attachment envelope geometry. Omitted or 0 selects v2 for old-client
+                    compatibility; explicit 2 and 3 select their respective chunk arithmetic.
                 chunk_size:
                   type: integer
                   description: Plaintext bytes per chunk. Fixed by the wire format.

@@ -106,6 +106,7 @@ describe('uploadAttachmentChunked', () => {
     expect(sent.declared_ciphertext_bytes).toBe(expectedBlobLength(plaintext));
     expect(sent.total_chunks).toBe(1);
     expect(sent.chunk_size).toBe(CHUNK_PLAINTEXT_BYTES);
+    expect(sent.envelope_version).toBe(2);
     expect(sent.key_version).toBe(3);
     expect(sent.channel_id).toBe('chan-1');
   });

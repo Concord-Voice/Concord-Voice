@@ -17,6 +17,11 @@
  *  2. Cloudflare caps request bodies at ~100 MB and `api.concordvoice.chat` is
  *     CF-proxied by standing requirement, so a single 256 MiB request is
  *     refused at the edge regardless of what the origin would accept.
+ *
+ * WIRE VERSION. `envelope_version` rides on every init. A control plane
+ * predating it ignores the field and sizes the session with v2 geometry, at
+ * which point the first chunk PUT is refused for length -- a clean, immediate
+ * 400, never a corrupt upload. Deploy the control plane first.
  */
 import { apiFetch } from './apiClient';
 import {
@@ -128,10 +133,16 @@ async function openSession(
       file_type: ctx.fileType,
       mime_type: ctx.mimeType,
       chunk_size: CHUNK_PLAINTEXT_BYTES,
+      // EVERY size below is derived from the SAME header this upload will seal
+      // with, never from the write-version constant. v2 and v3 disagree about
+      // the chunk count and the part boundaries for the same file, so a session
+      // opened under one version and sealed under the other has every part
+      // rejected for length.
+      envelope_version: header.version,
       total_chunks: header.totalChunks,
       // The server recomputes this and 400s on disagreement, so a client that
       // guesses fails closed rather than uploading something unreadable.
-      declared_ciphertext_bytes: expectedBlobLength(file.size),
+      declared_ciphertext_bytes: expectedBlobLength(file.size, header.version),
     }),
   });
   if (!res.ok) {

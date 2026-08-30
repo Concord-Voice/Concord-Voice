@@ -519,6 +519,121 @@ func TestUploadSession_RoundTripsByteIdentical(t *testing.T) {
 	assert.Equal(t, 1, keyVersion)
 }
 
+func TestInitUploadSession_PersistsEnvelopeVersionV3(t *testing.T) {
+	ss := setupSessionTest(t)
+	userID, _, channelID := ss.channelContext(t, "v3-version")
+	body := initBody(channelID, 4096)
+	body["envelope_version"] = 3
+	w := ss.doInit(userID, body)
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	sessionID, ok := parseBody(t, w)["session_id"].(string)
+	require.True(t, ok)
+	stored := ss.rdb.HGet(t.Context(), attachSessionKey(sessionID), "envelope_version").Val()
+	assert.Equal(t, "3", stored)
+}
+
+func TestInitUploadSession_EnvelopeVersionCompatibilityMatrix(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	tests := []struct {
+		name     string
+		declared *int
+		wantCode int
+		wantHash string
+	}{
+		{name: "omitted means v2", wantCode: http.StatusCreated, wantHash: "2"},
+		{name: "zero means v2", declared: intPtr(0), wantCode: http.StatusCreated, wantHash: "2"},
+		{name: "explicit v2", declared: intPtr(2), wantCode: http.StatusCreated, wantHash: "2"},
+		{name: "explicit v3", declared: intPtr(3), wantCode: http.StatusCreated, wantHash: "3"},
+		{name: "unsupported version", declared: intPtr(4), wantCode: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := setupSessionTest(t)
+			userID, _, channelID := ss.channelContext(t, "version-matrix")
+			body := initBody(channelID, 4096)
+			if tc.declared != nil {
+				body["envelope_version"] = *tc.declared
+			}
+			w := ss.doInit(userID, body)
+			require.Equal(t, tc.wantCode, w.Code, "body: %s", w.Body.String())
+			if tc.wantHash == "" {
+				return
+			}
+			sessionID, ok := parseBody(t, w)["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantHash,
+				ss.rdb.HGet(t.Context(), attachSessionKey(sessionID), "envelope_version").Val())
+		})
+	}
+}
+
+func TestUploadSession_V3VersionDrivesUniformPartGeometry(t *testing.T) {
+	ss := setupSessionTest(t)
+	userID, _, channelID := ss.channelContext(t, "v3-route")
+	const plaintext = 2*AttachmentChunkPlaintextBytes + 1
+	const totalChunks = 3
+	body := initBody(channelID, plaintext)
+	body["total_chunks"] = totalChunks
+	body["declared_ciphertext_bytes"] = AttachmentEnvelopeHeaderBytes +
+		AttachmentChunkOverheadBytes*totalChunks + plaintext
+	body["envelope_version"] = 3
+	w := ss.doInit(userID, body)
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	sessionID, ok := parseBody(t, w)["session_id"].(string)
+	require.True(t, ok)
+	part0 := make([]byte, 8_388_636)
+	w = ss.doPutChunk(userID, sessionID, 0, part0, int64(len(part0)))
+	assert.Equal(t, http.StatusOK, w.Code,
+		"v3 part 0 must exclude the 28-byte envelope header from its plaintext budget")
+}
+
+func TestInitUploadSession_V3FirstChunkCapacityBoundaries(t *testing.T) {
+	const first = AttachmentChunkPlaintextBytes - AttachmentEnvelopeHeaderBytes
+	for _, tc := range []struct {
+		name  string
+		pt    int64
+		total int64
+	}{
+		{name: "exact capacity", pt: first, total: 1},
+		{name: "one byte over", pt: first + 1, total: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := setupSessionTest(t)
+			userID, _, channelID := ss.channelContext(t, "v3-boundary")
+			body := initBody(channelID, tc.pt)
+			body["total_chunks"] = tc.total
+			body["declared_ciphertext_bytes"] = AttachmentEnvelopeHeaderBytes +
+				AttachmentChunkOverheadBytes*tc.total + tc.pt
+			body["envelope_version"] = 3
+			w := ss.doInit(userID, body)
+			require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+			sessionID, ok := parseBody(t, w)["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, "3", ss.rdb.HGet(t.Context(),
+				attachSessionKey(sessionID), "envelope_version").Val())
+		})
+	}
+}
+
+func TestInitUploadSession_V3PremiumCeiling(t *testing.T) {
+	ss := setupSessionTest(t)
+	userID, _, channelID := ss.channelContext(t, "v3-ceiling")
+	ss.handler.serverTiers = serverTierStub{tier: "mach3"}
+	const plaintext = 512 * 1024 * 1024
+	const totalChunks = 65
+	body := initBody(channelID, plaintext)
+	body["total_chunks"] = totalChunks
+	body["declared_ciphertext_bytes"] = AttachmentEnvelopeHeaderBytes +
+		AttachmentChunkOverheadBytes*totalChunks + plaintext
+	body["envelope_version"] = 3
+	w := ss.doInit(userID, body)
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	sessionID, ok := parseBody(t, w)["session_id"].(string)
+	require.True(t, ok)
+	assert.Equal(t, "3", ss.rdb.HGet(t.Context(),
+		attachSessionKey(sessionID), "envelope_version").Val())
+}
+
 func TestUploadSession_MultiChunkRoundTrip(t *testing.T) {
 	ss := setupSessionTest(t)
 	userID, _, channelID := ss.channelContext(t, "sess_multichunk")
