@@ -1,4 +1,7 @@
-import { useVideoSettingsStore, VIDEO_QUALITY_PRESETS } from '@/renderer/stores/videoSettingsStore';
+import {
+  useVideoSettingsStore,
+  VIDEO_QUALITY_PRESETS,
+} from '@/renderer/stores/voice/videoSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

@@ -1,6 +1,10 @@
 import { useCallback, useState } from 'react';
-import { useVoiceStore, AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voiceStore';
-import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
+import {
+  useVoiceStore,
+  AUDIO_QUALITY_TIERS,
+  type AudioQualityTier,
+} from '../../stores/voice/voiceStore';
+import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
 import {
   useDraftAudioSetting,
   setDraftAudioSetting,

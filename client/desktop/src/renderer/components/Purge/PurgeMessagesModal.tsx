@@ -13,9 +13,9 @@ import {
   type StepUpPurgeResult,
   type TerminalPurgeResult,
 } from '../../services/purgeApi';
-import { usePrivacyStore } from '../../stores/privacyStore';
-import { useSettingsNavStore } from '../../stores/settingsNavStore';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
+import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import './purgeMessages.css';
 
 interface PurgeMessagesModalProps {

@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import {
   useVideoSettingsStore,
   VIDEO_QUALITY_PRESETS,
   type ScreenContentType,
   type DegradationPreference,
   type VideoPriority,
-} from '../../stores/videoSettingsStore';
+} from '../../stores/voice/videoSettingsStore';
 import { codecKey, getCodecInfo, type CodecCapability } from '../../services/mediaCapabilities';
 import {
   buildCodecCandidates,
@@ -25,7 +25,7 @@ import {
 import { castingCopy } from './castingCopy';
 import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/useDraftSettings';
 import { useEntitlement } from '../../hooks/useEntitlement';
-import { useSubscriptionStore } from '../../stores/subscriptionStore';
+import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { useGateActivation } from '../../hooks/useGateActivation';
 import { nativeExceedsFree } from '../../utils/nativeExceedsFree';
 import {

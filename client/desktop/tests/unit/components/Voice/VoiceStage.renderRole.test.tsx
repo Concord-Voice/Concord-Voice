@@ -10,7 +10,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, waitFor, cleanup } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
+import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 
 // VoiceStage → StageVideo → ScreenShareAudioControls statically imports voiceService, so
 // the mock factory runs during the import chain (before module-body consts initialize) —

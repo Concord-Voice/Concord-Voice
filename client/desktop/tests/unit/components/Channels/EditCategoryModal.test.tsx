@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { mockServer } from '../../../mocks/fixtures';
 import type { ChannelGroup } from '@/renderer/types/chat';
 

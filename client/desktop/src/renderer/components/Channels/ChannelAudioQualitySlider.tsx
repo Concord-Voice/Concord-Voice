@@ -4,7 +4,7 @@ import {
   AUDIO_TIER_ORDER,
   serverAudioCeilingTier,
   type AudioQualityTier,
-} from '../../stores/voiceStore';
+} from '../../stores/voice/voiceStore';
 import '../common/audioQualitySlider.css';
 
 interface ChannelAudioQualitySliderProps {

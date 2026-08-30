@@ -1,6 +1,6 @@
 import { render, screen } from '../../../test-utils';
 import ConnectionStatus from '@/renderer/components/ConnectionStatus/ConnectionStatus';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 describe('ConnectionStatus', () => {

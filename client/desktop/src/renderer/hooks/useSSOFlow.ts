@@ -14,16 +14,16 @@
  */
 
 import { useCallback } from 'react';
-import { useSSOStore, type SSOState } from '../stores/ssoStore';
+import { useSSOStore, type SSOState } from '../stores/auth/ssoStore';
 import {
   startSSOFlow,
   type SSOProvider,
   type SSOResult,
   type SSOCompletionResult,
 } from '../services/ssoService';
-import { useAuthStore } from '../stores/authStore';
-import { useE2EEStore } from '../stores/e2eeStore';
-import { useMFAChallengeStore, type MFAChallengeResult } from '../stores/mfaChallengeStore';
+import { useAuthStore } from '../stores/auth/authStore';
+import { useE2EEStore } from '../stores/auth/e2eeStore';
+import { useMFAChallengeStore, type MFAChallengeResult } from '../stores/auth/mfaChallengeStore';
 import { revokeAbortedSession } from '../services/apiClient';
 import {
   captureRuntimeServerSelection,

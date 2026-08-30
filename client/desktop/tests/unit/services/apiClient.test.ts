@@ -3,9 +3,9 @@ import { resetAllStores } from '../../helpers/store-helpers';
 
 // We need to test apiClient which uses global fetch and authStore
 // Import the store directly
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
-import { useMFAChallengeStore } from '@/renderer/stores/mfaChallengeStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,

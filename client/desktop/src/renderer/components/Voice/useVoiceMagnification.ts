@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState } from 'react';
-import type { VoiceParticipant } from '../../stores/voiceStore';
+import type { VoiceParticipant } from '../../stores/voice/voiceStore';
 
 // Voice-triggered magnification (subtler than server bar's 40%)
 export const VOICE_MAX_SCALE = 1.12; // 12% magnification

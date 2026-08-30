@@ -20,7 +20,7 @@ vi.mock('@/renderer/components/Settings/ClientBehaviorSection', () => ({
 }));
 
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import AppearanceSection from '@/renderer/components/Settings/AppearanceSection';
 
 function customAddButton(): HTMLButtonElement {

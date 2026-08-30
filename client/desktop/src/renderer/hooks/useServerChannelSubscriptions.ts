@@ -9,17 +9,17 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { useServerStore } from '../stores/serverStore';
-import { useChatStore } from '../stores/chatStore';
-import { useChannelStore } from '../stores/channelStore';
-import { useUnreadStore } from '../stores/unreadStore';
+import { useServerStore } from '../stores/chat/serverStore';
+import { useChatStore } from '../stores/chat/chatStore';
+import { useChannelStore } from '../stores/chat/channelStore';
+import { useUnreadStore } from '../stores/chat/unreadStore';
 import { getWebSocketService } from '../services/websocketService';
 import {
   useNotificationPrefsStore,
   hasUnmutedChannel,
   isChannelMutedInMaps,
   isEntryCurrentlyMuted,
-} from '../stores/notificationPrefsStore';
+} from '../stores/ui/notificationPrefsStore';
 import { apiFetch } from '../services/apiClient';
 import { errorMessage } from '../utils/redactError';
 
@@ -195,8 +195,12 @@ export function useServerChannelSubscriptions() {
   // fetch-seeded dot before per-channel data has loaded.
   useEffect(() => {
     const activeId = useServerStore.getState().activeServerId;
-    const { unreadCounts, unreadCountsServerId, serverUnreadPreciseSet, serverUnreadChannelWinsSet } =
-      useUnreadStore.getState();
+    const {
+      unreadCounts,
+      unreadCountsServerId,
+      serverUnreadPreciseSet,
+      serverUnreadChannelWinsSet,
+    } = useUnreadStore.getState();
 
     // Reconcile BACKGROUND servers first. The active-server recompute below
     // can only see the active server's per-channel unread data, so a non-active

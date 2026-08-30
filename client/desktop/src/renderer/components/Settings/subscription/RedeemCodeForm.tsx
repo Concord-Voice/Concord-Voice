@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { apiFetch, safeJson } from '../../../services/apiClient';
-import { useSubscriptionStore } from '../../../stores/subscriptionStore';
+import { useSubscriptionStore } from '../../../stores/auth/subscriptionStore';
 import { easterEggMessage, type RedeemResult } from './redeemEasterEgg';
 
 // The universal redeem form (#1304 / #1303 engine). Labelled input → POST

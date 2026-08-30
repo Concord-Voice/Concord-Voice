@@ -1,10 +1,10 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: vi.fn(),

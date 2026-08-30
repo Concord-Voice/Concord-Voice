@@ -1,11 +1,11 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import MemberContextMenu from '@/renderer/components/Members/MemberContextMenu';
 import { mockMember, mockMember2 } from '../../../mocks/fixtures';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';

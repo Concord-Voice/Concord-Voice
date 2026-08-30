@@ -1,5 +1,5 @@
 import ToggleSwitch from './ToggleSwitch';
-import { usePrivacyStore, DMPrivacyLevel } from '../../stores/privacyStore';
+import { usePrivacyStore, DMPrivacyLevel } from '../../stores/ui/privacyStore';
 
 const DM_LABEL_ID = 'dm-privacy-label';
 

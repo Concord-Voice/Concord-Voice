@@ -12,7 +12,7 @@
 import { e2eeService } from './e2eeService';
 import { apiFetch } from './apiClient';
 import { errorMessage } from '../utils/redactError';
-import type { AppearanceSettings } from '../stores/settingsStore';
+import type { AppearanceSettings } from '../stores/ui/settingsStore';
 import {
   deriveLegacySidebarProfiles,
   migrateLegacySidebarState,
@@ -21,7 +21,7 @@ import {
   type ServerFolder,
   type SidebarDockPreference,
   type SidebarProfiles,
-} from '../stores/layoutStore';
+} from '../stores/ui/layoutStore';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,
@@ -329,7 +329,7 @@ class PreferencesSyncService {
     // Capture the generation so stale callbacks (from a stop/restart race) are discarded.
     const gen = this.watchGeneration;
 
-    import('../stores/settingsStore')
+    import('../stores/ui/settingsStore')
       .then(({ useSettingsStore }) => {
         if (gen !== this.watchGeneration) return; // stale — service was stopped/restarted
         const unsubSettings = useSettingsStore.subscribe(
@@ -343,7 +343,7 @@ class PreferencesSyncService {
         /* module already loaded — should not fail */
       });
 
-    import('../stores/layoutStore')
+    import('../stores/ui/layoutStore')
       .then(({ useLayoutStore }) => {
         if (gen !== this.watchGeneration) return; // stale — service was stopped/restarted
         const unsubLayout = useLayoutStore.subscribe(

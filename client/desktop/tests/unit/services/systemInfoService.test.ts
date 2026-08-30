@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { collect } from '@/renderer/services/systemInfoService';
 
 // Mock connection store before importing it via the service.
-vi.mock('@/renderer/stores/connectionStore', () => ({
+vi.mock('@/renderer/stores/ui/connectionStore', () => ({
   useConnectionStore: {
     getState: () => ({ phase: 'stable' }),
   },

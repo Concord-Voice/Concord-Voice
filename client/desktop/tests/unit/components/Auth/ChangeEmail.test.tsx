@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { ChangeEmail } from '@/renderer/components/Auth/ChangeEmail';
-import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
+import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 const mockFetch = vi.fn();

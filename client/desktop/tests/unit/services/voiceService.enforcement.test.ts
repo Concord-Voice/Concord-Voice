@@ -90,7 +90,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
 }));
 
 // --- osPermissionStore ---
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: {
     getState: vi.fn().mockReturnValue({
       checkOne: vi.fn().mockResolvedValue('granted'),
@@ -204,8 +204,8 @@ Object.defineProperty(navigator, 'mediaDevices', {
 // ---------------------------------------------------------------------------
 const { voiceService } = await import('@/renderer/services/voiceService');
 
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 // ---------------------------------------------------------------------------
 // Helpers

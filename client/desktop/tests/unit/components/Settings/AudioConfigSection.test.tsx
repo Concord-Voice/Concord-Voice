@@ -18,7 +18,7 @@ const defaultAudioSettings: Record<string, unknown> = {
   musicMode: false,
 };
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: vi.fn((selector) =>
     selector({
       qualityTier: 'standard' as const,
@@ -85,7 +85,7 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/audioSettingsStore', () => ({
+vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
   useAudioSettingsStore: Object.assign(
     vi.fn((s) => s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
     { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })) }
@@ -125,7 +125,7 @@ async function overrideDraftSettings(overrides: Record<string, unknown>) {
 
 /** Switch the audioSettingsStore mock to advanced mode. */
 async function enableAdvancedMode() {
-  const { useAudioSettingsStore } = await import('@/renderer/stores/audioSettingsStore');
+  const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
   (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
     (s: (state: Record<string, unknown>) => unknown) =>
       s({ advancedMode: true, setAdvancedMode: mockSetAdvancedMode })
@@ -137,7 +137,7 @@ async function enableAdvancedMode() {
 
 /** Override useVoiceStore to return a different tier. */
 async function overrideTier(tier: string) {
-  const { useVoiceStore } = await import('@/renderer/stores/voiceStore');
+  const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
   (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
     (s: (state: Record<string, unknown>) => unknown) =>
       s({ qualityTier: tier, setQualityTier: mockSetQualityTier })
@@ -151,13 +151,13 @@ describe('AudioConfigSection', () => {
     vi.clearAllMocks();
 
     // Re-apply default mock implementations (clearAllMocks wipes mockImplementation)
-    const { useVoiceStore } = await import('@/renderer/stores/voiceStore');
+    const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
     (useVoiceStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (s: (state: Record<string, unknown>) => unknown) =>
         s({ qualityTier: 'standard', setQualityTier: mockSetQualityTier })
     );
 
-    const { useAudioSettingsStore } = await import('@/renderer/stores/audioSettingsStore');
+    const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
     (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (s: (state: Record<string, unknown>) => unknown) =>
         s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })

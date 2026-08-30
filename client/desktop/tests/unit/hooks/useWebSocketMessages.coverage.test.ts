@@ -14,18 +14,18 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel, mockServer } from '../../mocks/fixtures';
 

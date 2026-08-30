@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 
 // Mock apiFetch to avoid MSW timing issues in jsdom
 vi.mock('@/renderer/services/apiClient', () => ({

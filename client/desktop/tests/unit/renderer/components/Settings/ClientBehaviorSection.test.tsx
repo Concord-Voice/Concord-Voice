@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ClientBehaviorSection } from '@/renderer/components/Settings/ClientBehaviorSection';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 
 beforeEach(() => {
   vi.clearAllMocks();

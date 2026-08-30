@@ -59,14 +59,14 @@ vi.mock('@/renderer/services/resetService', () => ({
 
 // Spy on the color-sync suppression leaf so the regression test can assert the
 // reset fires SYNCHRONOUSLY during logout() (a dynamic import would defer it).
-vi.mock('@/renderer/stores/colorSyncSuppression', () => ({
+vi.mock('@/renderer/stores/ui/colorSyncSuppression', () => ({
   setSyncSuppressed: vi.fn(() => logoutOrder.push('sync-suppression-reset')),
   isSyncSuppressed: vi.fn(() => false),
 }));
 
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { setSyncSuppressed } from '@/renderer/stores/colorSyncSuppression';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { setSyncSuppressed } from '@/renderer/stores/ui/colorSyncSuppression';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
 import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';

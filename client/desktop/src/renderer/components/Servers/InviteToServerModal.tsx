@@ -3,7 +3,7 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import Modal from '../ui/Modal';
 import CustomSelect from '../ui/CustomSelect';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import { useInviteStore } from '../../stores/inviteStore';
+import { useInviteStore } from '../../stores/chat/inviteStore';
 import { ServerWithRole, ServerInviteWithCreator } from '../../types/server';
 import { errorMessage } from '../../utils/redactError';
 import './InviteToServerModal.css';

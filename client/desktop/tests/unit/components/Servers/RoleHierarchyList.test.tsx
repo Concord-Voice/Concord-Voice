@@ -6,7 +6,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import RoleHierarchyList, {
   insertionToTargetIndex,
 } from '@/renderer/components/Servers/RoleHierarchyList';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import type { ReorderOutcome, Role, RoleReorderPayload, RoleViewer } from '@/renderer/types/server';
 
 /**

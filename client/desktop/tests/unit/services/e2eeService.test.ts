@@ -6,7 +6,7 @@ import {
   wrapChannelKey,
 } from '@/renderer/utils/crypto';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 
 // Test the singleton and clear between tests
 import { e2eeService } from '@/renderer/services/e2eeService';

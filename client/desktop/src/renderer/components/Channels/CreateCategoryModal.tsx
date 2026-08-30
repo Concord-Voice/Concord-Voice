@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import { useServerStore } from '../../stores/serverStore';
-import { useChannelStore } from '../../stores/channelStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
 import { apiFetch } from '../../services/apiClient';
 import './CreateChannelModal.css';
 

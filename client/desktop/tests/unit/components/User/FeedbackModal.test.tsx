@@ -3,7 +3,7 @@ import { vi } from 'vitest';
 import FeedbackModal from '@/renderer/components/User/FeedbackModal';
 
 // Mock the connection store the systemInfoService imports
-vi.mock('@/renderer/stores/connectionStore', () => ({
+vi.mock('@/renderer/stores/ui/connectionStore', () => ({
   useConnectionStore: { getState: () => ({ phase: 'stable' }) },
 }));
 

@@ -1,9 +1,9 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 

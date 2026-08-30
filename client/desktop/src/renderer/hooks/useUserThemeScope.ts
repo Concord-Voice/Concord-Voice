@@ -1,6 +1,6 @@
 import { useMemo, type CSSProperties } from 'react';
 import { resolveUserThemeScope } from '../utils/schemeColors';
-import { useSettingsStore } from '../stores/settingsStore';
+import { useSettingsStore } from '../stores/ui/settingsStore';
 
 interface ThemeScopeProps {
   'data-scheme': string;

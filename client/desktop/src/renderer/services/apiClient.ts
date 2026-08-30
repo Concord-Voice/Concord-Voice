@@ -12,14 +12,14 @@
  * handles refresh via safeStorage-encrypted token + net.fetch().
  */
 
-import { useAuthStore } from '../stores/authStore';
+import { useAuthStore } from '../stores/auth/authStore';
 import {
   captureRuntimeServerSelection,
   getApiBase,
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
 } from './runtimeServerBase';
-import type { TerminalAttestationCode } from '../stores/attestationFailureStore';
+import type { TerminalAttestationCode } from '../stores/auth/attestationFailureStore';
 
 export { API_BASE } from '../config';
 
@@ -329,7 +329,7 @@ async function handleMfaChallengeIfNeeded(
   if (result.status !== 'mfa_required' || !result.mfaChallengeToken) return null;
   if (!authLifecycleIsCurrent(lifecycle)) return null;
 
-  const { useMFAChallengeStore } = await import('../stores/mfaChallengeStore');
+  const { useMFAChallengeStore } = await import('../stores/auth/mfaChallengeStore');
   if (!authLifecycleIsCurrent(lifecycle)) return null;
   const mfaResult = await useMFAChallengeStore
     .getState()
@@ -682,7 +682,7 @@ async function handleTerminalAttestationPath(
   if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
   if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
 
-  const { useAttestationFailureStore } = await import('../stores/attestationFailureStore');
+  const { useAttestationFailureStore } = await import('../stores/auth/attestationFailureStore');
   if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
   if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
   useAttestationFailureStore.getState().showFailure({

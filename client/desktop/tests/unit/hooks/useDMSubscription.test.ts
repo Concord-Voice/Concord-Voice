@@ -1,6 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 
 const mockSubscribeDM = vi.fn();
 const mockUnsubscribeDM = vi.fn();

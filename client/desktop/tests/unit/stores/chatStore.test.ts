@@ -1,4 +1,4 @@
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockMessage, mockMessage2, mockPendingMessage } from '../../mocks/fixtures';
 

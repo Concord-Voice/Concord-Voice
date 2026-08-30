@@ -3,9 +3,9 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PrivacySecuritySection from '@/renderer/components/Settings/PrivacySecuritySection';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 vi.mock('@/renderer/components/Settings/MFATierSelector', () => ({
   default: () => null,

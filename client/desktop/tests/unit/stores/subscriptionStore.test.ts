@@ -9,7 +9,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   safeJson: vi.fn(),
 }));
 
-import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/subscriptionStore';
+import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
 import { apiFetch, safeJson } from '@/renderer/services/apiClient';
 
 const mockApiFetch = vi.mocked(apiFetch);

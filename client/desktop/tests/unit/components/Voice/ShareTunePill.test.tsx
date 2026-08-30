@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import type { ActiveScreenShare } from '@/renderer/stores/voiceStore';
+import type { ActiveScreenShare } from '@/renderer/stores/voice/voiceStore';
 
 vi.mock('@/renderer/components/Voice/ShareTunePill.css', () => ({}));
 

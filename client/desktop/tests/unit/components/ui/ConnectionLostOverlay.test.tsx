@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/ui/ConnectionLostOverlay.css', () => ({}));

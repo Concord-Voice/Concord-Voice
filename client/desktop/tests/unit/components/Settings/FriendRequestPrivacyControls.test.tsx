@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import FriendRequestPrivacyControls from '@/renderer/components/Settings/FriendRequestPrivacyControls';
-import type { FriendRequestPrivacyMode } from '@/renderer/stores/privacyStore';
+import type { FriendRequestPrivacyMode } from '@/renderer/stores/ui/privacyStore';
 
 const setup = (over: Partial<React.ComponentProps<typeof FriendRequestPrivacyControls>> = {}) => {
   const setMode = vi.fn();

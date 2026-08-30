@@ -8,7 +8,7 @@
  */
 
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore } from '../stores/chat/chatStore';
 import { apiFetch, safeJson } from '../services/apiClient';
 import { e2eeService } from '../services/e2eeService';
 import {

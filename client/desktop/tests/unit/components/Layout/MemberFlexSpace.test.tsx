@@ -1,8 +1,8 @@
 import { fireEvent, render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { mockServer } from '../../../mocks/fixtures';
 import MemberFlexSpace from '@/renderer/components/Layout/MemberFlexSpace';
 import { DockOverlayProvider } from '@/renderer/components/Layout/DockShell';

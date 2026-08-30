@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen } from '../../../../test-utils';
 import userEvent from '@testing-library/user-event';
 import PremiumGate from '@/renderer/components/common/PremiumGate';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../../helpers/store-helpers';
 
 beforeEach(() => {

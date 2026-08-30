@@ -1,8 +1,8 @@
 import React from 'react';
 import { render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { vi } from 'vitest';
 
 // ── Child component mocks ────────────────────────────────────────────────────

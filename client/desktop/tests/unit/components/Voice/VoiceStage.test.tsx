@@ -1,8 +1,8 @@
 import React from 'react';
 import { render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { vi } from 'vitest';
 
 // ── CSS mock ─────────────────────────────────────────────────────────────────

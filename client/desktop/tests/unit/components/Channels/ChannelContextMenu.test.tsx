@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { mockChannel } from '../../../mocks/fixtures';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { MANAGE_CHANNELS, BASE_PERMISSIONS, ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 

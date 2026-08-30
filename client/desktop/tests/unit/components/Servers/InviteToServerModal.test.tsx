@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { mockServer } from '../../../mocks/fixtures';
 import type { ServerWithRole } from '@/renderer/types/server';
 import { vi } from 'vitest';

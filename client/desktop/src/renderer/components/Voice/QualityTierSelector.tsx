@@ -1,6 +1,10 @@
 import React from 'react';
 import { Gauge, Crown } from 'lucide-react';
-import { useVoiceStore, AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voiceStore';
+import {
+  useVoiceStore,
+  AUDIO_QUALITY_TIERS,
+  type AudioQualityTier,
+} from '../../stores/voice/voiceStore';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import './QualityTierSelector.css';
 

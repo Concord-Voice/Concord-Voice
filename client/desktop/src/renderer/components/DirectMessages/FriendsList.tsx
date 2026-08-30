@@ -18,8 +18,8 @@ import {
   Folder,
   Search,
 } from 'lucide-react';
-import { useFriendStore, type Friend } from '../../stores/friendStore';
-import { useFriendOrgStore, type FriendCategory } from '../../stores/friendOrgStore';
+import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
+import { useFriendOrgStore, type FriendCategory } from '../../stores/chat/friendOrgStore';
 import ContextMenu from '../ui/ContextMenu';
 import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
 import { resolveUserAccentColors } from '../../utils/schemeColors';

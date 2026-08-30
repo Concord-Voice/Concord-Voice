@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { nativeExceedsFree } from '@/renderer/utils/nativeExceedsFree';
 import { videoLimitsFromEntitlement } from '@/renderer/utils/videoLimits';
-import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/subscriptionStore';
+import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subscriptionStore';
 
 // The screen-share option lists gate on the STREAM axis (#1602). The free stream
 // axis raw ceilings are 1080p / 60fps post-#2163 (the pixel-rate cap tiers fps

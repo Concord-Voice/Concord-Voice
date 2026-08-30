@@ -17,24 +17,24 @@
 
 import { Device, types as mediasoupTypes } from 'mediasoup-client';
 import { io, Socket } from 'socket.io-client';
-import { useAuthStore } from '../stores/authStore';
-import { useUserStore } from '../stores/userStore';
-import { useUpdateStatusStore } from '../stores/updateStatusStore';
-import { useSubscriptionStore } from '../stores/subscriptionStore';
+import { useAuthStore } from '../stores/auth/authStore';
+import { useUserStore } from '../stores/auth/userStore';
+import { useUpdateStatusStore } from '../stores/ui/updateStatusStore';
+import { useSubscriptionStore } from '../stores/auth/subscriptionStore';
 import {
   useVoiceStore,
   AUDIO_QUALITY_TIERS,
   MAX_TUNED_SCREEN_SHARES,
   type AudioQualityTier,
   type VoiceParticipant,
-} from '../stores/voiceStore';
-import { useAudioSettingsStore, type AudioPriority } from '../stores/audioSettingsStore';
+} from '../stores/voice/voiceStore';
+import { useAudioSettingsStore, type AudioPriority } from '../stores/audio/audioSettingsStore';
 import {
   useVideoSettingsStore,
   VIDEO_QUALITY_PRESETS,
   type VideoPriority,
   type ScreenShareOptions,
-} from '../stores/videoSettingsStore';
+} from '../stores/voice/videoSettingsStore';
 import { apiFetch } from './apiClient';
 import {
   BYPASS_PROBE_DELAY_MS,
@@ -54,7 +54,7 @@ import { E2EEKeyUnavailableError, isPendingKeyError } from './e2eeErrors';
 import {
   useOsPermissionStore,
   ensureOsPermission as ensureOsPermissionShared,
-} from '../stores/osPermissionStore';
+} from '../stores/voice/osPermissionStore';
 import {
   codecFamilyFromMimeType,
   codecFamilyFromRtpParameters,
@@ -2578,8 +2578,8 @@ class VoiceService {
     server_id: string;
     audio_quality_tier: string | null;
   }> {
-    const { useDMStore: importedDMStore } = await import('../stores/dmStore');
-    const { useUserStore: importedUserStore } = await import('../stores/userStore');
+    const { useDMStore: importedDMStore } = await import('../stores/chat/dmStore');
+    const { useUserStore: importedUserStore } = await import('../stores/auth/userStore');
     const conversation = importedDMStore.getState().conversations.find((c) => c.id === channelId);
     const currentUserId = importedUserStore.getState().user?.id;
     const synthName = await this.resolveDMChannelName(conversation, currentUserId);

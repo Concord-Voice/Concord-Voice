@@ -1,8 +1,8 @@
 import React, { useEffect } from 'react';
 import Modal from '../ui/Modal';
 import OverridePanel from '../Permissions/OverridePanel';
-import { usePermissionStore, ChannelOverride } from '../../stores/permissionStore';
-import { useMemberStore } from '../../stores/memberStore';
+import { usePermissionStore, ChannelOverride } from '../../stores/chat/permissionStore';
+import { useMemberStore } from '../../stores/chat/memberStore';
 import { ChannelGroup } from '../../types/chat';
 import './CategorySettingsModal.css';
 

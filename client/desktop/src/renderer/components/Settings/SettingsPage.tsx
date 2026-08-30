@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useTransition, useCallback } from 'react';
 import { useDraftSettingsLifecycle, useDraftActions } from '../../hooks/useDraftSettings';
 import { useSectionObserver } from '../../hooks/useSectionObserver';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
-import { useSettingsNavStore, type SettingsSection } from '../../stores/settingsNavStore';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
+import { useSettingsNavStore, type SettingsSection } from '../../stores/ui/settingsNavStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import AppearanceSection from './AppearanceSection';
 import PrivacySecuritySection from './PrivacySecuritySection';
 import VoiceAudioSection from './VoiceAudioSection';

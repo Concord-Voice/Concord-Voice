@@ -3,7 +3,7 @@ import {
   useNotificationPrefsStore,
   type MuteTargetType,
   type PreferenceWire,
-} from '../stores/notificationPrefsStore';
+} from '../stores/ui/notificationPrefsStore';
 import { errorMessage } from '../utils/redactError';
 import {
   isHydrationLifecycleCurrent,

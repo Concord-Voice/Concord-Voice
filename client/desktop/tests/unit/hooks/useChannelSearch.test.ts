@@ -1,6 +1,6 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { mockMessage, mockMessage2 } from '../../mocks/fixtures';
 import type { MessageWithStatus, MessageWithUser } from '@/renderer/types/chat';
 

@@ -1,7 +1,7 @@
 import { render, fireEvent } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // jsdom lacks scrollIntoView (used by the autocomplete's selected-item effect).
@@ -31,7 +31,7 @@ vi.mock('@/renderer/components/GifPicker/LazyGifPicker', () => ({
 }));
 vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({ default: () => null }));
 vi.mock('@/renderer/components/User/UserPanel', () => ({ default: () => <div /> }));
-vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false }));
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({ useLayoutStore: () => false }));
 vi.mock('@/renderer/hooks/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],

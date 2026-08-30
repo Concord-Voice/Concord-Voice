@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
-import { useNotificationStore } from '../../../src/renderer/stores/notificationStore';
+import { useNotificationStore } from '../../../src/renderer/stores/ui/notificationStore';
 
 // Mock the dynamic import of notificationNavigationStore
 const mockSetPendingNavigation = vi.fn();
-vi.mock('../../../src/renderer/stores/notificationNavigationStore', () => ({
+vi.mock('../../../src/renderer/stores/ui/notificationNavigationStore', () => ({
   useNotificationNavigationStore: {
     getState: () => ({
       setPendingNavigation: mockSetPendingNavigation,

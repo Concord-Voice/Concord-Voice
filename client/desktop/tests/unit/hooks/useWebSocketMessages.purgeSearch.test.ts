@@ -12,10 +12,10 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import {
   beginSearchBackfill,
   canIndexBackfillMessage,

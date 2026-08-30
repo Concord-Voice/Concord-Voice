@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { useNotificationStore } from '../../../src/renderer/stores/notificationStore';
+import { useNotificationStore } from '../../../src/renderer/stores/ui/notificationStore';
 
 // Must mock Audio before importing the service
 const mockPlay = vi.fn().mockResolvedValue(undefined);

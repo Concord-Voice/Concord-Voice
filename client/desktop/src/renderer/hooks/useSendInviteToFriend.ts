@@ -1,11 +1,11 @@
 import { useCallback } from 'react';
-import { useInviteStore } from '../stores/inviteStore';
-import { useDMStore } from '../stores/dmStore';
-import { useUserStore } from '../stores/userStore';
+import { useInviteStore } from '../stores/chat/inviteStore';
+import { useDMStore } from '../stores/chat/dmStore';
+import { useUserStore } from '../stores/auth/userStore';
 import { buildInviteUrl } from '../utils/inviteUrl';
 import { sendDMMessage } from '../services/dmMessageSender';
 import { e2eeService } from '../services/e2eeService';
-import type { Friend } from '../stores/friendStore';
+import type { Friend } from '../stores/chat/friendStore';
 
 export type SendInviteResult =
   | { ok: true; conversationId: string }

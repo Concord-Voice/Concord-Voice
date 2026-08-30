@@ -1,4 +1,4 @@
-import { useTTSSettingsStore } from '../stores/ttsSettingsStore';
+import { useTTSSettingsStore } from '../stores/audio/ttsSettingsStore';
 
 const MAX_UTTERANCE_LENGTH = 200;
 const MAX_QUEUE_SIZE = 3;

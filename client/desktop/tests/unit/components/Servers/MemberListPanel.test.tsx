@@ -2,7 +2,7 @@ import { render, screen, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import MemberListPanel from '@/renderer/components/Servers/MemberListPanel';
 import { vi } from 'vitest';
-import type { ServerMember } from '@/renderer/stores/memberStore';
+import type { ServerMember } from '@/renderer/stores/chat/memberStore';
 import type { Role } from '@/renderer/types/server';
 import { prefetchEligibility } from '@/renderer/services/friendEligibility';
 

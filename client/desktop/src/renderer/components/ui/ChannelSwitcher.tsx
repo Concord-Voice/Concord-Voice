@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Lock, Users, MessageSquare } from 'lucide-react';
-import { useKeyboardShortcutStore } from '../../stores/keyboardShortcutStore';
-import { useChannelStore } from '../../stores/channelStore';
-import { useDMStore } from '../../stores/dmStore';
-import { useServerStore } from '../../stores/serverStore';
-import { useUserStore } from '../../stores/userStore';
+import { useKeyboardShortcutStore } from '../../stores/ui/keyboardShortcutStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
+import { useDMStore } from '../../stores/chat/dmStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { useNavigate } from 'react-router';
 import './ChannelSwitcher.css';
 

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { presenceOverrideSyncService } from '../../services/presenceOverrideSync';
-import { useFriendStore, type Friend } from '../../stores/friendStore';
-import { usePresenceOverrideStore } from '../../stores/presenceOverrideStore';
+import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
+import { usePresenceOverrideStore } from '../../stores/ui/presenceOverrideStore';
 import { comparePresenceOverrideUserIds } from '../../utils/presenceOverrides';
 import PresenceExceptionModal from './PresenceExceptionModal';
 import './PresenceExceptions.css';

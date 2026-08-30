@@ -4,7 +4,7 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../../../../mocks/server';
 import { resetAllStores } from '../../../../helpers/store-helpers';
 import SubscriptionSection from '@/renderer/components/Settings/subscription/SubscriptionSection';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 const STATUS_PATH = 'http://localhost:8080/api/v1/subscriptions/me';
 const DISCLAIMER =

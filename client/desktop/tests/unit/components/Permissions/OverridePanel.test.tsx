@@ -33,9 +33,9 @@ vi.mock('@/renderer/components/Permissions/PermissionGrid', () => ({
 }));
 
 import OverridePanel from '@/renderer/components/Permissions/OverridePanel';
-import { ChannelOverride } from '@/renderer/stores/permissionStore';
+import { ChannelOverride } from '@/renderer/stores/chat/permissionStore';
 import { Role } from '@/renderer/types/server';
-import { ServerMember } from '@/renderer/stores/memberStore';
+import { ServerMember } from '@/renderer/stores/chat/memberStore';
 
 // --- Mock data ---
 

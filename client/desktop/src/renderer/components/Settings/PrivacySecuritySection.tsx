@@ -1,14 +1,14 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router';
-import { useAuthStore } from '../../stores/authStore';
-import { useUserStore } from '../../stores/userStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import {
   usePrivacyStore,
   DMPrivacyLevel,
   type FriendRequestPrivacyMode,
   type PrivacySettings,
-} from '../../stores/privacyStore';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+} from '../../stores/ui/privacyStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import { apiFetch, API_BASE } from '../../services/apiClient';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
@@ -22,7 +22,7 @@ import {
   useOsPermissionStore,
   type OsPermissionType,
   type OsPermissionStatus,
-} from '../../stores/osPermissionStore';
+} from '../../stores/voice/osPermissionStore';
 import DMPrivacyControls from './DMPrivacyControls';
 import FriendRequestPrivacyControls from './FriendRequestPrivacyControls';
 import ContentSafetyControls from './ContentSafetyControls';

@@ -42,9 +42,9 @@ vi.mock('@/renderer/services/voiceService', () => ({
 import { apiFetch } from '@/renderer/services/apiClient';
 import { notificationSoundService } from '@/renderer/services/notificationSoundService';
 import { voiceService } from '@/renderer/services/voiceService';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import type { DMConversation } from '@/renderer/stores/dmStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 import type { CallState } from '@/renderer/services/voiceService/callStateMachine';
 import { deferred } from '../../../helpers/deferred';
 

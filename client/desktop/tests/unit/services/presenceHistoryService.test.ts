@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import {
   ACTIVITY_HISTORY_RETENTION_DAYS,
   PresenceHistoryRequestError,

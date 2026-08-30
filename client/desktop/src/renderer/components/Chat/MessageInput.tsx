@@ -9,16 +9,20 @@ import LazyGifPicker, { preloadGifPicker } from '../GifPicker/LazyGifPicker';
 import UserPanel from '../User/UserPanel';
 import SyntaxHelpModal from '../Markdown/SyntaxHelpModal';
 import { InviteServerPicker } from './InviteServerPicker';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
-import { selectSidebarDock, type SidebarContext, useLayoutStore } from '../../stores/layoutStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
+import {
+  selectSidebarDock,
+  type SidebarContext,
+  useLayoutStore,
+} from '../../stores/ui/layoutStore';
 import { buildAddendum, encodeMentionMeta, type ParsedMention } from '../../utils/mentions';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
 import { useFileUpload, type AttachmentRejection } from '../../hooks/useFileUpload';
 import { useDraftMessage } from '../../hooks/useDraftMessage';
 import { useEntitlement } from '../../hooks/useEntitlement';
-import { useChatStore } from '../../stores/chatStore';
-import { usePermissionStore } from '../../stores/permissionStore';
-import { useInviteStore } from '../../stores/inviteStore';
+import { useChatStore } from '../../stores/chat/chatStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { useInviteStore } from '../../stores/chat/inviteStore';
 import { hasPermission, Permissions } from '../../utils/permissions';
 import { buildInviteUrl } from '../../utils/inviteUrl';
 import AttachmentUploadPreview from './AttachmentUploadPreview';

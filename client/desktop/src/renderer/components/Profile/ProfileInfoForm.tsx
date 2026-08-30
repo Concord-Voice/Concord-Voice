@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useUserStore, UpdateProfileData } from '../../stores/userStore';
+import { useUserStore, UpdateProfileData } from '../../stores/auth/userStore';
 import { useImageUpload } from '../../hooks/useImageUpload';
 import { useEntitlement } from '../../hooks/useEntitlement';
 import { formatFileSize } from '../../utils/attachmentCrypto';

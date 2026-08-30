@@ -6,10 +6,10 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,

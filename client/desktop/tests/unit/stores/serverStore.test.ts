@@ -1,8 +1,8 @@
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { vi } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
 import {

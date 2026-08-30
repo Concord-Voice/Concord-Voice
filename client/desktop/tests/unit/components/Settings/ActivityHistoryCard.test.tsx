@@ -9,11 +9,11 @@ import {
   type PresenceHistorySettings,
 } from '@/renderer/services/presenceHistoryService';
 import { clientConfigService } from '@/renderer/services/clientConfigService';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { vi } from 'vitest';
 import { deferred } from '../../../helpers/deferred';
 

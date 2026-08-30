@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { mockServer } from '../../../mocks/fixtures';
 import type { Role } from '@/renderer/types/server';
 import {
@@ -153,7 +153,7 @@ describe('ServerSettingsPage', () => {
   });
 
   it('closes the settings overlay on back button click', async () => {
-    const { useSettingsOverlayStore } = await import('@/renderer/stores/settingsOverlayStore');
+    const { useSettingsOverlayStore } = await import('@/renderer/stores/ui/settingsOverlayStore');
     useSettingsOverlayStore.getState().openSettings('server', { serverId: 'server-1' });
     render(<ServerSettingsPage serverId="server-1" />);
     fireEvent.click(screen.getByText('Back to app'));

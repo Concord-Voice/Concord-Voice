@@ -13,9 +13,9 @@ import ServerActionModal from '../Servers/ServerActionModal';
 import CreateServerModal from '../Servers/CreateServerModal';
 import JoinServerModal from '../Servers/JoinServerModal';
 import ServerContextMenu from '../Servers/ServerContextMenu';
-import { selectSidebarDock, useLayoutStore } from '../../stores/layoutStore';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useDMStore } from '../../stores/dmStore';
+import { selectSidebarDock, useLayoutStore } from '../../stores/ui/layoutStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useDMStore } from '../../stores/chat/dmStore';
 import { ServerWithRole } from '../../types/server';
 
 const DirectMessagesView: React.FC = () => {

@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
-import { useFriendStore } from '../stores/friendStore';
-import { useUserStore } from '../stores/userStore';
+import { useFriendStore } from '../stores/chat/friendStore';
+import { useUserStore } from '../stores/auth/userStore';
 import {
   fetchEligibility,
   peekEligibility,

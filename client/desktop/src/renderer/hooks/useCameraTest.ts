@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { useVoiceStore } from '../stores/voiceStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
 
 interface UseCameraTestReturn {
   isTesting: boolean;

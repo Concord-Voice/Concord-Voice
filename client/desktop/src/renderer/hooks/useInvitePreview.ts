@@ -1,10 +1,8 @@
 import { useEffect, useReducer, useRef } from 'react';
-import { useInviteStore, type InviteInfoResponse } from '@/renderer/stores/inviteStore';
+import { useInviteStore, type InviteInfoResponse } from '@/renderer/stores/chat/inviteStore';
 
 export type InvitePreviewState =
-  | { status: 'loading' }
-  | { status: 'ready'; info: InviteInfoResponse }
-  | { status: 'invalid' };
+  { status: 'loading' } | { status: 'ready'; info: InviteInfoResponse } | { status: 'invalid' };
 
 // Cache only DEFINITIVE successful responses (HTTP 2xx, valid true|false), with a
 // timestamp so entries revalidate on remount once stale — keeps the card

@@ -1,7 +1,11 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useFriendRequestState } from '@/renderer/hooks/useFriendRequestState';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useFriendStore, type Friend, type FriendRequest } from '@/renderer/stores/friendStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import {
+  useFriendStore,
+  type Friend,
+  type FriendRequest,
+} from '@/renderer/stores/chat/friendStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 vi.mock('@/renderer/services/apiClient', () => ({

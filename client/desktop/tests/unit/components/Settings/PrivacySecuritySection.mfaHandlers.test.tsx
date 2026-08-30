@@ -56,13 +56,13 @@ vi.mock('@/renderer/services/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
-vi.mock('@/renderer/stores/authStore', () => ({
+vi.mock('@/renderer/stores/auth/authStore', () => ({
   useAuthStore: vi.fn((s) => s({ accessToken: 'mock-token' })),
 }));
-vi.mock('@/renderer/stores/userStore', () => ({
+vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: vi.fn((s) => s({ logout: vi.fn() })),
 }));
-vi.mock('@/renderer/stores/privacyStore', () => ({
+vi.mock('@/renderer/stores/ui/privacyStore', () => ({
   usePrivacyStore: vi.fn((s) =>
     s({
       settings: {
@@ -84,7 +84,7 @@ vi.mock('@/renderer/stores/privacyStore', () => ({
   ),
   DMPrivacyLevel: {},
 }));
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: vi.fn((s) =>
     s({
       microphone: 'granted',
@@ -137,7 +137,7 @@ vi.mock('@/renderer/components/ui/Modal', () => ({
   default: ({ isOpen, children }: { isOpen: boolean; children: React.ReactNode }) =>
     isOpen ? <div data-testid="modal">{children}</div> : null,
 }));
-vi.mock('@/renderer/stores/clientConfigStore', () => ({
+vi.mock('@/renderer/stores/ui/clientConfigStore', () => ({
   useClientConfigStore: vi.fn((s) =>
     s({ activityHistoryCapability: { status: 'confirmed-unsupported' } })
   ),

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { renderHook, act } from '@testing-library/react';
 import {
   useFileUpload,
@@ -12,7 +12,7 @@ import {
   IMAGE_STRIP_MAX_BYTES,
   resolveAttachmentLimit,
 } from '@/renderer/utils/entitlementLimits';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 
 // Mock apiClient
 const mockApiFetch = vi.fn();

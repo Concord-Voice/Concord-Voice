@@ -14,7 +14,7 @@
  */
 import { http, HttpResponse } from 'msw';
 import { server as mswServer } from '../mocks/server';
-import type { ServerMember } from '@/renderer/stores/memberStore';
+import type { ServerMember } from '@/renderer/stores/chat/memberStore';
 
 export const MODERATION_API_BASE = 'http://localhost:8080';
 

@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useSSOFlow } from '@/renderer/hooks/useSSOFlow';
-import { useSSOStore } from '@/renderer/stores/ssoStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
-import { useMFAChallengeStore } from '@/renderer/stores/mfaChallengeStore';
+import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
+import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import {
   getApiBase,
   resetRuntimeServerBase,

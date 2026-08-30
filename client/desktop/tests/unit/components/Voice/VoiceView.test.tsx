@@ -1,8 +1,8 @@
 import React from 'react';
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 
 // ── Child component mocks ──────────────────────────────────────────────────────
 vi.mock('@/renderer/components/Voice/ParticipantGrid', () => ({

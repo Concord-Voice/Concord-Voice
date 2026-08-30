@@ -1,4 +1,4 @@
-import { useKeyboardShortcutStore, type KeyCombo } from '../stores/keyboardShortcutStore';
+import { useKeyboardShortcutStore, type KeyCombo } from '../stores/ui/keyboardShortcutStore';
 
 class KeyboardShortcutService {
   private readonly handlers = new Map<string, () => void>();

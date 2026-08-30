@@ -1,4 +1,4 @@
-import type { DMConversation } from '../stores/dmStore';
+import type { DMConversation } from '../stores/chat/dmStore';
 
 /**
  * Display name for a DM conversation header / voice surface. Moved out of

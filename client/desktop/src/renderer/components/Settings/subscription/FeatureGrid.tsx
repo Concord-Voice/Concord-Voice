@@ -1,6 +1,6 @@
 import React from 'react';
 import { useEntitlement } from '../../../hooks/useEntitlement';
-import type { Entitlement } from '../../../stores/subscriptionStore';
+import type { Entitlement } from '../../../stores/auth/subscriptionStore';
 
 // The Supersonic (premium) feature list — entitlement-backed premium
 // capabilities, anchored on the entitlement matrix §1 "User axis"

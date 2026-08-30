@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { LockKeyhole, KeyRound } from 'lucide-react';
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
-import { useMemberStore, type ServerMember } from '../../stores/memberStore';
-import { useDMStore, type DMParticipant } from '../../stores/dmStore';
-import { usePermissionStore } from '../../stores/permissionStore';
-import { useFriendOrgStore } from '../../stores/friendOrgStore';
+import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore';
+import { useDMStore, type DMParticipant } from '../../stores/chat/dmStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import MessageAvatar from './MessageAvatar';
 import MessageActions from './MessageActions';
@@ -29,8 +29,8 @@ import { InviteEmbed } from './InviteEmbed';
 import { messageInviteCodes } from '@/renderer/utils/inviteUrl';
 import { useMessageProfileCard } from '../../hooks/useMessageProfileCard';
 import MessageProfileCardHost from './MessageProfileCardHost';
-import { useSettingsStore } from '../../stores/settingsStore';
-import { usePrivacyStore } from '../../stores/privacyStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import './Message.css';
 
 // Stable empty references to avoid infinite re-renders when DM context skips server data

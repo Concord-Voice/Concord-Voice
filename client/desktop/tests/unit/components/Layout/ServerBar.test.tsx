@@ -1,11 +1,11 @@
 import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import ServerBar from '@/renderer/components/Layout/ServerBar';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useDMStore, type DMConversation } from '@/renderer/stores/dmStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { apiFetch } from '@/renderer/services/apiClient';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';

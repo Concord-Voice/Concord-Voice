@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useChatStore, TypingUser } from '../../stores/chatStore';
+import { useChatStore, TypingUser } from '../../stores/chat/chatStore';
 import './TypingIndicator.css';
 
 export interface TypingIndicatorProps {

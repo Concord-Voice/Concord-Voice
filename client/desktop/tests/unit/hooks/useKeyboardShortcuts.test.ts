@@ -37,25 +37,25 @@ let mockChannelStoreState: Record<string, unknown> = {};
 let mockUnreadStoreState: Record<string, unknown> = {};
 let mockVoiceStoreState: Record<string, unknown> = {};
 
-vi.mock('../../../src/renderer/stores/keyboardShortcutStore', () => ({
+vi.mock('../../../src/renderer/stores/ui/keyboardShortcutStore', () => ({
   useKeyboardShortcutStore: {
     getState: () => mockShortcutStoreState,
   },
 }));
 
-vi.mock('../../../src/renderer/stores/channelStore', () => ({
+vi.mock('../../../src/renderer/stores/chat/channelStore', () => ({
   useChannelStore: {
     getState: () => mockChannelStoreState,
   },
 }));
 
-vi.mock('../../../src/renderer/stores/unreadStore', () => ({
+vi.mock('../../../src/renderer/stores/chat/unreadStore', () => ({
   useUnreadStore: {
     getState: () => mockUnreadStoreState,
   },
 }));
 
-vi.mock('../../../src/renderer/stores/voiceStore', () => ({
+vi.mock('../../../src/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: {
     getState: () => mockVoiceStoreState,
   },
@@ -64,7 +64,7 @@ vi.mock('../../../src/renderer/stores/voiceStore', () => ({
 import { useKeyboardShortcuts } from '../../../src/renderer/hooks/useKeyboardShortcuts';
 // NOT mocked: unread navigation resolves mutes through the real prefs store,
 // so we drive it via setMute/clearAll to exercise the mute-aware skip.
-import { useNotificationPrefsStore } from '../../../src/renderer/stores/notificationPrefsStore';
+import { useNotificationPrefsStore } from '../../../src/renderer/stores/ui/notificationPrefsStore';
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -272,7 +272,7 @@ describe('useKeyboardShortcuts', () => {
   // ── Handler: open-settings ─────────────────────────────────────────
 
   it('open-settings opens the settings overlay', async () => {
-    const { useSettingsOverlayStore } = await import('@/renderer/stores/settingsOverlayStore');
+    const { useSettingsOverlayStore } = await import('@/renderer/stores/ui/settingsOverlayStore');
     useSettingsOverlayStore.getState().close();
     renderHook(() => useKeyboardShortcuts());
     getHandler('open-settings')();

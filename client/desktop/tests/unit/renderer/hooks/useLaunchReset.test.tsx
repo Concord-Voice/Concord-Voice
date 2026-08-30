@@ -5,11 +5,11 @@ import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,
   type Entitlement,
-} from '@/renderer/stores/subscriptionStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+} from '@/renderer/stores/auth/subscriptionStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 
 const PREMIUM_ENTITLEMENT: Entitlement = {
   ...FREE_ENTITLEMENT,

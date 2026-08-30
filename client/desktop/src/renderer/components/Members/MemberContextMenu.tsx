@@ -1,11 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { Clock, TimerOff } from 'lucide-react';
 import { useNavigate } from 'react-router';
-import { ServerMember, useMemberStore } from '../../stores/memberStore';
-import { usePermissionStore } from '../../stores/permissionStore';
-import { useDMStore } from '../../stores/dmStore';
-import { useUserStore } from '../../stores/userStore';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { ServerMember, useMemberStore } from '../../stores/chat/memberStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { useDMStore } from '../../stores/chat/dmStore';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import {
   Permissions,
   MUTE_MEMBERS,

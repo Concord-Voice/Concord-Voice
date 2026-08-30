@@ -1,7 +1,7 @@
 import React, { useRef, useCallback, useEffect, useMemo } from 'react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
-import { useChannelStore } from '../../stores/channelStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
 import VoiceControls from './VoiceControls';
 import VoiceTextChat from './VoiceTextChat';
 import './PersistentVoiceBar.css';

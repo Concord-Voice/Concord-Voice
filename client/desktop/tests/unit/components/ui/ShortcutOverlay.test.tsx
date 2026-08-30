@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
 import ShortcutOverlay from '@/renderer/components/ui/ShortcutOverlay';
-import { useKeyboardShortcutStore } from '@/renderer/stores/keyboardShortcutStore';
+import { useKeyboardShortcutStore } from '@/renderer/stores/ui/keyboardShortcutStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/ui/ShortcutOverlay.css', () => ({}));

@@ -1,12 +1,12 @@
 import { renderHook, act } from '@testing-library/react';
 import { useWebSocket } from '@/renderer/hooks/useWebSocket';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { ConnectionState } from '@/renderer/services/websocketService';
 import { resetAllStores } from '../../helpers/store-helpers';
 

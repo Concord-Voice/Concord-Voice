@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useDMStore, type DMConversation } from '@/renderer/stores/dmStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 

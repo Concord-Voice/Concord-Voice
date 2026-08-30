@@ -2,7 +2,7 @@ import {
   preferencesSyncService,
   type PreferencesSyncDeps,
 } from '@/renderer/services/preferencesSync';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import {
   LEGACY_COLLAPSED_WIDTH,
   SIDEBAR_COMPACT_BREAKPOINT,
@@ -10,11 +10,11 @@ import {
   useLayoutStore,
   type SidebarProfile,
   type SidebarProfiles,
-} from '@/renderer/stores/layoutStore';
+} from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 const API_BASE = 'http://localhost:8080';
 

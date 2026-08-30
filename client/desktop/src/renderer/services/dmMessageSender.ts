@@ -1,6 +1,6 @@
-import { useChatStore } from '../stores/chatStore';
-import { useUserStore } from '../stores/userStore';
-import { useDMStore } from '../stores/dmStore';
+import { useChatStore } from '../stores/chat/chatStore';
+import { useUserStore } from '../stores/auth/userStore';
+import { useDMStore } from '../stores/chat/dmStore';
 import { getWebSocketService, ConnectionState } from './websocketService';
 import { getMessageQueue } from './messageQueue';
 import { e2eeService } from './e2eeService';

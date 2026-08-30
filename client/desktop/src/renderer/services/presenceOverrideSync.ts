@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { usePresenceOverrideStore } from '../stores/presenceOverrideStore';
+import { usePresenceOverrideStore } from '../stores/ui/presenceOverrideStore';
 import { parsePresenceOverrides, type PresenceOverridesDocument } from '../utils/presenceOverrides';
 import { apiFetch } from './apiClient';
 import { e2eeService } from './e2eeService';

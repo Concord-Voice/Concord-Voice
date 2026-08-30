@@ -1,9 +1,9 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { isSyncSuppressed } from '@/renderer/stores/colorSyncSuppression';
-import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { isSyncSuppressed } from '@/renderer/stores/ui/colorSyncSuppression';
+import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 const storesDirectory = resolve(process.cwd(), 'src/renderer/stores');
@@ -68,9 +68,9 @@ describe('resetAllStores', () => {
   });
 
   it('covers every renderer store module with a reset call', () => {
-    const storeModules = readdirSync(storesDirectory)
+    const storeModules = readdirSync(storesDirectory, { recursive: true })
       .filter((name) => name.endsWith('Store.ts'))
-      .map((name) => name.replace(/\.ts$/, ''))
+      .map((name) => name.replaceAll('\\', '/').replace(/\.ts$/, ''))
       .sort();
     const helperSource = readFileSync(storeHelpersFile, 'utf8');
     const storeImports = [

@@ -8,7 +8,7 @@ import {
   type SidebarProfile,
   type SidebarProfiles,
   useLayoutStore,
-} from '@/renderer/stores/layoutStore';
+} from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 const dm: SidebarProfile = {

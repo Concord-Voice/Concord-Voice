@@ -1,7 +1,7 @@
 import { http, HttpResponse } from 'msw';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
-import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 

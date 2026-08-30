@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { mockEncryptedChannel } from '../../../mocks/fixtures';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import {
   ADMIN_PERMISSIONS,
   MANAGE_CHANNELS,

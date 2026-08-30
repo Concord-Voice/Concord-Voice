@@ -16,7 +16,7 @@ const defaultSettings: Record<string, unknown> = {
 
 const mockSetDraftAudioSetting = vi.fn();
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(vi.fn(), {
     getState: () => ({ reset: vi.fn() }),
     setState: vi.fn(),
@@ -34,7 +34,7 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/audioSettingsStore', () => ({
+vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
   useAudioSettingsStore: vi.fn(),
 }));
 
@@ -61,7 +61,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 // ── Imports (after mocks) ───────────────────────────────────────────────
 
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import AudioOpusSection from '@/renderer/components/Settings/AudioOpusSection';
 

@@ -24,20 +24,20 @@ import ChangelogModalHost from './components/ChangelogModal/ChangelogModal';
 import JoinServerModal from './components/Servers/JoinServerModal';
 import AddFriendModal from './components/DirectMessages/AddFriendModal';
 import SSOEagerUnlock from './components/Auth/SSOEagerUnlock';
-import { useAuthStore } from './stores/authStore';
-import { useE2EEStore } from './stores/e2eeStore';
-import { useUserStore } from './stores/userStore';
+import { useAuthStore } from './stores/auth/authStore';
+import { useE2EEStore } from './stores/auth/e2eeStore';
+import { useUserStore } from './stores/auth/userStore';
 import { errorMessage } from './utils/redactError';
 import { runRecoveryModule } from './utils/runRecoveryModule';
-import { useVideoSettingsStore } from './stores/videoSettingsStore';
-import { useOsPermissionStore, type OsPermissionType } from './stores/osPermissionStore';
+import { useVideoSettingsStore } from './stores/voice/videoSettingsStore';
+import { useOsPermissionStore, type OsPermissionType } from './stores/voice/osPermissionStore';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useLaunchReset } from './hooks/useLaunchReset';
 import SubscriptionResetModal from './components/Settings/SubscriptionResetModal';
 import { e2eeService } from './services/e2eeService';
 import { E2EEInitTeardownError } from './services/e2eeErrors';
 import { hydratePostLogin } from './services/postLoginHydration';
-import { usePrivacyStore } from './stores/privacyStore';
+import { usePrivacyStore } from './stores/ui/privacyStore';
 // Side-effect import: this module owns the KLIPY personalization wiring —
 // it applies the privacy preference to the provider singleton and keeps it
 // in sync. Importing it here (rather than duplicating the subscription in
@@ -47,13 +47,13 @@ import { usePrivacyStore } from './stores/privacyStore';
 import './services/gifProvider';
 import { clientConfigService } from './services/clientConfigService';
 import { detectCodecCapabilities, prewarmWebRTC } from './services/mediaCapabilities';
-import { useNotificationNavigationStore } from './stores/notificationNavigationStore';
-import { useServerStore } from './stores/serverStore';
-import { useChannelStore } from './stores/channelStore';
-import { useDMStore } from './stores/dmStore';
-import { useVoiceStore } from './stores/voiceStore';
+import { useNotificationNavigationStore } from './stores/ui/notificationNavigationStore';
+import { useServerStore } from './stores/chat/serverStore';
+import { useChannelStore } from './stores/chat/channelStore';
+import { useDMStore } from './stores/chat/dmStore';
+import { useVoiceStore } from './stores/voice/voiceStore';
 import { desktopNotificationService } from './services/desktopNotificationService';
-import { usePendingRegistrationStore } from './stores/pendingRegistrationStore';
+import { usePendingRegistrationStore } from './stores/auth/pendingRegistrationStore';
 // resetService is eagerly registered by main.tsx; local dynamic imports resolve
 // from that loaded module while avoiding direct feature-module cycles.
 

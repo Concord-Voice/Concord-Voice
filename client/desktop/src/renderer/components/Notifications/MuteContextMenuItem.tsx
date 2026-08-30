@@ -3,7 +3,7 @@ import ContextMenu from '../ui/ContextMenu';
 import {
   useNotificationPrefsStore,
   isEntryCurrentlyMuted,
-} from '../../stores/notificationPrefsStore';
+} from '../../stores/ui/notificationPrefsStore';
 import {
   setMutePreference,
   mutedUntilFromDuration,

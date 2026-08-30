@@ -25,8 +25,8 @@ import { vi } from 'vitest';
 
 import Login from '@/renderer/components/Auth/Login';
 import { ModalProvider } from '@/renderer/components/ui/ModalContext';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';

@@ -2,8 +2,8 @@ import { act, fireEvent, render, screen, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PresenceExceptions from '@/renderer/components/Settings/PresenceExceptions';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
-import { useFriendStore, type Friend } from '@/renderer/stores/friendStore';
-import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
+import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { deferred } from '../../../helpers/deferred';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';

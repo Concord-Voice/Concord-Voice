@@ -17,7 +17,7 @@ import {
 } from '../../utils/boundedResponseBody';
 import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/entitlementLimits';
 import type { AttachmentSummary } from '../../types/chat';
-import { useSettingsStore } from '../../stores/settingsStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
 import OverflowMarkdownAttachment from './OverflowMarkdownAttachment';
 import ThemedMediaPlayer from './ThemedMediaPlayer';
 import ImageLightbox from './ImageLightbox';

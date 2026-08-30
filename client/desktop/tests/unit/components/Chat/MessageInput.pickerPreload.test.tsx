@@ -1,7 +1,7 @@
 import { render } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // `mock`-prefixed so vitest permits referencing them inside the hoisted
@@ -25,7 +25,7 @@ vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({ default: 
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
-vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false }));
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({ useLayoutStore: () => false }));
 vi.mock('@/renderer/hooks/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],

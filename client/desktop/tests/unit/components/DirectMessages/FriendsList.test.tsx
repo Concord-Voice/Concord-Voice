@@ -1,8 +1,12 @@
 import { act, render, screen, fireEvent, waitFor, within, userEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useFriendStore, type Friend, type FriendRequest } from '@/renderer/stores/friendStore';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import {
+  useFriendStore,
+  type Friend,
+  type FriendRequest,
+} from '@/renderer/stores/chat/friendStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import { vi } from 'vitest';
 

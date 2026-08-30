@@ -1,6 +1,6 @@
 import React from 'react';
 import { X } from 'lucide-react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useScreenTileVideo } from '../../hooks/useScreenTileVideo';
 import './StreamBar.css';
 

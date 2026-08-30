@@ -1,7 +1,7 @@
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, act } from '../../../test-utils';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // ─── Module mocks ─────────────────────────────────────────────────────────────

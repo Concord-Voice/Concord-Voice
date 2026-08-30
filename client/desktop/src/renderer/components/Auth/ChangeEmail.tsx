@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
+import { usePendingRegistrationStore } from '../../stores/auth/pendingRegistrationStore';
 import { apiUrl } from '../../services/runtimeServerBase';
 import './ChangeEmail.css';
 

@@ -1,9 +1,9 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { VoiceParticipantContextMenu } from '@/renderer/components/Voice/VoiceParticipantContextMenu';
 import type { VoiceMenuParticipant } from '@/renderer/components/Voice/VoiceParticipantContextMenu';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import {
   ADMIN_PERMISSIONS,
   BASE_PERMISSIONS,

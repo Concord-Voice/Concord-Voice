@@ -150,7 +150,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
 const mockEnsureOsPermission = vi.fn().mockResolvedValue('granted');
 const mockCheckOne = vi.fn().mockResolvedValue('granted');
 const mockOpenSettings = vi.fn();
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: {
     getState: vi.fn().mockReturnValue({
       checkOne: (...args: unknown[]) => mockCheckOne(...args),
@@ -291,17 +291,17 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
 // ---------------------------------------------------------------------------
 const { voiceService } = await import('@/renderer/services/voiceService');
 
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { deferred } from '../../helpers/deferred';
 import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,
   type Entitlement,
-} from '@/renderer/stores/subscriptionStore';
+} from '@/renderer/stores/auth/subscriptionStore';
 
 /** Premium entitlement with all three stream-axis native sentinels (#2163). */
 const PREMIUM_ENTITLEMENT_2163: Entitlement = {

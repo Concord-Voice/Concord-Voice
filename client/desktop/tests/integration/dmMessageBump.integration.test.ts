@@ -1,8 +1,8 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../helpers/store-helpers';
 import { mockUser } from '../mocks/fixtures';
 

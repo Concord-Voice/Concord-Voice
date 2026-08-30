@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useUpdateStatusStore } from '../../../src/renderer/stores/updateStatusStore';
+import { useUpdateStatusStore } from '../../../src/renderer/stores/ui/updateStatusStore';
 
 describe('useUpdateStatusStore (#658)', () => {
   beforeEach(() => {

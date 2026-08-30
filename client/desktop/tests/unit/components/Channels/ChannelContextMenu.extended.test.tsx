@@ -1,9 +1,9 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { mockChannel } from '../../../mocks/fixtures';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 import type { Channel } from '@/renderer/types/chat';

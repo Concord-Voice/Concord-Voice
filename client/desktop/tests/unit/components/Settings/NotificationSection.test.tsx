@@ -50,7 +50,7 @@ const mockNotificationState = {
   setQuietHoursEnd: vi.fn(),
 };
 
-vi.mock('@/renderer/stores/notificationStore', () => ({
+vi.mock('@/renderer/stores/ui/notificationStore', () => ({
   useNotificationStore: vi.fn((selector?: (s: Record<string, unknown>) => unknown) => {
     const state = { ...mockNotificationState };
     return selector ? selector(state) : state;
@@ -60,7 +60,7 @@ vi.mock('@/renderer/stores/notificationStore', () => ({
 const mockRequestOne = vi.fn();
 const mockOpenSettings = vi.fn();
 
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: vi.fn((selector?: (s: Record<string, unknown>) => unknown) => {
     const state = {
       notifications: 'granted' as string,
@@ -80,7 +80,7 @@ vi.mock('@/renderer/services/notificationSoundService', () => ({
 }));
 
 import NotificationSection from '@/renderer/components/Settings/NotificationSection';
-import { useOsPermissionStore } from '@/renderer/stores/osPermissionStore';
+import { useOsPermissionStore } from '@/renderer/stores/voice/osPermissionStore';
 
 // Helper to override OS permission status
 function setPermissionStatus(status: string) {

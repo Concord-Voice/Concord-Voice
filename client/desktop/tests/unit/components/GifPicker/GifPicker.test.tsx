@@ -2,9 +2,9 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 
 // Mock the gifProvider entirely. The picker no longer talks to a vendor SDK
 // directly — it goes through the abstract gifProvider singleton, which we

@@ -38,10 +38,10 @@ vi.mock('@/renderer/components/Chat/AttachmentDisplay', () => ({
 vi.mock('@/renderer/components/Chat/GifEmbed', () => ({
   default: ({ slug }: { slug: string }) => <div data-testid="gif-embed">{slug}</div>,
 }));
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import userEvent from '@testing-library/user-event';
 

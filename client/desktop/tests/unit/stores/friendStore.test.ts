@@ -3,8 +3,8 @@ import {
   type Friend,
   type FriendRequest,
   type FriendCode,
-} from '@/renderer/stores/friendStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+} from '@/renderer/stores/chat/friendStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';

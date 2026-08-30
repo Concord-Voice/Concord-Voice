@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen } from '../../../test-utils';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/Voice/UserFrameBar.css', () => ({}));

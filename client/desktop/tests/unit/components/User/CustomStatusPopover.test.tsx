@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, userEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { server as mswServer } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';
 

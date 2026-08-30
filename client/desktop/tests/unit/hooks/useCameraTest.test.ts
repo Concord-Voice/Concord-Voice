@@ -1,14 +1,14 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(vi.fn(), {
     getState: vi.fn(() => ({ videoDeviceId: 'camera-1' })),
   }),
 }));
 
 import { useCameraTest } from '@/renderer/hooks/useCameraTest';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 const mockTrackStop = vi.fn();
 let mockGetUserMedia: ReturnType<typeof vi.fn>;

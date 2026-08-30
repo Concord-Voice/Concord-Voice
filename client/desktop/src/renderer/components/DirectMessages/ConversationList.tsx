@@ -1,16 +1,16 @@
 import { useState, useEffect, useRef, useCallback, useId } from 'react';
 import { MessageSquare, Users, BookOpen, MessagesSquare, PenLine, Search } from 'lucide-react';
-import { useDMStore, type DMConversation, type DMParticipant } from '../../stores/dmStore';
+import { useDMStore, type DMConversation, type DMParticipant } from '../../stores/chat/dmStore';
 import {
   useNotificationPrefsStore,
   isEntryCurrentlyMuted,
-} from '../../stores/notificationPrefsStore';
-import { useUserStore } from '../../stores/userStore';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useFriendStore, type Friend } from '../../stores/friendStore';
+} from '../../stores/ui/notificationPrefsStore';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { e2eeService } from '../../services/e2eeService';
 import { subscribeSearchScopeInvalidations } from '../../services/searchService';
-import { useDraftMessageStore } from '../../stores/draftMessageStore';
+import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { errorMessage } from '../../utils/redactError';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { formatMessagePreview } from '../../utils/messagePreview';

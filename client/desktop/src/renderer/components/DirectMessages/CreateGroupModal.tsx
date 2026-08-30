@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { X, Search, UserPlus } from 'lucide-react';
-import { useDMStore } from '../../stores/dmStore';
-import { useFriendStore, type Friend } from '../../stores/friendStore';
-import { useUserStore } from '../../stores/userStore';
+import { useDMStore } from '../../stores/chat/dmStore';
+import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import Modal from '../ui/Modal';
 import './DirectMessages.css';
 

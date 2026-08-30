@@ -1,4 +1,4 @@
-import { useSubscriptionStore, type Entitlement } from '../stores/subscriptionStore';
+import { useSubscriptionStore, type Entitlement } from '../stores/auth/subscriptionStore';
 
 /**
  * Selective subscription to one slice of the entitlement capability set.

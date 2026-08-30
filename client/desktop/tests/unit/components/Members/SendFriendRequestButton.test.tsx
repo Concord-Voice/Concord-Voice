@@ -1,7 +1,11 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import SendFriendRequestButton from '@/renderer/components/Members/SendFriendRequestButton';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useFriendStore, type Friend, type FriendRequest } from '@/renderer/stores/friendStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import {
+  useFriendStore,
+  type Friend,
+  type FriendRequest,
+} from '@/renderer/stores/chat/friendStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/services/apiClient', () => ({

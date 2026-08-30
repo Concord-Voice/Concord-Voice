@@ -14,8 +14,8 @@
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import { resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
 
 // Observe every session-teardown side effect through apiClient's configured

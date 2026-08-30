@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
-import { useFriendStore } from '@/renderer/stores/friendStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 
 // Mock Shamir secret sharing
 vi.mock('@/renderer/utils/shamir', () => ({

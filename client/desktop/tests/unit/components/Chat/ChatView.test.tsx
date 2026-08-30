@@ -1,11 +1,11 @@
 import { render, screen, act } from '../../../test-utils';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { PIN_MESSAGES } from '@/renderer/utils/permissions';
 import { mockUser, mockChannel, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 

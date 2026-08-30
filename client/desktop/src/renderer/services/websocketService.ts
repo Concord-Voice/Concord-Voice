@@ -14,8 +14,8 @@
  */
 
 import { getWsBase } from './runtimeServerBase';
-import { useAuthStore } from '../stores/authStore';
-import { useConnectionStore } from '../stores/connectionStore';
+import { useAuthStore } from '../stores/auth/authStore';
+import { useConnectionStore } from '../stores/ui/connectionStore';
 import { errorMessage, errorName } from '../utils/redactError';
 import { summarizeWsDiagnostic, summarizeWsServerError } from '../utils/wsDiagnostics';
 import {

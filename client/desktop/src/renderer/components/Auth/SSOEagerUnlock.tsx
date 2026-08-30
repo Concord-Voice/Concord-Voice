@@ -41,8 +41,8 @@ import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,
 } from '../../services/runtimeServerBase';
-import { useAuthStore } from '../../stores/authStore';
-import { useE2EEStore } from '../../stores/e2eeStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import LoadingSpinner from './LoadingSpinner';

@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import { Hash, Volume2, Pin, Eraser } from 'lucide-react';
-import { useUnreadStore } from '../../stores/unreadStore';
-import { useServerStore } from '../../stores/serverStore';
-import { hasUnmutedChannel } from '../../stores/notificationPrefsStore';
-import { usePermissionStore } from '../../stores/permissionStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { hasUnmutedChannel } from '../../stores/ui/notificationPrefsStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import {
   MANAGE_ALL_MESSAGES,
   MANAGE_OWN_MESSAGES,

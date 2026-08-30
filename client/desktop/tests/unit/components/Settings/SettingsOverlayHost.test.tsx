@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
-import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
+import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
 
 vi.mock('@/renderer/components/Settings/SettingsPage', async () => {
   const ReactModule = await import('react');

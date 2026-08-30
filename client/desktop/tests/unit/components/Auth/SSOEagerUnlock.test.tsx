@@ -2,8 +2,8 @@ import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import SSOEagerUnlock from '@/renderer/components/Auth/SSOEagerUnlock';
 import { e2eeService } from '@/renderer/services/e2eeService';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch (matches Register.test.tsx / SSOPassphraseSetup.test.tsx pattern)

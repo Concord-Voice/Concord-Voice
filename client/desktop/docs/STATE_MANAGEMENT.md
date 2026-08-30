@@ -1,7 +1,7 @@
 # State Management Architecture
 
 **Framework:** Zustand v5.0.12
-**Last Updated:** 2026-07-18
+**Last Updated:** 2026-08-30
 **Decision:** Zustand chosen over Redux after cost-benefit analysis (see below)
 
 ---
@@ -32,54 +32,56 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 
 ### Store Inventory
 
-| Store                           | Purpose                                                      | Persisted             | Phase |
-| ------------------------------- | ------------------------------------------------------------ | --------------------- | ----- |
-| **authStore**                   | Access/session lineage and auth lifecycle                    | ❌                    | 1A    |
-| **chatStore**                   | Messages, typing, connection                                 | ❌ (privacy)          | 1A    |
-| **serverStore**                 | Server list, active server                                   | ✅ active server ID   | 1A    |
-| **userStore**                   | User profile, preferences                                    | ❌                    | 1A    |
-| **channelStore**                | Channel list, active channel                                 | ✅ active channel ID  | 1B    |
-| **connectionStore**             | WebSocket connection state + `wireViolationCount` (PR #1184) | ❌                    | 1B    |
-| **memberStore**                 | Server members, roles                                        | ❌                    | 1B    |
-| **layoutStore**                 | UI layout state (sidebar, panels)                            | ✅ partial            | 1B    |
-| **settingsStore**               | App settings, theme, font scale                              | ✅                    | 1B    |
-| **unreadStore**                 | Unread message counts                                        | ❌                    | 1B    |
-| **inviteStore**                 | Server invites                                               | ❌                    | 1B    |
-| **draftSettingsStore**          | Unsaved settings drafts                                      | ❌                    | 1B    |
-| **ttsSettingsStore**            | Text-to-speech settings                                      | ✅                    | 1B    |
-| **voiceStore**                  | Voice state, participants, quality tiers                     | ✅ device settings    | 1C    |
-| **audioSettingsStore**          | Audio input/output device prefs                              | ✅                    | 1C    |
-| **videoSettingsStore**          | Video device and codec prefs                                 | ✅                    | 1C    |
-| **dmStore**                     | DM conversations, participants                               | ❌                    | 1C    |
-| **friendStore**                 | Friend list, friend requests                                 | ❌                    | 1C    |
-| **privacyStore**                | Privacy settings, friend codes                               | ❌                    | 1C    |
-| **clientConfigStore**           | Server-provided client configuration                         | ❌                    | 2A    |
-| **mfaChallengeStore**           | MFA challenge state during auth flows                        | ❌                    | 2A    |
-| **notificationStore**           | Desktop notification preferences and queue                   | ✅                    | 2A    |
-| **osPermissionStore**           | OS-level permission states (mic, camera, screen)             | ❌                    | 2A    |
-| **permissionStore**             | RBAC permission state for current server/channel             | ❌                    | 2A    |
-| **channelScrollStore**          | Per-channel scroll position tracking                         | ❌                    | 2B    |
-| **draftMessageStore**           | Per-channel unsent message drafts                            | ❌                    | 2B    |
-| **keyboardShortcutStore**       | Keyboard shortcut configuration and state                    | ✅                    | 2B    |
-| **notificationNavigationStore** | Notification click navigation targets                        | ❌                    | 2B    |
-| **savedGifsStore**              | User's saved/favourite GIFs (Klipy integration)              | ✅                    | 2B    |
-| **settingsOverlayStore**        | Settings panel open/close and active tab state               | ❌                    | 2B    |
-| **e2eeStore**                   | Reactive mirror of the `e2eeService` lifecycle               | ❌                    | 2B    |
-| **ssoStore**                    | In-flight SSO authentication state                           | ❌                    | 2B    |
-| **pendingRegistrationStore**    | Registration awaiting email verification                     | ✅ sessionStorage     | 2B    |
-| **updateStatusStore**           | Critical update-channel errors behind the security banner    | ❌                    | 2B    |
-| **notificationPrefsStore**      | Per-target mute preferences                                  | ❌ (server-side)      | 2B    |
-| **attestationFailureStore**     | Terminal client-attestation failure codes                    | ❌                    | 2B    |
-| **settingsNavStore**            | Settings left-nav section and deep-link target               | ❌                    | 2B    |
-| **subscriptionStore**           | Subscription entitlement capability set                      | ❌                    | 2B    |
-| **richPresenceStore**           | Rich Presence custom text status                             | ❌                    | 2B    |
-| **friendOrgStore**              | Friend categories (zero-knowledge organization blob)         | ❌                    | 2B    |
-| **changelogStore**              | Last-seen changelog version for the post-update modal        | ✅ localStorage       | 2B    |
-| **presenceOverrideStore**       | Custom Status recipient exceptions                           | ❌                    | 2B    |
+| Store                           | Purpose                                                      | Persisted            | Phase |
+| ------------------------------- | ------------------------------------------------------------ | -------------------- | ----- |
+| **authStore**                   | Access/session lineage and auth lifecycle                    | ❌                   | 1A    |
+| **chatStore**                   | Messages, typing, connection                                 | ❌ (privacy)         | 1A    |
+| **serverStore**                 | Server list, active server                                   | ✅ active server ID  | 1A    |
+| **userStore**                   | User profile, preferences                                    | ❌                   | 1A    |
+| **channelStore**                | Channel list, active channel                                 | ✅ active channel ID | 1B    |
+| **connectionStore**             | WebSocket connection state + `wireViolationCount` (PR #1184) | ❌                   | 1B    |
+| **memberStore**                 | Server members, roles                                        | ❌                   | 1B    |
+| **layoutStore**                 | UI layout state (sidebar, panels)                            | ✅ partial           | 1B    |
+| **settingsStore**               | App settings, theme, font scale                              | ✅                   | 1B    |
+| **unreadStore**                 | Unread message counts                                        | ❌                   | 1B    |
+| **inviteStore**                 | Server invites                                               | ❌                   | 1B    |
+| **draftSettingsStore**          | Unsaved settings drafts                                      | ❌                   | 1B    |
+| **ttsSettingsStore**            | Text-to-speech settings                                      | ✅                   | 1B    |
+| **voiceStore**                  | Voice state, participants, quality tiers                     | ✅ device settings   | 1C    |
+| **audioSettingsStore**          | Audio input/output device prefs                              | ✅                   | 1C    |
+| **videoSettingsStore**          | Video device and codec prefs                                 | ✅                   | 1C    |
+| **dmStore**                     | DM conversations, participants                               | ❌                   | 1C    |
+| **friendStore**                 | Friend list, friend requests                                 | ❌                   | 1C    |
+| **privacyStore**                | Privacy settings, friend codes                               | ❌                   | 1C    |
+| **clientConfigStore**           | Server-provided client configuration                         | ❌                   | 2A    |
+| **mfaChallengeStore**           | MFA challenge state during auth flows                        | ❌                   | 2A    |
+| **notificationStore**           | Desktop notification preferences and queue                   | ✅                   | 2A    |
+| **osPermissionStore**           | OS-level permission states (mic, camera, screen)             | ❌                   | 2A    |
+| **permissionStore**             | RBAC permission state for current server/channel             | ❌                   | 2A    |
+| **channelScrollStore**          | Per-channel scroll position tracking                         | ❌                   | 2B    |
+| **draftMessageStore**           | Per-channel unsent message drafts                            | ❌                   | 2B    |
+| **keyboardShortcutStore**       | Keyboard shortcut configuration and state                    | ✅                   | 2B    |
+| **notificationNavigationStore** | Notification click navigation targets                        | ❌                   | 2B    |
+| **savedGifsStore**              | User's saved/favourite GIFs (Klipy integration)              | ✅                   | 2B    |
+| **settingsOverlayStore**        | Settings panel open/close and active tab state               | ❌                   | 2B    |
+| **e2eeStore**                   | Reactive mirror of the `e2eeService` lifecycle               | ❌                   | 2B    |
+| **ssoStore**                    | In-flight SSO authentication state                           | ❌                   | 2B    |
+| **pendingRegistrationStore**    | Registration awaiting email verification                     | ✅ sessionStorage    | 2B    |
+| **updateStatusStore**           | Critical update-channel errors behind the security banner    | ❌                   | 2B    |
+| **notificationPrefsStore**      | Per-target mute preferences                                  | ❌ (server-side)     | 2B    |
+| **attestationFailureStore**     | Terminal client-attestation failure codes                    | ❌                   | 2B    |
+| **settingsNavStore**            | Settings left-nav section and deep-link target               | ❌                   | 2B    |
+| **subscriptionStore**           | Subscription entitlement capability set                      | ❌                   | 2B    |
+| **richPresenceStore**           | Rich Presence custom text status                             | ❌                   | 2B    |
+| **friendOrgStore**              | Friend categories (zero-knowledge organization blob)         | ❌                   | 2B    |
+| **changelogStore**              | Last-seen changelog version for the post-update modal        | ✅ localStorage      | 2B    |
+| **presenceOverrideStore**       | Custom Status recipient exceptions                           | ❌                   | 2B    |
 
 > **Current metrics:** See the "Key Counts" section of [[internal]](../../..[internal]).
 
 The inventory above is an architectural overview. The canonical store set lives in `src/renderer/stores/`.
+
+The table inventories 42 Zustand stores. The structural 43-module count in `[internal]` also includes `colorSyncSuppression.ts`, a dependency-free mutable UI support module intentionally excluded from this table.
 
 ---
 
@@ -89,7 +91,7 @@ The inventory above is an architectural overview. The canonical store set lives 
 
 **Purpose:** Renderer-owned access credentials and authentication lifecycle fencing
 
-**Location:** `src/renderer/stores/authStore.ts`
+**Location:** `src/renderer/stores/auth/authStore.ts`
 
 **State:**
 
@@ -120,7 +122,7 @@ interface AuthState {
 **Usage:**
 
 ```typescript
-import { useAuthStore } from '@/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // In component
 const accessToken = useAuthStore((state) => state.accessToken);
@@ -136,7 +138,7 @@ const generation = useAuthStore.getState().authGeneration;
 
 **Purpose:** Real-time messages, typing indicators, WebSocket connection status
 
-**Location:** `src/renderer/stores/chatStore.ts`
+**Location:** `src/renderer/stores/chat/chatStore.ts`
 
 **State:**
 
@@ -184,7 +186,7 @@ interface ChatState {
 **Usage:**
 
 ```typescript
-import { useChatStore } from '@/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 
 // Get messages for a channel
 const messages = useChatStore((state) => state.messagesByChannel.get(channelId) || []);
@@ -204,7 +206,7 @@ updateStatus(channelId, clientMessageId, 'delivered', serverMessageId);
 
 **Purpose:** Server list, active server selection
 
-**Location:** `src/renderer/stores/serverStore.ts`
+**Location:** `src/renderer/stores/chat/serverStore.ts`
 
 **State:**
 
@@ -236,7 +238,7 @@ interface ServerState {
 **Usage:**
 
 ```typescript
-import { useServerStore } from '@/stores/serverStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 
 // Get active server
 const activeServerId = useServerStore((state) => state.activeServerId);
@@ -258,7 +260,7 @@ setActiveServer(serverId);
 
 **Purpose:** User profile data, preferences, logout handling
 
-**Location:** `src/renderer/stores/userStore.ts`
+**Location:** `src/renderer/stores/auth/userStore.ts`
 
 **State:**
 
@@ -293,7 +295,7 @@ interface UserState {
 **Usage:**
 
 ```typescript
-import { useUserStore } from '@/stores/userStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 // Get current user
 const user = useUserStore((state) => state.user);
@@ -326,9 +328,7 @@ import { devtools } from 'zustand/middleware';
 
 export const useChatStore = create<ChatState>()(
   devtools(
-    (set, get) => ({
-      /* store logic */
-    }),
+    (set, get) => ({/* store logic */}),
     { name: 'ChatStore' } // Shows up in Redux DevTools!
   )
 );
@@ -367,17 +367,12 @@ import { persist, devtools } from 'zustand/middleware';
 
 const serverStore = create<ServerState>()(
   devtools(
-    persist(
-      (set) => ({
-        /* store logic */
+    persist((set) => ({/* store logic */}), {
+      name: 'concord-servers',
+      partialize: (state) => ({
+        activeServerId: state.activeServerId,
       }),
-      {
-        name: 'concord-servers',
-        partialize: (state) => ({
-          activeServerId: state.activeServerId,
-        }),
-      }
-    ),
+    }),
     { name: 'ServerStore' }
   )
 );
@@ -452,12 +447,7 @@ wsService.onMessage('message', (data) => {
 ```typescript
 // chatStore - NO persistence (privacy)
 export const useChatStore = create<ChatState>()(
-  devtools(
-    (set, get) => ({
-      /* ... */
-    }),
-    { name: 'ChatStore' }
-  )
+  devtools((set, get) => ({/* ... */}), { name: 'ChatStore' })
   // No persist middleware!
 );
 ```
@@ -478,7 +468,7 @@ export const useAuthStore = createStore<AuthState>()((set) => ({
 
 ```typescript
 // userStore.logout() delegates the final cross-store wipe to resetService.
-const { nuclearReset } = await import('../services/resetService');
+const { nuclearReset } = await import('../../services/resetService');
 nuclearReset();
 ```
 
@@ -514,7 +504,7 @@ export const useChatStore = create<ChatState>()(/* ... */);
 // userStore coordinates logout, then delegates the complete wipe.
 logout: async () => {
   // ...stop sync and request main-process logout
-  const { nuclearReset } = await import('../services/resetService');
+  const { nuclearReset } = await import('../../services/resetService');
   nuclearReset();
 };
 ```
@@ -531,7 +521,7 @@ logout: async () => {
 
 ```typescript
 import { renderHook, act } from '@testing-library/react';
-import { useAuthStore } from '@/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 describe('authStore', () => {
   beforeEach(() => {
@@ -666,6 +656,7 @@ Normal user-initiated logout should call `userStore.logout()`, which requests ma
 **2026-03-27:** Updated to Zustand 5.0.12, added the Phase 2A stores
 **2026-04-09:** Added the Phase 2B stores
 **2026-07-18:** Updated auth ownership and lifecycle semantics, replaced the point-in-time store total with the canonical Key Counts reference
+**2026-08-30:** Updated concern-grouped store paths and documented the non-Zustand support-module exclusion
 
 ---
 

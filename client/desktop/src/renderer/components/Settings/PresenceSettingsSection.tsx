@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { apiFetch } from '../../services/apiClient';
-import { useAuthStore } from '../../stores/authStore';
-import { useRichPresenceStore } from '../../stores/richPresenceStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import CategoryManagerPanel from '../DirectMessages/CategoryManagerPanel';
 import CollapsibleSection from './CollapsibleSection';
 import PresenceExceptions from './PresenceExceptions';

@@ -1,4 +1,4 @@
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

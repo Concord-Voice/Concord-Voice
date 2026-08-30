@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 const mockSetAggressiveReconnect = vi.fn();
 const mockGetState = vi.fn().mockReturnValue('DISCONNECTED');

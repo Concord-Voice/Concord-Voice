@@ -6,7 +6,7 @@ import {
   completeSSOMFA,
   abandonSSOReservation,
 } from '@/renderer/services/ssoService';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 const API_BASE = 'http://localhost:8080';
 

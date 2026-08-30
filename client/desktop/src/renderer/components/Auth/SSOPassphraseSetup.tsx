@@ -24,9 +24,9 @@
 import React, { useState } from 'react';
 import PasswordStrength from './PasswordStrength';
 import LoadingSpinner from './LoadingSpinner';
-import { useSSOStore } from '../../stores/ssoStore';
-import { useAuthStore } from '../../stores/authStore';
-import { useE2EEStore } from '../../stores/e2eeStore';
+import { useSSOStore } from '../../stores/auth/ssoStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { completeSSORegistration, SSOServiceError } from '../../services/ssoService';
 import { revokeAbortedSession, type AbortedSessionRef } from '../../services/apiClient';
 import {

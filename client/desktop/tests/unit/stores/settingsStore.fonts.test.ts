@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // resetAllStores() does NOT cover the settings store (it only clears storage), and

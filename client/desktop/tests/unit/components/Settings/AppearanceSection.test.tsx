@@ -1,6 +1,6 @@
 import { act, render, screen, fireEvent } from '../../../test-utils';
 import { LayoutSection } from '@/renderer/components/Settings/AppearanceSection';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // LayoutSection is the "Lock Interface" row that lives in Appearance settings

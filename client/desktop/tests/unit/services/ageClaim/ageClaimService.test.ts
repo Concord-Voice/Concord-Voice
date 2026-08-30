@@ -21,7 +21,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 vi.mock('@/renderer/services/e2eeService', () => ({
   e2eeService: mockE2EE,
 }));
-vi.mock('@/renderer/stores/userStore', () => ({
+vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: { getState: () => mockUser },
 }));
 

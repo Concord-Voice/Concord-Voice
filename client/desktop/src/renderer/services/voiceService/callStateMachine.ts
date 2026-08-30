@@ -18,8 +18,8 @@ import type {
   DMVoiceCallDeclinedPayload,
   DMVoiceCallTimedOutPayload,
 } from '../../types/ws-events';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useDMStore } from '../../stores/dmStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useDMStore } from '../../stores/chat/dmStore';
 import { apiFetch } from '../apiClient';
 import { notificationSoundService } from '../notificationSoundService';
 import { voiceService } from '../voiceService';

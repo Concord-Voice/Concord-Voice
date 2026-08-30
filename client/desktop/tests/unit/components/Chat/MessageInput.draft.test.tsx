@@ -36,7 +36,7 @@ vi.mock('@/renderer/hooks/useFileUpload', () => ({
   }),
 }));
 
-vi.mock('@/renderer/stores/layoutStore', () => ({
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({
   useLayoutStore: () => false,
 }));
 
@@ -66,7 +66,7 @@ vi.mock('@/renderer/components/User/UserPanel', () => ({
 }));
 
 const mockSetReplyingTo = vi.fn();
-vi.mock('@/renderer/stores/chatStore', () => ({
+vi.mock('@/renderer/stores/chat/chatStore', () => ({
   useChatStore: {
     getState: () => ({
       messagesByChannel: new Map(),

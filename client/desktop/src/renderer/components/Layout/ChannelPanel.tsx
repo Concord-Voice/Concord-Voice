@@ -1,5 +1,5 @@
 import React from 'react';
-import type { SidebarContext } from '../../stores/layoutStore';
+import type { SidebarContext } from '../../stores/ui/layoutStore';
 import UserPanel from '../User/UserPanel';
 import { DockShell } from './DockShell';
 

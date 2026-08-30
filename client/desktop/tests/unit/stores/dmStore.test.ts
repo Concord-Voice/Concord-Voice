@@ -1,6 +1,10 @@
-import { useDMStore, type DMConversation, type DMLastMessage } from '@/renderer/stores/dmStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import {
+  useDMStore,
+  type DMConversation,
+  type DMLastMessage,
+} from '@/renderer/stores/chat/dmStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
 import { resetAllStores } from '../../helpers/store-helpers';
@@ -1463,7 +1467,7 @@ describe('dmStore', () => {
         });
 
         // leaveGroup dynamically imports userStore — set user state
-        const { useUserStore } = await import('@/renderer/stores/userStore');
+        const { useUserStore } = await import('@/renderer/stores/auth/userStore');
         useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
 
         server.use(
@@ -1627,7 +1631,7 @@ describe('dmStore', () => {
 
     describe('leaveGroup - edge cases', () => {
       it('throws when user is not authenticated', async () => {
-        const { useUserStore } = await import('@/renderer/stores/userStore');
+        const { useUserStore } = await import('@/renderer/stores/auth/userStore');
         useUserStore.setState({ user: null });
 
         await expect(useDMStore.getState().leaveGroup('group-1')).rejects.toThrow(
@@ -1636,7 +1640,7 @@ describe('dmStore', () => {
       });
 
       it('throws on API error with message', async () => {
-        const { useUserStore } = await import('@/renderer/stores/userStore');
+        const { useUserStore } = await import('@/renderer/stores/auth/userStore');
         useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
 
         server.use(
@@ -1651,7 +1655,7 @@ describe('dmStore', () => {
       });
 
       it('uses generic error when none provided', async () => {
-        const { useUserStore } = await import('@/renderer/stores/userStore');
+        const { useUserStore } = await import('@/renderer/stores/auth/userStore');
         useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
 
         server.use(
@@ -1670,7 +1674,7 @@ describe('dmStore', () => {
         useDMStore.getState().addConversation(mockConversation);
         useDMStore.getState().setActiveConversation('conv-1');
 
-        const { useUserStore } = await import('@/renderer/stores/userStore');
+        const { useUserStore } = await import('@/renderer/stores/auth/userStore');
         useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
 
         server.use(
@@ -1928,7 +1932,7 @@ describe('dmStore', () => {
       e2eeMock.getChannelKey.mockRejectedValue(new E2EEKeyUnavailableError('NO_KEY_YET', false));
 
       // userStore needs to have user set for personal thread E2EE path
-      const { useUserStore } = await import('@/renderer/stores/userStore');
+      const { useUserStore } = await import('@/renderer/stores/auth/userStore');
       useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
 
       server.use(
@@ -1963,7 +1967,7 @@ describe('dmStore', () => {
       // getChannelKey resolves (key exists)
       e2eeMock.getChannelKey.mockResolvedValue('existing-key');
 
-      const { useUserStore } = await import('@/renderer/stores/userStore');
+      const { useUserStore } = await import('@/renderer/stores/auth/userStore');
       useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as any });
 
       server.use(
@@ -2553,7 +2557,7 @@ describe('dmStore', () => {
       // Load-bearing: ensurePersonalThreadKey returns early when no user is
       // set, so without this every case below passes whether or not the
       // narrowing works. The positive control is what surfaced that.
-      const { useUserStore } = await import('@/renderer/stores/userStore');
+      const { useUserStore } = await import('@/renderer/stores/auth/userStore');
       useUserStore.setState({ user: { id: 'user-1', username: 'alice' } as never });
       server.use(
         http.post(`${API_BASE}/api/v1/dm/conversations/personal`, () =>

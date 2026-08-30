@@ -1,7 +1,7 @@
-import type { Entitlement } from '../stores/subscriptionStore';
-import type { AppearanceSettings } from '../stores/settingsStore';
-import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../stores/voiceStore';
-import { VIDEO_QUALITY_PRESETS } from '../stores/videoSettingsStore';
+import type { Entitlement } from '../stores/auth/subscriptionStore';
+import type { AppearanceSettings } from '../stores/ui/settingsStore';
+import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../stores/voice/voiceStore';
+import { VIDEO_QUALITY_PRESETS } from '../stores/voice/videoSettingsStore';
 import {
   videoLimitsFromEntitlement,
   maxFpsForResolution,

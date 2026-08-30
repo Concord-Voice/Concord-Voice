@@ -4,7 +4,7 @@ import {
   isChannelMuted,
   isDMMuted,
   type PreferenceWire,
-} from '@/renderer/stores/notificationPrefsStore';
+} from '@/renderer/stores/ui/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 const SERVER_ID = '11111111-1111-1111-1111-111111111111';

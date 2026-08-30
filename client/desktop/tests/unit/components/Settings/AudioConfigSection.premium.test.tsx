@@ -9,7 +9,7 @@ const mockStashAndSwap = vi.fn();
 
 let currentTier = 'standard';
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(
     vi.fn((selector) => selector({ qualityTier: currentTier, setQualityTier: mockSetQualityTier })),
     { getState: () => ({ reset: vi.fn() }), setState: vi.fn() }
@@ -37,7 +37,7 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/audioSettingsStore', () => ({
+vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({
   useAudioSettingsStore: Object.assign(
     vi.fn((s) => s({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })),
     { getState: vi.fn(() => ({ advancedMode: false, setAdvancedMode: mockSetAdvancedMode })) }
@@ -72,7 +72,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import AudioConfigSection from '@/renderer/components/Settings/AudioConfigSection';
 

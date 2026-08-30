@@ -292,7 +292,7 @@ export interface ProvisionalDMParticipant {
 // maxaveragebitrate ceiling for a tier is the per-tier `maxBitrate` (bps) the
 // CLIENT requests at produce time. Mirrored here as a server constant from the
 // canonical client map AUDIO_QUALITY_TIERS in
-// `client/desktop/src/renderer/stores/voiceStore.ts` — `standard.maxBitrate`
+// `client/desktop/src/renderer/stores/voice/voiceStore.ts` — `standard.maxBitrate`
 // is 96_000 bps (the free ceiling). This is the audio-tier analogue of
 // FREE_MEDIA_ENTITLEMENT: a small, deliberately-pinned mirror of a client
 // value used only to enforce the floor. If a future tier's client maxBitrate

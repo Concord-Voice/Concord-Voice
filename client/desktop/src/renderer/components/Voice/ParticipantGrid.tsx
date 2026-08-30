@@ -3,10 +3,10 @@ import {
   useVoiceStore,
   type ActiveScreenShare,
   MAX_TUNED_SCREEN_SHARES,
-} from '../../stores/voiceStore';
-import { useUserStore } from '../../stores/userStore';
-import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
-import { useSettingsStore, type AppearanceSettings } from '../../stores/settingsStore';
+} from '../../stores/voice/voiceStore';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
+import { useSettingsStore, type AppearanceSettings } from '../../stores/ui/settingsStore';
 import ParticipantTile from './ParticipantTile';
 import ShareTunePill from './ShareTunePill';
 import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';

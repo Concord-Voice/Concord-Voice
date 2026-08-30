@@ -1,4 +1,4 @@
-import { useNotificationStore } from '../stores/notificationStore';
+import { useNotificationStore } from '../stores/ui/notificationStore';
 import { isInQuietHours } from './desktopNotificationService';
 
 /** Chat notification sound types */

@@ -9,9 +9,9 @@
 // participants — the dm_voice_call_declined WS payload carries only
 // decliner_user_id (no PII), so the tally never depends on wire-side names.
 
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useDMStore, type DMParticipant } from '../../stores/dmStore';
-import { useUserStore } from '../../stores/userStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useDMStore, type DMParticipant } from '../../stores/chat/dmStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { cancelOutgoingCall } from '../../services/voiceService/callStateMachine';
 import { peerName } from '../../utils/dm';
 import './OutgoingCallModal.css';

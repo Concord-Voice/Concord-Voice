@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useChannelScrollStore } from '@/renderer/stores/channelScrollStore';
+import { useChannelScrollStore } from '@/renderer/stores/chat/channelScrollStore';
 
 beforeEach(() => {
   useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });

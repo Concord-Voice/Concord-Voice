@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';
 import FolderBar from '@/renderer/components/Layout/FolderBar';
 

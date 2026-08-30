@@ -9,9 +9,9 @@ import React, {
 } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { AtSign, Users, Shield } from 'lucide-react';
-import { useMemberStore } from '../../stores/memberStore';
-import { useDMStore } from '../../stores/dmStore';
-import { usePermissionStore } from '../../stores/permissionStore';
+import { useMemberStore } from '../../stores/chat/memberStore';
+import { useDMStore } from '../../stores/chat/dmStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import {
   hasPermission,
   MENTION_EVERYONE,
@@ -160,10 +160,10 @@ const MentionAutocomplete = forwardRef<MentionAutocompleteHandle, MentionAutocom
 
     // Extract the active @query token at the cursor (start-of-input or
     // whitespace-preceded @, stopping at whitespace).
-    const query = useMemo(() => extractTriggerToken(text, cursorPosition, '@'), [
-      text,
-      cursorPosition,
-    ]);
+    const query = useMemo(
+      () => extractTriggerToken(text, cursorPosition, '@'),
+      [text, cursorPosition]
+    );
 
     // Compute effective permissions (server base + channel SBAC overrides)
     const permissions = useMemo(() => {

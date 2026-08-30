@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useUpdateStatusStore } from '../../../../src/renderer/stores/updateStatusStore';
+import { useUpdateStatusStore } from '../../../../src/renderer/stores/ui/updateStatusStore';
 import { UpdateSecurityBanner } from '../../../../src/renderer/components/Updates/UpdateSecurityBanner';
 
 describe('UpdateSecurityBanner (#658)', () => {

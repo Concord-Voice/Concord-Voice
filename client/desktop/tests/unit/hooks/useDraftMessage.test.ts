@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useDraftMessage } from '@/renderer/hooks/useDraftMessage';
-import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
+import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';
 

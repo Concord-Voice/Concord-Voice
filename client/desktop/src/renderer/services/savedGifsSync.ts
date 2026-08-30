@@ -9,7 +9,7 @@
  * The server stores only AES-256-GCM ciphertext; it cannot see which GIFs are saved.
  */
 
-import { useSavedGifsStore, type SavedGif } from '../stores/savedGifsStore';
+import { useSavedGifsStore, type SavedGif } from '../stores/chat/savedGifsStore';
 import { fetchEncryptedBlob, pushEncryptedBlob } from './e2eeBlobTransport';
 import {
   isHydrationLifecycleCurrent,

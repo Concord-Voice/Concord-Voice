@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import type { DMParticipant, DMConversation } from '../../stores/dmStore';
-import { useFriendStore } from '../../stores/friendStore';
-import type { PresenceStatus } from '../../stores/memberStore';
+import type { DMParticipant, DMConversation } from '../../stores/chat/dmStore';
+import { useFriendStore } from '../../stores/chat/friendStore';
+import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/apiClient';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import { useUserThemeScope } from '../../hooks/useUserThemeScope';
@@ -195,7 +195,11 @@ const DMProfileModal: React.FC<DMProfileModalProps> = ({
           }
         >
           {resolveMediaUrl(profile?.header_image_url) && (
-            <img src={resolveMediaUrl(profile?.header_image_url)} alt="" className="dm-profile-modal-banner-img" />
+            <img
+              src={resolveMediaUrl(profile?.header_image_url)}
+              alt=""
+              className="dm-profile-modal-banner-img"
+            />
           )}
           <button
             className="dm-profile-modal-close"

@@ -1,10 +1,10 @@
 import { render, screen, waitFor, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useDMStore, type DMConversation } from '@/renderer/stores/dmStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { vi } from 'vitest';
 

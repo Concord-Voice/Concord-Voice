@@ -4,8 +4,8 @@ import {
   FRIEND_REQUEST_SKEW_MESSAGE,
   PURGE_AUTH_SKEW_MESSAGE,
   type FriendRequestPrivacyMode,
-} from '@/renderer/stores/privacyStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+} from '@/renderer/stores/ui/privacyStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { useInvitePreview } from '@/renderer/hooks/useInvitePreview';
 import { resolveMediaUrl } from '@/renderer/utils/resolveMediaUrl';
 import './InviteEmbed.css';

@@ -1,11 +1,11 @@
 import React from 'react';
 import { render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { vi } from 'vitest';
 
@@ -54,7 +54,7 @@ vi.mock('@/renderer/services/pinService', () => ({
   unpinMessage: vi.fn().mockResolvedValue({}),
 }));
 
-vi.mock('@/renderer/stores/permissionStore', async () => {
+vi.mock('@/renderer/stores/chat/permissionStore', async () => {
   const { create } = await import('zustand');
   const store = create(() => ({
     hasServerPermission: vi.fn().mockReturnValue(true),
@@ -63,7 +63,7 @@ vi.mock('@/renderer/stores/permissionStore', async () => {
   return { usePermissionStore: store };
 });
 
-vi.mock('@/renderer/stores/serverStore', async () => {
+vi.mock('@/renderer/stores/chat/serverStore', async () => {
   const { create } = await import('zustand');
   const store = create(() => ({
     activeServerId: 'server-1',

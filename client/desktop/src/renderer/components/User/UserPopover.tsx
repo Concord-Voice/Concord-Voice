@@ -3,12 +3,12 @@ import { SmilePlus } from 'lucide-react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { openProfilePage } from '../../utils/openProfilePage';
 import { useNavigate } from 'react-router';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
-import { UserProfile, useUserStore } from '../../stores/userStore';
-import { useMemberStore, PresenceStatus } from '../../stores/memberStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
+import { UserProfile, useUserStore } from '../../stores/auth/userStore';
+import { useMemberStore, PresenceStatus } from '../../stores/chat/memberStore';
 import { getWebSocketService } from '../../services/websocketService';
 import { useUserThemeScope } from '../../hooks/useUserThemeScope';
-import { useSettingsStore } from '../../stores/settingsStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
 import './UserPopover.css';
 
 interface UserPopoverProps {

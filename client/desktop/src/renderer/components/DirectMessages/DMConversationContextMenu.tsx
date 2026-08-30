@@ -3,8 +3,8 @@ import { Eraser } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
 import { useRotateKey } from '../../hooks/useRotateKey';
-import { useDMStore, type DMConversation } from '../../stores/dmStore';
-import { useFriendStore } from '../../stores/friendStore';
+import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
+import { useFriendStore } from '../../stores/chat/friendStore';
 import { apiFetch } from '../../services/apiClient';
 import { initiateDMCall } from '../../services/voiceService/callStateMachine';
 

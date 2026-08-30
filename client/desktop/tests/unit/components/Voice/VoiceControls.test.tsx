@@ -1,9 +1,9 @@
 import React from 'react';
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { vi } from 'vitest';
 
 // ── Service mocks ────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ vi.mock('@/renderer/services/voiceService', () => ({
 // ── OS permission store mock ─────────────────────────────────────────────────
 const mockCheckOne = vi.fn().mockResolvedValue('granted');
 const mockOpenSettings = vi.fn();
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: Object.assign(vi.fn(), {
     getState: vi.fn(() => ({
       checkOne: mockCheckOne,

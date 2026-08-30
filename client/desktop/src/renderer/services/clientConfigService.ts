@@ -11,8 +11,8 @@ import {
   useClientConfigStore,
   ServerCapabilitiesSchema,
   type ServerCapabilities,
-} from '../stores/clientConfigStore';
-import { useVoiceStore } from '../stores/voiceStore';
+} from '../stores/ui/clientConfigStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STARTUP_DELAY_MS = 2_000; // 2s after mount — let auth + profile settle first

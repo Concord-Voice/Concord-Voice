@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { presenceOverrideSyncService } from '../../services/presenceOverrideSync';
-import { useFriendOrgStore, type FriendCategory } from '../../stores/friendOrgStore';
-import { useFriendStore, type Friend } from '../../stores/friendStore';
-import { usePresenceOverrideStore } from '../../stores/presenceOverrideStore';
+import { useFriendOrgStore, type FriendCategory } from '../../stores/chat/friendOrgStore';
+import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
+import { usePresenceOverrideStore } from '../../stores/ui/presenceOverrideStore';
 import { comparePresenceOverrideUserIds } from '../../utils/presenceOverrides';
 import './PresenceExceptions.css';
 

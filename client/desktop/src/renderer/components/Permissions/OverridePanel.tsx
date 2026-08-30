@@ -1,8 +1,8 @@
 import React, { useState, useMemo, useCallback } from 'react';
 import PermissionGrid from './PermissionGrid';
-import { ChannelOverride, UpsertOverrideRequest } from '../../stores/permissionStore';
+import { ChannelOverride, UpsertOverrideRequest } from '../../stores/chat/permissionStore';
 import { Role } from '../../types/server';
-import { ServerMember } from '../../stores/memberStore';
+import { ServerMember } from '../../stores/chat/memberStore';
 import { parsePermissions, countBits } from '../../utils/permissions';
 import './OverridePanel.css';
 

@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/subscriptionStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/Voice/ScreenSharePicker.css', () => ({}));
@@ -508,7 +508,9 @@ describe('ScreenSharePicker', () => {
 
       // Height fits the cap, so nothing is clamped and the label stays plain. Wait for the
       // fps option to settle (displayInfo resolved) before asserting the resolution label.
-      await waitFor(() => expect(screen.getByRole('option', { name: '30 FPS' })).toBeInTheDocument());
+      await waitFor(() =>
+        expect(screen.getByRole('option', { name: '30 FPS' })).toBeInTheDocument()
+      );
       expect(screen.getByRole('option', { name: /Source Native/ }).textContent).not.toContain(
         'Premium'
       );

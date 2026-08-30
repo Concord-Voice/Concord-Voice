@@ -11,11 +11,11 @@ import { e2eeService } from '../../services/e2eeService';
 import { errorMessage } from '../../utils/redactError';
 import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { abandonSSOReservation } from '../../services/ssoService';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import {
   usePendingRegistrationStore,
   type PendingRegistrationResponse,
-} from '../../stores/pendingRegistrationStore';
+} from '../../stores/auth/pendingRegistrationStore';
 import './Register.css';
 
 export interface RegisterProps {

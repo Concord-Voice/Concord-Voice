@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { sendDMMessage } from '@/renderer/services/dmMessageSender';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { mockUser } from '../../mocks/fixtures';
 import { ConnectionState } from '@/renderer/services/websocketService';
 

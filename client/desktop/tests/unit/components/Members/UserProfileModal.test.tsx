@@ -14,7 +14,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 import UserProfileModal from '@/renderer/components/Members/UserProfileModal';
-import type { ServerMember } from '@/renderer/stores/memberStore';
+import type { ServerMember } from '@/renderer/stores/chat/memberStore';
 
 // Match SafeLink.test.tsx's pattern: tests/setup.ts installs a base
 // `window.electron` mock; this helper attaches an openExternal vi.fn so

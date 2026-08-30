@@ -1,4 +1,4 @@
-import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';

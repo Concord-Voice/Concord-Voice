@@ -12,8 +12,8 @@
  */
 
 import { useCallback, useEffect, useRef } from 'react';
-import { useChatStore } from '../stores/chatStore';
-import { useUserStore } from '../stores/userStore';
+import { useChatStore } from '../stores/chat/chatStore';
+import { useUserStore } from '../stores/auth/userStore';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
 import { getMessageQueue, type QueuedMessage } from '../services/messageQueue';
 import { e2eeService } from '../services/e2eeService';

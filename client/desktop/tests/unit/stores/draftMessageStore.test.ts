@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   useDraftMessageStore,
   type DraftContent,
-} from '../../../src/renderer/stores/draftMessageStore';
+} from '../../../src/renderer/stores/chat/draftMessageStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('draftMessageStore', () => {

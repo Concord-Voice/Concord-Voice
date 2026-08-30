@@ -17,7 +17,7 @@
  *   recursive string visit.
  */
 
-import { useConnectionStore } from '../stores/connectionStore';
+import { useConnectionStore } from '../stores/ui/connectionStore';
 
 export interface GpuInfo {
   vendor: string;

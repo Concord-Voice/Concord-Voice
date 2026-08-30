@@ -3,7 +3,7 @@
  */
 
 import React from 'react';
-import { useChatStore } from '../../stores/chatStore';
+import { useChatStore } from '../../stores/chat/chatStore';
 import './ConnectionStatus.css';
 
 interface ConnectionStatusProps {

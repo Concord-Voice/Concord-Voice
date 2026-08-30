@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, within } from '../../../test-utils';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 

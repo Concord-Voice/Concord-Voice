@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
-import { useSSOStore } from '@/renderer/stores/ssoStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
+import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { API_BASE } from '@/renderer/config';
 import { getApiBase, resetRuntimeServerBase } from '@/renderer/services/runtimeServerBase';
 import { resetAllStores } from '../../../helpers/store-helpers';

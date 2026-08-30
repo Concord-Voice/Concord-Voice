@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import FriendsFlexSpace from '@/renderer/components/DirectMessages/FriendsFlexSpace';
 import { DockOverlayProvider } from '@/renderer/components/Layout/DockShell';
 

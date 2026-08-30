@@ -4,8 +4,8 @@ import {
   useFriendStore,
   type FriendCodePreview,
   type SearchResult,
-} from '../../stores/friendStore';
-import { usePrivacyStore } from '../../stores/privacyStore';
+} from '../../stores/chat/friendStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { apiFetch } from '../../services/apiClient';
 import Modal from '../ui/Modal';
 import { errorMessage } from '../../utils/redactError';

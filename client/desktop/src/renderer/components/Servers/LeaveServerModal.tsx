@@ -1,7 +1,7 @@
 import React from 'react';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
-import { useServerStore } from '../../stores/serverStore';
-import { useUserStore } from '../../stores/userStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { apiFetch } from '../../services/apiClient';
 import { ServerWithRole } from '../../types/server';
 

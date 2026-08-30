@@ -2,8 +2,8 @@ import { render, screen, fireEvent } from '../../test-utils';
 import { useMessageProfileCard } from '@/renderer/hooks/useMessageProfileCard';
 import MessageProfileCardHost from '@/renderer/components/Chat/MessageProfileCardHost';
 import type { MessageWithStatus, ChatContextType } from '@/renderer/types/chat';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { mockMessage, mockMember } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 

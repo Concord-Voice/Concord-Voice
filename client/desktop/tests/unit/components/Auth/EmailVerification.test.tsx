@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import EmailVerification from '@/renderer/components/Auth/EmailVerification';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,

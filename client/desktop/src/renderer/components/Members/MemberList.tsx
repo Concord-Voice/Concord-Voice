@@ -1,9 +1,9 @@
 import React, { useEffect, useState, useCallback, useId, useRef, useMemo } from 'react';
 import { prefetchEligibility } from '../../services/friendEligibility';
-import { useServerStore } from '../../stores/serverStore';
-import { useUserStore } from '../../stores/userStore';
-import { useMemberStore, ServerMember, PresenceStatus } from '../../stores/memberStore';
-import { usePermissionStore } from '../../stores/permissionStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useMemberStore, ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import MemberItem from './MemberItem';
 import MemberProfileCard from './MemberProfileCard';
 import MemberContextMenu from './MemberContextMenu';

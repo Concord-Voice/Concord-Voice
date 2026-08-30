@@ -3,10 +3,10 @@ import { render, screen, fireEvent } from '../../../test-utils';
 import MentionAutocomplete, {
   type MentionAutocompleteHandle,
 } from '@/renderer/components/Chat/MentionAutocomplete';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockMember, mockMember2 } from '../../../mocks/fixtures';
 import { MENTION_EVERYONE, MENTION_USERS, MENTION_ROLES } from '@/renderer/utils/permissions';

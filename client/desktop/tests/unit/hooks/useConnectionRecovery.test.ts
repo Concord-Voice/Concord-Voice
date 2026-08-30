@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 // Mock dependencies
 const mockSetAggressiveReconnect = vi.fn();
@@ -70,7 +70,7 @@ vi.mock('@/renderer/services/resetService', () => ({
 import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
 import { gracefulReset, recoveryReset } from '@/renderer/services/resetService';
 import { hydratePostLogin } from '@/renderer/services/postLoginHydration';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { voiceService } from '@/renderer/services/voiceService';
 
 beforeEach(() => {

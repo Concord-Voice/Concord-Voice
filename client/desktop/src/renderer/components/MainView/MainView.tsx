@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { PipSignalingProxy } from '../../services/pipSignalingProxy';
 import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
 import ChannelList from '../Channels/ChannelList';
@@ -13,8 +13,8 @@ import VoiceView from '../Voice/VoiceView';
 import PersistentVoiceBar from '../Voice/PersistentVoiceBar';
 import VoiceTextChat from '../Voice/VoiceTextChat';
 import UserPanel from '../User/UserPanel';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { selectSidebarDock, useLayoutStore } from '../../stores/layoutStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { selectSidebarDock, useLayoutStore } from '../../stores/ui/layoutStore';
 
 // New layout components
 import AppLayout from '../Layout/AppLayout';
@@ -23,9 +23,9 @@ import FolderBar from '../Layout/FolderBar';
 import ChannelPanel from '../Layout/ChannelPanel';
 import MemberFlexSpace from '../Layout/MemberFlexSpace';
 
-import { useServerStore } from '../../stores/serverStore';
-import { useChannelStore } from '../../stores/channelStore';
-import { usePermissionStore } from '../../stores/permissionStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { Permissions, hasPermission } from '../../utils/permissions';
 import { useServerChannelSubscriptions } from '../../hooks/useServerChannelSubscriptions';
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts';

@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { useKeyboardShortcutStore, type KeyCombo } from '../../stores/keyboardShortcutStore';
+import { useKeyboardShortcutStore, type KeyCombo } from '../../stores/ui/keyboardShortcutStore';
 import { keyboardShortcutService } from '../../services/keyboardShortcutService';
 import Modal from './Modal';
 import './ShortcutOverlay.css';

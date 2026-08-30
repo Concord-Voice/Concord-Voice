@@ -1,9 +1,9 @@
 import { render, screen, userEvent, within } from '../../../test-utils';
 import Login from '@/renderer/components/Auth/Login';
 import { vi } from 'vitest';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
-import { useSSOStore } from '@/renderer/stores/ssoStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import {

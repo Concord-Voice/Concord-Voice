@@ -4,10 +4,10 @@ import ChangelogModalHost, {
   ChangelogModal,
   MAX_RENDERED_SECTIONS,
 } from '../../../src/renderer/components/ChangelogModal/ChangelogModal';
-import { useChangelogStore } from '../../../src/renderer/stores/changelogStore';
-import { useAuthStore } from '../../../src/renderer/stores/authStore';
-import { useAttestationFailureStore } from '../../../src/renderer/stores/attestationFailureStore';
-import { useClientConfigStore } from '../../../src/renderer/stores/clientConfigStore';
+import { useChangelogStore } from '../../../src/renderer/stores/ui/changelogStore';
+import { useAuthStore } from '../../../src/renderer/stores/auth/authStore';
+import { useAttestationFailureStore } from '../../../src/renderer/stores/auth/attestationFailureStore';
+import { useClientConfigStore } from '../../../src/renderer/stores/ui/clientConfigStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { ChangelogSection } from '../../../src/renderer/services/changelog';
 

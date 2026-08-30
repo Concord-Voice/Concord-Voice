@@ -14,9 +14,9 @@ import { savedGifsSyncService } from './savedGifsSync';
 import { friendOrgSyncService } from './friendOrgSync';
 import { presenceOverrideSyncService } from './presenceOverrideSync';
 import { tryHydrateNotificationPrefs } from './notificationPrefsService';
-import { useSubscriptionStore } from '../stores/subscriptionStore';
-import { useSettingsStore } from '../stores/settingsStore';
-import { useLayoutStore } from '../stores/layoutStore';
+import { useSubscriptionStore } from '../stores/auth/subscriptionStore';
+import { useSettingsStore } from '../stores/ui/settingsStore';
+import { useLayoutStore } from '../stores/ui/layoutStore';
 import {
   beginPostLoginHydrationGuard,
   type HydrationLifecycleGuard,

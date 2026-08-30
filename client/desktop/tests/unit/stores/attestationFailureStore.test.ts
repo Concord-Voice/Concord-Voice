@@ -1,4 +1,4 @@
-import { useAttestationFailureStore } from '@/renderer/stores/attestationFailureStore';
+import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

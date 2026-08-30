@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ScreenShareAudioControls } from '@/renderer/components/Voice/ScreenShareAudioControls';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { voiceService } from '@/renderer/services/voiceService';
 
 /** Mark the local viewer as server-deafened (moderator-enforced). */
@@ -76,7 +76,9 @@ describe('ScreenShareAudioControls (#2162)', () => {
   it('leaves controls enabled when the local viewer is not server-deafened', () => {
     setLocalServerDeafened(false);
     render(<ScreenShareAudioControls sharerUserId="u1" />);
-    expect((screen.getByRole('button', { name: /mute screen audio/i }) as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (screen.getByRole('button', { name: /mute screen audio/i }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect((screen.getByLabelText('Screen share volume') as HTMLInputElement).disabled).toBe(false);
   });
 

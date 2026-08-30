@@ -1,6 +1,6 @@
 // Auth configuration types
-import type { UserProfile } from '../stores/userStore';
-export type { UserProfile } from '../stores/userStore';
+import type { UserProfile } from '../stores/auth/userStore';
+export type { UserProfile } from '../stores/auth/userStore';
 
 export type ConnectionMode = 'hosted' | 'hosted-login' | 'self-hosted';
 

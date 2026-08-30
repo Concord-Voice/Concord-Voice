@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { mockServer, mockServer2 } from '../../../mocks/fixtures';
 import { server as mswServer } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';

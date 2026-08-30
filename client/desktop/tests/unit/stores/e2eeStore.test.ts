@@ -1,4 +1,4 @@
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('e2eeStore', () => {

@@ -5,7 +5,7 @@ import {
   type RecoveryPhase,
   type DiagnosticResults,
   type CheckResult,
-} from '../../stores/connectionStore';
+} from '../../stores/ui/connectionStore';
 // recoveryService remains lazy. resetService is eagerly registered by main.tsx;
 // local dynamic imports avoid a direct feature-module dependency.
 import { runRecoveryModule } from '../../utils/runRecoveryModule';
@@ -74,11 +74,11 @@ function PhaseContent({
     // Wrap dynamic imports so a chunk-load failure doesn't silently no-op
     // the Retry button — exactly the UX pathology this PR is fixing.
     let getWebSocketService: typeof import('../../services/websocketService').getWebSocketService;
-    let useAuthStoreImport: typeof import('../../stores/authStore').useAuthStore;
+    let useAuthStoreImport: typeof import('../../stores/auth/authStore').useAuthStore;
     let runPreflight: typeof import('../../services/recoveryService').runPreflight;
     try {
       ({ getWebSocketService } = await import('../../services/websocketService'));
-      ({ useAuthStore: useAuthStoreImport } = await import('../../stores/authStore'));
+      ({ useAuthStore: useAuthStoreImport } = await import('../../stores/auth/authStore'));
       ({ runPreflight } = await import('../../services/recoveryService'));
     } catch {
       store.incrementRecoveryAttempts();

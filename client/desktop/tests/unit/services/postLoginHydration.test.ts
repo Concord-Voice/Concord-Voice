@@ -41,7 +41,7 @@ vi.mock('@/renderer/services/notificationPrefsService', () => ({
   stopExpirySweep: vi.fn(),
 }));
 
-vi.mock('@/renderer/stores/subscriptionStore', () => {
+vi.mock('@/renderer/stores/auth/subscriptionStore', () => {
   const hydrate = vi.fn().mockResolvedValue(undefined);
   const reset = vi.fn();
   return {
@@ -58,8 +58,8 @@ import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
 import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { tryHydrateNotificationPrefs } from '@/renderer/services/notificationPrefsService';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
-import { useLayoutStore, type SidebarProfiles } from '@/renderer/stores/layoutStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
+import { useLayoutStore, type SidebarProfiles } from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('hydratePostLogin', () => {

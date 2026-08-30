@@ -5,7 +5,7 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -250,7 +250,7 @@ describe('apiClient — extended', () => {
       };
 
       // Set connection store to a non-stable phase
-      const { useConnectionStore } = await import('@/renderer/stores/connectionStore');
+      const { useConnectionStore } = await import('@/renderer/stores/ui/connectionStore');
       useConnectionStore.getState().enterRecoveryA();
 
       mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));

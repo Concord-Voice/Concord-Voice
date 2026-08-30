@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useSSOStore } from '@/renderer/stores/ssoStore';
+import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 /**

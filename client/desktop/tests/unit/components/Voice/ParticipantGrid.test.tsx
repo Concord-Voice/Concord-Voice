@@ -2,10 +2,10 @@ import React from 'react';
 import { act } from 'react';
 import { waitFor } from '@testing-library/react';
 import { render, screen } from '../../../test-utils';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // ── Child component mocks ──────────────────────────────────────────────────────

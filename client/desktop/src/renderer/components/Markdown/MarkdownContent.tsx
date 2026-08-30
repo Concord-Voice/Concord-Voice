@@ -12,7 +12,7 @@ import SafeLink from './SafeLink';
 import Spoiler from './Spoiler';
 import MentionChip from './MentionChip';
 import { loadHighlightTheme } from './highlightTheme';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import type { MentionLookup } from './mentionTypes';
 import './MarkdownContent.css';
 

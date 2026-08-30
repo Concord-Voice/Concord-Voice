@@ -1,7 +1,7 @@
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
 import { resetAllStores } from '../../helpers/store-helpers';

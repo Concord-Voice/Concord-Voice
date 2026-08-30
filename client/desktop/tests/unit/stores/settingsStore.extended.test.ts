@@ -1,6 +1,6 @@
-import { useSettingsStore, syncColorSchemeToServer } from '@/renderer/stores/settingsStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useSettingsStore, syncColorSchemeToServer } from '@/renderer/stores/ui/settingsStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock matchMedia — jsdom doesn't implement it

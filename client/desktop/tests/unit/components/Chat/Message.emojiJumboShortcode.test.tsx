@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render } from '../../../test-utils';
 import Message from '@/renderer/components/Chat/Message';
-import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockMember } from '../../../mocks/fixtures';
 import { indexCategory } from '@/renderer/components/EmojiPicker/shortcodeIndex';

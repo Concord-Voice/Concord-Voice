@@ -1,8 +1,8 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import DMProfileModal from '@/renderer/components/DirectMessages/DMProfileModal';
-import type { DMParticipant, DMConversation } from '@/renderer/stores/dmStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import type { DMParticipant, DMConversation } from '@/renderer/stores/chat/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { server } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';

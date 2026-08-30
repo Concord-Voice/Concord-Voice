@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { INVITE } from '@/renderer/utils/permissions';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 
@@ -15,7 +15,7 @@ vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
-vi.mock('@/renderer/stores/layoutStore', () => ({
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({
   useLayoutStore: () => false,
 }));
 vi.mock('@/renderer/hooks/useFileUpload', () => ({

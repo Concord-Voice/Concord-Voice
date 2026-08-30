@@ -10,8 +10,8 @@ import React, {
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
 import Message from './Message';
 import { CallEventMessage } from '../DirectMessages/CallEventMessage';
-import { useChannelScrollStore } from '../../stores/channelScrollStore';
-import { useDMStore } from '../../stores/dmStore';
+import { useChannelScrollStore } from '../../stores/chat/channelScrollStore';
+import { useDMStore } from '../../stores/chat/dmStore';
 import './MessageList.css';
 
 export interface MessageListProps {

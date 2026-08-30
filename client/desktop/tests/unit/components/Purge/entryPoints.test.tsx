@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, userEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockChannel, mockServer, mockUser } from '../../../mocks/fixtures';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import {
   MANAGE_ALL_MESSAGES,
   MANAGE_CHANNELS,
@@ -15,7 +15,7 @@ import ServerContextMenu from '@/renderer/components/Servers/ServerContextMenu';
 import DMConversationContextMenu from '@/renderer/components/DirectMessages/DMConversationContextMenu';
 import GroupInfoPanel from '@/renderer/components/DirectMessages/GroupInfoPanel';
 import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
-import type { DMConversation } from '@/renderer/stores/dmStore';
+import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 
 const noop = () => {};
 const SERVER_ID = mockServer.id;

@@ -1,8 +1,8 @@
 import { useState, useCallback } from 'react';
 import { MessageWithStatus, type ChatContextType } from '../types/chat';
-import { useMemberStore, type ServerMember } from '../stores/memberStore';
-import { useFriendStore } from '../stores/friendStore';
-import { useSettingsStore } from '../stores/settingsStore';
+import { useMemberStore, type ServerMember } from '../stores/chat/memberStore';
+import { useFriendStore } from '../stores/chat/friendStore';
+import { useSettingsStore } from '../stores/ui/settingsStore';
 
 const EMPTY_MEMBERS: never[] = [];
 

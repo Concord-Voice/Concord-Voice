@@ -13,9 +13,9 @@
  */
 
 import { useEffect, useCallback, useRef } from 'react';
-import { useAuthStore } from '../stores/authStore';
-import { useChatStore } from '../stores/chatStore';
-import { useChannelStore } from '../stores/channelStore';
+import { useAuthStore } from '../stores/auth/authStore';
+import { useChatStore } from '../stores/chat/chatStore';
+import { useChannelStore } from '../stores/chat/channelStore';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
 import { e2eeService, type E2EEChannelOperationGuard } from '../services/e2eeService';
 import { apiFetch, safeJson } from '../services/apiClient';

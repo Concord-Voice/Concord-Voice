@@ -1,7 +1,7 @@
 import React from 'react';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
-import { useServerStore } from '../../stores/serverStore';
-import { useChannelStore } from '../../stores/channelStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
 import { apiFetch } from '../../services/apiClient';
 import { ChannelGroup } from '../../types/chat';
 

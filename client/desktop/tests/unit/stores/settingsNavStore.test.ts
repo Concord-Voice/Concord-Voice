@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 
 describe('settingsNavStore', () => {
   beforeEach(() => useSettingsNavStore.getState().clearFocusRequest());

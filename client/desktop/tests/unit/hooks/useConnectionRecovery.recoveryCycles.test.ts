@@ -15,15 +15,15 @@
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 
 const mockWsService = {
   setAggressiveReconnect: vi.fn(),
@@ -112,7 +112,7 @@ vi.mock('@/renderer/services/postLoginHydrationLifecycle', () => ({
 
 import { useConnectionRecovery } from '@/renderer/hooks/useConnectionRecovery';
 import { useMessageFetch } from '@/renderer/hooks/useMessageFetch';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { isHydrationLifecycleCurrent } from '@/renderer/services/postLoginHydrationLifecycle';
 import { resetAllStores } from '../../helpers/store-helpers';

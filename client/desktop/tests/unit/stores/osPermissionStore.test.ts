@@ -1,5 +1,8 @@
 import { vi } from 'vitest';
-import { useOsPermissionStore, ensureOsPermission } from '@/renderer/stores/osPermissionStore';
+import {
+  useOsPermissionStore,
+  ensureOsPermission,
+} from '@/renderer/stores/voice/osPermissionStore';
 
 function mockBrowserNotification(
   permission: NotificationPermission,

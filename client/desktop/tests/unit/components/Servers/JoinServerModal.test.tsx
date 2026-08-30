@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import JoinServerModal from '@/renderer/components/Servers/JoinServerModal';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { apiFetch } from '@/renderer/services/apiClient';
 
 vi.mock('@/renderer/services/apiClient', () => ({

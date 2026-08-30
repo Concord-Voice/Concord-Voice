@@ -1,4 +1,4 @@
-import { setSyncSuppressed, isSyncSuppressed } from '@/renderer/stores/colorSyncSuppression';
+import { setSyncSuppressed, isSyncSuppressed } from '@/renderer/stores/ui/colorSyncSuppression';
 
 // The color-sync suppression flag was extracted from settingsStore into this
 // dependency-free leaf module so userStore can flip it via a static import

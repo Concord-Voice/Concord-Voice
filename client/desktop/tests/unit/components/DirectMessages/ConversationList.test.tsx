@@ -1,11 +1,15 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
-import { useDMStore, type DMConversation, type DMLastMessage } from '@/renderer/stores/dmStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
-import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import {
+  useDMStore,
+  type DMConversation,
+  type DMLastMessage,
+} from '@/renderer/stores/chat/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
+import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { API_BASE } from '@/renderer/config';
 import { vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -866,7 +870,7 @@ describe('ConversationList', () => {
       removeFriend?: ReturnType<typeof vi.fn>;
       isFriend?: boolean;
     }) {
-      const { useFriendStore } = await import('@/renderer/stores/friendStore');
+      const { useFriendStore } = await import('@/renderer/stores/chat/friendStore');
       useFriendStore.setState({
         friends: opts.isFriend
           ? [
@@ -1154,7 +1158,7 @@ describe('ConversationList', () => {
 
   describe('View Profile modal flow (#1208)', () => {
     async function setupFriendStore(opts: { isFriend?: boolean } = {}) {
-      const { useFriendStore } = await import('@/renderer/stores/friendStore');
+      const { useFriendStore } = await import('@/renderer/stores/chat/friendStore');
       useFriendStore.setState({
         friends: opts.isFriend
           ? [

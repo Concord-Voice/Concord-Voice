@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import ServerActionBar from '@/renderer/components/Channels/ServerActionBar';
 import { mockServer } from '../../../mocks/fixtures';
 import type { ServerWithRole } from '@/renderer/types/server';

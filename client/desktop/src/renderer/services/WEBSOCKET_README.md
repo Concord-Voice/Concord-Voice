@@ -67,8 +67,10 @@ src/renderer/
 │   ├── websocketService.ts    # WebSocket connection manager (singleton)
 │   └── WEBSOCKET_README.md    # This file
 ├── stores/
-│   ├── chatStore.ts           # Real-time message and typing state (Zustand)
-│   └── authStore.ts           # JWT token storage (existing)
+│   ├── chat/
+│   │   └── chatStore.ts       # Real-time message and typing state (Zustand)
+│   └── auth/
+│       └── authStore.ts       # JWT token storage (existing)
 ├── hooks/
 │   ├── useWebSocket.ts         # React hook for WebSocket integration
 │   └── useChannelSubscription.ts # Auto-subscribe/unsubscribe to channels
@@ -89,6 +91,7 @@ src/renderer/
 Singleton service that manages the WebSocket connection lifecycle.
 
 **Features:**
+
 - Ticket-based authentication (POST /auth/ws-ticket → 30s single-use ticket)
 - Auto-reconnect with exponential backoff (1s → 2s → 4s → ... up to 30s)
 - Max 10 reconnection attempts
@@ -98,6 +101,7 @@ Singleton service that manages the WebSocket connection lifecycle.
 - Ping interval (30s) for connection health
 
 **Usage:**
+
 ```typescript
 import { getWebSocketService } from '../services/websocketService';
 
@@ -125,6 +129,7 @@ wsService.disconnect();
 ```
 
 **Connection Flow:**
+
 1. User logs in → JWT access token stored in `authStore`
 2. `useWebSocket` hook detects token → calls `POST /auth/ws-ticket` to get a 30-second single-use ticket
 3. WebSocket connects to `ws://localhost:8080/api/v1/ws?ticket=<ticket>`
@@ -134,11 +139,12 @@ wsService.disconnect();
 
 ---
 
-### 2. ChatStore (`stores/chatStore.ts`)
+### 2. ChatStore (`stores/chat/chatStore.ts`)
 
 Zustand store for real-time message state.
 
 **State:**
+
 ```typescript
 {
   messagesByChannel: Map<string, Message[]>,  // Messages grouped by channel ID
@@ -149,6 +155,7 @@ Zustand store for real-time message state.
 ```
 
 **Actions:**
+
 - `addMessage(channelId, message)` - Add/update message (deduplication by ID)
 - `updateMessage(channelId, messageId, updates)` - Edit message
 - `deleteMessage(channelId, messageId)` - Delete message
@@ -160,13 +167,12 @@ Zustand store for real-time message state.
 - `setConnectionStatus(isConnected, clientId)` - Update connection status
 
 **Usage:**
+
 ```typescript
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore } from '../stores/chat/chatStore';
 
 // In React component
-const messages = useChatStore((state) =>
-  state.messagesByChannel.get(channelId) || []
-);
+const messages = useChatStore((state) => state.messagesByChannel.get(channelId) || []);
 
 const isConnected = useChatStore((state) => state.isConnected);
 
@@ -180,6 +186,7 @@ const { addMessage } = useChatStore();
 React hook that bridges `websocketService` with `chatStore`.
 
 **Responsibilities:**
+
 - Auto-connect when JWT token is available
 - Auto-disconnect on unmount or token change
 - Set up message handlers for all message types:
@@ -192,6 +199,7 @@ React hook that bridges `websocketService` with `chatStore`.
 - Update connection status in chatStore
 
 **Usage:**
+
 ```typescript
 import { useWebSocket } from '../hooks/useWebSocket';
 
@@ -246,6 +254,7 @@ them.
 Convenience hook for automatic channel subscription management.
 
 **Usage:**
+
 ```typescript
 import { useChannelSubscription } from '../hooks/useChannelSubscription';
 
@@ -270,6 +279,7 @@ function ChannelView({ channelId }: { channelId: string }) {
 Visual indicator of WebSocket connection state.
 
 **Features:**
+
 - Green "Connected" badge when `isConnected === true`
 - Red "Offline" badge when `isConnected === false`
 - Animated pulsing dot for visual feedback
@@ -288,6 +298,7 @@ boundary. Read that file before you add or change a frame type.
 ### Client → Server
 
 **Subscribe to a channel:**
+
 ```json
 {
   "type": "subscribe",
@@ -298,6 +309,7 @@ boundary. Read that file before you add or change a frame type.
 ```
 
 **Unsubscribe from a channel:**
+
 ```json
 {
   "type": "unsubscribe",
@@ -308,6 +320,7 @@ boundary. Read that file before you add or change a frame type.
 ```
 
 **Send a message:**
+
 ```json
 {
   "type": "message",
@@ -325,6 +338,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 4400 on a frame that carries no `key_version`.
 
 **Send typing indicator:**
+
 ```json
 {
   "type": "typing",
@@ -340,6 +354,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ### Server → Client
 
 **Connection confirmation:**
+
 ```json
 {
   "type": "connected",
@@ -351,6 +366,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ```
 
 **Subscription confirmation:**
+
 ```json
 {
   "type": "subscribed",
@@ -361,6 +377,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ```
 
 **Incoming message:**
+
 ```json
 {
   "type": "message",
@@ -377,6 +394,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ```
 
 **Message update:**
+
 ```json
 {
   "type": "message_update",
@@ -390,6 +408,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ```
 
 **Message deletion:**
+
 ```json
 {
   "type": "message_delete",
@@ -401,6 +420,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ```
 
 **Typing indicator:**
+
 ```json
 {
   "type": "typing",
@@ -414,6 +434,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ```
 
 **Error:**
+
 ```json
 {
   "type": "error",
@@ -428,6 +449,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ## Connection Lifecycle
 
 ### 1. Initial Connection
+
 1. User logs in → JWT access token stored in `authStore`
 2. `App.tsx` renders `ProtectedRoute` → `useWebSocket()` hook activates
 3. Hook detects `accessToken` → calls `POST /auth/ws-ticket` to get a 30s single-use ticket
@@ -437,6 +459,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 7. `ConnectionStatus` component shows "Connected" badge
 
 ### 2. Channel Subscription
+
 1. User navigates to a channel
 2. `useChannelSubscription(channelId)` hook subscribes
 3. Backend adds client to channel's subscriber set
@@ -444,6 +467,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 5. User can now receive messages from that channel
 
 ### 3. Sending a Message
+
 1. User types message → clicks send
 2. Frontend encrypts via `e2eeService`, then calls
    `wsService.sendMessage(channelId, ciphertext, { keyVersion, ... })`
@@ -451,6 +475,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 4. All clients receive `message` event → update UI
 
 ### 4. Reconnection
+
 1. WebSocket connection lost (network issue, server restart, etc.)
 2. `wsService` detects close event → schedules reconnect
 3. Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
@@ -470,6 +495,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 `services/control-plane/internal/websocket/TEST_WEBSOCKET.html`
 
 **Steps:**
+
 1. Start backend server: `cd services/control-plane && ./bin/control-plane`
 2. Register/login to get JWT token:
    ```bash
@@ -488,6 +514,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ### Integration Testing
 
 **Test the full stack:**
+
 1. Start backend: `cd services/control-plane && ./bin/control-plane`
 2. Start frontend: `cd client/desktop && npm run dev`
 3. Login to frontend
@@ -500,6 +527,7 @@ Encrypt through `useMessaging` before you send. `content` must already be cipher
 ### Automated Testing (Future)
 
 Create E2E tests for:
+
 - [ ] WebSocket connection establishment
 - [ ] Auto-reconnection after disconnect
 - [ ] Message send/receive
@@ -511,6 +539,7 @@ Create E2E tests for:
 ## Performance Considerations
 
 ### Current Limits
+
 - **Max message size:** 512 KB (backend limit)
 - **Ping interval:** 30 seconds (client-side check)
 - **Pong timeout:** 60 seconds (backend closes connection if no pong)
@@ -518,12 +547,14 @@ Create E2E tests for:
 - **Max reconnect delay:** 30 seconds
 
 ### Optimizations
+
 - Buffered channels in Go backend (256 message buffer)
 - Message deduplication in chatStore (by ID)
 - Lazy loading of messages (pagination with `prependMessages`)
 - Typing indicator cleanup (remove >5s old indicators)
 
 ### Scalability
+
 - **Current:** Single backend instance (in-memory Hub)
 - **Future (Phase 2+):** Redis Pub/Sub for multi-instance message routing
 
@@ -532,12 +563,14 @@ Create E2E tests for:
 ## Debugging
 
 ### Enable Verbose Logging
+
 ```typescript
 // In websocketService.ts, uncomment console.log statements
 // In useWebSocket.ts, add console.log to handlers
 ```
 
 ### Check Connection State
+
 ```typescript
 // In React DevTools console:
 import { getWebSocketService } from './services/websocketService';
@@ -547,14 +580,16 @@ console.log('Connection info:', wsService.getConnectionInfo());
 ```
 
 ### Inspect Zustand State
+
 ```typescript
 // In React DevTools console:
-import { useChatStore } from './stores/chatStore';
+import { useChatStore } from './stores/chat/chatStore';
 console.log('Messages:', useChatStore.getState().messagesByChannel);
 console.log('Connected:', useChatStore.getState().isConnected);
 ```
 
 ### Backend Logs
+
 ```bash
 # Backend logs show:
 # - Client registered: user=<uuid> client=<uuid> total_clients=1
@@ -568,12 +603,14 @@ console.log('Connected:', useChatStore.getState().isConnected);
 ## Known Issues & Future Improvements
 
 ### Current Limitations
+
 - [x] Message delivery confirmation (sent vs received) — ✅ Implemented (Phase 1B)
 - [x] Offline message queue — ✅ Implemented via `messageQueue.ts`
 - [ ] No typing indicator debouncing (could spam server)
 - [x] Presence tracking UI — ✅ Implemented (online/offline indicators)
 
 ### Phase 1C Enhancements (Complete)
+
 - [x] E2EE message encryption/decryption — ✅ Implemented
 - [x] Presence system UI (online/offline/away indicators) — ✅ Implemented
 - [x] User avatars in messages — ✅ Implemented
@@ -581,6 +618,7 @@ console.log('Connected:', useChatStore.getState().isConnected);
 - [x] Voice/video signaling via NATS — ✅ Implemented (Media Plane)
 
 ### Phase 2 Enhancements
+
 - [x] Message reactions (emoji) — ✅ Implemented
 - [x] Message threading/replies — ✅ Implemented
 - [x] File attachments — ✅ Implemented
@@ -592,19 +630,22 @@ console.log('Connected:', useChatStore.getState().isConnected);
 ## Security Considerations
 
 ### Ticket-Based Authentication
+
 - ✅ Client gets a 30-second single-use ticket via `POST /auth/ws-ticket`
 - ✅ Ticket sent via query parameter (WebSocket upgrade handshake) — NOT the raw JWT
 - ✅ Ticket validated and consumed on backend before upgrade (single-use, prevents replay)
 - ✅ JWT blacklist check runs during ticket creation
-- ⚠️  Use HTTPS/WSS in production to protect ticket in transit
+- ⚠️ Use HTTPS/WSS in production to protect ticket in transit
 
 ### Connection Security
+
 - ✅ Ticket-based authentication required for all connections
 - ✅ User ID extracted from validated session (no client can spoof it)
-- ⚠️  Currently uses `ws://` (unencrypted), must use `wss://` in production
+- ⚠️ Currently uses `ws://` (unencrypted), must use `wss://` in production
 - ✅ CORS properly configured in backend
 
 ### Message Validation
+
 - ✅ All messages validated for channel_id
 - ✅ User permissions checked on backend (channel membership)
 - ✅ E2EE message encryption/decryption implemented (Phase 1C)

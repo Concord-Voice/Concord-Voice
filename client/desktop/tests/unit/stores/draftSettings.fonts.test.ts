@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
 import { setDraftAppearanceSetting } from '@/renderer/hooks/useDraftSettings';
 import { resetAllStores } from '../../helpers/store-helpers';
 

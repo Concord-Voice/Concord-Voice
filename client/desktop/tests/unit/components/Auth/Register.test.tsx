@@ -1,9 +1,9 @@
 import { render, screen, userEvent, waitFor } from '../../../test-utils';
 import Register from '@/renderer/components/Auth/Register';
 import { vi } from 'vitest';
-import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { generateRegistrationKeys } from '@/renderer/utils/crypto';
 import { abandonSSOReservation } from '@/renderer/services/ssoService';

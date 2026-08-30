@@ -1,15 +1,15 @@
 import { render, screen, act, waitFor } from '../../test-utils';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useNotificationNavigationStore } from '@/renderer/stores/notificationNavigationStore';
-import { usePendingRegistrationStore } from '@/renderer/stores/pendingRegistrationStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useNotificationNavigationStore } from '@/renderer/stores/ui/notificationNavigationStore';
+import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegistrationStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { extractInviteCodes } from '@/renderer/utils/inviteUrl';
 import { resetAllStores } from '../../helpers/store-helpers';
 

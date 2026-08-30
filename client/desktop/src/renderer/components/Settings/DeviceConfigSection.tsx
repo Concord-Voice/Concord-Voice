@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import DeviceSelector from '../Voice/DeviceSelector';
 import { useMicTest } from '../../hooks/useMicTest';
 import { useOutputTest } from '../../hooks/useOutputTest';

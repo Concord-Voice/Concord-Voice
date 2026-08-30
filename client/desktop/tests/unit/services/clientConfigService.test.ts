@@ -1,6 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock apiFetch

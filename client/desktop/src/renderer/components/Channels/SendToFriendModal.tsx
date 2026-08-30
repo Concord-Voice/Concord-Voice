@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import Modal from '../ui/Modal';
-import { useFriendStore, type Friend } from '../../stores/friendStore';
+import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { useSendInviteToFriend, type SendInviteResult } from '../../hooks/useSendInviteToFriend';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import './SendToFriendModal.css';

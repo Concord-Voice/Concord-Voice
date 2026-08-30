@@ -3,8 +3,8 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { clearInvitePreviewCache } from '@/renderer/hooks/useInvitePreview';
 import { InviteEmbed } from '@/renderer/components/Chat/InviteEmbed';
 

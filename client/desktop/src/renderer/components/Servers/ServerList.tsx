@@ -1,9 +1,9 @@
 import React, { useEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { useNavigate, useLocation } from 'react-router';
-import { useAuthStore } from '../../stores/authStore';
-import { useServerStore } from '../../stores/serverStore';
-import { useUnreadStore } from '../../stores/unreadStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
 
 import { ServerWithRole } from '../../types/server';
 import './ServerList.css';

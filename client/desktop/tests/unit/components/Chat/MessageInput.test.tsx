@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import { Permissions } from '@/renderer/utils/permissions';
 import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
@@ -29,7 +29,7 @@ vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
-vi.mock('@/renderer/stores/layoutStore', () => ({
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({
   selectSidebarDock: (
     state: { sidebarProfiles: typeof mockSidebarProfiles },
     context: 'dm' | 'server',

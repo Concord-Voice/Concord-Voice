@@ -1,9 +1,9 @@
 import { renderHook, act } from '@testing-library/react';
 import { useMessaging } from '@/renderer/hooks/useMessaging';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { mockUser, mockChannel, mockEncryptedChannel } from '../../mocks/fixtures';
 import { ConnectionState } from '@/renderer/services/websocketService';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2eeErrors';

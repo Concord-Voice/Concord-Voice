@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
-import { useDraftMessageStore, type DraftContent } from '../stores/draftMessageStore';
+import { useDraftMessageStore, type DraftContent } from '../stores/chat/draftMessageStore';
 import type { MessageWithStatus } from '../types/chat';
 
 interface PendingDebounce {

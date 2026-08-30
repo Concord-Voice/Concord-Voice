@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useId } from 'react';
 import { Plus, UserPlus, Settings } from 'lucide-react';
-import { useInviteStore } from '../../stores/inviteStore';
-import { usePermissionStore } from '../../stores/permissionStore';
+import { useInviteStore } from '../../stores/chat/inviteStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { Permissions, hasPermission } from '../../utils/permissions';
 import type { ServerWithRole, ServerInviteWithCreator } from '../../types/server';
 import { SendToFriendModal } from './SendToFriendModal';

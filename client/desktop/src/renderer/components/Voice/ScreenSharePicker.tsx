@@ -4,10 +4,10 @@ import {
   useVideoSettingsStore,
   type ScreenContentType,
   type ScreenShareOptions,
-} from '../../stores/videoSettingsStore';
+} from '../../stores/voice/videoSettingsStore';
 import CustomSelect from '../ui/CustomSelect';
 import { errorMessage } from '../../utils/redactError';
-import { useSubscriptionStore } from '../../stores/subscriptionStore';
+import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { effectiveStreamAxis, clampScreenCapture } from '../../utils/videoLimits';
 import { resolveScreenDims } from '../../utils/screenResolution';
 import './ScreenSharePicker.css';

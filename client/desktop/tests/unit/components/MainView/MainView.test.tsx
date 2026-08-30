@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { mockServer, mockChannel } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -310,7 +310,7 @@ vi.mock('@/renderer/services/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
 }));
 
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import MainView from '@/renderer/components/MainView/MainView';
 
 describe('MainView', () => {

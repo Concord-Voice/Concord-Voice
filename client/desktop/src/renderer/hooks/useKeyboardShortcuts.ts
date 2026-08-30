@@ -1,11 +1,11 @@
 import { useEffect } from 'react';
 import { keyboardShortcutService } from '../services/keyboardShortcutService';
-import { useSettingsOverlayStore } from '../stores/settingsOverlayStore';
-import { useKeyboardShortcutStore } from '../stores/keyboardShortcutStore';
-import { useChannelStore } from '../stores/channelStore';
-import { useUnreadStore } from '../stores/unreadStore';
-import { useVoiceStore } from '../stores/voiceStore';
-import { isChannelMuted } from '../stores/notificationPrefsStore';
+import { useSettingsOverlayStore } from '../stores/ui/settingsOverlayStore';
+import { useKeyboardShortcutStore } from '../stores/ui/keyboardShortcutStore';
+import { useChannelStore } from '../stores/chat/channelStore';
+import { useUnreadStore } from '../stores/chat/unreadStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
+import { isChannelMuted } from '../stores/ui/notificationPrefsStore';
 import type { Channel } from '../types/chat';
 
 /**

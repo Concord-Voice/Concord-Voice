@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

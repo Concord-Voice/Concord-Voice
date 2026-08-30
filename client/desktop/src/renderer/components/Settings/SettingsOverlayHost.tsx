@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import {
   isSettingsOverlayDismissBlocked,
   useSettingsOverlayStore,
-} from '../../stores/settingsOverlayStore';
+} from '../../stores/ui/settingsOverlayStore';
 import { ModalPortalHostContext } from '../ui/ModalContext';
 import './SettingsOverlayHost.css';
 

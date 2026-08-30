@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Download, RefreshCw, Loader, ExternalLink } from 'lucide-react';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import './ForceUpdateOverlay.css';
 
 type Phase = 'checking' | 'downloading' | 'downloaded' | 'error';

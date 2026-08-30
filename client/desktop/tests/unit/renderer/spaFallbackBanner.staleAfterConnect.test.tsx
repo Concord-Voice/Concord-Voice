@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { SPA_FALLBACK_MESSAGE, type SpaFallbackDiagnostic } from '@/shared/spaIpcTypes';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { SpaFallbackOverlay } from '@/renderer/components/SpaFallbackOverlay/SpaFallbackOverlay';

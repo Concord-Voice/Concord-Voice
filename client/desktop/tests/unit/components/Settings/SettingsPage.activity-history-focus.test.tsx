@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 
 vi.mock('@/renderer/components/Settings/PrivacySecuritySection', () => ({
   default: () => (

@@ -1,8 +1,8 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useFriendStore, type Friend } from '@/renderer/stores/friendStore';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
 import { server as mswServer } from '../../../mocks/server';
 import { http, HttpResponse } from 'msw';

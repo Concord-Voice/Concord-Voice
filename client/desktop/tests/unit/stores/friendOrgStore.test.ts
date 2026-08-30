@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 
 const reset = () => useFriendOrgStore.getState().reset();
 

@@ -1,8 +1,8 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock side-effecting services so the hook mounts cleanly (mirrors the

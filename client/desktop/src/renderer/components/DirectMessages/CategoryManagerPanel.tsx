@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { X } from 'lucide-react';
 import EmojiPicker from '../EmojiPicker/LazyEmojiPicker';
-import { useFriendOrgStore } from '../../stores/friendOrgStore';
+import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
 import './CategoryManagerPanel.css';
 
 interface CategoryManagerPanelProps {

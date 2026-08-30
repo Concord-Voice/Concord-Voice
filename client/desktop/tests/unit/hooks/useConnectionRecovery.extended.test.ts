@@ -5,11 +5,11 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // Mock dependencies
 const mockSetAggressiveReconnect = vi.fn();

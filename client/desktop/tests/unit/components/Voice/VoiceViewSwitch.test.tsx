@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { beforeEach, describe, expect, it } from 'vitest';
 import VoiceViewSwitch from '@/renderer/components/Voice/VoiceViewSwitch';
 

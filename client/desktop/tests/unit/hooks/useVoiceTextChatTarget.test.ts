@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 
 const mockChannelSub = vi.fn();
 const mockDMSub = vi.fn();

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { MoreHorizontal, Shield, ShieldOff, UserMinus } from 'lucide-react';
-import type { DMParticipant } from '../../stores/dmStore';
+import type { DMParticipant } from '../../stores/chat/dmStore';
 import './DirectMessages.css';
 
 export const GROUP_MEMBER_MENU_Z_INDEX = 100001;

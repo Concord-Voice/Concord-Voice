@@ -11,7 +11,7 @@
  * read category names, colors, emoji, OR membership (zero-knowledge).
  */
 
-import { useFriendOrgStore, type FriendOrgBlob } from '../stores/friendOrgStore';
+import { useFriendOrgStore, type FriendOrgBlob } from '../stores/chat/friendOrgStore';
 import { fetchEncryptedBlob, pushEncryptedBlob } from './e2eeBlobTransport';
 import { validateFriendOrgBlob } from '../utils/friendOrgBlob';
 import {

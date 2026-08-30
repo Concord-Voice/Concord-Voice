@@ -4,18 +4,18 @@ import { createPortal } from 'react-dom';
 import ServerHoverTooltip from './ServerHoverTooltip';
 import { useNavigate, useLocation } from 'react-router';
 import { MessageSquare, Plus, ChevronLeft, ChevronRight } from 'lucide-react';
-import { useServerStore } from '../../stores/serverStore';
-import { useUnreadStore } from '../../stores/unreadStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
 import {
   useNotificationPrefsStore,
   isEntryCurrentlyMuted,
   isServerUnreadVisible,
-} from '../../stores/notificationPrefsStore';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useLayoutStore } from '../../stores/layoutStore';
-import { useAuthStore } from '../../stores/authStore';
-import { useSettingsStore } from '../../stores/settingsStore';
-import { useDMStore } from '../../stores/dmStore';
+} from '../../stores/ui/notificationPrefsStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useLayoutStore } from '../../stores/ui/layoutStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
+import { useDMStore } from '../../stores/chat/dmStore';
 import { ServerWithRole } from '../../types/server';
 import './ServerBar.css';
 

@@ -1,10 +1,10 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { mockUser } from '../../../mocks/fixtures';
 
 // Mock websocketService

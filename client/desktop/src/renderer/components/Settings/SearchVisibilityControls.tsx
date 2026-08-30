@@ -1,5 +1,5 @@
 import ToggleSwitch from './ToggleSwitch';
-import { usePrivacyStore } from '../../stores/privacyStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 
 const SearchVisibilityControls = () => {
   const privacySettings = usePrivacyStore((s) => s.settings);

@@ -7,11 +7,11 @@ import {
   type DraftableVideoSettings,
   type DraftableTTSSettings,
   type DraftableAppearanceSettings,
-} from '../stores/draftSettingsStore';
-import { useAudioSettingsStore } from '../stores/audioSettingsStore';
-import { useVideoSettingsStore } from '../stores/videoSettingsStore';
-import { useTTSSettingsStore } from '../stores/ttsSettingsStore';
-import { useSettingsStore, type AppearanceSettings } from '../stores/settingsStore';
+} from '../stores/ui/draftSettingsStore';
+import { useAudioSettingsStore } from '../stores/audio/audioSettingsStore';
+import { useVideoSettingsStore } from '../stores/voice/videoSettingsStore';
+import { useTTSSettingsStore } from '../stores/audio/ttsSettingsStore';
+import { useSettingsStore, type AppearanceSettings } from '../stores/ui/settingsStore';
 
 // ---------------------------------------------------------------------------
 // Read hooks — return draft value if present, else snapshot, else real store

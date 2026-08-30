@@ -5,7 +5,7 @@ import {
   SIDEBAR_MIN_WIDTH,
   selectSidebarDock,
   useLayoutStore,
-} from '@/renderer/stores/layoutStore';
+} from '@/renderer/stores/ui/layoutStore';
 import AppLayout from '@/renderer/components/Layout/AppLayout';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 

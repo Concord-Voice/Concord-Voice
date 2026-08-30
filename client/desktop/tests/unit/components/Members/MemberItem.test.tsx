@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import MemberItem from '@/renderer/components/Members/MemberItem';
 import { vi } from 'vitest';
-import type { ServerMember, PresenceStatus } from '@/renderer/stores/memberStore';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import type { ServerMember, PresenceStatus } from '@/renderer/stores/chat/memberStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/utils/schemeColors', () => ({

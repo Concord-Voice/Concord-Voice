@@ -1,8 +1,8 @@
 import React from 'react';
 import { render } from '../../../test-utils';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock child components

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll, afterEach, beforeEach, vi } 
 import { http, HttpResponse } from 'msw';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // regression for #1763 (public Concord-Voice#3): after a user has verified their age,
 // returning to the age-verification surface re-rendered the first-run DOB-entry default

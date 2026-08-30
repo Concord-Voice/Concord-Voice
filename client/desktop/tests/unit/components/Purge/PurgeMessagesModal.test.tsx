@@ -5,7 +5,7 @@ import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
 import { formatRetryAfter } from '@/renderer/components/Purge/PurgeResult';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 
 const noop = () => {};
 

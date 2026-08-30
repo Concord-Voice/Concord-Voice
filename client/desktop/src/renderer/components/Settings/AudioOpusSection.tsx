@@ -4,8 +4,8 @@ import CustomSelect from '../ui/CustomSelect';
 import PremiumGate from '../common/PremiumGate';
 import PremiumChip from '../common/PremiumChip';
 import { useGateActivation } from '../../hooks/useGateActivation';
-import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voiceStore';
-import { type AudioPriority } from '../../stores/audioSettingsStore';
+import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voice/voiceStore';
+import { type AudioPriority } from '../../stores/audio/audioSettingsStore';
 import { useEntitlement } from '../../hooks/useEntitlement';
 import { useDraftAudioSetting, setDraftAudioSetting } from '../../hooks/useDraftSettings';
 

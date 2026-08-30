@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useUpdateStatusStore } from '../stores/updateStatusStore';
+import { useUpdateStatusStore } from '../stores/ui/updateStatusStore';
 
 /**
  * Subscribes to `update:error` IPC events via the preload bridge and routes

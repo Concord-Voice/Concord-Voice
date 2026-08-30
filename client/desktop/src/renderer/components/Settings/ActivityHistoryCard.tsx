@@ -9,13 +9,13 @@ import {
   type ActivityHistoryRetentionDays,
   type PresenceHistorySettings,
 } from '../../services/presenceHistoryService';
-import { useAuthStore } from '../../stores/authStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import {
   useClientConfigStore,
   type ActivityHistoryCapabilityState,
-} from '../../stores/clientConfigStore';
-import { useSettingsNavStore } from '../../stores/settingsNavStore';
-import { useUserStore } from '../../stores/userStore';
+} from '../../stores/ui/clientConfigStore';
+import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
 import ActivityHistoryConsentModal, {
   type ActivityHistoryConsentSelection,

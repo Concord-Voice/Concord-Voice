@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
+import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // jsdom has no MediaStream constructor; a typed sentinel is enough — the store

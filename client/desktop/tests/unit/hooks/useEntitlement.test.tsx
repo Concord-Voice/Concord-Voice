@@ -4,7 +4,7 @@ import { useEntitlement } from '../../../src/renderer/hooks/useEntitlement';
 import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,
-} from '../../../src/renderer/stores/subscriptionStore';
+} from '../../../src/renderer/stores/auth/subscriptionStore';
 
 describe('useEntitlement', () => {
   beforeEach(() => {

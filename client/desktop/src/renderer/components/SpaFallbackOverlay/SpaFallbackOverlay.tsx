@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react';
-import { useChatStore } from '../../stores/chatStore';
+import { useChatStore } from '../../stores/chat/chatStore';
 import type { SpaFallbackDiagnostic } from '../../../shared/spaIpcTypes';
 import './SpaFallbackOverlay.css';
 

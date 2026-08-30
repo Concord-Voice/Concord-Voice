@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openProfilePage } from '@/renderer/utils/openProfilePage';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 
 beforeEach(() => {
   useSettingsNavStore.getState().clearFocusRequest();

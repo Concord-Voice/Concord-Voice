@@ -1,5 +1,5 @@
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 
 // Mock the underlying provider so we can verify the wiring without doing
 // any actual KLIPY work.

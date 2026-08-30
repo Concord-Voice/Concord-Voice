@@ -2,7 +2,7 @@ import { useEffect, useRef, type MouseEvent } from 'react';
 import {
   useAttestationFailureStore,
   type TerminalAttestationCode,
-} from '../stores/attestationFailureStore';
+} from '../stores/auth/attestationFailureStore';
 import './AttestationFailedModal.css';
 
 /**

@@ -13,7 +13,7 @@ vi.mock('react-router', async () => {
 const mockCloseChannelSwitcher = vi.fn();
 let mockChannelSwitcherOpen = true;
 
-vi.mock('@/renderer/stores/keyboardShortcutStore', () => ({
+vi.mock('@/renderer/stores/ui/keyboardShortcutStore', () => ({
   useKeyboardShortcutStore: (selector: (s: Record<string, unknown>) => unknown) =>
     selector({
       channelSwitcherOpen: mockChannelSwitcherOpen,
@@ -23,7 +23,7 @@ vi.mock('@/renderer/stores/keyboardShortcutStore', () => ({
 
 const mockSetActiveChannel = vi.fn();
 
-vi.mock('@/renderer/stores/channelStore', () => {
+vi.mock('@/renderer/stores/chat/channelStore', () => {
   const store = {
     channels: [
       { id: 'ch-1', name: 'general', type: 'text' },
@@ -42,7 +42,7 @@ vi.mock('@/renderer/stores/channelStore', () => {
 
 const mockSetActiveConversation = vi.fn();
 
-vi.mock('@/renderer/stores/dmStore', () => ({
+vi.mock('@/renderer/stores/chat/dmStore', () => ({
   useDMStore: (selector: (s: Record<string, unknown>) => unknown) =>
     selector({
       conversations: [
@@ -78,14 +78,14 @@ vi.mock('@/renderer/stores/dmStore', () => ({
     }),
 }));
 
-vi.mock('@/renderer/stores/serverStore', () => ({
+vi.mock('@/renderer/stores/chat/serverStore', () => ({
   useServerStore: (selector: (s: Record<string, unknown>) => unknown) =>
     selector({
       servers: [{ id: 'srv-1', name: 'Test Server' }],
     }),
 }));
 
-vi.mock('@/renderer/stores/userStore', () => ({
+vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: (selector: (s: Record<string, unknown>) => unknown) =>
     selector({ user: { id: 'me' } }),
 }));

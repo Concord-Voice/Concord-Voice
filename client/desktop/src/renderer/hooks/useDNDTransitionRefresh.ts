@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react';
-import { useMemberStore } from '../stores/memberStore';
-import { useServerStore } from '../stores/serverStore';
-import { useChannelStore } from '../stores/channelStore';
-import { useUnreadStore } from '../stores/unreadStore';
-import { hasUnmutedChannel } from '../stores/notificationPrefsStore';
+import { useMemberStore } from '../stores/chat/memberStore';
+import { useServerStore } from '../stores/chat/serverStore';
+import { useChannelStore } from '../stores/chat/channelStore';
+import { useUnreadStore } from '../stores/chat/unreadStore';
+import { hasUnmutedChannel } from '../stores/ui/notificationPrefsStore';
 import { apiFetch } from '../services/apiClient';
 import { errorMessage } from '../utils/redactError';
 

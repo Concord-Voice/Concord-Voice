@@ -1,6 +1,6 @@
 import React from 'react';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
-import { useServerStore } from '../../stores/serverStore';
+import { useServerStore } from '../../stores/chat/serverStore';
 import { apiFetch } from '../../services/apiClient';
 import { ServerWithRole } from '../../types/server';
 import './DeleteServerModal.css';

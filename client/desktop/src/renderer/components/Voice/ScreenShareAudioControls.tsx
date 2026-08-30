@@ -1,8 +1,8 @@
 import React from 'react';
 import { Volume2, VolumeX } from 'lucide-react';
-import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useUserStore } from '../../stores/userStore';
+import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { voiceService } from '../../services/voiceService';
 import './ScreenShareAudioControls.css';
 

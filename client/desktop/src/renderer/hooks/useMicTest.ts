@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { useAudioSettingsStore } from '../stores/audioSettingsStore';
-import { useVoiceStore } from '../stores/voiceStore';
-import { ensureOsPermission } from '../stores/osPermissionStore';
+import { useAudioSettingsStore } from '../stores/audio/audioSettingsStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
+import { ensureOsPermission } from '../stores/voice/osPermissionStore';
 import { voiceService } from '../services/voiceService';
 
 interface UseMicTestReturn {

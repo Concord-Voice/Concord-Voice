@@ -15,7 +15,7 @@ import {
   IMAGE_STRIP_MAX_BYTES,
 } from '../utils/entitlementLimits';
 import { useEntitlement } from './useEntitlement';
-import { useClientConfigStore } from '../stores/clientConfigStore';
+import { useClientConfigStore } from '../stores/ui/clientConfigStore';
 import {
   uploadAttachmentChunked,
   abandonSessionOnUnload,

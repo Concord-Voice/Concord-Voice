@@ -22,7 +22,7 @@ const { mockSetDraftVideoSetting } = vi.hoisted(() => ({
 
 // ─── Mocks (before component imports) ───────────────────────────────────────
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(
     vi.fn((s: (state: Record<string, unknown>) => unknown) =>
       s({ activeCameraCodec: null, activeScreenCodec: null })
@@ -32,7 +32,7 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
 }));
 
 let videoAdvancedMode = false;
-vi.mock('@/renderer/stores/videoSettingsStore', () => ({
+vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   useVideoSettingsStore: Object.assign(
     vi.fn((s: (state: Record<string, unknown>) => unknown) =>
       s({
@@ -104,9 +104,9 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSection';
 
 function setEntitlement(overrides: Record<string, unknown>) {

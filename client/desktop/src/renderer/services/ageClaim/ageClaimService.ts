@@ -10,7 +10,7 @@ import { evaluateAge, type AgeSignal } from './evaluateAge';
 import { buildCanonicalBytes, validateAgeClaim, type AgeClaim } from './canonicalAgeClaim';
 import { e2eeService } from '../e2eeService';
 import { apiFetch } from '../apiClient';
-import { useUserStore } from '../../stores/userStore';
+import { useUserStore } from '../../stores/auth/userStore';
 
 /**
  * Result of a claim submission. On failure, `code` is the server's `error_code`
@@ -33,8 +33,7 @@ import { useUserStore } from '../../stores/userStore';
  * single non-oracle failure code); the distinction must reach the caller intact.
  */
 export type AgeClaimResult =
-  | { ok: true; validAge: boolean; nsfwAuth: boolean }
-  | { ok: false; code: string };
+  { ok: true; validAge: boolean; nsfwAuth: boolean } | { ok: false; code: string };
 
 export interface SubmitAgeClaimInput {
   /** Birthdate or coarse age-band. Consumed only by evaluateAge; never persisted. */

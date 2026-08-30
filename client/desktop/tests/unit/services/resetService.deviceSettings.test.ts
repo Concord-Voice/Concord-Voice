@@ -7,11 +7,11 @@ vi.mock('@/renderer/services/apiClient', () => ({
 }));
 
 import { nuclearReset } from '@/renderer/services/resetService';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useTTSSettingsStore } from '@/renderer/stores/ttsSettingsStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useTTSSettingsStore } from '@/renderer/stores/audio/ttsSettingsStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 /**

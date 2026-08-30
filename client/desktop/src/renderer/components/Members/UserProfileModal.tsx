@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import { ServerMember, PresenceStatus } from '../../stores/memberStore';
+import { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/apiClient';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import { useUserThemeScope } from '../../hooks/useUserThemeScope';
@@ -151,7 +151,11 @@ const UserProfileModal: React.FC<UserProfileModalProps> = ({
           }
         >
           {resolveMediaUrl(profile?.header_image_url) && (
-            <img src={resolveMediaUrl(profile?.header_image_url)} alt="" className="user-profile-modal-banner-img" />
+            <img
+              src={resolveMediaUrl(profile?.header_image_url)}
+              alt=""
+              className="user-profile-modal-banner-img"
+            />
           )}
           <button className="user-profile-modal-close" onClick={onClose} aria-label="Close">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">

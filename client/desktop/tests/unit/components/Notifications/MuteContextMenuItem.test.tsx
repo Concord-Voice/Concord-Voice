@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import ContextMenu from '@/renderer/components/ui/ContextMenu';
 import MuteContextMenuItem from '@/renderer/components/Notifications/MuteContextMenuItem';
 

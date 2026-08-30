@@ -1,4 +1,4 @@
-import { useTTSSettingsStore } from '@/renderer/stores/ttsSettingsStore';
+import { useTTSSettingsStore } from '@/renderer/stores/audio/ttsSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

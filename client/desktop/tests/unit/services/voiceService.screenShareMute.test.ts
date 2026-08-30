@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { voiceService } from '../../../src/renderer/services/voiceService';
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 // Screenshare mute rides the ConsumerPauseCoordinator's 'stream-mute' reason
 // (scope 'both'): pauseServerForwarding → socket.emit('pause-consumer') AND

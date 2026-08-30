@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import MemberProfileCard from '@/renderer/components/Members/MemberProfileCard';
 import { mockMember } from '../../../mocks/fixtures';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { fetchEligibility, peekEligibility } from '@/renderer/services/friendEligibility';
 import { resetAllStores } from '../../../helpers/store-helpers';
 

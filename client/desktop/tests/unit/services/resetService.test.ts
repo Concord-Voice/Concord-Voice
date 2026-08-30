@@ -57,20 +57,20 @@ vi.mock('@/renderer/services/e2eeService', () => ({
 }));
 
 import { gracefulReset, nuclearReset, recoveryReset } from '@/renderer/services/resetService';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
-import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/subscriptionStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
-import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
-import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
+import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
+import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
 import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
 import { friendOrgSyncService } from '@/renderer/services/friendOrgSync';
@@ -80,9 +80,9 @@ import { clearFriendEligibilityCache } from '@/renderer/services/friendEligibili
 import { stopProactiveRefresh } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/searchService';
-import { useDraftMessageStore } from '@/renderer/stores/draftMessageStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -499,7 +499,7 @@ describe('resetService', () => {
 describe('gracefulReset — deep-link session teardown (#2363)', () => {
   it('announces the session end so a held invite cannot cross to the next sign-in', async () => {
     const { gracefulReset } = await import('@/renderer/services/resetService');
-    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
     const seen: string[] = [];
     const handler = (): void => {
@@ -523,7 +523,7 @@ describe('gracefulReset — deep-link session teardown (#2363)', () => {
   // in. Announcing there erases the invite the user launched the app to accept.
   it('stays silent when there was no session — the cold-start invite must survive', async () => {
     const { gracefulReset } = await import('@/renderer/services/resetService');
-    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.setState({ accessToken: null });
     const forgetDeepLinks = vi.fn();
     window.electron.forgetDeepLinks = forgetDeepLinks;
@@ -561,7 +561,7 @@ describe('gracefulReset — deep-link session teardown (#2363)', () => {
   // into it, so the intent is now explicit at the call site rather than inferred.
   it('softRestart preserves deep links — Recovery B restarts a renderer, it does not end a session', async () => {
     const { softRestart } = await import('@/renderer/services/resetService');
-    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
     const forgetDeepLinks = vi.fn();
     window.electron.forgetDeepLinks = forgetDeepLinks;
@@ -588,7 +588,7 @@ describe('gracefulReset — deep-link session teardown (#2363)', () => {
   // user A's invite into user B's renderer (#2363).
   it('tells main to forget too — the renderer fence alone is not sufficient', async () => {
     const { gracefulReset } = await import('@/renderer/services/resetService');
-    const { useAuthStore } = await import('@/renderer/stores/authStore');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
     useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
     const forgetDeepLinks = vi.fn();
     window.electron.forgetDeepLinks = forgetDeepLinks;

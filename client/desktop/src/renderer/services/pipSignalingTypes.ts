@@ -9,7 +9,7 @@
  * Channel name: 'concord-pip'
  */
 
-import type { VoiceParticipant } from '../stores/voiceStore';
+import type { VoiceParticipant } from '../stores/voice/voiceStore';
 import type { RtpCapabilities, RtpParameters, DtlsParameters } from 'mediasoup-client/types';
 import type { RemoteVideoRole } from './remoteVideoLayerPolicy';
 

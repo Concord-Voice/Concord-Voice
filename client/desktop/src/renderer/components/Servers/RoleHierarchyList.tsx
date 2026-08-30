@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import RoleHierarchyRow from './RoleHierarchyRow';
-import { usePermissionStore } from '../../stores/permissionStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { decideDropIndex } from '../../utils/decideDropIndex';
 import {
   buildReorderPayload,

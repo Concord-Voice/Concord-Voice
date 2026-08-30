@@ -6,9 +6,9 @@ import {
   type GifCategory,
   type GifCategoryPreview,
 } from '../../services/gifProvider';
-import { useSavedGifsStore } from '../../stores/savedGifsStore';
-import { useSettingsStore } from '../../stores/settingsStore';
-import { usePrivacyStore } from '../../stores/privacyStore';
+import { useSavedGifsStore } from '../../stores/chat/savedGifsStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import './GifPicker.css';
 
 interface GifPickerProps {

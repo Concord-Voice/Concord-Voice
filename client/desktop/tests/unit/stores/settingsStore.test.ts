@@ -4,7 +4,7 @@ import {
   UI_SCALE_DEFAULT,
   UI_SCALE_MIN,
   UI_SCALE_MAX,
-} from '@/renderer/stores/settingsStore';
+} from '@/renderer/stores/ui/settingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('settingsStore', () => {
@@ -145,7 +145,7 @@ describe('settingsStore', () => {
   });
 
   // setSyncSuppressed / isSyncSuppressed moved to the colorSyncSuppression leaf
-  // module; their tests live in tests/unit/stores/colorSyncSuppression.test.ts.
+  // module; their tests live in tests/unit/stores/ui/colorSyncSuppression.test.ts.
 
   describe('persistence', () => {
     it('persists settings to localStorage', () => {

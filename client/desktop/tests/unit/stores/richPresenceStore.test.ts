@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useRichPresenceStore } from '@/renderer/stores/richPresenceStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('richPresenceStore', () => {

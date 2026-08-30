@@ -1,6 +1,6 @@
 import React from 'react';
 import { LayoutGrid, Focus } from 'lucide-react';
-import { useVoiceStore, type VoiceViewMode } from '../../stores/voiceStore';
+import { useVoiceStore, type VoiceViewMode } from '../../stores/voice/voiceStore';
 import './VoiceViewSwitch.css';
 
 const OPTIONS: ReadonlyArray<{ mode: VoiceViewMode; label: string; icon: React.ReactNode }> = [

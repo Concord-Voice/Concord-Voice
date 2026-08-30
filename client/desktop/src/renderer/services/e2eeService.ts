@@ -36,7 +36,7 @@ import {
   E2EEKeyUnavailableError,
   type E2EEKeyErrorCode,
 } from './e2eeErrors';
-import { useE2EEStore } from '../stores/e2eeStore';
+import { useE2EEStore } from '../stores/auth/e2eeStore';
 
 // Session lifetime — keys cached until explicit invalidation (rotation) or logout/close.
 // Lazy fetch + hold: each channel's key is fetched on first visit and held for the session.

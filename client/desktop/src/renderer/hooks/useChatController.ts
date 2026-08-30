@@ -11,9 +11,9 @@
  */
 
 import { useCallback, useEffect, useMemo } from 'react';
-import { useChatStore } from '../stores/chatStore';
-import { useUserStore } from '../stores/userStore';
-import { usePermissionStore } from '../stores/permissionStore';
+import { useChatStore } from '../stores/chat/chatStore';
+import { useUserStore } from '../stores/auth/userStore';
+import { usePermissionStore } from '../stores/chat/permissionStore';
 import { PIN_MESSAGES } from '../utils/permissions';
 import { useMessaging } from './useMessaging';
 import { pinMessage, unpinMessage } from '../services/pinService';

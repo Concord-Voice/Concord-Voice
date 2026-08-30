@@ -163,7 +163,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => {
 });
 
 // --- osPermissionStore ---
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: {
     getState: vi.fn().mockReturnValue({
       checkOne: vi.fn().mockResolvedValue('granted'),
@@ -181,8 +181,8 @@ const { voiceService } = await import('@/renderer/services/voiceService');
 const { e2eeService: mockedE2EEService } = await import('@/renderer/services/e2eeService');
 const { deriveFrameKey: mockedDeriveFrameKey } =
   await import('@/renderer/services/mediaEncryption');
-const { useUserStore } = await import('@/renderer/stores/userStore');
-const { useVoiceStore } = await import('@/renderer/stores/voiceStore');
+const { useUserStore } = await import('@/renderer/stores/auth/userStore');
+const { useVoiceStore } = await import('@/renderer/stores/voice/voiceStore');
 
 // Reflection helpers — mirror the existing voiceService tests' `as any` style.
 /* eslint-disable @typescript-eslint/no-explicit-any */

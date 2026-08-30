@@ -1,6 +1,6 @@
 import { renderHook, act } from '@testing-library/react';
 import { useVoiceMagnification } from '@/renderer/components/Voice/useVoiceMagnification';
-import type { VoiceParticipant } from '@/renderer/stores/voiceStore';
+import type { VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 
 // Mock requestAnimationFrame for synchronous testing
 let rafCallback: ((time: number) => void) | null = null;

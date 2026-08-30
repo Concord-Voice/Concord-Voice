@@ -3,7 +3,7 @@ import { AlertTriangle, ExternalLink } from 'lucide-react';
 import {
   useUpdateStatusStore,
   type UpdateCriticalErrorSubtype,
-} from '../../stores/updateStatusStore';
+} from '../../stores/ui/updateStatusStore';
 import './UpdateSecurityBanner.css';
 
 /**

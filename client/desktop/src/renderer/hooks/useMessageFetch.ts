@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore } from '../stores/chat/chatStore';
 import { apiFetch, safeJson } from '../services/apiClient';
 import { e2eeService, type E2EEChannelOperationGuard } from '../services/e2eeService';
 import { isPendingKeyError } from '../services/e2eeErrors';

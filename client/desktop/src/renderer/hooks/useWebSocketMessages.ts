@@ -6,14 +6,14 @@
  */
 
 import { useEffect } from 'react';
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore } from '../stores/chat/chatStore';
 import type { Channel, ChannelGroup } from '../types/chat';
-import { useChannelStore } from '../stores/channelStore';
-import { useServerStore } from '../stores/serverStore';
-import { useMemberStore } from '../stores/memberStore';
-import { usePermissionStore } from '../stores/permissionStore';
-import { useUserStore } from '../stores/userStore';
-import { useUnreadStore } from '../stores/unreadStore';
+import { useChannelStore } from '../stores/chat/channelStore';
+import { useServerStore } from '../stores/chat/serverStore';
+import { useMemberStore } from '../stores/chat/memberStore';
+import { usePermissionStore } from '../stores/chat/permissionStore';
+import { useUserStore } from '../stores/auth/userStore';
+import { useUnreadStore } from '../stores/chat/unreadStore';
 import { getWebSocketService, ConnectionState } from '../services/websocketService';
 import {
   handleCallInvited,
@@ -30,20 +30,20 @@ import { savedGifsSyncService } from '../services/savedGifsSync';
 import { friendOrgSyncService } from '../services/friendOrgSync';
 import { presenceOverrideSyncService } from '../services/presenceOverrideSync';
 import { apiFetch } from '../services/apiClient';
-import { useVoiceStore, channelVoiceMemberFromApi } from '../stores/voiceStore';
-import { useConnectionStore } from '../stores/connectionStore';
-import { useDMStore } from '../stores/dmStore';
-import { useFriendStore } from '../stores/friendStore';
-import { useFriendOrgStore } from '../stores/friendOrgStore';
-import { useSubscriptionStore } from '../stores/subscriptionStore';
-import { useRichPresenceStore } from '../stores/richPresenceStore';
+import { useVoiceStore, channelVoiceMemberFromApi } from '../stores/voice/voiceStore';
+import { useConnectionStore } from '../stores/ui/connectionStore';
+import { useDMStore } from '../stores/chat/dmStore';
+import { useFriendStore } from '../stores/chat/friendStore';
+import { useFriendOrgStore } from '../stores/chat/friendOrgStore';
+import { useSubscriptionStore } from '../stores/auth/subscriptionStore';
+import { useRichPresenceStore } from '../stores/ui/richPresenceStore';
 import { speak as ttsSpeak } from '../services/ttsService';
 import { notificationSoundService } from '../services/notificationSoundService';
 import {
   isChannelMuted,
   isDMMuted,
   hasChannelMuteOverride,
-} from '../stores/notificationPrefsStore';
+} from '../stores/ui/notificationPrefsStore';
 
 /**
  * True if the user has Do Not Disturb on. DND suppresses ALL notification

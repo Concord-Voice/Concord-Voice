@@ -1,4 +1,4 @@
-import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
+import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('savedGifsStore', () => {

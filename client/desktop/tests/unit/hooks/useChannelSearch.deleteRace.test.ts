@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MessageWithUser } from '@/renderer/types/chat';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 
 const mockDecryptForChannel = vi.fn();
 const mockApiFetch = vi.fn();

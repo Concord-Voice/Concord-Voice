@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import TOTPInput from './TOTPInput';
 import LoadingSpinner from './LoadingSpinner';
-import { useAuthStore } from '../../stores/authStore';
-import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { usePendingRegistrationStore } from '../../stores/auth/pendingRegistrationStore';
 import { revokeAbortedSession } from '../../services/apiClient';
 import {
   apiUrl,

@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { Settings } from 'lucide-react';
-import { useAuthStore } from '../../stores/authStore';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
-import { useUserStore } from '../../stores/userStore';
-import { useMemberStore, PresenceStatus } from '../../stores/memberStore';
-import { useRichPresenceStore } from '../../stores/richPresenceStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useMemberStore, PresenceStatus } from '../../stores/chat/memberStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import UserPopover from './UserPopover';
 import FeedbackModal from './FeedbackModal';
 import CustomStatusPopover from './CustomStatusPopover';

@@ -60,7 +60,7 @@ vi.mock('@/renderer/hooks/useEntitlement', () => ({
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { mockUser } from '../../../mocks/fixtures';
 import ProfileInfoForm from '@/renderer/components/Profile/ProfileInfoForm';
 

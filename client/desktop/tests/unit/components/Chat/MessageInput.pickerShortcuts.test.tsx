@@ -1,8 +1,8 @@
 import { render, fireEvent } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
@@ -27,7 +27,7 @@ vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({ default: 
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
-vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false }));
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({ useLayoutStore: () => false }));
 vi.mock('@/renderer/hooks/useFileUpload', () => ({
   useFileUpload: () => ({
     files: [],

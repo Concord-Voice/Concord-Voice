@@ -12,8 +12,8 @@ import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
 import { parseContinuationPair, type ContinuationPair } from '../../utils/continuationPair';
 import { hydratePostLogin } from '../../services/postLoginHydration';
 import { beginPostLoginHydrationGuard } from '../../services/postLoginHydrationLifecycle';
-import { useAuthStore } from '../../stores/authStore';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import {
   apiFetch,
   ensureMachineId,
@@ -26,7 +26,7 @@ import {
   type RuntimeServerSelection,
 } from '../../services/runtimeServerBase';
 import type { CredentialOwner } from '../../../main/ipcContract';
-import type { UserProfile } from '../../stores/userStore';
+import type { UserProfile } from '../../stores/auth/userStore';
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import WebAuthnPrompt from './WebAuthnPrompt';
@@ -38,7 +38,7 @@ import MFAMethodPicker, {
 import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/useSSOFlow';
-import { useSSOStore } from '../../stores/ssoStore';
+import { useSSOStore } from '../../stores/auth/ssoStore';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
 import { Eye, EyeOff } from 'lucide-react';
 import { base64urlToBuffer } from '../../utils/base64url';

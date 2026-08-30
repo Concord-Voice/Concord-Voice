@@ -32,7 +32,7 @@ import {
   wrapChannelKey,
   exportChannelKey,
 } from '@/renderer/utils/crypto';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 
 vi.mock('@/renderer/services/apiClient', () => ({

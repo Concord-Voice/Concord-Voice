@@ -1,5 +1,5 @@
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';

@@ -1,9 +1,9 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import SSOPassphraseSetup from '@/renderer/components/Auth/SSOPassphraseSetup';
-import { useSSOStore } from '@/renderer/stores/ssoStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import {
   resetRuntimeServerBase,
@@ -441,8 +441,8 @@ describe('SSOPassphraseSetup', () => {
     // teardown. This synthetic token-only clear leaves the epoch unchanged,
     // so the token-ownership admit gate must abort instead of setting phase
     // 'idle' with rejected credentials.
-    const { useAuthStore } = await import('@/renderer/stores/authStore');
-    const { useSSOStore } = await import('@/renderer/stores/ssoStore');
+    const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
+    const { useSSOStore } = await import('@/renderer/stores/auth/ssoStore');
     const { revokeAbortedSession } = await import('@/renderer/services/apiClient');
     const { e2eeService } = await import('@/renderer/services/e2eeService');
     // The token-only clear lands while init/persist is in flight.

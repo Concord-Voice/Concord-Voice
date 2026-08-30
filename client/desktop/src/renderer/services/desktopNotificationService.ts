@@ -1,4 +1,4 @@
-import { useNotificationStore } from '../stores/notificationStore';
+import { useNotificationStore } from '../stores/ui/notificationStore';
 
 export type NotificationType = 'dm' | 'mention' | 'message';
 
@@ -128,13 +128,15 @@ class DesktopNotificationService {
    */
   private handleClick(targetType: 'channel' | 'dm', targetId: string, serverId?: string): void {
     // Import dynamically to avoid circular deps
-    import('../stores/notificationNavigationStore').then(({ useNotificationNavigationStore }) => {
-      useNotificationNavigationStore.getState().setPendingNavigation({
-        type: targetType,
-        targetId,
-        serverId,
-      });
-    });
+    import('../stores/ui/notificationNavigationStore').then(
+      ({ useNotificationNavigationStore }) => {
+        useNotificationNavigationStore.getState().setPendingNavigation({
+          type: targetType,
+          targetId,
+          serverId,
+        });
+      }
+    );
 
     // Focus the app window
     globalThis.electron?.focusWindow?.();

@@ -8,7 +8,7 @@ import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
 } from '@/renderer/services/runtimeServerBase';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 // Mock WebSocket
 class MockWebSocket {

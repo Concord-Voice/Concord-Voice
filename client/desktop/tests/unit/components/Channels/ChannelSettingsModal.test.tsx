@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { usePermissionStore, type ChannelOverride } from '@/renderer/stores/permissionStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
+import { usePermissionStore, type ChannelOverride } from '@/renderer/stores/chat/permissionStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import type { Channel } from '@/renderer/types/chat';
 import type { Role } from '@/renderer/types/server';
 

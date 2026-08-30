@@ -1,4 +1,4 @@
-import { useMFAChallengeStore } from '@/renderer/stores/mfaChallengeStore';
+import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

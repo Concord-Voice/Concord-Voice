@@ -1,12 +1,12 @@
 import React, { useId } from 'react';
-import type { AppearanceSettings } from '../../stores/settingsStore';
+import type { AppearanceSettings } from '../../stores/ui/settingsStore';
 import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/useDraftSettings';
 import {
   resolveEffectiveFont,
   themeBundledFontFor,
   RESOLVER_CONFIG,
 } from '../../utils/effectiveFont';
-import { useSettingsNavStore } from '../../stores/settingsNavStore';
+import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
 import CollapsibleSection from './CollapsibleSection';
 import './FontSection.css';
 

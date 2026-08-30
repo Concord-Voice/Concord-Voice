@@ -1,4 +1,4 @@
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('authStore', () => {

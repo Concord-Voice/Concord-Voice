@@ -8,9 +8,9 @@ import {
 } from '@/renderer/services/apiClient';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { gracefulReset, nuclearReset } from '@/renderer/services/resetService';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);

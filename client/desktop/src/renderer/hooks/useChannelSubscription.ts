@@ -10,7 +10,7 @@
 
 import { useEffect } from 'react';
 import { getWebSocketService } from '../services/websocketService';
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore } from '../stores/chat/chatStore';
 import { pendingUnsubscribes, UNSUBSCRIBE_DELAY_MS } from './useDMSubscription';
 
 export function useChannelSubscription(channelId: string | null | undefined) {

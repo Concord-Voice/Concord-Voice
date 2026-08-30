@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import LinkedAccountsList from '@/renderer/components/Settings/LinkedAccountsList';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock global fetch (matches SSOAccountLinkConfirm.test.tsx / SSOPassphraseSetup.test.tsx pattern)

@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useInviteStore } from '@/renderer/stores/inviteStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useSendInviteToFriend } from '@/renderer/hooks/useSendInviteToFriend';
-import type { Friend } from '@/renderer/stores/friendStore';
+import type { Friend } from '@/renderer/stores/chat/friendStore';
 
 const mockSend = vi.fn(() => 'client-msg-1');
 vi.mock('@/renderer/services/dmMessageSender', () => ({

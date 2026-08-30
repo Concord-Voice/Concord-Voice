@@ -15,11 +15,11 @@ func TestAudioTierMirrorsStayInLockstep(t *testing.T) {
 	}
 	mediaPlaneBitrates := assertTypeScriptAudioTiers(t, "services/media-plane/src/config/index.ts", string(mediaPlaneRaw))
 
-	desktopRaw, err := os.ReadFile("../../../../client/desktop/src/renderer/stores/voiceStore.ts")
+	desktopRaw, err := os.ReadFile("../../../../client/desktop/src/renderer/stores/voice/voiceStore.ts")
 	if err != nil {
 		t.Fatalf("read desktop voice store: %v", err)
 	}
-	desktopBitrates := assertTypeScriptAudioTiers(t, "client/desktop/src/renderer/stores/voiceStore.ts", string(desktopRaw))
+	desktopBitrates := assertTypeScriptAudioTiers(t, "client/desktop/src/renderer/stores/voice/voiceStore.ts", string(desktopRaw))
 
 	for _, tier := range audioTierOrder {
 		if mediaPlaneBitrates[tier] != desktopBitrates[tier] {

@@ -6,8 +6,8 @@ import {
   SIDEBAR_MIN_WIDTH,
   useLayoutStore,
   type SidebarProfiles,
-} from '@/renderer/stores/layoutStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+} from '@/renderer/stores/ui/layoutStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import { AttributedPopover } from '@/renderer/components/Layout/AttributedPopover';
 

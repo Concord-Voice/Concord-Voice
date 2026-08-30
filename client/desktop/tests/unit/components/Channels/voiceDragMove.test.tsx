@@ -1,16 +1,12 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import ChannelList from '@/renderer/components/Channels/ChannelList';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import {
-  ADMIN_PERMISSIONS,
-  BASE_PERMISSIONS,
-  MOVE_MEMBERS,
-} from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS, BASE_PERMISSIONS, MOVE_MEMBERS } from '@/renderer/utils/permissions';
 import { vi } from 'vitest';
 import type { Channel } from '@/renderer/types/chat';
 
@@ -158,9 +154,7 @@ describe('voice participant drag-and-drop move (#487 Scope B)', () => {
     const dt = startParticipantDrag();
     const targetRow = screen.getByText('Target Voice').closest('.channel-item')!;
     fireEvent.dragOver(targetRow, { dataTransfer: dt });
-    expect(
-      container.querySelector('.channel-item--participant-drop-target')
-    ).toBeInTheDocument();
+    expect(container.querySelector('.channel-item--participant-drop-target')).toBeInTheDocument();
   });
 
   it('dropping on a TEXT channel is a no-op (no move call)', () => {

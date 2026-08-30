@@ -29,7 +29,7 @@ vi.resetModules();
 
 // Dynamic imports from the fresh module graph — these share the same
 // authStore instance that apiClient's init code subscribes to.
-const { useAuthStore } = await import('@/renderer/stores/authStore');
+const { useAuthStore } = await import('@/renderer/stores/auth/authStore');
 const { _resetRefreshState } = await import('@/renderer/services/apiClient');
 
 describe('apiClient — onTokenRefreshed IPC (#254)', () => {

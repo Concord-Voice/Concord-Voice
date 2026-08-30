@@ -89,8 +89,8 @@ vi.mock('@/renderer/utils/crypto', () => ({
   arrayBufferToBase64: vi.fn().mockReturnValue('mock-base64-string'),
 }));
 
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { ensureMachineId } from '@/renderer/services/apiClient';
 import { E2EEInitTeardownError } from '@/renderer/services/e2eeErrors';
 import { apiFetch } from '@/renderer/services/apiClient';
@@ -104,9 +104,9 @@ import {
   encryptBlob,
   unwrapPrivateKey,
 } from '@/renderer/utils/crypto';
-import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
-import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
+import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
 import { mockUser } from '../../mocks/fixtures';
 import { deferred } from '../../helpers/deferred';
 

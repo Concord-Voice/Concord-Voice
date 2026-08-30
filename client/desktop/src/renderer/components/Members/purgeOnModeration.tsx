@@ -1,4 +1,4 @@
-import { useMemberStore, type ServerMember } from '../../stores/memberStore';
+import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore';
 import { apiFetch, safeJson } from '../../services/apiClient';
 
 /**

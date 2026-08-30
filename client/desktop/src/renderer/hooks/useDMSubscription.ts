@@ -6,7 +6,7 @@
 
 import { useEffect } from 'react';
 import { getWebSocketService } from '../services/websocketService';
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore } from '../stores/chat/chatStore';
 
 /**
  * Shared pending-unsubscribe timer map — module-level so useChannelSubscription

@@ -5,11 +5,11 @@ import ChannelList, {
   buildNormalDropUpdates,
   buildOldGroupUpdates,
 } from '@/renderer/components/Channels/ChannelList';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockChannel } from '../../../mocks/fixtures';
 import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';

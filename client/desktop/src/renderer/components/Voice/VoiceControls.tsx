@@ -25,10 +25,10 @@ import {
   useVoiceStore,
   type ActiveScreenShare,
   MAX_TUNED_SCREEN_SHARES,
-} from '../../stores/voiceStore';
-import { useUserStore } from '../../stores/userStore';
-import { useChannelStore } from '../../stores/channelStore';
-import { useOsPermissionStore } from '../../stores/osPermissionStore';
+} from '../../stores/voice/voiceStore';
+import { useUserStore } from '../../stores/auth/userStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
+import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import ScreenSharePicker from './ScreenSharePicker';
 import './VoiceControls.css';
@@ -365,7 +365,7 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
 
   const handleScreenSourceSelected = async (
     sourceId: string,
-    options?: import('../../stores/videoSettingsStore').ScreenShareOptions
+    options?: import('../../stores/voice/videoSettingsStore').ScreenShareOptions
   ) => {
     setShowScreenPicker(false);
     try {

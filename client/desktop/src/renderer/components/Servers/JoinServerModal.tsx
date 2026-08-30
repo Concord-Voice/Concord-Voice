@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import { useInviteStore } from '../../stores/inviteStore';
+import { useInviteStore } from '../../stores/chat/inviteStore';
 import { apiFetch } from '../../services/apiClient';
 import { ServerWithRole, InviteInfoResponse } from '../../types/server';
 import './JoinServerModal.css';

@@ -1,26 +1,26 @@
 import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useChannelStore } from '../../stores/channelStore';
-import { useServerStore } from '../../stores/serverStore';
-import { useUnreadStore } from '../../stores/unreadStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
 import {
   useNotificationPrefsStore,
   isChannelMutedInMaps,
   hasUnmutedChannel,
-} from '../../stores/notificationPrefsStore';
+} from '../../stores/ui/notificationPrefsStore';
 import {
   useVoiceStore,
   type ChannelVoiceMember,
   channelVoiceMemberFromApi,
-} from '../../stores/voiceStore';
-import { usePermissionStore } from '../../stores/permissionStore';
-import { useDraftMessageStore } from '../../stores/draftMessageStore';
+} from '../../stores/voice/voiceStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
 import { Permissions, hasPermission, MOVE_MEMBERS } from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
 import { moveVoiceParticipant } from '../../services/voiceParticipantApi';
 import { Channel, ChannelGroup } from '../../types/chat';
-import { useUserStore } from '../../stores/userStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import ChannelItem, { type VoiceMemberInfo } from './ChannelItem';
 import VoiceParticipantContextMenu, {
   type VoiceMenuParticipant,

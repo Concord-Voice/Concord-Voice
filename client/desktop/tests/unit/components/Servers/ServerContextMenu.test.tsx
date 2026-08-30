@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { mockServer, mockUser } from '../../../mocks/fixtures';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { MANAGE_SERVER, BASE_PERMISSIONS } from '@/renderer/utils/permissions';
 import ServerContextMenu from '@/renderer/components/Servers/ServerContextMenu';
 

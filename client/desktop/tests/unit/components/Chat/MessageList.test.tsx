@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '../../../test-utils';
 import MessageList from '@/renderer/components/Chat/MessageList';
 import { mockMessage, mockMessage2 } from '../../../mocks/fixtures';
-import { useChannelScrollStore } from '@/renderer/stores/channelScrollStore';
+import { useChannelScrollStore } from '@/renderer/stores/chat/channelScrollStore';
 import { vi } from 'vitest';
 
 // Mock the Message component to simplify testing

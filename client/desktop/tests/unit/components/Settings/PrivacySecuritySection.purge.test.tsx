@@ -3,9 +3,9 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PrivacySecuritySection from '@/renderer/components/Settings/PrivacySecuritySection';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { PURGE_AUTH_SKEW_MESSAGE } from '@/renderer/stores/privacyStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { PURGE_AUTH_SKEW_MESSAGE } from '@/renderer/stores/ui/privacyStore';
 
 // Named fixture rather than an inline literal: the pre-commit detect-secrets
 // hook flags a credential-shaped key beside a quoted literal. Mirrors

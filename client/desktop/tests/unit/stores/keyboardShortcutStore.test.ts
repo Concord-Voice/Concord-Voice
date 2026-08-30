@@ -1,4 +1,4 @@
-import { useKeyboardShortcutStore } from '@/renderer/stores/keyboardShortcutStore';
+import { useKeyboardShortcutStore } from '@/renderer/stores/ui/keyboardShortcutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('keyboardShortcutStore', () => {

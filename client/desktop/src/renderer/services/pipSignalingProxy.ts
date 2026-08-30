@@ -28,8 +28,8 @@ import type {
   ConsumeResult,
   GetFrameKeyResult,
 } from './pipSignalingTypes';
-import { useVoiceStore } from '../stores/voiceStore';
-import { useUserStore } from '../stores/userStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
+import { useUserStore } from '../stores/auth/userStore';
 import { errorMessage } from '../utils/redactError';
 import type { RtpCapabilities } from 'mediasoup-client/types';
 import type { RemoteVideoRole } from './remoteVideoLayerPolicy';

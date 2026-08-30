@@ -4,9 +4,9 @@ import { render, screen, userEvent, waitFor } from '../../../test-utils';
 import { server } from '../../../mocks/server';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PurgeMessagesModal from '@/renderer/components/Purge/PurgeMessagesModal';
-import { usePrivacyStore, type PrivacySettings } from '@/renderer/stores/privacyStore';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { usePrivacyStore, type PrivacySettings } from '@/renderer/stores/ui/privacyStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 
 // Named fixtures, used only by reference: the pre-commit detect-secrets hook
 // flags a credential-shaped key sitting beside a quoted literal regardless of
@@ -89,7 +89,7 @@ function codeField(): HTMLInputElement {
 // The negative pattern excludes the one co-located spec in that directory —
 // importing it would re-register its suite inside this file.
 const storeModules: Record<string, unknown> = import.meta.glob(
-  ['../../../../src/renderer/stores/*.ts', '!../../../../src/renderer/stores/*.test.ts'],
+  ['../../../../src/renderer/stores/**/*.ts', '!../../../../src/renderer/stores/**/*.test.ts'],
   { eager: true }
 );
 

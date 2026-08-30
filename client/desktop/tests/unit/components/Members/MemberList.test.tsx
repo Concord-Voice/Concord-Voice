@@ -11,11 +11,11 @@ vi.mock('@/renderer/services/friendEligibility', () => ({
   prefetchEligibility: vi.fn(),
 }));
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useMemberStore, ServerMember } from '@/renderer/stores/memberStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMemberStore, ServerMember } from '@/renderer/stores/chat/memberStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import type { Role } from '@/renderer/types/server';
 import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
 import { mockUser, mockServer, mockMember, mockMember2 } from '../../../mocks/fixtures';

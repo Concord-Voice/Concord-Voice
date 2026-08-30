@@ -1,9 +1,9 @@
-import { useInviteStore } from '@/renderer/stores/inviteStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
+import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import type { Server } from '@/renderer/types/server';
 
 const API_BASE = 'http://localhost:8080';

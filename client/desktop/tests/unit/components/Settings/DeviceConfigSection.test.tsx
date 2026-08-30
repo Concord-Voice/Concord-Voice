@@ -39,7 +39,7 @@ vi.mock('@/renderer/hooks/useCameraTest', () => ({
 
 let mockConnectionState = 'disconnected';
 let mockLocalIsTesting = false;
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: vi.fn((s: any) =>
     s
       ? s({ connectionState: mockConnectionState, localIsTesting: mockLocalIsTesting })

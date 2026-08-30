@@ -5,7 +5,7 @@ import {
   useSubscriptionStore,
   FREE_ENTITLEMENT,
   type Entitlement,
-} from '@/renderer/stores/subscriptionStore';
+} from '@/renderer/stores/auth/subscriptionStore';
 import FeatureGrid from '@/renderer/components/Settings/subscription/FeatureGrid';
 
 // A premium entitlement fixture (mirrors entitlements.go premiumEntitlement for

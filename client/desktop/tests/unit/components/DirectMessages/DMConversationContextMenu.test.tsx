@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import DMConversationContextMenu from '@/renderer/components/DirectMessages/DMConversationContextMenu';
-import type { DMConversation } from '@/renderer/stores/dmStore';
+import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 
 vi.mock('@/renderer/services/apiClient', () => ({
   apiFetch: vi.fn(),
@@ -161,7 +161,7 @@ describe('DMConversationContextMenu', () => {
     it('clears unread count optimistically + rolls back on API rejection (#984 coverage)', async () => {
       // Pre-populate dmStore with a conversation that has unreads — so we can
       // observe the optimistic clear + rollback round-trip.
-      const { useDMStore } = await import('@/renderer/stores/dmStore');
+      const { useDMStore } = await import('@/renderer/stores/chat/dmStore');
       useDMStore.setState({
         conversations: [{ ...makeConversation({ id: 'conv-rollback', unreadCount: 7 }) }],
       });
@@ -180,7 +180,7 @@ describe('DMConversationContextMenu', () => {
     });
 
     it('clears unread count + rolls back on non-ok HTTP response (#984 coverage)', async () => {
-      const { useDMStore } = await import('@/renderer/stores/dmStore');
+      const { useDMStore } = await import('@/renderer/stores/chat/dmStore');
       useDMStore.setState({
         conversations: [{ ...makeConversation({ id: 'conv-nonok', unreadCount: 4 }) }],
       });
@@ -246,7 +246,7 @@ describe('DMConversationContextMenu', () => {
     });
 
     it('invokes dmStore.removeConversation with the correct id (#984 coverage)', async () => {
-      const { useDMStore } = await import('@/renderer/stores/dmStore');
+      const { useDMStore } = await import('@/renderer/stores/chat/dmStore');
       const removeSpy = vi.fn();
       useDMStore.setState({ removeConversation: removeSpy });
 

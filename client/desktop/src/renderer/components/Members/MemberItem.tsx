@@ -1,7 +1,7 @@
 import React from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import type { ServerMember, PresenceStatus } from '../../stores/memberStore';
-import { useRichPresenceStore } from '../../stores/richPresenceStore';
+import type { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 
 interface MemberItemProps {

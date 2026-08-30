@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { vi } from 'vitest';
 
 const channelPanelState = vi.hoisted(() => ({ compact: false }));

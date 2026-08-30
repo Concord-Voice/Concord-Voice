@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import type { PresenceStatus } from '../../stores/memberStore';
-import { useRichPresenceStore } from '../../stores/richPresenceStore';
-import { useUserStore } from '../../stores/userStore';
+import type { PresenceStatus } from '../../stores/chat/memberStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/useUserThemeScope';
 import SendFriendRequestButton from './SendFriendRequestButton';

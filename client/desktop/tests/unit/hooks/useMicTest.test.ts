@@ -2,7 +2,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 
 // Mock stores
-vi.mock('@/renderer/stores/audioSettingsStore', () => {
+vi.mock('@/renderer/stores/audio/audioSettingsStore', () => {
   const state = {
     musicMode: false,
     echoCancellation: true,
@@ -33,7 +33,7 @@ vi.mock('@/renderer/stores/audioSettingsStore', () => {
   return { useAudioSettingsStore: store };
 });
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(vi.fn(), {
     getState: vi.fn(() => ({
       audioInputDeviceId: null,
@@ -53,13 +53,13 @@ vi.mock('@/renderer/services/voiceService', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   ensureOsPermission: vi.fn().mockResolvedValue('granted'),
 }));
 
-import { ensureOsPermission } from '@/renderer/stores/osPermissionStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { ensureOsPermission } from '@/renderer/stores/voice/osPermissionStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useMicTest } from '@/renderer/hooks/useMicTest';
 import { voiceService } from '@/renderer/services/voiceService';
 

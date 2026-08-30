@@ -1,4 +1,4 @@
-import { useUnreadStore } from '@/renderer/stores/unreadStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('unreadStore', () => {

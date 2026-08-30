@@ -27,8 +27,8 @@ vi.mock('mediasoup-client/types', () => ({}));
 // ── Import after mocks ──────────────────────────────────────────────────
 
 import { PipSignalingProxy } from '@/renderer/services/pipSignalingProxy';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 

@@ -2,9 +2,9 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import SSOAccountLinkConfirm from '@/renderer/components/Auth/SSOAccountLinkConfirm';
 import { abandonSSOReservation } from '@/renderer/services/ssoService';
-import { useSSOStore } from '@/renderer/stores/ssoStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useSSOStore } from '@/renderer/stores/auth/ssoStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,

@@ -1,4 +1,4 @@
-import { useChannelStore } from '@/renderer/stores/channelStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel, mockEncryptedChannel } from '../../mocks/fixtures';
 import type { Channel, ChannelGroup } from '@/renderer/types/chat';

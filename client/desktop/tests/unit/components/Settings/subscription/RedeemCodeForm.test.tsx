@@ -3,7 +3,7 @@ import { render, screen, userEvent, waitFor } from '../../../../test-utils';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../../../mocks/server';
 import { resetAllStores } from '../../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import RedeemCodeForm from '@/renderer/components/Settings/subscription/RedeemCodeForm';
 
 const API_BASE = 'http://localhost:8080';

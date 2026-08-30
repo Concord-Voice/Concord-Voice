@@ -10,7 +10,7 @@ import React, {
 } from 'react';
 import { ChevronLeft, ChevronRight, Pin } from 'lucide-react';
 import { useResizablePanel } from '../../hooks/useResizablePanel';
-import { useSettingsStore } from '../../stores/settingsStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
 import {
   LEFT_SIDEBAR_MAX_WIDTH,
   RIGHT_SIDEBAR_MAX_WIDTH,
@@ -20,7 +20,7 @@ import {
   type SidebarContext,
   type SidebarSide,
   useLayoutStore,
-} from '../../stores/layoutStore';
+} from '../../stores/ui/layoutStore';
 import './AppLayout.css';
 
 interface DockOverlayContextValue {

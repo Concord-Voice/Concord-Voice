@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, waitFor, cleanup } from '@testing-library/react';
-import type { VoiceParticipant } from '../../../../src/renderer/stores/voiceStore';
+import type { VoiceParticipant } from '../../../../src/renderer/stores/voice/voiceStore';
 
 const setRemoteVideoRenderState = vi.fn();
 const removeRemoteVideoTile = vi.fn();

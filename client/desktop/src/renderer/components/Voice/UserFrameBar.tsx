@@ -3,8 +3,8 @@ import {
   useVoiceStore,
   type ActiveScreenShare,
   MAX_TUNED_SCREEN_SHARES,
-} from '../../stores/voiceStore';
-import { useUserStore } from '../../stores/userStore';
+} from '../../stores/voice/voiceStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { useVoiceMagnification } from './useVoiceMagnification';
 import ParticipantTile from './ParticipantTile';
 import ShareTunePill from './ShareTunePill';

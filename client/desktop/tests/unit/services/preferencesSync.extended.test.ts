@@ -5,12 +5,12 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { preferencesSyncService } from '@/renderer/services/preferencesSync';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useLayoutStore } from '@/renderer/stores/layoutStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useLayoutStore } from '@/renderer/stores/ui/layoutStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 
 const API_BASE = 'http://localhost:8080';
 

@@ -1,9 +1,9 @@
 import React from 'react';
 import { Eraser } from 'lucide-react';
 import { ServerWithRole } from '../../types/server';
-import { useUnreadStore } from '../../stores/unreadStore';
-import { usePermissionStore } from '../../stores/permissionStore';
-import { useUserStore } from '../../stores/userStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { MANAGE_ALL_MESSAGES, MANAGE_OWN_MESSAGES, Permissions } from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
 import ContextMenu from '../ui/ContextMenu';

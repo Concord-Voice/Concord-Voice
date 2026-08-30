@@ -1,5 +1,5 @@
 import React from 'react';
-import { useServerStore } from '../../stores/serverStore';
+import { useServerStore } from '../../stores/chat/serverStore';
 import MemberList from '../Members/MemberList';
 import { DockShell } from './DockShell';
 

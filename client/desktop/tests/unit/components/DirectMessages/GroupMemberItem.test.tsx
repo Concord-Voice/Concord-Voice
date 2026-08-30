@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { vi } from 'vitest';
-import type { DMParticipant } from '@/renderer/stores/dmStore';
+import type { DMParticipant } from '@/renderer/stores/chat/dmStore';
 
 import GroupMemberItem, {
   GROUP_MEMBER_MENU_Z_INDEX,

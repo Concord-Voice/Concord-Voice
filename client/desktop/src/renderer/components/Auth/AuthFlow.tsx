@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { ConnectionMode } from '../../types/auth';
-import { useAuthStore } from '../../stores/authStore';
-import { useUserStore, UserProfile } from '../../stores/userStore';
-import { usePendingRegistrationStore } from '../../stores/pendingRegistrationStore';
-import { useSSOStore } from '../../stores/ssoStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useUserStore, UserProfile } from '../../stores/auth/userStore';
+import { usePendingRegistrationStore } from '../../stores/auth/pendingRegistrationStore';
+import { useSSOStore } from '../../stores/auth/ssoStore';
 import { clientConfigService } from '../../services/clientConfigService';
 import { resetRuntimeServerBase, setRuntimeServerBase } from '../../services/runtimeServerBase';
 import ConnectionSelector from './ConnectionSelector';

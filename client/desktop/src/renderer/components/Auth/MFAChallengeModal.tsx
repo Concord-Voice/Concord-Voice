@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo } from 'react';
-import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/mfaChallengeStore';
+import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/auth/mfaChallengeStore';
 import { ensureMachineId, safeJson } from '../../services/apiClient';
 import { apiUrl, captureRuntimeServerSelection } from '../../services/runtimeServerBase';
 import { completeSSOMFA, SSOServiceError, abandonSSOReservation } from '../../services/ssoService';

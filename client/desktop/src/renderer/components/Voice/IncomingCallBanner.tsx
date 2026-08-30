@@ -6,9 +6,9 @@
 // of current navigation — incoming calls shouldn't be hidden by which
 // view the user is currently looking at.
 
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import { useDMStore } from '../../stores/dmStore';
+import { useDMStore } from '../../stores/chat/dmStore';
 import {
   acceptIncomingCall,
   declineIncomingCall,

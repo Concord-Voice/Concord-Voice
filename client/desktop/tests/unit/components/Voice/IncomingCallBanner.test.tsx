@@ -7,9 +7,9 @@
 
 import React from 'react';
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import type { DMConversation } from '@/renderer/stores/dmStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/Voice/IncomingCallBanner.css', () => ({}));

@@ -7,7 +7,7 @@ import {
   effectiveStreamAxis,
   shouldEnforceForSubscription,
 } from '@/renderer/utils/videoLimits';
-import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/subscriptionStore';
+import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subscriptionStore';
 
 const PREMIUM_ENTITLEMENT: Entitlement = {
   ...FREE_ENTITLEMENT,

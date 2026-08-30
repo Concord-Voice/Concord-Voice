@@ -8,12 +8,12 @@
 import { useCallback } from 'react';
 import { ConnectionState, getWebSocketService } from '../services/websocketService';
 import { e2eeService } from '../services/e2eeService';
-import { useConnectionStore } from '../stores/connectionStore';
-import { useUserStore } from '../stores/userStore';
-import { useVoiceStore } from '../stores/voiceStore';
-import { useMemberStore } from '../stores/memberStore';
-import { useServerStore } from '../stores/serverStore';
-import { useFriendStore } from '../stores/friendStore';
+import { useConnectionStore } from '../stores/ui/connectionStore';
+import { useUserStore } from '../stores/auth/userStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
+import { useMemberStore } from '../stores/chat/memberStore';
+import { useServerStore } from '../stores/chat/serverStore';
+import { useFriendStore } from '../stores/chat/friendStore';
 import { runRecoveryModule } from '../utils/runRecoveryModule';
 import { hydratePostLogin } from '../services/postLoginHydration';
 import {

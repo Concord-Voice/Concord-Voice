@@ -1,13 +1,13 @@
-import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useTTSSettingsStore } from '@/renderer/stores/ttsSettingsStore';
+import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useTTSSettingsStore } from '@/renderer/stores/audio/ttsSettingsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock settingsStore's syncColorSchemeToServer (called via the draft apply flow).
-vi.mock('@/renderer/stores/settingsStore', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/stores/settingsStore')>();
+vi.mock('@/renderer/stores/ui/settingsStore', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/stores/ui/settingsStore')>();
   return {
     ...actual,
     syncColorSchemeToServer: vi.fn(),
@@ -18,8 +18,8 @@ vi.mock('@/renderer/stores/settingsStore', async (importOriginal) => {
 // module (extracted from settingsStore to avoid the teardown-racing dynamic
 // import); the draft apply/teardown flow calls it from there.
 const setSyncSuppressedSpy = vi.fn();
-vi.mock('@/renderer/stores/colorSyncSuppression', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/renderer/stores/colorSyncSuppression')>();
+vi.mock('@/renderer/stores/ui/colorSyncSuppression', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/renderer/stores/ui/colorSyncSuppression')>();
   return {
     ...actual,
     setSyncSuppressed: (...args: Parameters<typeof actual.setSyncSuppressed>) => {

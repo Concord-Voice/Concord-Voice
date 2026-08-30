@@ -5,12 +5,12 @@ import ChannelEmojiField from './ChannelEmojiField';
 import Modal from '../ui/Modal';
 import CustomSelect from '../ui/CustomSelect';
 import LoadingSpinner from '../Auth/LoadingSpinner';
-import { useServerStore } from '../../stores/serverStore';
-import { useChannelStore } from '../../stores/channelStore';
-import { useUserStore } from '../../stores/userStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useChannelStore } from '../../stores/chat/channelStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import { apiFetch } from '../../services/apiClient';
 import { e2eeService } from '../../services/e2eeService';
-import { useAuthStore } from '../../stores/authStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,

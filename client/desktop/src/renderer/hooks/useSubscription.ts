@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { apiFetch, safeJson } from '../services/apiClient';
-import { useSubscriptionStore } from '../stores/subscriptionStore';
+import { useSubscriptionStore } from '../stores/auth/subscriptionStore';
 
 // Subscription status for the Settings subscription page (#1304). Reads
 // GET /api/v1/subscriptions/me (the read-only status companion to the

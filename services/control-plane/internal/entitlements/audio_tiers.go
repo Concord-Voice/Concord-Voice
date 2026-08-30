@@ -1,8 +1,9 @@
 package entitlements
 
 // audioTierOrder is the canonical 7-tier audio ladder, ascending. Index = rank.
-// MIRRORS the client AUDIO_QUALITY_TIERS (client/desktop/src/renderer/stores/
-// voiceStore.ts), the media-plane AUDIO_QUALITY_TIERS config, and the
+// MIRRORS the client AUDIO_QUALITY_TIERS
+// (client/desktop/src/renderer/stores/voice/voiceStore.ts), the media-plane
+// AUDIO_QUALITY_TIERS config, and the
 // media-plane AUDIO_TIER_OPUS_BITRATE_CEILING_BPS enforcement map. Keep all
 // mirrors in lockstep.
 var audioTierOrder = []string{"minimum", "low", "moderate", "standard", "high", "hifi", "studio"}

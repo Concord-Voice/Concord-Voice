@@ -3,14 +3,14 @@ import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import { createPortal } from 'react-dom';
 import ServerHoverTooltip from './ServerHoverTooltip';
 import { ChevronDown, FolderPlus, Pencil, Trash2 } from 'lucide-react';
-import { useServerStore } from '../../stores/serverStore';
-import { useUnreadStore } from '../../stores/unreadStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
 import {
   useNotificationPrefsStore,
   isServerUnreadVisible,
-} from '../../stores/notificationPrefsStore';
-import { useVoiceStore } from '../../stores/voiceStore';
-import { useLayoutStore, ServerFolder } from '../../stores/layoutStore';
+} from '../../stores/ui/notificationPrefsStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { useLayoutStore, ServerFolder } from '../../stores/ui/layoutStore';
 import { useNavigate, useLocation } from 'react-router';
 import { ServerWithRole } from '../../types/server';
 import ContextMenu from '../ui/ContextMenu';

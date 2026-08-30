@@ -6,7 +6,7 @@ import {
   type MutableRefObject,
   type ReactNode,
 } from 'react';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import { clientConfigService } from '../../services/clientConfigService';
 import {
   getPresenceHistoryPage,

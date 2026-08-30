@@ -1,6 +1,10 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { useOsPermissionStore, type OsPermissionStatus, type OsPermissionType } from '@/renderer/stores/osPermissionStore';
+import {
+  useOsPermissionStore,
+  type OsPermissionStatus,
+  type OsPermissionType,
+} from '@/renderer/stores/voice/osPermissionStore';
 import { useOsPermission } from '@/renderer/hooks/useOsPermission';
 import { resetAllStores } from '../../helpers/store-helpers';
 

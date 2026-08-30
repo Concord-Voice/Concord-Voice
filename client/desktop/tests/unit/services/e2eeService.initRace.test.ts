@@ -47,7 +47,7 @@ vi.mock('@/renderer/services/notificationPrefsService', () => ({
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { E2EEInitTeardownError } from '@/renderer/services/e2eeErrors';
 import { nuclearReset, recoveryReset } from '@/renderer/services/resetService';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { generateRegistrationKeys } from '@/renderer/utils/crypto';
 import { resetAllStores } from '../../helpers/store-helpers';
 

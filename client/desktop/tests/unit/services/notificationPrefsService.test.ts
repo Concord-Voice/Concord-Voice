@@ -24,7 +24,7 @@ import {
   tryHydrateNotificationPrefs,
   MUTE_DURATION_LABELS,
 } from '@/renderer/services/notificationPrefsService';
-import { useNotificationPrefsStore } from '@/renderer/stores/notificationPrefsStore';
+import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 const mockApiFetch = vi.mocked(apiFetch);

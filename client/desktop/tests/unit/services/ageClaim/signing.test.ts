@@ -12,7 +12,7 @@ import { resolve } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { e2eeService } from '@/renderer/services/e2eeService';
 import { generateRegistrationKeys, base64ToArrayBuffer } from '@/renderer/utils/crypto';
-import { useE2EEStore } from '@/renderer/stores/e2eeStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { buildCanonicalBytes, type AgeClaim } from '@/renderer/services/ageClaim/canonicalAgeClaim';
 
 // Server-owned single source of truth (#1623). Read via node:fs, not import.

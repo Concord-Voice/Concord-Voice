@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, within, act } from '../../../test-utils';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
-import { useDraftSettingsStore } from '@/renderer/stores/draftSettingsStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
+import { useDraftSettingsStore } from '@/renderer/stores/ui/draftSettingsStore';
 import { vi } from 'vitest';
 
 const mockApiFetch = vi.fn();
@@ -64,15 +64,15 @@ vi.mock('@/renderer/services/apiClient', () => ({
   API_BASE: 'http://localhost:8080',
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
-vi.mock('@/renderer/stores/authStore', () => ({
+vi.mock('@/renderer/stores/auth/authStore', () => ({
   useAuthStore: vi.fn((s) => s({ accessToken: 'mock-token' })),
 }));
-vi.mock('@/renderer/stores/userStore', () => ({
+vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: vi.fn((s) => s({ logout: vi.fn() })),
 }));
 const mockFetchPrivacy = vi.fn().mockResolvedValue(undefined);
 const mockUpdatePrivacy = vi.fn().mockResolvedValue(undefined);
-vi.mock('@/renderer/stores/privacyStore', () => ({
+vi.mock('@/renderer/stores/ui/privacyStore', () => ({
   usePrivacyStore: vi.fn((s) =>
     s({
       settings: {
@@ -106,7 +106,7 @@ vi.mock('@/renderer/stores/privacyStore', () => ({
 vi.mocked(usePrivacyStore).getState = vi.fn(() => ({
   settings: { dmPrivacyLevel: 2, allowFriendRequestsFrom: 'everyone' },
 })) as unknown as typeof usePrivacyStore.getState;
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: vi.fn((s) =>
     s({
       microphone: 'granted',
@@ -239,7 +239,7 @@ vi.mock('@/renderer/components/ui/Modal', () => ({
     ) : null,
 }));
 
-vi.mock('@/renderer/stores/clientConfigStore', () => ({
+vi.mock('@/renderer/stores/ui/clientConfigStore', () => ({
   useClientConfigStore: vi.fn((s) =>
     s({ activityHistoryCapability: { status: 'confirmed-unsupported' } })
   ),
@@ -882,7 +882,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows Denied badge for denied permission', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'denied',
@@ -902,7 +902,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows Restricted badge for restricted permission', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'restricted',
@@ -922,7 +922,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows Not Requested badge for not-determined permission', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'not-determined',
@@ -942,7 +942,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows Unavailable badge for unavailable permission', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'unavailable',
@@ -967,7 +967,7 @@ describe('PrivacySecuritySection', () => {
     // mockImplementation a prior test installed, so the default factory mock does
     // not reliably leak through as all-granted when this test runs mid-suite.
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -993,7 +993,7 @@ describe('PrivacySecuritySection', () => {
   it('shows "Request" (not "Open System Settings") for a not-determined row (#1743)', async () => {
     const requestOneMock = vi.fn().mockResolvedValue('granted');
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'not-determined',
@@ -1016,7 +1016,7 @@ describe('PrivacySecuritySection', () => {
   it('"Open System Settings" calls openSettings for the row type (#1743)', async () => {
     const openSettingsMock = vi.fn().mockResolvedValue(undefined);
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'denied',
@@ -1044,7 +1044,7 @@ describe('PrivacySecuritySection', () => {
 
   it('does not crash if openSettings rejects (#1743)', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -1240,7 +1240,7 @@ describe('PrivacySecuritySection', () => {
 
   it('renders DM description for level 0 (No One)', async () => {
     vi.mocked(
-      await import('@/renderer/stores/privacyStore').then((m) => m.usePrivacyStore)
+      await import('@/renderer/stores/ui/privacyStore').then((m) => m.usePrivacyStore)
     ).mockImplementation((s) =>
       s({
         settings: {
@@ -1339,7 +1339,7 @@ describe('PrivacySecuritySection', () => {
 
   it('renders GIF disabled hints when settings are off', async () => {
     vi.mocked(
-      await import('@/renderer/stores/privacyStore').then((m) => m.usePrivacyStore)
+      await import('@/renderer/stores/ui/privacyStore').then((m) => m.usePrivacyStore)
     ).mockImplementation((s) =>
       s({
         settings: {
@@ -1406,7 +1406,7 @@ describe('PrivacySecuritySection', () => {
 
   it('disables friends-of-friends toggle at DM level 3', async () => {
     vi.mocked(
-      await import('@/renderer/stores/privacyStore').then((m) => m.usePrivacyStore)
+      await import('@/renderer/stores/ui/privacyStore').then((m) => m.usePrivacyStore)
     ).mockImplementation((s) =>
       s({
         settings: {
@@ -1439,7 +1439,7 @@ describe('PrivacySecuritySection', () => {
 
   it('renders DM description for level 1 (Friends Only)', async () => {
     vi.mocked(
-      await import('@/renderer/stores/privacyStore').then((m) => m.usePrivacyStore)
+      await import('@/renderer/stores/ui/privacyStore').then((m) => m.usePrivacyStore)
     ).mockImplementation((s) =>
       s({
         settings: {
@@ -1669,7 +1669,7 @@ describe('PrivacySecuritySection', () => {
   it('submits Revoke All with password and logs out', async () => {
     const mockLogout = vi.fn().mockResolvedValue(undefined);
     vi.mocked(
-      await import('@/renderer/stores/userStore').then((m) => m.useUserStore)
+      await import('@/renderer/stores/auth/userStore').then((m) => m.useUserStore)
     ).mockImplementation((s) => s({ logout: mockLogout }));
     mockApiFetch
       .mockReset()
@@ -2326,7 +2326,7 @@ describe('PrivacySecuritySection', () => {
   it('revokes current session, confirms, and logs out', async () => {
     const mockLogout = vi.fn().mockResolvedValue(undefined);
     vi.mocked(
-      await import('@/renderer/stores/userStore').then((m) => m.useUserStore)
+      await import('@/renderer/stores/auth/userStore').then((m) => m.useUserStore)
     ).mockImplementation((s) => s({ logout: mockLogout }));
     mockApiFetch
       .mockReset()
@@ -2493,7 +2493,7 @@ describe('PrivacySecuritySection', () => {
   it('calls requestOne when notification Request button clicked', async () => {
     const mockRequestOne = vi.fn().mockResolvedValue('granted');
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -2518,7 +2518,7 @@ describe('PrivacySecuritySection', () => {
   it('calls openSettings when Open System Settings clicked for unavailable secure storage', async () => {
     const mockOpenSettings = vi.fn().mockResolvedValue(undefined);
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -2638,7 +2638,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows Open System Settings for unavailable secure storage', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -2669,7 +2669,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows Request button for not-determined notifications', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -2880,7 +2880,7 @@ describe('PrivacySecuritySection', () => {
     });
     const mockRequestOne = vi.fn().mockReturnValue(requestPromise);
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -3066,7 +3066,7 @@ describe('PrivacySecuritySection', () => {
 
   it('shows loading state when permissions not loaded', async () => {
     vi.mocked(
-      await import('@/renderer/stores/osPermissionStore').then((m) => m.useOsPermissionStore)
+      await import('@/renderer/stores/voice/osPermissionStore').then((m) => m.useOsPermissionStore)
     ).mockImplementation((s) =>
       s({
         microphone: 'granted',
@@ -3560,7 +3560,7 @@ describe('PrivacySecuritySection — rejected tier PATCH reverts the control (#1
 // ── #1241: the SECTION must forward `loaded`, not a literal ──────────────────
 //
 // privacyStore's own `loaded` transitions are covered in
-// tests/unit/stores/privacyStore.test.ts. What survived mutation was the WIRING:
+// tests/unit/stores/ui/privacyStore.test.ts. What survived mutation was the WIRING:
 // hardcoding `isLoaded={true}` at the FriendRequestPrivacyControls call site
 // left the suite green, so nothing proved the section forwards the store flag.
 describe('PrivacySecuritySection — friend-request control awaits `loaded` (#1241)', () => {

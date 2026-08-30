@@ -16,7 +16,7 @@ const defaultSettings: Record<string, unknown> = {
 
 const mockSetDraftAudioSetting = vi.fn();
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   AUDIO_QUALITY_TIERS: {
     standard: {
       preferredFrameSize: 20,
@@ -39,7 +39,7 @@ vi.mock('@/renderer/stores/voiceStore', () => ({
   },
 }));
 
-vi.mock('@/renderer/stores/audioSettingsStore', () => ({}));
+vi.mock('@/renderer/stores/audio/audioSettingsStore', () => ({}));
 
 vi.mock('@/renderer/hooks/useDraftSettings', () => ({
   useDraftAudioSetting: vi.fn((key: string) => defaultSettings[key] ?? false),

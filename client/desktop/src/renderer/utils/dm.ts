@@ -7,7 +7,7 @@
 
 /**
  * PeerInfo is the minimal participant shape peerName needs. It's a
- * structural subtype of `DMParticipant` from stores/dmStore, so callers
+ * structural subtype of `DMParticipant` from stores/chat/dmStore, so callers
  * that already have a `DMParticipant[]` can pass it directly without a
  * cast. Defined inline (rather than imported) to keep utils/ free of
  * cross-layer imports.

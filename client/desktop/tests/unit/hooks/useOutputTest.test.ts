@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: Object.assign(vi.fn(), {
     getState: vi.fn(() => ({
       audioOutputDeviceId: 'speaker-1',
@@ -20,7 +20,7 @@ vi.mock('@/renderer/services/voiceService', () => ({
 }));
 
 import { useOutputTest } from '@/renderer/hooks/useOutputTest';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { voiceService } from '@/renderer/services/voiceService';
 
 let mockSetSinkId: ReturnType<typeof vi.fn>;

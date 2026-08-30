@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 

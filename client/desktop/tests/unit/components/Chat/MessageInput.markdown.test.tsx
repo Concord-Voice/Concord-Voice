@@ -11,7 +11,7 @@ vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
-vi.mock('@/renderer/stores/layoutStore', () => ({
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({
   useLayoutStore: () => false,
 }));
 

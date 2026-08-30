@@ -8,7 +8,7 @@ import {
   useOsPermissionStore,
   type OsPermissionType,
   type OsPermissionStatus,
-} from '../stores/osPermissionStore';
+} from '../stores/voice/osPermissionStore';
 
 interface UseOsPermissionReturn {
   status: OsPermissionStatus;

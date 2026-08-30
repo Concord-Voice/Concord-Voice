@@ -1,5 +1,5 @@
 import { renderHook, waitFor, act } from '@testing-library/react';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';

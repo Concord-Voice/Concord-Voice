@@ -1,4 +1,4 @@
-import { FriendRequestPrivacyMode } from '../../stores/privacyStore';
+import { FriendRequestPrivacyMode } from '../../stores/ui/privacyStore';
 
 /**
  * Most restrictive on the LEFT, matching the shipped DMPrivacyControls axis

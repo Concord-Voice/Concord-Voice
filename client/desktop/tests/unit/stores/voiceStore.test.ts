@@ -2,7 +2,7 @@ import {
   useVoiceStore,
   MAX_TUNED_SCREEN_SHARES,
   type VoiceParticipant,
-} from '@/renderer/stores/voiceStore';
+} from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

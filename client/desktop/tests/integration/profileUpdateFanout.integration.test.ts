@@ -1,11 +1,11 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../helpers/store-helpers';
 import { mockUser } from '../mocks/fixtures';
 

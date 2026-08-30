@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, waitFor, act } from '../../../test-utils';
 import Message from '@/renderer/components/Chat/Message';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockMember } from '../../../mocks/fixtures';
 import type { MessageWithStatus } from '@/renderer/types/chat';

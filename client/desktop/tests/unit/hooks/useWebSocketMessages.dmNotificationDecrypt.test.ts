@@ -16,12 +16,12 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useDMStore } from '@/renderer/stores/dmStore';
-import { useNotificationStore } from '@/renderer/stores/notificationStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useNotificationStore } from '@/renderer/stores/ui/notificationStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 

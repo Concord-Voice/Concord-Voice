@@ -12,7 +12,7 @@ import { act, renderHook, waitFor } from '../../test-utils';
 import { http, HttpResponse } from 'msw';
 import { server } from '../../mocks/server';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useSubscription } from '@/renderer/hooks/useSubscription';
 import type { SubscriptionSource } from '@/renderer/hooks/useSubscription';
 

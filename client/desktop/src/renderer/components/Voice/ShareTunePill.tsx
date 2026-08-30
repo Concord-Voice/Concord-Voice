@@ -1,6 +1,6 @@
 import React, { useCallback } from 'react';
 import { Tv } from 'lucide-react';
-import { ActiveScreenShare, MAX_TUNED_SCREEN_SHARES } from '../../stores/voiceStore';
+import { ActiveScreenShare, MAX_TUNED_SCREEN_SHARES } from '../../stores/voice/voiceStore';
 import { errorMessage } from '../../utils/redactError';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import './ShareTunePill.css';

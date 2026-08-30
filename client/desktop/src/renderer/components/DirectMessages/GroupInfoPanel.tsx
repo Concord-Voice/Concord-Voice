@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import { LogOut, Trash2, Edit3, Eraser, X } from 'lucide-react';
-import { useDMStore, type DMConversation } from '../../stores/dmStore';
-import { useUserStore } from '../../stores/userStore';
+import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
+import { useUserStore } from '../../stores/auth/userStore';
 import GroupMemberItem from './GroupMemberItem';
 import EditGroupModal from './EditGroupModal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';

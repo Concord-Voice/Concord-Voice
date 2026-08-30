@@ -15,7 +15,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 vi.mock('@/renderer/services/apiClient', () => ({ apiFetch: vi.fn() }));
 
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { apiFetch } from '@/renderer/services/apiClient';
 
 const mockApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;

@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { ParticipantVolumeRow } from '@/renderer/components/Voice/ParticipantVolumeRow';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/Voice/ParticipantVolumeRow.css', () => ({}));

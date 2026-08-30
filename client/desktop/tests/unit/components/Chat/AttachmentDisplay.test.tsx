@@ -7,7 +7,7 @@ import AttachmentDisplay, {
 } from '@/renderer/components/Chat/AttachmentDisplay';
 import type { AttachmentSummary } from '@/renderer/types/chat';
 import { mockAttachment, mockAttachment2 } from '../../../mocks/fixtures';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { fireEvent } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/entitlementLimits';

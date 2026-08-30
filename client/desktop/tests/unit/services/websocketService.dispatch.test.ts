@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { WebSocketService } from '@/renderer/services/websocketService';
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 // Valid RFC 4122 v4 UUIDs — the `4` at position 13 marks version=4, and the

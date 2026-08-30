@@ -1,9 +1,9 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { mockServer, mockChannel, mockUser } from '../../../mocks/fixtures';
 
 // Mock apiFetch to avoid timing issues in jsdom

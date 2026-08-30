@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { AUDIO_TIER_ORDER, serverAudioCeilingTier } from '@/renderer/stores/voiceStore';
+import { AUDIO_TIER_ORDER, serverAudioCeilingTier } from '@/renderer/stores/voice/voiceStore';
 
 describe('audio tier helpers', () => {
   it('AUDIO_TIER_ORDER is the 7-tier ladder ascending', () => {

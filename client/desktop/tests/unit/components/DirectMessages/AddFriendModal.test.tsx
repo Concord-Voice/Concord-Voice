@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, act } from '../../../test-utils';
-import { useFriendStore } from '@/renderer/stores/friendStore';
-import { usePrivacyStore } from '@/renderer/stores/privacyStore';
+import { useFriendStore } from '@/renderer/stores/chat/friendStore';
+import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 

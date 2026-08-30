@@ -1,6 +1,6 @@
 import { renderHook } from '@testing-library/react';
 import { useChannelSubscription } from '@/renderer/hooks/useChannelSubscription';
-import { useChatStore } from '@/renderer/stores/chatStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import {
   __resetPendingUnsubscribes,
   UNSUBSCRIBE_DELAY_MS,

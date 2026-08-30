@@ -1,5 +1,5 @@
 import React from 'react';
-import { useAudioSettingsStore } from '../../stores/audioSettingsStore';
+import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
 import './ParticipantVolumeRow.css';
 
 interface ParticipantVolumeRowProps {

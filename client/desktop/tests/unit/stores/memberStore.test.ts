@@ -1,5 +1,5 @@
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockMember, mockMember2 } from '../../mocks/fixtures';
 import { server } from '../../mocks/server';

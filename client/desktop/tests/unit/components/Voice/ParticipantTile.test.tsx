@@ -1,6 +1,6 @@
 import React from 'react';
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useMemberStore } from '@/renderer/stores/memberStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 vi.mock('@/renderer/components/Voice/ParticipantTile.css', () => ({}));
@@ -15,7 +15,7 @@ vi.mock('@/renderer/hooks/useUserThemeScope', () => ({
 }));
 
 import ParticipantTile from '@/renderer/components/Voice/ParticipantTile';
-import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voiceStore';
+import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 
 const makeParticipant = (overrides: Partial<VoiceParticipant> = {}): VoiceParticipant => ({
   userId: 'user-1',

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { useSettingsOverlayStore } from '../../stores/settingsOverlayStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import ImageCropEditor from '../ui/ImageCropEditor';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import ToggleSwitch from '../Settings/ToggleSwitch';
@@ -17,10 +17,10 @@ import {
   type ServerFormErrors,
 } from './serverConstants';
 import { ServerNameField, ServerFormBanners } from './ServerNameField';
-import { useServerStore } from '../../stores/serverStore';
-import { useInviteStore } from '../../stores/inviteStore';
-import { usePermissionStore } from '../../stores/permissionStore';
-import { useMemberStore } from '../../stores/memberStore';
+import { useServerStore } from '../../stores/chat/serverStore';
+import { useInviteStore } from '../../stores/chat/inviteStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
+import { useMemberStore } from '../../stores/chat/memberStore';
 import { Permissions } from '../../utils/permissions';
 import { apiFetch } from '../../services/apiClient';
 import { formatFileSize } from '../../utils/attachmentCrypto';

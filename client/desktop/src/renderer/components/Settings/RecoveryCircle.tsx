@@ -3,7 +3,7 @@ import { split } from '../../utils/shamir';
 import { base64ToArrayBuffer, arrayBufferToBase64 } from '../../utils/crypto';
 import { e2eeService } from '../../services/e2eeService';
 import { apiFetch } from '../../services/apiClient';
-import { useFriendStore, Friend } from '../../stores/friendStore';
+import { useFriendStore, Friend } from '../../stores/chat/friendStore';
 
 interface RecoveryCircleProps {
   onComplete: () => void;

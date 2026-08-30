@@ -13,10 +13,10 @@
 
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useChatStore } from '@/renderer/stores/chatStore';
-import { useChannelStore } from '@/renderer/stores/channelStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useChatStore } from '@/renderer/stores/chat/chatStore';
+import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { mockChannel } from '../../mocks/fixtures';
 

@@ -142,7 +142,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
 }));
 
 // --- osPermissionStore ---
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: {
     getState: vi.fn().mockReturnValue({
       checkOne: vi.fn().mockResolvedValue('granted'),
@@ -284,12 +284,12 @@ function createMockMediaStream(tracks?: Array<{ kind: string; id?: string }>) {
 const { voiceService } = await import('@/renderer/services/voiceService');
 const { handleCallInvited } = await import('@/renderer/services/voiceService/callStateMachine');
 
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useAudioSettingsStore } from '@/renderer/stores/audioSettingsStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useUpdateStatusStore } from '@/renderer/stores/updateStatusStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useUpdateStatusStore } from '@/renderer/stores/ui/updateStatusStore';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2273,7 +2273,7 @@ describe('VoiceService', () => {
 
   describe('video error handling', () => {
     it('NotAllowedError', async () => {
-      const m = await import('@/renderer/stores/osPermissionStore');
+      const m = await import('@/renderer/stores/voice/osPermissionStore');
       vi.mocked(m.ensureOsPermission).mockResolvedValue('granted');
       await joinVoiceChannel();
       mockGetUserMedia.mockRejectedValue(new DOMException('d', 'NotAllowedError'));
@@ -2283,7 +2283,7 @@ describe('VoiceService', () => {
     });
 
     it('NotFoundError', async () => {
-      const m = await import('@/renderer/stores/osPermissionStore');
+      const m = await import('@/renderer/stores/voice/osPermissionStore');
       vi.mocked(m.ensureOsPermission).mockResolvedValue('granted');
       await joinVoiceChannel();
       mockGetUserMedia.mockRejectedValue(new DOMException('n', 'NotFoundError'));
@@ -2293,7 +2293,7 @@ describe('VoiceService', () => {
     });
 
     it('generic error', async () => {
-      const m = await import('@/renderer/stores/osPermissionStore');
+      const m = await import('@/renderer/stores/voice/osPermissionStore');
       vi.mocked(m.ensureOsPermission).mockResolvedValue('granted');
       await joinVoiceChannel();
       mockGetUserMedia.mockRejectedValue(new Error('boom'));
@@ -2303,7 +2303,7 @@ describe('VoiceService', () => {
     });
 
     it('falls back on OverconstrainedError', async () => {
-      const m = await import('@/renderer/stores/osPermissionStore');
+      const m = await import('@/renderer/stores/voice/osPermissionStore');
       vi.mocked(m.ensureOsPermission).mockResolvedValue('granted');
       useVideoSettingsStore.setState({ cameraPreset: '4K60' });
       const { sendTransport } = await joinVoiceChannel();
@@ -2543,7 +2543,7 @@ describe('VoiceService', () => {
 
   describe('OS permission', () => {
     it('throws for denied mic', async () => {
-      const m = await import('@/renderer/stores/osPermissionStore');
+      const m = await import('@/renderer/stores/voice/osPermissionStore');
       vi.mocked(m.ensureOsPermission).mockResolvedValue('denied');
       setupAuth();
       mockApiFetch.mockResolvedValueOnce({

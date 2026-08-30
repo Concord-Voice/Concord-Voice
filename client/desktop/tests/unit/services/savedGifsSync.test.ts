@@ -1,6 +1,6 @@
 import { savedGifsSyncService } from '@/renderer/services/savedGifsSync';
-import { useSavedGifsStore } from '@/renderer/stores/savedGifsStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
+import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { useSettingsStore, migratePersistedSettings } from '@/renderer/stores/settingsStore';
+import { useSettingsStore, migratePersistedSettings } from '@/renderer/stores/ui/settingsStore';
 import { DEFAULT_CLIENT_BEHAVIOR } from '@/shared/clientBehavior';
 
 const { mockSetClientBehavior } = vi.hoisted(() => ({

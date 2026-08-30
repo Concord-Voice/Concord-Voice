@@ -26,13 +26,13 @@ const { mockSetVideoAdvancedMode, mockSetDraftVideoSetting } = vi.hoisted(() => 
 
 // ─── Mocks (MUST be before component imports) ───────────────────────────────
 
-vi.mock('@/renderer/stores/voiceStore', () => ({
+vi.mock('@/renderer/stores/voice/voiceStore', () => ({
   useVoiceStore: vi.fn((s: (state: Record<string, unknown>) => unknown) =>
     s({ activeCameraCodec: null, activeScreenCodec: null })
   ),
 }));
 
-vi.mock('@/renderer/stores/videoSettingsStore', () => ({
+vi.mock('@/renderer/stores/voice/videoSettingsStore', () => ({
   useVideoSettingsStore: Object.assign(
     vi.fn((s: (state: Record<string, unknown>) => unknown) =>
       s({
@@ -126,8 +126,8 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
 // ─── Component imports (AFTER mocks) ────────────────────────────────────────
 import { render, screen, fireEvent } from '../../../test-utils';
 import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSection';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useDraftVideoSetting } from '@/renderer/hooks/useDraftSettings';
 import { getCodecInfo } from '@/renderer/services/mediaCapabilities';
 

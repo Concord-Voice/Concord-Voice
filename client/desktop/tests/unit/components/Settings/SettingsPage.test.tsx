@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { mockUser } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 

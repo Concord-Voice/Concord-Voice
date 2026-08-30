@@ -12,10 +12,10 @@ import {
   decideChangelogAction,
   type ChangelogSection,
 } from '../../services/changelog';
-import { useChangelogStore } from '../../stores/changelogStore';
-import { useAuthStore } from '../../stores/authStore';
-import { useAttestationFailureStore } from '../../stores/attestationFailureStore';
-import { useClientConfigStore } from '../../stores/clientConfigStore';
+import { useChangelogStore } from '../../stores/ui/changelogStore';
+import { useAuthStore } from '../../stores/auth/authStore';
+import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import './ChangelogModal.css';
 
 /** Public releases page (same public-repo target as UpdateSecurityBanner). */

@@ -2,7 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import StepUpFields, { type StepUpFieldErrors } from '../Purge/StepUpFields';
-import { usePrivacyStore, type PurgeFenceDisableResult } from '../../stores/privacyStore';
+import { usePrivacyStore, type PurgeFenceDisableResult } from '../../stores/ui/privacyStore';
 // StepUpFields renders the shipped #1354 markup, so it needs the shipped #1354
 // stylesheet — the Settings pane never loads PurgeMessagesModal.
 import '../Purge/purgeMessages.css';

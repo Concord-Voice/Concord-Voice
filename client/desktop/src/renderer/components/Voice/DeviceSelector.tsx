@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Mic, Speaker, Video } from 'lucide-react';
-import { useVoiceStore } from '../../stores/voiceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
 import CustomSelect from '../ui/CustomSelect';
 import './DeviceSelector.css';
 

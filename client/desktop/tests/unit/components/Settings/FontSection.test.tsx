@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, userEvent } from '../../../test-utils';
 import { vi } from 'vitest';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 
 // Mirrors AccessibilitySection.test.tsx — mock the draft hook so the section renders
 // in isolation. Variable is `mock`-prefixed so Vitest's hoisted factory may reference it.

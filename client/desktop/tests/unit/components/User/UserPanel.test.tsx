@@ -1,8 +1,8 @@
 import { render, screen, fireEvent } from '../../../test-utils';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { mockUser } from '../../../mocks/fixtures';
 
 // Mock UserPopover — minimal stub exposing the close + onOpenFeedback paths.

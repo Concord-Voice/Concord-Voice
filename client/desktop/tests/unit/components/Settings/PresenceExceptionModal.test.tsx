@@ -3,9 +3,9 @@ import { act, fireEvent, render, screen, userEvent, waitFor } from '../../../tes
 import { resetAllStores } from '../../../helpers/store-helpers';
 import PresenceExceptionModal from '@/renderer/components/Settings/PresenceExceptionModal';
 import { presenceOverrideSyncService } from '@/renderer/services/presenceOverrideSync';
-import { useFriendOrgStore } from '@/renderer/stores/friendOrgStore';
-import { useFriendStore, type Friend } from '@/renderer/stores/friendStore';
-import { usePresenceOverrideStore } from '@/renderer/stores/presenceOverrideStore';
+import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';
+import { useFriendStore, type Friend } from '@/renderer/stores/chat/friendStore';
+import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { deferred } from '../../../helpers/deferred';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';

@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { apiFetch } from '../../services/apiClient';
-import { useRichPresenceStore } from '../../stores/richPresenceStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import EmojiPicker from '../EmojiPicker/EmojiPicker';
 import './CustomStatusPopover.css';
 

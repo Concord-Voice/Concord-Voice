@@ -1,4 +1,4 @@
-import { useConnectionStore } from '@/renderer/stores/connectionStore';
+import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

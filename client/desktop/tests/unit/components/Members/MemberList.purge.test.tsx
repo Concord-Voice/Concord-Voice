@@ -1,10 +1,10 @@
 import { act, render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useMemberStore } from '@/renderer/stores/memberStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { server as mswServer } from '../../../mocks/server';
 import { mockUser, mockServer } from '../../../mocks/fixtures';
 import {

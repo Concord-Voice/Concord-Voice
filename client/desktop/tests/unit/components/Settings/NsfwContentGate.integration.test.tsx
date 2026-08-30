@@ -13,9 +13,9 @@ const { mockE2EE } = vi.hoisted(() => ({
 vi.mock('@/renderer/services/e2eeService', () => ({ e2eeService: mockE2EE }));
 
 import NsfwContentGate from '@/renderer/components/Settings/NsfwContentGate';
-import { useUserStore } from '@/renderer/stores/userStore';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 
 const FUTURE_COPY =
   'This saves your preference for future NSFW-marked channels. NSFW-marked channels are not available yet.';

@@ -1,9 +1,9 @@
 import { useMemo } from 'react';
-import { useVoiceStore } from '../stores/voiceStore';
-import { useChannelStore } from '../stores/channelStore';
-import { useDMStore } from '../stores/dmStore';
-import { useUserStore } from '../stores/userStore';
-import { useServerStore } from '../stores/serverStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
+import { useChannelStore } from '../stores/chat/channelStore';
+import { useDMStore } from '../stores/chat/dmStore';
+import { useUserStore } from '../stores/auth/userStore';
+import { useServerStore } from '../stores/chat/serverStore';
 import { useChannelSubscription } from './useChannelSubscription';
 import { useDMSubscription } from './useDMSubscription';
 import { getThreadName } from '../utils/dmThreadName';

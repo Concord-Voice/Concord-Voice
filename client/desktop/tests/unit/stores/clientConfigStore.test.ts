@@ -1,4 +1,4 @@
-import { useClientConfigStore } from '@/renderer/stores/clientConfigStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 beforeEach(() => {

@@ -1,6 +1,9 @@
 import React, { useEffect, useRef } from 'react';
-import { useNotificationStore, type NotificationContentMode } from '../../stores/notificationStore';
-import { useOsPermissionStore } from '../../stores/osPermissionStore';
+import {
+  useNotificationStore,
+  type NotificationContentMode,
+} from '../../stores/ui/notificationStore';
+import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import {

@@ -6,7 +6,7 @@ import {
   type AttestationFailedModalProps,
 } from '@/renderer/components/AttestationFailedModal';
 import AttestationFailedModalHost from '@/renderer/components/AttestationFailedModal';
-import { useAttestationFailureStore } from '@/renderer/stores/attestationFailureStore';
+import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
 
 // ── Mock CSS import so Vitest doesn't choke on it ─────────────────────────
 vi.mock('@/renderer/components/AttestationFailedModal.css', () => ({}));

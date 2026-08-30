@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { useSubscriptionStore } from '../stores/subscriptionStore';
-import { useSettingsStore } from '../stores/settingsStore';
-import { useVoiceStore } from '../stores/voiceStore';
-import { useVideoSettingsStore } from '../stores/videoSettingsStore';
-import { useAudioSettingsStore } from '../stores/audioSettingsStore';
+import { useSubscriptionStore } from '../stores/auth/subscriptionStore';
+import { useSettingsStore } from '../stores/ui/settingsStore';
+import { useVoiceStore } from '../stores/voice/voiceStore';
+import { useVideoSettingsStore } from '../stores/voice/videoSettingsStore';
+import { useAudioSettingsStore } from '../stores/audio/audioSettingsStore';
 import { clampToFreeTier, type ClampableSettings } from '../utils/clampToFreeTier';
 
 /**

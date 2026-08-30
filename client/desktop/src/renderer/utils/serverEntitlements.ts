@@ -5,7 +5,7 @@
 // mirrored for lock-affordance UX only — the control-plane is authoritative
 // and hard-enforces at the (future) create boundaries.
 // -1 = unlimited (selfhost). Same mirror-comment discipline as
-// AUDIO_QUALITY_TIERS in stores/voiceStore.ts.
+// AUDIO_QUALITY_TIERS in stores/voice/voiceStore.ts.
 //
 // Rows are deep-frozen: unlike Go's ForServer (which returns a value copy),
 // serverEntitlementsFor hands back the shared row object — freezing makes an

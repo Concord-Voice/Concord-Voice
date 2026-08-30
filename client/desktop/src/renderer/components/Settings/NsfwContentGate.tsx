@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { submitSignedAgeClaim } from '../../services/ageClaim/ageClaimService';
 import { type AgeSignal } from '../../services/ageClaim/evaluateAge';
 import { useAgeStatus } from '../../hooks/useAgeStatus';
-import { useSettingsStore } from '../../stores/settingsStore';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
 import ToggleSwitch from './ToggleSwitch';
 import './NsfwContentGate.css';
 

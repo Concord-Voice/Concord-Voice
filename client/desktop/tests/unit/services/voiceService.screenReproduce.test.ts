@@ -22,8 +22,8 @@
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing voiceService
@@ -84,7 +84,7 @@ vi.mock('@/renderer/services/mediaEncryption', () => ({
   ratchetKey: vi.fn().mockResolvedValue({} as CryptoKey),
 }));
 
-vi.mock('@/renderer/stores/osPermissionStore', () => ({
+vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
   useOsPermissionStore: {
     getState: vi.fn().mockReturnValue({
       checkOne: vi.fn().mockResolvedValue('granted'),

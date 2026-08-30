@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useChangelogStore } from '../../../src/renderer/stores/changelogStore';
+import { useChangelogStore } from '../../../src/renderer/stores/ui/changelogStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('changelogStore', () => {

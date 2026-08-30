@@ -1,5 +1,5 @@
-import { useServerStore } from '@/renderer/stores/serverStore';
-import { usePermissionStore } from '@/renderer/stores/permissionStore';
+import { useServerStore } from '@/renderer/stores/chat/serverStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { INVITE } from '@/renderer/utils/permissions';
 import ContextMenu from '@/renderer/components/ui/ContextMenu';
 import './InviteServerPicker.css';

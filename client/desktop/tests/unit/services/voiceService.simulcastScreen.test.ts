@@ -12,8 +12,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { voiceService } from '@/renderer/services/voiceService';
-import { useVideoSettingsStore } from '@/renderer/stores/videoSettingsStore';
-import { useVoiceStore } from '@/renderer/stores/voiceStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 describe('voiceService screen demand cleared on last-surface unmount (#1924 Fix #5)', () => {
   let svc: any;

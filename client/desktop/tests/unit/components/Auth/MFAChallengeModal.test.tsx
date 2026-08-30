@@ -1,6 +1,9 @@
 import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
-import { useMFAChallengeStore, type MFAChallengeResult } from '@/renderer/stores/mfaChallengeStore';
+import {
+  useMFAChallengeStore,
+  type MFAChallengeResult,
+} from '@/renderer/stores/auth/mfaChallengeStore';
 import { completeSSOMFA, abandonSSOReservation } from '@/renderer/services/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 

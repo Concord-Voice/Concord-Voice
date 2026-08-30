@@ -7,7 +7,7 @@ vi.mock('@/renderer/components/Chat/MessageInputContextMenu', () => ({ default: 
 vi.mock('@/renderer/components/User/UserPanel', () => ({
   default: () => <div data-testid="user-panel" />,
 }));
-vi.mock('@/renderer/stores/layoutStore', () => ({ useLayoutStore: () => false }));
+vi.mock('@/renderer/stores/ui/layoutStore', () => ({ useLayoutStore: () => false }));
 
 /** addFiles returns { accepted, rejections } — the accepted COUNT is reported
  *  explicitly rather than derived, because one `too-many` rejection can stand

@@ -11,8 +11,8 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
-import { useAuthStore } from '@/renderer/stores/authStore';
-import { useAttestationFailureStore } from '@/renderer/stores/attestationFailureStore';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
 
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();

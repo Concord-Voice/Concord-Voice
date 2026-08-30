@@ -15,7 +15,7 @@ import {
   MonitorOff,
   PhoneOff,
 } from 'lucide-react';
-import type { VoiceParticipant } from '../../stores/voiceStore';
+import type { VoiceParticipant } from '../../stores/voice/voiceStore';
 import type { AnyPipBroadcast, VoiceStateResult } from '../../services/pipSignalingTypes';
 import { PipVoiceClient } from '../../services/pipVoiceClient';
 import ParticipantTile from './ParticipantTile';

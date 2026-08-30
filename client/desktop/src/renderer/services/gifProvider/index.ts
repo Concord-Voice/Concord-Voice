@@ -18,7 +18,7 @@
 
 import type { GifProvider } from './types';
 import { klipyProvider } from './klipyProvider';
-import { usePrivacyStore } from '../../stores/privacyStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 
 export const gifProvider: GifProvider = klipyProvider;
 export type {

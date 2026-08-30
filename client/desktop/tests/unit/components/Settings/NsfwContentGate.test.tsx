@@ -2,7 +2,7 @@ import { render, screen, fireEvent, waitFor, userEvent } from '../../../test-uti
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { AgeStatus } from '@/renderer/hooks/useAgeStatus';
-import { useSettingsStore } from '@/renderer/stores/settingsStore';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 
 const { mockSubmit, ageStatusRef } = vi.hoisted(() => ({
   mockSubmit: vi.fn(),

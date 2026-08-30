@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, userEvent } from '../../../../test-utils';
 import SubscriptionResetModal from '@/renderer/components/Settings/SubscriptionResetModal';
-import { useSettingsNavStore } from '@/renderer/stores/settingsNavStore';
-import { useSettingsOverlayStore } from '@/renderer/stores/settingsOverlayStore';
+import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { resetAllStores } from '../../../../helpers/store-helpers';
 
 beforeEach(() => {

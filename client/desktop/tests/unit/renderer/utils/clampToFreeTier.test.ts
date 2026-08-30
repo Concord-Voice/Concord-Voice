@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { clampToFreeTier, type ClampableSettings } from '@/renderer/utils/clampToFreeTier';
-import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/subscriptionStore';
+import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subscriptionStore';
 
 /** A premium entitlement that allows everything the free floor blocks. Both video
  *  axes are native (uncapped, -1 sentinel) with premium bitrate ceilings (#1602). */

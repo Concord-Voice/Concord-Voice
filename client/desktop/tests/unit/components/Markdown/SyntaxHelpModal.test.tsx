@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '../../../test-utils';
 import SyntaxHelpModal from '@/renderer/components/Markdown/SyntaxHelpModal';
-import { useSubscriptionStore } from '@/renderer/stores/subscriptionStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 
 describe('SyntaxHelpModal', () => {
   beforeEach(() => useSubscriptionStore.getState().reset()); // FREE_ENTITLEMENT (5120)

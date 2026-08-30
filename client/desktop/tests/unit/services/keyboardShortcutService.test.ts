@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import type { ShortcutDefinition } from '../../../src/renderer/stores/keyboardShortcutStore';
+import type { ShortcutDefinition } from '../../../src/renderer/stores/ui/keyboardShortcutStore';
 
 // Mock the store module before importing the service
 const mockGetState = vi.fn();
-vi.mock('../../../src/renderer/stores/keyboardShortcutStore', () => ({
+vi.mock('../../../src/renderer/stores/ui/keyboardShortcutStore', () => ({
   useKeyboardShortcutStore: {
     getState: mockGetState,
   },
