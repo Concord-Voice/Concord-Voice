@@ -209,6 +209,16 @@ func (d permitAllSenders) RichPresenceEmissionState(
 	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
 }
 
+type unavailableSenderPresence struct{}
+
+func (unavailableSenderPresence) RichPresenceEmissionPermitted(context.Context, uuid.UUID) bool {
+	return false
+}
+
+func (unavailableSenderPresence) RichPresenceEmissionState(context.Context, uuid.UUID) (bool, error) {
+	return false, errors.New("presence lookup unavailable")
+}
+
 func newMemberLoaderExecutor(t *testing.T, sendersPerChannel int) (*Executor, *memberLoaderState) {
 	t.Helper()
 	memberLoaderDriverOnce.Do(func() {
@@ -300,4 +310,21 @@ func TestPrepareCapture_DistinctServers_EachIssueTheirOwnMemberRead(t *testing.T
 
 	assert.Equal(t, []uuid.UUID{serverA, serverB}, state.readServerIDs(),
 		"each capture reads its own server's membership, in order")
+}
+
+func TestPrepareCaptureStrict_PropagatesSenderPresenceError(t *testing.T) {
+	executor, _ := newMemberLoaderExecutor(t, 1)
+	executor.senderPresence = unavailableSenderPresence{}
+	serverID := uuid.New().String()
+
+	_, err := executor.PrepareCaptureStrict(
+		context.Background(), serverID, nil, nil,
+	)
+	require.Error(t, err, "ownership capture must fail closed on an unknown sender state")
+
+	plan, err := executor.PrepareCapture(
+		context.Background(), serverID, nil, nil,
+	)
+	require.NoError(t, err, "ordinary RBAC capture retains its lenient availability contract")
+	assert.False(t, plan.HasWork())
 }

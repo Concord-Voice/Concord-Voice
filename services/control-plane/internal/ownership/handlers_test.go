@@ -2,7 +2,6 @@ package ownership_test
 
 import (
 	"context"
-	"database/sql"
 	"net/http"
 	"testing"
 	"time"
@@ -570,7 +569,10 @@ func TestAutoCompleteExpiredTransfer(t *testing.T) {
 	require.NoError(t, err)
 
 	// Directly execute the completion logic (simulating the cleanup job)
-	completeExpiredTransfers(t, ts.DB, serverID, owner.ID, member.ID)
+	require.NotNil(t, ts.CompleteExpiredTransfers)
+	ts.CompleteExpiredTransfers(context.Background())
+	// A second claim sees no pending row and must not repeat success effects.
+	ts.CompleteExpiredTransfers(context.Background())
 
 	// Verify owner_id changed
 	var newOwnerID string
@@ -583,43 +585,30 @@ func TestAutoCompleteExpiredTransfer(t *testing.T) {
 	err = ts.DB.QueryRow(`SELECT status FROM ownership_transfers WHERE server_id = $1 ORDER BY requested_at DESC LIMIT 1`, serverID).Scan(&status)
 	require.NoError(t, err)
 	assert.Equal(t, "completed", status)
-}
 
-// completeExpiredTransfers mimics the cleanup job logic for testing.
-func completeExpiredTransfers(t *testing.T, db *sql.DB, _, _, _ string) {
-	t.Helper()
+	var fromRole, toRole string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2`,
+		serverID, owner.ID,
+	).Scan(&fromRole))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2`,
+		serverID, member.ID,
+	).Scan(&toRole))
+	assert.Equal(t, keyMember, fromRole)
+	assert.Equal(t, keyOwner, toRole)
 
-	rows, err := db.QueryContext(context.Background(), `
-		SELECT id, server_id, from_user_id, to_user_id
-		FROM ownership_transfers
-		WHERE status = 'pending' AND expires_at <= NOW()
-	`)
-	require.NoError(t, err)
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		var xferID, srvID, fromUID, toUID string
-		require.NoError(t, rows.Scan(&xferID, &srvID, &fromUID, &toUID))
-
-		tx, err := db.BeginTx(context.Background(), nil)
-		require.NoError(t, err)
-		defer func() { _ = tx.Rollback() }()
-
-		_, err = tx.Exec(`UPDATE ownership_transfers SET status = 'completed', completed_at = NOW() WHERE id = $1 AND status = 'pending'`, xferID)
-		require.NoError(t, err)
-
-		_, err = tx.Exec(`UPDATE servers SET owner_id = $1 WHERE id = $2`, toUID, srvID)
-		require.NoError(t, err)
-
-		_, err = tx.Exec(`UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, srvID, fromUID)
-		require.NoError(t, err)
-
-		_, err = tx.Exec(`UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, srvID, toUID)
-		require.NoError(t, err)
-
-		require.NoError(t, tx.Commit())
-	}
-	require.NoError(t, rows.Err())
+	// The zero-row second invocation is a total no-op: ownership, roles, and
+	// transfer status remain byte-for-byte unchanged.
+	var ownerAfter, statusAfter, fromRoleAfter, toRoleAfter string
+	require.NoError(t, ts.DB.QueryRow(`SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerAfter))
+	require.NoError(t, ts.DB.QueryRow(`SELECT status FROM ownership_transfers WHERE server_id = $1`, serverID).Scan(&statusAfter))
+	require.NoError(t, ts.DB.QueryRow(`SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, owner.ID).Scan(&fromRoleAfter))
+	require.NoError(t, ts.DB.QueryRow(`SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2`, serverID, member.ID).Scan(&toRoleAfter))
+	assert.Equal(t, newOwnerID, ownerAfter)
+	assert.Equal(t, status, statusAfter)
+	assert.Equal(t, fromRole, fromRoleAfter)
+	assert.Equal(t, toRole, toRoleAfter)
 }
 
 // --- Full lifecycle: initiate → cancel → re-initiate ---

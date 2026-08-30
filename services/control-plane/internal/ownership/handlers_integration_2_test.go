@@ -468,6 +468,14 @@ func TestReverseTransferOwnershipChangedSinceTransfer(t *testing.T) {
 	var reversalToken string
 	err := ts.DB.QueryRow(`SELECT reversal_token FROM ownership_transfers WHERE server_id = $1 AND status = 'completed'`, serverID).Scan(&reversalToken)
 	require.NoError(t, err)
+	for i := 0; i < 65; i++ {
+		channelID := ts.CreateVoiceChannel(t, serverID, "revchangevc"+uuid.NewString()[:12])
+		_, err := ts.DB.Exec(
+			`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`,
+			channelID, member1.ID,
+		)
+		require.NoError(t, err)
+	}
 
 	// Manually change ownership to member2 (simulating another transfer)
 	_, err = ts.DB.Exec(`UPDATE servers SET owner_id = $1 WHERE id = $2`, member2.ID, serverID)

@@ -3,10 +3,13 @@ package api_test
 import (
 	"context"
 	"database/sql"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/ownership"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 )
 
@@ -18,6 +21,11 @@ func (stubPresenceRecheck) PrepareCapture(
 	context.Context, string, []string, *string,
 ) (rbac.PresenceRecheckPlan, error) {
 	return nil, nil
+}
+func (s stubPresenceRecheck) PrepareCaptureStrict(
+	ctx context.Context, serverID string, channelIDs []string, affectedUserID *string,
+) (rbac.PresenceRecheckPlan, error) {
+	return s.PrepareCapture(ctx, serverID, channelIDs, affectedUserID)
 }
 func (stubPresenceRecheck) CaptureVisibility(
 	context.Context, *sql.Tx, rbac.PresenceRecheckPlan,
@@ -59,4 +67,34 @@ func TestPresenceRecheckGuardPredicate_ReflectsWiring(t *testing.T) {
 		assert.False(t, h.HasPresenceRecheck(),
 			"SetPresenceRecheck(nil) is not wiring")
 	})
+
+	t.Run("ownership handler has the same fail-closed wiring states", func(t *testing.T) {
+		unwired := &ownership.Handler{}
+		assert.False(t, unwired.HasPresenceRecheck())
+
+		wired := &ownership.Handler{}
+		wired.SetPresenceRecheck(stubPresenceRecheck{})
+		assert.True(t, wired.HasPresenceRecheck())
+
+		nilWiring := &ownership.Handler{}
+		nilWiring.SetPresenceRecheck(nil)
+		assert.False(t, nilWiring.HasPresenceRecheck())
+	})
+
+	// requirePresenceRecheckWired exits the process on failure, so keep this
+	// wiring assertion source-level and exercise the handler states above.
+	source, err := os.ReadFile("router.go") // #nosec G304 -- fixed test-only source path
+	assert.NoError(t, err)
+	if err == nil {
+		contents := string(source)
+		setter := "ownershipHandler.SetPresenceRecheck(presenceRecheckExecutor)"
+		guard := "requirePresenceRecheckWired(log, activityService, rbacHandler, ownershipHandler)"
+		assert.Contains(t, contents, setter)
+		assert.Contains(t, contents, guard)
+		assert.Less(t, strings.Index(contents, setter), strings.Index(contents, guard),
+			"ownership presence wiring must precede the startup guard")
+		assert.Contains(t, contents, "ownershipHandler == nil || !ownershipHandler.HasPresenceRecheck()",
+			"the startup guard must retain the ownership consumer arm")
+		assert.Equal(t, 1, strings.Count(contents, "ownershipHandler.HasPresenceRecheck()"))
+	}
 }

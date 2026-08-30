@@ -661,9 +661,20 @@ func (r *Resolver) queryChannelIDs(ctx context.Context, wrapMsg, query string, a
 // - Server owner always outranks everyone (owner gets permissions via owner-id bypass, not via roles)
 // - Users with PermAdministrator always outrank non-administrators
 func (r *Resolver) CheckHierarchy(ctx context.Context, serverID, actorID, targetID string) error {
+	return r.checkHierarchy(ctx, r.db, serverID, actorID, targetID)
+}
+
+// CheckHierarchyTx verifies hierarchy through a caller-supplied transaction.
+// It reads and publishes no cache entry, so an authorization decision shares
+// the caller's serialization with the write it permits.
+func (r *Resolver) CheckHierarchyTx(ctx context.Context, q rowQuerier, serverID, actorID, targetID string) error {
+	return r.checkHierarchy(ctx, q, serverID, actorID, targetID)
+}
+
+func (r *Resolver) checkHierarchy(ctx context.Context, q rowQuerier, serverID, actorID, targetID string) error {
 	// Server owner bypasses hierarchy — owner can moderate anyone
 	var ownerID string
-	if err := r.db.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
 		return fmt.Errorf(errMsgHierarchyCheckFailed, err)
 	}
 	if actorID == ownerID {
@@ -671,7 +682,7 @@ func (r *Resolver) CheckHierarchy(ctx context.Context, serverID, actorID, target
 	}
 
 	// Check if actor has PermAdministrator (bypasses position-based hierarchy)
-	actorPerms, err := r.computeRolePermissions(ctx, r.db, serverID, actorID)
+	actorPerms, err := r.computeRolePermissions(ctx, q, serverID, actorID)
 	if err != nil {
 		return fmt.Errorf(errMsgHierarchyCheckFailed, err)
 	}
@@ -708,7 +719,7 @@ func (r *Resolver) CheckHierarchy(ctx context.Context, serverID, actorID, target
 	`
 
 	var canModify bool
-	if err := r.db.QueryRowContext(ctx, query, serverID, actorID, targetID).Scan(&canModify); err != nil {
+	if err := q.QueryRowContext(ctx, query, serverID, actorID, targetID).Scan(&canModify); err != nil {
 		return fmt.Errorf(errMsgHierarchyCheckFailed, err)
 	}
 

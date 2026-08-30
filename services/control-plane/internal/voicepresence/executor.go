@@ -122,6 +122,27 @@ func (e *Executor) PrepareCapture(
 	channelIDs []string,
 	onlyUserID *string,
 ) (rbac.PresenceRecheckPlan, error) {
+	return e.prepareCapture(ctx, serverID, channelIDs, onlyUserID, false)
+}
+
+// PrepareCaptureStrict is the ownership-specific strict capture path. Unlike
+// ordinary RBAC writes, it refuses an undetermined base-presence read.
+func (e *Executor) PrepareCaptureStrict(
+	ctx context.Context,
+	serverID string,
+	channelIDs []string,
+	onlyUserID *string,
+) (rbac.PresenceRecheckPlan, error) {
+	return e.prepareCapture(ctx, serverID, channelIDs, onlyUserID, true)
+}
+
+func (e *Executor) prepareCapture(
+	ctx context.Context,
+	serverID string,
+	channelIDs []string,
+	onlyUserID *string,
+	strictPresence bool,
+) (rbac.PresenceRecheckPlan, error) {
 	serverUUID, err := uuid.Parse(serverID)
 	if err != nil {
 		return nil, fmt.Errorf("parse capture server: %w", err)
@@ -146,6 +167,10 @@ func (e *Executor) PrepareCapture(
 	// error #2445 exists to prevent. It loads lazily, so a capture whose
 	// senders all have presence disabled still issues zero reads.
 	memberLoader := presence.NewServerMemberLoader(e.db, serverUUID)
+	captureCandidates := presence.CaptureServerVoiceCandidatesWithMembers
+	if strictPresence {
+		captureCandidates = presence.CaptureServerVoiceCandidatesWithMembersStrict
+	}
 	builder := newPlanBuilder(serverID, onlyUserID)
 	for _, channelID := range channelIDs {
 		senders, sendersErr := e.activeSenders(ctx, channelID)
@@ -153,7 +178,7 @@ func (e *Executor) PrepareCapture(
 			return nil, sendersErr
 		}
 		for _, sender := range senders {
-			candidates, candidateErr := presence.CaptureServerVoiceCandidatesWithMembers(
+			candidates, candidateErr := captureCandidates(
 				ctx, e.db, e.senderPresence, sender.SenderID, serverUUID, memberLoader,
 			)
 			if candidateErr != nil {
@@ -178,7 +203,7 @@ func (e *Executor) CaptureVisibility(
 	plan rbac.PresenceRecheckPlan,
 ) error {
 	typed, ok := plan.(*Plan)
-	if !ok || !typed.hasCandidates() {
+	if !ok || !typed.HasWork() {
 		// No active senders, or every sender's base presence is off. The
 		// statement sequence is identical either way: zero visibility queries,
 		// and the filter returns immediately on an empty candidate list anyway
@@ -456,7 +481,7 @@ func (e *Executor) drainOnShutdown() {
 
 func (e *Executor) dispatch(plan *Plan) {
 	for _, sender := range plan.Senders {
-		if len(sender.OldAudience) == 0 {
+		if len(sender.Candidates) == 0 {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), presenceRecheckTimeout)

@@ -274,6 +274,40 @@ func TestServerMemberLoader_FiveSenders_IssueExactlyOneMemberRead(t *testing.T) 
 		"five senders must share ONE server_members read")
 	assert.Equal(t, []uuid.UUID{serverID}, state.readServerIDs(),
 		"the read must name the capture's server")
+
+	// The ownership path uses the strict entry point, but it must retain the
+	// same per-capture member-read sharing guarantee.
+	for i := 0; i < 5; i++ {
+		candidates, err := CaptureServerVoiceCandidatesWithMembersStrict(
+			context.Background(), db, alwaysPermitPresence{}, uuid.New(), serverID, loader,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, map[uuid.UUID]bool{state.memberID: true}, candidates,
+			"strict ownership capture resolves the full membership")
+	}
+	assert.Equal(t, 1, state.readCount(),
+		"strict captures must reuse the same server_members read")
+}
+
+func TestCaptureServerVoiceCandidatesWithMembers_UndeterminedPresence_LenientVsStrict(t *testing.T) {
+	db, state := openMemberCountDB(t)
+	serverID := uuid.New()
+	senderID := uuid.New()
+	loader := NewServerMemberLoader(db, serverID)
+
+	candidates, err := CaptureServerVoiceCandidatesWithMembers(
+		context.Background(), db, undeterminedPresenceStub{}, senderID, serverID, loader,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, candidates, "ordinary RBAC captures absorb transient presence errors")
+	assert.Zero(t, state.readCount(), "the lenient error short-circuits before membership")
+
+	candidates, err = CaptureServerVoiceCandidatesWithMembersStrict(
+		context.Background(), db, undeterminedPresenceStub{}, senderID, serverID, loader,
+	)
+	require.Error(t, err, "ownership captures must not turn an unknown sender state into empty")
+	assert.Nil(t, candidates)
+	assert.Zero(t, state.readCount(), "strict presence failure precedes membership reads")
 }
 
 // TierFriends is the tier that also issues per-sender relationship reads, so

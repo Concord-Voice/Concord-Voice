@@ -335,7 +335,7 @@ func TestExecutorRows_CaptureVisibility_OnlyUserOutsideCandidates_IssuesNoQuery(
 
 	assert.Empty(t, visibility.calls,
 		"a bounded filter input that is empty needs no visibility query at all")
-	assert.False(t, plan.HasWork())
+	assert.True(t, plan.HasWork(), "candidate-bearing sender with empty captured audience still needs refresh")
 }
 
 func TestExecutorRows_CaptureVisibility_UnparseableVisibleID_IsSkipped(t *testing.T) {
@@ -430,7 +430,7 @@ func TestExecutorRows_Dispatch_ContextDeadline_DisconnectsCapturedAudience(t *te
 		"a sender-gate deadline must disconnect the captured audience")
 }
 
-func TestExecutorRows_Dispatch_SkipsSendersWithNoCapturedAudience(t *testing.T) {
+func TestExecutorRows_Dispatch_SkipsSendersWithNoCandidates(t *testing.T) {
 	captured := uuid.New()
 	skipped := uuid.New()
 	refresher := &refresherStub{done: make(chan struct{}, 2)}
@@ -439,9 +439,10 @@ func TestExecutorRows_Dispatch_SkipsSendersWithNoCapturedAudience(t *testing.T) 
 	channelID := uuid.New()
 
 	executor.Execute(&Plan{Senders: []SenderCapture{
-		{SenderID: skipped, Scope: scopeFor(channelID), OldAudience: map[uuid.UUID]bool{}},
+		{SenderID: skipped, Scope: scopeFor(channelID), Candidates: map[uuid.UUID]bool{}, OldAudience: map[uuid.UUID]bool{}},
 		{
 			SenderID: captured, Scope: scopeFor(channelID),
+			Candidates:  map[uuid.UUID]bool{uuid.New(): true},
 			OldAudience: map[uuid.UUID]bool{uuid.New(): true},
 		},
 	}})
@@ -460,7 +461,7 @@ func TestExecutorRows_Dispatch_SkipsSendersWithNoCapturedAudience(t *testing.T) 
 	refresher.mu.Lock()
 	defer refresher.mu.Unlock()
 	assert.Equal(t, []uuid.UUID{captured}, refresher.calls,
-		"a sender nobody could see before the write has nothing to reconcile")
+		"a sender with no candidates has nothing to reconcile")
 }
 
 func TestExecutorRows_Disconnect_EmptyRecipientSet_NeverTouchesTheHub(t *testing.T) {

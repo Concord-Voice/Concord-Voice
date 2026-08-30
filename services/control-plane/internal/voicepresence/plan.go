@@ -1,5 +1,6 @@
 // Package voicepresence reconciles active Server Voice Rich Presence with
-// RBAC/SBAC visibility mutations (#2445). It is the ONLY package importing both
+// authority visibility mutations, including RBAC/SBAC and ownership (#2445,
+// #2666). It is the ONLY package importing both
 // internal/rbac and internal/presence: internal/rbac declares the narrow
 // PresenceRecheck interface at the consumer, and this package implements it.
 package voicepresence
@@ -32,26 +33,11 @@ type Plan struct {
 	Senders    []SenderCapture
 }
 
-// HasWork reports whether any sender carries a non-empty CAPTURED AUDIENCE —
-// i.e. whether phase 2 found anyone who could see the sender before the write.
-// Phase-1 candidates alone are not work. A capture over a channel with no
-// active senders, or over a sender whose base presence is off, is the benign
-// terminal.
+// HasWork reports whether any sender has phase-1 candidates. A candidate-bearing
+// sender must be refreshed even if its captured audience is empty: an authority
+// change can grant the sender's current state to a newly eligible viewer.
+// CapturedAudience remains old-audience-only for fail-closed abandonment.
 func (p *Plan) HasWork() bool {
-	if p == nil {
-		return false
-	}
-	for _, sender := range p.Senders {
-		if len(sender.OldAudience) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// hasCandidates reports whether phase 1 found anything for phase 2 to filter.
-// When it is false, CaptureVisibility issues ZERO visibility queries.
-func (p *Plan) hasCandidates() bool {
 	if p == nil {
 		return false
 	}

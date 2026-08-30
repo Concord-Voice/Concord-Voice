@@ -272,8 +272,8 @@ type RouterDependencies struct {
 	MediaWriteRouter media.WriteRouter
 }
 
-// requirePresenceRecheckWired fails startup when the #2445 Rich Presence capture
-// executor is missing while the activity service is present.
+// requirePresenceRecheckWired fails startup when either Rich Presence capture
+// consumer is missing while the activity service is present.
 //
 // A missing wiring line is the one fail-OPEN path in that design: RBAC mutations
 // would commit with no capture and no clear, silently restoring the disclosure
@@ -296,8 +296,9 @@ func requirePresenceRecheckWired(
 	log *logger.Logger,
 	activityService *presence.ActivityService,
 	rbacHandler *rbac.Handler,
+	ownershipHandler *ownership.Handler,
 ) {
-	if activityService != nil && !rbacHandler.HasPresenceRecheck() {
+	if activityService != nil && (rbacHandler == nil || !rbacHandler.HasPresenceRecheck() || ownershipHandler == nil || !ownershipHandler.HasPresenceRecheck()) {
 		log.Fatal("Rich Presence recheck executor is required when the activity service is wired")
 	}
 }
@@ -565,7 +566,7 @@ func NewRouter(
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
-) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Reconciler, error) {
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Reconciler, func(context.Context), error) {
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	router := gin.New()
@@ -588,7 +589,7 @@ func NewRouter(
 	// Initialize WebSocket hub
 	hub := websocket.NewHub(db, redis, opsCounters)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Initialize NATS (inter-service messaging with media plane)
@@ -691,7 +692,6 @@ func NewRouter(
 		db, activityService, rbacResolver, senderPresence, hub, log,
 	)
 	rbacHandler.SetPresenceRecheck(presenceRecheckExecutor)
-	requirePresenceRecheckWired(log, activityService, rbacHandler)
 
 	// Initialize email service
 	emailSvc := email.NewService(cfg, log)
@@ -863,6 +863,8 @@ func NewRouter(
 	// Ownership changes are the largest single permission delta (owner
 	// short-circuit) — they must push voice rechecks too (CV-CAN-007 P1).
 	ownershipHandler.SetVoiceEnforcer(voicePermEnforcer)
+	ownershipHandler.SetPresenceRecheck(presenceRecheckExecutor)
+	requirePresenceRecheckWired(log, activityService, rbacHandler, ownershipHandler)
 	var mediaHandler *media.Handler
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
@@ -2650,7 +2652,7 @@ func NewRouter(
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
-	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, nil
+	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, ownershipHandler.CompleteExpiredTransfers, nil
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

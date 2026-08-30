@@ -675,6 +675,24 @@ func (h *Handler) classifyMutationOutcome(
 	return nil, true
 }
 
+// classifyModerationTxError maps the authoritative transaction-time denial
+// sentinels before handling an ordinary pre- or post-commit mutation failure.
+func (h *Handler) classifyModerationTxError(
+	c *gin.Context, err error, ownerMessage, hierarchyMessage, logMessage, userMessage string, logArgs ...any,
+) (*presencehook.Failure, bool) {
+	switch {
+	case errors.Is(err, errRemoveCurrentOwner), errors.Is(err, errBanCurrentOwner):
+		c.JSON(http.StatusForbidden, gin.H{"error": ownerMessage})
+	case errors.Is(err, errModerationPermissionDenied):
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInsufficientPerms})
+	case errors.Is(err, errModerationHierarchyDenied):
+		c.JSON(http.StatusForbidden, gin.H{"error": hierarchyMessage})
+	default:
+		return h.classifyMutationOutcome(c, err, logMessage, userMessage, logArgs...)
+	}
+	return nil, true
+}
+
 // respondDurableDeliveryFailure reports a mutation that COMMITTED but whose
 // presence delivery did not settle. It is called only after the caller has run
 // its full de-authorization sequence — returning before that is what left
@@ -702,6 +720,39 @@ var errMemberAlreadyPresent = errors.New("members: user is already a member")
 // errMemberAlreadyPresent it never reaches the client as a string; AddMember
 // maps it to 403.
 var errMemberBanned = errors.New("members: user is banned from this server")
+
+// These authoritative in-transaction denials keep the pooled preflight from
+// granting a moderation action after its mutable facts have changed.
+var (
+	errRemoveCurrentOwner         = errors.New("members: cannot remove the current server owner")
+	errBanCurrentOwner            = errors.New("members: cannot ban the current server owner")
+	errModerationPermissionDenied = errors.New("members: moderator no longer has permission")
+	errModerationHierarchyDenied  = errors.New("members: moderator no longer outranks target")
+)
+
+// authorizeModerationTx revalidates the mutable moderator facts inside the
+// destructive transaction. The cached preflight is only an optimization.
+func (h *Handler) authorizeModerationTx(
+	ctx context.Context, tx *sql.Tx, serverID, actorID, targetUserID string, permission rbac.Permission,
+) error {
+	perms, err := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, actorID)
+	if errors.Is(err, rbac.ErrNotMember) {
+		return errModerationPermissionDenied
+	}
+	if err != nil {
+		return fmt.Errorf("resolve current moderator permissions: %w", err)
+	}
+	if !perms.Has(permission) {
+		return errModerationPermissionDenied
+	}
+	if err := h.resolver.CheckHierarchyTx(ctx, tx, serverID, actorID, targetUserID); err != nil {
+		if errors.Is(err, rbac.ErrHierarchyViolation) {
+			return errModerationHierarchyDenied
+		}
+		return fmt.Errorf("check current moderation hierarchy: %w", err)
+	}
+	return nil
+}
 
 // hydrateJoinerPresence pushes the newly authorized viewer their current
 // snapshot. It runs AFTER the commit and NEVER changes the response: hydration
@@ -1018,6 +1069,13 @@ type removalAuth struct {
 	isSelfRemoval bool
 }
 
+func removalCurrentOwnerMessage(isSelfRemoval bool) string {
+	if isSelfRemoval {
+		return "Server owner cannot leave. Delete the server or transfer ownership first."
+	}
+	return "Cannot remove the server owner"
+}
+
 func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserID, ownerID string) (*removalAuth, int, string) {
 	isSelfRemoval := userID == targetUserID
 
@@ -1060,7 +1118,7 @@ func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserI
 // that destroys the audience being captured. Everything after this function —
 // including BroadcastToServerAndPrune's deliver-then-prune ordering — is
 // untouched: the presence work has already completed by then.
-func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID string) error {
+func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID, actorID string) error {
 	spec := presencehook.Spec{
 		Family:      presencecapture.FamilyMemberRemove,
 		Posture:     presencecapture.FailClosedBlockWrite,
@@ -1068,6 +1126,26 @@ func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID stri
 	}
 
 	return presencehook.WithGatedTx(ctx, h.graphPresence, h.db, h.log, spec, func(tx *sql.Tx) error {
+		// The ownership transfer path takes this same lock before changing
+		// servers.owner_id. It must be this transaction's first SQL statement,
+		// then the current owner must be read before capture or any destructive
+		// write, so a target that became owner cannot be removed.
+		if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+			return fmt.Errorf("lock member removal server: %w", err)
+		}
+		var ownerID string
+		if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+			return fmt.Errorf("query current server owner for member removal: %w", err)
+		}
+		if ownerID == targetUserID {
+			return errRemoveCurrentOwner
+		}
+		if actorID != targetUserID && actorID != ownerID {
+			if err := h.authorizeModerationTx(ctx, tx, serverID, actorID, targetUserID, rbac.PermKick); err != nil {
+				return err
+			}
+		}
+
 		plan, captureErr := presencehook.Capture(ctx, h.graphPresence, tx, spec)
 		if captureErr != nil {
 			return fmt.Errorf("capture member removal presence: %w", captureErr)
@@ -1168,7 +1246,7 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// delivery failed. The de-authorization sequence still runs; the 503 is
 	// written after it.
 	var deliveryFailure *presencehook.Failure
-	if err := h.execRemovalTx(c.Request.Context(), serverID, targetUserID); err != nil {
+	if err := h.execRemovalTx(c.Request.Context(), serverID, targetUserID, userID); err != nil {
 		// Classify distinguishes a PRE-commit failure (500, nothing written) from
 		// a POST-commit delivery failure (503, the member IS removed and a retry
 		// is safe). The old blanket 500 told a client nothing had happened when
@@ -1181,8 +1259,9 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		// a media-plane session. That is stale authorization on a user who has
 		// actually been removed.
 		var handled bool
-		deliveryFailure, handled = h.classifyMutationOutcome(
-			c, err, "Failed to remove member", errMsgFailedRemoveMember)
+		deliveryFailure, handled = h.classifyModerationTxError(
+			c, err, removalCurrentOwnerMessage(auth.isSelfRemoval),
+			"Cannot remove a member with equal or higher role position", "Failed to remove member", errMsgFailedRemoveMember)
 		if handled {
 			return
 		}
@@ -1315,6 +1394,26 @@ func (h *Handler) execBanTx(
 	}
 
 	return presencehook.WithGatedTx(ctx, gated, h.db, h.log, spec, func(tx *sql.Tx) error {
+		// Match ownership transfer's per-server serialization before reading the
+		// authoritative owner. This is intentionally before membership/capture:
+		// a target made owner by a concurrent transfer must not be banned or have
+		// any associated state removed.
+		if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+			return fmt.Errorf("lock member ban server: %w", err)
+		}
+		var ownerID string
+		if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+			return fmt.Errorf("query current server owner for member ban: %w", err)
+		}
+		if ownerID == targetUserID {
+			return errBanCurrentOwner
+		}
+		if actorID != ownerID {
+			if err := h.authorizeModerationTx(ctx, tx, serverID, actorID, targetUserID, rbac.PermBan); err != nil {
+				return err
+			}
+		}
+
 		// Capture ONLY when the target is actually a member.
 		//
 		// This read stays INSIDE the transaction and remains THE AUTHORITY
@@ -1480,8 +1579,9 @@ func (h *Handler) BanMember(c *gin.Context) {
 		// subscription and un-revoked channel keys is the moderation bypass this
 		// whole slice exists to close.
 		var handled bool
-		banDeliveryFailure, handled = h.classifyMutationOutcome(
-			c, err, "Failed to ban member", errMsgFailedBanMember,
+		banDeliveryFailure, handled = h.classifyModerationTxError(
+			c, err, "Cannot ban the server owner",
+			"Cannot ban a member with equal or higher role position", "Failed to ban member", errMsgFailedBanMember,
 			"server_id", serverID, "user_id", targetUserID)
 		if handled {
 			return

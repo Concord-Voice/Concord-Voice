@@ -18,7 +18,7 @@ import (
 var ErrRecheckSenderNotCurrent = errors.New("rich-presence recheck sender is not current")
 
 // RefreshServerVoiceRecheck republishes one sender's Server Voice state after
-// an RBAC/SBAC visibility mutation, clearing every captured pre-mutation viewer
+// an authority visibility mutation, clearing every captured pre-mutation viewer
 // who is absent from the freshly authorized audience.
 //
 // It mirrors RefreshPrivateCall minus the mutation: an RBAC recheck applies no
@@ -167,6 +167,21 @@ func CaptureServerVoiceCandidatesWithMembers(
 ) (map[uuid.UUID]bool, error) {
 	return captureServerVoiceCandidates(
 		ctx, db, senderPresence, senderID, serverID, loader, false,
+	)
+}
+
+// CaptureServerVoiceCandidatesWithMembersStrict is the strict counterpart to
+// CaptureServerVoiceCandidatesWithMembers for a pre-mutation ownership capture.
+func CaptureServerVoiceCandidatesWithMembersStrict(
+	ctx context.Context,
+	db DBTX,
+	senderPresence SenderPresenceResolver,
+	senderID uuid.UUID,
+	serverID uuid.UUID,
+	loader *ServerMemberLoader,
+) (map[uuid.UUID]bool, error) {
+	return captureServerVoiceCandidates(
+		ctx, db, senderPresence, senderID, serverID, loader, true,
 	)
 }
 

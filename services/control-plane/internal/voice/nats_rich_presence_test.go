@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -379,6 +380,241 @@ func TestVoiceLifecycle_ComposedServerRichPresenceWireJoinMoveLeave(t *testing.T
 	require.Equal(t, sender.ID, newClear.Data["user_id"])
 	require.Equal(t, string(presence.CategoryServerVoice), newClear.Data["category"])
 	requireNoVoiceWireType(t, outsiderConn, "rich_presence_update")
+}
+
+// Regression for #2666: ownership is an authority input to channel visibility,
+// so confirming a transfer must reconcile already-delivered Server Voice state.
+func TestOwnershipTransfer_ReconcilesServerVoiceRecipients(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sender := ts.CreateTestUser(t, "rp_owner_sender")
+	oldOwner := ts.CreateTestUser(t, "rp_owner_old")
+	newOwner := ts.CreateTestUser(t, "rp_owner_new")
+	retained := ts.CreateTestUser(t, "rp_owner_retained")
+	serverID := ts.CreateTestServer(t, oldOwner.ID, "RP Ownership Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "rp-owner")
+	for _, user := range []testhelpers.TestUser{sender, newOwner, retained} {
+		ts.AddMemberToServer(t, serverID, user.ID, "member")
+	}
+	ts.CreateChannelOverride(t, channelID, "user", newOwner.ID, 0,
+		int64(rbac.PermViewVoiceChannels))
+	ts.CreateChannelOverride(t, channelID, "user", oldOwner.ID, 0,
+		int64(rbac.PermViewVoiceChannels))
+	_, err := ts.DB.Exec(`
+		INSERT INTO user_presence_settings
+			(user_id, master_enabled, server_voice_tier, server_voice_show_details)
+		VALUES ($1, TRUE, $2, FALSE)
+	`, sender.ID, presence.TierServers)
+	require.NoError(t, err)
+
+	oldConn := connectVoiceWireClient(t, ts, oldOwner)
+	retainedConn := connectVoiceWireClient(t, ts, retained)
+	senderConn := connectVoiceWireClient(t, ts, sender)
+	for _, conn := range []*gorillaWS.Conn{oldConn, retainedConn, senderConn} {
+		synchronizeVoiceWireClient(t, conn)
+	}
+	sub := newTestSubscriber(ts)
+	joinedAt := time.Date(2026, 8, 27, 12, 0, 0, 123456000, time.UTC)
+	sub.HandleJoined(mustJSON(t, map[string]interface{}{
+		"channelId": channelID, "userId": sender.ID, "username": sender.Username,
+		"timestamp": joinedAt.Format(time.RFC3339Nano),
+	}))
+	state, found, stateErr := presence.NewActivityStore(ts.Redis).Get(
+		context.Background(), uuid.MustParse(sender.ID), presence.CategoryServerVoice)
+	require.NoError(t, stateErr)
+	require.True(t, found, "initial generation must exist before ownership reconciliation")
+	require.Equal(t, uuid.MustParse(channelID), state.SourceToken)
+	lifecycleKey, keyErr := presence.VoiceLifecycleKey(uuid.MustParse(sender.ID), presence.CategoryServerVoice)
+	require.NoError(t, keyErr)
+	lifecycle, lifecycleErr := ts.Redis.HGetAll(context.Background(), lifecycleKey).Result()
+	require.NoError(t, lifecycleErr)
+	require.Len(t, lifecycle, 3, "voice lifecycle watermark must have exactly token, version, and active fields")
+	require.Equal(t, channelID, lifecycle["token"])
+	require.Equal(t, strconv.FormatInt(joinedAt.UnixMicro(), 10), lifecycle["version"])
+	require.Equal(t, "1", lifecycle["active"])
+	pttl, pttlErr := ts.Redis.PTTL(context.Background(), lifecycleKey).Result()
+	require.NoError(t, pttlErr)
+	require.Greater(t, pttl, time.Duration(0))
+	require.LessOrEqual(t, pttl, presence.ActivityStateTTL)
+	waitForVoiceWireType(t, oldConn, "rich_presence_update")
+	waitForVoiceWireType(t, retainedConn, "rich_presence_update")
+	newConn := connectVoiceWireClient(t, ts, newOwner)
+	synchronizeVoiceWireClient(t, newConn)
+
+	initiate := ts.DoRequest("POST", "/api/v1/servers/"+serverID+"/transfer-ownership",
+		map[string]interface{}{"target_user_id": newOwner.ID, "password": testhelpers.TestAuthPlaintext},
+		testhelpers.AuthHeaders(oldOwner.AccessToken))
+	require.Equal(t, http.StatusCreated, initiate.Code)
+	confirm := ts.DoRequest("POST", "/api/v1/servers/"+serverID+"/transfer-ownership/confirm",
+		nil, testhelpers.AuthHeaders(oldOwner.AccessToken))
+	require.Equal(t, http.StatusOK, confirm.Code)
+	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), logger.New("test-ownership-repro"))
+	oldVisible, visibilityErr := resolver.HasPermission(context.Background(), serverID, oldOwner.ID, channelID, rbac.PermViewVoiceChannels)
+	require.NoError(t, visibilityErr)
+	require.False(t, oldVisible, "fresh ownership visibility must revoke the outgoing owner's channel access")
+
+	clearFrame, clearErr := receiveVoiceWireType(oldConn, sender.ID, "rich_presence_clear")
+	require.NoError(t, clearErr, "ownership loss must clear the outgoing owner's view")
+	require.Equal(t, sender.ID, clearFrame.Data["user_id"], "ownership loss must clear the outgoing owner's view")
+	require.Equal(t, string(presence.CategoryServerVoice), clearFrame.Data["category"])
+	update, updateErr := receiveVoiceWireType(newConn, sender.ID, "rich_presence_update")
+	require.NoError(t, updateErr, "new owner must receive the current minimized update")
+	require.Equal(t, sender.ID, update.Data["user_id"], "new owner must receive the current minimized update")
+	require.Equal(t, string(presence.CategoryServerVoice), update.Data["category"])
+	require.Equal(t, true, update.Data["minimized"], "new owner must receive a minimized current update")
+	assertMinimalServerVoicePayload(t, update.Data["payload"], channelID, serverID, joinedAt)
+	requireNoVoiceWireType(t, retainedConn, "rich_presence_clear")
+}
+
+// Reversal must produce the exact inverse delta: the restored owner receives
+// the current state and the former owner is cleared; an unchanged viewer is
+// never cleared.
+func TestOwnershipReversal_ReconcilesInverseRecipients(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sender := ts.CreateTestUser(t, "rp_reverse_sender")
+	oldOwner := ts.CreateTestUser(t, "rp_reverse_old")
+	newOwner := ts.CreateTestUser(t, "rp_reverse_new")
+	retained := ts.CreateTestUser(t, "rp_reverse_retained")
+	serverID := ts.CreateTestServer(t, oldOwner.ID, "RP Reversal Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "rp-reversal")
+	for _, user := range []testhelpers.TestUser{sender, newOwner, retained} {
+		ts.AddMemberToServer(t, serverID, user.ID, "member")
+	}
+	// Owner bypass is the only initial visibility for oldOwner/newOwner.
+	ts.CreateChannelOverride(t, channelID, "user", oldOwner.ID, 0, int64(rbac.PermViewVoiceChannels))
+	ts.CreateChannelOverride(t, channelID, "user", newOwner.ID, 0, int64(rbac.PermViewVoiceChannels))
+	// Retained visibility is explicit and survives both ownership writes.
+	ts.CreateChannelOverride(t, channelID, "user", retained.ID, int64(rbac.PermViewVoiceChannels), 0)
+	_, err := ts.DB.Exec(`INSERT INTO user_presence_settings
+		(user_id, master_enabled, server_voice_tier, server_voice_show_details)
+		VALUES ($1, TRUE, $2, FALSE)`, sender.ID, presence.TierServers)
+	require.NoError(t, err)
+
+	oldConn := connectVoiceWireClient(t, ts, oldOwner)
+	newConn := connectVoiceWireClient(t, ts, newOwner)
+	retainedConn := connectVoiceWireClient(t, ts, retained)
+	senderConn := connectVoiceWireClient(t, ts, sender)
+	for _, conn := range []*gorillaWS.Conn{oldConn, newConn, retainedConn, senderConn} {
+		synchronizeVoiceWireClient(t, conn)
+	}
+	sub := newTestSubscriber(ts)
+	joinedAt := time.Date(2026, 8, 27, 12, 30, 0, 123456000, time.UTC)
+	sub.HandleJoined(mustJSON(t, map[string]interface{}{
+		"channelId": channelID, "userId": sender.ID, "username": sender.Username,
+		"timestamp": joinedAt.Format(time.RFC3339Nano),
+	}))
+	waitForVoiceWireType(t, oldConn, "rich_presence_update")
+	waitForVoiceWireType(t, retainedConn, "rich_presence_update")
+
+	initiate := ts.DoRequest("POST", "/api/v1/servers/"+serverID+"/transfer-ownership",
+		map[string]interface{}{"target_user_id": newOwner.ID, "password": testhelpers.TestAuthPlaintext},
+		testhelpers.AuthHeaders(oldOwner.AccessToken))
+	require.Equal(t, http.StatusCreated, initiate.Code)
+	confirm := ts.DoRequest("POST", "/api/v1/servers/"+serverID+"/transfer-ownership/confirm", nil,
+		testhelpers.AuthHeaders(oldOwner.AccessToken))
+	require.Equal(t, http.StatusOK, confirm.Code)
+	_, err = receiveVoiceWireType(oldConn, sender.ID, "rich_presence_clear")
+	require.NoError(t, err)
+	_, err = receiveVoiceWireType(newConn, sender.ID, "rich_presence_update")
+	require.NoError(t, err)
+
+	var reversalToken string
+	require.NoError(t, ts.DB.QueryRow(`SELECT reversal_token FROM ownership_transfers WHERE server_id = $1 AND status = 'completed'`, serverID).Scan(&reversalToken))
+	reverse := ts.DoRequest("POST", "/api/v1/ownership/reverse/"+reversalToken,
+		map[string]interface{}{"password": testhelpers.TestAuthPlaintext}, testhelpers.AuthHeaders(oldOwner.AccessToken))
+	require.Equal(t, http.StatusOK, reverse.Code)
+	clearFrame, clearErr := receiveVoiceWireType(newConn, sender.ID, "rich_presence_clear")
+	require.NoError(t, clearErr)
+	require.Equal(t, sender.ID, clearFrame.Data["user_id"])
+	require.Equal(t, string(presence.CategoryServerVoice), clearFrame.Data["category"])
+	update, updateErr := receiveVoiceWireType(oldConn, sender.ID, "rich_presence_update")
+	require.NoError(t, updateErr)
+	require.Equal(t, sender.ID, update.Data["user_id"])
+	require.Equal(t, string(presence.CategoryServerVoice), update.Data["category"])
+	require.Equal(t, true, update.Data["minimized"])
+	assertMinimalServerVoicePayload(t, update.Data["payload"], channelID, serverID, joinedAt)
+	requireNoVoiceWireType(t, retainedConn, "rich_presence_clear")
+}
+
+func TestExpiredOwnershipTransfer_ReconcilesServerVoiceRecipients(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sender := ts.CreateTestUser(t, "rp_expiry_sender")
+	oldOwner := ts.CreateTestUser(t, "rp_expiry_old")
+	newOwner := ts.CreateTestUser(t, "rp_expiry_new")
+	retained := ts.CreateTestUser(t, "rp_expiry_retained")
+	serverID := ts.CreateTestServer(t, oldOwner.ID, "RP Expiry Server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "rp-expiry")
+	for _, user := range []testhelpers.TestUser{sender, newOwner, retained} {
+		ts.AddMemberToServer(t, serverID, user.ID, "member")
+	}
+	ts.CreateChannelOverride(t, channelID, "user", newOwner.ID, 0, int64(rbac.PermViewVoiceChannels))
+	ts.CreateChannelOverride(t, channelID, "user", oldOwner.ID, 0, int64(rbac.PermViewVoiceChannels))
+	ts.CreateChannelOverride(t, channelID, "user", retained.ID, int64(rbac.PermViewVoiceChannels), 0)
+	_, err := ts.DB.Exec(`INSERT INTO user_presence_settings (user_id, master_enabled, server_voice_tier, server_voice_show_details) VALUES ($1, TRUE, $2, FALSE)`, sender.ID, presence.TierServers)
+	require.NoError(t, err)
+	oldConn := connectVoiceWireClient(t, ts, oldOwner)
+	retainedConn := connectVoiceWireClient(t, ts, retained)
+	senderConn := connectVoiceWireClient(t, ts, sender)
+	for _, conn := range []*gorillaWS.Conn{oldConn, retainedConn, senderConn} {
+		synchronizeVoiceWireClient(t, conn)
+	}
+	sub := newTestSubscriber(ts)
+	joinedAt := time.Date(2026, 8, 27, 13, 0, 0, 123456000, time.UTC)
+	sub.HandleJoined(mustJSON(t, map[string]interface{}{"channelId": channelID, "userId": sender.ID, "username": sender.Username, "timestamp": joinedAt.Format(time.RFC3339Nano)}))
+	waitForVoiceWireType(t, oldConn, "rich_presence_update")
+	waitForVoiceWireType(t, retainedConn, "rich_presence_update")
+	newConn := connectVoiceWireClient(t, ts, newOwner)
+	synchronizeVoiceWireClient(t, newConn)
+	initiate := ts.DoRequest("POST", "/api/v1/servers/"+serverID+"/transfer-ownership", map[string]interface{}{"target_user_id": newOwner.ID, "password": testhelpers.TestAuthPlaintext}, testhelpers.AuthHeaders(oldOwner.AccessToken))
+	require.Equal(t, http.StatusCreated, initiate.Code)
+	_, err = ts.DB.Exec(`UPDATE ownership_transfers SET expires_at = NOW() - INTERVAL '1 hour' WHERE server_id = $1 AND status = 'pending'`, serverID)
+	require.NoError(t, err)
+	require.NotNil(t, ts.CompleteExpiredTransfers)
+	ts.CompleteExpiredTransfers(context.Background())
+	clearFrame, clearErr := receiveVoiceWireType(oldConn, sender.ID, "rich_presence_clear")
+	require.NoError(t, clearErr)
+	require.Equal(t, sender.ID, clearFrame.Data["user_id"])
+	require.Equal(t, string(presence.CategoryServerVoice), clearFrame.Data["category"])
+	update, updateErr := receiveVoiceWireType(newConn, sender.ID, "rich_presence_update")
+	require.NoError(t, updateErr)
+	require.Equal(t, sender.ID, update.Data["user_id"])
+	require.Equal(t, string(presence.CategoryServerVoice), update.Data["category"])
+	require.Equal(t, true, update.Data["minimized"])
+	assertMinimalServerVoicePayload(t, update.Data["payload"], channelID, serverID, joinedAt)
+	requireNoVoiceWireType(t, retainedConn, "rich_presence_clear")
+}
+
+func receiveVoiceWireType(conn *gorillaWS.Conn, senderID, wantType string) (voiceWireEnvelope, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return voiceWireEnvelope{}, err
+	}
+	for {
+		var envelope voiceWireEnvelope
+		if err := conn.ReadJSON(&envelope); err != nil {
+			return voiceWireEnvelope{}, err
+		}
+		if envelope.Type == wantType {
+			return envelope, nil
+		}
+		if (envelope.Type == "rich_presence_clear" || envelope.Type == "rich_presence_update") &&
+			envelope.Data["user_id"] == senderID && envelope.Data["category"] == string(presence.CategoryServerVoice) {
+			return voiceWireEnvelope{}, fmt.Errorf("unexpected %s for sender %s while waiting for %s", envelope.Type, senderID, wantType)
+		}
+	}
+}
+
+func assertMinimalServerVoicePayload(t *testing.T, raw interface{}, channelID, serverID string, joinedAt time.Time) {
+	t.Helper()
+	payload, ok := raw.(map[string]interface{})
+	require.True(t, ok)
+	require.Len(t, payload, 3)
+	for _, key := range []string{"channel_id", "server_id", "started_at"} {
+		require.Contains(t, payload, key)
+	}
+	require.Equal(t, channelID, payload["channel_id"])
+	require.Equal(t, serverID, payload["server_id"])
+	require.Equal(t, float64(joinedAt.Unix()), payload["started_at"])
+	require.NotContains(t, payload, "channel_name")
+	require.NotContains(t, payload, "server_name")
 }
 
 func TestVoiceLifecycle_ComposedPrivateRichPresenceWireJoinLeaveEnd(t *testing.T) {

@@ -69,11 +69,12 @@ func (s *SyncBuffer) Reset() {
 
 // TestServer wraps a fully-wired Gin router with a real DB and Redis for integration testing.
 type TestServer struct {
-	Router          *gin.Engine
-	Hub             *websocket.Hub
-	DB              *sql.DB
-	Redis           *redis.Client
-	PresenceHistory *presencehistory.Service
+	Router                   *gin.Engine
+	Hub                      *websocket.Hub
+	DB                       *sql.DB
+	Redis                    *redis.Client
+	PresenceHistory          *presencehistory.Service
+	CompleteExpiredTransfers func(context.Context)
 
 	// logBuf captures all structured-log output emitted by handlers during the
 	// test. It is written alongside os.Stdout via an io.MultiWriter so human
@@ -124,7 +125,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, completeExpiredTransfers, err := api.NewRouter(
 		db,
 		redisClient,
 		nil,
@@ -156,12 +157,13 @@ func SetupTestServer(t *testing.T) *TestServer {
 	t.Cleanup(closePresence)
 
 	return &TestServer{
-		Router:          router,
-		Hub:             hub,
-		DB:              db,
-		Redis:           redisClient,
-		PresenceHistory: presenceHistoryService,
-		logBuf:          logBuf,
+		Router:                   router,
+		Hub:                      hub,
+		DB:                       db,
+		Redis:                    redisClient,
+		PresenceHistory:          presenceHistoryService,
+		CompleteExpiredTransfers: completeExpiredTransfers,
+		logBuf:                   logBuf,
 	}
 }
 

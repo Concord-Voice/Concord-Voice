@@ -88,6 +88,7 @@ func planWith(senderID uuid.UUID, viewers ...uuid.UUID) *Plan {
 	return &Plan{Senders: []SenderCapture{{
 		SenderID:    senderID,
 		Scope:       scopeFor(channelID),
+		Candidates:  map[uuid.UUID]bool{uuid.New(): true},
 		OldAudience: audience,
 	}}}
 }
@@ -108,6 +109,48 @@ func TestExecutor_Execute_DispatchesOneRefreshPerSender(t *testing.T) {
 	refresher.mu.Lock()
 	defer refresher.mu.Unlock()
 	assert.Equal(t, []uuid.UUID{senderID}, refresher.calls)
+}
+
+func TestExecutor_Execute_CandidateBearingSenderWithEmptyAudienceRefreshes(t *testing.T) {
+	refresher := &refresherStub{done: make(chan struct{}, 1)}
+	executor := newTestExecutor(refresher, &disconnectorStub{})
+	defer executor.Close()
+	senderID := uuid.New()
+	channelID := uuid.New()
+
+	executor.Execute(&Plan{Senders: []SenderCapture{{
+		SenderID:    senderID,
+		Scope:       scopeFor(channelID),
+		Candidates:  map[uuid.UUID]bool{uuid.New(): true},
+		OldAudience: map[uuid.UUID]bool{},
+	}}})
+
+	select {
+	case <-refresher.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("candidate-bearing sender with empty captured audience was not refreshed")
+	}
+	refresher.mu.Lock()
+	defer refresher.mu.Unlock()
+	require.Equal(t, []uuid.UUID{senderID}, refresher.calls,
+		"candidate-bearing sender must reach current-state refresh dispatch")
+}
+
+func TestExecutor_Execute_SenderWithoutCandidatesDoesNotRefresh(t *testing.T) {
+	refresher := &refresherStub{}
+	executor := newTestExecutor(refresher, &disconnectorStub{})
+	defer executor.Close()
+
+	executor.Execute(&Plan{Senders: []SenderCapture{{
+		SenderID:    uuid.New(),
+		Scope:       scopeFor(uuid.New()),
+		Candidates:  map[uuid.UUID]bool{},
+		OldAudience: map[uuid.UUID]bool{},
+	}}})
+
+	refresher.mu.Lock()
+	defer refresher.mu.Unlock()
+	assert.Empty(t, refresher.calls, "sender without candidates must not queue or refresh")
 }
 
 func TestExecutor_Execute_SenderNotCurrent_DisconnectsOnlyThatSendersViewers(t *testing.T) {
@@ -150,8 +193,8 @@ func TestExecutor_Abandon_DisconnectsTheWholeCapturedAudience(t *testing.T) {
 	viewerA, viewerB := uuid.New(), uuid.New()
 
 	executor.Abandon(&Plan{Senders: []SenderCapture{
-		{SenderID: uuid.New(), OldAudience: map[uuid.UUID]bool{viewerA: true}},
-		{SenderID: uuid.New(), OldAudience: map[uuid.UUID]bool{viewerB: true}},
+		{SenderID: uuid.New(), Candidates: map[uuid.UUID]bool{uuid.New(): true}, OldAudience: map[uuid.UUID]bool{viewerA: true}},
+		{SenderID: uuid.New(), Candidates: map[uuid.UUID]bool{uuid.New(): true}, OldAudience: map[uuid.UUID]bool{viewerB: true}},
 	}}, "ambiguous_commit")
 
 	disconnector.mu.Lock()

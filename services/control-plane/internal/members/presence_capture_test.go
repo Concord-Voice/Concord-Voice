@@ -14,14 +14,16 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 var errCaptureDoubleReached = errors.New("members: capture double reached")
 
 // recordingCapture is a GraphPresenceCapture double that records the Subject the
-// handler hands it. It never opens a transaction, so it exercises the
-// handler-side wiring without a database.
+// handler hands it. By default it exercises handler-side wiring without a
+// database; its optional db is used by the capture-failure test so the handler
+// closure reaches the real transaction guard before the forced capture error.
 //
 // WithGatedTx returns a sentinel rather than running work: the point of these
 // tests is the SUBJECT, and running the closure would need a real *sql.Tx. A
@@ -32,18 +34,34 @@ type recordingCapture struct {
 
 	// runWork makes WithGatedTx invoke the handler's closure instead of
 	// short-circuiting, so the capture-failure branch inside it can be reached.
-	// It hands the closure a nil *sql.Tx, which is safe ONLY in combination with
-	// captureErr: the branch returns before any statement runs.
+	// With no db it hands the closure a nil *sql.Tx for subject-only tests. That
+	// mode is safe only when the closure returns before any statement runs.
 	runWork    bool
 	captureErr error
+	db         *sql.DB
 }
 
 func (r *recordingCapture) WithGatedTx(
-	_ context.Context, subject presencecapture.Subject, work func(*sql.Tx) error,
-) error {
+	ctx context.Context, subject presencecapture.Subject, work func(*sql.Tx) error,
+) (err error) {
 	r.subjects = append(r.subjects, subject)
 	if r.runWork {
-		return work(nil)
+		if r.db == nil {
+			return work(nil)
+		}
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				err = errors.Join(err, fmt.Errorf("rollback capture-double transaction: %w", rollbackErr))
+			}
+		}()
+		if err = work(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	return errCaptureDoubleReached
 }
@@ -79,7 +97,7 @@ const (
 func TestRemovalCaptureSubject(t *testing.T) {
 	h, capture := newCaptureHandler(t)
 
-	err := h.execRemovalTx(context.Background(), captureServerID, captureTargetID)
+	err := h.execRemovalTx(context.Background(), captureServerID, captureTargetID, captureTargetID)
 	require.ErrorIs(t, err, errCaptureDoubleReached,
 		"the removal must enter through presencehook.WithGatedTx")
 
@@ -140,11 +158,16 @@ func TestMembershipFamilyPolicies(t *testing.T) {
 // end-to-end by TestBanMemberFailsClosedWhenTheDeleteFails instead.
 func TestRemovalFailsClosedOnCaptureFailure(t *testing.T) {
 	forced := errors.New("forced capture read failure")
-	capture := &recordingCapture{runWork: true, captureErr: forced}
-	h := &Handler{log: logger.New("test")}
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ownerID := dbtest.CreateUser(t, db)
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'capture failure server', $2)`, captureServerID, ownerID)
+	require.NoError(t, err)
+	capture := &recordingCapture{runWork: true, captureErr: forced, db: db}
+	h := &Handler{db: db, log: logger.New("test")}
 	h.SetGraphPresenceCapture(capture)
 
-	err := h.execRemovalTx(context.Background(), captureServerID, captureTargetID)
+	err = h.execRemovalTx(context.Background(), captureServerID, captureTargetID, captureTargetID)
 
 	require.ErrorIs(t, err, forced,
 		"a capture read failure must surface, not be swallowed into a successful removal")
@@ -241,6 +264,62 @@ func TestClassifyMutationOutcomeSplitsDurableFromTerminal(t *testing.T) {
 		// was written — the response comes after de-authorization.
 		require.Empty(t, rec.Body.String(),
 			"nothing may be written yet; the handler still has de-authorization to do")
+	})
+}
+
+func TestClassifyModerationTxErrorMapsTransactionDenialsAndDelegates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &Handler{log: logger.New("test")}
+	cases := []struct {
+		name, errText, hierarchyText, want string
+		err                                error
+	}{
+		{name: "kick current owner", err: errRemoveCurrentOwner, errText: "Cannot remove the server owner", want: "Cannot remove the server owner"},
+		{name: "self leave current owner", err: errRemoveCurrentOwner, errText: "Server owner cannot leave. Delete the server or transfer ownership first.", want: "Server owner cannot leave. Delete the server or transfer ownership first."},
+		{name: "ban current owner", err: errBanCurrentOwner, errText: "Cannot ban the server owner", want: "Cannot ban the server owner"},
+		{name: "kick permission", err: errModerationPermissionDenied, errText: "unused", want: errMsgInsufficientPerms},
+		{name: "ban permission", err: errModerationPermissionDenied, errText: "unused", want: errMsgInsufficientPerms},
+		{name: "kick hierarchy", err: errModerationHierarchyDenied, errText: "unused", hierarchyText: "Cannot remove a member with equal or higher role position", want: "Cannot remove a member with equal or higher role position"},
+		{name: "ban hierarchy", err: errModerationHierarchyDenied, errText: "unused", hierarchyText: "Cannot ban a member with equal or higher role position", want: "Cannot ban a member with equal or higher role position"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			failure, handled := h.classifyModerationTxError(
+				c, tc.err, tc.errText,
+				tc.hierarchyText, "log", "user-facing")
+
+			require.True(t, handled)
+			require.Nil(t, failure)
+			require.Equal(t, http.StatusForbidden, rec.Code)
+			require.JSONEq(t, fmt.Sprintf(`{"error":%q}`, tc.want), rec.Body.String())
+		})
+	}
+
+	t.Run("pre-commit failure delegates and halts", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		failure, handled := h.classifyModerationTxError(
+			c, errors.New("begin tx: connection refused"),
+			"owner", "hierarchy", "log", "user-facing")
+
+		require.True(t, handled)
+		require.Nil(t, failure)
+		require.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
+
+	t.Run("durable delivery failure delegates and continues", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		failure, handled := h.classifyModerationTxError(
+			c, fmt.Errorf("deliver: %w", presencecapture.ErrPostCommitDelivery),
+			"owner", "hierarchy", "log", "user-facing")
+
+		require.False(t, handled)
+		require.NotNil(t, failure)
+		require.Equal(t, http.StatusServiceUnavailable, failure.Status)
+		require.Empty(t, rec.Body.String())
 	})
 }
 

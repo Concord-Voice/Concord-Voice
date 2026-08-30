@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"errors"
 	"testing"
 
@@ -12,52 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
-
-type resultWithRowsAffected struct {
-	rows int64
-	err  error
-}
-
-var _ sql.Result = resultWithRowsAffected{}
-
-func (r resultWithRowsAffected) LastInsertId() (int64, error) {
-	return 0, nil
-}
-
-func (r resultWithRowsAffected) RowsAffected() (int64, error) {
-	return r.rows, r.err
-}
-
-func TestCheckedRowsAffectedReturnsCount(t *testing.T) {
-	got, err := checkedRowsAffected(resultWithRowsAffected{rows: 2}, "update member role")
-	require.NoError(t, err)
-	assert.Equal(t, int64(2), got)
-}
-
-func TestCheckedRowsAffectedWrapsDriverError(t *testing.T) {
-	wantErr := errors.New("driver rows-affected failure")
-	_, err := checkedRowsAffected(resultWithRowsAffected{err: wantErr}, "update member role")
-	require.ErrorIs(t, err, wantErr)
-	assert.ErrorContains(t, err, "update member role")
-}
-
-func TestJoinCleanupErrorPreservesBothErrors(t *testing.T) {
-	primaryErr := errors.New("transaction operation failed")
-	cleanupErr := errors.New("rollback failed")
-
-	err := joinCleanupError("rollback transfer transaction", primaryErr, cleanupErr)
-
-	require.ErrorIs(t, err, primaryErr)
-	require.ErrorIs(t, err, cleanupErr)
-	assert.ErrorContains(t, err, "rollback transfer transaction")
-}
-
-func TestJoinCleanupErrorReturnsPrimaryWhenCleanupSucceeds(t *testing.T) {
-	primaryErr := errors.New("transaction operation failed")
-	assert.ErrorIs(t, joinCleanupError("rollback transfer transaction", primaryErr, nil), primaryErr)
-}
 
 type stubPresenceStore struct {
 	keys      []string

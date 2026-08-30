@@ -193,6 +193,7 @@ func runControlPlane() (runErr error) {
 	// there). The nightly temp-grant sweep constructs its own tempGrantManager
 	// out here, so the executor is carried out to wire it.
 	var voicePresenceRecheck rbac.PresenceRecheck
+	completeExpiredOwnershipTransfers := func(context.Context) {}
 	// Closes both presence dispatch workers; ordered before hub.Shutdown so
 	// their fail-closed drains can still reach live sockets (#2738).
 	closePresenceWorkers := func() {}
@@ -214,7 +215,7 @@ func runControlPlane() (runErr error) {
 		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
 			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck,
-				closePresence, activePlans, routerErr := api.NewRouter(
+				closePresence, activePlans, completeExpiredTransfers, routerErr := api.NewRouter(
 				db,
 				redisClient,
 				mediaStore,
@@ -236,6 +237,7 @@ func runControlPlane() (runErr error) {
 			voicePresenceRecheck = presenceRecheck
 			closePresenceWorkers = closePresence
 			activePlanReconciler = activePlans
+			completeExpiredOwnershipTransfers = completeExpiredTransfers
 			return router, hub, natsClient, nil
 		},
 		reconcilePending: presenceHistoryService.ReconcilePending,
@@ -261,7 +263,7 @@ func runControlPlane() (runErr error) {
 		}
 	}
 
-	go runCleanupJob(cleanupCtx, db, redisClient, hub, log)
+	go runCleanupJob(cleanupCtx, db, redisClient, hub, log, completeExpiredOwnershipTransfers)
 
 	pendingRepo := auth.NewPendingRepo(db)
 	auth.StartPendingCleanupWorker(cleanupCtx, pendingRepo, log, auth.PendingCleanupInterval)
@@ -692,17 +694,17 @@ func initStorageClient(cfg *config.Config, log *logger.Logger) (*storage.Client,
 // runCleanupJob periodically purges expired tokens, stale sessions, and orphaned
 // Redis presence keys. The server must not rely on clients to clean up after
 // themselves — this job is the authoritative backstop.
-func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger) {
+func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger, ownershipCleanup func(context.Context)) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	// Run once at startup to catch anything that accumulated while the server was down
-	runCleanup(ctx, db, redisClient, hub, log)
+	runCleanup(ctx, db, redisClient, hub, log, ownershipCleanup)
 
 	for {
 		select {
 		case <-ticker.C:
-			runCleanup(ctx, db, redisClient, hub, log)
+			runCleanup(ctx, db, redisClient, hub, log, ownershipCleanup)
 		case <-ctx.Done():
 			log.Info("Cleanup job stopped")
 			return
@@ -710,7 +712,7 @@ func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, h
 	}
 }
 
-func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger) {
+func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger, ownershipCleanup func(context.Context)) {
 	taskCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -741,8 +743,11 @@ func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub 
 	// Task 3: Clean stale Redis presence keys
 	cleanupStalePresence(taskCtx, redisClient, hub, log)
 
-	// Task 4: Auto-complete expired ownership transfers
-	cleanupExpiredTransfers(taskCtx, db, redisClient, hub, log)
+	// Task 4: Auto-complete expired ownership transfers through the ownership
+	// handler, which owns its capture-bound authority transaction.
+	if ownershipCleanup != nil {
+		ownershipCleanup(taskCtx)
+	}
 
 	log.Debug("Cleanup completed")
 }
@@ -790,187 +795,4 @@ func cleanupStalePresence(ctx context.Context, redisClient stalePresenceStore, h
 	if staleCount > 0 {
 		log.Info("Cleanup: removed stale presence keys", logKeyCount, staleCount)
 	}
-}
-
-// cleanupExpiredTransfers finds pending ownership transfers past their 24h window
-// and completes them atomically (owner_id + server_members.role swap).
-func cleanupExpiredTransfers(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT id, server_id, from_user_id, to_user_id
-		FROM ownership_transfers
-		WHERE status = 'pending' AND expires_at <= NOW()
-	`)
-	if err != nil {
-		log.Error("Cleanup: failed to query expired transfers", "error", err)
-		return
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			log.Error("Cleanup: failed to close expired transfer rows", "error", closeErr)
-		}
-	}()
-
-	for rows.Next() {
-		var xfer pendingTransfer
-		if err := rows.Scan(&xfer.id, &xfer.serverID, &xfer.fromUserID, &xfer.toUserID); err != nil {
-			log.Error("Cleanup: failed to scan expired transfer", "error", err)
-			continue
-		}
-		if err := completeOwnershipTransfer(ctx, db, redisClient, hub, xfer); err != nil {
-			log.Error("Cleanup: failed to auto-complete transfer", "error", err,
-				"transfer_id", xfer.id, logKeyServerID, xfer.serverID)
-		} else {
-			log.Info("Cleanup: auto-completed ownership transfer",
-				"transfer_id", xfer.id, logKeyServerID, xfer.serverID,
-				"from_user_id", xfer.fromUserID, "to_user_id", xfer.toUserID)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Error("Cleanup: error during expired transfers iteration", "error", err)
-	}
-}
-
-// pendingTransfer holds the fields needed to complete an expired transfer.
-type pendingTransfer struct {
-	id, serverID, fromUserID, toUserID string
-}
-
-// completeOwnershipTransfer atomically transfers server ownership and invalidates caches.
-func completeOwnershipTransfer(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, xfer pendingTransfer) error {
-	completed, err := executeTransferTx(ctx, db, xfer)
-	if err != nil {
-		return err
-	}
-	if !completed {
-		return nil
-	}
-
-	for _, uid := range []string{xfer.fromUserID, xfer.toUserID} {
-		if err := invalidatePermissionCache(ctx, redisClient, xfer.serverID, uid); err != nil {
-			return err
-		}
-	}
-
-	broadcastOwnershipChange(hub, xfer)
-
-	return nil
-}
-
-func executeTransferTx(ctx context.Context, db *sql.DB, xfer pendingTransfer) (completed bool, retErr error) {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("begin transaction: %w", err)
-	}
-	defer func() {
-		rollbackErr := tx.Rollback()
-		if errors.Is(rollbackErr, sql.ErrTxDone) {
-			rollbackErr = nil
-		}
-		retErr = joinCleanupError("rollback transfer transaction", retErr, rollbackErr)
-	}()
-
-	res, err := tx.ExecContext(ctx, `
-		UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
-		WHERE id = $1 AND status = 'pending'
-	`, xfer.id)
-	if err != nil {
-		return false, fmt.Errorf("mark transfer completed: %w", err)
-	}
-	n, err := checkedRowsAffected(res, "mark transfer completed")
-	if err != nil {
-		return false, err
-	}
-	if n == 0 {
-		return false, nil
-	}
-
-	if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2`, xfer.toUserID, xfer.serverID); err != nil {
-		return false, fmt.Errorf("update server owner: %w", err)
-	}
-	if err := swapMemberRoles(ctx, tx, xfer); err != nil {
-		return false, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit: %w", err)
-	}
-	return true, nil
-}
-
-func swapMemberRoles(ctx context.Context, tx *sql.Tx, xfer pendingTransfer) error {
-	resFrom, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, xfer.serverID, xfer.fromUserID)
-	if err != nil {
-		return fmt.Errorf("update from_user role: %w", err)
-	}
-	n, err := checkedRowsAffected(resFrom, "read from_user role update result")
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return fmt.Errorf("from_user %s is no longer a member", xfer.fromUserID)
-	}
-	resTo, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, xfer.serverID, xfer.toUserID)
-	if err != nil {
-		return fmt.Errorf("update to_user role: %w", err)
-	}
-	n, err = checkedRowsAffected(resTo, "read to_user role update result")
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return fmt.Errorf("to_user %s is no longer a member", xfer.toUserID)
-	}
-	return nil
-}
-
-func checkedRowsAffected(result sql.Result, operation string) (int64, error) {
-	n, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("%s: rows affected: %w", operation, err)
-	}
-	return n, nil
-}
-
-func joinCleanupError(operation string, primaryErr, cleanupErr error) error {
-	if cleanupErr == nil {
-		return primaryErr
-	}
-	wrappedCleanupErr := fmt.Errorf("%s: %w", operation, cleanupErr)
-	if primaryErr == nil {
-		return wrappedCleanupErr
-	}
-	return errors.Join(primaryErr, wrappedCleanupErr)
-}
-
-func invalidatePermissionCache(ctx context.Context, redisClient *redis.Client, serverID, userID string) error {
-	pattern := fmt.Sprintf("perm:%s:%s*", serverID, userID)
-	iter := redisClient.Scan(ctx, 0, pattern, 100).Iterator()
-	var keys []string
-	for iter.Next(ctx) {
-		keys = append(keys, iter.Val())
-	}
-	if err := iter.Err(); err != nil {
-		return fmt.Errorf("scan permission cache keys for user %s: %w", userID, err)
-	}
-	if len(keys) > 0 {
-		if err := redisClient.Unlink(ctx, keys...).Err(); err != nil {
-			return fmt.Errorf("unlink permission cache keys for user %s: %w", userID, err)
-		}
-	}
-	return nil
-}
-
-func broadcastOwnershipChange(hub *websocket.Hub, xfer pendingTransfer) {
-	serverUUID, err := uuid.Parse(xfer.serverID)
-	if err != nil {
-		return
-	}
-	hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
-		Type: "ownership_transferred",
-		Data: map[string]interface{}{
-			logKeyServerID: xfer.serverID,
-			"old_owner_id": xfer.fromUserID,
-			"new_owner_id": xfer.toUserID,
-		},
-	})
 }

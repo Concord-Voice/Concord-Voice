@@ -27,13 +27,17 @@ import (
 const (
 	transferPendingDuration = 24 * time.Hour
 	reversalWindowDuration  = 24 * time.Hour
+	ownershipAuditTimeout   = 5 * time.Second
 
-	errMsgInvalidServerID       = "Invalid server ID"
-	errMsgServerNotFound        = "Server not found"
-	errMsgFailedQueryOwner      = "Failed to query server owner"
-	errMsgFailedVerifyOwnership = "Failed to verify ownership"
-	errMsgFailedVerifyPassword  = "Failed to verify password"
-	errMsgFailedReverseTransfer = "Failed to reverse transfer"
+	errMsgInvalidServerID        = "Invalid server ID"
+	errMsgServerNotFound         = "Server not found"
+	errMsgFailedQueryOwner       = "Failed to query server owner"
+	errMsgFailedVerifyOwnership  = "Failed to verify ownership"
+	errMsgFailedVerifyPassword   = "Failed to verify password"
+	errMsgFailedReverseTransfer  = "Failed to reverse transfer"
+	errMsgFailedInitiateTransfer = "Failed to initiate transfer"
+	errMsgFailedCancelTransfer   = "Failed to cancel transfer"
+	errMsgTransferAlreadyPending = "A transfer is already pending for this server"
 
 	keyServerID   = "server_id"
 	keyUserID     = "user_id"
@@ -60,12 +64,33 @@ type Handler struct {
 	// permission delta in the system (the resolver short-circuits the owner to
 	// OwnerPermissions). Wired via SetVoiceEnforcer; nil means no push.
 	voiceEnforcer rbac.VoiceEnforcer
+	// presenceRecheck captures the pre-mutation Server Voice audience and
+	// refreshes it after an ownership change commits. It is wired at router
+	// construction; a nil value preserves the isolated-handler test default.
+	presenceRecheck ownershipPresenceRecheck
+}
+
+type ownershipPresenceRecheck interface {
+	rbac.PresenceRecheck
+	PrepareCaptureStrict(
+		ctx context.Context, serverID string, channelIDs []string, onlyUserID *string,
+	) (rbac.PresenceRecheckPlan, error)
 }
 
 // SetVoiceEnforcer wires the mid-session voice permission push. Called once at
 // router construction, before the handler serves traffic.
 func (h *Handler) SetVoiceEnforcer(e rbac.VoiceEnforcer) {
 	h.voiceEnforcer = e
+}
+
+// SetPresenceRecheck wires Rich Presence reconciliation for ownership changes.
+func (h *Handler) SetPresenceRecheck(p ownershipPresenceRecheck) {
+	h.presenceRecheck = p
+}
+
+// HasPresenceRecheck reports whether Rich Presence reconciliation was wired.
+func (h *Handler) HasPresenceRecheck() bool {
+	return h.presenceRecheck != nil
 }
 
 // recheckVoiceBothParties re-pushes permissions for the two sides of an
@@ -76,6 +101,20 @@ func (h *Handler) recheckVoiceBothParties(serverID, fromUserID, toUserID string)
 	}
 	h.voiceEnforcer.RecheckUser(serverID, fromUserID)
 	h.voiceEnforcer.RecheckUser(serverID, toUserID)
+}
+
+func (h *Handler) presenceExecute(plan rbac.PresenceRecheckPlan) {
+	if h.presenceRecheck == nil || plan == nil || !plan.HasWork() {
+		return
+	}
+	h.presenceRecheck.Execute(plan)
+}
+
+func (h *Handler) presenceAbandon(plan rbac.PresenceRecheckPlan, cause string) {
+	if h.presenceRecheck == nil || plan == nil || !plan.HasWork() {
+		return
+	}
+	h.presenceRecheck.Abandon(plan, cause)
 }
 
 // HandlerDeps groups the dependencies required to construct a Handler.
@@ -157,7 +196,7 @@ func (h *Handler) InitiateTransfer(c *gin.Context) {
 	reversalToken, err := generateReversalToken()
 	if err != nil {
 		h.log.Error("Failed to generate reversal token", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate transfer"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedInitiateTransfer})
 		return
 	}
 
@@ -281,24 +320,56 @@ func (h *Handler) CancelTransfer(c *gin.Context) {
 		return
 	}
 
-	if err := h.requireServerOwner(ctx, c, serverID, userID, "cancel the transfer"); err != nil {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error("Failed to begin transfer cancellation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCancelTransfer})
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back transfer cancellation", "error", rollbackErr)
+		}
+	}()
+
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
+			return
+		}
+		h.internalError(c, errMsgFailedQueryOwner, errMsgFailedVerifyOwnership, err)
+		return
+	}
+	if ownerID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can cancel the transfer"})
 		return
 	}
 
-	res, err := h.db.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE ownership_transfers
 		SET status = 'cancelled', cancelled_at = NOW()
 		WHERE server_id = $1 AND status = 'pending'
 	`, serverID)
 	if err != nil {
-		h.log.Error("Failed to cancel transfer", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel transfer"})
+		h.log.Error(errMsgFailedCancelTransfer, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCancelTransfer})
 		return
 	}
 
-	rows, _ := res.RowsAffected()
+	rows, err := res.RowsAffected()
+	if err != nil {
+		h.log.Error("Failed to read transfer cancellation result", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCancelTransfer})
+		return
+	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No pending transfer to cancel"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transfer cancellation", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedCancelTransfer})
 		return
 	}
 
@@ -337,12 +408,12 @@ func (h *Handler) ConfirmTransfer(c *gin.Context) {
 	}
 
 	// Fetch pending transfer
-	var transferID, toUserID string
+	var transferID, fromUserID, toUserID string
 	err := h.db.QueryRowContext(ctx, `
-		SELECT id, to_user_id
+		SELECT id, from_user_id, to_user_id
 		FROM ownership_transfers
 		WHERE server_id = $1 AND status = 'pending'
-	`, serverID).Scan(&transferID, &toUserID)
+	`, serverID).Scan(&transferID, &fromUserID, &toUserID)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No pending transfer to confirm"})
 		return
@@ -354,10 +425,12 @@ func (h *Handler) ConfirmTransfer(c *gin.Context) {
 	}
 
 	// Execute the transfer
-	if err := h.executeTransfer(ctx, serverID, transferID, userID, toUserID); err != nil {
+	if err := h.executeTransfer(ctx, serverID, transferID, fromUserID, toUserID); err != nil {
 		switch {
 		case errors.Is(err, errTransferAlreadyCompleted):
 			c.JSON(http.StatusConflict, gin.H{"error": "Transfer has already been completed or cancelled"})
+		case errors.Is(err, errTransferOwnershipChanged):
+			c.JSON(http.StatusConflict, gin.H{"error": "Server ownership changed; transfer was cancelled"})
 		case errors.Is(err, errToUserNotMember):
 			c.JSON(http.StatusConflict, gin.H{"error": "Target user is no longer a member of this server"})
 		case errors.Is(err, errFromUserNotMember):
@@ -431,14 +504,21 @@ func (h *Handler) ReverseTransfer(c *gin.Context) {
 		return
 	}
 
-	if err := h.executeReversal(ctx, c, rec); err != nil {
+	plan, err := h.executeReversal(ctx, rec)
+	if err != nil {
+		switch {
+		case errors.Is(err, errReversalOwnershipChanged):
+			c.JSON(http.StatusConflict, gin.H{"error": "Ownership has changed since this transfer — reversal is no longer possible"})
+		case errors.Is(err, errReversalOriginalOwnerNotMember):
+			c.JSON(http.StatusConflict, gin.H{"error": "Original owner is no longer a member of this server"})
+		default:
+			h.log.Error("Failed to reverse ownership transfer", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedReverseTransfer})
+		}
 		return
 	}
 
-	bgCtx := context.Background()
-	_ = h.cache.Invalidate(bgCtx, rec.serverID, rec.fromUserID)
-	_ = h.cache.Invalidate(bgCtx, rec.serverID, rec.toUserID)
-	h.recheckVoiceBothParties(rec.serverID, rec.fromUserID, rec.toUserID)
+	h.reconcileOwnershipPostCommit(rec.serverID, rec.fromUserID, rec.toUserID, plan)
 
 	if serverUUID, err := uuid.Parse(rec.serverID); err == nil {
 		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
@@ -509,7 +589,7 @@ func (h *Handler) requireNoPendingTransfer(ctx context.Context, c *gin.Context, 
 		return err
 	}
 	if exists {
-		c.JSON(http.StatusConflict, gin.H{"error": "A transfer is already pending for this server"})
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgTransferAlreadyPending})
 		return fmt.Errorf("pending transfer exists")
 	}
 	return nil
@@ -534,19 +614,62 @@ type transferRecord struct {
 }
 
 func (h *Handler) insertTransferRecord(ctx context.Context, c *gin.Context, rec *transferRecord) error {
-	_, err := h.db.ExecContext(ctx, `
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.internalError(c, "Failed to begin transfer creation", errMsgFailedInitiateTransfer, err)
+		return fmt.Errorf("begin transfer creation transaction: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back transfer creation", "error", rollbackErr)
+		}
+	}()
+
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, rec.serverID).Scan(&ownerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return h.transferOwnershipChanged(c)
+		}
+		h.internalError(c, "Failed to lock transfer server", errMsgFailedInitiateTransfer, err)
+		return fmt.Errorf("lock transfer server: %w", err)
+	}
+	if ownerID != rec.fromUserID {
+		return h.transferOwnershipChanged(c)
+	}
+
+	var pending bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM ownership_transfers WHERE server_id = $1 AND status = 'pending')
+	`, rec.serverID).Scan(&pending); err != nil {
+		h.internalError(c, "Failed to check pending transfers", "Failed to check transfer status", err)
+		return fmt.Errorf("check pending transfer: %w", err)
+	}
+	if pending {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgTransferAlreadyPending})
+		return errTransferAlreadyPending
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO ownership_transfers (id, server_id, from_user_id, to_user_id, status, reversal_token, requested_at, expires_at)
 		VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
-	`, rec.id, rec.serverID, rec.fromUserID, rec.toUserID, rec.reversalToken, rec.requestedAt, rec.expiresAt)
-	if err == nil {
-		return nil
+	`, rec.id, rec.serverID, rec.fromUserID, rec.toUserID, rec.reversalToken, rec.requestedAt, rec.expiresAt); err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgTransferAlreadyPending})
+			return errTransferAlreadyPending
+		}
+		h.internalError(c, "Failed to create transfer record", errMsgFailedInitiateTransfer, err)
+		return fmt.Errorf("insert transfer record: %w", err)
 	}
-	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-		c.JSON(http.StatusConflict, gin.H{"error": "A transfer is already pending for this server"})
-		return err
+	if err := tx.Commit(); err != nil {
+		h.internalError(c, "Failed to commit transfer creation", errMsgFailedInitiateTransfer, err)
+		return fmt.Errorf("commit transfer creation transaction: %w", err)
 	}
-	h.internalError(c, "Failed to create transfer record", "Failed to initiate transfer", err)
-	return err
+	return nil
+}
+
+func (h *Handler) transferOwnershipChanged(c *gin.Context) error {
+	c.JSON(http.StatusConflict, gin.H{"error": "Server ownership changed; retry the transfer"})
+	return errTransferOwnershipChanged
 }
 
 func (h *Handler) lookupCompletedTransfer(ctx context.Context, c *gin.Context, token string) (*reversalRecord, error) {
@@ -574,121 +697,571 @@ func (h *Handler) internalError(c *gin.Context, msg, userMsg string, err error) 
 	c.JSON(http.StatusInternalServerError, gin.H{"error": userMsg})
 }
 
-func (h *Handler) executeReversal(ctx context.Context, c *gin.Context, rec *reversalRecord) error {
+func (h *Handler) executeReversal(ctx context.Context, rec *reversalRecord) (rbac.PresenceRecheckPlan, error) {
+	var reversalStillPossible bool
+	if err := h.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM ownership_transfers
+			JOIN servers ON servers.id = ownership_transfers.server_id
+			WHERE ownership_transfers.id = $1
+				AND ownership_transfers.status = 'completed'
+				AND ownership_transfers.server_id = $2
+				AND servers.owner_id = $3
+		)
+	`, rec.transferID, rec.serverID, rec.toUserID).Scan(&reversalStillPossible); err != nil {
+		return nil, fmt.Errorf("preflight reversal ownership: %w", err)
+	}
+	if !reversalStillPossible {
+		return nil, errReversalOwnershipChanged
+	}
+
+	plan, changed, err := h.withOwnershipCapture(ctx, rec.serverID, func(ctx context.Context, tx *sql.Tx) (bool, error) {
+		var transferID string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT id FROM ownership_transfers WHERE id = $1 AND status = 'completed' FOR UPDATE
+		`, rec.transferID).Scan(&transferID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, errReversalOwnershipChanged
+			}
+			return false, fmt.Errorf("lock completed transfer: %w", err)
+		}
+
+		var currentOwnerID string
+		if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, rec.serverID).Scan(&currentOwnerID); err != nil {
+			return false, fmt.Errorf("query current owner for reversal: %w", err)
+		}
+		if currentOwnerID != rec.toUserID {
+			return false, errReversalOwnershipChanged
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE ownership_transfers
+			SET status = 'cancelled', cancelled_at = NOW()
+			WHERE server_id = $1 AND status = 'pending'
+		`, rec.serverID); err != nil {
+			return false, fmt.Errorf("cancel pending transfers for reversal: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2`, rec.fromUserID, rec.serverID); err != nil {
+			return false, fmt.Errorf("update server owner for reversal: %w", err)
+		}
+
+		resFrom, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.fromUserID)
+		if err != nil {
+			return false, fmt.Errorf("update from_user role for reversal: %w", err)
+		}
+		n, err := resFrom.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read from_user role result for reversal: %w", err)
+		}
+		if n == 0 {
+			return false, errReversalOriginalOwnerNotMember
+		}
+
+		resTo, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.toUserID)
+		if err != nil {
+			return false, fmt.Errorf("update to_user role for reversal: %w", err)
+		}
+		if _, err := resTo.RowsAffected(); err != nil {
+			return false, fmt.Errorf("read to_user role result for reversal: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE ownership_transfers SET status = 'reversed', reversed_at = NOW() WHERE id = $1`, transferID); err != nil {
+			return false, fmt.Errorf("mark transfer reversed: %w", err)
+		}
+		return true, nil
+	})
+	if err != nil {
+		if errors.Is(err, rbac.ErrPresenceCaptureLimited) {
+			if recheckErr := h.classifyReversalCaptureLimit(ctx, rec); recheckErr != nil {
+				if !errors.Is(recheckErr, errReversalOwnershipChanged) && !errors.Is(recheckErr, errReversalOriginalOwnerNotMember) {
+					h.log.Error("ownership reversal capture-limit classification failed",
+						"failure_class", "ownership_reversal_capture_limit_classification",
+						"error", recheckErr,
+					)
+					return nil, errors.Join(errReversalOwnershipChanged, recheckErr)
+				}
+				return nil, recheckErr
+			}
+		}
+		return nil, err
+	}
+	if !changed {
+		return nil, errReversalOwnershipChanged
+	}
+	return plan, nil
+}
+
+// classifyReversalCaptureLimit distinguishes an ownership change that raced
+// capture from a current capture-limit failure without mutating any state.
+func (h *Handler) classifyReversalCaptureLimit(ctx context.Context, rec *reversalRecord) (retErr error) {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		h.internalError(c, "Failed to begin reversal transaction", errMsgFailedReverseTransfer, err)
-		return err
+		return fmt.Errorf("begin reversal capture-limit classification: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		rollbackErr := tx.Rollback()
+		if errors.Is(rollbackErr, sql.ErrTxDone) {
+			return
+		}
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("rollback reversal capture-limit classification: %w", rollbackErr)
+			if retErr == nil {
+				retErr = rollbackErr
+			} else {
+				retErr = errors.Join(retErr, rollbackErr)
+			}
+		}
+	}()
 
 	var currentOwnerID string
 	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, rec.serverID).Scan(&currentOwnerID); err != nil {
-		h.internalError(c, "Failed to query current owner for reversal", errMsgFailedReverseTransfer, err)
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return errReversalOwnershipChanged
+		}
+		return fmt.Errorf("lock reversal server for capture-limit classification: %w", err)
 	}
 	if currentOwnerID != rec.toUserID {
-		c.JSON(http.StatusConflict, gin.H{"error": "Ownership has changed since this transfer — reversal is no longer possible"})
-		return fmt.Errorf("ownership changed")
+		return errReversalOwnershipChanged
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2`, rec.fromUserID, rec.serverID); err != nil {
-		h.internalError(c, "Failed to update server owner for reversal", errMsgFailedReverseTransfer, err)
-		return err
+	var transferID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM ownership_transfers
+		WHERE id = $1
+			AND server_id = $2
+			AND from_user_id = $3
+			AND to_user_id = $4
+			AND status = 'completed'
+		FOR UPDATE
+	`, rec.transferID, rec.serverID, rec.fromUserID, rec.toUserID).Scan(&transferID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errReversalOwnershipChanged
+		}
+		return fmt.Errorf("lock reversal transfer for capture-limit classification: %w", err)
 	}
 
-	resFrom, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.fromUserID)
-	if err != nil {
-		h.internalError(c, "Failed to update from_user role for reversal", errMsgFailedReverseTransfer, err)
-		return err
+	var originalOwnerID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT user_id
+		FROM server_members
+		WHERE server_id = $1 AND user_id = $2
+		FOR UPDATE
+	`, rec.serverID, rec.fromUserID).Scan(&originalOwnerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errReversalOriginalOwnerNotMember
+		}
+		return fmt.Errorf("lock original owner membership for reversal capture-limit classification: %w", err)
 	}
-	if n, _ := resFrom.RowsAffected(); n == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "Original owner is no longer a member of this server"})
-		return fmt.Errorf("original owner not a member")
-	}
-
-	resTo, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, rec.serverID, rec.toUserID)
-	if err != nil {
-		h.internalError(c, "Failed to update to_user role for reversal", errMsgFailedReverseTransfer, err)
-		return err
-	}
-	if n, _ := resTo.RowsAffected(); n == 0 {
-		h.log.Warn("Transfer recipient no longer a member during reversal", "to_user_id", rec.toUserID, "server_id", rec.serverID)
-	}
-
-	if _, err := tx.ExecContext(ctx, `UPDATE ownership_transfers SET status = 'reversed', reversed_at = NOW() WHERE id = $1`, rec.transferID); err != nil {
-		h.internalError(c, "Failed to mark transfer as reversed", errMsgFailedReverseTransfer, err)
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		h.internalError(c, "Failed to commit reversal", errMsgFailedReverseTransfer, err)
-		return err
-	}
-
 	return nil
 }
 
 // Sentinel errors for executeTransfer so callers can map to appropriate HTTP status codes.
 var (
-	errTransferAlreadyCompleted = fmt.Errorf("transfer already completed or cancelled")
-	errFromUserNotMember        = fmt.Errorf("from_user is no longer a member")
-	errToUserNotMember          = fmt.Errorf("to_user is no longer a member")
+	errTransferAlreadyCompleted       = errors.New("transfer already completed or cancelled")
+	errTransferAlreadyPending         = errors.New("transfer already pending")
+	errTransferOwnershipChanged       = errors.New("transfer ownership changed")
+	errFromUserNotMember              = fmt.Errorf("from_user is no longer a member")
+	errToUserNotMember                = fmt.Errorf("to_user is no longer a member")
+	errReversalOwnershipChanged       = errTransferOwnershipChanged
+	errReversalOriginalOwnerNotMember = fmt.Errorf("original owner is no longer a member")
 )
 
-// executeTransfer atomically transfers ownership from one user to another.
-// Lock order: ownership_transfers → servers → server_members (matches cleanup job).
-func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fromUserID, toUserID string) error {
+type ownershipWriteOutcome uint8
+
+const (
+	ownershipWriteUnchanged ownershipWriteOutcome = iota
+	ownershipWriteChanged
+	ownershipWriteStaleCancelled
+)
+
+// ownershipPrepareFailureError marks errors produced before the ownership
+// transaction starts, so only those errors receive a stale-transfer recheck.
+type ownershipPrepareFailureError struct{ cause error }
+
+func (e *ownershipPrepareFailureError) Error() string { return e.cause.Error() }
+func (e *ownershipPrepareFailureError) Unwrap() error { return e.cause }
+
+func isOwnershipPrepareFailure(err error) bool {
+	var prepareErr *ownershipPrepareFailureError
+	return errors.As(err, &prepareErr)
+}
+
+type ownershipPrepareClassification uint8
+
+const (
+	ownershipPrepareCurrent ownershipPrepareClassification = iota
+	ownershipPrepareNoOp
+	ownershipPrepareStaleCancelled
+)
+
+// withOwnershipCapture runs an ownership write atomically with its pre-write
+// Server Voice visibility capture. The transaction locks advisory capture,
+// then the server relation, ownership_transfers, and server_members in that
+// order. A server deleted before its relation lock is a no-op.
+func (h *Handler) withOwnershipCapture(
+	ctx context.Context,
+	serverID string,
+	write func(context.Context, *sql.Tx) (bool, error),
+) (plan rbac.PresenceRecheckPlan, changed bool, retErr error) {
+	plan, outcome, retErr := h.withOwnershipCaptureOutcome(ctx, serverID, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+		changed, err := write(ctx, tx)
+		if !changed {
+			return ownershipWriteUnchanged, err
+		}
+		return ownershipWriteChanged, err
+	})
+	return plan, outcome == ownershipWriteChanged, retErr
+}
+
+func (h *Handler) withOwnershipCaptureOutcome(
+	ctx context.Context,
+	serverID string,
+	write func(context.Context, *sql.Tx) (ownershipWriteOutcome, error),
+) (plan rbac.PresenceRecheckPlan, outcome ownershipWriteOutcome, retErr error) {
+	if h.presenceRecheck != nil {
+		prepared, err := h.presenceRecheck.PrepareCaptureStrict(ctx, serverID, nil, nil)
+		if err != nil {
+			return nil, ownershipWriteUnchanged, &ownershipPrepareFailureError{
+				cause: fmt.Errorf("prepare ownership presence capture: %w", err),
+			}
+		}
+		plan = prepared
+	}
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return nil, ownershipWriteUnchanged, fmt.Errorf("begin ownership transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		rollbackErr := tx.Rollback()
+		if errors.Is(rollbackErr, sql.ErrTxDone) {
+			return
+		}
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("rollback ownership transaction: %w", rollbackErr)
+			if retErr == nil {
+				retErr = rollbackErr
+			} else {
+				retErr = errors.Join(retErr, rollbackErr)
+			}
+		}
+	}()
 
-	// Step 1: Claim the transfer row FIRST (consistent lock order with cleanup job)
-	res, err := tx.ExecContext(ctx, `
-		UPDATE ownership_transfers
-		SET status = 'completed', completed_at = NOW()
-		WHERE id = $1 AND status = 'pending'
-	`, transferID)
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return nil, ownershipWriteUnchanged, fmt.Errorf("lock ownership visibility capture: %w", err)
+	}
+	if h.presenceRecheck != nil && plan != nil {
+		if err := h.presenceRecheck.CaptureVisibility(ctx, tx, plan); err != nil {
+			return nil, ownershipWriteUnchanged, fmt.Errorf("capture ownership visibility: %w", err)
+		}
+	}
+	var lockedServerID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&lockedServerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ownershipWriteUnchanged, nil
+		}
+		return nil, ownershipWriteUnchanged, fmt.Errorf("lock ownership server: %w", err)
+	}
+	outcome, err = write(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("mark transfer completed: %w", err)
+		return nil, ownershipWriteUnchanged, err
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return errTransferAlreadyCompleted
+	if outcome == ownershipWriteUnchanged {
+		return nil, ownershipWriteUnchanged, nil
 	}
+	if err := tx.Commit(); err != nil {
+		h.presenceAbandon(plan, "ambiguous_commit")
+		return nil, ownershipWriteUnchanged, fmt.Errorf("commit ownership transaction: %w", err)
+	}
+	return plan, outcome, nil
+}
 
-	// Step 2: Update server owner
-	if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2`, toUserID, serverID); err != nil {
-		return fmt.Errorf("update server owner: %w", err)
+// classifyOwnershipPrepareFailure rechecks a pending transfer without presence
+// capture after strict preparation failed. It only makes a stale transfer
+// terminal; a current transfer keeps the original preparation error.
+func (h *Handler) classifyOwnershipPrepareFailure(
+	ctx context.Context, serverID, transferID, fromUserID, toUserID string,
+) (classification ownershipPrepareClassification, retErr error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ownershipPrepareCurrent, fmt.Errorf("begin ownership prepare-failure classification: %w", err)
 	}
+	defer func() {
+		rollbackErr := tx.Rollback()
+		if errors.Is(rollbackErr, sql.ErrTxDone) {
+			return
+		}
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("rollback ownership prepare-failure classification: %w", rollbackErr)
+			if retErr == nil {
+				retErr = rollbackErr
+			} else {
+				retErr = errors.Join(retErr, rollbackErr)
+			}
+		}
+	}()
 
-	// Step 3: Swap legacy roles — verify both users are still members
+	if err := rbac.LockServerVisibilityCapture(ctx, tx, serverID); err != nil {
+		return ownershipPrepareCurrent, fmt.Errorf("lock ownership visibility for prepare-failure classification: %w", err)
+	}
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ownershipPrepareNoOp, nil
+		}
+		return ownershipPrepareCurrent, fmt.Errorf("lock ownership server for prepare-failure classification: %w", err)
+	}
+	var lockedTransferID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id FROM ownership_transfers
+		WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND to_user_id = $4 AND status = 'pending'
+		FOR UPDATE
+	`, transferID, serverID, fromUserID, toUserID).Scan(&lockedTransferID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ownershipPrepareNoOp, nil
+		}
+		return ownershipPrepareCurrent, fmt.Errorf("lock ownership transfer for prepare-failure classification: %w", err)
+	}
+	if ownerID == fromUserID {
+		return ownershipPrepareCurrent, nil
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE ownership_transfers SET status = 'cancelled', cancelled_at = NOW()
+		WHERE id = $1 AND status = 'pending'
+	`, lockedTransferID)
+	if err != nil {
+		return ownershipPrepareCurrent, fmt.Errorf("cancel stale ownership transfer after prepare failure: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return ownershipPrepareCurrent, fmt.Errorf("read stale ownership prepare-failure cancellation result: %w", err)
+	}
+	if rows != 1 {
+		return ownershipPrepareNoOp, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return ownershipPrepareCurrent, fmt.Errorf("commit ownership prepare-failure classification: %w", err)
+	}
+	return ownershipPrepareStaleCancelled, nil
+}
+
+func swapOwnershipMemberRoles(ctx context.Context, tx *sql.Tx, serverID, fromUserID, toUserID string) error {
 	resFrom, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'member' WHERE server_id = $1 AND user_id = $2`, serverID, fromUserID)
 	if err != nil {
 		return fmt.Errorf("update from_user role: %w", err)
 	}
-	if n, _ := resFrom.RowsAffected(); n == 0 {
+	n, err := resFrom.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read from_user role result: %w", err)
+	}
+	if n == 0 {
 		return errFromUserNotMember
 	}
 	resTo, err := tx.ExecContext(ctx, `UPDATE server_members SET role = 'owner' WHERE server_id = $1 AND user_id = $2`, serverID, toUserID)
 	if err != nil {
 		return fmt.Errorf("update to_user role: %w", err)
 	}
-	if n, _ := resTo.RowsAffected(); n == 0 {
+	n, err = resTo.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read to_user role result: %w", err)
+	}
+	if n == 0 {
 		return errToUserNotMember
 	}
+	return nil
+}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+func (h *Handler) reconcileOwnershipPostCommit(
+	serverID, fromUserID, toUserID string,
+	plan rbac.PresenceRecheckPlan,
+) {
+	h.presenceExecute(plan)
+	if h.cache != nil {
+		for _, userID := range []string{fromUserID, toUserID} {
+			if err := h.cache.Invalidate(context.Background(), serverID, userID); err != nil {
+				h.log.Error("ownership permission-cache invalidation failed", "failure_class", "ownership_cache_invalidation")
+			}
+		}
+	}
+	h.recheckVoiceBothParties(serverID, fromUserID, toUserID)
+}
+
+func (h *Handler) cancelStaleTransfer(ctx context.Context, tx *sql.Tx, transferID, serverID, fromUserID string) (ownershipWriteOutcome, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE ownership_transfers
+		SET status = 'cancelled', cancelled_at = NOW(), completed_at = NULL
+		WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'completed'
+	`, transferID, serverID, fromUserID)
+	if err != nil {
+		return ownershipWriteUnchanged, fmt.Errorf("cancel stale ownership transfer: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return ownershipWriteUnchanged, fmt.Errorf("read stale ownership transfer cancellation result: %w", err)
+	}
+	if rows != 1 {
+		return ownershipWriteUnchanged, errTransferAlreadyCompleted
+	}
+	return ownershipWriteStaleCancelled, nil
+}
+
+type expiredTransfer struct {
+	id, serverID, fromUserID, toUserID string
+}
+
+// CompleteExpiredTransfers completes pending transfers whose confirmation
+// window elapsed. It is the only scheduled ownership writer.
+func (h *Handler) CompleteExpiredTransfers(ctx context.Context) {
+	rows, err := h.db.QueryContext(ctx, `
+		SELECT id, server_id, from_user_id, to_user_id
+		FROM ownership_transfers
+		WHERE status = 'pending' AND expires_at <= NOW()
+	`)
+	if err != nil {
+		h.log.Error("ownership expiry query failed", "failure_class", "ownership_expiry_query")
+		return
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			h.log.Error("ownership expiry row close failed", "failure_class", "ownership_expiry_rows_close")
+		}
+	}()
+
+	for rows.Next() {
+		var transfer expiredTransfer
+		if err := rows.Scan(&transfer.id, &transfer.serverID, &transfer.fromUserID, &transfer.toUserID); err != nil {
+			h.log.Error("ownership expiry row scan failed", "failure_class", "ownership_expiry_scan")
+			continue
+		}
+		if _, err := h.completeExpiredTransfer(ctx, transfer); err != nil {
+			h.log.Error("ownership expiry completion failed", "failure_class", "ownership_expiry_completion")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		h.log.Error("ownership expiry iteration failed", "failure_class", "ownership_expiry_iteration")
+	}
+}
+
+func (h *Handler) completeExpiredTransfer(ctx context.Context, transfer expiredTransfer) (bool, error) {
+	plan, outcome, err := h.withOwnershipCaptureOutcome(ctx, transfer.serverID, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
+			WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'pending'
+		`, transfer.id, transfer.serverID, transfer.fromUserID)
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("mark expired transfer completed: %w", err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("read expired transfer completion result: %w", err)
+		}
+		if rows == 0 {
+			return ownershipWriteUnchanged, nil
+		}
+		res, err = tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id = $3`, transfer.toUserID, transfer.serverID, transfer.fromUserID)
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("update server owner for expired transfer: %w", err)
+		}
+		rows, err = res.RowsAffected()
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("read expired transfer owner update result: %w", err)
+		}
+		if rows == 0 {
+			return h.cancelStaleTransfer(ctx, tx, transfer.id, transfer.serverID, transfer.fromUserID)
+		}
+		if err := swapOwnershipMemberRoles(ctx, tx, transfer.serverID, transfer.fromUserID, transfer.toUserID); err != nil {
+			return ownershipWriteUnchanged, err
+		}
+		return ownershipWriteChanged, nil
+	})
+	if err != nil {
+		if isOwnershipPrepareFailure(err) {
+			classification, classifyErr := h.classifyOwnershipPrepareFailure(
+				ctx, transfer.serverID, transfer.id, transfer.fromUserID, transfer.toUserID)
+			if classifyErr != nil {
+				return false, errors.Join(err, classifyErr)
+			}
+			if classification != ownershipPrepareCurrent {
+				return false, nil
+			}
+		}
+		return false, err
+	}
+	if outcome != ownershipWriteChanged {
+		return false, nil
 	}
 
-	// Invalidate permission cache for both users
-	bgCtx := context.Background()
-	_ = h.cache.Invalidate(bgCtx, serverID, fromUserID)
-	_ = h.cache.Invalidate(bgCtx, serverID, toUserID)
-	h.recheckVoiceBothParties(serverID, fromUserID, toUserID)
+	h.reconcileOwnershipPostCommit(transfer.serverID, transfer.fromUserID, transfer.toUserID, plan)
+	if serverUUID, err := uuid.Parse(transfer.serverID); err == nil {
+		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+			Type: "ownership_transferred",
+			Data: map[string]interface{}{
+				keyServerID:    transfer.serverID,
+				"old_owner_id": transfer.fromUserID,
+				"new_owner_id": transfer.toUserID,
+			},
+		})
+	}
+	return true, nil
+}
+
+// executeTransfer atomically transfers ownership from one user to another.
+// Lock order: servers → ownership_transfers → server_members.
+func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fromUserID, toUserID string) error {
+	plan, outcome, err := h.withOwnershipCaptureOutcome(ctx, serverID, func(ctx context.Context, tx *sql.Tx) (ownershipWriteOutcome, error) {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE ownership_transfers SET status = 'completed', completed_at = NOW()
+			WHERE id = $1 AND server_id = $2 AND from_user_id = $3 AND status = 'pending'
+		`, transferID, serverID, fromUserID)
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("mark transfer completed: %w", err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("read transfer completion result: %w", err)
+		}
+		if rows == 0 {
+			return ownershipWriteUnchanged, nil
+		}
+		res, err = tx.ExecContext(ctx, `UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id = $3`, toUserID, serverID, fromUserID)
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("update server owner: %w", err)
+		}
+		rows, err = res.RowsAffected()
+		if err != nil {
+			return ownershipWriteUnchanged, fmt.Errorf("read transfer owner update result: %w", err)
+		}
+		if rows == 0 {
+			return h.cancelStaleTransfer(ctx, tx, transferID, serverID, fromUserID)
+		}
+		if err := swapOwnershipMemberRoles(ctx, tx, serverID, fromUserID, toUserID); err != nil {
+			return ownershipWriteUnchanged, err
+		}
+		return ownershipWriteChanged, nil
+	})
+	if err != nil {
+		if isOwnershipPrepareFailure(err) {
+			classification, classifyErr := h.classifyOwnershipPrepareFailure(ctx, serverID, transferID, fromUserID, toUserID)
+			if classifyErr != nil {
+				return errors.Join(err, classifyErr)
+			}
+			switch classification {
+			case ownershipPrepareStaleCancelled:
+				return errTransferOwnershipChanged
+			case ownershipPrepareNoOp:
+				return errTransferAlreadyCompleted
+			}
+		}
+		return err
+	}
+	if outcome == ownershipWriteStaleCancelled {
+		return errTransferOwnershipChanged
+	}
+	if outcome != ownershipWriteChanged {
+		return errTransferAlreadyCompleted
+	}
+
+	h.reconcileOwnershipPostCommit(serverID, fromUserID, toUserID, plan)
 
 	// Broadcast
 	if serverUUID, err := uuid.Parse(serverID); err == nil {
@@ -702,8 +1275,11 @@ func (h *Handler) executeTransfer(ctx context.Context, serverID, transferID, fro
 		})
 	}
 
-	// Audit log
-	if err := h.audit.Log(bgCtx, serverID, nil, "ownership_transferred", keyServer, &serverID, map[string]interface{}{
+	// The transfer has committed; cancellation from the requester must not suppress
+	// its durable audit record.
+	auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), ownershipAuditTimeout)
+	defer cancelAudit()
+	if err := h.audit.Log(auditCtx, serverID, nil, "ownership_transferred", keyServer, &serverID, map[string]interface{}{
 		keyFromUserID: fromUserID,
 		keyToUserID:   toUserID,
 	}); err != nil {

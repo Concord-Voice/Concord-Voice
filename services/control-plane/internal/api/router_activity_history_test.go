@@ -37,12 +37,12 @@ func TestNewRouterRequiresOneUnboundActivityHistoryService(t *testing.T) {
 	cfg := &config.Config{Environment: "test"}
 	log := logger.NewWithWriter(io.Discard)
 
-	_, _, _, _, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
+	_, _, _, _, _, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
 	require.Error(t, err)
 
 	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(preboundActivityHistoryDelivery{}))
-	_, _, _, _, _, _, _, _, err = api.NewRouter(
+	_, _, _, _, _, _, _, _, _, err = api.NewRouter(
 		nil,
 		nil,
 		nil,
@@ -73,8 +73,11 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 		// added a 9th: the durable active-category reconciler, carried out so
 		// its startup pass and ticker join cmd/server's Activity History runtime
 		// instead of a second one under no guard.
+		// #2666 added a 10th: the ownership expiry callback, carried out so
+		// scheduled ownership writes use the same capture-bound transaction.
 		"return router, hub, natsClient, opsRuntime, voicePermEnforcer, " +
-			"presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, nil",
+			"presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, " +
+			"ownershipHandler.CompleteExpiredTransfers, nil",
 	}
 	prior := -1
 	for _, needle := range needles {

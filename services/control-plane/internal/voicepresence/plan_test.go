@@ -26,15 +26,19 @@ func TestPlan_HasWork_EmptyPlanIsBenign(t *testing.T) {
 	assert.False(t, (&Plan{Senders: []SenderCapture{{
 		SenderID: uuid.New(), OldAudience: map[uuid.UUID]bool{},
 	}}}).HasWork(), "a sender with an empty captured audience is no work")
-	assert.False(t, (&Plan{Senders: []SenderCapture{{
+}
+
+func TestPlan_HasWork_CandidateBearingSenderWithEmptyAudienceIsWork(t *testing.T) {
+	assert.True(t, (&Plan{Senders: []SenderCapture{{
 		SenderID:   uuid.New(),
 		Candidates: map[uuid.UUID]bool{uuid.New(): true},
-	}}}).HasWork(), "phase-1 candidates alone are not work; only a captured audience is")
+	}}}).HasWork(), "candidate-bearing sender must refresh even when captured audience is empty")
 }
 
 func TestPlan_HasWork_CapturedViewerIsWork(t *testing.T) {
 	plan := &Plan{Senders: []SenderCapture{{
 		SenderID:    uuid.New(),
+		Candidates:  map[uuid.UUID]bool{uuid.New(): true},
 		OldAudience: map[uuid.UUID]bool{uuid.New(): true},
 	}}}
 	assert.True(t, plan.HasWork())
