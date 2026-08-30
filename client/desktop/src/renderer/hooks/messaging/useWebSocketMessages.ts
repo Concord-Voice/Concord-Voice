@@ -22,7 +22,7 @@ import {
   handleCallTimedOut,
 } from '../../services/voiceService/callStateMachine';
 import { voiceService } from '../../services/voiceService';
-import type { WebSocketEvent } from '../../types/ws-events';
+import type { PresenceSnapshotPayload, WebSocketEvent } from '../../types/ws-events';
 import { e2eeService } from '../../services/e2eeService';
 import { isPendingKeyError } from '../../services/e2eeErrors';
 import { preferencesSyncService } from '../../services/preferencesSync';
@@ -36,7 +36,7 @@ import { useDMStore } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
-import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import { useRichPresenceStore, type OtherPresenceByUser } from '../../stores/ui/richPresenceStore';
 import { speak as ttsSpeak } from '../../services/ttsService';
 import { notificationSoundService } from '../../services/notificationSoundService';
 import {
@@ -125,6 +125,59 @@ function shouldShowChannelDesktopNotification(
     isWindowFocused: document.hasFocus(),
     isActiveChannel: channelId === activeChannelId,
   });
+}
+
+function buildOtherPresenceFromSnapshot(
+  users: PresenceSnapshotPayload['users'],
+  selfId: string | undefined
+): OtherPresenceByUser {
+  const nextRichPresence: OtherPresenceByUser = {};
+  for (const user of users ?? []) {
+    if (user.user_id === selfId || !user.rich_presence) continue;
+    const { server_voice: serverVoice, private_call: privateCall } = user.rich_presence;
+    const userPresence: OtherPresenceByUser[string] = {};
+    if (serverVoice) userPresence.server_voice = { category: 'server_voice', ...serverVoice };
+    if (privateCall) userPresence.private_call = { category: 'private_call', ...privateCall };
+    if (Object.keys(userPresence).length > 0) nextRichPresence[user.user_id] = userPresence;
+  }
+  return nextRichPresence;
+}
+
+function applyEnhancedPresenceSnapshot(
+  users: NonNullable<PresenceSnapshotPayload['users']>,
+  selfId: string | undefined
+): void {
+  useMemberStore.getState().setPresenceSnapshot(users);
+
+  const selfEntry = selfId ? users.find((u) => u.user_id === selfId) : undefined;
+  if (selfEntry) useMemberStore.getState().setSelfStatus(selfEntry.status);
+
+  const dmState = useDMStore.getState();
+  const friendState = useFriendStore.getState();
+  for (const user of users) {
+    dmState.updateParticipantProfile(user.user_id, { status: user.status });
+    friendState.updateFriendPresence(user.user_id, user.status);
+  }
+}
+
+function applyLegacyPresenceSnapshot(
+  userIds: NonNullable<PresenceSnapshotPayload['online_user_ids']>,
+  selfId: string | undefined
+): void {
+  useMemberStore.getState().setOnlineUsers(userIds);
+
+  // Legacy snapshots carry no per-user status; presence in the online list
+  // promotes a stale offline self, but must not downgrade dnd/invisible.
+  if (selfId && userIds.includes(selfId) && useMemberStore.getState().selfStatus === 'offline') {
+    useMemberStore.getState().setSelfStatus('online');
+  }
+
+  const dmState = useDMStore.getState();
+  const friendState = useFriendStore.getState();
+  for (const userId of userIds) {
+    dmState.updateParticipantProfile(userId, { status: 'online' });
+    friendState.updateFriendPresence(userId, 'online');
+  }
 }
 
 function shouldShowDMDesktopNotification(conversationId: string): boolean {
@@ -1632,6 +1685,14 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // to the free floor, so a failed/raced re-hydrate never escalates. (#1297 /
     // Gitar review: hydratePostLogin only covers fresh login/SSO/restore.)
     const unsubEntitlementsResync = wsService.onConnectionChange((state) => {
+      if (
+        state === ConnectionState.DISCONNECTED ||
+        state === ConnectionState.RECONNECTING ||
+        state === ConnectionState.CONNECTED ||
+        state === ConnectionState.ERROR
+      ) {
+        useRichPresenceStore.getState().clearAllOtherPresence();
+      }
       if (state === ConnectionState.CONNECTED) {
         useSubscriptionStore
           .getState()
@@ -1644,16 +1705,18 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       }
     });
 
+    const richPresenceSelfId = () =>
+      wsService.getConnectionInfo()?.userId ?? useUserStore.getState().user?.id;
+
     // Presence snapshot — msg.data narrowed to PresenceSnapshotPayload.
     // Both `users` (enhanced) and `online_user_ids` (legacy back-compat)
     // are schema-optional; the handler prefers `users` when present.
     const unsubPresenceSnapshot = wsService.on('presence_snapshot', (msg) => {
-      // A snapshot begins a fresh authoritative stream. Drop all previously
-      // received custom text before the server replays the statuses this viewer
-      // is still allowed to see. Otherwise an override applied while this
-      // socket was being closed could leave revoked text cached indefinitely.
-      // Preserve the self slice, which is owned by the settings REST flow.
-      useRichPresenceStore.getState().clearAllCustomText();
+      const selfId = richPresenceSelfId();
+      const { users, online_user_ids: onlineUserIds } = msg.data;
+      useRichPresenceStore
+        .getState()
+        .replaceOtherPresence(buildOtherPresenceFromSnapshot(users, selfId));
 
       // #803: selfStatus is the source of truth MemberList/UserPopover read for
       // the self-user, but nothing reconciled it with the server — so a stale or
@@ -1663,48 +1726,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       // the broadcast-to-others 'offline'. So it is safe to adopt the self entry
       // here. The `presence` broadcast handler below intentionally still skips
       // self (that path carries raw status and is not self-aware).
-      const selfId = useUserStore.getState().user?.id;
-      if (msg.data.users) {
-        const users = msg.data.users;
-        useMemberStore.getState().setPresenceSnapshot(users);
-
-        const selfEntry = selfId ? users.find((u) => u.user_id === selfId) : undefined;
-        if (selfEntry) {
-          useMemberStore.getState().setSelfStatus(selfEntry.status);
-        }
-
-        // Also update DM participant and friend presence
-        const dmState = useDMStore.getState();
-        const friendState = useFriendStore.getState();
-        for (const u of users) {
-          dmState.updateParticipantProfile(u.user_id, { status: u.status });
-          friendState.updateFriendPresence(u.user_id, u.status);
-        }
-      } else if (msg.data.online_user_ids) {
-        // Backward compatibility: simple list of online user IDs
-        const userIds = msg.data.online_user_ids;
-        useMemberStore.getState().setOnlineUsers(userIds);
-
-        // #803: legacy snapshots carry no per-user status; presence in the
-        // online list promotes a stale offline self → online (the #803 symptom)
-        // but must NOT downgrade a deliberate dnd/invisible choice (mirrors
-        // setOnlineUsers' preserve-non-offline rule). The current server always
-        // sends users[]; this branch is back-compat only.
-        if (
-          selfId &&
-          userIds.includes(selfId) &&
-          useMemberStore.getState().selfStatus === 'offline'
-        ) {
-          useMemberStore.getState().setSelfStatus('online');
-        }
-
-        const dmState2 = useDMStore.getState();
-        const friendState2 = useFriendStore.getState();
-        for (const id of userIds) {
-          dmState2.updateParticipantProfile(id, { status: 'online' });
-          friendState2.updateFriendPresence(id, 'online');
-        }
-      }
+      if (users) applyEnhancedPresenceSnapshot(users, selfId);
+      else if (onlineUserIds) applyLegacyPresenceSnapshot(onlineUserIds, selfId);
     });
 
     // Presence change — msg.data narrowed to PresencePayload.
@@ -2350,12 +2373,15 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
     // msg.data is already narrowed (no casts). The store keys other users'
     // custom text by user_id; the self slice is owned by the settings flow.
     const unsubRichPresenceUpdate = wsService.on('rich_presence_update', (msg) => {
-      if (msg.data.category !== 'custom_text') return;
-      useRichPresenceStore.getState().setCustomText(msg.data.user_id, msg.data.payload);
+      const selfId = richPresenceSelfId();
+      if (msg.data.user_id === selfId) return;
+      const { user_id: userId, ...entry } = msg.data;
+      useRichPresenceStore.getState().setOtherPresence(userId, entry);
     });
     const unsubRichPresenceClear = wsService.on('rich_presence_clear', (msg) => {
-      if (msg.data.category !== 'custom_text') return;
-      useRichPresenceStore.getState().clearCustomText(msg.data.user_id);
+      const selfId = richPresenceSelfId();
+      if (msg.data.user_id === selfId) return;
+      useRichPresenceStore.getState().clearOtherPresence(msg.data.user_id, msg.data.category);
     });
 
     // Cleanup handlers

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
-import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import { selectCustomText, useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
@@ -41,7 +41,7 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   // Selective subscription: this member's custom-text status (undefined if none).
-  const customText = useRichPresenceStore((s) => s.customTextByUser[member.user_id]);
+  const customText = useRichPresenceStore(selectCustomText(member.user_id));
   const currentUserId = useUserStore((s) => s.user?.id);
   // Drives whether the friend-request row renders at all (hidden for self).
   const { visible: friendActionVisible } = useFriendRequestState(member.user_id);

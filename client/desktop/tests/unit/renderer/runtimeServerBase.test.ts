@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { API_BASE, WS_BASE } from '@/renderer/config';
+import { resetAllStores } from '../../helpers/store-helpers';
 import {
   apiUrl,
   captureRuntimeServerSelection,
@@ -11,8 +12,13 @@ import {
   runtimeServerSelectionIsCurrent,
   setRuntimeServerBase,
 } from '@/renderer/services/runtimeServerBase';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 
 describe('runtimeServerBase', () => {
+  beforeEach(() => {
+    resetAllStores();
+  });
+
   afterEach(() => {
     resetRuntimeServerBase();
   });
@@ -87,5 +93,33 @@ describe('runtimeServerBase', () => {
     resetRuntimeServerBase();
     expect(captureRuntimeServerSelection().epoch).toBe(beforeReset.epoch + 1);
     expect(runtimeServerSelectionIsCurrent(beforeReset)).toBe(false);
+  });
+
+  it('clears remote rich presence on runtime-server changes while preserving local self state', () => {
+    const store = useRichPresenceStore.getState() as unknown as {
+      replaceOtherPresence?: (next: Record<string, Record<string, unknown>>) => void;
+      otherByUser?: unknown;
+    };
+    store.replaceOtherPresence?.({ other: { custom_text: { category: 'custom_text' } } });
+    useRichPresenceStore.getState().setSelfPresence({ tier: 1, customText: 'local' });
+    setRuntimeServerBase('https://other.example');
+    expect(
+      (useRichPresenceStore.getState() as unknown as { otherByUser?: unknown }).otherByUser
+    ).toEqual({});
+    expect(useRichPresenceStore.getState().self.customText).toBe('local');
+  });
+
+  it('clears remote rich presence on runtime-server reset while preserving local self state', () => {
+    const store = useRichPresenceStore.getState() as unknown as {
+      setOtherPresence?: (id: string, entry: { category: string }) => void;
+      otherByUser?: unknown;
+    };
+    store.setOtherPresence?.('other', { category: 'custom_text' });
+    useRichPresenceStore.getState().setSelfPresence({ tier: 1, customText: 'local' });
+    resetRuntimeServerBase();
+    expect(
+      (useRichPresenceStore.getState() as unknown as { otherByUser?: unknown }).otherByUser
+    ).toEqual({});
+    expect(useRichPresenceStore.getState().self.customText).toBe('local');
   });
 });

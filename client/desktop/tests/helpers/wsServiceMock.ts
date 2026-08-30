@@ -1,4 +1,5 @@
 import { vi } from 'vitest';
+import type { ConnectionInfo } from '@/renderer/services/websocketService';
 
 /**
  * Signature for a handler captured by {@link createMockWsService}.
@@ -53,6 +54,7 @@ export function createMockWsService() {
     }),
     /** Test helper: drive the captured connection listener. */
     emitConnectionChange: (state: unknown) => connectionListener?.(state),
+    getConnectionInfo: vi.fn<() => ConnectionInfo | null>(() => null),
     disconnect: vi.fn(),
   };
 }

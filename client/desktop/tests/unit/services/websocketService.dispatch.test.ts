@@ -77,6 +77,56 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
     expect(useConnectionStore.getState().wireViolationCount).toBe(0);
   });
 
+  it('rejects malformed rich-presence frames without invoking subscribers or logging payload data', () => {
+    const SENTINEL = 'private-user-name-and-participant-id';
+    const handler = vi.fn();
+    svc.on('rich_presence_update', handler);
+    fire({
+      type: 'rich_presence_update',
+      data: {
+        user_id: 'not-a-uuid',
+        category: 'private_call',
+        minimized: true,
+        payload: { call_type: 'group', participant_count: 99, participant: SENTINEL },
+        updated_at: 0,
+      },
+    });
+    expect(handler).not.toHaveBeenCalled();
+    expect(useConnectionStore.getState().wireViolationCount).toBe(1);
+    const loggedArgs = consoleErrorSpy.mock.calls.flat();
+    const logged = loggedArgs
+      .map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg)))
+      .join(' ');
+    expect(logged).not.toContain(SENTINEL);
+    expect(logged).not.toContain('not-a-uuid');
+    expect(logged).not.toContain('participant_count');
+    const containsError = (value: unknown): boolean => {
+      if (value instanceof Error) return true;
+      if (Array.isArray(value)) return value.some(containsError);
+      if (value !== null && typeof value === 'object')
+        return Object.values(value).some(containsError);
+      return false;
+    };
+    expect(loggedArgs.some(containsError)).toBe(false);
+  });
+
+  it('dispatches a valid detailed private-call category frame', () => {
+    const handler = vi.fn();
+    svc.on('rich_presence_update', handler);
+    fire({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category: 'private_call',
+        minimized: false,
+        payload: { call_type: 'group', participant_count: 3 },
+        updated_at: 2,
+      },
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(useConnectionStore.getState().wireViolationCount).toBe(0);
+  });
+
   it('JSON.parse failure → log + drop, counter NOT incremented', () => {
     const handler = vi.fn();
     svc.on('message', handler);
@@ -89,6 +139,27 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
       .flatMap((call) => call.map((arg) => (typeof arg === 'string' ? arg : '')))
       .join(' ');
     expect(allLogged).toContain('Failed to parse');
+  });
+
+  it('JSON.parse failure never logs exception text derived from the malformed frame', () => {
+    const SENTINEL = 'malformed-frame-content-must-not-reach-logs';
+    const parseSpy = vi.spyOn(JSON, 'parse').mockImplementationOnce(() => {
+      throw new SyntaxError(SENTINEL);
+    });
+
+    try {
+      fireRaw('{');
+
+      expect(useConnectionStore.getState().wireViolationCount).toBe(0);
+      const allLogged = consoleErrorSpy.mock.calls
+        .flatMap((call) => call.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg))))
+        .join(' ');
+      expect(allLogged).toContain('Failed to parse');
+      expect(allLogged).not.toContain(SENTINEL);
+      expect(allLogged).toContain('SyntaxError');
+    } finally {
+      parseSpy.mockRestore();
+    }
   });
 
   it('schema rejection (known type, bad shape) → counter += 1, payload values NOT leaked (PII sentinel)', () => {
@@ -114,6 +185,30 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
     expect(allLogged).toContain('[WS] wire violation');
   });
 
+  it('schema rejection logs omit strict unknown property names', () => {
+    const UNKNOWN_KEY = 'attacker-controlled-user-id';
+    const handler = vi.fn();
+    svc.on('rich_presence_update', handler);
+
+    fire({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category: 'custom_text',
+        payload: { text: 'working', [UNKNOWN_KEY]: 'sensitive-value' },
+        updated_at: 1,
+      },
+    });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(useConnectionStore.getState().wireViolationCount).toBe(1);
+    const allLogged = consoleErrorSpy.mock.calls
+      .flatMap((call) => call.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg))))
+      .join(' ');
+    expect(allLogged).not.toContain(UNKNOWN_KEY);
+    expect(allLogged).toContain('unrecognized_keys');
+  });
+
   it('entitlements_changed schema rejection (missing required field) → counter += 1, handler not invoked', () => {
     const handler = vi.fn();
     svc.on('entitlements_changed', handler);
@@ -127,12 +222,25 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
     expect(useConnectionStore.getState().wireViolationCount).toBe(1);
   });
 
+  it('presence snapshots with unknown envelope or data keys are rejected before dispatch', () => {
+    const handler = vi.fn();
+    svc.on('presence_snapshot', handler);
+    const validData = { users: [{ user_id: UUID_A, status: 'online' }] };
+
+    fire({ type: 'presence_snapshot', data: validData, unexpected: true });
+    fire({ type: 'presence_snapshot', data: { ...validData, unexpected: true } });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(useConnectionStore.getState().wireViolationCount).toBe(2);
+  });
+
   it('unknown event type → log + counter += 1 + distinct "unknown event type" message', () => {
+    const UNKNOWN_TYPE = 'attacker-controlled-event-id';
     const handler = vi.fn();
     svc.on('dm_message', handler);
 
     fire({
-      type: 'event_from_future_server_version',
+      type: UNKNOWN_TYPE,
       data: {},
     });
 
@@ -143,7 +251,8 @@ describe('WebSocketService.handleMessage — dispatch validation', () => {
       .flatMap((call) => call.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg))))
       .join(' ');
     expect(allLogged).toContain('unknown event type');
-    expect(allLogged).toContain('event_from_future_server_version');
+    expect(allLogged).not.toContain(UNKNOWN_TYPE);
+    expect(allLogged).toContain('invalid_union');
   });
 
   it('handler exception → sibling handlers still invoked, counter NOT incremented', () => {

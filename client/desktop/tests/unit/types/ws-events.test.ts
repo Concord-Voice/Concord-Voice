@@ -8,6 +8,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
 import {
   // Chat messages (9)
   MessageSchema,
@@ -917,6 +918,238 @@ describe('ws-events schemas — happy path (one per event)', () => {
   });
 });
 
+describe('rich presence category contracts (#2233)', () => {
+  const update = (category: string, payload: unknown, minimized = false, updatedAt = 1) =>
+    WebSocketEventSchema.safeParse({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category,
+        ...(category === 'custom_text' ? {} : { minimized }),
+        payload,
+        updated_at: updatedAt,
+      },
+    });
+
+  it('accepts detailed and minimized Server Voice with coupled fields', () => {
+    expect(
+      update('server_voice', {
+        channel_id: UUID_B,
+        server_id: UUID_C,
+        channel_name: 'Lounge',
+        server_name: 'Concord',
+      })
+    ).toMatchObject({ success: true });
+    expect(update('server_voice', { channel_id: UUID_B, server_id: UUID_C }, true)).toMatchObject({
+      success: true,
+    });
+  });
+
+  it('counts Server Voice names by Unicode code point', () => {
+    const payload = {
+      channel_id: UUID_B,
+      server_id: UUID_C,
+      channel_name: '😀'.repeat(100),
+      server_name: '😀'.repeat(100),
+    };
+
+    expect(update('server_voice', payload).success).toBe(true);
+    for (const field of ['channel_name', 'server_name'] as const) {
+      expect(update('server_voice', { ...payload, [field]: '😀'.repeat(101) }).success).toBe(false);
+    }
+  });
+
+  it('bounds Rich Presence timestamps to the backend exact-second cap', () => {
+    const cap = 9_007_199_254;
+    const updates = [
+      {
+        category: 'server_voice',
+        minimized: true,
+        payload: { channel_id: UUID_B, server_id: UUID_C, started_at: cap },
+      },
+      { category: 'private_call', minimized: true, payload: { call_type: 'dm', started_at: cap } },
+      { category: 'custom_text', minimized: false, payload: { text: 'working' } },
+    ] as const;
+
+    for (const { category, minimized, payload } of updates) {
+      expect(update(category, payload, minimized, cap).success).toBe(true);
+      expect(update(category, payload, minimized, cap + 1).success).toBe(false);
+    }
+    for (const { category, minimized, payload } of updates.slice(0, 2)) {
+      expect(update(category, { ...payload, started_at: cap + 1 }, minimized, cap).success).toBe(
+        false
+      );
+      for (const updatedAt of [cap, cap + 1]) {
+        expect(
+          PresenceSnapshotSchema.safeParse({
+            type: 'presence_snapshot',
+            data: {
+              users: [
+                {
+                  user_id: UUID_A,
+                  status: 'online',
+                  rich_presence: { [category]: { minimized, payload, updated_at: updatedAt } },
+                },
+              ],
+            },
+          }).success
+        ).toBe(updatedAt === cap);
+      }
+    }
+  });
+
+  it('rejects Server Voice minimized/detail mismatches and unknown fields', () => {
+    expect(update('server_voice', { channel_id: UUID_B, server_id: UUID_C }, false).success).toBe(
+      false
+    );
+    expect(
+      update(
+        'server_voice',
+        {
+          channel_id: UUID_B,
+          server_id: UUID_C,
+          channel_name: 'Lounge',
+          server_name: 'Concord',
+        },
+        true
+      ).success
+    ).toBe(false);
+    expect(
+      update('server_voice', { channel_id: UUID_B, server_id: UUID_C, leaked: 'pii' }, true).success
+    ).toBe(false);
+    expect(update('server_voice', { channel_id: UUID_B, server_id: UUID_C }, true, 0).success).toBe(
+      false
+    );
+    expect(
+      update('server_voice', { channel_id: UUID_B, server_id: UUID_C }, true, -1).success
+    ).toBe(false);
+  });
+
+  it('accepts detailed and minimized Private Call, but couples participant_count to detail', () => {
+    expect(update('private_call', { call_type: 'dm', participant_count: 2 })).toMatchObject({
+      success: true,
+    });
+    expect(update('private_call', { call_type: 'group' }, true)).toMatchObject({ success: true });
+    expect(update('private_call', { call_type: 'dm' }, false).success).toBe(false);
+    expect(update('private_call', { call_type: 'group', participant_count: 2 }, true).success).toBe(
+      false
+    );
+    expect(update('private_call', { call_type: 'dm' }, true)).toMatchObject({ success: true });
+    expect(update('private_call', { call_type: 'dm', participant_count: 0 }, false).success).toBe(
+      false
+    );
+    expect(
+      update('private_call', { call_type: 'dm', participant_count: 2, leaked: 'x' }, false).success
+    ).toBe(false);
+    expect(update('private_call', { call_type: 'dm', started_at: 0 }, true).success).toBe(false);
+  });
+
+  it('accepts Custom Status and rejects malformed category payloads', () => {
+    expect(update('custom_text', { text: 'working', emoji: '💻' })).toMatchObject({
+      success: true,
+    });
+    expect(update('custom_text', { text: '' })).toMatchObject({ success: false });
+    expect(update('custom_text', { text: 'ok', leaked: 'x' })).toMatchObject({ success: false });
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'rich_presence_update',
+        data: {
+          user_id: UUID_A,
+          category: 'custom_text',
+          minimized: false,
+          payload: { text: 'ok' },
+          updated_at: 1,
+        },
+      }).success
+    ).toBe(false);
+    expect(update('games', { text: 'future' })).toMatchObject({ success: false });
+    expect(update('private_call', { call_type: 'broadcast' }, true)).toMatchObject({
+      success: false,
+    });
+    expect(
+      update('server_voice', { channel_id: 'not-a-uuid', server_id: UUID_C }, true)
+    ).toMatchObject({ success: false });
+  });
+
+  it('accepts sparse rich-presence snapshots and rejects mismatched categories', () => {
+    const base = { user_id: UUID_A, status: 'online' };
+    expect(
+      PresenceSnapshotSchema.safeParse({
+        type: 'presence_snapshot',
+        data: {
+          users: [
+            {
+              ...base,
+              rich_presence: {
+                server_voice: {
+                  minimized: true,
+                  payload: { channel_id: UUID_B, server_id: UUID_C },
+                  updated_at: 1,
+                },
+              },
+            },
+          ],
+        },
+      }).success
+    ).toBe(true);
+    expect(
+      PresenceSnapshotSchema.safeParse({
+        type: 'presence_snapshot',
+        data: {
+          users: [
+            {
+              ...base,
+              rich_presence: {
+                server_voice: { minimized: true, payload: { call_type: 'dm' }, updated_at: 2 },
+              },
+            },
+          ],
+        },
+      }).success
+    ).toBe(false);
+    expect(
+      PresenceSnapshotSchema.safeParse({ type: 'presence_snapshot', data: { users: [base] } })
+        .success
+    ).toBe(true);
+    expect(
+      PresenceSnapshotSchema.safeParse({
+        type: 'presence_snapshot',
+        data: {
+          users: [
+            {
+              ...base,
+              rich_presence: {
+                private_call: { minimized: true, payload: { call_type: 'dm' }, updated_at: 2 },
+              },
+            },
+          ],
+        },
+      }).success
+    ).toBe(true);
+    expect(
+      PresenceSnapshotSchema.safeParse({
+        type: 'presence_snapshot',
+        data: { users: [{ ...base, unexpected: 'x' }] },
+      }).success
+    ).toBe(false);
+  });
+
+  it('rejects unknown presence snapshot envelope and data keys', () => {
+    const base = {
+      type: 'presence_snapshot',
+      data: { users: [{ user_id: UUID_A, status: 'online' }] },
+    };
+
+    expect(PresenceSnapshotSchema.safeParse({ ...base, unexpected: true }).success).toBe(false);
+    expect(
+      PresenceSnapshotSchema.safeParse({
+        ...base,
+        data: { ...base.data, unexpected: true },
+      }).success
+    ).toBe(false);
+  });
+});
+
 // ════════════════════════════════════════════════════════════════════════
 // 2. Rejection cases — required-field violations across domains
 // ════════════════════════════════════════════════════════════════════════
@@ -1268,6 +1501,66 @@ describe('WebSocketEventSchema — discriminated union behavior', () => {
 // ════════════════════════════════════════════════════════════════════════
 
 describe('scrubZodIssues — PII safety', () => {
+  it('retains only deduplicated issue codes for strict and custom failures', () => {
+    const UNKNOWN_FIELD = 'attacker-controlled-user-id';
+    const UNKNOWN_CATEGORY = 'attacker-controlled-presence-id';
+    const SENTINEL = 'attacker-controlled-custom-issue';
+    const strictFieldResult = WebSocketEventSchema.safeParse({
+      type: 'rich_presence_update',
+      data: {
+        user_id: UUID_A,
+        category: 'custom_text',
+        payload: { text: 'working', [UNKNOWN_FIELD]: 'sensitive-value' },
+        updated_at: 1,
+      },
+    });
+    const strictMapResult = PresenceSnapshotSchema.safeParse({
+      type: 'presence_snapshot',
+      data: {
+        users: [
+          {
+            user_id: UUID_A,
+            status: 'online',
+            rich_presence: { [UNKNOWN_CATEGORY]: {} },
+          },
+        ],
+      },
+    });
+
+    expect(strictFieldResult.success).toBe(false);
+    expect(strictMapResult.success).toBe(false);
+    if (!strictFieldResult.success && !strictMapResult.success) {
+      const scrubbed = scrubZodIssues([
+        ...strictFieldResult.error.issues,
+        ...strictMapResult.error.issues,
+        {
+          code: 'custom',
+          path: [SENTINEL],
+          message: SENTINEL,
+        } as unknown as z.core.$ZodIssue,
+      ]);
+      const serialized = JSON.stringify(scrubbed);
+
+      expect(scrubbed).toEqual(['unrecognized_keys', 'custom']);
+      expect(serialized).not.toContain(UNKNOWN_FIELD);
+      expect(serialized).not.toContain(UNKNOWN_CATEGORY);
+      expect(serialized).not.toContain(SENTINEL);
+    }
+  });
+
+  it('redacts record-key paths from schema diagnostics', () => {
+    const result = ServerOnlineCountsSchema.safeParse({
+      type: 'server_online_counts',
+      data: { counts: { [UUID_A]: 'not-a-count' } },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.includes(UUID_A))).toBe(true);
+      expect(JSON.stringify(scrubZodIssues(result.error.issues))).not.toContain(UUID_A);
+    }
+  });
+
   it('strips PII-bearing field values from scrubbed output (sentinel assertion)', () => {
     // The load-bearing security test: a payload with a sentinel string AND a
     // type violation. After scrubbing + stringification, neither the sentinel
@@ -1294,7 +1587,7 @@ describe('scrubZodIssues — PII safety', () => {
     }
   });
 
-  it('retains structural metadata (code, path, message) after scrubbing', () => {
+  it('retains a bounded issue code after scrubbing', () => {
     const result = MessageSchema.safeParse({
       type: 'message',
       data: {
@@ -1312,12 +1605,7 @@ describe('scrubZodIssues — PII safety', () => {
       const scrubbed = scrubZodIssues(result.error.issues);
       expect(scrubbed.length).toBeGreaterThan(0);
       for (const issue of scrubbed) {
-        expect(issue).toHaveProperty('code');
-        expect(typeof issue.code).toBe('string');
-        expect(issue).toHaveProperty('path');
-        expect(Array.isArray(issue.path)).toBe(true);
-        expect(issue).toHaveProperty('message');
-        expect(typeof issue.message).toBe('string');
+        expect(issue).toEqual(expect.any(String));
       }
     }
   });
@@ -1327,7 +1615,7 @@ describe('scrubZodIssues — PII safety', () => {
     expect(scrubbed).toEqual([]);
   });
 
-  it('handles multiple issues from one parse failure', () => {
+  it('deduplicates repeated issue codes from one parse failure', () => {
     // Empty data on MessageSchema produces multiple missing-required-field issues.
     const result = MessageSchema.safeParse({
       type: 'message',
@@ -1336,12 +1624,11 @@ describe('scrubZodIssues — PII safety', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       const scrubbed = scrubZodIssues(result.error.issues);
-      expect(scrubbed.length).toBeGreaterThan(1);
-      // Every issue retains its three structural fields.
+      expect(result.error.issues.length).toBeGreaterThan(1);
+      expect(scrubbed.length).toBeLessThan(result.error.issues.length);
+      // Every retained diagnostic is a bounded code.
       for (const issue of scrubbed) {
-        expect(issue.code).toBeTruthy();
-        expect(Array.isArray(issue.path)).toBe(true);
-        expect(typeof issue.message).toBe('string');
+        expect(issue).toEqual(expect.any(String));
       }
     }
   });

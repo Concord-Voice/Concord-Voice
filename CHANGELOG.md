@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Concord Voice keeps voice-channel and private-call activity current internally, and invite previews stay tied to the invite you opened. The visible activity view is not part of this update yet.
+
+### Changed
+
+- **The desktop now keeps voice-channel and private-call activity current internally** ([#3038](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3038)) — incoming activity is validated by category, snapshots replace stale entries, and disconnects or server switches clear cached activity. This prepares the data path for a later visible activity view; it does not add one yet.
+
 ### Fixed
 
 - **An invite preview no longer reuses details from a different invite while loading** ([#3037](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3037)) — preview results are now kept with the invite code they describe, so changing codes shows a loading state until the new details arrive.

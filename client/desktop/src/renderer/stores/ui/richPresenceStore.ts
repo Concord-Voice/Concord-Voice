@@ -1,95 +1,165 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { wrapStore } from '../../utils/createStore';
-import type { CustomTextPresencePayload } from '../../types/ws-events';
+import { onRuntimeServerSelectionChange } from '../../services/runtimeServerBase';
+import type { VoiceConnectionState } from '../voice/voiceStore';
+import type { CustomTextPresencePayload, RichPresenceEntry } from '../../types/ws-events';
 
-/**
- * Rich Presence — Custom Text Status (#1233).
- *
- * Holds OTHER users' custom-text presence (the `custom_text` rich-presence
- * category), keyed by user_id, plus the current user's OWN presence settings
- * (tier + draft/applied custom text). The map is populated by the
- * `rich_presence_update` / `rich_presence_clear` WS handlers in
- * useWebSocketMessages; self settings are populated by the presence-settings
- * REST flow + the settings UI.
- *
- * Wire payloads are schema-validated at the dispatch boundary
- * (CustomTextPresencePayloadSchema in types/ws-events.ts), so the value shape
- * stored here (`{ emoji?, text }`) is structurally guaranteed.
- */
-
-/** One other user's custom-text status. Mirrors CustomTextPresencePayload. */
 export type CustomTextStatus = CustomTextPresencePayload;
+export type RichPresenceCategory = RichPresenceEntry['category'];
 
-/** The current user's own presence settings. */
+type StoredCustomTextEntry = Omit<
+  Extract<RichPresenceEntry, { category: 'custom_text' }>,
+  'updated_at'
+> & {
+  updated_at?: number;
+};
+export type StoredRichPresenceEntry =
+  Exclude<RichPresenceEntry, { category: 'custom_text' }> | StoredCustomTextEntry;
+
+export type OtherPresenceByUser = Record<
+  string,
+  Partial<Record<RichPresenceCategory, StoredRichPresenceEntry>>
+>;
+
 export interface SelfPresence {
-  /** Subscription tier governing custom-text availability (0 = free). */
   tier: number;
-  /** The applied custom-text body, if set. */
   customText?: string;
-  /** The applied custom-text emoji, if set. */
   customTextEmoji?: string;
 }
 
 interface RichPresenceState {
-  /** Other users' custom text, keyed by user_id. */
-  customTextByUser: Record<string, CustomTextStatus>;
-  /** The current user's own presence settings. */
+  otherByUser: OtherPresenceByUser;
   self: SelfPresence;
-
-  /** Set (or replace) another user's custom-text status. */
+  setOtherPresence: (userId: string, entry: StoredRichPresenceEntry) => void;
+  clearOtherPresence: (userId: string, category: RichPresenceCategory) => void;
+  replaceOtherPresence: (next: OtherPresenceByUser) => void;
+  clearAllOtherPresence: () => void;
+  getPresence: (
+    userId: string,
+    category: RichPresenceCategory
+  ) => StoredRichPresenceEntry | undefined;
   setCustomText: (userId: string, status: CustomTextStatus) => void;
-  /** Remove another user's custom-text status. */
   clearCustomText: (userId: string) => void;
-  /** Clear every other user's custom text while preserving self settings. */
-  clearAllCustomText: () => void;
-  /** Read another user's custom-text status (undefined if none). */
   getCustomText: (userId: string) => CustomTextStatus | undefined;
-  /** Patch the current user's own presence settings. */
   setSelfPresence: (updates: Partial<SelfPresence>) => void;
-  /** Reset the store to initial state (test/teardown + sign-out). */
   reset: () => void;
 }
 
 const INITIAL_SELF: SelfPresence = { tier: 0 };
 
+export interface LocalRichPresenceVoiceState {
+  activeChannelId: string | null;
+  activeChannelName: string | null;
+  activeServerId: string | null;
+  connectionState: VoiceConnectionState;
+  isDMCall: boolean;
+  isGroupDM: boolean;
+  callState: { kind: string };
+  participants: Record<string, unknown>;
+}
+
+export type LocalRichPresenceActivity =
+  | {
+      category: 'server_voice';
+      channelId: string;
+      channelName: string;
+      serverId: string;
+    }
+  | {
+      category: 'private_call';
+      callType: 'dm' | 'group';
+      participantCount?: number;
+    };
+
+export function selectLocalRichPresenceActivity(
+  voiceState: LocalRichPresenceVoiceState
+): LocalRichPresenceActivity | null {
+  if (voiceState.connectionState !== 'connected') return null;
+
+  if (voiceState.isDMCall) {
+    if (voiceState.callState.kind !== 'in-call') return null;
+    const activity: LocalRichPresenceActivity = {
+      category: 'private_call',
+      callType: voiceState.isGroupDM ? 'group' : 'dm',
+    };
+    const participantCount = Object.keys(voiceState.participants).length;
+    return voiceState.isGroupDM && participantCount > 0
+      ? { ...activity, participantCount }
+      : activity;
+  }
+
+  if (voiceState.callState.kind !== 'idle' && voiceState.callState.kind !== 'in-call') return null;
+  if (!voiceState.activeChannelId || !voiceState.activeChannelName || !voiceState.activeServerId) {
+    return null;
+  }
+  return {
+    category: 'server_voice',
+    channelId: voiceState.activeChannelId,
+    channelName: voiceState.activeChannelName,
+    serverId: voiceState.activeServerId,
+  };
+}
+
+export const selectCustomText =
+  (userId: string) =>
+  (state: RichPresenceState): CustomTextStatus | undefined => {
+    const entry = state.otherByUser[userId]?.custom_text;
+    return entry?.category === 'custom_text' ? entry.payload : undefined;
+  };
+
 export const useRichPresenceStore = wrapStore(
   create<RichPresenceState>()(
     devtools(
       (set, get) => ({
-        customTextByUser: {},
+        otherByUser: {},
         self: { ...INITIAL_SELF },
 
-        setCustomText: (userId, status) => {
+        setOtherPresence: (userId, entry) => {
           set((state) => ({
-            customTextByUser: { ...state.customTextByUser, [userId]: status },
+            otherByUser: {
+              ...state.otherByUser,
+              [userId]: { ...state.otherByUser[userId], [entry.category]: entry },
+            },
           }));
         },
 
-        clearCustomText: (userId) => {
+        clearOtherPresence: (userId, category) => {
           set((state) => {
-            if (!(userId in state.customTextByUser)) return state;
-            const next = { ...state.customTextByUser };
-            delete next[userId];
-            return { customTextByUser: next };
+            const current = state.otherByUser[userId];
+            if (!current || !(category in current)) return state;
+            const nextUser = { ...current };
+            delete nextUser[category];
+            const next = { ...state.otherByUser };
+            if (Object.keys(nextUser).length === 0) delete next[userId];
+            else next[userId] = nextUser;
+            return { otherByUser: next };
           });
         },
 
-        clearAllCustomText: () => {
-          set({ customTextByUser: {} });
-        },
+        replaceOtherPresence: (next) => set({ otherByUser: next }),
+        clearAllOtherPresence: () => set({ otherByUser: {} }),
 
-        getCustomText: (userId) => get().customTextByUser[userId],
+        getPresence: (userId, category) => get().otherByUser[userId]?.[category],
+
+        setCustomText: (userId, status) =>
+          get().setOtherPresence(userId, { category: 'custom_text', payload: status }),
+
+        clearCustomText: (userId) => get().clearOtherPresence(userId, 'custom_text'),
+
+        getCustomText: (userId) => selectCustomText(userId)(get()),
 
         setSelfPresence: (updates) => {
           set((state) => ({ self: { ...state.self, ...updates } }));
         },
 
-        reset: () => {
-          set({ customTextByUser: {}, self: { ...INITIAL_SELF } });
-        },
+        reset: () => set({ otherByUser: {}, self: { ...INITIAL_SELF } }),
       }),
       { name: 'RichPresenceStore' }
     )
   )
 );
+
+onRuntimeServerSelectionChange(() => {
+  useRichPresenceStore.getState().clearAllOtherPresence();
+});

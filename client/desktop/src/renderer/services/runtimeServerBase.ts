@@ -3,10 +3,20 @@ import { API_BASE, WS_BASE } from '../config';
 let runtimeApiBase = API_BASE;
 let runtimeWsBase = WS_BASE;
 let runtimeServerSelectionEpoch = 0;
+const runtimeServerSelectionListeners = new Set<() => void>();
 
 export interface RuntimeServerSelection {
   readonly apiBase: string;
   readonly epoch: number;
+}
+
+export function onRuntimeServerSelectionChange(listener: () => void): () => void {
+  runtimeServerSelectionListeners.add(listener);
+  return () => runtimeServerSelectionListeners.delete(listener);
+}
+
+function notifyRuntimeServerSelectionChange(): void {
+  for (const listener of runtimeServerSelectionListeners) listener();
 }
 
 function normalizeHttpBase(base: string): string {
@@ -59,10 +69,12 @@ export function setRuntimeServerBase(base: string): void {
   runtimeApiBase = apiBase;
   runtimeWsBase = wsBase;
   runtimeServerSelectionEpoch += 1;
+  notifyRuntimeServerSelectionChange();
 }
 
 export function resetRuntimeServerBase(): void {
   runtimeApiBase = API_BASE;
   runtimeWsBase = WS_BASE;
   runtimeServerSelectionEpoch += 1;
+  notifyRuntimeServerSelectionChange();
 }

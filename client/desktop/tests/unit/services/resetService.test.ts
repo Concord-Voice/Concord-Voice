@@ -128,6 +128,36 @@ describe('resetService', () => {
   });
 
   describe('gracefulReset', () => {
+    it('clears every rich-presence category while preserving no self state on account reset', () => {
+      const store = useRichPresenceStore.getState() as unknown as {
+        replaceOtherPresence?: (next: Record<string, Record<string, unknown>>) => void;
+        otherByUser?: unknown;
+      };
+      store.replaceOtherPresence?.({
+        other: {
+          server_voice: { category: 'server_voice' },
+          private_call: { category: 'private_call' },
+          custom_text: { category: 'custom_text' },
+        },
+      });
+      useRichPresenceStore.getState().setSelfPresence({ tier: 2, customText: 'mine' });
+      gracefulReset();
+      expect(
+        (useRichPresenceStore.getState() as unknown as { otherByUser?: unknown }).otherByUser
+      ).toEqual({});
+      expect(useRichPresenceStore.getState().self).toEqual({ tier: 0 });
+    });
+
+    it('nuclear reset clears remote categories and self presence', () => {
+      useRichPresenceStore.getState().setCustomText('other-user', { text: 'remote' });
+      useRichPresenceStore.getState().setSelfPresence({ tier: 3, customText: 'mine' });
+      nuclearReset();
+      const current = useRichPresenceStore.getState();
+      expect(current.getCustomText('other-user')).toBeUndefined();
+      expect(current.self).toEqual({ tier: 0 });
+      expect((current as unknown as { otherByUser?: unknown }).otherByUser).toEqual({});
+    });
+
     it('cancels encrypted-social sync before clearing either decrypted store', () => {
       useFriendOrgStore.getState()._hydrate({
         v: 1,
@@ -231,7 +261,10 @@ describe('resetService', () => {
 
       gracefulReset();
 
-      expect(Object.keys(useRichPresenceStore.getState().customTextByUser)).toHaveLength(0);
+      expect(useRichPresenceStore.getState().getCustomText('other-user')).toBeUndefined();
+      expect(
+        (useRichPresenceStore.getState() as unknown as { otherByUser?: unknown }).otherByUser
+      ).toEqual({});
       expect(useRichPresenceStore.getState().self.tier).toBe(0);
       expect(useRichPresenceStore.getState().self.customText).toBeUndefined();
     });

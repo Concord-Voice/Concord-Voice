@@ -767,7 +767,9 @@ export class WebSocketService {
     try {
       raw = JSON.parse(event.data);
     } catch (error) {
-      console.error('Failed to parse WebSocket message:', errorMessage(error));
+      // JSON parser messages can include excerpts of the rejected frame.
+      // Keep the error class for triage without logging malformed wire data.
+      console.error('Failed to parse WebSocket message:', errorName(error));
       return;
     }
 
@@ -779,30 +781,20 @@ export class WebSocketService {
     // tests/unit/services/websocketService.dispatch.test.ts.
     const parsed = WebSocketEventSchema.safeParse(raw);
     if (!parsed.success) {
-      const rawType =
-        typeof raw === 'object' && raw !== null && 'type' in raw
-          ? String((raw as { type?: unknown }).type)
-          : '<unknown>';
       // Discriminator-mismatch produces issues[0].code === 'invalid_union' in
       // zod 4.x (the pre-4 name was 'invalid_union_discriminator'). When the
       // discriminator value isn't in the union's literal list, this is the
       // "unknown event type" case — client may be outdated relative to server.
       const isUnknownType = parsed.error.issues.some((i) => i.code === 'invalid_union');
-      // Format-string injection defense (CWE-134): keep the prefix string a
-      // constant literal; never interpolate the server-supplied `rawType` into
-      // the format string itself. console.error treats argument 1 as a printf-
-      // like format string, so a `rawType` containing `%s`/`%d` would consume
-      // the second argument unexpectedly. The structured object below carries
-      // `rawType` as a typed field, where it's safe.
       const logPrefix = isUnknownType
         ? '[WS] unknown event type — client may be outdated'
         : '[WS] wire violation';
-      // Structured metadata only — issues are PII-scrubbed via scrubZodIssues. The last
+      // Bounded issue codes only — scrubZodIssues strips the payload-derived
+      // paths, messages, and keys. The last
       // console.error arg here is an object literal (not a bare Error identifier), so the
       // no-restricted-syntax raw-err guard's selector doesn't match.
       console.error(logPrefix, {
-        type: rawType,
-        issues: scrubZodIssues(parsed.error.issues),
+        issue_codes: scrubZodIssues(parsed.error.issues),
       });
       useConnectionStore.getState().incrementWireViolation();
       return;

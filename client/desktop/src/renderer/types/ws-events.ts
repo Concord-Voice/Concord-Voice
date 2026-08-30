@@ -205,10 +205,158 @@ const VoiceActionSchema = z.enum([
 
 // ── Presence ──────────────────────────────────────────────────────────
 
+// Rich Presence wire objects are deliberately strict: this is the renderer's
+// trust boundary for server-authorized activity metadata.
+export const RichPresenceCategorySchema = z.enum([
+  'server_voice',
+  'private_call',
+  'games',
+  'music',
+  'streaming',
+  'browser',
+  'productivity',
+  'creator',
+  'custom_text',
+]);
+
+const CurrentRichPresenceCategorySchema = z.enum(['server_voice', 'private_call', 'custom_text']);
+
+export const CustomTextPresencePayloadSchema = z.strictObject({
+  emoji: z
+    .string()
+    .refine((value) => [...value].length <= 32)
+    .optional(),
+  text: z
+    .string()
+    .min(1)
+    .refine((value) => [...value].length <= 140),
+});
+
+const PresenceNameSchema = z
+  .string()
+  .min(1)
+  .refine((value) => [...value].length <= 100);
+const RichPresenceTimestampSchema = z.number().int().positive().max(9_007_199_254);
+
+export const ServerVoicePresencePayloadSchema = z.strictObject({
+  channel_id: UUID,
+  channel_name: PresenceNameSchema.optional(),
+  server_id: UUID,
+  server_name: PresenceNameSchema.optional(),
+  started_at: RichPresenceTimestampSchema.optional(),
+});
+
+export const PrivateCallPresencePayloadSchema = z.strictObject({
+  call_type: z.enum(['dm', 'group']),
+  participant_count: z.number().int().min(1).max(255).optional(),
+  started_at: RichPresenceTimestampSchema.optional(),
+});
+
+const RichPresenceUpdateBaseSchema = z.strictObject({
+  user_id: UUID,
+  updated_at: RichPresenceTimestampSchema,
+});
+
+const CustomTextRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
+  category: z.literal('custom_text'),
+  payload: CustomTextPresencePayloadSchema,
+});
+
+const ServerVoiceRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
+  category: z.literal('server_voice'),
+  minimized: z.boolean(),
+  payload: ServerVoicePresencePayloadSchema,
+});
+
+const PrivateCallRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
+  category: z.literal('private_call'),
+  minimized: z.boolean(),
+  payload: PrivateCallPresencePayloadSchema,
+});
+
+const RichPresenceUpdateDataSchema = z
+  .discriminatedUnion('category', [
+    CustomTextRichPresenceUpdateDataSchema,
+    ServerVoiceRichPresenceUpdateDataSchema,
+    PrivateCallRichPresenceUpdateDataSchema,
+  ])
+  .superRefine((data, ctx) => {
+    let validDetailShape = true;
+    if (data.category === 'server_voice') {
+      if (data.minimized) {
+        validDetailShape =
+          data.payload.channel_name === undefined && data.payload.server_name === undefined;
+      } else {
+        validDetailShape =
+          data.payload.channel_name !== undefined && data.payload.server_name !== undefined;
+      }
+    } else if (data.category === 'private_call') {
+      if (data.minimized) {
+        validDetailShape = data.payload.participant_count === undefined;
+      } else {
+        validDetailShape = data.payload.participant_count !== undefined;
+      }
+    }
+    if (!validDetailShape) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['payload'],
+        message: 'payload detail fields do not match minimized',
+      });
+    }
+  });
+
+const ServerVoiceSnapshotEntrySchema = z
+  .strictObject({
+    minimized: z.boolean(),
+    payload: ServerVoicePresencePayloadSchema,
+    updated_at: RichPresenceTimestampSchema,
+  })
+  .superRefine((entry, ctx) => {
+    const valid = entry.minimized
+      ? entry.payload.channel_name === undefined && entry.payload.server_name === undefined
+      : entry.payload.channel_name !== undefined && entry.payload.server_name !== undefined;
+    if (!valid)
+      ctx.addIssue({ code: 'custom', path: ['payload'], message: 'invalid detail shape' });
+  });
+
+const PrivateCallSnapshotEntrySchema = z
+  .strictObject({
+    minimized: z.boolean(),
+    payload: PrivateCallPresencePayloadSchema,
+    updated_at: RichPresenceTimestampSchema,
+  })
+  .superRefine((entry, ctx) => {
+    const valid = entry.minimized
+      ? entry.payload.participant_count === undefined
+      : entry.payload.participant_count !== undefined;
+    if (!valid)
+      ctx.addIssue({ code: 'custom', path: ['payload'], message: 'invalid detail shape' });
+  });
+
+export const RichPresenceMapSchema = z.strictObject({
+  server_voice: ServerVoiceSnapshotEntrySchema.optional(),
+  private_call: PrivateCallSnapshotEntrySchema.optional(),
+});
+
+export const RichPresenceUpdateSchema = z.strictObject({
+  type: z.literal('rich_presence_update'),
+  data: RichPresenceUpdateDataSchema,
+});
+
+export const RichPresenceClearSchema = z.strictObject({
+  type: z.literal('rich_presence_clear'),
+  data: z.strictObject({
+    user_id: UUID,
+    category: CurrentRichPresenceCategorySchema,
+  }),
+});
+
 /** One user's presence as emitted inside presence_snapshot.users. Server: hub.go:346 userPresenceInfo. */
-const UserPresenceInfoSchema = z.object({
+const UserPresenceInfoSchema = z.strictObject({
   user_id: UUID,
   status: PresenceStatusSchema,
+  rich_presence: RichPresenceMapSchema.optional(),
 });
 
 // ── Channel + server lifecycle ────────────────────────────────────────
@@ -897,9 +1045,9 @@ export const PresenceSchema = z.object({
  * Server emitter: `services/control-plane/internal/websocket/hub.go:375`
  * (`OutgoingMessage{Type: "presence_snapshot", ...}` on client connect).
  */
-export const PresenceSnapshotSchema = z.object({
+export const PresenceSnapshotSchema = z.strictObject({
   type: z.literal('presence_snapshot'),
-  data: z.object({
+  data: z.strictObject({
     online_user_ids: z.array(UUID).optional(),
     users: z.array(UserPresenceInfoSchema).optional(),
   }),
@@ -946,87 +1094,7 @@ export const ProfileUpdatedSchema = z.object({
   }),
 });
 
-// ──────────── Rich Presence — Custom Text Status (#1233, 2 events) ────
-// Minimal framework slice: only the custom_text category is wired end-to-end.
-// The category enum lists the full taxonomy for forward-compatibility; other
-// categories' payload schemas are added when those features land. Custom text is
-// DB-persistent + audience-filtered server-side (risk: privacy) — see
-// [internal]specs/2026-06-18-1233-custom-text-status-design.md §5.
-export const RichPresenceCategorySchema = z.enum([
-  'server_voice',
-  'private_call',
-  'games',
-  'music',
-  'streaming',
-  'browser',
-  'productivity',
-  'creator',
-  'custom_text',
-]);
-
-export const CustomTextPresencePayloadSchema = z.object({
-  emoji: z
-    .string()
-    .refine((value) => [...value].length <= 32)
-    .optional(),
-  text: z
-    .string()
-    .min(1)
-    .refine((value) => [...value].length <= 140),
-});
-
-const RichPresenceUpdateBaseSchema = z.object({
-  user_id: UUID,
-  updated_at: z.number().int().positive(),
-});
-
-const CustomTextRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
-  category: z.literal('custom_text'),
-  payload: CustomTextPresencePayloadSchema,
-});
-
-const ServerVoicePresencePayloadSchema = z.object({
-  channel_id: UUID,
-  server_id: UUID,
-  channel_name: z.string().min(1).max(100).optional(),
-  server_name: z.string().min(1).max(100).optional(),
-  started_at: z.number().int().positive().optional(),
-});
-
-const ServerVoiceRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
-  category: z.literal('server_voice'),
-  minimized: z.boolean(),
-  payload: ServerVoicePresencePayloadSchema,
-});
-
-const PrivateCallPresencePayloadSchema = z.object({
-  call_type: z.enum(['dm', 'group']),
-  participant_count: z.number().int().min(1).max(255).optional(),
-  started_at: z.number().int().positive().optional(),
-});
-
-const PrivateCallRichPresenceUpdateDataSchema = RichPresenceUpdateBaseSchema.extend({
-  category: z.literal('private_call'),
-  minimized: z.boolean(),
-  payload: PrivateCallPresencePayloadSchema,
-});
-
-export const RichPresenceUpdateSchema = z.object({
-  type: z.literal('rich_presence_update'),
-  data: z.discriminatedUnion('category', [
-    CustomTextRichPresenceUpdateDataSchema,
-    ServerVoiceRichPresenceUpdateDataSchema,
-    PrivateCallRichPresenceUpdateDataSchema,
-  ]),
-});
-
-export const RichPresenceClearSchema = z.object({
-  type: z.literal('rich_presence_clear'),
-  data: z.object({
-    user_id: UUID,
-    category: RichPresenceCategorySchema,
-  }),
-});
+// ──────────── Rich Presence — category-aware activity events (#2233) ───
 
 // ──────────── Channel + server lifecycle (13 events) — Task A8 ────────
 
@@ -1775,6 +1843,11 @@ export type ProfileUpdatedPayload = z.infer<typeof ProfileUpdatedSchema>['data']
 export type RichPresenceUpdatePayload = z.infer<typeof RichPresenceUpdateSchema>['data'];
 export type RichPresenceClearPayload = z.infer<typeof RichPresenceClearSchema>['data'];
 export type CustomTextPresencePayload = z.infer<typeof CustomTextPresencePayloadSchema>;
+export type RichPresenceEntry = RichPresenceUpdatePayload extends infer Entry
+  ? Entry extends { user_id: string }
+    ? Omit<Entry, 'user_id'>
+    : never
+  : never;
 
 // Channel + server lifecycle
 export type MemberJoinedPayload = z.infer<typeof MemberJoinedSchema>['data'];
@@ -1841,19 +1914,13 @@ export type HeartbeatAckPayload = z.infer<typeof HeartbeatAckSchema>['data'];
  *
  * @see [internal]rules/observability.md (wire-violation log discipline)
  */
-export interface ScrubbedIssue {
-  code: string;
-  path: PropertyKey[];
-  message: string; // zod's pre-formatted message — does NOT include the received value
-}
-
 /**
- * Strip PII-bearing fields from each zod issue. The returned `ScrubbedIssue[]`
- * contains only structural metadata safe for log sinks.
+ * Strip PII-bearing fields from each zod issue. The returned `string[]`
+ * contains only deduplicated, bounded issue codes safe for log sinks.
  *
  * Test-enforced via sentinel-string assertion in
  * client/desktop/tests/unit/types/ws-events.test.ts.
  */
-export function scrubZodIssues(issues: readonly z.core.$ZodIssue[]): ScrubbedIssue[] {
-  return issues.map(({ code, path, message }) => ({ code, path: [...path], message }));
+export function scrubZodIssues(issues: readonly z.core.$ZodIssue[]): string[] {
+  return [...new Set(issues.map(({ code }) => code))];
 }

@@ -1,7 +1,7 @@
 import React from 'react';
 import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
 import type { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
-import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import { selectCustomText, useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { resolveUserAccentColors } from '../../utils/schemeColors';
 
 interface MemberItemProps {
@@ -27,7 +27,7 @@ const MemberItem: React.FC<MemberItemProps> = ({
 }) => {
   const memberColors = resolveUserAccentColors(member.color_scheme);
   // Selective subscription: only this member's custom-text status (undefined if none).
-  const customText = useRichPresenceStore((s) => s.customTextByUser[member.user_id]);
+  const customText = useRichPresenceStore(selectCustomText(member.user_id));
   const topDisplayRole = member.roles?.length
     ? ([...member.roles]
         .filter((r) => r.display_separately)

@@ -812,13 +812,18 @@ when the authenticated `/api/v1/ws` upgrade has exactly one
 before Hub registration and reconnect bootstrap. Missing, malformed, or
 duplicate values fail closed. This preserves mixed-version sessions because
 released clients can accept an activity clear while misapplying it to Custom
-Status. The #2231 desktop advertises the value after adding category-specific
-live-update validation, but its handlers deliberately ignore Server Voice and
-Private Call updates/clears and its snapshot schema strips activity fields.
-Issue #2233 owns category state, snapshot replacement, resets, and rendering. Reconnect
-snapshot fields remain safe for legacy clients, whose schema strips them, and a capable client receives
-the snapshot before its buffered live tail because its capability is known
-before bootstrap starts.
+Status. The #2233 desktop ingestion contract is now landed: live updates enforce
+strict minimized/detail coupling; sparse Server Voice/Private Call snapshots
+omit self, build off-store, and atomically replace the complete category map.
+Self remote activity is ignored, absent or legacy state clears, and Custom
+Status replay remains separate and ordered. The detailed wire/store contract is
+in the [Rich Presence design](superpowers/specs/2026-05-28-rich-presence-design.md).
+Connection (`DISCONNECTED`, `RECONNECTING`, `ERROR`, and
+connected-before-snapshot),
+account/reset, and runtime-server epoch clears are synchronous. Local activity
+selection is pure and settings-independent. Issue #2234 owns confirmed settings
+and Issue #2235 owns presentation; issue #2233 introduces no outbound renderer
+command, Rich Presence service, or API.
 
 Migration 000098 adds `activity_settings_pending_cleanups`, one durable marker
 per user containing the exact versioned before/after policy bracket committed
@@ -1233,7 +1238,7 @@ Core logging rules (enforced by lint + AST regression tests, not convention):
 - **No key material** — channel/DM/session keys, RSA private keys, JWT/refresh tokens, password hashes never reach any log sink, in any form. Locked in `services/control-plane/internal/auth/` by an AST-walking test (`log_emissions_test.go`).
 - **No PII** — error paths redact emails, real-name fields, and IP addresses where avoidable.
 - **No `Error.cause` propagation** (Electron main) — never pass a raw `err` object to `console.error` or `console.warn`, because ES2022 `Error.cause` can carry secrets upward. An ESLint `no-restricted-syntax` rule scoped to `client/desktop/src/main/**` enforces this.
-- **No raw wire-violation payloads** — WebSocket schema-rejection logs emit only structural metadata (the envelope `type` + `scrubZodIssues`-scrubbed `{code, path, message}`), never received field values.
+- **No raw wire-violation payloads** — WebSocket schema-rejection logs emit only a bounded, deduplicated `issue_codes` list from `scrubZodIssues`, never the envelope `type`, Zod paths or messages, received field values, or rejected envelopes.
 - **No unsanitized control characters (CWE-117)** — route user-derived strings through `sanitizeLogValue` (`internal/websocket/logsanitize.go`) before interpolating them into stdlib `log.Printf`.
 
 ## Key Directories
