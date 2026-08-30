@@ -79,6 +79,10 @@ type FeaturesInfo struct {
 	// without object storage, and a client that fails closed on a missing field
 	// should never have to guess which of the two it is looking at.
 	ChunkedAttachmentUpload bool `json:"chunkedAttachmentUpload"`
+	// The envelope versions accepted by the reachable chunked-upload session.
+	// Omitted when the routes are not reachable, so clients cannot mistake a
+	// format capability for route availability.
+	AttachmentEnvelopeVersions []int `json:"attachmentEnvelopeVersions,omitempty"`
 }
 
 // Response is the payload for GET /api/v1/server/capabilities. The schema is
@@ -149,6 +153,9 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			ChunkedAttachmentUpload:  h.chunkedAttachmentUpload,
 		},
 		PolicyVersion: policyVersion,
+	}
+	if h.chunkedAttachmentUpload {
+		resp.Features.AttachmentEnvelopeVersions = []int{2, 3}
 	}
 
 	c.Header("Cache-Control", "public, max-age=300")

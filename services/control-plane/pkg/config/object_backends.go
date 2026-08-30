@@ -2,6 +2,11 @@ package config
 
 import "fmt"
 
+// LegacyAttachmentBackendID is the selector spelling for the permanent legacy
+// attachment backend. It is distinct from storage.LegacyBackendID, which
+// resolves NULL media_files.storage_backend rows.
+const LegacyAttachmentBackendID = "legacy"
+
 // Non-legacy object-storage backends (ADR-0038 / #2759).
 //
 // ADR-0038 DEMOTES MinIO, it does not remove it: MinIO stays permanently as

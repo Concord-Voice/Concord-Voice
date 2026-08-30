@@ -21,11 +21,12 @@
  * which is why v2 shipped and why nothing caught it — but under v2 every
  * attachment over 16 MiB is unuploadable to R2, on every entitlement tier.
  *
- * THIS BUILD READS BOTH, FOREVER, BUT WRITES v2 UNTIL ENVELOPE SUPPORT IS
- * NEGOTIATED. The existing `chunkedAttachmentUpload` capability does not name
- * an envelope version, so writing v3 under that boolean would break old servers
- * and old desktop clients. Every chunked attachment already stored is a v2
- * blob; dropping v2 read support is data loss.
+ * THIS BUILD READS BOTH, FOREVER. New writes select v3 only when the connected
+ * control plane explicitly advertises `attachmentEnvelopeVersions` containing
+ * 3; a missing or v2-only capability seals v2. The selection is made before
+ * encryption and is carried through the header and session init. Every chunked
+ * attachment already stored is a v2 blob; dropping v2 read support is data
+ * loss.
  *
  * The header is a PARSE HINT WITH ZERO TRUST. Concord is self-hostable, so a
  * server that rewrites stored bytes could edit any unauthenticated field — see
@@ -65,17 +66,16 @@ const MAGIC_1 = 0x56; // 'V'
 const FILE_NONCE_BYTES = 16;
 
 /** The original chunked format. Chunk 0 carries a FULL chunk of plaintext on top
- *  of the header, so part 0 is 28 bytes larger than its siblings. It remains the
- *  write default until envelope support is negotiated, and readable forever. */
+ *  of the header, so part 0 is 28 bytes larger than its siblings. It remains
+ *  readable forever and new v2 sessions route to legacy storage. */
 export const ENVELOPE_VERSION_V2 = 2;
 
 /** Uniform part geometry: chunk 0 gives up 28 bytes of plaintext to the header.
  *  See the module header for why R2 requires this. */
 export const ENVELOPE_VERSION_V3 = 3;
 
-/** The version this build SEALS with. Reading is not restricted to it.
- *  Keep v2 until the rollout has a version-bearing capability. */
-export const WRITE_ENVELOPE_VERSION = ENVELOPE_VERSION_V2;
+/** The two wire formats this build can explicitly select for a new upload. */
+export type AttachmentEnvelopeVersion = typeof ENVELOPE_VERSION_V2 | typeof ENVELOPE_VERSION_V3;
 
 const SUPPORTED_VERSIONS: ReadonlySet<number> = new Set([ENVELOPE_VERSION_V2, ENVELOPE_VERSION_V3]);
 
@@ -133,7 +133,7 @@ function chunkCountFor(version: number, chunkSize: number, plaintextTotal: numbe
 }
 
 export interface AttachmentEnvelopeHeader {
-  version: number;
+  version: AttachmentEnvelopeVersion;
   flags: number;
   chunkSize: number;
   totalChunks: number;
@@ -239,13 +239,8 @@ export function parseKeyVersionHeader(raw: string | null): number | null {
   return n;
 }
 
-/** Defaults to the current write format. Callers sizing an existing envelope
- *  pass its header version explicitly, because v2 and v3 can disagree about
- *  the chunk count for the same plaintext. */
-export function totalChunksFor(
-  plaintextTotal: number,
-  version: number = WRITE_ENVELOPE_VERSION
-): number {
+/** Returns the exact count for an explicitly selected envelope version. */
+export function totalChunksFor(plaintextTotal: number, version: AttachmentEnvelopeVersion): number {
   if (!Number.isSafeInteger(plaintextTotal) || plaintextTotal < 1) {
     throw new UnsupportedAttachmentFormatError(
       `plaintext length must be a positive safe integer, got ${plaintextTotal}`
@@ -268,7 +263,7 @@ export function totalChunksFor(
  *  33rd chunk; MAX_DECRYPTABLE_ATTACHMENT_BYTES is derived from that count. */
 export function expectedBlobLength(
   plaintextTotal: number,
-  version: number = WRITE_ENVELOPE_VERSION
+  version: AttachmentEnvelopeVersion
 ): number {
   return (
     ENVELOPE_HEADER_BYTES +
@@ -348,7 +343,7 @@ export function decodeEnvelopeHeader(bytes: Uint8Array): AttachmentEnvelopeHeade
   if (f.totalChunks < 1) {
     throw new UnsupportedAttachmentFormatError(`totalChunks must be >= 1, got ${f.totalChunks}`);
   }
-  return f;
+  return { ...f, version: f.version as AttachmentEnvelopeVersion };
 }
 
 /**
@@ -451,12 +446,15 @@ export function bufferChunkSource(buf: Uint8Array): ChunkSource {
   };
 }
 
-export function newEnvelopeHeader(plaintextTotal: number): AttachmentEnvelopeHeader {
+export function newEnvelopeHeader(
+  plaintextTotal: number,
+  version: AttachmentEnvelopeVersion
+): AttachmentEnvelopeHeader {
   return {
-    version: WRITE_ENVELOPE_VERSION,
+    version,
     flags: 0,
     chunkSize: CHUNK_PLAINTEXT_BYTES,
-    totalChunks: totalChunksFor(plaintextTotal, WRITE_ENVELOPE_VERSION),
+    totalChunks: totalChunksFor(plaintextTotal, version),
     // Client-generated: the server assigns fileID only AFTER the upload
     // completes, so there is no server-side identifier to bind at encrypt time.
     fileNonce: crypto.getRandomValues(new Uint8Array(FILE_NONCE_BYTES)),
@@ -595,7 +593,7 @@ export function classifyEnvelope(head: Uint8Array, totalLength: number): Envelop
   return {
     kind: version === ENVELOPE_VERSION_V2 ? 'v2' : 'v3',
     header: {
-      version,
+      version: version as AttachmentEnvelopeVersion,
       flags,
       chunkSize,
       totalChunks,

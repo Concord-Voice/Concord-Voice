@@ -93,6 +93,44 @@ func TestIsSelfHostedInstance(t *testing.T) {
 	assert.False(t, IsSelfHostedInstance("enterprise"))
 }
 
+func TestAttachmentWriteBackendSelector(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		instance  string
+		want      string
+		wantArmed bool
+		wantErr   bool
+	}{
+		{"unset defaults to legacy", "", InstanceTypeSaaS, LegacyAttachmentBackendID, false, false},
+		{"empty defaults to legacy", "", InstanceTypeSaaS, LegacyAttachmentBackendID, false, false},
+		{"whitespace defaults to legacy", "  \t", InstanceTypeSaaS, LegacyAttachmentBackendID, false, false},
+		{"r2-useast is accepted on SaaS without credentials", "r2-useast", InstanceTypeSaaS, "r2-useast", true, false},
+		{"minio is rejected", "minio", InstanceTypeSaaS, "minio", false, true},
+		{"s3 is rejected", "s3", InstanceTypeSaaS, "s3", false, true},
+		{"r2 is rejected", "r2", InstanceTypeSaaS, "r2", false, true},
+		{"b2 is rejected", "b2", InstanceTypeSaaS, "b2", false, true},
+		{"selector is case sensitive", "R2-UsEast", InstanceTypeSaaS, "R2-UsEast", false, true},
+		{"trailing whitespace is rejected before normalization", "legacy ", InstanceTypeSaaS, "legacy", false, true},
+		{"r2-useast is rejected self-hosted", "r2-useast", InstanceTypeSelfHosted, "r2-useast", false, true},
+		{"explicit legacy is not armed", "legacy", InstanceTypeSaaS, "legacy", false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{AttachmentWriteBackend: tc.raw, InstanceType: tc.instance}
+			assert.Equal(t, tc.want, normalizeAttachmentWriteBackend(cfg.AttachmentWriteBackend))
+			err := cfg.validateAttachmentWriteBackend()
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			cfg.AttachmentWriteBackend = normalizeAttachmentWriteBackend(cfg.AttachmentWriteBackend)
+			assert.Equal(t, tc.wantArmed, cfg.AttachmentWriteBackendArmed())
+		})
+	}
+}
+
 func TestLoad(t *testing.T) {
 	// Save and unset all env vars to test defaults
 	envVars := []string{

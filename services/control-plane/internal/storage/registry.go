@@ -72,6 +72,9 @@ var (
 // reading its bytes.
 type Registry struct {
 	entries map[BackendID]backendEntry
+	// attachmentWrite is the selector captured at boot. It intentionally has no
+	// fallback: an armed but unusable backend must fail the new write closed.
+	attachmentWrite BackendID
 	// order preserves registration order (legacy first, then every non-legacy
 	// backend that actually got an entry) -- see BackendIDs. A plain map
 	// iteration would work for Resolve/ResolveRow, which only ever look up one
@@ -106,7 +109,10 @@ type backendEntry struct {
 // messaging, voice and the entire MinIO-resident corpus over a store that
 // (while the write default still points at MinIO) holds no objects at all.
 func NewRegistry(cfg *config.Config, legacy *Client, log *logger.Logger) *Registry {
-	registry := &Registry{entries: make(map[BackendID]backendEntry, 2)}
+	registry := &Registry{
+		entries:         make(map[BackendID]backendEntry, 2),
+		attachmentWrite: LegacyBackendID,
+	}
 
 	if legacy != nil {
 		registry.entries[LegacyBackendID] = backendEntry{client: legacy}
@@ -124,8 +130,17 @@ func NewRegistry(cfg *config.Config, legacy *Client, log *logger.Logger) *Regist
 	if cfg == nil {
 		return registry
 	}
+	registry.attachmentWrite = BackendID(cfg.AttachmentWriteBackend)
+	if registry.attachmentWrite == "" {
+		registry.attachmentWrite = LegacyBackendID
+	}
 	for _, backend := range cfg.AttachmentBackends() {
 		registry.register(backend, log)
+	}
+	if _, err := registry.Resolve(registry.attachmentWrite); err != nil {
+		log.Error("ATTACHMENT WRITE BACKEND UNUSABLE", "backend", string(registry.attachmentWrite), "error", err)
+	} else {
+		log.Info("Attachment write default", "backend", string(registry.attachmentWrite))
 	}
 	return registry
 }
@@ -245,19 +260,11 @@ func (r *Registry) BackendIDs() []BackendID {
 
 // AttachmentWriteBackendID names the backend a NEW tier-2 attachment write
 // (the attachments/ prefix) should target right now.
-//
-// ADR-0038 / #2759: THE FLIP IS NOT THIS UNIT'S JOB. This returns
-// LegacyBackendID unconditionally -- there is no STORAGE_DEFAULT_WRITE_BACKEND
-// configuration field yet, deliberately: unit B3's job is the STATIC
-// separation between tier-1 (ALWAYS the legacy backend -- see
-// media.Handler's WriteRouter, which never calls this method at all) and
-// tier-2 (the only caller of this method), not the write-default flip
-// itself. When the write default is wired to configuration, this is the one
-// place that changes; every attachments/ write call site already asks the
-// registry through a media.WriteRouter built over this method, so nothing
-// downstream has to move.
 func (r *Registry) AttachmentWriteBackendID() BackendID {
-	return LegacyBackendID
+	if r == nil || r.attachmentWrite == "" {
+		return LegacyBackendID
+	}
+	return r.attachmentWrite
 }
 
 // newVendorClient builds a client for a non-legacy backend.

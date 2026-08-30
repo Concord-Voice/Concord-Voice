@@ -179,15 +179,29 @@ func TestRegistry_ConfigCannotClaimTheLegacyIdentifier(t *testing.T) {
 	assert.Equal(t, []BackendID{LegacyBackendID}, registry.BackendIDs())
 }
 
-// TestRegistry_AttachmentWriteBackendIDIsLegacy pins the pre-flip state.
-//
-// This test is EXPECTED TO FAIL when Wave C lands, and that is its job: the
-// flip must be a deliberate edit here, not something that arrives as a
-// side effect of a config change. Update it in the same commit as the flip.
-func TestRegistry_AttachmentWriteBackendIDIsLegacy(t *testing.T) {
+func TestRegistry_AttachmentWriteBackendID_ConfiguredSelectorIsVerbatim(t *testing.T) {
+	legacy := &Client{bucket: "legacy-bucket"}
+	cfg := &config.Config{AttachmentWriteBackend: "r2-useast"}
+	registry := NewRegistry(cfg, legacy, testRegistryLogger())
+
+	assert.Equal(t, BackendID("r2-useast"), registry.AttachmentWriteBackendID(),
+		"the boot snapshot must preserve the configured selector even when its client is unavailable")
+}
+
+func TestRegistry_AttachmentWriteBackendID_NilConfigUsesLegacy(t *testing.T) {
 	registry, _ := legacyOnlyRegistry()
-	assert.Equal(t, LegacyBackendID, registry.AttachmentWriteBackendID(),
-		"new attachments still write to the legacy backend until the Wave C flip")
+	assert.Equal(t, LegacyBackendID, registry.AttachmentWriteBackendID())
+}
+
+func TestRegistry_AttachmentWriteBackendID_ZeroValueConfigUsesLegacy(t *testing.T) {
+	legacy := &Client{bucket: "legacy-bucket"}
+	registry := NewRegistry(&config.Config{}, legacy, testRegistryLogger())
+	assert.Equal(t, LegacyBackendID, registry.AttachmentWriteBackendID())
+}
+
+func TestRegistry_LegacyAttachmentBackendConstantsMatch(t *testing.T) {
+	assert.Equal(t, "legacy", string(LegacyBackendID))
+	assert.Equal(t, "legacy", config.LegacyAttachmentBackendID)
 }
 
 // --- vendorEndpointHost ----------------------------------------------------

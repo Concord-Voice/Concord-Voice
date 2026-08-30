@@ -108,6 +108,30 @@ func TestRequireAttachmentWriteStore_ReturnsTheBackendIdentifier(t *testing.T) {
 		"the row must record the backend the object was actually written to")
 }
 
+func TestRequireUploadSessionWriteStore_VersionRoutesRails(t *testing.T) {
+	legacy, vendor := newMockStore(), newMockStore()
+	h := writeRoutingHandler(stubWriteRouter{
+		tier1: legacy, attachment: vendor, backendID: "r2-useast",
+	}, nil)
+	for _, tc := range []struct {
+		name    string
+		version EnvelopeVersion
+		want    ObjectStore
+		wantID  string
+	}{
+		{"v2 uses legacy rail", EnvelopeVersionV2, legacy, ""},
+		{"v3 uses attachment rail", EnvelopeVersionV3, vendor, "r2-useast"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := writeRoutingContext()
+			got, id, ok := h.requireUploadSessionWriteStore(c, tc.version)
+			require.True(t, ok)
+			assert.Same(t, tc.want, got)
+			assert.Equal(t, tc.wantID, id)
+		})
+	}
+}
+
 // TestRequireAttachmentWriteStore_LegacyYieldsAnEmptyIdentifier locks the NULL
 // spelling: the column must stay NULL for legacy objects, never carry the
 // literal string "legacy". Migration 000114 states NULL is never backfilled, so

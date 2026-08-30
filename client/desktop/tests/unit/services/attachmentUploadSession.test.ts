@@ -20,6 +20,7 @@ const ctx: UploadSessionContext = {
   keyVersion: 3,
   fileType: 'file',
   mimeType: 'application/octet-stream',
+  envelopeVersion: 3,
 };
 
 const fileOf = (bytes: number) =>
@@ -103,12 +104,55 @@ describe('uploadAttachmentChunked', () => {
     const sent = JSON.parse(apiFetch.mock.calls[0][1].body as string);
     // The server recomputes this and 400s on disagreement, so a client that
     // guesses here fails closed rather than uploading garbage.
-    expect(sent.declared_ciphertext_bytes).toBe(expectedBlobLength(plaintext));
+    expect(sent.declared_ciphertext_bytes).toBe(expectedBlobLength(plaintext, 3));
     expect(sent.total_chunks).toBe(1);
     expect(sent.chunk_size).toBe(CHUNK_PLAINTEXT_BYTES);
-    expect(sent.envelope_version).toBe(2);
+    expect(sent.envelope_version).toBe(3);
     expect(sent.key_version).toBe(3);
     expect(sent.channel_id).toBe('chan-1');
+  });
+
+  it('uses the explicitly selected v2 version for header and init', async () => {
+    const key = await aesKey();
+    apiFetch
+      .mockResolvedValueOnce(initOK())
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(commitOK());
+
+    await uploadAttachmentChunked(
+      fileOf(4096),
+      key,
+      { ...ctx, envelopeVersion: 2 },
+      new AbortController().signal,
+      { onChunkCommitted: () => {} }
+    );
+
+    const sent = JSON.parse(apiFetch.mock.calls[0][1].body as string);
+    expect(sent.envelope_version).toBe(2);
+    expect(sent.declared_ciphertext_bytes).toBe(expectedBlobLength(4096, 2));
+    expect(bodyOf(1)[2]).toBe(2);
+  });
+
+  it('does not retry a rejected v3 init as v2', async () => {
+    const key = await aesKey();
+    apiFetch.mockResolvedValueOnce(json(400, { error: 'unsupported envelope version' }));
+
+    await expect(
+      uploadAttachmentChunked(fileOf(4096), key, ctx, new AbortController().signal, {
+        onChunkCommitted: () => {},
+      })
+    ).rejects.toThrow();
+
+    const initCalls = apiFetch.mock.calls.filter(
+      ([path, init]) =>
+        path === '/api/v1/media/upload/attachment/session' && init?.method === 'POST'
+    );
+    expect(initCalls).toHaveLength(1);
+    const initBody = JSON.parse(initCalls[0][1].body as string);
+    expect(initBody.envelope_version).toBe(3);
+    expect(
+      initCalls.some(([, init]) => JSON.parse(init.body as string).envelope_version === 2)
+    ).toBe(false);
   });
 
   it('re-PUTs only the indices the 409 names, holding fileNonce stable', async () => {
@@ -239,6 +283,7 @@ describe('uploadAttachmentChunked', () => {
         keyVersion: 3,
         fileType: 'file',
         mimeType: 'application/octet-stream',
+        envelopeVersion: 3,
       },
       new AbortController().signal,
       { onChunkCommitted: () => {} }
@@ -422,6 +467,7 @@ describe('uploadAttachmentChunked — exactly one upload target', () => {
         keyVersion: 3,
         fileType: 'file',
         mimeType: 'application/octet-stream',
+        envelopeVersion: 3,
       },
       new AbortController().signal,
       { onChunkCommitted: () => {} }
@@ -447,6 +493,7 @@ describe('uploadAttachmentChunked — exactly one upload target', () => {
         keyVersion: 3,
         fileType: 'file',
         mimeType: 'application/octet-stream',
+        envelopeVersion: 3,
       },
       new AbortController().signal,
       { onChunkCommitted: () => {} }
@@ -471,7 +518,13 @@ describe('uploadAttachmentChunked — exactly one upload target', () => {
       await uploadAttachmentChunked(
         fileOf(1024),
         key,
-        { ...target, keyVersion: 3, fileType: 'file', mimeType: 'application/octet-stream' },
+        {
+          ...target,
+          keyVersion: 3,
+          fileType: 'file',
+          mimeType: 'application/octet-stream',
+          envelopeVersion: 3,
+        },
         new AbortController().signal,
         { onChunkCommitted: () => {} }
       );

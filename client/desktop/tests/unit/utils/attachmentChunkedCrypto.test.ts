@@ -35,10 +35,15 @@ const header = (over: Partial<AttachmentEnvelopeHeader> = {}): AttachmentEnvelop
 });
 
 describe('envelope version rollout', () => {
-  it('keeps new writes on v2 until envelope support is negotiated', () => {
-    expect(newEnvelopeHeader(1).version).toBe(2);
-    expect(newEnvelopeHeader(CHUNK_PLAINTEXT_BYTES).totalChunks).toBe(1);
-    expect(newEnvelopeHeader(CHUNK_PLAINTEXT_BYTES + 1).totalChunks).toBe(2);
+  it('constructs an explicitly selected v3 write while retaining v2 geometry', () => {
+    expect(newEnvelopeHeader(1, 3).version).toBe(3);
+    const v3FirstChunkCapacity = CHUNK_PLAINTEXT_BYTES - ENVELOPE_HEADER_BYTES;
+    expect(newEnvelopeHeader(v3FirstChunkCapacity, 3).totalChunks).toBe(1);
+    expect(newEnvelopeHeader(v3FirstChunkCapacity + 1, 3).totalChunks).toBe(2);
+
+    const v2 = newEnvelopeHeader(CHUNK_PLAINTEXT_BYTES + 1, 2);
+    expect(v2.version).toBe(2);
+    expect(v2.totalChunks).toBe(2);
   });
 
   it('binds v3 to the CVA3 AAD domain', () => {
@@ -46,16 +51,15 @@ describe('envelope version rollout', () => {
     expect(Array.from(aad.slice(0, 4))).toEqual([0x43, 0x56, 0x41, 0x33]);
   });
 
-  it('reserves the header bytes in chunk zero so non-trailing parts are uniform', async () => {
+  it('makes default v3 non-trailing parts uniformly sized', async () => {
     const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, [
       'encrypt',
       'decrypt',
     ]);
     const plaintext = new Uint8Array(CHUNK_PLAINTEXT_BYTES * 2 + 1);
-    const h = header({
-      version: 3,
-      totalChunks: totalChunksFor(plaintext.byteLength, 3),
-    });
+    const h = newEnvelopeHeader(plaintext.byteLength, 3);
+    expect(h.version).toBe(3);
+    expect(h.totalChunks).toBe(3);
     const source = bufferChunkSource(plaintext);
     const first = await buildUploadPart(source, key, h, 0);
     const second = await buildUploadPart(source, key, h, 1);
@@ -200,7 +204,7 @@ describe('size arithmetic', () => {
   });
 
   it('rejects a zero-length plaintext', () => {
-    expect(() => totalChunksFor(0)).toThrow(UnsupportedAttachmentFormatError);
+    expect(() => totalChunksFor(0, 2)).toThrow(UnsupportedAttachmentFormatError);
   });
 });
 
@@ -222,9 +226,7 @@ describe('buildUploadPart', () => {
   it('prepends the header to part 0 only, and the parts sum to the length identity', async () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES + 100);
-    const h = newEnvelopeHeader(pt.byteLength);
-    h.version = 2;
-    h.totalChunks = totalChunksFor(pt.byteLength, 2);
+    const h = newEnvelopeHeader(pt.byteLength, 2);
     expect(h.totalChunks).toBe(2);
 
     const src = bufferChunkSource(pt);
@@ -235,7 +237,7 @@ describe('buildUploadPart', () => {
       ENVELOPE_HEADER_BYTES + CHUNK_OVERHEAD_BYTES + CHUNK_PLAINTEXT_BYTES
     );
     expect(p1.byteLength).toBe(CHUNK_OVERHEAD_BYTES + 100);
-    expect(p0.byteLength + p1.byteLength).toBe(expectedBlobLength(pt.byteLength));
+    expect(p0.byteLength + p1.byteLength).toBe(expectedBlobLength(pt.byteLength, 2));
     expect(decodeEnvelopeHeader(p0).totalChunks).toBe(2);
   });
 
@@ -244,7 +246,7 @@ describe('buildUploadPart', () => {
     // reuse an (key, IV) pair, which is the one failure GCM does not survive.
     const key = await aesKey();
     const pt = filled(1024);
-    const h = newEnvelopeHeader(pt.byteLength);
+    const h = newEnvelopeHeader(pt.byteLength, 2);
     h.version = 2;
     h.totalChunks = totalChunksFor(pt.byteLength, 2);
     const src = bufferChunkSource(pt);
@@ -258,7 +260,7 @@ describe('buildUploadPart', () => {
   it('produces IVs that are unique across chunks', async () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES * 2 + 1);
-    const h = newEnvelopeHeader(pt.byteLength);
+    const h = newEnvelopeHeader(pt.byteLength, 2);
     const src = bufferChunkSource(pt);
     const ivs = new Set<string>();
     for (let i = 0; i < h.totalChunks; i++) {
@@ -272,9 +274,7 @@ describe('buildUploadPart', () => {
   it('seals each chunk under its own AAD, so chunk 0 cannot open chunk 1', async () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES + 10);
-    const h = newEnvelopeHeader(pt.byteLength);
-    h.version = 2;
-    h.totalChunks = totalChunksFor(pt.byteLength, 2);
+    const h = newEnvelopeHeader(pt.byteLength, 2);
     const p1 = await buildUploadPart(bufferChunkSource(pt), key, h, 1);
     const iv = p1.slice(0, 12);
     const body = p1.slice(12);
@@ -293,8 +293,8 @@ describe('buildUploadPart', () => {
   });
 
   it('gives every file a distinct fileNonce', () => {
-    const a = newEnvelopeHeader(1024).fileNonce;
-    const b = newEnvelopeHeader(1024).fileNonce;
+    const a = newEnvelopeHeader(1024, 2).fileNonce;
+    const b = newEnvelopeHeader(1024, 2).fileNonce;
     expect(Array.from(a)).not.toEqual(Array.from(b));
   });
 
@@ -302,7 +302,7 @@ describe('buildUploadPart', () => {
     // The whole point of the format: bounded residency regardless of file size.
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES * 3);
-    const h = newEnvelopeHeader(pt.byteLength);
+    const h = newEnvelopeHeader(pt.byteLength, 2);
     let widest = 0;
     const spy: ChunkSource = {
       byteLength: pt.byteLength,
@@ -319,7 +319,7 @@ describe('buildUploadPart', () => {
   it('refuses a chunk index outside the declared range before reading anything', async () => {
     const key = await aesKey();
     const pt = filled(1024);
-    const h = newEnvelopeHeader(pt.byteLength);
+    const h = newEnvelopeHeader(pt.byteLength, 2);
     let read = false;
     const src: ChunkSource = {
       byteLength: pt.byteLength,
@@ -362,9 +362,7 @@ const concat = (...parts: Uint8Array[]): Uint8Array<ArrayBuffer> => {
 
 /** Seal a whole plaintext as a chunked blob, the way the upload session assembles it. */
 const sealEnvelope = async (key: CryptoKey, pt: Uint8Array, version: 2 | 3 = 2) => {
-  const header = newEnvelopeHeader(pt.byteLength);
-  header.version = version;
-  header.totalChunks = totalChunksFor(pt.byteLength, version);
+  const header = newEnvelopeHeader(pt.byteLength, version);
   const src = bufferChunkSource(pt);
   const parts: Uint8Array[] = [];
   for (let i = 0; i < header.totalChunks; i++)
@@ -378,7 +376,7 @@ describe('deterministic dispatch', () => {
   it('routes a v2 blob to v2 and a legacy blob to legacy', async () => {
     const key = await aesKey();
     const pt = filled(4096);
-    const { blob } = await sealEnvelope(key, pt);
+    const { blob } = await sealEnvelope(key, pt, 2);
     expect(classifyEnvelope(blob.subarray(0, ENVELOPE_HEADER_BYTES), blob.byteLength).kind).toBe(
       'v2'
     );
@@ -418,7 +416,7 @@ describe('deterministic dispatch', () => {
   it('round-trips a v2 blob across a chunk boundary', async () => {
     const key = await aesKey();
     const pt = filled(CHUNK_PLAINTEXT_BYTES + 12345);
-    const { blob } = await sealEnvelope(key, pt);
+    const { blob } = await sealEnvelope(key, pt, 2);
     const out = await bytesOf(await decryptAttachmentBlob(blob, key, 'application/pdf'));
     expect(out.byteLength).toBe(pt.byteLength);
     expect(Array.from(out.slice(0, 64))).toEqual(Array.from(pt.slice(0, 64)));
@@ -444,7 +442,7 @@ describe('deterministic dispatch', () => {
   it('round-trips a single-chunk v2 blob', async () => {
     const key = await aesKey();
     const pt = filled(1000);
-    const { blob } = await sealEnvelope(key, pt);
+    const { blob } = await sealEnvelope(key, pt, 2);
     const out = await bytesOf(await decryptAttachmentBlob(blob, key, 'image/png'));
     expect(Array.from(out)).toEqual(Array.from(pt));
   });

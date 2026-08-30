@@ -258,3 +258,32 @@ func TestGetCapabilities_ChunkedAttachmentUpload_ReflectsWiring(t *testing.T) {
 	// and downgrades every client to the legacy path in silence.
 	assert.Equal(t, true, features["chunkedAttachmentUpload"])
 }
+
+func TestGetCapabilities_AttachmentEnvelopeVersions_OnlyWhenChunkedWired(t *testing.T) {
+	t.Run("unwired omits version capability", func(t *testing.T) {
+		w, c := newTestContext()
+		servercapabilities.NewHandler(&config.Config{InstanceType: "saas"}).GetCapabilities(c)
+
+		var body struct {
+			Features map[string]json.RawMessage `json:"features"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		_, present := body.Features["attachmentEnvelopeVersions"]
+		assert.False(t, present, "unwired routes must not advertise an envelope version")
+	})
+
+	t.Run("wired advertises exactly v2 and v3", func(t *testing.T) {
+		h := servercapabilities.NewHandler(&config.Config{InstanceType: "saas"})
+		h.SetChunkedAttachmentUpload(true)
+		w, c := newTestContext()
+		h.GetCapabilities(c)
+
+		var body struct {
+			Features struct {
+				AttachmentEnvelopeVersions []int `json:"attachmentEnvelopeVersions"`
+			} `json:"features"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, []int{2, 3}, body.Features.AttachmentEnvelopeVersions)
+	})
+}

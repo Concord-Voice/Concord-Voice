@@ -254,6 +254,43 @@ describe('clientConfigService', () => {
         status: 'error',
       });
     });
+
+    it('preserves supported and future numeric envelope versions', async () => {
+      mockApiFetch.mockResolvedValueOnce(
+        jsonResponse({
+          server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+          auth: { oauthProviders: [] },
+          features: { chunkedAttachmentUpload: true, attachmentEnvelopeVersions: [2, 3, 4] },
+        })
+      );
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().serverCapabilities?.features).toHaveProperty(
+        'attachmentEnvelopeVersions',
+        [2, 3, 4]
+      );
+    });
+
+    it.each([
+      ['string version', [2, '3']],
+      ['null version', [null]],
+      ['fractional version', [2, 3.5]],
+      ['non-positive version', [0]],
+    ])('rejects an invalid envelope version list: %s', async (_label, versions) => {
+      mockApiFetch.mockResolvedValueOnce(
+        jsonResponse({
+          server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+          auth: { oauthProviders: [] },
+          features: { chunkedAttachmentUpload: true, attachmentEnvelopeVersions: versions },
+        })
+      );
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+      expect(useClientConfigStore.getState().chunkedUploadCapability).toEqual({ status: 'error' });
+    });
   });
 
   describe('Activity History capability discovery', () => {

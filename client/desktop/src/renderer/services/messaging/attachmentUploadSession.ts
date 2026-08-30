@@ -18,10 +18,11 @@
  *     CF-proxied by standing requirement, so a single 256 MiB request is
  *     refused at the edge regardless of what the origin would accept.
  *
- * WIRE VERSION. `envelope_version` rides on every init. A control plane
- * predating it ignores the field and sizes the session with v2 geometry, at
- * which point the first chunk PUT is refused for length -- a clean, immediate
- * 400, never a corrupt upload. Deploy the control plane first.
+ * WIRE VERSION. `envelope_version` rides on every init and comes from the
+ * version-bearing capability selected before encryption. A control plane that
+ * predates that capability receives v2 geometry; only an explicit v3 offer
+ * authorizes v3. This avoids a version-skew 400 without retrying or downgrading
+ * ciphertext after encryption starts.
  */
 import { apiFetch } from '../system/apiClient';
 import {
@@ -31,6 +32,7 @@ import {
   newEnvelopeHeader,
   CHUNK_PLAINTEXT_BYTES,
   type AttachmentEnvelopeHeader,
+  type AttachmentEnvelopeVersion,
   type ChunkSource,
 } from '../../utils/attachmentChunkedCrypto';
 
@@ -59,6 +61,7 @@ export type UploadSessionContext = UploadSessionTarget & {
   keyVersion: number;
   fileType: string;
   mimeType: string;
+  envelopeVersion: AttachmentEnvelopeVersion;
 };
 
 export interface UploadSessionCallbacks {
@@ -354,7 +357,7 @@ export async function uploadAttachmentChunked(
     // A restart draws a NEW fileNonce: the old session's parts are gone, so
     // reusing it buys nothing. Within a session it must stay stable, because it
     // is bound into every chunk's AAD.
-    const header = newEnvelopeHeader(file.size);
+    const header = newEnvelopeHeader(file.size, ctx.envelopeVersion);
     const sess: OpenSession = {
       sessionId: await openSession(file, ctx, header, signal),
       header,

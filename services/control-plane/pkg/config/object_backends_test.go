@@ -60,6 +60,12 @@ func TestAttachmentBackends_NilConfig(t *testing.T) {
 	assert.Nil(t, cfg.AttachmentBackends())
 }
 
+func TestAttachmentBackendCandidates_IncludeR2USEastWithoutCredentials(t *testing.T) {
+	candidates := AttachmentBackendCandidatesForTest(&Config{})
+	require.Len(t, candidates, 1)
+	assert.Equal(t, AttachmentBackendR2USEast, candidates[0].ID)
+}
+
 // TestObjectBackendString_RedactsBothCredentials — the whole point of the
 // custom String(). Asserting the length marker is present is not enough; the
 // test must assert the secret VALUES are absent, which is what actually fails

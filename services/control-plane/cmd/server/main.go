@@ -28,6 +28,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage/probe"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/subscriptions"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -49,12 +50,14 @@ const (
 type controlPlaneSubcommandRunners struct {
 	admin           func([]string) int
 	activityHistory func([]string) int
+	storageProbe    func([]string) int
 }
 
 func dispatchControlPlaneSubcommand(args []string) (int, bool) {
 	return dispatchControlPlaneSubcommandWithRunners(args, controlPlaneSubcommandRunners{
 		admin:           admin.RunAdminCtl,
 		activityHistory: presencehistory.RunAdminCtl,
+		storageProbe:    probe.Run,
 	})
 }
 
@@ -70,8 +73,16 @@ func dispatchControlPlaneSubcommandWithRunners(
 		return runners.admin(args[2:]), true
 	case "activity-history":
 		return runners.activityHistory(args[2:]), true
-	default:
+	case "storage-probe":
+		return runners.storageProbe(args[2:]), true
+	case "serve":
 		return 0, false
+	default:
+		if args[1] == "" {
+			return 0, false
+		}
+		fmt.Fprintln(os.Stderr, "usage: control-plane [admin|activity-history|storage-probe] ...")
+		return 64, true
 	}
 }
 

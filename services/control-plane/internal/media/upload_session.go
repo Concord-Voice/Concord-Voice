@@ -525,6 +525,16 @@ type initUploadSessionRequest struct {
 	DeclaredCiphertextBytes int64 `json:"declared_ciphertext_bytes"`
 }
 
+// requireUploadSessionWriteStore keeps v2 and omitted sessions on legacy so
+// their historical envelope layout never follows the v3 write selector.
+func (h *Handler) requireUploadSessionWriteStore(c *gin.Context, version EnvelopeVersion) (ObjectStore, string, bool) {
+	if version == EnvelopeVersionV2 {
+		store, ok := h.requireTier1WriteStore(c)
+		return store, "", ok
+	}
+	return h.requireAttachmentWriteStore(c)
+}
+
 // InitUploadSession opens a chunked attachment upload session.
 // POST /api/v1/media/upload/attachment/session
 //
@@ -558,7 +568,7 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 	if !ok {
 		return
 	}
-	store, backendID, ok := h.requireAttachmentWriteStore(c)
+	store, backendID, ok := h.requireUploadSessionWriteStore(c, envelopeVersion)
 	if !ok {
 		return
 	}

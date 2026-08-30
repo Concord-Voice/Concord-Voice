@@ -43,6 +43,9 @@ export const ServerCapabilitiesSchema = z.object({
      *  must read as false — the client then keeps the legacy single-shot path
      *  and its renderer-memory ceiling. */
     chunkedAttachmentUpload: z.boolean().optional(),
+    /** Versions whose init-session geometry this control plane understands.
+     *  Missing on older servers; callers must select v2 in that case. */
+    attachmentEnvelopeVersions: z.array(z.number().int().positive()).optional(),
   }),
 });
 

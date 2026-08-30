@@ -532,6 +532,44 @@ func TestInitUploadSession_PersistsEnvelopeVersionV3(t *testing.T) {
 	assert.Equal(t, "3", stored)
 }
 
+func TestInitUploadSession_VersionSelectsWriteBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		version    *int
+		wantID     string
+		wantLegacy bool
+	}{
+		{"omitted envelope version uses legacy", nil, "", true},
+		{"envelope version 2 uses legacy", func() *int { v := 2; return &v }(), "", true},
+		{"envelope version 3 uses vendor backend", func() *int { v := 3; return &v }(), "r2-useast", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := setupSessionTest(t)
+			vendor := newFakeMultipartStore()
+			ss.handler.SetWriteRouter(stubWriteRouter{
+				tier1: ss.fake, attachment: vendor, backendID: "r2-useast",
+			})
+			userID, _, channelID := ss.channelContext(t, "version-backend")
+			body := initBody(channelID, 4096)
+			if tc.version != nil {
+				body["envelope_version"] = *tc.version
+			}
+			w := ss.doInit(userID, body)
+			require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+			sessionID, ok := parseBody(t, w)["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantID, ss.rdb.HGet(t.Context(), attachSessionKey(sessionID), "backend").Val())
+			if tc.wantLegacy {
+				assert.Equal(t, 1, ss.fake.openUploadCount())
+				assert.Equal(t, 0, vendor.openUploadCount())
+			} else {
+				assert.Equal(t, 0, ss.fake.openUploadCount())
+				assert.Equal(t, 1, vendor.openUploadCount())
+			}
+		})
+	}
+}
+
 func TestInitUploadSession_EnvelopeVersionCompatibilityMatrix(t *testing.T) {
 	intPtr := func(v int) *int { return &v }
 	tests := []struct {

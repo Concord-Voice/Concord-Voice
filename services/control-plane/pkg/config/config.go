@@ -303,15 +303,17 @@ type Config struct {
 	// candidate row and storage.NewRegistry builds a vendor client from it at
 	// boot, after which backend-aware reads, deletes and session sweeping all
 	// resolve through it. What remains dormant is narrower than "the backend"
-	// — it is the WRITE DEFAULT. Registry.AttachmentWriteBackendID returns the
-	// legacy id unconditionally, so every attachment is still written to
-	// MinIO and every existing row carries a NULL storage_backend that
-	// resolves to legacy. The flip is a later wave.
+	// — it is the WRITE DEFAULT. AttachmentWriteBackend chooses the backend for
+	// new v3 attachments; existing rows always resolve from their persisted
+	// storage_backend, where NULL remains legacy forever.
 	//
 	// In practice the whole struct also stays inert until an operator seeds
 	// the credential pair: AttachmentBackends() gates the candidate on it, so
 	// with no credential there is no registered backend at all.
 	CloudflareR2 CloudflareR2Config
+	// AttachmentWriteBackend is the registry backend id for new v3 attachment
+	// writes. Empty configuration normalizes to the permanent legacy selector.
+	AttachmentWriteBackend string
 
 	// Message-purge engine (#1352). Lightweight compose-only tunables — NOT in
 	// validate()/provision-secrets.yml (won't fatal-exit, won't trip Class-1 drift).
@@ -490,11 +492,12 @@ func Load() (*Config, error) {
 			AccessKeyID:     getEnv("CLOUDFLARE_R2_USEAST_ID", ""),
 			SecretAccessKey: getEnv("CLOUDFLARE_R2_USEAST_ID_KEY", ""), // #nosec G101 -- env var name, not a secret
 		},
-		PurgeMaxBatch:      getEnvInt("PURGE_MAX_BATCH", 5000),
-		PurgeRateLimit:     getEnvInt("PURGE_RATE_LIMIT", 5),
-		PurgeRateWindowSec: getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
-		KlipyAPIKey:        getEnv("KLIPY_API_KEY", ""),
-		KlipyCustomerIDKey: getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
+		AttachmentWriteBackend: normalizeAttachmentWriteBackend(getEnv("ATTACHMENT_WRITE_BACKEND", "")),
+		PurgeMaxBatch:          getEnvInt("PURGE_MAX_BATCH", 5000),
+		PurgeRateLimit:         getEnvInt("PURGE_RATE_LIMIT", 5),
+		PurgeRateWindowSec:     getEnvInt("PURGE_RATE_WINDOW_SEC", 3600),
+		KlipyAPIKey:            getEnv("KLIPY_API_KEY", ""),
+		KlipyCustomerIDKey:     getEnv("KLIPY_CUSTOMER_ID_KEY", ""),
 		GitHubFeedback: GitHubFeedbackConfig{
 			// TrimSpace both fields: a trailing newline on the PAT (the common
 			// copy-paste / secret-store artifact) corrupts the
@@ -768,7 +771,50 @@ func (c *Config) validate() error {
 	if err := c.validateActivityHistory(); err != nil {
 		return err
 	}
+	if err := c.validateAttachmentWriteBackend(); err != nil {
+		return err
+	}
 	return c.validateProduction()
+}
+
+func normalizeAttachmentWriteBackend(raw string) string {
+	if value := strings.TrimSpace(raw); value != "" {
+		return value
+	}
+	return LegacyAttachmentBackendID
+}
+
+// AttachmentWriteBackendArmed reports whether new v3 attachment sessions may
+// follow a non-legacy backend selection.
+func (c *Config) AttachmentWriteBackendArmed() bool {
+	if c == nil {
+		return false
+	}
+	return normalizeAttachmentWriteBackend(c.AttachmentWriteBackend) != LegacyAttachmentBackendID &&
+		c.validateAttachmentWriteBackend() == nil
+}
+
+func (c *Config) validateAttachmentWriteBackend() error {
+	selected := c.AttachmentWriteBackend
+	if strings.TrimSpace(selected) == "" {
+		selected = LegacyAttachmentBackendID
+	}
+	if selected != LegacyAttachmentBackendID {
+		valid := false
+		for _, backend := range attachmentBackendCandidates(c) {
+			if selected == backend.ID {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("ATTACHMENT_WRITE_BACKEND must be %q or a configured attachment backend id", LegacyAttachmentBackendID)
+		}
+	}
+	if selected != LegacyAttachmentBackendID && IsSelfHostedInstance(c.InstanceType) {
+		return fmt.Errorf("ATTACHMENT_WRITE_BACKEND must be %q for self-hosted deployments", LegacyAttachmentBackendID)
+	}
+	return nil
 }
 
 // Structural RFC 6797 STS policy pieces: bare or token=token directives

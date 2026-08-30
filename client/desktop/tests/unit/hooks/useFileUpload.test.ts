@@ -13,6 +13,10 @@ import {
   resolveAttachmentLimit,
 } from '@/renderer/utils/entitlementLimits';
 import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
+import {
+  CHUNK_PLAINTEXT_BYTES,
+  ENVELOPE_HEADER_BYTES,
+} from '@/renderer/utils/attachmentChunkedCrypto';
 
 // Mock apiClient
 const mockApiFetch = vi.fn();
@@ -358,6 +362,17 @@ function setChunkedCapability(supported: boolean): void {
   });
   store.setChunkedUploadCapability({
     status: supported ? 'supported' : 'confirmed-unsupported',
+  });
+}
+
+function setEnvelopeVersions(versions: number[] | undefined): void {
+  const current = useClientConfigStore.getState().serverCapabilities;
+  useClientConfigStore.getState().setServerCapabilities({
+    auth: current?.auth ?? { oauthProviders: [] },
+    features: {
+      ...(current?.features ?? {}),
+      ...(versions === undefined ? {} : { attachmentEnvelopeVersions: versions }),
+    },
   });
 }
 
@@ -1524,6 +1539,33 @@ describe('useFileUpload — cancel, stall, and unmount', () => {
     });
   });
 
+  it('subtracts the v3 header reserve from committed plaintext progress', async () => {
+    setEnvelopeVersions([2, 3]);
+    const flight = pausableUpload();
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([
+        createMockFile('big.bin', CHUNK_PLAINTEXT_BYTES + 1, 'application/octet-stream'),
+      ]);
+    });
+
+    let done!: Promise<unknown>;
+    await act(async () => {
+      done = result.current.uploadAll('channel-1');
+      await Promise.resolve();
+    });
+    await act(async () => {
+      flight.commitChunk(0, 2);
+    });
+
+    expect(result.current.files[0].bytesSent).toBe(CHUNK_PLAINTEXT_BYTES - ENVELOPE_HEADER_BYTES);
+
+    await act(async () => {
+      flight.release();
+      await done;
+    });
+  });
+
   it('opens as preparing on the chunked path — nothing is committed yet', async () => {
     const flight = pausableUpload();
     const { result } = renderHook(() => useFileUpload());
@@ -1907,5 +1949,42 @@ describe('useFileUpload — the chunked path strips metadata too', () => {
     // greps for its absence is not asserting against a file that never had it.
     const before = new Uint8Array(await original.arrayBuffer());
     expect(bytesContain(before, STRIP_MARKER)).toBe(true);
+  });
+});
+
+describe('useFileUpload — envelope version negotiation', () => {
+  beforeEach(() => {
+    mockUploadAttachmentChunked.mockReset();
+    mockUploadAttachmentChunked.mockResolvedValue({
+      file_id: 'file-1',
+      storage_key: 'attachments/x',
+      file_type: 'file',
+      file_size: 1,
+    });
+  });
+
+  async function uploadWithVersions(versions: number[] | undefined): Promise<unknown> {
+    setChunkedCapability(true);
+    setEnvelopeVersions(versions);
+    const { result } = renderHook(() => useFileUpload());
+    await act(async () => {
+      await result.current.addFiles([
+        createMockFile('negotiated.bin', 4096, 'application/octet-stream'),
+      ]);
+    });
+    await act(async () => {
+      await result.current.uploadAll('channel-1');
+    });
+    return mockUploadAttachmentChunked.mock.calls[0]?.[2];
+  }
+
+  it('selects v2 when the server omits envelope versions', async () => {
+    const ctx = (await uploadWithVersions(undefined)) as { envelopeVersion?: number };
+    expect(ctx.envelopeVersion).toBe(2);
+  });
+
+  it('selects v3 only when the server advertises it', async () => {
+    const ctx = (await uploadWithVersions([2, 3])) as { envelopeVersion?: number };
+    expect(ctx.envelopeVersion).toBe(3);
   });
 });

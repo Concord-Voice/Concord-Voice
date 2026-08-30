@@ -21,7 +21,13 @@ import {
   abandonSessionOnUnload,
   UploadAbortedError,
 } from '../../services/messaging/attachmentUploadSession';
-import { CHUNK_PLAINTEXT_BYTES } from '../../utils/attachmentChunkedCrypto';
+import {
+  CHUNK_PLAINTEXT_BYTES,
+  ENVELOPE_HEADER_BYTES,
+  ENVELOPE_VERSION_V2,
+  ENVELOPE_VERSION_V3,
+  type AttachmentEnvelopeVersion,
+} from '../../utils/attachmentChunkedCrypto';
 import type { AttachmentSummary } from '../../types/chat';
 
 const DEFAULT_MIME = 'application/octet-stream';
@@ -252,6 +258,9 @@ interface UploadContext {
    *  Fail-closed: false means the legacy single-shot path, which is what every
    *  server predating #2157 PR 2 gets. */
   chunkedUploadSupported: boolean;
+  /** Fixed before the upload starts. The session header, init arithmetic, and
+   *  every sealed part derive from this one negotiated value. */
+  envelopeVersion: AttachmentEnvelopeVersion;
   /** One controller per in-flight upload, keyed by uploadId. Cancel is per-file
    *  and the shared `signal` below cannot express that: aborting it would kill
    *  every queued upload, not the one whose X was clicked. */
@@ -378,7 +387,11 @@ async function uploadOnePending(
       stall.commit();
       const pct = Math.round(((index + 1) / total) * 100);
       // Plaintext bytes the server has ACCEPTED, not bytes handed to fetch.
-      const bytes = Math.min(entry.file.size, (index + 1) * CHUNK_PLAINTEXT_BYTES);
+      const bytes = Math.min(
+        entry.file.size,
+        (index + 1) * CHUNK_PLAINTEXT_BYTES -
+          (ctx.envelopeVersion === ENVELOPE_VERSION_V3 ? ENVELOPE_HEADER_BYTES : 0)
+      );
       setFiles((prev) =>
         prev.map((f) =>
           f.uploadId === uploadId
@@ -565,6 +578,7 @@ async function uploadSingleFile(
         keyVersion,
         fileType: classifyFileType(entry.file.type),
         mimeType: entry.file.type || DEFAULT_MIME,
+        envelopeVersion: ctx.envelopeVersion,
       },
       signal,
       {
@@ -668,6 +682,16 @@ export function useFileUpload() {
     // is carried into the limit below so the notice can say which one happened.
     (s) => s.chunkedUploadCapability.status === 'supported'
   );
+  const attachmentEnvelopeVersions = useClientConfigStore(
+    (s) => s.serverCapabilities?.features.attachmentEnvelopeVersions
+  );
+  // Select once before encryption. A missing, malformed, or v2-only capability
+  // is deliberately v2-safe; `chunkedUploadSupported` separately proves the
+  // session routes are reachable.
+  const envelopeVersion: AttachmentEnvelopeVersion =
+    chunkedUploadSupported && attachmentEnvelopeVersions?.includes(ENVELOPE_VERSION_V3)
+      ? ENVELOPE_VERSION_V3
+      : ENVELOPE_VERSION_V2;
   const limit = useMemo(
     // #1556 SEAM: pass `serverMaxUploadBytes` here once the server composes the
     // Mach axis. Nothing else in this file changes when it does.
@@ -876,6 +900,7 @@ export function useFileUpload() {
           channelId,
           conversationId,
           chunkedUploadSupported,
+          envelopeVersion,
           fileAborts: fileAbortsRef.current,
           liveSessions: liveSessionsRef.current,
           stopped: stoppedRef,
@@ -902,7 +927,7 @@ export function useFileUpload() {
     // chunkedUploadSupported selects the upload PATH, so a stale value here
     // would keep sending single-shot uploads after a reconnect told us the
     // server supports sessions -- silently, and only for premium-sized files.
-    [files, chunkedUploadSupported]
+    [files, chunkedUploadSupported, envelopeVersion]
   );
 
   const hasFiles = files.length > 0;

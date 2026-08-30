@@ -60,6 +60,15 @@ func TestDispatchControlPlaneSubcommandProductionWrapperLeavesStartupUnhandled(t
 	}
 }
 
+func TestDispatchControlPlaneSubcommandUnknownNonEmptyReturnsUsageExit64(t *testing.T) {
+	code, handled := dispatchControlPlaneSubcommandWithRunners(
+		[]string{"control-plane", "unknown-subcommand"}, controlPlaneSubcommandRunners{},
+	)
+	if !handled || code != 64 {
+		t.Fatalf("unknown dispatch = code:%d handled:%v, want exit 64 and handled", code, handled)
+	}
+}
+
 func TestMainDispatchesControlPlaneSubcommandsBeforeConfigLoad(t *testing.T) {
 	source, err := os.ReadFile("main.go") // #nosec G304 -- fixed test-only source path
 	if err != nil {
