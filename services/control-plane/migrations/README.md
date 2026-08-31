@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000113)
+## Existing Migrations (000001–000116)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -223,6 +223,9 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000111 | add_active_pending_plans | Durable active-category Rich Presence reconciliation on a sibling rail to 000087 (#2448) |
 | 000112 | allow_friend_requests_from | Friend-request privacy gate enforced by a single constant-shape statement (#1240) |
 | 000113 | presence_audience_suppressed_metric | Admit presence_audience_suppressed_total into the closed operations metric catalog (#1654) |
+| 000114 | media_files_storage_backend | Add nullable per-object attachment backend placement (ADR-0038, #2759) |
+| 000115 | media_files_storage_key_lookup | Add pair-key lookup support for account-erasure attachment recovery (#2759) |
+| 000116 | media_files_reap_attempts | Track failed orphan-reap attempts for bounded retry fairness |
 
 ## Troubleshooting
 
