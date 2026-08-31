@@ -123,25 +123,6 @@ export default [
     // sets to 'detect' for us.
 
     rules: {
-      // @eslint-react/unsupported-syntax fires on three pattern groups inside
-      // React components / hooks:
-      //   (a) IIFEs in JSX, e.g. {(() => { if (x) return <A/>; return <B/>; })()}
-      //   (b) eval calls
-      //   (c) with statements
-      // Case (a) is idiomatic in this codebase for complex conditional rendering
-      // that cannot be cleanly expressed via ternary (~35 sites at time of
-      // writing, 2026-05-13). The rule exists primarily to prevent React Compiler
-      // from stumbling on these patterns, but this project does not use React
-      // Compiler. Cases (b) and (c) are independently prohibited by [internal]
-      // and reviewed out at PR time via the RCI workflow + AI-Code Assurance —
-      // not via this lint rule. If lint-level eval/with detection is desired
-      // later, prefer the `no-eval` rule from eslint:recommended rather than
-      // re-enabling unsupported-syntax with its IIFE noise. Extraction of the
-      // IIFE sites to named helpers (and re-enabling this rule at error) is
-      // tracked by #987 — dormant until either React Compiler is adopted or
-      // a Compiler-dependent feature lands.
-      '@eslint-react/unsupported-syntax': 'off',
-
       // Web-API leak rules promoted from `warn` (preset default) to `error`.
       // These rules catch resource-cleanup bugs in useEffect/useLayoutEffect
       // that silently leak fetch handles, event listeners, timers, and
