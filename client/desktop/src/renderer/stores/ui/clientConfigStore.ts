@@ -45,7 +45,7 @@ export const ServerCapabilitiesSchema = z.object({
     chunkedAttachmentUpload: z.boolean().optional(),
     /** Versions whose init-session geometry this control plane understands.
      *  Missing on older servers; callers must select v2 in that case. */
-    attachmentEnvelopeVersions: z.array(z.number().int().positive()).optional(),
+    attachmentEnvelopeVersions: z.array(z.union([z.literal(2), z.literal(3)])).optional(),
   }),
 });
 

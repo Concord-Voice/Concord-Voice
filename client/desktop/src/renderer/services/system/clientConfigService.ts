@@ -205,6 +205,7 @@ class ClientConfigService {
     try {
       const res = await apiFetch('/api/v1/server/capabilities', {
         signal: controller.signal,
+        cache: 'no-store',
       });
       if (!this.isCurrentCapabilityRequest(controller, generation)) return;
       if (!res.ok) {

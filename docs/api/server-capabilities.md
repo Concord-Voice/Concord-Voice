@@ -7,8 +7,9 @@ desktop client connects to an older self-hosted server).
 
 - **Auth:** none required. The response is identical with or without an
   `Authorization` header — it carries no user-specific data.
-- **Caching:** `Cache-Control: public, max-age=300` (5-minute TTL, a rollout
-  configuration change propagates within the TTL).
+- **Caching:** `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`;
+  `Pragma: no-cache` (capability changes must be visible immediately during
+  rollouts).
 - **Rate limit:** 30 requests/minute/IP (matches the sibling `/client/config`).
   The descriptor is constant and auth-state-independent, so there is nothing to
   enumerate. The limit is abuse/DoS throttling. It is deliberately not tighter

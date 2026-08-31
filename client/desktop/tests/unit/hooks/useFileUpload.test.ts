@@ -1983,6 +1983,11 @@ describe('useFileUpload — envelope version negotiation', () => {
     expect(ctx.envelopeVersion).toBe(2);
   });
 
+  it('selects v2 when the server advertises only v2', async () => {
+    const ctx = (await uploadWithVersions([2])) as { envelopeVersion?: number };
+    expect(ctx.envelopeVersion).toBe(2);
+  });
+
   it('selects v3 only when the server advertises it', async () => {
     const ctx = (await uploadWithVersions([2, 3])) as { envelopeVersion?: number };
     expect(ctx.envelopeVersion).toBe(3);

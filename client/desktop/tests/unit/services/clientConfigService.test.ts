@@ -146,7 +146,7 @@ describe('clientConfigService', () => {
       expect(mockApiFetch).toHaveBeenNthCalledWith(
         2,
         '/api/v1/server/capabilities',
-        expect.objectContaining({ signal: expect.any(AbortSignal) })
+        expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) })
       );
       expect(useClientConfigStore.getState().serverCapabilities).toEqual({
         auth: { oauthProviders: ['google'] },
@@ -255,7 +255,31 @@ describe('clientConfigService', () => {
       });
     });
 
-    it('preserves supported and future numeric envelope versions', async () => {
+    it('accepts the supported numeric envelope versions', async () => {
+      mockApiFetch.mockResolvedValueOnce(
+        jsonResponse({
+          server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
+          auth: { oauthProviders: [] },
+          features: { chunkedAttachmentUpload: true, attachmentEnvelopeVersions: [2, 3] },
+        })
+      );
+
+      await clientConfigService.refreshServerCapabilities();
+
+      expect(useClientConfigStore.getState().serverCapabilities?.features).toHaveProperty(
+        'attachmentEnvelopeVersions',
+        [2, 3]
+      );
+    });
+
+    it('rejects an unknown numeric envelope version', async () => {
+      useClientConfigStore.setState({
+        serverCapabilities: {
+          auth: { oauthProviders: [] },
+          features: { chunkedAttachmentUpload: true, attachmentEnvelopeVersions: [2, 3] },
+        },
+        chunkedUploadCapability: { status: 'supported' },
+      });
       mockApiFetch.mockResolvedValueOnce(
         jsonResponse({
           server: { name: 'Concord Voice', version: 'test', instanceType: 'saas' },
@@ -266,10 +290,10 @@ describe('clientConfigService', () => {
 
       await clientConfigService.refreshServerCapabilities();
 
-      expect(useClientConfigStore.getState().serverCapabilities?.features).toHaveProperty(
-        'attachmentEnvelopeVersions',
-        [2, 3, 4]
-      );
+      expect(useClientConfigStore.getState().serverCapabilities).toBeNull();
+      expect(useClientConfigStore.getState().chunkedUploadCapability).toEqual({
+        status: 'error',
+      });
     });
 
     it.each([

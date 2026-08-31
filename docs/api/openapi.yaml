@@ -3049,7 +3049,9 @@ paths:
 
         set before login (version skew). Response is identical regardless of auth
 
-        state. Cache-Control: public, max-age=300. Rate limit: 30 requests per minute
+        state. Cache-Control: no-store, no-cache, must-revalidate, max-age=0.
+
+        Pragma: no-cache. Rate limit: 30 requests per minute
 
         (IP-based). Schema is additively-evolvable (new fields optional).
 

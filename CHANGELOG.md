@@ -20,6 +20,7 @@ Concord Voice now lets you choose who can see your voice-channel and private-cal
 
 ### Fixed
 
+- **Encrypted attachments stay on the compatible storage format during rollouts** ([#3051](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3051)) — the server no longer advertises a new format before every supported client can read it, and the desktop rejects capability lists containing unknown formats instead of assuming the remaining entries are safe.
 - **An invite preview no longer reuses details from a different invite while loading** ([#3037](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3037)) — preview results are now kept with the invite code they describe, so changing codes shows a loading state until the new details arrive.
 - **Prepared large encrypted attachments for consistently sized upload pieces** ([#3039](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3039)) — the client and server now understand a new attachment format that reserves room for the header inside the first piece, while retaining the existing write format until compatible server and client versions can be negotiated. Attachments already stored in the older format still open normally.
 
