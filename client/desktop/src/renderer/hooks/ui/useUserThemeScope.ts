@@ -1,5 +1,5 @@
 import { useMemo, type CSSProperties } from 'react';
-import { resolveUserThemeScope } from '../../utils/schemeColors';
+import { resolveUserThemeScope } from '../../utils/ui/schemeColors';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 
 interface ThemeScopeProps {

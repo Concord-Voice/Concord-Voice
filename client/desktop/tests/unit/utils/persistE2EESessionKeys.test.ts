@@ -6,7 +6,7 @@
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { persistE2EESessionKeys } from '@/renderer/utils/persistE2EESessionKeys';
+import { persistE2EESessionKeys } from '@/renderer/utils/crypto/persistE2EESessionKeys';
 
 const keys = {
   wrappingKeyBase64: 'wk',

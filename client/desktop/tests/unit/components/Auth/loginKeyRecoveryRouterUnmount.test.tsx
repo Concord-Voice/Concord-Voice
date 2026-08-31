@@ -30,7 +30,7 @@ import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { resetRuntimeServerBase } from '@/renderer/services/system/runtimeServerBase';
-import { isE2EEUnlockPending } from '@/renderer/utils/authAdmissionGate';
+import { isE2EEUnlockPending } from '@/renderer/utils/auth/authAdmissionGate';
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -55,7 +55,7 @@ const { mockE2EESessionKeys, mockE2EEInitializationReceipt, mockE2EEClearKeys } 
   };
 });
 
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   unwrapLoginKeys: (...args: unknown[]) => mockUnwrapLoginKeys(...args),
   generateRegistrationKeys: (...args: unknown[]) => mockGenerateRegistrationKeys(...args),
   exportPublicKey: vi.fn().mockResolvedValue('mock-public-key'),

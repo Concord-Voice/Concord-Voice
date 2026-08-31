@@ -8,7 +8,7 @@ import {
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { apiFetch } from '../../services/system/apiClient';
 import Modal from '../ui/Modal';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import CustomSelect from '../ui/CustomSelect';
 import './DirectMessages.css';
 

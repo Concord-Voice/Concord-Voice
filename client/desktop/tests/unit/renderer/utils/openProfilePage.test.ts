@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { openProfilePage } from '@/renderer/utils/openProfilePage';
+import { openProfilePage } from '@/renderer/utils/ui/openProfilePage';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 

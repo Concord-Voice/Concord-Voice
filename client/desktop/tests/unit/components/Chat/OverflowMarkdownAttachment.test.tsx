@@ -5,7 +5,7 @@ import OverflowMarkdownAttachment from '@/renderer/components/Chat/OverflowMarkd
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 import type { AttachmentSummary } from '@/renderer/types/chat';
-import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/entitlementLimits';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/policy/entitlementLimits';
 
 // ---------------------------------------------------------------------------
 // Module-level mocks
@@ -26,7 +26,7 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
 }));
 
 // Mock attachmentCrypto.decryptFile so tests control the decrypted bytes
-vi.mock('@/renderer/utils/attachmentCrypto', () => ({
+vi.mock('@/renderer/utils/crypto/attachmentCrypto', () => ({
   formatFileSize: (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -62,7 +62,7 @@ const sampleAttachment: AttachmentSummary = {
 // ---------------------------------------------------------------------------
 
 async function setupDecryptFile(plaintextString: string) {
-  const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+  const { decryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
   const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   const mockKey = {} as CryptoKey;
   (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue(mockKey);
@@ -236,7 +236,7 @@ describe('OverflowMarkdownAttachment', () => {
   // 6. Memoization: collapse + re-expand does not re-fetch or re-decrypt
   // -------------------------------------------------------------------------
   it('memoizes decrypted content — re-expand after collapse does not re-decrypt', async () => {
-    const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { decryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
     const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const mockKey = {} as CryptoKey;
     const decryptSpy = vi.fn().mockResolvedValue(enc.encode('full content').buffer as ArrayBuffer);
@@ -283,7 +283,7 @@ describe('OverflowMarkdownAttachment', () => {
   // -------------------------------------------------------------------------
   it('does not setState after unmount during in-flight expand', async () => {
     const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
-    const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { decryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
 
     // Mock getChannelKey to resolve (so fetch completes) but decryptFile to hang forever
     (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue({} as CryptoKey);
@@ -388,7 +388,7 @@ describe('OverflowMarkdownAttachment', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       /too large to open in this version of Concord/
     );
-    const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { decryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
     expect(decryptFile).not.toHaveBeenCalled();
   });
 
@@ -396,7 +396,7 @@ describe('OverflowMarkdownAttachment', () => {
   // 8. Focus management — Collapse button is focused after entering rendered state
   // -------------------------------------------------------------------------
   it('focuses the Collapse button after entering rendered state', async () => {
-    const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { decryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
     const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     const mockKey = {} as CryptoKey;
     (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue(mockKey);

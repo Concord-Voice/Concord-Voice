@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
 import { apiFetch } from '../../services/system/apiClient';
-import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import './UserProfileModal.css';
 

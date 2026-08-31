@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 
 interface UnreadState {
   // Channel ID -> unread count (per-channel, active server only)

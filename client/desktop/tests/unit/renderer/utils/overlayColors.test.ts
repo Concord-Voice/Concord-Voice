@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { deriveOverlayColors } from '@/renderer/utils/overlayColors';
+import { deriveOverlayColors } from '@/renderer/utils/ui/overlayColors';
 
 describe('deriveOverlayColors', () => {
   it('returns dark palette for dark theme', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { base64urlToBuffer, bufferToBase64url } from '@/renderer/utils/base64url';
+import { base64urlToBuffer, bufferToBase64url } from '@/renderer/utils/crypto/base64url';
 
 const bytes = (...values: number[]): ArrayBuffer => new Uint8Array(values).buffer;
 

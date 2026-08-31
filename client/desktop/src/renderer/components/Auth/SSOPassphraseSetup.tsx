@@ -34,11 +34,11 @@ import {
   runtimeServerSelectionIsCurrent,
 } from '../../services/system/runtimeServerBase';
 import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
-import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
+import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto/crypto';
 import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2ee/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
-import { errorMessage } from '../../utils/redactError';
-import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import { errorMessage } from '../../utils/runtime/redactError';
+import { persistE2EESessionKeys } from '../../utils/crypto/persistE2EESessionKeys';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import './SSOPassphraseSetup.css';
 

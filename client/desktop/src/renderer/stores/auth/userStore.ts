@@ -1,9 +1,9 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import { useAuthStore } from './authStore';
 import { apiFetch, ensureMachineId } from '../../services/system/apiClient';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import { getWebSocketService } from '../../services/messaging/websocketService';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
@@ -27,15 +27,15 @@ import {
   base64ToArrayBuffer,
   arrayBufferToBase64,
   type KeyDerivationAlgorithm,
-} from '../../utils/crypto';
-import { parsePresenceOverrides } from '../../utils/presenceOverrides';
+} from '../../utils/crypto/crypto';
+import { parsePresenceOverrides } from '../../utils/policy/presenceOverrides';
 import {
   isHydrationLifecycleCurrent,
   resetPostLoginHydrationLifecycle,
   type HydrationLifecycleGuard,
 } from '../../services/system/postLoginHydrationLifecycle';
-import { parseContinuationPair, type ContinuationPair } from '../../utils/continuationPair';
-import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import { parseContinuationPair, type ContinuationPair } from '../../utils/crypto/continuationPair';
+import { persistE2EESessionKeys } from '../../utils/crypto/persistE2EESessionKeys';
 import {
   captureRuntimeServerSelection,
   runtimeServerSelectionIsCurrent,

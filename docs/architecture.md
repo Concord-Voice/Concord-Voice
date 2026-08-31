@@ -445,7 +445,7 @@ already within bounds" optimisation would take.
 **Tier 2 (message attachments) — client-side, before encryption.** These are
 end-to-end encrypted, so the server never sees plaintext and cannot strip
 anything; a GPS-tagged photo would reach every recipient intact and could not be
-remediated after the fact. `client/desktop/src/renderer/utils/imageMetadata/`
+remediated after the fact. `client/desktop/src/renderer/utils/ui/imageMetadata/`
 rewrites the container byte-for-byte before `encryptFile` runs.
 
 That module parses containers rather than re-encoding pixels, which keeps the

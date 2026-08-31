@@ -4,7 +4,7 @@
 
 // Type-only import: erased by esbuild → zero runtime coupling, no circular dependency
 // (the runtime import edge stays one-way settingsStore → effectiveFont).
-import type { AppearanceSettings } from '../stores/ui/settingsStore';
+import type { AppearanceSettings } from '../../stores/ui/settingsStore';
 
 export type AppFontId =
   | 'default' // Concord Voice Default (brand) — ALSO the "no explicit pick" sentinel

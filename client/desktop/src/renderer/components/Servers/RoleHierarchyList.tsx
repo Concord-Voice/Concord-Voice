@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import RoleHierarchyRow from './RoleHierarchyRow';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
-import { decideDropIndex } from '../../utils/decideDropIndex';
+import { decideDropIndex } from '../../utils/policy/decideDropIndex';
 import {
   buildReorderPayload,
   evaluateReorderPrecondition,
   moveWithinBand,
   partitionRoleHierarchy,
-} from '../../utils/roleHierarchy';
-import { errorMessage } from '../../utils/redactError';
+} from '../../utils/policy/roleHierarchy';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { ReorderPrecondition, Role, RoleViewer } from '../../types/server';
 
 /**
@@ -18,7 +18,7 @@ import type { ReorderPrecondition, Role, RoleViewer } from '../../types/server';
  * toolbar pair acting on the selected role.
  *
  * Nothing in this rail can express an order the server would refuse: the payload
- * projects exactly the band (see `utils/roleHierarchy.ts`, which owns the
+ * projects exactly the band (see `utils/policy/roleHierarchy.ts`, which owns the
  * contract), so error handling only ever has to explain staleness.
  */
 

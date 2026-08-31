@@ -4,8 +4,8 @@ import { resetAllStores } from '../../helpers/store-helpers';
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
 import type { Role, RoleHierarchy } from '@/renderer/types/server';
-import { buildReorderPayload } from '@/renderer/utils/roleHierarchy';
-import { ADMINISTRATOR, MANAGE_SERVER, SEND_MESSAGES } from '@/renderer/utils/permissions';
+import { buildReorderPayload } from '@/renderer/utils/policy/roleHierarchy';
+import { ADMINISTRATOR, MANAGE_SERVER, SEND_MESSAGES } from '@/renderer/utils/policy/permissions';
 
 const API_BASE = 'http://localhost:8080';
 

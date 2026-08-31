@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { errorMessage, errorName } from '@/renderer/utils/redactError';
+import { errorMessage, errorName } from '@/renderer/utils/runtime/redactError';
 
 describe('errorMessage', () => {
   it('returns Error.message for Error instances', () => {

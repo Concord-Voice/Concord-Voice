@@ -13,7 +13,7 @@
 
 import { useFriendOrgStore, type FriendOrgBlob } from '../../stores/chat/friendOrgStore';
 import { fetchEncryptedBlob, pushEncryptedBlob } from '../e2ee/e2eeBlobTransport';
-import { validateFriendOrgBlob } from '../../utils/friendOrgBlob';
+import { validateFriendOrgBlob } from '../../utils/auth/friendOrgBlob';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,

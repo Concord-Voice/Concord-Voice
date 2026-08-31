@@ -45,7 +45,7 @@ import type {
   RoleHierarchy,
   RoleReorderPayload,
   RoleViewer,
-} from '../types/server';
+} from '../../types/server';
 
 /**
  * The default role (`@all`). Always rendered last, never draggable, and never

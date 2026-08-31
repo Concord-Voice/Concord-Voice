@@ -7,7 +7,7 @@ import React, {
   useImperativeHandle,
   forwardRef,
 } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { AtSign, Users, Shield } from 'lucide-react';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { useDMStore } from '../../stores/chat/dmStore';
@@ -17,8 +17,8 @@ import {
   MENTION_EVERYONE,
   MENTION_USERS,
   MENTION_ROLES,
-} from '../../utils/permissions';
-import type { ParsedMention } from '../../utils/mentions';
+} from '../../utils/policy/permissions';
+import type { ParsedMention } from '../../utils/messaging/mentions';
 import { extractTriggerToken, handleTypeaheadKeyDown } from './typeaheadAutocomplete';
 import './typeaheadAutocomplete.css';
 import './MentionAutocomplete.css';

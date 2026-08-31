@@ -36,7 +36,7 @@ import {
   type ConsumeResult,
   type GetFrameKeyResult,
 } from './pipSignalingTypes';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import {
   codecFamilyFromRtpParameters,
   type E2EEMainMessage,

@@ -1,5 +1,5 @@
 import type { KeyboardEvent } from 'react';
-import { createResizeKeyHandler, type ResizeKeyOptions } from '@/renderer/utils/resizeKeyboard';
+import { createResizeKeyHandler, type ResizeKeyOptions } from '@/renderer/utils/ui/resizeKeyboard';
 
 describe('createResizeKeyHandler', () => {
   const makeHandler = (overrides: Partial<ResizeKeyOptions> = {}) => {

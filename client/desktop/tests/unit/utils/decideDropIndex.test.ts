@@ -1,5 +1,5 @@
 /**
- * Unit tests for `src/renderer/utils/decideDropIndex.ts` (#2359).
+ * Unit tests for `src/renderer/utils/policy/decideDropIndex.ts` (#2359).
  *
  * SYNTHETIC RECTS ONLY — nothing is rendered here, deliberately. jsdom reports
  * zero-height rects and Vitest runs with `css: false`, so a geometry assertion
@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { decideDropIndex } from '@/renderer/utils/decideDropIndex';
+import { decideDropIndex } from '@/renderer/utils/policy/decideDropIndex';
 
 /** A synthetic, fully-formed DOMRect. Only `top`/`bottom` are read. */
 function rect(top: number, height: number): DOMRect {

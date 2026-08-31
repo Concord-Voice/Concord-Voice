@@ -8,7 +8,7 @@ import {
   indexMessages,
   subscribeSearchResultInvalidations,
 } from '../../services/messaging/searchService';
-import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
+import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
 
 const DEFAULT_LIMIT = 50;
 const MAX_PAGINATION_RECONCILIATION_ATTEMPTS = 2;

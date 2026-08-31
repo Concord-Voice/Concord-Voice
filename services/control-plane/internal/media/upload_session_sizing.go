@@ -5,7 +5,7 @@ import "fmt"
 // Attachment envelope arithmetic for the chunked wire format (#2157 PR 2).
 //
 // These constants MUST match
-// client/desktop/src/renderer/utils/attachmentChunkedCrypto.ts. They are
+// client/desktop/src/renderer/utils/crypto/attachmentChunkedCrypto.ts. They are
 // compile-time constants on both sides deliberately: the chunk size is bound
 // into every chunk's GCM AAD, so an operator-tunable value would silently
 // invalidate stored ciphertext.

@@ -13,7 +13,7 @@ import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useDMStore, type DMParticipant } from '../../stores/chat/dmStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { cancelOutgoingCall } from '../../services/voice/voiceService/callStateMachine';
-import { peerName } from '../../utils/dm';
+import { peerName } from '../../utils/messaging/dm';
 import './OutgoingCallModal.css';
 
 /** Resolve a user ID to a display name via the conversation's participants. */

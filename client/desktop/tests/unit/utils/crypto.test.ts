@@ -27,7 +27,7 @@ import {
   wrapWithRecoveryKey,
   unwrapWithRecoveryKey,
   deriveKeyArgon2idExportable,
-} from '@/renderer/utils/crypto';
+} from '@/renderer/utils/crypto/crypto';
 
 describe('crypto utilities', () => {
   describe('arrayBufferToBase64 / base64ToArrayBuffer', () => {
@@ -349,7 +349,7 @@ describe('crypto utilities', () => {
 
   describe('deriveKeyFromPasswordExportable', () => {
     it('derives an extractable AES-GCM key', async () => {
-      const { deriveKeyFromPasswordExportable } = await import('@/renderer/utils/crypto');
+      const { deriveKeyFromPasswordExportable } = await import('@/renderer/utils/crypto/crypto');
       const salt = generateSalt();
       const key = await deriveKeyFromPasswordExportable('password', salt);
       expect(key.algorithm.name).toBe('AES-GCM');
@@ -359,7 +359,7 @@ describe('crypto utilities', () => {
 
   describe('derivePreferencesKeyExportable', () => {
     it('derives an extractable AES-GCM preferences key', async () => {
-      const { derivePreferencesKeyExportable } = await import('@/renderer/utils/crypto');
+      const { derivePreferencesKeyExportable } = await import('@/renderer/utils/crypto/crypto');
       const salt = generateSalt();
       const key = await derivePreferencesKeyExportable('password', salt);
       expect(key.algorithm.name).toBe('AES-GCM');
@@ -372,7 +372,7 @@ describe('crypto utilities', () => {
   describe('wrapChannelKey / unwrapChannelKey', () => {
     it('round-trips a channel key through RSA-OAEP wrapping', async () => {
       const { generateChannelKey, wrapChannelKey, unwrapChannelKey, exportChannelKey } =
-        await import('@/renderer/utils/crypto');
+        await import('@/renderer/utils/crypto/crypto');
       const keyPair = await generateKeyPair();
       const channelKey = await generateChannelKey();
       const wrapped = await wrapChannelKey(channelKey, keyPair.publicKey);
@@ -391,7 +391,7 @@ describe('crypto utilities', () => {
   describe('ECDH operations', () => {
     // Regression for #2355: recovery ECDH must meet the P-384 policy floor and retain a non-exportable private key.
     it('generates ECDH key pair', async () => {
-      const { generateECDHKeyPair } = await import('@/renderer/utils/crypto');
+      const { generateECDHKeyPair } = await import('@/renderer/utils/crypto/crypto');
       const kp = await generateECDHKeyPair();
       expect.soft(kp.publicKey.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
       expect.soft(kp.privateKey.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
@@ -401,7 +401,7 @@ describe('crypto utilities', () => {
 
     it('exports and imports ECDH public key', async () => {
       const { generateECDHKeyPair, exportECDHPublicKey, importECDHPublicKey } =
-        await import('@/renderer/utils/crypto');
+        await import('@/renderer/utils/crypto/crypto');
       const kp = await generateECDHKeyPair();
       expect(kp.publicKey.algorithm).toMatchObject({ name: 'ECDH', namedCurve: 'P-384' });
       const exported = await exportECDHPublicKey(kp.publicKey);
@@ -412,7 +412,8 @@ describe('crypto utilities', () => {
     });
 
     it('rejects a P-256 recovery public key', async () => {
-      const { exportECDHPublicKey, importECDHPublicKey } = await import('@/renderer/utils/crypto');
+      const { exportECDHPublicKey, importECDHPublicKey } =
+        await import('@/renderer/utils/crypto/crypto');
       const legacy = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, [
         'deriveKey',
       ]);
@@ -430,7 +431,7 @@ describe('crypto utilities', () => {
         deriveSharedSecret,
         encryptWithSharedSecret,
         decryptWithSharedSecret,
-      } = await import('@/renderer/utils/crypto');
+      } = await import('@/renderer/utils/crypto/crypto');
 
       const alice = await generateECDHKeyPair();
       const bob = await generateECDHKeyPair();
@@ -460,7 +461,7 @@ describe('crypto utilities', () => {
         derivePreferencesKeyExportable,
         wrapPrefsKeyWithRecoveryKey,
         unwrapPrefsKeyWithRecoveryKey,
-      } = await import('@/renderer/utils/crypto');
+      } = await import('@/renderer/utils/crypto/crypto');
 
       const salt = generateSalt();
       const prefsKey = await derivePreferencesKeyExportable('password', salt);
@@ -486,7 +487,7 @@ describe('crypto utilities', () => {
 
   describe('derivePreferencesKeyArgon2id', () => {
     it('derives an Argon2id preferences key', async () => {
-      const { derivePreferencesKeyArgon2id } = await import('@/renderer/utils/crypto');
+      const { derivePreferencesKeyArgon2id } = await import('@/renderer/utils/crypto/crypto');
       const salt = generateSalt();
       const key = await derivePreferencesKeyArgon2id('password', salt);
       expect(key.algorithm.name).toBe('AES-GCM');
@@ -496,7 +497,8 @@ describe('crypto utilities', () => {
 
   describe('derivePreferencesKeyArgon2idExportable', () => {
     it('derives an extractable Argon2id preferences key', async () => {
-      const { derivePreferencesKeyArgon2idExportable } = await import('@/renderer/utils/crypto');
+      const { derivePreferencesKeyArgon2idExportable } =
+        await import('@/renderer/utils/crypto/crypto');
       const salt = generateSalt();
       const key = await derivePreferencesKeyArgon2idExportable('password', salt);
       expect(key.algorithm.name).toBe('AES-GCM');

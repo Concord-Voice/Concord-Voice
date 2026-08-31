@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { EmojiEntry, EmojiCategory } from './types';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import {
   getCachedCategory,
   setCachedCategory,

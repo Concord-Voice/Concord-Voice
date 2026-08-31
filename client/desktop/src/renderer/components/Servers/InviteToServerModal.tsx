@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import Modal from '../ui/Modal';
 import CustomSelect from '../ui/CustomSelect';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useInviteStore } from '../../stores/chat/inviteStore';
 import { ServerWithRole, ServerInviteWithCreator } from '../../types/server';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import './InviteToServerModal.css';
 
 const EMPTY_INVITES: ServerInviteWithCreator[] = [];

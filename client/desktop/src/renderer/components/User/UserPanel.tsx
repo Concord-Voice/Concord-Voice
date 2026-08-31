@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { Settings } from 'lucide-react';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';

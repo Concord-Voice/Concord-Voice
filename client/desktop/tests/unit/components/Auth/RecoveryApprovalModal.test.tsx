@@ -2,7 +2,7 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 
 // Mock crypto utilities
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   generateECDHKeyPair: vi.fn().mockResolvedValue({
     publicKey: 'mock-pub',
     privateKey: 'mock-priv',

@@ -8,7 +8,7 @@ import {
   isValidHex,
   deriveThemeVariables,
   type CustomColors,
-} from '@/renderer/utils/colorUtils';
+} from '@/renderer/utils/ui/colorUtils';
 
 // ─── hexToHsl ────────────────────────────────────────────────────────────────
 

@@ -10,6 +10,7 @@ Concord Voice keeps voice-channel and private-call activity current internally, 
 
 ### Changed
 
+- **Desktop utilities are now organized by concern** ([#3045](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3045)) — this internal maintenance change moves existing helpers without changing app behavior, saved data, or security behavior.
 - **The desktop now keeps voice-channel and private-call activity current internally** ([#3038](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3038)) — incoming activity is validated by category, snapshots replace stale entries, and disconnects or server switches clear cached activity. This prepares the data path for a later visible activity view; it does not add one yet.
 - **Encrypted attachment uploads now negotiate their storage format with the server** ([#3044](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3044)) — when both sides support consistently sized upload pieces, the desktop uses that format; older servers keep receiving the earlier format. This prepares the hosted attachment-storage migration without changing the live storage destination yet.
 

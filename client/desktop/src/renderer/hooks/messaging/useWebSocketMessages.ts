@@ -60,9 +60,9 @@ function isDoNotDisturb(): boolean {
   return useMemberStore.getState().selfStatus === 'dnd';
 }
 import { indexMessage, removeMessage, removeScope } from '../../services/messaging/searchService';
-import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
-import { formatMessagePreview } from '../../utils/messagePreview';
-import { summarizeWsServerError } from '../../utils/wsDiagnostics';
+import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
+import { formatMessagePreview } from '../../utils/messaging/messagePreview';
+import { summarizeWsServerError } from '../../utils/runtime/wsDiagnostics';
 import {
   desktopNotificationService,
   type NotificationType,

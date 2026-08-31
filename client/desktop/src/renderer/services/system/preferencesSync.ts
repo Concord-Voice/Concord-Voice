@@ -11,7 +11,7 @@
 
 import { e2eeService } from '../e2ee/e2eeService';
 import { apiFetch } from './apiClient';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { AppearanceSettings } from '../../stores/ui/settingsStore';
 import {
   deriveLegacySidebarProfiles,

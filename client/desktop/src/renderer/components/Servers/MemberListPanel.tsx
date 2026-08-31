@@ -1,11 +1,11 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { prefetchEligibility } from '../../services/system/friendEligibility';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { createPortal } from 'react-dom';
 import { MicOff, HeadphoneOff, Lock, Clock } from 'lucide-react';
 import type { ServerMember } from '../../stores/chat/memberStore';
 import type { Role } from '../../types/server';
-import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import MemberContextMenu from '../Members/MemberContextMenu';
 import UserProfileModal from '../Members/UserProfileModal';
 import ConfirmActionModal from '../ui/ConfirmActionModal';

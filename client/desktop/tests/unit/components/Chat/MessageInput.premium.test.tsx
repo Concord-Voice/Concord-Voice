@@ -62,7 +62,7 @@ import {
   FREE_ATTACHMENT_BYTES,
   PREMIUM_ATTACHMENT_BYTES,
   resolveAttachmentLimit,
-} from '@/renderer/utils/entitlementLimits';
+} from '@/renderer/utils/policy/entitlementLimits';
 
 function setEntitlement(overrides: Record<string, unknown>) {
   for (const k of Object.keys(entitlementOverrides)) delete entitlementOverrides[k];

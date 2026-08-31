@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveMediaUrl } from '@/renderer/utils/resolveMediaUrl';
+import { resolveMediaUrl } from '@/renderer/utils/ui/resolveMediaUrl';
 import { API_BASE } from '@/renderer/config';
 
 describe('resolveMediaUrl', () => {

@@ -77,7 +77,7 @@ vi.mock('@/renderer/services/e2ee/e2eeBlobTransport', () => ({
 }));
 
 // Mock all crypto functions
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   deriveKeyFromPassword: vi.fn().mockResolvedValue({} as CryptoKey),
   deriveKeyArgon2id: vi.fn().mockResolvedValue({} as CryptoKey),
   derivePreferencesKeyArgon2id: vi.fn().mockResolvedValue({} as CryptoKey),
@@ -103,7 +103,7 @@ import {
   derivePreferencesKeyArgon2id,
   encryptBlob,
   unwrapPrivateKey,
-} from '@/renderer/utils/crypto';
+} from '@/renderer/utils/crypto/crypto';
 import { usePresenceOverrideStore } from '@/renderer/stores/ui/presenceOverrideStore';
 import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
 import { useFriendOrgStore } from '@/renderer/stores/chat/friendOrgStore';

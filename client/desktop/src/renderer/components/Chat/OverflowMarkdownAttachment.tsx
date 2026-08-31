@@ -3,15 +3,21 @@ import { ChevronDown, ChevronUp, FileText, Loader2 } from 'lucide-react';
 import MarkdownContent from '../Markdown/MarkdownContent';
 import { apiFetch } from '../../services/system/apiClient';
 import { e2eeService } from '../../services/e2ee/e2eeService';
-import { formatFileSize } from '../../utils/attachmentCrypto';
-import { decryptAttachmentBlob, parseKeyVersionHeader } from '../../utils/attachmentChunkedCrypto';
+import { formatFileSize } from '../../utils/crypto/attachmentCrypto';
+import {
+  decryptAttachmentBlob,
+  parseKeyVersionHeader,
+} from '../../utils/crypto/attachmentChunkedCrypto';
 import {
   AttachmentTooLargeError,
   readBoundedBody,
   tooLargeMessage,
-} from '../../utils/boundedResponseBody';
-import { isRenderableMarkdown, MAX_RENDERABLE_MD_BYTES } from '../../utils/renderableMarkdown';
-import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/entitlementLimits';
+} from '../../utils/runtime/boundedResponseBody';
+import {
+  isRenderableMarkdown,
+  MAX_RENDERABLE_MD_BYTES,
+} from '../../utils/messaging/renderableMarkdown';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/policy/entitlementLimits';
 import type { AttachmentSummary } from '../../types/chat';
 import type { MentionLookup } from './messageUtils';
 import './OverflowMarkdownAttachment.css';

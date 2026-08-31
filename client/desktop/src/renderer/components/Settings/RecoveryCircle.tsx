@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { split } from '../../utils/shamir';
-import { base64ToArrayBuffer, arrayBufferToBase64 } from '../../utils/crypto';
+import { split } from '../../utils/crypto/shamir';
+import { base64ToArrayBuffer, arrayBufferToBase64 } from '../../utils/crypto/crypto';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { apiFetch } from '../../services/system/apiClient';
 import { useFriendStore, Friend } from '../../stores/chat/friendStore';

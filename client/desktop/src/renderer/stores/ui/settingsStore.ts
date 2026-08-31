@@ -1,14 +1,14 @@
 import { create } from 'zustand';
 import { persist, subscribeWithSelector } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import {
   type CustomColors,
   deriveThemeVariables,
   applyCustomThemeVariables,
   clearCustomThemeVariables,
-} from '../../utils/colorUtils';
+} from '../../utils/ui/colorUtils';
 import { DEFAULT_CLIENT_BEHAVIOR, type ClientBehavior } from '../../../shared/clientBehavior';
-import { deriveOverlayColors } from '../../utils/overlayColors';
+import { deriveOverlayColors } from '../../utils/ui/overlayColors';
 import { useUserStore } from '../auth/userStore';
 import { useMemberStore } from '../chat/memberStore';
 // Sync-suppression flag lives in a dependency-free leaf module so that
@@ -20,7 +20,7 @@ import {
   resolveEffectiveFont,
   themeBundledFontFor,
   RESOLVER_CONFIG,
-} from '../../utils/effectiveFont';
+} from '../../utils/ui/effectiveFont';
 
 export interface AppearanceSettings {
   theme: 'dark' | 'light' | 'system';
@@ -84,7 +84,7 @@ export function clampUiScale(value: number): number {
   return Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_MIN, value));
 }
 
-export type { CustomColors } from '../../utils/colorUtils';
+export type { CustomColors } from '../../utils/ui/colorUtils';
 
 interface SettingsState {
   appearance: AppearanceSettings;
@@ -185,7 +185,7 @@ function applyHighContrast(enabled: boolean) {
   document.documentElement.dataset.highContrast = enabled ? 'true' : 'false';
 }
 
-// Single DOM sink for the resolved application font (see utils/effectiveFont.ts).
+// Single DOM sink for the resolved application font (see utils/ui/effectiveFont.ts).
 // The resolver decides which font wins; this just writes the one attribute CSS
 // keys on (`[data-appfont='…']`). Do NOT add a second sink for dyslexic/theme —
 // they feed the resolver, not the DOM.
@@ -396,7 +396,7 @@ useSettingsStore.subscribe(
 
 // Subscribe to the effective-font inputs (appFont, dyslexicSupport, colorScheme)
 // and apply the resolved font as the single `data-appfont` attribute. This is the
-// ONLY DOM write for fonts — the resolver (utils/effectiveFont.ts) owns precedence
+// ONLY DOM write for fonts — the resolver (utils/ui/effectiveFont.ts) owns precedence
 // (Dyslexic > user pick > theme-bundled > default). In C1 `themeBundledFontFor`
 // returns null; #1643 fills it. `lockReason`/`pickerLocked` are read by the picker.
 useSettingsStore.subscribe(

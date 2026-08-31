@@ -29,7 +29,7 @@
  * restrictive, never less. We trust the server, but never the client or users.
  */
 
-import type { MessageWithStatus } from '../types/chat';
+import type { MessageWithStatus } from '../../types/chat';
 
 /**
  * Sanitize a single message's embed flag based on the user's local preference.

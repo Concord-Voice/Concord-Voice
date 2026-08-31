@@ -4,7 +4,7 @@ import {
   generateRegistrationKeys,
   generateChannelKey,
   wrapChannelKey,
-} from '@/renderer/utils/crypto';
+} from '@/renderer/utils/crypto/crypto';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 

@@ -18,7 +18,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 
 /** Clamp a volume value to the 0–100 range */
 const clamp = (value: number): number => Math.max(0, Math.min(100, value));

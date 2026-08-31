@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { apiFetch } from '../../services/system/apiClient';
-import { formatRetryAfter } from '../../utils/formatRetryAfter';
+import { formatRetryAfter } from '../../utils/runtime/formatRetryAfter';
 
 type RotateStatus = 'idle' | 'success' | 'error';
 

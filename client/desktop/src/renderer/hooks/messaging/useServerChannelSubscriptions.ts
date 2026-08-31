@@ -21,7 +21,7 @@ import {
   isEntryCurrentlyMuted,
 } from '../../stores/ui/notificationPrefsStore';
 import { apiFetch } from '../../services/system/apiClient';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 
 export function useServerChannelSubscriptions() {
   const servers = useServerStore((s) => s.servers);

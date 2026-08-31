@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { nativeExceedsFree } from '@/renderer/utils/nativeExceedsFree';
-import { videoLimitsFromEntitlement } from '@/renderer/utils/videoLimits';
+import { nativeExceedsFree } from '@/renderer/utils/policy/nativeExceedsFree';
+import { videoLimitsFromEntitlement } from '@/renderer/utils/policy/videoLimits';
 import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subscriptionStore';
 
 // The screen-share option lists gate on the STREAM axis (#1602). The free stream

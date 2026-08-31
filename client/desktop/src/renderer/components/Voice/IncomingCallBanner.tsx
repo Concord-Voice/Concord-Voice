@@ -7,7 +7,7 @@
 // view the user is currently looking at.
 
 import { useVoiceStore } from '../../stores/voice/voiceStore';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { useDMStore } from '../../stores/chat/dmStore';
 import {
   acceptIncomingCall,

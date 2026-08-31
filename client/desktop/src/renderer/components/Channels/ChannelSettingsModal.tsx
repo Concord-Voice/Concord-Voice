@@ -5,7 +5,11 @@ import OverridePanel from '../Permissions/OverridePanel';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import { usePermissionStore, ChannelOverride } from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
-import { MANAGE_ALL_MESSAGES, MANAGE_OWN_MESSAGES, hasPermission } from '../../utils/permissions';
+import {
+  MANAGE_ALL_MESSAGES,
+  MANAGE_OWN_MESSAGES,
+  hasPermission,
+} from '../../utils/policy/permissions';
 import { Channel } from '../../types/chat';
 import './ChannelSettingsModal.css';
 

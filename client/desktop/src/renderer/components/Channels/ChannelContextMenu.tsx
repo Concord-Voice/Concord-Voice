@@ -9,7 +9,7 @@ import {
   MANAGE_OWN_MESSAGES,
   Permissions,
   hasPermission,
-} from '../../utils/permissions';
+} from '../../utils/policy/permissions';
 import { apiFetch } from '../../services/system/apiClient';
 import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { Channel } from '../../types/chat';

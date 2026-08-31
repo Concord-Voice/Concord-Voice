@@ -3,7 +3,7 @@ import {
   resolveEffectiveFont,
   themeBundledFontFor,
   RESOLVER_CONFIG,
-} from '@/renderer/utils/effectiveFont';
+} from '@/renderer/utils/ui/effectiveFont';
 
 const userWins = { themeVsUser: 'user-wins' as const };
 const themeWins = { themeVsUser: 'theme-wins' as const };

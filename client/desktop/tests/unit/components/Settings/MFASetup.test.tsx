@@ -15,7 +15,7 @@ vi.mock('qrcode', () => ({
   },
 }));
 
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   generateRecoveryKey: vi.fn().mockReturnValue('AAAA-BBBB-CCCC-DDDD'),
   wrapWithRecoveryKey: vi.fn().mockResolvedValue({
     wrappedKey: 'mock-wrapped-key',
@@ -696,7 +696,7 @@ describe('MFASetup', () => {
   describe('Recovery key generation exception', () => {
     it('skips to done when generateAndStoreRecoveryKey throws', async () => {
       // Make crypto functions throw
-      const { generateRecoveryKey } = await import('@/renderer/utils/crypto');
+      const { generateRecoveryKey } = await import('@/renderer/utils/crypto/crypto');
       vi.mocked(generateRecoveryKey).mockImplementationOnce(() => {
         throw new Error('crypto failure');
       });

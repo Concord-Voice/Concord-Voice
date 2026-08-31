@@ -10,9 +10,9 @@ import {
   importECDHPublicKey,
   deriveSharedSecret,
   decryptWithSharedSecret,
-} from '../../utils/crypto';
+} from '../../utils/crypto/crypto';
 import { apiUrl } from '../../services/system/runtimeServerBase';
-import { assertValidUUID, isValidUUID } from '../../utils/uuid';
+import { assertValidUUID, isValidUUID } from '../../utils/runtime/uuid';
 import LoadingSpinner from './LoadingSpinner';
 import './Login.css';
 
@@ -275,7 +275,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
 
         if (data.status === 'complete' && data.responses) {
           // Reconstruct from shares
-          const { combine } = await import('../../utils/shamir');
+          const { combine } = await import('../../utils/crypto/shamir');
           const shares: Array<{ index: number; data: Uint8Array }> = [];
 
           for (const resp of data.responses) {

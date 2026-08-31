@@ -9,8 +9,13 @@ import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
-import { Permissions, MUTE_MEMBERS, DEAFEN_MEMBERS, MOVE_MEMBERS } from '../../utils/permissions';
-import { errorMessage } from '../../utils/redactError';
+import {
+  Permissions,
+  MUTE_MEMBERS,
+  DEAFEN_MEMBERS,
+  MOVE_MEMBERS,
+} from '../../utils/policy/permissions';
+import { errorMessage } from '../../utils/runtime/redactError';
 import {
   moveVoiceParticipant,
   disconnectVoiceParticipant,

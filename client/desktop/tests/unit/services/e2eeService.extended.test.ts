@@ -14,7 +14,7 @@ import {
   exportChannelKey,
   exportPublicKey,
   arrayBufferToBase64,
-} from '@/renderer/utils/crypto';
+} from '@/renderer/utils/crypto/crypto';
 
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';

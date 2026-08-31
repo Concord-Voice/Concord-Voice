@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useServerStore } from '../../stores/chat/serverStore';
@@ -16,7 +16,7 @@ import {
 } from '../../stores/voice/voiceStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useDraftMessageStore } from '../../stores/chat/draftMessageStore';
-import { Permissions, hasPermission, MOVE_MEMBERS } from '../../utils/permissions';
+import { Permissions, hasPermission, MOVE_MEMBERS } from '../../utils/policy/permissions';
 import { apiFetch } from '../../services/system/apiClient';
 import { moveVoiceParticipant } from '../../services/voice/voiceParticipantApi';
 import { Channel, ChannelGroup } from '../../types/chat';

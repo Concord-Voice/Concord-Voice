@@ -23,7 +23,7 @@ import {
   type SearchBackfillGuard,
 } from '../../services/messaging/searchService';
 import type { MessageWithStatus, MessageWithUser } from '../../types/chat';
-import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
+import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
 
 export const BACKFILL_BATCH_SIZE = 200;
 export const BACKFILL_DELAY_MS = 100;

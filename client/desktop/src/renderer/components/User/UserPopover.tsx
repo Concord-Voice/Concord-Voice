@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useMemo } from 'react';
 import { SmilePlus } from 'lucide-react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
-import { openProfilePage } from '../../utils/openProfilePage';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
+import { openProfilePage } from '../../utils/ui/openProfilePage';
 import { useNavigate } from 'react-router';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { UserProfile, useUserStore } from '../../stores/auth/userStore';

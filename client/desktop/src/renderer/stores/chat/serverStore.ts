@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist, devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import { ServerWithRole } from '../../types/server';
 import { apiFetch } from '../../services/system/apiClient';
 import {

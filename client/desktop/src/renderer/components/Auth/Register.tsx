@@ -4,12 +4,12 @@ import InfoTooltip from './InfoTooltip';
 import LoadingSpinner from './LoadingSpinner';
 import { SSOButton } from './SSOButton';
 import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
-import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
+import { generateRegistrationKeys, exportPublicKey } from '../../utils/crypto/crypto';
 import { ensureMachineId } from '../../services/system/apiClient';
 import { apiUrl } from '../../services/system/runtimeServerBase';
 import { e2eeService } from '../../services/e2ee/e2eeService';
-import { errorMessage } from '../../utils/redactError';
-import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import { errorMessage } from '../../utils/runtime/redactError';
+import { persistE2EESessionKeys } from '../../utils/crypto/persistE2EESessionKeys';
 import { abandonSSOReservation } from '../../services/system/ssoService';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import {

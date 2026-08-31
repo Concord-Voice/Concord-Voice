@@ -3,7 +3,7 @@ import { useChatController } from '@/renderer/hooks/messaging/useChatController'
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { PIN_MESSAGES } from '@/renderer/utils/permissions';
+import { PIN_MESSAGES } from '@/renderer/utils/policy/permissions';
 import { mockUser, mockMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { ConnectionState } from '@/renderer/services/messaging/websocketService';

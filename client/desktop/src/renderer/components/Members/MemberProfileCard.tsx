@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
 import { selectCustomText, useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import SendFriendRequestButton from './SendFriendRequestButton';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';

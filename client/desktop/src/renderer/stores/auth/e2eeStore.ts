@@ -28,7 +28,7 @@
  * one-shot signal that should never survive a reload.
  */
 
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 import type { CredentialOwner } from '../../../main/ipcContract';
 
 interface E2EEStore {

@@ -9,7 +9,7 @@ import {
   MANAGE_CHANNELS,
   MANAGE_OWN_MESSAGES,
   READ_MESSAGE_HISTORY,
-} from '@/renderer/utils/permissions';
+} from '@/renderer/utils/policy/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 import ServerContextMenu from '@/renderer/components/Servers/ServerContextMenu';
 import DMConversationContextMenu from '@/renderer/components/DirectMessages/DMConversationContextMenu';

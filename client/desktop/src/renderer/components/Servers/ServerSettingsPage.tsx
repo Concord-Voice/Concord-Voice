@@ -21,9 +21,9 @@ import { useServerStore } from '../../stores/chat/serverStore';
 import { useInviteStore } from '../../stores/chat/inviteStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
-import { Permissions } from '../../utils/permissions';
+import { Permissions } from '../../utils/policy/permissions';
 import { apiFetch } from '../../services/system/apiClient';
-import { formatFileSize } from '../../utils/attachmentCrypto';
+import { formatFileSize } from '../../utils/crypto/attachmentCrypto';
 import type { ServerInviteWithCreator, Role } from '../../types/server';
 import './ServerSettingsPage.css';
 

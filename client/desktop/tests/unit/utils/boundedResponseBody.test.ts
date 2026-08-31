@@ -3,7 +3,7 @@ import {
   AttachmentTooLargeError,
   parseContentLength,
   readBoundedBody,
-} from '@/renderer/utils/boundedResponseBody';
+} from '@/renderer/utils/runtime/boundedResponseBody';
 
 const MAX = 1024;
 

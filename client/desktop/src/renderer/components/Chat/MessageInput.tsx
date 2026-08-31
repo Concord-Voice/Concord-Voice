@@ -15,7 +15,11 @@ import {
   type SidebarContext,
   useLayoutStore,
 } from '../../stores/ui/layoutStore';
-import { buildAddendum, encodeMentionMeta, type ParsedMention } from '../../utils/mentions';
+import {
+  buildAddendum,
+  encodeMentionMeta,
+  type ParsedMention,
+} from '../../utils/messaging/mentions';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
 import { useFileUpload, type AttachmentRejection } from '../../hooks/messaging/useFileUpload';
 import { useDraftMessage } from '../../hooks/messaging/useDraftMessage';
@@ -23,13 +27,13 @@ import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useInviteStore } from '../../stores/chat/inviteStore';
-import { hasPermission, Permissions } from '../../utils/permissions';
-import { buildInviteUrl } from '../../utils/inviteUrl';
+import { hasPermission, Permissions } from '../../utils/policy/permissions';
+import { buildInviteUrl } from '../../utils/messaging/inviteUrl';
 import AttachmentUploadPreview from './AttachmentUploadPreview';
 import ReplyPreviewBar from './ReplyPreviewBar';
-import { composeMarkdownOverflow } from '../../utils/overflowToMarkdown';
-import { MAX_ATTACHMENTS } from '../../utils/attachmentCrypto';
-import { clampMessageCharsForTier } from '../../utils/entitlementLimits';
+import { composeMarkdownOverflow } from '../../utils/messaging/overflowToMarkdown';
+import { MAX_ATTACHMENTS } from '../../utils/crypto/attachmentCrypto';
+import { clampMessageCharsForTier } from '../../utils/policy/entitlementLimits';
 import AttachmentNotice from './AttachmentNotice';
 import './MessageInput.css';
 

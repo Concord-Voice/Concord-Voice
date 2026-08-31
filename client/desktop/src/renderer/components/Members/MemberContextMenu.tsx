@@ -11,9 +11,9 @@ import {
   MUTE_MEMBERS,
   DEAFEN_MEMBERS,
   TIMEOUT_MEMBERS,
-} from '../../utils/permissions';
+} from '../../utils/policy/permissions';
 import ContextMenu from '../ui/ContextMenu';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import { EnforcementMenuItems } from '../ui/EnforcementMenuItems';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
 import { apiFetch, safeJson } from '../../services/system/apiClient';

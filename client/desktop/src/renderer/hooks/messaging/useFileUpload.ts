@@ -6,14 +6,14 @@ import {
   classifyFileType,
   isImageType,
   MAX_ATTACHMENTS,
-} from '../../utils/attachmentCrypto';
-import { stripFileMetadata, sniffHandledImage, SNIFF_BYTES } from '../../utils/imageMetadata';
+} from '../../utils/crypto/attachmentCrypto';
+import { stripFileMetadata, sniffHandledImage, SNIFF_BYTES } from '../../utils/ui/imageMetadata';
 import {
   formatLimitBytes,
   resolveAttachmentLimit,
   type AttachmentLimit,
   IMAGE_STRIP_MAX_BYTES,
-} from '../../utils/entitlementLimits';
+} from '../../utils/policy/entitlementLimits';
 import { useEntitlement } from '../ui/useEntitlement';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import {
@@ -27,7 +27,7 @@ import {
   ENVELOPE_VERSION_V2,
   ENVELOPE_VERSION_V3,
   type AttachmentEnvelopeVersion,
-} from '../../utils/attachmentChunkedCrypto';
+} from '../../utils/crypto/attachmentChunkedCrypto';
 import type { AttachmentSummary } from '../../types/chat';
 
 const DEFAULT_MIME = 'application/octet-stream';

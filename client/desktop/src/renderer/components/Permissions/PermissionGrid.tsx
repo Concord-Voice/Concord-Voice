@@ -1,5 +1,5 @@
 import React, { useCallback } from 'react';
-import { PERMISSION_CATEGORIES, type PermissionInfo } from '../../utils/permissions';
+import { PERMISSION_CATEGORIES, type PermissionInfo } from '../../utils/policy/permissions';
 import './PermissionGrid.css';
 
 interface PermissionGridProps {

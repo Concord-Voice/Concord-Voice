@@ -5,7 +5,11 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import ServerActionBar from '@/renderer/components/Channels/ServerActionBar';
 import { mockServer } from '../../../mocks/fixtures';
 import type { ServerWithRole } from '@/renderer/types/server';
-import { MANAGE_SERVER, BASE_PERMISSIONS, ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
+import {
+  MANAGE_SERVER,
+  BASE_PERMISSIONS,
+  ADMIN_PERMISSIONS,
+} from '@/renderer/utils/policy/permissions';
 
 // Isolate ServerActionBar from the modal's internals (friendStore/router/hook).
 vi.mock('@/renderer/components/Channels/SendToFriendModal', () => ({

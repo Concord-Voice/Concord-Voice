@@ -1,4 +1,4 @@
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 import type { UserProfile } from './userStore';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import type { SSOCompletionResult, SSOProvider } from '../../services/system/ssoService';

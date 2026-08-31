@@ -5,7 +5,7 @@ import {
   NAME_MAX,
   validateChannelName,
   getChannelTypeIcon,
-} from '@/renderer/utils/channelHelpers';
+} from '@/renderer/utils/messaging/channelHelpers';
 
 describe('channelHelpers', () => {
   describe('constants', () => {

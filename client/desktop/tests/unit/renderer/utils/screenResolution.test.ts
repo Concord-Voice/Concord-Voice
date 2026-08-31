@@ -3,7 +3,7 @@ import {
   SCREEN_RES_DIMS,
   resolveScreenDims,
   highestFreeScreenResolution,
-} from '@/renderer/utils/screenResolution';
+} from '@/renderer/utils/ui/screenResolution';
 
 describe('#2163 screenResolution', () => {
   it('maps the fixed presets', () => {

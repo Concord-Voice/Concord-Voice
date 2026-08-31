@@ -4,7 +4,7 @@ import {
   type MuteTargetType,
   type PreferenceWire,
 } from '../../stores/ui/notificationPrefsStore';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,

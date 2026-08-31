@@ -1,7 +1,7 @@
 /**
  * Chunked attachment upload session client (#2157 PR 2).
  *
- * Transport only. All crypto lives in `utils/attachmentChunkedCrypto`; this
+ * Transport only. All crypto lives in `utils/crypto/attachmentChunkedCrypto`; this
  * module never touches a key beyond handing it to `buildUploadPart`.
  *
  * WHY PER-CHUNK REQUESTS RATHER THAN ONE STREAMED BODY — two independent
@@ -34,7 +34,7 @@ import {
   type AttachmentEnvelopeHeader,
   type AttachmentEnvelopeVersion,
   type ChunkSource,
-} from '../../utils/attachmentChunkedCrypto';
+} from '../../utils/crypto/attachmentChunkedCrypto';
 
 const SESSION_PATH = '/api/v1/media/upload/attachment/session';
 

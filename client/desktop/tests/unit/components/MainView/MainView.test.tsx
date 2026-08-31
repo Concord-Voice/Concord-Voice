@@ -3,7 +3,7 @@ import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS } from '@/renderer/utils/policy/permissions';
 import { mockServer, mockChannel } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 

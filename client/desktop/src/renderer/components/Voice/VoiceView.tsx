@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useCallback, useMemo } from 'react';
 import { Lock, Users, ChevronUp, ChevronDown } from 'lucide-react';
-import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
+import { createResizeKeyHandler } from '../../utils/ui/resizeKeyboard';
 import { useVoiceStore, MAX_TUNED_SCREEN_SHARES } from '../../stores/voice/voiceStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts

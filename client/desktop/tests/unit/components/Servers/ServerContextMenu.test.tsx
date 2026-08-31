@@ -2,7 +2,7 @@ import { render, screen, fireEvent } from '../../../test-utils';
 import { mockServer, mockUser } from '../../../mocks/fixtures';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
-import { MANAGE_SERVER, BASE_PERMISSIONS } from '@/renderer/utils/permissions';
+import { MANAGE_SERVER, BASE_PERMISSIONS } from '@/renderer/utils/policy/permissions';
 import ServerContextMenu from '@/renderer/components/Servers/ServerContextMenu';
 
 const SERVER_ID = 'server-1';

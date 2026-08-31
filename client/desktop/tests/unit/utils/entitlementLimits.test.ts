@@ -6,7 +6,7 @@ import {
   MAX_DECRYPTABLE_ATTACHMENT_BYTES,
   resolveAttachmentLimit,
   formatLimitBytes,
-} from '@/renderer/utils/entitlementLimits';
+} from '@/renderer/utils/policy/entitlementLimits';
 
 describe('attachment limit constants', () => {
   it('free mirrors the Go free floor (entitlements.go:111)', () => {

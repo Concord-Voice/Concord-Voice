@@ -13,7 +13,7 @@
 
 import { classifyError } from '../e2ee/e2eeErrors';
 import { e2eeService } from '../e2ee/e2eeService';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 
 export enum MessageStatus {
   PENDING = 'pending', // Waiting to be sent

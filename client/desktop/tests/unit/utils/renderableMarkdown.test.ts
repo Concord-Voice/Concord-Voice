@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { isRenderableMarkdown, MAX_RENDERABLE_MD_BYTES } from '@/renderer/utils/renderableMarkdown';
+import {
+  isRenderableMarkdown,
+  MAX_RENDERABLE_MD_BYTES,
+} from '@/renderer/utils/messaging/renderableMarkdown';
 
 describe('isRenderableMarkdown', () => {
   const enc = new TextEncoder();

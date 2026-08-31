@@ -1,12 +1,12 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import {
   isHydrationLifecycleCurrent,
   type HydrationLifecycleGuard,
 } from '../../services/system/postLoginHydrationLifecycle';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { PresenceStatus } from './memberStore';
 
 // ── API response DTOs (server → client) ────────────────────────────────

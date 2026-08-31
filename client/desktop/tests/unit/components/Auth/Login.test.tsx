@@ -38,7 +38,7 @@ const { mockE2EESessionKeys, mockE2EEInitializationReceipt, mockE2EEClearKeys } 
 });
 
 // Mock crypto and services to avoid real key operations
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   unwrapLoginKeys: (...args: unknown[]) => mockUnwrapLoginKeys(...args),
   generateRegistrationKeys: (...args: unknown[]) => mockGenerateRegistrationKeys(...args),
   exportPublicKey: vi.fn().mockResolvedValue('mock-public-key'),

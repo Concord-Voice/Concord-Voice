@@ -30,7 +30,7 @@ import type {
 } from './pipSignalingTypes';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { RtpCapabilities } from 'mediasoup-client/types';
 import type { RemoteVideoRole } from './remoteVideoLayerPolicy';
 

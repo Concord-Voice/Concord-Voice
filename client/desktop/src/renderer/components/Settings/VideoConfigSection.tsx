@@ -31,15 +31,15 @@ import { useDraftVideoSetting, setDraftVideoSetting } from '../../hooks/ui/useDr
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { useGateActivation } from '../../hooks/ui/useGateActivation';
-import { nativeExceedsFree } from '../../utils/nativeExceedsFree';
+import { nativeExceedsFree } from '../../utils/policy/nativeExceedsFree';
 import {
   videoLimitsFromEntitlement,
   clampScreenCapture,
   effectiveStreamAxis,
   shouldEnforceForSubscription,
   type VideoAxisLimit,
-} from '../../utils/videoLimits';
-import { SCREEN_RES_DIMS } from '../../utils/screenResolution';
+} from '../../utils/policy/videoLimits';
+import { SCREEN_RES_DIMS } from '../../utils/ui/screenResolution';
 import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';

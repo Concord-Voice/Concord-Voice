@@ -14,8 +14,8 @@ package entitlements
 //
 // Values are the pricing ground truth (concordvoice-com teams.astro/compare.astro,
 // finalized 2026-06-18) — see ADR-0028. Do not change a row without checking the
-// live pricing pages; the client mirror (client/desktop/src/renderer/utils/
-// serverEntitlements.ts) must change in lockstep.
+// live pricing pages; the client mirror
+// (client/desktop/src/renderer/utils/policy/serverEntitlements.ts) must change in lockstep.
 
 // Server-tier identifiers (ADR-0028 ladder). Stored as VARCHAR for
 // extensibility. The pre-ladder binary "mach" string is RETIRED — it was never

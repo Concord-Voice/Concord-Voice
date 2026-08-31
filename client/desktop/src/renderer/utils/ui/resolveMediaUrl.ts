@@ -1,4 +1,4 @@
-import { mediaUrl } from '../services/system/runtimeServerBase';
+import { mediaUrl } from '../../services/system/runtimeServerBase';
 
 /**
  * Absolutize a server-origin media URL for use in an <img>/<video>/<audio> src.

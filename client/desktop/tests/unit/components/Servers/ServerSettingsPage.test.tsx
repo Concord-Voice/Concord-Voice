@@ -12,7 +12,7 @@ import {
   MANAGE_ROLES,
   MANAGE_ROLES_ASSIGN,
   INVITE,
-} from '@/renderer/utils/permissions';
+} from '@/renderer/utils/policy/permissions';
 import { vi } from 'vitest';
 
 // Mock apiFetch

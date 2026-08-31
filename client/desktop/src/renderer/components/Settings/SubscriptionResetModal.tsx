@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { openSubscriptionPage } from '../../utils/openSubscriptionPage';
+import { openSubscriptionPage } from '../../utils/ui/openSubscriptionPage';
 import { useDialogSync } from '../../hooks/ui/useDialogSync';
 import './SubscriptionResetModal.css';
 

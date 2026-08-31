@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isValidUUID, assertValidUUID } from '@/renderer/utils/uuid';
+import { isValidUUID, assertValidUUID } from '@/renderer/utils/runtime/uuid';
 
 describe('isValidUUID', () => {
   it('returns true for a canonical UUID shape', () => {

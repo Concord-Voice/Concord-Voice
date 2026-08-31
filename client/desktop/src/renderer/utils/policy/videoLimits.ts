@@ -1,4 +1,4 @@
-import type { Entitlement } from '../stores/auth/subscriptionStore';
+import type { Entitlement } from '../../stores/auth/subscriptionStore';
 
 /**
  * Per-axis video ceiling used for client-side settings gating (#1602). A negative

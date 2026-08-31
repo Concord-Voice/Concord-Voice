@@ -1,6 +1,6 @@
 import type { MessageWithUser } from '../../types/chat';
 import { e2eeService } from '../../services/e2ee/e2eeService';
-import { unwrapGifEnvelope } from '../../utils/gifEnvelope';
+import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
 import MarkdownContent from '../Markdown/MarkdownContent';
 import AttachmentDisplay from './AttachmentDisplay';
 import GifEmbed from './GifEmbed';

@@ -17,7 +17,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useMemberStore, ServerMember } from '@/renderer/stores/chat/memberStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import type { Role } from '@/renderer/types/server';
-import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS } from '@/renderer/utils/policy/permissions';
 import { mockUser, mockServer, mockMember, mockMember2 } from '../../../mocks/fixtures';
 
 import MemberList from '@/renderer/components/Members/MemberList';

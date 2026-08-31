@@ -7,7 +7,7 @@
  */
 
 import type { MediaEncryption, FrameKeyMissError } from './mediaEncryption';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { CodecFamily } from '../../workers/e2eeProtocol';
 
 /**

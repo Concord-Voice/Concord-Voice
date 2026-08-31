@@ -3,8 +3,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripGif } from '@/renderer/utils/imageMetadata/gif';
-import { ImageParseError } from '@/renderer/utils/imageMetadata/reader';
+import { stripGif } from '@/renderer/utils/ui/imageMetadata/gif';
+import { ImageParseError } from '@/renderer/utils/ui/imageMetadata/reader';
 import {
   GPS_MARKER,
   XMP_MARKER,

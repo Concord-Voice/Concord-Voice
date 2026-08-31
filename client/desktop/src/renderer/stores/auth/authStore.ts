@@ -1,4 +1,4 @@
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 
 interface AuthState {
   accessToken: string | null;

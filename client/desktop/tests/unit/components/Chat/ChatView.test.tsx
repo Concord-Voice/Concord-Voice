@@ -6,7 +6,7 @@ import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { PIN_MESSAGES } from '@/renderer/utils/permissions';
+import { PIN_MESSAGES } from '@/renderer/utils/policy/permissions';
 import { mockUser, mockChannel, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 
 // Mock apiFetch to prevent hanging fetches

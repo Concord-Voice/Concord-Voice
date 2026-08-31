@@ -5,7 +5,7 @@ import { getWebSocketService, ConnectionState } from './websocketService';
 import { getMessageQueue } from './messageQueue';
 import { e2eeService } from '../e2ee/e2eeService';
 import { classifyError } from '../e2ee/e2eeErrors';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { AttachmentSummary, MessageWithStatus } from '../../types/chat';
 
 export interface SendMessageOptions {

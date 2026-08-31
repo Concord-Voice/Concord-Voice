@@ -48,7 +48,7 @@ import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 import { E2EEInitTeardownError } from '@/renderer/services/e2ee/e2eeErrors';
 import { nuclearReset, recoveryReset } from '@/renderer/services/system/resetService';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
-import { generateRegistrationKeys } from '@/renderer/utils/crypto';
+import { generateRegistrationKeys } from '@/renderer/utils/crypto/crypto';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 describe('e2eeService fresh-login init/teardown race (#2199 / CWE-212)', () => {

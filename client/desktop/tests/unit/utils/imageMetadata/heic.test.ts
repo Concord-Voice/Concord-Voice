@@ -7,8 +7,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripHeic } from '@/renderer/utils/imageMetadata/bmff';
-import { ImageParseError } from '@/renderer/utils/imageMetadata/reader';
+import { stripHeic } from '@/renderer/utils/ui/imageMetadata/bmff';
+import { ImageParseError } from '@/renderer/utils/ui/imageMetadata/reader';
 import {
   GPS_MARKER,
   PIXEL_MARKER,

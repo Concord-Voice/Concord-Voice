@@ -2343,7 +2343,7 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
    an unconsumed token owned by the theme-font work in #1643), so override the body
    font-family directly. `[data-appfont='…'] body` outranks the bare `body` rule by
    specificity. Body/UI text only — brand/heading surfaces keep var(--font-display-stack).
-   `data-appfont` reflects the RESOLVED font (utils/effectiveFont.ts); 'default' has no
+   `data-appfont` reflects the RESOLVED font (utils/ui/effectiveFont.ts); 'default' has no
    rule, so the base body stack stands. Self-hosted faces only (no CDN). See
    [internal]specs/2026-06-18-1642-appearance-fonts-foundation-design.md §3.5. */
 [data-appfont='system'] body {

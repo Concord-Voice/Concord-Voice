@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import QRCode from 'qrcode';
 import { apiFetch } from '../../services/system/apiClient';
-import { errorMessage } from '../../utils/redactError';
-import { base64urlToBuffer, bufferToBase64url } from '../../utils/base64url';
+import { errorMessage } from '../../utils/runtime/redactError';
+import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
 import TOTPInput from '../Auth/TOTPInput';
 import MFAVerifyPrompt from '../Auth/MFAVerifyPrompt';
 import BackupCodeDisplay from './BackupCodeDisplay';
@@ -11,7 +11,7 @@ import {
   generateRecoveryKey,
   wrapWithRecoveryKey,
   wrapPrefsKeyWithRecoveryKey,
-} from '../../utils/crypto';
+} from '../../utils/crypto/crypto';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 
 // ── Extracted helpers (reduce cognitive complexity) ───────────────────

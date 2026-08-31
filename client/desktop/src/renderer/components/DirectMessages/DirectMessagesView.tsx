@@ -8,7 +8,7 @@ import DMChatArea from './DMChatArea';
 import FriendsFlexSpace from './FriendsFlexSpace';
 import UserPanel from '../User/UserPanel';
 import PersistentVoiceBar from '../Voice/PersistentVoiceBar';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import ServerActionModal from '../Servers/ServerActionModal';
 import CreateServerModal from '../Servers/CreateServerModal';
 import JoinServerModal from '../Servers/JoinServerModal';

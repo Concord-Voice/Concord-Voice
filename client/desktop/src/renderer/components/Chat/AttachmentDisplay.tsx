@@ -8,14 +8,14 @@ import {
   decryptAttachmentBlob,
   UnsupportedAttachmentFormatError,
   AttachmentIntegrityError,
-} from '../../utils/attachmentChunkedCrypto';
-import { formatFileSize } from '../../utils/attachmentCrypto';
+} from '../../utils/crypto/attachmentChunkedCrypto';
+import { formatFileSize } from '../../utils/crypto/attachmentCrypto';
 import {
   AttachmentTooLargeError,
   readBoundedBody,
   tooLargeMessage,
-} from '../../utils/boundedResponseBody';
-import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/entitlementLimits';
+} from '../../utils/runtime/boundedResponseBody';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/policy/entitlementLimits';
 import type { AttachmentSummary } from '../../types/chat';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import OverflowMarkdownAttachment from './OverflowMarkdownAttachment';

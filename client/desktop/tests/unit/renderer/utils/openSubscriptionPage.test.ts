@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { openSubscriptionPage } from '@/renderer/utils/openSubscriptionPage';
+import { openSubscriptionPage } from '@/renderer/utils/ui/openSubscriptionPage';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { resetAllStores } from '../../../helpers/store-helpers';

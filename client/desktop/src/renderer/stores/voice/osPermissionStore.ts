@@ -7,8 +7,8 @@
  * always fetched fresh from the main process via IPC.
  */
 
-import { createStore } from '../../utils/createStore';
-import { errorMessage } from '../../utils/redactError';
+import { createStore } from '../../utils/runtime/createStore';
+import { errorMessage } from '../../utils/runtime/redactError';
 
 // ─── Types (mirror permissionManager.ts in main process) ──────────────
 

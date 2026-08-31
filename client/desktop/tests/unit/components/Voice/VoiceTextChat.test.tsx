@@ -73,7 +73,7 @@ vi.mock('@/renderer/stores/chat/serverStore', async () => {
   return { useServerStore: store };
 });
 
-vi.mock('@/renderer/utils/permissions', () => ({
+vi.mock('@/renderer/utils/policy/permissions', () => ({
   PIN_MESSAGES: 'pin_messages',
 }));
 

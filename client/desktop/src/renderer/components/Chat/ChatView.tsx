@@ -8,7 +8,7 @@ import { pinMessage, unpinMessage, getChannelPins } from '../../services/messagi
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useChannelSubscription } from '../../hooks/messaging/useChannelSubscription';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useUnreadStore } from '../../stores/chat/unreadStore';

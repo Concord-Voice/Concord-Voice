@@ -1,5 +1,5 @@
 import { unwrapGifEnvelope } from './gifEnvelope';
-import type { CallEventPayload } from '../types/chat';
+import type { CallEventPayload } from '../../types/chat';
 
 interface PreviewAttachment {
   readonly file_type?: string | null;

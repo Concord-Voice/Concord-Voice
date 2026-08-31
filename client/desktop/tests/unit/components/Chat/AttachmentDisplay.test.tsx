@@ -10,8 +10,8 @@ import { mockAttachment, mockAttachment2 } from '../../../mocks/fixtures';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { fireEvent } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/entitlementLimits';
-import { AttachmentTooLargeError } from '@/renderer/utils/boundedResponseBody';
+import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '@/renderer/utils/policy/entitlementLimits';
+import { AttachmentTooLargeError } from '@/renderer/utils/runtime/boundedResponseBody';
 
 // Mock OverflowMarkdownAttachment so we can assert dispatch without exercising
 // the full decrypt/expand path (covered by OverflowMarkdownAttachment.test.tsx).
@@ -60,10 +60,10 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
  *  bytes the fake actually holds rather than the size under test. Real format
  *  dispatch is covered at the unit level in attachmentChunkedCrypto.test.ts. */
 const mockDecryptAttachmentBlob = vi.fn();
-vi.mock('@/renderer/utils/attachmentChunkedCrypto', async () => {
-  const actual = await vi.importActual<typeof import('@/renderer/utils/attachmentChunkedCrypto')>(
-    '@/renderer/utils/attachmentChunkedCrypto'
-  );
+vi.mock('@/renderer/utils/crypto/attachmentChunkedCrypto', async () => {
+  const actual = await vi.importActual<
+    typeof import('@/renderer/utils/crypto/attachmentChunkedCrypto')
+  >('@/renderer/utils/crypto/attachmentChunkedCrypto');
   return {
     ...actual,
     decryptAttachmentBlob: (...args: unknown[]) => mockDecryptAttachmentBlob(...args),
@@ -74,13 +74,13 @@ import { BLOB_CACHE_RETAIN_MAX_BYTES } from '@/renderer/components/Chat/Attachme
 import {
   UnsupportedAttachmentFormatError,
   AttachmentIntegrityError,
-} from '@/renderer/utils/attachmentChunkedCrypto';
+} from '@/renderer/utils/crypto/attachmentChunkedCrypto';
 
 // Mock decryptFile
 const mockDecryptFile = vi.fn();
-vi.mock('@/renderer/utils/attachmentCrypto', async () => {
-  const actual = await vi.importActual<typeof import('@/renderer/utils/attachmentCrypto')>(
-    '@/renderer/utils/attachmentCrypto'
+vi.mock('@/renderer/utils/crypto/attachmentCrypto', async () => {
+  const actual = await vi.importActual<typeof import('@/renderer/utils/crypto/attachmentCrypto')>(
+    '@/renderer/utils/crypto/attachmentCrypto'
   );
   return {
     ...actual,

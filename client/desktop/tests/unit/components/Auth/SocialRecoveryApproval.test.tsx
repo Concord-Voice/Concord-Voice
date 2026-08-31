@@ -2,7 +2,7 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 
 // Mock crypto utilities
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   base64ToArrayBuffer: vi.fn().mockImplementation((input: string) => {
     // For the myEncryptedShare prop, return the JSON payload as bytes
     // For other calls (k, iv, c fields), return generic buffer

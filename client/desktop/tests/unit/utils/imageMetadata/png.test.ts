@@ -3,8 +3,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripPng } from '@/renderer/utils/imageMetadata/png';
-import { ImageParseError } from '@/renderer/utils/imageMetadata/reader';
+import { stripPng } from '@/renderer/utils/ui/imageMetadata/png';
+import { ImageParseError } from '@/renderer/utils/ui/imageMetadata/reader';
 import {
   GPS_MARKER,
   ICC_MARKER,

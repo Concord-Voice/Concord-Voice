@@ -6,10 +6,10 @@ import {
   type ScreenShareOptions,
 } from '../../stores/voice/videoSettingsStore';
 import CustomSelect from '../ui/CustomSelect';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
-import { effectiveStreamAxis, clampScreenCapture } from '../../utils/videoLimits';
-import { resolveScreenDims } from '../../utils/screenResolution';
+import { effectiveStreamAxis, clampScreenCapture } from '../../utils/policy/videoLimits';
+import { resolveScreenDims } from '../../utils/ui/screenResolution';
 import './ScreenSharePicker.css';
 
 interface DesktopSource {

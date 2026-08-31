@@ -2,7 +2,7 @@ import { render, act } from '../../../test-utils';
 import { vi } from 'vitest';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
-import { openSubscriptionPage } from '@/renderer/utils/openSubscriptionPage';
+import { openSubscriptionPage } from '@/renderer/utils/ui/openSubscriptionPage';
 import SettingsPage from '@/renderer/components/Settings/SettingsPage';
 
 // jsdom lacks scrollIntoView

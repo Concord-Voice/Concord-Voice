@@ -4,7 +4,7 @@ import ToggleSwitch from '../Settings/ToggleSwitch';
 import EmojiPicker from '../EmojiPicker/LazyEmojiPicker';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import RoleHierarchyList from './RoleHierarchyList';
-import { parsePermissions } from '../../utils/permissions';
+import { parsePermissions } from '../../utils/policy/permissions';
 import type { Role } from '../../types/server';
 
 interface RoleEditorPanelProps {

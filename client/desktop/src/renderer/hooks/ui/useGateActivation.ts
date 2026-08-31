@@ -1,5 +1,8 @@
 import { useCallback, useId, useMemo } from 'react';
-import { openSubscriptionPage, type SubscriptionDeepLink } from '../../utils/openSubscriptionPage';
+import {
+  openSubscriptionPage,
+  type SubscriptionDeepLink,
+} from '../../utils/ui/openSubscriptionPage';
 
 /**
  * Shared activation wiring for every lock affordance (#1301). Returns a single

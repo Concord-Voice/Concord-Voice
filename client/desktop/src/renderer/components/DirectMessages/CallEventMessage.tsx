@@ -14,7 +14,7 @@
 
 import './CallEventMessage.css';
 import type { CallEventPayload } from '../../types/chat';
-import { formatCallEventPreview } from '../../utils/messagePreview';
+import { formatCallEventPreview } from '../../utils/messaging/messagePreview';
 
 // Re-export the centralized types (#1219) via `export...from` so existing
 // importers (e.g. CallEventMessage.test.tsx) keep working off this module path

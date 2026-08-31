@@ -1,7 +1,7 @@
 /**
  * Unit tests for the pure role-hierarchy model behind the role reorder rail (#2359).
  *
- * These tests exercise `src/renderer/utils/roleHierarchy.ts` directly: no DOM, no
+ * These tests exercise `src/renderer/utils/policy/roleHierarchy.ts` directly: no DOM, no
  * store, no React. Where the implementation's ACTUAL behaviour differs from the
  * behaviour the copy implies, the test asserts the ACTUAL behaviour and names the
  * gap in a comment — see `evaluateReorderPrecondition` § known copy defect.
@@ -13,7 +13,7 @@ import {
   evaluateReorderPrecondition,
   moveWithinBand,
   partitionRoleHierarchy,
-} from '@/renderer/utils/roleHierarchy';
+} from '@/renderer/utils/policy/roleHierarchy';
 import type { Role, RoleHierarchy, RoleViewer } from '@/renderer/types/server';
 
 const SERVER_ID = '11111111-1111-4111-8111-111111111111';

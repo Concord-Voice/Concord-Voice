@@ -7,8 +7,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripJpeg } from '@/renderer/utils/imageMetadata/jpeg';
-import { ImageParseError } from '@/renderer/utils/imageMetadata/reader';
+import { stripJpeg } from '@/renderer/utils/ui/imageMetadata/jpeg';
+import { ImageParseError } from '@/renderer/utils/ui/imageMetadata/reader';
 import {
   GPS_MARKER,
   ICC_MARKER,

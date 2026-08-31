@@ -6,7 +6,7 @@ import {
   generateECDHKeyPair,
   deriveSharedSecret,
   encryptWithSharedSecret,
-} from '../../utils/crypto';
+} from '../../utils/crypto/crypto';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { apiFetch } from '../../services/system/apiClient';
 

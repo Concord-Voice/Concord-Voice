@@ -11,7 +11,7 @@ import {
   type MuteDuration,
   type MuteTargetType,
 } from '../../services/system/notificationPrefsService';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 
 /* ------------------------------------------------------------------ */
 /* MuteContextMenuItem                                                */

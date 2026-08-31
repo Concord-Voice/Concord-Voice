@@ -6,7 +6,7 @@ import {
   clampScreenForSubscription,
   effectiveStreamAxis,
   shouldEnforceForSubscription,
-} from '@/renderer/utils/videoLimits';
+} from '@/renderer/utils/policy/videoLimits';
 import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subscriptionStore';
 
 const PREMIUM_ENTITLEMENT: Entitlement = {

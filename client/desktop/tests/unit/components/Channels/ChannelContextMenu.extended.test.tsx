@@ -4,7 +4,7 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
-import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/policy/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 import type { Channel } from '@/renderer/types/chat';
 

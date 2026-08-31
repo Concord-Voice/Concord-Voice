@@ -3,7 +3,7 @@ import { usePresenceOverrideStore } from '../../stores/ui/presenceOverrideStore'
 import {
   parsePresenceOverrides,
   type PresenceOverridesDocument,
-} from '../../utils/presenceOverrides';
+} from '../../utils/policy/presenceOverrides';
 import { apiFetch } from './apiClient';
 import { e2eeService } from '../e2ee/e2eeService';
 

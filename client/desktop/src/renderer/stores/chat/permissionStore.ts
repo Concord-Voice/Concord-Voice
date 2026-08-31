@@ -3,7 +3,7 @@
  * Integrates with the backend RBAC/SBAC system.
  */
 
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
 import {
   Role,
@@ -11,7 +11,7 @@ import {
   type RoleReorderPayload,
   type RoleViewer,
 } from '../../types/server';
-import { hasPermission, parsePermissions } from '../../utils/permissions';
+import { hasPermission, parsePermissions } from '../../utils/policy/permissions';
 
 export interface ChannelOverride {
   id: string;

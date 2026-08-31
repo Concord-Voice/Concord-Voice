@@ -1,5 +1,5 @@
-import { useSettingsNavStore } from '../stores/ui/settingsNavStore';
-import { useSettingsOverlayStore } from '../stores/ui/settingsOverlayStore';
+import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 
 /**
  * Best-effort deep-link hint for the Subscription page (#1304). The

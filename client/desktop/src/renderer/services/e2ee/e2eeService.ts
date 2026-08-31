@@ -29,7 +29,7 @@ import {
   importPublicKey,
   arrayBufferToBase64,
   base64ToArrayBuffer,
-} from '../../utils/crypto';
+} from '../../utils/crypto/crypto';
 import { apiFetch, safeJson } from '../system/apiClient';
 import {
   E2EEInitTeardownError,

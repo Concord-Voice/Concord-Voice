@@ -10,7 +10,7 @@ import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
-import { extractInviteCodes } from '@/renderer/utils/inviteUrl';
+import { extractInviteCodes } from '@/renderer/utils/messaging/inviteUrl';
 import { resetAllStores } from '../../helpers/store-helpers';
 
 const mockDirectMessagesView = vi.hoisted(() => ({ shouldThrow: false }));

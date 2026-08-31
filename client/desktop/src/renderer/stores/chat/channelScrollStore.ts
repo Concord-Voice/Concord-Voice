@@ -8,7 +8,7 @@
  * NOT persisted across app restarts: positions are session-scoped, since
  * saved scroll offsets only make sense against a live message cache.
  */
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 
 export interface ChannelScrollState {
   positions: Record<string, number>;

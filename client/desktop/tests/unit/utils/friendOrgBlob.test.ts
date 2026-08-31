@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { validateFriendOrgBlob, EMPTY_FRIEND_ORG } from '@/renderer/utils/friendOrgBlob';
+import { validateFriendOrgBlob, EMPTY_FRIEND_ORG } from '@/renderer/utils/auth/friendOrgBlob';
 
 describe('validateFriendOrgBlob', () => {
   it('accepts a well-formed blob', () => {

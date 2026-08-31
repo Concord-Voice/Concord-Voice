@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripFileMetadata, ImageParseError } from '@/renderer/utils/imageMetadata';
+import { stripFileMetadata, ImageParseError } from '@/renderer/utils/ui/imageMetadata';
 import {
   GPS_MARKER,
   PIXEL_MARKER,

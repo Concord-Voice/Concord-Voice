@@ -6,7 +6,7 @@ import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
-import { ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS } from '@/renderer/utils/policy/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';
 

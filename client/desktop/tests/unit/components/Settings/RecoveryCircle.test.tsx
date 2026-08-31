@@ -3,7 +3,7 @@ import { vi } from 'vitest';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 
 // Mock Shamir secret sharing
-vi.mock('@/renderer/utils/shamir', () => ({
+vi.mock('@/renderer/utils/crypto/shamir', () => ({
   split: vi.fn().mockImplementation((_secret: Uint8Array, n: number) => {
     return Array.from({ length: n }, (_, i) => ({
       index: i + 1,
@@ -13,7 +13,7 @@ vi.mock('@/renderer/utils/shamir', () => ({
 }));
 
 // Mock crypto utilities
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   base64ToArrayBuffer: vi.fn().mockReturnValue(new ArrayBuffer(32)),
   arrayBufferToBase64: vi.fn().mockReturnValue('bW9jay1iYXNlNjQ='),
 }));

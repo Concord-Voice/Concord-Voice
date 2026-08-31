@@ -4,7 +4,7 @@ import { render, screen, fireEvent } from '../../../test-utils';
 vi.mock('@/renderer/components/Permissions/PermissionGrid.css', () => ({}));
 
 import PermissionGrid from '@/renderer/components/Permissions/PermissionGrid';
-import { PERMISSION_CATEGORIES } from '@/renderer/utils/permissions';
+import { PERMISSION_CATEGORIES } from '@/renderer/utils/policy/permissions';
 
 // Find the first permission bit from the categories for testing
 const firstPerm = PERMISSION_CATEGORIES[0].permissions[0];

@@ -5,7 +5,7 @@ import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
 import { hasUnmutedChannel } from '../../stores/ui/notificationPrefsStore';
 import { apiFetch } from '../../services/system/apiClient';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 
 /**
  * Watches the user's self-status and refetches unread counts for the

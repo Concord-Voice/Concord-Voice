@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { useNavigate, useLocation } from 'react-router';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useServerStore } from '../../stores/chat/serverStore';

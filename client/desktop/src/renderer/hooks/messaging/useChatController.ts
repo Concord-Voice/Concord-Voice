@@ -14,7 +14,7 @@ import { useCallback, useEffect, useMemo } from 'react';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
-import { PIN_MESSAGES } from '../../utils/permissions';
+import { PIN_MESSAGES } from '../../utils/policy/permissions';
 import { useMessaging } from './useMessaging';
 import { pinMessage, unpinMessage } from '../../services/messaging/pinService';
 import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';

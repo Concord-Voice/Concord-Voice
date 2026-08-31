@@ -6,7 +6,7 @@ import {
   segmentMessage,
   type MentionResolveContext,
   type ParsedMention,
-} from '@/renderer/utils/mentions';
+} from '@/renderer/utils/messaging/mentions';
 
 function makeCtx(overrides?: Partial<MentionResolveContext>): MentionResolveContext {
   return {

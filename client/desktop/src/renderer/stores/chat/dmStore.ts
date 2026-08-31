@@ -1,11 +1,11 @@
 import { create } from 'zustand';
 import { persist, devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import { apiFetch } from '../../services/system/apiClient';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { E2EEKeyUnavailableError, isPendingKeyError } from '../../services/e2ee/e2eeErrors';
 import { removeScope } from '../../services/messaging/searchService';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import { useChatStore } from './chatStore';
 import type { CallEventPayload } from '../../types/chat';
 

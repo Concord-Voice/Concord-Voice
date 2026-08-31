@@ -8,7 +8,7 @@ const AES_GCM_IV_LENGTH = 12;
 // MAX_FILE_SIZE lived here until #2157: a flat, entitlement-blind 25 MiB cap
 // that rejected uploads between 25 and 32 MiB which the server and the pricing
 // page both accept. The per-file limit is now derived from the user's live
-// entitlement — see `resolveAttachmentLimit` in `utils/entitlementLimits.ts`.
+// entitlement — see `resolveAttachmentLimit` in `utils/policy/entitlementLimits.ts`.
 // This module is crypto + MIME classification only; tier policy does not
 // belong in it.
 

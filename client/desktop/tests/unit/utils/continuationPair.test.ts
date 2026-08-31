@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseContinuationPair } from '@/renderer/utils/continuationPair';
+import { parseContinuationPair } from '@/renderer/utils/crypto/continuationPair';
 
 describe('parseContinuationPair', () => {
   it('returns the triple when all three fields are non-empty strings', () => {

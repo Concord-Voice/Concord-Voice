@@ -3,7 +3,7 @@ import { presenceOverrideSyncService } from '../../services/system/presenceOverr
 import { useFriendOrgStore, type FriendCategory } from '../../stores/chat/friendOrgStore';
 import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { usePresenceOverrideStore } from '../../stores/ui/presenceOverrideStore';
-import { comparePresenceOverrideUserIds } from '../../utils/presenceOverrides';
+import { comparePresenceOverrideUserIds } from '../../utils/policy/presenceOverrides';
 import './PresenceExceptions.css';
 
 const EXPLANATION =

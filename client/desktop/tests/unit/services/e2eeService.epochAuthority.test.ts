@@ -31,7 +31,7 @@ import {
   generateChannelKey,
   wrapChannelKey,
   exportChannelKey,
-} from '@/renderer/utils/crypto';
+} from '@/renderer/utils/crypto/crypto';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
 

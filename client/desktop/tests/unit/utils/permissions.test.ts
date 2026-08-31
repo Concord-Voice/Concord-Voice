@@ -6,7 +6,7 @@ import {
   MENTION_ROLES,
   ADMINISTRATOR,
   type PermissionOverride,
-} from '@/renderer/utils/permissions';
+} from '@/renderer/utils/policy/permissions';
 
 const VIEWER = 'user-1';
 const ROLE = 'role-mod';

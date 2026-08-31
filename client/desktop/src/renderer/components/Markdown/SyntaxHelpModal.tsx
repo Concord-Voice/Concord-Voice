@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
 import { useDialogSync } from '../../hooks/ui/useDialogSync';
-import { clampMessageCharsForTier } from '../../utils/entitlementLimits';
+import { clampMessageCharsForTier } from '../../utils/policy/entitlementLimits';
 import './SyntaxHelpModal.css';
 
 // jsdom (the vitest test environment) implements <dialog> but does NOT fire

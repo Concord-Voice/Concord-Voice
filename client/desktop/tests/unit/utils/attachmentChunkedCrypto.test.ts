@@ -20,8 +20,8 @@ import {
   parseKeyVersionHeader,
   AttachmentKeyEpochError,
   type ChunkSource,
-} from '@/renderer/utils/attachmentChunkedCrypto';
-import { encryptFile } from '@/renderer/utils/attachmentCrypto';
+} from '@/renderer/utils/crypto/attachmentChunkedCrypto';
+import { encryptFile } from '@/renderer/utils/crypto/attachmentCrypto';
 
 const nonce = (fill: number) => new Uint8Array(16).fill(fill);
 

@@ -2,12 +2,12 @@ import React from 'react';
 import { AlertTriangle, Clock } from 'lucide-react';
 import PremiumChip from '../common/PremiumChip';
 import { useGateActivation } from '../../hooks/ui/useGateActivation';
-import { formatFileSize, MAX_ATTACHMENTS } from '../../utils/attachmentCrypto';
+import { formatFileSize, MAX_ATTACHMENTS } from '../../utils/crypto/attachmentCrypto';
 import {
   formatLimitBytes,
   PREMIUM_ATTACHMENT_BYTES,
   IMAGE_STRIP_MAX_BYTES,
-} from '../../utils/entitlementLimits';
+} from '../../utils/policy/entitlementLimits';
 import type { AttachmentRejection } from '../../hooks/messaging/useFileUpload';
 import './AttachmentNotice.css';
 

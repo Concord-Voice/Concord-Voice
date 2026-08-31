@@ -1,6 +1,10 @@
 import React, { useCallback, useMemo, useRef } from 'react';
-import { selectSidebarDock, type SidebarContext, useLayoutStore } from '../../stores/ui/layoutStore';
-import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
+import {
+  selectSidebarDock,
+  type SidebarContext,
+  useLayoutStore,
+} from '../../stores/ui/layoutStore';
+import { createResizeKeyHandler } from '../../utils/ui/resizeKeyboard';
 import { DockOverlayProvider } from './DockShell';
 import './AppLayout.css';
 

@@ -9,7 +9,7 @@ import {
   BASE_PERMISSIONS,
   MOVE_MEMBERS,
   MUTE_MEMBERS,
-} from '@/renderer/utils/permissions';
+} from '@/renderer/utils/policy/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockChannel } from '../../../mocks/fixtures';
 

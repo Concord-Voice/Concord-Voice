@@ -11,7 +11,7 @@
  * authorization grants that should only live in memory.
  */
 
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 import type { SSOProvider } from '../../services/system/ssoService';
 
 export type SSOState =

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Play, Pause, Volume2, VolumeX, Maximize, PictureInPicture2 } from 'lucide-react';
 import type { MediaPlayerState, MediaPlayerActions } from '../../hooks/voice/useMediaPlayer';
-import { formatMediaTime } from '../../utils/formatMediaTime';
+import { formatMediaTime } from '../../utils/ui/formatMediaTime';
 
 interface MediaControlsBarProps {
   readonly variant: 'video' | 'audio';

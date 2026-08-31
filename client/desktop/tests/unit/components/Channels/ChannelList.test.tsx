@@ -14,7 +14,7 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockChannel, mockEncryptedChannel } from '../../../mocks/fixtures';
-import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/policy/permissions';
 import { vi } from 'vitest';
 import type { Channel, ChannelGroup } from '@/renderer/types/chat';
 

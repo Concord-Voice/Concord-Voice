@@ -1,6 +1,6 @@
-import type { E2EESessionKeys } from '../services/e2ee/e2eeService';
-import type { CredentialOwner } from '../../main/ipcContract';
-import { errorMessage } from './redactError';
+import type { E2EESessionKeys } from '../../services/e2ee/e2eeService';
+import type { CredentialOwner } from '../../../main/ipcContract';
+import { errorMessage } from '../runtime/redactError';
 
 /**
  * Persist E2EE session keys to the OS keychain via the main process.

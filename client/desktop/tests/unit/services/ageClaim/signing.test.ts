@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
-import { generateRegistrationKeys, base64ToArrayBuffer } from '@/renderer/utils/crypto';
+import { generateRegistrationKeys, base64ToArrayBuffer } from '@/renderer/utils/crypto/crypto';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import {
   buildCanonicalBytes,

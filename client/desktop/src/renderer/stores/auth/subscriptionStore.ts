@@ -1,4 +1,4 @@
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { EntitlementsChangedSchema, type EntitlementsChangedPayload } from '../../types/ws-events';
 import {

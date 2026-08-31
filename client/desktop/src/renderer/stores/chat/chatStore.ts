@@ -6,9 +6,12 @@
 
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import type { MessageWithStatus } from '../../types/chat';
-import { sanitizeMessageEmbeds, sanitizeMessagesEmbeds } from '../../utils/messageSanitizer';
+import {
+  sanitizeMessageEmbeds,
+  sanitizeMessagesEmbeds,
+} from '../../utils/messaging/messageSanitizer';
 import { usePrivacyStore } from '../ui/privacyStore';
 
 export interface TypingUser {

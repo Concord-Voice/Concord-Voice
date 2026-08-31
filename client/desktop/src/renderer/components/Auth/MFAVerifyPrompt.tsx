@@ -2,7 +2,7 @@ import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import TOTPInput from './TOTPInput';
 import BackupCodeInput from './BackupCodeInput';
 import { apiFetch } from '../../services/system/apiClient';
-import { base64urlToBuffer, bufferToBase64url } from '../../utils/base64url';
+import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
 import {
   getAvailableCategories,
   getDefaultMethod,

@@ -12,7 +12,7 @@ import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockChannel } from '../../../mocks/fixtures';
-import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/permissions';
+import { ADMIN_PERMISSIONS, MANAGE_CHANNELS } from '@/renderer/utils/policy/permissions';
 import type { Channel, ChannelGroup } from '@/renderer/types/chat';
 
 vi.mock('@/renderer/services/system/apiClient', () => ({

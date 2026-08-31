@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { stripJpeg } from '@/renderer/utils/imageMetadata/jpeg';
-import { stripHeic } from '@/renderer/utils/imageMetadata/bmff';
-import { stripFileMetadata, ImageParseError } from '@/renderer/utils/imageMetadata';
+import { stripJpeg } from '@/renderer/utils/ui/imageMetadata/jpeg';
+import { stripHeic } from '@/renderer/utils/ui/imageMetadata/bmff';
+import { stripFileMetadata, ImageParseError } from '@/renderer/utils/ui/imageMetadata';
 import {
   GPS_MARKER,
   PIXEL_MARKER,

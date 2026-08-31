@@ -1,10 +1,10 @@
-import { formatFileSize } from './attachmentCrypto';
+import { formatFileSize } from '../crypto/attachmentCrypto';
 import {
   CHUNK_OVERHEAD_BYTES,
   ENVELOPE_HEADER_BYTES,
   ENVELOPE_VERSION_V3,
   totalChunksFor,
-} from './attachmentChunkedCrypto';
+} from '../crypto/attachmentChunkedCrypto';
 
 export const FREE_MESSAGE_CHARS = 5120;
 export const PREMIUM_MESSAGE_CHARS = 10240;
@@ -101,7 +101,7 @@ export interface AttachmentLimitInput {
    *
    *  A NEGATIVE value is a real sentinel meaning "unlimited (selfhost)" — see
    *  `entitlements.go:211-215` (`if server.MaxServerUploadBytes < 0 { return
-   *  ServerLimitUnlimited }`) and the header of `utils/serverEntitlements.ts`.
+   *  ServerLimitUnlimited }`) and the header of `utils/policy/serverEntitlements.ts`.
    *  PR 1 deliberately does NOT honour it: `isUsable` treats anything
    *  non-finite or `<= 0` as ABSENT, so a selfhost server falls back to the
    *  user axis rather than to unlimited. That is fail-closed and costs nothing

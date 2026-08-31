@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { PipSignalingProxy } from '../../services/voice/pipSignalingProxy';
-import { createResizeKeyHandler } from '../../utils/resizeKeyboard';
+import { createResizeKeyHandler } from '../../utils/ui/resizeKeyboard';
 import ChannelList from '../Channels/ChannelList';
 import ServerActionBar from '../Channels/ServerActionBar';
 import MainViewModals from './MainViewModals';
@@ -26,7 +26,7 @@ import MemberFlexSpace from '../Layout/MemberFlexSpace';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
-import { Permissions, hasPermission } from '../../utils/permissions';
+import { Permissions, hasPermission } from '../../utils/policy/permissions';
 import { useServerChannelSubscriptions } from '../../hooks/messaging/useServerChannelSubscriptions';
 import { useKeyboardShortcuts } from '../../hooks/ui/useKeyboardShortcuts';
 import { useDNDTransitionRefresh } from '../../hooks/messaging/useDNDTransitionRefresh';

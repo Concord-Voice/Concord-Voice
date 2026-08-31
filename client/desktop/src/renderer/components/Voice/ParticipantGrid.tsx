@@ -12,7 +12,7 @@ import ShareTunePill from './ShareTunePill';
 import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification';
 import { useGridLayout } from '../../hooks/ui/useGridLayout';
 import { useScreenTileVideo } from '../../hooks/voice/useScreenTileVideo';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import './ParticipantGrid.css';
 
 /** Base vertical px reserved below each grid slot for the Tune In/Out pill row. */

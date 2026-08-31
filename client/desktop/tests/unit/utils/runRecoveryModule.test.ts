@@ -8,7 +8,7 @@ vi.mock('@/renderer/spaSelfHealClient', () => ({
   triggerChunkSelfHeal: (...args: unknown[]) => mockTriggerChunkSelfHeal(...args),
 }));
 
-import { runRecoveryModule } from '@/renderer/utils/runRecoveryModule';
+import { runRecoveryModule } from '@/renderer/utils/runtime/runRecoveryModule';
 
 beforeEach(() => {
   vi.clearAllMocks();

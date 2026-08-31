@@ -6,7 +6,7 @@ import {
   MANAGE_CHANNELS,
   MANAGE_CRYPTO_ROTATION,
   BASE_PERMISSIONS,
-} from '@/renderer/utils/permissions';
+} from '@/renderer/utils/policy/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 
 vi.mock('@/renderer/services/system/apiClient', () => ({

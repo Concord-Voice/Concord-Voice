@@ -1,15 +1,19 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { z } from 'zod';
-import { unwrapLoginKeys, generateRegistrationKeys, exportPublicKey } from '../../utils/crypto';
+import {
+  unwrapLoginKeys,
+  generateRegistrationKeys,
+  exportPublicKey,
+} from '../../utils/crypto/crypto';
 import {
   e2eeService,
   type E2EEInitializationGuard,
   type E2EEInitializationReceipt,
 } from '../../services/e2ee/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
-import { errorMessage } from '../../utils/redactError';
-import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
-import { parseContinuationPair, type ContinuationPair } from '../../utils/continuationPair';
+import { errorMessage } from '../../utils/runtime/redactError';
+import { persistE2EESessionKeys } from '../../utils/crypto/persistE2EESessionKeys';
+import { parseContinuationPair, type ContinuationPair } from '../../utils/crypto/continuationPair';
 import { hydratePostLogin } from '../../services/system/postLoginHydration';
 import { beginPostLoginHydrationGuard } from '../../services/system/postLoginHydrationLifecycle';
 import { useAuthStore } from '../../stores/auth/authStore';
@@ -41,7 +45,7 @@ import { useSSOFlow } from '../../hooks/ui/useSSOFlow';
 import { useSSOStore } from '../../stores/auth/ssoStore';
 import KeyRecoveryPrompt from './KeyRecoveryPrompt';
 import { Eye, EyeOff } from 'lucide-react';
-import { base64urlToBuffer } from '../../utils/base64url';
+import { base64urlToBuffer } from '../../utils/crypto/base64url';
 import './Login.css';
 import './TOTPInput.css';
 

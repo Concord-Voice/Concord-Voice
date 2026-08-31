@@ -1,6 +1,6 @@
 import React from 'react';
 import { MessageWithStatus } from '../../types/chat';
-import { copyText } from '../../utils/clipboard';
+import { copyText } from '../../utils/ui/clipboard';
 import ContextMenu from '../ui/ContextMenu';
 
 interface MessageContextMenuProps {

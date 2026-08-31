@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { split, combine } from '@/renderer/utils/shamir';
+import { split, combine } from '@/renderer/utils/crypto/shamir';
 
 describe('Shamir Secret Sharing', () => {
   describe('split + combine round-trips', () => {

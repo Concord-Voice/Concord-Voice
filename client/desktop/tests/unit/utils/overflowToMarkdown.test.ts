@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   composeMarkdownOverflow,
   OVERFLOW_PREVIEW_CHARS,
-} from '@/renderer/utils/overflowToMarkdown';
+} from '@/renderer/utils/messaging/overflowToMarkdown';
 
 describe('composeMarkdownOverflow', () => {
   it('produces preview text of OVERFLOW_PREVIEW_CHARS chars + ellipsis', () => {

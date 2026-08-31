@@ -2,7 +2,7 @@ import React from 'react';
 import type { AppearanceSettings, CustomColors } from '../../stores/ui/settingsStore';
 import { useDraftAppearance, setDraftAppearanceSetting } from '../../hooks/ui/useDraftSettings';
 import { useLayoutStore } from '../../stores/ui/layoutStore';
-import { isValidHex } from '../../utils/colorUtils';
+import { isValidHex } from '../../utils/ui/colorUtils';
 import CollapsibleSection from './CollapsibleSection';
 import { ClientBehaviorSection } from './ClientBehaviorSection';
 import ToggleSwitch from './ToggleSwitch';

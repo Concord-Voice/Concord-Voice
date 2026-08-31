@@ -11,12 +11,12 @@ import {
   PREMIUM_ATTACHMENT_BYTES,
   IMAGE_STRIP_MAX_BYTES,
   resolveAttachmentLimit,
-} from '@/renderer/utils/entitlementLimits';
+} from '@/renderer/utils/policy/entitlementLimits';
 import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 import {
   CHUNK_PLAINTEXT_BYTES,
   ENVELOPE_HEADER_BYTES,
-} from '@/renderer/utils/attachmentChunkedCrypto';
+} from '@/renderer/utils/crypto/attachmentChunkedCrypto';
 
 // Mock apiClient
 const mockApiFetch = vi.fn();
@@ -54,9 +54,9 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
 }));
 
 // Mock attachmentCrypto
-vi.mock('@/renderer/utils/attachmentCrypto', async () => {
-  const actual = await vi.importActual<typeof import('@/renderer/utils/attachmentCrypto')>(
-    '@/renderer/utils/attachmentCrypto'
+vi.mock('@/renderer/utils/crypto/attachmentCrypto', async () => {
+  const actual = await vi.importActual<typeof import('@/renderer/utils/crypto/attachmentCrypto')>(
+    '@/renderer/utils/crypto/attachmentCrypto'
   );
   return {
     ...actual,
@@ -757,7 +757,7 @@ describe('useFileUpload', () => {
   });
 
   it('uploads with encryption (always)', async () => {
-    const { encryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { encryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
     mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
     mockSafeJson.mockResolvedValue({
       file_id: 'attach-enc-1',
@@ -784,7 +784,7 @@ describe('useFileUpload', () => {
   // could still encrypt the original. This inspects what encryptFile actually
   // received and requires the GPS marker to be absent from it.
   it('strips image metadata before the bytes reach encryptFile', async () => {
-    const { encryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { encryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
     mockApiFetch.mockResolvedValue({ ok: true, status: 201 });
     mockSafeJson.mockResolvedValue({ file_id: 'strip-1', file_type: 'photo', file_size: 100 });
 
@@ -838,7 +838,7 @@ describe('useFileUpload', () => {
   // fallback path uploaded the original bytes alongside. This asserts on the
   // bytes that actually reach the transport.
   it('uploads the encrypted buffer, never the raw file bytes', async () => {
-    const { encryptFile } = await import('@/renderer/utils/attachmentCrypto');
+    const { encryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
     const ciphertext = new ArrayBuffer(64);
     vi.mocked(encryptFile).mockResolvedValueOnce(ciphertext);
 

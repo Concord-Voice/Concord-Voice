@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 
 export interface KeyCombo {
   key: string; // e.g. 'k', 'ArrowUp', '/', 'Escape', ','

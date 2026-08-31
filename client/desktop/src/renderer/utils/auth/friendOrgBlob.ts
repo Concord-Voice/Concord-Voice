@@ -3,7 +3,7 @@ import {
   BUILTIN_SECTION_ORDER,
   type FriendOrgBlob,
   type FriendCategory,
-} from '../stores/chat/friendOrgStore';
+} from '../../stores/chat/friendOrgStore';
 
 export const EMPTY_FRIEND_ORG: FriendOrgBlob = { v: 1, categories: [], sectionOrder: [] };
 

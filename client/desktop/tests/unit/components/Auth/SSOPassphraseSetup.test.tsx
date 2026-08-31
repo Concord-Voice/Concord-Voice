@@ -18,7 +18,7 @@ vi.mock('@/renderer/services/system/apiClient', async (orig) => ({
 }));
 
 // Mock crypto utilities so the test does not actually run RSA-4096 keygen
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   generateRegistrationKeys: vi.fn().mockResolvedValue({
     wrappedPrivateKey: 'bW9jay13cmFwcGVkLXByaXZhdGUta2V5', // pragma: allowlist secret
     keyDerivationSalt: 'bW9jay1zYWx0', // pragma: allowlist secret

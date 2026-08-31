@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { INVITE } from '@/renderer/utils/permissions';
+import { INVITE } from '@/renderer/utils/policy/permissions';
 import { InviteServerPicker } from '@/renderer/components/Chat/InviteServerPicker';
 
 describe('InviteServerPicker', () => {

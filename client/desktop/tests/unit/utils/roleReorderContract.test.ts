@@ -39,7 +39,7 @@ import {
   evaluateReorderPrecondition,
   moveWithinBand,
   partitionRoleHierarchy,
-} from '../../../src/renderer/utils/roleHierarchy';
+} from '../../../src/renderer/utils/policy/roleHierarchy';
 import type {
   ReorderPrecondition,
   Role,

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import './Titlebar.css';
 import { SPA_VERSION } from '../../config';
-import { compactSpaHash, formatClientVersion } from '../../utils/clientVersion';
+import { compactSpaHash, formatClientVersion } from '../../utils/runtime/clientVersion';
 
 const RENDERER_SPA_VERSION = compactSpaHash(SPA_VERSION) ? SPA_VERSION : null;
 

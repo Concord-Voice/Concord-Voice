@@ -9,7 +9,11 @@ import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { mockMember, mockMember2 } from '../../../mocks/fixtures';
-import { MENTION_EVERYONE, MENTION_USERS, MENTION_ROLES } from '@/renderer/utils/permissions';
+import {
+  MENTION_EVERYONE,
+  MENTION_USERS,
+  MENTION_ROLES,
+} from '@/renderer/utils/policy/permissions';
 import { vi } from 'vitest';
 
 // jsdom lacks scrollIntoView

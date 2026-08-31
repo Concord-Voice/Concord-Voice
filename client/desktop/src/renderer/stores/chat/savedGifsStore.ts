@@ -1,4 +1,4 @@
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 
 export interface SavedGif {
   slug: string;

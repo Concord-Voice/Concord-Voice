@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 
 const formatImageLimit = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))}MB`;
 

@@ -6,7 +6,7 @@ import {
   useSendInviteToFriend,
   type SendInviteResult,
 } from '../../hooks/messaging/useSendInviteToFriend';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import './SendToFriendModal.css';
 
 interface SendToFriendModalProps {

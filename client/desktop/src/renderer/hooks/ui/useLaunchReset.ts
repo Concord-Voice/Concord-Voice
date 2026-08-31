@@ -4,7 +4,7 @@ import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useVideoSettingsStore } from '../../stores/voice/videoSettingsStore';
 import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
-import { clampToFreeTier, type ClampableSettings } from '../../utils/clampToFreeTier';
+import { clampToFreeTier, type ClampableSettings } from '../../utils/policy/clampToFreeTier';
 
 /**
  * Launch-reset orchestrator (#1301 Decision 4 / spec §4). Runs once per session

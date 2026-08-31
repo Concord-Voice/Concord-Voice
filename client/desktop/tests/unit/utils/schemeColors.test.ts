@@ -1,4 +1,4 @@
-import { resolveUserAccentColors, resolveUserThemeScope } from '@/renderer/utils/schemeColors';
+import { resolveUserAccentColors, resolveUserThemeScope } from '@/renderer/utils/ui/schemeColors';
 
 describe('schemeColors', () => {
   // --- resolveUserAccentColors ---

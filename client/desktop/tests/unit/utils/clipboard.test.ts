@@ -1,4 +1,4 @@
-import { copyText, readText, cutSelection, selectAll } from '@/renderer/utils/clipboard';
+import { copyText, readText, cutSelection, selectAll } from '@/renderer/utils/ui/clipboard';
 
 describe('clipboard', () => {
   beforeEach(() => {

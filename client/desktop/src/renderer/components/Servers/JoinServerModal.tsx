@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import Modal from '../ui/Modal';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import { useInviteStore } from '../../stores/chat/inviteStore';

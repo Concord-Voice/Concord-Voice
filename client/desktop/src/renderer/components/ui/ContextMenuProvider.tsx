@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import ContextMenu from './ContextMenu';
-import { copyText, readText, cutSelection, selectAll } from '../../utils/clipboard';
+import { copyText, readText, cutSelection, selectAll } from '../../utils/ui/clipboard';
 
 /* ------------------------------------------------------------------ */
 /*  Target resolution types                                           */

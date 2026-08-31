@@ -4,7 +4,11 @@ import { ServerWithRole } from '../../types/server';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useUserStore } from '../../stores/auth/userStore';
-import { MANAGE_ALL_MESSAGES, MANAGE_OWN_MESSAGES, Permissions } from '../../utils/permissions';
+import {
+  MANAGE_ALL_MESSAGES,
+  MANAGE_OWN_MESSAGES,
+  Permissions,
+} from '../../utils/policy/permissions';
 import { apiFetch } from '../../services/system/apiClient';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';

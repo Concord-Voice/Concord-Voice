@@ -6,7 +6,11 @@ import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { ADMIN_PERMISSIONS, BASE_PERMISSIONS, MOVE_MEMBERS } from '@/renderer/utils/permissions';
+import {
+  ADMIN_PERMISSIONS,
+  BASE_PERMISSIONS,
+  MOVE_MEMBERS,
+} from '@/renderer/utils/policy/permissions';
 import { vi } from 'vitest';
 import type { Channel } from '@/renderer/types/chat';
 

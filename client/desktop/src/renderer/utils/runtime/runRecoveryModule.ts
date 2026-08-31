@@ -1,4 +1,4 @@
-import { triggerChunkSelfHeal } from '../spaSelfHealClient';
+import { triggerChunkSelfHeal } from '../../spaSelfHealClient';
 
 /**
  * Lazily import a recovery/reset module and run an action on it, swallowing a

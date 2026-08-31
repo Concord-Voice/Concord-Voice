@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { createPortal } from 'react-dom';
 import ServerHoverTooltip from './ServerHoverTooltip';
 import { ChevronDown, FolderPlus, Pencil, Trash2 } from 'lucide-react';

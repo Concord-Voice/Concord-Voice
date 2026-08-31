@@ -94,10 +94,10 @@ import {
   type DecryptRecoveryCallbacks,
   type InsertableStreamsReceiver,
 } from '../e2ee/voiceE2eeTransforms';
-import { errorMessage } from '../../utils/redactError';
-import { hasPermission, SPEAK } from '../../utils/permissions';
-import { clampScreenForSubscription } from '../../utils/videoLimits';
-import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/screenResolution';
+import { errorMessage } from '../../utils/runtime/redactError';
+import { hasPermission, SPEAK } from '../../utils/policy/permissions';
+import { clampScreenForSubscription } from '../../utils/policy/videoLimits';
+import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/ui/screenResolution';
 import type { CallState } from './voiceService/callStateMachine';
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
@@ -2569,7 +2569,7 @@ class VoiceService {
    * spec §7.9). Extracted from joinChannel to keep that function's
    * cognitive complexity within the project's S3776 bound. The synth name
    * is "group name" for group DMs, peer's displayName for 1:1 DMs (via
-   * the utils/dm.peerName helper, which is store-agnostic per the
+   * the utils/messaging/dm.peerName helper, which is store-agnostic per the
    * SonarCloud architecture rule), or a fallback string.
    */
   private async synthesizeDMChannel(channelId: string): Promise<{
@@ -2605,7 +2605,7 @@ class VoiceService {
     if (!conversation) return 'Voice call';
     if (conversation.isGroup) return conversation.name ?? 'Group voice call';
     if (!currentUserId) return 'Voice call';
-    const { peerName: synthesizePeerName } = await import('../../utils/dm');
+    const { peerName: synthesizePeerName } = await import('../../utils/messaging/dm');
     return synthesizePeerName(conversation.participants, currentUserId);
   }
 

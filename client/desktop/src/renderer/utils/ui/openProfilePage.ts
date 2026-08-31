@@ -1,5 +1,5 @@
-import { useSettingsNavStore } from '../stores/ui/settingsNavStore';
-import { useSettingsOverlayStore } from '../stores/ui/settingsOverlayStore';
+import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
+import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 
 /**
  * The single navigation route from the user-popover "My Profile" quick-link to the

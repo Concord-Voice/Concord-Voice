@@ -6,7 +6,11 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useFriendStore } from '@/renderer/stores/chat/friendStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
 import { apiFetch, safeJson } from '@/renderer/services/system/apiClient';
-import { ADMIN_PERMISSIONS, BASE_PERMISSIONS, TIMEOUT_MEMBERS } from '@/renderer/utils/permissions';
+import {
+  ADMIN_PERMISSIONS,
+  BASE_PERMISSIONS,
+  TIMEOUT_MEMBERS,
+} from '@/renderer/utils/policy/permissions';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import type { Role } from '@/renderer/types/server';
 

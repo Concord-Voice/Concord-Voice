@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pseudonymizeLogUuids } from '@/renderer/utils/pseudonymizeLogUuids';
+import { pseudonymizeLogUuids } from '@/renderer/utils/runtime/pseudonymizeLogUuids';
 
 const A = '550e8400-e29b-41d4-a716-446655440000';
 const B = '00000000-0000-4000-8000-000000000001';

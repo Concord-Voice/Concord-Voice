@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 
 // Mirrors the backend ClientConfigResponse from services/control-plane/internal/clientconfig/handlers.go
 

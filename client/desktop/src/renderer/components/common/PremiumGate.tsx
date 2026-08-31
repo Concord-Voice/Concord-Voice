@@ -1,7 +1,7 @@
 import React from 'react';
 import PremiumChip from './PremiumChip';
 import { useGateActivation } from '../../hooks/ui/useGateActivation';
-import type { SubscriptionDeepLink } from '../../utils/openSubscriptionPage';
+import type { SubscriptionDeepLink } from '../../utils/ui/openSubscriptionPage';
 import './PremiumGate.css';
 
 export type PremiumGateMode = 'dim' | 'clamp' | 'option';

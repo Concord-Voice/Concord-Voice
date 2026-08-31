@@ -39,7 +39,7 @@ vi.mock('@/renderer/components/Members/MemberProfileCard', () => ({
   ),
 }));
 
-vi.mock('@/renderer/utils/schemeColors', () => ({
+vi.mock('@/renderer/utils/ui/schemeColors', () => ({
   resolveUserAccentColors: vi.fn().mockReturnValue(null),
 }));
 

@@ -1,13 +1,13 @@
-import type { Entitlement } from '../stores/auth/subscriptionStore';
-import type { AppearanceSettings } from '../stores/ui/settingsStore';
-import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../stores/voice/voiceStore';
-import { VIDEO_QUALITY_PRESETS } from '../stores/voice/videoSettingsStore';
+import type { Entitlement } from '../../stores/auth/subscriptionStore';
+import type { AppearanceSettings } from '../../stores/ui/settingsStore';
+import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from '../../stores/voice/voiceStore';
+import { VIDEO_QUALITY_PRESETS } from '../../stores/voice/videoSettingsStore';
 import {
   videoLimitsFromEntitlement,
   maxFpsForResolution,
   type VideoAxisLimit,
 } from './videoLimits';
-import { SCREEN_RES_DIMS, highestFreeScreenResolution } from './screenResolution';
+import { SCREEN_RES_DIMS, highestFreeScreenResolution } from '../ui/screenResolution';
 
 /**
  * A pure snapshot of the client settings that the launch-reset clamp touches —

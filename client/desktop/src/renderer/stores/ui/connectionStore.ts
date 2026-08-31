@@ -1,4 +1,4 @@
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 // Re-export from recoveryService so there is a single source of truth.
 // ConnectionLostOverlay.tsx imports these types from connectionStore — the
 // re-export keeps that contract working without touching import sites.

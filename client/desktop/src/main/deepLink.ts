@@ -2,7 +2,7 @@
  * The 8-char ambiguity-stripped charset predicate for this surface. It is one of
  * THREE independent copies — the others are `INVITE_CODE_PATTERN` in
  * [internal]workers/invite-landing/src/stub.ts and `CODE_CLASS`
- * in client/desktop/src/renderer/utils/inviteUrl.ts. #1557's variable-length
+ * in client/desktop/src/renderer/utils/messaging/inviteUrl.ts. #1557's variable-length
  * vanity slugs must relax all three; missing the Worker copy is a validation
  * bypass on the anonymous edge path.
  */

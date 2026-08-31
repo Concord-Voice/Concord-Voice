@@ -5,7 +5,7 @@ import { usePendingRegistrationStore } from '@/renderer/stores/auth/pendingRegis
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
-import { generateRegistrationKeys } from '@/renderer/utils/crypto';
+import { generateRegistrationKeys } from '@/renderer/utils/crypto/crypto';
 import { abandonSSOReservation } from '@/renderer/services/system/ssoService';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
@@ -14,7 +14,7 @@ const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
 // Mock crypto
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   generateRegistrationKeys: vi.fn().mockResolvedValue({
     wrappedPrivateKey: 'mock',
     keyDerivationSalt: 'mock',

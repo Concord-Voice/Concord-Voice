@@ -16,8 +16,8 @@
 import { getWsBase } from '../system/runtimeServerBase';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useConnectionStore } from '../../stores/ui/connectionStore';
-import { errorMessage, errorName } from '../../utils/redactError';
-import { summarizeWsDiagnostic, summarizeWsServerError } from '../../utils/wsDiagnostics';
+import { errorMessage, errorName } from '../../utils/runtime/redactError';
+import { summarizeWsDiagnostic, summarizeWsServerError } from '../../utils/runtime/wsDiagnostics';
 import {
   WebSocketEventSchema,
   scrubZodIssues,

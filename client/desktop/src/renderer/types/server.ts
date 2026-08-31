@@ -28,7 +28,7 @@ export interface Role {
   is_default: boolean;
   // `@all` is created is_default AND is_managed (internal/servers/handlers.go:191),
   // so every predicate that means "managed, therefore locked" must carry
-  // `&& !is_default` — see utils/roleHierarchy.ts.
+  // `&& !is_default` — see utils/policy/roleHierarchy.ts.
   is_managed: boolean;
   display_separately: boolean;
   mentionable: boolean;
@@ -39,7 +39,7 @@ export interface Role {
 // --- Role hierarchy / reorder types (#2359) ---
 //
 // Spec: [internal]specs/2026-08-21-2359-role-reorder-ui-design.md.
-// The payload invariant itself is documented once, in utils/roleHierarchy.ts,
+// The payload invariant itself is documented once, in utils/policy/roleHierarchy.ts,
 // which owns the only constructor of RoleReorderPayload.
 
 /**
@@ -76,7 +76,7 @@ export type RoleViewer =
  * inhabit this type, so handing the display list to the store is a compile
  * error rather than a review question.
  *
- * `buildReorderPayload` (utils/roleHierarchy.ts) is the ONLY constructor. Build
+ * `buildReorderPayload` (utils/policy/roleHierarchy.ts) is the ONLY constructor. Build
  * it at Apply from the reconciled hierarchy and never store it: a payload that
  * cannot be held cannot go stale.
  *

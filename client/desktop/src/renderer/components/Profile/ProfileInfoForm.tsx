@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useUserStore, UpdateProfileData } from '../../stores/auth/userStore';
 import { useImageUpload } from '../../hooks/messaging/useImageUpload';
 import { useEntitlement } from '../../hooks/ui/useEntitlement';
-import { formatFileSize } from '../../utils/attachmentCrypto';
+import { formatFileSize } from '../../utils/crypto/attachmentCrypto';
 import LoadingSpinner from '../Auth/LoadingSpinner';
 import Modal from '../ui/Modal';
 import ImageCropEditor from '../ui/ImageCropEditor';

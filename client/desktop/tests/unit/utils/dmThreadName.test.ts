@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getThreadName } from '@/renderer/utils/dmThreadName';
+import { getThreadName } from '@/renderer/utils/messaging/dmThreadName';
 import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 
 const conv = (over: Partial<DMConversation>): DMConversation =>

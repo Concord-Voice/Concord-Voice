@@ -1,4 +1,4 @@
-import { createStore } from '../../utils/createStore';
+import { createStore } from '../../utils/runtime/createStore';
 
 export type SectionKey = 'pending' | 'online' | 'offline';
 export const BUILTIN_SECTION_ORDER: SectionKey[] = ['pending', 'online', 'offline'];

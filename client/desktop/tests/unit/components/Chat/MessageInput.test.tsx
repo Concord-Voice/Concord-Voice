@@ -2,7 +2,7 @@ import { render, screen, fireEvent, act } from '../../../test-utils';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
-import { Permissions } from '@/renderer/utils/permissions';
+import { Permissions } from '@/renderer/utils/policy/permissions';
 import { vi } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';

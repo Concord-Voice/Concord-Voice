@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist, devtools, subscribeWithSelector } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 
 export interface ServerFolder {
   id: string;

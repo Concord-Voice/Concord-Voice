@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import { Channel, ChannelGroup } from '../../types/chat';
 import { apiFetch } from '../../services/system/apiClient';
 import { e2eeService } from '../../services/e2ee/e2eeService';

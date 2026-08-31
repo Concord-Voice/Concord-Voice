@@ -8,7 +8,7 @@ import {
 } from '../../stores/ui/connectionStore';
 // recoveryService remains lazy. resetService is eagerly registered by main.tsx;
 // local dynamic imports avoid a direct feature-module dependency.
-import { runRecoveryModule } from '../../utils/runRecoveryModule';
+import { runRecoveryModule } from '../../utils/runtime/runRecoveryModule';
 import './ConnectionLostOverlay.css';
 
 /** Display text per CheckResult value. Extracted from the inline ternary

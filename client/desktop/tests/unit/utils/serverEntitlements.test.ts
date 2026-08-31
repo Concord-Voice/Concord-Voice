@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   SERVER_TIER_ENTITLEMENTS,
   serverEntitlementsFor,
-} from '@/renderer/utils/serverEntitlements';
+} from '@/renderer/utils/policy/serverEntitlements';
 
 describe('serverEntitlementsFor', () => {
   it('mirrors the Go ladder values (server_entitlements.go is source of truth)', () => {

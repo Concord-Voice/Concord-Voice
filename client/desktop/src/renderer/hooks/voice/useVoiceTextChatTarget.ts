@@ -6,7 +6,7 @@ import { useUserStore } from '../../stores/auth/userStore';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useChannelSubscription } from '../messaging/useChannelSubscription';
 import { useDMSubscription } from '../messaging/useDMSubscription';
-import { getThreadName } from '../../utils/dmThreadName';
+import { getThreadName } from '../../utils/messaging/dmThreadName';
 import type { ChatContext } from '../../types/chat';
 
 export interface VoiceTextChatTarget {

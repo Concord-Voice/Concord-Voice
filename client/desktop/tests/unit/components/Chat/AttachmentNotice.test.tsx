@@ -3,14 +3,14 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import AttachmentNotice from '@/renderer/components/Chat/AttachmentNotice';
 import type { AttachmentRejection } from '@/renderer/hooks/messaging/useFileUpload';
-import { MAX_ATTACHMENTS } from '@/renderer/utils/attachmentCrypto';
+import { MAX_ATTACHMENTS } from '@/renderer/utils/crypto/attachmentCrypto';
 import {
   FREE_ATTACHMENT_BYTES,
   PREMIUM_ATTACHMENT_BYTES,
   resolveAttachmentLimit,
-} from '@/renderer/utils/entitlementLimits';
+} from '@/renderer/utils/policy/entitlementLimits';
 
-vi.mock('@/renderer/utils/openSubscriptionPage', () => ({
+vi.mock('@/renderer/utils/ui/openSubscriptionPage', () => ({
   openSubscriptionPage: vi.fn(),
 }));
 
@@ -19,9 +19,9 @@ vi.mock('@/renderer/utils/openSubscriptionPage', () => ({
 // sources the constant. Mocking it to a DIFFERENT value is what makes the
 // assertion discriminate (#2837 mutation sweep).
 const MOCK_MAX_ATTACHMENTS = 7;
-vi.mock('@/renderer/utils/attachmentCrypto', async () => {
-  const actual = await vi.importActual<typeof import('@/renderer/utils/attachmentCrypto')>(
-    '@/renderer/utils/attachmentCrypto'
+vi.mock('@/renderer/utils/crypto/attachmentCrypto', async () => {
+  const actual = await vi.importActual<typeof import('@/renderer/utils/crypto/attachmentCrypto')>(
+    '@/renderer/utils/crypto/attachmentCrypto'
   );
   return { ...actual, MAX_ATTACHMENTS: 7 };
 });

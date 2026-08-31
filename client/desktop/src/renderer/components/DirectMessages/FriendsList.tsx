@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useId, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import {
   ChevronDown,
   ChevronRight,
@@ -22,10 +22,10 @@ import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { useFriendOrgStore, type FriendCategory } from '../../stores/chat/friendOrgStore';
 import ContextMenu from '../ui/ContextMenu';
 import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
-import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import AddFriendModal from './AddFriendModal';
 import CategoryManagerPanel from './CategoryManagerPanel';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './DirectMessages.css';
 

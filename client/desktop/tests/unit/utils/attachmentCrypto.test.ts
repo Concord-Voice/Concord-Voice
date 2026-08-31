@@ -6,7 +6,7 @@ import {
   formatFileSize,
   isImageType,
   MAX_ATTACHMENTS,
-} from '@/renderer/utils/attachmentCrypto';
+} from '@/renderer/utils/crypto/attachmentCrypto';
 
 describe('attachmentCrypto', () => {
   // Generate a test AES-256-GCM key

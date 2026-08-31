@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatMediaTime } from '@/renderer/utils/formatMediaTime';
+import { formatMediaTime } from '@/renderer/utils/ui/formatMediaTime';
 
 describe('formatMediaTime', () => {
   it('formats zero', () => expect(formatMediaTime(0)).toBe('0:00'));

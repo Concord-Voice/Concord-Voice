@@ -14,7 +14,7 @@ import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
-import { runRecoveryModule } from '../../utils/runRecoveryModule';
+import { runRecoveryModule } from '../../utils/runtime/runRecoveryModule';
 import { hydratePostLogin } from '../../services/system/postLoginHydration';
 import {
   beginPostLoginHydrationGuard,

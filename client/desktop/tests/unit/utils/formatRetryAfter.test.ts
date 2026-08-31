@@ -1,4 +1,4 @@
-import { formatRetryAfter } from '@/renderer/utils/formatRetryAfter';
+import { formatRetryAfter } from '@/renderer/utils/runtime/formatRetryAfter';
 
 describe('formatRetryAfter', () => {
   it('formats seconds under 1 minute', () => {

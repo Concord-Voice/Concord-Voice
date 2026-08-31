@@ -5,7 +5,7 @@ import {
   resolveEffectiveFont,
   themeBundledFontFor,
   RESOLVER_CONFIG,
-} from '../../utils/effectiveFont';
+} from '../../utils/ui/effectiveFont';
 import { useSettingsNavStore } from '../../stores/ui/settingsNavStore';
 import CollapsibleSection from './CollapsibleSection';
 import './FontSection.css';
@@ -13,7 +13,7 @@ import './FontSection.css';
 // Self-hosted, license-cleared application fonts (see public/branding/Concord-Voice/
 // fonts/LICENSES.md). `family` drives only the per-option live PREVIEW; selecting an
 // option writes `appFont` to the draft store, and the effective-font resolver
-// (utils/effectiveFont.ts) applies the result via the `data-appfont` attribute.
+// (utils/ui/effectiveFont.ts) applies the result via the `data-appfont` attribute.
 // 'default' previews the base body face (SourceSans). The picker changes BODY text;
 // brand/heading surfaces keep their display face.
 const FONT_OPTIONS: { id: AppearanceSettings['appFont']; label: string; family: string }[] = [

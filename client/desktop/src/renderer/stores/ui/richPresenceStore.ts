@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { wrapStore } from '../../utils/createStore';
+import { wrapStore } from '../../utils/runtime/createStore';
 import { onRuntimeServerSelectionChange } from '../../services/system/runtimeServerBase';
 import type { VoiceConnectionState } from '../voice/voiceStore';
 import type { CustomTextPresencePayload, RichPresenceEntry } from '../../types/ws-events';

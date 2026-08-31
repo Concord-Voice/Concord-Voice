@@ -4,7 +4,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useInviteStore } from '@/renderer/stores/chat/inviteStore';
-import { INVITE } from '@/renderer/utils/permissions';
+import { INVITE } from '@/renderer/utils/policy/permissions';
 import MessageInput from '@/renderer/components/Chat/MessageInput';
 
 // --- Mocks required by MessageInput ---

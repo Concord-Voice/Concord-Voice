@@ -5,7 +5,7 @@ import { useMemberStore, type ServerMember } from '../../stores/chat/memberStore
 import { useDMStore, type DMParticipant } from '../../stores/chat/dmStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
-import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import MessageAvatar from './MessageAvatar';
 import MessageActions from './MessageActions';
 import ReactionBar from './ReactionBar';
@@ -26,7 +26,7 @@ import MarkdownContent from '../Markdown/MarkdownContent';
 import AttachmentDisplay from './AttachmentDisplay';
 import GifEmbed from './GifEmbed';
 import { InviteEmbed } from './InviteEmbed';
-import { messageInviteCodes } from '@/renderer/utils/inviteUrl';
+import { messageInviteCodes } from '@/renderer/utils/messaging/inviteUrl';
 import { useMessageProfileCard } from '../../hooks/messaging/useMessageProfileCard';
 import MessageProfileCardHost from './MessageProfileCardHost';
 import { useSettingsStore } from '../../stores/ui/settingsStore';

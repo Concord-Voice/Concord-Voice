@@ -12,8 +12,8 @@ import {
   concat,
   startsWith,
   tag,
-} from '@/renderer/utils/imageMetadata/reader';
-import { stripGif } from '@/renderer/utils/imageMetadata/gif';
+} from '@/renderer/utils/ui/imageMetadata/reader';
+import { stripGif } from '@/renderer/utils/ui/imageMetadata/gif';
 import { buildGifWithSubBlockChain, cat, asc } from './fixtures';
 
 const reader = (values: number[], budget?: number): ByteReader =>

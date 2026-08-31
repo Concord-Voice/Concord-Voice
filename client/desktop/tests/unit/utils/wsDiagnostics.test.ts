@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { summarizeWsDiagnostic, summarizeWsServerError } from '@/renderer/utils/wsDiagnostics';
+import {
+  summarizeWsDiagnostic,
+  summarizeWsServerError,
+} from '@/renderer/utils/runtime/wsDiagnostics';
 
 describe('summarizeWsDiagnostic', () => {
   it('summarizes CloseEvent metadata without logging the raw event', () => {

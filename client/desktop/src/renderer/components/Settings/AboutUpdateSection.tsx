@@ -3,7 +3,7 @@ import CollapsibleSection from './CollapsibleSection';
 import ToggleSwitch from './ToggleSwitch';
 import { SPA_VERSION } from '../../config';
 import { LEGAL_DOCUMENTS } from '../../legalDocuments';
-import { compactSpaHash } from '../../utils/clientVersion';
+import { compactSpaHash } from '../../utils/runtime/clientVersion';
 import './AboutUpdateSection.css';
 
 type UpdateStatus =

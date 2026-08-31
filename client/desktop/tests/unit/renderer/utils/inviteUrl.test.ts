@@ -5,7 +5,7 @@ import {
   buildInviteUrl,
   extractInviteCodes,
   messageInviteCodes,
-} from '@/renderer/utils/inviteUrl';
+} from '@/renderer/utils/messaging/inviteUrl';
 
 describe('inviteUrl', () => {
   it('builds the canonical URL', () => {

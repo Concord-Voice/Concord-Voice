@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useFormState } from '../../hooks/ui/useFormState';
-import { NAME_MAX, validateChannelName, getChannelTypeIcon } from '../../utils/channelHelpers';
+import {
+  NAME_MAX,
+  validateChannelName,
+  getChannelTypeIcon,
+} from '../../utils/messaging/channelHelpers';
 import ChannelEmojiField from './ChannelEmojiField';
 import Modal from '../ui/Modal';
 import CustomSelect from '../ui/CustomSelect';

@@ -1,7 +1,11 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import { mockChannel } from '../../../mocks/fixtures';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { MANAGE_CHANNELS, BASE_PERMISSIONS, ADMIN_PERMISSIONS } from '@/renderer/utils/permissions';
+import {
+  MANAGE_CHANNELS,
+  BASE_PERMISSIONS,
+  ADMIN_PERMISSIONS,
+} from '@/renderer/utils/policy/permissions';
 import ChannelContextMenu from '@/renderer/components/Channels/ChannelContextMenu';
 
 const SERVER_ID = 'server-1';

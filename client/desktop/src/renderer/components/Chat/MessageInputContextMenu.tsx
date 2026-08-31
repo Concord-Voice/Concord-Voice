@@ -1,6 +1,6 @@
 import React from 'react';
 import ContextMenu from '../ui/ContextMenu';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 
 interface MessageInputContextMenuProps {
   position: { x: number; y: number };

@@ -29,7 +29,7 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
   },
 }));
 
-vi.mock('@/renderer/utils/attachmentCrypto', () => ({
+vi.mock('@/renderer/utils/crypto/attachmentCrypto', () => ({
   formatFileSize: (bytes: number) => `${bytes} B`,
   decryptFile: vi.fn(),
 }));
@@ -83,7 +83,7 @@ const DENIED_PROTOCOLS = /^(javascript|data|file|blob|vbscript):/i;
 const enc = new TextEncoder();
 
 async function setupDecryptFile(plaintextString: string) {
-  const { decryptFile } = await import('@/renderer/utils/attachmentCrypto');
+  const { decryptFile } = await import('@/renderer/utils/crypto/attachmentCrypto');
   const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   (e2eeService.getChannelKey as ReturnType<typeof vi.fn>).mockResolvedValue({} as CryptoKey);
   (decryptFile as ReturnType<typeof vi.fn>).mockResolvedValue(enc.encode(plaintextString).buffer);

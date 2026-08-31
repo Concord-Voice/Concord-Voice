@@ -34,7 +34,7 @@ import {
   revokeAbortedSession,
   captureAuthSession,
 } from '../../services/system/apiClient';
-import { type KeyDerivationAlgorithm } from '../../utils/crypto';
+import { type KeyDerivationAlgorithm } from '../../utils/crypto/crypto';
 import { e2eeService, type E2EEInitializationReceipt } from '../../services/e2ee/e2eeService';
 import { E2EEInitTeardownError } from '../../services/e2ee/e2eeErrors';
 import {
@@ -43,7 +43,7 @@ import {
 } from '../../services/system/runtimeServerBase';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
-import { persistE2EESessionKeys } from '../../utils/persistE2EESessionKeys';
+import { persistE2EESessionKeys } from '../../utils/crypto/persistE2EESessionKeys';
 import type { CredentialOwner } from '../../../main/ipcContract';
 import LoadingSpinner from './LoadingSpinner';
 import './SSOEagerUnlock.css';

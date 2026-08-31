@@ -14,7 +14,7 @@ import ChannelSettingsModal from '../Channels/ChannelSettingsModal';
 import CategorySettingsModal from '../Channels/CategorySettingsModal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
-import { MANAGE_ALL_MESSAGES, hasPermission } from '../../utils/permissions';
+import { MANAGE_ALL_MESSAGES, hasPermission } from '../../utils/policy/permissions';
 import { ServerWithRole } from '../../types/server';
 import { Channel, ChannelGroup } from '../../types/chat';
 

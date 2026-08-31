@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compactSpaHash, formatClientVersion } from '@/renderer/utils/clientVersion';
+import { compactSpaHash, formatClientVersion } from '@/renderer/utils/runtime/clientVersion';
 
 const FULL_HASH = 'a'.repeat(40);
 

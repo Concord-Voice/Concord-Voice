@@ -6,8 +6,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripTiff } from '@/renderer/utils/imageMetadata/tiff';
-import { ImageParseError } from '@/renderer/utils/imageMetadata/reader';
+import { stripTiff } from '@/renderer/utils/ui/imageMetadata/tiff';
+import { ImageParseError } from '@/renderer/utils/ui/imageMetadata/reader';
 import {
   GPS_MARKER,
   PIXEL_MARKER,

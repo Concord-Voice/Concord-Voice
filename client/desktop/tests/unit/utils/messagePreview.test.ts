@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CallEventStatus } from '@/renderer/types/chat';
-import { formatMessagePreview } from '@/renderer/utils/messagePreview';
+import { formatMessagePreview } from '@/renderer/utils/messaging/messagePreview';
 
 describe('formatMessagePreview', () => {
   it('keeps plaintext previews primary', () => {

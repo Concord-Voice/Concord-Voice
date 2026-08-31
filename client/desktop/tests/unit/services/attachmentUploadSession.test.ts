@@ -7,7 +7,7 @@ import {
   CHUNK_PLAINTEXT_BYTES,
   ENVELOPE_HEADER_BYTES,
   expectedBlobLength,
-} from '@/renderer/utils/attachmentChunkedCrypto';
+} from '@/renderer/utils/crypto/attachmentChunkedCrypto';
 
 const apiFetch = vi.hoisted(() => vi.fn());
 vi.mock('@/renderer/services/system/apiClient', () => ({ apiFetch }));

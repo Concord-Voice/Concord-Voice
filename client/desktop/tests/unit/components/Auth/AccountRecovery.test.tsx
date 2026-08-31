@@ -6,7 +6,7 @@ const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
 // Mock crypto utilities
-vi.mock('@/renderer/utils/crypto', () => ({
+vi.mock('@/renderer/utils/crypto/crypto', () => ({
   unwrapWithRecoveryKey: vi.fn().mockResolvedValue(new ArrayBuffer(32)),
   generateRegistrationKeys: vi.fn().mockResolvedValue({
     wrappedPrivateKey: 'mock-wrapped-key',
@@ -399,7 +399,7 @@ describe('AccountRecovery', () => {
   });
 
   it('shows error for invalid recovery key', async () => {
-    const { unwrapWithRecoveryKey } = await import('@/renderer/utils/crypto');
+    const { unwrapWithRecoveryKey } = await import('@/renderer/utils/crypto/crypto');
     (unwrapWithRecoveryKey as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
       new Error('Invalid key')
     );

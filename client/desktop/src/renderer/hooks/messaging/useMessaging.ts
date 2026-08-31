@@ -18,7 +18,7 @@ import { getWebSocketService, ConnectionState } from '../../services/messaging/w
 import { getMessageQueue, type QueuedMessage } from '../../services/messaging/messageQueue';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { classifyError } from '../../services/e2ee/e2eeErrors';
-import { errorMessage } from '../../utils/redactError';
+import { errorMessage } from '../../utils/runtime/redactError';
 import type { MessageWithStatus } from '../../types/chat';
 import {
   sendDMMessage as sendDMMessageImpl,

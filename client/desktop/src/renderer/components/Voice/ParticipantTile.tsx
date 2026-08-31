@@ -1,12 +1,12 @@
 import React, { useRef, useEffect, useMemo, useState, useId } from 'react';
 import { prefetchEligibility } from '../../services/system/friendEligibility';
-import { resolveMediaUrl } from '../../utils/resolveMediaUrl';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { MicOff, HeadphoneOff, Lock, Monitor, MoreVertical, Wrench } from 'lucide-react';
 import { VoiceParticipantContextMenu } from './VoiceParticipantContextMenu';
 import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
 import { useVoiceStore, type VoiceParticipant } from '../../stores/voice/voiceStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
-import { resolveUserAccentColors } from '../../utils/schemeColors';
+import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
 import { useRenderStateReporter } from '../../hooks/voice/useRenderStateReporter';
 import './ParticipantTile.css';

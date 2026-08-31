@@ -329,7 +329,7 @@ export default [
             'JSXOpeningElement[name.name=/^(img|video|audio)$/]' +
             ':has(JSXAttribute[name.name="src"] > JSXExpressionContainer > MemberExpression[property.name=/^(avatar_url|avatarUrl|header_image_url|icon_url|banner_url|server_icon)$/])',
           message:
-            'Server-origin media src must be wrapped: src={resolveMediaUrl(x)} (from utils/resolveMediaUrl). A raw relative /api/v1/media/* path resolves against the SPA origin on the remote SPA, not the API host. See [internal]rules/electron.md "API URLs ... MUST be absolute" (#1586). For a local objectURL/blob/data preview, add `eslint-disable-next-line no-restricted-syntax -- <rationale>`.',
+            'Server-origin media src must be wrapped: src={resolveMediaUrl(x)} (from utils/ui/resolveMediaUrl). A raw relative /api/v1/media/* path resolves against the SPA origin on the remote SPA, not the API host. See [internal]rules/electron.md "API URLs ... MUST be absolute" (#1586). For a local objectURL/blob/data preview, add `eslint-disable-next-line no-restricted-syntax -- <rationale>`.',
         },
         // Bare-identifier shape: <img src={avatarUrl}>
         {
@@ -337,7 +337,7 @@ export default [
             'JSXOpeningElement[name.name=/^(img|video|audio)$/]' +
             ':has(JSXAttribute[name.name="src"] > JSXExpressionContainer > Identifier[name=/^(avatarUrl|avatar_url)$/])',
           message:
-            'Server-origin media src must be wrapped: src={resolveMediaUrl(avatarUrl)} (from utils/resolveMediaUrl). See [internal]rules/electron.md "API URLs ... MUST be absolute" (#1586).',
+            'Server-origin media src must be wrapped: src={resolveMediaUrl(avatarUrl)} (from utils/ui/resolveMediaUrl). See [internal]rules/electron.md "API URLs ... MUST be absolute" (#1586).',
         },
       ],
     },
