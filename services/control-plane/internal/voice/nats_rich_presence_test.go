@@ -1468,9 +1468,9 @@ func TestHandleHeartbeat_ServerReconcilesFullStaleSetAt1000ParticipantLimit(t *t
 	})
 
 	var participantCount, refreshedCount int
-	var heartbeatAt time.Time
-	for attempt := range 3 {
-		heartbeatAt = rowAt.Add(time.Minute + time.Duration(attempt)*time.Second)
+	heartbeatAt := rowAt.Add(time.Minute)
+	// Retry one logical heartbeat so deadline-limited partial work accumulates.
+	for range 15 {
 		sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
 			"channelId": channelID,
 			"userIds":   mediaUserIDs,
