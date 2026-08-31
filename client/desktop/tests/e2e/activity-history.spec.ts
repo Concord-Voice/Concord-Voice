@@ -255,10 +255,10 @@ function activityHistoryCard(page: Page): Locator {
     .filter({ has: page.getByRole('heading', { name: 'Activity History', level: 3 }) });
 }
 
-async function openCustomStatusSettings(page: Page): Promise<Locator> {
+async function openRichPresenceSettings(page: Page): Promise<Locator> {
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Settings', level: 1 })).toBeVisible();
-  await settingsNav(page).getByRole('button', { name: 'Custom Status', exact: true }).click();
+  await settingsNav(page).getByRole('button', { name: 'Rich Presence', exact: true }).click();
   const card = activityHistoryCard(page);
   await expect(card).toBeVisible({ timeout: 15_000 });
   return card;
@@ -398,7 +398,7 @@ test.describe('Activity History lifecycle', () => {
   }) => {
     test.slow();
     const session = await registerWithSession(page);
-    const card = await openCustomStatusSettings(page);
+    const card = await openRichPresenceSettings(page);
 
     await expect(card.getByText('Off', { exact: true })).toBeVisible();
     await expect(card.getByRole('switch', { name: 'Activity History' })).not.toBeChecked();
@@ -429,7 +429,7 @@ test.describe('Activity History lifecycle', () => {
     await expect(
       initialFeed.getByRole('heading', { name: 'Activity History', level: 3 })
     ).toBeFocused();
-    await settingsNav(page).getByRole('button', { name: 'Custom Status', exact: true }).click();
+    await settingsNav(page).getByRole('button', { name: 'Rich Presence', exact: true }).click();
     await expect(card).toBeVisible();
 
     await patchPresence(page, session, {
@@ -465,7 +465,7 @@ test.describe('Activity History lifecycle', () => {
     expect(afterTierChange.items[0]?.id).toBe(recorded.id);
     expect(afterTierChange.items[0]?.ended_at).toBeNull();
 
-    await settingsNav(page).getByRole('button', { name: 'Custom Status', exact: true }).click();
+    await settingsNav(page).getByRole('button', { name: 'Rich Presence', exact: true }).click();
     await retention.selectOption('90');
     await expect
       .poll(async () => (await getHistorySettings(page, session)).retention_days)

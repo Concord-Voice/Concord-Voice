@@ -111,7 +111,7 @@ const DMPrivacyControls = ({
               'Also allow DMs from people who share a mutual friend with you'}
           </span>
           <span className="settings-row-hint">
-            This also expands who can see your custom status at the Friends tier.
+            This also expands who can see your rich presence when set to Friends tier.
           </span>
         </div>
         <ToggleSwitch

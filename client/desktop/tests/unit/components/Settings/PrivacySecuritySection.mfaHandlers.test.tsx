@@ -57,7 +57,13 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
 vi.mock('@/renderer/stores/auth/authStore', () => ({
-  useAuthStore: vi.fn((s) => s({ accessToken: 'mock-token' })),
+  useAuthStore: Object.assign(
+    vi.fn((s) => s({ accessToken: 'mock-token', authGeneration: 0 })),
+    {
+      subscribe: vi.fn(),
+      getState: vi.fn(() => ({ accessToken: 'mock-token', authGeneration: 0 })),
+    }
+  ),
 }));
 vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: vi.fn((s) => s({ logout: vi.fn() })),

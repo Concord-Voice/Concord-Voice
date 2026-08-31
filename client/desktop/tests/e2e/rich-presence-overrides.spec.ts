@@ -297,7 +297,7 @@ async function openExceptions(senderPage: Page): Promise<void> {
   await senderPage.getByRole('button', { name: 'Settings', exact: true }).click();
   await expect(senderPage.getByRole('heading', { name: 'Settings', level: 1 })).toBeVisible();
   const settingsNav = senderPage.locator('nav.settings-nav');
-  await settingsNav.getByRole('button', { name: 'Custom Status', exact: true }).click();
+  await settingsNav.getByRole('button', { name: 'Rich Presence', exact: true }).click();
   const summary = senderPage.getByText('Exceptions - 0 people', { exact: true });
   await expect(summary).toBeVisible();
   await summary.click();

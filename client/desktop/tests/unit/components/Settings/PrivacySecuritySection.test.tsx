@@ -36,8 +36,27 @@ const mockPresenceGetFetch = vi.fn(async () => ({
   ok: true,
   status: 200,
   headers: new Headers({ 'Content-Type': 'application/json' }),
-  json: async () => ({ custom_text_tier: 0, custom_text: '', custom_text_emoji: '' }),
-  text: async () => JSON.stringify({ custom_text_tier: 0, custom_text: '', custom_text_emoji: '' }),
+  json: async () => ({
+    master_enabled: true,
+    server_voice_tier: 1,
+    server_voice_show_details: true,
+    private_call_tier: 0,
+    private_call_show_details: false,
+    custom_text_tier: 0,
+    custom_text: null,
+    custom_text_emoji: null,
+  }),
+  text: async () =>
+    JSON.stringify({
+      master_enabled: true,
+      server_voice_tier: 1,
+      server_voice_show_details: true,
+      private_call_tier: 0,
+      private_call_show_details: false,
+      custom_text_tier: 0,
+      custom_text: null,
+      custom_text_emoji: null,
+    }),
 }));
 vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => {
@@ -65,7 +84,13 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
   safeJson: async (res: { json: () => Promise<unknown> }) => res.json(),
 }));
 vi.mock('@/renderer/stores/auth/authStore', () => ({
-  useAuthStore: vi.fn((s) => s({ accessToken: 'mock-token' })),
+  useAuthStore: Object.assign(
+    vi.fn((s) => s({ accessToken: 'mock-token', authGeneration: 0 })),
+    {
+      subscribe: vi.fn(),
+      getState: vi.fn(() => ({ accessToken: 'mock-token', authGeneration: 0 })),
+    }
+  ),
 }));
 vi.mock('@/renderer/stores/auth/userStore', () => ({
   useUserStore: vi.fn((s) => s({ logout: vi.fn() })),
@@ -330,6 +355,16 @@ describe('PrivacySecuritySection', () => {
     render(<PrivacySecuritySection />);
     await vi.waitFor(() =>
       expect(screen.getByText('Allow Friends-of-Friends')).toBeInTheDocument()
+    );
+  });
+  it('explains Rich Presence expansion for Friends tier', async () => {
+    render(<PrivacySecuritySection />);
+    await vi.waitFor(() =>
+      expect(
+        screen.getByText(
+          'This also expands who can see your rich presence when set to Friends tier.'
+        )
+      ).toBeInTheDocument()
     );
   });
   it('renders auto-accept friend codes toggle', async () => {

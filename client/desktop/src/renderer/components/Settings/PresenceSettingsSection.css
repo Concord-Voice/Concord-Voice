@@ -1,9 +1,3 @@
-/* Segmented control for the custom-status visibility tier (#1233 B6).
-   A native <fieldset> (implicit role="group") wrapping native <button>
-   elements, per the accessibility rule (S6819/WCAG) — no role="group" on a
-   <div> and no role+tabIndex spans. The block below resets the user-agent
-   <fieldset> defaults (border, margin, padding, min-inline-size) so the
-   segmented-control visual is identical to the prior <div role="group">. */
 .presence-tier-segmented {
   display: inline-flex;
   flex-shrink: 0;
@@ -16,8 +10,6 @@
   background: var(--bg-tertiary);
 }
 
-/* Visually-hidden legend — provides the accessible group name (replacing the
-   old aria-label) without affecting layout. */
 .presence-tier-legend {
   position: absolute;
   width: 1px;
@@ -53,7 +45,7 @@
 
 .presence-tier-option.active {
   background: var(--accent-primary);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .presence-tier-option:focus-visible {
@@ -61,7 +53,148 @@
   outline-offset: -2px;
 }
 
+.presence-retry-button:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
 .presence-tier-option:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.presence-activity-info {
+  margin: 16px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.presence-activity {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.presence-activity-card {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+}
+
+.presence-activity-card-privateCall {
+  border-color: var(--text-warning-strong);
+}
+
+.presence-activity-card-header h3 {
+  margin: 0 0 4px;
+  color: var(--text-primary);
+  font-size: calc(16px * var(--font-scale, 1));
+}
+
+.presence-activity-card-header p {
+  margin: 0 0 16px;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.45;
+}
+
+.presence-activity-tier-segmented {
+  display: flex;
+  width: 100%;
+}
+
+.presence-activity-tier-segmented .presence-tier-option {
+  flex: 1;
+  min-width: 0;
+  padding-inline: 8px;
+  white-space: normal;
+}
+
+.presence-activity-details-row {
+  align-items: flex-start;
+  margin-top: 12px;
+  padding: 12px 0;
+}
+
+.presence-activity-preview {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 12px;
+  border-radius: 6px;
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.45;
+}
+
+.presence-activity-preview > div {
+  display: grid;
+  gap: 2px;
+}
+
+.presence-preview-label {
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.presence-activity-warning {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 10px;
+  border: 1px dashed var(--text-warning-strong);
+  color: var(--text-warning-strong);
+  font-size: calc(12px * var(--font-scale, 1));
+  line-height: 1.45;
+}
+
+.presence-activity-warning > span:first-child {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.presence-retry-button {
+  margin-top: 8px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.presence-retry-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.presence-retry-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.settings-status {
+  margin: 10px 0;
+  color: var(--text-muted);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+@media (max-width: 640px) {
+  .presence-activity {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .presence-tier-option {
+    transition: none;
+  }
 }

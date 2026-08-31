@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-Concord Voice keeps voice-channel and private-call activity current internally, and invite previews stay tied to the invite you opened. The visible activity view is not part of this update yet.
+Concord Voice now lets you choose who can see your voice-channel and private-call activity, while keeping that activity current internally. Invite previews stay tied to the invite you opened; the visible activity view is not part of this update yet.
+
+### Added
+
+- **You can now choose who sees your voice-channel and private-call activity** ([#3042](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3042)) — Settings ▸ Rich Presence has separate audience and detail controls for server voice and private calls, with a preview of what each choice shares. Turning Rich Presence off hides both categories; people currently in a private call can still see that you are in their call while it is on.
 
 ### Changed
 

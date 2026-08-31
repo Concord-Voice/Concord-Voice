@@ -171,7 +171,7 @@ const NAV_SUBSECTIONS: Record<string, NavSubsection[]> = {
   ],
   privacy: [
     { id: 'privacy-settings', label: 'Privacy' },
-    { id: 'presence-settings', label: 'Custom Status' },
+    { id: 'presence-settings', label: 'Rich Presence' },
     { id: 'system-permissions', label: 'System Permissions' },
     { id: 'mfa', label: 'Multi-Factor Auth' },
     {
