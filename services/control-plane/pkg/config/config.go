@@ -160,8 +160,9 @@ func (c CloudflareKVBridgeConfig) String() string {
 // two account-scoped Cloudflare credential pairs, which are CI-only and must
 // never reach this host-bound rail.
 //
-// Fully optional-resolve today: MinIO remains the sole SaaS WRITE target for
-// attachments/, so what is dormant is the write DEFAULT -- not this struct. The
+// Required on SaaS production even while MinIO remains the write target; a
+// rollback changes the write default but R2-resident rows still need reads and
+// erasure. Self-hosted deployments remain legacy-only and leave this empty. The
 // storage_backend registry landed with ADR-0038 Wave B and does read it:
 // AttachmentBackends() gates each candidate on the credential pair, and
 // storage.NewRegistry builds a vendor client from a seeded pair at boot, after
@@ -169,15 +170,13 @@ func (c CloudflareKVBridgeConfig) String() string {
 // the write-default flip is a later wave's scope. (An earlier revision of this
 // comment said the struct was "not yet consumed by any storage client" and then
 // contradicted itself in the next clause.)
-// Promote AccessKeyID/SecretAccessKey/Bucket to production-required at the
-// write-default flip (ADR-0038 action item 8) — not before, and NOT via a
+// Provision AccessKeyID/SecretAccessKey as required before the selector flip
+// (ADR-0038 action item 8) and keep them required on rollback. This is NOT via a
 // compose fail-loud interpolation: that form has no conditional variant and
 // would break self-host and every deploy on merge (ADR-0038 § Parameters (c),
 // Correction 2026-08-29). The promotion is provision-secrets.yml's
-// required=true plus an application-layer assertion whose site item 8 chooses.
-// The predicate is "write default != legacy", NOT "!= minio" — minio is a
-// STORAGE_BACKEND vendor value, not a registry backend id, and reading it
-// literally would demand this credential from every self-hoster on s3 or b2.
+// required=true plus validateProduction's selector-blind SaaS assertion. It
+// deliberately exempts self-hosted deployments, which are permanently legacy.
 //
 // String() redacts both credential fields; Endpoint/Region/Bucket are
 // non-secret and logged in full.
@@ -469,10 +468,10 @@ func Load() (*Config, error) {
 		StorageUseSSL:               getEnvAlias("STORAGE_USE_SSL", "MINIO_USE_SSL", "false") == "true",
 		StorageBucket:               getEnvAlias("STORAGE_BUCKET", "MINIO_BUCKET", "concord-media"),
 		UploadMaxSize:               getEnvInt64("UPLOAD_MAX_SIZE", 25*1024*1024), // 25 MB default
-		// Cloudflare R2 attachment-bucket credential (ADR-0038). Optional-
-		// resolve while the WRITE DEFAULT is still legacy — see
-		// CloudflareR2Config's doc comment and validateProduction() for the
-		// https://-only endpoint guard.
+		// Cloudflare R2 attachment-bucket credential (ADR-0038). Managed SaaS
+		// production requires the pair for every provision and restart, regardless
+		// of the write selector; only self-hosted leaves it empty. See
+		// CloudflareR2Config and validateProduction().
 		//
 		// Two different provenances share this block, and the distinction is
 		// the point. Endpoint/Region/Bucket are DEPLOYMENT-PINNED literals,
@@ -1044,6 +1043,10 @@ func (c *Config) vendorEndpointIsPlaintext() bool {
 	return c.CloudflareR2.Endpoint != "" && !strings.HasPrefix(c.CloudflareR2.Endpoint, "https://")
 }
 
+func (c *Config) managedR2CredentialMissing(value string) bool {
+	return !IsSelfHostedInstance(c.InstanceType) && strings.TrimSpace(value) == ""
+}
+
 func (c *Config) storageDestinationEscapesTheCluster() bool {
 	if c.InstanceType == InstanceTypeSelfHosted {
 		return false
@@ -1126,22 +1129,16 @@ func (c *Config) validateProduction() error {
 		// so the unsafe combination is the one you get by omission.
 		{c.storageTravelsInTheClear(),
 			"STORAGE_USE_SSL must be true when STORAGE_ENDPOINT is not an in-cluster host. Plaintext object storage is only acceptable over the private container network."},
-		// ADR-0038 — Cloudflare R2 attachment-bucket endpoint. TLS is
-		// mandatory and NOT configurable for this backend: unlike
-		// STORAGE_USE_SSL above (which exists only for the in-cluster MinIO
-		// dial), there is no *_USE_SSL escape hatch here. Fires only when an
-		// endpoint is actually configured — the backend is dormant by
-		// default (MinIO remains the SaaS write target; only
-		// docker-compose.production.yml sets this literal today), so an
-		// empty value is not an error. Do NOT add a required-in-production
-		// guard for Bucket/AccessKeyID/SecretAccessKey here yet — that
-		// promotion rides the write-default flip (ADR-0038 action item 8),
-		// together with provision-secrets.yml's required=true. It is NOT
-		// paired with a compose fail-loud form: that limb was struck as wrong
-		// (ADR-0038 § Parameters (c), Correction 2026-08-29). Whether the guard
-		// can live in this function at all depends on item 8 wiring the write
-		// default to configuration; today it cannot, because internal/storage
-		// imports this package and not the reverse.
+		// ADR-0038 — the attachment-bucket credential is required on every SaaS
+		// production boot, even while the write selector is legacy. Rollback
+		// changes where new objects land; it does not remove the need to read
+		// and reap R2-resident rows. Self-hosted stays legacy-only and exempt.
+		{c.managedR2CredentialMissing(c.CloudflareR2.AccessKeyID),
+			"CLOUDFLARE_R2_USEAST_ID must be set on SaaS production deployments for attachment reads and erasure."},
+		{c.managedR2CredentialMissing(c.CloudflareR2.SecretAccessKey),
+			"CLOUDFLARE_R2_USEAST_ID_KEY must be set on SaaS production deployments for attachment reads and erasure."},
+		// TLS is mandatory and has no *_USE_SSL escape hatch. The endpoint is
+		// a reviewed compose literal; empty remains valid for self-hosted.
 		{c.vendorEndpointIsPlaintext(),
 			"CLOUDFLARE_R2_USEAST_ENDPOINT must use https:// — TLS is mandatory for the Cloudflare R2 attachment backend and there is no *_USE_SSL escape hatch."},
 		{invalidHSTSHeaderValue(c.HSTSHeaderValue),

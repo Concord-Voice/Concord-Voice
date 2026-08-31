@@ -10,6 +10,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,6 +113,14 @@ func reapedAt(t *testing.T, db *sql.DB, key string) *time.Time {
 	require.NoError(t, db.QueryRow(
 		`SELECT blob_reaped_at FROM media_files WHERE storage_key = $1`, key).Scan(&at))
 	return at
+}
+
+func reapAttempts(t *testing.T, db *sql.DB, key string) int {
+	t.Helper()
+	var attempts int
+	require.NoError(t, db.QueryRow(
+		`SELECT reap_attempts FROM media_files WHERE storage_key = $1`, key).Scan(&attempts))
+	return attempts
 }
 
 // TestSweepOnce_ReapsOnlyEligibleStragglers locks the sweep predicate: a row past the
@@ -419,6 +429,7 @@ func TestReapBlob_NonLegacyBackendSuccessMarksReaped(t *testing.T) {
 	r.reapBlob(context.Background(), media.BlobRef{Key: key, Backend: &backend})
 
 	assert.NotNil(t, reapedAt(t, db, key), "a successful delete on a non-legacy backend must be marked")
+	assert.Equal(t, 0, reapAttempts(t, db, key), "a successful delete must not increment failure attempts")
 	assert.Equal(t, []string{key}, fake.keys)
 }
 
@@ -439,6 +450,7 @@ func TestReapBlob_UnresolvableBackendIsNotMarked(t *testing.T) {
 
 	assert.Nil(t, reapedAt(t, db, key),
 		"an unresolvable backend must NOT be recorded as reaped — the object may still exist")
+	assert.Equal(t, 1, reapAttempts(t, db, key), "an unresolvable backend must count as a failed attempt")
 }
 
 // TestReapBlob_FailedDeleteIsNotMarked — same fail-closed shape for a delete
@@ -456,6 +468,7 @@ func TestReapBlob_FailedDeleteIsNotMarked(t *testing.T) {
 	r.reapBlob(context.Background(), media.BlobRef{Key: key, Backend: &backend})
 
 	assert.Nil(t, reapedAt(t, db, key), "a failed delete must NOT be marked reaped")
+	assert.Equal(t, 1, reapAttempts(t, db, key), "a failed delete must count as a failed attempt")
 	assert.Equal(t, 1, failing.calls)
 }
 
@@ -475,7 +488,130 @@ func TestReapBlob_NoResolverRefusesARowThatNamesABackend(t *testing.T) {
 	backend := "r2-useast"
 	r.reapBlob(context.Background(), media.BlobRef{Key: named, Backend: &backend})
 	assert.Nil(t, reapedAt(t, db, named), "a row naming a backend must not be marked with no resolver wired")
+	assert.Equal(t, 1, reapAttempts(t, db, named), "a missing resolver must count as a failed attempt")
 
 	r.reapBlob(context.Background(), media.BlobRef{Key: nullRow})
 	assert.NotNil(t, reapedAt(t, db, nullRow), "a NULL row has no blob to leak and must be marked")
+	assert.Equal(t, 0, reapAttempts(t, db, nullRow), "a successful no-backend reap must not increment attempts")
+}
+
+func TestCollectStragglers_RetryReservationRotatesCandidates(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	channelID := seedAttachmentChannel(t, db, uploader)
+	const retryPrefix = "attachments/fairness-retry-"
+	const freshPrefix = "attachments/fairness-fresh-"
+	_, err := db.Exec(`
+		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version, channel_id,
+		                         mime_type, file_size, storage_key, storage_backend,
+		                         deleted_at, reap_attempts)
+		SELECT $1, 'file', 2, 1, $2, 'application/octet-stream', 1,
+		       CASE WHEN n <= 101 THEN $3 || n ELSE $4 || n END,
+		       'r2-useast', NOW() - make_interval(secs => $5),
+		       CASE WHEN n <= 101 THEN 1 ELSE 0 END
+		FROM generate_series(1, 1101) AS candidates(n)`,
+		uploader, channelID, retryPrefix, freshPrefix, stragglerGraceSeconds+600)
+	require.NoError(t, err)
+
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), stubDeleterResolver{err: errors.New("backend unavailable")})
+	refs, err := r.collectStragglers(context.Background())
+	require.NoError(t, err)
+	require.Len(t, refs, stragglerSweepLimit)
+	for i, ref := range refs[:900] {
+		require.True(t, strings.HasPrefix(ref.Key, freshPrefix),
+			"fresh work must run before potentially stalled retries; position %d held %q", i, ref.Key)
+	}
+
+	selectedRetries := make([]media.BlobRef, 0, stragglerSweepLimit/10)
+	selectedFresh := 0
+	selected := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if strings.HasPrefix(ref.Key, retryPrefix) {
+			selectedRetries = append(selectedRetries, ref)
+			selected[ref.Key] = struct{}{}
+		} else if strings.HasPrefix(ref.Key, freshPrefix) {
+			selectedFresh++
+		}
+	}
+	require.Len(t, selectedRetries, stragglerSweepLimit/10,
+		"the reserved retry lane must survive saturated fresh work")
+	assert.Equal(t, 900, selectedFresh, "fresh work must fill the remainder of the stride")
+
+	backend := "r2-useast"
+	for _, ref := range selectedRetries {
+		r.reapBlob(context.Background(), media.BlobRef{Key: ref.Key, Backend: &backend})
+	}
+
+	second, err := r.collectStragglers(context.Background())
+	require.NoError(t, err)
+	require.Len(t, second, stragglerSweepLimit)
+
+	var excluded string
+	for n := 1; n <= 101; n++ {
+		key := retryPrefix + strconv.Itoa(n)
+		if _, ok := selected[key]; !ok {
+			excluded = key
+			break
+		}
+	}
+	require.NotEmpty(t, excluded, "first collection must leave exactly one retry candidate behind")
+	assert.Contains(t, retryKeys(second, retryPrefix), excluded,
+		"the previously excluded lower-attempt retry must rotate into the next collection")
+}
+
+func retryKeys(refs []media.BlobRef, prefix string) []string {
+	keys := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if strings.HasPrefix(ref.Key, prefix) {
+			keys = append(keys, ref.Key)
+		}
+	}
+	return keys
+}
+
+func TestCollectStragglers_ReservesEachBackendRetryLane(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	channelID := seedAttachmentChannel(t, db, uploader)
+	const r2Prefix = "attachments/backend-fairness-r2-"
+	const legacyKey = "attachments/backend-fairness-legacy"
+	const freshPrefix = "attachments/backend-fairness-fresh-"
+	_, err := db.Exec(`
+		INSERT INTO media_files (uploader_id, file_type, media_tier, key_version, channel_id,
+		                         mime_type, file_size, storage_key, storage_backend,
+		                         deleted_at, reap_attempts)
+		SELECT $1, 'file', 2, 1, $2, 'application/octet-stream', 1,
+		       CASE WHEN n <= 100 THEN $3 || n
+		            WHEN n = 101 THEN $4
+		            ELSE $5 || n END,
+		       CASE WHEN n <= 100 THEN 'r2-useast' ELSE NULL END,
+		       NOW() - make_interval(secs => $6),
+		       CASE WHEN n <= 100 THEN 1 WHEN n = 101 THEN 2 ELSE 0 END
+		FROM generate_series(1, 1001) AS candidates(n)`,
+		uploader, channelID, r2Prefix, legacyKey, freshPrefix, stragglerGraceSeconds+600)
+	require.NoError(t, err)
+
+	r := NewReaper(db, logger.NewWithWriter(io.Discard), nil)
+	refs, err := r.collectStragglers(context.Background())
+	require.NoError(t, err)
+	require.Len(t, refs, stragglerSweepLimit)
+
+	legacySelected := false
+	r2Retries := 0
+	fresh := 0
+	for _, ref := range refs {
+		switch {
+		case ref.Key == legacyKey:
+			legacySelected = true
+			require.Nil(t, ref.Backend, "NULL storage_backend is the legacy placement")
+		case strings.HasPrefix(ref.Key, r2Prefix):
+			r2Retries++
+		case strings.HasPrefix(ref.Key, freshPrefix):
+			fresh++
+		}
+	}
+	assert.True(t, legacySelected,
+		"the legacy retry must be reserved even when R2 has 100 competing retries")
+	assert.Equal(t, 99, r2Retries)
+	assert.Equal(t, 900, fresh)
 }

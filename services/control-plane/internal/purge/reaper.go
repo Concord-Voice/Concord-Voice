@@ -3,6 +3,7 @@ package purge
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -19,6 +20,10 @@ const (
 	// stragglerSweepInterval is how often the crash-orphan sweep runs.
 	stragglerSweepInterval = 15 * time.Minute
 
+	// blobDeleteTimeout prevents one stalled backend request from pinning the
+	// serial queue worker or straggler sweep indefinitely.
+	blobDeleteTimeout = 15 * time.Second
+
 	// stragglerGraceSeconds excludes rows soft-deleted so recently that the
 	// background worker is still expected to be draining them (do not race it).
 	stragglerGraceSeconds = 300 // 5 minutes
@@ -26,6 +31,7 @@ const (
 	// stragglerSweepLimit bounds rows scanned per sweep tick. It is a stride, NOT a
 	// cap: reaped rows are marked (blob_reaped_at) and therefore leave the candidate
 	// set, so consecutive ticks advance through the backlog until it is drained.
+	// One tenth is reserved for retries so persistent failures cannot fill a tick.
 	stragglerSweepLimit = 1000
 )
 
@@ -136,6 +142,7 @@ func (r *Reaper) reapBlob(ctx context.Context, ref media.BlobRef) {
 		if ref.Backend != nil {
 			r.log.Error("purge reaper: row names a storage backend but no resolver is wired; leaving unmarked for sweep retry",
 				"key", ref.Key, "storage_backend", ref.BackendLabel())
+			r.recordReapFailure(ctx, ref)
 			return
 		}
 		r.markReaped(ctx, ref)
@@ -146,11 +153,16 @@ func (r *Reaper) reapBlob(ctx context.Context, ref media.BlobRef) {
 	if err != nil {
 		r.log.Error("purge reaper: could not resolve the storage backend for a blob; leaving unmarked for sweep retry",
 			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+		r.recordReapFailure(ctx, ref)
 		return
 	}
-	if err := store.DeleteObject(ctx, ref.Key); err != nil {
+	deleteCtx, cancel := context.WithTimeout(ctx, blobDeleteTimeout)
+	deleteErr := store.DeleteObject(deleteCtx, ref.Key)
+	cancel()
+	if deleteErr != nil {
 		r.log.Warn("purge reaper: blob delete failed; leaving unmarked for sweep retry",
-			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+			"error", deleteErr, "key", ref.Key, "storage_backend", ref.BackendLabel())
+		r.recordReapFailure(ctx, ref)
 		return
 	}
 	r.markReaped(ctx, ref)
@@ -189,6 +201,7 @@ func (r *Reaper) reapSweptBlob(ctx context.Context, ref media.BlobRef) {
 		// an object whose live-reference status could not be established.
 		r.log.Warn("purge reaper: live-key check failed; skipping reap for retry",
 			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+		r.recordReapFailure(ctx, ref)
 		return
 	}
 	if liveExists {
@@ -218,15 +231,13 @@ func (r *Reaper) markReaped(ctx context.Context, ref media.BlobRef) {
 // This is the ONLY guarantee that an EnqueueBlobDeletes drop is recoverable, so it
 // must have no upper time bound — see stragglerSweepQuery.
 //
-// Accepted limitation (head-of-line): a failed delete stays unmarked and keeps its
-// old deleted_at, so if a full stride's worth of the OLDEST rows fail persistently
-// while storage is otherwise healthy, each tick re-selects that same set and newer
-// rows wait behind it. Not fixed here: the realistic failures are storage-wide
-// (nothing to starve — every key is stuck) or transient (clears on the next tick),
-// a persistently-failing subset of 1000+ keys is exotic, and each failure logs. New
-// purges are also unaffected — they reap through the queue; only this safety net
-// backs up. Upgrade path if it ever bites: a reap_attempts counter ordered
-// (attempts, deleted_at) so repeat failures sink instead of blocking the head.
+// Failed deletes stay unmarked but increment reap_attempts. Each tick reserves 10%
+// (100 rows) for retries and fills the rest with fresh rows, so persistent failures
+// cannot pin the stride. No finite worker guarantees retry progress: active backend
+// groups must stay below 100, and persistent retry arrivals must stay below service
+// capacity. The counter is keyed by the row's (storage_key, storage_backend) pair,
+// preserving the placement claim that the delete path must never substitute from
+// another row.
 //
 // An unresolvable BACKEND now joins that same class: those rows also stay unmarked
 // and are retried every tick, which is the intended trade — a loud, bounded retry
@@ -262,15 +273,19 @@ func (r *Reaper) sweepOnce(ctx context.Context) {
 // collectStragglers reads the next stride of unreaped straggler blobs, each with
 // the backend its row names. The backend comes from the SAME ROW as the key, in
 // the same scan — the sweep never re-queries for placement it already selected.
-func (r *Reaper) collectStragglers(ctx context.Context) ([]media.BlobRef, error) {
+func (r *Reaper) collectStragglers(ctx context.Context) (refs []media.BlobRef, returnErr error) {
 	rows, err := r.db.QueryContext(ctx, stragglerSweepQuery,
 		stragglerGraceSeconds, stragglerSweepLimit)
 	if err != nil {
 		return nil, fmt.Errorf("purge reaper: straggler query: %w", err)
 	}
-	defer rows.Close() //nolint:errcheck
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			refs = nil
+			returnErr = errors.Join(returnErr, fmt.Errorf("purge reaper: close straggler rows: %w", closeErr))
+		}
+	}()
 
-	var refs []media.BlobRef
 	for rows.Next() {
 		var key string
 		var backend sql.NullString
@@ -313,6 +328,9 @@ func (r *Reaper) collectStragglers(ctx context.Context) ([]media.BlobRef, error)
 //
 // Declared const (not a function returning a literal) so static analysis can see the
 // query is not dynamically constructed — no identifier or value is ever interpolated.
+// The three materialized lanes reserve 10% of a stride for backend-fair retry rows,
+// use the remainder for fresh rows, then backfill an underfull fresh lane with more
+// retries. Fresh rows execute first so a stalled retry backend cannot block them.
 // `media_tier = 2` bounds the sweep to MESSAGE ATTACHMENTS — the only rows a purge
 // can orphan (the engine's reap CTE joins message_attachments / dm_message_attachments,
 // and the valid_media_context CHECK makes tier 2 exactly the channel/conversation-scoped
@@ -330,13 +348,53 @@ func (r *Reaper) collectStragglers(ctx context.Context) ([]media.BlobRef, error)
 // Do NOT widen this to all tiers to "also clean up old avatars": tier-1 uploads write
 // the object BEFORE inserting the row (media/handlers.go PutObject → insertTier1Record),
 // so a sweep racing a re-upload would delete the live asset's object out from under it.
-const stragglerSweepQuery = `SELECT storage_key, storage_backend FROM media_files
-	         WHERE deleted_at IS NOT NULL
-	           AND blob_reaped_at IS NULL
-	           AND media_tier = 2
-	           AND deleted_at < NOW() - make_interval(secs => $1)
-	         ORDER BY deleted_at
-	         LIMIT $2`
+const stragglerSweepQuery = `WITH retry_ranked AS MATERIALIZED (
+	SELECT id, storage_key, storage_backend, reap_attempts, deleted_at,
+	       row_number() OVER (
+	         PARTITION BY COALESCE(storage_backend, 'legacy')
+	         ORDER BY reap_attempts, deleted_at
+	       ) AS backend_rank
+	  FROM media_files
+	 WHERE deleted_at IS NOT NULL
+	   AND blob_reaped_at IS NULL
+	   AND media_tier = 2
+	   AND deleted_at < NOW() - make_interval(secs => $1)
+	   AND reap_attempts > 0
+	), retry_reservation AS MATERIALIZED (
+	SELECT id, storage_key, storage_backend, reap_attempts, deleted_at, backend_rank
+	  FROM retry_ranked
+	 ORDER BY backend_rank, reap_attempts, deleted_at
+	 LIMIT GREATEST(1, $2 / 10)
+), fresh AS MATERIALIZED (
+	SELECT id, storage_key, storage_backend, reap_attempts, deleted_at
+	  FROM media_files
+	 WHERE deleted_at IS NOT NULL
+	   AND blob_reaped_at IS NULL
+	   AND media_tier = 2
+	   AND deleted_at < NOW() - make_interval(secs => $1)
+	   AND reap_attempts = 0
+	 ORDER BY deleted_at
+	 LIMIT GREATEST($2 - (SELECT count(*) FROM retry_reservation), 0)
+), retry_overflow AS MATERIALIZED (
+	SELECT id, storage_key, storage_backend, reap_attempts, deleted_at, backend_rank
+	  FROM retry_ranked
+	 WHERE NOT EXISTS (SELECT 1 FROM retry_reservation WHERE retry_reservation.id = retry_ranked.id)
+	 ORDER BY backend_rank, reap_attempts, deleted_at
+	 LIMIT GREATEST(
+		$2 - (SELECT count(*) FROM retry_reservation) - (SELECT count(*) FROM fresh),
+		0
+	 )
+)
+SELECT storage_key, storage_backend
+  FROM (
+	SELECT 0 AS lane, storage_key, storage_backend, reap_attempts, deleted_at, NULL::bigint AS backend_rank FROM fresh
+	UNION ALL
+	SELECT 1, storage_key, storage_backend, reap_attempts, deleted_at, backend_rank FROM retry_reservation
+	UNION ALL
+	SELECT 2, storage_key, storage_backend, reap_attempts, deleted_at, backend_rank FROM retry_overflow
+  ) AS selected
+ ORDER BY lane, backend_rank NULLS LAST, reap_attempts, deleted_at
+ LIMIT $2`
 
 // markBlobReapedQuery records a confirmed object delete. Guarded on
 // blob_reaped_at IS NULL so a concurrent worker/sweep re-mark is a no-op.
@@ -366,6 +424,26 @@ const markBlobReapedQuery = `UPDATE media_files SET blob_reaped_at = NOW()
 	           AND storage_backend IS NOT DISTINCT FROM $2::text
 	           AND deleted_at IS NOT NULL
 	           AND blob_reaped_at IS NULL`
+
+// incrementReapAttemptsQuery records a failed delete without retiring the row from
+// the sweep. Pair-keying keeps retry state attached to the object named by this row.
+const incrementReapAttemptsQuery = `UPDATE media_files SET reap_attempts = reap_attempts + 1
+	         WHERE storage_key = $1
+	           AND storage_backend IS NOT DISTINCT FROM $2::text
+	           AND deleted_at IS NOT NULL
+	           AND blob_reaped_at IS NULL`
+
+// recordReapFailure advances a failed row's fairness counter. Concurrent worker
+// and sweep failures each count because this is an atomic ranking signal, not an
+// idempotency token. Best-effort: failure accounting cannot turn a failed delete
+// into a successful reap, so any database error is logged and the row remains
+// eligible for another attempt.
+func (r *Reaper) recordReapFailure(ctx context.Context, ref media.BlobRef) {
+	if _, err := r.db.ExecContext(ctx, incrementReapAttemptsQuery, ref.Key, ref.Backend); err != nil {
+		r.log.Warn("purge reaper: failed to record blob reap failure",
+			"error", err, "key", ref.Key, "storage_backend", ref.BackendLabel())
+	}
+}
 
 // liveRowForKeyQuery reports whether any LIVE (not soft-deleted) media_files row
 // still points at this OBJECT — i.e. whether it is still in use.

@@ -1,8 +1,11 @@
 package purge
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -31,6 +34,54 @@ func failingDB(t *testing.T) *sql.DB {
 	return db
 }
 
+var errReaperRowsClose = errors.New("forced reaper rows close failure")
+
+type reaperRowsCloseConnector struct{}
+
+func (reaperRowsCloseConnector) Connect(context.Context) (driver.Conn, error) {
+	return reaperRowsCloseConn{}, nil
+}
+
+func (reaperRowsCloseConnector) Driver() driver.Driver { return reaperRowsCloseDriver{} }
+
+type reaperRowsCloseDriver struct{}
+
+func (reaperRowsCloseDriver) Open(string) (driver.Conn, error) { return reaperRowsCloseConn{}, nil }
+
+type reaperRowsCloseConn struct{}
+
+func (reaperRowsCloseConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not supported")
+}
+
+func (reaperRowsCloseConn) Close() error { return nil }
+func (reaperRowsCloseConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not supported")
+}
+
+func (reaperRowsCloseConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return &reaperRowsCloseRows{}, nil
+}
+
+type reaperRowsCloseRows struct{ delivered bool }
+
+func (*reaperRowsCloseRows) Columns() []string {
+	return []string{"storage_key", "storage_backend"}
+}
+func (*reaperRowsCloseRows) Close() error           { return errReaperRowsClose }
+func (*reaperRowsCloseRows) HasNextResultSet() bool { return true }
+func (*reaperRowsCloseRows) NextResultSet() error   { return io.EOF }
+
+func (r *reaperRowsCloseRows) Next(values []driver.Value) error {
+	if r.delivered {
+		return io.EOF
+	}
+	r.delivered = true
+	values[0] = "attachments/test"
+	values[1] = nil
+	return nil
+}
+
 // fakeDeleter records every storage key it is asked to delete and (optionally)
 // signals each on a channel so a test can wait for the worker to drain.
 type fakeDeleter struct {
@@ -47,6 +98,27 @@ func (f *fakeDeleter) DeleteObject(_ context.Context, key string) error {
 		f.seen <- key
 	}
 	return nil
+}
+
+type deadlineRecordingDeleter struct {
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (d *deadlineRecordingDeleter) DeleteObject(ctx context.Context, _ string) error {
+	d.deadline, d.hasDeadline = ctx.Deadline()
+	return nil
+}
+
+func TestReaper_ReapBlob_BoundsDelete(t *testing.T) {
+	fake := &deadlineRecordingDeleter{}
+	r := NewReaper(failingDB(t), testLogger(), media.NewDeleterResolver(nil, fake))
+	started := time.Now()
+
+	r.reapBlob(context.Background(), media.BlobRef{Key: "attachments/deadline"})
+
+	require.True(t, fake.hasDeadline, "storage delete must not pin the serial reaper indefinitely")
+	assert.WithinDuration(t, started.Add(15*time.Second), fake.deadline, time.Second)
 }
 
 func TestReaper_EnqueueDrainsEveryKeyToDeleter(t *testing.T) {
@@ -119,7 +191,17 @@ func TestStragglerSweepQuery_Shape(t *testing.T) {
 	assert.Contains(t, q, "deleted_at IS NOT NULL")
 	assert.Contains(t, q, "blob_reaped_at IS NULL")    // retires reaped rows — see below
 	assert.Contains(t, q, "make_interval(secs => $1)") // grace lower bound
-	assert.Contains(t, q, "LIMIT $2")                  // per-tick stride
+	assert.Contains(t, q, "WITH retry_ranked AS MATERIALIZED")
+	assert.Contains(t, q, "row_number() OVER")
+	assert.Contains(t, q, "PARTITION BY COALESCE(storage_backend, 'legacy')")
+	assert.Contains(t, q, "fresh AS MATERIALIZED")
+	assert.Contains(t, q, "retry_overflow AS MATERIALIZED")
+	assert.Contains(t, q, "reap_attempts > 0")
+	assert.Contains(t, q, "ORDER BY backend_rank, reap_attempts, deleted_at")
+	assert.Contains(t, q, "reap_attempts = 0")
+	assert.Contains(t, q, "LIMIT GREATEST(1, $2 / 10)")
+	assert.Contains(t, q, "NOT EXISTS (SELECT 1 FROM retry_reservation")
+	assert.Contains(t, q, "LIMIT $2") // final stride cap
 
 	// #1352 regression lock, cheap enough to assert on the SQL itself. There must be
 	// no upper time bound: one aged a row out of the sweep permanently, leaking any
@@ -135,6 +217,27 @@ func TestReaper_CollectStragglers_SurfacesQueryError(t *testing.T) {
 	r := NewReaper(failingDB(t), testLogger(), nil)
 	_, err := r.collectStragglers(context.Background())
 	require.Error(t, err)
+}
+
+func TestReaper_CollectStragglers_SurfacesRowsCloseError(t *testing.T) {
+	db := sql.OpenDB(reaperRowsCloseConnector{})
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	r := NewReaper(db, testLogger(), nil)
+	_, err := r.collectStragglers(context.Background())
+	require.ErrorIs(t, err, errReaperRowsClose)
+	assert.ErrorContains(t, err, "purge reaper: close straggler rows")
+	assert.NotContains(t, err.Error(), "purge reaper: straggler scan")
+}
+
+func TestReaper_ReapSweptBlob_LiveCheckErrorAttemptsFailureAccounting(t *testing.T) {
+	var logs bytes.Buffer
+	r := NewReaper(failingDB(t), logger.NewWithWriter(&logs), nil)
+
+	r.reapSweptBlob(context.Background(), media.BlobRef{Key: "attachments/live-check-error"})
+
+	assert.Contains(t, logs.String(), "failed to record blob reap failure",
+		"a failed live-key check must attempt to move the row into the retry lane")
 }
 
 func TestReaper_SweepOnce_DoesNotPanicOnQueryError(t *testing.T) {

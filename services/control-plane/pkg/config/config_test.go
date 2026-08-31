@@ -282,15 +282,19 @@ func validProductionConfig() *Config { // #nosec G101 -- test fixture with fake 
 	dbURL := "postgres://concord:" + testVal + "@db:5432/concord?sslmode=disable" //nolint:gosec // test fixture
 	redisURL := "redis://:" + testVal + "@redis:6379"                             //nolint:gosec // test fixture
 	return &Config{                                                               //nolint:gosec // G101: test fixture with fake values, not real credentials
-		Environment:       "production",
-		JWTSecret:         "real-production-jwt-secret", //nolint:gosec // G101 false positive: test fixture, not a real secret
-		DatabaseURL:       dbURL,
-		RedisURL:          redisURL,
-		MFAEncryptionKey:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		StorageSecretKey:  "real-minio-secret",
-		StorageAccessKey:  "real-minio-access",
-		StorageEndpoint:   "minio:9000",
-		StorageBucket:     "concord-media",
+		Environment:      "production",
+		JWTSecret:        "real-production-jwt-secret", //nolint:gosec // G101 false positive: test fixture, not a real secret
+		DatabaseURL:      dbURL,
+		RedisURL:         redisURL,
+		MFAEncryptionKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		StorageSecretKey: "real-minio-secret",
+		StorageAccessKey: "real-minio-access",
+		StorageEndpoint:  "minio:9000",
+		StorageBucket:    "concord-media",
+		CloudflareR2: CloudflareR2Config{
+			AccessKeyID:     "test-r2-access-key-id",
+			SecretAccessKey: "test-r2-secret-access-key", // pragma: allowlist secret
+		},
 		SMTPHost:          "smtp.example.com",
 		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
 		// Satisfy the #725 MEDIA_PLANE_URL production guards: must be set,
@@ -321,6 +325,33 @@ func TestValidateDevelopmentSkipsAllChecks(t *testing.T) {
 func TestValidateProductionPassesWithValidConfig(t *testing.T) {
 	cfg := validProductionConfig()
 	assert.NoError(t, cfg.validate())
+}
+
+func TestValidateProductionRequiresCloudflareR2CredentialsWhileSelectorIsLegacy(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		missing func(*Config)
+		want    string
+	}{
+		{"access key", func(cfg *Config) { cfg.CloudflareR2.AccessKeyID = "" }, "CLOUDFLARE_R2_USEAST_ID"},
+		{"secret key", func(cfg *Config) { cfg.CloudflareR2.SecretAccessKey = "" }, "CLOUDFLARE_R2_USEAST_ID_KEY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validProductionConfig()
+			cfg.AttachmentWriteBackend = LegacyAttachmentBackendID
+			tc.missing(cfg)
+			err := cfg.validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+
+	t.Run("self-hosted remains legacy-only without R2 credentials", func(t *testing.T) {
+		cfg := validProductionConfig()
+		cfg.InstanceType = InstanceTypeSelfHosted
+		cfg.CloudflareR2 = CloudflareR2Config{}
+		assert.NoError(t, cfg.validate())
+	})
 }
 
 // TestValidateRedemptionAdminToken covers the #1303 issuer-authz token guard:
@@ -1257,36 +1288,8 @@ func TestValidate_WarnsOnBroadRFC1918Fallback(t *testing.T) {
 		log.SetOutput(oldOutput)
 	})
 
-	// Build a config that satisfies all production guards.
-	// Use concatenation for URLs so detect-secrets doesn't flag embedded basic-auth.
-	pw := "pass"                                          //nolint:gosec // test fixture, not a real credential
-	dbURL := "postgres://prod:" + pw + "@db:5432/concord" //nolint:gosec // test fixture
-	redisURL := "redis://:" + pw + "@redis:6379"          //nolint:gosec // test fixture
-	cfg := &Config{                                       //nolint:gosec // G101: test fixture with fake values, not real credentials
-		Environment:       "production",
-		JWTSecret:         "real-secret-not-default", //nolint:gosec // G101 false positive: test fixture
-		DatabaseURL:       dbURL,
-		RedisURL:          redisURL,
-		MFAEncryptionKey:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		StorageAccessKey:  "ak",
-		StorageSecretKey:  "real-minio-secret",
-		StorageEndpoint:   "minio:9000",
-		StorageBucket:     "concord-media",
-		SMTPHost:          "smtp.example.com",
-		TrustedProxyCIDRs: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
-		MediaPlaneURL:     "https://media.concordvoice.chat",
-		// #158 — feedback handler production guards.
-		GitHubFeedback: GitHubFeedbackConfig{ //nolint:gosec // G101: test fixture with fake PAT
-			Token: "ghp_real_production_pat", // #nosec G101 -- test fixture, not a real PAT
-			Repo:  "Concord-Voice/Concord-Voice-Feedback",
-		},
-		// #1688 — admin WebAuthn production guards.
-		AdminWebAuthnRPID:           "admin.concordvoice.chat",
-		AdminWebAuthnRPOrigins:      []string{"https://admin.concordvoice.chat"},
-		AdminWebAuthnAllowedAAGUIDs: []string{"ee882879-721c-4913-9775-3dfcce97072a"},
-		CFAccessAUD:                 "test-access-aud",
-		CFAccessTeamDomain:          "https://team.cloudflareaccess.com",
-	}
+	cfg := validProductionConfig()
+	cfg.TrustedProxyCIDRs = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 
 	err := cfg.validate()
 	require.NoError(t, err)
@@ -1513,11 +1516,9 @@ func TestLoad_CloudflareR2_ReadsAllFieldsFromEnv(t *testing.T) {
 
 // TestValidateProductionCloudflareR2Endpoint pins the ADR-0038 TLS-mandatory
 // guard: unlike STORAGE_USE_SSL, there is no escape hatch for this backend.
-// The guard fires ONLY when an endpoint is actually configured — the dormant
-// zero-value state (exercised by validProductionConfig's zero-value
-// CloudflareR2 field) must keep passing production validation unmodified.
+// Credential requiredness is covered separately; this isolates endpoint shape.
 func TestValidateProductionCloudflareR2Endpoint(t *testing.T) {
-	t.Run("dormant (empty endpoint) passes", func(t *testing.T) {
+	t.Run("empty endpoint does not trigger the TLS guard", func(t *testing.T) {
 		cfg := validProductionConfig()
 		cfg.CloudflareR2.Endpoint = ""
 		assert.NoError(t, cfg.validate())
