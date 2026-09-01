@@ -29,7 +29,7 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@typescript/native": "npm:typescript@~7.0.2",
-    "@vitejs/plugin-react": "^6.0.5",
+    "@vitejs/plugin-react": "^6.1.0",
     "@vitest/coverage-istanbul": "^4.1.9",
     "eslint": "^10.8.1",
     "eslint-config-prettier": "^10.1.8",
@@ -39,7 +39,7 @@
     "prettier": "^3.9.6",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.67.0",
-    "vite": "^8.2.1",
+    "vite": "^8.2.2",
     "vitest": "^4.0.18"
   },
   "//engines": "node's floor was raised from the former 24.x by the jsdom 30 bump: jsdom@30 declares node ^22.22.2 || ^24.15.0 || >=26.0.0, so a plain 24.x advertised 24.0-24.14 as supported while the test environment was not. Advisory only — no .npmrc in this repo sets engine-strict — and CI is unaffected either way because setup-node's `node-version: 24` resolves the newest 24.x. The floor form is deliberate over ^24.15.0: it keeps Node 26 valid, which jsdom supports and which developers here actually run.",
