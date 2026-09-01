@@ -573,57 +573,15 @@ func voiceLifecycleAdvisoryKey(
 	return int64(binary.BigEndian.Uint64(digest[:8])), nil //nolint:gosec
 }
 
-func privateVoiceParticipantSetAdvisoryKey(conversationID uuid.UUID) (int64, error) {
-	if conversationID == uuid.Nil {
-		return 0, errors.New("invalid private voice participant-set lock")
-	}
-	digest := sha256.Sum256([]byte(
-		"private_voice_participant_set\x00" + conversationID.String(),
-	))
-	// Preserve the complete digest bit pattern in PostgreSQL's signed key type.
-	return int64(binary.BigEndian.Uint64(digest[:8])), nil //nolint:gosec
-}
-
-func privateVoiceScopeAdvisoryKey(userID uuid.UUID) (int64, error) {
-	if userID == uuid.Nil {
-		return 0, errors.New("invalid private voice scope lock")
-	}
-	digest := sha256.Sum256([]byte("private_voice_scope\x00" + userID.String()))
-	return int64(binary.BigEndian.Uint64(digest[:8])), nil //nolint:gosec
-}
-
 func lockPrivateVoiceScopes(
 	ctx context.Context,
 	tx *sql.Tx,
 	userIDs []uuid.UUID,
 ) error {
-	if tx == nil || len(userIDs) == 0 || len(userIDs) > maxPrivateVoiceParticipantIDs {
+	if len(userIDs) > maxPrivateVoiceParticipantIDs {
 		return errors.New("invalid private voice scope locks")
 	}
-	ordered := append([]uuid.UUID(nil), userIDs...)
-	sort.Slice(ordered, func(left, right int) bool {
-		return ordered[left].String() < ordered[right].String()
-	})
-	previous := uuid.Nil
-	for _, userID := range ordered {
-		if userID == uuid.Nil {
-			return errors.New("invalid private voice scope lock")
-		}
-		if userID == previous {
-			continue
-		}
-		previous = userID
-		lockKey, err := privateVoiceScopeAdvisoryKey(userID)
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(
-			ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey,
-		); err != nil {
-			return fmt.Errorf("lock private voice scope: %w", err)
-		}
-	}
-	return nil
+	return dm.LockPrivateVoiceScopesTx(ctx, tx, userIDs)
 }
 
 func lockPrivateVoiceParticipantSets(
@@ -664,17 +622,7 @@ func lockPrivateVoiceParticipantSet(
 	tx *sql.Tx,
 	conversationID uuid.UUID,
 ) error {
-	if tx == nil {
-		return errors.New("private voice participant-set transaction unavailable")
-	}
-	lockKey, err := privateVoiceParticipantSetAdvisoryKey(conversationID)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
-		return fmt.Errorf("lock private voice participant set: %w", err)
-	}
-	return nil
+	return dm.LockDMVoiceParticipantSetTx(ctx, tx, conversationID)
 }
 
 func lockPrivateVoiceParticipantLifecycles(
@@ -2253,6 +2201,17 @@ func (s *NATSSubscriber) currentDMVoiceMembers(
 	rawParticipantIDs := make([]string, 0, len(participantIDs))
 	for _, participantID := range participantIDs {
 		rawParticipantIDs = append(rawParticipantIDs, participantID.String())
+	}
+	var parentID uuid.UUID
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id FROM dm_conversations
+		WHERE id = $1
+		FOR KEY SHARE
+	`, conversationID).Scan(&parentID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("lock private voice conversation: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT user_id

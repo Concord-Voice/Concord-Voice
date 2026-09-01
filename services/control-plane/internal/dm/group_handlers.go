@@ -2,10 +2,13 @@ package dm
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
@@ -35,7 +38,13 @@ const maxGroupVoiceCandidates = 16
 // between the pre-transaction candidate read and the conversation lock. It is a
 // CONFLICT, not a server fault: the set can only grow through a concurrent DM
 // call join, so it is self-clearing and client-retryable.
-var errCandidateSetDrifted = errors.New("dm: voice participant set changed under the conversation lock")
+var (
+	errCandidateSetDrifted = errors.New("dm: voice participant set changed under the conversation lock")
+	// errMemberRemovalStateDrifted reports that the preflight authorization or
+	// target membership changed before the destructive transaction acquired its
+	// locks. Retrying performs a fresh authorization decision.
+	errMemberRemovalStateDrifted = errors.New("dm: member removal state changed under transaction lock")
+)
 
 // groupDeleteStatements is the child-first deletion order. dm_voice_participants
 // leads, which is why plan capture must precede it: those rows are the evidence
@@ -56,6 +65,82 @@ var groupDeleteStatements = []struct{ query, label string }{
 // questions of the same table.
 type rowsQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+// VoiceParticipantSetAdvisoryKey derives the lock that serializes a private
+// call's ingress mutations with group-member removal. It is shared with voice
+// ingress so neither transaction can hold a participant row while waiting for
+// the other to acquire the conversation-wide mutation lock.
+func VoiceParticipantSetAdvisoryKey(conversationID uuid.UUID) (int64, error) {
+	if conversationID == uuid.Nil {
+		return 0, errors.New("invalid private voice participant-set lock")
+	}
+	digest := sha256.Sum256([]byte(
+		"private_voice_participant_set\x00" + conversationID.String(),
+	))
+	// Preserve the complete digest bit pattern in PostgreSQL's signed key type.
+	return int64(binary.BigEndian.Uint64(digest[:8])), nil //nolint:gosec
+}
+
+// LockDMVoiceParticipantSetTx takes the shared private-call participant-set
+// transaction lock before a mutation reads or writes dm_participants.
+func LockDMVoiceParticipantSetTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID uuid.UUID,
+) error {
+	if tx == nil {
+		return errors.New("private voice participant-set transaction unavailable")
+	}
+	lockKey, err := VoiceParticipantSetAdvisoryKey(conversationID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		return fmt.Errorf("lock private voice participant set: %w", err)
+	}
+	return nil
+}
+
+// PrivateVoiceScopeAdvisoryKey derives a stable PostgreSQL advisory-lock key
+// for a private-call audience. SHA-256 has no confidentiality or key-material
+// role here.
+func PrivateVoiceScopeAdvisoryKey(userID uuid.UUID) (int64, error) {
+	if userID == uuid.Nil {
+		return 0, errors.New("invalid private voice scope lock")
+	}
+	digest := sha256.Sum256([]byte("private_voice_scope\x00" + userID.String()))
+	return int64(binary.BigEndian.Uint64(digest[:8])), nil //nolint:gosec
+}
+
+// LockPrivateVoiceScopesTx serializes mutations of each affected private-call
+// audience in deterministic order.
+func LockPrivateVoiceScopesTx(ctx context.Context, tx *sql.Tx, userIDs []uuid.UUID) error {
+	if tx == nil || len(userIDs) == 0 {
+		return errors.New("invalid private voice scope locks")
+	}
+	ordered := append([]uuid.UUID(nil), userIDs...)
+	sort.Slice(ordered, func(left, right int) bool {
+		return ordered[left].String() < ordered[right].String()
+	})
+	previous := uuid.Nil
+	for _, userID := range ordered {
+		if userID == uuid.Nil {
+			return errors.New("invalid private voice scope lock")
+		}
+		if userID == previous {
+			continue
+		}
+		previous = userID
+		lockKey, err := PrivateVoiceScopeAdvisoryKey(userID)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+			return fmt.Errorf("lock private voice scope: %w", err)
+		}
+	}
+	return nil
 }
 
 // UpdateRoleRequest represents the request body for updating a DM participant's role.

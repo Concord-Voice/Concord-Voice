@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -143,6 +144,41 @@ func (r *Rail) CapturePlansTx(ctx context.Context, tx *sql.Tx, plans []Plan) err
 		}
 	}
 	return nil
+}
+
+// CapturePrivateCallPlansAlreadyGated captures one conservative plan per subject.
+func (r *Rail) CapturePrivateCallPlansAlreadyGated(
+	ctx context.Context,
+	tx *sql.Tx,
+	subjects []uuid.UUID,
+) error {
+	if r == nil {
+		return ErrRailNotWired
+	}
+	capturedAt := time.Now()
+	plans := make([]Plan, 0, len(subjects))
+	for _, subject := range subjects {
+		plans = append(plans, Plan{
+			SubjectID:   subject,
+			Category:    CategoryPrivateCall,
+			OperationID: uuid.New(),
+			Resolution:  ResolutionConservative,
+			EventAt:     capturedAt,
+		})
+	}
+	return r.CapturePlansTx(ctx, tx, plans)
+}
+
+// CompletePrivateCallPlansAlreadyGated completes each subject's private-call plan.
+func (r *Rail) CompletePrivateCallPlansAlreadyGated(
+	ctx context.Context,
+	subjects []uuid.UUID,
+) error {
+	keys := make([]PlanKey, 0, len(subjects))
+	for _, subject := range subjects {
+		keys = append(keys, PlanKey{SubjectID: subject, Category: CategoryPrivateCall})
+	}
+	return r.CompleteAlreadyGated(ctx, nil, keys)
 }
 
 // CompleteAlreadyGated resolves and delivers the just-committed plans without

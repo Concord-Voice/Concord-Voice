@@ -309,6 +309,94 @@ func TestCapturePlansTxRefusesAnInvalidPlan(t *testing.T) {
 	require.ErrorIs(t, rail.CapturePlansTx(context.Background(), tx, []Plan{{}}), ErrInvalidPlan)
 }
 
+func TestPrivateCallAlreadyGatedCaptureWritesOneConservativePlanPerSubject(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subjects := []uuid.UUID{dbtest.CreateUser(t, db), dbtest.CreateUser(t, db)}
+	r := NewRail(db, newCountingGate(), nil, nil)
+
+	tx := beginTx(t, db)
+	require.NoError(t, r.CapturePrivateCallPlansAlreadyGated(context.Background(), tx, subjects))
+	require.NoError(t, tx.Commit())
+
+	require.Equal(t, 2, countPlans(t, db))
+	for _, subject := range subjects {
+		var category, resolution string
+		var lifecycle *uuid.UUID
+		err := db.QueryRow(`
+			SELECT category, resolution, scope_lifecycle_id
+			FROM presence_active_pending_plans WHERE user_id = $1`, subject).
+			Scan(&category, &resolution, &lifecycle)
+		require.NoError(t, err)
+		require.Equal(t, "private_call", category)
+		require.Equal(t, "conservative", resolution)
+		require.Nil(t, lifecycle)
+	}
+}
+
+func TestPrivateCallAlreadyGatedCaptureRejectsMoreThanTheBound(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subjects := make([]uuid.UUID, maxActiveSubjects+1)
+	for i := range subjects {
+		subjects[i] = uuid.New()
+	}
+	r := NewRail(db, newCountingGate(), nil, nil)
+
+	tx := beginTx(t, db)
+	require.ErrorIs(t,
+		r.CapturePrivateCallPlansAlreadyGated(context.Background(), tx, subjects),
+		ErrTooManySubjects)
+	require.NoError(t, tx.Commit())
+	require.Zero(t, countPlans(t, db), "an over-bound capture writes nothing")
+}
+
+func TestPrivateCallAlreadyGatedCompletionDoesNotReEnterTheGate(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subject := dbtest.CreateUser(t, db)
+	gate := newCountingGate()
+	deliverer := &recordingDeliverer{}
+	r := NewRail(db, gate, wiredReconciler(db, deliverer), nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- gate.WithSenders(context.Background(), []uuid.UUID{subject}, func() error {
+			tx, err := db.BeginTx(context.Background(), nil)
+			if err != nil {
+				return err
+			}
+			if err := r.CapturePrivateCallPlansAlreadyGated(context.Background(), tx, []uuid.UUID{subject}); err != nil {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+					return errors.Join(err, rollbackErr)
+				}
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			return r.CompletePrivateCallPlansAlreadyGated(context.Background(), []uuid.UUID{subject})
+		})
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("CompletePrivateCallPlansAlreadyGated re-entered the sender gate and deadlocked")
+	}
+}
+
+func TestPrivateCallAlreadyGatedCompletionAttemptsEverySubject(t *testing.T) {
+	closed, err := sql.Open("postgres", "postgres://u:p@127.0.0.1:1/none?sslmode=disable")
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	r := NewRail(closed, passthroughGate{}, wiredReconciler(closed, &recordingDeliverer{}), nil)
+
+	err = r.CompletePrivateCallPlansAlreadyGated(context.Background(), []uuid.UUID{uuid.New(), uuid.New()})
+	require.Error(t, err)
+	joined, ok := err.(interface{ Unwrap() []error })
+	require.True(t, ok, "failures must be joined, not replaced")
+	require.Len(t, joined.Unwrap(), 2, "every subject's failure is reported")
+}
+
 // An unwired rail must FAIL the mutation rather than report a discharged
 // obligation it never delivered.
 func TestCompleteAlreadyGatedRefusesAnUnwiredRail(t *testing.T) {

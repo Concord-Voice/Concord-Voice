@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -98,14 +100,15 @@ const (
 )
 
 var (
-	errInitialKeyDistributionCreator = errors.New("initial channel key distribution requires creator")
-	errInitialKeyDistributionBusy    = errors.New("initial channel key distribution is incomplete")
-	errInitialCreatorKeyMissing      = errors.New("creator initial key missing")
-	errUnissuedChannelKeyVersion     = errors.New("channel key version was not issued for rotation")
-	errRotationDistributor           = errors.New("channel key rotation already has a distributor")
-	errChannelKeyDistributorAccess   = errors.New("channel key distributor no longer has access")
-	errNoChannelKeyRecipients        = errors.New("channel key distribution has no eligible recipients")
-	errManualRotationRateLimited     = errors.New("manual channel rotation rate limited")
+	errInitialKeyDistributionCreator  = errors.New("initial channel key distribution requires creator")
+	errInitialKeyDistributionBusy     = errors.New("initial channel key distribution is incomplete")
+	errInitialCreatorKeyMissing       = errors.New("creator initial key missing")
+	errUnissuedChannelKeyVersion      = errors.New("channel key version was not issued for rotation")
+	errRotationDistributor            = errors.New("channel key rotation already has a distributor")
+	errChannelKeyDistributorAccess    = errors.New("channel key distributor no longer has access")
+	errNoChannelKeyRecipients         = errors.New("channel key distribution has no eligible recipients")
+	errManualRotationRateLimited      = errors.New("manual channel rotation rate limited")
+	errDMKeyDistributorNotParticipant = errors.New("dm key distributor is no longer a participant")
 )
 
 // Handler handles channel-related requests
@@ -2040,6 +2043,10 @@ func insertWrappedChannelKeyTx(ctx context.Context, tx *sql.Tx, channelID, membe
 // revoked epochs get a typed 409, credential-epoch rejections get the generic
 // 401, and unexpected transaction or statement failures get a 500.
 func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, contextID string) {
+	if errors.Is(distErr, errDMKeyDistributorNotParticipant) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied})
+		return
+	}
 	if errors.Is(distErr, errChannelKeyDistributorAccess) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You must have the channel key to distribute keys"})
 		return
@@ -3202,9 +3209,9 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 	// It sits BEFORE the body parse, so a blocked request costs as little as
 	// possible. It must never become gin middleware, which runs before the
 	// handler and therefore on the wrong side of the gate; and it must stay
-	// outside distributeDMKeys, whose transaction opens with credepoch.GuardTx
-	// — a new early return after that fence would consult it and then discard
-	// it.
+	// outside distributeDMKeys, whose transaction opens by locking the affected
+	// users and checking the actor's credential epoch — a new early return after
+	// that fence would consult it and then discard it.
 	//
 	// The 250ms admission bound mirrors RotateKey's. IsRateLimited fails open
 	// on a Redis error, so without it a stalled Redis costs the ceiling AND
@@ -3243,6 +3250,10 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"distributed": distributed, "context_type": "dm"})
 }
 
+type dmKeyVersionQueryRower interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
 // resolveTargetKeyVersionDM mirrors resolveTargetKeyVersion for DM conversations.
 // Returns the explicit version if the caller provided one > 0 (rotation path);
 // otherwise returns the EXISTING max version so peer-fulfilled wraps of the
@@ -3262,12 +3273,17 @@ func (h *Handler) DistributeUnifiedKeys(c *gin.Context) {
 // at this point, so the only safe reading is to refuse. The deleted
 // dm.resolveDMDistributionKeyVersion failed closed here; this is now the only
 // path that can.
-func (h *Handler) resolveTargetKeyVersionDM(conversationID string, explicitVersion *int) (int, error) {
+func resolveTargetKeyVersionDM(
+	ctx context.Context,
+	querier dmKeyVersionQueryRower,
+	conversationID string,
+	explicitVersion *int,
+) (int, error) {
 	if explicitVersion != nil && *explicitVersion > 0 {
 		return *explicitVersion, nil
 	}
 	var v int
-	if err := h.db.QueryRow(
+	if err := querier.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(key_version), 1) FROM dm_channel_keys WHERE conversation_id = $1`,
 		conversationID,
 	).Scan(&v); err != nil {
@@ -3286,7 +3302,8 @@ func (h *Handler) resolveTargetKeyVersionDM(conversationID string, explicitVersi
 }
 
 // distributeDMKeys mirrors distributeChannelKeysToMembers' guarded-transaction
-// shape (#2201): one tx, actor-epoch GuardTx first, post-commit notifications.
+// shape (#2201): one tx, actor epoch checked under user locks before domain
+// locks, post-commit notifications.
 // insertWrappedDMKeyTx mirrors insertWrappedChannelKeyTx for the unified-DM
 // branch: inserted=false means an idempotent duplicate; any error (statement OR
 // RowsAffected — the latter leaves delivery unknowable, Codex #2397 review)
@@ -3318,11 +3335,24 @@ func enqueueDMKeyRequest(ctx context.Context, tx *sql.Tx, conversationID, userID
 }
 
 // distributeOneDMKey processes one DM distribution target inside the caller's
-// epoch-guarded transaction: the #2420 recipient-freshness guard (fail-open when
-// the distributor supplied no version) and the idempotent insert. A stale
-// recipient is skipped (inserted=false) after a self-heal enqueue; any statement
-// error fails the batch (25P02).
+// epoch-guarded transaction: the current-participant and #2420 recipient-
+// freshness guards (fail-open when the distributor supplied no version), then
+// the idempotent insert. A stale or removed recipient is skipped (inserted=false);
+// a stale recipient additionally gets a self-heal enqueue. Any statement error
+// fails the batch (25P02). Its sole caller holds the participant-set lock.
 func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberUserID, wrappedKey string, wrappedKeyVersions map[string]int, keyVersion int) (inserted bool, err error) {
+	var current bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM dm_participants
+			WHERE conversation_id = $1 AND user_id = $2
+		)
+	`, conversationID, memberUserID).Scan(&current); err != nil {
+		return false, fmt.Errorf("read dm key distribution recipient: %w", err)
+	}
+	if !current {
+		return false, nil
+	}
 	if wrappedVersion, ok := wrappedKeyVersions[memberUserID]; ok {
 		fresh, fErr := recipientKeyFresh(ctx, tx, memberUserID, wrappedVersion)
 		if fErr != nil {
@@ -3338,10 +3368,78 @@ func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberU
 	return insertWrappedDMKeyTx(ctx, tx, conversationID, memberUserID, wrappedKey, keyVersion)
 }
 
-func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, conversationID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, explicitVersion *int) (int, error) {
-	keyVersion, err := h.resolveTargetKeyVersionDM(conversationID, explicitVersion)
+// lockDMKeyDistributionUsers takes every user-row lock this request can need
+// before touching the DM scope. The UUID ordering is load-bearing: account
+// erasure locks its affected users before its conversation scopes, so lazy
+// recipient locks here could form a cycle with that path.
+func lockDMKeyDistributionUsers(ctx context.Context, tx *sql.Tx, actorID, tokenEpoch string, wrappedKeys map[string]string) (returnErr error) {
+	actorUUID, err := uuid.Parse(actorID)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("parse dm key distributor: %w", err)
+	}
+	userIDs := []uuid.UUID{actorUUID}
+	seen := map[uuid.UUID]struct{}{actorUUID: {}}
+	for recipientID := range wrappedKeys {
+		recipientUUID, parseErr := uuid.Parse(recipientID)
+		if parseErr != nil {
+			continue
+		}
+		if _, exists := seen[recipientUUID]; exists {
+			continue
+		}
+		seen[recipientUUID] = struct{}{}
+		userIDs = append(userIDs, recipientUUID)
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i].String() < userIDs[j].String() })
+	rawUserIDs := make([]string, 0, len(userIDs))
+	for _, userID := range userIDs {
+		rawUserIDs = append(rawUserIDs, userID.String())
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, credential_epoch
+		FROM users
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id
+		FOR SHARE
+	`, pq.Array(rawUserIDs))
+	if err != nil {
+		return fmt.Errorf("lock dm key distribution users: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close dm key distribution users: %w", closeErr))
+		}
+	}()
+
+	actorFound := false
+	for rows.Next() {
+		var userID uuid.UUID
+		var credentialEpoch sql.NullString
+		if scanErr := rows.Scan(&userID, &credentialEpoch); scanErr != nil {
+			return fmt.Errorf("scan dm key distribution user: %w", scanErr)
+		}
+		if userID != actorUUID {
+			continue
+		}
+		actorFound = true
+		if epochErr := credepoch.MatchEpoch(credentialEpoch, tokenEpoch); epochErr != nil {
+			return epochErr
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return fmt.Errorf("iterate dm key distribution users: %w", rowsErr)
+	}
+	if !actorFound {
+		return errDMKeyDistributorNotParticipant
+	}
+	return nil
+}
+
+func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, conversationID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, explicitVersion *int) (int, error) {
+	conversationUUID, err := uuid.Parse(conversationID)
+	if err != nil {
+		return 0, fmt.Errorf("parse dm conversation ID: %w", err)
 	}
 
 	// #2201 review: request context, same rationale as distributeChannelKeysToMembers.
@@ -3354,8 +3452,39 @@ func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, con
 			h.log.Error("Failed to rollback dm distribution tx", "error", rbErr)
 		}
 	}()
-	if guardErr := credepoch.GuardTx(ctx, tx, actorID, tokenEpoch); guardErr != nil {
-		return 0, guardErr
+	if lockErr := lockDMKeyDistributionUsers(ctx, tx, actorID, tokenEpoch, wrappedKeys); lockErr != nil {
+		return 0, lockErr
+	}
+	if err := dm.LockDMVoiceParticipantSetTx(ctx, tx, conversationUUID); err != nil {
+		return 0, err
+	}
+	var parentID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM dm_conversations
+		WHERE id = $1
+		FOR KEY SHARE
+	`, conversationID).Scan(&parentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, errDMKeyDistributorNotParticipant
+	}
+	if err != nil {
+		return 0, fmt.Errorf("recheck dm key distributor conversation: %w", err)
+	}
+	var memberID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT user_id FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+		FOR KEY SHARE
+	`, conversationID, actorID).Scan(&memberID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, errDMKeyDistributorNotParticipant
+	}
+	if err != nil {
+		return 0, fmt.Errorf("recheck dm key distributor membership: %w", err)
+	}
+	keyVersion, err := resolveTargetKeyVersionDM(ctx, tx, conversationID, explicitVersion)
+	if err != nil {
+		return 0, err
 	}
 
 	distributed := 0

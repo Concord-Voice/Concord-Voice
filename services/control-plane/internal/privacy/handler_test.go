@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -296,6 +297,52 @@ func TestEraseAccount_DurableDeliveryFailureStillRevokesTokens(t *testing.T) {
 	ttl, err := rdb.TTL(ctx, middleware.UserDisabledKey(userID)).Result()
 	require.NoError(t, err)
 	assert.Positive(t, ttl, "the disabled marker must carry a TTL, not linger forever")
+}
+
+func TestEraseAccount_CandidateSetDriftReturnsConflictWithoutRevocation(t *testing.T) {
+	rdb := redistest.Client(t)
+	userID, jti := "drift-user-uuid", "drift-current-token"
+	stub := &stubAccountDeleter{err: users.ErrErasureCandidateSetDrifted}
+	h := privacy.NewHandler(stub, rdb, logger.New("test"))
+	c, w := newTestContext(t, `{}`, userID)
+	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{
+		"jti": jti,
+		"exp": float64(time.Now().Add(10 * time.Minute).Unix()),
+	})
+
+	h.EraseAccount(c)
+
+	require.True(t, stub.called)
+	assert.Equal(t, http.StatusConflict, c.Writer.Status())
+	assert.JSONEq(t, `{"error":"account state changed; retry the deletion"}`, w.Body.String())
+	ctx := context.Background()
+	blacklisted, err := rdb.Exists(ctx, "blacklist:"+jti).Result()
+	require.NoError(t, err)
+	assert.Zero(t, blacklisted, "conflict must not revoke the access token")
+	disabled, err := rdb.Exists(ctx, middleware.UserDisabledKey(userID)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, disabled, "conflict must not disable the account")
+}
+
+func TestEraseAccount_JoinedActivePlanDeliveryFailureStillRevokesTokens(t *testing.T) {
+	rdb := redistest.Client(t)
+	userID, jti := "active-plan-user-uuid", "active-plan-current-token"
+	stub := &stubAccountDeleter{err: errors.Join(
+		presencecapture.ErrPostCommitDelivery,
+		activepresence.ErrDeliveryIncomplete,
+	)}
+	h := privacy.NewHandler(stub, rdb, logger.New("test"))
+	c, _ := newTestContext(t, `{}`, userID)
+	c.Set(middleware.JWTClaimsContextKey, jwt.MapClaims{
+		"jti": jti,
+		"exp": float64(time.Now().Add(10 * time.Minute).Unix()),
+	})
+	h.EraseAccount(c)
+
+	assert.Equal(t, http.StatusServiceUnavailable, c.Writer.Status())
+	blacklisted, err := rdb.Exists(context.Background(), "blacklist:"+jti).Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, blacklisted)
 }
 
 // A genuine pre-commit failure must still be a 500 — the durable arm must not

@@ -11,6 +11,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -26,6 +27,18 @@ import (
 // idempotent (retry after a successful delete is harmless) while still
 // distinguishing "already gone" from "just deleted" in operational logs.
 var ErrUserNotFound = errors.New("user not found")
+
+// ErrErasureCandidateSetDrifted means the private-call audience changed after
+// it was gated and before the erasure transaction locked its evidence.
+var ErrErasureCandidateSetDrifted = errors.New(
+	"account erasure active-call candidate set changed under lock",
+)
+
+const maxErasurePrivateCallSubjects = 16
+
+type erasureCandidateQuerier interface {
+	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+}
 
 // AccountDeleter is the narrow interface the privacy handler depends on.
 // Declared here so privacy can import it without pulling the concrete
@@ -140,6 +153,13 @@ type ActivePlanDrain interface {
 	// erasure has committed, and a presence delivery failure must never fail an
 	// erasure that already happened.
 	ClearDrained(ctx context.Context, subjectID uuid.UUID, categories []presence.Category)
+
+	CapturePrivateCallPlansAlreadyGated(
+		ctx context.Context, tx *sql.Tx, subjects []uuid.UUID,
+	) error
+	CompletePrivateCallPlansAlreadyGated(
+		ctx context.Context, subjects []uuid.UUID,
+	) error
 }
 
 // drainedObligation is deleteAccountTx's transferable output: the subject whose
@@ -151,6 +171,14 @@ type ActivePlanDrain interface {
 type drainedObligation struct {
 	subject    uuid.UUID
 	categories []presence.Category
+}
+
+type committedAccountDeletion struct {
+	channelIDs       pq.StringArray
+	serverIDs        pq.StringArray
+	drained          drainedObligation
+	stranded         erasedMedia
+	survivorSubjects []uuid.UUID
 }
 
 // AccountService is the concrete AccountDeleter backed by the primary
@@ -259,50 +287,127 @@ func (s *AccountService) DeleteAccount(
 	ctx context.Context,
 	userID string,
 ) error {
-	if s.activityCleanup == nil {
-		return s.deleteAccount(ctx, userID)
-	}
-	parsedUserID, err := uuid.Parse(userID)
+	creatorID, err := uuid.Parse(userID)
 	if err != nil {
 		return fmt.Errorf("delete account: invalid user id: %w", err)
 	}
-	if s.activityCleanup.presenceHistory == nil {
-		return errors.New("delete account: activity cleanup coordinator unavailable")
+	candidates, overflow, err := readErasurePrivateCallCandidates(ctx, s.db, creatorID)
+	if err != nil {
+		return fmt.Errorf("delete account: read private-call candidates: %w", err)
 	}
-	if s.activityCleanup.activitySuppressor == nil {
-		return errors.New("delete account: full activity suppression unavailable")
+	if overflow {
+		return fmt.Errorf("private-call candidate fan-out exceeds %d subjects", maxErasurePrivateCallSubjects)
 	}
-	return s.activityCleanup.presenceHistory.WithSender(ctx, parsedUserID, func() error {
-		if _, err := s.activityCleanup.resumePendingActivitySettingsCleanup(
-			ctx, parsedUserID,
-		); err != nil {
-			return fmt.Errorf("delete account: resume activity cleanup: %w", err)
-		}
-		if err := s.activityCleanup.activitySuppressor.SuppressAllActivityAlreadyGated(
-			ctx, parsedUserID,
-		); err != nil {
-			return fmt.Errorf("delete account: suppress active activity: %w", err)
-		}
-		return s.deleteAccount(ctx, userID)
-	})
+	if len(candidates) > 0 && (s.activityCleanup == nil || s.activePlans == nil) {
+		return errors.New("delete account: private-call erasure wiring unavailable")
+	}
+	survivorSubjects := append([]uuid.UUID(nil), candidates...)
+	committed, operationErr := s.deleteAccountWithActivityCleanup(
+		ctx, userID, creatorID, candidates, &survivorSubjects,
+	)
+	if committed != nil {
+		s.runPostCommitObligations(ctx, userID, committed.channelIDs,
+			committed.serverIDs, committed.drained, committed.stranded)
+	}
+	return operationErr
 }
 
-func (s *AccountService) deleteAccount(ctx context.Context, userID string) error {
-	// #2992: bracket the whole transaction. The erasure cascades both friendships
-	// and server_members, so it revokes presence-audience membership for every
-	// surviving viewer. Complete's dispatch below is post-commit and cannot order
-	// an audience apply that beats it; this can.
-	//
-	// One statement, no branch: BeginAudienceRevocation guards its own nil
-	// receiver and s.audienceFence is a concrete *websocket.Hub, so the method
-	// call is legal on a nil pointer and yields an inert closer.
-	//
-	// The defer is function-scoped, so the bracket outlives the transaction and
-	// also covers Complete's post-commit dispatch. Deliberate; do not narrow it.
-	defer s.audienceFence.BeginAudienceRevocation()()
+func (s *AccountService) deleteAccountWithActivityCleanup(
+	ctx context.Context,
+	userID string,
+	creatorID uuid.UUID,
+	candidates []uuid.UUID,
+	survivorSubjects *[]uuid.UUID,
+) (*committedAccountDeletion, error) {
+	var committed *committedAccountDeletion
+	work := func() error {
+		// The transaction and its post-commit private-call completion form one
+		// audience revocation interval. The sender gate remains held outside this
+		// closure until the fence has closed.
+		defer s.audienceFence.BeginAudienceRevocation()()
+		var err error
+		committed, err = s.deleteAccount(ctx, userID, candidates, survivorSubjects)
+		return s.completeErasurePrivateCallPlans(ctx, committed, err)
+	}
+	if s.activityCleanup == nil {
+		err := work()
+		return committed, err
+	}
+	if s.activityCleanup.presenceHistory == nil {
+		return nil, errors.New("delete account: activity cleanup coordinator unavailable")
+	}
+	if s.activityCleanup.activitySuppressor == nil {
+		return nil, errors.New("delete account: full activity suppression unavailable")
+	}
+	err := s.activityCleanup.presenceHistory.WithSenders(ctx,
+		append([]uuid.UUID{creatorID}, candidates...), func() error {
+			if _, err := s.activityCleanup.resumePendingActivitySettingsCleanup(ctx, creatorID); err != nil {
+				return fmt.Errorf("delete account: resume activity cleanup: %w", err)
+			}
+			if err := s.activityCleanup.activitySuppressor.SuppressAllActivityAlreadyGated(ctx, creatorID); err != nil {
+				return fmt.Errorf("delete account: suppress active activity: %w", err)
+			}
+			return work()
+		})
+	return committed, err
+}
+
+func (s *AccountService) completeErasurePrivateCallPlans(
+	ctx context.Context,
+	committed *committedAccountDeletion,
+	operationErr error,
+) error {
+	if committed == nil || s.activePlans == nil || len(committed.survivorSubjects) == 0 {
+		return operationErr
+	}
+	if err := s.activePlans.CompletePrivateCallPlansAlreadyGated(ctx, committed.survivorSubjects); err != nil {
+		deliveryErr := fmt.Errorf("%w: %w", presencecapture.ErrPostCommitDelivery, err)
+		if operationErr == nil {
+			return deliveryErr
+		}
+		return errors.Join(operationErr, deliveryErr)
+	}
+	return operationErr
+}
+
+func readErasurePrivateCallCandidates(
+	ctx context.Context, querier erasureCandidateQuerier, creatorID uuid.UUID,
+) (candidates []uuid.UUID, overflow bool, returnErr error) {
+	rows, err := querier.QueryContext(ctx, `
+		SELECT DISTINCT dvp.user_id
+		FROM dm_conversations c
+		JOIN dm_voice_participants dvp ON dvp.conversation_id = c.id
+		WHERE c.created_by = $1 AND dvp.user_id <> $1
+		ORDER BY dvp.user_id
+		LIMIT $2`, creatorID, maxErasurePrivateCallSubjects+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("query candidates: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close candidate rows: %w", closeErr))
+		}
+	}()
+	candidates = make([]uuid.UUID, 0, maxErasurePrivateCallSubjects)
+	for rows.Next() {
+		var subject uuid.UUID
+		if err := rows.Scan(&subject); err != nil {
+			return nil, false, fmt.Errorf("scan candidate: %w", err)
+		}
+		candidates = append(candidates, subject)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate candidates: %w", err)
+	}
+	return candidates, len(candidates) > maxErasurePrivateCallSubjects, nil
+}
+
+func (s *AccountService) deleteAccount(
+	ctx context.Context, userID string, candidates []uuid.UUID, survivorSubjects *[]uuid.UUID,
+) (*committedAccountDeletion, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("delete account: begin tx: %w", err)
+		return nil, fmt.Errorf("delete account: begin tx: %w", err)
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
@@ -311,13 +416,13 @@ func (s *AccountService) deleteAccount(ctx context.Context, userID string) error
 			}
 		}
 	}()
-	channelIDs, serverIDs, plan, drained, stranded, err := s.deleteAccountTx(ctx, tx, userID)
+	channelIDs, serverIDs, plan, drained, stranded, err := s.deleteAccountTx(ctx, tx, userID, candidates, survivorSubjects)
 	if err != nil {
 		// CauseWriteFailed and friends prove no commit happened, so Abandon does
 		// NOT disconnect anyone on those causes -- the deferred rollback discards
 		// the plan along with the transaction.
 		presencehook.Abandon(s.graphPresence, plan, presencecapture.CauseWriteFailed)
-		return err
+		return nil, err
 	}
 	// Complete owns the commit. A bare tx.Commit() here would leave the captured
 	// plan undispatched, so the surviving senders' audiences would never be
@@ -332,19 +437,19 @@ func (s *AccountService) deleteAccount(ctx context.Context, userID string) error
 	var deliveryErr error
 	if err := presencehook.Complete(ctx, s.graphPresence, tx, plan); err != nil {
 		if !errors.Is(err, presencecapture.ErrPostCommitDelivery) {
-			return fmt.Errorf("delete account: commit: %w", err)
+			return nil, fmt.Errorf("delete account: commit: %w", err)
 		}
 		deliveryErr = err
 	}
-
-	s.runPostCommitObligations(ctx, userID, channelIDs, serverIDs, drained, stranded)
-
-	// Surfaced only after every post-commit obligation has run. The account IS
-	// erased; this reports that presence delivery did not settle.
-	if deliveryErr != nil {
-		return fmt.Errorf("delete account: presence delivery: %w", deliveryErr)
+	committed := &committedAccountDeletion{
+		channelIDs: channelIDs, serverIDs: serverIDs, drained: drained,
+		stranded:         stranded,
+		survivorSubjects: append([]uuid.UUID(nil), (*survivorSubjects)...),
 	}
-	return nil
+	if deliveryErr != nil {
+		return committed, fmt.Errorf("delete account: presence delivery: %w", deliveryErr)
+	}
+	return committed, nil
 }
 
 // runPostCommitObligations discharges everything the erasure owes AFTER its
@@ -444,14 +549,18 @@ func (s *AccountService) deleteAccountTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	userID string,
+	candidates []uuid.UUID,
+	survivorSubjects *[]uuid.UUID,
 ) (pq.StringArray, pq.StringArray, presencecapture.Plan, drainedObligation, erasedMedia, error) {
-	var lockedUserID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil, nil, drainedObligation{}, erasedMedia{}, ErrUserNotFound
-		}
-		return nil, nil, nil, drainedObligation{}, erasedMedia{}, fmt.Errorf("delete account: lock user: %w", err)
+	creatorID, lockedUserID, err := lockErasureSubjectsAndConversations(ctx, tx, userID, candidates)
+	if err != nil {
+		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
 	}
+	currentCandidates, err := readCurrentErasurePrivateCallCandidates(ctx, tx, creatorID, candidates)
+	if err != nil {
+		return nil, nil, nil, drainedObligation{}, erasedMedia{}, err
+	}
+	*survivorSubjects = append((*survivorSubjects)[:0], currentCandidates...)
 
 	// Capture-before-cascade, under the user-row lock, with nothing between it
 	// and the DELETE below that could change the audience. user_presence_settings
@@ -480,6 +589,9 @@ func (s *AccountService) deleteAccountTx(
 	drained, drainErr := s.drainActivePlansAlreadyGated(ctx, tx, lockedUserID)
 	if drainErr != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, drainErr
+	}
+	if err := s.captureErasurePrivateCallPlans(ctx, tx, currentCandidates); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{}, err
 	}
 
 	// Capture the object-storage half under the user-row lock, and BEFORE the
@@ -518,11 +630,11 @@ func (s *AccountService) deleteAccountTx(
 	if err != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, fmt.Errorf("delete account: delete user: %w", err)
 	}
-	rows, err := result.RowsAffected()
+	affected, err := result.RowsAffected()
 	if err != nil {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, fmt.Errorf("delete account: rows affected: %w", err)
 	}
-	if rows == 0 {
+	if affected == 0 {
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, ErrUserNotFound
 	}
 
@@ -532,6 +644,119 @@ func (s *AccountService) deleteAccountTx(
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, fmt.Errorf("delete account: insert audit: %w", err)
 	}
 	return channelIDs, serverIDs, plan, drained, stranded, nil
+}
+
+func lockErasureSubjectsAndConversations(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+	candidates []uuid.UUID,
+) (creatorID uuid.UUID, lockedUserID string, returnErr error) {
+	var err error
+	creatorID, err = uuid.Parse(userID)
+	if err != nil {
+		return uuid.Nil, "", fmt.Errorf("delete account: parse user: %w", err)
+	}
+	lockedSubjects := append([]uuid.UUID{creatorID}, candidates...)
+	if err := dm.LockPrivateVoiceScopesTx(ctx, tx, lockedSubjects); err != nil {
+		return uuid.Nil, "", fmt.Errorf("delete account: lock private voice scopes: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+		pq.Array(lockedSubjects))
+	if err != nil {
+		return uuid.Nil, "", fmt.Errorf("delete account: lock users: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("delete account: close locked users: %w", closeErr))
+		}
+	}()
+	var foundCreator bool
+	for rows.Next() {
+		var subject uuid.UUID
+		if err := rows.Scan(&subject); err != nil {
+			return uuid.Nil, "", fmt.Errorf("delete account: scan locked user: %w", err)
+		}
+		if subject == creatorID {
+			foundCreator = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return uuid.Nil, "", fmt.Errorf("delete account: iterate locked users: %w", err)
+	}
+	if !foundCreator {
+		return uuid.Nil, "", ErrUserNotFound
+	}
+	if err := lockErasureConversations(ctx, tx, creatorID); err != nil {
+		return uuid.Nil, "", err
+	}
+	return creatorID, creatorID.String(), nil
+}
+
+func lockErasureConversations(ctx context.Context, tx *sql.Tx, creatorID uuid.UUID) (returnErr error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM dm_conversations WHERE created_by = $1 ORDER BY id FOR UPDATE`, creatorID)
+	if err != nil {
+		return fmt.Errorf("delete account: lock conversations: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("delete account: close locked conversations: %w", closeErr))
+		}
+	}()
+	for rows.Next() {
+		var conversationID uuid.UUID
+		if err := rows.Scan(&conversationID); err != nil {
+			return fmt.Errorf("delete account: scan locked conversation: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("delete account: iterate locked conversations: %w", err)
+	}
+	return nil
+}
+
+func readCurrentErasurePrivateCallCandidates(
+	ctx context.Context,
+	tx *sql.Tx,
+	creatorID uuid.UUID,
+	candidates []uuid.UUID,
+) ([]uuid.UUID, error) {
+	currentCandidates, overflow, err := readErasurePrivateCallCandidates(ctx, tx, creatorID)
+	if err != nil {
+		return nil, fmt.Errorf("delete account: reread private-call candidates: %w", err)
+	}
+	if overflow {
+		return nil, ErrErasureCandidateSetDrifted
+	}
+	preGatedCandidates := make(map[uuid.UUID]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		preGatedCandidates[candidate] = struct{}{}
+	}
+	for _, candidate := range currentCandidates {
+		if _, ok := preGatedCandidates[candidate]; !ok {
+			return nil, ErrErasureCandidateSetDrifted
+		}
+	}
+	return currentCandidates, nil
+}
+
+func (s *AccountService) captureErasurePrivateCallPlans(
+	ctx context.Context,
+	tx *sql.Tx,
+	candidates []uuid.UUID,
+) error {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if s.activePlans == nil {
+		return errors.New("delete account: private-call erasure rail unavailable")
+	}
+	if err := s.activePlans.CapturePrivateCallPlansAlreadyGated(ctx, tx, candidates); err != nil {
+		return fmt.Errorf("delete account: capture private-call plans: %w", err)
+	}
+	return nil
 }
 
 // captureErasedMedia reads the objects this erasure is about to strand, split

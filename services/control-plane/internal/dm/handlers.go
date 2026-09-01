@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
@@ -1150,9 +1151,15 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	// Execute removal in transaction
-	newCreatorID, maxVersion, err := h.removeMemberTx(convID, targetUserID, createdBy, userID)
-	if err != nil {
+	// Execute removal in transaction. A delivery error is post-commit: the
+	// membership change and its durable reconciliation plan both remain.
+	newCreatorID, maxVersion, err := h.removeMemberTx(c.Request.Context(), convID, targetUserID, userID)
+	deliveryIncomplete := errors.Is(err, activepresence.ErrDeliveryIncomplete)
+	switch {
+	case errors.Is(err, errCandidateSetDrifted), errors.Is(err, errMemberRemovalStateDrifted):
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgFailedRemoveMember})
+		return
+	case err != nil && !deliveryIncomplete:
 		h.log.Error("Failed to remove member", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRemoveMember})
 		return
@@ -1168,97 +1175,405 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	// Broadcast events
 	h.broadcastMemberRemoved(convID, targetUserID, userID, isSelfLeave, newCreatorID, maxVersion)
 
+	if deliveryIncomplete {
+		h.log.Error("member removed but presence delivery did not settle", "failure_class", "delivery")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Member removed; presence update pending"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "Member removed"})
 }
 
 // removeMemberTx removes a participant and handles creator transfer in a transaction.
 // Returns the new creator ID (empty if no transfer) and the max key version.
-func (h *Handler) removeMemberTx(convID, targetUserID, createdBy, callerUserID string) (string, int, error) {
-	tx, err := h.db.Begin()
+func (h *Handler) removeMemberTx(
+	ctx context.Context,
+	convID, targetUserID, callerUserID string,
+) (string, int, error) {
+	targetID, err := uuid.Parse(targetUserID)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse target user ID: %w", err)
+	}
+	preflight, err := h.readMemberRemovalPreflight(ctx, convID, targetID)
 	if err != nil {
 		return "", 0, err
 	}
+	if h.afterCandidateReadHook != nil {
+		h.afterCandidateReadHook()
+	}
+
+	if preflight.targetActive {
+		return h.removeActiveMemberTx(ctx, convID, targetID, callerUserID, preflight)
+	}
+	return h.removeInactiveMemberTx(ctx, convID, targetID, callerUserID, preflight)
+}
+
+type dmRowQuerier interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+type memberRemovalPreflight struct {
+	creatorID       string
+	successorID     string
+	targetActive    bool
+	successorActive bool
+	activeSubjects  []uuid.UUID
+}
+
+func (h *Handler) readMemberRemovalPreflight(
+	ctx context.Context,
+	convID string,
+	targetID uuid.UUID,
+) (memberRemovalPreflight, error) {
+	var preflight memberRemovalPreflight
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT created_by FROM dm_conversations WHERE id = $1`, convID,
+	).Scan(&preflight.creatorID); err != nil {
+		return memberRemovalPreflight{}, fmt.Errorf("read member-removal creator: %w", err)
+	}
+	candidates, err := readVoiceCandidates(ctx, h.db, convID)
+	if err != nil {
+		return memberRemovalPreflight{}, fmt.Errorf("read voice candidates: %w", err)
+	}
+	preflight.targetActive = slices.Contains(candidates, targetID)
+	if preflight.targetActive {
+		preflight.activeSubjects = append(preflight.activeSubjects, targetID)
+	}
+	if preflight.creatorID != targetID.String() {
+		return preflight, nil
+	}
+
+	preflight.successorID, err = selectReplacementCreator(ctx, h.db, convID, targetID.String())
+	if errors.Is(err, sql.ErrNoRows) {
+		return memberRemovalPreflight{}, errMemberRemovalStateDrifted
+	}
+	if err != nil {
+		return memberRemovalPreflight{}, err
+	}
+	successorUUID, err := uuid.Parse(preflight.successorID)
+	if err != nil {
+		return memberRemovalPreflight{}, fmt.Errorf("parse member-removal successor: %w", err)
+	}
+	preflight.successorActive = slices.Contains(candidates, successorUUID)
+	if preflight.successorActive {
+		preflight.activeSubjects = append(preflight.activeSubjects, successorUUID)
+	}
+	return preflight, nil
+}
+
+func (h *Handler) removeActiveMemberTx(
+	ctx context.Context,
+	convID string,
+	targetID uuid.UUID,
+	callerUserID string,
+	preflight memberRemovalPreflight,
+) (string, int, error) {
+	if h.activePlans == nil {
+		return "", 0, activepresence.ErrRailNotWired
+	}
+	var newCreatorID string
+	var maxVersion int
+	err := h.activePlans.WithGatedTx(ctx, preflight.activeSubjects, func(tx *sql.Tx) error {
+		if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects); err != nil {
+			return err
+		}
+		if h.afterUsersLockHook != nil {
+			h.afterUsersLockHook(tx)
+		}
+		var keys []activepresence.PlanKey
+		var err error
+		newCreatorID, maxVersion, keys, err = h.removeMemberRowsTx(
+			ctx, tx, convID, targetID, callerUserID, preflight,
+		)
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit member removal: %w", err)
+		}
+		return h.activePlans.CompleteAlreadyGated(ctx, nil, keys)
+	})
+	return newCreatorID, maxVersion, err
+}
+
+func (h *Handler) removeInactiveMemberTx(
+	ctx context.Context,
+	convID string,
+	targetID uuid.UUID,
+	callerUserID string,
+	preflight memberRemovalPreflight,
+) (string, int, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", 0, fmt.Errorf("begin member removal: %w", err)
+	}
 	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
 		}
 	}()
-
-	var lockedConversationID string
-	if err := tx.QueryRow(
-		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
-	).Scan(&lockedConversationID); err != nil {
+	if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects); err != nil {
 		return "", 0, err
 	}
 
-	var newCreatorID string
-
-	// If creator is leaving, transfer ownership
-	if targetUserID == createdBy {
-		newCreatorID, err = h.transferCreator(tx, convID, targetUserID)
-		if err != nil {
-			return "", 0, err
-		}
-	}
-
-	// Remove the participant
-	if _, err := tx.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, targetUserID); err != nil {
+	newCreatorID, maxVersion, _, err := h.removeMemberRowsTx(
+		ctx, tx, convID, targetID, callerUserID, preflight,
+	)
+	if err != nil {
 		return "", 0, err
 	}
-
-	// Record key revocation
-	var maxVersion int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&maxVersion); err != nil {
-		return "", 0, err
-	}
-
-	if maxVersion > 0 {
-		if _, err := tx.Exec(`
-			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
-			VALUES ($1, $2, $3, 'member_removed', $4)
-			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
-		`, convID, maxVersion, maxVersion+1, callerUserID); err != nil {
-			return "", 0, err
-		}
-	}
-
 	if err := tx.Commit(); err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("commit member removal: %w", err)
 	}
 	return newCreatorID, maxVersion, nil
 }
 
-// transferCreator finds a successor and transfers group ownership within the given transaction.
-func (h *Handler) transferCreator(tx *sql.Tx, convID, leavingUserID string) (string, error) {
-	var newCreatorID string
+func lockMemberRemovalActiveSubjects(ctx context.Context, tx *sql.Tx, subjects []uuid.UUID) error {
+	if len(subjects) == 0 {
+		return nil
+	}
+	if err := LockPrivateVoiceScopesTx(ctx, tx, subjects); err != nil {
+		return err
+	}
+	return lockVoiceCandidates(ctx, tx, subjects)
+}
 
-	// Try to find another admin first
-	err := tx.QueryRow(`
-		SELECT user_id FROM dm_participants
-		WHERE conversation_id = $1 AND role = 'admin' AND user_id != $2
-		ORDER BY joined_at ASC LIMIT 1
-	`, convID, leavingUserID).Scan(&newCreatorID)
+// removeMemberRowsTx is the shared, ordered mutation body. Inactive-to-active
+// drift cannot be captured without taking a new sender gate, while
+// active-to-inactive shrink is safe.
+func (h *Handler) removeMemberRowsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	convID string,
+	targetID uuid.UUID,
+	callerUserID string,
+	preflight memberRemovalPreflight,
+) (string, int, []activepresence.PlanKey, error) {
+	conversationID, err := uuid.Parse(convID)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("parse conversation ID: %w", err)
+	}
+	if err := LockDMVoiceParticipantSetTx(ctx, tx, conversationID); err != nil {
+		return "", 0, nil, err
+	}
+	if err := lockMemberRemovalConversation(ctx, tx, convID); err != nil {
+		return "", 0, nil, err
+	}
+	createdBy, err := revalidateRemoveMemberAuthority(ctx, tx, convID, targetID, callerUserID)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if createdBy != preflight.creatorID {
+		return "", 0, nil, errMemberRemovalStateDrifted
+	}
+	activeNow, err := revalidateMemberRemovalCandidates(ctx, tx, convID, targetID, preflight)
+	if err != nil {
+		return "", 0, nil, err
+	}
 
-	if err == sql.ErrNoRows {
-		// Fall back to longest-standing member
-		err = tx.QueryRow(`
-			SELECT user_id FROM dm_participants
-			WHERE conversation_id = $1 AND user_id != $2
-			ORDER BY joined_at ASC LIMIT 1
-		`, convID, leavingUserID).Scan(&newCreatorID)
+	var keys []activepresence.PlanKey
+	if activeNow {
+		keys, err = h.captureGroupPlans(ctx, tx, []uuid.UUID{targetID})
+		if err != nil {
+			return "", 0, nil, err
+		}
+	}
+
+	newCreatorID, err := h.transferMemberRemovalCreator(ctx, tx, convID, targetID, createdBy, preflight.successorID)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	maxVersion, err := removeMemberRowsAndRecordRevocation(ctx, tx, convID, targetID, callerUserID)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return newCreatorID, maxVersion, keys, nil
+}
+
+func revalidateMemberRemovalCandidates(
+	ctx context.Context,
+	tx *sql.Tx,
+	convID string,
+	targetID uuid.UUID,
+	preflight memberRemovalPreflight,
+) (bool, error) {
+	current, err := readVoiceCandidates(ctx, tx, convID)
+	if err != nil {
+		return false, fmt.Errorf("re-read voice candidates: %w", err)
+	}
+	activeNow := slices.Contains(current, targetID)
+	if !preflight.targetActive && activeNow {
+		return false, errCandidateSetDrifted
+	}
+	if preflight.successorID == "" || preflight.successorActive {
+		return activeNow, nil
+	}
+	successorUUID, err := uuid.Parse(preflight.successorID)
+	if err != nil {
+		return false, fmt.Errorf("parse member-removal successor: %w", err)
+	}
+	if slices.Contains(current, successorUUID) {
+		return false, errCandidateSetDrifted
+	}
+	return activeNow, nil
+}
+
+func (h *Handler) transferMemberRemovalCreator(
+	ctx context.Context,
+	tx *sql.Tx,
+	convID string,
+	targetID uuid.UUID,
+	createdBy string,
+	preflightSuccessorID string,
+) (string, error) {
+	if targetID.String() != createdBy {
+		return "", nil
+	}
+	newCreatorID, err := selectReplacementCreator(ctx, tx, convID, targetID.String())
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errMemberRemovalStateDrifted
 	}
 	if err != nil {
 		return "", err
 	}
-
-	if _, err := tx.Exec(`UPDATE dm_conversations SET created_by = $1 WHERE id = $2`, newCreatorID, convID); err != nil {
+	if newCreatorID != preflightSuccessorID {
+		return "", errMemberRemovalStateDrifted
+	}
+	if err := h.transferCreator(ctx, tx, convID, newCreatorID); err != nil {
 		return "", err
 	}
-	if _, err := tx.Exec(`UPDATE dm_participants SET role = 'admin' WHERE conversation_id = $1 AND user_id = $2`, convID, newCreatorID); err != nil {
-		return "", err
-	}
-
 	return newCreatorID, nil
+}
+
+func removeMemberRowsAndRecordRevocation(
+	ctx context.Context,
+	tx *sql.Tx,
+	convID string,
+	targetID uuid.UUID,
+	callerUserID string,
+) (int, error) {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, targetID.String()); err != nil {
+		return 0, fmt.Errorf("delete voice participant: %w", err)
+	}
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, targetID.String())
+	if err != nil {
+		return 0, fmt.Errorf("delete participant: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read deleted participant count: %w", err)
+	}
+	if rowsAffected != 1 {
+		return 0, errMemberRemovalStateDrifted
+	}
+
+	var maxVersion int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID,
+	).Scan(&maxVersion); err != nil {
+		return 0, fmt.Errorf("read max key version: %w", err)
+	}
+	if maxVersion > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
+			VALUES ($1, $2, $3, 'member_removed', $4)
+			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
+		`, convID, maxVersion, maxVersion+1, callerUserID); err != nil {
+			return 0, fmt.Errorf("record member removal revocation: %w", err)
+		}
+	}
+	return maxVersion, nil
+}
+
+// lockMemberRemovalConversation locks the parent strongly enough to serialize
+// concurrent membership writes without taking the deletion-only FOR UPDATE
+// lock used by group deletion.
+func lockMemberRemovalConversation(ctx context.Context, tx *sql.Tx, convID string) error {
+	var lockedConversationID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		return fmt.Errorf("lock member-removal conversation: %w", err)
+	}
+	return nil
+}
+
+// revalidateRemoveMemberAuthority locks the caller's membership after the
+// conversation lock so a preflight admin grant, participant row, or creator
+// assignment cannot authorize the destructive part of the transaction.
+func revalidateRemoveMemberAuthority(
+	ctx context.Context,
+	tx *sql.Tx,
+	convID string,
+	targetID uuid.UUID,
+	callerUserID string,
+) (string, error) {
+	var createdBy string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT created_by FROM dm_conversations WHERE id = $1`, convID,
+	).Scan(&createdBy); err != nil {
+		return "", fmt.Errorf("read current conversation creator: %w", err)
+	}
+
+	var callerRole string
+	err := tx.QueryRowContext(ctx, `
+		SELECT role FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+		FOR UPDATE
+	`, convID, callerUserID).Scan(&callerRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errMemberRemovalStateDrifted
+	}
+	if err != nil {
+		return "", fmt.Errorf("lock caller membership: %w", err)
+	}
+
+	isSelfLeave := targetID.String() == callerUserID
+	if !isSelfLeave && callerRole != "admin" {
+		return "", errMemberRemovalStateDrifted
+	}
+	if !isSelfLeave && targetID.String() == createdBy {
+		return "", errMemberRemovalStateDrifted
+	}
+	return createdBy, nil
+}
+
+// selectReplacementCreator deterministically prefers the oldest remaining
+// admin, then the oldest remaining member. It is shared by the preflight and
+// under-lock recheck so the transfer target cannot drift between them.
+func selectReplacementCreator(ctx context.Context, q dmRowQuerier, convID, leavingUserID string) (string, error) {
+	var successorID string
+	err := q.QueryRowContext(ctx, `
+		SELECT user_id FROM dm_participants
+		WHERE conversation_id = $1 AND role = 'admin' AND user_id != $2
+		ORDER BY joined_at ASC LIMIT 1
+	`, convID, leavingUserID).Scan(&successorID)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		// Fall back to longest-standing member
+		err = q.QueryRowContext(ctx, `
+			SELECT user_id FROM dm_participants
+			WHERE conversation_id = $1 AND user_id != $2
+			ORDER BY joined_at ASC LIMIT 1
+		`, convID, leavingUserID).Scan(&successorID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("select replacement creator: %w", err)
+	}
+	return successorID, nil
+}
+
+// transferCreator applies a successor selected and verified by the caller.
+func (h *Handler) transferCreator(ctx context.Context, tx *sql.Tx, convID, successorID string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE dm_conversations SET created_by = $1 WHERE id = $2`, successorID, convID); err != nil {
+		return fmt.Errorf("transfer conversation creator: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dm_participants SET role = 'admin' WHERE conversation_id = $1 AND user_id = $2`, convID, successorID); err != nil {
+		return fmt.Errorf("promote replacement creator: %w", err)
+	}
+	return nil
 }
 
 // broadcastMemberRemoved sends WebSocket events for a removed group DM member.
