@@ -437,3 +437,85 @@ func TestInactiveCreatorRemovalSerializesBeforeErasureLocks(t *testing.T) {
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM users WHERE id = $1`, creator))
 }
+
+// The account-erasure transaction locks its user row before deleting it. A
+// non-creator admin removal reaches the revocation ledger with a FOR KEY SHARE
+// check on that same user row, after it has locked the conversation and caller
+// membership. Staging the two waits makes the pre-fix cycle deterministic.
+func TestAdminRemovalAgainstCallerErasureCompletesWithoutDeadlock(t *testing.T) {
+	db, convID, creator, target, h, _ := seedMemberRemovalFixture(t, true)
+	caller := dbtest.CreateUser(t, db)
+	_, err := db.Exec(`
+		INSERT INTO dm_participants (conversation_id, user_id, role)
+		VALUES ($1, $2, 'admin')`, convID, caller)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version)
+		VALUES ($1, $2, $3, 1)`, convID, creator, []byte("key"))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	erasureTx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := erasureTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback erasure transaction: %v", rollbackErr)
+		}
+	}()
+	var erasureTxID int64
+	require.NoError(t, erasureTx.QueryRowContext(ctx, `SELECT txid_current()`).Scan(&erasureTxID))
+	var lockedUser uuid.UUID
+	require.NoError(t, erasureTx.QueryRowContext(ctx, `
+		SELECT id FROM users WHERE id = $1 FOR UPDATE`, caller).Scan(&lockedUser))
+
+	removalDone := make(chan error, 1)
+	go func() {
+		_, _, removeErr := h.removeMemberTx(ctx, convID, target.String(), caller.String())
+		removalDone <- removeErr
+	}()
+
+	// This waiter plus the relation-lock sample pins the fixed order: removal
+	// waits on the caller user before acquiring the conversation. On the
+	// baseline, removal reaches the late revocation FK check after locking the
+	// conversation.
+	dbtest.WaitForRowLockWaiter(t, db, erasureTxID)
+	var waitingPID int
+	require.NoError(t, db.QueryRow(`
+		SELECT pid FROM pg_locks
+		WHERE locktype = 'transactionid' AND NOT granted
+		  AND transactionid::text::bigint = $1
+		LIMIT 1`, dbtest.TransactionIDForLockProbe(erasureTxID)).Scan(&waitingPID))
+	require.NotContains(t, sampleRelationLocks(t, db, waitingPID), "dm_conversations",
+		"removal must wait on the caller user before acquiring the conversation")
+
+	erasureDone := make(chan error, 1)
+	go func() {
+		_, erasureErr := erasureTx.ExecContext(ctx, `DELETE FROM users WHERE id = $1`, caller)
+		if erasureErr == nil {
+			erasureErr = erasureTx.Commit()
+		}
+		erasureDone <- erasureErr
+	}()
+
+	var removalErr, erasureErr error
+	removalFinished, erasureFinished := false, false
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for !removalFinished || !erasureFinished {
+		select {
+		case removalErr = <-removalDone:
+			removalFinished = true
+		case erasureErr = <-erasureDone:
+			erasureFinished = true
+		case <-deadline.C:
+			t.Fatal("admin removal against caller erasure exceeded liveness bound; neither transaction may return PostgreSQL 40P01")
+		}
+	}
+	require.NoError(t, erasureErr,
+		"caller account erasure must complete without a deadlock victim")
+	require.ErrorIs(t, removalErr, errMemberRemovalStateDrifted,
+		"admin removal must fail closed with state drift after caller erasure, without a deadlock victim")
+}

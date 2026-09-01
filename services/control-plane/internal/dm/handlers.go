@@ -1274,7 +1274,7 @@ func (h *Handler) removeActiveMemberTx(
 	var newCreatorID string
 	var maxVersion int
 	err := h.activePlans.WithGatedTx(ctx, preflight.activeSubjects, func(tx *sql.Tx) error {
-		if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects); err != nil {
+		if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects, callerUserID); err != nil {
 			return err
 		}
 		if h.afterUsersLockHook != nil {
@@ -1312,7 +1312,7 @@ func (h *Handler) removeInactiveMemberTx(
 			h.log.Error(errMsgFailedRollbackTransaction, "error", rbErr)
 		}
 	}()
-	if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects); err != nil {
+	if err := lockMemberRemovalActiveSubjects(ctx, tx, preflight.activeSubjects, callerUserID); err != nil {
 		return "", 0, err
 	}
 
@@ -1328,14 +1328,26 @@ func (h *Handler) removeInactiveMemberTx(
 	return newCreatorID, maxVersion, nil
 }
 
-func lockMemberRemovalActiveSubjects(ctx context.Context, tx *sql.Tx, subjects []uuid.UUID) error {
-	if len(subjects) == 0 {
-		return nil
+func lockMemberRemovalActiveSubjects(
+	ctx context.Context,
+	tx *sql.Tx,
+	subjects []uuid.UUID,
+	callerUserID string,
+) error {
+	if len(subjects) > 0 {
+		if err := LockPrivateVoiceScopesTx(ctx, tx, subjects); err != nil {
+			return err
+		}
 	}
-	if err := LockPrivateVoiceScopesTx(ctx, tx, subjects); err != nil {
-		return err
+	callerID, err := uuid.Parse(callerUserID)
+	if err != nil {
+		return fmt.Errorf("parse caller user ID: %w", err)
 	}
-	return lockVoiceCandidates(ctx, tx, subjects)
+	candidates := subjects
+	if !slices.Contains(subjects, callerID) {
+		candidates = append([]uuid.UUID{callerID}, subjects...)
+	}
+	return lockVoiceCandidates(ctx, tx, candidates)
 }
 
 // removeMemberRowsTx is the shared, ordered mutation body. Inactive-to-active
