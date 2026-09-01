@@ -55,7 +55,7 @@ func seedMediaFile(t *testing.T, setup *hubTestSetup, tier int) string {
 		`INSERT INTO media_files
 		   (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
 		 VALUES ($1, $2, 'photo', 1, 'image/png', 100, $3)`,
-		fileID, setup.user1.String(), "avatars/"+fileID,
+		fileID, setup.user1.String(), "attachments/"+fileID,
 	)
 	require.NoError(t, err)
 	return fileID

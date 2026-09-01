@@ -39,12 +39,16 @@ import (
 )
 
 const (
-	errMsgAccessDenied        = "Access denied"
-	logMsgChannelServerLookup = "Failed to look up channel server"
-	errMsgFailedVerifyAccess  = "Failed to verify access"
-	errMsgFailedVerifyPerms   = "Failed to verify permissions"
-	errMsgInternalServer      = "Internal server error"
-	errMsgStorageUnavailable  = "Object storage unavailable"
+	errMsgAccessDenied              = "Access denied"
+	logMsgChannelServerLookup       = "Failed to look up channel server"
+	errMsgFailedVerifyAccess        = "Failed to verify access"
+	errMsgFailedVerifyPerms         = "Failed to verify permissions"
+	errMsgFailedStoreImage          = "Failed to store image"
+	errMsgUserNotFound              = "User not found"
+	errMsgFailedRecordMediaMetadata = "Failed to record media metadata"
+	errMsgNotFound                  = "Not found"
+	errMsgInternalServer            = "Internal server error"
+	errMsgStorageUnavailable        = "Object storage unavailable"
 	// errMsgAttachmentStorageAtCapacity is returned with 507 Insufficient
 	// Storage when DiskWatermark.Check refuses a new attachment write
 	// (#2759 unit A1). SaaS-only -- see disk_watermark.go.
@@ -61,7 +65,34 @@ const (
 	cacheControlPublic                = "public, max-age=3600, must-revalidate"
 	cacheControlPublicShort           = "public, max-age=60, must-revalidate"
 	cacheControlPrivate               = "private, max-age=3600, must-revalidate"
+	cacheControlNoStore               = "no-store"
 )
+
+const profileTier1MediaAdmittedQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM media_files
+		WHERE storage_key = $1 AND media_tier = 1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR uploader_id = $2)
+	) AND NOT EXISTS (
+		SELECT 1 FROM tier1_erasure_delete_obligations WHERE storage_key = $1
+	)
+`
+
+const profileTier1SlotKeyQuery = `
+	SELECT storage_key
+	FROM media_files
+	WHERE uploader_id = $1
+	  AND media_tier = 1
+	  AND deleted_at IS NULL
+	  AND (
+		profile_slot = $2
+		OR ($2 = 'avatar' AND profile_slot IS NULL AND storage_key = 'avatars/' || uploader_id::text)
+		OR ($2 = 'banner' AND profile_slot IS NULL AND storage_key = 'banners/' || uploader_id::text)
+	  )
+	  AND NOT EXISTS (
+		SELECT 1 FROM tier1_erasure_delete_obligations
+		WHERE storage_key = media_files.storage_key
+	  )`
 
 // ObjectStore defines the storage operations required by the media handler.
 // This interface is satisfied by *storage.Client and can be mocked for testing.
@@ -103,8 +134,13 @@ const (
 // in UploadAvatar/UploadBanner (#1298). Server uploads parse at the absolute
 // server-axis max, then apply the tier-specific cap after server_id validation.
 const (
-	serverImageMaxUpload = 8 * 1024 * 1024 // 8 MiB — Mach cap, used only before multipart parsing
-	iconMaxUpload        = 5 * 1024 * 1024 // 5 MiB — group-DM icons stay on the existing limit
+	serverImageMaxUpload  = 8 * 1024 * 1024 // 8 MiB — Mach cap, used only before multipart parsing
+	iconMaxUpload         = 5 * 1024 * 1024 // 5 MiB — group-DM icons stay on the existing limit
+	profileTier1TxTimeout = 10 * time.Second
+	// Keep a compromised or repeatedly cancelled profile upload from accumulating
+	// unbounded durable deletion evidence. A soft-deleted generation remains
+	// unresolved until successful object deletion removes its obligation.
+	maxUnresolvedProfileUploadEvidence = 20
 )
 
 // Allowed MIME types for Tier 1 image uploads
@@ -162,6 +198,9 @@ type Handler struct {
 	// SetWriteRouter; nil keeps every write on the process-wide store, which is
 	// exactly the pre-ADR-0038 behaviour — see write_routing.go.
 	writeRouter WriteRouter
+	// tier1UploadCommit is a package-test seam for definite versus ambiguous
+	// profile-upload metadata commits. Production uses tx.Commit.
+	tier1UploadCommit func(*sql.Tx) error
 }
 
 // SetOpsCounter enables aggregate successful-upload counting.
@@ -181,6 +220,13 @@ func (h *Handler) recordSuccessfulUpload() {
 	if h.opsCounter != nil {
 		h.opsCounter.Increment(opsmetrics.MetricMediaUploadsTotal)
 	}
+}
+
+func (h *Handler) commitTier1Upload(tx *sql.Tx) error {
+	if h.tier1UploadCommit != nil {
+		return h.tier1UploadCommit(tx)
+	}
+	return tx.Commit()
 }
 
 // NewHandler creates a new media handler.
@@ -475,30 +521,32 @@ func (h *Handler) userCanDownloadAttachment(c *gin.Context, userID string, chann
 // PUBLIC: registered without auth middleware so plain <img> tags can render
 // avatars without an Authorization header. Do not add JWT/membership
 // assumptions to this handler — see router.go for the registration.
-// Response is publicly cacheable (Cloudflare-friendly).
+// Responses are never cached so erasure cannot be served from a cache.
 func (h *Handler) ProxyAvatar(c *gin.Context) {
+	c.Header(headerCacheControl, cacheControlNoStore)
 	targetUserID := c.Param("user_id")
 	if _, err := uuid.Parse(targetUserID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
-	h.proxyTier1Media(c, fmt.Sprintf("avatars/%s", targetUserID), true)
+	h.proxyProfileTier1Media(c, targetUserID, ProfileSlotAvatar)
 }
 
 // ProxyBanner serves a user's banner/header image through the control plane.
 // GET /api/v1/media/banners/:user_id
 //
 // PUBLIC: registered without auth middleware (same as ProxyAvatar). Do not
-// add JWT/membership assumptions. Response is publicly cacheable.
+// add JWT/membership assumptions. Responses are never cached.
 func (h *Handler) ProxyBanner(c *gin.Context) {
+	c.Header(headerCacheControl, cacheControlNoStore)
 	targetUserID := c.Param("user_id")
 	if _, err := uuid.Parse(targetUserID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
-	h.proxyTier1Media(c, fmt.Sprintf("banners/%s", targetUserID), true)
+	h.proxyProfileTier1Media(c, targetUserID, ProfileSlotBanner)
 }
 
 // ProxyServerIcon serves a server's icon through the control plane.
@@ -574,12 +622,13 @@ func (h *Handler) ProxyInviteServerIcon(c *gin.Context) {
 // so an anonymous caller cannot tell them apart at all.
 //
 // Header parity is now real rather than aspirational: the success arm routes
-// through proxyFriendCodeAvatarObject (not the shared proxyInviteIcon) and emits
-// the same max-age=60 every fallback does. An earlier revision emitted 3600 on
-// success, leaving the cache directive as an oracle after the bytes had been
-// equalized; a revision before THAT claimed parity it did not have.
+// through proxyFriendCodeAvatarObject (not the shared proxyInviteIcon) and both
+// success and fallback emit no-store. An earlier revision emitted different
+// cache lifetimes, leaving the directive as an oracle after the bytes had been
+// equalized.
 // GET /api/v1/friends/codes/:code/avatar
 func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
+	c.Header(headerCacheControl, cacheControlNoStore)
 	// The edge rate-limit rule matches on the RAW wire path, but gin routes on
 	// the percent-DECODED path, so /…/CODE%2Favatar reaches this handler while
 	// matching no WAF rule — no managed challenge, no edge bucket.
@@ -599,13 +648,13 @@ func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
 	// Reject in the SAME uniform shape as every other invalid class, so closing
 	// the rate-limit bypass introduces no enumeration oracle (#945, VULN-001).
 	if c.Request.URL.RawPath != "" {
-		serveInviteIconFallback(c)
+		serveFriendCodeAvatarFallback(c)
 		return
 	}
 
 	code := c.Param("code")
 	if !invitecodes.IsValidCode(code) {
-		serveInviteIconFallback(c)
+		serveFriendCodeAvatarFallback(c)
 		return
 	}
 
@@ -625,7 +674,7 @@ func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
 		WHERE fc.code = $1
 	`, code).Scan(&ownerID, &expiresAt, &isRevoked, &maxUses, &useCount, &avatarURL)
 	if errors.Is(err, sql.ErrNoRows) {
-		serveInviteIconFallback(c)
+		serveFriendCodeAvatarFallback(c)
 		return
 	}
 	if err != nil {
@@ -638,11 +687,16 @@ func (h *Handler) ProxyFriendCodeAvatar(c *gin.Context) {
 		(expiresAt == nil || expiresAt.After(time.Now().UTC())) &&
 		(maxUses == nil || *maxUses == 0 || useCount < *maxUses)
 	if !valid || avatarURL == nil {
-		serveInviteIconFallback(c)
+		serveFriendCodeAvatarFallback(c)
 		return
 	}
 
-	h.proxyFriendCodeAvatarObject(c, fmt.Sprintf("avatars/%s", ownerID))
+	key, found, err := ProfileTier1StorageKey(c.Request.Context(), h.db, ownerID, ProfileSlotAvatar)
+	if err != nil || !found {
+		serveFriendCodeAvatarFallback(c)
+		return
+	}
+	h.proxyFriendCodeAvatarObject(c, key)
 }
 
 // friendAvatarMaxBytes bounds the in-memory buffer below. It matches the largest
@@ -671,11 +725,15 @@ func (h *Handler) proxyFriendCodeAvatarObject(c *gin.Context, key string) {
 		serveFriendCodeAvatarFallback(c)
 		return
 	}
+	admitted, err := h.profileTier1MediaAdmitted(c.Request.Context(), key)
+	if err != nil || !admitted {
+		serveFriendCodeAvatarFallback(c)
+		return
+	}
 	obj, contentType, err := h.store.GetObject(c.Request.Context(), key)
 	if err != nil {
 		if !errors.Is(err, storage.ErrObjectNotFound) {
-			// Key only — never the code, which is bearer material.
-			h.log.Error("Failed to fetch friend-code avatar from storage", "error", err, "key", key)
+			h.log.Error("Failed to fetch friend-code avatar from storage")
 		}
 		serveFriendCodeAvatarFallback(c)
 		return
@@ -695,25 +753,18 @@ func (h *Handler) proxyFriendCodeAvatarObject(c *gin.Context, key string) {
 	// and treat that overflow as a failure too.
 	buf, err := io.ReadAll(io.LimitReader(obj, friendAvatarMaxBytes+1))
 	if err != nil || int64(len(buf)) > friendAvatarMaxBytes {
-		// Key only — never the code, which is bearer material.
-		h.log.Error("Failed to read friend-code avatar from storage",
-			"error", err, "key", key, "bytes", len(buf))
+		h.log.Error("Failed to read friend-code avatar from storage")
 		serveFriendCodeAvatarFallback(c)
 		return
 	}
 
-	// The SHORT TTL, deliberately not cacheControlPublic. Every fallback answers
-	// with max-age=60, so a 3600 here would leave the cache directive itself
-	// separating "live code with an avatar" from everything else — the same
-	// oracle in a header instead of a status line.
-	c.Header(headerCacheControl, cacheControlPublicShort)
+	c.Header(headerCacheControl, cacheControlNoStore)
 	c.Data(http.StatusOK, contentType, buf)
 }
 
-// serveFriendCodeAvatarFallback is serveInviteIconFallback under a name that
-// says which route's uniformity contract it belongs to.
 func serveFriendCodeAvatarFallback(c *gin.Context) {
-	serveInviteIconFallback(c)
+	c.Header(headerCacheControl, cacheControlNoStore)
+	c.Data(http.StatusOK, "image/svg+xml; charset=utf-8", []byte(invitecodes.PublicInviteIconSVG))
 }
 
 // ProxyServerBanner serves a server's banner through the control plane.
@@ -846,40 +897,62 @@ func (h *Handler) handleTier1Upload(c *gin.Context, userID, purpose string, maxS
 		return // response already sent
 	}
 
-	storageKey := tier1StorageKey(purpose, userID, serverID, conversationID)
-
 	store, ok := h.requireTier1WriteStore(c)
 	if !ok {
 		return
 	}
 
+	var fileID string
+	if purpose == purposeAvatar || purpose == purposeBanner {
+		storageKey := profileTier1StorageKey(purpose, userID)
+		if !h.createProfileTier1UploadIntent(c, userID, profileSlotForPurpose(purpose), storageKey) {
+			return
+		}
+		fileID, ok = h.storeProfileTier1Image(c, store, userID, purpose, storageKey, processed)
+		if !ok {
+			return
+		}
+		h.respondTier1Upload(c, purpose, userID, storageKey, fileID, header.Size, processed)
+		return
+	}
+	storageKey := tier1StorageKey(purpose, userID, serverID, conversationID)
 	reader := bytes.NewReader(processed.Data)
 	if err := store.PutObject(c.Request.Context(), storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
 		h.log.Error("Failed to store processed image", "error", err, "user_id", userID, "purpose", purpose)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store image"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
 		return
 	}
 
-	fileID, err := insertTier1Record(h, c, store, userID, storageKey, processed)
+	fileID, err = insertTier1Record(c.Request.Context(), h, c, nil, userID, storageKey, processed)
 	if err != nil {
+		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
+			h.log.Error("Failed to delete orphaned media object", "error", delErr, "storage_key", storageKey)
+		}
 		return // response already sent
 	}
-
 	if purpose == purposeDMIcon {
 		if err := updateDMIconURL(h, c, conversationID); err != nil {
 			return
 		}
 	}
 
+	h.respondTier1Upload(c, purpose, userID, storageKey, fileID, header.Size, processed)
+}
+
+func (h *Handler) respondTier1Upload(c *gin.Context, purpose, userID, storageKey, fileID string, originalSize int64, processed *ProcessedImage) {
 	h.log.Info("Tier 1 image uploaded", "purpose", purpose, "user_id", userID,
-		"size_original", header.Size, "size_processed", len(processed.Data),
+		"size_original", originalSize, "size_processed", len(processed.Data),
 		"dimensions", fmt.Sprintf("%dx%d", processed.Width, processed.Height))
 
 	h.recordSuccessfulUpload()
+	url := fmt.Sprintf("/api/v1/media/%s", storageKey)
+	if purpose == purposeAvatar || purpose == purposeBanner {
+		url = profileTier1CanonicalURL(purpose, userID)
+	}
 	c.JSON(http.StatusCreated, gin.H{
 		"file_id":     fileID,
 		"storage_key": storageKey,
-		"url":         fmt.Sprintf("/api/v1/media/%s", storageKey),
+		"url":         url,
 		"file_size":   len(processed.Data),
 		"width":       processed.Width,
 		"height":      processed.Height,
@@ -1129,7 +1202,266 @@ func tier1StorageKey(purpose, userID, serverID, conversationID string) string {
 	return fmt.Sprintf("media/%s/%s", purpose, userID)
 }
 
-func insertTier1Record(h *Handler, c *gin.Context, store ObjectStore, userID, storageKey string, processed *ProcessedImage) (string, error) {
+func profileSlotForPurpose(purpose string) string {
+	if purpose == purposeBanner {
+		return ProfileSlotBanner
+	}
+	return ProfileSlotAvatar
+}
+
+func profileTier1StorageKey(purpose, userID string) string {
+	prefix := "avatars"
+	if purpose == purposeBanner {
+		prefix = "banners"
+	}
+	return fmt.Sprintf("%s/%s/%s", prefix, userID, uuid.NewString())
+}
+
+func profileTier1CanonicalURL(purpose, userID string) string {
+	if purpose == purposeBanner {
+		return fmt.Sprintf("/api/v1/media/banners/%s", userID)
+	}
+	return fmt.Sprintf("/api/v1/media/avatars/%s", userID)
+}
+
+func (h *Handler) createProfileTier1UploadIntent(c *gin.Context, userID, profileSlot, storageKey string) bool {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), profileTier1TxTimeout)
+	defer cancel()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.log.Error("Failed to begin profile upload intent transaction", "error", err, "profile_slot", profileSlot)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return false
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back profile upload intent transaction", "error", rollbackErr, "profile_slot", profileSlot)
+		}
+	}()
+
+	var lockedUserID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotFound})
+			return false
+		}
+		h.log.Error("Failed to lock profile upload intent user", "error", err, "profile_slot", profileSlot)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return false
+	}
+	avatarPrefix := fmt.Sprintf("avatars/%s/", lockedUserID)
+	bannerPrefix := fmt.Sprintf("banners/%s/", lockedUserID)
+	// The range bounds use the byte immediately after '/' so the primary-key
+	// lookup is limited to immutable generations for this user, rather than
+	// scanning all permanent obligations. LIMIT keeps the count work bounded.
+	var unresolvedEvidence int
+	if err := tx.QueryRowContext(ctx, `
+		WITH bounded_evidence AS (
+			SELECT 1
+			FROM (
+				SELECT 1
+				FROM tier1_profile_upload_intents
+				WHERE user_id = $1
+				LIMIT $2
+			) AS active_intents
+			UNION ALL
+			SELECT 1
+			FROM (
+				SELECT 1
+				FROM tier1_erasure_delete_obligations AS obligation
+				WHERE (
+					(obligation.storage_key >= $3 AND obligation.storage_key < $4)
+					OR (obligation.storage_key >= $5 AND obligation.storage_key < $6)
+				)
+				LIMIT $2
+			) AS unresolved_obligations
+		)
+		SELECT COUNT(*) FROM bounded_evidence`,
+		lockedUserID,
+		maxUnresolvedProfileUploadEvidence,
+		avatarPrefix,
+		fmt.Sprintf("avatars/%s0", lockedUserID),
+		bannerPrefix,
+		fmt.Sprintf("banners/%s0", lockedUserID),
+	).Scan(&unresolvedEvidence); err != nil {
+		h.log.Error("Failed to count unresolved profile upload evidence", "error", err, "profile_slot", profileSlot)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return false
+	}
+	if unresolvedEvidence >= maxUnresolvedProfileUploadEvidence {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many unresolved profile uploads"})
+		return false
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO tier1_profile_upload_intents (storage_key, user_id, profile_slot) VALUES ($1, $2, $3)`,
+		storageKey, lockedUserID, profileSlot,
+	); err != nil {
+		h.log.Error("Failed to persist profile upload intent", "error", err, "profile_slot", profileSlot)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit profile upload intent", "error", err, "profile_slot", profileSlot)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (h *Handler) storeProfileTier1Image(c *gin.Context, store ObjectStore, userID, purpose, storageKey string, processed *ProcessedImage) (fileID string, ok bool) {
+	txCtx, cancel := context.WithTimeout(c.Request.Context(), profileTier1TxTimeout)
+	defer cancel()
+
+	tx, err := h.db.BeginTx(txCtx, nil)
+	if err != nil {
+		h.log.Error("Failed to begin profile image transaction", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back profile image transaction", "error", rollbackErr, "purpose", purpose)
+		}
+	}()
+
+	var lockedUserID string
+	if err := tx.QueryRowContext(txCtx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotFound})
+			return "", false
+		}
+		h.log.Error("Failed to lock profile image user", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+
+	profileSlot := profileSlotForPurpose(purpose)
+	var intentKey string
+	err = tx.QueryRowContext(txCtx, `
+		SELECT storage_key
+		FROM tier1_profile_upload_intents AS intents
+		WHERE storage_key = $1 AND user_id = $2 AND profile_slot = $3
+		  AND NOT EXISTS (
+			SELECT 1 FROM tier1_erasure_delete_obligations
+			WHERE storage_key = intents.storage_key
+		  )
+		FOR UPDATE`, storageKey, lockedUserID, profileSlot,
+	).Scan(&intentKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgUserNotFound})
+		return "", false
+	}
+	if err != nil {
+		h.log.Error("Failed to lock profile upload intent", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+
+	if _, err := tx.ExecContext(txCtx, `
+		INSERT INTO tier1_erasure_delete_obligations (storage_key)
+		SELECT storage_key FROM tier1_profile_upload_intents
+		WHERE user_id = $1 AND profile_slot = $2 AND storage_key <> $3
+		ON CONFLICT (storage_key) DO NOTHING`, lockedUserID, profileSlot, intentKey); err != nil {
+		h.log.Error("Failed to terminalize superseded profile upload intents", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	if _, err := tx.ExecContext(txCtx,
+		`DELETE FROM tier1_profile_upload_intents WHERE user_id = $1 AND profile_slot = $2 AND storage_key <> $3`,
+		lockedUserID, profileSlot, intentKey,
+	); err != nil {
+		h.log.Error("Failed to delete superseded profile upload intents", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	legacyKey := tier1StorageKey(purpose, lockedUserID, "", "")
+	if err := ensureProfileSlotUsesLegacyBackend(txCtx, tx, lockedUserID, profileSlot, legacyKey); err != nil {
+		h.log.Error("Profile image replacement refused non-legacy backend", "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	if _, err := tx.ExecContext(txCtx, `
+		WITH retired AS (
+			UPDATE media_files SET deleted_at = NOW()
+			WHERE uploader_id = $1 AND media_tier = 1
+			  AND deleted_at IS NULL
+			  AND (profile_slot = $2 OR storage_key = $3)
+			RETURNING storage_key
+		)
+		INSERT INTO tier1_erasure_delete_obligations (storage_key)
+		SELECT storage_key FROM retired
+		UNION
+		SELECT $3
+		ON CONFLICT (storage_key) DO NOTHING`, lockedUserID, profileSlot, legacyKey); err != nil {
+		h.log.Error("Failed to retire prior profile image", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+
+	fileID, err = h.insertProfileTier1Record(txCtx, c, tx, lockedUserID, profileSlot, intentKey, processed)
+	if err != nil {
+		return "", false
+	}
+
+	reader := bytes.NewReader(processed.Data)
+	if err := store.PutObject(txCtx, storageKey, reader, int64(len(processed.Data)), processed.ContentType); err != nil {
+		h.log.Error("Failed to store profile image", "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	result, err := tx.ExecContext(txCtx,
+		`DELETE FROM tier1_profile_upload_intents WHERE storage_key = $1 AND user_id = $2 AND profile_slot = $3`,
+		intentKey, lockedUserID, profileSlot,
+	)
+	if err != nil {
+		h.log.Error("Failed to finalize profile upload intent", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil || rowsAffected != 1 {
+		h.log.Error("Profile upload intent finalization did not affect exactly one row", "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+
+	if err := h.commitTier1Upload(tx); err != nil {
+		h.log.Error("Failed to commit profile image metadata", "error", err, "purpose", purpose)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedStoreImage})
+		return "", false
+	}
+	committed = true
+	return fileID, true
+}
+
+func (h *Handler) insertProfileTier1Record(ctx context.Context, c *gin.Context, tx *sql.Tx, userID, profileSlot, storageKey string, processed *ProcessedImage) (string, error) {
+	fileID := uuid.NewString()
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO media_files (
+			id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		RETURNING id`,
+		fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
+		processed.ContentType, len(processed.Data), storageKey, profileSlot,
+	).Scan(&fileID)
+	if err != nil {
+		h.log.Error("Failed to record profile image metadata", "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRecordMediaMetadata})
+		return "", err
+	}
+	return fileID, nil
+}
+
+func insertTier1Record(ctx context.Context, h *Handler, c *gin.Context, tx *sql.Tx, userID, storageKey string, processed *ProcessedImage) (string, error) {
 	fileID := uuid.New().String()
 
 	insertQuery := `
@@ -1139,14 +1471,17 @@ func insertTier1Record(h *Handler, c *gin.Context, store ObjectStore, userID, st
 		DO UPDATE SET uploader_id = EXCLUDED.uploader_id, file_size = EXCLUDED.file_size, mime_type = EXCLUDED.mime_type, updated_at = NOW()
 		RETURNING id
 	`
-	err := h.db.QueryRow(insertQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
-		processed.ContentType, len(processed.Data), storageKey).Scan(&fileID)
+	var err error
+	if tx != nil {
+		err = tx.QueryRowContext(ctx, insertQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
+			processed.ContentType, len(processed.Data), storageKey).Scan(&fileID)
+	} else {
+		err = h.db.QueryRowContext(ctx, insertQuery, fileID, userID, string(FileTypePhoto), MediaTierAuthenticated,
+			processed.ContentType, len(processed.Data), storageKey).Scan(&fileID)
+	}
 	if err != nil {
-		h.log.Error("Failed to record media metadata", "error", err, "user_id", userID)
-		if delErr := store.DeleteObject(c.Request.Context(), storageKey); delErr != nil {
-			h.log.Error("Failed to delete orphaned media object", "error", delErr, "storage_key", storageKey)
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record media metadata"})
+		h.log.Error(errMsgFailedRecordMediaMetadata, "error", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedRecordMediaMetadata})
 		return "", err
 	}
 	return fileID, nil
@@ -1356,10 +1691,20 @@ func createAttachmentRecord(h *Handler, c *gin.Context, p attachmentParams) erro
 
 // proxyTier1Media fetches a Tier 1 media object from MinIO and streams it to
 // the client with appropriate cache headers. Used for avatars, banners,
-// server icons, server banners, and DM icons.
-// If public is true, the response is marked publicly cacheable (Cloudflare /
-// shared caches OK) — only safe for routes registered without auth middleware.
+// server icons, server banners, and DM icons. Profile keys are admitted only
+// when live metadata exists and no durable erasure tombstone exists.
+// If public is true, non-profile responses are marked publicly cacheable
+// (Cloudflare / shared caches OK) — only safe for routes registered without
+// auth middleware.
 func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
+	profileMedia := isProfileTier1StorageKey(key)
+	if profileMedia {
+		admitted, err := h.profileTier1MediaAdmitted(c.Request.Context(), key)
+		if err != nil || !admitted {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+			return
+		}
+	}
 	store, ok := h.requireObjectStore(c)
 	if !ok {
 		return
@@ -1367,19 +1712,24 @@ func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 	obj, contentType, err := store.GetObject(c.Request.Context(), key)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
 			return
 		}
-		h.log.Error("Failed to fetch media from storage", "error", err, "key", key)
+		if profileMedia {
+			h.log.Error("Failed to fetch profile media from storage")
+		} else {
+			h.log.Error("Failed to fetch media from storage", "error", err, "key", key)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInternalServer})
 		return
 	}
 	defer func() { _ = obj.Close() }()
 
-	// Cache for 1 hour, allow revalidation. Public avatars/banners use a
-	// shared-cacheable directive so Cloudflare can serve them; membership-gated
-	// assets stay private.
-	if public {
+	// Profile media remains uncached to make durable erasure visible immediately;
+	// public server/DM assets retain their shared-cache policy.
+	if profileMedia {
+		c.Header(headerCacheControl, cacheControlNoStore)
+	} else if public {
 		c.Header(headerCacheControl, cacheControlPublic)
 	} else {
 		c.Header(headerCacheControl, cacheControlPrivate)
@@ -1388,8 +1738,66 @@ func (h *Handler) proxyTier1Media(c *gin.Context, key string, public bool) {
 	c.Status(http.StatusOK)
 
 	if _, err := io.Copy(c.Writer, obj); err != nil {
-		h.log.Warn("Failed to stream media to client", "error", err, "key", key)
+		if profileMedia {
+			h.log.Warn("Failed to stream profile media to client")
+		} else {
+			h.log.Warn("Failed to stream media to client", "error", err, "key", key)
+		}
 	}
+}
+
+func (h *Handler) proxyProfileTier1Media(c *gin.Context, userID, profileSlot string) {
+	key, found, err := ProfileTier1StorageKey(c.Request.Context(), h.db, userID, profileSlot)
+	if err != nil || !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgNotFound})
+		return
+	}
+	h.proxyTier1Media(c, key, true)
+}
+
+func isProfileTier1StorageKey(key string) bool {
+	return strings.HasPrefix(key, "avatars/") || strings.HasPrefix(key, "banners/")
+}
+
+func (h *Handler) profileTier1MediaAdmitted(ctx context.Context, key string) (bool, error) {
+	return profileTier1MediaAdmitted(ctx, h.db, key, nil)
+}
+
+// ProfileTier1MediaOwnedAdmitted reports whether a user's exact profile-media
+// key is live Tier 1 metadata and is not pending durable erasure.
+func ProfileTier1MediaOwnedAdmitted(ctx context.Context, db RowQuerier, key, userID string) (bool, error) {
+	return profileTier1MediaAdmitted(ctx, db, key, &userID)
+}
+
+// ProfileTier1MediaOwnedSlotAdmitted reports whether a canonical profile slot
+// resolves to one live, non-tombstoned immutable physical object for its owner.
+func ProfileTier1MediaOwnedSlotAdmitted(ctx context.Context, db RowQuerier, userID, profileSlot string) (bool, error) {
+	_, found, err := ProfileTier1StorageKey(ctx, db, userID, profileSlot)
+	return found, err
+}
+
+// ProfileTier1StorageKey resolves a canonical avatar/banner slot to its exact
+// immutable object key. The durable tombstone check prevents a retired key from
+// being served even if its metadata is still visible to a concurrent reader.
+func ProfileTier1StorageKey(ctx context.Context, db RowQuerier, userID, profileSlot string) (string, bool, error) {
+	if profileSlot != ProfileSlotAvatar && profileSlot != ProfileSlotBanner {
+		return "", false, fmt.Errorf("invalid profile slot %q", profileSlot)
+	}
+	var storageKey string
+	err := db.QueryRowContext(ctx, profileTier1SlotKeyQuery, userID, profileSlot).Scan(&storageKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return storageKey, true, nil
+}
+
+func profileTier1MediaAdmitted(ctx context.Context, db RowQuerier, key string, userID *string) (bool, error) {
+	var admitted bool
+	err := db.QueryRowContext(ctx, profileTier1MediaAdmittedQuery, key, userID).Scan(&admitted)
+	return admitted, err
 }
 
 func (h *Handler) proxyInviteIcon(c *gin.Context, key string) {

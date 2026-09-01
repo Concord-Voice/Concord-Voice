@@ -108,6 +108,12 @@ func (m *mockStore) hasObject(key string) bool {
 	return ok
 }
 
+func (m *mockStore) objectCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.objects)
+}
+
 // --- Multipart upload: interface satisfaction only -------------------------
 //
 // The chunked attachment session is exercised against a real MinIO in

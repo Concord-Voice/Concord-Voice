@@ -1358,12 +1358,11 @@ func (h *Handler) GetPublicFriendCodePreview(c *gin.Context) {
 // store is configured, so the public avatar route always answers with the same
 // bytes regardless of which arm the router selected.
 //
-// The status, Cache-Control, Content-Type and body are copied verbatim from
-// media.serveInviteIconFallback: the two arms must be byte-identical, headers
-// included, or the fallback itself becomes a signal.
+// The status, Cache-Control, Content-Type and body match the media
+// friend-avatar fallback so object-store availability is not a signal.
 // GET /api/v1/friends/codes/:code/avatar
 func (h *Handler) GetPublicFriendAvatarFallback(c *gin.Context) {
-	c.Header("Cache-Control", "public, max-age=60, must-revalidate")
+	c.Header("Cache-Control", "no-store")
 	c.Data(http.StatusOK, "image/svg+xml; charset=utf-8", []byte(invites.PublicInviteIconSVG))
 }
 

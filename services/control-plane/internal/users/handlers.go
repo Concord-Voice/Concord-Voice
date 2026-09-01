@@ -97,9 +97,9 @@ type Handler struct {
 	sessionDisconnector                sessionDisconnector
 	mfaVerifier                        MFAVerifier
 	tiers                              entitlements.TierResolver // resolves the acting user's subscription tier (#1298)
-	store                              media.ObjectDeleter       // nil when object storage is not configured
-	credFence                          *credepoch.Fence          // per-user credential-epoch fence (#2201)
-	tokenPairs                         TokenPairIssuer           // continuation pair for ChangePassword/ReplaceMyKeys (#2201)
+	tier1ErasureWake                   func()
+	credFence                          *credepoch.Fence // per-user credential-epoch fence (#2201)
+	tokenPairs                         TokenPairIssuer  // continuation pair for ChangePassword/ReplaceMyKeys (#2201)
 
 	// graphPresence reconciles already-delivered Rich Presence with the
 	// audience a settings write destroys (#2446). Nil leaves every handler at
@@ -174,9 +174,9 @@ func (h *Handler) SetActivitySettingsSuppressor(suppressor ActivitySettingsSuppr
 	h.activitySuppressor = suppressor
 }
 
-// SetMediaStore configures optional object storage for media cleanup on profile image removal.
-func (h *Handler) SetMediaStore(store media.ObjectDeleter) {
-	h.store = store
+// SetTier1ErasureWake requests prompt processing of durable tier-1 cleanup work.
+func (h *Handler) SetTier1ErasureWake(wake func()) {
+	h.tier1ErasureWake = wake
 }
 
 // GetMe returns the current user's profile
@@ -584,11 +584,11 @@ type UpdateProfileRequest struct {
 // profileUpdateBuilder accumulates SET clauses, arguments, and media keys for
 // the dynamic UPDATE query in UpdateMe. Extracted to reduce cognitive complexity.
 type profileUpdateBuilder struct {
-	setClauses        []string
-	args              []interface{}
-	argIdx            int
-	mediaKeysToDelete []string
-	usernameChanged   bool
+	setClauses           []string
+	args                 []interface{}
+	argIdx               int
+	profileSlotsToDelete []string
+	usernameChanged      bool
 	// usernameChangeInterval is the tier-resolved cadence (#1298). Set in
 	// validateUsername before usernameChanged is flipped true, and reused by
 	// executeProfileUpdate's SQL WHERE so the precheck and the authoritative
@@ -729,7 +729,7 @@ var (
 func validateAvatarURL(b *profileUpdateBuilder, avatarURL string, userID interface{}) (int, string) {
 	if avatarURL == "" {
 		b.addClause("avatar_url", nil)
-		b.mediaKeysToDelete = append(b.mediaKeysToDelete, fmt.Sprintf("avatars/%s", userID))
+		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotAvatar)
 		return 0, ""
 	}
 	expectedAvatarURL := fmt.Sprintf("/api/v1/media/avatars/%s", userID)
@@ -740,6 +740,9 @@ func validateAvatarURL(b *profileUpdateBuilder, avatarURL string, userID interfa
 		return http.StatusBadRequest, "Inline avatar image too large — upload larger images via the avatar upload endpoint"
 	}
 	b.addClause("avatar_url", avatarURL)
+	if avatarURL != expectedAvatarURL {
+		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotAvatar)
+	}
 	return 0, ""
 }
 
@@ -747,7 +750,7 @@ func validateAvatarURL(b *profileUpdateBuilder, avatarURL string, userID interfa
 func validateHeaderImageURL(b *profileUpdateBuilder, headerImageURL string, userID interface{}) (int, string) {
 	if headerImageURL == "" {
 		b.addClause("header_image_url", nil)
-		b.mediaKeysToDelete = append(b.mediaKeysToDelete, fmt.Sprintf("banners/%s", userID))
+		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotBanner)
 		return 0, ""
 	}
 	expectedBannerURL := fmt.Sprintf("/api/v1/media/banners/%s", userID)
@@ -758,6 +761,9 @@ func validateHeaderImageURL(b *profileUpdateBuilder, headerImageURL string, user
 		return http.StatusBadRequest, "Inline header image too large — upload larger images via the banner upload endpoint"
 	}
 	b.addClause("header_image_url", headerImageURL)
+	if headerImageURL != expectedBannerURL {
+		b.profileSlotsToDelete = append(b.profileSlotsToDelete, media.ProfileSlotBanner)
+	}
 	return 0, ""
 }
 
@@ -866,7 +872,7 @@ func (h *Handler) collectProfileValidators(req *UpdateProfileRequest, userID int
 }
 
 // executeProfileUpdate runs the UPDATE query and scans the result into a User model.
-func (h *Handler) executeProfileUpdate(b *profileUpdateBuilder, userID interface{}) (*models.User, int, string) {
+func (h *Handler) executeProfileUpdate(ctx context.Context, db *sql.Tx, b *profileUpdateBuilder, userID string) (*models.User, int, string) {
 	b.setClauses = append(b.setClauses, "updated_at = NOW()")
 
 	whereClause := fmt.Sprintf("WHERE id = $%d", b.argIdx)
@@ -896,7 +902,7 @@ func (h *Handler) executeProfileUpdate(b *profileUpdateBuilder, userID interface
 	}
 
 	var user models.User
-	err := h.db.QueryRow(query, b.args...).Scan(
+	err := db.QueryRowContext(ctx, query, b.args...).Scan(
 		&user.ID, &user.Email, &user.Username, &user.DisplayName,
 		&user.Bio, &user.AvatarURL, &user.HeaderImageURL, &user.ColorScheme,
 		&user.Links, &user.EmailVerified, &user.AgeVerified,
@@ -916,6 +922,59 @@ func (h *Handler) executeProfileUpdate(b *profileUpdateBuilder, userID interface
 	}
 	h.log.Error(errMsgFailedUpdateProfile, "error", err)
 	return nil, http.StatusInternalServerError, errMsgFailedUpdateProfile
+}
+
+// executeProfileUpdateTransaction runs the authoritative profile update and
+// atomically records retry evidence for each retired profile-media object.
+func (h *Handler) executeProfileUpdateTransaction(ctx context.Context, req *UpdateProfileRequest, b *profileUpdateBuilder, userID string) (*models.User, int, string) {
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error("Failed to begin profile update transaction", "error", err)
+		return nil, http.StatusInternalServerError, errMsgFailedUpdateProfile
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				h.log.Error("Failed to roll back profile update transaction", "error", rollbackErr)
+			}
+		}
+	}()
+
+	var lockedUserID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+	).Scan(&lockedUserID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, http.StatusNotFound, errMsgUserNotFound
+	}
+	if err != nil {
+		h.log.Error("Failed to lock profile user", "error", err)
+		return nil, http.StatusInternalServerError, errMsgFailedUpdateProfile
+	}
+
+	if status, msg := h.validateCanonicalProfileMediaURLs(ctx, req, userID, tx); status != 0 {
+		return nil, status, msg
+	}
+
+	for _, profileSlot := range b.profileSlotsToDelete {
+		if err := media.TerminalizeProfileSlot(ctx, tx, userID, profileSlot); err != nil {
+			h.log.Warn("Profile media terminalization failed", "failure_class", "database")
+			return nil, http.StatusInternalServerError, errMsgFailedUpdateProfile
+		}
+	}
+
+	user, status, msg := h.executeProfileUpdate(ctx, tx, b, userID)
+	if status != 0 {
+		return nil, status, msg
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit profile update transaction", "error", err)
+		return nil, http.StatusInternalServerError, errMsgFailedUpdateProfile
+	}
+	committed = true
+	return user, 0, ""
 }
 
 // UpdateMe updates the current user's profile
@@ -945,21 +1004,25 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 		c.JSON(status, resp)
 		return
 	}
-
+	userIDString, ok := userID.(string)
+	if !ok || userIDString == "" {
+		h.log.Error("Profile update missing authenticated user ID")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateProfile})
+		return
+	}
 	if len(b.setClauses) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No fields to update"})
 		return
 	}
 
-	user, status, msg := h.executeProfileUpdate(b, userID)
+	user, status, msg := h.executeProfileUpdateTransaction(c.Request.Context(), &req, b, userIDString)
 	if status != 0 {
 		c.JSON(status, gin.H{"error": msg})
 		return
 	}
 
-	// Clean up orphaned media objects from storage after successful DB update
-	for _, key := range b.mediaKeysToDelete {
-		media.CleanupObject(c.Request.Context(), h.db, h.store, h.log, key)
+	if len(b.profileSlotsToDelete) != 0 && h.tier1ErasureWake != nil {
+		h.tier1ErasureWake()
 	}
 
 	// Record username change in history for audit/abuse tracking
@@ -994,6 +1057,44 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"user": user.PublicUser(),
 	})
+}
+
+// validateCanonicalProfileMediaURLs keeps a canonical profile proxy URL from
+// becoming publication authority on its own. Data URLs and clears are handled
+// by the normal profile validators and retain their existing behavior.
+func (h *Handler) validateCanonicalProfileMediaURLs(ctx context.Context, req *UpdateProfileRequest, userID string, db media.RowQuerier) (int, string) {
+	for _, candidate := range []struct {
+		url         *string
+		profileSlot string
+		expected    string
+		message     string
+	}{
+		{
+			url:         req.AvatarURL,
+			profileSlot: media.ProfileSlotAvatar,
+			expected:    fmt.Sprintf("/api/v1/media/avatars/%s", userID),
+			message:     "Avatar must be an uploaded avatar URL for this user or an image data URL",
+		},
+		{
+			url:         req.HeaderImageURL,
+			profileSlot: media.ProfileSlotBanner,
+			expected:    fmt.Sprintf("/api/v1/media/banners/%s", userID),
+			message:     "Header image must be an uploaded banner URL for this user or an image data URL",
+		},
+	} {
+		if candidate.url == nil || *candidate.url != candidate.expected {
+			continue
+		}
+		admitted, err := media.ProfileTier1MediaOwnedSlotAdmitted(ctx, db, userID, candidate.profileSlot)
+		if err != nil {
+			h.log.Error("Failed to verify profile image publication metadata", "error", err)
+			return http.StatusInternalServerError, errMsgFailedUpdateProfile
+		}
+		if !admitted {
+			return http.StatusBadRequest, candidate.message
+		}
+	}
+	return 0, ""
 }
 
 // changePasswordPresenceOverride carries the opaque replacement ciphertext

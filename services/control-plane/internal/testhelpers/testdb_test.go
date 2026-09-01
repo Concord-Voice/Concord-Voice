@@ -51,9 +51,14 @@ func TestTruncateAllTablesClearsData(t *testing.T) {
 		'$argon2id$v=19$m=65536,t=3,p=4$3pE9STD1TqLPoZQ2/BTLCg$8SKTCjsZh8Q7pAulEqAIEzJQK9eeOb5ipWhPz4REdCY',
 		true, true)`)
 	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key)
+		VALUES ('avatars/trunctest')`)
+	require.NoError(t, err)
 
 	var before int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&before))
+	assert.Equal(t, 1, before)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations`).Scan(&before))
 	assert.Equal(t, 1, before)
 
 	// Truncate and verify.
@@ -61,6 +66,8 @@ func TestTruncateAllTablesClearsData(t *testing.T) {
 
 	var after int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&after))
+	assert.Equal(t, 0, after)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations`).Scan(&after))
 	assert.Equal(t, 0, after)
 }
 

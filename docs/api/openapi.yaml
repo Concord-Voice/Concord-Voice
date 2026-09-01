@@ -6430,8 +6430,10 @@ paths:
 
         Every invalid class — malformed, unknown, expired, revoked, maxed-out — every
         owner without an avatar, and every object-storage failure returns the same
-        silhouette fallback with identical bytes AND identical headers, including
-        Cache-Control: public, max-age=60, must-revalidate on the success path too.
+        silhouette fallback with identical bytes AND identical headers. Responses
+        use Cache-Control: no-store, including the success path. A permanent
+        account-erasure tombstone makes the route return the same fallback without
+        reading object storage.
         A storage outage therefore cannot turn this route into a validity oracle.
         Bytes are proxied, never redirected: a 302 would put the owner''s UUID in
         the Location header.
@@ -6455,7 +6457,7 @@ paths:
           description: Avatar image bytes, or the shared silhouette fallback
           headers:
             Cache-Control:
-              description: public cache directive for the avatar stream
+              description: no-store; the avatar stream is never persisted in a public cache
               schema:
                 type: string
           content:
@@ -6948,8 +6950,9 @@ paths:
       - Media
       summary: Get a user's avatar image
       operationId: mediaProxyAvatar
-      description: 'Public Tier 1 image proxy — streams the avatar from object storage with shared-cacheable
-        headers.
+      description: 'Public Tier 1 image proxy — streams the avatar from object storage with no-store
+        headers. A permanent account-erasure tombstone returns the ordinary missing
+        response without reading object storage.
 
         Rate limit: 120 requests per minute (IP-based).
 
@@ -6968,7 +6971,7 @@ paths:
           description: Avatar image stream (content type from storage)
           headers:
             Cache-Control:
-              description: public, max-age=3600, must-revalidate
+              description: no-store
               schema:
                 type: string
           content:
@@ -6984,6 +6987,11 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: No avatar stored for this user
+          headers:
+            Cache-Control:
+              description: no-store
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -7002,8 +7010,9 @@ paths:
       - Media
       summary: Get a user's profile banner image
       operationId: mediaProxyBanner
-      description: 'Public Tier 1 image proxy — streams the banner from object storage with shared-cacheable
-        headers.
+      description: 'Public Tier 1 image proxy — streams the banner from object storage with no-store
+        headers. A permanent account-erasure tombstone returns the ordinary missing
+        response without reading object storage.
 
         Rate limit: 120 requests per minute (IP-based).
 
@@ -7022,7 +7031,7 @@ paths:
           description: Banner image stream (content type from storage)
           headers:
             Cache-Control:
-              description: public, max-age=3600, must-revalidate
+              description: no-store
               schema:
                 type: string
           content:
@@ -7038,6 +7047,11 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: No banner stored for this user
+          headers:
+            Cache-Control:
+              description: no-store
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -17122,10 +17136,10 @@ components:
           format: uuid
         storage_key:
           type: string
-          description: Object-storage key (e.g. avatars/<user_id>)
+          description: Opaque immutable physical object-storage key for this profile generation; clients must not derive or reuse it.
         url:
           type: string
-          description: Proxy URL path for the stored image (e.g. /api/v1/media/avatars/<user_id>)
+          description: Canonical proxy URL for the profile slot; this stable URL resolves the current immutable physical generation.
         file_size:
           type: integer
           description: Size in bytes after processing

@@ -44,10 +44,19 @@ func (r *recordingReclaimer) keys(refs []media.BlobRef) []string {
 // exact ownership shapes the narrowing has to distinguish between.
 func insertTier1Row(t *testing.T, ts *testhelpers.TestServer, uploaderID, key string) {
 	t.Helper()
+	var slot *string
+	switch key {
+	case "avatars/" + uploaderID:
+		value := "avatar"
+		slot = &value
+	case "banners/" + uploaderID:
+		value := "banner"
+		slot = &value
+	}
 	_, err := ts.DB.Exec(`
-		INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
-		VALUES ($1, 'photo', 1, 'image/webp', 1024, $2)`,
-		uploaderID, key)
+		INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+		VALUES ($1, 'photo', 1, 'image/webp', 1024, $2, $3)`,
+		uploaderID, key, slot)
 	require.NoError(t, err)
 }
 
@@ -64,8 +73,9 @@ func insertTier2Row(t *testing.T, ts *testhelpers.TestServer, uploaderID, channe
 	require.NoError(t, err)
 }
 
-// TestDeleteAccountCapturesOwnMediaOnly is THE regression test for this change,
-// and the assertion that matters is the NEGATIVE one.
+// TestDeleteAccountCapturesOwnMediaOnly is THE regression test for this change.
+// The callback remains the wake seam, but Tier 1 must be handed to the durable
+// obligation rail rather than directly to request-path object deletion.
 //
 // A bare `WHERE uploader_id = $1` capture passes every positive assertion below
 // and still ships a data-destruction bug: `server-icons/<serverID>` and
@@ -107,18 +117,81 @@ func TestDeleteAccountCapturesOwnMediaOnly(t *testing.T) {
 	require.NoError(t, svc.DeleteAccount(context.Background(), uploader.ID))
 	require.True(t, rec.called, "the reclaimer must run for a user who uploaded media")
 
-	assert.ElementsMatch(t, []string{avatarKey, bannerKey}, rec.keys(rec.tier1),
-		"tier-1 capture must be exactly the two keys whose SUBJECT is the erased user")
+	assert.Empty(t, rec.tier1,
+		"the post-commit callback is only a wake seam; Tier-1 keys must not be directly deleted by the request path")
 	assert.ElementsMatch(t, []string{attachmentKey}, rec.keys(rec.tier2),
 		"tier-2 capture must be the user's own attachments")
 
-	// The negative assertion, stated separately so a failure names the defect.
-	for _, shared := range []string{serverIconKey, serverBannerKey, dmIconKey} {
-		assert.NotContains(t, rec.keys(rec.tier1), shared,
-			"capture must NOT include %s: the object belongs to a subject that survives this erasure", shared)
-		assert.NotContains(t, rec.keys(rec.tier2), shared,
-			"capture must NOT include %s on the tier-2 leg either", shared)
+	var obligations []string
+	rows, err := ts.DB.Query(`
+		SELECT storage_key
+		FROM tier1_erasure_delete_obligations
+		WHERE storage_key IN ($1, $2, $3, $4, $5)
+		ORDER BY storage_key`, avatarKey, bannerKey, serverIconKey, serverBannerKey, dmIconKey)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	for rows.Next() {
+		var key string
+		require.NoError(t, rows.Scan(&key))
+		obligations = append(obligations, key)
 	}
+	require.NoError(t, rows.Err())
+	assert.ElementsMatch(t, []string{avatarKey, bannerKey}, obligations,
+		"successful erasure must persist exactly profile Tier-1 keys before cascade; shared server/DM keys must never be obligations")
+}
+
+func TestDeleteAccountTier1ObligationsAreAtomicWithErasure(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "obligationatomicity")
+	avatarKey := "avatars/" + user.ID
+	bannerKey := "banners/" + user.ID
+	insertTier1Row(t, ts, user.ID, avatarKey)
+	insertTier1Row(t, ts, user.ID, bannerKey)
+
+	createFunction := `
+		CREATE FUNCTION tier1_obligation_atomicity_fn() RETURNS trigger AS $fn$
+		DECLARE obligation_count integer;
+		BEGIN
+			SELECT count(*) INTO obligation_count
+			FROM tier1_erasure_delete_obligations
+			WHERE storage_key IN ('avatars/' || OLD.id::text, 'banners/' || OLD.id::text);
+			IF obligation_count <> 2 THEN
+				RAISE EXCEPTION 'tier1 obligations missing before cascade';
+			END IF;
+			RAISE EXCEPTION 'tier1 obligation atomicity sentinel';
+		END;
+		$fn$ LANGUAGE plpgsql`
+	_, err := ts.DB.Exec(createFunction)
+	require.NoError(t, err)
+	createTrigger := `
+		CREATE TRIGGER tier1_obligation_atomicity_trg
+		BEFORE DELETE ON users
+		FOR EACH ROW
+		EXECUTE FUNCTION tier1_obligation_atomicity_fn()`
+	_, err = ts.DB.Exec(createTrigger)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, err := ts.DB.Exec(`DROP TRIGGER IF EXISTS tier1_obligation_atomicity_trg ON users`); err != nil {
+			t.Errorf("drop target-scoped trigger: %v", err)
+		}
+		if _, err := ts.DB.Exec(`DROP FUNCTION IF EXISTS tier1_obligation_atomicity_fn()`); err != nil {
+			t.Errorf("drop target-scoped trigger function: %v", err)
+		}
+	})
+
+	svc := users.NewAccountService(ts.DB, logger.New("test"))
+	err = svc.DeleteAccount(context.Background(), user.ID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tier1 obligation atomicity sentinel",
+		"obligations must be visible before the user cascade reaches its trigger")
+
+	var userCount, obligationCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM users WHERE id = $1`, user.ID).Scan(&userCount))
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT count(*) FROM tier1_erasure_delete_obligations
+		WHERE storage_key IN ($1, $2)`, avatarKey, bannerKey).Scan(&obligationCount))
+	assert.Equal(t, 1, userCount, "sentinel rollback must retain the user")
+	assert.Zero(t, obligationCount, "sentinel rollback must discard same-transaction obligations")
 }
 
 // TestDeleteAccountCaptureCarriesBackend proves the capture keeps the PAIR, not
@@ -148,8 +221,8 @@ func TestDeleteAccountCaptureCarriesBackend(t *testing.T) {
 }
 
 // TestDeleteAccountWithoutReclaimerStillErases pins the deliberate degrade: an
-// unwired reclaimer leaves the pre-existing leak but must never fail a GDPR
-// Article 17 erasure.
+// unwired reclaimer leaves Tier-2 cleanup pending and loses only the prompt
+// Tier-1 wake, but must never fail a GDPR Article 17 erasure.
 func TestDeleteAccountWithoutReclaimerStillErases(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	user := ts.CreateTestUser(t, "erasemedianowire")
@@ -192,17 +265,16 @@ func TestDeleteAccountSkipsAlreadySoftDeletedRows(t *testing.T) {
 		"soft-deleted rows are the orphan reaper's input, not the capture's")
 }
 
-// TestReclaimErasedMediaDetachesRequestContext proves the reclamation survives
-// request-context cancellation.
+// TestReclaimErasedMediaDetachesRequestContext proves the Tier-2 callback
+// survives request-context cancellation.
 //
 // THE WINDOW IS REAL. DeleteAccount is handed c.Request.Context()
 // (privacy/handler.go), which cancels the instant the client disconnects, and
 // account deletion is exactly the flow where someone confirms and then closes
 // the app while the erasure is still doing its sender-gated suppression,
 // presence capture and cascade. By the time the reclaimer runs the users row is
-// GONE, so a live cancelled context would strand the objects with nothing able
-// to retry -- and on the tier-1 leg that residue is plaintext, permanent, and
-// outside the orphan reaper's tier-2 scope.
+// GONE, so a live cancelled context would strand the Tier-2 object until its
+// existing orphan-reaper path can find it.
 //
 // Driven at the unit rather than through DeleteAccount because the window is
 // unreachable from outside: cancelling before the call fails BeginTx (no
@@ -225,13 +297,12 @@ func TestReclaimErasedMediaDetachesRequestContext(t *testing.T) {
 	})
 
 	users.ReclaimErasedMediaForTest(ctx, svc,
-		[]media.BlobRef{media.NewBlobRef("avatars/x", sql.NullString{})},
+		nil,
 		[]media.BlobRef{media.NewBlobRef("attachments/y", sql.NullString{})})
 
-	require.Equal(t, 2, reclaimed, "both legs must reach the reclaimer")
+	require.Equal(t, 1, reclaimed, "the Tier-2 leg must reach the callback")
 	assert.NoError(t, reclaimErr,
-		"the reclaimer got a cancelled context: its object deletes would fail with the "+
-			"users row already gone and no sweep able to retry the tier-1 leg")
+		"the callback got a cancelled context: its object delete would fail")
 	assert.True(t, deadline,
 		"detached but unbounded would let an unresponsive backend hold the request goroutine open")
 }
@@ -280,21 +351,25 @@ func TestDeleteAccountCapturesAttachmentsInItsOwnIncompleteChannels(t *testing.T
 			"and the object leaks with nothing able to find it")
 }
 
-// TestDeleteAccountCapturesSoftDeletedProfileMedia is the regression for the
-// tier-1 half of erasedMediaQuery's split filter.
+// TestDeleteAccountPersistsSoftDeletedProfileMediaObligations is the regression
+// for the tier-1 half of erasedMediaQuery's split filter.
 //
 // media.CleanupObject soft-deletes a tier-1 row even when its DeleteObject
 // FAILED, so a soft-deleted `avatars/<uid>` row can still have a live object.
 // Applying `deleted_at IS NULL` to the tier-1 arm — as an earlier revision did —
 // strands it permanently: the straggler sweep and the orphan reaper are both
 // media_tier = 2, and the residue is server-decoded PLAINTEXT.
-func TestDeleteAccountCapturesSoftDeletedProfileMedia(t *testing.T) {
+func TestDeleteAccountPersistsSoftDeletedProfileMediaObligations(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	user := ts.CreateTestUser(t, "erasesoftdeletedavatar")
 
 	avatarKey := "avatars/" + user.ID
+	bannerKey := "banners/" + user.ID
 	insertTier1Row(t, ts, user.ID, avatarKey)
+	insertTier1Row(t, ts, user.ID, bannerKey)
 	_, err := ts.DB.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE storage_key = $1`, avatarKey)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE storage_key = $1`, bannerKey)
 	require.NoError(t, err)
 
 	rec := &recordingReclaimer{}
@@ -303,7 +378,21 @@ func TestDeleteAccountCapturesSoftDeletedProfileMedia(t *testing.T) {
 
 	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
 
-	assert.Contains(t, rec.keys(rec.tier1), avatarKey,
-		"a soft-deleted profile-media row may still have a LIVE object (CleanupObject "+
-			"soft-deletes even when the delete failed), and no tier-2 sweep can reach it")
+	assert.Empty(t, rec.tier1, "soft-deleted profile media must not be directly deleted by the callback")
+	var obligations []string
+	rows, err := ts.DB.Query(`
+		SELECT storage_key
+		FROM tier1_erasure_delete_obligations
+		WHERE storage_key IN ($1, $2)
+		ORDER BY storage_key`, avatarKey, bannerKey)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	for rows.Next() {
+		var key string
+		require.NoError(t, rows.Scan(&key))
+		obligations = append(obligations, key)
+	}
+	require.NoError(t, rows.Err())
+	assert.ElementsMatch(t, []string{avatarKey, bannerKey}, obligations,
+		"soft-deleted profile rows must still produce exact durable avatar/banner obligations")
 }

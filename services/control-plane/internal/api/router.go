@@ -257,6 +257,7 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 type RouterDependencies struct {
 	OpsMetricsReader opsmetrics.Reader
 	PresenceHistory  *presencehistory.Service
+	Tier1ErasureWake func()
 	// MediaStoreResolver resolves a media_files.storage_backend value to the
 	// object store holding that row's object (ADR-0038 / #2759). Typed as the
 	// media consumer interface rather than *storage.Registry so this package
@@ -717,6 +718,7 @@ func NewRouter(
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
 	usersHandler.SetRedis(redis)
+	usersHandler.SetTier1ErasureWake(dependencies.Tier1ErasureWake)
 	requireStepUpBudgetWired(log, usersHandler)
 	usersHandler.SetPresenceHistory(presenceHistoryService)
 	usersHandler.SetActivitySettingsSuppressor(activityService)
@@ -869,7 +871,6 @@ func NewRouter(
 	if store != nil {
 		mediaHandler = media.NewHandler(db, store, log, cfg, rbacResolver, entCache, serverEntCache)
 		wireMediaHandler(mediaHandler, redis, cfg, log, opsCounters, dependencies)
-		usersHandler.SetMediaStore(store)
 		serversHandler.SetMediaStore(store)
 	}
 	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins,
@@ -893,18 +894,10 @@ func NewRouter(
 	// until buildPrivacyHandler returns on the line above.
 	accountService.SetActivePlanRail(activePlanRail)
 
-	// The erasure's object-storage reclamation (#2759 follow-on). This closure
-	// is the whole wiring, and it lives here because this is the one scope
-	// holding BOTH halves: `store` (the legacy tier-1 client) and `purgeReaper`.
-	//
-	// The two legs are not interchangeable. Tier-2 keys are per-upload unique,
-	// which is exactly what EnqueueBlobDeletes' contract demands. Tier-1 keys
-	// are deterministic per subject, which is exactly what it refuses -- so
-	// routing tier-1 through the queue would delete an object a live row may
-	// still point at. See media.ErasableTier1Keys for the narrowing that makes
-	// the tier-1 set safe in the first place.
+	// Durable erasure wiring: Tier-1 wakes its worker and Tier-2 goes only to
+	// the existing purge queue.
 	accountService.SetErasedMediaReclaimer(
-		newErasedMediaReclaimer(store, purgeReaper.EnqueueBlobDeletes, log))
+		newDurableErasedMediaReclaimer(dependencies.Tier1ErasureWake, purgeReaper.EnqueueBlobDeletes))
 
 	// Runs here, not beside the other wiring: accountService is the last #2447
 	// consumer and is constructed on the line above.
@@ -969,6 +962,10 @@ func NewRouter(
 		}
 	}
 	// API v1 routes
+	noStore := func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		c.Next()
+	}
 	v1 := router.Group("/api/v1")
 	{
 		// Auth routes with rate limiting + IP-based auth failure ban check
@@ -1179,6 +1176,7 @@ func NewRouter(
 			friendsHandler.GetPublicFriendCodePreview,
 		)
 		v1.GET("/friends/codes/:code/avatar",
+			noStore,
 			middleware.RateLimitByIP(redis, 60, 1*time.Minute),
 			publicFriendAvatarHandler(friendsHandler, mediaHandler),
 		)
@@ -1196,10 +1194,12 @@ func NewRouter(
 		// Membership checks have been removed from their handlers.
 		if mediaHandler != nil {
 			v1.GET("/media/avatars/:user_id",
+				noStore,
 				middleware.RateLimitByIP(redis, 120, 1*time.Minute),
 				mediaHandler.ProxyAvatar,
 			)
 			v1.GET("/media/banners/:user_id",
+				noStore,
 				middleware.RateLimitByIP(redis, 120, 1*time.Minute),
 				mediaHandler.ProxyBanner,
 			)
@@ -1219,6 +1219,7 @@ func NewRouter(
 			// Match the protected fallback below so misconfiguration fails
 			// with a clear 503 instead of a 404 for all public Tier 1 routes.
 			mediaUnavailable := func(c *gin.Context) {
+				c.Header("Cache-Control", "no-store")
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "media storage not configured"})
 			}
 			v1.GET("/media/avatars/:user_id", mediaUnavailable)

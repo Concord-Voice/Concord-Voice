@@ -91,7 +91,7 @@ func TestMigration000114_InsertWithoutStorageBackendReadsBackNull(t *testing.T) 
 	var storageBackend sql.NullString
 	require.NoError(t, db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
-		VALUES ($1, 'photo', 1, 'image/png', 1, 'avatars/' || gen_random_uuid()::text)
+		VALUES ($1, 'photo', 1, 'image/png', 1, 'attachments/' || gen_random_uuid()::text)
 		RETURNING storage_backend`, uploaderID).Scan(&storageBackend))
 
 	assert.False(t, storageBackend.Valid,
@@ -114,7 +114,7 @@ func TestMigration000114_AcceptsArbitraryBackendIdentifier(t *testing.T) {
 			var got sql.NullString
 			require.NoError(t, db.QueryRow(`
 				INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key, storage_backend)
-				VALUES ($1, 'photo', 1, 'image/png', 1, 'avatars/' || gen_random_uuid()::text || '/' || $2, $2)
+				VALUES ($1, 'photo', 1, 'image/png', 1, 'attachments/' || gen_random_uuid()::text || '/' || $2, $2)
 				RETURNING storage_backend`, uploaderID, backend).Scan(&got))
 			require.True(t, got.Valid)
 			assert.Equal(t, backend, got.String,
@@ -133,7 +133,7 @@ func TestMigration000114_UpdateChangesPlacementPerObject(t *testing.T) {
 	var id string
 	require.NoError(t, db.QueryRow(`
 		INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
-		VALUES ($1, 'photo', 1, 'image/png', 1, 'avatars/' || gen_random_uuid()::text)
+		VALUES ($1, 'photo', 1, 'image/png', 1, 'attachments/' || gen_random_uuid()::text)
 		RETURNING id`, uploaderID).Scan(&id))
 
 	_, err := db.Exec(`UPDATE media_files SET storage_backend = 'r2' WHERE id = $1`, id)

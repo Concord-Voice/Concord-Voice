@@ -196,14 +196,14 @@ func seedTier1MediaFile(t *testing.T, db *sql.DB, uploader string, deletedAgoSec
 	var err error
 	if deletedAgoSecs == nil {
 		err = db.QueryRow(`
-			INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
-			VALUES ($1::uuid, 'photo', 1, 'image/png', 1, 'avatars/' || $2::text)
+			INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+			VALUES ($1::uuid, 'photo', 1, 'image/png', 1, 'avatars/' || $2::text, 'avatar')
 			RETURNING storage_key`, uploader, uploader).Scan(&key)
 	} else {
 		err = db.QueryRow(`
-			INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key, deleted_at)
+			INSERT INTO media_files (uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot, deleted_at)
 			VALUES ($1::uuid, 'photo', 1, 'image/png', 1, 'avatars/' || $2::text,
-			        NOW() - make_interval(secs => $3))
+			        'avatar', NOW() - make_interval(secs => $3))
 			RETURNING storage_key`, uploader, uploader, *deletedAgoSecs).Scan(&key)
 	}
 	require.NoError(t, err)

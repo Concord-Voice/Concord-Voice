@@ -47,6 +47,7 @@ func seedFriendAvatarFixtures(t *testing.T, ts *testSetup) (live string, cases [
 	_, err := ts.db.Exec(`UPDATE users SET avatar_url = $1 WHERE id = $2`,
 		"/api/v1/media/avatars/"+withAvatar, withAvatar)
 	require.NoError(t, err)
+	ts.createTestTier1Media(t, withAvatar, "avatars/"+withAvatar)
 	noAvatar := ts.createTestUser(t, "faobob")
 
 	insert := func(owner, code string, revoked bool) {
@@ -96,9 +97,10 @@ func serveFriendAvatar(t *testing.T, h *Handler, code string) *httptest.Response
 // Body BYTES, not just length, and Cache-Control alongside Content-Type: a
 // length-only comparison passes for two different fallback bodies that happen to
 // match in size, and omitting the cache directive would let the oracle survive in
-// a header — which is the very reason this fix also drops the success TTL to
-// max-age=60. Asserting parity while ignoring the header the fix equalizes would
-// have been a test that agreed with the change instead of checking it.
+// a header — which is the very reason this route now uses no-store on both
+// success and fallback. Asserting parity while ignoring the header the fix
+// equalizes would have been a test that agreed with the change instead of
+// checking it.
 func shape(w *httptest.ResponseRecorder) string {
 	return fmt.Sprintf("status=%d content-type=%q cache-control=%q body=%q",
 		w.Code,

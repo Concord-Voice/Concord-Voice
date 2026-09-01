@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/gif"
@@ -14,24 +15,28 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	_ "github.com/lib/pq" // register PostgreSQL driver for side effects
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	invitecodes "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/redistest"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/lib/pq/pqerror"
 )
 
 // mediaTestWithResolver builds a media testSetup whose handler is wired with the
@@ -181,6 +186,31 @@ func (ts *testSetup) createTestUser(t *testing.T, username string) string {
 	)
 	require.NoError(t, err)
 	return userID
+}
+
+func (ts *testSetup) createTestTier1Media(t *testing.T, userID, storageKey string) {
+	t.Helper()
+	var profileSlot *string
+	if storageKey == fmt.Sprintf("avatars/%s", userID) {
+		slot := "avatar"
+		profileSlot = &slot
+	} else if storageKey == fmt.Sprintf("banners/%s", userID) {
+		slot := "banner"
+		profileSlot = &slot
+	}
+	_, err := ts.db.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+		 VALUES ($1, $2, 'photo', 1, $3, $4, $5, $6)`,
+		uuid.New().String(), userID, mimeImagePNG, 100, storageKey, profileSlot,
+	)
+	require.NoError(t, err)
+}
+
+func (ts *testSetup) liveProfileStorageKey(t *testing.T, userID, slot string) string {
+	t.Helper()
+	var key string
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_key FROM media_files WHERE uploader_id = $1 AND profile_slot = $2 AND deleted_at IS NULL`, userID, slot).Scan(&key))
+	return key
 }
 
 // createTestServer inserts a server + owner membership and returns the server ID.
@@ -370,8 +400,34 @@ func TestUploadAvatarSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, w.Code)
 	resp := parseBody(t, w)
 	assert.Equal(t, fmt.Sprintf("/api/v1/media/avatars/%s", userID), resp["url"])
-	assert.True(t, ts.store.hasObject(fmt.Sprintf("avatars/%s", userID)))
+	key := ts.liveProfileStorageKey(t, userID, "avatar")
+	assert.True(t, ts.store.hasObject(key))
 	assert.Equal(t, 1, counters.uploads)
+}
+
+func TestUploadAvatarRejectsUnresolvedErasureEvidenceCapBeforePut(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "avatar-evidence-cap")
+
+	for i := 0; i < maxUnresolvedProfileUploadEvidence; i++ {
+		key := fmt.Sprintf("avatars/%s/%s", userID, uuid.NewString())
+		_, err := ts.db.Exec(`
+			INSERT INTO media_files (
+				id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot, deleted_at
+			) VALUES (gen_random_uuid(), $1, 'photo', 1, 'image/png', 4, $2, 'avatar', NOW())`, userID, key)
+		require.NoError(t, err)
+		_, err = ts.db.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key) VALUES ($1)`, key)
+		require.NoError(t, err)
+	}
+
+	body, contentType := multipartBody(t, "file", "avatar.png", makePNG(t, 200, 200), nil)
+	w := ts.doMultipart(ts.handler.UploadAvatar, http.MethodPost, pathUploadAvatar, userID, body, contentType)
+
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
+	assert.Zero(t, ts.store.objectCount(), "the cap must reject before PutObject")
+	var intentCount int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM tier1_profile_upload_intents WHERE user_id = $1`, userID).Scan(&intentCount))
+	assert.Zero(t, intentCount, "the cap must reject before creating an upload intent")
 }
 
 func TestUploadAvatarInvalidType(t *testing.T) {
@@ -437,6 +493,553 @@ func TestUploadAvatarStorageDisabledReturns503(t *testing.T) {
 	assertStorageDisabledResponse(t, w)
 }
 
+// tier1RaceStore exposes only the ordering needed by the profile-upload race
+// tests. It deliberately embeds the normal fake so unrelated ObjectStore
+// methods retain their existing behavior.
+type tier1RaceStore struct {
+	*mockStore
+	putStarted     chan struct{}
+	putRelease     chan struct{}
+	putErr         error
+	waitForCancel  bool
+	writeThenErr   error
+	putDeadline    time.Time
+	putStartedAt   time.Time
+	putHasDeadline bool
+	mu             sync.Mutex
+	puts           int
+	gets           int
+	deletes        int
+}
+
+type lateWriteRaceStore struct {
+	*mockStore
+	putStarted chan struct{}
+	lateWrite  chan struct{}
+	lateResult chan error
+	key        string
+}
+
+type blockingGetStore struct {
+	*mockStore
+	started     chan struct{}
+	release     chan struct{}
+	mu          sync.Mutex
+	gets        int
+	releaseOnce sync.Once
+}
+
+func (s *blockingGetStore) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
+	s.mu.Lock()
+	s.gets++
+	s.mu.Unlock()
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	}
+	return s.mockStore.GetObject(ctx, key)
+}
+
+func (s *blockingGetStore) releaseGet() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+func (s *blockingGetStore) getCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gets
+}
+
+func (s *lateWriteRaceStore) PutObject(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
+	s.key = key
+	select {
+	case s.putStarted <- struct{}{}:
+	default:
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	<-ctx.Done()
+	lateCtx := context.WithoutCancel(ctx)
+	go func() {
+		<-s.lateWrite
+		s.lateResult <- s.mockStore.PutObject(lateCtx, key, bytes.NewReader(data), size, contentType)
+	}()
+	return ctx.Err()
+}
+
+func (s *lateWriteRaceStore) DeleteObject(ctx context.Context, key string) error {
+	return s.mockStore.DeleteObject(ctx, key)
+}
+
+func (s *tier1RaceStore) PutObject(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
+	s.mu.Lock()
+	s.puts++
+	s.putStartedAt = time.Now()
+	s.putDeadline, s.putHasDeadline = ctx.Deadline()
+	s.mu.Unlock()
+	if s.putStarted != nil {
+		select {
+		case s.putStarted <- struct{}{}:
+		default:
+		}
+	}
+	if s.putRelease != nil {
+		select {
+		case <-s.putRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if s.waitForCancel {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if s.putErr != nil {
+		return s.putErr
+	}
+	if err := s.mockStore.PutObject(ctx, key, reader, size, contentType); err != nil {
+		return err
+	}
+	return s.writeThenErr
+}
+
+func (s *tier1RaceStore) DeleteObject(ctx context.Context, key string) error {
+	s.mu.Lock()
+	s.deletes++
+	s.mu.Unlock()
+	return s.mockStore.DeleteObject(ctx, key)
+}
+
+func (s *tier1RaceStore) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
+	s.mu.Lock()
+	s.gets++
+	s.mu.Unlock()
+	return s.mockStore.GetObject(ctx, key)
+}
+
+func (s *tier1RaceStore) counts() (puts, deletes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.puts, s.deletes
+}
+
+func (s *tier1RaceStore) getCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gets
+}
+
+func (s *tier1RaceStore) putDeadlineInfo() (deadline, startedAt time.Time, hasDeadline bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putDeadline, s.putStartedAt, s.putHasDeadline
+}
+
+// eraseUserForTier1Race mirrors the account-erasure lock/obligation ordering
+// without importing internal/users (which would create a package cycle).
+func eraseUserForTier1Race(db *sql.DB, userID string, locked chan<- int64, release <-chan struct{}) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var id string
+	if err := tx.QueryRow(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&id); err != nil {
+		return err
+	}
+	if locked != nil {
+		var txID int64
+		if err := tx.QueryRow(`SELECT txid_current()`).Scan(&txID); err != nil {
+			return err
+		}
+		locked <- txID
+	}
+	if release != nil {
+		<-release
+	}
+	_, err = tx.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key)
+		SELECT storage_key FROM media_files WHERE uploader_id = $1 AND media_tier = 1
+		UNION
+		SELECT storage_key FROM tier1_profile_upload_intents WHERE user_id = $1
+		UNION
+		SELECT 'avatars/' || $1
+		UNION
+		SELECT 'banners/' || $1
+		ON CONFLICT (storage_key) DO NOTHING`, userID)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM tier1_profile_upload_intents WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rowLockWaiterExists(t *testing.T, probe *sql.DB, txID int64) bool {
+	t.Helper()
+	var waiting bool
+	err := probe.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted AND transactionid::text::bigint = $1)`, testdb.TransactionIDForLockProbe(txID)).Scan(&waiting)
+	require.NoError(t, err)
+	return waiting
+}
+
+func TestUploadFirstErasureWaitsForProfileMetadataCommit(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "uploadfirst")
+	store := &tier1RaceStore{mockStore: newMockStore(), putStarted: make(chan struct{}, 1), putRelease: make(chan struct{})}
+	ts.handler.store = store
+	body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	uploadDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		uploadDone <- ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+	}()
+	select {
+	case <-store.putStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("profile upload did not reach object storage")
+	}
+	erasureDone := make(chan error, 1)
+	go func() { erasureDone <- eraseUserForTier1Race(ts.db, userID, nil, nil) }()
+	select {
+	case err := <-erasureDone:
+		close(store.putRelease)
+		<-uploadDone
+		assert.NoError(t, err)
+		t.Fatal("account erasure committed before the profile upload metadata transaction")
+	default:
+	}
+	probeTx, err := ts.db.Begin()
+	require.NoError(t, err)
+	var lockedID string
+	lockErr := probeTx.QueryRow(`SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT`, userID).Scan(&lockedID)
+	assert.Error(t, lockErr, "upload-first ordering must hold the conflicting users-row lock")
+	if pgErr, ok := lockErr.(*pq.Error); ok {
+		assert.Equal(t, pqerror.Code("55P03"), pgErr.Code, "lock probe must fail because the row is busy")
+	}
+	_ = probeTx.Rollback()
+	close(store.putRelease)
+	assert.Equal(t, http.StatusCreated, (<-uploadDone).Code)
+	physicalKey := ts.liveProfileStorageKey(t, userID, "avatar")
+	assert.NoError(t, <-erasureDone)
+	worker := NewTier1ErasureReclaimer(ts.db, store, logger.New("test"))
+	_, err = worker.reclaimDue(context.Background(), 10)
+	require.NoError(t, err)
+	assert.False(t, store.hasObject(physicalKey), "reclaimer must delete the upload-first avatar object")
+	var count int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations WHERE storage_key IN ($1, $2, $3)`, physicalKey, tier1StorageKey(purposeAvatar, userID, "", ""), tier1StorageKey(purposeBanner, userID, "", "")).Scan(&count))
+	assert.Equal(t, 3, count, "successful reclaimer pass must retain all permanent tombstones")
+}
+
+func TestErasureFirstProfileUploadPerformsNoPut(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "erasurefirst")
+	store := &tier1RaceStore{mockStore: newMockStore(), putStarted: make(chan struct{}, 1)}
+	ts.handler.store = store
+	locked, release := make(chan int64, 1), make(chan struct{})
+	erasureDone := make(chan error, 1)
+	go func() { erasureDone <- eraseUserForTier1Race(ts.db, userID, locked, release) }()
+	txID := <-locked
+	body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	uploadDone := make(chan *httptest.ResponseRecorder, 1)
+	probe, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = probe.Close() })
+	go func() {
+		uploadDone <- ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
+	}()
+	waiting := false
+	for i := 0; i < 1000 && !waiting; i++ {
+		waiting = rowLockWaiterExists(t, probe, txID)
+	}
+	if !waiting {
+		close(release)
+		assert.NoError(t, <-erasureDone)
+		<-uploadDone
+		t.Fatal("profile upload did not wait on the erasure transaction's users-row lock")
+	}
+	testdb.WaitForRowLockWaiter(t, probe, txID)
+	close(release)
+	assert.NoError(t, <-erasureDone)
+	assert.NotEqual(t, http.StatusCreated, (<-uploadDone).Code)
+	puts, _ := store.counts()
+	assert.Zero(t, puts, "an upload after erasure must not mutate object storage")
+}
+
+func TestTier1TombstoneSurvivesLateObjectAndReclaimsItAgain(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "lateobject")
+	store := &lateWriteRaceStore{mockStore: newMockStore(), putStarted: make(chan struct{}, 1), lateWrite: make(chan struct{}), lateResult: make(chan error, 1)}
+	ts.handler.store = store
+	body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	req := httptest.NewRequest(http.MethodPost, pathUploadAvatar, body)
+	req.Header.Set("Content-Type", ct)
+	putDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = req
+		c.Set("user_id", userID)
+		ts.handler.UploadAvatar(c)
+		putDone <- w
+	}()
+	select {
+	case <-store.putStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-write upload did not reach object storage")
+	}
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-putDone:
+	case <-time.After(12 * time.Second):
+		t.Fatal("profile upload did not honor its object-store deadline")
+	}
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	require.NoError(t, eraseUserForTier1Race(ts.db, userID, nil, nil))
+	key := store.key
+	assert.NotEqual(t, tier1StorageKey(purposeAvatar, userID, "", ""), key)
+
+	worker := NewTier1ErasureReclaimer(ts.db, store, logger.New("test"))
+	_, err := worker.reclaimDue(context.Background(), 10)
+	require.NoError(t, err)
+	close(store.lateWrite)
+	require.NoError(t, <-store.lateResult)
+	assert.True(t, store.hasObject(key), "the delayed backend write must recreate the physical object")
+	w = ts.doJSON(ts.handler.ProxyAvatar, http.MethodGet, "/api/v1/media/avatars/"+userID, userID,
+		gin.Params{{Key: "user_id", Value: userID}})
+	assert.Equal(t, http.StatusNotFound, w.Code, "a tombstoned object must never be served")
+
+	_, err = ts.db.Exec(`UPDATE tier1_erasure_delete_obligations SET reconcile_after = now() - interval '1 minute' WHERE storage_key = $1`, key)
+	require.NoError(t, err)
+	_, err = worker.reclaimDue(context.Background(), 10)
+	require.NoError(t, err)
+	assert.False(t, store.hasObject(key), "a later reclaim must delete a late object")
+	var count int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations WHERE storage_key = $1`, key).Scan(&count))
+	assert.Equal(t, 1, count, "the permanent tombstone must survive successful deletion")
+}
+
+func TestProfileUploadWithLiveTombstonePerformsNoPut(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "livetombstone")
+	legacyKey := tier1StorageKey(purposeAvatar, userID, "", "")
+	_, err := ts.db.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key) VALUES ($1)`, legacyKey)
+	require.NoError(t, err)
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	ts.handler.store = store
+	body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	w := ts.doMultipart(ts.handler.UploadAvatar, http.MethodPost, pathUploadAvatar, userID, body, ct)
+	assert.Equal(t, http.StatusCreated, w.Code)
+	puts, _ := store.counts()
+	assert.Equal(t, 1, puts, "a legacy canonical tombstone must not block a fresh immutable key")
+	physicalKey := ts.liveProfileStorageKey(t, userID, "avatar")
+	assert.NotEqual(t, legacyKey, physicalKey)
+	assert.True(t, store.hasObject(physicalKey))
+	assert.Equal(t, 1, obligationCountForKey(t, ts.db, legacyKey))
+}
+
+func installTier1MetadataFailure(t *testing.T, db *sql.DB) func() {
+	t.Helper()
+	_, err := db.Exec(`CREATE OR REPLACE FUNCTION test_tier1_metadata_failure() RETURNS trigger AS $$
+	BEGIN RAISE EXCEPTION 'forced metadata failure'; END; $$ LANGUAGE plpgsql`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TRIGGER test_tier1_metadata_failure_trigger BEFORE INSERT OR UPDATE ON media_files FOR EACH ROW EXECUTE FUNCTION test_tier1_metadata_failure()`)
+	require.NoError(t, err)
+	return func() {
+		if _, dropErr := db.Exec(`DROP TRIGGER IF EXISTS test_tier1_metadata_failure_trigger ON media_files`); dropErr != nil {
+			t.Errorf("drop test trigger: %v", dropErr)
+		}
+		if _, dropErr := db.Exec(`DROP FUNCTION IF EXISTS test_tier1_metadata_failure()`); dropErr != nil {
+			t.Errorf("drop test function: %v", dropErr)
+		}
+	}
+}
+
+func TestDefiniteMetadataFailureDoesNotPutOrAlterPriorProfileObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "metadatafailure")
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	ts.handler.store = store
+	firstBody, firstCT := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	assert.Equal(t, http.StatusCreated, ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, firstBody, firstCT).Code)
+	key := ts.liveProfileStorageKey(t, userID, "avatar")
+	first, _, err := store.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	firstBytes, err := io.ReadAll(first)
+	require.NoError(t, err)
+	var beforeSize int
+	var beforeMIME string
+	require.NoError(t, ts.db.QueryRow(`SELECT file_size, mime_type FROM media_files WHERE storage_key = $1 AND deleted_at IS NULL`, key).Scan(&beforeSize, &beforeMIME))
+	cleanup := installTier1MetadataFailure(t, ts.db)
+	defer cleanup()
+	secondBody, secondCT := multipartBody(t, "file", "avatar.png", makePNG(t, 128, 128), nil)
+	assert.Equal(t, http.StatusInternalServerError, ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, secondBody, secondCT).Code)
+	puts, deletes := store.counts()
+	assert.Equal(t, 1, puts, "definite metadata failure must occur before the second writer's PUT")
+	assert.Zero(t, deletes, "metadata failure must not destructively compensate the deterministic key")
+	var afterSize int
+	var afterMIME string
+	require.NoError(t, ts.db.QueryRow(`SELECT file_size, mime_type FROM media_files WHERE storage_key = $1 AND deleted_at IS NULL`, key).Scan(&afterSize, &afterMIME))
+	assert.Equal(t, beforeSize, afterSize, "failed writer must not alter prior metadata size")
+	assert.Equal(t, beforeMIME, afterMIME, "failed writer must not alter prior metadata content type")
+	obj, _, err := store.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	after, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	assert.Equal(t, firstBytes, after, "failed writer must not alter the successful writer's object")
+}
+
+func TestDefiniteMetadataFailureBeforeSuccessCannotPoisonLaterWriter(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "failurefirst")
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	ts.handler.store = store
+	cleanup := installTier1MetadataFailure(t, ts.db)
+	t.Cleanup(cleanup)
+	body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	assert.Equal(t, http.StatusInternalServerError, ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct).Code)
+	var metadataCount int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id = $1 AND profile_slot = 'avatar' AND deleted_at IS NULL`, userID).Scan(&metadataCount))
+	assert.Zero(t, metadataCount, "definite metadata failure must leave no live metadata")
+	puts, deletes := store.counts()
+	assert.Zero(t, puts, "definite metadata failure must occur before any PUT")
+	assert.Zero(t, deletes, "definite metadata failure must not issue destructive compensation")
+	cleanup()
+	secondBody, secondCT := multipartBody(t, "file", "avatar.png", makePNG(t, 128, 128), nil)
+	assert.Equal(t, http.StatusCreated, ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, secondBody, secondCT).Code)
+	key := ts.liveProfileStorageKey(t, userID, "avatar")
+	obj, _, err := store.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	secondBytes, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	assert.NotEmpty(t, secondBytes, "a later successful writer's immutable object must remain intact")
+}
+
+func TestProfilePutErrorsNeverDeleteDeterministicObject(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		writeThen bool
+	}{
+		{name: "honest put error"},
+		{name: "write then error", writeThen: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			userID := ts.createTestUser(t, "puterror"+strings.ReplaceAll(tc.name, " ", ""))
+			store := &tier1RaceStore{mockStore: newMockStore(), putErr: errors.New("put failed")}
+			if tc.writeThen {
+				store.putErr = nil
+				store.writeThenErr = errors.New("ambiguous put failure")
+			}
+			ts.handler.store = store
+			body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+			assert.Equal(t, http.StatusInternalServerError, ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct).Code)
+			_, deletes := store.counts()
+			assert.Zero(t, deletes, "PUT failure must not issue destructive compensation")
+			var metadataCount int
+			require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE uploader_id = $1 AND profile_slot = 'avatar' AND deleted_at IS NULL`, userID).Scan(&metadataCount))
+			assert.Zero(t, metadataCount, "PUT failure must leave transactional metadata absent")
+		})
+	}
+}
+
+func TestProfilePutTimeoutBoundsObjectStoreContextAndReleasesTransaction(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "puttimeout")
+	store := &tier1RaceStore{mockStore: newMockStore(), putStarted: make(chan struct{}, 1), waitForCancel: true}
+	ts.handler.store = store
+	probeDB, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	probeDB.SetMaxOpenConns(1)
+	probeDB.SetMaxIdleConns(1)
+	probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	require.NoError(t, probeDB.PingContext(probeCtx))
+	cancel()
+	t.Cleanup(func() {
+		if err := probeDB.Close(); err != nil {
+			t.Errorf("close profile upload probe database: %v", err)
+		}
+	})
+	ts.handler.db = probeDB
+
+	body, ct := multipartBody(t, "file", "avatar.png", makePNG(t, 64, 64), nil)
+	req := httptest.NewRequest(http.MethodPost, pathUploadAvatar, body)
+	req.Header.Set("Content-Type", ct)
+	putDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = req
+		c.Set("user_id", userID)
+		ts.handler.UploadAvatar(c)
+		putDone <- w
+	}()
+	select {
+	case <-store.putStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("profile upload did not reach object storage")
+	}
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-putDone:
+	case <-time.After(12 * time.Second):
+		t.Fatal("profile upload did not stop at its ten-second transaction deadline")
+	}
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	deadline, putStartedAt, hasDeadline := store.putDeadlineInfo()
+	require.True(t, hasDeadline, "profile object-store PUT must have a deadline")
+	assert.False(t, deadline.After(putStartedAt.Add(10*time.Second+100*time.Millisecond)),
+		"PUT deadline must be bounded to ten seconds from the PUT")
+
+	var metadataCount int
+	probeCtx, cancel = context.WithTimeout(context.Background(), time.Second)
+	queryErr := probeDB.QueryRowContext(probeCtx,
+		`SELECT COUNT(*) FROM media_files WHERE uploader_id = $1 AND profile_slot = 'avatar' AND deleted_at IS NULL`, userID,
+	).Scan(&metadataCount)
+	cancel()
+	require.NoError(t, queryErr, "failed profile upload must release its transaction connection")
+	assert.Zero(t, metadataCount, "failed profile upload must leave no live metadata")
+}
+
+func TestAmbiguousTier1MetadataCommitNeverDeletesObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	userID := ts.createTestUser(t, "ambiguouscommit")
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	ts.handler.store = store
+	ts.handler.tier1UploadCommit = func(tx *sql.Tx) error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return errors.New("commit outcome unknown")
+	}
+	expected := makePNG(t, 64, 64)
+	body, ct := multipartBody(t, "file", "avatar.png", expected, nil)
+	assert.Equal(t, http.StatusInternalServerError, ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct).Code)
+	key := ts.liveProfileStorageKey(t, userID, "avatar")
+	var metadataCount int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE storage_key = $1 AND deleted_at IS NULL`, key).Scan(&metadataCount))
+	assert.Equal(t, 1, metadataCount, "ambiguous commit must retain committed metadata")
+	obj, _, err := store.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	actual, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	assert.Equal(t, expected, actual, "ambiguous commit must retain the committed immutable object")
+	puts, deletes := store.counts()
+	assert.Equal(t, 1, puts, "ambiguous commit must perform exactly one PUT")
+	assert.Zero(t, deletes, "ambiguous commit must not destructively compensate the immutable key")
+}
+
 // =====================================================================
 // Tier 1 Server Upload Authorization Tests
 // =====================================================================
@@ -478,6 +1081,25 @@ func TestUploadServerIconInvalidServerID(t *testing.T) {
 	w := ts.doMultipart(ts.handler.UploadServerIcon, "POST", pathUploadServerIcon, owner, body, ct)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestUploadServerIconStoreFailureReturns500WithoutObject(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "iconstorefailure")
+	serverID := ts.createTestServer(t, owner, "Icon Store Failure")
+	store := &tier1RaceStore{mockStore: ts.store, putErr: errors.New("put failed")}
+	ts.handler.store = store
+	counters := &mediaOpsCounterSpy{}
+	ts.handler.SetOpsCounter(counters)
+
+	imgData := makePNG(t, 100, 100)
+	body, ct := multipartBody(t, "file", fileIconPng, imgData, map[string]string{"server_id": serverID})
+	w := ts.doMultipart(ts.handler.UploadServerIcon, "POST", pathUploadServerIcon, owner, body, ct)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Equal(t, errMsgFailedStoreImage, parseBody(t, w)["error"])
+	assert.False(t, ts.store.hasObject(fmt.Sprintf("server-icons/%s", serverID)))
+	assert.Zero(t, counters.uploads)
 }
 
 func TestEnforceTier1UploadLimit_GroundspeedServerImagesRejectOverFiveMiB(t *testing.T) {
@@ -1192,13 +1814,17 @@ func TestDeleteMediaStorageDisabledReturns503AndLeavesRowActive(t *testing.T) {
 // Proxy Tests
 // =====================================================================
 
-func TestProxyAvatarNotFound(t *testing.T) {
+func TestProxyAvatarAbsentProfileMediaReturnsNoStoreWithoutStorageRead(t *testing.T) {
 	ts := setupMediaTest(t)
-	fakeID := uuid.New().String()
+	userID := ts.createTestUser(t, "avatarabsent")
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	ts.handler.store = store
 
-	w := ts.doJSON(ts.handler.ProxyAvatar, "GET", "/api/v1/media/avatars/"+fakeID, fakeID, gin.Params{{Key: "user_id", Value: fakeID}})
+	w := ts.doJSON(ts.handler.ProxyAvatar, "GET", "/api/v1/media/avatars/"+userID, userID, gin.Params{{Key: "user_id", Value: userID}})
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, cacheControlNoStore, w.Header().Get(hdrCacheControl))
+	assert.Zero(t, store.getCount(), "absent profile media must be denied before object storage")
 }
 
 func TestProxyAvatarInvalidID(t *testing.T) {
@@ -1211,7 +1837,8 @@ func TestProxyAvatarInvalidID(t *testing.T) {
 
 func TestProxyAvatarStorageDisabledReturns503(t *testing.T) {
 	ts := setupMediaTest(t)
-	userID := uuid.New().String()
+	userID := ts.createTestUser(t, "avatarstoragedisabled")
+	ts.createTestTier1Media(t, userID, tier1StorageKey(purposeAvatar, userID, "", ""))
 	ts.handler.store = nil
 
 	var w *httptest.ResponseRecorder
@@ -1219,6 +1846,207 @@ func TestProxyAvatarStorageDisabledReturns503(t *testing.T) {
 		w = ts.doJSON(ts.handler.ProxyAvatar, "GET", "/api/v1/media/avatars/"+userID, userID, gin.Params{{Key: "user_id", Value: userID}})
 	})
 	assertStorageDisabledResponse(t, w)
+}
+
+func TestProxyProfileMediaSuccessIsNoStore(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, key string
+		handler         func(*Handler, *gin.Context)
+	}{
+		{"avatar", "/api/v1/media/avatars/", "avatars/", (*Handler).ProxyAvatar},
+		{"banner", "/api/v1/media/banners/", "banners/", (*Handler).ProxyBanner},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			userID := ts.createTestUser(t, "nostore"+tc.name)
+			key := tc.key + userID
+			ts.createTestTier1Media(t, userID, key)
+			require.NoError(t, ts.store.PutObject(context.Background(), key, bytes.NewReader(makePNG(t, 32, 32)), 100, mimeImagePNG))
+			w := ts.doJSON(func(c *gin.Context) { tc.handler(ts.handler, c) }, http.MethodGet, tc.path+userID, userID,
+				gin.Params{{Key: "user_id", Value: userID}})
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, cacheControlNoStore, w.Header().Get(hdrCacheControl))
+		})
+	}
+}
+
+func seedProxyLoggingProfile(t *testing.T, ts *testSetup, userID, slot, key string) {
+	t.Helper()
+	_, err := ts.db.Exec(`
+		INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+		VALUES ($1, $2, 'photo', 1, 'image/png', 100, $3, $4)`,
+		uuid.New().String(), userID, key, slot)
+	require.NoError(t, err)
+}
+
+func TestProfileProxyStorageFailuresDoNotLogSensitiveDetails(t *testing.T) {
+	const providerDetail = "storage-backend-detail"
+	for _, tc := range []struct {
+		name        string
+		slot        string
+		path        string
+		partial     bool
+		status      int
+		errorDetail string
+		message     string
+	}{
+		{name: "avatar_fetch", slot: ProfileSlotAvatar, path: "/api/v1/media/avatars/", status: http.StatusInternalServerError, errorDetail: providerDetail, message: "Failed to fetch profile media from storage"},
+		{name: "banner_fetch", slot: ProfileSlotBanner, path: "/api/v1/media/banners/", status: http.StatusInternalServerError, errorDetail: providerDetail, message: "Failed to fetch profile media from storage"},
+		{name: "avatar_stream", slot: ProfileSlotAvatar, path: "/api/v1/media/avatars/", partial: true, status: http.StatusOK, errorDetail: "connection reset mid-transfer", message: "Failed to stream profile media to client"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			userID := ts.createTestUser(t, "proxylog"+tc.name)
+			generationID := uuid.New().String()
+			prefix := "avatars"
+			if tc.slot == ProfileSlotBanner {
+				prefix = "banners"
+			}
+			key := prefix + "/" + userID + "/" + generationID
+			seedProxyLoggingProfile(t, ts, userID, tc.slot, key)
+
+			if tc.partial {
+				ts.store.getPartial = []byte("partial profile media")
+			} else {
+				ts.store.getErr = errors.New(providerDetail)
+			}
+			var output bytes.Buffer
+			ts.handler.log = logger.NewWithWriter(&output)
+
+			w := ts.doNoAuth(func(c *gin.Context) {
+				if tc.slot == ProfileSlotAvatar {
+					ts.handler.ProxyAvatar(c)
+				} else {
+					ts.handler.ProxyBanner(c)
+				}
+			}, http.MethodGet, tc.path+userID, gin.Params{{Key: "user_id", Value: userID}})
+
+			require.Equal(t, tc.status, w.Code)
+			log := output.String()
+			require.Contains(t, log, tc.message)
+			for _, sensitiveDetail := range []string{key, userID, generationID, tc.errorDetail} {
+				require.NotContains(t, log, sensitiveDetail, "proxy failure log leaked sensitive detail")
+			}
+		})
+	}
+}
+
+func TestFriendCodeAvatarStorageFailuresDoNotLogSensitiveDetails(t *testing.T) {
+	const providerDetail = "storage-backend-detail"
+	for _, tc := range []struct {
+		name        string
+		partial     bool
+		errorDetail string
+		message     string
+	}{
+		{name: "fetch", errorDetail: providerDetail, message: "Failed to fetch friend-code avatar from storage"},
+		{name: "read", partial: true, errorDetail: "connection reset mid-transfer", message: "Failed to read friend-code avatar from storage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			ownerID := ts.createTestUser(t, "friendproxylog"+tc.name)
+			generationID := uuid.New().String()
+			key := "avatars/" + ownerID + "/" + generationID
+			ts.setUserAvatarURL(t, ownerID, "/api/v1/media/avatars/"+ownerID)
+			ts.createTestFriendCode(t, ownerID, "FAVBLZE2", false, nil, 0, 0)
+			seedProxyLoggingProfile(t, ts, ownerID, ProfileSlotAvatar, key)
+
+			if tc.partial {
+				ts.store.getPartial = []byte("partial avatar")
+			} else {
+				ts.store.getErr = errors.New(providerDetail)
+			}
+			var output bytes.Buffer
+			ts.handler.log = logger.NewWithWriter(&output)
+
+			w := ts.getFriendCodeAvatar(friendCodeAvatarPath("FAVBLZE2"), "FAVBLZE2")
+			require.Equal(t, http.StatusOK, w.Code)
+			log := output.String()
+			require.Contains(t, log, tc.message)
+			for _, sensitiveDetail := range []string{key, ownerID, generationID, tc.errorDetail} {
+				require.NotContains(t, log, sensitiveDetail, "friend-code avatar failure log leaked sensitive detail")
+			}
+		})
+	}
+}
+
+func TestProxyAvatarTombstoneLookupErrorFailsClosedBeforeGet(t *testing.T) {
+	closed, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	h := NewHandler(closed, store, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+	userID := uuid.New().String()
+	w := (&testSetup{handler: h, store: store.mockStore, db: closed}).doJSON(
+		h.ProxyAvatar, http.MethodGet, "/api/v1/media/avatars/"+userID, userID,
+		gin.Params{{Key: "user_id", Value: userID}},
+	)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Zero(t, store.getCount(), "tombstone lookup errors must not reach object storage")
+}
+
+func TestProfileMediaAdmissionAllowsInFlightReadAfterErasure(t *testing.T) {
+	for _, tc := range []struct {
+		name, keyPrefix string
+		handle          func(*Handler, *gin.Context)
+		path            func(string) string
+		params          func(string) gin.Params
+		friendCode      bool
+		secondStatus    int
+	}{
+		{"avatar", "avatars/", (*Handler).ProxyAvatar, func(id string) string { return "/api/v1/media/avatars/" + id }, func(id string) gin.Params { return gin.Params{{Key: "user_id", Value: id}} }, false, http.StatusNotFound},
+		{"banner", "banners/", (*Handler).ProxyBanner, func(id string) string { return "/api/v1/media/banners/" + id }, func(id string) gin.Params { return gin.Params{{Key: "user_id", Value: id}} }, false, http.StatusNotFound},
+		{"friend-code avatar", "avatars/", (*Handler).ProxyFriendCodeAvatar, func(string) string { return friendCodeAvatarPath("ABCDEFGH") }, func(string) gin.Params { return gin.Params{{Key: "code", Value: "ABCDEFGH"}} }, true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupMediaTest(t)
+			owner := ts.createTestUser(t, "admission"+strings.ReplaceAll(tc.name, "-", ""))
+			if tc.friendCode {
+				ts.setUserAvatarURL(t, owner, "/api/v1/media/avatars/"+owner)
+				ts.createTestFriendCode(t, owner, "ABCDEFGH", false, nil, 0, 0)
+			}
+			key := tc.keyPrefix + owner
+			ts.createTestTier1Media(t, owner, key)
+			plaintext := makePNG(t, 32, 32)
+			store := &blockingGetStore{mockStore: newMockStore(), started: make(chan struct{}, 1), release: make(chan struct{})}
+			require.NoError(t, store.PutObject(context.Background(), key, bytes.NewReader(plaintext), int64(len(plaintext)), mimeImagePNG))
+			hA := NewHandler(ts.db, store, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+			hB := NewHandler(ts.db, store, logger.New("test"), &config.Config{}, nil, freeTierStub{})
+			t.Cleanup(store.releaseGet)
+			request := func(h *Handler) *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest(http.MethodGet, tc.path(owner), nil)
+				c.Params = tc.params(owner)
+				handle := tc.handle
+				handle(h, c)
+				return w
+			}
+			firstDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { firstDone <- request(hA) }()
+			select {
+			case <-store.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("first reader did not reach object storage")
+			}
+			require.NoError(t, eraseUserForTier1Race(ts.db, owner, nil, nil))
+			second := request(hB)
+			assert.Equal(t, tc.secondStatus, second.Code)
+			assert.Equal(t, cacheControlNoStore, second.Header().Get(hdrCacheControl))
+			assert.Equal(t, 1, store.getCount(), "post-erasure reader must be denied before storage")
+			store.releaseGet()
+			var first *httptest.ResponseRecorder
+			select {
+			case first = <-firstDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("admitted reader did not finish after release")
+			}
+			assert.Equal(t, http.StatusOK, first.Code)
+			assert.Equal(t, cacheControlNoStore, first.Header().Get(hdrCacheControl))
+			assert.Equal(t, plaintext, first.Body.Bytes(), "the pre-erasure admitted read may finish with the object it fetched")
+		})
+	}
 }
 
 // TestProxyServerIconPublic asserts that server-icons are now a public Tier 1
@@ -1591,7 +2419,7 @@ func TestUploadAvatarAnimatedGIF_PremiumPreservesAnimation(t *testing.T) {
 	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
 
 	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
-	data, contentType := ts.storedObject(t, fmt.Sprintf("avatars/%s", userID))
+	data, contentType := ts.storedObject(t, ts.liveProfileStorageKey(t, userID, "avatar"))
 	assert.Equal(t, "image/gif", contentType, "animated output keeps the gif content type")
 
 	out, err := gif.DecodeAll(bytes.NewReader(data))
@@ -1610,7 +2438,7 @@ func TestUploadAvatarAnimatedGIF_FreeRejectedWithUpsellCode(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, w.Code)
 	resp := parseBody(t, w)
 	assert.Equal(t, "animated_profile_premium", resp["code"], "typed upsell code (#1522 pattern)")
-	assert.False(t, ts.store.hasObject(fmt.Sprintf("avatars/%s", userID)), "nothing stored on reject")
+	assert.False(t, ts.store.hasObject("avatars/"+userID), "nothing stored on reject")
 }
 
 // Behavior lock: a STATIC (single-frame) GIF keeps today's flatten path for
@@ -1624,7 +2452,7 @@ func TestUploadAvatarStaticGIF_FreeFlattensUnchanged(t *testing.T) {
 	w := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body, ct)
 
 	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
-	_, contentType := ts.storedObject(t, fmt.Sprintf("avatars/%s", userID))
+	_, contentType := ts.storedObject(t, ts.liveProfileStorageKey(t, userID, "avatar"))
 	assert.Equal(t, "image/png", contentType, "static gif avatar flattens via the static path")
 }
 
@@ -1775,11 +2603,12 @@ func friendCodeAvatarPath(code string) string {
 func TestProxyFriendCodeAvatarSuccess(t *testing.T) {
 	ts := setupMediaTest(t)
 	owner := ts.createTestUser(t, "fcavatarok")
-	ts.setUserAvatarURL(t, owner, "avatars/"+owner)
+	ts.setUserAvatarURL(t, owner, "/api/v1/media/avatars/"+owner)
 	ts.createTestFriendCode(t, owner, "ABCDEFGH", false, nil, 0, 0)
 
 	avatar := makePNG(t, 32, 32)
 	key := fmt.Sprintf("avatars/%s", owner)
+	ts.createTestTier1Media(t, owner, key)
 	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(avatar), 100, mimeImagePNG))
 
 	w := ts.getFriendCodeAvatar(friendCodeAvatarPath("ABCDEFGH"), "ABCDEFGH")
@@ -1787,12 +2616,7 @@ func TestProxyFriendCodeAvatarSuccess(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, avatar, w.Body.Bytes(), "the owner's avatar must be proxied, never redirected to")
 	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
-	// max-age=60, matching EVERY fallback, not the 3600 this asserted before
-	// #945 Md6. Equalizing bytes and status while the success path still emitted
-	// a distinct cache directive left the same validity oracle in a header: any
-	// shared proxy could separate "live code whose owner has an avatar" from
-	// every other class by TTL alone. The short TTL is the fix, not an accident.
-	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=60")
+	assert.Equal(t, cacheControlNoStore, w.Header().Get(hdrCacheControl))
 	// The route is keyed by CODE precisely so the owner's UUID never escapes -
 	// including via a redirect, which would put it in Location. Sweep every
 	// header rather than the one or two a redirect would have used.
@@ -1804,6 +2628,24 @@ func TestProxyFriendCodeAvatarSuccess(t *testing.T) {
 	}
 }
 
+func TestProxyFriendCodeAvatarTombstoneUsesUniformFallback(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "fcavatartombstone")
+	ts.setUserAvatarURL(t, owner, "/api/v1/media/avatars/"+owner)
+	ts.createTestFriendCode(t, owner, "ABCDEFGH", false, nil, 0, 0)
+	key := "avatars/" + owner
+	_, err := ts.db.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key) VALUES ($1)`, key)
+	require.NoError(t, err)
+	store := &tier1RaceStore{mockStore: newMockStore()}
+	ts.handler.store = store
+
+	w := ts.getFriendCodeAvatar(friendCodeAvatarPath("ABCDEFGH"), "ABCDEFGH")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, cacheControlNoStore, w.Header().Get(hdrCacheControl))
+	assert.Equal(t, []byte(invitecodes.PublicInviteIconSVG), w.Body.Bytes())
+	assert.Zero(t, store.getCount(), "tombstoned friend-code avatars must not reach object storage")
+}
+
 // TestProxyFriendCodeAvatarFallbackClasses proves every rejected class serves
 // the shared silhouette, byte for byte and header for header. An attacker who
 // could tell "unknown code" from "revoked code" would have an enumeration
@@ -1812,7 +2654,8 @@ func TestProxyFriendCodeAvatarSuccess(t *testing.T) {
 func TestProxyFriendCodeAvatarFallbackClasses(t *testing.T) {
 	ts := setupMediaTest(t)
 	owner := ts.createTestUser(t, "fcavatarfb")
-	ts.setUserAvatarURL(t, owner, "avatars/"+owner)
+	ts.setUserAvatarURL(t, owner, "/api/v1/media/avatars/"+owner)
+	ts.createTestTier1Media(t, owner, "avatars/"+owner)
 	require.NoError(t, ts.store.PutObject(
 		context.TODO(), "avatars/"+owner, bytes.NewReader(makePNG(t, 32, 32)), 100, mimeImagePNG,
 	))
@@ -1830,7 +2673,7 @@ func TestProxyFriendCodeAvatarFallbackClasses(t *testing.T) {
 	reference := ts.getFriendCodeAvatar(friendCodeAvatarPath("ZZZZZZZZ"), "ZZZZZZZZ")
 	require.Equal(t, http.StatusOK, reference.Code)
 	require.Contains(t, reference.Header().Get(hdrContentType), mimeImageSVG)
-	require.Contains(t, reference.Header().Get(hdrCacheControl), "max-age=60")
+	require.Equal(t, cacheControlNoStore, reference.Header().Get(hdrCacheControl))
 
 	for _, tc := range []struct{ name, path, code string }{
 		{"malformed charset", friendCodeAvatarPath("AAAA000I"), "AAAA000I"},
@@ -1878,4 +2721,37 @@ func TestProxyFriendCodeAvatarDatabaseError(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 	assert.JSONEq(t, `{"error":"`+errMsgInternalServer+`"}`, w.Body.String())
 	assert.NotContains(t, w.Body.String(), "ABCDEFGH", "the code is bearer material")
+}
+
+func TestProfileTier1OwnedAdmissionAndSlotResolution(t *testing.T) {
+	ts := setupMediaTest(t)
+	owner := ts.createTestUser(t, "profileadmitowner")
+	other := ts.createTestUser(t, "profileadmitother")
+	key := "avatars/" + owner + "/" + uuid.NewString()
+	_, err := ts.db.Exec(`
+		INSERT INTO media_files (
+			id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot
+		) VALUES (gen_random_uuid(), $1, 'photo', 1, 'image/png', 4, $2, 'avatar')`, owner, key)
+	require.NoError(t, err)
+
+	admitted, err := ProfileTier1MediaOwnedAdmitted(context.Background(), ts.db, key, owner)
+	require.NoError(t, err)
+	assert.True(t, admitted)
+	admitted, err = ProfileTier1MediaOwnedAdmitted(context.Background(), ts.db, key, other)
+	require.NoError(t, err)
+	assert.False(t, admitted)
+	admitted, err = ProfileTier1MediaOwnedSlotAdmitted(context.Background(), ts.db, owner, ProfileSlotAvatar)
+	require.NoError(t, err)
+	assert.True(t, admitted)
+
+	_, _, err = ProfileTier1StorageKey(context.Background(), ts.db, owner, "invalid")
+	require.ErrorContains(t, err, "invalid profile slot")
+	_, err = ts.db.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key) VALUES ($1)`, key)
+	require.NoError(t, err)
+	admitted, err = ProfileTier1MediaOwnedAdmitted(context.Background(), ts.db, key, owner)
+	require.NoError(t, err)
+	assert.False(t, admitted)
+	admitted, err = ProfileTier1MediaOwnedSlotAdmitted(context.Background(), ts.db, owner, ProfileSlotAvatar)
+	require.NoError(t, err)
+	assert.False(t, admitted)
 }

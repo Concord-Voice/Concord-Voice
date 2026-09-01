@@ -17,11 +17,9 @@ import (
 // unconfigured. NewRouter's parameter is the media.ObjectStore INTERFACE, so
 // assigning the concrete pointer directly yields a NON-NIL interface holding a
 // nil pointer. Every downstream `store == nil` check then silently evaluates
-// false — including media.ReclaimErasedTier1's "object storage is not
-// configured" branch, which became `(*storage.Client)(nil).DeleteObject` →
-// panic, POST-COMMIT on an account erasure. The account is already gone at that
-// point, so the privacy handler's revokeAccessTokens never runs and already-issued
-// access tokens keep working against the erased account.
+// false — including the durable Tier-1 erasure worker's nil-store branch. That
+// would turn a retryable retained obligation into a typed-nil DeleteObject
+// dereference after the account is already gone.
 //
 // `assert.Nil` is NOT sufficient here: testify's Nil uses reflection and reports
 // a typed nil as nil, so it passes against the very bug this pins. The bare
@@ -34,7 +32,7 @@ func TestMediaObjectStoreNeverProducesATypedNil(t *testing.T) {
 		// is exactly what a typed nil defeats, which is what this test exists to catch.
 		assert.True(t, got == nil,
 			"a typed nil here re-arms the dead-guard class: `store == nil` goes false "+
-				"downstream and ReclaimErasedTier1 dereferences it on the GDPR path")
+				"downstream and the durable GDPR erasure worker dereferences it")
 	})
 
 	t.Run("non-nil client is passed through", func(t *testing.T) {

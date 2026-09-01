@@ -159,18 +159,16 @@ func runControlPlane() (runErr error) {
 	// media.ObjectStore INTERFACE -- so passing the concrete pointer directly
 	// produces a NON-NIL interface holding a nil pointer, and every downstream
 	// `store == nil` guard silently becomes dead code. That is not theoretical:
-	// it made router.go's "media endpoints disabled" branch and
-	// media.ReclaimErasedTier1's "object storage is not configured" branch both
-	// unreachable, turning the latter into a nil dereference on the GDPR
-	// erasure path -- POST-COMMIT, so the account is already gone and the
-	// handler's own revokeAccessTokens never runs, leaving live access tokens
-	// against an erased account (found by three independent reviewers on
-	// PR #3019).
+	// it made router.go's "media endpoints disabled" branch unreachable and
+	// could hand the durable GDPR erasure worker a typed-nil deleter instead of
+	// letting it retain the obligation for a configured replica to retry (found
+	// by three independent reviewers on PR #3019).
 	//
 	// Converting once, here at the boundary, is what makes those guards mean
 	// what they say. Do NOT pass storageClient directly to an interface
 	// parameter again; the compiler cannot catch it.
 	mediaStore := mediaObjectStore(storageClient)
+	tier1ErasureReclaimer := media.NewTier1ErasureReclaimer(db, mediaStore, log)
 
 	// Boot-time object-storage backend registry (ADR-0038 / #2759). Placement
 	// is per object, so reads resolve the store from the media_files row
@@ -236,6 +234,7 @@ func runControlPlane() (runErr error) {
 				api.RouterDependencies{
 					OpsMetricsReader:   adminMetricsRouterReader,
 					PresenceHistory:    presenceHistoryService,
+					Tier1ErasureWake:   tier1ErasureReclaimer.Wake,
 					MediaStoreResolver: media.NewRegistryStoreResolver(storageRegistry),
 					MediaWriteRouter:   media.NewRegistryWriteRouter(storageRegistry),
 				},
@@ -267,8 +266,10 @@ func runControlPlane() (runErr error) {
 	hub := runtime.hub
 	natsClient := runtime.natsClient
 	waitActivityHistoryWorkers := runtime.waitWorkers
+	waitTier1ErasureReclaimer := func() {}
 	waitBackgroundWorkers := func() {
 		waitActivityHistoryWorkers()
+		waitTier1ErasureReclaimer()
 		if voicePermissionEnforcer != nil {
 			voicePermissionEnforcer.Close()
 		}
@@ -342,6 +343,7 @@ func runControlPlane() (runErr error) {
 	// registered-but-unavailable legacy backend is recognised and skipped
 	// quietly rather than logged as a fault.
 	media.StartSessionSweepWorkers(cleanupCtx, storageRegistry, log, media.DefaultSessionSweepInterval)
+	waitTier1ErasureReclaimer = tier1ErasureReclaimer.Start(cleanupCtx)
 
 	// Tier-2 orphan reclamation (#2759 follow-on). A SIBLING of the sweeper
 	// above, not a duplicate: that one aborts INCOMPLETE multipart uploads,

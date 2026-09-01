@@ -483,7 +483,9 @@ func (h *Handler) UpdateServer(c *gin.Context) {
 
 	// Clean up orphaned media objects from storage after successful DB update
 	for _, key := range mediaKeysToDelete {
-		media.CleanupObject(c.Request.Context(), h.db, h.store, h.log, key)
+		if err := media.CleanupObject(c.Request.Context(), h.db, h.store, key); err != nil {
+			h.log.Warn("Server media cleanup incomplete")
+		}
 	}
 
 	h.log.Info("Server updated", "server_id", serverID, "user_id", userID)

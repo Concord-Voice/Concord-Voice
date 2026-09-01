@@ -219,7 +219,7 @@ func TestPublicFriendCodeAvatar(t *testing.T) {
 		reference := getPublicFriendCode(t, ts, noAvatar.Code, friendCodeAvatarSuffix, "")
 		require.Equal(t, http.StatusOK, reference.Code)
 		require.Equal(t, "image/svg+xml; charset=utf-8", reference.Header().Get("Content-Type"))
-		require.Equal(t, "public, max-age=60, must-revalidate", reference.Header().Get("Cache-Control"))
+		require.Equal(t, "no-store", reference.Header().Get("Cache-Control"))
 
 		for _, tc := range []struct{ name, code string }{
 			{"malformed charset", "AAAA000I"},
@@ -239,15 +239,12 @@ func TestPublicFriendCodeAvatar(t *testing.T) {
 	})
 
 	t.Run("fallback matches the shipped invite icon fallback byte for byte", func(t *testing.T) {
-		// The two arms of publicFriendAvatarHandler must be indistinguishable
-		// from each other AND from the invite pair they mirror; a divergence in
-		// either direction turns the fallback itself into a signal.
+		// The two friend-avatar arms must be indistinguishable from each other.
 		friend := getPublicFriendCode(t, ts, noAvatar.Code, friendCodeAvatarSuffix, "")
 		invite := ts.DoRequest(http.MethodGet, "/api/v1/invites/ZZZZZZZZ/icon", nil, nil)
 		require.Equal(t, http.StatusOK, invite.Code)
 		assert.Equal(t, invite.Body.Bytes(), friend.Body.Bytes())
 		assert.Equal(t, invite.Header().Get("Content-Type"), friend.Header().Get("Content-Type"))
-		assert.Equal(t, invite.Header().Get("Cache-Control"), friend.Header().Get("Cache-Control"))
 	})
 
 	t.Run("no UUID in the body or any response header", func(t *testing.T) {
@@ -416,6 +413,12 @@ func TestPublicFriendCodeAvatarEncodedPath(t *testing.T) {
 		key:  "avatars/" + seeded.Owner.ID,
 		body: []byte("proxied-avatar-bytes-945"),
 	}
+	_, err := ts.DB.Exec(
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+		 VALUES (gen_random_uuid(), $1, 'photo', 1, $2, $3, $4, 'avatar')`,
+		seeded.Owner.ID, "image/png", len(store.body), store.key,
+	)
+	require.NoError(t, err)
 	router := newFriendCodeAvatarRouter(t, ts, store)
 
 	do := func(t *testing.T, path string) *httptest.ResponseRecorder {

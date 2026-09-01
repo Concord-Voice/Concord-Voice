@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-Concord Voice now lets you choose who can see your voice-channel and private-call activity, while keeping that activity current internally. Invite previews stay tied to the invite you opened; the visible activity view is not part of this update yet.
+Concord Voice now lets you choose who can see your voice-channel and private-call activity, while keeping that activity current internally. Invite previews stay tied to the invite you opened, and profile-media cleanup now survives storage failures and service restarts — including ordinary clears and account deletion. The visible activity view is not part of this update yet.
 
 ### Added
 
@@ -22,6 +22,7 @@ Concord Voice now lets you choose who can see your voice-channel and private-cal
 
 - **Removing someone from a private conversation or deleting its creator no longer leaves stale voice activity after a restart** ([#3052](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3052)) — Concord now records the required activity clear before membership or account deletion removes the information needed to find it.
 - **Encrypted attachments stay on the compatible storage format during rollouts** ([#3051](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3051)) — the server no longer advertises a new format before every supported client can read it, and the desktop rejects capability lists containing unknown formats instead of assuming the remaining entries are safe.
+- **Profile-media cleanup now survives storage failures** ([#3043](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3043)) — avatar and banner uploads use immutable generation-suffixed physical keys behind stable canonical profile URLs. Durable pre-upload intents fence ambiguous writes, while unresolved intents and deletion backlog stay bounded by a per-user debt cap. Profile and friend-code avatar reads fail closed and are not cached; a late object-store write can exist briefly, but Concord Voice cannot serve it and keeps deleting it.
 - **An invite preview no longer reuses details from a different invite while loading** ([#3037](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3037)) — preview results are now kept with the invite code they describe, so changing codes shows a loading state until the new details arrive.
 - **Prepared large encrypted attachments for consistently sized upload pieces** ([#3039](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3039)) — the client and server now understand a new attachment format that reserves room for the header inside the first piece, while retaining the existing write format until compatible server and client versions can be negotiated. Attachments already stored in the older format still open normally.
 

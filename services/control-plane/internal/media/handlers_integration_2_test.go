@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -47,7 +48,9 @@ func TestUploadBannerSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, w.Code)
 	resp := parseBody(t, w)
 	assert.Equal(t, fmt.Sprintf("/api/v1/media/banners/%s", userID), resp["url"])
-	assert.True(t, ts.store.hasObject(fmt.Sprintf("banners/%s", userID)))
+	var key string
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_key FROM media_files WHERE uploader_id = $1 AND profile_slot = 'banner' AND deleted_at IS NULL`, userID).Scan(&key))
+	assert.True(t, ts.store.hasObject(key))
 }
 
 func TestUploadBannerMissingFile(t *testing.T) {
@@ -498,6 +501,7 @@ func TestProxyAvatarSuccess(t *testing.T) {
 	userID := ts.createTestUser(t, "proxyavatar")
 
 	key := fmt.Sprintf(fmtAvatarsKey, userID)
+	ts.createTestTier1Media(t, userID, key)
 	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
 
 	// Public route — invoke without setting user_id in the gin context to
@@ -506,9 +510,7 @@ func TestProxyAvatarSuccess(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, mimeImagePNG, w.Header().Get(hdrContentType))
-	// Cloudflare/shared caches must be allowed.
-	assert.Contains(t, w.Header().Get(hdrCacheControl), "public")
-	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=3600")
+	assert.Equal(t, cacheControlNoStore, w.Header().Get(hdrCacheControl))
 }
 
 func TestProxyBannerSuccess(t *testing.T) {
@@ -516,6 +518,7 @@ func TestProxyBannerSuccess(t *testing.T) {
 	userID := ts.createTestUser(t, "proxybanner")
 
 	key := fmt.Sprintf("banners/%s", userID)
+	ts.createTestTier1Media(t, userID, key)
 	require.NoError(t, ts.store.PutObject(context.TODO(), key, bytes.NewReader(makePNG(t, 200, 50)), 200, mimeImageJPEG))
 
 	// Public route — no user_id in context (see TestProxyAvatarSuccess).
@@ -523,8 +526,7 @@ func TestProxyBannerSuccess(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, mimeImageJPEG, w.Header().Get(hdrContentType))
-	assert.Contains(t, w.Header().Get(hdrCacheControl), "public")
-	assert.Contains(t, w.Header().Get(hdrCacheControl), "max-age=3600")
+	assert.Equal(t, cacheControlNoStore, w.Header().Get(hdrCacheControl))
 }
 
 func TestProxyBannerInvalidID(t *testing.T) {
@@ -740,8 +742,8 @@ func TestDeleteMediaTier1Rejected(t *testing.T) {
 	storageKey := fmt.Sprintf(fmtAvatarsKey, owner)
 	require.NoError(t, ts.store.PutObject(context.TODO(), storageKey, bytes.NewReader(makePNG(t, 64, 64)), 100, mimeImagePNG))
 	_, err := ts.db.Exec(
-		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key)
-		 VALUES ($1, $2, 'photo', 1, 'image/png', 100, $3)`,
+		`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+			 VALUES ($1, $2, 'photo', 1, 'image/png', 100, $3, 'avatar')`,
 		fileID, owner, storageKey,
 	)
 	require.NoError(t, err)
@@ -758,26 +760,40 @@ func TestDeleteMediaTier1Rejected(t *testing.T) {
 // Upload: Avatar re-upload (upsert)
 // =====================================================================
 
-func TestUploadAvatarReuploadOverwrites(t *testing.T) {
+func TestUploadAvatarReuploadUsesFreshKeyAndCanonicalProxy(t *testing.T) {
 	ts := setupMediaTest(t)
 	counters := &mediaOpsCounterSpy{}
 	ts.handler.SetOpsCounter(counters)
 	userID := ts.createTestUser(t, "reupavatar")
 
-	// First upload
 	imgData1 := makePNG(t, 100, 100)
 	body1, ct1 := multipartBody(t, "file", fileAvatarPng, imgData1, nil)
 	w1 := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body1, ct1)
 	assert.Equal(t, http.StatusCreated, w1.Code)
 
-	// Second upload overwrites the same key
+	var firstKey string
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_key FROM media_files WHERE uploader_id = $1 AND deleted_at IS NULL`, userID).Scan(&firstKey))
+
 	imgData2 := makePNG(t, 200, 200)
 	body2, ct2 := multipartBody(t, "file", fileAvatarPng, imgData2, nil)
 	w2 := ts.doMultipart(ts.handler.UploadAvatar, "POST", pathUploadAvatar, userID, body2, ct2)
 	assert.Equal(t, http.StatusCreated, w2.Code)
 
-	// The storage key should still exist (overwritten, not duplicated)
-	assert.True(t, ts.store.hasObject(fmt.Sprintf(fmtAvatarsKey, userID)))
+	var secondKey string
+	require.NoError(t, ts.db.QueryRow(`SELECT storage_key FROM media_files WHERE uploader_id = $1 AND deleted_at IS NULL`, userID).Scan(&secondKey))
+	assert.NotEqual(t, firstKey, secondKey, "each successful profile upload needs an immutable physical key")
+	assert.True(t, ts.store.hasObject(firstKey))
+	assert.True(t, ts.store.hasObject(secondKey))
+	var tombstones int
+	require.NoError(t, ts.db.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations WHERE storage_key = $1`, firstKey).Scan(&tombstones))
+	assert.Equal(t, 1, tombstones, "the retired physical key must remain permanently reclaimable")
+
+	w := ts.doNoAuth(ts.handler.ProxyAvatar, "GET", "/api/v1/media/avatars/"+userID, gin.Params{{Key: "user_id", Value: userID}})
+	assert.Equal(t, http.StatusOK, w.Code)
+	storedSecond, _ := ts.storedObject(t, secondKey)
+	got, err := io.ReadAll(w.Body)
+	require.NoError(t, err)
+	assert.Equal(t, storedSecond, got, "the canonical route must resolve the current metadata key")
 	assert.Equal(t, 2, counters.uploads)
 }
 

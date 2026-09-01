@@ -1980,7 +1980,7 @@ func TestGetPublicFriendAvatarFallback(t *testing.T) {
 	reference := getPublicFriendCode(t, router, publicFriendCodesPath+"ABCDEFGH"+avatarSuffix)
 	require.Equal(t, http.StatusOK, reference.Code)
 	assert.Equal(t, svgContentType, reference.Header().Get(headerContentType))
-	assert.Equal(t, shortPublicCache, reference.Header().Get(headerCacheControl))
+	assert.Equal(t, "no-store", reference.Header().Get(headerCacheControl))
 	assert.Equal(t, invites.PublicInviteIconSVG, reference.Body.String(),
 		"the fallback must serve the shared silhouette the proxying arm serves")
 
@@ -1996,7 +1996,7 @@ func TestGetPublicFriendAvatarFallback(t *testing.T) {
 			assert.Equal(t, http.StatusOK, w.Code)
 			assert.Equal(t, reference.Body.Bytes(), w.Body.Bytes())
 			assert.Equal(t, svgContentType, w.Header().Get(headerContentType))
-			assert.Equal(t, shortPublicCache, w.Header().Get(headerCacheControl))
+			assert.Equal(t, "no-store", w.Header().Get(headerCacheControl))
 		})
 	}
 }

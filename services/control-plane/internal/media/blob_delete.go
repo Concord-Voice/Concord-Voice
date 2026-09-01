@@ -42,10 +42,10 @@ import (
 //     commit. TIER 2 arrives here, through EnqueueBlobDeletes, whose
 //     per-upload-unique-key contract `attachments/<fileID>` satisfies. TIER 1
 //     does NOT and must not: its keys are deterministic per subject, exactly
-//     what that contract refuses, so it goes to media.ReclaimErasedTier1
-//     instead — and only for the two keys whose SUBJECT is the erased user (see
-//     ErasableTier1Keys; `server-icons/` and `dm-icons/` belong to subjects that
-//     outlive their uploader).
+//     what that contract refuses, so it goes to the durable Tier-1 erasure
+//     obligation worker instead — and only for the two keys whose SUBJECT is
+//     the erased user (see ErasableTier1Keys; `server-icons/` and `dm-icons/`
+//     belong to subjects that outlive their uploader).
 //   - media.OrphanReaper recovers the history the capture cannot reach — every
 //     object stranded by an erasure that already happened, plus the
 //     soft-deleted-but-unreaped rows the same cascade destroys. It is TIER 2

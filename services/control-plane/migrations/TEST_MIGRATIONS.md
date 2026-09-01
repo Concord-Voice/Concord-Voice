@@ -78,11 +78,11 @@ Expected output:
 Checking migration version...
 Building migrate tool...
 ./bin/migrate -command=version
-Current version: 113 (clean)
+Current version: 126 (clean)
 ```
 
 The number is the highest migration in `migrations/`. Run `ls migrations/*.up.sql | tail -1` to
-confirm the current value. 113 was the latest when this document was written.
+confirm the current value.
 
 #### Test Rollback
 ```bash
@@ -104,7 +104,7 @@ make migrate-version
 
 Expected output:
 ```
-Current version: 112 (clean)
+Current version: 125 (clean)
 ```
 
 The version is one lower than the value from the previous step.

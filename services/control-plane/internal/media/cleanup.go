@@ -4,13 +4,132 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"fmt"
 )
 
 // ObjectDeleter is the subset of ObjectStore needed for media cleanup.
 type ObjectDeleter interface {
 	DeleteObject(ctx context.Context, key string) error
+}
+
+// RowQuerier is implemented by both *sql.DB and *sql.Tx.
+type RowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// DBTX is the database surface CleanupObject needs. Keeping the cleanup on the
+// caller's transaction lets profile updates serialize their metadata erasure.
+type DBTX interface {
+	RowQuerier
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// ProfileSlotAvatar and ProfileSlotBanner identify the two canonical profile
+// endpoints backed by immutable physical objects.
+const (
+	ProfileSlotAvatar = "avatar"
+	ProfileSlotBanner = "banner"
+)
+
+// TerminalizeProfileSlot records every physical generation that a profile slot
+// can still name before removing the metadata and upload intents. Callers hold
+// the user row lock, which serializes this with intent creation and publication.
+func TerminalizeProfileSlot(ctx context.Context, tx *sql.Tx, userID, profileSlot string) error {
+	if profileSlot != ProfileSlotAvatar && profileSlot != ProfileSlotBanner {
+		return fmt.Errorf("terminalize profile slot: invalid slot %q", profileSlot)
+	}
+	legacyKey := "avatars/" + userID
+	if profileSlot == ProfileSlotBanner {
+		legacyKey = "banners/" + userID
+	}
+	if err := ensureProfileSlotUsesLegacyBackend(ctx, tx, userID, profileSlot, legacyKey); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tier1_erasure_delete_obligations (storage_key)
+		SELECT storage_key
+		FROM tier1_profile_upload_intents
+		WHERE user_id = $1 AND profile_slot = $2
+		UNION
+		SELECT storage_key
+		FROM media_files
+		WHERE uploader_id = $1
+		  AND media_tier = 1
+		  AND deleted_at IS NULL
+		  AND (profile_slot = $2 OR storage_key = $3)
+		UNION
+		SELECT $3
+		ON CONFLICT (storage_key) DO NOTHING`, userID, profileSlot, legacyKey); err != nil {
+		return fmt.Errorf("terminalize profile slot: record deletion obligations: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM tier1_profile_upload_intents WHERE user_id = $1 AND profile_slot = $2`,
+		userID, profileSlot,
+	); err != nil {
+		return fmt.Errorf("terminalize profile slot: delete upload intents: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE media_files
+		SET deleted_at = NOW()
+		WHERE uploader_id = $1
+		  AND media_tier = 1
+		  AND deleted_at IS NULL
+		  AND (profile_slot = $2 OR storage_key = $3)`, userID, profileSlot, legacyKey); err != nil {
+		return fmt.Errorf("terminalize profile slot: retire media metadata: %w", err)
+	}
+	return nil
+}
+
+// ensureProfileSlotUsesLegacyBackend preserves CleanupObject's placement
+// invariant before a permanent tombstone makes a profile key unservable. The
+// caller holds the user lock; this check refuses rather than recording an
+// erasure against a bucket the legacy reclaimer cannot safely delete from.
+func ensureProfileSlotUsesLegacyBackend(ctx context.Context, tx *sql.Tx, userID, profileSlot, legacyKey string) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT storage_backend
+		FROM media_files
+		WHERE uploader_id = $1
+		  AND media_tier = 1
+		  AND deleted_at IS NULL
+		  AND (profile_slot = $2 OR storage_key = $3)`, userID, profileSlot, legacyKey)
+	if err != nil {
+		return fmt.Errorf("terminalize profile slot: check storage backend: %w", err)
+	}
+	for rows.Next() {
+		var backend *string
+		if err := rows.Scan(&backend); err != nil {
+			if closeErr := rows.Close(); closeErr != nil {
+				return errors.Join(
+					fmt.Errorf("terminalize profile slot: scan storage backend: %w", err),
+					fmt.Errorf("terminalize profile slot: close storage backend rows: %w", closeErr),
+				)
+			}
+			return fmt.Errorf("terminalize profile slot: scan storage backend: %w", err)
+		}
+		if !isLegacyBackend(backend) {
+			if closeErr := rows.Close(); closeErr != nil {
+				return errors.Join(
+					errors.New("terminalize profile slot: refused non-legacy backend"),
+					fmt.Errorf("terminalize profile slot: close storage backend rows: %w", closeErr),
+				)
+			}
+			return errors.New("terminalize profile slot: refused non-legacy backend")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if closeErr := rows.Close(); closeErr != nil {
+			return errors.Join(
+				fmt.Errorf("terminalize profile slot: read storage backend rows: %w", err),
+				fmt.Errorf("terminalize profile slot: close storage backend rows: %w", closeErr),
+			)
+		}
+		return fmt.Errorf("terminalize profile slot: read storage backend rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("terminalize profile slot: close storage backend rows: %w", err)
+	}
+	return nil
 }
 
 // liveMediaBackendQuery reads the placement of the LIVE row for a storage key.
@@ -33,9 +152,9 @@ const cleanupSoftDeleteQuery = `UPDATE media_files SET deleted_at = NOW()
 	           AND deleted_at IS NULL`
 
 // CleanupObject removes a media object from storage and soft-deletes its metadata row.
-// Best-effort: logs warnings but does not return errors — the caller's operation should
-// not fail because of a cleanup issue.
-// The DB soft-delete runs regardless of whether store is configured (store may be nil).
+// It returns cleanup failures so transactional callers can roll back, while
+// post-commit callers can retain best-effort behavior. A failed object deletion
+// leaves metadata live as the only available retry signal.
 //
 // PLACEMENT (ADR-0038 / #2759 unit B2). This is the TIER-1 cleanup path: its
 // only callers hand it profile-media keys (avatars/, server-banners/,
@@ -58,28 +177,23 @@ const cleanupSoftDeleteQuery = `UPDATE media_files SET deleted_at = NOW()
 //     match reality. Refusing loudly is the only honest answer available here.
 //
 // A non-legacy value arriving here is an ADR-0038 violation upstream, not a
-// case to be handled: the right response is a loud ERROR an operator can act on
-// (see the follow-on note in the unit report about a durable retry queue, which
-// is deliberately NOT built here).
-func CleanupObject(ctx context.Context, db *sql.DB, store ObjectDeleter, log *logger.Logger, storageKey string) {
+// case to be handled. Returning an error keeps its metadata live and lets the
+// caller surface the failure; no vendor delete path is added here.
+func CleanupObject(ctx context.Context, db DBTX, store ObjectDeleter, storageKey string) error {
 	backend, found, err := liveMediaBackend(ctx, db, storageKey)
 	if err != nil {
 		// Placement unknown. Do not delete (we would be guessing at a bucket)
 		// and do not soft-delete (that would record an erasure nothing
 		// performed). Nothing changes, so the caller's next attempt retries.
-		log.Error("Failed to read the storage backend for a media object; skipping cleanup",
-			"error", err, "key", storageKey)
-		return
+		return fmt.Errorf("read media storage backend: %w", err)
 	}
 	if found && !isLegacyBackend(backend) {
-		log.Error("Refusing to clean up media held by a non-legacy storage backend: profile media is MinIO-resident by ADR-0038, and this path has no retry behind it",
-			"key", storageKey, "storage_backend", describeBackend(backend))
-		return
+		return errors.New("media cleanup refused non-legacy backend")
 	}
 
 	if store != nil {
 		if err := store.DeleteObject(ctx, storageKey); err != nil {
-			log.Warn("Failed to delete media object from storage", "error", err, "key", storageKey)
+			return fmt.Errorf("delete media object: %w", err)
 		}
 	}
 
@@ -88,16 +202,25 @@ func CleanupObject(ctx context.Context, db *sql.DB, store ObjectDeleter, log *lo
 		// ran, which is the pre-existing behaviour — a caller may legitimately
 		// hand us a key whose row was already retired, and skipping the delete
 		// would leak the object with nothing to sweep it.
-		return
+		return nil
 	}
-	if _, err := db.ExecContext(ctx, cleanupSoftDeleteQuery, storageKey, backend); err != nil {
-		log.Warn("Failed to soft-delete media metadata", "error", err, "key", storageKey)
+	result, err := db.ExecContext(ctx, cleanupSoftDeleteQuery, storageKey, backend)
+	if err != nil {
+		return fmt.Errorf("soft-delete media metadata: %w", err)
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read media metadata cleanup result: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("soft-delete media metadata: affected %d rows, want 1", affected)
+	}
+	return nil
 }
 
 // liveMediaBackend reads the storage_backend of the live row for storageKey.
 // found is false when no live row exists, which is not an error.
-func liveMediaBackend(ctx context.Context, db *sql.DB, storageKey string) (backend *string, found bool, err error) {
+func liveMediaBackend(ctx context.Context, db RowQuerier, storageKey string) (backend *string, found bool, err error) {
 	err = db.QueryRowContext(ctx, liveMediaBackendQuery, storageKey).Scan(&backend)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -131,66 +254,5 @@ func ErasableTier1Keys(userID string) []string {
 	return []string{
 		tier1StorageKey(purposeAvatar, userID, "", ""),
 		tier1StorageKey(purposeBanner, userID, "", ""),
-	}
-}
-
-// ReclaimErasedTier1 deletes the profile-media objects an erased account's own
-// keys named.
-//
-// It does NOT route through CleanupObject, and the reason is timing rather than
-// preference. This runs POST-COMMIT, after the ON DELETE CASCADE has already
-// hard-deleted the rows, so CleanupObject's liveMediaBackend read would find
-// nothing every single time -- a guaranteed-empty query whose answer the caller
-// has already captured under the user-row lock. The placement check that read
-// exists to perform is done here instead, against the captured value, which is
-// the only place it can still be performed truthfully.
-//
-// Post-commit and not pre-: deleting the object first would leave a transaction
-// free to roll back onto an account whose avatar is already gone.
-func ReclaimErasedTier1(ctx context.Context, store ObjectDeleter, log *logger.Logger, refs []BlobRef) {
-	for _, ref := range refs {
-		if !isLegacyBackend(ref.Backend) {
-			// ADR-0038 pins ALL profile media to the legacy backend
-			// permanently, so this is an upstream violation rather than a case
-			// to handle. Deleting from `store` anyway would hit the wrong
-			// bucket and SUCCEED (an S3 DELETE of an absent key returns
-			// success), recording an erasure that did not happen with no retry
-			// behind it -- the straggler sweep is bounded to media_tier = 2.
-			log.Error("account erasure: refusing to reclaim profile media held by a non-legacy backend",
-				"storage_key", ref.Key, "storage_backend", ref.BackendLabel())
-			continue
-		}
-		if store == nil {
-			// No object storage in THIS process -- which is emphatically not
-			// "nothing was ever written". An earlier revision said that, and it
-			// was backwards: every ref here came from a LIVE media_files row
-			// (erasedMediaQuery), and a row exists only because some process
-			// successfully wrote the object. So the bytes are there, this
-			// replica cannot reach them, and nothing else will -- the straggler
-			// sweep and the orphan reaper are both media_tier = 2. That is a
-			// configuration fault causing permanent plaintext retention on a
-			// GDPR path, hence Error rather than Warn.
-			log.Error("account erasure: object storage is not configured; profile media NOT reclaimed and unrecoverable",
-				"storage_key", ref.Key)
-			continue
-		}
-		if err := store.DeleteObject(ctx, ref.Key); err != nil {
-			// ERROR, not Warn, and the severity is the finding: this is the one
-			// branch in this file with an IRREVERSIBLE consequence. The other
-			// three refusals above change nothing and leave the caller free to
-			// retry; this one has already lost the row, so no sweep will ever
-			// revisit the key -- the straggler sweep and the orphan reaper are
-			// both tier-2, because a row-less tier-1 object is indistinguishable
-			// from a live server icon. The bytes are plaintext and they stay.
-			//
-			// Review suggested also logging the erased user id, so an operator
-			// could reconcile the residue against users.avatar_url later. It is
-			// already there: every key this function can receive is
-			// `avatars/<userID>` or `banners/<userID>` by construction
-			// (ErasableTier1Keys), so the id IS the key's suffix. Threading the
-			// subject through the reclaimer signature would duplicate it.
-			log.Error("account erasure: failed to delete profile media object; PLAINTEXT bytes remain and nothing will retry",
-				"error", err, "storage_key", ref.Key)
-		}
 	}
 }

@@ -537,7 +537,7 @@ erDiagram
 | Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093                                                                                                                                                                              |
 | Media                | `media_files` (000042)                                                                                                                                                                                                                                                                                        |
 | Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047)                                                                                                                                                                                                                            |
-| Compliance           | `audit_log` (000035); `account_deletions` (000059)                                                                                                                                                                                                                                                            |
+| Compliance           | `audit_log` (000035); `account_deletions` (000059); `tier1_erasure_delete_obligations` (000117, 000118); immutable profile generations, slots, and pre-PUT intents (000119–000126)                                                                                                                                                  |
 | Subscriptions / redemption | `subscriptions` (000070; status expanded with `expired` by 000083; `source` constrained exactly to `code` \| `stripe` by 000110); `redemption_codes` (000071); `code_redemptions` (000072); `redemption_code_issuance` (000076)                                                                                   |
 | Attestation          | `release_binaries`, `release_spas` (000066)                                                                                                                                                                                                                                                                   |
 | Admin console        | `admin_users`, `admin_webauthn_credentials`, `admin_audit_log` (000077) — sessions are Redis-backed (opaque sids), not a table                                                                                                                                                                                |
@@ -1092,27 +1092,53 @@ keys, memberships, messages, and DM data are removed atomically — strictly
 stronger than the soft-revoke in `ChangePassword` (no token residue). A
 NULL-`user_id` audit row is written to `account_deletions`.
 
-**Object storage is reclaimed by a capture, because the cascade destroys the
-only handle to it.** `media_files.uploader_id` is also `ON DELETE CASCADE`, so
-the same statement that erases the account removes every row naming the objects
-that account uploaded — and every reclamation path in the service starts *from*
-a row (the purge queue, `SweepStragglers`, `CleanupObject`). Erasure is how GDPR
-Article 17 is implemented here, so those bytes used to outlive the erasure meant
-to remove them. `deleteAccountTx` therefore captures the `BlobRef` set under the
-user-row lock **before both deletes** — ahead of `deleteIncompleteChannelsTx`
-too, since `media_files.channel_id` cascades as well — and `reclaimErasedMedia`
-discharges it after the commit on a context detached from the request.
+**Account erasure uses separate durable reclamation rails.** For live Tier-2
+objects, `deleteAccountTx` captures the `BlobRef` set under the users-row lock
+before the cascading deletes, then `reclaimErasedMedia` purges those objects
+after commit on a context detached from the request. Tier-1 profile media has a
+durable row handle in the current `media_files.profile_slot`: current generations
+and pre-PUT intents are terminalized under the user lock before account deletion.
+Exact `avatars/<userID>` and `banners/<userID>` keys are legacy compatibility evidence
+from 000117–000119; migration 000120 transfers that evidence into
+`tier1_erasure_delete_obligations`, and migration 000118 makes the ledger permanent.
+A server worker retries legacy-store deletion, records
+`last_delete_at` on success, retries after one minute on the first attempt and
+after each later success daily; failures retry after one minute. Each retry pass
+captures one database cutoff, drains every row due at that cutoff in bounded
+100-row transactions, and defers rows that become due during the pass.
 
-The capture is deliberately **narrow**, and the narrowing is a safety property
-rather than an optimisation: `proxyTier1Media` serves profile media by key
-without ever reading `media_files`, so a `server-icons/` row's `uploader_id`
-does not denote ownership of the object. It admits tier 2 plus exactly
-`avatars/<userID>` and `banners/<userID>` (`media.ErasableTier1Keys`); a capture
-keyed on `uploader_id` alone would blank a live server's icon. Residue from
-erasures that predate the capture is recovered by `media.OrphanReaper`, a daily
-bucket-listing sweep scoped permanently to `attachments/` — tier-1 only ever
-shrinks by capture, never by reaper. See
+The Tier-1 rail is deliberately narrow. Shared objects such as server icons,
+server banners, and DM icons are excluded; their keys cannot be inferred from
+the erased user's ownership row. Tier-1 uploads serialize on the users row
+with erasure, but an already-started remote PUT can still complete after its
+transaction rolls back and erasure commits. The permanent tombstone makes that
+late byte unservable, and repeated deletion eventually removes it. Profile and
+friend-code avatar admission uses one fail-closed query immediately before
+storage: it accepts only a live Tier-1 `media_files` row and always requires no
+matching tombstone. Legacy profile objects are restored only by a drained,
+attested newline manifest of exact `avatars/<uuid>` and `banners/<uuid>` keys
+passed to `migrate-media --manifest <file>`; the tool stats storage, locks and
+rechecks the exact canonical URL and no tombstone, then inserts real metadata.
+A URL and object alone are not authority. Future user-profile migrations must
+commit metadata and URL atomically. Profile
+media stranded by an erasure predating 000117 remains operator-recovery
+residue; it is not silently treated as a current durable obligation. See
 [ADR-0038](adr/0038-attachment-storage-placement-and-delivery.md).
+
+Migration 000119's transient profile-clear rail is historical. Migration 000120 transfers its
+evidence into permanent deletion obligations, adds canonical `media_files.profile_slot`, and
+creates durable pre-PUT intents. Profile writes use immutable UUID-suffixed physical keys under
+the matching `avatars/<userID>/` or `banners/<userID>/` prefix; stable canonical URLs resolve
+through the live slot row. Publication, replacement, clear, intent expiry, and account erasure
+serialize under the users-row lock. Migrations 000121–000122 validate the forward key shape and
+000123–000124 validate the reverse non-NULL owner/prefix/slot backlink, and 000125–000126 explicitly
+reject NULL-slot profile-shaped writes, preventing mixed-version bypasses. Intent expiry and
+ambiguous terminalization retain a permanent tombstone; confirmed deletion may retire only a
+provably published generation, so
+an ambiguous delete cannot remove a replacement and a late PUT cannot create a reusable-key
+orphan. A per-user ambiguity-debt cap counts active intents and all generated-key deletion
+obligations, including published tombstones retained during storage-delete outages, and fails
+closed at capacity. Successful deletes may retire only provably published obligations.
 
 ### Runtime Client Configuration
 

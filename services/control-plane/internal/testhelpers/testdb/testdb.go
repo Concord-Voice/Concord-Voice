@@ -251,6 +251,7 @@ func truncateAllTablesOnce(db *sql.DB) error {
 		account_deletions,
 		age_verification_records,
 		user_sso_identities,
+		tier1_erasure_delete_obligations,
 		users,
 		user_keys,
 		public_keys,

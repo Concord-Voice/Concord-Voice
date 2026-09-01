@@ -51,28 +51,13 @@ type AccountDeleter interface {
 // erasure removes an incomplete channel.
 type ChannelDeletedBroadcaster func(serverID, channelID string)
 
-// ErasedMediaReclaimer discharges the OBJECT-STORAGE half of an account
-// erasure, given the blob references captured before the cascade destroyed the
-// rows that named them (#2759 follow-on).
-//
-// A func type rather than an interface, mirroring ChannelDeletedBroadcaster:
-// the two halves live in different packages (media for tier 1, purge for tier
-// 2) and the router already holds both, so a closure there is the whole wiring.
-//
-// nil means unwired, and unwired means the pre-existing leak. That is a
-// deliberate degrade rather than a boot refusal, because an erasure that
-// completes with residue is strictly better than one that cannot run at all --
-// but production must wire it, and the orphan reaper only covers tier 2.
+// ErasedMediaReclaimer wakes durable Tier-1 retry processing and hands captured
+// Tier-2 refs to the purge rail after an erasure commits. Production passes no
+// Tier-1 refs through this callback.
 type ErasedMediaReclaimer func(ctx context.Context, tier1, tier2 []media.BlobRef)
 
-// erasedMedia is the object-storage half of one erasure, captured under the
-// user-row lock BEFORE `DELETE FROM users` fires.
-//
-// Split by tier because the two halves discharge through different rails for
-// different reasons. Tier 2 goes to the purge reaper's queue, whose contract
-// requires per-upload-unique keys -- `attachments/<fileID>` satisfies it. Tier 1
-// cannot: its keys are DETERMINISTIC per subject, which is exactly the input
-// EnqueueBlobDeletes refuses, so it goes to media.ReclaimErasedTier1 instead.
+// erasedMedia is the tier-2 object-storage half of one erasure, captured under
+// the user-row lock BEFORE `DELETE FROM users` fires.
 type erasedMedia struct {
 	tier1 []media.BlobRef
 	tier2 []media.BlobRef
@@ -83,51 +68,23 @@ type erasedMedia struct {
 // not that the budget was tight.
 const erasedMediaReclaimTimeout = 30 * time.Second
 
-// erasedMediaQuery captures the objects an erasure strands, under the user-row
-// lock and before the cascade removes the rows.
-//
-// THE `storage_key = ANY($2)` ARM IS THE SAFETY ARGUMENT and it is in the SQL
-// deliberately, where it is visible next to the uploader_id predicate it
-// narrows. $2 is media.ErasableTier1Keys -- the two tier-1 keys whose subject
-// IS this user. A bare `WHERE uploader_id = $1` would additionally sweep in
-// `server-icons/`, `server-banners/` and `dm-icons/` rows, whose objects belong
-// to servers and conversations that survive this user; see ErasableTier1Keys
-// for why uploader_id does not mean what it looks like it means there.
-//
-// THE `deleted_at` FILTER IS ON THE TIER-2 ARM ONLY, and that asymmetry is the
-// whole point -- an earlier revision applied it to both and stranded tier-1
-// plaintext (caught in review of PR #3019).
-//
-// On the TIER-2 arm it rides idx_media_files_uploader (partial on exactly that
+// erasedMediaQuery captures the live Tier-2 objects an erasure strands. It
+// rides idx_media_files_uploader (partial on exactly that
 // predicate) instead of sequentially scanning media_files under the erasure's
 // user-row lock, and the rows it skips are genuinely covered: a soft-deleted
 // attachment row is either already reaped or is a straggler-sweep candidate,
 // and once the cascade destroys it the orphan reaper (media.OrphanReaper)
 // reclaims the object from the bucket. Two mechanisms, one deliberate handoff.
-//
-// On the TIER-1 arm that reasoning does NOT hold, and applying the filter there
-// leaks. media.CleanupObject soft-deletes the row even when its DeleteObject
-// FAILED and even when no store is configured, so a soft-deleted
-// `avatars/<userID>` row can legitimately still have a live object. Nothing
-// else would ever find it: the straggler sweep is `media_tier = 2`, and so is
-// the orphan reaper. The residue would be PLAINTEXT (processTier1Image decodes
-// and re-encodes server-side) and would be created by erasures AFTER this
-// change, not merely inherited from before it.
-//
-// Widening is safe rather than merely better: both keys are subject-scoped to
-// the user being erased, so no shared subject can be reached; the tier-1 arm is
-// an equality probe against idx_media_files_storage_key_all (migration 000115),
-// so it costs an index lookup rather than a scan; and re-deleting an object
-// that was already reaped is a success no-op.
-//
-// DISTINCT because tier-1 keys are deterministic: an old avatar row and the
-// live one legitimately share `avatars/<userID>`, and the object only needs
-// deleting once.
-const erasedMediaQuery = `SELECT DISTINCT media_tier, storage_key, storage_backend
+const erasedMediaQuery = `SELECT storage_key, storage_backend
 	         FROM media_files
 	         WHERE uploader_id = $1
-	           AND ((media_tier = 2 AND deleted_at IS NULL)
-	                OR storage_key = ANY($2::text[]))`
+	           AND media_tier = 2
+	           AND deleted_at IS NULL`
+
+const insertTier1ErasureObligationsQuery = `INSERT INTO tier1_erasure_delete_obligations (storage_key)
+	SELECT storage_key
+	FROM unnest($1::text[]) AS keys(storage_key)
+	ON CONFLICT (storage_key) DO NOTHING`
 
 // ActivePlanDrain is the #2448 durable active-category rail's erasure seam,
 // implemented by *activepresence.Rail.
@@ -190,10 +147,9 @@ type AccountService struct {
 	activityCleanup *Handler
 	channelDeleted  ChannelDeletedBroadcaster
 
-	// reclaimMedia discharges the object-storage half of the erasure. nil
-	// leaves the pre-existing behaviour: the cascade hard-deletes every
-	// media_files row this user uploaded and the objects stay on the backend
-	// with nothing able to find them again. See ErasedMediaReclaimer.
+	// reclaimMedia wakes durable Tier-1 retry processing and enqueues Tier-2
+	// refs after commit. A nil callback delays Tier-1 until the fixed worker
+	// interval and leaves Tier-2 without its queue handoff.
 	reclaimMedia ErasedMediaReclaimer
 
 	// graphPresence is the #2447 erasure presence capture. nil means unwired.
@@ -475,52 +431,20 @@ func (s *AccountService) runPostCommitObligations(
 	}
 }
 
-// reclaimErasedMedia is the post-commit half of the media capture: the objects
-// are deleted only once the erasure that stranded them has definitely landed.
-//
-// Post-commit and not pre-, for the same reason transferDrainedActivePlans is:
-// an object delete is not rollback-able, so performing it inside the
-// transaction would let a rollback restore an account whose avatar is already
-// gone from the bucket and whose row still points at it.
-//
-// THE REQUEST CONTEXT IS DETACHED, and this MATCHES the file rather than
-// departing from it. Every other post-commit obligation here is already immune
-// to request cancellation: publishErasureCleared takes no context at all,
-// ClearDrained takes one and discards it (`_ context.Context`), and
-// channelDeleted is a hub broadcast. This was the only one that passed a LIVE
-// request context into work that can fail on cancellation -- an S3 DELETE.
-//
-// The window is real, not theoretical. DeleteAccount is handed
-// c.Request.Context() (privacy/handler.go), which cancels the moment the client
-// disconnects, and account deletion is exactly the flow where someone confirms
-// and then closes the app while the erasure is still doing its sender-gated
-// suppression, presence capture and cascade. The users row is already gone by
-// the time we get here, so a cancelled context would strand the objects with
-// nobody able to retry: tier 2 would wait for the next orphan sweep, and TIER 1
-// has no sweep at all -- that residue is plaintext and permanent.
-//
-// Bounded rather than unbounded: this runs on the request goroutine, so an
-// unresponsive object store must not hold it open indefinitely. The timeout is
-// generous because the work is a handful of DELETEs, and exceeding it means the
-// backend is unhealthy rather than that we were impatient.
+// reclaimErasedMedia invokes the post-commit wake and Tier-2 queue handoff on
+// a detached bounded context.
 func (s *AccountService) reclaimErasedMedia(ctx context.Context, stranded erasedMedia) {
-	if len(stranded.tier1) == 0 && len(stranded.tier2) == 0 {
-		return
-	}
 	if s.reclaimMedia == nil {
-		// Unwired. Say so rather than returning silently: this is the
-		// pre-existing leak, and on the tier-1 leg it is PLAINTEXT residue
-		// surviving a GDPR Article 17 erasure with no sweep able to find it.
 		if s.log != nil {
-			s.log.Error("delete account: no media reclaimer is wired; erased account's objects remain on the backend",
-				"tier1_objects", len(stranded.tier1), "tier2_objects", len(stranded.tier2))
+			s.log.Error("delete account: no media reclaimer is wired; Tier-2 objects are not queued",
+				"tier2_objects", len(stranded.tier2))
 		}
 		return
 	}
 	detached, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), erasedMediaReclaimTimeout)
 	defer cancel()
-	s.reclaimMedia(detached, stranded.tier1, stranded.tier2)
+	s.reclaimMedia(detached, nil, stranded.tier2)
 }
 
 // transferDrainedActivePlans is the post-commit half of the erasure drain
@@ -594,6 +518,21 @@ func (s *AccountService) deleteAccountTx(
 		return nil, nil, plan, drainedObligation{}, erasedMedia{}, err
 	}
 
+	if _, err := tx.ExecContext(
+		ctx,
+		insertTier1ErasureObligationsQuery,
+		pq.Array(media.ErasableTier1Keys(lockedUserID)),
+	); err != nil {
+		return nil, nil, plan, drainedObligation{}, erasedMedia{},
+			fmt.Errorf("delete account: insert tier1 erasure obligations: %w", err)
+	}
+	for _, profileSlot := range []string{media.ProfileSlotAvatar, media.ProfileSlotBanner} {
+		if err := media.TerminalizeProfileSlot(ctx, tx, lockedUserID, profileSlot); err != nil {
+			return nil, nil, plan, drainedObligation{}, erasedMedia{},
+				fmt.Errorf("delete account: terminalize %s profile slot: %w", profileSlot, err)
+		}
+	}
+
 	// Capture the object-storage half under the user-row lock, and BEFORE the
 	// two deletes below -- both of which destroy rows that name objects.
 	//
@@ -610,7 +549,7 @@ func (s *AccountService) deleteAccountTx(
 	// (graphpresence's FailConservativeDegrade shape), which buys a degrade this
 	// path does not want: the erasure is retryable and idempotent, so a caller
 	// that retries gets both the erasure and its reclamation, where a degrade
-	// would silently leak tier-1 plaintext with nothing to sweep it. Wrapping
+	// would silently leave Tier-2 objects without their queue handoff. Wrapping
 	// the error names the capture, per migration 000110's precedent.
 	stranded, mediaErr := s.captureErasedMedia(ctx, tx, lockedUserID)
 	if mediaErr != nil {
@@ -767,27 +706,18 @@ func (s *AccountService) captureErasedMedia(
 	lockedUserID string,
 ) (erasedMedia, error) {
 	var out erasedMedia
-	rows, err := tx.QueryContext(ctx, erasedMediaQuery,
-		lockedUserID, pq.Array(media.ErasableTier1Keys(lockedUserID)))
+	rows, err := tx.QueryContext(ctx, erasedMediaQuery, lockedUserID)
 	if err != nil {
 		return erasedMedia{}, err
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		var tier int
 		var key string
 		var backend sql.NullString
-		if err := rows.Scan(&tier, &key, &backend); err != nil {
+		if err := rows.Scan(&key, &backend); err != nil {
 			return erasedMedia{}, err
 		}
-		ref := media.NewBlobRef(key, backend)
-		// The query admits only tiers 1 and 2, so anything not tier 1 is tier 2
-		// by construction.
-		if tier == media.MediaTierAuthenticated {
-			out.tier1 = append(out.tier1, ref)
-			continue
-		}
-		out.tier2 = append(out.tier2, ref)
+		out.tier2 = append(out.tier2, media.NewBlobRef(key, backend))
 	}
 	if err := rows.Err(); err != nil {
 		return erasedMedia{}, err

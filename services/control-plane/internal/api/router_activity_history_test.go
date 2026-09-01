@@ -21,8 +21,25 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPublicProfileMediaFallbackWhenStoreUnavailableIsNoStore(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	userID := uuid.New().String()
+
+	for _, path := range []string{
+		"/api/v1/media/avatars/" + userID,
+		"/api/v1/media/banners/" + userID,
+	} {
+		t.Run(path, func(t *testing.T) {
+			w := ts.DoRequest(http.MethodGet, path, nil, nil)
+			assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+			assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+		})
+	}
+}
 
 type preboundActivityHistoryDelivery struct{}
 

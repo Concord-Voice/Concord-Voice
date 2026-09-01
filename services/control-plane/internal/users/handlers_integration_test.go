@@ -21,6 +21,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -31,6 +32,22 @@ const (
 	urlUsersMePrefs   = "/api/v1/users/me/preferences"
 	urlUsersMePrivacy = "/api/v1/users/me/privacy"
 )
+
+func seedLiveTier1ProfileMedia(t *testing.T, ts *testhelpers.TestServer, userID, key string) {
+	t.Helper()
+	var slot *string
+	switch {
+	case strings.HasPrefix(key, "avatars/"+userID+"/") || key == "avatars/"+userID:
+		value := "avatar"
+		slot = &value
+	case strings.HasPrefix(key, "banners/"+userID+"/") || key == "banners/"+userID:
+		value := "banner"
+		slot = &value
+	}
+	_, err := ts.DB.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+		VALUES ($1, $2, 'photo', 1, 'image/png', 4, $3, $4)`, uuid.New().String(), userID, key, slot)
+	require.NoError(t, err)
+}
 
 // Note: setupTS, testPassword, and various constants are defined in handlers_test.go.
 
@@ -213,6 +230,84 @@ func TestUpdateMeHeaderImageDataURL(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestUpdateMeInlineProfileImageTerminalizesCanonicalMedia(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, prefix, slot string
+	}{
+		{"avatar", "avatar_url", "avatars/", "avatar"},
+		{"banner", "header_image_url", "banners/", "banner"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupTS(t)
+			user := ts.CreateTestUser(t, "inlineclear"+tc.name)
+			key := tc.prefix + user.ID + "/" + uuid.NewString()
+			seedLiveTier1ProfileMedia(t, ts, user.ID, key)
+			canonicalURL := fmt.Sprintf("/api/v1/media/%s%s", tc.prefix, user.ID)
+			column := "avatar_url"
+			if tc.slot == "banner" {
+				column = "header_image_url"
+			}
+			_, err := ts.DB.Exec(fmt.Sprintf("UPDATE users SET %s = $1 WHERE id = $2", column), canonicalURL, user.ID)
+			require.NoError(t, err)
+
+			inlineValue := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+			response := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
+				tc.field: inlineValue,
+			}, testhelpers.AuthHeaders(user.AccessToken))
+			require.Equal(t, http.StatusOK, response.Code)
+
+			var storedURL *string
+			require.NoError(t, ts.DB.QueryRow(fmt.Sprintf("SELECT %s FROM users WHERE id = $1", column), user.ID).Scan(&storedURL))
+			require.NotNil(t, storedURL)
+			assert.Equal(t, inlineValue, *storedURL, "inline replacement must preserve the accepted data URL")
+
+			_, found, err := media.ProfileTier1StorageKey(t.Context(), ts.DB, user.ID, tc.slot)
+			require.NoError(t, err)
+			assert.False(t, found, "retired profile media must no longer resolve through the canonical proxy")
+
+			// The media row is retired and represented by a durable delete obligation.
+			var retiredAt sql.NullTime
+			require.NoError(t, ts.DB.QueryRow(`SELECT deleted_at FROM media_files WHERE storage_key = $1`, key).Scan(&retiredAt))
+			assert.True(t, retiredAt.Valid, "inline replacement must retire the old profile media")
+
+			var obligations int
+			require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations WHERE storage_key = $1`, key).Scan(&obligations))
+			assert.Equal(t, 1, obligations, "inline replacement must persist a durable deletion obligation")
+
+		})
+	}
+}
+
+func TestUpdateMeInlineProfileImageRefusesVendorMedia(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "inlinevendoravatar")
+	key := "avatars/" + user.ID + "/" + uuid.NewString()
+	seedLiveTier1ProfileMedia(t, ts, user.ID, key)
+	_, err := ts.DB.Exec(`UPDATE media_files SET storage_backend = 'r2-useast' WHERE storage_key = $1`, key)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`UPDATE users SET avatar_url = $1 WHERE id = $2`,
+		fmt.Sprintf("/api/v1/media/avatars/%s", user.ID), user.ID)
+	require.NoError(t, err)
+
+	response := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{
+		"avatar_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusInternalServerError, response.Code, "vendor-backed profile media must fail closed")
+
+	var storedURL *string
+	require.NoError(t, ts.DB.QueryRow(`SELECT avatar_url FROM users WHERE id = $1`, user.ID).Scan(&storedURL))
+	require.NotNil(t, storedURL)
+	assert.Equal(t, fmt.Sprintf("/api/v1/media/avatars/%s", user.ID), *storedURL, "failed replacement must retain the canonical URL")
+
+	var retiredAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`SELECT deleted_at FROM media_files WHERE storage_key = $1`, key).Scan(&retiredAt))
+	assert.False(t, retiredAt.Valid, "failed replacement must leave vendor media live")
+
+	var obligations int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM tier1_erasure_delete_obligations WHERE storage_key = $1`, key).Scan(&obligations))
+	assert.Zero(t, obligations, "failed replacement must not record an unsafe deletion obligation")
+}
+
 func TestUpdateMeHeaderImageInvalidURL(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "headerinvalid")
@@ -238,6 +333,7 @@ func TestUpdateMeHeaderImageClear(t *testing.T) {
 func TestUpdateMeValidAvatarUploadURL(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "avatarupload")
+	seedLiveTier1ProfileMedia(t, ts, user.ID, "avatars/"+user.ID)
 
 	payload := map[string]interface{}{
 		"avatar_url": fmt.Sprintf("/api/v1/media/avatars/%s", user.ID),
@@ -249,12 +345,64 @@ func TestUpdateMeValidAvatarUploadURL(t *testing.T) {
 func TestUpdateMeValidBannerUploadURL(t *testing.T) {
 	ts := setupTS(t)
 	user := ts.CreateTestUser(t, "bannerupload")
+	seedLiveTier1ProfileMedia(t, ts, user.ID, "banners/"+user.ID)
 
 	payload := map[string]interface{}{
 		"header_image_url": fmt.Sprintf("/api/v1/media/banners/%s", user.ID),
 	}
 	w := ts.DoRequest(methodPatch, urlUsersMe, payload, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestUpdateMeCanonicalMediaURLRequiresOwnedLiveTier1Media(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, prefix string
+	}{
+		{"avatar", "avatar_url", "avatars/"},
+		{"banner", "header_image_url", "banners/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, want := range []struct {
+				name          string
+				seedMedia     bool
+				seedTombstone bool
+				wrongOwner    bool
+				status        int
+			}{
+				{"missing owned media", false, false, false, http.StatusBadRequest},
+				{"tombstoned media", true, true, false, http.StatusBadRequest},
+				{"wrong owner media", true, false, true, http.StatusBadRequest},
+			} {
+				t.Run(want.name, func(t *testing.T) {
+					ts := setupTS(t)
+					user := ts.CreateTestUser(t, "canonical"+tc.name+strings.ReplaceAll(want.name, " ", ""))
+					key := tc.prefix + user.ID
+					if want.seedMedia {
+						uploaderID := user.ID
+						if want.wrongOwner {
+							other := ts.CreateTestUser(t, "otherowner"+tc.name)
+							uploaderID = other.ID
+							key = tc.prefix + uploaderID
+						}
+						_, err := ts.DB.Exec(
+							`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, profile_slot)
+						 VALUES ($1, $2, 'photo', 1, 'image/png', 4, $3, $4)`,
+							uuid.New().String(), uploaderID, key, tc.name,
+						)
+						require.NoError(t, err)
+					}
+					if want.seedTombstone {
+						_, err := ts.DB.Exec(`INSERT INTO tier1_erasure_delete_obligations (storage_key) VALUES ($1)`, key)
+						require.NoError(t, err)
+					}
+
+					url := fmt.Sprintf("/api/v1/media/%s%s", tc.prefix, user.ID)
+					w := ts.DoRequest(methodPatch, urlUsersMe, map[string]interface{}{tc.field: url}, testhelpers.AuthHeaders(user.AccessToken))
+					assert.Equal(t, want.status, w.Code)
+				})
+			}
+		})
+	}
 }
 
 func TestUpdateMeColorSchemeValid(t *testing.T) {

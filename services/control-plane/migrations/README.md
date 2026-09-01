@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000116)
+## Existing Migrations (000001–000126)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -226,6 +226,16 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000114 | media_files_storage_backend | Add nullable per-object attachment backend placement (ADR-0038, #2759) |
 | 000115 | media_files_storage_key_lookup | Add pair-key lookup support for account-erasure attachment recovery (#2759) |
 | 000116 | media_files_reap_attempts | Track failed orphan-reap attempts for bounded retry fairness |
+| 000117 | tier1_erasure_delete_obligations | Durable key-only retry obligations for erased-user avatar and banner objects |
+| 000118 | tier1_erasure_key_tombstones | Make 000117 rows permanent key-reuse tombstones; retain delete-attempt evidence |
+| 000119 | tier1_profile_clear_delete_obligations | Historical transient clear rail, consumed and transferred into permanent obligations by 000120 |
+| 000120 | tier1_profile_upload_intents | Transfer 000119 evidence to permanent obligations; add canonical profile slots and durable pre-PUT intents for immutable generations |
+| 000121 | guard_tier1_profile_storage_shape | Add NOT VALID forward UUID-generation key-shape guards |
+| 000122 | validate_tier1_profile_storage_shape | Validate the forward profile storage-shape guards |
+| 000123 | guard_profile_key_slot_backlink | Add NOT VALID reverse non-NULL owner/prefix/slot backlink guard |
+| 000124 | validate_profile_key_slot_backlink | Validate the reverse profile key/slot guard |
+| 000125 | reject_unclassified_profile_keys | Add NOT VALID explicit NULL-slot rejection for profile-shaped keys |
+| 000126 | validate_profile_key_requires_slot | Backfill slots on historical soft-deleted exact legacy profile rows, then validate explicit NULL-slot rejection |
 
 ## Troubleshooting
 
