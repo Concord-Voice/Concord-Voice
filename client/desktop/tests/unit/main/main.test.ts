@@ -4671,8 +4671,10 @@ describe('main.ts', () => {
 
     it('injects Authorization header when token and matching origin are available', async () => {
       const tokenManager = await import('../../../src/main/tokenManager');
+      const { app } = await import('electron');
       (tokenManager.getCachedAccessToken as Mock).mockReturnValueOnce('test-jwt-token');
       (tokenManager.getApiBaseOrigin as Mock).mockReturnValueOnce('http://localhost:8080');
+      (app.getVersion as Mock).mockReturnValueOnce('1.0.0');
 
       const details = {
         url: 'http://localhost:8080/api/v1/klipy/media?url=https%3A%2F%2Fstatic.klipy.com%2Fimg.gif',
@@ -4683,9 +4685,35 @@ describe('main.ts', () => {
       klipyInterceptor!.callback(details, callback);
 
       expect(callback).toHaveBeenCalledWith({
-        requestHeaders: { Authorization: 'Bearer test-jwt-token' },
+        requestHeaders: {
+          Authorization: 'Bearer test-jwt-token',
+          'X-Concord-Client-Version': '1.0.0',
+        },
       });
     });
+
+    it.each(['1.0.0-beta.1', 'custom-build'])(
+      'omits the client-version header for app version %s',
+      async (version) => {
+        const tokenManager = await import('../../../src/main/tokenManager');
+        const { app } = await import('electron');
+        (tokenManager.getCachedAccessToken as Mock).mockReturnValueOnce('test-jwt-token');
+        (tokenManager.getApiBaseOrigin as Mock).mockReturnValueOnce('http://localhost:8080');
+        (app.getVersion as Mock).mockReturnValueOnce(version);
+
+        const details = {
+          url: 'http://localhost:8080/api/v1/klipy/media?url=test',
+          requestHeaders: {} as Record<string, string>,
+        };
+        const callback = vi.fn();
+
+        klipyInterceptor!.callback(details, callback);
+
+        expect(callback).toHaveBeenCalledWith({
+          requestHeaders: { Authorization: 'Bearer test-jwt-token' },
+        });
+      }
+    );
 
     it('does not inject header when token is null (pre-login)', async () => {
       const tokenManager = await import('../../../src/main/tokenManager');
@@ -4700,6 +4728,7 @@ describe('main.ts', () => {
       klipyInterceptor!.callback(details, callback);
 
       expect(callback).toHaveBeenCalledWith({ requestHeaders: {} });
+      expect(details.requestHeaders['X-Concord-Client-Version']).toBeUndefined();
     });
 
     it('does not inject header when request origin does not match API base', async () => {
@@ -4717,6 +4746,7 @@ describe('main.ts', () => {
 
       expect(callback).toHaveBeenCalledWith({ requestHeaders: {} });
       expect(details.requestHeaders['Authorization']).toBeUndefined();
+      expect(details.requestHeaders['X-Concord-Client-Version']).toBeUndefined();
     });
 
     it('does not inject header when API base origin is null', async () => {

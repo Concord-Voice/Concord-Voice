@@ -9,6 +9,8 @@ import {
   setRuntimeServerBase,
 } from '@/renderer/services/system/runtimeServerBase';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { _resetClientVersionCache } from '@/renderer/utils/runtime/clientVersion';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock WebSocket
 class MockWebSocket {
@@ -16,6 +18,7 @@ class MockWebSocket {
   static OPEN = 1;
   static CLOSING = 2;
   static CLOSED = 3;
+  static constructed = 0;
 
   readyState = MockWebSocket.CONNECTING;
   url: string;
@@ -26,6 +29,7 @@ class MockWebSocket {
   sentMessages: string[] = [];
 
   constructor(url: string) {
+    MockWebSocket.constructed += 1;
     this.url = url;
     // Simulate async open
     setTimeout(() => {
@@ -92,6 +96,8 @@ describe('WebSocketService', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    resetAllStores();
+    _resetClientVersionCache();
     // Mock fetch for ws-ticket endpoint
     mockFetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -99,6 +105,7 @@ describe('WebSocketService', () => {
     });
     globalThis.fetch = mockFetch;
     resetRuntimeServerBase();
+    MockWebSocket.constructed = 0;
     service = new WebSocketService('ws://localhost:8080');
   });
 
@@ -126,6 +133,112 @@ describe('WebSocketService', () => {
       expect(service.getState()).toBe(ConnectionState.CONNECTING);
     });
 
+    it('declares the desktop version on the raw ticket request and final WebSocket URL', async () => {
+      const getVersion = vi.fn().mockResolvedValue('1.2.3');
+      const originalElectron = globalThis.electron;
+      (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
+        getVersion,
+      };
+
+      try {
+        const ws = await connectAndWaitForOpen(service);
+        const headers = mockFetch.mock.calls[0][1]?.headers as Record<string, string>;
+
+        expect(headers['X-Concord-Client-Version']).toBe('1.2.3');
+        expect(new URL(ws.url).searchParams.get('client_version')).toBe('1.2.3');
+        expect(getVersion).toHaveBeenCalledTimes(1);
+      } finally {
+        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+          originalElectron;
+      }
+    });
+
+    it('declares the desktop version on a final URL built from a cached ticket', async () => {
+      const getVersion = vi.fn().mockResolvedValue('1.2.3');
+      const originalElectron = globalThis.electron;
+      (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
+        getVersion,
+      };
+      const cachedService = new WebSocketService('ws://localhost:8080');
+      const cache = cachedService as unknown as {
+        ticketCache: {
+          ticket: string;
+          issuedAt: number;
+          token: string;
+          sessionId: string | null;
+        } | null;
+      };
+      cache.ticketCache = {
+        ticket: 'cached-ticket',
+        issuedAt: Date.now(),
+        token: 'test-token',
+        sessionId: null,
+      };
+
+      try {
+        const ws = await connectAndWaitForOpen(cachedService);
+
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(new URL(ws.url).searchParams.get('client_version')).toBe('1.2.3');
+        expect(getVersion).toHaveBeenCalledTimes(1);
+      } finally {
+        cachedService.disconnect();
+        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+          originalElectron;
+      }
+    });
+
+    it.each([
+      ['the runtime server changes', () => setRuntimeServerBase('https://successor.example')],
+      [
+        'the auth generation changes',
+        () => useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 }),
+      ],
+    ] as const)(
+      'does not construct a stale WebSocket when %s during final version lookup',
+      async (_name, changeAuthority) => {
+        let resolveVersion: (version: string) => void = () => {
+          throw new Error('version resolver was not initialized');
+        };
+        const getVersion = vi
+          .fn()
+          .mockResolvedValueOnce('1.2.3')
+          .mockImplementationOnce(
+            () =>
+              new Promise<string>((resolve) => {
+                resolveVersion = resolve;
+              })
+          );
+        const originalElectron = globalThis.electron;
+        (globalThis as unknown as { electron: { getVersion: typeof getVersion } }).electron = {
+          getVersion,
+        };
+        mockFetch.mockImplementationOnce(async () => {
+          _resetClientVersionCache();
+          return { ok: true, json: () => Promise.resolve({ ticket: 'mock-ticket' }) };
+        });
+
+        try {
+          service.connect('test-token');
+          await vi.advanceTimersByTimeAsync(0);
+          await vi.waitFor(() => expect(getVersion).toHaveBeenCalledTimes(2));
+          changeAuthority();
+          resolveVersion('1.2.3');
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(MockWebSocket.constructed).toBe(0);
+          expect((service as unknown as { ws: MockWebSocket | null }).ws).toBeNull();
+          expect(service.getState()).toBe(ConnectionState.CONNECTING);
+          expect(
+            (service as unknown as { reconnectTimer: NodeJS.Timeout | null }).reconnectTimer
+          ).toBeNull();
+        } finally {
+          (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+            originalElectron;
+        }
+      }
+    );
+
     it('does not reconnect if already connected', async () => {
       const ws = await connectAndWaitForOpen(service);
 
@@ -145,16 +258,18 @@ describe('WebSocketService', () => {
       expect(service.getState()).toBe(ConnectionState.CONNECTED);
     });
 
-    it('restarts an in-flight connect when called with a newer token (#1977)', () => {
+    it('restarts an in-flight connect when called with a newer token (#1977)', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: () => new Promise(() => undefined),
       });
 
       service.connect('stale-token');
+      await vi.advanceTimersByTimeAsync(0);
       expect(mockFetch).toHaveBeenCalledTimes(1);
 
       service.connect('fresh-token');
+      await vi.advanceTimersByTimeAsync(0);
 
       expect(mockFetch).toHaveBeenCalledTimes(2);
       expect(mockFetch.mock.calls[1][1]?.headers).toMatchObject({
@@ -206,6 +321,7 @@ describe('WebSocketService', () => {
       expect(staleWs.onopen).not.toBeNull();
 
       service.connect('fresh-token');
+      await vi.advanceTimersByTimeAsync(0);
 
       expect(staleWs.onopen).toBeNull();
       expect(staleWs.onmessage).toBeNull();

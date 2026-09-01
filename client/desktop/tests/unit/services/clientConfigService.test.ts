@@ -476,6 +476,7 @@ describe('clientConfigService', () => {
       const oldConfigSignal = (mockApiFetch.mock.calls[0]?.[1] as RequestInit | undefined)?.signal;
       const oldCapabilitySignal = (mockApiFetch.mock.calls[1]?.[1] as RequestInit | undefined)
         ?.signal;
+      const oldRequestRevision = useClientConfigStore.getState().configRequestRevision;
 
       useClientConfigStore.setState({
         minVersion: '0.2.0',
@@ -499,6 +500,7 @@ describe('clientConfigService', () => {
         spaUrl: '',
         spaIpcContract: 0,
         lastFetchedAt: null,
+        acceptedConfigRevision: 0,
       });
       expect(mockApiFetch).toHaveBeenNthCalledWith(
         3,
@@ -524,6 +526,10 @@ describe('clientConfigService', () => {
       newCapabilities.resolve(jsonResponse(serverCapabilitiesPayload(true)));
       await switchedRefresh;
 
+      const currentRequestRevision = useClientConfigStore.getState().configRequestRevision;
+      expect(currentRequestRevision).toBeGreaterThan(oldRequestRevision);
+      expect(useClientConfigStore.getState().acceptedConfigRevision).toBe(currentRequestRevision);
+
       oldConfig.resolve(
         jsonResponse({
           minVersion: '0.2.0',
@@ -538,6 +544,7 @@ describe('clientConfigService', () => {
       await oldFetch;
 
       expect(useClientConfigStore.getState().mediaPlaneUrl).toBe('https://new-media.test');
+      expect(useClientConfigStore.getState().acceptedConfigRevision).toBe(currentRequestRevision);
       expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
         status: 'supported',
       });

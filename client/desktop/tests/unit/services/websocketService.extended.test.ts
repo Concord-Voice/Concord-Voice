@@ -6,6 +6,14 @@
  */
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { WebSocketService, ConnectionState } from '@/renderer/services/messaging/websocketService';
+import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
+import { _resetClientVersionCache } from '@/renderer/utils/runtime/clientVersion';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
+import { resetAllStores } from '../../helpers/store-helpers';
 
 // Mock WebSocket
 class MockWebSocket {
@@ -100,6 +108,9 @@ describe('WebSocketService — extended', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    resetAllStores();
+    resetRuntimeServerBase();
+    _resetClientVersionCache();
     mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ ticket: 'mock-ticket' }),
@@ -110,6 +121,7 @@ describe('WebSocketService — extended', () => {
 
   afterEach(() => {
     service.disconnect();
+    resetRuntimeServerBase();
     vi.useRealTimers();
     globalThis.fetch = originalFetch;
   });
@@ -432,6 +444,167 @@ describe('WebSocketService — extended', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       expect(service.getState()).toBe(ConnectionState.ERROR);
+    });
+
+    it('handles CLIENT_VERSION_TOO_OLD despite a never-settling updater check without reconnecting', async () => {
+      const forceCheckForUpdates = vi.fn(() => new Promise<void>(() => {}));
+      const originalElectron = globalThis.electron;
+      (globalThis as unknown as { electron: typeof globalThis.electron }).electron = {
+        ...originalElectron,
+        updater: {
+          ...originalElectron?.updater,
+          forceCheckForUpdates,
+        },
+      };
+      try {
+        mockFetch.mockResolvedValueOnce({
+          ok: false,
+          status: 403,
+          json: () =>
+            Promise.resolve({
+              code: 'CLIENT_VERSION_TOO_OLD',
+              requiredMinVersion: '1.2.3',
+              downloadHelpUrl: 'https://concord.example/download',
+            }),
+        });
+
+        service.connect('test-token');
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(service.getState()).toBe(ConnectionState.ERROR);
+        expect(forceCheckForUpdates).toHaveBeenCalledWith('attestation_required');
+        expect(useAttestationFailureStore.getState()).toMatchObject({
+          visible: true,
+          code: 'CLIENT_VERSION_TOO_OLD',
+          requiredMinVersion: '1.2.3',
+          downloadHelpUrl: 'https://concord.example/download',
+        });
+        expect(
+          (service as unknown as { reconnectTimer: NodeJS.Timeout | null }).reconnectTimer
+        ).toBeNull();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      } finally {
+        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+          originalElectron;
+      }
+    });
+
+    it('still shows terminal version denial when the updater check rejects', async () => {
+      const forceCheckForUpdates = vi.fn().mockRejectedValue(new Error('updater unavailable'));
+      const originalElectron = globalThis.electron;
+      (globalThis as unknown as { electron: typeof globalThis.electron }).electron = {
+        ...originalElectron,
+        updater: {
+          ...originalElectron?.updater,
+          forceCheckForUpdates,
+        },
+      };
+      try {
+        mockFetch.mockResolvedValueOnce({
+          ok: false,
+          status: 403,
+          json: () => Promise.resolve({ code: 'CLIENT_VERSION_TOO_OLD' }),
+        });
+
+        service.connect('test-token');
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(forceCheckForUpdates).toHaveBeenCalledWith('attestation_required');
+        expect(useAttestationFailureStore.getState()).toMatchObject({
+          visible: true,
+          code: 'CLIENT_VERSION_TOO_OLD',
+        });
+        expect(service.getState()).toBe(ConnectionState.ERROR);
+        expect(
+          (service as unknown as { reconnectTimer: NodeJS.Timeout | null }).reconnectTimer
+        ).toBeNull();
+      } finally {
+        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+          originalElectron;
+      }
+    });
+
+    it('ignores a delayed terminal ticket denial after the runtime server changes', async () => {
+      let resolveTicket: ((response: Response) => void) | undefined;
+      const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+      const originalElectron = globalThis.electron;
+      (globalThis as unknown as { electron: typeof globalThis.electron }).electron = {
+        ...originalElectron,
+        updater: {
+          ...originalElectron?.updater,
+          forceCheckForUpdates,
+        },
+      };
+      try {
+        mockFetch.mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              resolveTicket = resolve;
+            })
+        );
+
+        service.connect('test-token');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+
+        setRuntimeServerBase('https://new-server.example');
+        resolveTicket?.(
+          new Response(JSON.stringify({ code: 'CLIENT_VERSION_TOO_OLD' }), { status: 403 })
+        );
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(forceCheckForUpdates).not.toHaveBeenCalled();
+        expect(useAttestationFailureStore.getState().visible).toBe(false);
+        expect(service.getState()).toBe(ConnectionState.CONNECTING);
+        expect(
+          (service as unknown as { reconnectTimer: NodeJS.Timeout | null }).reconnectTimer
+        ).toBeNull();
+      } finally {
+        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+          originalElectron;
+      }
+    });
+
+    it('ignores a delayed terminal ticket denial after the auth generation changes', async () => {
+      let resolveTicket: ((response: Response) => void) | undefined;
+      const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+      const originalElectron = globalThis.electron;
+      (globalThis as unknown as { electron: typeof globalThis.electron }).electron = {
+        ...originalElectron,
+        updater: {
+          ...originalElectron?.updater,
+          forceCheckForUpdates,
+        },
+      };
+      try {
+        mockFetch.mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              resolveTicket = resolve;
+            })
+        );
+
+        service.connect('test-token');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+
+        useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 });
+        resolveTicket?.(
+          new Response(JSON.stringify({ code: 'CLIENT_VERSION_TOO_OLD' }), { status: 403 })
+        );
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(forceCheckForUpdates).not.toHaveBeenCalled();
+        expect(useAttestationFailureStore.getState().visible).toBe(false);
+        expect(service.getState()).toBe(ConnectionState.CONNECTING);
+        expect(
+          (service as unknown as { reconnectTimer: NodeJS.Timeout | null }).reconnectTimer
+        ).toBeNull();
+      } finally {
+        (globalThis as unknown as { electron: typeof globalThis.electron }).electron =
+          originalElectron;
+      }
     });
 
     it('handles AbortError silently on disconnect during connect', async () => {

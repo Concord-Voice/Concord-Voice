@@ -19,6 +19,8 @@ import {
   runtimeServerSelectionIsCurrent,
   type RuntimeServerSelection,
 } from './runtimeServerBase';
+import { getDesktopClientVersion } from '../../utils/runtime/clientVersion';
+import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
 import type { TerminalAttestationCode } from '../../stores/auth/attestationFailureStore';
 
 export { API_BASE } from '../../config';
@@ -543,6 +545,11 @@ interface AttestationFailureBody {
   downloadHelpUrl: string | undefined;
 }
 
+async function setClientVersionHeader(headers: Headers): Promise<void> {
+  const clientVersion = await getDesktopClientVersion();
+  if (clientVersion) headers.set('X-Concord-Client-Version', clientVersion);
+}
+
 /**
  * Parse a 403 response body into the AttestationFailureBody shape.
  * Uses response.clone() so the original response body remains readable by
@@ -568,17 +575,18 @@ async function parseAttestationBody(response: Response): Promise<AttestationFail
  * attestation token record (keyed by session_id + machine_id) — omitting it on
  * the retry guarantees a second 403 even with the fresh token.
  */
-function buildAttestationRetryHeaders(
+async function buildAttestationRetryHeaders(
   init: RequestInit | undefined,
   mid: string | null,
   freshAttToken: string
-): Headers {
+): Promise<Headers> {
   const headers = new Headers(init?.headers);
   const currentToken = useAuthStore.getState().accessToken;
   if (currentToken) headers.set('Authorization', `Bearer ${currentToken}`);
   const sessionId = useAuthStore.getState().sessionId;
   if (sessionId) headers.set('X-Session-ID', sessionId);
   if (mid) headers.set('X-Machine-Id', mid);
+  await setClientVersionHeader(headers);
   headers.set('X-Attestation-Token', freshAttToken);
   return headers;
 }
@@ -655,19 +663,76 @@ async function handleReattestPath(
     return response;
   }
 
-  // Retry ONCE with the fresh attestation token. Raw fetch — no recursion.
-  const retryHeaders = buildAttestationRetryHeaders(init, mid, fresh);
-  return apiFetchRaw(serverSelection.apiBase, path, init, retryHeaders);
+  // Retry ONCE with the fresh attestation token. Raw fetch — no re-attestation
+  // recursion. A terminal denial on that one retry still needs its terminal UI.
+  const retryHeaders = await buildAttestationRetryHeaders(init, mid, fresh);
+  if (
+    !runtimeServerSelectionIsCurrent(serverSelection) ||
+    !requestLifecycleIsCurrent(lifecycle, init?.signal)
+  ) {
+    return response;
+  }
+  const retryResponse = await apiFetchRaw(serverSelection.apiBase, path, init, retryHeaders);
+  if (retryResponse.status !== 403) return retryResponse;
+
+  const retryBody = await parseAttestationBody(retryResponse);
+  if (retryBody.code !== null && isTerminalAttestationCode(retryBody.code)) {
+    return handleTerminalAttestationPath(
+      serverSelection,
+      retryBody.code,
+      retryBody,
+      retryResponse,
+      lifecycle,
+      init?.signal
+    );
+  }
+  return retryResponse;
 }
 
 /**
- * Terminal path: this build is permanently rejected. Trigger an update check
- * and surface the failure modal via the store. Returns the original 403 so
- * callers see the unmodified server response.
+ * Terminal path: this build is permanently rejected. Surface the failure first,
+ * then start an update check without making terminal enforcement depend on it.
  *
  * Accepts a pre-narrowed TerminalAttestationCode so the modal cannot be
  * opened with an unrecognized code that would render inappropriate UX.
  */
+async function publishTerminalAttestationFailure(
+  isCurrent: () => boolean,
+  code: TerminalAttestationCode,
+  requiredMinVersion?: string,
+  downloadHelpUrl?: string
+): Promise<void> {
+  if (!isCurrent()) return;
+  const observedConfigRequestRevision =
+    code === 'CLIENT_VERSION_TOO_OLD'
+      ? useClientConfigStore.getState().configRequestRevision
+      : undefined;
+  const { useAttestationFailureStore } = await import('../../stores/auth/attestationFailureStore');
+  if (!isCurrent()) return;
+  useAttestationFailureStore.getState().showFailure({
+    code,
+    requiredMinVersion,
+    downloadHelpUrl,
+    observedConfigRequestRevision,
+  });
+  void globalThis.electron?.updater?.forceCheckForUpdates('attestation_required').catch(() => {
+    // The failure surface remains terminal when this best-effort update check fails.
+  });
+}
+
+export async function handleTerminalClientVersionTooOld(
+  isCurrent: () => boolean,
+  requiredMinVersion?: string,
+  downloadHelpUrl?: string
+): Promise<void> {
+  await publishTerminalAttestationFailure(
+    isCurrent,
+    'CLIENT_VERSION_TOO_OLD',
+    requiredMinVersion,
+    downloadHelpUrl
+  );
+}
+
 async function handleTerminalAttestationPath(
   serverSelection: RuntimeServerSelection,
   code: TerminalAttestationCode,
@@ -676,20 +741,18 @@ async function handleTerminalAttestationPath(
   lifecycle: AuthLifecycleSnapshot,
   signal?: AbortSignal | null
 ): Promise<Response> {
-  if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
-  if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
-  await globalThis.electron?.updater?.forceCheckForUpdates('attestation_required');
-  if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
-  if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
+  const isCurrent = () =>
+    runtimeServerSelectionIsCurrent(serverSelection) &&
+    signal?.aborted !== true &&
+    authLifecycleIsCurrent(lifecycle);
+  if (!isCurrent()) return response;
 
-  const { useAttestationFailureStore } = await import('../../stores/auth/attestationFailureStore');
-  if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
-  if (!requestLifecycleIsCurrent(lifecycle, signal)) return response;
-  useAttestationFailureStore.getState().showFailure({
+  await publishTerminalAttestationFailure(
+    isCurrent,
     code,
-    requiredMinVersion: body.requiredMinVersion,
-    downloadHelpUrl: body.downloadHelpUrl,
-  });
+    body.requiredMinVersion,
+    body.downloadHelpUrl
+  );
 
   return response;
 }
@@ -718,9 +781,9 @@ async function handle403Attestation(
 ): Promise<Response> {
   const body = await parseAttestationBody(response);
   if (!runtimeServerSelectionIsCurrent(serverSelection)) return response;
-  if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
 
   if (body.code !== null && ATTESTATION_REATTEST_CODES.has(body.code)) {
+    if (!requestLifecycleIsCurrent(lifecycle, init?.signal)) return response;
     return handleReattestPath(serverSelection, path, init, response, mid, lifecycle);
   }
 
@@ -770,6 +833,7 @@ async function build401RetryHeaders(
   const sessionId = useAuthStore.getState().sessionId;
   if (sessionId) headers.set('X-Session-ID', sessionId);
   if (mid) headers.set('X-Machine-Id', mid);
+  await setClientVersionHeader(headers);
   const attToken = await getAttestationTokenSafe();
   if (attToken) headers.set('X-Attestation-Token', attToken);
   return headers;
@@ -834,7 +898,10 @@ async function handle401Recovery(
   if (!refreshedRequestLifecycleIsCurrent(lifecycle, newToken, init?.signal)) {
     return response;
   }
-  return apiFetchRaw(serverSelection.apiBase, path, init, retryHeaders);
+  const refreshedLifecycle = captureAuthLifecycle();
+  const retryResponse = await apiFetchRaw(serverSelection.apiBase, path, init, retryHeaders);
+  if (retryResponse.status !== 403) return retryResponse;
+  return handle403Attestation(serverSelection, path, init, retryResponse, mid, refreshedLifecycle);
 }
 
 /**
@@ -852,32 +919,62 @@ export async function apiFetch(
 ): Promise<Response> {
   const serverSelection = captureRuntimeServerSelection();
   const requestApiBase = serverSelection.apiBase;
-  const authLifecycle = captureAuthLifecycle();
-  const token = authLifecycle.accessToken;
+  const admittedAuthLifecycle = captureAuthLifecycle();
 
   const headers = new Headers(init?.headers);
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
-  }
-  // X-Session-ID is required by the attestation middleware to look up the
-  // per-session token record keyed by (session_id, machine_id). Omitting it
-  // when attestation is enabled produces 403 ATTESTATION_MISSING / EXPIRED.
-  // Read from authStore (populated by /auth/login and /auth/refresh responses).
-  const sessionId = authLifecycle.sessionId;
-  if (sessionId) {
-    headers.set('X-Session-ID', sessionId);
-  }
   const mid = getMachineIdSync(requestApiBase);
   if (mid) {
     headers.set('X-Machine-Id', mid);
   }
 
-  // Attach attestation token if present. getAttestationTokenSafe never throws —
-  // it returns null on the web/test path (no electron bridge) AND on any IPC
-  // failure, so an optional header can never brick the whole request.
-  const attToken = await getAttestationTokenSafe();
+  await setClientVersionHeader(headers);
+
+  const requestContextChanged = (lifecycle: AuthLifecycleSnapshot) =>
+    !runtimeServerSelectionIsCurrent(serverSelection) ||
+    init?.signal?.aborted === true ||
+    !authLifecyclesMatch(admittedAuthLifecycle, lifecycle);
+
+  let requestAuthLifecycle = captureAuthLifecycle();
+  if (requestContextChanged(requestAuthLifecycle)) {
+    throw new DOMException('Request lifecycle changed before dispatch', 'AbortError');
+  }
+
+  // Attestation tokens are session-scoped. If the session rotates while the
+  // IPC lookup is in flight, fetch once more for the replacement session;
+  // a second concurrent session rotation aborts instead of mixing headers.
+  let attToken: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const attestationSessionId = requestAuthLifecycle.sessionId;
+    // getAttestationTokenSafe never throws: a missing bridge or IPC failure
+    // degrades to no optional header rather than bricking the request.
+    attToken = await getAttestationTokenSafe();
+    const currentAuthLifecycle = captureAuthLifecycle();
+    if (requestContextChanged(currentAuthLifecycle)) {
+      throw new DOMException('Request lifecycle changed before dispatch', 'AbortError');
+    }
+    requestAuthLifecycle = currentAuthLifecycle;
+    if (requestAuthLifecycle.sessionId === attestationSessionId) break;
+    if (attempt === 1) {
+      throw new DOMException('Request lifecycle changed before dispatch', 'AbortError');
+    }
+  }
   if (attToken) {
     headers.set('X-Attestation-Token', attToken);
+  }
+
+  // Async version/attestation lookups may overlap an ordinary credential
+  // refresh. The generation still identifies the same account, so dispatch
+  // with the credentials current at the fetch boundary instead of failing the
+  // user action. The exact request lifecycle below still guards any delayed
+  // 401 from tearing down a later rotation.
+  if (requestAuthLifecycle.accessToken) {
+    headers.set('Authorization', `Bearer ${requestAuthLifecycle.accessToken}`);
+  }
+  // X-Session-ID is required by the attestation middleware to look up the
+  // per-session token record keyed by (session_id, machine_id). Omitting it
+  // when attestation is enabled produces 403 ATTESTATION_MISSING / EXPIRED.
+  if (requestAuthLifecycle.sessionId) {
+    headers.set('X-Session-ID', requestAuthLifecycle.sessionId);
   }
 
   const response = await apiFetchRaw(requestApiBase, path, init, headers);
@@ -889,7 +986,7 @@ export async function apiFetch(
 
   // Intercept 403 attestation failures before the 401 path.
   if (response.status === 403) {
-    return handle403Attestation(serverSelection, path, init, response, mid, authLifecycle);
+    return handle403Attestation(serverSelection, path, init, response, mid, requestAuthLifecycle);
   }
 
   // If not 401, return as-is
@@ -904,7 +1001,7 @@ export async function apiFetch(
     response,
     mid,
     opts?.authoritative ?? true,
-    authLifecycle
+    requestAuthLifecycle
   );
 }
 

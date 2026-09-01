@@ -28,18 +28,24 @@ describe('clientConfigStore', () => {
     expect(state.serverCapabilities).toBeNull();
     expect(state.activityHistoryCapability).toEqual({ status: 'loading' });
     expect(state.lastFetchedAt).toBeNull();
+    expect(state.configRequestRevision).toBe(0);
+    expect(state.acceptedConfigRevision).toBe(0);
   });
 
   it('setConfig updates all fields', () => {
     const before = Date.now();
-    useClientConfigStore.getState().setConfig({
-      minVersion: '0.2.0',
-      featureFlags: { gifsEnabled: true },
-      mediaPlaneUrl: 'https://media.concordvoice.chat',
-      turn: { host: 'turn.concordvoice.chat', realm: 'concord' },
-      spaUrl: 'https://app.concordvoice.chat',
-      spaIpcContract: 3,
-    });
+    const requestRevision = useClientConfigStore.getState().beginConfigRequest();
+    useClientConfigStore.getState().setConfig(
+      {
+        minVersion: '0.2.0',
+        featureFlags: { gifsEnabled: true },
+        mediaPlaneUrl: 'https://media.concordvoice.chat',
+        turn: { host: 'turn.concordvoice.chat', realm: 'concord' },
+        spaUrl: 'https://app.concordvoice.chat',
+        spaIpcContract: 3,
+      },
+      requestRevision
+    );
 
     const state = useClientConfigStore.getState();
     expect(state.minVersion).toBe('0.2.0');
@@ -49,19 +55,25 @@ describe('clientConfigStore', () => {
     expect(state.spaUrl).toBe('https://app.concordvoice.chat');
     expect(state.spaIpcContract).toBe(3);
     expect(state.lastFetchedAt).toBeGreaterThanOrEqual(before);
+    expect(state.configRequestRevision).toBe(requestRevision);
+    expect(state.acceptedConfigRevision).toBe(requestRevision);
   });
 
   it('setConfig sets lastFetchedAt timestamp', () => {
     expect(useClientConfigStore.getState().lastFetchedAt).toBeNull();
 
-    useClientConfigStore.getState().setConfig({
-      minVersion: '0.1.0',
-      featureFlags: { gifsEnabled: true },
-      mediaPlaneUrl: '',
-      turn: { host: '', realm: '' },
-      spaUrl: '',
-      spaIpcContract: 0,
-    });
+    const requestRevision = useClientConfigStore.getState().beginConfigRequest();
+    useClientConfigStore.getState().setConfig(
+      {
+        minVersion: '0.1.0',
+        featureFlags: { gifsEnabled: true },
+        mediaPlaneUrl: '',
+        turn: { host: '', realm: '' },
+        spaUrl: '',
+        spaIpcContract: 0,
+      },
+      requestRevision
+    );
 
     expect(useClientConfigStore.getState().lastFetchedAt).not.toBeNull();
   });
@@ -87,5 +99,26 @@ describe('clientConfigStore', () => {
     expect(useClientConfigStore.getState().activityHistoryCapability).toEqual({
       status: 'loading',
     });
+  });
+
+  it('preserves config request order but invalidates accepted evidence across a runtime-server reset', () => {
+    const requestRevision = useClientConfigStore.getState().beginConfigRequest();
+    useClientConfigStore.getState().setConfig(
+      {
+        minVersion: '0.1.0',
+        featureFlags: {},
+        mediaPlaneUrl: '',
+        turn: { host: '', realm: '' },
+        spaUrl: '',
+        spaIpcContract: 0,
+      },
+      requestRevision
+    );
+
+    useClientConfigStore.getState().resetForRuntimeServer();
+
+    const state = useClientConfigStore.getState();
+    expect(state.configRequestRevision).toBe(requestRevision);
+    expect(state.acceptedConfigRevision).toBe(0);
   });
 });

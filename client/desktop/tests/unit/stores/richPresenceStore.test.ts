@@ -728,6 +728,7 @@ describe('presence settings contract (#2234)', () => {
 
   it('ignores stale auth and runtime continuations and reset invalidates pending work', async () => {
     const response = deferred<void>();
+    const requestStarted = deferred<void>();
     let getCount = 0;
     const successorResponse = { ...completeSettingsResponse, master_enabled: false };
     server.use(
@@ -735,6 +736,7 @@ describe('presence settings contract (#2234)', () => {
         getCount += 1;
         if (getCount === 1) return HttpResponse.json(completeSettingsResponse);
         if (getCount === 2) {
+          requestStarted.resolve();
           await response.promise;
           return HttpResponse.json(completeSettingsResponse);
         }
@@ -744,6 +746,7 @@ describe('presence settings contract (#2234)', () => {
     await settingsStore().hydratePresenceSettings();
     const baseline = settingsStore().presenceSettings;
     const hydration = settingsStore().hydratePresenceSettings();
+    await requestStarted.promise;
     useAuthStore.getState().setAccessToken('successor-token');
     const successorHydration = settingsStore().hydratePresenceSettings();
     await successorHydration;

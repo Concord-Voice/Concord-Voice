@@ -33,7 +33,15 @@ export function useRotateKey(endpoint: string, onSuccess: () => void): UseRotate
         setRotateStatus('error');
         setRotateMessage(data.error || 'Rotation failed');
       }
-    } catch {
+    } catch (error) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'name' in error &&
+        error.name === 'AbortError'
+      ) {
+        return;
+      }
       setRotateStatus('error');
       setRotateMessage('Network error');
     }

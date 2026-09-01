@@ -35,14 +35,13 @@ export interface AttestationFailedModalProps {
 /**
  * AttestationFailedModal — presentational, props-driven, no store coupling.
  *
- * Renders the "Update Required" dialog when the server rejects the client
- * with an attestation 403 (ATTESTATION_UNKNOWN_RELEASE, ATTESTATION_REVOKED,
- * CLIENT_VERSION_TOO_OLD). BSL clarity copy: users of self-hosted servers are
- * not blocked; only concordvoice.chat requires official signed releases.
+ * Renders the dismissible dialog when the server rejects the client with an
+ * unknown or revoked attestation. Version-floor failures use
+ * ForceUpdateOverlay instead.
  *
  * SECURITY: downloadHelpUrl is server-supplied and therefore untrusted.
  * Scheme is validated against SAFE_PROTOCOLS before rendering or passing to
- * window.electron.openExternal. An unsafe or missing URL renders no link at all.
+ * window.electron.openExternal. An unsafe or missing URL renders no link.
  */
 export function AttestationFailedModal({
   code,
@@ -50,7 +49,10 @@ export function AttestationFailedModal({
   downloadHelpUrl,
   onDismiss,
 }: Readonly<AttestationFailedModalProps>) {
-  const isSafeUrl = downloadHelpUrl !== undefined && SAFE_PROTOCOLS.test(downloadHelpUrl);
+  const downloadUrl =
+    downloadHelpUrl !== undefined && SAFE_PROTOCOLS.test(downloadHelpUrl)
+      ? downloadHelpUrl
+      : undefined;
   const dialogRef = useRef<HTMLDialogElement>(null);
 
   // Open the native <dialog> imperatively. showModal() gives us native modal
@@ -62,8 +64,8 @@ export function AttestationFailedModal({
     dlg.showModal();
   }, []);
 
-  // Native <dialog> fires a 'close' event on Escape (and on dlg.close()).
-  // Bridge it to onDismiss so the host component can update the store.
+  // Native <dialog> fires a 'cancel' event before Escape closes it, followed by
+  // 'close'. Attestation failures remain dismissible.
   // Listener attached imperatively rather than via JSX so the jsx-a11y rule
   // "non-interactive elements should not be assigned mouse or keyboard event
   // listeners" doesn't fire on the <dialog> JSX node.
@@ -79,9 +81,9 @@ export function AttestationFailedModal({
 
   const handleDownloadClick = (e: MouseEvent<HTMLAnchorElement>): void => {
     // Type-narrowing guard, not a runtime branch: the anchor only mounts when
-    // `isSafeUrl && downloadHelpUrl`, so this never fires at runtime — but it
+    // `downloadUrl`, so this never fires at runtime — but it
     // narrows `string | undefined` to `string` for the openExternal call below.
-    if (!downloadHelpUrl) return;
+    if (!downloadUrl) return;
     // Route through the preload bridge so the OS browser opens the URL.
     // Guard defensively — the bridge may be absent in tests or future environments.
     const api = (
@@ -91,7 +93,7 @@ export function AttestationFailedModal({
     ).electron;
     if (api && typeof api.openExternal === 'function') {
       e.preventDefault();
-      const result: Promise<unknown> | void = api.openExternal(downloadHelpUrl);
+      const result: Promise<unknown> | void = api.openExternal(downloadUrl);
       if (isPromiseLike(result)) {
         result.catch(() => {
           /* main-process logged the failure; renderer treats as no-op */
@@ -122,9 +124,9 @@ export function AttestationFailedModal({
           </p>
         )}
         <div className="attestation-modal__actions">
-          {isSafeUrl && downloadHelpUrl && (
+          {downloadUrl && (
             <a
-              href={downloadHelpUrl}
+              href={downloadUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="attestation-modal__download-link"
@@ -161,7 +163,7 @@ export default function AttestationFailedModalHost() {
   const dismiss = useAttestationFailureStore((s) => s.dismiss);
 
   // Early return AFTER all hooks (React rules of hooks requirement)
-  if (!visible || !code) return null;
+  if (!visible || !code || code === 'CLIENT_VERSION_TOO_OLD') return null;
 
   return (
     <AttestationFailedModal

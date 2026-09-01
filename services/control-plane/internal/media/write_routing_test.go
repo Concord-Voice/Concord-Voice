@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -130,6 +131,22 @@ func TestRequireUploadSessionWriteStore_VersionRoutesRails(t *testing.T) {
 			assert.Equal(t, tc.wantID, id)
 		})
 	}
+}
+
+func TestRequireUploadSessionWriteStore_RejectsV2WhenAttachmentBackendArmed(t *testing.T) {
+	h := writeRoutingHandler(stubWriteRouter{
+		tier1: newMockStore(), attachment: newMockStore(), backendID: "r2-useast",
+	}, nil)
+	h.cfg = &config.Config{AttachmentWriteBackend: "r2-useast"}
+
+	c, rec := writeRoutingContext()
+	store, backendID, ok := h.requireUploadSessionWriteStore(c, EnvelopeVersionV2)
+
+	assert.False(t, ok)
+	assert.Nil(t, store)
+	assert.Empty(t, backendID)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.JSONEq(t, `{"error":"envelope_version must be 3 while the attachment write backend is armed","envelope_versions":[3]}`, rec.Body.String())
 }
 
 // TestRequireAttachmentWriteStore_LegacyYieldsAnEmptyIdentifier locks the NULL

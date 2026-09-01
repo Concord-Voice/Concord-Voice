@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,9 +15,11 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 )
 
@@ -612,14 +615,97 @@ func TestAuthenticateWebSocketBlacklistedJWT(t *testing.T) {
 func TestHandleWebSocketUnauthorized(t *testing.T) {
 	hub := NewHub(nil, nil)
 	h := NewHandler(hub, nil, nil, testJWTSecret, []string{"*"}, nil, nil)
+	h.SetMinimumClientVersion("3.0.0")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest("GET", "/ws", nil)
+	c.Request, _ = http.NewRequest("GET", "/ws?client_version=0.0.1", nil)
 
 	h.HandleWebSocket(c)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.JSONEq(t, `{"error":"Unauthorized"}`, w.Body.String())
+}
+
+func TestHandlerSetMinimumClientVersion(t *testing.T) {
+	h := NewHandler(nil, nil, nil, testJWTSecret, nil, nil, nil)
+
+	h.SetMinimumClientVersion("3.0.0")
+
+	assert.Equal(t, "3.0.0", h.minimumClientVersion)
+}
+
+func TestHandleWebSocketClientVersionFloorTicket(t *testing.T) {
+	testHandleWebSocketClientVersionFloor(t, "ticket", func(t *testing.T, redisClient *redis.Client, userID uuid.UUID) string {
+		t.Helper()
+		ticket := "client-version-ticket-" + uuid.NewString()
+		require.NoError(t, redisClient.Set(context.Background(), wsTicketKeyPfx+ticket, userID.String(), 30*time.Second).Err())
+		return wsTicketPath + ticket
+	})
+}
+
+func TestHandleWebSocketClientVersionFloorJWT(t *testing.T) {
+	testHandleWebSocketClientVersionFloor(t, "direct JWT", func(t *testing.T, _ *redis.Client, userID uuid.UUID) string {
+		t.Helper()
+		return wsTokenPath + generateTestJWT(t, userID.String(), testJWTSecret)
+	})
+}
+
+func testHandleWebSocketClientVersionFloor(t *testing.T, authPathName string, authPath func(*testing.T, *redis.Client, uuid.UUID) string) {
+	t.Helper()
+	db := setupHubTestDB(t)
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(db, redisClient)
+	go hub.Run()
+	handler := NewHandler(hub, db, redisClient, testJWTSecret, []string{"*"}, nil, nil)
+	server := setupWSTestServer(t, handler, hub)
+	userID := uuid.New()
+
+	tests := []struct {
+		name          string
+		minimum       string
+		clientVersion string
+		wantStatus    int
+	}{
+		{name: "disabled", clientVersion: "0.0.1", wantStatus: http.StatusSwitchingProtocols},
+		{name: "missing", minimum: "3.0.0", wantStatus: http.StatusForbidden},
+		{name: "malformed", minimum: "3.0.0", clientVersion: "three", wantStatus: http.StatusForbidden},
+		{name: "older", minimum: "3.0.0", clientVersion: "2.9.9", wantStatus: http.StatusForbidden},
+		{name: "equal", minimum: "3.0.0", clientVersion: "3.0.0", wantStatus: http.StatusSwitchingProtocols},
+		{name: "newer", minimum: "3.0.0", clientVersion: "3.0.1", wantStatus: http.StatusSwitchingProtocols},
+	}
+
+	for _, test := range tests {
+		t.Run(authPathName+"/"+test.name, func(t *testing.T) {
+			handler.SetMinimumClientVersion(test.minimum)
+			wsURL := "ws" + server.URL[4:] + authPath(t, redisClient, userID) + "&client_version=" + test.clientVersion
+
+			conn, response, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
+			if test.wantStatus == http.StatusSwitchingProtocols {
+				require.NoError(t, err)
+				assert.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
+				require.NoError(t, conn.Close())
+				return
+			}
+
+			require.Error(t, err)
+			require.NotNil(t, response, "version denial must happen before the WebSocket upgrade")
+			defer func() {
+				assert.NoError(t, response.Body.Close())
+			}()
+			assert.Equal(t, test.wantStatus, response.StatusCode)
+
+			var body attestation.ErrorResponse
+			require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
+			assert.Equal(t, attestation.ErrorResponse{
+				Error:              "Client version too old",
+				Code:               attestation.ErrVersionTooOld,
+				UpdateAvailable:    true,
+				RequiredMinVersion: test.minimum,
+				DownloadHelpURL:    attestation.DownloadHelpURLDefault,
+			}, body)
+		})
+	}
 }
 
 func setupWSTestServer(t *testing.T, h *Handler, hub *Hub) *httptest.Server {

@@ -121,6 +121,7 @@ class ClientConfigService {
   }
 
   private async fetchClientConfig(): Promise<void> {
+    const requestRevision = useClientConfigStore.getState().beginConfigRequest();
     this.configAbortController?.abort();
     const controller = new AbortController();
     this.configAbortController = controller;
@@ -159,14 +160,17 @@ class ClientConfigService {
         JSON.stringify(prevState.featureFlags) !== JSON.stringify(data.featureFlags) ||
         JSON.stringify(prevState.turn) !== JSON.stringify(nextTurn);
 
-      useClientConfigStore.getState().setConfig({
-        minVersion: data.minVersion,
-        featureFlags: data.featureFlags,
-        mediaPlaneUrl: data.mediaPlaneUrl,
-        turn: nextTurn,
-        spaUrl: nextSpaUrl,
-        spaIpcContract: nextSpaIpcContract,
-      });
+      useClientConfigStore.getState().setConfig(
+        {
+          minVersion: data.minVersion,
+          featureFlags: data.featureFlags,
+          mediaPlaneUrl: data.mediaPlaneUrl,
+          turn: nextTurn,
+          spaUrl: nextSpaUrl,
+          spaIpcContract: nextSpaIpcContract,
+        },
+        requestRevision
+      );
 
       // SPA updates are applied through main's spaUpdate bridge so the shell
       // re-runs resolveSpaSource and keeps session-only auth in main memory.

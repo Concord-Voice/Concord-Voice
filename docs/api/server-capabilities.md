@@ -17,6 +17,22 @@ desktop client connects to an older self-hosted server).
   self-hosted deployments commonly egress many clients through one NAT IP.
 - **Introduced:** #662 (child of epic #1615, self-hosted deployment).
 
+## Compatibility declaration and reader floor
+
+`X-Concord-Client-Version` on authenticated REST requests and `client_version` on
+authenticated WebSocket admission are untrusted compatibility declarations. They
+are exact stable ASCII `X.Y.Z` values, are forgeable, and are never signed
+attestation, authentication, authorization, entitlement, or cryptographic evidence.
+
+When configured, the server rejects missing, malformed, or below-floor declarations
+with HTTP 403 `CLIENT_VERSION_TOO_OLD`. Public config, authentication, update, and
+recovery routes remain available. `/attestation/verify` remains AuthRequired-only
+and is explicitly outside the floor so attestation bootstrap remains possible.
+
+The floor protects attachment readability: stored v1/v2 objects remain readable
+forever. An armed R2 selector rejects only new v2 chunked session initialization
+before allocation; it does not change existing rows or reads.
+
 ## Response schema
 
 | Field | Type | Notes |

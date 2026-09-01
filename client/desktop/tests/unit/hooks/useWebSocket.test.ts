@@ -1,6 +1,7 @@
 import { renderHook, act } from '@testing-library/react';
 import { useWebSocket } from '@/renderer/hooks/messaging/useWebSocket';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
+import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
@@ -154,6 +155,50 @@ describe('useWebSocket', () => {
 
       expect(mockWsService.resetReconnectState).toHaveBeenCalledTimes(1);
       expect(mockWsService.connect).toHaveBeenCalledWith('fresh-token');
+      expect(mockWsService.updateToken).not.toHaveBeenCalled();
+    });
+
+    it('reconnects an error socket only after the client version floor clears', () => {
+      useAuthStore.getState().setAccessToken('test-token');
+      useAttestationFailureStore.getState().showFailure({
+        code: 'CLIENT_VERSION_TOO_OLD',
+        observedConfigRequestRevision: 0,
+      });
+      const failureRevision = useAttestationFailureStore.getState().failureRevision;
+      mockWsService.getState.mockReturnValue(ConnectionState.ERROR);
+
+      renderHook(() => useWebSocket());
+      expect(mockWsService.connect).not.toHaveBeenCalled();
+
+      act(() => {
+        useAttestationFailureStore.getState().clearVersionFloorIfCurrent(failureRevision, 0);
+      });
+
+      expect(mockWsService.resetReconnectState).toHaveBeenCalledTimes(1);
+      expect(mockWsService.connect).toHaveBeenCalledWith('test-token');
+    });
+
+    it.each([
+      ['connected', ConnectionState.CONNECTED],
+      ['connecting', ConnectionState.CONNECTING],
+      ['reconnecting', ConnectionState.RECONNECTING],
+    ] as const)('disconnects when the client version floor appears while %s', (_name, state) => {
+      useAuthStore.getState().setAccessToken('test-token');
+      mockWsService.getState.mockReturnValue(state);
+      renderHook(() => useWebSocket());
+      mockWsService.connect.mockClear();
+      mockWsService.disconnect.mockClear();
+      mockWsService.updateToken.mockClear();
+
+      act(() => {
+        useAttestationFailureStore.getState().showFailure({
+          code: 'CLIENT_VERSION_TOO_OLD',
+          observedConfigRequestRevision: 0,
+        });
+      });
+
+      expect(mockWsService.disconnect).toHaveBeenCalledTimes(1);
+      expect(mockWsService.connect).not.toHaveBeenCalled();
       expect(mockWsService.updateToken).not.toHaveBeenCalled();
     });
   });

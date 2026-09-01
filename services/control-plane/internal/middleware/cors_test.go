@@ -141,6 +141,14 @@ func TestCORSPreflightAllowedOrigin(t *testing.T) {
 	assert.Equal(t, testOrigin, w.Header().Get(headerAccessControlAllowOrigin))
 }
 
+func TestCORSPreflightAllowsClientVersionHeader(t *testing.T) {
+	r := corsRouter([]string{testOrigin})
+	w := doCORS(r, "OPTIONS", testOrigin)
+
+	assert.Equal(t, 204, w.Code)
+	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), middleware.ClientVersionHeader)
+}
+
 func TestCORSPreflightEmptyOrigin(t *testing.T) {
 	r := corsRouter([]string{"*"})
 	w := doCORS(r, "OPTIONS", "")

@@ -525,9 +525,17 @@ type initUploadSessionRequest struct {
 	DeclaredCiphertextBytes int64 `json:"declared_ciphertext_bytes"`
 }
 
-// requireUploadSessionWriteStore keeps v2 and omitted sessions on legacy so
-// their historical envelope layout never follows the v3 write selector.
+// requireUploadSessionWriteStore keeps v2 and omitted sessions on legacy while
+// dormant, and rejects v2 once the attachment write selector is armed so its
+// historical envelope layout never follows the v3 write selector.
 func (h *Handler) requireUploadSessionWriteStore(c *gin.Context, version EnvelopeVersion) (ObjectStore, string, bool) {
+	if version == EnvelopeVersionV2 && h.cfg.AttachmentWriteBackendArmed() {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "envelope_version must be 3 while the attachment write backend is armed",
+			"envelope_versions": []EnvelopeVersion{EnvelopeVersionV3},
+		})
+		return nil, "", false
+	}
 	if version == EnvelopeVersionV2 {
 		store, ok := h.requireTier1WriteStore(c)
 		return store, "", ok

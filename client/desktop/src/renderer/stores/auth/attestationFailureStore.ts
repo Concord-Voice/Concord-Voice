@@ -18,6 +18,7 @@ interface AttestationFailureInfo {
   code: TerminalAttestationCode;
   requiredMinVersion?: string;
   downloadHelpUrl?: string;
+  observedConfigRequestRevision?: number;
 }
 
 interface AttestationFailureState {
@@ -25,6 +26,8 @@ interface AttestationFailureState {
   code: TerminalAttestationCode | null;
   requiredMinVersion?: string;
   downloadHelpUrl?: string;
+  failureRevision: number;
+  observedConfigRequestRevision?: number;
   /**
    * Surface the attestation failure modal with the given info.
    * Actions live on the store (Concord frontend rule).
@@ -32,6 +35,10 @@ interface AttestationFailureState {
   showFailure: (info: AttestationFailureInfo) => void;
   /** Dismiss the modal and reset all state. */
   dismiss: () => void;
+  clearVersionFloorIfCurrent: (
+    failureRevision: number,
+    observedConfigRequestRevision: number
+  ) => void;
 }
 
 export const useAttestationFailureStore = createStore<AttestationFailureState>()((set) => ({
@@ -39,14 +46,18 @@ export const useAttestationFailureStore = createStore<AttestationFailureState>()
   code: null,
   requiredMinVersion: undefined,
   downloadHelpUrl: undefined,
+  failureRevision: 0,
+  observedConfigRequestRevision: undefined,
 
   showFailure: (info) =>
-    set({
+    set((state) => ({
       visible: true,
       code: info.code,
       requiredMinVersion: info.requiredMinVersion,
       downloadHelpUrl: info.downloadHelpUrl,
-    }),
+      observedConfigRequestRevision: info.observedConfigRequestRevision,
+      failureRevision: state.failureRevision + 1,
+    })),
 
   dismiss: () =>
     set({
@@ -54,5 +65,24 @@ export const useAttestationFailureStore = createStore<AttestationFailureState>()
       code: null,
       requiredMinVersion: undefined,
       downloadHelpUrl: undefined,
+      observedConfigRequestRevision: undefined,
+    }),
+  clearVersionFloorIfCurrent: (failureRevision, observedConfigRequestRevision) =>
+    set((state) => {
+      if (
+        !state.visible ||
+        state.code !== 'CLIENT_VERSION_TOO_OLD' ||
+        state.failureRevision !== failureRevision ||
+        state.observedConfigRequestRevision !== observedConfigRequestRevision
+      ) {
+        return {};
+      }
+      return {
+        visible: false,
+        code: null,
+        requiredMinVersion: undefined,
+        downloadHelpUrl: undefined,
+        observedConfigRequestRevision: undefined,
+      };
     }),
 }));

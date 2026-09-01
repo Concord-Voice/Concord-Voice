@@ -159,6 +159,23 @@ describe('AttestationFailedModalHost (store-connected)', () => {
     expect(screen.getByText('Download Official Client')).toBeInTheDocument();
   });
 
+  it('does not mount the native dialog for a visible version-floor failure', () => {
+    render(<AttestationFailedModalHost />);
+
+    act(() => {
+      useAttestationFailureStore.getState().showFailure({
+        code: 'CLIENT_VERSION_TOO_OLD',
+        requiredMinVersion: '0.2.44',
+      });
+    });
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(useAttestationFailureStore.getState()).toMatchObject({
+      visible: true,
+      code: 'CLIENT_VERSION_TOO_OLD',
+    });
+  });
+
   // 8. Clicking Dismiss flips store back to visible: false
   it('clicking "Dismiss" hides the modal and resets the store to visible:false', () => {
     render(<AttestationFailedModalHost />);

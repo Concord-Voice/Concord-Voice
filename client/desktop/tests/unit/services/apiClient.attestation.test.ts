@@ -13,6 +13,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
+import { useClientConfigStore } from '@/renderer/stores/ui/clientConfigStore';
 
 const mockGracefulReset = vi.fn();
 const mockNuclearReset = vi.fn();
@@ -23,10 +24,16 @@ vi.stubGlobal('fetch', mockFetch);
 
 import {
   apiFetch,
+  handleTerminalClientVersionTooOld,
   _resetRefreshState,
   ensureMachineId,
   configureRefreshFailureReset,
 } from '@/renderer/services/system/apiClient';
+import { _resetClientVersionCache } from '@/renderer/utils/runtime/clientVersion';
+import {
+  resetRuntimeServerBase,
+  setRuntimeServerBase,
+} from '@/renderer/services/system/runtimeServerBase';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -45,10 +52,12 @@ function makeElectronBridge(
     getToken?: () => Promise<string | null>;
     clearToken?: () => Promise<void>;
     forceCheckForUpdates?: (reason: string) => Promise<void>;
+    getVersion?: () => Promise<string>;
   } = {}
 ) {
   return {
     getMachineId: vi.fn().mockResolvedValue(''),
+    getVersion: vi.fn(overrides.getVersion ?? (() => Promise.resolve('0.1.0-test'))),
     refreshToken: vi.fn().mockResolvedValue({ status: 'error' }),
     attestation: {
       getToken: vi.fn(overrides.getToken ?? (() => Promise.resolve(null))),
@@ -67,7 +76,9 @@ function makeElectronBridge(
 describe('apiClient attestation — X-Attestation-Token injection', () => {
   beforeEach(() => {
     resetAllStores();
+    _resetClientVersionCache();
     _resetRefreshState();
+    resetRuntimeServerBase();
     vi.clearAllMocks();
     configureRefreshFailureReset({
       gracefulReset: mockGracefulReset,
@@ -76,6 +87,7 @@ describe('apiClient attestation — X-Attestation-Token injection', () => {
   });
 
   afterEach(() => {
+    resetRuntimeServerBase();
     (globalThis as Record<string, unknown>).electron = undefined;
   });
 
@@ -91,6 +103,18 @@ describe('apiClient attestation — X-Attestation-Token injection', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
     const headers = mockFetch.mock.calls[0][1].headers as Headers;
     expect(headers.get('X-Attestation-Token')).toBe('attest-token-123');
+  });
+
+  it('records the config revision from before terminal failure publication begins', async () => {
+    const preCallRevision = useClientConfigStore.getState().beginConfigRequest();
+    const pending = handleTerminalClientVersionTooOld(() => true, '1.0.0');
+    useClientConfigStore.getState().beginConfigRequest();
+
+    await pending;
+
+    expect(useAttestationFailureStore.getState().observedConfigRequestRevision).toBe(
+      preCallRevision
+    );
   });
 
   it('injects X-Session-ID header when authStore.sessionId is populated (HIGH #12)', async () => {
@@ -173,6 +197,77 @@ describe('apiClient attestation — X-Attestation-Token injection', () => {
     expect(headers.get('X-Attestation-Token')).toBeNull();
   });
 
+  it.each([
+    ['the runtime server changes', () => setRuntimeServerBase('https://successor.example')],
+    [
+      'the auth generation changes',
+      () => useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 }),
+    ],
+  ] as const)(
+    'does not dispatch when %s during asynchronous header lookup',
+    async (_name, change) => {
+      let resolveVersion: (version: string) => void = () => {
+        throw new Error('version resolver was not initialized');
+      };
+      const getVersion = vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveVersion = resolve;
+          })
+      );
+      (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+        getVersion: () => getVersion(),
+      });
+      useAuthStore.getState().setAccessToken('original-token');
+
+      const pending = apiFetch('/api/v1/test');
+      await vi.waitFor(() => expect(getVersion).toHaveBeenCalledTimes(1));
+      change();
+      resolveVersion('0.2.18');
+
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+      expect(mockFetch).not.toHaveBeenCalled();
+    }
+  );
+
+  it('dispatches with refreshed credentials when they rotate during asynchronous header lookup', async () => {
+    let resolveAttestation: (token: string | null) => void = () => {
+      throw new Error('attestation resolver was not initialized');
+    };
+    const getToken = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveAttestation = resolve;
+          })
+      )
+      .mockResolvedValueOnce('new-attest');
+    (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+      getToken: () => getToken(),
+    });
+    const generation = useAuthStore
+      .getState()
+      .beginAuthLifecycle('original-token', 'original-session');
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    const pending = apiFetch('/api/v1/test');
+    await vi.waitFor(() => expect(getToken).toHaveBeenCalledTimes(1));
+    expect(
+      useAuthStore
+        .getState()
+        .rotateAuthCredentials(generation, 'refreshed-token', 'refreshed-session')
+    ).toBe(true);
+    resolveAttestation('old-attest');
+
+    await expect(pending).resolves.toMatchObject({ status: 200 });
+    expect(getToken).toHaveBeenCalledTimes(2);
+    const headers = mockFetch.mock.calls[0][1].headers as Headers;
+    expect(headers.get('Authorization')).toBe('Bearer refreshed-token');
+    expect(headers.get('X-Session-ID')).toBe('refreshed-session');
+    expect(headers.get('X-Attestation-Token')).toBe('new-attest');
+  });
+
   it('200 OK with attestation token — passes through normally, body readable', async () => {
     (globalThis as Record<string, unknown>).electron = makeElectronBridge({
       getToken: () => Promise.resolve('attest-token-123'),
@@ -194,7 +289,9 @@ describe('apiClient attestation — X-Attestation-Token injection', () => {
 describe('apiClient attestation — 403 interception', () => {
   beforeEach(() => {
     resetAllStores();
+    _resetClientVersionCache();
     _resetRefreshState();
+    resetRuntimeServerBase();
     vi.clearAllMocks();
     configureRefreshFailureReset({
       gracefulReset: mockGracefulReset,
@@ -203,6 +300,7 @@ describe('apiClient attestation — 403 interception', () => {
   });
 
   afterEach(() => {
+    resetRuntimeServerBase();
     (globalThis as Record<string, unknown>).electron = undefined;
   });
 
@@ -375,6 +473,26 @@ describe('apiClient attestation — 403 interception', () => {
     expect(storeState.downloadHelpUrl).toBe('https://concordvoice.com/download');
   });
 
+  it.each([
+    'CLIENT_VERSION_TOO_OLD',
+    'ATTESTATION_UNKNOWN_RELEASE',
+    'ATTESTATION_REVOKED',
+  ] as const)(
+    '%s publishes the terminal failure before a never-settling updater check',
+    async (code) => {
+      const forceCheckMock = vi.fn(() => new Promise<void>(() => {}));
+      (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+        forceCheckForUpdates: (reason: string) => forceCheckMock(reason),
+      });
+      useAuthStore.getState().setAccessToken('auth-token');
+      mockFetch.mockResolvedValueOnce(makeAttestationFailureResponse(code));
+
+      await expect(apiFetch('/api/v1/test')).resolves.toMatchObject({ status: 403 });
+      expect(forceCheckMock).toHaveBeenCalledWith('attestation_required');
+      expect(useAttestationFailureStore.getState()).toMatchObject({ visible: true, code });
+    }
+  );
+
   // ── Terminal path: ATTESTATION_REVOKED ────────────────────────────────────
 
   it('ATTESTATION_REVOKED → terminal branch: forceCheckForUpdates called, clearToken NOT called', async () => {
@@ -401,6 +519,95 @@ describe('apiClient attestation — 403 interception', () => {
     const storeState = useAttestationFailureStore.getState();
     expect(storeState.visible).toBe(true);
     expect(storeState.code).toBe('ATTESTATION_REVOKED');
+  });
+
+  it.each(['ATTESTATION_UNKNOWN_RELEASE', 'ATTESTATION_REVOKED'] as const)(
+    '%s preserves the terminal denial when the updater check rejects',
+    async (code) => {
+      const forceCheckMock = vi.fn().mockRejectedValue(new Error('updater unavailable'));
+      (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+        forceCheckForUpdates: (reason: string) => forceCheckMock(reason),
+      });
+      useAuthStore.getState().setAccessToken('auth-token');
+      mockFetch.mockResolvedValueOnce(makeAttestationFailureResponse(code));
+
+      const response = await apiFetch('/api/v1/test');
+
+      expect(response.status).toBe(403);
+      expect(forceCheckMock).toHaveBeenCalledWith('attestation_required');
+      expect(useAttestationFailureStore.getState()).toMatchObject({ visible: true, code });
+    }
+  );
+
+  it.each([
+    'CLIENT_VERSION_TOO_OLD',
+    'ATTESTATION_UNKNOWN_RELEASE',
+    'ATTESTATION_REVOKED',
+  ] as const)(
+    '%s remains terminal after credentials rotate within the same generation',
+    async (code) => {
+      let resolveResponse: (response: Response) => void = () => {
+        throw new Error('response resolver was not initialized');
+      };
+      const forceCheckMock = vi.fn().mockResolvedValue(undefined);
+      (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+        forceCheckForUpdates: (reason: string) => forceCheckMock(reason),
+      });
+      const generation = useAuthStore
+        .getState()
+        .beginAuthLifecycle('original-token', 'original-session');
+      mockFetch.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveResponse = resolve;
+          })
+      );
+
+      const pending = apiFetch('/api/v1/test');
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      expect(
+        useAuthStore
+          .getState()
+          .rotateAuthCredentials(generation, 'rotated-token', 'rotated-session')
+      ).toBe(true);
+      resolveResponse(makeAttestationFailureResponse(code));
+
+      await expect(pending).resolves.toMatchObject({ status: 403 });
+      expect(forceCheckMock).toHaveBeenCalledWith('attestation_required');
+      expect(useAttestationFailureStore.getState()).toMatchObject({ visible: true, code });
+    }
+  );
+
+  it.each([
+    ['the runtime server changes', () => setRuntimeServerBase('https://successor.example')],
+    [
+      'a successor auth generation begins',
+      () => useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 }),
+    ],
+  ] as const)('suppresses a delayed terminal denial when %s', async (_name, changeAuthority) => {
+    let resolveResponse: (response: Response) => void = () => {
+      throw new Error('response resolver was not initialized');
+    };
+    const forceCheckMock = vi.fn().mockResolvedValue(undefined);
+    (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+      forceCheckForUpdates: (reason: string) => forceCheckMock(reason),
+    });
+    useAuthStore.getState().setAccessToken('original-token');
+    mockFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        })
+    );
+
+    const pending = apiFetch('/api/v1/test');
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+    changeAuthority();
+    resolveResponse(makeAttestationFailureResponse('CLIENT_VERSION_TOO_OLD'));
+
+    await expect(pending).resolves.toMatchObject({ status: 403 });
+    expect(forceCheckMock).not.toHaveBeenCalled();
+    expect(useAttestationFailureStore.getState().visible).toBe(false);
   });
 
   // ── Non-attestation 403 pass-through ──────────────────────────────────────
@@ -536,9 +743,11 @@ describe('apiClient attestation — 403 interception', () => {
       .mockResolvedValueOnce('old-attest') // injection
       .mockResolvedValueOnce('new-attest'); // re-attest
     const clearTokenMock = vi.fn().mockResolvedValue(undefined);
+    const getVersion = vi.fn().mockResolvedValue('0.2.18');
 
     (globalThis as Record<string, unknown>).electron = {
       getMachineId: vi.fn().mockResolvedValue('machine-uuid-456'),
+      getVersion,
       refreshToken: vi.fn().mockResolvedValue({ status: 'error' }),
       attestation: {
         getToken: vi.fn(() => getTokenMock()),
@@ -559,6 +768,8 @@ describe('apiClient attestation — 403 interception', () => {
     const retryHeaders = mockFetch.mock.calls[1][1].headers as Headers;
     expect(retryHeaders.get('Authorization')).toBe('Bearer bearer-token');
     expect(retryHeaders.get('X-Attestation-Token')).toBe('new-attest');
+    expect(retryHeaders.get('X-Concord-Client-Version')).toBe('0.2.18');
+    expect(getVersion).toHaveBeenCalledTimes(1);
     // machine ID may or may not be set depending on cache state; just assert no throw
   });
 
@@ -614,6 +825,164 @@ describe('apiClient attestation — 403 interception', () => {
     expect(retryHeaders.get('X-Attestation-Token')).toBe('new-attest');
   });
 
+  it('routes a terminal denial from the one ATTESTATION_EXPIRED retry without a second retry', async () => {
+    const getTokenMock = vi
+      .fn()
+      .mockResolvedValueOnce('old-attest')
+      .mockResolvedValueOnce('new-attest');
+    const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+    (globalThis as Record<string, unknown>).electron = {
+      ...makeElectronBridge({
+        getToken: () => getTokenMock(),
+        forceCheckForUpdates,
+      }),
+    } as unknown;
+    useAuthStore.getState().setAccessToken('auth-token');
+    mockFetch.mockResolvedValueOnce(makeAttestationFailureResponse('ATTESTATION_EXPIRED'));
+    mockFetch.mockResolvedValueOnce(
+      makeAttestationFailureResponse('CLIENT_VERSION_TOO_OLD', {
+        requiredMinVersion: '0.2.44',
+      })
+    );
+
+    await expect(apiFetch('/api/v1/test')).resolves.toMatchObject({ status: 403 });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(forceCheckForUpdates).toHaveBeenCalledWith('attestation_required');
+    expect(useAttestationFailureStore.getState()).toMatchObject({
+      visible: true,
+      code: 'CLIENT_VERSION_TOO_OLD',
+      requiredMinVersion: '0.2.44',
+    });
+  });
+
+  it('keeps a terminal re-attest retry denial after credentials rotate within the same generation', async () => {
+    let resolveRetry: (response: Response) => void = () => {
+      throw new Error('retry resolver was not initialized');
+    };
+    const getTokenMock = vi
+      .fn()
+      .mockResolvedValueOnce('old-attest')
+      .mockResolvedValueOnce('new-attest');
+    const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+    (globalThis as Record<string, unknown>).electron = {
+      ...makeElectronBridge({
+        getToken: () => getTokenMock(),
+        forceCheckForUpdates,
+      }),
+    } as unknown;
+    const generation = useAuthStore
+      .getState()
+      .beginAuthLifecycle('original-token', 'original-session');
+    mockFetch.mockResolvedValueOnce(makeAttestationFailureResponse('ATTESTATION_EXPIRED'));
+    mockFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveRetry = resolve;
+        })
+    );
+
+    const pending = apiFetch('/api/v1/test');
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+    expect(
+      useAuthStore.getState().rotateAuthCredentials(generation, 'rotated-token', 'rotated-session')
+    ).toBe(true);
+    resolveRetry(makeAttestationFailureResponse('CLIENT_VERSION_TOO_OLD'));
+
+    await expect(pending).resolves.toMatchObject({ status: 403 });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(forceCheckForUpdates).toHaveBeenCalledWith('attestation_required');
+    expect(useAttestationFailureStore.getState()).toMatchObject({
+      visible: true,
+      code: 'CLIENT_VERSION_TOO_OLD',
+    });
+  });
+
+  it.each([
+    ['the runtime server changes', () => setRuntimeServerBase('https://successor.example')],
+    [
+      'the auth generation changes',
+      () => useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 }),
+    ],
+  ] as const)(
+    'suppresses a terminal denial from the re-attest retry when %s',
+    async (_name, changeAuthority) => {
+      let resolveRetry: (response: Response) => void = () => {
+        throw new Error('retry resolver was not initialized');
+      };
+      const getTokenMock = vi
+        .fn()
+        .mockResolvedValueOnce('old-attest')
+        .mockResolvedValueOnce('new-attest');
+      const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+      (globalThis as Record<string, unknown>).electron = {
+        ...makeElectronBridge({
+          getToken: () => getTokenMock(),
+          forceCheckForUpdates,
+        }),
+      } as unknown;
+      useAuthStore.getState().setAccessToken('auth-token');
+      mockFetch.mockResolvedValueOnce(makeAttestationFailureResponse('ATTESTATION_EXPIRED'));
+      mockFetch.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveRetry = resolve;
+          })
+      );
+
+      const pending = apiFetch('/api/v1/test');
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+      changeAuthority();
+      resolveRetry(makeAttestationFailureResponse('CLIENT_VERSION_TOO_OLD'));
+
+      await expect(pending).resolves.toMatchObject({ status: 403 });
+      expect(forceCheckForUpdates).not.toHaveBeenCalled();
+      expect(useAttestationFailureStore.getState().visible).toBe(false);
+    }
+  );
+
+  it.each([
+    ['runtime server changes', () => setRuntimeServerBase('https://successor.example')],
+    [
+      'auth generation changes',
+      () => useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 }),
+    ],
+  ] as const)(
+    'does not re-attest against a stale origin when %s during version lookup',
+    async (_name, changeAuthority) => {
+      let resolveVersion: (version: string) => void = () => {
+        throw new Error('version resolver was not initialized');
+      };
+      const getVersion = vi
+        .fn()
+        .mockResolvedValueOnce('0.2.18')
+        .mockImplementationOnce(
+          () =>
+            new Promise<string>((resolve) => {
+              resolveVersion = resolve;
+            })
+        );
+      const getToken = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce('fresh-attest');
+      (globalThis as Record<string, unknown>).electron = makeElectronBridge({
+        getVersion: () => getVersion(),
+        getToken: () => getToken(),
+      });
+      useAuthStore.getState().setAccessToken('auth-token');
+      mockFetch.mockImplementationOnce(async () => {
+        _resetClientVersionCache();
+        return makeAttestationFailureResponse('ATTESTATION_EXPIRED');
+      });
+
+      const pending = apiFetch('/api/v1/test');
+      await vi.waitFor(() => expect(getVersion).toHaveBeenCalledTimes(2));
+      changeAuthority();
+      resolveVersion('0.2.18');
+
+      await expect(pending).resolves.toMatchObject({ status: 403 });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    }
+  );
+
   it('ATTESTATION_EXPIRED + clearToken AND getToken both reject → no throw, original 403 returned (defense-in-depth #1527)', async () => {
     // No-rot guard: the re-attest path routes clearToken/getToken through the
     // *Safe wrappers, so a sender-frame (or any IPC) failure on the recovery
@@ -640,6 +1009,7 @@ describe('apiClient attestation — 403 interception', () => {
 describe('apiClient — 401 recovery header preservation (HIGH #14)', () => {
   beforeEach(() => {
     resetAllStores();
+    _resetClientVersionCache();
     _resetRefreshState();
     vi.clearAllMocks();
     configureRefreshFailureReset({
@@ -772,5 +1142,66 @@ describe('apiClient — 401 recovery header preservation (HIGH #14)', () => {
     expect(retryHeaders.get('Authorization')).toBe('Bearer refreshed-jwt');
     expect(retryHeaders.get('X-Attestation-Token')).toBeNull(); // degraded gracefully
     warnSpy.mockRestore();
+  });
+
+  it('routes a 403 floor denial from the one 401 retry through the terminal path', async () => {
+    const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+    (globalThis as Record<string, unknown>).electron = {
+      ...makeElectronBridge({ forceCheckForUpdates }),
+      refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'refreshed-jwt' }),
+    } as unknown;
+    useAuthStore.getState().setAccessToken('expired-jwt');
+
+    mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+    mockFetch.mockResolvedValueOnce(
+      makeAttestationFailureResponse('CLIENT_VERSION_TOO_OLD', {
+        requiredMinVersion: '0.2.44',
+      })
+    );
+
+    const response = await apiFetch('/api/v1/test');
+
+    expect(response.status).toBe(403);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(forceCheckForUpdates).toHaveBeenCalledWith('attestation_required');
+    expect(useAttestationFailureStore.getState()).toMatchObject({
+      visible: true,
+      code: 'CLIENT_VERSION_TOO_OLD',
+      requiredMinVersion: '0.2.44',
+    });
+  });
+
+  it.each([
+    ['the runtime server changes', () => setRuntimeServerBase('https://successor.example')],
+    [
+      'a successor auth generation begins',
+      () => useAuthStore.setState({ authGeneration: useAuthStore.getState().authGeneration + 1 }),
+    ],
+  ] as const)('suppresses a terminal retry denial when %s', async (_name, changeAuthority) => {
+    let resolveRetry: (response: Response) => void = () => {
+      throw new Error('retry resolver was not initialized');
+    };
+    const forceCheckForUpdates = vi.fn().mockResolvedValue(undefined);
+    (globalThis as Record<string, unknown>).electron = {
+      ...makeElectronBridge({ forceCheckForUpdates }),
+      refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'refreshed-jwt' }),
+    } as unknown;
+    useAuthStore.getState().setAccessToken('expired-jwt');
+    mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+    mockFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveRetry = resolve;
+        })
+    );
+
+    const pending = apiFetch('/api/v1/test');
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+    changeAuthority();
+    resolveRetry(makeAttestationFailureResponse('CLIENT_VERSION_TOO_OLD'));
+
+    await expect(pending).resolves.toMatchObject({ status: 403 });
+    expect(forceCheckForUpdates).not.toHaveBeenCalled();
+    expect(useAttestationFailureStore.getState().visible).toBe(false);
   });
 });

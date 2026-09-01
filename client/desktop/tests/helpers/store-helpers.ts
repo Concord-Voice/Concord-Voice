@@ -97,7 +97,7 @@ export function resetAllStores(): void {
   useE2EEStore.getState().reset();
   usePendingRegistrationStore.getState().clearPending();
   useNotificationPrefsStore.getState().clearAll();
-  useAttestationFailureStore.getState().dismiss();
+  resetToInitialState(useAttestationFailureStore);
   useRichPresenceStore.getState().reset();
   useFriendOrgStore.getState().reset();
   usePresenceOverrideStore.getState().reset();

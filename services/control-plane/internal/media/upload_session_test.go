@@ -57,6 +57,7 @@ type fakeMultipartStore struct {
 
 	// Injected failures, one per verb, so each object-store error path gets its
 	// own status assertion rather than sharing one.
+	newCalls    int
 	newErr      error
 	putPartErr  error
 	listErr     error
@@ -91,6 +92,7 @@ func newFakeMultipartStore() *fakeMultipartStore {
 func (f *fakeMultipartStore) NewMultipartUpload(_ context.Context, key, contentType string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.newCalls++
 	if f.newErr != nil {
 		return "", f.newErr
 	}
@@ -292,6 +294,12 @@ func (f *fakeMultipartStore) openUploadCount() int {
 	return len(f.uploads)
 }
 
+func (f *fakeMultipartStore) newMultipartUploadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.newCalls
+}
+
 // --- test harness ---------------------------------------------------------
 
 type sessionSetup struct {
@@ -341,6 +349,15 @@ func (ss *sessionSetup) doInit(userID string, body map[string]any) *httptest.Res
 	c.Set("user_id", userID)
 	ss.handler.InitUploadSession(c)
 	return w
+}
+
+func (ss *sessionSetup) reservationCount(t *testing.T, userID string) int {
+	t.Helper()
+	budget, err := ss.rdb.Exists(t.Context(), attachBudgetKey(userID)).Result()
+	require.NoError(t, err)
+	slots, err := ss.rdb.SCard(t.Context(), attachUserSessionsKey(userID)).Result()
+	require.NoError(t, err)
+	return int(budget + slots)
 }
 
 // initBody is the default well-formed init payload for a plaintext of the given size.
@@ -565,6 +582,62 @@ func TestInitUploadSession_VersionSelectsWriteBackend(t *testing.T) {
 			} else {
 				assert.Equal(t, 0, ss.fake.openUploadCount())
 				assert.Equal(t, 1, vendor.openUploadCount())
+			}
+		})
+	}
+}
+
+func TestInitUploadSession_R2AdmissionMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		selector    string
+		version     int
+		wantCode    int
+		wantBackend string
+	}{
+		{name: "legacy selector v2", selector: config.LegacyAttachmentBackendID, version: 2, wantCode: http.StatusCreated},
+		{name: "legacy selector v3", selector: config.LegacyAttachmentBackendID, version: 3, wantCode: http.StatusCreated},
+		{name: "r2 selector v2", selector: "r2-useast", version: 2, wantCode: http.StatusBadRequest},
+		{name: "r2 selector v3", selector: "r2-useast", version: 3, wantCode: http.StatusCreated, wantBackend: "r2-useast"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := setupSessionTest(t)
+			ss.handler.cfg.AttachmentWriteBackend = tc.selector
+			vendor := newFakeMultipartStore()
+			if tc.selector == "r2-useast" {
+				ss.handler.SetWriteRouter(stubWriteRouter{
+					tier1: ss.fake, attachment: vendor, backendID: "r2-useast",
+				})
+			} else {
+				ss.handler.SetWriteRouter(stubWriteRouter{
+					tier1: ss.fake, attachment: ss.fake,
+				})
+			}
+			userID, _, channelID := ss.channelContext(t, "r2-admission")
+			body := initBody(channelID, 4096)
+			body["envelope_version"] = tc.version
+			w := ss.doInit(userID, body)
+			require.Equal(t, tc.wantCode, w.Code, "body: %s", w.Body.String())
+
+			if tc.wantCode == http.StatusBadRequest {
+				assert.JSONEq(t, `{"error":"envelope_version must be 3 while the attachment write backend is armed","envelope_versions":[3]}`, w.Body.String())
+				assert.Zero(t, ss.reservationCount(t, userID))
+				assert.Zero(t, ss.fake.newMultipartUploadCount())
+				assert.Zero(t, vendor.newMultipartUploadCount())
+				return
+			}
+
+			sessionID, ok := parseBody(t, w)["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantBackend,
+				ss.rdb.HGet(t.Context(), attachSessionKey(sessionID), "backend").Val())
+			assert.Equal(t, 2, ss.reservationCount(t, userID))
+			if tc.wantBackend == "" {
+				assert.Equal(t, 1, ss.fake.newMultipartUploadCount())
+				assert.Zero(t, vendor.newMultipartUploadCount())
+			} else {
+				assert.Zero(t, ss.fake.newMultipartUploadCount())
+				assert.Equal(t, 1, vendor.newMultipartUploadCount())
 			}
 		})
 	}

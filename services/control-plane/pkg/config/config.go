@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/clientversion"
 	"github.com/joho/godotenv"
 )
 
@@ -434,7 +435,7 @@ func Load() (*Config, error) {
 		TURNSecret:               getEnv("TURN_SECRET", ""),
 		TURNRealm:                getEnv("TURN_REALM", "localhost"),
 		AllowedOrigins:           parseOrigins(getEnv("ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3002,app://concord,spa-cache://concord")),
-		ClientMinVersion:         getEnv("CLIENT_MIN_VERSION", ""),
+		ClientMinVersion:         strings.TrimSpace(getEnv("CLIENT_MIN_VERSION", "")),
 		SpaURL:                   getEnv("SPA_URL", ""),
 		SpaIpcContract:           getEnvInt("SPA_IPC_CONTRACT", 0),
 		SpaConfigFile:            getEnv("SPA_CONFIG_FILE", ""),
@@ -761,6 +762,11 @@ func loadCloudflareKVBridgeConfig(cfg *Config) error {
 // validate checks for dangerous configuration in production environments.
 // Returns an error if required secrets are missing or still set to dev defaults.
 func (c *Config) validate() error {
+	if c.ClientMinVersion != "" {
+		if _, err := clientversion.Parse(c.ClientMinVersion); err != nil {
+			return fmt.Errorf("CLIENT_MIN_VERSION must be a stable X.Y.Z version: %w", err)
+		}
+	}
 	// Ordered before validateActivityHistory for the same reason as in
 	// loadActivityHistoryConfig (#2178): the unconditional constraint is the
 	// root cause, and fixing it also satisfies the Activity History one.

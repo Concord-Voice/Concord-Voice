@@ -91,14 +91,17 @@ interface ClientConfigState extends ClientConfig {
   activityHistoryCapability: ActivityHistoryCapabilityState;
   chunkedUploadCapability: ChunkedUploadCapabilityState;
   lastFetchedAt: number | null;
-  setConfig: (config: ClientConfig) => void;
+  configRequestRevision: number;
+  acceptedConfigRevision: number;
+  beginConfigRequest: () => number;
+  setConfig: (config: ClientConfig, requestRevision: number) => void;
   setServerCapabilities: (capabilities: ServerCapabilities | null) => void;
   setActivityHistoryCapability: (capability: ActivityHistoryCapabilityState) => void;
   setChunkedUploadCapability: (capability: ChunkedUploadCapabilityState) => void;
   resetForRuntimeServer: () => void;
 }
 
-export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
+export const useClientConfigStore = createStore<ClientConfigState>()((set, get) => ({
   minVersion: '',
   featureFlags: {},
   mediaPlaneUrl: '',
@@ -109,7 +112,15 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
   activityHistoryCapability: { status: 'loading' },
   chunkedUploadCapability: { status: 'loading' },
   lastFetchedAt: null,
-  setConfig: (config) => set({ ...config, lastFetchedAt: Date.now() }),
+  configRequestRevision: 0,
+  acceptedConfigRevision: 0,
+  beginConfigRequest: () => {
+    const revision = get().configRequestRevision + 1;
+    set({ configRequestRevision: revision });
+    return revision;
+  },
+  setConfig: (config, requestRevision) =>
+    set({ ...config, lastFetchedAt: Date.now(), acceptedConfigRevision: requestRevision }),
   setServerCapabilities: (serverCapabilities) => set({ serverCapabilities }),
   setActivityHistoryCapability: (activityHistoryCapability) => set({ activityHistoryCapability }),
   setChunkedUploadCapability: (chunkedUploadCapability) => set({ chunkedUploadCapability }),
@@ -125,5 +136,6 @@ export const useClientConfigStore = createStore<ClientConfigState>()((set) => ({
       activityHistoryCapability: { status: 'loading' },
       chunkedUploadCapability: { status: 'loading' },
       lastFetchedAt: null,
+      acceptedConfigRevision: 0,
     }),
 }));

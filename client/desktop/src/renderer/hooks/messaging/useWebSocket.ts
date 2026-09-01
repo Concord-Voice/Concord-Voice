@@ -14,6 +14,7 @@
 
 import { useEffect, useCallback, useRef } from 'react';
 import { useAuthStore } from '../../stores/auth/authStore';
+import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';
@@ -54,6 +55,9 @@ function createRotationOperationGuard(
 
 export function useWebSocket() {
   const accessToken = useAuthStore((state) => state.accessToken);
+  const clientVersionBlocked = useAttestationFailureStore(
+    (state) => state.visible && state.code === 'CLIENT_VERSION_TOO_OLD'
+  );
   const wsService = useRef(getWebSocketService()).current;
   const epochValidationGenerationRef = useRef(0);
 
@@ -312,6 +316,13 @@ export function useWebSocket() {
       wsService.disconnect();
       return;
     }
+    // A ws-ticket version denial is terminal until a later authoritative
+    // client-config response retracts the floor. Re-running this effect when
+    // that store flag clears restarts an ERROR socket with the current token.
+    if (clientVersionBlocked) {
+      wsService.disconnect();
+      return;
+    }
 
     const state = wsService.getState();
     // RECONNECTING and CONNECTING both can carry an in-flight ws-ticket
@@ -331,7 +342,7 @@ export function useWebSocket() {
       // future reconnect uses it.
       wsService.updateToken(accessToken);
     }
-  }, [accessToken, wsService]);
+  }, [accessToken, clientVersionBlocked, wsService]);
 
   // Unmount-only cleanup. Kept in a separate effect (no accessToken in
   // deps) so token rotation doesn't trigger a disconnect.

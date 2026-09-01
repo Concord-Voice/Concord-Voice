@@ -1,17 +1,18 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Download, RefreshCw, Loader, ExternalLink } from 'lucide-react';
+import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
+import {
+  compareStableDesktopVersions,
+  getDesktopClientVersion,
+  getDesktopClientDisplayVersion,
+} from '../../utils/runtime/clientVersion';
 import './ForceUpdateOverlay.css';
 
 type Phase = 'checking' | 'downloading' | 'downloaded' | 'error';
 
 const DOWNLOAD_URL = 'https://concordvoice.com/download';
-/** After this many failed attempts, show a "Continue Anyway" escape hatch.
- *  This is intentional: the overlay is a UX gate, not a hard security boundary.
- *  Hard enforcement is done server-side by rejecting API calls from outdated clients.
- *  The escape prevents permanent lockout on network failure or delayed releases. */
 const ESCAPE_AFTER_FAILURES = 2;
-
 /** Compare two semver strings. Returns negative if a < b, 0 if equal, positive if a > b.
  *  Strips prerelease/build metadata (e.g. "0.2.0-beta.1" → "0.2.0") before comparing. */
 function compareSemver(a: string, b: string): number {
@@ -32,17 +33,68 @@ function compareSemver(a: string, b: string): number {
 const ForceUpdateOverlay: React.FC = () => {
   const minVersion = useClientConfigStore((s) => s.minVersion);
   const lastFetchedAt = useClientConfigStore((s) => s.lastFetchedAt);
+  const acceptedConfigRevision = useClientConfigStore((s) => s.acceptedConfigRevision);
+  const attestationVisible = useAttestationFailureStore((s) => s.visible);
+  const attestationCode = useAttestationFailureStore((s) => s.code);
+  const attestationRequiredMinVersion = useAttestationFailureStore((s) => s.requiredMinVersion);
+  const failureRevision = useAttestationFailureStore((s) => s.failureRevision);
+  const observedConfigRequestRevision = useAttestationFailureStore(
+    (s) => s.observedConfigRequestRevision
+  );
+  const clearVersionFloorIfCurrent = useAttestationFailureStore(
+    (s) => s.clearVersionFloorIfCurrent
+  );
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [strictAppVersion, setStrictAppVersion] = useState<string | null | undefined>(undefined);
   const [phase, setPhase] = useState<Phase | null>(null);
   const [progress, setProgress] = useState(0);
   const [errorMsg, setErrorMsg] = useState('');
   const failureCountRef = useRef(0);
-  const [dismissed, setDismissed] = useState(false);
+  const [dismissedMinVersion, setDismissedMinVersion] = useState<string | null>(null);
 
   // Get current app version on mount
   useEffect(() => {
-    globalThis.electron?.getVersion?.().then(setAppVersion);
+    void Promise.all([getDesktopClientDisplayVersion(), getDesktopClientVersion()]).then(
+      ([displayVersion, strictVersion]) => {
+        setAppVersion(displayVersion);
+        setStrictAppVersion(strictVersion);
+      }
+    );
   }, []);
+
+  useEffect(() => {
+    if (
+      !attestationVisible ||
+      attestationCode !== 'CLIENT_VERSION_TOO_OLD' ||
+      observedConfigRequestRevision === undefined ||
+      acceptedConfigRevision <= observedConfigRequestRevision
+    ) {
+      return;
+    }
+    const comparison =
+      strictAppVersion === undefined || strictAppVersion === null
+        ? null
+        : compareStableDesktopVersions(strictAppVersion, minVersion);
+    if (minVersion === '' || (comparison !== null && comparison >= 0)) {
+      const currentConfig = useClientConfigStore.getState();
+      if (
+        currentConfig.acceptedConfigRevision !== acceptedConfigRevision ||
+        currentConfig.minVersion !== minVersion
+      ) {
+        return;
+      }
+      clearVersionFloorIfCurrent(failureRevision, observedConfigRequestRevision);
+    }
+  }, [
+    acceptedConfigRevision,
+    strictAppVersion,
+    attestationCode,
+    attestationVisible,
+    clearVersionFloorIfCurrent,
+    failureRevision,
+    minVersion,
+    observedConfigRequestRevision,
+  ]);
 
   // Brief grace period on mount so the overlay doesn't flash during initial render.
   // Config fetch has a 2s startup delay, so this just prevents sub-second flicker
@@ -53,13 +105,37 @@ const ForceUpdateOverlay: React.FC = () => {
     return () => clearTimeout(t);
   }, []);
 
-  const updateRequired = !!(
+  const attestationRequiresUpdate =
+    attestationVisible && attestationCode === 'CLIENT_VERSION_TOO_OLD';
+  const configRequiresUpdate = !!(
     ready &&
     appVersion &&
     minVersion &&
     lastFetchedAt &&
     compareSemver(appVersion, minVersion) < 0
   );
+  const configOnlyRequiresUpdate = configRequiresUpdate && !attestationRequiresUpdate;
+  const updateRequired = attestationRequiresUpdate || configRequiresUpdate;
+  const configOnlyDismissed =
+    dismissedMinVersion !== null && compareSemver(minVersion, dismissedMinVersion) <= 0;
+  const configOnlyDismissalRearmed =
+    configOnlyRequiresUpdate &&
+    dismissedMinVersion !== null &&
+    compareSemver(minVersion, dismissedMinVersion) > 0;
+  const requiredVersion = attestationRequiresUpdate
+    ? attestationRequiredMinVersion || undefined
+    : minVersion || undefined;
+
+  useEffect(() => {
+    if (!configOnlyDismissalRearmed) return;
+    failureCountRef.current = 0;
+    /* eslint-disable @eslint-react/set-state-in-effect -- an increased minimum invalidates
+     * the dismissed floor's updater state; the render guard above prevents an escape flash. */
+    setPhase(null);
+    setErrorMsg('');
+    setDismissedMinVersion(null);
+    /* eslint-enable @eslint-react/set-state-in-effect -- floor-transition reset ends here */
+  }, [configOnlyDismissalRearmed]);
 
   // Subscribe to update IPC events when overlay is active
   useEffect(() => {
@@ -117,8 +193,14 @@ const ForceUpdateOverlay: React.FC = () => {
   const handleUpdate = useCallback(async () => {
     setPhase('checking');
     setErrorMsg('');
+    if (!globalThis.electron?.checkForUpdates) {
+      failureCountRef.current++;
+      setPhase('error');
+      setErrorMsg('Failed to check for updates.');
+      return;
+    }
     try {
-      await globalThis.electron?.checkForUpdates();
+      await globalThis.electron.checkForUpdates();
     } catch {
       failureCountRef.current++;
       setPhase('error');
@@ -130,9 +212,13 @@ const ForceUpdateOverlay: React.FC = () => {
     globalThis.electron?.installUpdate();
   }, []);
 
-  if (!updateRequired || dismissed) return null;
+  if (!updateRequired || (configOnlyRequiresUpdate && configOnlyDismissed)) return null;
 
-  const showEscape = phase === 'error' && failureCountRef.current >= ESCAPE_AFTER_FAILURES;
+  const showEscape =
+    configOnlyRequiresUpdate &&
+    !configOnlyDismissalRearmed &&
+    phase === 'error' &&
+    failureCountRef.current >= ESCAPE_AFTER_FAILURES;
 
   return (
     <div className="force-update-overlay">
@@ -142,8 +228,16 @@ const ForceUpdateOverlay: React.FC = () => {
         </div>
         <h2 className="force-update-title">Update Required</h2>
         <p className="force-update-message">
-          Your version (<strong>v{appVersion}</strong>) is below the minimum required version ({' '}
-          <strong>v{minVersion}</strong>). Please update to continue using Concord.
+          {appVersion
+            ? `Your version (v${appVersion}) is below the minimum required version`
+            : 'This server requires an update'}
+          {requiredVersion && (
+            <>
+              {' '}
+              (<strong>v{requiredVersion}</strong>)
+            </>
+          )}
+          . Please update to continue using Concord.
         </p>
 
         {phase === 'checking' && (
@@ -204,7 +298,7 @@ const ForceUpdateOverlay: React.FC = () => {
         {showEscape && (
           <button
             className="force-update-btn secondary force-update-escape"
-            onClick={() => setDismissed(true)}
+            onClick={() => setDismissedMinVersion(minVersion)}
           >
             Continue Anyway
           </button>

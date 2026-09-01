@@ -17,6 +17,7 @@ import { loadWindowState, attachWindowState } from './windowState';
 import { isWayland } from './waylandDetect';
 import { deriveCloseAction, deriveMinimizeAction } from '../shared/clientBehavior';
 import { SPA_FALLBACK_MESSAGE } from '../shared/spaIpcTypes';
+import { isStableDesktopVersion } from '../shared/stableDesktopVersion';
 import {
   app,
   autoUpdater as electronAutoUpdater,
@@ -1594,6 +1595,10 @@ app.whenReady().then(async () => {
           const requestOrigin = new URL(details.url).origin;
           if (requestOrigin === apiOrigin) {
             details.requestHeaders['Authorization'] = `Bearer ${token}`;
+            const clientVersion = app.getVersion();
+            if (isStableDesktopVersion(clientVersion)) {
+              details.requestHeaders['X-Concord-Client-Version'] = clientVersion;
+            }
           }
         } catch {
           // Malformed URL — skip injection

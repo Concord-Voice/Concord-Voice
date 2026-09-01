@@ -26,6 +26,8 @@ type Handler struct {
 	redis          *redis.Client
 	jwtSecret      string
 	allowedOrigins []string
+	// minimumClientVersion is optional: empty preserves the existing admission path.
+	minimumClientVersion string
 	// fence enforces the per-user credential epoch on both WS auth paths
 	// (#2201) so ticket redemption and the JWT fallback carry the same
 	// revocation semantics as HTTP bearer auth. nil disables (tests only).
@@ -81,12 +83,20 @@ func NewHandler(hub *Hub, db *sql.DB, redisClient *redis.Client, jwtSecret strin
 	return h
 }
 
+// SetMinimumClientVersion configures the optional client-version admission floor.
+func (h *Handler) SetMinimumClientVersion(minimum string) {
+	h.minimumClientVersion = minimum
+}
+
 // HandleWebSocket upgrades HTTP connections to WebSocket
 func (h *Handler) HandleWebSocket(c *gin.Context) {
 	// Authenticate: prefer ticket-based auth, fall back to JWT for backward compat
 	userID, sessionID, err := h.authenticateWebSocket(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	if !middleware.EnforceClientVersion(c, h.minimumClientVersion, c.Query("client_version")) {
 		return
 	}
 	activityRichPresenceCapable := requestSupportsActivityRichPresence(c.Request)

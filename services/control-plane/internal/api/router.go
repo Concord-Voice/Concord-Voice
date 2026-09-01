@@ -875,6 +875,7 @@ func NewRouter(
 	}
 	wsHandler := websocket.NewHandler(hub, db, redis, cfg.JWTSecret, cfg.AllowedOrigins,
 		credFence, middleware.SecurityHeaderSet(cfg.Environment, cfg.HSTSHeaderValue))
+	wsHandler.SetMinimumClientVersion(cfg.ClientMinVersion)
 	wsTicketHandler := auth.NewWSTicketHandler(redis, cfg.JWTSecret)
 	clientConfigHandler := clientconfig.NewHandler(cfg, liveSpa, log)
 	serverCapabilitiesHandler := servercapabilities.NewHandler(cfg)
@@ -1265,6 +1266,7 @@ func NewRouter(
 		// defined and unit-tested but never registered on any route).
 		authRequired := v1.Group("/")
 		authRequired.Use(middleware.AuthRequired(cfg.JWTSecret, redis, credFence))
+		authRequired.Use(middleware.RequireClientVersion(cfg.ClientMinVersion))
 		authRequired.Use(middleware.RequireAttestation(cfg.RequireClientAttestation, redis, log))
 
 		// ── Pending-OK routes (unverified email allowed) ──────────────

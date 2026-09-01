@@ -136,6 +136,7 @@ func TestLoad(t *testing.T) {
 	envVars := []string{
 		"ENVIRONMENT", "PORT", "DATABASE_URL", "REDIS_URL", "JWT_SECRET", "NATS_URL",
 		"ALLOWED_ORIGINS", "TRUSTED_PROXY_CIDRS", "HSTS_HEADER_VALUE",
+		"CLIENT_MIN_VERSION",
 		"ACTIVITY_HISTORY_CLUSTER_ENABLED",
 		"CONTROL_PLANE_REPLICA_COUNT", "ACTIVITY_HISTORY_OPERATOR_NAME",
 		"ACTIVITY_HISTORY_PRIVACY_POLICY_URL",
@@ -187,6 +188,48 @@ func TestLoad(t *testing.T) {
 		assert.Equal(t, "9090", cfg.Port)
 		assert.Equal(t, "staging", cfg.Environment)
 	})
+}
+
+func TestClientVersionLoad(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "development")
+
+	t.Run("empty disables enforcement", func(t *testing.T) {
+		t.Setenv("CLIENT_MIN_VERSION", "")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Empty(t, cfg.ClientMinVersion)
+	})
+
+	t.Run("stable triple loads exactly", func(t *testing.T) {
+		t.Setenv("CLIENT_MIN_VERSION", "0.2.44")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "0.2.44", cfg.ClientMinVersion)
+	})
+
+	t.Run("surrounding whitespace is trimmed at load", func(t *testing.T) {
+		t.Setenv("CLIENT_MIN_VERSION", " 0.2.44 ")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "0.2.44", cfg.ClientMinVersion)
+	})
+}
+
+func TestClientVersionValidationRejectsMalformedValuesInEveryEnvironment(t *testing.T) {
+	for _, environment := range []string{"development", "staging", "production"} {
+		for _, version := range []string{"0.2", " 0.2.44 "} {
+			t.Run(environment+"/"+version, func(t *testing.T) {
+				cfg := &Config{Environment: environment, ClientMinVersion: version}
+
+				err := cfg.validate()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "CLIENT_MIN_VERSION")
+			})
+		}
+	}
 }
 
 // TestLoad_AllowedOriginsDefault_OmitsHostedSpaOrigin pins the post-#1664

@@ -19,6 +19,15 @@ info:
 
     - All timestamps are ISO 8601 with timezone (TIMESTAMPTZ)
 
+    - Authenticated application requests may carry `X-Concord-Client-Version` and
+      the WebSocket admission query may carry `client_version`. These are exact
+      stable ASCII `X.Y.Z` compatibility declarations, not signed attestation,
+      authentication, authorization, entitlement, or cryptographic evidence. When
+      a deployment configures a minimum, missing, malformed, or older declarations
+      receive 403 `CLIENT_VERSION_TOO_OLD`. Public config, authentication, update,
+      and recovery routes remain available; `/attestation/verify` is AuthRequired-only
+      and outside this floor.
+
     - Error envelopes are endpoint-specific. Most legacy routes use `{"error":
       "message"}`; Activity History handler errors use a stable `{"code":"..."}`
       envelope. Its bearer-token and rate-limit failures retain the existing
@@ -1877,6 +1886,8 @@ paths:
         '
       security:
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ClientVersionHeader'
       responses:
         '200':
           description: Ticket issued
@@ -1890,6 +1901,8 @@ paths:
                     description: Single-use ticket (30s TTL)
         '429':
           $ref: '#/components/responses/RateLimited'
+        '403':
+          $ref: '#/components/responses/ClientVersionTooOld'
   /categories/{id}/overrides:
     get:
       tags:
@@ -14540,6 +14553,7 @@ paths:
 
         '
       parameters:
+      - $ref: '#/components/parameters/ClientVersionQuery'
       - name: activity_rich_presence
         in: query
         required: false
@@ -14555,6 +14569,8 @@ paths:
       responses:
         '101':
           description: Switching Protocols (WebSocket upgrade)
+        '403':
+          $ref: '#/components/responses/ClientVersionTooOld'
 components:
   securitySchemes:
     BearerAuth:
@@ -14582,6 +14598,24 @@ components:
         (Role is per-server only); this is the closest existing privileged-auth gate.
         When REDEMPTION_ADMIN_TOKEN is unset the endpoint is disabled (503).'
   parameters:
+    ClientVersionHeader:
+      name: X-Concord-Client-Version
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 32
+        pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+      description: Untrusted compatibility declaration. Exact stable ASCII X.Y.Z; never signed attestation or auth evidence.
+    ClientVersionQuery:
+      name: client_version
+      in: query
+      required: false
+      schema:
+        type: string
+        maxLength: 32
+        pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+      description: Untrusted compatibility declaration used for authenticated WebSocket admission; exact stable ASCII X.Y.Z.
     ServerId:
       name: id
       in: path
@@ -14664,6 +14698,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    ClientVersionTooOld:
+      description: Client version is missing, malformed, or below the configured compatibility floor.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AttestationError'
     RateLimited:
       description: Too many requests — rate limit exceeded
       headers:
@@ -17440,7 +17480,7 @@ components:
           - CLIENT_VERSION_TOO_OLD
         updateAvailable:
           type: boolean
-          description: Present (true) for UNKNOWN_RELEASE and VERSION_TOO_OLD rejections
+          description: Present (true) for ATTESTATION_UNKNOWN_RELEASE and CLIENT_VERSION_TOO_OLD rejections
         requiredMinVersion:
           type: string
         downloadHelpUrl:

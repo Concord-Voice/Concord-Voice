@@ -13,10 +13,16 @@
  * @see services/control-plane/internal/websocket for backend implementation
  */
 
-import { getWsBase } from '../system/runtimeServerBase';
+import {
+  captureRuntimeServerSelection,
+  getWsBase,
+  runtimeServerSelectionIsCurrent,
+} from '../system/runtimeServerBase';
+import { handleTerminalClientVersionTooOld } from '../system/apiClient';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useConnectionStore } from '../../stores/ui/connectionStore';
 import { errorMessage, errorName } from '../../utils/runtime/redactError';
+import { getDesktopClientVersion } from '../../utils/runtime/clientVersion';
 import { summarizeWsDiagnostic, summarizeWsServerError } from '../../utils/runtime/wsDiagnostics';
 import {
   WebSocketEventSchema,
@@ -65,6 +71,30 @@ function validateWsBaseUrl(rawUrl: string): URL | null {
   if (url.protocol !== 'wss:' && url.protocol !== 'ws:') return null;
   if (import.meta.env.PROD && url.protocol !== 'wss:') return null;
   return url;
+}
+
+interface ClientVersionDenial {
+  requiredMinVersion?: string;
+  downloadHelpUrl?: string;
+}
+
+class ClientVersionTooOldTicketError extends Error {
+  constructor(readonly denial: ClientVersionDenial) {
+    super('WebSocket ticket denied: client version too old');
+    this.name = 'ClientVersionTooOldTicketError';
+  }
+}
+
+function parseClientVersionDenial(body: unknown): ClientVersionDenial | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
+  const record = body as Record<string, unknown>;
+  if (record.code !== 'CLIENT_VERSION_TOO_OLD') return null;
+  return {
+    requiredMinVersion:
+      typeof record.requiredMinVersion === 'string' ? record.requiredMinVersion : undefined,
+    downloadHelpUrl:
+      typeof record.downloadHelpUrl === 'string' ? record.downloadHelpUrl : undefined,
+  };
 }
 
 export enum ConnectionState {
@@ -654,6 +684,8 @@ export class WebSocketService {
     const ticketHeaders: Record<string, string> = { Authorization: `Bearer ${token}` };
     const sessionId = useAuthStore.getState().sessionId ?? null;
     if (sessionId) ticketHeaders['X-Session-ID'] = sessionId;
+    const clientVersion = await getDesktopClientVersion();
+    if (clientVersion) ticketHeaders['X-Concord-Client-Version'] = clientVersion;
 
     const ticketRes = await fetch(ticketUrl.href, {
       method: 'POST',
@@ -661,13 +693,42 @@ export class WebSocketService {
       signal,
     });
     if (!ticketRes.ok) {
+      if (ticketRes.status === 403) {
+        let body: unknown = null;
+        try {
+          body = await ticketRes.json();
+        } catch {
+          // Non-JSON ticket failures remain ordinary reconnectable failures.
+        }
+        const denial = parseClientVersionDenial(body);
+        if (denial) throw new ClientVersionTooOldTicketError(denial);
+      }
       this.logTicketFetchFailure(ticketRes.status);
       throw new Error(`WebSocket ticket request failed: ${ticketRes.status}`);
     }
     return (await ticketRes.json()).ticket as string;
   }
 
+  private async handleClientVersionTicketDenial(
+    error: ClientVersionTooOldTicketError,
+    attemptIsCurrent: () => boolean
+  ): Promise<void> {
+    await handleTerminalClientVersionTooOld(
+      attemptIsCurrent,
+      error.denial.requiredMinVersion,
+      error.denial.downloadHelpUrl
+    );
+    if (attemptIsCurrent()) this.setState(ConnectionState.ERROR);
+  }
+
   private async createConnection(signal?: AbortSignal, forceDespiteOffline = false): Promise<void> {
+    const serverSelection = captureRuntimeServerSelection();
+    const authGeneration = useAuthStore.getState().authGeneration;
+    const attemptIsCurrent = () =>
+      !signal?.aborted &&
+      runtimeServerSelectionIsCurrent(serverSelection) &&
+      useAuthStore.getState().authGeneration === authGeneration;
+
     if (!this.token) {
       console.error('Cannot connect: No JWT token provided');
       this.setState(ConnectionState.ERROR);
@@ -708,7 +769,7 @@ export class WebSocketService {
 
       // If this attempt was superseded while awaiting the ticket, discard it.
       // The replacement attempt may be using a different token/session.
-      if (signal?.aborted) return;
+      if (!attemptIsCurrent()) return;
 
       if (!isValidWsTicket(ticket)) {
         // Ticket-shape failure is treated as TRANSIENT — a server bug or
@@ -727,6 +788,9 @@ export class WebSocketService {
       const finalUrl = new URL(wsBaseUrl.href);
       finalUrl.searchParams.set('ticket', ticket);
       finalUrl.searchParams.set('activity_rich_presence', '1');
+      const clientVersion = await getDesktopClientVersion();
+      if (clientVersion) finalUrl.searchParams.set('client_version', clientVersion);
+      if (!attemptIsCurrent()) return;
 
       this.ws = new WebSocket(finalUrl.href);
 
@@ -737,6 +801,10 @@ export class WebSocketService {
     } catch (error) {
       // AbortError is expected when disconnect() cancels an in-flight ticket fetch
       if (error instanceof DOMException && error.name === 'AbortError') return;
+      if (error instanceof ClientVersionTooOldTicketError) {
+        await this.handleClientVersionTicketDenial(error, attemptIsCurrent);
+        return;
+      }
       // Log error.name (e.g. "SyntaxError"), NOT the raw error or its message.
       // `new WebSocket(url)` throws synchronously with a SyntaxError whose
       // message includes the full URL — including the `?ticket=<hex>` query

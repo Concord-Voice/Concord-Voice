@@ -28,10 +28,12 @@ import {
   revokeAbortedSession,
   configureRefreshFailureReset,
 } from '@/renderer/services/system/apiClient';
+import { _resetClientVersionCache } from '@/renderer/utils/runtime/clientVersion';
 
 describe('apiClient', () => {
   beforeEach(() => {
     resetAllStores();
+    _resetClientVersionCache();
     _resetRefreshState();
     vi.clearAllMocks();
     configureRefreshFailureReset({
@@ -68,6 +70,31 @@ describe('apiClient', () => {
     expect(headers.get('Authorization')).toBe('Bearer test-token');
   });
 
+  it('declares the exact desktop client version on the initial request', async () => {
+    const getVersion = vi.fn().mockResolvedValue('0.2.18');
+    globalThis.electron = { getVersion } as unknown as typeof globalThis.electron;
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    await apiFetch('/api/v1/test');
+
+    const headers = mockFetch.mock.calls[0][1].headers as Headers;
+    expect(headers.get('X-Concord-Client-Version')).toBe('0.2.18');
+    expect(getVersion).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits the client version when the bridge lookup rejects without failing the request', async () => {
+    globalThis.electron = {
+      getVersion: vi.fn().mockRejectedValue(new Error('bridge unavailable')),
+    } as unknown as typeof globalThis.electron;
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    const response = await apiFetch('/api/v1/test');
+
+    expect(response.status).toBe(200);
+    const headers = mockFetch.mock.calls[0][1].headers as Headers;
+    expect(headers.get('X-Concord-Client-Version')).toBeNull();
+  });
+
   it('uses the active runtime API base for requests', async () => {
     setRuntimeServerBase('https://homelab.lan:8443');
     mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
@@ -80,7 +107,7 @@ describe('apiClient', () => {
     );
   });
 
-  it('does not recover or tear down after an A -> B -> A switch during attestation', async () => {
+  it('does not dispatch, recover, or tear down after an A -> B -> A switch during attestation', async () => {
     const requestApiBase = 'https://old-origin.example';
     setRuntimeServerBase(requestApiBase);
     useAuthStore.getState().setAccessToken('old-token');
@@ -88,26 +115,27 @@ describe('apiClient', () => {
       throw new Error('Attestation resolver was not initialized.');
     };
     const refreshToken = vi.fn().mockResolvedValue({ status: 'error' });
+    const getToken = vi.fn().mockReturnValue(
+      new Promise<string | null>((resolve) => {
+        resolveAttestation = resolve;
+      })
+    );
     globalThis.electron = {
       refreshToken,
       attestation: {
-        getToken: vi.fn().mockReturnValue(
-          new Promise<string | null>((resolve) => {
-            resolveAttestation = resolve;
-          })
-        ),
+        getToken,
       },
     } as any;
     mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
 
     const pending = apiFetch('/api/v1/users/me');
+    await vi.waitFor(() => expect(getToken).toHaveBeenCalledTimes(1));
     setRuntimeServerBase('https://successor-origin.example');
     setRuntimeServerBase(requestApiBase);
     resolveAttestation(null);
-    const response = await pending;
 
-    expect(response.status).toBe(401);
-    expect(mockFetch).toHaveBeenCalledWith(`${requestApiBase}/api/v1/users/me`, expect.any(Object));
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(mockFetch).not.toHaveBeenCalled();
     expect(refreshToken).not.toHaveBeenCalled();
     expect(mockGracefulReset).not.toHaveBeenCalled();
     expect(mockNuclearReset).not.toHaveBeenCalled();
@@ -154,6 +182,23 @@ describe('apiClient', () => {
     expect(retryHeaders.get('Authorization')).toBe('Bearer new-token');
     // Verify new token is stored in authStore
     expect(useAuthStore.getState().accessToken).toBe('new-token');
+  });
+
+  it('declares the cached desktop client version on a 401 retry', async () => {
+    const getVersion = vi.fn().mockResolvedValue('0.2.18');
+    globalThis.electron = {
+      getVersion,
+      refreshToken: vi.fn().mockResolvedValue({ status: 'ok', accessToken: 'new-token' }),
+    } as unknown as typeof globalThis.electron;
+    useAuthStore.getState().setAccessToken('old-token');
+    mockFetch.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
+    await apiFetch('/api/v1/test');
+
+    const retryHeaders = mockFetch.mock.calls[1][1].headers as Headers;
+    expect(retryHeaders.get('X-Concord-Client-Version')).toBe('0.2.18');
+    expect(getVersion).toHaveBeenCalledTimes(1);
   });
 
   it('calls nuclearReset when IPC refresh fails and rememberMe is off', async () => {
