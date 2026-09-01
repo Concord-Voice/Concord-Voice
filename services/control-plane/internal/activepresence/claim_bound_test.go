@@ -19,6 +19,7 @@ import (
 type deadlineRecordingReader struct {
 	sawDeadline bool
 	deadline    time.Time
+	deadlines   []time.Time
 	called      bool
 }
 
@@ -27,6 +28,9 @@ func (d *deadlineRecordingReader) GetWithLease(
 ) (presence.ActivityState, bool, error) {
 	d.called = true
 	d.deadline, d.sawDeadline = ctx.Deadline()
+	if d.sawDeadline {
+		d.deadlines = append(d.deadlines, d.deadline)
+	}
 	return presence.ActivityState{}, false, nil
 }
 
@@ -56,9 +60,10 @@ func TestClaimAndResolveAreTimeBoundedWithoutACallerDeadline(t *testing.T) {
 	require.False(t, hasDeadline, "fixture must start from an unbounded context")
 
 	var pass passState
-	require.NoError(t, r.resolveOneAlreadyGated(ctx, PlanKey{
+	_, err := r.resolveOneAlreadyGated(ctx, PlanKey{
 		SubjectID: subject, Category: presence.CategoryPrivateCall,
-	}, &pass))
+	}, &pass)
+	require.NoError(t, err)
 
 	require.True(t, reader.called, "the resolver must have been reached")
 	require.True(t, reader.sawDeadline,

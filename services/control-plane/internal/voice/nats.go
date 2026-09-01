@@ -573,6 +573,22 @@ func voiceLifecycleAdvisoryKey(
 	return int64(binary.BigEndian.Uint64(digest[:8])), nil //nolint:gosec
 }
 
+// LockServerVoiceLifecycleTx shares the Server Voice lifecycle serialization
+// used by ingress with destructive writers that can remove participant evidence.
+func LockServerVoiceLifecycleTx(ctx context.Context, tx *sql.Tx, senderID uuid.UUID) error {
+	if tx == nil {
+		return errors.New("server voice lifecycle transaction unavailable")
+	}
+	lockKey, err := voiceLifecycleAdvisoryKey(presence.CategoryServerVoice, senderID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		return fmt.Errorf("lock voice lifecycle mutation: %w", err)
+	}
+	return nil
+}
+
 func lockPrivateVoiceScopes(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -824,10 +840,6 @@ func (s *NATSSubscriber) withServerVoiceLifecycleClaim(
 	request voiceLifecycleClaimRequest,
 	mutation func(context.Context, *sql.Tx, voiceLifecycleClaimStatus) (bool, error),
 ) (applied bool, status voiceLifecycleClaimStatus, returnErr error) {
-	lockKey, err := voiceLifecycleAdvisoryKey(request.category, request.senderID)
-	if err != nil {
-		return false, voiceLifecycleRejected, err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, voiceLifecycleRejected, fmt.Errorf("begin voice lifecycle mutation: %w", err)
@@ -836,8 +848,8 @@ func (s *NATSSubscriber) withServerVoiceLifecycleClaim(
 		rollbackErr := tx.Rollback()
 		returnErr = joinRollbackErr(returnErr, rollbackErr, "rollback voice lifecycle mutation")
 	}()
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
-		return false, voiceLifecycleRejected, fmt.Errorf("lock voice lifecycle mutation: %w", err)
+	if err := LockServerVoiceLifecycleTx(ctx, tx, request.senderID); err != nil {
+		return false, voiceLifecycleRejected, err
 	}
 	qualified, err := s.serverVoiceLifecycleClaimQualified(ctx, tx, request)
 	if err != nil || !qualified {

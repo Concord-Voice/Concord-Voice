@@ -9,22 +9,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The #2992 wiring lock for the first hand-wired seam, and the arm has to be a
-// REFUSED delete for the test to mean anything.
-//
-// A successful delete already advances the epoch without any bracket at all:
-// disconnectServerAudience runs post-commit and calls
-// DisconnectRichPresenceClients, which bumps it. An assertion on the successful
-// path is therefore satisfied by machinery that shipped in #2975 and says
-// nothing about whether this handler took a bracket -- it passes identically
-// with the defer deleted. (Observed: the first version of this test was green
-// before the production change existed.)
-//
-// A refused delete is the discriminator. The ownership check runs INSIDE the
-// transaction (handlers.go, `SELECT owner_id ... FOR UPDATE` then the 403), and
-// the 403 returns long before disconnectServerAudience. So on this path the
-// bracket -- taken before BeginTx -- is the ONLY thing that can move the epoch.
-func TestDeleteServerBracketsEvenWhenTheDeleteIsRefused(t *testing.T) {
+// Authorization is a preflight: refused requests must not inspect candidates,
+// open the active-presence fence, or mutate either half of PresenceAuthz.
+func TestDeleteServerDoesNotOpenFenceWhenTheDeleteIsRefused(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "delfenceowner")
 	other := ts.CreateTestUser(t, "delfenceother")
@@ -38,13 +25,10 @@ func TestDeleteServerBracketsEvenWhenTheDeleteIsRefused(t *testing.T) {
 		testhelpers.AuthHeaders(other.AccessToken))
 	require.Equal(t, http.StatusForbidden, w.Code)
 
-	assert.Greater(t, ts.Hub.PresenceAuthzEpochForTest(), beforeEpoch,
-		"the bracket is taken before BeginTx, so it must have advanced the epoch even "+
-			"though this request was refused inside the transaction and never reached "+
-			"the post-commit disconnect -- if this is equal, the defer is missing")
+	assert.Equal(t, beforeEpoch, ts.Hub.PresenceAuthzEpochForTest(),
+		"authorization preflight must not advance the epoch")
 	assert.Zero(t, ts.Hub.PresenceAuthzOpenForTest(),
-		"a refused request must still RELEASE the bracket: a leaked open count "+
-			"suppresses base presence hub-wide, permanently, and self-heals never")
+		"a refused request must not open the fence")
 
 	var rows int
 	require.NoError(t, ts.DB.QueryRow(
@@ -53,9 +37,8 @@ func TestDeleteServerBracketsEvenWhenTheDeleteIsRefused(t *testing.T) {
 }
 
 // The success path. The epoch is deliberately NOT asserted here -- it would pass
-// on the pre-existing post-commit bump alone (see above). What this locks is the
-// RELEASE across a path that commits, cascades and then disconnects, which is
-// the longest-lived bracket this handler takes.
+// on the post-commit disconnect bump alone. What this locks is that a completed
+// delete never leaks the transaction's bracket.
 func TestDeleteServerReleasesTheBracketOnASuccessfulDelete(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "delfenceowner2")
@@ -68,7 +51,7 @@ func TestDeleteServerReleasesTheBracketOnASuccessfulDelete(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 
 	assert.Zero(t, ts.Hub.PresenceAuthzOpenForTest(),
-		"the bracket must be released after commit, cascade and disconnect")
+		"the bracket must be released after the committed delete")
 }
 
 // The negative control. An invalid path parameter returns before BeginTx is

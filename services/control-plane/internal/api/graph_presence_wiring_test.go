@@ -100,6 +100,7 @@ func fullyWiredGraphPresenceConsumers() graphPresenceConsumers {
 	c.members.SetGraphPresenceCapture(nopCapture{})
 	c.invites.SetGraphPresenceCapture(nopCapture{})
 	c.servers.SetGraphPresenceCapture(nopCapture{})
+	c.servers.SetActivePlanRail(deliverableActivePlanRail())
 	c.dm.SetActivePlanRail(deliverableActivePlanRail())
 	return c
 }
@@ -133,6 +134,11 @@ func TestGraphPresenceGuardDetectsEachUnwiredConsumer(t *testing.T) {
 		"members": func(c *graphPresenceConsumers) { c.members = &members.Handler{} },
 		"invites": func(c *graphPresenceConsumers) { c.invites = &invites.Handler{} },
 		"servers": func(c *graphPresenceConsumers) { c.servers = &servers.Handler{} },
+		"servers active-category rail": func(c *graphPresenceConsumers) {
+			fresh := &servers.Handler{}
+			fresh.SetGraphPresenceCapture(nopCapture{})
+			c.servers = fresh
+		},
 		"erasure": func(c *graphPresenceConsumers) { c.erasure = &users.AccountService{} },
 		"erasure clear publisher": func(c *graphPresenceConsumers) {
 			// Capture and drain wired, SetNATS NEVER CALLED. Still fails closed,
@@ -321,6 +327,7 @@ func TestActivePlanRailIsWiredAtItsConstructionSites(t *testing.T) {
 		"activePlanRail, activePlanReconciler := buildActivePlanRail(",
 		"ActivePlans: activePlanRail,",
 		"accountService.SetActivePlanRail(activePlanRail)",
+		"serversHandler.SetActivePlanRail(activePlanRail)",
 	} {
 		// require, not assert: an absent line makes strings.Index return -1, and
 		// the ordering assertion below would PASS on it.

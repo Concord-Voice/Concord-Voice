@@ -3,6 +3,7 @@ package servers_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/require"
@@ -14,7 +15,12 @@ import (
 func TestDeleteServerFailsClosedWhenTheDeleteFails(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "delfailowner")
+	sender := ts.CreateTestUser(t, "delfailsender")
 	serverID := ts.CreateTestServer(t, owner.ID, "DelFailServer")
+	ts.AddMemberToServer(t, serverID, sender.ID, "member")
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice")
+	insertVoiceParticipant(t, ts, channelID, sender.ID,
+		time.Date(2026, time.January, 16, 10, 0, 0, 0, time.UTC))
 
 	_, err := ts.DB.Exec(`
 		CREATE OR REPLACE FUNCTION concord_test_fail_server_delete() RETURNS TRIGGER AS $$
@@ -45,4 +51,10 @@ func TestDeleteServerFailsClosedWhenTheDeleteFails(t *testing.T) {
 	require.NoError(t, ts.DB.QueryRow(
 		`SELECT COUNT(*) FROM servers WHERE id = $1`, serverID).Scan(&rows))
 	require.Equal(t, 1, rows, "the server must survive a failed delete")
+	require.Equal(t, 1, countRows(t, ts,
+		`SELECT COUNT(*) FROM voice_participants WHERE channel_id = $1`, channelID),
+		"the active sender must survive a failed delete")
+	require.Zero(t, countRows(t, ts,
+		`SELECT COUNT(*) FROM presence_active_pending_plans WHERE user_id = $1`, sender.ID),
+		"a rolled-back delete must leave no active reconciliation plan")
 }

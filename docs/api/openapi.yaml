@@ -10464,6 +10464,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: Server activity changed before deletion committed; retry the deletion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Server deletion committed, but presence cleanup is pending; do not retry the deletion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /servers/{id}/entitlements:
     get:
       tags:

@@ -13,14 +13,14 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
-// deliveryTimeout bounds one plan's terminal. Detached from the request context
-// so a cancelled request cannot cancel reconciliation.
+// deliveryTimeout bounds one plan's terminal. The terminal detaches request
+// cancellation but keeps any earlier caller deadline.
 const deliveryTimeout = 5 * time.Second
 
 // claimTimeout bounds the TRANSACTIONAL segment of one plan -- BeginTx, the
-// FOR UPDATE claim, and the resolver's Redis read -- which deliver() and
-// acknowledge() do NOT cover: each of those detaches and applies its own
-// deliveryTimeout, so neither inherits a bound from here.
+// FOR UPDATE claim, and the resolver's Redis read. deliver() and acknowledge()
+// detach cancellation and apply deliveryTimeout without extending an earlier
+// caller deadline.
 //
 // It exists because CompleteAlreadyGated detaches with context.WithoutCancel,
 // and that strips the DEADLINE as well as cancellation. Without this the claim
@@ -38,6 +38,14 @@ const deliveryTimeout = 5 * time.Second
 // two reconcile intervals: long enough that a contended claim completes,
 // short enough that a wedged dependency releases the gate in bounded time.
 const claimTimeout = 10 * time.Second
+
+func detachedTerminalContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(time.Now().Add(deliveryTimeout)) {
+		return context.WithDeadline(detached, deadline)
+	}
+	return context.WithTimeout(detached, deliveryTimeout)
+}
 
 // Deliverer is the terminal. ClearSenderActiveCategory is the ORDINARY arm;
 // DisconnectAllRichPresenceClients is reserved for the integrity anomalies no
@@ -171,7 +179,8 @@ func (r *Reconciler) ReconcilePass(ctx context.Context, limit int) (PassStats, e
 	for _, key := range keys {
 		subject := key.SubjectID
 		gateErr := r.gate.WithSenders(ctx, []uuid.UUID{subject}, func() error {
-			return r.resolveOneAlreadyGated(ctx, key, pass)
+			_, err := r.resolveOneAlreadyGated(ctx, key, pass)
+			return err
 		})
 		// Fixed class only. An interpolated database error here would put data
 		// into a log line; the row survives and the next pass retries it.
@@ -188,16 +197,16 @@ func (r *Reconciler) resolveOneAlreadyGated(
 	ctx context.Context,
 	key PlanKey,
 	pass *passState,
-) error {
-	// Bound the transactional segment. deliver() and acknowledge() below keep
-	// taking the caller's ctx: each detaches and applies deliveryTimeout of its
-	// own, so they are already bounded and must not inherit this one.
+) (bool, error) {
+	// Bound only the transactional segment. deliver() and acknowledge() receive
+	// ctx, not txCtx: they detach cancellation and keep an earlier caller/batch
+	// deadline.
 	txCtx, cancelTx := context.WithTimeout(ctx, claimTimeout)
 	defer cancelTx()
 
 	tx, err := r.db.BeginTx(txCtx, nil)
 	if err != nil {
-		return fmt.Errorf("begin active-category reconciliation: %w", err)
+		return false, fmt.Errorf("begin active-category reconciliation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -205,18 +214,17 @@ func (r *Reconciler) resolveOneAlreadyGated(
 	// snapshot is the bug: the row may already be gone, or already claimed.
 	plan, found, err := ClaimTx(txCtx, tx, key)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !found {
-		// The plan is already gone or already claimed by another replica. That
-		// is a no-op, not a failure -- but the commit can still fail, and an
-		// unwrapped error here is indistinguishable from any other database
-		// error in the logs. The three sibling commits below all name their
-		// operation; this one was the odd one out.
+		// The plan is already gone or already claimed by another replica. Either
+		// is a no-op for this pass, but neither proves synchronous completion:
+		// another claimant may still be delivering or may fail and leave the
+		// durable obligation pending.
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit active-category no-op: %w", err)
+			return false, fmt.Errorf("commit active-category no-op: %w", err)
 		}
-		return nil
+		return false, nil
 	}
 
 	decision := Resolve(txCtx, r.reader, plan, time.Now())
@@ -227,44 +235,47 @@ func (r *Reconciler) resolveOneAlreadyGated(
 		// B4's generation belongs to a LIVE successor, so touching Redis here
 		// would kill a live call's presence.
 		if err := DeletePlanTx(txCtx, tx, plan); err != nil {
-			return err
+			return false, err
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit active-category acknowledgement: %w", err)
+			return false, fmt.Errorf("commit active-category acknowledgement: %w", err)
 		}
 		pass.stats.Acked++
-		return nil
+		return true, nil
 
 	case OutcomeCleared, OutcomeDisconnected:
 		// Commit the claim BEFORE delivering. Advancing reconcile_after under
 		// the row lock is what stops a second replica delivering the same plan.
 		if err := RecordAttemptTx(txCtx, tx, plan, FailureNone, r.interval); err != nil {
-			return err
+			return false, err
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit active-category claim: %w", err)
+			return false, fmt.Errorf("commit active-category claim: %w", err)
 		}
 		if !r.deliver(ctx, plan, decision, pass) {
-			return nil
+			return false, nil
 		}
-		return r.acknowledge(ctx, plan)
+		if err := r.acknowledge(ctx, plan); err != nil {
+			return false, err
+		}
+		return true, nil
 
 	default:
 		// OutcomeRetained, OutcomeQuarantined, and any value outside the closed
 		// vocabulary. Never acknowledge: the row is the evidence that an
 		// obligation is undischarged, and dropping it fails open.
 		if err := RecordAttemptTx(txCtx, tx, plan, decision.Failure, r.interval); err != nil {
-			return err
+			return false, err
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit active-category retention: %w", err)
+			return false, fmt.Errorf("commit active-category retention: %w", err)
 		}
 		if decision.Outcome == OutcomeQuarantined {
 			pass.stats.Quarantined++
 		} else {
 			pass.stats.Retained++
 		}
-		return nil
+		return false, nil
 	}
 }
 
@@ -279,8 +290,9 @@ func (r *Reconciler) deliver(
 	decision Decision,
 	pass *passState,
 ) bool {
-	// Detached: a cancelled request must not cancel reconciliation.
-	deliverCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryTimeout)
+	// Detached: a cancelled request must not cancel reconciliation. An earlier
+	// batch deadline still caps the terminal.
+	deliverCtx, cancel := detachedTerminalContext(ctx)
 	defer cancel()
 
 	switch decision.Outcome {
@@ -340,7 +352,7 @@ func (r *Reconciler) deleteGeneration(ctx context.Context, plan Plan, decision D
 // authorization: a plan rewritten between claim and ack has a different id and
 // survives.
 func (r *Reconciler) acknowledge(ctx context.Context, plan Plan) error {
-	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryTimeout)
+	ackCtx, cancel := detachedTerminalContext(ctx)
 	defer cancel()
 
 	tx, err := r.db.BeginTx(ackCtx, nil)

@@ -343,6 +343,7 @@ func graphPresenceWiringComplete(c graphPresenceConsumers) bool {
 		c.erasure.HasGraphPresenceCapture() &&
 		c.erasure.HasErasureClearPublisher() &&
 		c.dm.HasActivePlanRail() &&
+		c.servers.HasActivePlanRail() &&
 		c.erasure.HasActivePlanDrain() &&
 		c.erasure.AudienceFenceWired()
 }
@@ -776,6 +777,7 @@ func NewRouter(
 	// bindPresenceHistoryRuntime above returns an error on a nil service.
 	activePlanRail, activePlanReconciler := buildActivePlanRail(
 		db, presenceHistoryService, activityStore, hub, log)
+	serversHandler.SetActivePlanRail(activePlanRail)
 
 	// mfaHandler implements mfa.Verifier — the DM purge step-up gate (#1352).
 	dmHandler := dm.NewHandler(dm.HandlerDeps{

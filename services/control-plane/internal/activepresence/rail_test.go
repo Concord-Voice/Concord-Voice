@@ -155,6 +155,42 @@ func TestCompleteAlreadyGatedDeliversWithoutReEnteringTheGate(t *testing.T) {
 	require.Zero(t, countPlans(t, db), "a delivered plan must be acknowledged")
 }
 
+func TestCompleteAlreadyGatedReportsARetainedPlanAsIncomplete(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subject := dbtest.CreateUser(t, db)
+	insert(t, db, livePlan(subject))
+	rail := NewRail(db, passthroughGate{}, NewReconciler(
+		db, passthroughGate{}, &fakeStateReader{err: errors.New("state unavailable")},
+		&recordingDeleter{}, &recordingDeliverer{}, nil,
+	), nil)
+
+	err := rail.CompleteAlreadyGated(context.Background(), nil, []PlanKey{{
+		SubjectID: subject, Category: presence.CategoryPrivateCall,
+	}})
+
+	require.ErrorIs(t, err, ErrDeliveryIncomplete)
+	require.Equal(t, 1, countPlans(t, db), "an incomplete plan must remain for retry")
+}
+
+func TestCompleteAlreadyGatedReportsAnAlreadyClaimedPlanAsIncomplete(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subject := dbtest.CreateUser(t, db)
+	insert(t, db, livePlan(subject))
+	_, err := db.Exec(`
+		UPDATE presence_active_pending_plans
+		SET reconcile_after = clock_timestamp() + interval '1 minute'
+		WHERE user_id = $1 AND category = 'private_call'`, subject)
+	require.NoError(t, err)
+	rail := NewRail(db, passthroughGate{}, wiredReconciler(db, &recordingDeliverer{}), nil)
+
+	err = rail.CompleteAlreadyGated(context.Background(), nil, []PlanKey{{
+		SubjectID: subject, Category: presence.CategoryPrivateCall,
+	}})
+
+	require.ErrorIs(t, err, ErrDeliveryIncomplete)
+	require.Equal(t, 1, countPlans(t, db), "another replica's claim remains pending until acknowledged")
+}
+
 func TestWithGatedTxRollsBackWhenWorkFails(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	subject := dbtest.CreateUser(t, db)
@@ -234,6 +270,149 @@ func TestWithGatedTxAcquiresTheGateBeforeOpeningTheTransaction(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("WithGatedTx never returned after the gate was released")
 	}
+}
+
+type orderedGate struct {
+	entered  chan struct{}
+	release  chan struct{}
+	released chan struct{}
+}
+
+func newOrderedGate() *orderedGate {
+	return &orderedGate{
+		entered:  make(chan struct{}, 1),
+		release:  make(chan struct{}),
+		released: make(chan struct{}, 1),
+	}
+}
+
+func (g *orderedGate) WithSenders(_ context.Context, _ []uuid.UUID, work func() error) error {
+	g.entered <- struct{}{}
+	<-g.release
+	defer func() { g.released <- struct{}{} }()
+	return work()
+}
+
+func TestWithGatedRevocationTxDoesNotOpenFenceWhileGateWaits(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	gate := newOrderedGate()
+	rail := NewRail(db, gate, nil, nil)
+	fenceOpened := make(chan struct{}, 1)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- rail.WithGatedRevocationTx(context.Background(), []uuid.UUID{uuid.New()}, func() func() {
+			fenceOpened <- struct{}{}
+			return func() {}
+		}, func(tx *sql.Tx) error { return tx.Commit() })
+	}()
+
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WithGatedRevocationTx never reached the sender gate")
+	}
+	select {
+	case <-fenceOpened:
+		t.Fatal("revocation fence opened while waiting for the sender gate")
+	default:
+	}
+	close(gate.release)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WithGatedRevocationTx did not return after the gate was released")
+	}
+}
+
+func TestWithGatedRevocationTxOrdersFenceTransactionAndGate(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	gate := newOrderedGate()
+	close(gate.release)
+	rail := NewRail(db, gate, nil, nil)
+	events := make(chan string, 3)
+
+	err := rail.WithGatedRevocationTx(context.Background(), []uuid.UUID{uuid.New()}, func() func() {
+		events <- "fence-open"
+		return func() { events <- "fence-close" }
+	}, func(tx *sql.Tx) error {
+		events <- "work"
+		require.Equal(t, 1, db.Stats().InUse, "work must run with the transaction open")
+		return tx.Commit()
+	})
+	require.NoError(t, err)
+	require.Equal(t, "fence-open", <-events)
+	require.Equal(t, "work", <-events)
+	require.Equal(t, "fence-close", <-events)
+	select {
+	case <-gate.released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sender gate was not released")
+	}
+}
+
+func TestWithGatedRevocationTxRollsBackBeforeClosingFenceOnWorkError(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	gate := newOrderedGate()
+	close(gate.release)
+	rail := NewRail(db, gate, nil, nil)
+	subject := dbtest.CreateUser(t, db)
+	closedAfterRollback := make(chan bool, 1)
+
+	err := rail.WithGatedRevocationTx(context.Background(), []uuid.UUID{subject}, func() func() {
+		return func() {
+			var count int
+			err := db.QueryRow(`SELECT count(*) FROM presence_active_pending_plans WHERE user_id = $1`, subject).Scan(&count)
+			closedAfterRollback <- err == nil && count == 0
+		}
+	}, func(tx *sql.Tx) error {
+		require.NoError(t, rail.CapturePlansTx(context.Background(), tx, []Plan{livePlan(subject)}))
+		return errWorkFailed
+	})
+	require.ErrorIs(t, err, errWorkFailed)
+	require.True(t, <-closedAfterRollback, "fence must close after the failed transaction rolls back")
+	select {
+	case <-gate.released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sender gate was not released after work failed")
+	}
+}
+
+func TestWithGatedRevocationTxRefusesNilFenceWithoutRunningWork(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	called := false
+	err := NewRail(db, newCountingGate(), nil, nil).WithGatedRevocationTx(context.Background(), []uuid.UUID{uuid.New()}, nil,
+		func(*sql.Tx) error {
+			called = true
+			return nil
+		})
+	require.ErrorContains(t, err, "revocation fence is unavailable")
+	require.NotErrorIs(t, err, ErrRailNotWired)
+	require.False(t, called, "nil fence must fail closed before work")
+}
+
+// Every claim in one completion batch must inherit the same deadline. Giving
+// each key a fresh claimTimeout would let a held sender gate grow linearly with
+// the batch size.
+func TestCompleteAlreadyGatedSharesOneClaimDeadlineAcrossBatch(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	reader := &deadlineRecordingReader{}
+	rail := NewRail(db, passthroughGate{}, NewReconciler(
+		db, passthroughGate{}, reader, &recordingDeleter{}, &recordingDeliverer{}, nil,
+	), nil)
+	subjects := []uuid.UUID{dbtest.CreateUser(t, db), dbtest.CreateUser(t, db)}
+	keys := make([]PlanKey, 0, len(subjects))
+
+	for _, subject := range subjects {
+		insert(t, db, conservativePlan(subject, CategoryPrivateCall))
+		keys = append(keys, PlanKey{SubjectID: subject, Category: CategoryPrivateCall})
+	}
+
+	require.NoError(t, rail.CompleteAlreadyGated(context.Background(), nil, keys))
+	require.Len(t, reader.deadlines, len(keys))
+	require.True(t, reader.deadlines[0].Equal(reader.deadlines[1]),
+		"every key must inherit the one batch claim deadline")
 }
 
 func TestWithGatedTxRefusesAnUnwiredRail(t *testing.T) {

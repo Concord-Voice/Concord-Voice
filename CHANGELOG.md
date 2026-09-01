@@ -20,6 +20,7 @@ Concord Voice now lets you choose who can see your voice-channel and private-cal
 
 ### Fixed
 
+- **Deleting a server no longer leaves its voice activity visible after a restart** ([#3054](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3054)) — Concord now records the affected active voice sessions before deleting the server, so a restart cannot leave connected clients displaying stale activity after the server-side record expires.
 - **Removing someone from a private conversation no longer causes a database deadlock if the administrator's account is deleted at the same time** ([#3079](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3079)) — account deletion now finishes while removal safely reports changed state, because the two actions lock the affected accounts in one consistent order.
 - **Removing someone from a private conversation or deleting its creator no longer leaves stale voice activity after a restart** ([#3052](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3052)) — Concord now records the required activity clear before membership or account deletion removes the information needed to find it.
 - **The server can enforce a minimum desktop version before attachment format changes** ([#3053](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3053)) — authenticated REST and WebSocket admission can reject clients below the configured reader floor, while public recovery routes remain available. The declaration is a compatibility signal, not attestation; stored attachment formats remain readable.

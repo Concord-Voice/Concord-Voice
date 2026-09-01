@@ -9,14 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -25,14 +28,15 @@ import (
 )
 
 const (
-	dataImagePrefix       = "data:image/"
-	dataURLHeaderSlack    = 64
-	errMsgInvalidServerID = "Invalid server ID"
-	errMsgServerNotFound  = "Server not found"
-	errMsgFailedCreate    = "Failed to create server"
-	errMsgFailedFetch     = "Failed to fetch server"
-	errMsgFailedUpdate    = "Failed to update server"
-	errMsgFailedDelete    = "Failed to delete server"
+	dataImagePrefix             = "data:image/"
+	dataURLHeaderSlack          = 64
+	errMsgInvalidServerID       = "Invalid server ID"
+	errMsgServerNotFound        = "Server not found"
+	errMsgFailedCreate          = "Failed to create server"
+	errMsgFailedFetch           = "Failed to fetch server"
+	errMsgFailedUpdate          = "Failed to update server"
+	errMsgFailedDelete          = "Failed to delete server"
+	errMsgServerActivityChanged = "Server activity changed; retry deletion"
 )
 
 // Handler handles server-related requests
@@ -47,6 +51,15 @@ type Handler struct {
 
 	// graphPresence is the #2447 membership presence capture. nil means unwired.
 	graphPresence presencecapture.GraphPresenceCapture
+	activePlans   ActivePlanRail
+}
+
+// ActivePlanRail is the narrow durable active-category seam used by server
+// deletion. The concrete rail remains owned by internal/activepresence.
+type ActivePlanRail interface {
+	WithGatedRevocationTx(context.Context, []uuid.UUID, func() func(), func(*sql.Tx) error) error
+	CapturePlansTx(context.Context, *sql.Tx, []activepresence.Plan) error
+	CompleteAlreadyGated(context.Context, *sql.Tx, []activepresence.PlanKey) error
 }
 
 // NewHandler creates a new server handler
@@ -585,122 +598,51 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 	serverID := c.Param("id")
 
 	// Validate server ID
-	if _, err := uuid.Parse(serverID); err != nil {
+	serverUUID, err := uuid.Parse(serverID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
 		return
 	}
 
 	ctx := c.Request.Context()
-
-	// ONE transaction covering lock -> owner check -> capture -> delete. The
-	// ownership read and the delete used to be two separate autocommit
-	// statements, leaving a TOCTOU window: ownership could transfer between
-	// them and the delete would still proceed on the stale answer.
-	//
-	// Server delete takes NO presencehook.Spec and appends no family. It carries
-	// no rail obligation: the fan-out is N senders, the sender set is unknowable
-	// before the gates are acquired, and a large member set would saturate the
-	// sender-gate stripe array. So the capture here is in-memory and fail-closed,
-	// and graphPresence stays wired on this handler only as the seam #2448 needs.
-	//
-	// Lock order: users FIRST, then servers. This path's users set is empty, so
-	// the chain degenerates to `servers FOR UPDATE` alone — but the rule binds
-	// the moment #2448 adds a rail obligation, which is why it is stated here.
-	// #2992: bracket the whole transaction. Server delete cascades server_members,
-	// so it revokes presence-audience membership for every remaining member — and
-	// it takes no presencehook.Spec, so graphpresence's choke point never sees
-	// this transaction. disconnectServerAudience below is post-commit and cannot
-	// order an audience apply that beats it; this can.
-	//
-	// One statement, no branch: this handler is at gocognit 20 against a
-	// SonarQube S3776 ceiling of 15, so an `if h.hub != nil` here is not
-	// affordable. It is not needed either -- BeginAudienceRevocation guards its
-	// own nil receiver, and h.hub is a concrete *websocket.Hub, so invoking the
-	// method on a nil pointer is legal Go and yields an inert closer.
-	//
-	// The defer is function-scoped, so the bracket outlives the transaction and
-	// also covers the post-commit disconnectServerAudience. That is deliberate
-	// and conservative in the safe direction; do not narrow it to the tx.
-	defer h.hub.BeginAudienceRevocation()()
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		h.log.Error(errMsgFailedDelete, "failure_class", "begin")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
-		return
-	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			h.log.Error("Failed to roll back server delete", "failure_class", "rollback")
-		}
-	}()
-
-	var ownerID string
-	err = tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID)
-	if errors.Is(err, sql.ErrNoRows) {
+	candidates, err := h.preflightServerVoiceCandidates(ctx, serverID, userID)
+	switch {
+	case errors.Is(err, errServerDeleteNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
 		return
-	} else if err != nil {
-		h.log.Error("Failed to check ownership", "failure_class", "lock")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
-		return
-	}
-
-	if ownerID != userID {
+	case errors.Is(err, errServerDeleteNotOwner):
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can delete the server"})
 		return
+	case errors.Is(err, errServerVoiceCandidateConflict):
+		h.log.Warn(errMsgFailedDelete, "failure_class", serverVoiceCandidateFailureClass(err))
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgServerActivityChanged})
+		return
+	case err != nil:
+		h.log.Error(errMsgFailedDelete, "failure_class", "preflight")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+		return
 	}
-
-	// Capture BEFORE the cascade, fail closed. server_members cascades from
-	// servers, so after the DELETE below this read returns nothing — which is
-	// the entire reason the capture has to precede it.
-	affected, captureErr := h.captureServerAudience(ctx, tx, serverID)
-	oversized := errors.Is(captureErr, errServerAudienceTooLarge)
-	if captureErr != nil && !oversized {
-		h.log.Error(errMsgFailedDelete, "failure_class", "capture")
+	if h.activePlans == nil {
+		h.log.Error(errMsgFailedDelete, "failure_class", "rail_unwired")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
 		return
 	}
 
-	// Delete server (cascades to members and channels)
-	if _, err = tx.ExecContext(ctx, `DELETE FROM servers WHERE id = $1`, serverID); err != nil {
-		h.log.Error(errMsgFailedDelete, "failure_class", "write")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
-		return
-	}
-
-	if err = tx.Commit(); err != nil {
-		h.log.Error(errMsgFailedDelete, "failure_class", "commit_unresolved")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
-		return
-	}
-
-	// context.WithoutCancel, not ctx: the delete has already COMMITTED, so this
-	// is a compensating action and a client that aborts the request must not be
-	// able to skip it. Same defect class as the ctx.Err() guard removed from
-	// publishErasureCleared in this PR; the sibling site had it too (security
-	// review, PR #2840).
-	reconcileCtx, cancelReconcile := context.WithTimeout(
-		context.WithoutCancel(ctx), serverDeletePresenceTimeout)
-	defer cancelReconcile()
-	if oversized {
-		// Audience too large to reconcile exactly. Fall back to the conservative
-		// fleet-wide disconnect — the sanctioned substitute wherever the affected
-		// set cannot be resolved safely. Reconciling a TRUNCATED audience would be
-		// worse: the untouched remainder would hold revoked state with no signal.
-		h.log.Info("Server delete audience exceeded the capture bound; disconnecting conservatively")
-		if h.hub != nil {
-			if err := h.hub.DisconnectAllRichPresenceClients(reconcileCtx); err != nil {
-				h.log.Error("Server delete conservative disconnect failed", "failure_class", "delivery")
-			}
-		}
-	} else {
-		h.disconnectServerAudience(reconcileCtx, affected)
-	}
-
-	h.log.Info("Server deleted", "server_id", serverID, "user_id", userID)
-
-	// Broadcast deletion to server subscribers so frontends can clean up
-	if serverUUID, err := uuid.Parse(serverID); err == nil {
+	// C3 Server Voice captures exact durable plans. C2 Custom Status remains the
+	// bounded member-audience disconnect below, after the gated bracket closes.
+	// The destructive lock order is gates -> fence -> Server Voice advisories ->
+	// users -> server -> channels.
+	var outcome serverDeleteOutcome
+	err = h.activePlans.WithGatedRevocationTx(ctx, candidateSubjectIDs(candidates), func() func() {
+		return h.hub.BeginAudienceRevocation()
+	}, func(tx *sql.Tx) error {
+		return h.deleteServerWithActivePlans(
+			ctx, tx, serverID, userID, candidates, &outcome,
+		)
+	})
+	if outcome.committed {
+		h.reconcileServerDeleteAudience(ctx, outcome.affected, outcome.oversized)
+		h.log.Info("Server deleted", "server_id", serverID, "user_id", userID)
 		h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
 			Type: "server_deleted",
 			Data: map[string]interface{}{
@@ -708,8 +650,358 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 			},
 		})
 	}
+	if err != nil {
+		if outcome.committed {
+			h.log.Error(errMsgFailedDelete, "failure_class", "delivery")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Server deleted; presence cleanup is pending"})
+			return
+		}
+		if errors.Is(err, errServerDeleteNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgServerNotFound})
+			return
+		}
+		if errors.Is(err, errServerDeleteNotOwner) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Only the server owner can delete the server"})
+			return
+		}
+		if errors.Is(err, errServerVoiceCandidateConflict) {
+			h.log.Warn(errMsgFailedDelete, "failure_class", serverVoiceCandidateFailureClass(err))
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgServerActivityChanged})
+			return
+		}
+		h.log.Error(errMsgFailedDelete, "failure_class", serverDeleteTransactionFailureClass(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDelete})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Server deleted successfully"})
+}
+
+const maxServerVoiceCandidates = 16
+
+var (
+	errServerDeleteNotFound         = errors.New("servers: server was not found")
+	errServerDeleteNotOwner         = errors.New("servers: server ownership changed")
+	errServerVoiceCandidateConflict = errors.New("servers: server voice candidates changed")
+	errServerDeleteCommitUnresolved = errors.New("servers: server deletion commit is unresolved")
+)
+
+var (
+	errServerVoiceCandidateBound     = fmt.Errorf("%w: bound exceeded", errServerVoiceCandidateConflict)
+	errServerVoiceCandidateAmbiguous = fmt.Errorf("%w: duplicate evidence", errServerVoiceCandidateConflict)
+	errServerVoiceCandidateDrift     = fmt.Errorf("%w: candidate drift", errServerVoiceCandidateConflict)
+)
+
+func serverVoiceCandidateFailureClass(err error) string {
+	switch {
+	case errors.Is(err, errServerVoiceCandidateBound):
+		return "candidate_bound"
+	case errors.Is(err, errServerVoiceCandidateAmbiguous):
+		return "candidate_ambiguous"
+	default:
+		return "candidate_drift"
+	}
+}
+
+func serverDeleteTransactionFailureClass(err error) string {
+	if errors.Is(err, errServerDeleteCommitUnresolved) {
+		return "commit_unresolved"
+	}
+	return "transaction"
+}
+
+type serverVoiceCandidate struct {
+	subjectID        uuid.UUID
+	channelID        uuid.UUID
+	lifecycleEventAt time.Time
+}
+
+type serverDeleteOutcome struct {
+	committed bool
+	affected  []uuid.UUID
+	oversized bool
+}
+
+func (h *Handler) preflightServerVoiceCandidates(ctx context.Context, serverID, userID string) (candidates []serverVoiceCandidate, returnErr error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin server-delete preflight: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("rollback server-delete preflight: %w", rollbackErr))
+		}
+	}()
+
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errServerDeleteNotFound
+		}
+		return nil, fmt.Errorf("lock server-delete preflight: %w", err)
+	}
+	if ownerID != userID {
+		return nil, errServerDeleteNotOwner
+	}
+	candidates, err = readServerVoiceCandidates(ctx, tx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateServerVoiceCandidates(candidates, nil); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit server-delete preflight: %w", err)
+	}
+	return candidates, nil
+}
+
+func (h *Handler) deleteServerWithActivePlans(
+	ctx context.Context,
+	tx *sql.Tx,
+	serverID, userID string,
+	preflight []serverVoiceCandidate,
+	outcome *serverDeleteOutcome,
+) error {
+	for _, candidate := range preflight {
+		if err := voice.LockServerVoiceLifecycleTx(ctx, tx, candidate.subjectID); err != nil {
+			return fmt.Errorf("lock server voice lifecycle: %w", err)
+		}
+	}
+	survivingUsers, err := lockServerVoiceCandidateUsers(ctx, tx, preflight)
+	if err != nil {
+		return err
+	}
+
+	var ownerID string
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&ownerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errServerDeleteNotFound
+		}
+		return fmt.Errorf("lock server deletion: %w", err)
+	}
+	if ownerID != userID {
+		return errServerDeleteNotOwner
+	}
+	channelParents, err := lockServerVoiceChannelParents(ctx, tx, serverID)
+	if err != nil {
+		return err
+	}
+	final, err := readServerVoiceCandidates(ctx, tx, serverID)
+	if err != nil {
+		return err
+	}
+	final = preserveDeletedChannelCandidates(preflight, final, survivingUsers, channelParents)
+	allowed := make(map[uuid.UUID]struct{}, len(preflight))
+	for _, candidate := range preflight {
+		allowed[candidate.subjectID] = struct{}{}
+	}
+	if err := validateServerVoiceCandidates(final, allowed); err != nil {
+		return err
+	}
+
+	plans, keys := serverVoicePlans(final)
+	if err := h.activePlans.CapturePlansTx(ctx, tx, plans); err != nil {
+		return fmt.Errorf("capture server voice active plans: %w", err)
+	}
+	capturedAudience, captureErr := h.captureServerAudience(ctx, tx, serverID)
+	outcome.oversized = errors.Is(captureErr, errServerAudienceTooLarge)
+	if captureErr != nil && !outcome.oversized {
+		return captureErr
+	}
+	outcome.affected = capturedAudience
+	if _, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE id = $1`, serverID); err != nil {
+		return fmt.Errorf("delete server: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%w: %w", errServerDeleteCommitUnresolved, err)
+	}
+	outcome.committed = true
+	return h.activePlans.CompleteAlreadyGated(ctx, nil, keys)
+}
+
+func readServerVoiceCandidates(
+	ctx context.Context,
+	tx *sql.Tx,
+	serverID string,
+) (candidates []serverVoiceCandidate, returnErr error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT vp.user_id, vp.channel_id, vp.lifecycle_event_at
+		FROM voice_participants vp
+		JOIN channels c ON c.id = vp.channel_id
+		WHERE c.server_id = $1
+		ORDER BY vp.user_id, vp.channel_id
+		LIMIT 17`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("read server voice candidates: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close server voice candidates: %w", closeErr))
+		}
+	}()
+	candidates = make([]serverVoiceCandidate, 0, maxServerVoiceCandidates)
+	for rows.Next() {
+		var candidate serverVoiceCandidate
+		if err := rows.Scan(&candidate.subjectID, &candidate.channelID, &candidate.lifecycleEventAt); err != nil {
+			return nil, fmt.Errorf("scan server voice candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate server voice candidates: %w", err)
+	}
+	return candidates, nil
+}
+
+func validateServerVoiceCandidates(candidates []serverVoiceCandidate, allowed map[uuid.UUID]struct{}) error {
+	seen := make(map[uuid.UUID]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := seen[candidate.subjectID]; exists {
+			return errServerVoiceCandidateAmbiguous
+		}
+		seen[candidate.subjectID] = struct{}{}
+	}
+	if len(seen) > maxServerVoiceCandidates {
+		return errServerVoiceCandidateBound
+	}
+	if allowed == nil {
+		return nil
+	}
+	for subjectID := range seen {
+		if _, exists := allowed[subjectID]; !exists {
+			return errServerVoiceCandidateDrift
+		}
+	}
+	return nil
+}
+
+func candidateSubjectIDs(candidates []serverVoiceCandidate) []uuid.UUID {
+	subjects := make([]uuid.UUID, 0, len(candidates))
+	for _, candidate := range candidates {
+		subjects = append(subjects, candidate.subjectID)
+	}
+	sort.Slice(subjects, func(left, right int) bool { return subjects[left].String() < subjects[right].String() })
+	return subjects
+}
+
+func lockServerVoiceCandidateUsers(
+	ctx context.Context,
+	tx *sql.Tx,
+	candidates []serverVoiceCandidate,
+) (surviving map[uuid.UUID]struct{}, returnErr error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	ids := candidateSubjectIDs(candidates)
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE`, pq.Array(ids))
+	if err != nil {
+		return nil, fmt.Errorf("lock server voice users: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close locked server voice users: %w", closeErr))
+		}
+	}()
+	surviving = make(map[uuid.UUID]struct{}, len(ids))
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan locked server voice user: %w", err)
+		}
+		surviving[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate locked server voice users: %w", err)
+	}
+	return surviving, nil
+}
+
+func lockServerVoiceChannelParents(
+	ctx context.Context,
+	tx *sql.Tx,
+	serverID string,
+) (parents map[uuid.UUID]struct{}, returnErr error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM channels WHERE server_id = $1 ORDER BY id FOR UPDATE`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("lock server voice channel parents: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close locked server voice channel parents: %w", closeErr))
+		}
+	}()
+	parents = make(map[uuid.UUID]struct{})
+	for rows.Next() {
+		var channelID uuid.UUID
+		if err := rows.Scan(&channelID); err != nil {
+			return nil, fmt.Errorf("scan locked server voice channel parent: %w", err)
+		}
+		parents[channelID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate locked server voice channel parents: %w", err)
+	}
+	return parents, nil
+}
+
+func preserveDeletedChannelCandidates(
+	preflight, final []serverVoiceCandidate,
+	survivingUsers, channelParents map[uuid.UUID]struct{},
+) []serverVoiceCandidate {
+	finalSubjects := make(map[uuid.UUID]struct{}, len(final))
+	for _, candidate := range final {
+		finalSubjects[candidate.subjectID] = struct{}{}
+	}
+	for _, candidate := range preflight {
+		_, alreadyFinal := finalSubjects[candidate.subjectID]
+		_, userSurvived := survivingUsers[candidate.subjectID]
+		_, channelSurvived := channelParents[candidate.channelID]
+		if alreadyFinal || !userSurvived || channelSurvived {
+			continue
+		}
+		final = append(final, candidate)
+	}
+	sort.Slice(final, func(left, right int) bool {
+		if final[left].subjectID != final[right].subjectID {
+			return final[left].subjectID.String() < final[right].subjectID.String()
+		}
+		return final[left].channelID.String() < final[right].channelID.String()
+	})
+	return final
+}
+
+func serverVoicePlans(candidates []serverVoiceCandidate) ([]activepresence.Plan, []activepresence.PlanKey) {
+	plans := make([]activepresence.Plan, 0, len(candidates))
+	keys := make([]activepresence.PlanKey, 0, len(candidates))
+	for _, candidate := range candidates {
+		plans = append(plans, activepresence.Plan{
+			SubjectID: candidate.subjectID, Category: activepresence.CategoryServerVoice,
+			OperationID: uuid.New(), Resolution: activepresence.ResolutionExact,
+			LifecycleID: candidate.channelID, EventAt: candidate.lifecycleEventAt,
+		})
+		keys = append(keys, activepresence.PlanKey{
+			SubjectID: candidate.subjectID, Category: activepresence.CategoryServerVoice,
+		})
+	}
+	return plans, keys
+}
+
+func (h *Handler) reconcileServerDeleteAudience(ctx context.Context, affected []uuid.UUID, oversized bool) {
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serverDeletePresenceTimeout)
+	defer cancel()
+	if oversized {
+		h.log.Info("Server delete audience exceeded the capture bound; disconnecting conservatively")
+		if h.hub != nil {
+			if err := h.hub.DisconnectAllRichPresenceClients(reconcileCtx); err != nil {
+				h.log.Error("Server delete conservative disconnect failed", "failure_class", "delivery")
+			}
+		}
+		return
+	}
+	h.disconnectServerAudience(reconcileCtx, affected)
 }
 
 // SetGraphPresenceCapture wires the #2447 membership presence capture. A nil
@@ -718,6 +1010,12 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 func (h *Handler) SetGraphPresenceCapture(c presencecapture.GraphPresenceCapture) {
 	h.graphPresence = c
 }
+
+// SetActivePlanRail wires the durable Server Voice deletion producer.
+func (h *Handler) SetActivePlanRail(rail ActivePlanRail) { h.activePlans = rail }
+
+// HasActivePlanRail reports whether the deletion producer was wired at boot.
+func (h *Handler) HasActivePlanRail() bool { return h.activePlans != nil }
 
 // HasGraphPresenceCapture reports whether the capture was wired. The router's
 // boot guard interrogates the HANDLER through this, never the constructed
@@ -779,18 +1077,9 @@ func (h *Handler) captureServerAudience(ctx context.Context, tx *sql.Tx, serverI
 // gone by then, so the rebuild simply omits it.
 //
 // A disconnect rather than an exact clear, deliberately. ClearServerVoice is
-// keyed on the specific voice channel a sender occupies, and discovering that
-// per member is the N-sender fan-out this path is explicitly excused from. The
-// conservative disconnect is the sanctioned fail-closed substitute the voice
-// bridge already uses wherever the audience cannot be determined safely.
-//
-// ponytail: blunt disconnect of the whole member set, no durable plan. Server
-// deletion is rare, so the hammer is affordable. Interim residual, named rather
-// than bounded: the active category decays within the presence TTL, but Custom
-// Status has no TTL and no heartbeat, so a member who is offline at delete time
-// keeps a stale value until their next reconnect. The failure mode is stale
-// state, never clear-a-successor. Upgrade path is #2448's rail, which resolves
-// the sender set durably.
+// keyed on the specific voice channel a sender occupies. Server Voice now has
+// exact durable plans; this remains only the bounded C2 Custom Status
+// compensation, which cannot be represented on the active-presence rail.
 func (h *Handler) disconnectServerAudience(ctx context.Context, members []uuid.UUID) {
 	if h.hub == nil || len(members) == 0 {
 		return

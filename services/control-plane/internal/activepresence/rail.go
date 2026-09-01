@@ -41,11 +41,13 @@ const (
 
 // Rail is the public seam consumer packages hold.
 //
-// TWO FLAVOURS OF EVERY ENTRY POINT, and choosing wrong hangs the process
+// THREE FLAVOURS OF EVERY ENTRY POINT, and choosing wrong hangs the process
 // forever rather than returning an error:
 //
 //   - WithGatedTx acquires the sender gates and then opens the transaction. Use
 //     it from a caller that is NOT already inside a gate (internal/dm).
+//   - WithGatedRevocationTx does the same, with an audience fence opened only
+//     after the gates and kept through post-commit completion (servers).
 //   - CompleteAlreadyGated / DrainAlreadyGated assume the gate is already held.
 //     Use them from a caller that IS (internal/users, whose DeleteAccount
 //     documents at delete_account.go:309-311 that it deliberately avoids
@@ -64,7 +66,7 @@ type Rail struct {
 }
 
 // NewRail wires the seam. reconciler and log may be nil; db and gate are
-// required by WithGatedTx and checked there.
+// required by the gated transaction entry points and checked there.
 func NewRail(db *sql.DB, gate Gate, reconciler *Reconciler, log *logger.Logger) *Rail {
 	return &Rail{db: db, gate: gate, reconciler: reconciler, log: log}
 }
@@ -91,6 +93,31 @@ func (r *Rail) WithGatedTx(
 	subjects []uuid.UUID,
 	work func(tx *sql.Tx) error,
 ) error {
+	return r.withGatedTx(ctx, subjects, nil, work)
+}
+
+// WithGatedRevocationTx keeps an audience-revocation fence open from after the
+// sender gates are acquired through the caller's committed-plan completion.
+// The rail receives only the bracket callback so it stays independent of the
+// websocket hub that owns the fence.
+func (r *Rail) WithGatedRevocationTx(
+	ctx context.Context,
+	subjects []uuid.UUID,
+	beginFence func() func(),
+	work func(tx *sql.Tx) error,
+) error {
+	if beginFence == nil {
+		return errors.New("activepresence: revocation fence is unavailable")
+	}
+	return r.withGatedTx(ctx, subjects, beginFence, work)
+}
+
+func (r *Rail) withGatedTx(
+	ctx context.Context,
+	subjects []uuid.UUID,
+	beginFence func() func(),
+	work func(tx *sql.Tx) error,
+) error {
 	if r == nil || r.db == nil || r.gate == nil {
 		return ErrRailNotWired
 	}
@@ -99,12 +126,24 @@ func (r *Rail) WithGatedTx(
 	}
 	ordered := canonicalSubjects(subjects)
 
-	return r.gate.WithSenders(ctx, ordered, func() error {
+	return r.gate.WithSenders(ctx, ordered, func() (returnErr error) {
+		if beginFence != nil {
+			closeFence := beginFence()
+			if closeFence == nil {
+				return errors.New("activepresence: revocation fence closer is unavailable")
+			}
+			defer closeFence()
+		}
 		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin gated active-presence mutation: %w", err)
 		}
-		defer func() { _ = tx.Rollback() }()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				returnErr = errors.Join(returnErr,
+					fmt.Errorf("rollback gated active-presence mutation: %w", rollbackErr))
+			}
+		}()
 		return work(tx)
 	})
 }
@@ -186,9 +225,9 @@ func (r *Rail) CompletePrivateCallPlansAlreadyGated(
 // WithGatedTx closure.
 //
 // The tx parameter is deliberately unused: the caller has already committed, and
-// accepting it keeps the call site's ownership obvious. Every key is attempted
-// and every failure is joined -- returning on the first would leave a later
-// subject's undelivered clear invisible.
+// accepting it keeps the call site's ownership obvious. One bounded claim
+// budget covers the batch; when it expires, untouched durable plans remain for
+// the reconciler rather than extending the sender-gate hold per key.
 //
 // Each key's failure is wrapped in ErrDeliveryIncomplete INDIVIDUALLY rather
 // than the join being wrapped once: wrapping the join would add a second
@@ -207,21 +246,27 @@ func (r *Rail) CompleteAlreadyGated(ctx context.Context, _ *sql.Tx, keys []PlanK
 	// cancellation lost the synchronous fast path and left the row for the
 	// 5-second reconciler. Correct but slower, and it contradicted the
 	// acceptance criterion; detaching here makes the whole completion match it.
-	// WithoutCancel strips the DEADLINE as well as cancellation. That is the
-	// point for cancellation and a hazard for the deadline: without a
-	// replacement bound the claim and resolve steps would run unbounded while
-	// the caller holds its sender gate. resolveOneAlreadyGated therefore
-	// applies claimTimeout to its own transactional segment -- see the const
-	// for why that bound is longer than deliveryTimeout rather than a sum of
-	// the others. Found by review after the first version of this detachment.
-	ctx = context.WithoutCancel(ctx)
+	// WithoutCancel strips the DEADLINE as well as cancellation. Restore one
+	// claimTimeout for the whole batch: a per-key deadline makes a 16-key batch
+	// hold its sender gates for sixteen claim budgets.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
+	defer cancel()
 
 	pass := &passState{}
 	var deliveryErr error
 	for _, key := range keys {
-		if err := r.reconciler.resolveOneAlreadyGated(ctx, key, pass); err != nil {
+		if err := ctx.Err(); err != nil {
 			deliveryErr = errors.Join(deliveryErr,
 				fmt.Errorf("%w: %w", ErrDeliveryIncomplete, err))
+			break
+		}
+		settled, err := r.reconciler.resolveOneAlreadyGated(ctx, key, pass)
+		if err != nil {
+			deliveryErr = errors.Join(deliveryErr,
+				fmt.Errorf("%w: %w", ErrDeliveryIncomplete, err))
+		} else if !settled {
+			deliveryErr = errors.Join(deliveryErr,
+				fmt.Errorf("%w: plan remains pending", ErrDeliveryIncomplete))
 		}
 	}
 	return deliveryErr
