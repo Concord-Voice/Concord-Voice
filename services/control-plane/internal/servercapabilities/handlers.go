@@ -7,6 +7,7 @@ package servercapabilities
 import (
 	"net/http"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/clientversion"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/gin-gonic/gin"
 )
@@ -155,8 +156,16 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 		PolicyVersion: policyVersion,
 	}
 	if h.chunkedAttachmentUpload {
-		// Do not advertise v3 until every supported client can read it.
+		// Route reachability is the outer gate. v3 additionally requires the
+		// enforced desktop reader floor: advertising an unreadable format would
+		// strand an admitted older client. Empty, malformed, and older floors
+		// deliberately retain v2-only advertisement.
 		resp.Features.AttachmentEnvelopeVersions = []int{2}
+		configured, configuredErr := clientversion.Parse(h.cfg.ClientMinVersion)
+		if configuredErr == nil && clientversion.Compare(configured,
+			clientversion.Version{Major: 0, Minor: 2, Patch: 44}) >= 0 {
+			resp.Features.AttachmentEnvelopeVersions = []int{2, 3}
+		}
 	}
 
 	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")

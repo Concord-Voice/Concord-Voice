@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Large encrypted attachments can now use consistently sized upload pieces during the storage rollout** ([#3086](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3086)) — clients at or above the configured reader floor can choose the newer format, while older or unversioned clients stay on the earlier format and attachments continue using the existing storage destination until the R2 cutover is completed.
+
 ## [0.2.44] — 2026-09-01
 
 Concord Voice now lets you choose who can see your voice-channel and private-call activity, while keeping that activity current internally, and invite previews stay tied to the invite you opened. The attachment stack is ready for the hosted storage cutover without moving writes yet: production validates the R2 destination, format rollout remains fenced to compatible clients, and cleanup work retries fairly across storage backends. Account, conversation, and server deletion now preserve the media and voice-activity cleanup they trigger, while refreshed dependencies and tooling address newly reported advisories.

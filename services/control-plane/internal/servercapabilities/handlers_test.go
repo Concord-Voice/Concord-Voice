@@ -261,32 +261,77 @@ func TestGetCapabilities_ChunkedAttachmentUpload_ReflectsWiring(t *testing.T) {
 	assert.Equal(t, true, features["chunkedAttachmentUpload"])
 }
 
-func TestGetCapabilities_AttachmentEnvelopeVersions_OnlyWhenChunkedWired(t *testing.T) {
-	t.Run("unwired omits version capability", func(t *testing.T) {
-		w, c := newTestContext()
-		servercapabilities.NewHandler(&config.Config{InstanceType: "saas"}).GetCapabilities(c)
+func TestGetCapabilities_AttachmentEnvelopeVersions_ReaderFloor(t *testing.T) {
+	tests := []struct {
+		name        string
+		wired       bool
+		readerFloor string
+		want        []int
+		wantPresent bool
+	}{
+		{
+			name:        "unwired omits versions even with reader floor",
+			readerFloor: "0.2.44",
+		},
+		{
+			name:        "wired empty floor remains v2 only",
+			wired:       true,
+			want:        []int{2},
+			wantPresent: true,
+		},
+		{
+			name:        "wired older floor remains v2 only",
+			wired:       true,
+			readerFloor: "0.2.43",
+			want:        []int{2},
+			wantPresent: true,
+		},
+		{
+			name:        "wired malformed floor remains v2 only",
+			wired:       true,
+			readerFloor: "v0.2.44",
+			want:        []int{2},
+			wantPresent: true,
+		},
+		{
+			name:        "wired floor at minimum advertises v2 and v3",
+			wired:       true,
+			readerFloor: "0.2.44",
+			want:        []int{2, 3},
+			wantPresent: true,
+		},
+		{
+			name:        "wired later stable floor advertises v2 and v3",
+			wired:       true,
+			readerFloor: "0.10.0",
+			want:        []int{2, 3},
+			wantPresent: true,
+		},
+	}
 
-		var body struct {
-			Features map[string]json.RawMessage `json:"features"`
-		}
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-		_, present := body.Features["attachmentEnvelopeVersions"]
-		assert.False(t, present, "unwired routes must not advertise an envelope version")
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := servercapabilities.NewHandler(&config.Config{
+				InstanceType:     "saas",
+				ClientMinVersion: tc.readerFloor,
+			})
+			h.SetChunkedAttachmentUpload(tc.wired)
+			w, c := newTestContext()
+			h.GetCapabilities(c)
 
-	t.Run("wired public JSON advertises exactly v2", func(t *testing.T) {
-		h := servercapabilities.NewHandler(&config.Config{InstanceType: "saas"})
-		h.SetChunkedAttachmentUpload(true)
-		w, c := newTestContext()
-		h.GetCapabilities(c)
+			var body struct {
+				Features map[string]json.RawMessage `json:"features"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+			rawVersions, present := body.Features["attachmentEnvelopeVersions"]
+			assert.Equal(t, tc.wantPresent, present)
+			if !present {
+				return
+			}
 
-		var body struct {
-			Features struct {
-				AttachmentEnvelopeVersions []int `json:"attachmentEnvelopeVersions"`
-			} `json:"features"`
-		}
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-		assert.Equal(t, []int{2}, body.Features.AttachmentEnvelopeVersions,
-			`public JSON features.attachmentEnvelopeVersions equals exactly [2]`)
-	})
+			var versions []int
+			require.NoError(t, json.Unmarshal(rawVersions, &versions))
+			assert.Equal(t, tc.want, versions)
+		})
+	}
 }
