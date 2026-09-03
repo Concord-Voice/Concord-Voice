@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - **Your voice and call status no longer disappears every hour** ([#3102](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3102)) — a routine server cleanup that clears out expired presence records was also deleting the records behind Rich Presence. The "In Voice" and "In a Call" status other people could see was wiped every time the server restarted and once every hour after that, and it did not come back until you rejoined. The cleanup now touches only the records it owns.
+- **Deleting a message now also retires its unshared attachment** ([#3100](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3100)) — channel messages, direct messages, and group conversations now schedule the encrypted file for storage cleanup after its final message reference is removed. An attachment shared by another message stays available until that last reference is deleted. Group deletion now revalidates the administrator under lock so a concurrent demotion or removal cannot authorize deletion.
 
 ## [0.2.45] — 2026-09-02
 

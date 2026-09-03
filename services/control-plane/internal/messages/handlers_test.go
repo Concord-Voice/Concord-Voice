@@ -2,12 +2,14 @@ package messages_test
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -350,6 +352,151 @@ func TestDeleteMessageAsAuthor(t *testing.T) {
 
 	w := ts.DoRequest("DELETE", "/api/v1/messages/"+msgID, nil, testhelpers.AuthHeaders(user.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestDeleteMessage_FailsClosedWithoutPurgeEngine(t *testing.T) {
+	ts, user, _, _, msgID := setupWithMessage(t)
+	log := logger.New("test")
+	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), log)
+	handler := messages.NewHandler(ts.DB, log, ts.Hub, resolver, nil, nil)
+	router := gin.New()
+	router.DELETE("/api/v1/messages/:id", func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		handler.DeleteMessage(c)
+	})
+
+	request := httptest.NewRequest(http.MethodDelete, "/api/v1/messages/"+msgID, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, msgID).Scan(&count))
+	assert.Equal(t, 1, count, "missing purge engine must not delete the message")
+}
+
+func insertChannelAttachmentForDeleteTest(t *testing.T, ts *testhelpers.TestServer, uploaderID, channelID, messageID string) string {
+	t.Helper()
+	var fileID string
+	err := ts.DB.QueryRow(`
+		INSERT INTO media_files
+			(id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key,
+			 key_version, channel_id, created_at)
+		VALUES
+			(gen_random_uuid(), $1, 'file', 2, 'application/octet-stream', 1,
+			 'attachments/' || gen_random_uuid(), 1, $2, NOW())
+		RETURNING id`, uploaderID, channelID).Scan(&fileID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO message_attachments (message_id, file_id, position)
+		VALUES ($1, $2, 0)`, messageID, fileID)
+	require.NoError(t, err)
+	return fileID
+}
+
+func assertMediaSoftDeleted(t *testing.T, ts *testhelpers.TestServer, fileID string) {
+	t.Helper()
+	var deletedAt sql.NullTime
+	err := ts.DB.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt)
+	require.NoError(t, err)
+	assert.True(t, deletedAt.Valid, "linked Tier-2 media row should be retired")
+}
+
+func TestDeleteMessageAsAuthorReapsFinalAttachment(t *testing.T) {
+	ts, user, _, channelID, msgID := setupWithMessage(t)
+	fileID := insertChannelAttachmentForDeleteTest(t, ts, user.ID, channelID, msgID)
+
+	w := ts.DoRequest("DELETE", "/api/v1/messages/"+msgID, nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, "Message deleted successfully", body["message"])
+	assertMediaSoftDeleted(t, ts, fileID)
+}
+
+func TestDeleteMessage_CommitFailureRollsBackWithoutBroadcast(t *testing.T) {
+	ts, user, serverID, channelID, msgID := setupWithMessage(t)
+	fileID := insertChannelAttachmentForDeleteTest(t, ts, user.ID, channelID, msgID)
+	conn := dialPurgeObserver(t, ts, user, serverID, channelID)
+	_, err := ts.DB.Exec(`
+		CREATE FUNCTION test_reject_message_delete_commit() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced message delete commit failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE CONSTRAINT TRIGGER test_reject_message_delete_commit
+		AFTER DELETE ON messages
+		DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION test_reject_message_delete_commit()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := ts.DB.Exec(`
+			DROP TRIGGER IF EXISTS test_reject_message_delete_commit ON messages;
+			DROP FUNCTION IF EXISTS test_reject_message_delete_commit()`)
+		require.NoError(t, cleanupErr)
+	})
+
+	w := ts.DoRequest("DELETE", "/api/v1/messages/"+msgID, nil, testhelpers.AuthHeaders(user.AccessToken))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var messageCount, bridgeCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, msgID).Scan(&messageCount))
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM message_attachments WHERE message_id = $1 AND file_id = $2`, msgID, fileID).Scan(&bridgeCount))
+	assert.Equal(t, 1, messageCount, "commit failure must roll back the message delete")
+	assert.Equal(t, 1, bridgeCount, "commit failure must retain the attachment bridge")
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid, "commit failure must not retire media")
+
+	_, err = ts.DB.Exec(`
+		DROP TRIGGER IF EXISTS test_reject_message_delete_commit ON messages;
+		DROP FUNCTION IF EXISTS test_reject_message_delete_commit()`)
+	require.NoError(t, err)
+	secondResponse := ts.DoRequest("POST", "/api/v1/messages", map[string]interface{}{
+		"channel_id":  channelID,
+		"content":     testhelpers.ValidCiphertext(),
+		"key_version": 1,
+	}, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusCreated, secondResponse.Code)
+	var secondBody map[string]interface{}
+	testhelpers.ParseJSON(t, secondResponse, &secondBody)
+	secondMessage, ok := secondBody["message"].(map[string]interface{})
+	require.True(t, ok)
+	secondID, ok := secondMessage["id"].(string)
+	require.True(t, ok)
+	secondDelete := ts.DoRequest("DELETE", "/api/v1/messages/"+secondID, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, secondDelete.Code)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	for {
+		var event struct {
+			Type string                 `json:"type"`
+			Data map[string]interface{} `json:"data"`
+		}
+		require.NoError(t, conn.ReadJSON(&event))
+		if event.Type != "message_delete" {
+			continue
+		}
+		assert.NotEqual(t, msgID, event.Data["id"], "failed delete must not broadcast")
+		assert.Equal(t, secondID, event.Data["id"], "successful delete should produce the observation event")
+		break
+	}
+}
+
+func TestAttachmentRetirementAssertion_PositiveControl(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "retireassert")
+	serverID := ts.CreateTestServer(t, user.ID, "Retirement Assertion Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	var fileID string
+	err := ts.DB.QueryRow(`
+		INSERT INTO media_files
+			(id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key,
+			 key_version, channel_id, created_at)
+		VALUES
+			(gen_random_uuid(), $1, 'file', 2, 'application/octet-stream', 1,
+			 'attachments/' || gen_random_uuid(), 1, $2, NOW())
+		RETURNING id`, user.ID, channelID).Scan(&fileID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
+	require.NoError(t, err)
+	assertMediaSoftDeleted(t, ts, fileID)
 }
 
 func TestDeleteMessageNotAuthor(t *testing.T) {

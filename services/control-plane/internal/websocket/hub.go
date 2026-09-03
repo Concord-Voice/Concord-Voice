@@ -2184,15 +2184,17 @@ func (h *Hub) parseAttachmentIDs(msg IncomingMessage) ([]string, bool) {
 			h.sendError(msg.ClientID, "Invalid attachment ID format")
 			return nil, false
 		}
-		if _, err := uuid.Parse(idStr); err != nil {
+		parsedID, err := uuid.Parse(idStr)
+		if err != nil {
 			h.sendError(msg.ClientID, "Invalid attachment ID")
 			return nil, false
 		}
-		if seen[idStr] {
+		canonicalID := parsedID.String()
+		if seen[canonicalID] {
 			continue // deduplicate
 		}
-		seen[idStr] = true
-		ids = append(ids, idStr)
+		seen[canonicalID] = true
+		ids = append(ids, canonicalID)
 	}
 	return ids, true
 }
@@ -2381,18 +2383,20 @@ func (h *Hub) sendMessageAck(ack messageAck) {
 }
 
 // linkChannelAttachments validates and links attachment file_ids to a channel message.
-func (h *Hub) linkChannelAttachments(messageID uuid.UUID, userID string, attachmentIDs []string, channelID string) []models.AttachmentSummary {
-	return h.linkAttachmentsToTable(attachmentLinkCtx{
+func (h *Hub) linkChannelAttachments(ctx context.Context, tx *sql.Tx, messageID uuid.UUID, userID string, attachmentIDs []string, channelID string) ([]models.AttachmentSummary, error) {
+	return h.linkAttachmentsToTable(ctx, tx, attachmentLinkCtx{
 		messageID: messageID, userID: userID, channelID: channelID,
-		insertSQL: `INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+		parentLockSQL: `SELECT id FROM messages WHERE id = $1 FOR KEY SHARE`,
+		insertSQL:     `INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 	}, attachmentIDs)
 }
 
 // linkDMAttachments validates and links attachment file_ids to a DM message.
-func (h *Hub) linkDMAttachments(messageID uuid.UUID, userID string, attachmentIDs []string, conversationID string) []models.AttachmentSummary {
-	return h.linkAttachmentsToTable(attachmentLinkCtx{
+func (h *Hub) linkDMAttachments(ctx context.Context, tx *sql.Tx, messageID uuid.UUID, userID string, attachmentIDs []string, conversationID string) ([]models.AttachmentSummary, error) {
+	return h.linkAttachmentsToTable(ctx, tx, attachmentLinkCtx{
 		messageID: messageID, userID: userID, conversationID: conversationID,
-		insertSQL: `INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+		parentLockSQL: `SELECT id FROM dm_messages WHERE id = $1 FOR KEY SHARE`,
+		insertSQL:     `INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 	}, attachmentIDs)
 }
 
@@ -2402,57 +2406,88 @@ type attachmentLinkCtx struct {
 	userID         string
 	channelID      string
 	conversationID string
+	parentLockSQL  string
 	insertSQL      string
 }
 
 // linkAttachmentsToTable validates and links attachment file_ids using the provided INSERT query.
-func (h *Hub) linkAttachmentsToTable(ctx attachmentLinkCtx, attachmentIDs []string) []models.AttachmentSummary {
+func (h *Hub) linkAttachmentsToTable(ctx context.Context, tx *sql.Tx, link attachmentLinkCtx, attachmentIDs []string) ([]models.AttachmentSummary, error) {
 	if len(attachmentIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	var summaries []models.AttachmentSummary
+	var parentID uuid.UUID
+	if err := tx.QueryRowContext(ctx, link.parentLockSQL, link.messageID).Scan(&parentID); err != nil {
+		return nil, fmt.Errorf("lock attachment parent: %w", err)
+	}
+
+	type attachmentPosition struct {
+		fileID   string
+		position int
+	}
+	ordered := make([]attachmentPosition, len(attachmentIDs))
 	for i, fileID := range attachmentIDs {
-		summary, ok := h.validateAndLinkAttachment(ctx, fileID, i)
+		ordered[i] = attachmentPosition{fileID: fileID, position: i}
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].fileID < ordered[j].fileID })
+
+	type linkedAttachment struct {
+		position int
+		summary  models.AttachmentSummary
+	}
+	linked := make([]linkedAttachment, 0, len(ordered))
+	for _, attachment := range ordered {
+		summary, ok, err := h.validateAndLinkAttachment(ctx, tx, link, attachment.fileID, attachment.position)
+		if err != nil {
+			return nil, err
+		}
 		if ok {
-			summaries = append(summaries, summary)
+			linked = append(linked, linkedAttachment{position: attachment.position, summary: summary})
 		}
 	}
-	return summaries
+	sort.Slice(linked, func(i, j int) bool { return linked[i].position < linked[j].position })
+	summaries := make([]models.AttachmentSummary, 0, len(linked))
+	for _, attachment := range linked {
+		summaries = append(summaries, attachment.summary)
+	}
+	return summaries, nil
 }
 
 // validateAndLinkAttachment validates a single attachment and links it to a message.
-func (h *Hub) validateAndLinkAttachment(ctx attachmentLinkCtx, fileID string, position int) (models.AttachmentSummary, bool) {
+func (h *Hub) validateAndLinkAttachment(ctx context.Context, tx *sql.Tx, link attachmentLinkCtx, fileID string, position int) (models.AttachmentSummary, bool, error) {
 	var summary models.AttachmentSummary
 	var uploaderID string
 	var fileChannelID, fileConvID *string
 
-	err := h.db.QueryRow(
+	err := tx.QueryRowContext(ctx,
 		// #2843: media_tier = 2 is defence in depth. Tier-1 rows leave channel_id
 		// and conversation_id NULL and verifyAttachmentAccess requires an exact
 		// match, so a tier-1 row cannot currently be linked to a message — but
 		// nothing in THIS query said so, and the filter is free.
 		`SELECT uploader_id, file_type, mime_type, file_size, channel_id, conversation_id
-		 FROM media_files WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`,
+		 FROM media_files WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2
+		 FOR KEY SHARE`,
 		fileID,
 	).Scan(&uploaderID, &summary.FileType, &summary.MimeType, &summary.FileSize, &fileChannelID, &fileConvID)
 	if err != nil {
-		log.Printf("Attachment %s not found or deleted: %v", sanitizeLogValue(fileID), err)
-		return summary, false
+		if errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Attachment %s not found or deleted: %v", sanitizeLogValue(fileID), err)
+			return summary, false, nil
+		}
+		return summary, false, fmt.Errorf("lock attachment %s: %w", sanitizeLogValue(fileID), err)
 	}
 
-	if !h.verifyAttachmentAccess(fileID, uploaderID, ctx, fileChannelID, fileConvID) {
-		return summary, false
+	if !h.verifyAttachmentAccess(fileID, uploaderID, link, fileChannelID, fileConvID) {
+		return summary, false, nil
 	}
 
-	_, err = h.db.Exec(ctx.insertSQL, ctx.messageID, fileID, position)
-	if err != nil {
-		log.Printf("Failed to link attachment %s to message %s: %v", sanitizeLogValue(fileID), sanitizeLogValue(ctx.messageID.String()), err)
-		return summary, false
+	if _, err = tx.ExecContext(ctx, link.insertSQL, link.messageID, fileID, position); err != nil {
+		log.Printf("Failed to link attachment %s to message %s: %v", sanitizeLogValue(fileID), sanitizeLogValue(link.messageID.String()), err)
+		return summary, false, fmt.Errorf("link attachment %s: %w", sanitizeLogValue(fileID), err)
 	}
 
 	summary.ID = fileID
-	return summary, true
+	return summary, true, nil
 }
 
 // verifyAttachmentAccess checks that the file is owned by the sender and belongs to the correct channel/conversation.
@@ -2484,6 +2519,7 @@ type persistMessageParams struct {
 	embedsSuppressed      bool
 	replyToID             *string
 	gifSlug               *string
+	attachmentIDs         []string
 }
 
 func lockMessageMembership(ctx context.Context, tx *sql.Tx, p persistMessageParams) (*time.Time, error) {
@@ -2518,15 +2554,16 @@ func messageCredentialGuardError(ctx context.Context, tx *sql.Tx, p persistMessa
 
 // persistMessage returns a specific error message on failure and, for a timeout
 // rechecked under the membership lock, its locked deadline.
-func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time.Time, string, *time.Time) {
+func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time.Time, []models.AttachmentSummary, string, *time.Time) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
+	var attachmentSummaries []models.AttachmentSummary
 	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
 	defer cancel()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Failed to begin message tx: %v", err)
-		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
@@ -2538,7 +2575,7 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 	// superseded epoch. GuardTx (users-row FOR SHARE) rechecks the sender's
 	// connect-time epoch against the current DB epoch inside the write tx.
 	if guardError := messageCredentialGuardError(ctx, tx, p); guardError != "" {
-		return messageID, createdAt, updatedAt, guardError, nil
+		return messageID, createdAt, updatedAt, nil, guardError, nil
 	}
 	// Lock the preflight membership row inside the write transaction. Its immutable
 	// joined_at value rejects a same-key rejoin after a kick/ban finishes purging,
@@ -2547,13 +2584,13 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 	timedOutUntil, err := lockMessageMembership(ctx, tx, p)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return messageID, createdAt, updatedAt, errMsgNotMemberOfServer, nil
+			return messageID, createdAt, updatedAt, nil, errMsgNotMemberOfServer, nil
 		}
 		log.Printf("Failed to lock message membership: %v", err)
-		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
 	}
 	if timedOutUntil != nil {
-		return messageID, createdAt, updatedAt, errMsgMemberTimedOut, timedOutUntil
+		return messageID, createdAt, updatedAt, nil, errMsgMemberTimedOut, timedOutUntil
 	}
 	err = tx.QueryRowContext(ctx,
 		`INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at)
@@ -2562,17 +2599,22 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 		messageID, p.channelUUID, p.userID, p.content, p.keyVersion, p.embedsSuppressed, p.replyToID, p.gifSlug,
 	).Scan(&createdAt, &updatedAt)
 	if err != nil && isFKViolation(err) {
-		return messageID, createdAt, updatedAt, "Reply target message not found", nil
+		return messageID, createdAt, updatedAt, nil, "Reply target message not found", nil
 	}
 	if err != nil {
 		log.Printf("Failed to persist message: %v", err)
-		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
+	}
+	attachmentSummaries, err = h.linkChannelAttachments(ctx, tx, messageID, p.userID.String(), p.attachmentIDs, p.channelUUID.String())
+	if err != nil {
+		log.Printf("Failed to link channel attachments: %v", err)
+		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit message: %v", err)
-		return messageID, createdAt, updatedAt, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
 	}
-	return messageID, createdAt, updatedAt, "", nil
+	return messageID, createdAt, updatedAt, attachmentSummaries, "", nil
 }
 
 // isFKViolation returns true if the error is a PostgreSQL foreign key violation (23503).
@@ -2745,9 +2787,9 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 	}
 
 	// Persist message
-	messageID, createdAt, updatedAt, persistErr, timedOutUntil := h.persistMessage(persistMessageParams{
+	messageID, createdAt, updatedAt, attachmentSummaries, persistErr, timedOutUntil := h.persistMessage(persistMessageParams{
 		channelUUID: channelUUID, userID: msg.UserID, credEpoch: msg.CredEpoch, membershipIncarnation: membershipIncarnation, content: input.content,
-		keyVersion:       input.keyVersion,
+		keyVersion: input.keyVersion, attachmentIDs: input.attachmentIDs,
 		embedsSuppressed: embedsSuppressed, replyToID: replyToID, gifSlug: input.gifSlug,
 	})
 	if h.respondPersistMessageError(msg, persistErr, timedOutUntil) {
@@ -2756,9 +2798,6 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 	if h.opsCounter != nil {
 		h.opsCounter.Increment(opsmetrics.MetricChannelMessagesTotal)
 	}
-
-	// Link attachments to message (if any)
-	attachmentSummaries := h.linkChannelAttachments(messageID, msg.UserID.String(), input.attachmentIDs, channelID)
 
 	// Ack to sender
 	nonce, _ := msg.Data[keyNonce].(string)
@@ -3762,19 +3801,21 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 	return false
 }
 
-func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, error) {
+func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, []models.AttachmentSummary, error) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
-	ctx := context.Background()
+	var attachmentSummaries []models.AttachmentSummary
+	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
+	defer cancel()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return messageID, createdAt, updatedAt, err
+		return messageID, createdAt, updatedAt, nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	// #2201 (Codex #2397 review): fence the WS DM ciphertext write against a
 	// destructive reset that advanced the sender's epoch after connect.
 	if guardErr := credepoch.GuardTx(ctx, tx, userID.String(), credEpoch); guardErr != nil {
-		return messageID, createdAt, updatedAt, guardErr
+		return messageID, createdAt, updatedAt, nil, guardErr
 	}
 	if err = tx.QueryRowContext(ctx,
 		`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version, type, gif_slug, created_at, updated_at)
@@ -3782,9 +3823,16 @@ func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, credEpoch s
 		 RETURNING created_at, updated_at`,
 		messageID, convUUID, userID, input.content, input.keyVersion, input.msgType, input.gifSlug,
 	).Scan(&createdAt, &updatedAt); err != nil {
-		return messageID, createdAt, updatedAt, err
+		return messageID, createdAt, updatedAt, nil, err
 	}
-	return messageID, createdAt, updatedAt, tx.Commit()
+	attachmentSummaries, err = h.linkDMAttachments(ctx, tx, messageID, userID.String(), input.attachmentIDs, convUUID.String())
+	if err != nil {
+		return messageID, createdAt, updatedAt, nil, fmt.Errorf("link DM attachments: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return messageID, createdAt, updatedAt, nil, err
+	}
+	return messageID, createdAt, updatedAt, attachmentSummaries, nil
 }
 
 // dmMessageAckParams holds the fields for a dm_message_ack response.
@@ -3879,7 +3927,7 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 		return
 	}
 
-	messageID, createdAt, updatedAt, err := h.persistDMMessage(convUUID, msg.UserID, msg.CredEpoch, input)
+	messageID, createdAt, updatedAt, attachments, err := h.persistDMMessage(convUUID, msg.UserID, msg.CredEpoch, input)
 	if err != nil {
 		// Any guard/store failure logs and returns the retryable save error (a
 		// fenced epoch mismatch is caught by the client's next authoritative API
@@ -3892,9 +3940,6 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 	if input.msgType == "user" && h.opsCounter != nil {
 		h.opsCounter.Increment(opsmetrics.MetricDMMessagesTotal)
 	}
-
-	convID := convUUID.String()
-	attachments := h.linkDMAttachments(messageID, msg.UserID.String(), input.attachmentIDs, convID)
 
 	nonce, _ := msg.Data[keyNonce].(string)
 	h.sendDMMessageAck(dmMessageAckParams{

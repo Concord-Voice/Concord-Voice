@@ -40,6 +40,7 @@ const (
 	errMsgFailedCreatePersonalThread = "Failed to create personal thread"
 	errMsgFailedUpdateConversation   = "Failed to update conversation"
 	errMsgFailedUpdateMessage        = "Failed to update message"
+	errMsgFailedDeleteMessage        = "Failed to delete message"
 	errMsgMessageNotFound            = "Message not found"
 	errMsgFailedStartTransaction     = "Failed to start transaction"
 	errMsgFailedRollbackTransaction  = "Failed to rollback transaction"
@@ -2597,7 +2598,7 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		return
 	} else if err != nil {
 		h.log.Error("Failed to check DM message author", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete message"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
 
@@ -2606,9 +2607,23 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	if _, err := h.db.Exec(`DELETE FROM dm_messages WHERE id = $1`, messageID); err != nil {
+	if h.purgeEngine == nil {
+		h.log.Error("Failed to delete DM message", "error", "purge engine unavailable")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return
+	}
+
+	if err := h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
+		MessagesTable:    "dm_messages",
+		ScopeColumn:      "conversation_id",
+		ScopeID:          convID,
+		AttachmentsTable: "dm_message_attachments",
+	}); errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return
+	} else if err != nil {
 		h.log.Error("Failed to delete DM message", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete message"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
 

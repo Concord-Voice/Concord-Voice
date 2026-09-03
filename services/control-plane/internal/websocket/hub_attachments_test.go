@@ -1,7 +1,10 @@
 package websocket
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -9,6 +12,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func beginAttachmentTx(t *testing.T, setup *hubTestSetup) *sql.Tx {
+	t.Helper()
+	tx, err := setup.db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback() })
+	return tx
+}
 
 const (
 	testFileID    = "file-1"
@@ -61,6 +72,28 @@ func seedMediaFile(t *testing.T, setup *hubTestSetup, tier int) string {
 	return fileID
 }
 
+func seedChannelMessage(t *testing.T, setup *hubTestSetup) uuid.UUID {
+	t.Helper()
+	messageID := uuid.New()
+	_, err := setup.db.Exec(`
+		INSERT INTO messages (id, channel_id, user_id, content, key_version)
+		VALUES ($1, $2, $3, 'Y2lwaGVydGV4dA==', 1)`, messageID, setup.convID, setup.user1)
+	require.NoError(t, err)
+	return messageID
+}
+
+func seedChannelMediaFile(t *testing.T, setup *hubTestSetup) string {
+	t.Helper()
+	fileID := uuid.New().String()
+	_, err := setup.db.Exec(`
+		INSERT INTO media_files
+		  (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, channel_id)
+		VALUES ($1, $2, 'photo', 2, 'image/png', 100, $3, 1, $4)`,
+		fileID, setup.user1, "attachments/"+fileID, setup.convID)
+	require.NoError(t, err)
+	return fileID
+}
+
 func dmLinkCtx(setup *hubTestSetup, msgID uuid.UUID) attachmentLinkCtx {
 	return attachmentLinkCtx{
 		userID:         setup.user1.String(),
@@ -77,8 +110,11 @@ func TestValidateAndLinkAttachmentTier2Succeeds(t *testing.T) {
 	msgID := seedDMMessage(t, setup)
 	fileID := seedMediaFile(t, setup, 2)
 
-	summary, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), fileID, 0)
+	tx := beginAttachmentTx(t, setup)
+	summary, ok, err := setup.hub.validateAndLinkAttachment(context.Background(), tx, dmLinkCtx(setup, msgID), fileID, 0)
 
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 	require.True(t, ok, "a tier-2 attachment owned by the sender must link")
 	assert.Equal(t, fileID, summary.ID)
 
@@ -101,8 +137,11 @@ func TestValidateAndLinkAttachmentRejectsTier1(t *testing.T) {
 	msgID := seedDMMessage(t, setup)
 	fileID := seedMediaFile(t, setup, 1)
 
-	_, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), fileID, 0)
+	tx := beginAttachmentTx(t, setup)
+	_, ok, err := setup.hub.validateAndLinkAttachment(context.Background(), tx, dmLinkCtx(setup, msgID), fileID, 0)
 
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 	assert.False(t, ok, "a tier-1 row must not be linkable as a message attachment")
 
 	var linked int
@@ -117,8 +156,11 @@ func TestValidateAndLinkAttachmentUnknownFile(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
 	msgID := seedDMMessage(t, setup)
 
-	_, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), uuid.New().String(), 0)
+	tx := beginAttachmentTx(t, setup)
+	_, ok, err := setup.hub.validateAndLinkAttachment(context.Background(), tx, dmLinkCtx(setup, msgID), uuid.New().String(), 0)
 
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 	assert.False(t, ok, "an unknown file id must not link")
 }
 
@@ -129,9 +171,76 @@ func TestValidateAndLinkAttachmentSoftDeletedFile(t *testing.T) {
 	_, err := setup.db.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
 	require.NoError(t, err)
 
-	_, ok := setup.hub.validateAndLinkAttachment(dmLinkCtx(setup, msgID), fileID, 0)
+	tx := beginAttachmentTx(t, setup)
+	_, ok, err := setup.hub.validateAndLinkAttachment(context.Background(), tx, dmLinkCtx(setup, msgID), fileID, 0)
 
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 	assert.False(t, ok, "a soft-deleted file must not link")
+}
+
+func TestLinkChannelAttachments_PreservesInputOrder(t *testing.T) {
+	setup := setupMessageTest(t)
+	messageID := seedChannelMessage(t, setup)
+	fileIDs := []string{seedChannelMediaFile(t, setup), seedChannelMediaFile(t, setup), seedChannelMediaFile(t, setup)}
+	input := []string{fileIDs[2], fileIDs[0], fileIDs[1]}
+	tx := beginAttachmentTx(t, setup)
+
+	summaries, err := setup.hub.linkChannelAttachments(context.Background(), tx, messageID, setup.user1.String(), input, setup.convID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	require.Len(t, summaries, len(input))
+	for i, summary := range summaries {
+		assert.Equal(t, input[i], summary.ID, "summaries must retain client attachment order")
+	}
+	var positions []int
+	rows, err := setup.db.Query(`SELECT position FROM message_attachments WHERE message_id = $1 ORDER BY position`, messageID)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var position int
+		require.NoError(t, rows.Scan(&position))
+		positions = append(positions, position)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []int{0, 1, 2}, positions)
+}
+
+func TestLinkDMAttachments_InvalidIDsAreOmitted(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	messageID := seedDMMessage(t, setup)
+	fileID := seedMediaFile(t, setup, 2)
+	tx := beginAttachmentTx(t, setup)
+
+	summaries, err := setup.hub.linkDMAttachments(context.Background(), tx, messageID, setup.user1.String(), []string{uuid.New().String(), fileID}, setup.convID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	require.Len(t, summaries, 1)
+	assert.Equal(t, fileID, summaries[0].ID)
+}
+
+func TestLinkAttachmentsToTable_InsertFailureRollsBackParent(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	messageID := uuid.New()
+	tx := beginAttachmentTx(t, setup)
+	_, err := tx.Exec(`
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version)
+		VALUES ($1, $2, $3, 'Y2lwaGVydGV4dA==', 1)`, messageID, setup.convID, setup.user1)
+	require.NoError(t, err)
+	fileID := seedMediaFile(t, setup, 2)
+	_, err = setup.hub.linkAttachmentsToTable(context.Background(), tx, attachmentLinkCtx{
+		messageID: messageID, userID: setup.user1.String(), conversationID: setup.convID,
+		parentLockSQL: `SELECT id FROM dm_messages WHERE id = $1 FOR KEY SHARE`,
+		insertSQL:     `INSERT INTO dm_message_attachments (missing_column) VALUES ($1)`,
+	}, []string{fileID})
+	require.Error(t, err)
+	require.NoError(t, tx.Rollback())
+
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM dm_messages WHERE id = $1`, messageID).Scan(&count))
+	assert.Zero(t, count, "a bridge failure must roll back the parent message")
 }
 
 // --- parseAttachmentIDs tests ---
@@ -166,6 +275,24 @@ func TestParseAttachmentIDsValid(t *testing.T) {
 	assert.Len(t, ids, 2)
 	assert.Equal(t, id1, ids[0])
 	assert.Equal(t, id2, ids[1])
+}
+
+func TestParseAttachmentIDsCanonicalizesAndDeduplicates(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	canonical := uuid.MustParse("01234567-89ab-cdef-0123-456789abcdef")
+	other := uuid.New()
+	msg := IncomingMessage{
+		ClientID: setup.client.ID,
+		UserID:   setup.user1,
+		Data: map[string]interface{}{
+			"attachment_ids": []interface{}{strings.ToUpper(canonical.String()), canonical.String(), other.String()},
+		},
+	}
+
+	ids, ok := setup.hub.parseAttachmentIDs(msg)
+
+	assert.True(t, ok)
+	assert.Equal(t, []string{canonical.String(), other.String()}, ids)
 }
 
 func TestParseAttachmentIDsTooMany(t *testing.T) {
@@ -399,20 +526,24 @@ func TestSendMessageAckWithoutAttachments(t *testing.T) {
 
 func TestLinkAttachmentsToTableEmpty(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
-	result := setup.hub.linkAttachmentsToTable(attachmentLinkCtx{
+	tx := beginAttachmentTx(t, setup)
+	result, err := setup.hub.linkAttachmentsToTable(context.Background(), tx, attachmentLinkCtx{
 		messageID: uuid.New(),
 		userID:    setup.user1.String(),
 		insertSQL: `INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, $3)`,
 	}, nil)
+	require.NoError(t, err)
 	assert.Nil(t, result)
 }
 
 func TestLinkAttachmentsToTableEmptySlice(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
-	result := setup.hub.linkAttachmentsToTable(attachmentLinkCtx{
+	tx := beginAttachmentTx(t, setup)
+	result, err := setup.hub.linkAttachmentsToTable(context.Background(), tx, attachmentLinkCtx{
 		messageID: uuid.New(),
 		userID:    setup.user1.String(),
 		insertSQL: `INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, $3)`,
 	}, []string{})
+	require.NoError(t, err)
 	assert.Nil(t, result)
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/lib/pq"
@@ -2265,6 +2266,141 @@ func TestDeleteMessage_Success(t *testing.T) {
 	err := ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_messages WHERE id = $1`, msgID).Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 0, count, "message should be deleted from database")
+}
+
+func TestDeleteMessage_FailsClosedWithoutPurgeEngine(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "delmsgnopurge1")
+	user2 := ts.CreateTestUser(t, "delmsgnopurge2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	msgID := insertDMMessage(t, ts, convID, user1.ID, "must remain")
+	handler := dm.NewHandler(dm.HandlerDeps{DB: ts.DB, Log: logger.New("test"), Hub: ts.Hub})
+	router := gin.New()
+	router.DELETE(pathDMConversationsPrefix+":id/messages/:message_id", func(c *gin.Context) {
+		c.Set("user_id", user1.ID)
+		handler.DeleteMessage(c)
+	})
+
+	request := httptest.NewRequest(http.MethodDelete, pathDMConversationsPrefix+convID+pathMsgSlash+msgID, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_messages WHERE id = $1`, msgID).Scan(&count))
+	assert.Equal(t, 1, count, "missing purge engine must not delete the message")
+}
+
+func TestDeleteMessage_SuccessReapsFinalAttachment(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "delatt1")
+	user2 := ts.CreateTestUser(t, "delatt2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	msgID := insertDMMessage(t, ts, convID, user1.ID, "to be deleted")
+	fileID := insertDMMediaFile(t, ts, user1.ID, convID, "file", "application/octet-stream", 1)
+	insertDMMessageAttachment(t, ts, msgID, fileID, 0)
+
+	w := ts.DoRequest("DELETE", pathDMConversationsPrefix+convID+pathMsgSlash+msgID, nil, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assert.Equal(t, true, body["success"])
+
+	var deletedAt sql.NullTime
+	err := ts.DB.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt)
+	require.NoError(t, err)
+	assert.True(t, deletedAt.Valid, "linked Tier-2 media row should be retired")
+}
+
+func TestDeleteMessage_RetirementFailureRollsBack(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "delattfail1")
+	user2 := ts.CreateTestUser(t, "delattfail2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	msgID := insertDMMessage(t, ts, convID, user1.ID, "to be retained")
+	fileID := insertDMMediaFile(t, ts, user1.ID, convID, "file", "application/octet-stream", 1)
+	insertDMMessageAttachment(t, ts, msgID, fileID, 0)
+	ticket := "dm-delete-broadcast-test-" + uuid.NewString()
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, user2.ID+":delete-test", time.Minute).Err())
+	wsServer := httptest.NewServer(ts.Router)
+	t.Cleanup(wsServer.Close)
+	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	for {
+		var event struct {
+			Type string `json:"type"`
+		}
+		require.NoError(t, conn.ReadJSON(&event))
+		if event.Type == "connected" {
+			break
+		}
+	}
+	require.NoError(t, conn.WriteJSON(map[string]interface{}{
+		"type": "subscribe_dm",
+		"data": map[string]interface{}{"conversation_id": convID},
+	}))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	for {
+		var event struct {
+			Type string `json:"type"`
+		}
+		require.NoError(t, conn.ReadJSON(&event))
+		if event.Type == "dm_subscribed" {
+			break
+		}
+	}
+	_, err = ts.DB.Exec(`
+		CREATE FUNCTION test_reject_dm_delete_media_retirement() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced media retirement failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER test_reject_dm_delete_media_retirement
+		BEFORE UPDATE OF deleted_at ON media_files
+		FOR EACH ROW EXECUTE FUNCTION test_reject_dm_delete_media_retirement()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := ts.DB.Exec(`
+			DROP TRIGGER IF EXISTS test_reject_dm_delete_media_retirement ON media_files;
+			DROP FUNCTION IF EXISTS test_reject_dm_delete_media_retirement()`)
+		require.NoError(t, cleanupErr)
+	})
+
+	w := ts.DoRequest("DELETE", pathDMConversationsPrefix+convID+pathMsgSlash+msgID, nil, testhelpers.AuthHeaders(user1.AccessToken))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var messageCount, bridgeCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_messages WHERE id = $1`, msgID).Scan(&messageCount))
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_message_attachments WHERE message_id = $1 AND file_id = $2`, msgID, fileID).Scan(&bridgeCount))
+	assert.Equal(t, 1, messageCount, "retirement failure must roll back the message delete")
+	assert.Equal(t, 1, bridgeCount, "retirement failure must retain the attachment bridge")
+	var deletedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid, "retirement failure must not retire media")
+
+	_, err = ts.DB.Exec(`
+		DROP TRIGGER IF EXISTS test_reject_dm_delete_media_retirement ON media_files;
+		DROP FUNCTION IF EXISTS test_reject_dm_delete_media_retirement()`)
+	require.NoError(t, err)
+	secondID := insertDMMessage(t, ts, convID, user1.ID, "successful delete observation")
+	secondDelete := ts.DoRequest("DELETE", pathDMConversationsPrefix+convID+pathMsgSlash+secondID, nil, testhelpers.AuthHeaders(user1.AccessToken))
+	require.Equal(t, http.StatusOK, secondDelete.Code)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	for {
+		var event struct {
+			Type string                 `json:"type"`
+			Data map[string]interface{} `json:"data"`
+		}
+		require.NoError(t, conn.ReadJSON(&event))
+		if event.Type != "dm_message_delete" {
+			continue
+		}
+		assert.NotEqual(t, msgID, event.Data["id"], "failed delete must not broadcast")
+		assert.Equal(t, secondID, event.Data["id"], "successful delete should produce the observation event")
+		break
+	}
 }
 
 func TestDeleteMessage_NotAuthor(t *testing.T) {

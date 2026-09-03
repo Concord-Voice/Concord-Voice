@@ -36,7 +36,7 @@ func TestDeleteGroupDataZeroCandidateDriftFailsClosed(t *testing.T) {
 		once.Do(func() { joinExtraVoiceParticipant(t, db, convID) })
 	}
 
-	err := handler.deleteGroupData(context.Background(), convID)
+	err := handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID))
 	require.ErrorIs(t, err, errCandidateSetDrifted,
 		"a call started inside the window must refuse the deletion, not destroy the evidence")
 
@@ -57,7 +57,7 @@ func TestDeleteGroupDataZeroCandidateStillDeletesWithoutDrift(t *testing.T) {
 	convID, _ := seedGroupCallWithParticipants(t, db, 0)
 	handler, _ := newDMHandlerWithRail(t, db, convID)
 
-	require.NoError(t, handler.deleteGroupData(context.Background(), convID))
+	require.NoError(t, handler.deleteGroupData(context.Background(), convID, groupCreatorID(t, db, convID)))
 	require.Zero(t,
 		countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID),
 		"an undisturbed deletion must still delete")

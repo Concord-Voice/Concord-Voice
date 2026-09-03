@@ -12,6 +12,7 @@ package purge
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -85,71 +86,68 @@ func validateIdentifiers(s DeleteSpec) error {
 	return nil
 }
 
-// deleteQueries are fixed per-store templates. PostgreSQL cannot bind table or
-// column identifiers, so validated DeleteSpec fields choose one of these static
-// statements while all runtime values remain parameters.
-//
-// The reap CTE returns storage_backend ALONGSIDE storage_key (ADR-0038 / #2759
-// unit B2): placement is per object, and the reaper must delete each blob from
-// the backend its row names rather than from one process-wide client. The two
-// arrays are aggregated in a SINGLE `reaped` CTE and read from that one row, so
-// they are index-aligned by construction — one Aggregate node consumes one tuple
-// stream, so both array_agg calls see the same rows in the same order. Two
-// separate `(SELECT array_agg(...) FROM reap)` subqueries would pair them only
-// by relying on a materialized CTE being rescanned in insertion order, which is
-// an implementation detail and not something a deletion path should rest on.
-var deleteQueries = map[string]string{
-	"messages": `
-WITH victims AS (
-  SELECT id FROM messages
-  WHERE channel_id = $1
-    AND ($2::timestamp IS NULL OR created_at >= $2::timestamp)
-    AND ($3::uuid IS NULL OR user_id = $3)
-  ORDER BY created_at LIMIT $4
-),
-reap AS (
-  UPDATE media_files SET deleted_at = NOW()
-  WHERE id IN (SELECT file_id FROM message_attachments WHERE message_id IN (SELECT id FROM victims))
-    AND deleted_at IS NULL
-  RETURNING storage_key, storage_backend
-),
-del AS (
-  DELETE FROM messages WHERE id IN (SELECT id FROM victims) RETURNING 1
-),
-reaped AS (
-  SELECT COALESCE(array_agg(storage_key), '{}') AS keys,
-         COALESCE(array_agg(storage_backend), '{}'::text[]) AS backends
-  FROM reap
-)
-SELECT (SELECT count(*) FROM del),
-       (SELECT keys FROM reaped),
-       (SELECT backends FROM reaped)`,
-	"dm_messages": `
-WITH victims AS (
-  SELECT id FROM dm_messages
-  WHERE conversation_id = $1
-    AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
-    AND ($3::uuid IS NULL OR user_id = $3)
-  ORDER BY created_at LIMIT $4
-),
-reap AS (
-  UPDATE media_files SET deleted_at = NOW()
-  WHERE id IN (SELECT file_id FROM dm_message_attachments WHERE message_id IN (SELECT id FROM victims))
-    AND deleted_at IS NULL
-  RETURNING storage_key, storage_backend
-),
-del AS (
-  DELETE FROM dm_messages WHERE id IN (SELECT id FROM victims) RETURNING 1
-),
-reaped AS (
-  SELECT COALESCE(array_agg(storage_key), '{}') AS keys,
-         COALESCE(array_agg(storage_backend), '{}'::text[]) AS backends
-  FROM reap
-)
-SELECT (SELECT count(*) FROM del),
-       (SELECT keys FROM reaped),
-       (SELECT backends FROM reaped)`,
+type deleteQuerySet struct {
+	selectBatch         string
+	selectOne           string
+	selectAttachedMedia string
+	deleteParents       string
 }
+
+// PostgreSQL cannot bind identifiers, so each allowed table has one fixed query
+// set. Runtime values remain parameters.
+var deleteQueries = map[string]deleteQuerySet{
+	"messages": {
+		selectBatch: `SELECT id FROM messages
+WHERE channel_id = $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+  AND ($3::uuid IS NULL OR user_id = $3)
+ORDER BY created_at, id
+LIMIT $4
+FOR UPDATE`,
+		selectOne: `SELECT id FROM messages WHERE id = $1 AND channel_id = $2 FOR UPDATE`,
+		selectAttachedMedia: `SELECT mf.id
+FROM media_files mf
+WHERE mf.media_tier = 2
+  AND mf.deleted_at IS NULL
+  AND mf.id IN (
+    SELECT ma.file_id FROM message_attachments ma
+    WHERE ma.message_id = ANY($1::uuid[])
+  )
+ORDER BY mf.id
+FOR UPDATE`,
+		deleteParents: `DELETE FROM messages WHERE id = ANY($1::uuid[])`,
+	},
+	"dm_messages": {
+		selectBatch: `SELECT id FROM dm_messages
+WHERE conversation_id = $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+  AND ($3::uuid IS NULL OR user_id = $3)
+ORDER BY created_at, id
+LIMIT $4
+FOR UPDATE`,
+		selectOne: `SELECT id FROM dm_messages WHERE id = $1 AND conversation_id = $2 FOR UPDATE`,
+		selectAttachedMedia: `SELECT mf.id
+FROM media_files mf
+WHERE mf.media_tier = 2
+  AND mf.deleted_at IS NULL
+  AND mf.id IN (
+    SELECT dma.file_id FROM dm_message_attachments dma
+    WHERE dma.message_id = ANY($1::uuid[])
+  )
+ORDER BY mf.id
+FOR UPDATE`,
+		deleteParents: `DELETE FROM dm_messages WHERE id = ANY($1::uuid[])`,
+	},
+}
+
+const retireAttachedMediaQuery = `UPDATE media_files mf
+SET deleted_at = NOW()
+WHERE mf.id = ANY($1::uuid[])
+  AND mf.media_tier = 2
+  AND mf.deleted_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM message_attachments ma WHERE ma.file_id = mf.id)
+  AND NOT EXISTS (SELECT 1 FROM dm_message_attachments dma WHERE dma.file_id = mf.id)
+RETURNING mf.storage_key, mf.storage_backend`
 
 // Engine runs audit-first -> batched delete -> reap. Store-agnostic.
 type Engine struct {
@@ -265,12 +263,13 @@ func (e *Engine) durableDeletedCount(ctx context.Context, purgeID string, fallba
 }
 
 // deleteBatched runs the batched delete for one DeleteSpec until fewer than
-// maxBatch rows remain. Each batch is a single round-trip that soft-deletes the
-// victims' media_files, hard-deletes the message rows, and returns both the deleted
-// count and the reaped blobs (key + backend); the blobs are handed to the
-// background reaper.
+// maxBatch rows remain. Each batch locks parents and attachments, hard-deletes
+// the messages, and returns final-reference blobs to the background reaper.
 func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds DeleteSpec) (int, error) {
-	q := deleteQueries[ds.MessagesTable]
+	q, ok := deleteQueries[ds.MessagesTable]
+	if !ok {
+		return 0, fmt.Errorf("purge: query set for %q not found", ds.MessagesTable)
+	}
 
 	total := 0
 	for {
@@ -279,11 +278,8 @@ func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds D
 			return total, err
 		}
 
-		// Best-effort, off the request path: the reaper drains these to object
-		// storage; a dropped/undrained blob is recovered by the straggler sweeper.
 		e.reaper.EnqueueBlobDeletes(refs)
 		total += affected
-
 		if affected < e.maxBatch {
 			break
 		}
@@ -291,7 +287,7 @@ func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds D
 	return total, nil
 }
 
-func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
+func (e *Engine) deleteBatch(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("purge: begin batch tx: %w", err)
@@ -302,28 +298,32 @@ func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan,
 		}
 	}()
 
-	var affected int
-	var keys []string
-	// Nullable per element: NULL is the legacy backend and the permanent value of
-	// every pre-cutover object, so this cannot scan into []string.
-	var backends []sql.NullString
-	// One row: deleted count + the reaped keys and their backends. pq.Array scans
-	// the text[] results; the NullString element type routes through pq's
-	// GenericArray, which honours sql.Scanner and therefore NULL elements.
-	if err := tx.QueryRowContext(ctx, query, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch).
-		Scan(&affected, pq.Array(&keys), pq.Array(&backends)); err != nil {
-		return 0, nil, fmt.Errorf("purge: batch delete query: %w", err)
-	}
-	refs, err := blobRefs(keys, backends)
+	rows, err := tx.QueryContext(ctx, queries.selectBatch, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch)
 	if err != nil {
-		// The soft-deletes in this batch are about to commit, so the rows are
-		// already straggler-sweep candidates. Drop the enqueue rather than reap
-		// a mispaired key against the wrong backend: the sweep re-reads both
-		// columns off the same row and recovers them. Loud, because this shape
-		// is not supposed to be reachable.
-		e.log.Error("purge: reaped key/backend arrays disagree; leaving these blobs to the straggler sweep",
-			"error", err, "purge_id", purgeID)
-		refs = nil
+		return 0, nil, fmt.Errorf("purge: select batch victims: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close batch victim rows", "error", closeErr)
+		}
+	}()
+	messageIDs := make([]string, 0, e.maxBatch)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return 0, nil, fmt.Errorf("purge: scan batch victim: %w", err)
+		}
+		messageIDs = append(messageIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("purge: iterate batch victims: %w", err)
+	}
+	if len(messageIDs) == 0 {
+		return 0, nil, nil
+	}
+	affected, refs, err := e.deleteMessagesTx(ctx, tx, queries, messageIDs)
+	if err != nil {
+		return 0, nil, err
 	}
 	if affected > 0 {
 		if _, err := tx.ExecContext(ctx,
@@ -337,26 +337,176 @@ func (e *Engine) deleteBatch(ctx context.Context, purgeID, query string, p Plan,
 	return affected, refs, nil
 }
 
-// blobRefs pairs the reaped storage keys with their backends.
-//
-// The two arrays come from one Aggregate node over one tuple stream, so they are
-// index-aligned by construction and a length mismatch is structurally impossible.
-// It is still checked, because the failure it would otherwise produce is the exact
-// one this unit exists to close: a key reaped against SOMEBODY ELSE'S backend
-// deletes nothing, returns success, and stamps blob_reaped_at on a row whose object
-// still exists.
-func blobRefs(keys []string, backends []sql.NullString) ([]media.BlobRef, error) {
-	if len(keys) != len(backends) {
-		return nil, fmt.Errorf("purge: reaped %d keys but %d backends", len(keys), len(backends))
+// deleteMessagesTx locks attached media before deleting messages. This parent →
+// media order serializes attachment linking with retirement.
+func (e *Engine) deleteMessagesTx(ctx context.Context, tx *sql.Tx, queries deleteQuerySet, messageIDs []string) (int, []media.BlobRef, error) {
+	if len(messageIDs) == 0 {
+		return 0, nil, nil
 	}
-	if len(keys) == 0 {
-		return nil, nil
+	mediaRows, err := tx.QueryContext(ctx, queries.selectAttachedMedia, pq.Array(messageIDs))
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge: lock attached media: %w", err)
 	}
-	refs := make([]media.BlobRef, 0, len(keys))
-	for i, key := range keys {
-		refs = append(refs, media.NewBlobRef(key, backends[i]))
+	defer func() {
+		if closeErr := mediaRows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close attached media rows", "error", closeErr)
+		}
+	}()
+	mediaIDs := make([]string, 0)
+	for mediaRows.Next() {
+		var id string
+		if err := mediaRows.Scan(&id); err != nil {
+			return 0, nil, fmt.Errorf("purge: scan attached media: %w", err)
+		}
+		mediaIDs = append(mediaIDs, id)
 	}
-	return refs, nil
+	if err := mediaRows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("purge: iterate attached media: %w", err)
+	}
+
+	result, err := tx.ExecContext(ctx, queries.deleteParents, pq.Array(messageIDs))
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge: delete messages: %w", err)
+	}
+	affected64, err := result.RowsAffected()
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge: count deleted messages: %w", err)
+	}
+
+	if len(mediaIDs) == 0 {
+		return int(affected64), nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, retireAttachedMediaQuery, pq.Array(mediaIDs))
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge: retire unreferenced media: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close retired media rows", "error", closeErr)
+		}
+	}()
+	refs := make([]media.BlobRef, 0)
+	for rows.Next() {
+		var key string
+		var backend sql.NullString
+		if err := rows.Scan(&key, &backend); err != nil {
+			return 0, nil, fmt.Errorf("purge: scan retired media: %w", err)
+		}
+		refs = append(refs, media.NewBlobRef(key, backend))
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("purge: iterate retired media: %w", err)
+	}
+	return int(affected64), refs, nil
+}
+
+// DeleteOne retires one message and its final-reference attachments atomically.
+func (e *Engine) DeleteOne(ctx context.Context, messageID string, spec DeleteSpec) error {
+	if err := validateIdentifiers(spec); err != nil {
+		return err
+	}
+	queries := deleteQueries[spec.MessagesTable]
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return contextError(ctx, fmt.Errorf("purge: begin single delete tx: %w", err))
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			e.log.Warn("purge: failed to rollback single delete transaction", "error", rollbackErr)
+		}
+	}()
+
+	var lockedID string
+	if err := tx.QueryRowContext(ctx, queries.selectOne, messageID, spec.ScopeID).Scan(&lockedID); err != nil {
+		return contextError(ctx, fmt.Errorf("purge: lock message %s: %w", messageID, err))
+	}
+	_, refs, err := e.deleteMessagesTx(ctx, tx, queries, []string{lockedID})
+	if err != nil {
+		return contextError(ctx, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("purge: commit single delete: %w", err)
+	}
+	e.reaper.EnqueueBlobDeletes(refs)
+	return nil
+}
+
+// CaptureConversationBlobsTx captures all matching Tier-2 media IDs before the
+// conversation's foreign-key cascade removes their metadata, returning blob
+// refs only for objects not yet reaped. The caller must hold the conversation
+// lock and keep this transaction open until the parent deletion commits.
+func (e *Engine) CaptureConversationBlobsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID string,
+) ([]string, []media.BlobRef, error) {
+	if tx == nil {
+		return nil, nil, errors.New("purge: capture conversation blobs requires a transaction")
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT mf.id, mf.storage_key, mf.storage_backend,
+		       COALESCE(mf.conversation_id = $1::uuid, FALSE) AS correctly_scoped,
+		       mf.blob_reaped_at IS NULL AS needs_reap
+		FROM media_files mf
+		WHERE mf.media_tier = 2
+		  AND (
+			mf.conversation_id = $1::uuid
+			OR mf.id IN (
+				SELECT dma.file_id
+				FROM dm_message_attachments dma
+				JOIN dm_messages dm ON dm.id = dma.message_id
+				WHERE dm.conversation_id = $1::uuid
+			)
+		  )
+		ORDER BY mf.id
+		FOR UPDATE`, conversationID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("purge: capture conversation blobs: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close conversation blob rows", "error", closeErr)
+		}
+	}()
+
+	fileIDs := make([]string, 0)
+	refs := make([]media.BlobRef, 0)
+	for rows.Next() {
+		var fileID, key string
+		var backend sql.NullString
+		var correctlyScoped, needsReap bool
+		if err := rows.Scan(&fileID, &key, &backend, &correctlyScoped, &needsReap); err != nil {
+			return nil, nil, fmt.Errorf("purge: scan conversation blob: %w", err)
+		}
+		if !correctlyScoped {
+			return nil, nil, fmt.Errorf("purge: conversation attachment %s has an out-of-scope media file", fileID)
+		}
+		fileIDs = append(fileIDs, fileID)
+		if needsReap {
+			refs = append(refs, media.NewBlobRef(key, backend))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("purge: iterate conversation blobs: %w", err)
+	}
+	return fileIDs, refs, nil
+}
+
+// EnqueueBlobDeletes hands committed conversation-deletion refs to the existing
+// backend-aware reaper. It is intentionally a narrow forwarding seam so group
+// deletion cannot accidentally enqueue before its transaction commits.
+func (e *Engine) EnqueueBlobDeletes(refs []media.BlobRef) {
+	if e == nil || e.reaper == nil {
+		return
+	}
+	e.reaper.EnqueueBlobDeletes(refs)
+}
+
+func contextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 // writeAuditInProgress inserts the in_progress audit row and returns its id.

@@ -13,8 +13,8 @@ import (
 
 const (
 	// blobQueueSize bounds the in-memory blob-delete backlog. Overflow is dropped
-	// (logged) rather than blocking the request path — a dropped key is recovered
-	// by SweepStragglers, never leaked.
+	// (logged) rather than blocking the request path. SweepStragglers recovers refs
+	// whose soft-deleted row remains; media.OrphanReaper recovers rowless refs.
 	blobQueueSize = 4096
 
 	// stragglerSweepInterval is how often the crash-orphan sweep runs.
@@ -72,7 +72,8 @@ func NewReaper(db *sql.DB, log *logger.Logger, backends media.DeleterResolver) *
 
 // EnqueueBlobDeletes hands blob references to the background worker. Non-blocking:
 // if the bounded buffer is full, the ref is dropped (and logged) rather than
-// stalling the caller — SweepStragglers re-reaps any blob the worker never drains.
+// stalling the caller. SweepStragglers recovers it while its soft-deleted row
+// remains; media.OrphanReaper recovers it after a caller hard-deletes that row.
 //
 // A ref carries the BACKEND as well as the key. Enqueueing a bare key would leave
 // the worker to guess at placement, and the wrong guess is not a failed delete but
@@ -228,8 +229,9 @@ func (r *Reaper) markReaped(ctx context.Context, ref media.BlobRef) {
 // (blob_reaped_at IS NULL), whether orphaned by a mid-purge restart or by queue
 // overflow on a large purge. Blocks until ctx is cancelled; run it in a goroutine.
 //
-// This is the ONLY guarantee that an EnqueueBlobDeletes drop is recoverable, so it
-// must have no upper time bound — see stragglerSweepQuery.
+// This is the recovery guarantee for an EnqueueBlobDeletes drop whose soft-deleted
+// row remains, so it must have no upper time bound — see stragglerSweepQuery.
+// Callers that hard-delete the row rely on media.OrphanReaper's per-backend sweep.
 //
 // Failed deletes stay unmarked but increment reap_attempts. Each tick reserves 10%
 // (100 rows) for retries and fills the rest with fresh rows, so persistent failures

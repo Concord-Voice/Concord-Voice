@@ -972,12 +972,25 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	// Delete message
-	deleteQuery := `DELETE FROM messages WHERE id = $1`
+	if h.purgeEngine == nil {
+		h.log.Error(errMsgFailedDeleteMessage, "error", "purge engine unavailable")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return
+	}
 
-	_, err = h.db.Exec(deleteQuery, messageID)
+	// Delete message and retire any final-reference attachments atomically.
+	err = h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
+		MessagesTable:    "messages",
+		ScopeColumn:      "channel_id",
+		ScopeID:          channelID,
+		AttachmentsTable: "message_attachments",
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return
+	}
 	if err != nil {
-		h.log.Error("Failed to delete message", "error", err)
+		h.log.Error(errMsgFailedDeleteMessage, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/activepresence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -40,6 +41,10 @@ const maxGroupVoiceCandidates = 16
 // call join, so it is self-clearing and client-retryable.
 var (
 	errCandidateSetDrifted = errors.New("dm: voice participant set changed under the conversation lock")
+	// errGroupDeleteStateDrifted reports that the caller's preflight admin
+	// authority changed before the destructive transaction acquired its locks.
+	// Retrying performs a fresh authorization decision.
+	errGroupDeleteStateDrifted = errors.New("dm: group delete authorization changed under transaction lock")
 	// errMemberRemovalStateDrifted reports that the preflight authorization or
 	// target membership changed before the destructive transaction acquired its
 	// locks. Retrying performs a fresh authorization decision.
@@ -294,7 +299,7 @@ func (h *Handler) DeleteGroup(c *gin.Context) {
 	}
 
 	// Delete all group data in a transaction
-	if err := h.deleteGroupData(c.Request.Context(), convID); err != nil {
+	if err := h.deleteGroupData(c.Request.Context(), convID, userID); err != nil {
 		h.respondDeleteGroupError(c, err)
 		return
 	}
@@ -309,10 +314,11 @@ func (h *Handler) DeleteGroup(c *gin.Context) {
 // retry the same request".
 func (h *Handler) respondDeleteGroupError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, errCandidateSetDrifted):
-		// A conflict, not a server fault: the participant set changed under the
-		// caller. Self-clearing and client-retryable, so no in-handler retry
-		// loop — that would hold the sender gates across an indeterminate wait.
+	case errors.Is(err, errCandidateSetDrifted), errors.Is(err, errGroupDeleteStateDrifted):
+		// A conflict, not a server fault: either the active-call participant set
+		// or the caller's delete authority changed under the transaction lock.
+		// Client-retryable, so no in-handler retry loop — that would hold the
+		// sender gates across an indeterminate wait.
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgFailedDeleteGroup})
 	case errors.Is(err, activepresence.ErrDeliveryIncomplete):
 		// The conversation IS deleted and only presence delivery failed. A 500
@@ -396,7 +402,7 @@ func (h *Handler) fetchParticipantIDs(convID string) ([]string, error) {
 //
 // Plan capture sits after the conversation lock and before the first DELETE,
 // because DELETE FROM dm_voice_participants destroys the evidence.
-func (h *Handler) deleteGroupData(ctx context.Context, convID string) error {
+func (h *Handler) deleteGroupData(ctx context.Context, convID, actorUserID string) error {
 	// Resolved on the plain connection: the gates are acquired from this set,
 	// and acquiring them inside the transaction is what clause 1 forbids.
 	candidates, err := readVoiceCandidates(ctx, h.db, convID)
@@ -410,9 +416,9 @@ func (h *Handler) deleteGroupData(ctx context.Context, convID string) error {
 		return fmt.Errorf("%w: %d", activepresence.ErrTooManySubjects, len(candidates))
 	}
 	if h.activePlans == nil || len(candidates) == 0 {
-		return h.deleteGroupRows(ctx, convID, candidates)
+		return h.deleteGroupRows(ctx, convID, actorUserID, candidates)
 	}
-	return h.deleteGroupWithPlans(ctx, convID, candidates)
+	return h.deleteGroupWithPlans(ctx, convID, actorUserID, candidates)
 }
 
 // deleteGroupWithPlans runs the gated, plan-capturing path. The rail owns the
@@ -420,10 +426,11 @@ func (h *Handler) deleteGroupData(ctx context.Context, convID string) error {
 func (h *Handler) deleteGroupWithPlans(
 	ctx context.Context,
 	convID string,
+	actorUserID string,
 	candidates []uuid.UUID,
 ) error {
 	return h.activePlans.WithGatedTx(ctx, candidates, func(tx *sql.Tx) error {
-		keys, err := h.deleteGroupRowsTx(ctx, tx, convID, candidates)
+		result, err := h.deleteGroupRowsTx(ctx, tx, convID, actorUserID, candidates)
 		if err != nil {
 			return err
 		}
@@ -432,9 +439,10 @@ func (h *Handler) deleteGroupWithPlans(
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit group deletion: %w", err)
 		}
+		h.purgeEngine.EnqueueBlobDeletes(result.refs)
 		// Post-commit, STILL INSIDE the gate. Re-entering WithGatedTx here
 		// would hash to the same buffer-1 stripe and block forever.
-		return h.activePlans.CompleteAlreadyGated(ctx, nil, keys)
+		return h.activePlans.CompleteAlreadyGated(ctx, nil, result.keys)
 	})
 }
 
@@ -455,7 +463,14 @@ func (h *Handler) deleteGroupWithPlans(
 // captures the plan. Capturing here instead is not available -- writing a plan
 // row needs that subject's sender gate, and acquiring a gate inside an open
 // transaction is the cycle the gate ordering exists to prevent.
-func (h *Handler) deleteGroupRows(ctx context.Context, convID string, candidates []uuid.UUID) error {
+func (h *Handler) deleteGroupRows(
+	ctx context.Context,
+	convID, actorUserID string,
+	candidates []uuid.UUID,
+) error {
+	if h.purgeEngine == nil {
+		return errors.New("group deletion: purge engine is unavailable")
+	}
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -469,15 +484,32 @@ func (h *Handler) deleteGroupRows(ctx context.Context, convID string, candidates
 	if err := lockConversation(ctx, tx, convID); err != nil {
 		return err
 	}
+	if err := revalidateGroupDeleteAuthority(ctx, tx, convID, actorUserID); err != nil {
+		return err
+	}
 	if err := revalidateVoiceCandidates(ctx, tx, convID, candidates); err != nil {
 		return err
 	}
-	if err := execGroupDeletes(ctx, tx, convID); err != nil {
+	if err := lockConversationMessages(ctx, tx, convID); err != nil {
+		return err
+	}
+	fileIDs, refs, err := h.purgeEngine.CaptureConversationBlobsTx(ctx, tx, convID)
+	if err != nil {
+		return err
+	}
+	if err := execGroupChildDeletes(ctx, tx, convID); err != nil {
+		return err
+	}
+	if err := ensureNoAttachmentBridges(ctx, tx, fileIDs); err != nil {
+		return err
+	}
+	if err := deleteGroupConversation(ctx, tx, convID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
+	h.purgeEngine.EnqueueBlobDeletes(refs)
 	return nil
 }
 
@@ -486,34 +518,101 @@ func (h *Handler) deleteGroupRows(ctx context.Context, convID string, candidates
 func (h *Handler) deleteGroupRowsTx(
 	ctx context.Context,
 	tx *sql.Tx,
-	convID string,
+	convID, actorUserID string,
 	candidates []uuid.UUID,
-) ([]activepresence.PlanKey, error) {
+) (groupDeleteResult, error) {
+	if h.purgeEngine == nil {
+		return groupDeleteResult{}, errors.New("group deletion: purge engine is unavailable")
+	}
 	// 1. users FIRST — clause 2 of deleteGroupData's contract.
 	if err := lockVoiceCandidates(ctx, tx, candidates); err != nil {
-		return nil, err
+		return groupDeleteResult{}, err
 	}
 	if h.afterUsersLockHook != nil {
 		h.afterUsersLockHook(tx)
 	}
 	// 2. Then the domain parent.
 	if err := lockConversation(ctx, tx, convID); err != nil {
-		return nil, err
+		return groupDeleteResult{}, err
+	}
+	if err := revalidateGroupDeleteAuthority(ctx, tx, convID, actorUserID); err != nil {
+		return groupDeleteResult{}, err
 	}
 	// 3. Re-validate under the lock, fail closed.
 	if err := revalidateVoiceCandidates(ctx, tx, convID, candidates); err != nil {
-		return nil, err
+		return groupDeleteResult{}, err
 	}
-	// 4. Capture BEFORE the evidence-destroying DELETE.
+	// 4. Lock messages, then capture media BEFORE the evidence-destroying DELETE.
+	if err := lockConversationMessages(ctx, tx, convID); err != nil {
+		return groupDeleteResult{}, err
+	}
+	fileIDs, refs, err := h.purgeEngine.CaptureConversationBlobsTx(ctx, tx, convID)
+	if err != nil {
+		return groupDeleteResult{}, err
+	}
 	keys, err := h.captureGroupPlans(ctx, tx, candidates)
 	if err != nil {
-		return nil, err
+		return groupDeleteResult{}, err
 	}
 	// 5. The existing deletes, unchanged order.
-	if err := execGroupDeletes(ctx, tx, convID); err != nil {
-		return nil, err
+	if err := execGroupChildDeletes(ctx, tx, convID); err != nil {
+		return groupDeleteResult{}, err
 	}
-	return keys, nil
+	if err := ensureNoAttachmentBridges(ctx, tx, fileIDs); err != nil {
+		return groupDeleteResult{}, err
+	}
+	if err := deleteGroupConversation(ctx, tx, convID); err != nil {
+		return groupDeleteResult{}, err
+	}
+	return groupDeleteResult{keys: keys, refs: refs}, nil
+}
+
+type groupDeleteResult struct {
+	keys []activepresence.PlanKey
+	refs []media.BlobRef
+}
+
+func lockConversationMessages(ctx context.Context, tx *sql.Tx, convID string) (returnErr error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM dm_messages WHERE conversation_id = $1 ORDER BY created_at, id FOR UPDATE`, convID)
+	if err != nil {
+		return fmt.Errorf("lock conversation messages: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && returnErr == nil {
+			returnErr = fmt.Errorf("close conversation message locks: %w", closeErr)
+		}
+	}()
+	for rows.Next() {
+		var messageID string
+		if err := rows.Scan(&messageID); err != nil {
+			return fmt.Errorf("scan conversation message lock: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate conversation message locks: %w", err)
+	}
+	return nil
+}
+
+func ensureNoAttachmentBridges(ctx context.Context, tx *sql.Tx, fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+	var fileID string
+	err := tx.QueryRowContext(ctx, `
+		SELECT file_id FROM (
+			SELECT file_id FROM message_attachments WHERE file_id = ANY($1::uuid[])
+			UNION ALL
+			SELECT file_id FROM dm_message_attachments WHERE file_id = ANY($1::uuid[])
+		) AS remaining LIMIT 1`, pq.Array(fileIDs)).Scan(&fileID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check remaining attachment bridges: %w", err)
+	}
+	return fmt.Errorf("group deletion: attachment %s remains referenced", fileID)
 }
 
 // lockVoiceCandidates takes the users rows in database-side sorted order, so
@@ -552,6 +651,28 @@ func lockConversation(ctx context.Context, tx *sql.Tx, convID string) error {
 		`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, convID,
 	).Scan(&lockedConversationID); err != nil {
 		return fmt.Errorf("lock conversation: %w", err)
+	}
+	return nil
+}
+
+// revalidateGroupDeleteAuthority locks the caller's membership after the
+// conversation lock, so a preflight admin check cannot authorize deletion
+// after the caller is demoted or removed.
+func revalidateGroupDeleteAuthority(ctx context.Context, tx *sql.Tx, convID, actorUserID string) error {
+	var actorRole string
+	err := tx.QueryRowContext(ctx, `
+		SELECT role FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2
+		FOR UPDATE
+	`, convID, actorUserID).Scan(&actorRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errGroupDeleteStateDrifted
+	}
+	if err != nil {
+		return fmt.Errorf("lock group deletion caller membership: %w", err)
+	}
+	if actorRole != "admin" {
+		return errGroupDeleteStateDrifted
 	}
 	return nil
 }
@@ -637,11 +758,18 @@ func readVoiceCandidates(ctx context.Context, q rowsQuerier, convID string) ([]u
 	return candidates, nil
 }
 
-func execGroupDeletes(ctx context.Context, tx *sql.Tx, convID string) error {
-	for _, d := range groupDeleteStatements {
+func execGroupChildDeletes(ctx context.Context, tx *sql.Tx, convID string) error {
+	for _, d := range groupDeleteStatements[:len(groupDeleteStatements)-1] {
 		if _, err := tx.ExecContext(ctx, d.query, convID); err != nil {
 			return fmt.Errorf("delete %s: %w", d.label, err)
 		}
+	}
+	return nil
+}
+
+func deleteGroupConversation(ctx context.Context, tx *sql.Tx, convID string) error {
+	if _, err := tx.ExecContext(ctx, groupDeleteStatements[len(groupDeleteStatements)-1].query, convID); err != nil {
+		return fmt.Errorf("delete conversation: %w", err)
 	}
 	return nil
 }

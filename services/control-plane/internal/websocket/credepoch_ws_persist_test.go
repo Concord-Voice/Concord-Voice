@@ -37,7 +37,7 @@ func TestPersistMessage_StaleEpochRejected(t *testing.T) {
 		userID.String(), "wsstalechan@test.concord.chat", "wsstalechan", wsPersistArgonHash)
 	require.NoError(t, err)
 
-	_, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
+	_, _, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
 		channelUUID: uuid.New(), userID: userID, credEpoch: "staleEpoch",
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -56,7 +56,7 @@ func TestPersistMessage_GuardReadFailureIsSaveError(t *testing.T) {
 	db := setupHubTestDB(t)
 	hub := NewHub(db, nil)
 
-	_, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
+	_, _, _, _, errMsg, _ := hub.persistMessage(persistMessageParams{
 		channelUUID: uuid.New(), userID: uuid.New(), credEpoch: "whatever",
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -72,7 +72,7 @@ func TestPersistMessage_RemovedMemberRejected(t *testing.T) {
 	_, err := setup.db.Exec(`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, setup.user2, setup.user1)
 	require.NoError(t, err)
 
-	_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+	_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
 		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -93,7 +93,7 @@ func TestPersistMessage_RejoinedMemberRejected(t *testing.T) {
 	_, err = setup.db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')`, setup.user2, setup.user1)
 	require.NoError(t, err)
 
-	_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+	_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
 		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -115,7 +115,7 @@ func TestPersistMessage_MemberUpdateKeepsIncarnation(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+	_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
 		channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 	})
@@ -238,7 +238,7 @@ func TestPersistMessage_MembershipLockHonorsTimeout(t *testing.T) {
 
 	result := make(chan string, 1)
 	go func() {
-		_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+		_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
 			channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 			content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 		})
@@ -266,7 +266,7 @@ func TestPersistMessage_MembershipLockWriterFirstDefersRemoval(t *testing.T) {
 
 	sendResult := make(chan string, 1)
 	go func() {
-		_, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
+		_, _, _, _, errMsg, _ := setup.hub.persistMessage(persistMessageParams{
 			channelUUID: channelID, userID: setup.user1, membershipIncarnation: incarnation,
 			content: "Y2lwaGVydGV4dA==", keyVersion: 1,
 		})
@@ -338,7 +338,7 @@ func TestPersistDMMessage_StaleEpochRejected(t *testing.T) {
 		userID.String(), "wsstaledm@test.concord.chat", "wsstaledm", wsPersistArgonHash)
 	require.NoError(t, err)
 
-	_, _, _, gErr := hub.persistDMMessage(uuid.New(), userID, "staleEpoch", &dmMessageInput{
+	_, _, _, _, gErr := hub.persistDMMessage(uuid.New(), userID, "staleEpoch", &dmMessageInput{
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user",
 	})
 	assert.ErrorIs(t, gErr, credepoch.ErrEpochMismatch, "stale-epoch WS DM send must fail closed")
@@ -346,4 +346,39 @@ func TestPersistDMMessage_StaleEpochRejected(t *testing.T) {
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_messages WHERE user_id = $1`, userID.String()).Scan(&count))
 	assert.Zero(t, count, "no DM message may persist under a stale epoch")
+}
+
+func TestPersistDMMessage_AttachmentLockHonorsTimeout(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	fileID := seedMediaFile(t, setup, 2)
+
+	lockTx, err := setup.db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	var lockedID string
+	require.NoError(t, lockTx.QueryRow(
+		`SELECT id FROM media_files WHERE id = $1 FOR UPDATE`, fileID,
+	).Scan(&lockedID))
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, _, persistErr := setup.hub.persistDMMessage(
+			uuid.MustParse(setup.convID), setup.user1, "", &dmMessageInput{
+				content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user", attachmentIDs: []string{fileID},
+			},
+		)
+		result <- persistErr
+	}()
+
+	select {
+	case persistErr := <-result:
+		require.ErrorContains(t, persistErr, "link DM attachments: lock attachment "+fileID,
+			"DM attachment persistence must fail while waiting on the locked media row")
+	case <-time.After(channelAuthCtxTimeout + time.Second):
+		t.Fatal("DM attachment lock did not honor the WebSocket message timeout")
+	}
+
+	var count int
+	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&count))
+	assert.Zero(t, count, "a timed-out DM attachment link must roll back its message")
 }
