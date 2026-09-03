@@ -25,6 +25,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
@@ -275,7 +276,7 @@ func runControlPlane() (runErr error) {
 		}
 	}
 
-	go runCleanupJob(cleanupCtx, db, redisClient, hub, log, completeExpiredOwnershipTransfers)
+	go runCleanupJob(cleanupCtx, db, redisClient, log, completeExpiredOwnershipTransfers)
 
 	pendingRepo := auth.NewPendingRepo(db)
 	auth.StartPendingCleanupWorker(cleanupCtx, pendingRepo, log, auth.PendingCleanupInterval)
@@ -704,20 +705,21 @@ func initStorageClient(cfg *config.Config, log *logger.Logger) (*storage.Client,
 	return nil, nil
 }
 
-// runCleanupJob periodically purges expired tokens, stale sessions, and orphaned
-// Redis presence keys. The server must not rely on clients to clean up after
-// themselves — this job is the authoritative backstop.
-func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger, ownershipCleanup func(context.Context)) {
+// runCleanupJob periodically purges expired tokens, stale sessions, and
+// UNEXPIRING Redis presence keys. The server must not rely on clients to clean
+// up after themselves — this job is the authoritative backstop. Genuine orphans
+// are reaped by their own 120s TTL, not by this job; see cleanupStalePresence.
+func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, log *logger.Logger, ownershipCleanup func(context.Context)) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	// Run once at startup to catch anything that accumulated while the server was down
-	runCleanup(ctx, db, redisClient, hub, log, ownershipCleanup)
+	runCleanup(ctx, db, redisClient, log, ownershipCleanup)
 
 	for {
 		select {
 		case <-ticker.C:
-			runCleanup(ctx, db, redisClient, hub, log, ownershipCleanup)
+			runCleanup(ctx, db, redisClient, log, ownershipCleanup)
 		case <-ctx.Done():
 			log.Info("Cleanup job stopped")
 			return
@@ -725,7 +727,7 @@ func runCleanupJob(ctx context.Context, db *sql.DB, redisClient *redis.Client, h
 	}
 }
 
-func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub *websocket.Hub, log *logger.Logger, ownershipCleanup func(context.Context)) {
+func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, log *logger.Logger, ownershipCleanup func(context.Context)) {
 	taskCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -754,7 +756,7 @@ func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub 
 	}
 
 	// Task 3: Clean stale Redis presence keys
-	cleanupStalePresence(taskCtx, redisClient, hub, log)
+	cleanupStalePresence(taskCtx, redisClient, log)
 
 	// Task 4: Auto-complete expired ownership transfers through the ownership
 	// handler, which owns its capture-bound authority transaction.
@@ -765,47 +767,204 @@ func runCleanup(ctx context.Context, db *sql.DB, redisClient *redis.Client, hub 
 	log.Debug("Cleanup completed")
 }
 
+const (
+	// basePresenceScanPattern bounds the cleanup SCAN to the presence keyspace.
+	basePresenceScanPattern = "presence:*"
+	// presenceScanBatch is the SCAN COUNT hint, and therefore also the number of
+	// TTL reads that ride in one pipeline round trip.
+	presenceScanBatch = 100
+)
+
 type stalePresenceStore interface {
 	Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd
-	Del(ctx context.Context, keys ...string) *redis.IntCmd
+	Pipelined(ctx context.Context, fn func(redis.Pipeliner) error) ([]redis.Cmder, error)
 }
 
-// cleanupStalePresence compares presence:* keys against the authoritative set
-// of connected users from the hub and removes stale entries.
-func cleanupStalePresence(ctx context.Context, redisClient stalePresenceStore, hub *websocket.Hub, log *logger.Logger) {
-	connectedUsers := hub.GetConnectedUsers()
-	var staleCount int
-	var cursor uint64
-	deleteStaleKey := func(key string) {
-		if err := redisClient.Del(ctx, key).Err(); err != nil {
-			log.Error("Cleanup: failed to delete stale presence key", "error", err)
-			return
-		}
-		staleCount++
+// reapUnexpiringPresenceLua deletes a base presence key only if it has NO
+// expiry, atomically, returning the number of keys it removed.
+//
+// The guard lives in Lua for two independent reasons, and both are load-bearing.
+//
+// It makes the read and the delete ONE operation. A separate PTTL then DEL has a
+// window: PTTL can report -2 (key already gone), a disconnected user can
+// reconnect and SET the key with a fresh 120s TTL, and the DEL then destroys a
+// live registration -- proven with a passing exploit during review. Batching the
+// reads made that window WIDER, not narrower, because it spans the rest of the
+// batch rather than a single round trip.
+//
+// And PTTL's sentinels are raw integers here, so `== -1` means exactly "exists
+// with no expiry" with no client-side scaling question at all. That matters
+// because go-redis returns -1/-2 UNSCALED as nanoseconds, making the natural
+// `ttl == -1*time.Second` permanently false. internal/presence keeps its own
+// PTTL guard in Lua for precisely this reason; this is the same decision.
+const reapUnexpiringPresenceLua = `
+if redis.call('PTTL', KEYS[1]) == -1 then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`
+
+// isBasePresenceKey reports whether key is exactly the key that
+// presence.StatusRedisKey builds for some user ID.
+//
+// This is an ALLOWLIST, and that is the point. "presence:" is a SHARED prefix:
+// rich presence stores "presence:rich:<uuid>:<category>" beneath it, and any
+// family added later lands there too. The previous denylist -- delete whatever
+// does not parse as presence:<uuid> -- therefore treated every rich-presence key
+// as malformed and deleted the lot on every pass.
+//
+// The round trip through StatusRedisKey is load-bearing, not decoration, and it
+// must not be "simplified" back to `err == nil`. uuid.Parse's own documentation
+// says it should not be used to validate strings: it is case-insensitive and
+// accepts the urn:uuid:, brace-wrapped and bare-32-hex spellings, and its
+// 38-byte arm strips the first byte WITHOUT checking that it was a brace -- so a
+// bare Parse admits "presence:@<uuid>#" and every other single-delimiter shape.
+// Under the old denylist that leniency erred toward KEEPING keys; under an
+// allowlist the same leniency errs toward DELETING them, so the predicate is
+// pinned to the one spelling the writer actually emits.
+func isBasePresenceKey(key string) bool {
+	userID, found := strings.CutPrefix(key, "presence:")
+	if !found {
+		return false
 	}
-	for {
-		keys, nextCursor, err := redisClient.Scan(ctx, cursor, "presence:*", 100).Result()
+	parsed, err := uuid.Parse(userID)
+	return err == nil && key == presence.StatusRedisKey(parsed)
+}
+
+// reapUnexpiringPresence deletes every key in the batch that carries no expiry,
+// running one atomic guard per key in ONE pipeline round trip.
+//
+// Batching is not a micro-optimization. A candidate key is roughly "one
+// currently-online user", so a guard per candidate un-batched turns a ~N/100
+// round-trip pass into ~N, inside the single 30s budget this job shares with the
+// ownership-transfer sweep that runs AFTER it -- a large fleet could starve that
+// sweep and surface only as a context deadline in an unrelated task.
+//
+// A key whose guard fails to run is left alone. The entire justification for
+// deleting rests on that read, so an unread TTL must never authorize a delete;
+// the key is reconsidered next pass and expires on its own regardless.
+func reapUnexpiringPresence(
+	ctx context.Context,
+	redisClient stalePresenceStore,
+	keys []string,
+) (reaped, failed int, firstErr error) {
+	if len(keys) == 0 {
+		return 0, 0, nil
+	}
+	cmds := make([]*redis.Cmd, len(keys))
+	_, pipeErr := redisClient.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, key := range keys {
+			cmds[i] = pipe.Eval(ctx, reapUnexpiringPresenceLua, []string{key})
+		}
+		return nil
+	})
+	for _, cmd := range cmds {
+		// A nil command means the pipeline never queued this guard, so pipeErr is
+		// the only error there is to report for it. Per-command errors are
+		// preferred where they exist: one unrunnable guard must not discard the
+		// verdict for the rest of the batch.
+		if cmd == nil {
+			failed++
+			if firstErr == nil {
+				firstErr = pipeErr
+			}
+			continue
+		}
+		removed, err := cmd.Int()
 		if err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// The script returns what DEL actually removed, so a key that expired
+		// between the SCAN and the guard contributes 0 and is never counted as
+		// reaped.
+		reaped += removed
+	}
+	return reaped, failed, firstErr
+}
+
+// cleanupStalePresence removes base presence keys that outlived their expiry.
+//
+// Every writer of presence:<uuid> sets a 120s TTL (internal/websocket/hub.go
+// registration, offline transition, set_status, and the heartbeat repair paths;
+// refreshPresenceTTL renews it with EXPIRE). A base key that still exists with
+// no expiry therefore cannot have come from any of them, and is the only thing
+// this job may delete.
+//
+// It deliberately does NOT consult the hub's connected-user set. That check
+// could only ever reap an orphan Redis expiry removes within 120s anyway, which
+// does not buy enough to justify what it cost: runCleanup fires once at startup
+// against an empty hub, so every restart deleted every live base presence key in
+// the fleet -- deterministically, not as a race it might have lost.
+//
+// The pass summary is logged UNCONDITIONALLY, and that is a consequence of the
+// predicate above rather than a style choice. A healthy fleet now deletes
+// nothing, so a summary gated on "something was deleted" would emit no line
+// ever; before the fix the accidental rich-presence deletions fired it every
+// hour and it doubled as this job's only heartbeat. Losing that would leave a
+// panicked goroutine, a cancelled context, a ticker that never fired and a
+// Redis ACL denying SCAN all indistinguishable from perfect health, because
+// runCleanup's own completion line is Debug and production logs at Info.
+func cleanupStalePresence(ctx context.Context, redisClient stalePresenceStore, log *logger.Logger) {
+	var (
+		scanned     int
+		candidates  int
+		staleCount  int
+		ttlErrors   int
+		firstTTLErr error
+		partial     bool
+		cursor      uint64
+	)
+
+	for {
+		keys, nextCursor, err := redisClient.Scan(ctx, cursor, basePresenceScanPattern, presenceScanBatch).Result()
+		if err != nil {
+			// Truncating the pass is right -- the summary below must still run --
+			// but the summary has to SAY it was truncated, or a partial pass that
+			// reaped two keys reports identically to a complete one.
 			log.Error("Cleanup: failed to scan presence keys", "error", err)
+			partial = true
 			break
 		}
+		scanned += len(keys)
+
+		batch := make([]string, 0, len(keys))
 		for _, key := range keys {
-			uidStr := strings.TrimPrefix(key, "presence:")
-			uid, parseErr := uuid.Parse(uidStr)
-			if parseErr != nil {
-				deleteStaleKey(key)
-				continue
-			}
-			if !connectedUsers[uid] {
-				deleteStaleKey(key)
+			if isBasePresenceKey(key) {
+				batch = append(batch, key)
 			}
 		}
+		candidates += len(batch)
+
+		reaped, failed, guardErr := reapUnexpiringPresence(ctx, redisClient, batch)
+		staleCount += reaped
+		ttlErrors += failed
+		if firstTTLErr == nil {
+			firstTTLErr = guardErr
+		}
+
 		cursor = nextCursor
 		if cursor == 0 {
 			break
 		}
 	}
-	if staleCount > 0 {
-		log.Info("Cleanup: removed stale presence keys", logKeyCount, staleCount)
+
+	// One aggregated line, never one per key: a Redis fault that fails every
+	// PTTL while SCAN keeps succeeding would otherwise emit one Error per online
+	// user per hour, indefinitely. The key itself is never logged -- it embeds a
+	// user UUID (observability.md principle 2).
+	if firstTTLErr != nil {
+		log.Error("Cleanup: failed to reap unexpiring presence keys",
+			"error", firstTTLErr, "affected", ttlErrors)
 	}
+	log.Info("Cleanup: presence pass complete",
+		"scanned", scanned,
+		"candidates", candidates,
+		logKeyCount, staleCount,
+		"ttl_errors", ttlErrors,
+		"partial", partial,
+	)
 }
