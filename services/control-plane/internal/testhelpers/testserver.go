@@ -108,6 +108,13 @@ func SetupTestServer(t *testing.T) *TestServer {
 		ControlPlaneReplicaCount:         1,
 		ControlPlaneReplicaCountExplicit: true,
 		NATSUrl:                          os.Getenv("NATS_URL"),
+		// Empty by default, so the client-version gate is OFF for every suite
+		// that does not opt in — which is all of them but the one that exists to
+		// exercise it. That default is exactly why the 2026-09-02 outage was
+		// invisible to the integration suite: EnforceClientVersion returns true
+		// immediately on an empty minimum, so those suites' greenness carried no
+		// information about the gate. A test opts in with t.Setenv.
+		ClientMinVersion: os.Getenv("TEST_CLIENT_MIN_VERSION"),
 	}
 
 	// Route logs through a MultiWriter: humans running `go test -v` still see

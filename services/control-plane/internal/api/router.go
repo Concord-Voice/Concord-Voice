@@ -1268,6 +1268,12 @@ func NewRouter(
 		// defined and unit-tested but never registered on any route).
 		authRequired := v1.Group("/")
 		authRequired.Use(middleware.AuthRequired(cfg.JWTSecret, redis, credFence))
+		// Marks authenticated media-plane hops so RequireClientVersion below can
+		// exempt them. Ordered after AuthRequired (an unauthenticated request is
+		// rejected before any proof is examined) and before the gate it exempts;
+		// router_client_version_wiring_test.go pins that ordering. It does NOT
+		// exempt RequireAttestation — see the middleware's doc comment.
+		authRequired.Use(middleware.MediaPlaneServiceHop(cfg.JWTSecret, log))
 		authRequired.Use(middleware.RequireClientVersion(cfg.ClientMinVersion))
 		authRequired.Use(middleware.RequireAttestation(cfg.RequireClientAttestation, redis, log))
 

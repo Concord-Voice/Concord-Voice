@@ -463,6 +463,65 @@ interface ChannelJoinAuthorizationResponse {
 
 const DM_VOICE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
 
+/**
+ * Control-plane paths this service re-validates against. Both sit under the
+ * router's `authRequired` group, so both carry the client-facing gates below.
+ */
+const channelVoiceJoinPath = (channelId: string) => `/api/v1/channels/${channelId}/voice/join`;
+const dmVoiceAuthorizePath = (conversationId: string) =>
+  `/api/v1/dm/conversations/${conversationId}/voice/authorize`;
+
+/**
+ * Domain-separated key for the media-plane service-hop proof. Deliberately a
+ * DIFFERENT context string from the DM authorization proof: that one gates the
+ * media handoff itself and binds the call ID, this one only asserts "the caller
+ * is the media plane". Separate contexts mean neither proof can be replayed as
+ * the other even though both derive from the same JWT secret.
+ */
+const SERVICE_HOP_PROOF_CONTEXT = 'concord/media-plane-service-hop/v1';
+const SERVICE_HOP_PROOF_VERSION = 'v1';
+
+/**
+ * Headers that authenticate this hop to the control plane as the media plane
+ * rather than as an end-user client.
+ *
+ * The control plane applies RequireClientVersion to every route under
+ * `authRequired`, including both voice-join endpoints. That gate asks "is the
+ * END-USER's app new enough?" — a question this hop cannot answer, and whose
+ * answer is client-asserted on the direct path anyway. Presenting a proof lets
+ * the control plane exempt the hop from it while every user-scoped check (auth,
+ * RBAC, verified email, timeout, credential epoch) still runs unchanged.
+ *
+ * It does NOT exempt attestation, and must not be extended to. The premise that
+ * would justify it — that the user's own gated call already happened — does not
+ * hold for server channels: this service admits SFU sockets on the JWT alone,
+ * and the control plane's channel join writes no reservation, so a tampered
+ * client can skip its own gated call and arrive here directly.
+ *
+ * Binding the token digest means a captured proof cannot be replayed with a
+ * different user's bearer token; binding the method and full request URI means
+ * it cannot be moved to another endpoint or have a query string appended; the
+ * timestamp bounds replay to the control plane's clock-skew window. A member
+ * holds their bearer token but not the signing key, so they cannot mint one.
+ */
+function serviceHopProofHeaders(
+  method: 'POST' | 'DELETE',
+  path: string,
+  token: string
+): Record<string, string> {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const tokenDigest = createHash('sha256').update(token).digest('hex');
+  const proofKey = createHmac('sha256', config.jwtSecret)
+    .update(SERVICE_HOP_PROOF_CONTEXT)
+    .digest();
+  const payload = [SERVICE_HOP_PROOF_VERSION, timestamp, method, path, tokenDigest].join('\n');
+  return {
+    'X-Concord-Service-Timestamp': timestamp,
+    'X-Concord-Service-Proof': createHmac('sha256', proofKey).update(payload).digest('hex'),
+  };
+}
+
+
 function deniedChannelAccess(channelId: string, error: string): ChannelAccessResult {
   return {
     allowed: false,
@@ -477,6 +536,25 @@ function deniedChannelAccess(channelId: string, error: string): ChannelAccessRes
     maxManualBitrateBps: FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps,
     error,
   };
+}
+
+/**
+ * Best-effort structured reason from a control-plane rejection, for the log
+ * line only. Never reaches the client: the user-facing message stays the
+ * status-derived sentence so a denial does not disclose which gate fired.
+ *
+ * Total by construction — a denial path must never turn a body it could not
+ * read into a second failure, and this runs only after the request has already
+ * been rejected.
+ */
+async function denialReason(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: unknown; code?: unknown };
+    const parts = [body.code, body.error].filter((v): v is string => typeof v === 'string');
+    return parts.length > 0 ? parts.join(': ').slice(0, 200) : 'no reason in body';
+  } catch {
+    return 'unreadable body';
+  }
 }
 
 function channelAccessDenial(status: number): string {
@@ -507,6 +585,7 @@ function dmVoiceMediaRequest(
       'Content-Type': 'application/json',
       'X-Concord-Media-Timestamp': timestamp,
       'X-Concord-Media-Proof': createHmac('sha256', proofKey).update(payload).digest('hex'),
+      ...serviceHopProofHeaders(method, dmVoiceAuthorizePath(channelId), token),
     },
     body: JSON.stringify({ call_id: callId }),
   };
@@ -518,10 +597,9 @@ function channelAccessRequest(
   roomKind: RoomKind,
   requestedCallId?: string
 ): { endpoint: string; request: RequestInit } {
-  const endpoint =
-    roomKind === 'dm'
-      ? `${config.controlPlaneUrl}/api/v1/dm/conversations/${channelId}/voice/authorize`
-      : `${config.controlPlaneUrl}/api/v1/channels/${channelId}/voice/join`;
+  const path =
+    roomKind === 'dm' ? dmVoiceAuthorizePath(channelId) : channelVoiceJoinPath(channelId);
+  const endpoint = `${config.controlPlaneUrl}${path}`;
   if (roomKind === 'dm') {
     return {
       endpoint,
@@ -535,6 +613,7 @@ function channelAccessRequest(
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
+        ...serviceHopProofHeaders('POST', path, token),
       },
     },
   };
@@ -545,8 +624,11 @@ export async function releaseDMVoiceAuthorization(
   token: string,
   callId: string
 ): Promise<void> {
+  // Carries the same service-hop proof as the admission hop: this DELETE runs
+  // under the identical `authRequired` chain, so without it a client-facing
+  // gate 403s the RELEASE and strands the call lease.
   const response = await fetch(
-    `${config.controlPlaneUrl}/api/v1/dm/conversations/${conversationId}/voice/authorize`,
+    `${config.controlPlaneUrl}${dmVoiceAuthorizePath(conversationId)}`,
     dmVoiceMediaRequest('DELETE', conversationId, token, callId)
   );
   if (!response.ok) {
@@ -630,10 +712,29 @@ export async function validateChannelAccess(
     // join returns full channel + enforcement state; DM authorize returns
     // only { authorized, is_group }). Both serve the same purpose:
     // defense-in-depth re-validation of the user's access to the room.
-    const { endpoint, request } = channelAccessRequest(channelId, token, roomKind, requestedCallId);
+    const { endpoint, request } = channelAccessRequest(
+      channelId,
+      token,
+      roomKind,
+      requestedCallId
+    );
     const channelRes = await fetch(endpoint, request);
 
     if (!channelRes.ok) {
+      // Log the control plane's OWN status and reason before collapsing them.
+      // channelAccessDenial() maps 401 and 403 to one user-facing sentence, so
+      // without this an operator reading media-plane logs sees exactly what the
+      // user sees — which is how a CLIENT_MIN_VERSION rollout looked
+      // indistinguishable from an RBAC denial for hours on 2026-09-02. The
+      // user-facing string is deliberately left unchanged: it must not disclose
+      // which gate rejected the caller.
+      logger.warn('Control plane rejected voice-join re-validation', {
+        userId,
+        channelId,
+        roomKind,
+        status: channelRes.status,
+        reason: await denialReason(channelRes),
+      });
       return deniedChannelAccess(channelId, channelAccessDenial(channelRes.status));
     }
 

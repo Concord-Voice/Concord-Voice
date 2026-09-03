@@ -14,6 +14,13 @@ const ClientVersionHeader = "X-Concord-Client-Version"
 // RequireClientVersion rejects clients older than the configured minimum.
 func RequireClientVersion(minimum string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// An authenticated media-plane hop is exempt: it is a service
+		// re-validating on behalf of a user whose own client already passed
+		// this gate on the same operation. See MediaPlaneServiceHop.
+		if IsMediaPlaneServiceHop(c) {
+			c.Next()
+			return
+		}
 		if !EnforceClientVersion(c, minimum, c.GetHeader(ClientVersionHeader)) {
 			return
 		}

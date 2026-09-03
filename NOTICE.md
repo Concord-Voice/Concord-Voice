@@ -148,8 +148,8 @@ The following Go modules are linked into the control-plane runtime binary
 | github.com/go-playground/universal-translator | v0.18.1 | MIT |
 | github.com/go-playground/validator/v10 | v10.30.3 | MIT |
 | github.com/go-viper/mapstructure/v2 | v2.5.0 | MIT |
-| github.com/go-webauthn/webauthn | v0.17.4 | BSD-3-Clause |
-| github.com/go-webauthn/x | v0.2.6 | BSD-3-Clause |
+| github.com/go-webauthn/webauthn | v0.18.0 | BSD-3-Clause |
+| github.com/go-webauthn/x | v0.3.0 | BSD-3-Clause |
 | github.com/goccy/go-yaml | v1.19.2 | MIT |
 | github.com/golang-jwt/jwt/v5 | v5.3.1 | MIT |
 | github.com/golang-migrate/migrate/v4 | v4.19.1 | MIT |

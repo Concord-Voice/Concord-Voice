@@ -6,9 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.45] — 2026-09-02
+
+Voice channels and private calls can be joined again: a minimum-app-version requirement was also being applied to Concord Voice's own internal service calls, which have no app version to report, so every join attempt was refused. This release also refreshes the desktop runtime to Electron 43.5.1, keeps forwarded video within its requested temporal-quality limit, and makes sign-in and security-key enrollment reject extension data Concord Voice did not request. Groundwork for the hosted attachment-storage move continues in the background; where your attachments are stored has not changed yet.
+
 ### Changed
 
+- **The desktop runtime was refreshed to Electron 43.5.1** ([#3087](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3087)) — this updates the embedded Chromium, Node.js, and V8 versions and takes upstream sandbox, permission, custom-protocol, and context-bridge fixes without changing app settings or saved data.
 - **Large encrypted attachments can now use consistently sized upload pieces during the storage rollout** ([#3086](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3086)) — clients at or above the configured reader floor can choose the newer format, while older or unversioned clients stay on the earlier format and attachments continue using the existing storage destination until the R2 cutover is completed.
+- **Video forwarding now keeps temporal quality at or below the requested layer** ([#3055](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3055)) — the media server caps the temporal layer at the requested preference for both simulcast and scalable-video streams. When no usable spatial layer exists at or below the preferred one, it can select a higher spatial layer instead of stopping there. Upstream classifies this as a breaking behavior change; no Concord wire-format or configuration migration is required.
+- **Admin and media-plane production dependencies were refreshed** ([#3073](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3073), [#3098](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3098)) — `lucide-react` and the media-plane `qs` transitive moved to their reviewed releases.
+- **Development and CI tooling was refreshed** ([#3099](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3099), [#3097](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3097), [#3096](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3096), [#3065](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3065), [#3074](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3074), [#3071](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3071), [#3070](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3070), [#3085](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3085)) — linting, test, type, and GitHub Actions packages advanced without changing runtime behavior.
+
+### Fixed
+
+- **Voice channels and calls can be joined again** ([#3088](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3088)) — a server setting that checks which app version you are running was also being applied to an internal check between Concord's own services, which has no app version to report. Every attempt to join a voice channel or start a call was refused as unauthorized, even when you had permission. The internal check now identifies itself directly, so the version requirement applies only where it is meant to.
+
+### Security
+
+- **WebAuthn ceremonies now reject unexpected client extension output** ([#3090](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3090)) — sign-in and security-key enrollment explicitly fail closed when a client returns extension data that Concord did not request.
+
+- **The control-plane dependency graph no longer includes the advisory-affected MongoDB driver release** ([#3091](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3091)) — Concord does not call the affected bulk-write API, but the indirect driver is patched before that path can become reachable. The same update advances the indirect `quic-go` and `sonic` modules to their reviewed releases.
 
 ## [0.2.44] — 2026-09-01
 

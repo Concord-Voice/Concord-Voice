@@ -29,6 +29,28 @@ func TestRouterClientVersionWiring(t *testing.T) {
 	assert.Less(t, authIndex, versionIndex)
 	assert.Less(t, versionIndex, attestationIndex)
 
+	// The service-hop marker must sit strictly between AuthRequired and the gate
+	// it exempts. This is not cosmetic ordering: registered before AuthRequired
+	// there is no authenticated user to bind a proof to, and registered after
+	// RequireClientVersion the exemption can never be consulted — the fix
+	// becomes dead code with a fully green suite, which is exactly how the
+	// 2026-09-02 outage would return unnoticed.
+	hopIndex := strings.Index(source, "authRequired.Use(middleware.MediaPlaneServiceHop(cfg.JWTSecret, log))")
+	require.NotEqual(t, -1, hopIndex, "MediaPlaneServiceHop must stay registered on the authRequired group")
+	assert.Less(t, authIndex, hopIndex, "the hop marker needs an authenticated user")
+	assert.Less(t, hopIndex, versionIndex, "the hop marker must precede the gate it exempts")
+
+	// RequireAttestation must NOT consult the hop marker. An adversarial pass
+	// proved the exemption's premise false for server channels: the media plane
+	// admits SFU sockets on the JWT alone and the channel join writes no
+	// reservation, so a tampered client can reach the hop without ever passing
+	// its own gated call. Attestation is the one control such a client cannot
+	// satisfy. See [internal]0010-client-attestation.md.
+	attestationSource, err := os.ReadFile("../middleware/attestation.go") //nolint:gosec // G304: fixed test-only source path
+	require.NoError(t, err)
+	assert.NotContains(t, string(attestationSource), "IsMediaPlaneServiceHop",
+		"RequireAttestation must not exempt the media-plane hop")
+
 	for _, route := range []string{
 		"authRequired.GET(\"/users/me\"",
 		"protected.POST(\"/auth/ws-ticket\"",

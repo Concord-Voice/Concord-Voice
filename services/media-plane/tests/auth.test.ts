@@ -1155,3 +1155,226 @@ describe('resolveParticipantIdentity', () => {
     expect(result).toEqual(spoofedHandshake);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Service-hop proof on the server-to-server calls
+//
+// Regression cover for the 2026-09-02 voice outage. The control plane applies
+// RequireClientVersion to every route under `authRequired` — which includes both
+// voice-join endpoints the media plane re-validates against. That gate reads a
+// header the renderer sends and this hop did not, so setting
+// CLIENT_MIN_VERSION=0.2.44 made `clientversion.Parse("")` fail and 403'd every
+// join. The media plane collapsed that into the same "Not authorized to access
+// this channel" string a real RBAC denial produces.
+//
+// The hop now authenticates itself instead, and the control plane exempts a
+// proven hop from that ONE gate. It deliberately does not forward a client
+// version: that leg required a client update to work at all (deployed builds
+// send nothing), so it fixed the outage for nobody while adding an unvalidated
+// client string to an outbound header.
+// ---------------------------------------------------------------------------
+
+describe('service-hop proof on control-plane calls', () => {
+  const SERVICE_PROOF_CONTEXT = 'concord/media-plane-service-hop/v1';
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mockFetch = () => globalThis.fetch as ReturnType<typeof vi.fn>;
+
+  function expectedServiceProof(timestamp: string, method: string, path: string, token: string) {
+    const tokenDigest = createHash('sha256').update(token).digest('hex');
+    const proofKey = createHmac('sha256', TEST_SIGNING_KEY).update(SERVICE_PROOF_CONTEXT).digest();
+    return createHmac('sha256', proofKey)
+      .update(['v1', timestamp, method, path, tokenDigest].join('\n'))
+      .digest('hex');
+  }
+
+  function okChannelResponse() {
+    return {
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          allowed: true,
+          media_server_url: 'http://media',
+          server_muted: false,
+          server_deafened: false,
+          channel: { id: 'ch-1', server_id: 's', name: 'n' },
+        }),
+    };
+  }
+
+  function okDmResponse() {
+    return {
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          authorized: true,
+          is_group: false,
+          server_muted: false,
+          server_deafened: false,
+        }),
+    };
+  }
+
+  it('binds a service-hop proof to the server-channel join path', async () => {
+    mockFetch().mockResolvedValueOnce(okChannelResponse());
+
+    await validateChannelAccess('u-1', 'ch-1', 'jwt-token');
+
+    const headers = (mockFetch().mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    const timestamp = headers['X-Concord-Service-Timestamp'];
+    expect(timestamp).toMatch(/^\d+$/);
+    expect(headers['X-Concord-Service-Proof']).toBe(
+      expectedServiceProof(timestamp, 'POST', '/api/v1/channels/ch-1/voice/join', 'jwt-token')
+    );
+  });
+
+  it('binds a service-hop proof to the DM authorize path', async () => {
+    mockFetch().mockResolvedValueOnce(okDmResponse());
+
+    await validateChannelAccess('u-1', 'conv-1', 'jwt-token', 'dm');
+
+    const headers = (mockFetch().mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers['X-Concord-Service-Proof']).toBe(
+      expectedServiceProof(
+        headers['X-Concord-Service-Timestamp'],
+        'POST',
+        '/api/v1/dm/conversations/conv-1/voice/authorize',
+        'jwt-token'
+      )
+    );
+  });
+
+  it('carries the proof on the DM authorization RELEASE too', async () => {
+    // The DELETE runs under the same authRequired chain as the admission hop.
+    // A gate rejecting it strands the call lease rather than failing a join, so
+    // the failure is quieter and the coverage matters more, not less.
+    mockFetch().mockResolvedValueOnce({ ok: true });
+
+    await releaseDMVoiceAuthorization('conv-1', 'jwt-token', '11111111-1111-4111-8111-111111111111');
+
+    const headers = (mockFetch().mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers['X-Concord-Service-Proof']).toBe(
+      expectedServiceProof(
+        headers['X-Concord-Service-Timestamp'],
+        'DELETE',
+        '/api/v1/dm/conversations/conv-1/voice/authorize',
+        'jwt-token'
+      )
+    );
+  });
+
+  it('never forwards a client version — that leg was removed', async () => {
+    mockFetch().mockResolvedValueOnce(okChannelResponse());
+
+    await validateChannelAccess('u-1', 'ch-1', 'jwt-token');
+
+    const headers = (mockFetch().mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers).not.toHaveProperty('X-Concord-Client-Version');
+  });
+
+  it('signs a path with no query string, matching the control plane\'s RequestURI binding', async () => {
+    // The control plane verifies against c.Request.URL.RequestURI(), which
+    // includes the query string. These calls carry none, so the two coincide —
+    // asserted rather than assumed, because a future query parameter here would
+    // silently invalidate every proof.
+    mockFetch().mockResolvedValueOnce(okChannelResponse());
+
+    await validateChannelAccess('u-1', 'ch-1', 'jwt-token');
+
+    const [endpoint] = mockFetch().mock.calls[0] as [string, RequestInit];
+    expect(endpoint).toBe('http://localhost:8080/api/v1/channels/ch-1/voice/join');
+    expect(endpoint).not.toContain('?');
+  });
+
+  it('keeps the DM endpoint proof alongside the service-hop proof', async () => {
+    // The DM-specific proof binds the call ID and gates the media handoff
+    // itself; the service-hop proof only asserts "this is the media plane".
+    // They answer different questions, so adding one must not drop the other.
+    mockFetch().mockResolvedValueOnce(okDmResponse());
+
+    await validateChannelAccess('u-1', 'conv-1', 'jwt-token', 'dm');
+
+    const headers = (mockFetch().mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers['X-Concord-Media-Proof']).toMatch(/^[0-9a-f]{64}$/);
+    expect(headers['X-Concord-Service-Proof']).toMatch(/^[0-9a-f]{64}$/);
+    expect(headers['X-Concord-Media-Proof']).not.toBe(headers['X-Concord-Service-Proof']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Denial diagnosability
+//
+// channelAccessDenial() maps 401 and 403 to one user-facing sentence, and until
+// this PR that collapsed string was ALSO all that reached the log — so an
+// operator reading media-plane logs saw exactly what the user saw. That is why
+// the 2026-09-02 CLIENT_MIN_VERSION rollout was indistinguishable from an RBAC
+// denial for hours. These tests pin both halves: the log gains the control
+// plane's own status and reason, and the user-facing string does not.
+// ---------------------------------------------------------------------------
+
+describe('control-plane denial diagnosability', () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  const mockFetch = () => globalThis.fetch as ReturnType<typeof vi.fn>;
+
+  async function denyWith(body: unknown, status = 403) {
+    const { logger } = await import('../src/lib/logger.js');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    mockFetch().mockResolvedValueOnce({
+      ok: false,
+      status,
+      json: () => (body instanceof Error ? Promise.reject(body) : Promise.resolve(body)),
+    });
+    const result = await validateChannelAccess('u-1', 'ch-1', 'jwt-token');
+    // findLast, not find: vi.spyOn returns the SAME spy on repeat calls, so its
+    // mock.calls accumulate across denyWith invocations within one test.
+    const matching = warn.mock.calls.filter(
+      ([msg]) => msg === 'Control plane rejected voice-join re-validation'
+    );
+    const entry = matching[matching.length - 1];
+    return { result, meta: entry?.[1] as Record<string, unknown> | undefined };
+  }
+
+  it('logs the control plane status and its structured reason', async () => {
+    const { result, meta } = await denyWith({
+      code: 'CLIENT_VERSION_TOO_OLD',
+      error: 'Client version too old',
+    });
+
+    expect(meta).toMatchObject({ status: 403, reason: 'CLIENT_VERSION_TOO_OLD: Client version too old' });
+    // The user-facing string must stay status-derived: it must not disclose
+    // which gate rejected the caller.
+    expect(result.error).toBe('Not authorized to access this channel');
+  });
+
+  it('distinguishes a body with no reason from one that could not be read', async () => {
+    const { meta: empty } = await denyWith({});
+    expect(empty?.reason).toBe('no reason in body');
+
+    const { meta: broken } = await denyWith(new Error('not json'));
+    expect(broken?.reason).toBe('unreadable body');
+  });
+
+  it('bounds the logged reason so a pathological body cannot blow up log volume', async () => {
+    const { meta } = await denyWith({ error: 'x'.repeat(5000) });
+
+    expect((meta?.reason as string).length).toBeLessThanOrEqual(200);
+  });
+});

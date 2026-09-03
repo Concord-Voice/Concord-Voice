@@ -274,6 +274,35 @@ func httpReq(body []byte) *http.Request {
 	return &http.Request{Body: io.NopCloser(bytes.NewReader(body))}
 }
 
+// persistedSession mirrors the JSON round trip through Redis between the
+// WebAuthn begin and finish endpoints.
+func persistedSession(t *testing.T, session webauthn.SessionData) webauthn.SessionData {
+	t.Helper()
+	assert.True(t, session.Extensions.IsZero(), "test ceremonies request no extensions")
+
+	raw, err := json.Marshal(session)
+	require.NoError(t, err)
+
+	var persisted webauthn.SessionData
+	require.NoError(t, json.Unmarshal(raw, &persisted))
+	assert.Equal(t, session, persisted)
+	return persisted
+}
+
+func withUnsolicitedCredPropsOutput(t *testing.T, body []byte) []byte {
+	t.Helper()
+
+	var credential map[string]any
+	require.NoError(t, json.Unmarshal(body, &credential))
+	credential["clientExtensionResults"] = map[string]any{
+		"credProps": map[string]any{"rk": true},
+	}
+
+	withOutput, err := json.Marshal(credential)
+	require.NoError(t, err)
+	return withOutput
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -301,7 +330,7 @@ func TestAdminWebAuthn_RegisterThenLogin_HappyPath(t *testing.T) {
 	creation, session := beginAdminRegistration(t, svc, user)
 	regBody := va.attestationResponse(t, testAdminRPID, creation.Response.Challenge.String(), testAdminOrigin, flagUP|flagUV|flagBE|flagBS)
 
-	cred, err := svc.FinishRegistration(user, *session, httpReq(regBody))
+	cred, err := svc.FinishRegistration(user, persistedSession(t, *session), httpReq(regBody))
 	require.NoError(t, err)
 	require.NotNil(t, cred)
 	assert.Equal(t, va.credID, cred.ID)
@@ -320,7 +349,7 @@ func TestAdminWebAuthn_RegisterThenLogin_HappyPath(t *testing.T) {
 	va.signCount++ // a real authenticator increments per assertion
 	loginBody := va.assertionResponse(t, testAdminRPID, assertion.Response.Challenge.String(), testAdminOrigin, flagUP|flagUV|flagBE|flagBS, false)
 
-	matched, err := svc.FinishLogin(loginUser, *loginSession, httpReq(loginBody))
+	matched, err := svc.FinishLogin(loginUser, persistedSession(t, *loginSession), httpReq(loginBody))
 	require.NoError(t, err)
 	require.NotNil(t, matched)
 	assert.Equal(t, va.credID, matched.ID)
@@ -337,7 +366,35 @@ func TestAdminWebAuthn_Register_RejectsWrongRPOrigin(t *testing.T) {
 	// Origin the authenticator signs over does NOT match the admin RP origin.
 	regBody := va.attestationResponse(t, testAdminRPID, creation.Response.Challenge.String(), "https://evil.example.com", flagUP|flagUV)
 
-	cred, err := svc.FinishRegistration(user, *session, httpReq(regBody))
+	cred, err := svc.FinishRegistration(user, persistedSession(t, *session), httpReq(regBody))
+	require.Error(t, err)
+	assert.Nil(t, cred)
+}
+
+func TestAdminWebAuthn_Register_RejectsWrongRPID(t *testing.T) {
+	svc, err := admin.NewAdminWebAuthn(testAdminConfig())
+	require.NoError(t, err)
+
+	va := newVirtualAuthenticator(t, uuid.MustParse(testAllowedAAGID))
+	user := adminWebAuthnUser()
+	creation, session := beginAdminRegistration(t, svc, user)
+
+	regBody := va.attestationResponse(t, "evil.example.com", creation.Response.Challenge.String(), testAdminOrigin, flagUP|flagUV)
+	cred, err := svc.FinishRegistration(user, persistedSession(t, *session), httpReq(regBody))
+	require.Error(t, err)
+	assert.Nil(t, cred)
+}
+
+func TestAdminWebAuthn_Register_RejectsUnsolicitedExtensionOutput(t *testing.T) {
+	svc, err := admin.NewAdminWebAuthn(testAdminConfig())
+	require.NoError(t, err)
+
+	va := newVirtualAuthenticator(t, uuid.MustParse(testAllowedAAGID))
+	user := adminWebAuthnUser()
+	creation, session := beginAdminRegistration(t, svc, user)
+	regBody := va.attestationResponse(t, testAdminRPID, creation.Response.Challenge.String(), testAdminOrigin, flagUP|flagUV)
+
+	cred, err := svc.FinishRegistration(user, persistedSession(t, *session), httpReq(withUnsolicitedCredPropsOutput(t, regBody)))
 	require.Error(t, err)
 	assert.Nil(t, cred)
 }

@@ -16,9 +16,10 @@ type WebAuthnService struct {
 // NewWebAuthnService creates a WebAuthn relying party configuration.
 func NewWebAuthnService(rpID, rpDisplayName string, rpOrigins []string) (*WebAuthnService, error) {
 	cfg := &webauthn.Config{
-		RPID:          rpID,
-		RPDisplayName: rpDisplayName,
-		RPOrigins:     rpOrigins,
+		RPID:                              rpID,
+		RPDisplayName:                     rpDisplayName,
+		RPOrigins:                         rpOrigins,
+		ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyReject,
 	}
 
 	wan, err := webauthn.New(cfg)
