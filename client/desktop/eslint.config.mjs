@@ -320,6 +320,48 @@ export default [
           message:
             'Server-origin media src must be wrapped: src={resolveMediaUrl(avatarUrl)} (from utils/ui/resolveMediaUrl). See [internal]rules/electron.md "API URLs ... MUST be absolute" (#1586).',
         },
+        // #3104 NC-1: nothing derived from the server-minted ICE-server list
+        // may reach a console sink. logBufferService.ts shadow-records all
+        // five console methods into the bug-report ring buffer, which reaches
+        // a PUBLIC repo, and a TURN entry carries a live 24h HMAC relay
+        // credential plus an `<expiry>:<userID>` username.
+        //
+        // Renderer-WIDE on purpose. This selector previously lived in a block
+        // scoped to `src/renderer/services/voice/**`, which was blind twice
+        // over: `voiceService.getIceServersForPip()` is public on the exported
+        // singleton, so any component / store / hook / error boundary can
+        // import it and log the credentialed list one directory over; and that
+        // narrower block REPLACED this block's `no-restricted-syntax` for its
+        // subtree (a scoped block replaces a rule key wholesale), silently
+        // turning off the two #754 bare-anchor and two #1586 resolveMediaUrl
+        // selectors there. Adding a scoped block under src/renderer/ is how
+        // both defects arise; add selectors here instead. Locked by
+        // tests/unit/main/eslint-ice-servers-console.test.ts.
+        //
+        // Descendant match with the sanctioned reducer carved out BY ANCESTRY,
+        // not at the call: `console.debug('[ice] servers',
+        // describeIceServers(list))` is permitted, while
+        // `console.debug(describeIceServers(a), rawList)` is still flagged.
+        // A renamed local (`const l = iceServers; console.debug(l)`) escapes
+        // this selector by construction — that is why the capture-time scrub
+        // in logBufferService.ts is the PRIMARY control and this is defence in
+        // depth. See [internal]rules/frontend.md "ICE-server threading".
+        //
+        // #3104 D6 extends the alternation to the PiP session capability:
+        // `getPipSession` returns the token and `pipSessionChannelName` embeds
+        // it, so either in a console argument publishes the secret that names
+        // the private signaling channel. Both identifiers are distinctive, which
+        // is why they are listed and the bare local `token` is not — a
+        // renderer-wide selector on a generic name would be noise, and layer 1
+        // stays the primary control.
+        {
+          selector:
+            'CallExpression[callee.object.name="console"] ' +
+            'Identifier[name=/^(iceServers|pipIceServers|getIceServersForPip|getPipSession|pipSessionChannelName)$/]' +
+            ':not(CallExpression[callee.name="describeIceServers"] *)',
+          message:
+            'NC-1: do not pass the ICE-server list — or anything derived from it, including voiceService.getIceServersForPip() — to console.*. Entries carry live HMAC TURN credentials and every console method is captured into the bug-report buffer that reaches a PUBLIC repo. Log describeIceServers(list) instead, which emits scheme and count only. See [internal]rules/frontend.md "ICE-server threading" (NC-1).',
+        },
       ],
     },
   },

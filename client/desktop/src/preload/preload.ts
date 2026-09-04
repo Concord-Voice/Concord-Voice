@@ -120,6 +120,28 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.removeListener('pip:closed', handler);
     };
   },
+  /**
+   * #3104 D6 — the main window learns each PiP's session capability at window
+   * creation, symmetric with `onPipClosed`. Push rather than pull, because the
+   * signaling proxy must already hold the token when the PiP's own renderer
+   * finishes booting and issues its first RPC.
+   */
+  onPipOpened: (callback: (session: { id: string; token: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; token: string }) =>
+      callback(data);
+    ipcRenderer.on('pip:opened', handler);
+    return () => {
+      ipcRenderer.removeListener('pip:opened', handler);
+    };
+  },
+  /**
+   * #3104 D6 — a PiP window asks the main process for its OWN session
+   * capability. Main answers only the PiP's own main frame; every other caller
+   * gets `null`, which the renderer treats as "no PiP voice" and never as
+   * "proceed unauthenticated".
+   */
+  getPipSession: (id: string) =>
+    ipcRenderer.invoke('pip:session', { id }) as Promise<{ token: string } | null>,
 
   // Secure auth token management (safeStorage via main process)
   storeRefreshToken: (data: {
@@ -551,6 +573,10 @@ export interface ElectronAPI {
   closePipWindow: (id: string) => Promise<void>;
   setPipAlwaysOnTop: (id: string, flag: boolean) => Promise<void>;
   onPipClosed: (callback: (id: string) => void) => () => void;
+  /** #3104 D6: main -> main-window push of a newly opened PiP's session capability. */
+  onPipOpened: (callback: (session: { id: string; token: string }) => void) => () => void;
+  /** #3104 D6: a PiP window pulls its OWN session capability; `null` for anyone else. */
+  getPipSession: (id: string) => Promise<{ token: string } | null>;
 
   // Secure auth token management
   storeRefreshToken: (data: {

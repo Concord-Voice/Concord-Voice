@@ -108,6 +108,7 @@ import { resolveCachedSpa } from './spaCache/resolveCachedSpa';
 import { SPA_CACHE_HOST, SPA_CACHE_SCHEME } from './spaCache/manifestSchema';
 import { handleDidFailLoad, handleSpaRequestSelfHeal } from './spaSelfHealMainFrame';
 import { buildRemotePipUrl, isValidPipOpenSender } from './pipUrl';
+import { mintPipSessionToken } from './pipSession';
 import {
   extractInviteDeepLinkFromArgv,
   normalizeInviteDeepLink,
@@ -2678,6 +2679,14 @@ type PipWindowEntry = {
   window: BrowserWindow;
   ownerFrameTreeNodeId: number;
   remoteSpaUrl: string | null;
+  /**
+   * #3104 D6 — the per-window capability that authenticates this PiP on the
+   * renderer-side `concord-pip` RPC channel. Minted here because the main
+   * process is the only out-of-band path between two renderers, and disclosed
+   * only by `pip:opened` (to the main window) and `pip:session` (to this PiP's
+   * own main frame). Never log it: the private reply channel is NAMED from it.
+   */
+  sessionToken: string;
 };
 const pipWindows = new Map<string, PipWindowEntry>();
 
@@ -2688,7 +2697,17 @@ function destroyPipWindowsForQuit(): void {
   }
 }
 
-function getOwnedPipWindow(event: IpcMainInvokeEvent, id: string): BrowserWindow | null {
+/**
+ * Resolve the PiP `id` names together with WHICH of the two permitted
+ * relationships the sender holds. `pip:close` / `pip:setAlwaysOnTop` accept
+ * either; `pip:session` accepts only the PiP's own main frame, because the
+ * token it returns is a working capability rather than a window mutation.
+ */
+function resolvePipSender(
+  event: IpcMainInvokeEvent,
+  id: unknown
+): { entry: PipWindowEntry; isPipMainFrame: boolean } | null {
+  if (typeof id !== 'string' || id.length === 0) return null;
   const senderFrame = event.senderFrame;
   if (!senderFrame) return null;
   const entry = pipWindows.get(id);
@@ -2707,7 +2726,11 @@ function getOwnedPipWindow(event: IpcMainInvokeEvent, id: string): BrowserWindow
   }
   const isOwnerFrame = entry.ownerFrameTreeNodeId === senderFrame.frameTreeNodeId;
   if (!isOwnerFrame && !isPipMainFrame) return null;
-  return entry.window;
+  return { entry, isPipMainFrame };
+}
+
+function getOwnedPipWindow(event: IpcMainInvokeEvent, id: string): BrowserWindow | null {
+  return resolvePipSender(event, id)?.entry.window ?? null;
 }
 
 ipcMain.handle(
@@ -2783,16 +2806,24 @@ ipcMain.handle(
       pip.loadURL(`app://concord/index.html#/pip/${opts.id}`);
     }
 
+    const sessionToken = mintPipSessionToken();
     pipWindows.set(opts.id, {
       window: pip,
       ownerFrameTreeNodeId: senderFrame.frameTreeNodeId,
       remoteSpaUrl: remoteUrl,
+      sessionToken,
     });
 
     pip.on('closed', () => {
       pipWindows.delete(opts.id);
       mainWindow?.webContents.send('pip:closed', { id: opts.id });
     });
+
+    // #3104 D6 — deliberately a PUSH, symmetric with 'pip:closed' above. The
+    // main renderer's signaling proxy must already know the capability when the
+    // PiP's own renderer finishes booting and issues its first RPC; a pull would
+    // race that boot. The PiP window gets its copy by pulling 'pip:session'.
+    mainWindow?.webContents.send('pip:opened', { id: opts.id, token: sessionToken });
   }
 );
 
@@ -2802,6 +2833,32 @@ ipcMain.handle('pip:close', (event, opts: { id: string }) => {
 
 ipcMain.handle('pip:setAlwaysOnTop', (event, opts: { id: string; flag: boolean }) => {
   getOwnedPipWindow(event, opts.id)?.setAlwaysOnTop(opts.flag);
+});
+
+/**
+ * #3104 D6 — disclose one PiP's session capability to that PiP alone.
+ *
+ * This is the whole trust boundary for the renderer-side `concord-pip` RPC
+ * channel: `BroadcastChannel` reaches every same-origin document, so the proxy
+ * in the main renderer can only distinguish a real PiP by a secret the PiP
+ * could not have obtained on its own. `resolvePipSender` proves the caller is
+ * this window's main frame (same `webContents`, same `frameTreeNodeId` as its
+ * `mainFrame`, and a permitted frame URL), which no other document can forge.
+ *
+ * The OPENER frame is refused even though it passes the ownership check used by
+ * `pip:close`: it already received the token on the `pip:opened` push, so a
+ * second disclosure path would widen the surface for nothing.
+ *
+ * Fails closed to `null` on every other input. The renderer treats `null` as
+ * "this window gets no PiP voice", never as "proceed unauthenticated".
+ *
+ * The token is never logged — the private reply channel is NAMED from it, so
+ * printing it is equivalent to publishing it.
+ */
+ipcMain.handle('pip:session', (event, opts: unknown) => {
+  const resolved = resolvePipSender(event, (opts as { id?: unknown } | null | undefined)?.id);
+  if (!resolved?.isPipMainFrame) return null;
+  return { token: resolved.entry.sessionToken };
 });
 
 ipcMain.handle('spa:requestSelfHeal', async (event, payload: unknown) => {

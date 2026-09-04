@@ -2282,6 +2282,92 @@ describe('main.ts', () => {
       closed();
     });
 
+    // ── #3104 D6: the per-window PiP session capability ──────────────
+    //
+    // `pip:session` is the ONLY disclosure path for the token that authenticates
+    // the `concord-pip` RPC channel. Everything below is a negative control on
+    // that disclosure: a frame that is not the PiP's own main frame must get
+    // `null`, not a token, because a token is a working capability.
+
+    it('pushes pip:opened with a per-window token to the main window', async () => {
+      mockWebContents.send.mockClear();
+      const closedA = await openPip('token-push-a');
+      const closedB = await openPip('token-push-b');
+
+      const opened = mockWebContents.send.mock.calls.filter((c) => c[0] === 'pip:opened');
+      expect(opened).toHaveLength(2);
+      expect(opened[0][1].id).toBe('token-push-a');
+      expect(opened[1][1].id).toBe('token-push-b');
+      expect(typeof opened[0][1].token).toBe('string');
+      expect(opened[0][1].token.length).toBeGreaterThanOrEqual(32);
+      // Distinct windows never share a capability.
+      expect(opened[0][1].token).not.toBe(opened[1][1].token);
+
+      closedA();
+      closedB();
+    });
+
+    it('returns the token ONLY to the PiP window own main frame', async () => {
+      mockWebContents.send.mockClear();
+      const closed = await openPip('session-token-pip');
+      const pushed = mockWebContents.send.mock.calls.find((c) => c[0] === 'pip:opened')?.[1] as {
+        id: string;
+        token: string;
+      };
+
+      const pipMainFrameEvent = {
+        sender: mockWebContents,
+        senderFrame: mockWebContents.mainFrame,
+      };
+      const granted = await handlers.get('pip:session')!(pipMainFrameEvent, {
+        id: 'session-token-pip',
+      });
+      expect(granted).toEqual({ token: pushed.token });
+      closed();
+    });
+
+    it.each([
+      ['the opener frame', () => pipOwnerEvent],
+      ['another permitted frame', () => otherPermittedPipEvent],
+      ['an untrusted origin', () => foreignIpcEvent],
+      ['a frameless sender', () => ({ senderFrame: null })],
+    ])('refuses pip:session to %s', async (_label, makeEvent) => {
+      const closed = await openPip('session-denied-pip');
+      const result = await handlers.get('pip:session')!(makeEvent(), {
+        id: 'session-denied-pip',
+      });
+      expect(result).toBeNull();
+      closed();
+    });
+
+    it('refuses pip:session for an unknown or already-closed PiP id', async () => {
+      const pipMainFrameEvent = {
+        sender: mockWebContents,
+        senderFrame: mockWebContents.mainFrame,
+      };
+      expect(
+        await handlers.get('pip:session')!(pipMainFrameEvent, { id: 'never-opened-pip' })
+      ).toBeNull();
+
+      const closed = await openPip('transient-session-pip');
+      closed();
+      expect(
+        await handlers.get('pip:session')!(pipMainFrameEvent, { id: 'transient-session-pip' })
+      ).toBeNull();
+    });
+
+    it('refuses pip:session for a malformed id payload', async () => {
+      const closed = await openPip('malformed-session-pip');
+      const pipMainFrameEvent = {
+        sender: mockWebContents,
+        senderFrame: mockWebContents.mainFrame,
+      };
+      for (const payload of [undefined, null, {}, { id: 42 }, { id: '' }]) {
+        expect(await handlers.get('pip:session')!(pipMainFrameEvent, payload)).toBeNull();
+      }
+      closed();
+    });
+
     it.each([
       {
         name: 'remote to bundled',

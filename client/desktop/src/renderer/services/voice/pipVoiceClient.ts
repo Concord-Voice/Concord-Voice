@@ -29,6 +29,7 @@
 import { Device, types as mediasoupTypes } from 'mediasoup-client';
 import {
   generateRequestId,
+  pipSessionChannelName,
   type PipChannelMessage,
   type AnyPipBroadcast,
   type VoiceStateResult,
@@ -37,6 +38,7 @@ import {
   type GetFrameKeyResult,
 } from './pipSignalingTypes';
 import { errorMessage } from '../../utils/runtime/redactError';
+import { normalizeIceServers } from './iceServers';
 import {
   codecFamilyFromRtpParameters,
   type E2EEMainMessage,
@@ -123,7 +125,14 @@ interface ConsumedTrack {
 
 export class PipVoiceClient {
   private readonly pipId: string;
-  private readonly bc: BroadcastChannel;
+  /**
+   * This window's private signaling channel (#3104 D6). Null until `init()` has
+   * proved the window is a real PiP by obtaining its main-process capability.
+   * There is deliberately no unauthenticated fallback: the shared `concord-pip`
+   * channel is reachable by every same-origin document, which is the surface D6
+   * closes.
+   */
+  private bc: BroadcastChannel | null = null;
   private device: Device | null = null;
   private recvTransport: mediasoupTypes.Transport | null = null;
   private recvTransportId: string | null = null;
@@ -170,7 +179,41 @@ export class PipVoiceClient {
 
   constructor(pipId: string) {
     this.pipId = pipId;
-    this.bc = new BroadcastChannel('concord-pip');
+  }
+
+  /**
+   * Obtain this window's session capability and open the channel it names.
+   *
+   * **Fails closed.** A missing preload bridge, a shell too old to implement
+   * `pip:session`, a rejected invoke, or a `null` answer all throw, and no RPC
+   * is ever attempted on the legacy shared channel. The availability cost to a
+   * legitimate PiP is nil: the same main-process code path that created this
+   * window minted the token, so a refusal means the caller is not the window it
+   * claims to be — or the bridge is absent, in which case `closePipWindow` and
+   * `setPipAlwaysOnTop` are already gone too. The window stays interactive and
+   * closable either way; only media is withheld.
+   *
+   * The token is never logged and never placed in a message body. It NAMES the
+   * channel, so disclosing it discloses the session — NC-1 extends to it.
+   */
+  private async openSessionChannel(): Promise<void> {
+    if (this.bc) return;
+    const getPipSession = globalThis.electron?.getPipSession;
+    let token: unknown;
+    if (typeof getPipSession === 'function') {
+      try {
+        token = (await getPipSession(this.pipId))?.token;
+      } catch {
+        // A rejected invoke is indistinguishable from a refusal here, and the
+        // rejection text is not ours to surface.
+        token = undefined;
+      }
+    }
+    if (typeof token !== 'string' || token.length === 0) {
+      throw new Error('PiP session capability unavailable');
+    }
+    if (this.disposed) throw new Error('PipVoiceClient disposed');
+    this.bc = new BroadcastChannel(pipSessionChannelName(token));
     this.bc.onmessage = this.handleMessage;
   }
 
@@ -181,6 +224,10 @@ export class PipVoiceClient {
    * Returns the initial voice state for the PiP UI.
    */
   async init(): Promise<VoiceStateResult> {
+    // 0. Prove this window is a real PiP and open its private channel. Nothing
+    // below can send anything until this resolves (#3104 D6).
+    await this.openSessionChannel();
+
     // 1. Request voice state from main window (with retry — the PipSignalingProxy
     // may not exist yet if the async import in MainView hasn't resolved)
     let state: VoiceStateResult | null = null;
@@ -224,11 +271,23 @@ export class PipVoiceClient {
 
     if (this.disposed) throw new Error('PipVoiceClient disposed');
 
+    // Re-normalize on the receiving side: the main window is trusted, but the
+    // PiP owns its own RTCPeerConnection and a defensive parse here costs
+    // nothing and keeps the two windows' contracts independent (#3104).
+    // NC-1: neither this list nor `transportInfo` may ever reach a console.*
+    // call — the PiP renderer runs the same installLogBuffer() ring buffer.
+    const pipIceServers = normalizeIceServers(transportInfo.iceServers);
+
     this.recvTransport = this.device.createRecvTransport({
       id: transportInfo.transportId,
       iceParameters: transportInfo.iceParameters as mediasoupTypes.IceParameters,
       iceCandidates: transportInfo.iceCandidates as mediasoupTypes.IceCandidate[],
       dtlsParameters: transportInfo.dtlsParameters as mediasoupTypes.DtlsParameters,
+      // Omitted entirely when empty, so a degraded session's options object is
+      // deep-equal to the pre-#3104 shape.
+      ...(pipIceServers.length > 0
+        ? { iceServers: pipIceServers, iceTransportPolicy: 'all' as const }
+        : {}),
     });
 
     // Handle transport 'connect' event (DTLS handshake)
@@ -790,10 +849,14 @@ export class PipVoiceClient {
     this.recvTransportInfoPromise = null;
 
     this.cancelPendingRpcs(true);
-    try {
-      this.bc.close();
-    } catch {
-      /* ignore */
+    const channel = this.bc;
+    this.bc = null;
+    if (channel) {
+      try {
+        channel.close();
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -853,6 +916,13 @@ export class PipVoiceClient {
       return Promise.reject(new Error('PiP signaling proxy unavailable'));
     }
 
+    // No capability, no channel, no RPC. Reached when init() has not run or has
+    // already been finalized — never as a downgrade to the shared channel.
+    const channel = this.bc;
+    if (!channel) {
+      return Promise.reject(new Error('PiP session capability unavailable'));
+    }
+
     return new Promise<T>((resolve, reject) => {
       const id = generateRequestId(this.pipId);
 
@@ -868,7 +938,7 @@ export class PipVoiceClient {
         preserveOnDispose,
       });
 
-      this.bc.postMessage({
+      channel.postMessage({
         kind: 'rpc-request',
         id,
         pipId: this.pipId,

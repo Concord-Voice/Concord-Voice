@@ -204,8 +204,19 @@
  *        Sender-fenced like the auth channels beside it. The SERVER's
  *        spaIpcContract stays 19: an older SPA simply never calls it, and the
  *        pre-existing renderer-side fence still applies there.
+ * - v26: PiP channel authentication (#3104 D6): the `pip:session` handler (a
+ *        PiP's own main frame pulls its per-window capability; every other
+ *        caller gets `null`) and the `pip:opened` event (main -> main window,
+ *        `{ id, token }`, symmetric with `pip:closed`). Together they are the
+ *        only disclosure paths for the secret that names the private
+ *        BroadcastChannel the PiP RPC protocol now runs on — before this,
+ *        `concord-pip` accepted RPC from any same-origin document and fanned
+ *        every reply, including server-minted TURN credentials, back to all of
+ *        them. The SERVER's spaIpcContract stays 19: a shell without these
+ *        channels yields `undefined` from `getPipSession`, which the renderer
+ *        treats as "no PiP voice" — degraded, never unauthenticated.
  */
-export const IPC_CONTRACT_VERSION = 25;
+export const IPC_CONTRACT_VERSION = 26;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.

@@ -127,6 +127,78 @@ const PATTERNS: ReadonlyArray<{ re: RegExp; replacement: string }> = [
     re: new RegExp(String.raw`\b[A-Za-z0-9+/=_-]{40,${PATTERN_MAX}}\b`, 'g'),
     replacement: '<base64>',
   },
+
+  // ─── TURN relay credentials (#3104) ─────────────────────────────────────
+  //
+  // These four entries sit AFTER the long-base64 entry deliberately: a longer
+  // blob must be consumed as <base64> first, so the narrow 28-char band at the
+  // end can never chop a fragment out of the middle of one.
+  //
+  // Why they are needed at all: the control plane mints ephemeral coturn
+  // credentials per voice join (services/control-plane/pkg/config/turn.go).
+  // The username is `<unix expiry>:<userID>` and the credential is base64 of an
+  // HMAC-SHA1 digest — 20 bytes, which encode to EXACTLY 27 base64 characters
+  // plus one '=' pad. 28 characters is under the 40-char floor above, so the
+  // credential passed the whole scrub untouched, and `pseudonymizeLogUuids`
+  // (submit time) rescued only the UUID half of the username. These are live
+  // relay credentials with a 24 h TTL and the buffer feeds a bug report that
+  // reaches a PUBLIC repo.
+
+  // Key-shaped redaction first (most specific, and shape-independent — it
+  // still holds if the control plane changes the credential algorithm).
+  // `stringifyArg` serializes an RTCIceServer with JSON.stringify, giving
+  // `"credential":"…"`; a pre-formatted util.inspect string gives
+  // `credential: '…'`. Both forms, and both `credential` and `password`,
+  // with an optional identifier prefix (`turnCredential`, `newPassword`).
+  //
+  // The two entries are split by whether the KEY is quoted, and the bare-key
+  // one accepts EITHER quote style around its value — `credential: 'x'` from
+  // util.inspect, `credential: "x"` from a hand-formatted or JS-object-literal
+  // line. That last form used to be redacted by NOTHING: the JSON entry
+  // requires a quoted key and this one required a single-quoted value, so a
+  // bare key with a double-quoted value satisfied neither. It is written as
+  // two complete alternation branches rather than one widened `["']` class so
+  // that each branch's value class excludes only its OWN quote — a shared
+  // class would stop at an embedded foreign quote and leak the rest of the
+  // value. Both branches keep the PATTERN_MAX bound (Sonar S5852), and neither
+  // is ambiguous with its closing quote, so the alternation adds no
+  // backtracking. The Go backstop carries the same shape for the same reason;
+  // see services/control-plane/internal/feedback/sanitize.go.
+  {
+    re: new RegExp(
+      String.raw`"([^"\\]{0,32}(?:credential|password))"\s{0,8}:\s{0,8}"[^"\\]{0,${PATTERN_MAX}}"`,
+      'gi'
+    ),
+    replacement: '"$1":"<redacted>"',
+  },
+  {
+    re: new RegExp(
+      String.raw`([A-Za-z0-9_$]{0,32}(?:credential|password))\s{0,8}:\s{0,8}(?:'[^'\\]{0,${PATTERN_MAX}}'|"[^"\\]{0,${PATTERN_MAX}}")`,
+      'gi'
+    ),
+    replacement: "$1: '<redacted>'",
+  },
+  // TURN REST-API username — `<unix expiry>:<userID>` (turn.go:31). 9-12
+  // digits covers every plausible second-precision expiry; the userID half is
+  // a UUID. Redacting the whole token here is what removes the expiry, which
+  // the submit-time UUID pseudonymizer never touched.
+  {
+    re: /\b\d{9,12}:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g,
+    replacement: '<turn-username>',
+  },
+  // TURN REST-API credential — the 28-char band the 40-char floor misses.
+  // The lookaround pair pins it to a STANDALONE 27-chars-plus-one-pad token:
+  // inside any longer padded token every 27-char window is preceded by another
+  // base64 character, so a 32-char token (base64 of 23 bytes) does not match.
+  // Deliberately replaced with the EXISTING <base64> token rather than a
+  // TURN-specific one — the shape is base64-of-20-bytes, not proof of a TURN
+  // credential, and labelling an unrelated 20-byte digest `<turn-credential>`
+  // would be a false tripwire. `<turn-username>` above is the tripwire: it has
+  // no other plausible producer, and a TURN entry always carries both.
+  {
+    re: /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{27}=(?![A-Za-z0-9+/=])/g,
+    replacement: '<base64>',
+  },
 ];
 
 /**

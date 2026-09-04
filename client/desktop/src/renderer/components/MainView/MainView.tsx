@@ -116,12 +116,26 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
     let capturedVoiceService:
       (typeof import('../../services/voice/voiceService'))['voiceService'] | null = null;
 
+    // #3104 D6: subscribe to the capability push SYNCHRONOUSLY, before the
+    // dynamic import settles. The token minted at `pip:open` is what
+    // authenticates every subsequent PiP RPC, so a push that lands while the
+    // import is still in flight must be buffered rather than dropped — otherwise
+    // that PiP is indistinguishable from an arbitrary document for the rest of
+    // its life. Registering here removes the race instead of leaning on the
+    // PiP's own init retry to paper over it.
+    const pendingSessions: Array<{ id: string; token: string }> = [];
+    const removePipOpened = globalThis.electron?.onPipOpened?.((session) => {
+      if (proxy) proxy.registerSession(session.id, session.token);
+      else pendingSessions.push(session);
+    });
+
     import('../../services/voice/voiceService')
       .then(({ voiceService }) => {
         if (cancelled) return;
         capturedVoiceService = voiceService;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- PipSignalingProxy's voiceService parameter expects an internal interface that isn't exported from voiceService's public module; typing it would require re-exporting internal mediasoup handler types
-        proxy = new PipSignalingProxy(voiceService as any);
+        proxy = new PipSignalingProxy(voiceService);
+        for (const session of pendingSessions) proxy.registerSession(session.id, session.token);
+        pendingSessions.length = 0;
 
         // Wire producer lifecycle events so PiP windows learn about new/removed producers
         voiceService.onProducerAdded = (pid: string, uid: string, src: string) => {
@@ -143,6 +157,7 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
 
     return () => {
       cancelled = true;
+      removePipOpened?.();
       if (proxy) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- `_ipcCleanup` is a private cleanup-callback slot stored on the proxy instance via `(proxy as PipSignalingProxy & { _ipcCleanup? })` at attach time; optional chaining here handles the case where the IPC bridge was never registered
         (proxy as any)._ipcCleanup?.();

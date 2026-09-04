@@ -570,9 +570,13 @@ async function main() {
   }
 
   // Initialize RoomManager
-  const roomManager = new RoomManager(mediasoupService);
   // #1553 measurement counters — accumulated from heartbeat samples, surfaced on /health.
+  // Constructed BEFORE RoomManager so the #3104 ICE counters can be injected into it.
   const mediaMetrics = new MediaMetrics();
+  const roomManager = new RoomManager(mediasoupService, {
+    onIceSelected: (protocol) => mediaMetrics.incrementIceSelected(protocol),
+    onIceTerminalWithoutConnect: () => mediaMetrics.incrementIceTerminalWithoutConnect(),
+  });
   const opsMetricsPublisher = new OpsMetricsPublisher({
     enabled: config.opsMetrics.enabled,
     nodeId: config.opsMetrics.nodeId,

@@ -6,7 +6,21 @@
  * Instead, they proxy all SFU signaling through the main window via
  * BroadcastChannel RPC.
  *
- * Channel name: 'concord-pip'
+ * **Channel name: `concord-pip:<session token>` — never plain `concord-pip`
+ * (#3104 D6).** A `BroadcastChannel` reaches every same-origin document in the
+ * partition, so a shared name gave any frame in the app both an RPC entry point
+ * (including the privileged `action: leave`) and a copy of every reply, which
+ * since #3104 carries live HMAC TURN credentials. The main process mints a
+ * per-window token at `pip:open` and discloses it only to the main window
+ * (`pip:opened`) and to that PiP's own main frame (`pip:session`); naming the
+ * channel from it makes possession of the channel the proof of identity.
+ *
+ * **The token is therefore never placed IN a message.** The #3104 design sketch
+ * put it in the RPC envelope and moved only the replies to the private channel;
+ * that is unsound — the envelope would travel on the shared channel and hand the
+ * eavesdropper the capability. Both directions move instead, and the envelope's
+ * `pipId` is treated as untrusted decoration: the proxy uses the id bound to the
+ * channel the message arrived on.
  */
 
 import type { VoiceParticipant } from '../../stores/voice/voiceStore';
@@ -46,6 +60,22 @@ export interface CreateRecvTransportResult {
   iceParameters: unknown;
   iceCandidates: unknown[];
   dtlsParameters: unknown;
+  /**
+   * Server-minted STUN/TURN for this PiP's own transport (#3104).
+   *
+   * Carried on THIS result rather than on VoiceStateResult for three reasons:
+   * the other four transport parameters already travel here and there is exactly
+   * one consumer; `request-state` is retried, so it would give the credentials a
+   * longer residency; and VoiceStateResult is the payload already treated as
+   * sanitization-sensitive (see `sanitizedParticipants` in pipSignalingProxy).
+   *
+   * Absent when the main window holds no list — the PiP then builds its
+   * transport exactly as it did before #3104.
+   *
+   * Delivered only on the requesting session's private channel (#3104 D6), so a
+   * document that holds no capability neither receives it nor can ask for it.
+   */
+  iceServers?: RTCIceServer[];
 }
 
 /** Connect a recv transport (DTLS handshake) */
@@ -263,6 +293,24 @@ export type AnyPipBroadcast =
 export type PipChannelMessage = AnyPipRpcRequest | PipRpcResponse | AnyPipBroadcast;
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Legacy shared channel name, kept ONLY as the private channels' prefix.
+ * Nothing subscribes to it and nothing is ever posted on it — see the module
+ * header. Do not reintroduce a listener here "for compatibility": that would
+ * restore the exact ingress #3104 D6 closed.
+ */
+export const PIP_CHANNEL_PREFIX = 'concord-pip';
+
+/**
+ * The private channel one PiP session runs on. The token is a base64url secret
+ * minted by the main process (`mintPipSessionToken`), so every character is a
+ * legal channel-name character and the name is unguessable. Knowing the name IS
+ * the capability — never log it, and never post it.
+ */
+export function pipSessionChannelName(token: string): string {
+  return `${PIP_CHANNEL_PREFIX}:${token}`;
+}
 
 let _reqCounter = 0;
 export function generateRequestId(pipId: string): string {

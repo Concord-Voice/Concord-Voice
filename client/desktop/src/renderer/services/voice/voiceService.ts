@@ -73,6 +73,11 @@ import {
 } from './voiceCodecSelection';
 import { extractWebrtcHwSignal, shouldReselectForHwDowngrade } from './webrtcHwSignal';
 import {
+  describeIceServers,
+  extractSelectedCandidatePairType,
+  normalizeIceServers,
+} from './iceServers';
+import {
   FORCE_LEGACY_E2EE_KEY,
   resolveEncodedTransformSupport,
   type EncodedTransformPath,
@@ -378,7 +383,11 @@ interface JoinResponse {
   allowed: boolean;
   call_id?: string;
   media_server_url: string;
-  ice_servers: Array<{ urls: string; username?: string; credential?: string }>;
+  // OPTIONAL because the value arrives through an unchecked `await res.json()` cast
+  // (authorizeVoiceJoin), not a validated parse. An older control plane, or a
+  // self-hosted instance on turn.go's STUN-only fallback, legitimately omits it.
+  // Always read it through normalizeIceServers — never index into it directly (#3104).
+  ice_servers?: unknown;
   // Server-channel responses include `channel`; DM voice responses omit it
   // and include `conversation` with {id, is_group, caller_role} instead.
   // The renderer synthesizes a channel-like object for DM at join time
@@ -474,6 +483,18 @@ class VoiceService {
   // Send transport stays single (server allows only 1, and send path has no demux).
   private recvTransportAudio: mediasoupTypes.Transport | null = null;
   private recvTransportVideo: mediasoupTypes.Transport | null = null;
+
+  /**
+   * Server-minted ICE servers for the CURRENT media session (#3104). Set at the
+   * single join choke point (establishMediaSession) from the freshly authorized
+   * joinData, and nulled by both teardown paths. Deliberately NOT in a Zustand
+   * store: these are live HMAC TURN credentials and a store exposes them to
+   * persist middleware and any state serializer.
+   *
+   * NEVER pass this value, or anything derived from it, to console.* — see NC-1
+   * in [internal]rules/frontend.md § ICE-server threading.
+   */
+  private iceServers: RTCIceServer[] | null = null;
 
   // Local producers: source → Producer
   private readonly producers: Map<string, mediasoupTypes.Producer> = new Map();
@@ -3007,6 +3028,14 @@ class VoiceService {
     joinData: JoinResponse,
     micStreamPromise: Promise<MediaStream | null> | null
   ): Promise<void> {
+    // Both entry paths funnel through here with a freshly authorized joinData:
+    // joinChannel (initial join) and resumeAfterReconnect. Setting it here is
+    // what makes the reconnect rebuild use the re-minted credentials (#3104).
+    this.iceServers = normalizeIceServers(joinData.ice_servers);
+    // Scheme + count ONLY. The list itself carries live HMAC TURN credentials and
+    // every console method is captured into the bug-report buffer (NC-1, #3104).
+    console.debug('[ice] servers', describeIceServers(this.iceServers));
+
     const roomJoined = await this.emitAsync<RoomJoinedResponse>('join-room', {
       roomId: channelId,
       rtpCapabilities: undefined, // Will be set after device.load
@@ -3218,6 +3247,8 @@ class VoiceService {
     this.sendTransport = null;
     this.recvTransportAudio = null;
     this.recvTransportVideo = null;
+    // Credentials must not outlive the transports they were minted for (#3104).
+    this.iceServers = null;
   }
 
   /** Tear down already-invalidated shared E2EE state synchronously. */
@@ -5394,6 +5425,25 @@ class VoiceService {
 
   // ─── Transport Setup ───────────────────────────────────────────────
 
+  /**
+   * The ICE fragment of a transport-options object. Returns `{}` when there is
+   * nothing to add, so a degraded session's options object is deep-equal to the
+   * pre-#3104 shape rather than carrying an empty array.
+   *
+   * `iceTransportPolicy: 'all'` is the WebRTC DEFAULT — it is stated for the
+   * reader, not for behaviour. `iceServers` is the working part of the fix; do
+   * not "simplify" by dropping it and keeping the policy.
+   */
+  private iceConfigForTransport(): { iceServers?: RTCIceServer[]; iceTransportPolicy?: 'all' } {
+    if (!this.iceServers || this.iceServers.length === 0) return {};
+    return { iceServers: this.iceServers, iceTransportPolicy: 'all' };
+  }
+
+  /** Read access for PipSignalingProxy's create-recv-transport response (#3104). */
+  getIceServersForPip(): RTCIceServer[] | null {
+    return this.iceServers;
+  }
+
   private async createSendTransport(): Promise<void> {
     if (!this.device) throw new Error('Device not initialized before creating send transport');
     const expectedSessionGeneration = this.videoReproduceGeneration;
@@ -5418,6 +5468,8 @@ class VoiceService {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
       }),
+      // Server-minted STUN/TURN (#3104). Empty when unavailable — see iceConfigForTransport.
+      ...this.iceConfigForTransport(),
     });
     this.videoReproduceSessionActive = true;
 
@@ -5451,6 +5503,7 @@ class VoiceService {
     // DEBUG: Capture SDP from the send transport's PeerConnection
     // to identify the source of the payload_type=45 BUNDLE collision
     this.logTransportSdp(this.sendTransport, 'send');
+    this.recordSelectedCandidatePair(this.sendTransport, 'send');
   }
 
   /**
@@ -5487,6 +5540,8 @@ class VoiceService {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
       }),
+      // Server-minted STUN/TURN (#3104). Empty when unavailable — see iceConfigForTransport.
+      ...this.iceConfigForTransport(),
     });
 
     if (mediaKind === 'audio') {
@@ -5506,6 +5561,7 @@ class VoiceService {
 
     // DEBUG: Capture SDP from E2EE recv transport
     this.logTransportSdp(transport, `recv-${mediaKind}`);
+    this.recordSelectedCandidatePair(transport, `recv-${mediaKind}`);
   }
 
   /**
@@ -5536,6 +5592,32 @@ class VoiceService {
     } catch {
       // Non-critical debug logging — don't break transport setup
     }
+  }
+
+  /**
+   * Record the selected ICE candidate-pair type once per transport (#3104).
+   *
+   * `type` is one of host | srflx | prflx | relay and nothing else from the
+   * stats report is read or emitted, so this is safe under NC-1 — it is the
+   * support-diagnostic signal that tells us whether a user landed on a relay.
+   */
+  private recordSelectedCandidatePair(transport: mediasoupTypes.Transport, label: string): void {
+    let recorded = false;
+    transport.on('connectionstatechange', (state) => {
+      if (state !== 'connected' || recorded) return;
+      recorded = true;
+      transport
+        .getStats()
+        .then((stats) => {
+          const type = extractSelectedCandidatePairType(stats);
+          if (type) console.debug('[ice] selected-pair', { label, type });
+        })
+        .catch(() => {
+          // Stats unavailable for this transport — no diagnostic, no failure.
+          // Deliberately swallowed without logging the error: observability.md
+          // principle 3 forbids propagating a cause chain into a log sink.
+        });
+    });
   }
 
   /** Get the recv transport for a given media kind (always split audio/video — all channels are E2EE) */
@@ -8152,6 +8234,8 @@ class VoiceService {
     this.sendTransport = null;
     this.recvTransportAudio = null;
     this.recvTransportVideo = null;
+    // Duplicated deliberately: cleanup() does not call cleanupMediaAndTransports() (#3104).
+    this.iceServers = null;
 
     // Stop local VAD, noise gate, input volume, and live subscriptions
     this.stopLocalVAD();

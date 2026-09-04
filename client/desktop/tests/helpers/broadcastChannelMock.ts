@@ -22,7 +22,13 @@ export class MockBroadcastChannel {
 
   constructor(name: string) {
     this.name = name;
+    // Seeded from the class-level default so a test can arm a responder BEFORE
+    // the code under test opens its channel. PiP channels are now created inside
+    // `PipVoiceClient.init()` (the name derives from a capability fetched over
+    // IPC, #3104 D6), so an instance-only responder would arrive too late.
+    this.autoResponder = MockBroadcastChannel.defaultAutoResponder;
     MockBroadcastChannel.instances.push(this);
+    MockBroadcastChannel.all.push(this);
   }
 
   postMessage(data: unknown): void {
@@ -56,9 +62,24 @@ export class MockBroadcastChannel {
   /** All live MockBroadcastChannel instances (for cross-instance delivery) */
   static instances: MockBroadcastChannel[] = [];
 
+  /**
+   * Applied to every instance constructed after it is set. Use this when the
+   * channel does not exist yet at arm time; `install()`/`reset()` clear it.
+   */
+  static defaultAutoResponder: AutoResponder | null = null;
+
+  /**
+   * Every instance constructed since the last reset, INCLUDING closed ones.
+   * `instances` models live delivery and therefore shrinks on close; assertions
+   * that inspect what a channel posted usually run after teardown closed it.
+   */
+  static all: MockBroadcastChannel[] = [];
+
   /** Clear all instances and reset */
   static reset(): void {
     MockBroadcastChannel.instances = [];
+    MockBroadcastChannel.all = [];
+    MockBroadcastChannel.defaultAutoResponder = null;
   }
 
   /** Original BroadcastChannel saved during install() */

@@ -15,6 +15,7 @@ const mockVoiceService = {
   resumeConsumer: vi.fn(),
   emitPreferredLayersForConsumer: vi.fn(),
   deriveFrameKeyForPip: vi.fn(),
+  getIceServersForPip: vi.fn().mockReturnValue(null),
   toggleMute: vi.fn().mockResolvedValue(undefined),
   toggleDeafen: vi.fn(),
   toggleVideo: vi.fn().mockResolvedValue(undefined),
@@ -32,10 +33,28 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-function getChannel(): MockBroadcastChannel {
-  const ch = MockBroadcastChannel.latest;
-  if (!ch) throw new Error('No MockBroadcastChannel instance');
+/**
+ * #3104 D6: the proxy opens one PRIVATE channel per admitted PiP session,
+ * named from a capability the main process minted, and never subscribes to the
+ * shared `concord-pip` name. Tests therefore admit a session first and address
+ * that channel.
+ */
+const TEST_PIP_ID = 'test-pip';
+const TEST_SESSION_TOKEN = 'test-session-token';
+
+function getChannel(pipId = TEST_PIP_ID): MockBroadcastChannel {
+  const name = `concord-pip:${sessionTokens.get(pipId) ?? ''}`;
+  const ch = MockBroadcastChannel.all.filter((c) => c.name === name).at(-1);
+  if (!ch) throw new Error(`No session channel for ${pipId}`);
   return ch;
+}
+
+/** pipId -> the token its session was admitted under. */
+const sessionTokens = new Map<string, string>();
+
+function admit(proxy: PipSignalingProxy, pipId: string, token = `token-${pipId}`): void {
+  sessionTokens.set(pipId, token);
+  proxy.registerSession(pipId, token);
 }
 
 /** Send an RPC request and wait for response */
@@ -85,11 +104,15 @@ describe('PipSignalingProxy', () => {
     resetAllStores();
     vi.clearAllMocks();
     mockVoiceService.forwardToServer.mockReset().mockResolvedValue({});
+    // Default to the pre-#3104 shape: no list held, so no iceServers key is attached.
+    mockVoiceService.getIceServersForPip.mockReset().mockReturnValue(null);
 
     useUserStore.setState({ user: { id: 'local-user-123' } as any });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     proxy = new PipSignalingProxy(mockVoiceService as any);
+    sessionTokens.clear();
+    admit(proxy, TEST_PIP_ID, TEST_SESSION_TOKEN);
   });
 
   afterEach(() => {
@@ -100,9 +123,9 @@ describe('PipSignalingProxy', () => {
   // ── Constructor & Lifecycle ─────────────────────────────────────────
 
   describe('constructor & lifecycle', () => {
-    it('creates BroadcastChannel with name concord-pip', () => {
-      const ch = getChannel();
-      expect(ch.name).toBe('concord-pip');
+    it('opens a PRIVATE channel per session and never the shared name (#3104 D6)', () => {
+      expect(getChannel().name).toBe(`concord-pip:${TEST_SESSION_TOKEN}`);
+      expect(MockBroadcastChannel.all.filter((c) => c.name === 'concord-pip')).toHaveLength(0);
     });
 
     it('subscribes to voice store changes and broadcasts state updates', async () => {
@@ -231,6 +254,108 @@ describe('PipSignalingProxy', () => {
         forceTcp: true,
       });
       expect(result.transportId).toBe('tp-1');
+    });
+
+    // ── ICE servers across the PiP window boundary (#3104) ──────────
+    describe('create-recv-transport ICE servers (#3104)', () => {
+      /** Byte-identical to the fixture the pipVoiceClient suite consumes, so the
+       *  two ends of the create-recv-transport contract are checked against ONE
+       *  wire shape rather than against each other's mocks. */
+      const TURN = {
+        urls: 'turn:turn.example.test:3478',
+        username: '1780000000:user-1',
+        credential: 'Zm9vYmFyYmF6',
+      };
+
+      function serverTransportReply(): void {
+        mockVoiceService.forwardToServer.mockResolvedValueOnce({
+          id: 'tp-1',
+          iceParameters: {},
+          iceCandidates: [],
+          dtlsParameters: {},
+        });
+      }
+
+      it('attaches the main window ICE list to the RPC result', async () => {
+        serverTransportReply();
+        mockVoiceService.getIceServersForPip.mockReturnValue([TURN]);
+
+        const result = (await sendRpc(getChannel(), 'create-recv-transport', {})) as any;
+
+        expect(result.iceServers).toEqual([TURN]);
+        expect(result.transportId).toBe('tp-1');
+      });
+
+      it('omits the key entirely when the main window holds no list', async () => {
+        serverTransportReply();
+        mockVoiceService.getIceServersForPip.mockReturnValue(null);
+
+        const result = (await sendRpc(getChannel(), 'create-recv-transport', {})) as any;
+
+        expect(Object.hasOwn(result, 'iceServers')).toBe(false);
+      });
+
+      it('omits the key entirely when the main window holds an empty list', async () => {
+        serverTransportReply();
+        mockVoiceService.getIceServersForPip.mockReturnValue([]);
+
+        const result = (await sendRpc(getChannel(), 'create-recv-transport', {})) as any;
+
+        expect(Object.hasOwn(result, 'iceServers')).toBe(false);
+      });
+
+      /** The SFU's create-transport reply is not a carrier for ICE credentials;
+       *  only the main window's own list may populate the key. A type-level Omit
+       *  erases at runtime, so this is asserted on BOTH branches — the overriding
+       *  one and, more importantly, the one where nothing would override it. */
+      function sfuInjectedTransportReply(): void {
+        mockVoiceService.forwardToServer.mockResolvedValueOnce({
+          id: 'tp-1',
+          iceParameters: {},
+          iceCandidates: [],
+          dtlsParameters: {},
+          iceServers: [{ urls: 'turn:attacker.example:3478', username: 'x', credential: 'y' }],
+        });
+      }
+
+      it('never lets the media plane inject an iceServers field of its own', async () => {
+        sfuInjectedTransportReply();
+        mockVoiceService.getIceServersForPip.mockReturnValue([TURN]);
+
+        const result = (await sendRpc(getChannel(), 'create-recv-transport', {})) as any;
+
+        expect(result.iceServers).toEqual([TURN]);
+      });
+
+      it('drops a media-plane iceServers field even when the main window holds none', async () => {
+        sfuInjectedTransportReply();
+        mockVoiceService.getIceServersForPip.mockReturnValue(null);
+
+        const result = (await sendRpc(getChannel(), 'create-recv-transport', {})) as any;
+
+        expect(Object.hasOwn(result, 'iceServers')).toBe(false);
+      });
+
+      it('never logs the ICE list (NC-1)', async () => {
+        const spies = (['log', 'warn', 'error', 'debug', 'info'] as const).map((level) =>
+          vi.spyOn(console, level).mockImplementation(() => {})
+        );
+        try {
+          serverTransportReply();
+          mockVoiceService.getIceServersForPip.mockReturnValue([TURN]);
+
+          await sendRpc(getChannel(), 'create-recv-transport', {});
+
+          const logged = spies.flatMap((s) => s.mock.calls.map((args) => JSON.stringify(args)));
+          for (const line of logged) {
+            expect(line).not.toContain(TURN.credential);
+            expect(line).not.toContain(TURN.username);
+            expect(line).not.toContain('turn.example.test');
+          }
+        } finally {
+          for (const s of spies) s.mockRestore();
+        }
+      });
     });
 
     it('connect-transport forwards transportId and dtlsParameters', async () => {
@@ -401,14 +526,18 @@ describe('PipSignalingProxy', () => {
         new Map([['c1', { source: 'mic', producerUserId: 'u1', producerId: 'p1' }]])
       );
 
+      // #3104 D6: the id comes from the SESSION the message arrived on, so the
+      // request must be sent on frames-1's own channel. The envelope's `pipId`
+      // is untrusted decoration (see the spoofing test in pipSessionAuth).
+      admit(proxy, 'frames-1');
       await sendRpc(
-        getChannel(),
+        getChannel('frames-1'),
         'pip-ready',
         { consumerSources: [{ source: 'mic', producerUserId: 'u1' }] },
         'frames-1'
       );
 
-      const ch = getChannel();
+      const ch = getChannel('frames-1');
       const transferred = ch.posted.find(
         (m: any) => m.kind === 'broadcast' && m.type === 'ownership-transferred'
       ) as any;
@@ -442,8 +571,9 @@ describe('PipSignalingProxy', () => {
         new Map([['c1', { source: 'mic', producerUserId: 'u1', producerId: 'p1' }]])
       );
 
+      admit(proxy, 'frames-1');
       await sendRpc(
-        getChannel(),
+        getChannel('frames-1'),
         'pip-ready',
         { consumerSources: [{ source: 'mic', producerUserId: 'u1' }] },
         'frames-1'

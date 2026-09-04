@@ -6903,3 +6903,95 @@ describe('tier-aware cap enforcement (#1542)', () => {
     }
   });
 });
+
+describe('ICE outcome counters (#3104)', () => {
+  let router: ReturnType<typeof createMockRouter>;
+  let manager: RoomManager;
+  let onIceSelected: ReturnType<typeof vi.fn>;
+  let onIceTerminalWithoutConnect: ReturnType<typeof vi.fn>;
+  let transport: ReturnType<typeof createMockTransport>;
+
+  async function makeTransport() {
+    router = createMockRouter();
+    onIceSelected = vi.fn();
+    onIceTerminalWithoutConnect = vi.fn();
+    manager = new RoomManager(createMockMediasoupService(router) as any, {
+      onIceSelected,
+      onIceTerminalWithoutConnect,
+    });
+    await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+    transport = createMockTransport();
+    router.createWebRtcTransport.mockResolvedValueOnce(transport);
+    await manager.createTransport('room-1', 'u-1', 'send');
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await makeTransport();
+  });
+
+  it('counts a udp selected tuple once', async () => {
+    transport._emit('iceselectedtuplechange', { protocol: 'udp', remoteIp: '203.0.113.9' });
+    expect(onIceSelected).toHaveBeenCalledExactlyOnceWith('udp');
+  });
+
+  it('counts a tcp selected tuple once', async () => {
+    transport._emit('iceselectedtuplechange', { protocol: 'tcp', remoteIp: '203.0.113.9' });
+    expect(onIceSelected).toHaveBeenCalledExactlyOnceWith('tcp');
+  });
+
+  it('counts only the FIRST selected tuple — a mid-call migration is not a new transport', () => {
+    transport._emit('iceselectedtuplechange', { protocol: 'udp', remoteIp: '203.0.113.9' });
+    transport._emit('iceselectedtuplechange', { protocol: 'tcp', remoteIp: '203.0.113.9' });
+    transport._emit('iceselectedtuplechange', { protocol: 'udp', remoteIp: '198.51.100.4' });
+    expect(onIceSelected).toHaveBeenCalledExactlyOnceWith('udp');
+  });
+
+  it('ignores a tuple whose protocol is outside the closed set', () => {
+    transport._emit('iceselectedtuplechange', { protocol: 'sctp', remoteIp: '203.0.113.9' });
+    transport._emit('iceselectedtuplechange', { remoteIp: '203.0.113.9' });
+    expect(onIceSelected).not.toHaveBeenCalled();
+  });
+
+  it('counts a transport that goes straight to disconnected', () => {
+    transport._emit('icestatechange', 'disconnected');
+    expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts a transport that goes straight to closed', () => {
+    transport._emit('icestatechange', 'closed');
+    expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts a never-connected transport only once across disconnected then closed', () => {
+    transport._emit('icestatechange', 'disconnected');
+    transport._emit('icestatechange', 'closed');
+    expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT count a transport that connected before terminating', () => {
+    transport._emit('icestatechange', 'connected');
+    transport._emit('icestatechange', 'disconnected');
+    transport._emit('icestatechange', 'closed');
+    expect(onIceTerminalWithoutConnect).not.toHaveBeenCalled();
+  });
+
+  it('does NOT count a transport that completed before terminating', () => {
+    transport._emit('icestatechange', 'completed');
+    transport._emit('icestatechange', 'closed');
+    expect(onIceTerminalWithoutConnect).not.toHaveBeenCalled();
+  });
+
+  it('constructs without counters and does not throw on ICE events', async () => {
+    const bareRouter = createMockRouter();
+    const bare = new RoomManager(createMockMediasoupService(bareRouter) as any);
+    await joinRoomWithSupportedCrypto(bare, 'room-2', 'u-2', 'sock-2', { username: 'bob' });
+    const t = createMockTransport();
+    bareRouter.createWebRtcTransport.mockResolvedValueOnce(t);
+    await bare.createTransport('room-2', 'u-2', 'send');
+    expect(() => {
+      t._emit('iceselectedtuplechange', { protocol: 'udp', remoteIp: '203.0.113.9' });
+      t._emit('icestatechange', 'closed');
+    }).not.toThrow();
+  });
+});

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Voice now works on networks that block UDP** ([#3104](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3104)) — Concord's servers were already offering relay servers that can carry a call over TCP or TLS when a network blocks the usual voice traffic, but the desktop app was discarding that offer and never trying them. On a corporate or campus network that blocks UDP this was not degraded audio, it was no call at all: every join attempt ran out of options and timed out. The app now uses the relay servers it is given, in the main window and in Picture-in-Picture, and falls back to today's behaviour unchanged when a server offers none.
+- **Picture-in-Picture voice windows now prove who they are** ([#3104](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3104)) — the private channel a PiP window uses to talk to the main window accepted instructions from any page loaded in the app and echoed every answer back to all of them. The desktop app now issues each PiP window its own one-time credential and gives it a private line, so nothing else in the app can listen in, ask for connection details, or hang up your call on your behalf.
+
 ### Fixed
 
 - **Your voice and call status no longer disappears every hour** ([#3102](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3102)) — a routine server cleanup that clears out expired presence records was also deleting the records behind Rich Presence. The "In Voice" and "In a Call" status other people could see was wiped every time the server restarted and once every hour after that, and it did not come back until you rejoined. The cleanup now touches only the records it owns.

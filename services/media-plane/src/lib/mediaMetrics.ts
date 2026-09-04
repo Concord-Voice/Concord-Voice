@@ -30,6 +30,28 @@ export interface MetricsSnapshot {
    * publisher, whose metric-key catalog is closed (ADR-0030).
    */
   admissionRejected: number;
+  /**
+   * ICE outcome counters (#3104). Cumulative, process-lifetime, aggregate-only:
+   * no transport id, no room, no user, no address — which is what keeps
+   * /health's exposure note (index.ts:595-602) true.
+   *
+   * The udp/tcp split is a WIRE-PROTOCOL fact, not a reason dimension: it does
+   * not discriminate a branch of any deliberately-uniform refusal, so
+   * observability.md principle 7 is satisfied.
+   *
+   * Deliberately NOT on AggregateMediaMetrics: that feeds the ops-metrics
+   * publisher, whose metric-key catalog is closed (ADR-0030) — the same reason
+   * admissionRejected (#2032) lives here.
+   */
+  iceSelectedUdp: number;
+  iceSelectedTcp: number;
+  /**
+   * Transports that reached a terminal ICE state having never reached connected
+   * or completed. Named for the STATE TRANSITION, not for "failure": an
+   * abandoned join counts here too, and mediasoup's IceState has no `failed`
+   * member, so this case has to be derived.
+   */
+  iceTerminalWithoutConnect: number;
 }
 
 export interface AggregateMediaMetrics {
@@ -59,6 +81,9 @@ export class MediaMetrics {
   private currentBps = 0;
   private peakBps = 0;
   private admissionRejected = 0;
+  private iceSelectedUdp = 0;
+  private iceSelectedTcp = 0;
+  private iceTerminalWithoutConnect = 0;
 
   /**
    * Count one admission-gate rejection (#2032). Not fed by `ingest` because it
@@ -67,6 +92,21 @@ export class MediaMetrics {
    */
   incrementAdmissionRejected(): void {
     this.admissionRejected += 1;
+  }
+
+  /**
+   * Count the FIRST selected tuple of one transport (#3104). Event-driven like
+   * incrementAdmissionRejected, not fed by `ingest`. A protocol outside the
+   * closed set increments nothing — there is no third bucket.
+   */
+  incrementIceSelected(protocol: 'udp' | 'tcp'): void {
+    if (protocol === 'udp') this.iceSelectedUdp += 1;
+    else if (protocol === 'tcp') this.iceSelectedTcp += 1;
+  }
+
+  /** Count one transport that reached a terminal ICE state without connecting (#3104). */
+  incrementIceTerminalWithoutConnect(): void {
+    this.iceTerminalWithoutConnect += 1;
   }
 
   ingest(sample: MetricsSample, tickSeconds: number): void {
@@ -112,6 +152,9 @@ export class MediaMetrics {
         peakBps: this.peakBps,
       },
       admissionRejected: this.admissionRejected,
+      iceSelectedUdp: this.iceSelectedUdp,
+      iceSelectedTcp: this.iceSelectedTcp,
+      iceTerminalWithoutConnect: this.iceTerminalWithoutConnect,
     };
   }
 
@@ -139,5 +182,8 @@ export class MediaMetrics {
     this.currentBps = 0;
     this.peakBps = 0;
     this.admissionRejected = 0;
+    this.iceSelectedUdp = 0;
+    this.iceSelectedTcp = 0;
+    this.iceTerminalWithoutConnect = 0;
   }
 }

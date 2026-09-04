@@ -1,6 +1,31 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MockBroadcastChannel, createRpcResponder } from '../../helpers/broadcastChannelMock';
+import type { AutoResponder } from '../../helpers/broadcastChannelMock';
 import { resetAllStores } from '../../helpers/store-helpers';
+
+/**
+ * #3104 D6: the client no longer opens `concord-pip`. It pulls a per-window
+ * capability over `pip:session` and opens `concord-pip:<token>` inside `init()`,
+ * so tests must supply the capability and look the channel up by prefix.
+ */
+const PIP_SESSION_TOKEN = 'test-session-token';
+const PIP_CHANNEL = `concord-pip:${PIP_SESSION_TOKEN}`;
+
+/**
+ * The client's private session channel, once `init()` has opened it. Searches
+ * `all` rather than `instances` so a post-teardown assertion can still read what
+ * the channel posted — `close()` removes it from the live-delivery list.
+ */
+function pipChannel(): MockBroadcastChannel | undefined {
+  return MockBroadcastChannel.all.filter((c) => c.name === PIP_CHANNEL).at(-1);
+}
+
+/** Arm a responder that survives the channel not existing yet. */
+function setResponder(fn: AutoResponder): void {
+  MockBroadcastChannel.defaultAutoResponder = fn;
+  const ch = pipChannel();
+  if (ch) ch.autoResponder = fn;
+}
 
 // ── mediasoup-client mock ───────────────────────────────────────────────
 
@@ -121,10 +146,7 @@ const defaultRpcResponses: Record<string, unknown> = {
 
 /** Set up auto-responder on the client's broadcast channel */
 function setupAutoResponder(overrides: Record<string, unknown> = {}): void {
-  const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
-  if (ch) {
-    ch.autoResponder = createRpcResponder({ ...defaultRpcResponses, ...overrides });
-  }
+  setResponder(createRpcResponder({ ...defaultRpcResponses, ...overrides }));
 }
 
 interface CleanupResponderOptions {
@@ -134,14 +156,25 @@ interface CleanupResponderOptions {
   transportError?: string;
 }
 
-function setupCleanupResponder(options: CleanupResponderOptions = {}): MockBroadcastChannel {
-  const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
-  if (!ch) throw new Error('No PiP BroadcastChannel');
+/** Arm the cleanup responder and hand back the live session channel. */
+function withCleanupResponder(options: CleanupResponderOptions = {}): MockBroadcastChannel {
+  setupCleanupResponder(options);
+  // The channel does not exist yet — `init()` opens it. Bind on first read.
+  let bound: MockBroadcastChannel | undefined;
+  return new Proxy({} as MockBroadcastChannel, {
+    get(_target, prop) {
+      bound ??= pipChannel();
+      if (!bound) throw new Error('No PiP session channel — init() has not opened one');
+      return Reflect.get(bound, prop);
+    },
+  });
+}
 
+function setupCleanupResponder(options: CleanupResponderOptions = {}): void {
   const consumerIds = options.consumerIds ?? ['consumer-1'];
   let consumeIndex = 0;
 
-  ch.autoResponder = (data: unknown) => {
+  setResponder((data: unknown) => {
     const msg = data as {
       kind?: string;
       id?: string;
@@ -181,9 +214,7 @@ function setupCleanupResponder(options: CleanupResponderOptions = {}): MockBroad
       return { kind: 'rpc-response', id: msg.id, error: 'No mock for ' + msg.method };
     }
     return { kind: 'rpc-response', id: msg.id, result };
-  };
-
-  return ch;
+  });
 }
 
 function cleanupRequests(ch: MockBroadcastChannel): Array<{
@@ -222,11 +253,18 @@ describe('PipVoiceClient', () => {
   let client: PipVoiceClient;
 
   let savedMediaStream: unknown;
+  let savedElectron: unknown;
 
   beforeEach(() => {
     resetAllStores();
     vi.useFakeTimers();
     MockBroadcastChannel.install();
+    // #3104 D6: init() refuses to open any channel without this capability.
+    savedElectron = globalThis.electron;
+    (globalThis as unknown as { electron: unknown }).electron = {
+      ...(savedElectron as object),
+      getPipSession: vi.fn().mockResolvedValue({ token: PIP_SESSION_TOKEN }),
+    };
     savedMediaStream = globalThis.MediaStream;
     (globalThis as any).MediaStream = MockMediaStream;
     vi.clearAllMocks();
@@ -274,15 +312,24 @@ describe('PipVoiceClient', () => {
     vi.useRealTimers();
     MockBroadcastChannel.uninstall();
     (globalThis as any).MediaStream = savedMediaStream;
+    (globalThis as unknown as { electron: unknown }).electron = savedElectron;
   });
 
   // ── Constructor ─────────────────────────────────────────────────────
 
   describe('constructor', () => {
-    it('creates BroadcastChannel with name concord-pip', () => {
+    it('opens NO channel until init() proves the window holds a capability (#3104 D6)', async () => {
       client = new PipVoiceClient('controls-main');
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
-      expect(ch).toBeDefined();
+      expect(MockBroadcastChannel.instances).toHaveLength(0);
+
+      setupAutoResponder();
+      await client.init();
+
+      expect(pipChannel()).toBeDefined();
+      // The legacy shared name is never opened — a listener on it is deaf.
+      expect(MockBroadcastChannel.instances.filter((c) => c.name === 'concord-pip')).toHaveLength(
+        0
+      );
     });
 
     it('stores pipId', () => {
@@ -291,6 +338,58 @@ describe('PipVoiceClient', () => {
       setupAutoResponder();
       // pipId will appear in messages when init() is called
       expect(client).toBeDefined();
+    });
+  });
+
+  // ── Session capability, fail-closed (#3104 D6) ──────────────────────
+
+  describe('session capability (#3104 D6)', () => {
+    function setPipSession(impl: unknown): void {
+      (globalThis as unknown as { electron: Record<string, unknown> }).electron.getPipSession =
+        impl as never;
+    }
+
+    /** No channel of ANY name was opened — not even the legacy shared one. */
+    function expectNoChannelOpened(): void {
+      expect(MockBroadcastChannel.all).toHaveLength(0);
+    }
+
+    it.each([
+      ['the shell is too old to implement pip:session', undefined],
+      ['main refuses the caller', vi.fn().mockResolvedValue(null)],
+      ['main answers without a token', vi.fn().mockResolvedValue({})],
+      ['main answers with a non-string token', vi.fn().mockResolvedValue({ token: 7 })],
+      ['main answers with an empty token', vi.fn().mockResolvedValue({ token: '' })],
+      ['the invoke rejects', vi.fn().mockRejectedValue(new Error('ipc down'))],
+    ])('refuses to signal at all when %s', async (_label, impl) => {
+      setPipSession(impl);
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await expect(client.init()).rejects.toThrow('PiP session capability unavailable');
+      expectNoChannelOpened();
+    });
+
+    it('does not fall back to an unauthenticated channel for later RPCs either', async () => {
+      setPipSession(vi.fn().mockResolvedValue(null));
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await expect(client.init()).rejects.toThrow('PiP session capability unavailable');
+      await expect(client.action('leave')).rejects.toThrow('PiP session capability unavailable');
+      expectNoChannelOpened();
+    });
+
+    it('asks main for THIS window id and opens the channel that token names', async () => {
+      const getPipSession = vi.fn().mockResolvedValue({ token: PIP_SESSION_TOKEN });
+      setPipSession(getPipSession);
+      client = new PipVoiceClient('frames-42');
+      setupAutoResponder();
+
+      await client.init();
+
+      expect(getPipSession).toHaveBeenCalledWith('frames-42');
+      expect(MockBroadcastChannel.all.map((c) => c.name)).toEqual([PIP_CHANNEL]);
     });
   });
 
@@ -346,8 +445,7 @@ describe('PipVoiceClient', () => {
       let callCount = 0;
 
       // First two calls timeout (no response), third succeeds
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
-      ch.autoResponder = (data: unknown) => {
+      setResponder((data: unknown) => {
         const msg = data as { kind?: string; id?: string; method?: string };
         if (msg.kind !== 'rpc-request' || !msg.id) return undefined;
         callCount++;
@@ -358,7 +456,7 @@ describe('PipVoiceClient', () => {
         const result = responses[msg.method ?? ''];
         if (result === undefined) return { kind: 'rpc-response', id: msg.id, error: 'no mock' };
         return { kind: 'rpc-response', id: msg.id, result };
-      };
+      });
 
       // Advance timers to trigger the 3s init timeout + 1s retry delays
       const initPromise = client.init();
@@ -398,17 +496,168 @@ describe('PipVoiceClient', () => {
       client = new PipVoiceClient('test-pip');
 
       // Auto-responder returns an explicit error (not a timeout)
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
-      if (ch) {
-        ch.autoResponder = (data: unknown) => {
-          const msg = data as { kind?: string; id?: string; method?: string };
-          if (msg.kind !== 'rpc-request') return undefined;
-          return { kind: 'rpc-response', id: msg.id, error: 'proxy error' };
-        };
-      }
+      setResponder((data: unknown) => {
+        const msg = data as { kind?: string; id?: string; method?: string };
+        if (msg.kind !== 'rpc-request') return undefined;
+        return { kind: 'rpc-response', id: msg.id, error: 'proxy error' };
+      });
 
       // Should fail immediately without retrying
       await expect(client.init()).rejects.toThrow('proxy error');
+    });
+  });
+
+  // ── PiP ICE servers (#3104) ─────────────────────────────────────────
+
+  describe('PiP ICE servers (#3104)', () => {
+    /** Byte-identical to the fixture the pipSignalingProxy suite attaches, so the
+     *  two ends of the create-recv-transport contract are checked against ONE
+     *  wire shape rather than against each other's mocks. */
+    const TURN = {
+      urls: 'turn:turn.example.test:3478',
+      username: '1780000000:user-1',
+      credential: 'Zm9vYmFyYmF6',
+    };
+
+    /** The pre-#3104 create-recv-transport result, before iceServers is layered on. */
+    const baseTransportResult = {
+      transportId: 'transport-1',
+      iceParameters: { usernameFragment: 'frag', password: 'pass' }, // pragma: allowlist secret
+      iceCandidates: [],
+      dtlsParameters: { role: 'auto', fingerprints: [] },
+    };
+
+    it('passes the proxied ICE servers into the recv transport', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder({
+        'create-recv-transport': { ...baseTransportResult, iceServers: [TURN] },
+      });
+
+      await client.init();
+
+      const opts = mockCreateRecvTransport.mock.calls[0][0];
+      expect(opts.iceServers).toEqual([TURN]);
+      expect(opts.iceTransportPolicy).toBe('all');
+    });
+
+    it('omits the iceServers key when the proxy sends none', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await client.init();
+
+      const opts = mockCreateRecvTransport.mock.calls[0][0];
+      expect(Object.hasOwn(opts, 'iceServers')).toBe(false);
+      expect(Object.hasOwn(opts, 'iceTransportPolicy')).toBe(false);
+    });
+
+    it('omits the iceServers key when the proxy sends an empty list', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder({
+        'create-recv-transport': { ...baseTransportResult, iceServers: [] },
+      });
+
+      await client.init();
+
+      const opts = mockCreateRecvTransport.mock.calls[0][0];
+      expect(Object.hasOwn(opts, 'iceServers')).toBe(false);
+      expect(Object.hasOwn(opts, 'iceTransportPolicy')).toBe(false);
+    });
+
+    it('drops a malformed entry rather than the whole list', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder({
+        'create-recv-transport': {
+          ...baseTransportResult,
+          iceServers: [{ urls: 'http://nope' }, TURN],
+        },
+      });
+
+      await client.init();
+
+      expect(mockCreateRecvTransport.mock.calls[0][0].iceServers).toEqual([TURN]);
+    });
+
+    it('drops a turn: entry that arrives without a credential pair', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder({
+        'create-recv-transport': {
+          ...baseTransportResult,
+          iceServers: [{ urls: 'turn:turn.example.test:3478' }, TURN],
+        },
+      });
+
+      await client.init();
+
+      expect(mockCreateRecvTransport.mock.calls[0][0].iceServers).toEqual([TURN]);
+    });
+
+    it('survives a non-array iceServers field without failing the transport', async () => {
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder({
+        'create-recv-transport': { ...baseTransportResult, iceServers: 'turn:nope' },
+      });
+
+      await client.init();
+
+      const opts = mockCreateRecvTransport.mock.calls[0][0];
+      expect(opts.id).toBe('transport-1');
+      expect(Object.hasOwn(opts, 'iceServers')).toBe(false);
+    });
+
+    it('never logs the transport result or any ICE credential (NC-1)', async () => {
+      const spies = (['log', 'warn', 'error', 'debug', 'info'] as const).map((level) =>
+        vi.spyOn(console, level).mockImplementation(() => {})
+      );
+      try {
+        client = new PipVoiceClient('test-pip');
+        setupAutoResponder({
+          'create-recv-transport': { ...baseTransportResult, iceServers: [TURN] },
+        });
+
+        await client.init();
+        await client.consume('prod-1', 'mic', 'user-1');
+
+        const logged = spies.flatMap((s) => s.mock.calls.map((args) => JSON.stringify(args)));
+        for (const line of logged) {
+          expect(line).not.toContain(TURN.credential);
+          expect(line).not.toContain(TURN.username);
+          expect(line).not.toContain('turn.example.test');
+        }
+      } finally {
+        for (const s of spies) s.mockRestore();
+      }
+    });
+
+    it('emits no credential to console.* on the create-recv-transport path', async () => {
+      const captured: unknown[][] = [];
+      const spies = (['log', 'warn', 'error', 'debug', 'info'] as const).map((level) =>
+        vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+          captured.push(args);
+        })
+      );
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder({
+        'create-recv-transport': {
+          transportId: 'transport-1',
+          iceParameters: { usernameFragment: 'frag', password: 'pass' }, // pragma: allowlist secret
+          iceCandidates: [],
+          dtlsParameters: { role: 'auto', fingerprints: [] },
+          iceServers: [
+            {
+              urls: 'turn:sentinel-turn.invalid:3478',
+              username: 'SENTINEL-USER-8f3a',
+              credential: 'SENTINEL-CRED-8f3a',
+            },
+          ],
+        },
+      });
+      await client.init();
+      const blob = JSON.stringify(captured);
+      for (const s of ['SENTINEL-USER-8f3a', 'SENTINEL-CRED-8f3a', 'sentinel-turn.invalid']) {
+        expect(blob).not.toContain(s);
+      }
+      for (const sp of spies) sp.mockRestore();
     });
   });
 
@@ -438,7 +687,7 @@ describe('PipVoiceClient', () => {
       await client.consume('prod-1', 'mic', 'user-1');
 
       // Check that resume-consumer was sent via BroadcastChannel
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const ch = pipChannel();
       const resumeMsg = ch?.posted.find(
         (m: any) => m.kind === 'rpc-request' && m.method === 'resume-consumer'
       ) as any;
@@ -473,7 +722,7 @@ describe('PipVoiceClient', () => {
       await client.consume('prod-1', 'mic', 'user-1');
       await client.signalReady();
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const ch = pipChannel();
       const readyMsg = ch?.posted.find(
         (m: any) => m.kind === 'rpc-request' && m.method === 'pip-ready'
       ) as any;
@@ -486,7 +735,7 @@ describe('PipVoiceClient', () => {
     it('action sends correct action RPC', async () => {
       await client.action('toggle-mute');
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const ch = pipChannel();
       const actionMsg = ch?.posted.find(
         (m: any) => m.kind === 'rpc-request' && m.method === 'action'
       ) as any;
@@ -562,7 +811,7 @@ describe('PipVoiceClient', () => {
         focusedWindow: true,
       });
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const ch = pipChannel();
       const msg = ch?.posted.find(
         (m: any) => m.kind === 'rpc-request' && m.method === 'set-preferred-layers'
       ) as any;
@@ -601,7 +850,7 @@ describe('PipVoiceClient', () => {
       await client.init();
       await client.consume('prod-1', 'mic', 'user-1');
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+      const ch = pipChannel()!;
       ch.autoResponder = null;
       ch.simulateMessage({ kind: 'broadcast', type: 'voice-ended' });
 
@@ -622,7 +871,7 @@ describe('PipVoiceClient', () => {
       await client.init();
       await client.consume('prod-1', 'mic', 'user-1');
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+      const ch = pipChannel()!;
       ch.autoResponder = null;
 
       const disposePromise = client.dispose();
@@ -645,7 +894,7 @@ describe('PipVoiceClient', () => {
       await client.init();
 
       // Capture channel reference before dispose closes it
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+      const ch = pipChannel()!;
       await client.dispose();
 
       const closingMsg = ch.posted.find(
@@ -656,7 +905,7 @@ describe('PipVoiceClient', () => {
 
     it('retains the server receive transport id and closes owned consumers before the transport', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder();
+      const ch = withCleanupResponder();
       await client.init();
       await client.consume('prod-1', 'mic', 'user-1');
 
@@ -683,10 +932,7 @@ describe('PipVoiceClient', () => {
 
     it('closes a receive transport whose acknowledgement arrives after disposal starts', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = MockBroadcastChannel.instances.find((instance) => instance.name === 'concord-pip');
-      if (!ch) throw new Error('No PiP BroadcastChannel');
-
-      ch.autoResponder = (data: unknown) => {
+      setResponder((data: unknown) => {
         const msg = data as { kind?: string; id?: string; method?: string };
         if (msg.kind !== 'rpc-request' || !msg.id || !msg.method) return undefined;
         if (msg.method === 'create-recv-transport') return undefined;
@@ -695,9 +941,12 @@ describe('PipVoiceClient', () => {
           id: msg.id,
           result: defaultRpcResponses[msg.method],
         };
-      };
+      });
 
       const initPromise = client.init().catch((err: Error) => err);
+      // The session channel only exists once init() has obtained the capability.
+      await vi.waitFor(() => expect(pipChannel()).toBeDefined());
+      const ch = pipChannel()!;
       await vi.waitFor(() => {
         expect(
           ch.posted.some(
@@ -735,7 +984,7 @@ describe('PipVoiceClient', () => {
 
     it('closes the server receive transport when no consumers were created', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder();
+      const ch = withCleanupResponder();
       await client.init();
 
       await client.dispose();
@@ -748,7 +997,7 @@ describe('PipVoiceClient', () => {
 
     it('continues closing remaining consumers and the transport after a consumer close error', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder({
+      const ch = withCleanupResponder({
         consumerIds: ['consumer-1', 'consumer-2'],
         consumerErrors: new Set(['consumer-1']),
       });
@@ -768,7 +1017,7 @@ describe('PipVoiceClient', () => {
 
     it('continues teardown after a consumer close timeout', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder({
+      const ch = withCleanupResponder({
         consumerIds: ['consumer-1', 'consumer-2'],
         consumerTimeouts: new Set(['consumer-1']),
       });
@@ -790,7 +1039,7 @@ describe('PipVoiceClient', () => {
 
     it('bounds consumer cleanup time by closing consumers concurrently before the transport', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder({
+      const ch = withCleanupResponder({
         consumerIds: ['consumer-1', 'consumer-2'],
         consumerTimeouts: new Set(['consumer-1', 'consumer-2']),
       });
@@ -811,7 +1060,7 @@ describe('PipVoiceClient', () => {
     });
     it('completes local teardown when the server transport close fails', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder({ transportError: 'transport cleanup rejected' });
+      const ch = withCleanupResponder({ transportError: 'transport cleanup rejected' });
       await client.init();
       await client.consume('prod-1', 'mic', 'user-1');
 
@@ -827,7 +1076,7 @@ describe('PipVoiceClient', () => {
 
     it('continues local finalization when a consumer close throws', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder({ consumerIds: ['consumer-1', 'consumer-2'] });
+      const ch = withCleanupResponder({ consumerIds: ['consumer-1', 'consumer-2'] });
       await client.init();
       await client.consume('prod-1', 'mic', 'user-1');
       await client.consume('prod-2', 'camera', 'user-2');
@@ -845,7 +1094,7 @@ describe('PipVoiceClient', () => {
 
     it('emits one remote teardown sequence for concurrent and repeated dispose calls', async () => {
       client = new PipVoiceClient('test-pip');
-      const ch = setupCleanupResponder();
+      const ch = withCleanupResponder();
       await client.init();
       await client.consume('prod-1', 'mic', 'user-1');
 
@@ -910,7 +1159,7 @@ describe('PipVoiceClient', () => {
       setupAutoResponder();
       await client.init();
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+      const ch = pipChannel()!;
       await client.dispose();
       const countAfterFirst = ch.posted.length;
 
@@ -930,7 +1179,7 @@ describe('PipVoiceClient', () => {
       const callback = vi.fn();
       client.onStateUpdate = callback;
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const ch = pipChannel();
       ch?.simulateMessage({
         kind: 'broadcast',
         type: 'state-update',
@@ -950,7 +1199,7 @@ describe('PipVoiceClient', () => {
       const callback = vi.fn();
       client.onStateUpdate = callback;
 
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
+      const ch = pipChannel();
       ch?.simulateMessage({ kind: 'broadcast', type: 'voice-ended' });
 
       expect(callback).toHaveBeenCalledWith(expect.objectContaining({ type: 'voice-ended' }));
@@ -960,14 +1209,11 @@ describe('PipVoiceClient', () => {
       client = new PipVoiceClient('test-pip');
 
       // All RPCs return error — init() retries then throws after exhausting attempts
-      const ch = MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip');
-      if (ch) {
-        ch.autoResponder = (data: unknown) => {
-          const msg = data as { kind?: string; id?: string; method?: string };
-          if (msg.kind !== 'rpc-request') return undefined;
-          return { kind: 'rpc-response', id: msg.id, error: 'test error' };
-        };
-      }
+      setResponder((data: unknown) => {
+        const msg = data as { kind?: string; id?: string; method?: string };
+        if (msg.kind !== 'rpc-request') return undefined;
+        return { kind: 'rpc-response', id: msg.id, error: 'test error' };
+      });
 
       const initPromise = client.init().catch((err: Error) => err);
       // Advance through retry delays (errors are immediate, but retries use 1s setTimeout)

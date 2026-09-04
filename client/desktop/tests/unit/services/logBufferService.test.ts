@@ -197,6 +197,166 @@ describe('logBufferService', () => {
     });
   });
 
+  // #3104 follow-up: a live TURN relay credential must not survive capture.
+  //
+  // The fixture is generated the SAME WAY services/control-plane/pkg/config/turn.go
+  // generates it — HMAC-SHA1 over `<expiry>:<userID>`, standard base64 — rather
+  // than hand-written, because the defect is a LENGTH defect: base64 of 20 HMAC
+  // bytes is exactly 28 characters, and the long-base64 PATTERN has a 40-char
+  // floor. A hand-written literal of the wrong length would make every assertion
+  // below vacuous.
+  describe('TURN credential scrub (#3104)', () => {
+    const TURN_SHARED_SECRET = 'test-turn-shared-secret-not-a-real-one'; // pragma: allowlist secret -- synthetic HMAC input; mirrors turn.go's TURNSecret so the fixture has production shape
+    const USER_ID = '550e8400-e29b-41d4-a716-446655440000';
+    const EXPIRY = 1774000000; // unix seconds, 10 digits like a real 24h TTL
+
+    // A credential with the production SHAPE, built without production's crypto
+    // and without a credential-shaped literal.
+    //
+    // The defect under test is a LENGTH defect: turn.go base64-encodes 20
+    // HMAC-SHA1 bytes, which is always 28 characters, and the scrubber's
+    // long-base64 pattern had a 40-character floor — so the credential walked
+    // straight through it. Any 20-byte value reproduces that exactly, so this
+    // encodes an obviously-fake 20-character string instead.
+    //
+    // Two scanners shaped this. A live `createHmac('sha1', ...)` fed by a user
+    // id is flagged by CodeQL as weak crypto on sensitive data — correctly, on
+    // shape — and pinning its output instead tripped gitleaks as a generic API
+    // key, since a real HMAC is exactly what a real credential looks like.
+    // Encoding readable plaintext satisfies both without weakening anything:
+    // the length assertion below is the guard, and it is the whole defect.
+    //
+    // Production-shape fidelity keeps its own test on the Go side, where
+    // sanitize_test.go still mints this the real way under a documented
+    // `#nosec G505` (SHA-1 is mandated by the TURN REST API credential spec).
+    // If turn.go's algorithm ever changes, that is the test that notices.
+    const TURN_CREDENTIAL = Buffer.from('NOT-A-REAL-CRED-1234').toString('base64');
+    function mintTurnCredentials(): { username: string; credential: string } {
+      return { username: `${EXPIRY}:${USER_ID}`, credential: TURN_CREDENTIAL };
+    }
+
+    it('the fixture has the production shape the defect depends on', () => {
+      const { username, credential } = mintTurnCredentials();
+      // 20 HMAC-SHA1 bytes -> 27 base64 chars + one pad = 28. Strictly under the
+      // 40-char floor of the long-base64 PATTERN, which is why it used to survive.
+      expect(credential).toHaveLength(28);
+      expect(credential.endsWith('=')).toBe(true);
+      expect(username).toMatch(/^\d{10}:[0-9a-f-]{36}$/);
+    });
+
+    it('does NOT let the credential survive sanitize()', () => {
+      const { username, credential } = mintTurnCredentials();
+      const line = `[ice] transport opts ${JSON.stringify({
+        urls: 'turn:turn.concordvoice.chat:3478',
+        username,
+        credential,
+      })}`;
+      const out = sanitize(line);
+      expect(out).not.toContain(credential);
+    });
+
+    it('does NOT let the TURN username survive sanitize()', () => {
+      const { username, credential } = mintTurnCredentials();
+      const out = sanitize(`[ice] username=${username} credential=${credential}`);
+      expect(out).not.toContain(username);
+      expect(out).not.toContain(String(EXPIRY));
+    });
+
+    it('redacts credential/password by KEY in the JSON serialization form', () => {
+      const out = sanitize('{"urls":"turn:h:3478","credential":"whatever-shape-this-is"}');
+      expect(out).not.toContain('whatever-shape-this-is');
+      expect(out).toContain('"credential"');
+    });
+
+    it('redacts credential/password by KEY in the util.inspect form', () => {
+      const out = sanitize("RTCConfiguration { credential: 'zzz', password: 'qqq' }");
+      expect(out).not.toContain('zzz');
+      expect(out).not.toContain('qqq');
+    });
+
+    it('never enters the ring buffer raw (capture-time, not read-time)', () => {
+      const { username, credential } = mintTurnCredentials();
+      install();
+      // eslint-disable-next-line no-console
+      console.debug('[ice] servers', [
+        { urls: 'turn:turn.concordvoice.chat:3478', username, credential },
+      ]);
+      const joined = formatEntries(getEntries());
+      expect(joined).not.toContain(credential);
+      expect(joined).not.toContain(username);
+    });
+
+    // False-positive containment. Over-redaction degrades every bug report, so
+    // the narrow-band rule must not swallow ordinary diagnostic text.
+    it.each([
+      'voice join ok in 412ms, 3 servers, policy=all, attempt 2 of 5',
+      'GET /api/v1/channels?limit=50&before=abc -> 200',
+      "RTCPeerConnection { connectionState: 'connected', iceGatheringState: 'complete' }",
+      'chunk assets/index-Bq7Xr2Kd.js loaded',
+      // 28 base64 characters with NO pad — the narrow band must key on the
+      // '=' at position 28, not on the length alone.
+      'consumer AbCdEfGhIjKlMnOpQrStUvWxYz01 resumed',
+    ])('does not redact ordinary diagnostic text: %s', (line) => {
+      expect(sanitize(line)).toBe(line);
+    });
+
+    it('does not redact a 32-char base64 token (only the 27+pad band matches)', () => {
+      // base64 of 23 bytes -> 32 chars with one pad. Neither 40+ nor 27+pad.
+      const token = Buffer.alloc(23, 7).toString('base64');
+      expect(token).toHaveLength(32);
+      expect(sanitize(`build=${token}`)).toContain(token);
+    });
+
+    it('still redacts a long base64 blob as <base64> (existing category intact)', () => {
+      const blob = Buffer.alloc(48, 3).toString('base64');
+      expect(sanitize(`key=${blob}`)).toContain('<base64>');
+    });
+
+    // ─── #3117 gap 2: a bare key with a double-quoted value ────────────────
+    //
+    // The JSON entry requires a QUOTED key; the util.inspect entry required a
+    // SINGLE-quoted value. A bare key with a double-quoted value satisfied
+    // neither, so it was redacted by nothing. Present identically in the Go
+    // backstop, which is why both surfaces move in the same change.
+    it.each([
+      'credential: "whatever-shape-this-is"',
+      'turnCredential: "whatever-shape-this-is"',
+      '{ password: "whatever-shape-this-is" }', // pragma: allowlist secret -- synthetic scrubber input, not a credential
+      '{credential:"whatever-shape-this-is"}',
+    ])('redacts a bare key with a double-quoted value: %s', (line) => {
+      const out = sanitize(line);
+      expect(out).not.toContain('whatever-shape-this-is');
+      // It must be the KEY-shaped entry that ate it, not an incidental shape
+      // match elsewhere in the table — and the key must survive so a triager
+      // can still see WHAT was redacted.
+      expect(out).toContain('<redacted>');
+    });
+
+    // #3117 gap 1 is a Go-only defect: `\b` supplies no boundary when the
+    // token's OWN first character is '+' or '/', because both are non-word and
+    // so is every realistic delimiter. The client's lookbehind has no such
+    // hole. This pins the client half of the parity claim — it was already
+    // green before the fix, so it is a pin, not a regression test.
+    //
+    // The leading base64 character encodes the top 6 bits of byte 0: 0xF8
+    // yields index 62 ('+') and 0xFC yields index 63 ('/').
+    it.each([
+      { firstByte: 0xf8, firstChar: '+' },
+      { firstByte: 0xfc, firstChar: '/' },
+    ])(
+      'redacts a credential whose first base64 character is $firstChar',
+      ({ firstByte, firstChar }) => {
+        const credential = Buffer.concat([
+          Buffer.from([firstByte]),
+          Buffer.alloc(19, 0x42),
+        ]).toString('base64');
+        expect(credential).toHaveLength(28);
+        expect(credential.startsWith(firstChar)).toBe(true);
+        expect(sanitize(`[ice] relay cred ${credential} ok`)).not.toContain(credential);
+      }
+    );
+  });
+
   describe('capture-time sanitization', () => {
     it('strips emails from captured log lines (PII never enters the buffer raw)', () => {
       install();

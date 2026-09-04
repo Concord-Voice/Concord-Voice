@@ -110,4 +110,60 @@ describe('MediaMetrics', () => {
     expect(s.egress.peakBps).toBe(0);
     expect(s.peakConcurrentVideoPublishersPerRoom).toBe(0);
   });
+
+  it('starts all three ICE counters at zero', () => {
+    const s = m.getSnapshot();
+    expect(s.iceSelectedUdp).toBe(0);
+    expect(s.iceSelectedTcp).toBe(0);
+    expect(s.iceTerminalWithoutConnect).toBe(0);
+  });
+
+  it('counts selected-tuple protocol into separate scalars', () => {
+    m.incrementIceSelected('udp');
+    m.incrementIceSelected('udp');
+    m.incrementIceSelected('tcp');
+    const s = m.getSnapshot();
+    expect(s.iceSelectedUdp).toBe(2);
+    expect(s.iceSelectedTcp).toBe(1);
+  });
+
+  it('counts transports that terminate without ever connecting', () => {
+    m.incrementIceTerminalWithoutConnect();
+    m.incrementIceTerminalWithoutConnect();
+    expect(m.getSnapshot().iceTerminalWithoutConnect).toBe(2);
+  });
+
+  it('resets all three ICE counters', () => {
+    m.incrementIceSelected('udp');
+    m.incrementIceSelected('tcp');
+    m.incrementIceTerminalWithoutConnect();
+    m.reset();
+    const s = m.getSnapshot();
+    expect(s.iceSelectedUdp).toBe(0);
+    expect(s.iceSelectedTcp).toBe(0);
+    expect(s.iceTerminalWithoutConnect).toBe(0);
+  });
+
+  // The ops-metrics publisher validates every aggregate key against the CLOSED
+  // 13-key catalog in opsMetricsCatalog.ts (:47 throws "Unknown metric key").
+  // These three counters must therefore never appear on the aggregate shape.
+  it('keeps the ICE counters OFF AggregateMediaMetrics', () => {
+    m.incrementIceSelected('udp');
+    m.incrementIceSelected('tcp');
+    m.incrementIceTerminalWithoutConnect();
+    const agg = m.getAggregateMetrics() as Record<string, unknown>;
+    expect(Object.keys(agg)).not.toContain('iceSelectedUdp');
+    expect(Object.keys(agg)).not.toContain('iceSelectedTcp');
+    expect(Object.keys(agg)).not.toContain('iceTerminalWithoutConnect');
+    expect(Object.keys(agg)).toHaveLength(9);
+  });
+
+  // observability.md principle 7: no reason/cause dimension. An unexpected
+  // protocol value must fall into NO bucket rather than creating a third one.
+  it('ignores a protocol value outside the closed set', () => {
+    (m as unknown as { incrementIceSelected: (p: string) => void }).incrementIceSelected('sctp');
+    const s = m.getSnapshot();
+    expect(s.iceSelectedUdp).toBe(0);
+    expect(s.iceSelectedTcp).toBe(0);
+  });
 });

@@ -151,13 +151,22 @@ const defaultRpcResponses: Record<string, unknown> = {
   'pip-ready': { success: true, pausedCount: 0 },
 };
 
+/**
+ * #3104 D6: the client opens `concord-pip:<token>` inside `init()`, not
+ * `concord-pip` in its constructor. Search `all` so a post-teardown assertion
+ * still sees what the (now closed) channel posted.
+ */
+const PIP_SESSION_TOKEN = 'e2ee-session-token';
+const PIP_CHANNEL = `concord-pip:${PIP_SESSION_TOKEN}`;
+
 function channel(): MockBroadcastChannel {
-  return MockBroadcastChannel.instances.find((c) => c.name === 'concord-pip')!;
+  return MockBroadcastChannel.all.filter((c) => c.name === PIP_CHANNEL).at(-1)!;
 }
 
 function setupResponder(overrides: Record<string, unknown> = {}): void {
   const responses = { ...defaultRpcResponses, ...overrides };
-  channel().autoResponder = (data: unknown) => {
+  // Armed as the class default: the channel does not exist until init() runs.
+  MockBroadcastChannel.defaultAutoResponder = (data: unknown) => {
     const msg = data as { kind?: string; id?: string; method?: string };
     if (msg.kind !== 'rpc-request' || !msg.id || !msg.method) return undefined;
     const result = responses[msg.method];
@@ -189,11 +198,18 @@ class MockMediaStream {
 describe('PipVoiceClient — receive-side E2EE (2026-08-21 PiP E2EE gap)', () => {
   let client: PipVoiceClient;
   let savedMediaStream: unknown;
+  let savedElectron: unknown;
 
   beforeEach(() => {
     resetAllStores();
     vi.useFakeTimers();
     MockBroadcastChannel.install();
+    // #3104 D6: init() opens no channel without this capability.
+    savedElectron = globalThis.electron;
+    (globalThis as unknown as { electron: unknown }).electron = {
+      ...(savedElectron as object),
+      getPipSession: vi.fn().mockResolvedValue({ token: PIP_SESSION_TOKEN }),
+    };
     savedMediaStream = globalThis.MediaStream;
     (globalThis as any).MediaStream = MockMediaStream;
     workerInstances.length = 0;
@@ -213,6 +229,7 @@ describe('PipVoiceClient — receive-side E2EE (2026-08-21 PiP E2EE gap)', () =>
     vi.useRealTimers();
     MockBroadcastChannel.uninstall();
     (globalThis as any).MediaStream = savedMediaStream;
+    (globalThis as unknown as { electron: unknown }).electron = savedElectron;
   });
 
   async function join(overrides: Record<string, unknown> = {}): Promise<void> {

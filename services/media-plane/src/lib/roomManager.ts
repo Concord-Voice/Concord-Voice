@@ -803,6 +803,17 @@ export interface AggregateRoomCounts {
   readonly screenshareParticipants: number;
 }
 
+/**
+ * Narrow ICE outcome hooks (#3104). Deliberately the SAME shape discipline as
+ * admissionGate's `onReject`: the callback is given the wire protocol and
+ * nothing else — no transport id, no room, no user, no address — so /health
+ * stays aggregate-only (index.ts:595-602).
+ */
+export interface IceCounters {
+  onIceSelected?: (protocol: 'udp' | 'tcp') => void;
+  onIceTerminalWithoutConnect?: () => void;
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (extracted to reduce cognitive complexity of computeCodecFloor)
 // ---------------------------------------------------------------------------
@@ -1032,7 +1043,10 @@ export class RoomManager {
   private readonly mediasoup: MediasoupService;
   private readonly eventHandlers: RoomEventHandler[] = [];
 
-  constructor(mediasoup: MediasoupService) {
+  constructor(
+    mediasoup: MediasoupService,
+    private readonly iceCounters: IceCounters = {}
+  ) {
     this.mediasoup = mediasoup;
   }
 
@@ -1857,6 +1871,12 @@ export class RoomManager {
       failed: 'error',
       closed: 'warn',
     };
+    // #3104 ICE outcome counters. Both closures are per-transport, so the
+    // counters are comparable to one another and to the transport count.
+    let everConnected = false;
+    let terminalCounted = false;
+    let tupleCounted = false;
+
     transport.on('icestatechange', (iceState) => {
       logger.log(iceLogLevel[iceState] || 'debug', 'Transport ICE state change', {
         transportId: transport.id,
@@ -1865,7 +1885,29 @@ export class RoomManager {
         direction,
         iceState,
       });
+      // mediasoup's IceState has no `failed` member, so "never got anywhere" has
+      // to be derived: a terminal state with no prior connected/completed.
+      if (iceState === 'connected' || iceState === 'completed') {
+        everConnected = true;
+        return;
+      }
+      if (iceState !== 'disconnected' && iceState !== 'closed') return;
+      if (everConnected || terminalCounted) return;
+      terminalCounted = true;
+      this.iceCounters.onIceTerminalWithoutConnect?.();
     });
+
+    // Fires after ICE reaches `completed`, and again on every tuple change.
+    // Count the FIRST selection only: a mid-call path migration is a distinct
+    // phenomenon, and counting it would let "selected" exceed "transports".
+    transport.on('iceselectedtuplechange', (tuple) => {
+      if (tupleCounted) return;
+      const protocol = tuple?.protocol;
+      if (protocol !== 'udp' && protocol !== 'tcp') return;
+      tupleCounted = true;
+      this.iceCounters.onIceSelected?.(protocol);
+    });
+
     transport.on('dtlsstatechange', (dtlsState) => {
       logger.log(dtlsLogLevel[dtlsState] || 'debug', 'Transport DTLS state change', {
         transportId: transport.id,
