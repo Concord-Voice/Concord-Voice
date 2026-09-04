@@ -237,6 +237,7 @@ const { voiceService } = await import('@/renderer/services/voice/voiceService');
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { extractSelectedCandidatePairType } from '@/renderer/services/voice/iceServers';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -602,7 +603,7 @@ describe('VoiceService ICE-server threading (#3104)', () => {
     debug.mockRestore();
   });
 
-  it('stays silent when getStats rejects', async () => {
+  it('reports a rejected read under its own label, never as unresolved', async () => {
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
     const transport = makeSendTransportWithEvents(RELAY_STATS);
     transport.getStats = vi.fn().mockRejectedValue(new Error('stats unavailable'));
@@ -610,9 +611,395 @@ describe('VoiceService ICE-server threading (#3104)', () => {
     await joinWith([STUN, TURN]);
 
     transport._fire('connectionstatechange', 'connected');
-    await vi.waitFor(() => expect(transport.getStats).toHaveBeenCalled());
+    await vi.waitFor(() => {
+      expect(
+        debug,
+        'a rejected getStats() must be observable -- absence of every line is ' +
+          'ambiguous with the handler never running -- but under its OWN label'
+      ).toHaveBeenCalledWith('[ice] selected-pair-stats-unavailable', { label: 'send' });
+    });
+    expect(debug).not.toHaveBeenCalledWith('[ice] selected-pair', expect.anything());
+    // The discrimination IS the point. Reusing `-unresolved` here would make it
+    // mean "the timing contract broke OR stats were unavailable", destroying its
+    // value as the register entry's runtime proof.
+    expect(
+      debug,
+      'a rejected read must not masquerade as a timing-contract break'
+    ).not.toHaveBeenCalledWith('[ice] selected-pair-unresolved', expect.anything());
+    // observability.md principle 3: the cause chain never reaches the sink.
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('stats unavailable');
+    debug.mockRestore();
+  });
+
+  // Runtime proof for the platform-behavior register ([internal]rules/frontend.md
+  // § Platform-behavior register). These CANNOT prove the Chromium timing
+  // contract -- a synthetic Map returns whatever it was built to return, which
+  // is the register's entire premise. They prove only that the PROOF MECHANISM
+  // works, so a real engine break shows up in a bug report instead of being
+  // swallowed the way #3117's dead diagnostic was.
+  const UNRESOLVABLE_STATS = new Map<string, unknown>([
+    [
+      'cp-1',
+      { id: 'cp-1', type: 'candidate-pair', state: 'in-progress', localCandidateId: 'lc-1' },
+    ],
+    ['lc-1', { id: 'lc-1', type: 'local-candidate', candidateType: 'relay' }],
+  ]);
+
+  it('emits selected-pair-unresolved when connected resolves no pair', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    const transport = makeSendTransportWithEvents(UNRESOLVABLE_STATS);
+    mockCreateSendTransport.mockReturnValueOnce(transport);
+    await joinWith([STUN, TURN]);
+
+    transport._fire('connectionstatechange', 'connected');
+    await vi.waitFor(() => {
+      expect(debug).toHaveBeenCalledWith('[ice] selected-pair-unresolved', { label: 'send' });
+    });
     expect(debug).not.toHaveBeenCalledWith('[ice] selected-pair', expect.anything());
     debug.mockRestore();
+  });
+
+  it('re-arms after an unresolved read so a genuine reconnect retries', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    const transport = makeSendTransportWithEvents(UNRESOLVABLE_STATS);
+    mockCreateSendTransport.mockReturnValueOnce(transport);
+    await joinWith([STUN, TURN]);
+
+    transport._fire('connectionstatechange', 'connected');
+    await vi.waitFor(() =>
+      expect(debug).toHaveBeenCalledWith('[ice] selected-pair-unresolved', { label: 'send' })
+    );
+
+    // A reconnect CHANGES the state value, so mediasoup does not dedupe it
+    // (Transport.js:794) -- unlike ICE `completed`, which collapses onto the
+    // already-seen 'connected' and is why the first read is otherwise final.
+    transport.getStats = vi.fn().mockResolvedValue(RELAY_STATS);
+    transport._fire('connectionstatechange', 'disconnected');
+    transport._fire('connectionstatechange', 'connected');
+    await vi.waitFor(() => {
+      expect(debug).toHaveBeenCalledWith('[ice] selected-pair', { label: 'send', type: 'relay' });
+    });
+    debug.mockRestore();
+  });
+
+  // The reconnect arrives WHILE the first read is still in flight, which is the
+  // case the plain re-arm test cannot see: it waits for the first read to settle
+  // before firing the transition, so `inFlight` is already clear by then.
+  // mediasoup does not replay a state event we declined to act on, so an event
+  // dropped here is lost for good and the documented retry never happens.
+  it('retries a reconnect observed while the first read was still in flight', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    let settleFirst!: (v: unknown) => void;
+    const pending = new Promise((resolve) => {
+      settleFirst = resolve;
+    });
+    const transport = makeSendTransportWithEvents(UNRESOLVABLE_STATS);
+    transport.getStats = vi.fn().mockReturnValueOnce(pending).mockResolvedValue(RELAY_STATS);
+    mockCreateSendTransport.mockReturnValueOnce(transport);
+    await joinWith([STUN, TURN]);
+
+    transport._fire('connectionstatechange', 'connected');
+    // Reconnect DURING the in-flight read. This is the event that must survive.
+    transport._fire('connectionstatechange', 'disconnected');
+    transport._fire('connectionstatechange', 'connected');
+    // Only now does the first read settle, resolving nothing.
+    settleFirst(UNRESOLVABLE_STATS);
+
+    await vi.waitFor(() => {
+      expect(
+        debug,
+        'a reconnect seen during an in-flight read must still produce a retry: ' +
+          'mediasoup never replays the dropped state event, so the retry invariant ' +
+          'documented in the platform-behavior register is otherwise unmet'
+      ).toHaveBeenCalledWith('[ice] selected-pair', { label: 'send', type: 'relay' });
+    });
+    expect(transport.getStats).toHaveBeenCalledTimes(2);
+    debug.mockRestore();
+  });
+
+  // Rapid flap: the QUEUED connection ends before the pending read settles.
+  // Replaying it would measure a transport that is no longer connected, and the
+  // runtime-proof marker would then mean "disconnected" as well as "the engine
+  // timing contract broke" -- the same precision loss as folding a rejected read
+  // into `-unresolved`, arriving by a different route.
+  it('does not replay a queued reconnect that has itself already disconnected', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    let settleFirst!: (v: unknown) => void;
+    const pending = new Promise((resolve) => {
+      settleFirst = resolve;
+    });
+    const transport = makeSendTransportWithEvents(UNRESOLVABLE_STATS);
+    transport.getStats = vi.fn().mockReturnValueOnce(pending).mockResolvedValue(RELAY_STATS);
+    mockCreateSendTransport.mockReturnValueOnce(transport);
+    await joinWith([STUN, TURN]);
+
+    transport._fire('connectionstatechange', 'connected');
+    transport._fire('connectionstatechange', 'disconnected');
+    transport._fire('connectionstatechange', 'connected');
+    transport._fire('connectionstatechange', 'disconnected');
+    settleFirst(UNRESOLVABLE_STATS);
+    // Drain the whole then/catch/finally chain on a MACROTASK. `vi.waitFor` is
+    // useless here: getStats was already called once synchronously, so a
+    // "has been called" predicate resolves immediately and the count assertion
+    // would run before `.finally()` ever executes -- passing for the wrong
+    // reason. Verified: without this the guard's own mutation goes undetected.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(
+      transport.getStats,
+      'the queued connection ended before the read settled, so replaying it would ' +
+        'measure a transport that is no longer connected'
+    ).toHaveBeenCalledTimes(1);
+    expect(
+      debug,
+      'the runtime-proof marker must not fire for a merely-disconnected transport'
+    ).not.toHaveBeenCalledWith('[ice] selected-pair-unresolved', expect.anything());
+    debug.mockRestore();
+  });
+
+  // The other half: a read that RESOLVES after its own connection ended must not
+  // latch `recorded`, or a measurement from a dead connection permanently
+  // suppresses the next real one.
+  it('does not latch a result whose connection ended mid-read', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    let settleFirst!: (v: unknown) => void;
+    const pending = new Promise((resolve) => {
+      settleFirst = resolve;
+    });
+    const transport = makeSendTransportWithEvents(RELAY_STATS);
+    transport.getStats = vi.fn().mockReturnValueOnce(pending).mockResolvedValue(RELAY_STATS);
+    mockCreateSendTransport.mockReturnValueOnce(transport);
+    await joinWith([STUN, TURN]);
+
+    transport._fire('connectionstatechange', 'connected');
+    transport._fire('connectionstatechange', 'disconnected');
+    // Stats retained from the connection that just ended.
+    settleFirst(RELAY_STATS);
+    await vi.waitFor(() => expect(transport.getStats).toHaveBeenCalled());
+    expect(
+      debug,
+      'a result belonging to an ended connection must not be reported'
+    ).not.toHaveBeenCalledWith('[ice] selected-pair', expect.anything());
+
+    // ...and the next genuine connection must still be measurable.
+    transport._fire('connectionstatechange', 'connected');
+    await vi.waitFor(() => {
+      expect(debug).toHaveBeenCalledWith('[ice] selected-pair', { label: 'send', type: 'relay' });
+    });
+    debug.mockRestore();
+  });
+
+  it('does not re-read once a pair has been recorded', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    const transport = makeSendTransportWithEvents(RELAY_STATS);
+    mockCreateSendTransport.mockReturnValueOnce(transport);
+    await joinWith([STUN, TURN]);
+
+    transport._fire('connectionstatechange', 'connected');
+    await vi.waitFor(() =>
+      expect(debug).toHaveBeenCalledWith('[ice] selected-pair', { label: 'send', type: 'relay' })
+    );
+    transport._fire('connectionstatechange', 'disconnected');
+    transport._fire('connectionstatechange', 'connected');
+    await vi.waitFor(() => expect(transport.getStats).toHaveBeenCalled());
+    expect(transport.getStats).toHaveBeenCalledTimes(1);
+    debug.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractSelectedCandidatePairType — Chrome-shaped `transport` reads
+// (reproduction for the ICE selected-pair line never emitting)
+// ---------------------------------------------------------------------------
+
+describe('extractSelectedCandidatePairType — Chrome transport-entry defect', () => {
+  /**
+   * ORACLE (verbatim):
+   * Given a Chrome-shaped `RTCStatsReport` captured at the moment ICE reaches
+   * `connected`, `extractSelectedCandidatePairType` returns the selected local
+   * candidate's `candidateType` — it must not return `null` merely because
+   * nomination has not yet completed, when the report's `transport` entry
+   * names the selected pair outright via `selectedCandidatePairId`.
+   */
+
+  /**
+   * A faithful Chrome stats report captured the instant `iceConnectionState`
+   * becomes `'connected'` (i.e. the ONE observation mediasoup-client's
+   * `Transport.js:794` fires — before nomination completes). Every entry
+   * carries an `id` field equal to its Map key, as a real `RTCStatsReport` does.
+   */
+  function chromeConnectedStats(): Map<string, unknown> {
+    return new Map<string, unknown>([
+      [
+        'transport-1',
+        {
+          type: 'transport',
+          id: 'transport-1',
+          dtlsState: 'connected',
+          selectedCandidatePairId: 'cp-succeeded',
+          bytesSent: 48213,
+          bytesReceived: 91022,
+        },
+      ],
+      [
+        'cp-succeeded',
+        {
+          type: 'candidate-pair',
+          id: 'cp-succeeded',
+          state: 'succeeded',
+          nominated: false, // Chrome: false at the moment iceConnectionState -> 'connected'
+          // No `selected` key at all — Chrome omits this legacy field entirely.
+          localCandidateId: 'lc-relay',
+          remoteCandidateId: 'rc-1',
+        },
+      ],
+      [
+        'cp-inprogress',
+        {
+          type: 'candidate-pair',
+          id: 'cp-inprogress',
+          state: 'in-progress',
+          nominated: false,
+          localCandidateId: 'lc-host',
+          remoteCandidateId: 'rc-1',
+        },
+      ],
+      [
+        'lc-relay',
+        {
+          type: 'local-candidate',
+          id: 'lc-relay',
+          candidateType: 'relay',
+          protocol: 'udp',
+          address: '203.0.113.5',
+          port: 54321,
+        },
+      ],
+      [
+        'lc-host',
+        {
+          type: 'local-candidate',
+          id: 'lc-host',
+          candidateType: 'host',
+          protocol: 'udp',
+          address: '192.168.1.5',
+          port: 55000,
+        },
+      ],
+      [
+        'rc-1',
+        {
+          type: 'remote-candidate',
+          id: 'rc-1',
+          candidateType: 'host',
+          protocol: 'udp',
+          address: '198.51.100.9',
+          port: 3478,
+        },
+      ],
+      [
+        'rtp-out-1',
+        {
+          type: 'outbound-rtp',
+          id: 'rtp-out-1',
+          kind: 'audio',
+          packetsSent: 500,
+          bytesSent: 40000,
+        },
+      ],
+      [
+        'rtp-in-1',
+        {
+          type: 'inbound-rtp',
+          id: 'rtp-in-1',
+          kind: 'audio',
+          packetsReceived: 480,
+          bytesReceived: 38000,
+        },
+      ],
+      ['codec-1', { type: 'codec', id: 'codec-1', mimeType: 'audio/opus', clockRate: 48000 }],
+    ]);
+  }
+
+  // regression for the [ice] selected-pair line never emitting
+  it('reads the transport entry selectedCandidatePairId when nomination has not completed', () => {
+    const stats = chromeConnectedStats();
+    const result = extractSelectedCandidatePairType(stats as unknown as RTCStatsReport);
+    expect(
+      result,
+      'extractSelectedCandidatePairType must resolve the LOCAL candidateType of the pair ' +
+        "named by the transport entry's selectedCandidatePairId, not require nominated===true"
+    ).toBe('relay');
+  });
+
+  // --- Guard rails: must pass both BEFORE and AFTER any fix ---
+
+  it('still returns the type via the existing nominated-true path', () => {
+    const stats = new Map<string, unknown>([
+      [
+        'cp-1',
+        {
+          type: 'candidate-pair',
+          id: 'cp-1',
+          state: 'succeeded',
+          nominated: true,
+          localCandidateId: 'lc-1',
+        },
+      ],
+      ['lc-1', { type: 'local-candidate', id: 'lc-1', candidateType: 'relay' }],
+    ]);
+    expect(extractSelectedCandidatePairType(stats as unknown as RTCStatsReport)).toBe('relay');
+  });
+
+  it('returns null when there is no succeeded candidate pair at all', () => {
+    const stats = new Map<string, unknown>([
+      [
+        'cp-1',
+        {
+          type: 'candidate-pair',
+          id: 'cp-1',
+          state: 'failed',
+          nominated: false,
+          localCandidateId: 'lc-1',
+        },
+      ],
+      ['lc-1', { type: 'local-candidate', id: 'lc-1', candidateType: 'relay' }],
+    ]);
+    expect(extractSelectedCandidatePairType(stats as unknown as RTCStatsReport)).toBeNull();
+  });
+
+  it('returns null rather than throwing when selectedCandidatePairId points at a missing id', () => {
+    const stats = new Map<string, unknown>([
+      [
+        'transport-1',
+        {
+          type: 'transport',
+          id: 'transport-1',
+          selectedCandidatePairId: 'does-not-exist',
+        },
+      ],
+    ]);
+    expect(() =>
+      extractSelectedCandidatePairType(stats as unknown as RTCStatsReport)
+    ).not.toThrow();
+    expect(extractSelectedCandidatePairType(stats as unknown as RTCStatsReport)).toBeNull();
+  });
+
+  it('returns null when the selected local candidate has an unknown candidateType', () => {
+    const stats = new Map<string, unknown>([
+      [
+        'cp-1',
+        {
+          type: 'candidate-pair',
+          id: 'cp-1',
+          state: 'succeeded',
+          nominated: true,
+          localCandidateId: 'lc-1',
+        },
+      ],
+      ['lc-1', { type: 'local-candidate', id: 'lc-1', candidateType: 'bogus' }],
+    ]);
+    expect(extractSelectedCandidatePairType(stats as unknown as RTCStatsReport)).toBeNull();
   });
 });
 

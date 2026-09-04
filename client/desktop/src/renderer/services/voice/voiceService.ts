@@ -5602,21 +5602,104 @@ class VoiceService {
    * support-diagnostic signal that tells us whether a user landed on a relay.
    */
   private recordSelectedCandidatePair(transport: mediasoupTypes.Transport, label: string): void {
+    // A GENERATION FENCE, not another flag. Ad-hoc booleans answered "is a read
+    // running?" and "did we skip one?", but never the question that actually
+    // matters: does this result still describe the connection that is live NOW?
+    // Each flap variant needed its own flag until the fence replaced them.
+    //
+    // `liveGen` increments on every genuine transition INTO connected. A read
+    // carries the generation it was started for and reports only if that
+    // generation is still both current and connected.
     let recorded = false;
-    transport.on('connectionstatechange', (state) => {
-      if (state !== 'connected' || recorded) return;
-      recorded = true;
+    let inFlight = false;
+    let isConnected = false;
+    let liveGen = 0;
+    let queuedGen = 0; // 0 = nothing queued
+
+    // Stale means: the connection this read belongs to has ended, or a newer one
+    // replaced it. Report NOTHING then. Emitting here would make the markers
+    // mean "...or the transport disconnected", and their whole value to the
+    // platform-behavior register is that they do not mean that.
+    const isStale = (gen: number): boolean => !isConnected || gen !== liveGen;
+
+    const readOnce = (gen: number): void => {
+      inFlight = true;
       transport
         .getStats()
         .then((stats) => {
+          if (isStale(gen)) return;
           const type = extractSelectedCandidatePairType(stats);
-          if (type) console.debug('[ice] selected-pair', { label, type });
+          if (type) {
+            recorded = true;
+            console.debug('[ice] selected-pair', { label, type });
+            return;
+          }
+          // RUNTIME PROOF for the platform-behavior register entry "ICE
+          // selected-pair resolution timing" ([internal]rules/frontend.md).
+          //
+          // Reaching `connected` with nothing resolvable means the engine
+          // timing contract this diagnostic rests on did not hold. That
+          // contract is unobservable to a test: a synthetic stats Map returns
+          // whatever it was built to return, which is exactly how #3117
+          // shipped a dead diagnostic under a green suite. Only a real engine
+          // can break it, so only a real run can prove it — this line is what
+          // makes the break visible in a bug report instead of silent.
+          //
+          // Safe under NC-1: `label` is a call-site literal (send /
+          // recv-audio / recv-video), never anything derived from ice_servers.
+          console.debug('[ice] selected-pair-unresolved', { label });
         })
         .catch(() => {
-          // Stats unavailable for this transport — no diagnostic, no failure.
-          // Deliberately swallowed without logging the error: observability.md
-          // principle 3 forbids propagating a cause chain into a log sink.
+          if (isStale(gen)) return;
+          // A DISTINCT label from `-unresolved`, deliberately. A rejection here
+          // is almost always the transport closing under us (mediasoup's
+          // getTransportStats asserts not-closed first) — benign, and NOT the
+          // engine timing contract breaking. Reusing `-unresolved` would make
+          // that signal mean "the contract broke OR stats were unavailable",
+          // destroying its value as the register entry's runtime proof.
+          //
+          // Emitting SOMETHING still matters: absence of every line is
+          // ambiguous with the handler never having run at all.
+          //
+          // The error VALUE is still never logged — observability.md principle
+          // 3 forbids propagating a cause chain into a log sink.
+          console.debug('[ice] selected-pair-stats-unavailable', { label });
+        })
+        .finally(() => {
+          inFlight = false;
+          const queued = queuedGen;
+          queuedGen = 0;
+          // Replay a declined `connected` ONLY while it is still the live,
+          // connected generation. mediasoup never replays a state event we
+          // declined, so without this the reconnect is lost — but replaying one
+          // that has since disconnected measures a dead transport.
+          if (!recorded && queued !== 0 && queued === liveGen && isConnected) {
+            readOnce(queued);
+          }
         });
+    };
+
+    transport.on('connectionstatechange', (state) => {
+      if (state !== 'connected') {
+        // Any other state ends the current connection. A queued replay is not
+        // cleared here: `.finally()` re-checks `isConnected`, so a flap back to
+        // connected before the read settles is still honoured.
+        isConnected = false;
+        return;
+      }
+      // mediasoup dedupes on the state VALUE (Transport.js:794), so a second
+      // `connected` with no intervening change is not a new connection — which
+      // is also why ICE `completed`, the moment the old nominated-based
+      // heuristic would have worked, never arrives as a second event.
+      if (isConnected) return;
+      isConnected = true;
+      liveGen += 1;
+      if (recorded) return;
+      if (inFlight) {
+        queuedGen = liveGen;
+        return;
+      }
+      readOnce(liveGen);
     });
   }
 

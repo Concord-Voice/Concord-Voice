@@ -130,9 +130,11 @@ export function describeIceServers(servers: unknown): {
  * this reads the iteration KEY rather than a `value.id` field, keeping both identical.
  */
 export function extractSelectedCandidatePairType(stats: RTCStatsReport): CandidatePairType | null {
+  let selectedPairId: string | undefined;
   let chosenLocalId: string | undefined;
   let sawSelected = false;
   const localTypes = new Map<string, unknown>();
+  const pairLocalIds = new Map<string, string | undefined>();
 
   stats.forEach((report: unknown, key: string) => {
     const r = report as {
@@ -142,12 +144,27 @@ export function extractSelectedCandidatePairType(stats: RTCStatsReport): Candida
       selected?: boolean;
       localCandidateId?: string;
       candidateType?: unknown;
+      selectedCandidatePairId?: unknown;
     };
     if (r.type === 'local-candidate') {
       localTypes.set(key, r.candidateType);
       return;
     }
-    if (r.type !== 'candidate-pair' || r.state !== 'succeeded') return;
+    if (r.type === 'transport') {
+      // Authoritative: Chrome names the selected pair here as soon as ICE
+      // selects one, which is strictly BEFORE nomination completes. The
+      // heuristics below cannot see that window -- `selected` is a legacy
+      // field Chrome never emits, and `nominated` is still false -- while
+      // mediasoup collapses ICE `connected` and `completed` into one event
+      // (Transport.js:794), so the post-nomination retry never arrives.
+      if (typeof r.selectedCandidatePairId === 'string') {
+        selectedPairId = r.selectedCandidatePairId;
+      }
+      return;
+    }
+    if (r.type !== 'candidate-pair') return;
+    pairLocalIds.set(key, r.localCandidateId);
+    if (r.state !== 'succeeded') return;
     if (r.selected === true) {
       chosenLocalId = r.localCandidateId;
       sawSelected = true;
@@ -158,8 +175,12 @@ export function extractSelectedCandidatePairType(stats: RTCStatsReport): Candida
     }
   });
 
-  if (chosenLocalId === undefined) return null;
-  const type = localTypes.get(chosenLocalId);
+  // A transport entry that names a pair wins outright. If it names one that is
+  // absent the report is internally inconsistent, so fail closed to no
+  // diagnostic rather than falling back to a guess about a different pair.
+  const localId = selectedPairId === undefined ? chosenLocalId : pairLocalIds.get(selectedPairId);
+  if (localId === undefined) return null;
+  const type = localTypes.get(localId);
   if (typeof type !== 'string' || !CANDIDATE_PAIR_TYPES.has(type)) return null;
   return type as CandidatePairType;
 }
