@@ -110,7 +110,11 @@ CONTROL_PLANE_URL=http://localhost:8080
 # WebRTC settings
 ANNOUNCED_IP=127.0.0.1
 RTC_MIN_PORT=40000
-RTC_MAX_PORT=49999
+# Must stay INSIDE the range the compose file publishes — mediasoup does not
+# bound a bind to the published window, so a wider range here binds ports
+# Docker never published. The shipped files publish 40000-40099 (dev),
+# 40000-40199 (staging) and 40000-41999 (production).
+RTC_MAX_PORT=40099
 
 # Mediasoup settings
 NUM_WORKERS=4
@@ -120,7 +124,82 @@ MEDIASOUP_LOG_LEVEL=warn
 **Important for Docker/Cloud:**
 
 - Set `ANNOUNCED_IP` to your server's public IP
-- Open UDP ports `40000-49999` in your firewall
+- Open the UDP range your compose file publishes — `40000-40099` (dev), `40000-40199`
+  (staging), `40000-41999` (production) — in your firewall. UDP-only, by design, per ADR-0040 (not an
+  oversight): see [ADR-0040](../../[internal]0040-ice-tcp-ingress-posture.md). ICE-TCP is
+  gated off by default via `MEDIASOUP_ENABLE_TCP` (only a value that normalizes to `true` —
+  trimmed and case-insensitive — opens it). If
+  you enable it, open the **same range for TCP first** — on the publish stanza of whichever
+  compose file you deploy with, and on both firewall surfaces — or clients will burn ICE
+  connectivity checks on a candidate your ingress black-holes with no reset. The firewall
+  permits must be **scoped to the public interface**, which the existing UDP rules are not, so
+  do not copy their shape:
+
+  ```bash
+  # NET_IFACE is a LOCAL variable inside provision-production.sh — it is neither
+  # exported nor persisted, so an operator shell must resolve it first or these
+  # commands expand to `ufw allow in on  to any ...` and fail.
+  NET_IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+  NET_IFACE="${NET_IFACE:-eth0}"
+
+  ufw allow in on ${NET_IFACE} to any port 40000:41999 proto tcp comment 'RTC TCP'
+  iptables -I DOCKER-USER -i ${NET_IFACE} -p tcp --dport 40000:41999 -j RETURN
+  ```
+
+  **The `iptables` line above is NOT persistent, and running it alone is a trap.**
+  `docker-user-firewall.service` runs `/etc/iptables/docker-user-rules.sh` on boot, which
+  begins by flushing the chain (`iptables -F DOCKER-USER`) and rebuilding it from the
+  provisioning source. A live `-I` therefore survives until the next reboot or firewall-service
+  restart and then vanishes — while the compose gate stays enabled, so advertised TCP candidates
+  are black-holed again with nothing in the config to show why. Make it persistent WITHOUT re-running
+  the provisioner: **`provision-production.sh` unconditionally rewrites the nginx config to its
+  port-80 bootstrap form**, which drops HTTPS while the certificate stays valid — the runbook
+  warns about exactly this at
+  [`hetzner-ovh-migration.md:478-500`](../../[internal]hetzner-ovh-migration.md). ADR-0040
+  says this opt-in needs no host reprovisioning, and it should not.
+
+  Instead, do both of these:
+
+  1. **On the host**, add the permit to `/etc/iptables/docker-user-rules.sh` beside the existing
+     `-I DOCKER-USER` lines — but write the interface name **literally**; do NOT paste the
+     `${NET_IFACE}` form shown above. That file is generated from an *unquoted* heredoc
+     (`provision-production.sh:1002`), so the variable is expanded as the file is written and
+     the installed script neither sets nor inherits it — systemd runs it with an empty
+     environment. The empty expansion does not survive as an empty argument — it disappears, so
+     a pasted `-i ${NET_IFACE}` reaches iptables as `-i -p tcp ...` with `-p` consumed as the
+     interface name. Whatever iptables then makes of that, it is not the rule that was written,
+     and the rest of the script carries on rebuilding the chain — leaving the gate enabled and
+     the permit absent, with no failed unit to notice. Read the concrete name off that file's
+     own last line (`-A DOCKER-USER -i <iface> -j DROP`, already expanded for the same reason).
+     Then
+     `systemctl restart docker-user-firewall.service` to apply it.
+  2. **In the repo**, persist **both** permits in `[internal]provision-production.sh`.
+     They have separate reset paths, so fixing one leaves the other to vanish:
+     - **DOCKER-USER** — inside the `IPTEOF` heredoc, beside the other `-I DOCKER-USER` rules
+       (`:1030-1044`). Write `${NET_IFACE}` here: unlike step 1 this is the generating side,
+       where it expands correctly.
+     - **UFW** — beside `ufw allow 40000:49999/udp comment 'WebRTC RTP media'` (`:975`). The
+       firewall section opens with `ufw --force reset` (`:959`) and rebuilds from that list
+       alone, so a permit added only with `ufw allow` on the host is erased by the next
+       legitimate provision — while the committed gate and publication stay enabled, which
+       black-holes the advertised candidates again with nothing in the config to show why.
+
+     **These two edits must land in ONE commit, together with the TCP publication and
+     the gate flip** — do not stage them as a separate "firewall first" change. The
+     parity test's disabled branch rejects any firewall permit overlapping the RTC
+     window while the compose literals still read `"false"`, so a repo commit carrying
+     only the permits fails the repository's own blocking check and cannot merge.
+
+     The live-host steps in 1 are a different matter and the ordering there is the
+     opposite: apply the host permits **before** flipping the gate, or clients burn ICE
+     checks on candidates the ingress black-holes. Host actions are not commits, so no
+     test gates them. Either way, do not run the provisioner to deliver any of this.
+
+  That detection is the same one `provision-production.sh` uses at `:783-784`. An
+  unscoped permit also opens the TCP listener on the OVH private `ens3` and on any future
+  WireGuard backplane; `-I` rather than `-A` because the chain ends in an interface-scoped
+  `DROP` and an appended permit lands after it. `test-rtc-port-ingress-parity.sh` accepts only
+  these shapes
 - `NUM_WORKERS=4` is the code default and the value `docker-compose.yml` sets.
   **Production uses `3`**, matching the media-plane's `cpus: '3'` limit in
   `docker-compose.production.yml`. A mediasoup worker is a single-threaded C++
@@ -305,9 +384,22 @@ Client 3 (Producer) → WebRTC Transport ↗         ↘ WebRTC Transport → Cl
 
 ### UDP
 
-- **40000-49999** - RTC media ports (configurable)
+- **RTC media ports** — UDP-only by design, per ADR-0040; no TCP is published. The code default
+  is `40000-49999`, but every shipped compose file narrows `RTC_MIN_PORT`/`RTC_MAX_PORT` to match
+  what it publishes: `40000-40099` (dev), `40000-40199` (staging), `40000-41999` (production).
 
-**Note:** in production, consider a smaller port range to reduce firewall rules. A small deployment might use 40000-40099.
+**Note:** the RTC range and the compose publish stanza must agree, and the range must not be
+wider. mediasoup does not validate this — it will happily bind a port Docker never published,
+which fails with no useful diagnostic. `[internal]tests/test-rtc-port-ingress-parity.sh`
+asserts the containment for every compose file. A narrower range also means fewer iptables DNAT
+rules, which is why production uses 2,000 ports rather than the full 10,000.
+
+**UDP-only is by design** ([ADR-0040](../../[internal]0040-ice-tcp-ingress-posture.md)), not a
+gap — no TCP listener is published for the RTC range. ICE-TCP exists in mediasoup but is gated
+off by `MEDIASOUP_ENABLE_TCP` (default `false`). Before enabling it, open the **same range for
+TCP first**, on the same publish stanza and both firewall surfaces the UDP range already uses;
+otherwise you recreate the exact defect ADR-0040 removed. UDP-blocked clients already have a
+path: TURN/TURNS relay on `3478/tcp` and `5349/tcp`.
 
 ## Scaling
 

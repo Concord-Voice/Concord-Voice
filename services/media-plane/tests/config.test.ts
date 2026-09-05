@@ -43,6 +43,7 @@ describe('config', () => {
     delete process.env.NUM_WORKERS;
     delete process.env.RTC_MIN_PORT;
     delete process.env.RTC_MAX_PORT;
+    delete process.env.MEDIASOUP_ENABLE_TCP;
     delete process.env.OPS_METRICS_ENABLED;
     delete process.env.OPS_METRICS_NODE_ID;
     delete process.env.OPS_METRICS_SHARED_SECRET;
@@ -201,6 +202,41 @@ describe('config', () => {
     it('applies ALLOWED_ORIGINS override', async () => {
       const { config } = await loadConfig({ ALLOWED_ORIGINS: 'https://a.com, https://b.com' });
       expect(config.allowedOrigins).toEqual(['https://a.com', 'https://b.com']);
+    });
+
+    describe('MEDIASOUP_ENABLE_TCP gate (#3105)', () => {
+      it('defaults enableTcp to false when the var is unset', async () => {
+        const { config } = await loadConfig();
+        expect(config.mediasoup.webRtcTransport.enableTcp).toBe(false);
+      });
+
+      // The ONLY input that opens the capability is the exact string 'true',
+      // trimmed and case-folded. Every other shape — including the truthy-
+      // looking '1'/'yes'/'on' — is false. There is no fail-open path.
+      it.each([
+        ['true', true],
+        ['TRUE', true],
+        ['True', true],
+        ['  true  ', true],
+        ['', false],
+        ['1', false],
+        ['yes', false],
+        ['on', false],
+        ['false', false],
+        ['FALSE', false],
+        ['tru', false],
+        ['true!', false],
+        ['truthy', false],
+      ])('MEDIASOUP_ENABLE_TCP=%j resolves to %s', async (raw, expected) => {
+        const { config } = await loadConfig({ MEDIASOUP_ENABLE_TCP: raw });
+        expect(config.mediasoup.webRtcTransport.enableTcp).toBe(expected);
+      });
+
+      it('leaves enableUdp and preferUdp untouched when the gate is open', async () => {
+        const { config } = await loadConfig({ MEDIASOUP_ENABLE_TCP: 'true' });
+        expect(config.mediasoup.webRtcTransport.enableUdp).toBe(true);
+        expect(config.mediasoup.webRtcTransport.preferUdp).toBe(true);
+      });
     });
 
     it('applies NUM_WORKERS override', async () => {

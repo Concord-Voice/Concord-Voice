@@ -28,7 +28,8 @@ vi.mock('@/config/index.js', () => ({
       webRtcTransport: {
         listenIps: [{ ip: '0.0.0.0', announcedIp: '127.0.0.1' }],
         enableUdp: true,
-        enableTcp: true,
+        // #3105: matches production, where the gate defaults closed.
+        enableTcp: false,
         preferUdp: true,
         initialAvailableOutgoingBitrate: 1_000_000,
         maxIncomingBitrate: 50_000_000,
@@ -71,6 +72,7 @@ import {
 // `./mocks/logger.js` (imported above) replaces @/lib/logger with vi.fn() spies;
 // importing it here gives us the SAME mocked object to assert on.
 import { logger } from '../src/lib/logger.js';
+import { config as mockedConfig } from '@/config/index.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1470,6 +1472,32 @@ describe('RoomManager', () => {
       expect(result.id).toBe(transport.id);
       expect(result.iceParameters).toBeDefined();
       expect(result.dtlsParameters).toBeDefined();
+    });
+
+    // #3105: roomManager must pass the config value through VERBATIM. Before
+    // this assertion existed, `enableTcp` could be flipped in production config
+    // and no test in the repo would notice.
+    //
+    // BOTH values are driven deliberately. Asserting only the shipped default
+    // (`false`) is vacuous: a hardcoded `enableTcp: false` in roomManager would
+    // satisfy it just as well as a real pass-through, so the test would prove
+    // the value is false rather than that it came from config.
+    it.each([false, true])('passes config enableTcp=%s through to createWebRtcTransport verbatim', async (gate) => {
+      const wrt = mockedConfig.mediasoup.webRtcTransport as { enableTcp: boolean };
+      const original = wrt.enableTcp;
+      wrt.enableTcp = gate;
+      try {
+        const transport = createMockTransport();
+        mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+
+        await manager.createTransport('room-1', 'u-1', 'send');
+
+        expect(mockRouter.createWebRtcTransport).toHaveBeenCalledWith(
+          expect.objectContaining({ enableTcp: gate, enableUdp: true, preferUdp: true })
+        );
+      } finally {
+        wrt.enableTcp = original;
+      }
     });
 
     it('creates a recv transport and adds to recvTransports map', async () => {

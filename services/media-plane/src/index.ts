@@ -1426,6 +1426,23 @@ async function main() {
       port,
       environment: config.environment,
     });
+
+    // #3105 / ADR-0040. An env gate cannot see a firewall, so this converts an
+    // invisible misconfiguration into a visible one and does nothing more.
+    if (config.mediasoup.webRtcTransport.enableTcp) {
+      logger.warn(
+        'MEDIASOUP_ENABLE_TCP is set — mediasoup will bind an ICE-TCP listener ' +
+          'per WebRTC transport and advertise a TCP candidate. This process ' +
+          'CANNOT verify that those ports are reachable. Publish the RTC range ' +
+          'for TCP in compose AND allow it on both firewall surfaces (ufw and ' +
+          'the DOCKER-USER chain), or every client will burn ICE connectivity ' +
+          'checks on a black-holed candidate. See ADR-0040.',
+        {
+          rtcMinPort: config.mediasoup.worker.rtcMinPort,
+          rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
+        }
+      );
+    }
   });
 
   // Graceful shutdown

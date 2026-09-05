@@ -509,6 +509,7 @@ opt-in unavailable. It does not prevent existing history reads or deletion.
 | `ANNOUNCED_IP` | `127.0.0.1` | Public IP for WebRTC |
 | `RTC_MIN_PORT` | `40000` | Min RTC port |
 | `RTC_MAX_PORT` | `49999` | Max RTC port |
+| `MEDIASOUP_ENABLE_TCP` | `false` | Opens mediasoup ICE-TCP. Binds a TCP listener per transport. Only the exact string `true` (trimmed, case-insensitive) enables it. Do not set without publishing the RTC range for TCP and allowing it on both firewall surfaces — see [ADR-0040](adr/0040-ice-tcp-ingress-posture.md) |
 | `NUM_WORKERS` | `4` (code); Compose sets its own literal per file — `4` in `docker-compose.yml`, `3` in `docker-compose.production.yml` | Mediasoup workers. The production value matches that file's `cpus: '3'` limit — a mediasoup worker is a single-threaded subprocess pinned to one core, and nothing enforces agreement between the two values, so change them together. Validated fail-closed at startup (#2178): anything that is not an integer `>= 1` logs `FATAL:` and exits 1 rather than falling back to the default. `0` would otherwise build an empty worker pool that starts and answers `/health`, then crashes on the first voice join |
 
 ### STUN/TURN (coturn)
@@ -605,7 +606,7 @@ npm install --global windows-build-tools
 
 ### WebRTC connection issues
 
-- Check firewall allows UDP ports 40000-49999
+- Check the firewall allows **UDP** ports 40000-49999. UDP-only is by design ([ADR-0040](adr/0040-ice-tcp-ingress-posture.md)) — ICE-TCP is gated off, and clients on UDP-blocking networks reach voice via TURN/TURNS (3478/tcp, 5349/tcp)
 - Verify `ANNOUNCED_IP` is correct
 - Test with localhost first before remote connections
 - Check browser console for ICE errors

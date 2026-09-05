@@ -300,7 +300,11 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
       JWT_SECRET: ${JWT_SECRET:?}
       RTC_MIN_PORT: 40000
-      RTC_MAX_PORT: 49999
+      # Constrain RTC port range to match the Docker port mapping below.
+      # mediasoup does NOT bound a bind to the published window (#3105), so a
+      # wider range here binds ports Docker never published. Staging carries
+      # the identical constraint (docker-compose.staging.yml:49-52).
+      RTC_MAX_PORT: 40099
       ANNOUNCED_IP: 127.0.0.1
       OPS_METRICS_ENABLED: ${OPS_METRICS_ENABLED:-false}
       OPS_METRICS_NODE_ID: ${OPS_METRICS_NODE_ID:-}
@@ -314,6 +318,14 @@ services:
       # its own copy to its cpus allocation — see docker-compose.production.yml.
       # A literal, not an interpolation: see the production file for why.
       NUM_WORKERS: "4"
+      # ICE-TCP gate (#3105, ADR-0040). A literal, not an interpolation —
+      # same rationale as NUM_WORKERS: it never enters /opt/concord/.env and
+      # so carries none of the five env-var surfaces. Declared here rather
+      # than omitted because the container reads process.env directly; an
+      # undeclared var is permanently undefined and the documented opt-in
+      # would silently do nothing. Enabling it REQUIRES publishing the RTC
+      # range for TCP and allowing it on both firewall surfaces first.
+      MEDIASOUP_ENABLE_TCP: "false"
       # Peers whose X-Real-IP / X-Forwarded-For the #2032 admission gate trusts
       # (src/lib/admissionGate.ts). Matched by CIDR, not string equality — the
       # media-plane is reached through a docker bridge whose address is not a

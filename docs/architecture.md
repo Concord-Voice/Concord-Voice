@@ -604,9 +604,9 @@ login-enabled role must revoke successfully, or startup fails closed.
 
 ### Media Plane (Node.js + mediasoup) ✅ Implemented
 
-**Port**: 3000 · **RTC ports**: 40000–40099/UDP (dev), 40000–41999/UDP (production) · Source: `services/media-plane/`
+**Port**: 3000 · **RTC ports**: 40000–40099/UDP (dev), 40000–41999/UDP (production) — UDP by default; ICE-TCP requires `MEDIASOUP_ENABLE_TCP=true` plus matching TCP ingress ([ADR-0040](adr/0040-ice-tcp-ingress-posture.md)) · Source: `services/media-plane/`
 
-**Tech Stack:** Node.js 24, mediasoup 3.22, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
+**Tech Stack:** Node.js 24, mediasoup 3.26.0, Socket.IO 4.8, NATS 2.x, `redis` (node-redis) client 6.x connecting to the shared Redis 7 server. The builder stage uses a custom GHCR base image (`ghcr.io/concord-voice/node-buildtools`, digest-pinned) that pre-bakes the mediasoup native-compile toolchain.
 
 **Responsibilities:**
 

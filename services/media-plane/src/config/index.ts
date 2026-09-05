@@ -333,6 +333,23 @@ function parseWorkerCountEnv(raw: string | undefined, fallback: number): number 
   return workers;
 }
 
+/**
+ * Fail-closed gate for mediasoup ICE-TCP (#3105, ADR-0040).
+ *
+ * Only the exact string 'true' (trimmed, case-insensitive) opens it. Unset,
+ * empty, '1', 'yes', 'on' and anything unparseable are all false — the safe
+ * reading of garbage IS false, so unlike parseWorkerCountEnv there is no
+ * fatal-exit branch here.
+ *
+ * Opening this gate binds a real TCP listener per live WebRTC transport
+ * (mediasoup 3.26.0 worker/src/RTC/WebRtcTransport.cpp:154-187), so it must
+ * not be opened unless the RTC port range is published in compose AND allowed
+ * on both firewall surfaces. No deployed environment does that today.
+ */
+function parseTcpEnabledEnv(raw: string | undefined): boolean {
+  return raw?.trim().toLowerCase() === 'true';
+}
+
 function parseOpsMetricsIntervalMs(raw: string | undefined): number {
   const match = /^(\d+)(ms|s|m)$/.exec((raw || '15s').trim());
   if (!match) return Number.NaN;
@@ -450,7 +467,15 @@ export const config = {
       initialAvailableOutgoingBitrate: 1_000_000, // 1 Mbps initial estimate
       maxIncomingBitrate: 50_000_000, // 50 Mbps cap (supports 4K60)
       enableUdp: true,
-      enableTcp: true, // TCP fallback for restrictive firewalls
+      // #3105 / ADR-0040. Was `true` with the comment "TCP fallback for
+      // restrictive firewalls" — that fallback never existed: no deployed
+      // environment publishes or firewalls the RTC TCP range, so mediasoup
+      // advertised a candidate the ingress black-holed with no RST. Restrictive
+      // networks are served by TURN/TURNS (3478/tcp, 5349/tcp), which ARE
+      // published and firewalled and have been consumed by the desktop client
+      // since #3104. Opening this gate without opening those ports recreates
+      // the original defect.
+      enableTcp: parseTcpEnabledEnv(process.env.MEDIASOUP_ENABLE_TCP),
       preferUdp: true, // UDP preferred for lower latency
     },
   },
