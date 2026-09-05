@@ -5,7 +5,7 @@
 # the default tag (`node:latest`, currently Debian-based `node:26`). PR #2800
 # did exactly that -- swapping this stage to a 443 MB Debian image with nothing
 # in the diff to show it. Keep tag+digest together on every bump.
-FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS admin-ui-builder
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS admin-ui-builder
 
 WORKDIR /src
 COPY --from=admin_ui package.json package-lock.json ./
