@@ -38,7 +38,7 @@ import {
   type GetFrameKeyResult,
 } from './pipSignalingTypes';
 import { errorMessage } from '../../utils/runtime/redactError';
-import { normalizeIceServers } from './iceServers';
+import { extractSelectedCandidatePairType, normalizeIceServers } from './iceServers';
 import {
   codecFamilyFromRtpParameters,
   type E2EEMainMessage,
@@ -301,6 +301,65 @@ export class PipVoiceClient {
       } catch (err) {
         errback(err instanceof Error ? err : new Error(String(err)));
       }
+    });
+
+    const recvTransport = this.recvTransport;
+    let candidatePairRecorded = false;
+    let candidatePairInFlight = false;
+    let candidatePairConnected = false;
+    let candidatePairGeneration = 0;
+    let candidatePairQueuedGeneration = 0;
+
+    const isCandidatePairStatsStale = (generation: number): boolean =>
+      this.disposed || !candidatePairConnected || generation !== candidatePairGeneration;
+
+    const readCandidatePairStats = (generation: number): void => {
+      candidatePairInFlight = true;
+      recvTransport
+        .getStats()
+        .then((stats) => {
+          if (isCandidatePairStatsStale(generation)) return;
+          const type = extractSelectedCandidatePairType(stats);
+          if (type) {
+            candidatePairRecorded = true;
+            console.debug('[ice] selected-pair', { label: 'pip-recv', type });
+            return;
+          }
+          console.debug('[ice] selected-pair-unresolved', { label: 'pip-recv' });
+        })
+        .catch(() => {
+          if (isCandidatePairStatsStale(generation)) return;
+          console.debug('[ice] selected-pair-stats-unavailable', { label: 'pip-recv' });
+        })
+        .finally(() => {
+          candidatePairInFlight = false;
+          const queuedGeneration = candidatePairQueuedGeneration;
+          candidatePairQueuedGeneration = 0;
+          if (
+            !candidatePairRecorded &&
+            queuedGeneration !== 0 &&
+            queuedGeneration === candidatePairGeneration &&
+            candidatePairConnected &&
+            !this.disposed
+          ) {
+            readCandidatePairStats(queuedGeneration);
+          }
+        });
+    };
+
+    recvTransport.on('connectionstatechange', (connectionState) => {
+      if (connectionState !== 'connected') {
+        candidatePairConnected = false;
+        return;
+      }
+      if (candidatePairConnected || candidatePairRecorded) return;
+      candidatePairConnected = true;
+      const generation = ++candidatePairGeneration;
+      if (candidatePairInFlight) {
+        candidatePairQueuedGeneration = generation;
+        return;
+      }
+      readCandidatePairStats(generation);
     });
 
     return state;

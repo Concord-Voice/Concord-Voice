@@ -497,3 +497,14 @@ describe('classifyFallbackReason (#2401)', () => {
     }
   });
 });
+
+describe('authenticated PiP rollout safety', () => {
+  it('keeps released pre-contract-26 shells on the authenticated remote renderer', async () => {
+    const actual = await vi.importActual<typeof import('@/main/ipcContract')>('@/main/ipcContract');
+
+    expect(
+      actual.SPA_MIN_CONTRACT,
+      'raising the floor strands contract-25 shells on their legacy unauthenticated PiP bundle'
+    ).toBe(19);
+  });
+});

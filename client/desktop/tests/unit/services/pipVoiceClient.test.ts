@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MockBroadcastChannel, createRpcResponder } from '../../helpers/broadcastChannelMock';
 import type { AutoResponder } from '../../helpers/broadcastChannelMock';
 import { resetAllStores } from '../../helpers/store-helpers';
+import { deferred } from '../../helpers/deferred';
 
 /**
  * #3104 D6: the client no longer opens `concord-pip`. It pulls a per-window
@@ -33,6 +34,8 @@ const mockConsumerClose = vi.fn();
 const mockConsumerOn = vi.fn();
 const mockTransportClose = vi.fn();
 const mockTransportOn = vi.fn();
+const mockTransportGetStats = vi.fn();
+const pipTransportHandlers: Record<string, (...args: any[]) => unknown> = {};
 
 // ── E2EE globals (2026-08-21 PiP E2EE gap) ────────────────────────────────────────────────
 // The PiP attaches a decrypt transform at receiver creation and refuses to play
@@ -76,6 +79,7 @@ const mockCreateRecvTransport = vi.fn().mockReturnValue({
   id: 'transport-1',
   consume: mockTransportConsume,
   on: mockTransportOn,
+  getStats: mockTransportGetStats,
   close: mockTransportClose,
 });
 
@@ -147,6 +151,14 @@ const defaultRpcResponses: Record<string, unknown> = {
 /** Set up auto-responder on the client's broadcast channel */
 function setupAutoResponder(overrides: Record<string, unknown> = {}): void {
   setResponder(createRpcResponder({ ...defaultRpcResponses, ...overrides }));
+}
+
+function selectedRelayStats(): RTCStatsReport {
+  return new Map<string, Record<string, unknown>>([
+    ['transport', { type: 'transport', selectedCandidatePairId: 'pair-1' }],
+    ['pair-1', { type: 'candidate-pair', localCandidateId: 'local-1' }],
+    ['local-1', { type: 'local-candidate', candidateType: 'relay' }],
+  ]) as unknown as RTCStatsReport;
 }
 
 interface CleanupResponderOptions {
@@ -268,6 +280,11 @@ describe('PipVoiceClient', () => {
     savedMediaStream = globalThis.MediaStream;
     (globalThis as any).MediaStream = MockMediaStream;
     vi.clearAllMocks();
+    for (const key of Object.keys(pipTransportHandlers)) delete pipTransportHandlers[key];
+    mockTransportOn.mockImplementation((event: string, handler: (...args: any[]) => unknown) => {
+      pipTransportHandlers[event] = handler;
+    });
+    mockTransportGetStats.mockResolvedValue(new Map());
     mockTransportConsume
       .mockReset()
       .mockImplementation(
@@ -504,6 +521,126 @@ describe('PipVoiceClient', () => {
 
       // Should fail immediately without retrying
       await expect(client.init()).rejects.toThrow('proxy error');
+    });
+  });
+
+  // ── PiP selected ICE candidate diagnostic ───────────────────────────
+
+  describe('PiP selected candidate diagnostic', () => {
+    it('observes the recv transport and records one closed-enum candidate after connected twice', async () => {
+      mockTransportGetStats.mockResolvedValue(selectedRelayStats());
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await client.init();
+
+      expect(pipTransportHandlers.connectionstatechange).toBeTypeOf(
+        'function',
+        'PiP receive transport must install a connectionstatechange observer for ICE diagnostics'
+      );
+      pipTransportHandlers.connectionstatechange?.('connected');
+      pipTransportHandlers.connectionstatechange?.('connected');
+
+      await vi.waitFor(() => expect(mockTransportGetStats).toHaveBeenCalledTimes(1));
+      const selectedPairLogs = debug.mock.calls.filter(
+        ([message]) => message === '[ice] selected-pair'
+      );
+      expect(selectedPairLogs).toHaveLength(1);
+      expect(selectedPairLogs[0]).toEqual([
+        '[ice] selected-pair',
+        { label: 'pip-recv', type: 'relay' },
+      ]);
+      debug.mockRestore();
+    });
+
+    it('does not record a stale selected pair when the transport disconnects during stats', async () => {
+      const stats = deferred<RTCStatsReport>();
+      mockTransportGetStats.mockReturnValue(stats.promise);
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await client.init();
+      expect(pipTransportHandlers.connectionstatechange).toBeTypeOf('function');
+      pipTransportHandlers.connectionstatechange?.('connected');
+      pipTransportHandlers.connectionstatechange?.('disconnected');
+      stats.resolve(selectedRelayStats());
+      await Promise.resolve();
+
+      expect(
+        debug.mock.calls.filter(
+          ([message]) => typeof message === 'string' && message.startsWith('[ice] selected-pair')
+        )
+      ).toHaveLength(0);
+      debug.mockRestore();
+    });
+
+    it('records a fixed-label diagnostic when stats rejects', async () => {
+      mockTransportGetStats.mockRejectedValue(new Error('stats unavailable'));
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await client.init();
+      expect(pipTransportHandlers.connectionstatechange).toBeTypeOf('function');
+      pipTransportHandlers.connectionstatechange?.('connected');
+      await vi.waitFor(() =>
+        expect(debug.mock.calls).toContainEqual([
+          '[ice] selected-pair-stats-unavailable',
+          { label: 'pip-recv' },
+        ])
+      );
+      expect(debug.mock.calls.flat()).not.toContain('stats unavailable');
+      debug.mockRestore();
+    });
+
+    it('records unresolved candidate stats with the fixed PiP label', async () => {
+      mockTransportGetStats.mockResolvedValue(new Map());
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await client.init();
+      pipTransportHandlers.connectionstatechange?.('connected');
+      await vi.waitFor(() =>
+        expect(debug.mock.calls).toContainEqual([
+          '[ice] selected-pair-unresolved',
+          { label: 'pip-recv' },
+        ])
+      );
+      debug.mockRestore();
+    });
+
+    it('queues one reconnect stats read and records the live pair', async () => {
+      const first = deferred<RTCStatsReport>();
+      const second = deferred<RTCStatsReport>();
+      mockTransportGetStats.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+      client = new PipVoiceClient('test-pip');
+      setupAutoResponder();
+
+      await client.init();
+      pipTransportHandlers.connectionstatechange?.('connected');
+      pipTransportHandlers.connectionstatechange?.('disconnected');
+      pipTransportHandlers.connectionstatechange?.('connected');
+      expect(mockTransportGetStats).toHaveBeenCalledTimes(1);
+
+      first.resolve(new Map());
+      await vi.waitFor(() => expect(mockTransportGetStats).toHaveBeenCalledTimes(2));
+      second.resolve(selectedRelayStats());
+      await vi.waitFor(() =>
+        expect(debug.mock.calls).toContainEqual([
+          '[ice] selected-pair',
+          { label: 'pip-recv', type: 'relay' },
+        ])
+      );
+      expect(
+        debug.mock.calls.filter(
+          ([message]) => typeof message === 'string' && message.startsWith('[ice] selected-pair')
+        )
+      ).toEqual([['[ice] selected-pair', { label: 'pip-recv', type: 'relay' }]]);
+      debug.mockRestore();
     });
   });
 

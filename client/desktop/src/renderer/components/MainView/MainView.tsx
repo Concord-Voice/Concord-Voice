@@ -128,6 +128,14 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
       if (proxy) proxy.registerSession(session.id, session.token);
       else pendingSessions.push(session);
     });
+    const removePipClosed = globalThis.electron?.onPipClosed?.((pipId: string) => {
+      if (proxy) {
+        proxy.onPipClosed(pipId);
+        return;
+      }
+      const pendingIndex = pendingSessions.findIndex((session) => session.id === pipId);
+      if (pendingIndex !== -1) pendingSessions.splice(pendingIndex, 1);
+    });
 
     import('../../services/voice/voiceService')
       .then(({ voiceService }) => {
@@ -144,12 +152,6 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
         voiceService.onProducerClosed = (pid: string, uid: string) => {
           proxy?.broadcastProducerClosed(pid, uid);
         };
-
-        const cleanup = globalThis.electron?.onPipClosed?.((pipId: string) => {
-          proxy?.onPipClosed(pipId);
-        });
-
-        (proxy as PipSignalingProxy & { _ipcCleanup?: () => void })._ipcCleanup = cleanup;
       })
       .catch(() => {
         /* voiceService import failed — nothing to proxy */
@@ -158,11 +160,8 @@ const usePipSignalingProxy = (isInVoice: boolean): void => {
     return () => {
       cancelled = true;
       removePipOpened?.();
-      if (proxy) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- `_ipcCleanup` is a private cleanup-callback slot stored on the proxy instance via `(proxy as PipSignalingProxy & { _ipcCleanup? })` at attach time; optional chaining here handles the case where the IPC bridge was never registered
-        (proxy as any)._ipcCleanup?.();
-        proxy.dispose();
-      }
+      removePipClosed?.();
+      proxy?.dispose();
       // Clear producer lifecycle callbacks synchronously to avoid race
       if (capturedVoiceService) {
         capturedVoiceService.onProducerAdded = null;

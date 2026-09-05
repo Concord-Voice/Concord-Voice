@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
@@ -8,6 +8,22 @@ import { mockServer, mockChannel } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
 const channelPanelPresentation = vi.hoisted(() => ({ compact: false }));
+
+const pipLifecycle = vi.hoisted(() => {
+  let resolveVoiceImport!: () => void;
+  const voiceImport = new Promise<void>((resolve) => {
+    resolveVoiceImport = resolve;
+  });
+  return {
+    voiceImport,
+    resolveVoiceImport,
+    opened: undefined as ((session: { id: string; token: string }) => void) | undefined,
+    closed: undefined as ((id: string) => void) | undefined,
+    proxyCreated: vi.fn(),
+    registerSession: vi.fn(),
+    onPipClosed: vi.fn(),
+  };
+});
 
 // ── Layout mocks ───────────────────────────────────────────────────────────────
 
@@ -103,12 +119,18 @@ vi.mock('@/renderer/services/voice/pipSignalingProxy', () => ({
   // Regular function (not arrow) so `new PipSignalingProxy(...)` works.
   // Returns the mock object so proxy.dispose() is callable.
   PipSignalingProxy: vi.fn(function MockPipProxy() {
-    return { dispose: vi.fn(), onPipClosed: vi.fn() };
+    pipLifecycle.proxyCreated();
+    return {
+      dispose: vi.fn(),
+      registerSession: pipLifecycle.registerSession,
+      onPipClosed: pipLifecycle.onPipClosed,
+    };
   }),
 }));
-vi.mock('@/renderer/services/voice/voiceService', () => ({
-  voiceService: {},
-}));
+vi.mock('@/renderer/services/voice/voiceService', async () => {
+  await pipLifecycle.voiceImport;
+  return { voiceService: {} };
+});
 
 // ── Channel list / action bar ──────────────────────────────────────────────────
 
@@ -753,5 +775,71 @@ describe('MainView', () => {
     fireEvent.click(screen.getByTestId('ctx-edit'));
     expect(useSettingsOverlayStore.getState().open).toBe('server');
     expect(useSettingsOverlayStore.getState().payload?.serverId).toBe('server-1');
+  });
+
+  it('drops a PiP session closed before the voice proxy import settles', async () => {
+    const previousElectron = globalThis.electron;
+    globalThis.electron = {
+      onPipOpened: (callback) => {
+        pipLifecycle.opened = callback;
+        return () => {
+          if (pipLifecycle.opened === callback) pipLifecycle.opened = undefined;
+        };
+      },
+      onPipClosed: (callback) => {
+        pipLifecycle.closed = callback;
+        return () => {
+          if (pipLifecycle.closed === callback) pipLifecycle.closed = undefined;
+        };
+      },
+    } as typeof globalThis.electron;
+
+    try {
+      useVoiceStore.setState({ activeChannelId: 'voice-1', connectionState: 'connected' });
+      render(<MainView />);
+
+      pipLifecycle.opened?.({ id: 'pip-early', token: 'test-token-123' });
+      pipLifecycle.closed?.('pip-early');
+      pipLifecycle.resolveVoiceImport();
+
+      await waitFor(() => expect(pipLifecycle.proxyCreated).toHaveBeenCalledOnce());
+      expect(pipLifecycle.registerSession).not.toHaveBeenCalledWith('pip-early', 'test-token-123');
+    } finally {
+      globalThis.electron = previousElectron;
+    }
+  });
+
+  it('revokes a PiP session closed after proxy creation exactly once', async () => {
+    const previousElectron = globalThis.electron;
+    globalThis.electron = {
+      onPipOpened: (callback) => {
+        pipLifecycle.opened = callback;
+        return () => {
+          if (pipLifecycle.opened === callback) pipLifecycle.opened = undefined;
+        };
+      },
+      onPipClosed: (callback) => {
+        pipLifecycle.closed = callback;
+        return () => {
+          if (pipLifecycle.closed === callback) pipLifecycle.closed = undefined;
+        };
+      },
+    } as typeof globalThis.electron;
+
+    try {
+      useVoiceStore.setState({ activeChannelId: 'voice-1', connectionState: 'connected' });
+      render(<MainView />);
+      pipLifecycle.resolveVoiceImport();
+
+      await waitFor(() => expect(pipLifecycle.proxyCreated).toHaveBeenCalledOnce());
+      pipLifecycle.opened?.({ id: 'pip-live', token: 'test-token-456' });
+      pipLifecycle.closed?.('pip-live');
+
+      expect(pipLifecycle.registerSession).toHaveBeenCalledWith('pip-live', 'test-token-456');
+      expect(pipLifecycle.onPipClosed).toHaveBeenCalledTimes(1);
+      expect(pipLifecycle.onPipClosed).toHaveBeenCalledWith('pip-live');
+    } finally {
+      globalThis.electron = previousElectron;
+    }
   });
 });

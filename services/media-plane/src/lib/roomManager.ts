@@ -1790,6 +1790,10 @@ export class RoomManager {
     userId: string,
     direction: 'send' | 'recv'
   ): Promise<TransportOptions> {
+    if (direction !== 'send' && direction !== 'recv') {
+      throw new Error('Invalid transport direction');
+    }
+
     const room = this.rooms.get(roomId);
     if (!room) throw new Error('Room not found');
 
@@ -1853,6 +1857,7 @@ export class RoomManager {
     // the transport to a detached object that nothing ever closes and that the
     // recv cap cannot see. Close the orphan and fail closed (#2032).
     if (room.participants.get(userId) !== participant) {
+      this.iceCounters.onIceTerminalWithoutConnect?.();
       if (!transport.closed) transport.close();
       if (direction === 'recv') this.releaseRecvTransportReservation(participant);
       throw new Error('Participant left during transport creation');

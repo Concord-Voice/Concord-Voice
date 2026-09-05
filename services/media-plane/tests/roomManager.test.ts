@@ -1482,23 +1482,26 @@ describe('RoomManager', () => {
     // (`false`) is vacuous: a hardcoded `enableTcp: false` in roomManager would
     // satisfy it just as well as a real pass-through, so the test would prove
     // the value is false rather than that it came from config.
-    it.each([false, true])('passes config enableTcp=%s through to createWebRtcTransport verbatim', async (gate) => {
-      const wrt = mockedConfig.mediasoup.webRtcTransport as { enableTcp: boolean };
-      const original = wrt.enableTcp;
-      wrt.enableTcp = gate;
-      try {
-        const transport = createMockTransport();
-        mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+    it.each([false, true])(
+      'passes config enableTcp=%s through to createWebRtcTransport verbatim',
+      async (gate) => {
+        const wrt = mockedConfig.mediasoup.webRtcTransport as { enableTcp: boolean };
+        const original = wrt.enableTcp;
+        wrt.enableTcp = gate;
+        try {
+          const transport = createMockTransport();
+          mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
 
-        await manager.createTransport('room-1', 'u-1', 'send');
+          await manager.createTransport('room-1', 'u-1', 'send');
 
-        expect(mockRouter.createWebRtcTransport).toHaveBeenCalledWith(
-          expect.objectContaining({ enableTcp: gate, enableUdp: true, preferUdp: true })
-        );
-      } finally {
-        wrt.enableTcp = original;
+          expect(mockRouter.createWebRtcTransport).toHaveBeenCalledWith(
+            expect.objectContaining({ enableTcp: gate, enableUdp: true, preferUdp: true })
+          );
+        } finally {
+          wrt.enableTcp = original;
+        }
       }
-    });
+    );
 
     it('creates a recv transport and adds to recvTransports map', async () => {
       const transport = createMockTransport();
@@ -3754,6 +3757,14 @@ describe('RoomManager', () => {
       await manager.createTransport('room-1', 'u-1', 'recv');
       return transport;
     }
+
+    it('rejects a runtime-invalid direction before allocating or reserving', async () => {
+      await expect(manager.createTransport('room-1', 'u-1', 'sideways' as never)).rejects.toThrow(
+        'Invalid transport direction'
+      );
+      expect(mockRouter.createWebRtcTransport).not.toHaveBeenCalled();
+      expect(manager.getParticipant('room-1', 'u-1')!.pendingRecvTransports).toBe(0);
+    });
 
     it('allows the first 4 receive transports and rejects the 5th', async () => {
       for (let i = 0; i < MAX_RECV_TRANSPORTS_PER_PARTICIPANT; i += 1) {
@@ -7021,5 +7032,82 @@ describe('ICE outcome counters (#3104)', () => {
       t._emit('iceselectedtuplechange', { protocol: 'udp', remoteIp: '203.0.113.9' });
       t._emit('icestatechange', 'closed');
     }).not.toThrow();
+  });
+
+  it('counts an open orphan before closing it after its bitrate cap awaits', async () => {
+    const events: string[] = [];
+    onIceTerminalWithoutConnect.mockImplementation(() => events.push('callback'));
+
+    let releaseBitrateCap!: () => void;
+    let bitrateCapStarted!: () => void;
+    const bitrateCapEntered = new Promise<void>((resolve) => {
+      bitrateCapStarted = resolve;
+    });
+    const orphan = createMockTransport();
+    orphan.close.mockImplementation(() => {
+      events.push('close');
+    });
+    orphan.setMaxIncomingBitrate.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          bitrateCapStarted();
+          releaseBitrateCap = resolve;
+        })
+    );
+    router.createWebRtcTransport.mockResolvedValueOnce(orphan);
+
+    const departedParticipant = manager.getParticipant('room-1', 'u-1')!;
+    const creation = manager.createTransport('room-1', 'u-1', 'recv');
+    await bitrateCapEntered;
+    await manager.leaveRoom('room-1', 'u-1');
+    releaseBitrateCap();
+
+    await expect(creation).rejects.toThrow(/Participant left during transport creation/);
+    expect(departedParticipant.pendingRecvTransports).toBe(0);
+    expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
+    expect(orphan.close).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['callback', 'close']);
+  });
+
+  it('counts an already-closed orphan without closing it twice', async () => {
+    // Positive control: the same injected callback is wired for a committed
+    // transport's normal ICE terminal event.
+    transport._emit('icestatechange', 'closed');
+    expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
+    onIceTerminalWithoutConnect.mockClear();
+
+    const events: string[] = [];
+    onIceTerminalWithoutConnect.mockImplementation(() => events.push('callback'));
+
+    let releaseBitrateCap!: () => void;
+    let bitrateCapStarted!: () => void;
+    const bitrateCapEntered = new Promise<void>((resolve) => {
+      bitrateCapStarted = resolve;
+    });
+    const orphan = createMockTransport();
+    orphan.setMaxIncomingBitrate.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          bitrateCapStarted();
+          releaseBitrateCap = resolve;
+        })
+    );
+    router.createWebRtcTransport.mockResolvedValueOnce(orphan);
+
+    const departedParticipant = manager.getParticipant('room-1', 'u-1')!;
+    const creation = manager.createTransport('room-1', 'u-1', 'recv');
+    await bitrateCapEntered;
+    await manager.leaveRoom('room-1', 'u-1');
+    // Model mediasoup's router-close path winning the race while the cap call
+    // is still awaiting: the orphan is already closed by the time cleanup
+    // reaches the participant-identity check.
+    orphan.closed = true;
+    releaseBitrateCap();
+
+    await expect(creation).rejects.toThrow(/Participant left during transport creation/);
+    expect(departedParticipant.pendingRecvTransports).toBe(0);
+    expect(orphan.close).not.toHaveBeenCalled();
+    expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['callback']);
   });
 });
