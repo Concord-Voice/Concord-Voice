@@ -162,7 +162,7 @@ MEDIASOUP_LOG_LEVEL=warn
 
   1. **On the host**, add the permit to `/etc/iptables/docker-user-rules.sh` beside the existing
      `-I DOCKER-USER` lines — but write the interface name **literally**; do NOT paste the
-     `${NET_IFACE}` form shown above. That file is generated from an *unquoted* heredoc
+     `${NET_IFACE}` form shown above. That file is generated from an _unquoted_ heredoc
      (`provision-production.sh:1002`), so the variable is expanded as the file is written and
      the installed script neither sets nor inherits it — systemd runs it with an empty
      environment. The empty expansion does not survive as an empty argument — it disappears, so
@@ -186,20 +186,47 @@ MEDIASOUP_LOG_LEVEL=warn
 
      **These two edits must land in ONE commit, together with the TCP publication and
      the gate flip** — do not stage them as a separate "firewall first" change. The
-     parity test's disabled branch rejects any firewall permit overlapping the RTC
-     window while the compose literals still read `"false"`, so a repo commit carrying
-     only the permits fails the repository's own blocking check and cannot merge.
+     parity test's disabled branch rejects any _recognised_ firewall permit overlapping
+     the RTC window while the compose literals still read `"false"`, so a repo commit
+     carrying only the permits fails the repository's own blocking check and cannot
+     merge. It also refuses, loudly, any permit it cannot classify, along two separate
+     axes. A permit yielding **no port range** must fall into one of four provably-safe
+     shapes (wrong protocol, established-only, a non-public interface, or a pinned
+     service name), or name a pinned variable port. A permit that **does** carry a port
+     must actually have been accepted by the range extractor — the test compares the two
+     sets and refuses the difference, so a rule the extractor silently dropped for
+     carrying a selector it does not recognise (`-o docker0`, `-p 6`, `--syn`) fails
+     rather than falling between them. Unrecognised `ufw` verbs and rule languages the
+     test does not parse (`iptables-restore`, `nft`) are refused outright rather than
+     read partially.
+
+     The residual is **recognition, not classification**: a permit installed by
+     something the provisioner calls but does not inline is outside the text this test
+     reads at all, and no amount of classifying closes that. That is why "recognised"
+     appears in the first sentence of this paragraph: it is a qualifier, not filler.
 
      The live-host steps in 1 are a different matter and the ordering there is the
      opposite: apply the host permits **before** flipping the gate, or clients burn ICE
      checks on candidates the ingress black-holes. Host actions are not commits, so no
      test gates them. Either way, do not run the provisioner to deliver any of this.
 
-  That detection is the same one `provision-production.sh` uses at `:783-784`. An
-  unscoped permit also opens the TCP listener on the OVH private `ens3` and on any future
-  WireGuard backplane; `-I` rather than `-A` because the chain ends in an interface-scoped
-  `DROP` and an appended permit lands after it. `test-rtc-port-ingress-parity.sh` accepts only
-  these shapes
+  **Why the interface scope and the `-I`.** The public interface is whatever
+  `ip route get 1.1.1.1` resolves to — the same detection `provision-production.sh` performs
+  at `:783-784`, defaulting to `eth0`. Scope the permit to it explicitly: an unscoped rule
+  also opens the TCP listener on the OVH private `ens3` and on any future WireGuard
+  backplane. Use `-I` rather than `-A` because the chain ends in an interface-scoped `DROP`,
+  so an appended permit lands after it and is inert.
+
+  `test-rtc-port-ingress-parity.sh` accepts exactly these two shapes, and refuses anything
+  it cannot prove equivalent:
+
+  ```sh
+  ufw allow in on ${NET_IFACE} to any port <lo>:<hi> proto tcp
+  iptables -I DOCKER-USER -i ${NET_IFACE} -p tcp --dport <lo>:<hi> -j RETURN
+  ```
+
+  `<lo>:<hi>` must EQUAL the TCP publication — wider is rejected, not just uncovered.
+
 - `NUM_WORKERS=4` is the code default and the value `docker-compose.yml` sets.
   **Production uses `3`**, matching the media-plane's `cpus: '3'` limit in
   `docker-compose.production.yml`. A mediasoup worker is a single-threaded C++
