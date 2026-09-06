@@ -145,7 +145,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		t.Fatalf("testhelpers: initialize router: %v", err)
 	}
 	if natsClient != nil {
-		t.Cleanup(func() { natsClient.Close() })
+		t.Cleanup(func() { _ = natsClient.Close() })
 	}
 	t.Cleanup(permissionEnforcer.Close)
 	t.Cleanup(func() {

@@ -54,7 +54,7 @@ func TestAnUnreachableBusYieldsAReconnectingClientNotAnError(t *testing.T) {
 			"that is merely non-nil never recovers")
 
 	// Close the reconnect goroutine rather than leaking it into later tests.
-	c.Close()
+	_ = c.Close()
 }
 
 // The other half, and the one a careless fix drops: a CONFIGURATION fault must

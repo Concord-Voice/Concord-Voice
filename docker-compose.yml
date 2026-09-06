@@ -271,6 +271,45 @@ services:
       OPS_METRICS_INTERVAL: ${OPS_METRICS_INTERVAL:-15s}
       OPS_METRICS_ROLE: ${OPS_METRICS_ROLE:-local}
       PORT: 8080
+    # Probes /health (LIVENESS), deliberately NOT /readyz. Docker exposes one
+    # health state per container and #3107's healthwatch actor restarts on it,
+    # so a readiness predicate here would turn a Postgres or Redis blip into a
+    # restart of a healthy control-plane holding live voice sessions — which
+    # cannot fix the dependency and fails the same probe again on restart.
+    # Readiness is gated by `concord-ctl.sh wait-healthy`, which probes
+    # /readyz, so a deploy still cannot pass with the database unreachable.
+    # Enforced by [internal]tests/test-compose-health-contract.sh.
+    #
+    # BusyBox wget: curl is absent from alpine:3.24 and no package may be added
+    # to the runtime image. --spider writes nothing, so this survives the
+    # production overlay's read_only + cap_drop: ALL + tmpfs-only hardening.
+    # 127.0.0.1 rather than localhost — musl resolves IPv6-first.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 60s
+    # 45s, not Docker's 10s default. NOT a derived number: only srv.Shutdown
+    # carries the 30s context at services/control-plane/cmd/server/main.go
+    # (#3106 gave the ops-metrics stage its own 3s budget, because sharing the
+    # drain context handed it an already-expired one). #3106 also put
+    # waitBackgroundWorkers, closePresenceWorkers and hub.Shutdown -- which take
+    # no context of their own -- under ONE shared deadline (shutdownDrainBudget,
+    # 30s) at the shutdown orchestrator, so the whole path now spends at most
+    # 3+30+3+5+2 = 43s of this 45s.
+    #
+    # That bounds the WAIT, not the work: Go cannot cancel a goroutine, so an
+    # overrunning stage keeps running until the process exits. What it buys is
+    # that the stages AFTER it still run -- SIGKILL used to discard those too,
+    # including the NATS drain. An abandoned stage logs one WARN carrying
+    # failure_class shutdown_stage_overran.
+    #
+    # 45s still covers the median, not the tail (the presence sink's drain worst
+    # case is measured in tens of minutes, and no budget makes that fit). It is
+    # still a 4.5x improvement on a default under which that 30s context has
+    # never once run to completion.
+    stop_grace_period: 45s
     ports:
       - "8080:8080"
     depends_on:

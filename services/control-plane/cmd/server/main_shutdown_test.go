@@ -13,9 +13,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/gin-gonic/gin"
+	"net/http"
+	"net/http/httptest"
+	"syscall"
 )
 
 type serverOpsMetricsReader struct{}
@@ -355,6 +361,8 @@ func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 
 	go func() {
 		result <- shutdownControlPlane(
+			context.Background(),
+			nil,
 			func() { events <- "cancel" },
 			func() error {
 				close(httpStarted)
@@ -403,6 +411,8 @@ func TestShutdownControlPlaneCleansUpAfterHTTPError(t *testing.T) {
 	events := make([]string, 0, 8)
 
 	gotErr := shutdownControlPlane(
+		context.Background(),
+		nil,
 		func() { events = append(events, "cancel") },
 		func() error {
 			events = append(events, "http")
@@ -448,11 +458,21 @@ func TestRunControlPlaneServerCleansReaderAfterListenerFailure(t *testing.T) {
 		},
 	}
 
+	// beginDrain must NOT fire on the serve-error arm: the listener is
+	// already dead there, so marking drained adds restart latency and answers
+	// nothing (#3106).
+	drained := false
+
 	err := runControlPlaneServer(
 		func() error { return wantServeErr },
 		stop,
 		func() error { return runtime.Stop(context.Background()) },
+		func() { drained = true },
 	)
+
+	if drained {
+		t.Fatal("beginDrain fired on the serve-error arm; it belongs on the signal arm only")
+	}
 
 	if !errors.Is(err, wantServeErr) {
 		t.Fatalf("runControlPlaneServer error = %v, want listener error %v", err, wantServeErr)
@@ -462,5 +482,67 @@ func TestRunControlPlaneServerCleansReaderAfterListenerFailure(t *testing.T) {
 	}
 	if closeCalls != 1 {
 		t.Fatalf("reader cleanup calls = %d, want 1", closeCalls)
+	}
+}
+
+// TestRunControlPlaneServerMarksDrainOnSignal proves the SIGTERM arm marks the
+// drain, and — more importantly — that the flag it marks is the one a real
+// /readyz handler reads. A wrong-instance drain flag is the defect class where
+// every test passes, the deploy is green, and the drain silently never
+// happens, so asserting "beginDrain was called" alone would be too weak.
+func TestRunControlPlaneServerMarksDrainOnSignal(t *testing.T) {
+	stubDrainSettle(t) // the settle is asserted in main_drainsettle_test.go; do not pay it here
+	readiness := health.NewReadiness()
+	prober := health.NewProber(
+		readiness,
+		[]health.Check{{Name: "postgres", Gating: true, Probe: func(context.Context) error { return nil }}},
+		// PRODUCTION-shaped interval, deliberately. An earlier revision used
+		// 1ms here — 5000x faster than the real 5s — which made the drain
+		// appear on the next tick and hid the fact that the handler was
+		// reading a CACHED drain bit that never updates before the listener
+		// closes. A slow interval is what makes this assertion meaningful.
+		5*time.Second, 20*time.Second, time.Now,
+	)
+	proberCtx, stopProber := context.WithCancel(context.Background())
+	defer stopProber()
+	go prober.Start(proberCtx)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/readyz", api.ReadyzHandler(prober))
+	probe := func() int {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rec.Code
+	}
+
+	// Precondition. Without it the 503 below could pass against a handler that
+	// is wired to a DIFFERENT Readiness and answers 503 for some other reason.
+	deadline := time.Now().Add(2 * time.Second)
+	for probe() != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatal("precondition: a healthy prober must reach 200 before the drain")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// From here on there is NO polling: the drain must be visible on the very
+	// next request, not eventually. Waiting for it would re-hide VULN-001.
+
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	if err := runControlPlaneServer(
+		func() error { select {} },
+		stop,
+		func() error { return nil },
+		readiness.MarkDraining,
+	); err != nil {
+		t.Fatalf("runControlPlaneServer = %v, want nil on the signal arm", err)
+	}
+
+	if got := probe(); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d immediately after the SIGTERM drain, want 503. "+
+			"The drain must be read from the LIVE flag, not a cached verdict: "+
+			"srv.Shutdown closes the listener microseconds after the latch, so "+
+			"a probe tick never lands.", got)
 	}
 }

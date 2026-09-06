@@ -81,10 +81,25 @@ func newInMemorySink(
 // residual rather than papering over it (PR #2738 review, @code-reviewer).
 //
 // The residual is benign in this process because Close is only ever called from
-// shutdown, and the shutdown sequence runs it BEFORE hub.Shutdown, which then
+// shutdown, and the shutdown sequence STARTS it before hub.Shutdown, which then
 // closes every local client connection anyway. A plan stranded in the buffer
 // would have disconnected users the hub is about to disconnect regardless. If
 // Close ever gains a non-shutdown caller, that argument dies with it.
+//
+// "STARTS it before" is deliberately weaker than the "runs it before" this said
+// until #3106. Shutdown stages now share one deadline (cmd/server/main.go
+// awaitStage): if this Close overruns its share it is ABANDONED, and hub.Shutdown
+// begins while the drain is still going. The conclusion is unchanged -- the hub
+// still closes every client, so a stranded plan still costs nothing -- but the
+// premise is now about ordering of STARTS, not of completions, and a future
+// reader must not lean on the stronger reading.
+//
+// Audited when that bound landed: the abandoned drain's whole path is
+// concurrency-safe against a closing hub. abandon -> DisconnectRichPresenceClients
+// takes h.mu.RLock for the map reads, InvalidatePresenceAudiences is atomic, and
+// disconnectPrivacyCriticalClient bottoms out at client.Conn.Close(), which is
+// safe to call twice (alreadyDisconnected swallows the repeat). hub.Shutdown and
+// this Close are both sync.Once + close + wait, so neither double-closes.
 func (s *inMemorySink) Enqueue(plan *Plan) {
 	if plan == nil {
 		return

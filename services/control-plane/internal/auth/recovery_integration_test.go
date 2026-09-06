@@ -110,7 +110,7 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 	)
 	require.NoError(t, err)
 	if natsClient != nil {
-		t.Cleanup(func() { natsClient.Close() })
+		t.Cleanup(func() { _ = natsClient.Close() })
 	}
 	t.Cleanup(permissionEnforcer.Close)
 	t.Cleanup(func() { require.NoError(t, opsRuntime.Stop(context.Background())) })

@@ -84,7 +84,7 @@ func subscribeDMVoiceEnforcement(t *testing.T, subject string) chan map[string]i
 	if err != nil {
 		t.Skipf("NATS unavailable (%v); skipping live DM enforcement test", err)
 	}
-	t.Cleanup(observer.Close)
+	t.Cleanup(func() { _ = observer.Close() })
 	messages := make(chan map[string]interface{}, 8)
 	subscription, err := observer.Subscribe(subject, func(data []byte) {
 		var payload map[string]interface{}

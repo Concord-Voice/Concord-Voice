@@ -760,10 +760,10 @@ func TestHandleHeartbeat_PrivateCallRetriesDisconnectForReportedNonMember(t *tes
 	if err != nil {
 		t.Skipf("NATS unavailable (%v); skipping heartbeat revocation retry test", err)
 	}
-	t.Cleanup(publisher.Close)
+	t.Cleanup(func() { _ = publisher.Close() })
 	observer, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
-	t.Cleanup(observer.Close)
+	t.Cleanup(func() { _ = observer.Close() })
 	disconnects := make(chan map[string]interface{}, 4)
 	subscription, err := observer.Subscribe(natsSubjectEnforceDisconnectForTest, func(data []byte) {
 		var payload map[string]interface{}

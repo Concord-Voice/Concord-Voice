@@ -46,7 +46,7 @@ func TestPublicMediaRateLimitExceededResponsesAreNotStored(t *testing.T) {
 		hub.Shutdown()
 		permissionEnforcer.Close()
 		if natsClient != nil {
-			natsClient.Close()
+			_ = natsClient.Close()
 		}
 		require.NoError(t, opsRuntime.Stop(context.Background()))
 	})

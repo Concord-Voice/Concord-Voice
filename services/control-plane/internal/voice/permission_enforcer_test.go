@@ -36,11 +36,11 @@ func setupEnforcerRig(t *testing.T) *enforcerTestRig {
 	if err != nil {
 		t.Skipf("NATS unavailable (%v); skipping live enforcer test (runs in CI)", err)
 	}
-	t.Cleanup(pubClient.Close)
+	t.Cleanup(func() { _ = pubClient.Close() })
 
 	obsClient, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
-	t.Cleanup(obsClient.Close)
+	t.Cleanup(func() { _ = obsClient.Close() })
 
 	ts := testhelpers.SetupTestServer(t)
 	resolver := rbac.NewResolver(ts.DB, rbac.NewPermissionCache(ts.Redis), logger.New("test"))
@@ -458,7 +458,7 @@ func TestPermissionEnforcer_ResolverErrorDisconnects(t *testing.T) {
 	r := setupEnforcerRig(t)
 	pubClient, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
-	t.Cleanup(pubClient.Close)
+	t.Cleanup(func() { _ = pubClient.Close() })
 	owner := r.ts.CreateTestUser(t, "peowner5")
 	member := r.ts.CreateTestUser(t, "pemember5")
 	serverID := r.ts.CreateTestServer(t, owner.ID, "PermEnforce Broken")

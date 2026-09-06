@@ -3,8 +3,10 @@ package nats
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -103,9 +105,72 @@ func (c *Client) Flush() error {
 	return c.conn.Flush()
 }
 
-// Close drains and closes the NATS connection.
-func (c *Client) Close() {
-	if c.conn != nil {
-		_ = c.conn.Drain()
+// Drain outcomes. These are OUR sentinels, not nats.go's, so callers classify
+// a shutdown without importing the driver -- and so the classification survives
+// a driver upgrade that renames its own errors.
+var (
+	// ErrDrainNothingToDo: the connection was already closed. Benign.
+	ErrDrainNothingToDo = errors.New("nats: connection already closed; nothing to drain")
+	// ErrDrainSkippedReconnecting: the connection was mid-reconnect, so nats.go
+	// closed it WITHOUT draining. Publishes buffered at that moment are gone.
+	ErrDrainSkippedReconnecting = errors.New("nats: connection was reconnecting; closed without draining")
+	// ErrDrainTimedOut: the drain started but had not finished when the budget
+	// expired. The process is about to exit and will kill it.
+	ErrDrainTimedOut = errors.New("nats: drain did not finish within its budget")
+)
+
+// drainWaitBudget bounds how long Close waits for an asynchronous drain.
+const drainWaitBudget = 2 * time.Second
+
+// Close drains the NATS connection and WAITS for the drain to finish, bounded.
+//
+// The wait is the whole point. nats.go's Drain() is ASYNCHRONOUS: it flips the
+// status to DRAINING_SUBS, spawns `go nc.drainConnection()`, and returns nil as
+// soon as that goroutine STARTS (nats.go v1.53.1). So a caller that returns
+// immediately gets nil, the process exits, and the in-flight drain dies with it
+// -- which is precisely the "buffered publishes were dropped" case an earlier
+// version of this function reported by returning that nil.
+//
+// It also used to discard the error entirely with a blank assignment, the shape
+// errcheck honours and [internal]rules/backend.md forbids. Callers on a
+// best-effort path (defer, t.Cleanup) may still discard it explicitly; the
+// production shutdown stage classifies it.
+func (c *Client) Close() error {
+	if c == nil || c.conn == nil {
+		return nil
 	}
+	switch err := c.conn.Drain(); {
+	case err == nil:
+	case errors.Is(err, nats.ErrConnectionClosed):
+		return ErrDrainNothingToDo
+	case errors.Is(err, nats.ErrConnectionReconnecting):
+		return ErrDrainSkippedReconnecting
+	default:
+		return err
+	}
+
+	deadline := time.Now().Add(drainWaitBudget)
+	for time.Now().Before(deadline) {
+		if c.conn.IsClosed() || !c.conn.IsDraining() {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c.conn.IsClosed() || !c.conn.IsDraining() {
+		return nil
+	}
+	return ErrDrainTimedOut
+}
+
+// IsConnected reports whether the wrapped connection is currently CONNECTED.
+//
+// Nil-safe at BOTH levels: Connect returns a nil *Client on a config error,
+// and a non-nil Client can hold a nil conn. It reports false during a
+// reconnect window, which is the correct signal and is harmless because NATS
+// is a non-gating readiness check (#3106) -- RetryOnFailedConnect(true) plus
+// MaxReconnects(-1) mean a NATS outage self-heals, so gating on it would 503
+// the only control-plane node during every cold start where NATS lags
+// Postgres.
+func (c *Client) IsConnected() bool {
+	return c != nil && c.conn != nil && c.conn.IsConnected()
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -189,6 +190,14 @@ func runControlPlane() (runErr error) {
 	// Start background cleanup job (reaps expired tokens, stale sessions, orphaned presence)
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	defer cleanupCancel()
+
+	// ONE readiness flag, declared in the scope that bindRouter,
+	// cleanupRuntime and the runControlPlaneServer call site all close
+	// over. A second health.NewReadiness() anywhere would silently divorce
+	// the drain from the probe that reports it: the flag would flip, every
+	// test would still pass, the deploy would be green, and the drain would
+	// simply never be visible (#3106).
+	readiness := health.NewReadiness()
 	retentionWorker := presencehistory.NewRetentionWorker(db, log)
 	var deferredAdminMetricsReader *deferredAdminOpsMetricsReader
 	var adminMetricsRouterReader opsmetrics.Reader
@@ -238,6 +247,7 @@ func runControlPlane() (runErr error) {
 					Tier1ErasureWake:   tier1ErasureReclaimer.Wake,
 					MediaStoreResolver: media.NewRegistryStoreResolver(storageRegistry),
 					MediaWriteRouter:   media.NewRegistryWriteRouter(storageRegistry),
+					Readiness:          readiness,
 				},
 			)
 			if routerErr != nil {
@@ -377,30 +387,76 @@ func runControlPlane() (runErr error) {
 	cleanupRuntime := func() error {
 		cleanupStarted = true
 		log.Info("Shutting down server...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), shutdownDrainBudget)
+		defer drainCancel()
+		httpCtx, httpCancel := context.WithTimeout(drainCtx, shutdownHTTPBudget)
+		defer httpCancel()
 
 		// Stop accepting and drain HTTP handlers before closing the dependencies
 		// they may still use. net/http does not wait for hijacked WebSocket
 		// connections; hub.Shutdown closes those after ordinary handlers finish.
 		return shutdownControlPlane(
+			drainCtx,
+			func(stage string, starved bool) {
+				class, detail := "shutdown_stage_overran", "used its whole share of the drain budget"
+				if starved {
+					class, detail = "shutdown_stage_starved", "arrived after an earlier stage had drained the shared budget, so it never ran"
+				}
+				log.Warn("shutdown stage abandoned; its remaining work is lost, but the "+
+					"stages after it still ran ("+detail+")",
+					"stage", stage,
+					"failure_class", class,
+					"drain_budget_ms", shutdownDrainBudget.Milliseconds())
+			},
 			func() {
 				cleanupCancel()
 				liveSpa.Stop()
 			},
-			func() error { return srv.Shutdown(ctx) },
+			func() error { return srv.Shutdown(httpCtx) },
 			waitBackgroundWorkers,
 			func() { closePresenceWorkers() },
 			func() { hub.Shutdown() },
-			func() error { return opsMetricsRuntime.Stop(ctx) },
 			func() error {
-				readerCleanupCtx, readerCleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				// Own context, NOT the 30s drain budget above. That budget is
+				// consumed by srv.Shutdown, and a metrics stage handed an
+				// already-expired context returns a context error that
+				// errors.Join turns into a non-zero exit on an otherwise
+				// CORRECT shutdown. The admin reader at the next stage
+				// already has its own (readerCleanupCtx); this one did not.
+				metricsCtx, metricsCancel := context.WithTimeout(context.Background(), shutdownMetricsBudget)
+				defer metricsCancel()
+				return opsMetricsRuntime.Stop(metricsCtx)
+			},
+			func() error {
+				readerCleanupCtx, readerCleanupCancel := context.WithTimeout(context.Background(), shutdownAdminReaderBudget)
 				defer readerCleanupCancel()
 				return adminMetricsReaderRuntime.Stop(readerCleanupCtx)
 			},
 			func() {
-				if natsClient != nil {
-					natsClient.Close()
+				if natsClient == nil {
+					return
+				}
+				// Close now WAITS for the drain, bounded, and classifies the outcome.
+				// It previously reported "drain did not complete" only on an ERROR --
+				// but nats.go's Drain() is asynchronous and returns nil the moment its
+				// goroutine starts, so the common path (drain still running when the
+				// process exits, publishes lost) returned nil and logged NOTHING, while
+				// the two cases that did fire got a message describing neither.
+				//
+				// The CWE-532 rationale that sat here was imported from router.go's
+				// nats_config warning and does not apply: every value below is a package
+				// sentinel, never a *url.Error, so none of them can carry a credential.
+				switch err := natsClient.Close(); {
+				case err == nil, errors.Is(err, natsclient.ErrDrainNothingToDo):
+					// Drained, or there was nothing to drain.
+				case errors.Is(err, natsclient.ErrDrainSkippedReconnecting):
+					log.Warn("NATS was reconnecting at shutdown and closed WITHOUT draining; buffered publishes were dropped",
+						"failure_class", "nats_drain_skipped_reconnecting")
+				case errors.Is(err, natsclient.ErrDrainTimedOut):
+					log.Warn("NATS drain did not finish within its budget; buffered publishes may have been dropped",
+						"failure_class", "nats_drain_timeout")
+				default:
+					log.Warn("NATS drain failed to start", "failure_class", "nats_drain_start_failed")
 				}
 			},
 		)
@@ -443,19 +499,153 @@ func runControlPlane() (runErr error) {
 	}
 
 	log.Info("Starting Control Plane server", "port", cfg.Port, "env", cfg.Environment)
-	if err := runControlPlaneServer(func() error { return srv.ListenAndServe() }, quit, cleanupRuntime); err != nil {
+	if err := runControlPlaneServer(func() error { return srv.ListenAndServe() }, quit, cleanupRuntime, readiness.MarkDraining); err != nil {
 		return err
 	}
 	log.Info("Server exited")
 	return nil
 }
 
+// drainSettle is how long the process stays NOT-READY but still LISTENING
+// after the SIGTERM latch, so a readiness consumer can actually observe the
+// `draining` 503 before the socket disappears.
+//
+// Sized against the OBSERVER's poll cadence (concord-ctl.sh wait-healthy polls
+// at INTERVAL=2), not against readyzProbeInterval -- the handler reads the
+// drain LIVE, so no probe tick has to land inside this window. Charged against
+// stop_grace_period: 45s, where it competes with real drain work.
+//
+// Design ruling A3 dropped this settle, arguing a 3s window "very likely
+// elapses entirely between two probes, so nothing observes the 503". That was
+// correct WHEN IT WAS WRITTEN, because the handler then read the drain from the
+// cached probe verdict. The VULN-001 fix replaced that with a live
+// Prober.Draining() read and thereby overturned A3's premise -- but A3 was
+// never revisited, so the settle stayed dropped.
+//
+// Measured without it: the latch-to-listener-close window is ~5us. A
+// fresh-connection poller running flat out observed 5111 `200`s and ZERO
+// `draining` responses, going straight from 200 to connection-refused. The
+// window this issue exists to create was not delivered.
+const drainSettle = 3 * time.Second
+
+// drainSettleSleep is the seam that keeps the settle assertable without a test
+// ever really sleeping.
+var drainSettleSleep = time.Sleep
+
+// The shutdown budget, and the arithmetic it has to fit inside.
+//
+// stop_grace_period is 45s. drainSettle spends 3s of it before cleanup even
+// starts, and the tail stages carry their own bounds (3s ops-metrics, 5s admin
+// reader, 2s NATS drain = 10s). That leaves 32s, and shutdownDrainBudget claims
+// 30 of it, keeping ~2s of margin for process teardown.
+//
+// Before this, waitBackgroundWorkers, closePresenceWorkers and hub.Shutdown
+// took no context at all. A stage that blocked ran until Docker SIGKILLed the
+// process at 45s -- and SIGKILL does not merely truncate THAT stage, it skips
+// every stage after it, so the NATS drain never ran and its buffered publishes
+// were lost. The bound converts that into a clean 143.
+//
+// What the bound does NOT do is cancel the work: Go has no primitive for
+// stopping a goroutine, so an overrunning stage keeps running until the process
+// exits. The trade is therefore not "abandon work vs finish it" -- SIGKILL
+// abandoned the same work -- it is "abandon one stage's remainder vs abandon
+// that PLUS everything downstream". An overrun is logged at WARN with
+// failure_class shutdown_stage_overran, which is the signal AC-10's post-merge
+// observation should watch.
+const shutdownDrainBudget = 30 * time.Second
+
+// shutdownHTTPBudget sub-caps srv.Shutdown INSIDE that one deadline, so a slow
+// HTTP drain cannot consume the whole phase and starve the three stages after
+// it. That ordering is deliberate: those stages flush presence dispatch queues
+// and activity-history workers, whose writes nothing else recomputes, whereas a
+// truncated in-flight HTTP request is a retry for the client.
+const shutdownHTTPBudget = 20 * time.Second
+
+// The tail budgets, named so the arithmetic above is checkable rather than
+// merely asserted. These deliberately do NOT derive from drainCtx: a tail stage
+// handed an already-expired context returns a context error, and errors.Join
+// turns that into a non-zero exit on an otherwise CORRECT shutdown.
+const (
+	shutdownMetricsBudget     = 3 * time.Second
+	shutdownAdminReaderBudget = 5 * time.Second
+)
+
+// awaitStage runs fn, returning when it finishes or when ctx expires.
+//
+// It cannot cancel fn. On expiry the goroutine keeps running until the process
+// exits; what the caller gets back is the ability to run the NEXT stage.
+//
+// That overlap is new -- before this bound the stages ran strictly sequentially,
+// so an abandoned one could never run alongside its successor. Audited when it
+// landed (Gitar, PR #3106): the three stages' internals are concurrency-safe
+// against each other. hub.Shutdown and inMemorySink.Close are both
+// sync.Once + close(done) + <-stopped, so neither double-closes nor races a
+// repeat; the presence drain's disconnect path takes h.mu.RLock for its map
+// reads, bumps an atomic audience epoch, and ends at client.Conn.Close(), which
+// tolerates being called twice. Re-run that audit if a stage gains state that is
+// neither mutex-guarded nor idempotent.
+//
+// starved distinguishes the two ways a stage fails to finish, which the first
+// version of this conflated. A stage that HAD budget and used it all is slow
+// and worth investigating; a stage that arrived after an earlier one drained
+// the shared pot never ran at all, and reporting it identically sends an
+// operator after two innocent stages. One slow stage plus two starved ones is a
+// cascade with a single cause.
+func awaitStage(ctx context.Context, name string, fn func(), onAbandon func(name string, starved bool)) {
+	// Sampled BEFORE fn starts: afterwards the answer is "yes" either way.
+	starved := ctx.Err() != nil
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Prefer a stage that actually finished: when ctx fires at the same
+		// instant fn completes, both cases are ready and select picks at
+		// random.
+		//
+		// NO TEST DRIVES THIS BRANCH, and the honest reason is that the window
+		// cannot be opened deterministically from outside -- awaitStage owns
+		// the goroutine, so a test cannot arrange for `done` to close exactly
+		// during the select. It is kept as cheap defence-in-depth, not as a
+		// covered path; removing it survives the whole suite.
+		//
+		// It is also NOT the fix for the reported symptom, which measurement
+		// settled: with an exhausted budget the spawned goroutine is usually
+		// not scheduled at all before the select runs, so this preference moved
+		// a direct probe only from 20000/20000 to 19995/20000. What made the
+		// signal honest was the `starved` split above -- those stages were
+		// never slow, they were given no budget.
+		select {
+		case <-done:
+		default:
+			if onAbandon != nil {
+				onAbandon(name, starved)
+			}
+		}
+	}
+}
+
 func runControlPlaneServer(
 	serve func() error,
 	stop <-chan os.Signal,
 	shutdown func() error,
+	// beginDrain marks the process not-ready so GET /readyz answers 503 while
+	// the listener is still open (#3106). It runs ONLY on the signal arm: on
+	// the serve-error arm the listener is already dead, so marking there adds
+	// restart latency and answers nothing.
+	//
+	// It lives here rather than inside shutdownControlPlane because the two
+	// arms of the select below already ARE the discriminator. Threading one
+	// into shutdownControlPlane would widen an eight-value signature whose
+	// call ORDER carries three load-bearing comments, inviting a future
+	// reorder to break the drain-before-listener-close property.
+	beginDrain func(),
 ) (runErr error) {
-	if serve == nil || stop == nil || shutdown == nil {
+	if serve == nil || stop == nil || shutdown == nil || beginDrain == nil {
 		return errors.New("control plane server lifecycle is incomplete")
 	}
 	defer func() {
@@ -466,6 +656,18 @@ func runControlPlaneServer(
 	go func() { serveResult <- serve() }()
 	select {
 	case <-stop:
+		// Latched BEFORE the deferred shutdown() runs, so the drain is
+		// visible to /readyz for the whole of it -- and, critically, before
+		// the hub shutdown loop, whose per-user offline pass is where the
+		// documented 29-against-25 pool peak lives. Marking first means a
+		// normal termination is never misread as pool saturation.
+		beginDrain()
+		// Then HOLD THE LISTENER OPEN for drainSettle. Latching the flag and
+		// making the drain OBSERVABLE are different things: srv.Shutdown runs
+		// in the deferred cleanup immediately after this returns, and without
+		// the settle it closes the listener ~5us after the latch -- so no
+		// external consumer can ever see the `draining` 503.
+		drainSettleSleep(drainSettle)
 		return nil
 	case err := <-serveResult:
 		if err == nil {
@@ -479,6 +681,11 @@ func runControlPlaneServer(
 }
 
 func shutdownControlPlane(
+	// drainCtx is the ONE deadline the HTTP drain and the three stages after it
+	// share. The tail stages below deliberately do NOT derive from it -- see the
+	// comment at their call site.
+	drainCtx context.Context,
+	onStageAbandoned func(stage string, starved bool),
 	stopBackground func(),
 	shutdownHTTP func() error,
 	waitActivityWorkers func(),
@@ -494,9 +701,12 @@ func shutdownControlPlane(
 ) error {
 	stopBackground()
 	shutdownErr := shutdownHTTP()
-	waitActivityWorkers()
-	closePresenceWorkers()
-	shutdownHub()
+	// Each of these three takes no context of its own, so the bound has to be
+	// applied here. They consume ONE budget in order: a fast HTTP drain leaves
+	// more for the hub, which is the right dynamic.
+	awaitStage(drainCtx, "background_workers", waitActivityWorkers, onStageAbandoned)
+	awaitStage(drainCtx, "presence_workers", closePresenceWorkers, onStageAbandoned)
+	awaitStage(drainCtx, "hub", shutdownHub, onStageAbandoned)
 	shutdownErr = errors.Join(shutdownErr, shutdownMetrics())
 	shutdownErr = errors.Join(shutdownErr, shutdownAdminMetricsReader())
 	closeNATS()

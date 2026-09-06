@@ -21,6 +21,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedback"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/friends"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
@@ -271,6 +272,18 @@ type RouterDependencies struct {
 	// embedder with no registry, in which case every write stays on the single
 	// process-wide store exactly as it did before ADR-0038.
 	MediaWriteRouter media.WriteRouter
+
+	// Readiness is the process-wide drain flag (#3106). It flows IN rather
+	// than out of NewRouter's return list on purpose: cmd/server constructs
+	// it exactly once and is also the one that later calls MarkDraining on
+	// SIGTERM, so this field is the ONLY way the background readiness prober
+	// built inside NewRouter and the shutdown path can share the same
+	// instance. A second health.NewReadiness() call anywhere would silently
+	// divorce the two -- the drain flag would flip and /readyz would never
+	// see it. Nil-safe: every health.Readiness method tolerates a nil
+	// receiver, so an embedder or test that leaves this unset gets a
+	// never-draining default rather than a panic.
+	Readiness *health.Readiness
 }
 
 // requirePresenceRecheckWired fails startup when either Rich Presence capture
@@ -602,8 +615,7 @@ func NewRouter(
 		// RetryOnFailedConnect (pkg/nats.Connect) makes an unreachable bus
 		// return a reconnecting client rather than an error (#2854 finding A),
 		// so what is left is an unparseable URL or bad credentials -- a
-		// deterministic deploy defect. The boot guard fatals shortly after; this
-		// is the line that says why.
+		// deterministic deploy defect, and this is the line that says why.
 		//
 		// Deliberately NOT a list of affected features (#2875). The old text
 		// named only voice-state sync while the bus had since gained the
@@ -616,11 +628,71 @@ func NewRouter(
 		// The raw error is NOT logged: natsclient.Connect wraps nats.Connect,
 		// whose *url.Error formats the raw URL, so a nats://<user>:<pass>@host
 		// misconfiguration would write the credential into the log (CWE-532).
+		// "boot continues", NOT "boot will fail". This said the latter for its
+		// whole life and it was never true: there is no nil-natsClient fatal
+		// anywhere in the service (main.go and router.go only guard, and
+		// opsmetrics_runtime degrades). The process comes up with a permanently
+		// nil client, so /readyz reports nats down for its entire lifetime --
+		// which is why the readiness check classifies that case separately as
+		// nats_unconfigured rather than as a self-healing reconnect.
 		log.Warn("NATS configuration is invalid — every bus-dependent feature "+
-			"would be degraded; boot will fail", "failure_class", "nats_config")
+			"is degraded; boot continues with NATS unavailable",
+			"failure_class", "nats_config")
 	} else {
 		natsClient = nc
 	}
+
+	// #3106: background readiness prober. Runs on a ticker over the SERVING
+	// db/redis/nats handles established above -- never a dedicated handle --
+	// so /readyz shares their fate rather than reporting healthy while the
+	// pool the application actually uses is wedged. dependencies.Readiness
+	// flows in from cmd/server so the SAME instance the shutdown path later
+	// marks draining is the one this prober's Evaluate reads (see the
+	// RouterDependencies.Readiness doc comment).
+	readinessProber := health.NewProber(
+		dependencies.Readiness,
+		newReadinessChecks(db, redis, natsClient),
+		readyzProbeInterval,
+		readyzStaleAfter,
+		time.Now,
+	)
+	// Level-selecting, not a bare log.Info. A readiness LOSS -- Postgres or
+	// Redis unreachable -- is a production incident, and at Info it lands in
+	// the same stream as the per-request line middleware.Logger emits for
+	// every HTTP call, indistinguishable BY LEVEL from routine traffic. So no
+	// level-based alert could ever fire on it. Recovery stays Info.
+	readinessProber.SetLogger(func(msg string, kv ...any) {
+		routeReadinessLine(msg, kv, log.Info, log.Warn, log.Error)
+	})
+	// The prober MUST be stoppable: on an uncancellable lifetime it outlives
+	// the process's useful life, querying a database being torn down while
+	// holding a pooled connection the drain is competing for, and leaking one
+	// ticker per NewRouter call in tests. Stop BOUNDS that overlap rather than
+	// eliminating it -- it closes a channel and returns without joining an
+	// in-flight probe, so a probe already inside Evaluate can still hold a
+	// pooled connection while teardown proceeds -- for health.ProbeTimeout if
+	// it honours cancellation, and INDEFINITELY if it does not, which is the
+	// wedged case probeWatched reports. ProbeTimeout bounds the probe's
+	// context, never its return.
+	// Not joining is deliberate: blocking shutdown on a driver that is already
+	// ignoring cancellation would be the worse failure, and a query against a
+	// closing *sql.DB returns ErrConnDone rather than panicking. It owns its own lifetime via Stop()
+	// rather than a context.CancelFunc created here — a CancelFunc that is
+	// created in one scope and invoked from another cannot be deferred, which
+	// is both a lint finding and a genuine smell. Its Stop is folded into the
+	// presence closer below rather than becoming an 11th return value.
+	//
+	// Start MUST be called or /readyz never publishes a verdict, Current()
+	// reports not-fresh forever, and the endpoint answers probe_stale 503 for
+	// the life of the process — failing every deploy at wait-healthy. Pinned
+	// by TestNewRouterWiresTheReadinessProberToTheSharedDrainFlag, because
+	// nothing else here
+	// exercises this wiring: every prober test constructs one directly and
+	// calls Start itself.
+	go readinessProber.Start(context.Background())
+	readyzHandler := ReadyzHandler(readinessProber)
+	router.GET("/readyz", readyzHandler)
+	router.HEAD("/readyz", readyzHandler)
 
 	// Initialize MFA handler — versioned keyring (#2307). ParseKeyring errors
 	// never contain key material, only version numbers.
@@ -2663,6 +2735,18 @@ func NewRouter(
 	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
+	// Fold the readiness prober's cancel into the presence closer IN PLACE,
+	// rather than returning a differently-named closure. The return statement
+	// below is pinned by TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal,
+	// which matches its literal text — renaming the value silently breaks that
+	// wiring-order guard, which is exactly the kind of assertion that should
+	// not be defeated by an unrelated change.
+	presenceCloser := closePresenceWorkers
+	closePresenceWorkers = func() {
+		readinessProber.Stop()
+		presenceCloser()
+	}
+
 	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, ownershipHandler.CompleteExpiredTransfers, nil
 }
 

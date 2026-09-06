@@ -45,7 +45,7 @@ func run() int {
 		log.Print("ops-agent startup failed: reason=nats_connect")
 		return 1
 	}
-	defer natsClient.Close()
+	defer func() { _ = natsClient.Close() }() // best-effort: the agent is exiting
 
 	dockerReader, err := opsmetrics.NewDockerReader(dockerSocketURL)
 	if err != nil {

@@ -37,7 +37,7 @@ func subscribeVoicePermissions(t *testing.T) chan map[string]interface{} {
 	if err != nil {
 		t.Skipf("NATS unavailable (%v); skipping live enforcement test (runs in CI)", err)
 	}
-	t.Cleanup(obsClient.Close)
+	t.Cleanup(func() { _ = obsClient.Close() })
 
 	msgs := make(chan map[string]interface{}, 8)
 	sub, err := obsClient.Subscribe("voice.enforce.permissions", func(data []byte) {

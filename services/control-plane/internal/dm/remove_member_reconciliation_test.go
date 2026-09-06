@@ -224,7 +224,7 @@ func TestRemoveMemberDeliveryFailureStillEnforcesAndBroadcasts(t *testing.T) {
 	}
 	bus, err := natsclient.Connect(natsURL)
 	require.NoError(t, err)
-	t.Cleanup(bus.Close)
+	t.Cleanup(func() { _ = bus.Close() })
 	enforcement := make(chan map[string]interface{}, 8)
 	subscription, err := bus.Subscribe("voice.enforce.disconnect", func(data []byte) {
 		var payload map[string]interface{}

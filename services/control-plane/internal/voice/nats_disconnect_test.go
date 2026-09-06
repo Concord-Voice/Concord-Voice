@@ -33,12 +33,12 @@ func TestPublishForceDisconnect_PublishesPayload(t *testing.T) {
 	if err != nil {
 		t.Skipf("NATS unavailable (%v); skipping live publish test (runs in CI)", err)
 	}
-	t.Cleanup(pubClient.Close)
+	t.Cleanup(func() { _ = pubClient.Close() })
 
 	// Observer client subscribes to capture the published message.
 	obsClient, err := natsclient.Connect(natsTestURL())
 	require.NoError(t, err)
-	t.Cleanup(obsClient.Close)
+	t.Cleanup(func() { _ = obsClient.Close() })
 
 	ts := testhelpers.SetupTestServer(t)
 	sub := voice.NewNATSSubscriber(ts.DB, logger.New("test"), ts.Hub, pubClient, ts.Redis, nil, nil)
