@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.46] — 2026-09-07
+
+Voice now connects on networks that block UDP: Concord's servers were already offering relay servers that carry a call over TCP or TLS, and the desktop app was discarding that offer, so on many corporate and campus networks this was not degraded audio but no call at all. Picture-in-Picture voice windows are also hardened — each now gets a private line and a one-time credential, so nothing else loaded in the app can listen in or hang up your call — and every call stops spending part of its setup on a TCP route no Concord server has ever accepted. On the server side, updates no longer cut your connection short, and an update that comes back up unable to reach its database is now caught instead of being recorded as a success. Smaller fixes stop your voice and call status disappearing every hour, close Picture-in-Picture cleanly when it is dismissed during startup, and retire an unshared attachment when its message is deleted.
+
 ### Security
 
 - **Voice now works on networks that block UDP** ([#3104](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3104)) — Concord's servers were already offering relay servers that can carry a call over TCP or TLS when a network blocks the usual voice traffic, but the desktop app was discarding that offer and never trying them. On a corporate or campus network that blocks UDP this was not degraded audio, it was no call at all: every join attempt ran out of options and timed out. The app now uses the relay servers it is given, in the main window and in Picture-in-Picture, and falls back to today's behaviour unchanged when a server offers none.
