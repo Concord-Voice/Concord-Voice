@@ -224,6 +224,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 | `database`      | PostgreSQL connection + migration runner                                                     |
 | `dm`            | DM conversation CRUD, DM messages, DM voice calls (ring/decline/cancel), DM key distribution |
 | `email`         | Email sending (verification codes, notifications) via SMTP/Resend                            |
+| `expiration`    | Shared channel/DM message-expiration policy and bounded resumable backfill                   |
 | `friends`       | Friend requests, acceptance/decline, blocking, friend codes                                  |
 | `invites`       | Server invite code generation, listing, revoking, joining, preview                           |
 | `klipy`         | KLIPY GIF API + media proxy with SSRF egress guard                                           |
@@ -342,6 +343,11 @@ erDiagram
         UUID server_id FK
         VARCHAR type
         UUID linked_voice_channel_id FK
+        INTEGER expiration_window_seconds "nullable; 1h, 1d, 7d, or 30d"
+        TIMESTAMPTZ expiration_updated_at "nullable"
+        BIGINT expiration_revision
+        TEXT expiration_backfill_mode "nullable; apply or clear"
+        TIMESTAMPTZ expiration_backfill_cutoff "nullable"
     }
     server_members {
         UUID server_id PK, FK
@@ -387,6 +393,7 @@ erDiagram
         UUID reply_to_id FK
         UUID pinned_by FK
         TIMESTAMPTZ edited_at
+        TIMESTAMPTZ expires_at "nullable; server-stamped"
     }
     dm_conversations {
         UUID id PK
@@ -394,6 +401,11 @@ erDiagram
         VARCHAR name
         TEXT icon_url
         UUID created_by FK
+        INTEGER expiration_window_seconds "nullable; 1h, 1d, 7d, or 30d"
+        TIMESTAMPTZ expiration_updated_at "nullable"
+        BIGINT expiration_revision
+        TEXT expiration_backfill_mode "nullable; apply or clear"
+        TIMESTAMPTZ expiration_backfill_cutoff "nullable"
     }
     dm_participants {
         UUID conversation_id PK, FK
@@ -408,6 +420,7 @@ erDiagram
         VARCHAR type "incl. call_event"
         UUID pinned_by FK
         JSONB call_event_payload
+        TIMESTAMPTZ expires_at "nullable; server-stamped"
     }
     message_reactions {
         UUID message_id FK
@@ -551,6 +564,7 @@ erDiagram
 > - `key_revocations.revoked_by` changed to `ON DELETE SET NULL` (000059), so account erasure is not blocked
 > - migrations 000093–000097 added, backfilled, validated, and enforced microsecond lifecycle watermarks on both active voice-participant tables
 > - migration 000098 added one privacy-critical pending Rich Presence settings-cleanup marker per user
+> - migrations 000127–000129 added shared channel/DM expiration policy state, nullable message expiry timestamps, and dedicated partial indexes for expiry lookups
 
 #### Admin auth surface (#1688)
 

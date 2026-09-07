@@ -25,6 +25,139 @@ func setupResolver(t *testing.T) (*rbac.Resolver, *testhelpers.TestServer) {
 	return resolver, ts
 }
 
+func TestResolveChannelPermissionsTx(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("fresh user allow overrides role deny and leaves cache unchanged", func(t *testing.T) {
+		resolver, ts := setupResolver(t)
+		owner := ts.CreateTestUser(t, "txallowowner")
+		member := ts.CreateTestUser(t, "txallowmember")
+		serverID := ts.CreateTestServer(t, owner.ID, "Tx Channel Allow")
+		ts.AddMemberToServer(t, serverID, member.ID, "member")
+		channelID := ts.CreateTestChannel(t, serverID, "tx-allow")
+		var allRoleID string
+		require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID).Scan(&allRoleID))
+		ts.CreateChannelOverride(t, channelID, "role", allRoleID, 0, int64(rbac.PermSendMessages))
+		ts.CreateChannelOverride(t, channelID, "user", member.ID, int64(rbac.PermSendMessages), 0)
+
+		cache := rbac.NewPermissionCache(ts.Redis)
+		require.NoError(t, cache.Set(ctx, serverID, member.ID, channelID, 0))
+		tx, err := ts.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback transaction: %v", rollbackErr)
+			}
+		}()
+		require.NoError(t, rbac.LockServerVisibilityCapture(ctx, tx, serverID))
+
+		perms, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, member.ID, channelID)
+		require.NoError(t, err)
+		assert.True(t, perms.Has(rbac.PermSendMessages))
+		var one int
+		require.NoError(t, tx.QueryRowContext(ctx, `SELECT 1`).Scan(&one))
+		assert.Equal(t, 1, one)
+		cached, ok := cache.Get(ctx, serverID, member.ID, channelID)
+		require.True(t, ok)
+		assert.Equal(t, rbac.Permission(0), cached)
+	})
+
+	t.Run("fresh user deny overrides base permission and leaves cache unchanged", func(t *testing.T) {
+		resolver, ts := setupResolver(t)
+		owner := ts.CreateTestUser(t, "txdenyowner")
+		member := ts.CreateTestUser(t, "txdenymember")
+		serverID := ts.CreateTestServer(t, owner.ID, "Tx Channel Deny")
+		ts.AddMemberToServer(t, serverID, member.ID, "member")
+		channelID := ts.CreateTestChannel(t, serverID, "tx-deny")
+		ts.CreateChannelOverride(t, channelID, "user", member.ID, 0, int64(rbac.PermSendMessages))
+
+		cache := rbac.NewPermissionCache(ts.Redis)
+		require.NoError(t, cache.Set(ctx, serverID, member.ID, channelID, rbac.PermSendMessages))
+		tx, err := ts.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback transaction: %v", rollbackErr)
+			}
+		}()
+		require.NoError(t, rbac.LockServerVisibilityCapture(ctx, tx, serverID))
+
+		perms, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, member.ID, channelID)
+		require.NoError(t, err)
+		assert.False(t, perms.Has(rbac.PermSendMessages))
+		var one int
+		require.NoError(t, tx.QueryRowContext(ctx, `SELECT 1`).Scan(&one))
+		assert.Equal(t, 1, one)
+		cached, ok := cache.Get(ctx, serverID, member.ID, channelID)
+		require.True(t, ok)
+		assert.Equal(t, rbac.PermSendMessages, cached)
+	})
+
+	t.Run("owner bypasses channel overrides", func(t *testing.T) {
+		resolver, ts := setupResolver(t)
+		owner := ts.CreateTestUser(t, "txowner")
+		serverID := ts.CreateTestServer(t, owner.ID, "Tx Owner")
+		channelID := ts.CreateTestChannel(t, serverID, "tx-owner")
+		ts.CreateChannelOverride(t, channelID, "user", owner.ID, 0, int64(rbac.PermSendMessages))
+
+		tx, err := ts.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback transaction: %v", rollbackErr)
+			}
+		}()
+		require.NoError(t, rbac.LockServerVisibilityCapture(ctx, tx, serverID))
+		perms, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, owner.ID, channelID)
+		require.NoError(t, err)
+		assert.True(t, perms.Has(rbac.PermSendMessages))
+	})
+
+	t.Run("administrator bypasses channel overrides", func(t *testing.T) {
+		resolver, ts := setupResolver(t)
+		owner := ts.CreateTestUser(t, "txadminowner")
+		admin := ts.CreateTestUser(t, "txadmin")
+		serverID := ts.CreateTestServer(t, owner.ID, "Tx Admin")
+		ts.AddMemberToServer(t, serverID, admin.ID, "member")
+		adminRoleID := ts.CreateTestRole(t, serverID, "TxAdministrator", 10, int64(rbac.PermAdministrator))
+		ts.AssignRoleToUser(t, serverID, admin.ID, adminRoleID)
+		channelID := ts.CreateTestChannel(t, serverID, "tx-admin")
+		ts.CreateChannelOverride(t, channelID, "user", admin.ID, 0, int64(rbac.PermSendMessages))
+
+		tx, err := ts.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback transaction: %v", rollbackErr)
+			}
+		}()
+		require.NoError(t, rbac.LockServerVisibilityCapture(ctx, tx, serverID))
+		perms, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, admin.ID, channelID)
+		require.NoError(t, err)
+		assert.True(t, perms.Has(rbac.PermSendMessages))
+	})
+
+	t.Run("outsider returns ErrNotMember", func(t *testing.T) {
+		resolver, ts := setupResolver(t)
+		owner := ts.CreateTestUser(t, "txoutsiderowner")
+		outsider := ts.CreateTestUser(t, "txoutsider")
+		serverID := ts.CreateTestServer(t, owner.ID, "Tx Outsider")
+		channelID := ts.CreateTestChannel(t, serverID, "tx-outsider")
+
+		tx, err := ts.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback transaction: %v", rollbackErr)
+			}
+		}()
+		require.NoError(t, rbac.LockServerVisibilityCapture(ctx, tx, serverID))
+		perms, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverID, outsider.ID, channelID)
+		assert.ErrorIs(t, err, rbac.ErrNotMember)
+		assert.Zero(t, perms)
+	})
+}
+
 func TestHasPermissionBaseMember(t *testing.T) {
 	resolver, ts := setupResolver(t)
 	ctx := context.Background()

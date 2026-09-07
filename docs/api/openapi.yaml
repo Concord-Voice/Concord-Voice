@@ -2237,6 +2237,87 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /channels/{id}/expiration:
+    patch:
+      tags:
+      - Channels
+      summary: Update channel message expiration
+      description: 'Set, clear, or resume the shared message-expiration policy for a text channel.
+        `set` is valid only for text channels; `clear` and `resume` are also valid when a channel has
+        been retyped as non-text. Requires `Manage Channels`. The complete JSON document is limited to
+        1 KiB. Each request performs at most five 5,000-row backfill batches; remaining work stays
+        resumable. This foundation exposes policy state only; deletion and retention enforcement are
+        documented separately.'
+      operationId: updateChannelExpiration
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpirationRequest'
+      responses:
+        '200':
+          description: Current channel expiration policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpirationPolicy'
+        '400':
+          description: Invalid operation shape or unsupported expiration window
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required or token invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Visible channel member lacks channel-management permission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel or caller membership/authorization context not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Backfill already pending, or a post-commit resume conflict returned the current policy
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ExpirationPolicy'
+        '500':
+          description: Database error before the policy change was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request JSON document exceeds 1 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: A bounded backfill may leave a durable marker, or any Start commit error may return a candidate ExpirationPolicy that was not persisted, including new_only and leave_pending. Re-fetch the chat policy; resume only when the fetched policy has backfill_pending true at the matching revision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpirationPolicy'
   /channels/{id}/keys:
     get:
       tags:
@@ -3484,6 +3565,92 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /dm/conversations/{id}/expiration:
+    patch:
+      tags:
+      - DM
+      summary: Update DM message expiration
+      description: 'Set, clear, or resume the shared message-expiration policy for a 1:1 or group DM.
+        A 1:1 participant or group-DM admin may change the policy. The complete JSON document is limited
+        to 1 KiB. Each request performs at most five 5,000-row backfill batches; remaining work stays
+        resumable. This foundation exposes policy state only; deletion and retention enforcement are
+        documented separately.'
+      operationId: updateDMConversationExpiration
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Conversation UUID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpirationRequest'
+      responses:
+        '200':
+          description: Current DM expiration policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpirationPolicy'
+        '400':
+          description: Invalid operation shape or unsupported expiration window
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required or token invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Visible participant lacks the required group-admin role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Conversation or caller participant/authorization context not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Backfill already pending, or a post-commit resume conflict returned the current policy
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ExpirationPolicy'
+        '500':
+          description: Database error before the policy change was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request JSON document exceeds 1 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: A bounded backfill may leave a durable marker, or any Start commit error may return a candidate ExpirationPolicy that was not persisted, including new_only and leave_pending. Re-fetch the chat policy; resume only when the fetched policy has backfill_pending true at the matching revision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpirationPolicy'
   /dm/conversations/{id}/keys:
     get:
       tags:
@@ -3899,6 +4066,10 @@ paths:
                       key_version:
                         type: integer
                       edited_at:
+                        type: string
+                        format: date-time
+                        nullable: true
+                      expires_at:
                         type: string
                         format: date-time
                         nullable: true
@@ -10314,10 +10485,10 @@ paths:
         Authorization is re-resolved PER CHANNEL: channels where the actor lacks
         `Manage All Messages` (or is denied it by a channel permission override) are
         skipped rather than purged, and an actor holding only `Manage Own Messages` in
-	        a channel purges only their own messages there. If the server has no channels,
-	        an actor authorized at server scope receives 200 with a zero-count audit row;
-	        otherwise, if no channel is purgeable the request returns 403 with nothing
-	        deleted and no audit row.
+        a channel purges only their own messages there. If the server has no channels,
+        an actor authorized at server scope receives 200 with a zero-count audit row;
+        otherwise, if no channel is purgeable the request returns 403 with nothing
+        deleted and no audit row.
 
 
         Emits one `channel_purged` event per affected channel.
@@ -15583,6 +15754,78 @@ components:
           type: string
           nullable: true
           description: Data URL or null to remove
+    ExpirationRequest:
+      oneOf:
+      - $ref: '#/components/schemas/SetExpirationRequest'
+      - $ref: '#/components/schemas/ClearExpirationRequest'
+      - $ref: '#/components/schemas/ResumeExpirationRequest'
+      discriminator:
+        propertyName: mode
+        mapping:
+          set: '#/components/schemas/SetExpirationRequest'
+          clear: '#/components/schemas/ClearExpirationRequest'
+          resume: '#/components/schemas/ResumeExpirationRequest'
+      description: Exactly one explicit expiration operation. Missing fields are not interpreted as clear.
+    SetExpirationRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, window_seconds, retroactive]
+      properties:
+        mode:
+          type: string
+          enum: [set]
+        window_seconds:
+          type: integer
+          enum: [3600, 86400, 604800, 2592000]
+          description: Expiration window in seconds (1 hour, 1 day, 7 days, or 30 days).
+        retroactive:
+          type: string
+          enum: [apply, new_only]
+          description: Apply the window to eligible existing messages, or stamp only new messages.
+    ClearExpirationRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, retroactive]
+      properties:
+        mode:
+          type: string
+          enum: [clear]
+        retroactive:
+          type: string
+          enum: [clear_pending, leave_pending]
+          description: Clear eligible future expiry stamps, or leave existing stamps unchanged.
+    ResumeExpirationRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, revision]
+      properties:
+        mode:
+          type: string
+          enum: [resume]
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Exact pending policy revision to resume.
+    ExpirationPolicy:
+      type: object
+      required: [window_seconds, updated_at, revision, backfill_pending]
+      properties:
+        window_seconds:
+          type: integer
+          nullable: true
+          enum: [3600, 86400, 604800, 2592000, null]
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Time the current policy was accepted.
+        revision:
+          type: integer
+          format: int64
+        backfill_pending:
+          type: boolean
+          description: True while a bounded retroactive operation remains resumable.
     CreateChannelRequest:
       type: object
       required:
@@ -16011,6 +16254,22 @@ components:
         updated_at:
           type: string
           format: date-time
+        expiration_window_seconds:
+          type: integer
+          nullable: true
+          enum: [3600, 86400, 604800, 2592000, null]
+          description: Shared message-expiration window in seconds; null disables new expiry stamps.
+        expiration_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        expiration_revision:
+          type: integer
+          format: int64
+          description: Monotonic expiration-policy operation generation.
+        expiration_backfill_pending:
+          type: boolean
+          description: Whether retroactive expiry work remains pending.
     Message:
       type: object
       properties:
@@ -16035,6 +16294,11 @@ components:
         updated_at:
           type: string
           format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Server-stamped expiry time; deletion is enforced by a later retention rollout.
     MessageWithUser:
       allOf:
       - $ref: '#/components/schemas/Message'
@@ -16413,6 +16677,11 @@ components:
           properties:
             content:
               type: string
+            expires_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: Server-stamped expiry time; deletion is enforced by a later retention rollout.
             user_id:
               type: string
               format: uuid
@@ -16458,6 +16727,22 @@ components:
         created_at:
           type: string
           format: date-time
+        expiration_window_seconds:
+          type: integer
+          nullable: true
+          enum: [3600, 86400, 604800, 2592000, null]
+          description: Shared message-expiration window in seconds; null disables new expiry stamps.
+        expiration_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        expiration_revision:
+          type: integer
+          format: int64
+          description: Monotonic expiration-policy operation generation.
+        expiration_backfill_pending:
+          type: boolean
+          description: Whether retroactive expiry work remains pending.
     DMMessage:
       type: object
       properties:
@@ -16483,6 +16768,11 @@ components:
         created_at:
           type: string
           format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Server-stamped expiry time; deletion is enforced by a later retention rollout.
         username:
           type: string
         display_name:

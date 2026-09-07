@@ -49,19 +49,23 @@ type ChannelGroup struct {
 
 // Channel represents a voice or text channel within a server
 type Channel struct {
-	ID                   string    `json:"id" db:"id"`
-	ServerID             string    `json:"server_id" db:"server_id"`
-	Name                 string    `json:"name" db:"name"`
-	Description          *string   `json:"description,omitempty" db:"description"`
-	Type                 string    `json:"type" db:"type"`                                                 // voice, text, bulletin
-	Emoji                *string   `json:"emoji,omitempty" db:"emoji"`                                     // Optional custom emoji
-	AudioQualityTier     *string   `json:"audio_quality_tier,omitempty" db:"audio_quality_tier"`           // voice/standard/high/hifi/studio or nil (personal)
-	GroupID              *string   `json:"group_id,omitempty" db:"group_id"`                               // FK to channel_groups; nil = uncategorized
-	LinkedVoiceChannelID *string   `json:"linked_voice_channel_id,omitempty" db:"linked_voice_channel_id"` // Non-nil = hidden text chat for a voice channel
-	SyncPermissions      bool      `json:"sync_permissions" db:"sync_permissions"`                         // Whether channel overrides sync from parent category
-	Position             int       `json:"position" db:"position"`
-	CreatedAt            time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at" db:"updated_at"`
+	ID                        string     `json:"id" db:"id"`
+	ServerID                  string     `json:"server_id" db:"server_id"`
+	Name                      string     `json:"name" db:"name"`
+	Description               *string    `json:"description,omitempty" db:"description"`
+	Type                      string     `json:"type" db:"type"`                                                 // voice, text, bulletin
+	Emoji                     *string    `json:"emoji,omitempty" db:"emoji"`                                     // Optional custom emoji
+	AudioQualityTier          *string    `json:"audio_quality_tier,omitempty" db:"audio_quality_tier"`           // voice/standard/high/hifi/studio or nil (personal)
+	GroupID                   *string    `json:"group_id,omitempty" db:"group_id"`                               // FK to channel_groups; nil = uncategorized
+	LinkedVoiceChannelID      *string    `json:"linked_voice_channel_id,omitempty" db:"linked_voice_channel_id"` // Non-nil = hidden text chat for a voice channel
+	SyncPermissions           bool       `json:"sync_permissions" db:"sync_permissions"`                         // Whether channel overrides sync from parent category
+	Position                  int        `json:"position" db:"position"`
+	ExpirationWindowSeconds   *int       `json:"expiration_window_seconds" db:"expiration_window_seconds"`
+	ExpirationUpdatedAt       *time.Time `json:"expiration_updated_at" db:"expiration_updated_at"`
+	ExpirationRevision        int64      `json:"expiration_revision" db:"expiration_revision"`
+	ExpirationBackfillPending bool       `json:"expiration_backfill_pending" db:"-"`
+	CreatedAt                 time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 // ChannelKey represents a channel symmetric key wrapped for a specific user
@@ -87,6 +91,7 @@ type Message struct {
 	PinnedAt         *time.Time `json:"pinned_at,omitempty" db:"pinned_at"`
 	PinnedBy         *string    `json:"pinned_by,omitempty" db:"pinned_by"`
 	EditedAt         *time.Time `json:"edited_at,omitempty" db:"edited_at"`
+	ExpiresAt        *time.Time `json:"expires_at" db:"expires_at"`
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
 }

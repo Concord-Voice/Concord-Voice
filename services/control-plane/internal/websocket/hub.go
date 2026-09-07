@@ -2350,6 +2350,7 @@ type messageAck struct {
 	ChannelUUID uuid.UUID
 	CreatedAt   interface{}
 	UpdatedAt   interface{}
+	ExpiresAt   *time.Time
 	ReplyToID   *string
 	GifSlug     *string
 	Attachments []models.AttachmentSummary
@@ -2363,6 +2364,7 @@ func (h *Hub) sendMessageAck(ack messageAck) {
 		keyChannelID: ack.ChannelUUID.String(),
 		keyCreatedAt: ack.CreatedAt,
 		keyUpdatedAt: ack.UpdatedAt,
+		"expires_at": ack.ExpiresAt,
 	}
 	if ack.ReplyToID != nil {
 		ackData["reply_to_id"] = *ack.ReplyToID
@@ -2555,15 +2557,21 @@ func messageCredentialGuardError(ctx context.Context, tx *sql.Tx, p persistMessa
 // persistMessage returns a specific error message on failure and, for a timeout
 // rechecked under the membership lock, its locked deadline.
 func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time.Time, []models.AttachmentSummary, string, *time.Time) {
+	messageID, createdAt, updatedAt, _, attachments, persistErr, timedOutUntil := h.persistMessageWithExpiry(p)
+	return messageID, createdAt, updatedAt, attachments, persistErr, timedOutUntil
+}
+
+func (h *Hub) persistMessageWithExpiry(p persistMessageParams) (uuid.UUID, time.Time, time.Time, *time.Time, []models.AttachmentSummary, string, *time.Time) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
+	var expiresAt *time.Time
 	var attachmentSummaries []models.AttachmentSummary
 	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
 	defer cancel()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Failed to begin message tx: %v", err)
-		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedSaveMessage, nil
 	}
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
@@ -2575,7 +2583,14 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 	// superseded epoch. GuardTx (users-row FOR SHARE) rechecks the sender's
 	// connect-time epoch against the current DB epoch inside the write tx.
 	if guardError := messageCredentialGuardError(ctx, tx, p); guardError != "" {
-		return messageID, createdAt, updatedAt, nil, guardError, nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, guardError, nil
+	}
+	var windowSeconds sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT expiration_window_seconds FROM channels WHERE id = $1 FOR SHARE`, p.channelUUID,
+	).Scan(&windowSeconds); err != nil {
+		log.Printf("Failed to lock message channel: %v", err)
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedSaveMessage, nil
 	}
 	// Lock the preflight membership row inside the write transaction. Its immutable
 	// joined_at value rejects a same-key rejoin after a kick/ban finishes purging,
@@ -2584,37 +2599,44 @@ func (h *Hub) persistMessage(p persistMessageParams) (uuid.UUID, time.Time, time
 	timedOutUntil, err := lockMessageMembership(ctx, tx, p)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return messageID, createdAt, updatedAt, nil, errMsgNotMemberOfServer, nil
+			return messageID, createdAt, updatedAt, expiresAt, nil, errMsgNotMemberOfServer, nil
 		}
 		log.Printf("Failed to lock message membership: %v", err)
-		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedSaveMessage, nil
 	}
 	if timedOutUntil != nil {
-		return messageID, createdAt, updatedAt, nil, errMsgMemberTimedOut, timedOutUntil
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgMemberTimedOut, timedOutUntil
+	}
+	var window any
+	if windowSeconds.Valid {
+		window = windowSeconds.Int64
 	}
 	err = tx.QueryRowContext(ctx,
-		`INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-		 RETURNING created_at, updated_at`,
-		messageID, p.channelUUID, p.userID, p.content, p.keyVersion, p.embedsSuppressed, p.replyToID, p.gifSlug,
-	).Scan(&createdAt, &updatedAt)
+		`WITH timestamps AS (SELECT clock_timestamp() AS created_at)
+		 INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at, expires_at)
+		 SELECT $1, $2, $3, $4, $5, $6, $7, $8, timestamps.created_at, timestamps.created_at,
+		        CASE WHEN $9::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $9) END
+		 FROM timestamps
+		 RETURNING created_at, updated_at, expires_at`,
+		messageID, p.channelUUID, p.userID, p.content, p.keyVersion, p.embedsSuppressed, p.replyToID, p.gifSlug, window,
+	).Scan(&createdAt, &updatedAt, &expiresAt)
 	if err != nil && isFKViolation(err) {
-		return messageID, createdAt, updatedAt, nil, "Reply target message not found", nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, "Reply target message not found", nil
 	}
 	if err != nil {
 		log.Printf("Failed to persist message: %v", err)
-		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedSaveMessage, nil
 	}
 	attachmentSummaries, err = h.linkChannelAttachments(ctx, tx, messageID, p.userID.String(), p.attachmentIDs, p.channelUUID.String())
 	if err != nil {
 		log.Printf("Failed to link channel attachments: %v", err)
-		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedSaveMessage, nil
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit message: %v", err)
-		return messageID, createdAt, updatedAt, nil, errMsgFailedSaveMessage, nil
+		return messageID, createdAt, updatedAt, expiresAt, nil, errMsgFailedSaveMessage, nil
 	}
-	return messageID, createdAt, updatedAt, attachmentSummaries, "", nil
+	return messageID, createdAt, updatedAt, expiresAt, attachmentSummaries, "", nil
 }
 
 // isFKViolation returns true if the error is a PostgreSQL foreign key violation (23503).
@@ -2690,6 +2712,7 @@ type messageBroadcastCtx struct {
 	embedsSuppressed bool
 	createdAt        interface{}
 	updatedAt        interface{}
+	expiresAt        *time.Time
 	replyToID        *string
 	gifSlug          *string
 	attachments      []models.AttachmentSummary
@@ -2709,6 +2732,7 @@ func (h *Hub) buildMessageBroadcast(ctx messageBroadcastCtx) map[string]interfac
 		"embeds_suppressed": ctx.embedsSuppressed,
 		keyCreatedAt:        ctx.createdAt,
 		keyUpdatedAt:        ctx.updatedAt,
+		"expires_at":        ctx.expiresAt,
 	}
 	if ctx.replyToID != nil {
 		data["reply_to_id"] = *ctx.replyToID
@@ -2787,7 +2811,7 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 	}
 
 	// Persist message
-	messageID, createdAt, updatedAt, attachmentSummaries, persistErr, timedOutUntil := h.persistMessage(persistMessageParams{
+	messageID, createdAt, updatedAt, expiresAt, attachmentSummaries, persistErr, timedOutUntil := h.persistMessageWithExpiry(persistMessageParams{
 		channelUUID: channelUUID, userID: msg.UserID, credEpoch: msg.CredEpoch, membershipIncarnation: membershipIncarnation, content: input.content,
 		keyVersion: input.keyVersion, attachmentIDs: input.attachmentIDs,
 		embedsSuppressed: embedsSuppressed, replyToID: replyToID, gifSlug: input.gifSlug,
@@ -2808,6 +2832,7 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 		ChannelUUID: channelUUID,
 		CreatedAt:   createdAt,
 		UpdatedAt:   updatedAt,
+		ExpiresAt:   expiresAt,
 		ReplyToID:   replyToID,
 		GifSlug:     input.gifSlug,
 		Attachments: attachmentSummaries,
@@ -2817,7 +2842,7 @@ func (h *Hub) handleMessage(msg IncomingMessage) {
 	broadcastData := h.buildMessageBroadcast(messageBroadcastCtx{
 		messageID: messageID, channelUUID: channelUUID, userID: msg.UserID,
 		client: client, input: input, embedsSuppressed: embedsSuppressed,
-		createdAt: createdAt, updatedAt: updatedAt,
+		createdAt: createdAt, updatedAt: updatedAt, expiresAt: expiresAt,
 		replyToID: replyToID, gifSlug: input.gifSlug, attachments: attachmentSummaries,
 	})
 	h.broadcast <- BroadcastMessage{
@@ -3802,37 +3827,65 @@ func (h *Hub) enforceDMEpoch(msg IncomingMessage, convUUID uuid.UUID, keyVersion
 }
 
 func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, []models.AttachmentSummary, error) {
+	messageID, createdAt, updatedAt, _, attachments, err := h.persistDMMessageWithExpiry(convUUID, userID, credEpoch, input)
+	return messageID, createdAt, updatedAt, attachments, err
+}
+
+func (h *Hub) persistDMMessageWithExpiry(convUUID uuid.UUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, *time.Time, []models.AttachmentSummary, error) {
 	messageID := uuid.New()
 	var createdAt, updatedAt time.Time
+	var expiresAt *time.Time
 	var attachmentSummaries []models.AttachmentSummary
 	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
 	defer cancel()
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return messageID, createdAt, updatedAt, nil, err
+		return messageID, createdAt, updatedAt, expiresAt, nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			log.Printf("Failed to rollback DM message transaction: %v", rollbackErr)
+		}
+	}()
 	// #2201 (Codex #2397 review): fence the WS DM ciphertext write against a
 	// destructive reset that advanced the sender's epoch after connect.
 	if guardErr := credepoch.GuardTx(ctx, tx, userID.String(), credEpoch); guardErr != nil {
-		return messageID, createdAt, updatedAt, nil, guardErr
+		return messageID, createdAt, updatedAt, expiresAt, nil, guardErr
+	}
+	var windowSeconds sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT expiration_window_seconds FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convUUID,
+	).Scan(&windowSeconds); err != nil {
+		return messageID, createdAt, updatedAt, expiresAt, nil, err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, convUUID, userID,
+	).Scan(new(int)); err != nil {
+		return messageID, createdAt, updatedAt, expiresAt, nil, fmt.Errorf("lock DM message participant: %w", err)
+	}
+	var window any
+	if windowSeconds.Valid {
+		window = windowSeconds.Int64
 	}
 	if err = tx.QueryRowContext(ctx,
-		`INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version, type, gif_slug, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-		 RETURNING created_at, updated_at`,
-		messageID, convUUID, userID, input.content, input.keyVersion, input.msgType, input.gifSlug,
-	).Scan(&createdAt, &updatedAt); err != nil {
-		return messageID, createdAt, updatedAt, nil, err
+		`WITH timestamps AS (SELECT clock_timestamp() AS created_at)
+		 INSERT INTO dm_messages (id, conversation_id, user_id, content, key_version, type, gif_slug, created_at, updated_at, expires_at)
+		 SELECT $1, $2, $3, $4, $5, $6, $7, timestamps.created_at, timestamps.created_at,
+		        CASE WHEN $8::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $8) END
+		 FROM timestamps
+		 RETURNING created_at, updated_at, expires_at`,
+		messageID, convUUID, userID, input.content, input.keyVersion, input.msgType, input.gifSlug, window,
+	).Scan(&createdAt, &updatedAt, &expiresAt); err != nil {
+		return messageID, createdAt, updatedAt, expiresAt, nil, err
 	}
 	attachmentSummaries, err = h.linkDMAttachments(ctx, tx, messageID, userID.String(), input.attachmentIDs, convUUID.String())
 	if err != nil {
-		return messageID, createdAt, updatedAt, nil, fmt.Errorf("link DM attachments: %w", err)
+		return messageID, createdAt, updatedAt, expiresAt, nil, fmt.Errorf("link DM attachments: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return messageID, createdAt, updatedAt, nil, err
+		return messageID, createdAt, updatedAt, expiresAt, nil, err
 	}
-	return messageID, createdAt, updatedAt, attachmentSummaries, nil
+	return messageID, createdAt, updatedAt, expiresAt, attachmentSummaries, nil
 }
 
 // dmMessageAckParams holds the fields for a dm_message_ack response.
@@ -3843,6 +3896,7 @@ type dmMessageAckParams struct {
 	convUUID    uuid.UUID
 	createdAt   time.Time
 	updatedAt   time.Time
+	expiresAt   *time.Time
 	gifSlug     *string
 	attachments []models.AttachmentSummary
 }
@@ -3854,6 +3908,7 @@ func (h *Hub) sendDMMessageAck(p dmMessageAckParams) {
 		"conversation_id": p.convUUID.String(),
 		keyCreatedAt:      p.createdAt,
 		keyUpdatedAt:      p.updatedAt,
+		"expires_at":      p.expiresAt,
 	}
 	if p.gifSlug != nil {
 		dmAckData["gif_slug"] = *p.gifSlug
@@ -3876,6 +3931,7 @@ type dmBroadcastCtx struct {
 	input        *dmMessageInput
 	createdAt    time.Time
 	updatedAt    time.Time
+	expiresAt    *time.Time
 	attachments  []models.AttachmentSummary
 	convPersonal bool
 }
@@ -3893,6 +3949,7 @@ func (h *Hub) broadcastDMMessage(ctx dmBroadcastCtx) {
 		"type":            ctx.input.msgType,
 		keyCreatedAt:      ctx.createdAt,
 		keyUpdatedAt:      ctx.updatedAt,
+		"expires_at":      ctx.expiresAt,
 	}
 	if ctx.input.gifSlug != nil {
 		dmBroadcastData["gif_slug"] = *ctx.input.gifSlug
@@ -3927,7 +3984,7 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 		return
 	}
 
-	messageID, createdAt, updatedAt, attachments, err := h.persistDMMessage(convUUID, msg.UserID, msg.CredEpoch, input)
+	messageID, createdAt, updatedAt, expiresAt, attachments, err := h.persistDMMessageWithExpiry(convUUID, msg.UserID, msg.CredEpoch, input)
 	if err != nil {
 		// Any guard/store failure logs and returns the retryable save error (a
 		// fenced epoch mismatch is caught by the client's next authoritative API
@@ -3944,11 +4001,11 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 	nonce, _ := msg.Data[keyNonce].(string)
 	h.sendDMMessageAck(dmMessageAckParams{
 		client: client, nonce: nonce, messageID: messageID, convUUID: convUUID,
-		createdAt: createdAt, updatedAt: updatedAt, gifSlug: input.gifSlug, attachments: attachments,
+		createdAt: createdAt, updatedAt: updatedAt, expiresAt: expiresAt, gifSlug: input.gifSlug, attachments: attachments,
 	})
 	h.broadcastDMMessage(dmBroadcastCtx{
 		messageID: messageID, convUUID: convUUID, senderUserID: msg.UserID,
-		client: client, input: input, createdAt: createdAt, updatedAt: updatedAt,
+		client: client, input: input, createdAt: createdAt, updatedAt: updatedAt, expiresAt: expiresAt,
 		attachments: attachments, convPersonal: convPersonal,
 	})
 	h.sendDMUnreadNotify(convUUID, msg.UserID, dmUnreadLastMessage{

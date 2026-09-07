@@ -162,6 +162,26 @@ func (r *Resolver) ResolveServerPermissionsTx(
 	return perms, err
 }
 
+// ResolveChannelPermissionsTx resolves one channel's effective permissions in
+// the caller's transaction. It deliberately avoids the cache and a nested
+// transaction because callers use it to authorize a concurrent mutation.
+func (r *Resolver) ResolveChannelPermissionsTx(
+	ctx context.Context, tx *sql.Tx, serverID, userID, channelID string,
+) (Permission, error) {
+	basePerms, isOwner, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
+	if err != nil {
+		return 0, err
+	}
+	if isOwner || basePerms.Has(PermAdministrator) {
+		return basePerms, nil
+	}
+	permsByChannel := map[string]Permission{channelID: basePerms}
+	if err := r.applyBatchedChannelOverrides(ctx, tx, []string{channelID}, serverID, userID, basePerms, permsByChannel); err != nil {
+		return 0, err
+	}
+	return permsByChannel[channelID], nil
+}
+
 // ResolveEffectivePermissionsForChannelsFresh resolves a member's effective
 // permissions for channels from one server in one fresh database pass. It keeps
 // per-channel SBAC allow/deny semantics while avoiding an N+1 preflight loop.

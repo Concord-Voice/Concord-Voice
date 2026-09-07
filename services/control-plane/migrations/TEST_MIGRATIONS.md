@@ -280,17 +280,11 @@ psql "postgres://concord:concord_dev_password@localhost:5432/concord?sslmode=dis
 
 **Cause**: Migration failed mid-execution
 
-**Fix**:
-```bash
-# Connect to database
-docker exec -it concord-postgres psql -U concord -d concord
-
-# Check schema_migrations table
-SELECT * FROM schema_migrations;
-
-# If dirty = true, manually fix the schema and update:
-UPDATE schema_migrations SET dirty = false;
-```
+**Fix**: `RunMigrations` fails closed on any dirty version. Follow the inspected
+recovery procedure in [migrations/README.md](README.md#dirty-migration-state):
+inspect `schema_migrations` and `pg_index.indisvalid`, repair only the identified
+partial concurrent index, verify the intended schema, and force the exact clean
+version. Do not update the dirty flag blindly.
 
 ### Issue: "migration file not found"
 

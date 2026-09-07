@@ -227,7 +227,8 @@ func (h *Handler) ListChannels(c *gin.Context) {
 
 func (h *Handler) queryVisibleChannels(serverID string, visibleSet map[string]bool) ([]models.Channel, error) {
 	rows, err := h.db.Query(
-		`SELECT id, server_id, name, type, description, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position, created_at, updated_at
+		`SELECT id, server_id, name, type, description, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
+		        expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at
 		FROM channels
 		WHERE server_id = $1
 		ORDER BY position ASC, created_at ASC`,
@@ -266,6 +267,7 @@ func scanChannel(rows *sql.Rows) (models.Channel, error) {
 		&ch.ID, &ch.ServerID, &ch.Name, &ch.Type, &ch.Description,
 		&ch.Emoji, &ch.AudioQualityTier, &ch.GroupID,
 		&ch.LinkedVoiceChannelID, &ch.SyncPermissions, &ch.Position,
+		&ch.ExpirationWindowSeconds, &ch.ExpirationUpdatedAt, &ch.ExpirationRevision, &ch.ExpirationBackfillPending,
 		&ch.CreatedAt, &ch.UpdatedAt,
 	)
 	return ch, err
@@ -850,15 +852,19 @@ func (h *Handler) broadcastChannelCreated(serverID string, channel models.Channe
 // channelToMap converts a Channel model to a map for broadcast payloads.
 func channelToMap(ch models.Channel) map[string]interface{} {
 	m := map[string]interface{}{
-		"id":         ch.ID,
-		"server_id":  ch.ServerID,
-		"name":       ch.Name,
-		"type":       ch.Type,
-		"emoji":      ch.Emoji,
-		"group_id":   ch.GroupID,
-		"position":   ch.Position,
-		"created_at": ch.CreatedAt,
-		"updated_at": ch.UpdatedAt,
+		"id":                          ch.ID,
+		"server_id":                   ch.ServerID,
+		"name":                        ch.Name,
+		"type":                        ch.Type,
+		"emoji":                       ch.Emoji,
+		"group_id":                    ch.GroupID,
+		"position":                    ch.Position,
+		"expiration_window_seconds":   ch.ExpirationWindowSeconds,
+		"expiration_updated_at":       ch.ExpirationUpdatedAt,
+		"expiration_revision":         ch.ExpirationRevision,
+		"expiration_backfill_pending": ch.ExpirationBackfillPending,
+		"created_at":                  ch.CreatedAt,
+		"updated_at":                  ch.UpdatedAt,
 	}
 	if ch.LinkedVoiceChannelID != nil {
 		m["linked_voice_channel_id"] = ch.LinkedVoiceChannelID
@@ -891,7 +897,8 @@ func (h *Handler) GetChannel(c *gin.Context) {
 
 	// Get channel and check if user is a member of the server
 	query := `
-		SELECT c.id, c.server_id, c.name, c.type, c.description, c.emoji, c.audio_quality_tier, c.group_id, c.linked_voice_channel_id, c.sync_permissions, c.position, c.created_at, c.updated_at
+		SELECT c.id, c.server_id, c.name, c.type, c.description, c.emoji, c.audio_quality_tier, c.group_id, c.linked_voice_channel_id, c.sync_permissions, c.position,
+		       c.expiration_window_seconds, c.expiration_updated_at, c.expiration_revision, c.expiration_backfill_mode IS NOT NULL, c.created_at, c.updated_at
 		FROM channels c
 		INNER JOIN server_members sm ON c.server_id = sm.server_id
 		WHERE c.id = $1 AND sm.user_id = $2
@@ -910,6 +917,10 @@ func (h *Handler) GetChannel(c *gin.Context) {
 		&channel.LinkedVoiceChannelID,
 		&channel.SyncPermissions,
 		&channel.Position,
+		&channel.ExpirationWindowSeconds,
+		&channel.ExpirationUpdatedAt,
+		&channel.ExpirationRevision,
+		&channel.ExpirationBackfillPending,
 		&channel.CreatedAt,
 		&channel.UpdatedAt,
 	)
@@ -1100,24 +1111,28 @@ func (h *Handler) executeChannelUpdate(channelID string, req UpdateChannelReques
 			`UPDATE channels
 			SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, group_id = $5, updated_at = NOW()
 			WHERE id = $6
-			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position, created_at, updated_at`,
+			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
+			          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
 			req.Name, req.Type, req.Emoji, req.AudioQualityTier, resolveGroupIDParam(req.GroupID), channelID,
 		).Scan(
 			&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier,
 			&channel.GroupID, &channel.LinkedVoiceChannelID, &channel.SyncPermissions,
-			&channel.Position, &channel.CreatedAt, &channel.UpdatedAt,
+			&channel.Position, &channel.ExpirationWindowSeconds, &channel.ExpirationUpdatedAt,
+			&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt,
 		)
 	} else {
 		err = h.db.QueryRow(
 			`UPDATE channels
 			SET name = $1, type = $2, emoji = $3, audio_quality_tier = $4, updated_at = NOW()
 			WHERE id = $5
-			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position, created_at, updated_at`,
+			RETURNING server_id, emoji, audio_quality_tier, group_id, linked_voice_channel_id, sync_permissions, position,
+			          expiration_window_seconds, expiration_updated_at, expiration_revision, expiration_backfill_mode IS NOT NULL, created_at, updated_at`,
 			req.Name, req.Type, req.Emoji, req.AudioQualityTier, channelID,
 		).Scan(
 			&channel.ServerID, &channel.Emoji, &channel.AudioQualityTier,
 			&channel.GroupID, &channel.LinkedVoiceChannelID, &channel.SyncPermissions,
-			&channel.Position, &channel.CreatedAt, &channel.UpdatedAt,
+			&channel.Position, &channel.ExpirationWindowSeconds, &channel.ExpirationUpdatedAt,
+			&channel.ExpirationRevision, &channel.ExpirationBackfillPending, &channel.CreatedAt, &channel.UpdatedAt,
 		)
 	}
 	if err != nil && err != sql.ErrNoRows {

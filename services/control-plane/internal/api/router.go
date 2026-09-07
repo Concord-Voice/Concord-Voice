@@ -2140,6 +2140,10 @@ func NewRouter(
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					channelsHandler.UpdateChannel,
 				)
+				channelRoutes.PATCH("/:id/expiration",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					channelsHandler.UpdateExpiration,
+				)
 
 				// Delete channel (5 requests per minute - destructive action)
 				channelRoutes.DELETE("/:id",
@@ -2431,6 +2435,10 @@ func NewRouter(
 				dmRoutes.PATCH("/:id",
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
 					dmHandler.UpdateConversation,
+				)
+				dmRoutes.PATCH("/:id/expiration",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					dmHandler.UpdateExpiration,
 				)
 
 				// Group member management (10 requests per minute)

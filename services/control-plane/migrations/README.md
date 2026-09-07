@@ -59,7 +59,7 @@ make migrate-version
 1. **Always create both UP and DOWN migrations** - Every migration must be reversible
 2. **Test rollbacks** - Make sure your down migration properly reverses the up migration
 3. **One logical change per migration** - Do not mix unrelated schema changes
-4. **Use transactions implicitly** - Each migration file runs in its own transaction
+4. **Know the runner's transaction boundary** - The v4.19.1 PostgreSQL driver executes each migration file as one `Exec` call. Most files therefore run atomically, but `CREATE INDEX CONCURRENTLY` cannot run inside an explicit transaction. Put each concurrent index in its own dedicated, one-statement migration file; do not combine it with schema changes.
 5. **Avoid data migrations in schema migrations** - Consider separate data migration scripts
 6. **Never modify committed migrations** - Create new migrations to fix issues
 
@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000126)
+## Existing Migrations (000001–000129)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -236,18 +236,32 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000124 | validate_profile_key_slot_backlink | Validate the reverse profile key/slot guard |
 | 000125 | reject_unclassified_profile_keys | Add NOT VALID explicit NULL-slot rejection for profile-shaped keys |
 | 000126 | validate_profile_key_requires_slot | Backfill slots on historical soft-deleted exact legacy profile rows, then validate explicit NULL-slot rejection |
+| 000127 | message_expiration_schema | Add nullable message expiry timestamps and shared channel/DM expiration policy state |
+| 000128 | messages_expires_at_index | Concurrent partial index on `messages (expires_at)` for non-null expiry timestamps |
+| 000129 | dm_messages_expires_at_index | Concurrent partial index on `dm_messages (expires_at)` for non-null expiry timestamps |
+
+Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
+000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
+both values directly and do not repeat a legacy timezone conversion. Migration
+000127 carries the schema changes, while
+000128 and 000129 remain separate one-statement concurrent-index migrations so the
+runner can execute them outside an explicit transaction.
 
 ## Troubleshooting
 
 ### Dirty Migration State
 
-If a migration fails mid-execution, the database may be in a "dirty" state:
+`RunMigrations` fails closed on any dirty version. Do not clear the flag blindly
+or assume that PostgreSQL rolled the migration back. Inspect the `schema_migrations`
+row and `pg_index.indisvalid`, then repair or drop only the identified partial
+concurrent index. Verify the intended schema and choose or force the correct clean
+version explicitly; never blindly force `version - 1`.
 
 ```bash
-# Check if dirty
+# Inspect the dirty version and the affected indexes/schema
 make migrate-version
-# To fix, manually correct the database and force version
-# OR rollback to previous version and reapply
+# After the identified repair, verify the intended schema and force that exact
+# clean version, then rerun migrations.
 ```
 
 ### Migration Conflicts

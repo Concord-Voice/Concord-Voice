@@ -200,6 +200,7 @@ type dmMessageResponse struct {
 	CallEventPayload json.RawMessage            `json:"call_event_payload,omitempty"`
 	KeyVersion       int                        `json:"key_version"`
 	EditedAt         *string                    `json:"edited_at,omitempty"`
+	ExpiresAt        *string                    `json:"expires_at"`
 	CreatedAt        string                     `json:"created_at"`
 	Username         string                     `json:"username"`
 	DisplayName      *string                    `json:"display_name,omitempty"`
@@ -253,16 +254,20 @@ func (h *Handler) enrichDMAttachments(messages []dmMessageResponse) {
 
 // conversationResponse represents a DM conversation in API responses.
 type conversationResponse struct {
-	ID           string                `json:"id"`
-	IsGroup      bool                  `json:"is_group"`
-	IsPersonal   bool                  `json:"is_personal"`
-	Name         *string               `json:"name,omitempty"`
-	IconURL      *string               `json:"icon_url,omitempty"`
-	CreatedBy    string                `json:"created_by"`
-	Participants []participantResponse `json:"participants"`
-	LastMessage  *lastMessageResponse  `json:"last_message,omitempty"`
-	UnreadCount  int                   `json:"unread_count"`
-	CreatedAt    string                `json:"created_at"`
+	ID                        string                `json:"id"`
+	IsGroup                   bool                  `json:"is_group"`
+	IsPersonal                bool                  `json:"is_personal"`
+	Name                      *string               `json:"name,omitempty"`
+	IconURL                   *string               `json:"icon_url,omitempty"`
+	CreatedBy                 string                `json:"created_by"`
+	Participants              []participantResponse `json:"participants"`
+	LastMessage               *lastMessageResponse  `json:"last_message,omitempty"`
+	UnreadCount               int                   `json:"unread_count"`
+	ExpirationWindowSeconds   *int                  `json:"expiration_window_seconds"`
+	ExpirationUpdatedAt       *string               `json:"expiration_updated_at"`
+	ExpirationRevision        int64                 `json:"expiration_revision"`
+	ExpirationBackfillPending bool                  `json:"expiration_backfill_pending"`
+	CreatedAt                 string                `json:"created_at"`
 }
 
 type participantResponse struct {
@@ -277,6 +282,7 @@ type participantResponse struct {
 type lastMessageResponse struct {
 	Content          string          `json:"content"`
 	UserID           string          `json:"user_id"`
+	ExpiresAt        *string         `json:"expires_at"`
 	CreatedAt        string          `json:"created_at"`
 	Type             string          `json:"type,omitempty"`
 	CallEventPayload json.RawMessage `json:"call_event_payload,omitempty"`
@@ -310,8 +316,9 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 	//nolint:gosec // G202: concatenated fragment is a compile-time constant (hardcoded alias + integer placeholder); all values parameterized
 	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	query := `
-		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by, dc.created_at,
-		       dm.content, dm.created_at, dm.user_id, dm.type, dm.call_event_payload,
+		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by,
+		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL, dc.created_at,
+		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload,
 		       (SELECT COUNT(*) FROM dm_messages m
 		        WHERE m.conversation_id = dc.id
 		          AND m.created_at > COALESCE(drs.last_read_at, '1970-01-01')
@@ -322,7 +329,7 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $1
 		LEFT JOIN dm_read_states drs ON drs.conversation_id = dc.id AND drs.user_id = $1
 		LEFT JOIN LATERAL (
-		    SELECT m.content, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
+		    SELECT m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
 		    WHERE m.conversation_id = dc.id ` + hiddenRangeFilter(1) + `
 		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
@@ -354,11 +361,12 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 
 func (h *Handler) scanConversationRow(rows *sql.Rows) (conversationResponse, error) {
 	var conv conversationResponse
-	var lmContent, lmCreatedAt, lmUserID, lmType sql.NullString
+	var lmContent, lmExpiresAt, lmCreatedAt, lmUserID, lmType sql.NullString
 	var lmCallEventPayload []byte
 	if err := rows.Scan(
-		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy, &conv.CreatedAt,
-		&lmContent, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
+		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy,
+		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.CreatedAt,
+		&lmContent, &lmExpiresAt, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
 		&conv.UnreadCount,
 	); err != nil {
 		return conv, err
@@ -366,6 +374,7 @@ func (h *Handler) scanConversationRow(rows *sql.Rows) (conversationResponse, err
 	if lmContent.Valid {
 		conv.LastMessage = &lastMessageResponse{
 			Content:          lmContent.String,
+			ExpiresAt:        nullStringPointer(lmExpiresAt),
 			UserID:           lmUserID.String,
 			CreatedAt:        lmCreatedAt.String,
 			Type:             lmType.String,
@@ -373,6 +382,13 @@ func (h *Handler) scanConversationRow(rows *sql.Rows) (conversationResponse, err
 		}
 	}
 	return conv, nil
+}
+
+func nullStringPointer(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
 }
 
 func (h *Handler) attachParticipants(conversations []conversationResponse, convIDs []string) {
@@ -1684,7 +1700,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
 			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, COALESCE(m.key_version, 1),
-			       m.edited_at, m.created_at,
+			       m.edited_at, m.expires_at, m.created_at,
 			       u.username, u.display_name, u.avatar_url
 			FROM dm_messages m
 			INNER JOIN users u ON u.id = m.user_id
@@ -1699,7 +1715,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
 			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, COALESCE(m.key_version, 1),
-			       m.edited_at, m.created_at,
+			       m.edited_at, m.expires_at, m.created_at,
 			       u.username, u.display_name, u.avatar_url
 			FROM dm_messages m
 			INNER JOIN users u ON u.id = m.user_id
@@ -1724,7 +1740,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		var callEventRaw []byte
 		if err := rows.Scan(
 			&m.ID, &m.ConversationID, &m.UserID, &m.Content, &m.Type, &callEventRaw, &m.KeyVersion,
-			&m.EditedAt, &m.CreatedAt,
+			&m.EditedAt, &m.ExpiresAt, &m.CreatedAt,
 			&m.Username, &m.DisplayName, &m.AvatarURL,
 		); err != nil {
 			h.log.Error("Failed to scan DM message", "error", err)
@@ -2321,21 +2337,23 @@ func (h *Handler) isParticipant(convID, userID string) bool {
 // nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversationResponse {
 	var conv conversationResponse
-	var lmContent, lmCreatedAt, lmUserID, lmType sql.NullString
+	var lmContent, lmExpiresAt, lmCreatedAt, lmUserID, lmType sql.NullString
 	var lmCallEventPayload []byte
 	err := h.db.QueryRow(`
-		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by, dc.created_at,
-		       dm.content, dm.created_at, dm.user_id, dm.type, dm.call_event_payload
+		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by,
+		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL, dc.created_at,
+		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload
 		FROM dm_conversations dc
 		LEFT JOIN LATERAL (
-		    SELECT m.content, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
+		    SELECT m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
 		    WHERE m.conversation_id = dc.id `+hiddenRangeFilter(2)+`
 		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
 		WHERE dc.id = $1
 	`, convID, viewerID).Scan(
-		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy, &conv.CreatedAt,
-		&lmContent, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
+		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy,
+		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.CreatedAt,
+		&lmContent, &lmExpiresAt, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
 	)
 	if err != nil {
 		return nil
@@ -2343,6 +2361,7 @@ func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversati
 	if lmContent.Valid {
 		conv.LastMessage = &lastMessageResponse{
 			Content:          lmContent.String,
+			ExpiresAt:        nullStringPointer(lmExpiresAt),
 			UserID:           lmUserID.String,
 			CreatedAt:        lmCreatedAt.String,
 			Type:             lmType.String,
@@ -2416,6 +2435,7 @@ type updateDMMessageResult struct {
 	Content    string  `json:"content"`
 	KeyVersion int     `json:"key_version"`
 	EditedAt   *string `json:"edited_at"`
+	ExpiresAt  *string `json:"expires_at"`
 	CreatedAt  string  `json:"created_at"`
 }
 
@@ -2493,8 +2513,8 @@ func (h *Handler) updateDMMessageCiphertext(
 		      SELECT 1 FROM dm_key_revocations
 		      WHERE conversation_id = $4 AND revoked_epoch = $2
 		  )
-		RETURNING COALESCE(key_version, 1), edited_at, created_at
-	`, req.Content, req.KeyVersion, messageID, convID).Scan(&result.KeyVersion, &result.EditedAt, &result.CreatedAt)
+		RETURNING COALESCE(key_version, 1), edited_at, expires_at, created_at
+	`, req.Content, req.KeyVersion, messageID, convID).Scan(&result.KeyVersion, &result.EditedAt, &result.ExpiresAt, &result.CreatedAt)
 	if err == sql.ErrNoRows {
 		if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
 			return updateDMMessageResult{}, false
@@ -2578,6 +2598,7 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 			"content":         req.Content,
 			"key_version":     result.KeyVersion,
 			"edited_at":       result.EditedAt,
+			"expires_at":      result.ExpiresAt,
 		},
 	})
 

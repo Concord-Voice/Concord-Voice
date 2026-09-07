@@ -282,7 +282,7 @@ func (h *Handler) GetChannelPins(c *gin.Context) {
 
 	rows, err := h.db.Query(`
 		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
-		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.created_at, m.updated_at,
+		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
 		       u.username, u.display_name, u.avatar_url
 		FROM messages m
 		INNER JOIN users u ON m.user_id = u.id
@@ -302,7 +302,7 @@ func (h *Handler) GetChannelPins(c *gin.Context) {
 		scanErr := rows.Scan(
 			&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.KeyVersion,
 			&msg.EmbedsSuppressed, &msg.ReplyToID, &msg.PinnedAt, &msg.PinnedBy, &msg.EditedAt,
-			&msg.CreatedAt, &msg.UpdatedAt, &msg.Username, &msg.DisplayName, &msg.AvatarURL,
+			&msg.ExpiresAt, &msg.CreatedAt, &msg.UpdatedAt, &msg.Username, &msg.DisplayName, &msg.AvatarURL,
 		)
 		if scanErr != nil {
 			h.log.Error("Failed to scan pinned message row", "error", scanErr)
@@ -331,6 +331,7 @@ type dmPinnedMessage struct {
 	PinnedAt       *time.Time `json:"pinned_at"`
 	PinnedBy       *string    `json:"pinned_by"`
 	EditedAt       *time.Time `json:"edited_at,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 	Username       string     `json:"username"`
@@ -365,7 +366,7 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	rows, err := h.db.Query(`
 		SELECT dm.id, dm.conversation_id, dm.user_id, dm.content, dm.type,
-		       dm.pinned_at, dm.pinned_by, dm.edited_at, dm.created_at, dm.updated_at,
+		       dm.pinned_at, dm.pinned_by, dm.edited_at, dm.expires_at, dm.created_at, dm.updated_at,
 		       u.username, u.display_name, u.avatar_url
 		FROM dm_messages dm
 		INNER JOIN users u ON dm.user_id = u.id
@@ -385,7 +386,7 @@ func (h *Handler) getDMConversationPins(c *gin.Context, conversationID, userID s
 		var m dmPinnedMessage
 		if scanErr := rows.Scan(
 			&m.ID, &m.ConversationID, &m.UserID, &m.Content, &m.Type,
-			&m.PinnedAt, &m.PinnedBy, &m.EditedAt, &m.CreatedAt, &m.UpdatedAt,
+			&m.PinnedAt, &m.PinnedBy, &m.EditedAt, &m.ExpiresAt, &m.CreatedAt, &m.UpdatedAt,
 			&m.Username, &m.DisplayName, &m.AvatarURL,
 		); scanErr != nil {
 			h.log.Error("Failed to scan pinned DM message row", "error", scanErr)

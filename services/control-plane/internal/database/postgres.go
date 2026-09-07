@@ -4,7 +4,6 @@ package database
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -35,10 +34,6 @@ func New(databaseURL string) (*sql.DB, error) {
 }
 
 // RunMigrations runs database migrations using golang-migrate.
-// Automatically recovers from dirty migration state, which can occur when
-// a process is interrupted mid-migration. PostgreSQL DDL is transactional,
-// so the migration either fully applied or fully rolled back — the dirty
-// flag just means the process didn't get to clear it.
 func RunMigrations(db *sql.DB) error {
 	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	if err != nil {
@@ -54,21 +49,15 @@ func RunMigrations(db *sql.DB) error {
 		return fmt.Errorf("could not create migrate instance: %w", err)
 	}
 
-	// Check for dirty migration state and auto-recover
+	// A dirty migration may have committed non-transactional or concurrent
+	// objects before the runner failed. Refuse to guess whether the recorded
+	// version is safe to replay; an operator must inspect and repair it first.
 	version, dirty, err := m.Version()
 	if err != nil && err != migrate.ErrNilVersion {
 		return fmt.Errorf("could not check migration version: %w", err)
 	}
 	if dirty {
-		log.Printf("WARNING: Database migration version %d is dirty — auto-recovering", version)
-		// PostgreSQL DDL is transactional: the migration SQL either fully
-		// committed or fully rolled back. Force the version clean so
-		// golang-migrate can proceed. If the SQL rolled back, Up() will
-		// re-apply it; if it committed, Up() moves to the next version.
-		if err := m.Force(int(version)); err != nil { //nolint:gosec // migration version is always small
-			return fmt.Errorf("could not force dirty migration clean: %w", err)
-		}
-		log.Printf("Forced version %d clean — continuing with pending migrations", version)
+		return fmt.Errorf("database migration version %d is dirty; inspect and repair migration %d before clearing its state, then rerun migrations (use migrate -command=force -force-version=<verified version> only after verification)", version, version)
 	}
 
 	// Run all pending migrations

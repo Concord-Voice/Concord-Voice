@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Message expiry groundwork now covers shared chats** ([#3144](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3144), [#2195](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2195)) — the server now stores shared expiry policy and expiry metadata for channels, direct messages, and group DMs, and can apply or clear that policy on existing messages in resumable batches. Settings UI and automatic deletion arrive in later work, so this groundwork does not enable retention by itself.
+
 ## [0.2.46] — 2026-09-07
 
 Voice now connects on networks that block UDP: Concord's servers were already offering relay servers that carry a call over TCP or TLS, and the desktop app was discarding that offer, so on many corporate and campus networks this was not degraded audio but no call at all. Picture-in-Picture voice windows are also hardened — each now gets a private line and a one-time credential, so nothing else loaded in the app can listen in or hang up your call — and every call stops spending part of its setup on a TCP route no Concord server has ever accepted. On the server side, updates no longer cut your connection short, and an update that comes back up unable to reach its database is now caught instead of being recorded as a success. Smaller fixes stop your voice and call status disappearing every hour, close Picture-in-Picture cleanly when it is dismissed during startup, and retire an unshared attachment when its message is deleted.

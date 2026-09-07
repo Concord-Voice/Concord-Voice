@@ -366,7 +366,7 @@ func (h *Handler) queryMessages(channelID, before string, limit int) ([]models.M
 func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cutoff *time.Time) ([]models.MessageWithUser, error) {
 	query := `
 		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
-		       m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.created_at, m.updated_at,
+			   m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
 		       u.username, u.display_name, u.avatar_url
 		FROM messages m
 		INNER JOIN users u ON m.user_id = u.id
@@ -412,6 +412,7 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 			&msg.PinnedAt,
 			&msg.PinnedBy,
 			&msg.EditedAt,
+			&msg.ExpiresAt,
 			&msg.CreatedAt,
 			&msg.UpdatedAt,
 			&msg.Username,
@@ -669,9 +670,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 // persistMessage inserts a validated message and writes the matching HTTP response.
 func (h *Handler) persistMessage(c *gin.Context, serverID string, membershipIncarnation time.Time, message models.Message) {
 	insertQuery := `
-		INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-		RETURNING created_at, updated_at
+		WITH timestamps AS (SELECT clock_timestamp() AS created_at)
+		INSERT INTO messages (id, channel_id, user_id, content, key_version, embeds_suppressed, reply_to_id, gif_slug, created_at, updated_at, expires_at)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, timestamps.created_at, timestamps.created_at,
+		       CASE WHEN $9::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $9) END
+		FROM timestamps
+		RETURNING created_at, updated_at, expires_at
 	`
 
 	// #2201: an encrypted message write is key-material-coupled state — recheck
@@ -694,16 +698,32 @@ func (h *Handler) persistMessage(c *gin.Context, serverID string, membershipInca
 		h.respondGuardTxError(c, guardErr, errMsgFailedSendMessage)
 		return
 	}
+	var windowSeconds sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT expiration_window_seconds FROM channels WHERE id = $1 FOR SHARE`, message.ChannelID,
+	).Scan(&windowSeconds); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+			return
+		}
+		h.log.Error("Failed to lock message channel", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSendMessage})
+		return
+	}
 	// Serialize the message write with member removal. The preflight's immutable
 	// joined_at value prevents a kicked sender from writing through a same-key rejoin.
 	if !h.lockMessageMembership(ctx, c, tx, serverID, message.UserID, membershipIncarnation) {
 		return
 	}
 
+	var window any
+	if windowSeconds.Valid {
+		window = windowSeconds.Int64
+	}
 	err := tx.QueryRowContext(ctx, insertQuery,
 		message.ID, message.ChannelID, message.UserID, message.Content, message.KeyVersion,
-		message.EmbedsSuppressed, message.ReplyToID, message.GifSlug,
-	).Scan(&message.CreatedAt, &message.UpdatedAt)
+		message.EmbedsSuppressed, message.ReplyToID, message.GifSlug, window,
+	).Scan(&message.CreatedAt, &message.UpdatedAt, &message.ExpiresAt)
 	if err != nil {
 		if isFKViolation(err) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Reply target message not found"})
@@ -818,7 +838,7 @@ func (h *Handler) updateMessageCiphertext(
 		      SELECT 1 FROM key_revocations
 		      WHERE channel_id = $4 AND revoked_epoch = $2
 		  )
-		RETURNING channel_id, key_version, embeds_suppressed, edited_at, created_at, updated_at
+		RETURNING channel_id, key_version, embeds_suppressed, edited_at, expires_at, created_at, updated_at
 	`
 
 	var message models.Message
@@ -831,6 +851,7 @@ func (h *Handler) updateMessageCiphertext(
 		&message.KeyVersion,
 		&message.EmbedsSuppressed,
 		&message.EditedAt,
+		&message.ExpiresAt,
 		&message.CreatedAt,
 		&message.UpdatedAt,
 	)
@@ -907,6 +928,7 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 				"key_version":       message.KeyVersion,
 				"embeds_suppressed": message.EmbedsSuppressed,
 				"edited_at":         message.EditedAt,
+				"expires_at":        message.ExpiresAt,
 				"updated_at":        message.UpdatedAt,
 			},
 		})
