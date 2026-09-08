@@ -99,9 +99,18 @@ export default [
             // build tooling, not app source — so it belongs to no TS project and
             // projectService cannot parse it without this entry.
             'build/makerNsis.ts',
+            // ADR-0043: the concord-audiocap loader and its public typings. Same
+            // category as build/makerNsis.ts above — real code that belongs to no
+            // tsconfig, because native/ is a separate toolchain (node-gyp) whose
+            // output the TS bundle never compiles. The loader is 40 lines and
+            // carries the contract that a capability miss means video-only and
+            // never a system mix, so leaving it unlinted would be the wrong trade.
+            'native/concord-audiocap/index.js',
+            'native/concord-audiocap/index.d.ts',
           ],
-          // The 13 on-disk allowDefaultProject files (3 root configs + 8
-          // scripts/*.test.ts + csp-prod-strip.ts + build/makerNsis.ts) exceed typescript-eslint's
+          // The 15 on-disk allowDefaultProject files (3 root configs + 8
+          // scripts/*.test.ts + csp-prod-strip.ts + build/makerNsis.ts + the two
+          // native/concord-audiocap entries) exceed typescript-eslint's
           // default cap of 8 default-project files, so a full-tree `npm run lint`
           // (`eslint .`) fails with "Too many files (>8) have matched the default
           // project". The per-file pre-commit eslint hook never trips this (it
@@ -111,7 +120,9 @@ export default [
           // bounded cap is the right-sized fix; the perf caveat in the option's
           // name is immaterial for ~9 tiny tooling files. If this set grows much
           // larger, prefer moving scripts/ into a dedicated scripts/tsconfig.json.
-          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 13,
+          // At 15 that advice is close to due: the next addition should create the
+          // dedicated tsconfig rather than bump this number a third time.
+          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 15,
         },
         tsconfigRootDir: import.meta.dirname,
       },

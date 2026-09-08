@@ -120,9 +120,42 @@ const linuxIconConfig = () => ({
 const config: ForgeConfig = {
   packagerConfig: {
     asar: {
-      // Exclude source maps from the packaged ASAR archive. Source maps must
-      // NOT ship to end users — they expose full source code and any secrets
-      // or logic embedded in it.
+      // Source maps must NOT ship to end users — they expose full source code and
+      // any secrets or logic embedded in it. That exclusion is `ignore` below;
+      // this block is about what stays OUTSIDE the archive.
+      //
+      // DO NOT SET `unpack` OR `unpackDir` HERE UNTIL THE BLOCKER BELOW IS FIXED.
+      // Both options are currently NON-FUNCTIONAL in this repo, and the failure is
+      // a packaging crash rather than a silent no-op:
+      //
+      //     TypeError: (0 , minimatch_1.default) is not a function
+      //         at shouldUnpackPath (@electron/asar/lib/asar.js:147)
+      //
+      // @electron/asar@3.4.1 declares minimatch ^3.0.4 and calls its DEFAULT
+      // export. This package overrides minimatch globally to ^10.2.6, and
+      // minimatch dropped the default export at 9 — it exports { minimatch }. So
+      // `shouldUnpackPath` throws for any non-empty glob. The code path is only
+      // reached when one of these options is set, which is why nothing noticed:
+      // both have been `undefined` for the life of the override.
+      //
+      // The minimatch override is NOT the thing to change. It is security-
+      // validated (see the //overrides_security note in package.json — it clears
+      // four advisory floors), its governing principle is that every skew is
+      // UPWARD, and client/admin explicitly recorded "Do not re-add a minimatch
+      // pin below 10" in PR #2715. Capping asar back to minimatch 3 to make an
+      // unpack glob work would invert all of that.
+      //
+      // ADR-0043 D1 needs a .node OUTSIDE the archive — dlopen/LoadLibrary needs a
+      // real path on disk and everything inside app.asar is virtual. Three ways to
+      // get there, for whoever takes PR 5:
+      //   1. Override @electron/asar to ^4.3.0, which declares minimatch ^10.0.1.
+      //      Fixes it at the source and the skew is upward — but @electron/packager
+      //      declares ^3.2.13, so it forces a MAJOR onto the release path and needs
+      //      its own validation.
+      //   2. Ship the addon via `extraResource` (already used in this config)
+      //      instead of unpacking it. Touches no dependency at all; the loader
+      //      resolves through process.resourcesPath rather than a relative require.
+      //   3. Wait for @electron/packager to move to asar 4.
       unpackDir: undefined,
     },
     // Only four things belong in the archive: `dist/` (built main, preload and
@@ -175,7 +208,22 @@ const config: ForgeConfig = {
       // dist/renderer by Vite, and `assets/tray` reaches <Resources>/tray via
       // extraResource (resolveTrayIconPath reads process.resourcesPath when
       // packaged, and cwd/assets only in dev).
-      /^\/(src|tests|docs|scripts|schemas|functions|public|assets|coverage|playwright-report|test-results)($|\/)/,
+      /^\/(src|tests|docs|scripts|schemas|functions|public|assets|coverage|playwright-report|test-results|native|spikes)($|\/)/,
+      // `native` and `spikes` were added by the payload-boundary guard's own
+      // finding on PR #3155: both were shipping their full source into app.asar.
+      // `spikes/` is a throwaway Windows measurement probe (s2probe.cpp and its
+      // WAV output) that has no business in a user's install at all. `native/`
+      // is the concord-audiocap addon SOURCE — C++, binding.gyp, tests, the
+      // fuzzer — none of which runs at runtime.
+      //
+      // NOTE FOR ADR-0043 PR 5: excluding the tree is correct TODAY precisely
+      // because nothing is compiled during packaging yet. When the .node is
+      // actually built, it needs to be OUTSIDE the archive anyway (dlopen and
+      // LoadLibrary need a real path, and everything inside app.asar is
+      // virtual), so it should arrive via extraResource or an unpack route --
+      // see the long asar comment above for why `unpackDir` is currently
+      // non-functional. Do NOT "fix" this by deleting the exclusion: that ships
+      // the source and still leaves the binary unloadable.
       // `build/` is ALMOST all packaging-time input the makers read from the
       // source directory — but not quite, so it cannot be excluded wholesale.
       // Two files are read from inside the archive at runtime via

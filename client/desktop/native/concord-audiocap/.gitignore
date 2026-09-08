@@ -1,0 +1,3 @@
+# node-gyp output. The .node binary is built per platform and per ABI; it is never
+# committed.
+build/
