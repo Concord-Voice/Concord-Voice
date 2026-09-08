@@ -191,7 +191,12 @@
 
 .participant-tile__status--server-muted,
 .participant-tile__status--server-deafened {
-  color: var(--warning);
+  /* Was var(--warning), which is defined in NO theme block — an undefined
+     custom property with no fallback makes the whole declaration invalid, so
+     these badges silently inherited their colour and the server-enforced state
+     read as ordinary. --text-warning-strong is the real token, defined in both
+     the dark and light roots. */
+  color: var(--text-warning-strong);
   position: relative;
 }
 
@@ -237,6 +242,80 @@
 .participant-tile__menu-trigger:focus-visible {
   outline: 2px solid var(--accent-primary, #4a9eff);
   outline-offset: 2px;
+}
+
+/* Muting one person's voice took right-click, menu, slider, drag to zero. This
+   is the same capability in one click. Top-RIGHT, opposite the menu trigger, so
+   the two expanded pointer targets cannot overlap on any tile. */
+.participant-tile__mute-toggle {
+  /* A flex item inside .participant-tile__overlays, NOT absolutely positioned.
+     It used to sit at the cluster's own corner one stacking level above it,
+     which hid every status badge behind it. `position: relative` remains, but
+     only to anchor the expanded hit target below. */
+  position: relative;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  padding: 0;
+  z-index: 4;
+}
+
+/* Fitts: the glyph stays 22px so it does not dominate a small tile, while the
+   POINTER TARGET is a 44x44 box centred on it.
+   Stated honestly: the tile sets overflow:hidden, and clipping affects hit
+   testing, so at a 6px inset roughly 5px of that box is clipped on the top and
+   right edges — the effective target is about 39x39. That is short of WCAG
+   2.5.5 (AAA, 44x44) and comfortably past 2.5.8 (AA, 24x24), which is the level
+   this repo holds. Insetting to 11px would buy a true 44 at the cost of visibly
+   misaligning this control against the 6px menu trigger. */
+.participant-tile__mute-toggle::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+}
+
+/* Muted-by-you is a STATE, not just an affordance, so it stays visible when the
+   pointer leaves — unlike the menu trigger. Someone scanning a grid has to be
+   able to see who they have already silenced without hovering every tile. */
+.participant-tile:hover .participant-tile__mute-toggle,
+.participant-tile__mute-toggle:focus-visible,
+.participant-tile__mute-toggle--on {
+  opacity: 1;
+}
+
+.participant-tile__mute-toggle--on {
+  color: var(--danger);
+}
+
+.participant-tile__mute-toggle:focus-visible {
+  outline: 2px solid var(--accent-primary, #4a9eff);
+  outline-offset: 2px;
+}
+
+.participant-tile--compact .participant-tile__mute-toggle {
+  width: 16px;
+  height: 16px;
+}
+
+/* On a compact tile a 44px box would be mostly clipped and could reach across
+   to the menu trigger. 24x24 is the WCAG 2.5.8 AA minimum. */
+.participant-tile--compact .participant-tile__mute-toggle::before {
+  width: 24px;
+  height: 24px;
 }
 
 .participant-tile--compact .participant-tile__menu-trigger {

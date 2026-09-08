@@ -161,8 +161,15 @@
   z-index: 2;
 }
 
+/* Keyboard focus reveals these exactly as hover does. Without the focus arms the
+   control is opacity:0 while focused, so a keyboard user Tabs to something they
+   cannot see — WCAG 2.4.7. :focus-within on the stage covers arriving at the
+   control; :focus-visible on the control covers it being focused directly. */
 .voice-stage:hover .voice-stage__layout-toggle,
-.voice-stage--equal:hover .voice-stage__layout-toggle {
+.voice-stage--equal:hover .voice-stage__layout-toggle,
+.voice-stage:focus-within .voice-stage__layout-toggle,
+.voice-stage--equal:focus-within .voice-stage__layout-toggle,
+.voice-stage__layout-toggle:focus-visible {
   opacity: 1;
 }
 
@@ -192,7 +199,9 @@
     background 150ms ease;
 }
 
-.voice-stage:hover .voice-stage__nav {
+.voice-stage:hover .voice-stage__nav,
+.voice-stage:focus-within .voice-stage__nav,
+.voice-stage__nav:focus-visible {
   opacity: 1;
 }
 
@@ -230,7 +239,9 @@
     background 150ms ease;
 }
 
-.voice-stage:hover .voice-stage__pip-btn {
+.voice-stage:hover .voice-stage__pip-btn,
+.voice-stage:focus-within .voice-stage__pip-btn,
+.voice-stage__pip-btn:focus-visible {
   opacity: 1;
 }
 

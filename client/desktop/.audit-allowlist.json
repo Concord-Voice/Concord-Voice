@@ -16,6 +16,13 @@
       "review_by": "2026-11-13"
     },
     {
+      "id": "GHSA-7PQW-9J4J-H8Q3",
+      "package": "extract-zip",
+      "scope": "dev",
+      "reason": "extract-zip arbitrary file writes through symlink archive entries — a SECOND advisory for the same package already accepted above as GHSA-JMR9-QJV8-65GV, describing the same symlink-extraction weakness from the write side rather than the link-planting side. Entries are keyed by id, so the new id blocks despite the identical package, chain and disposition. Every load-bearing fact re-verified 2026-09-08 rather than inherited: extract-zip@2.0.1 is still the newest published release (vulnerable <=2.0.1, first-patched NONE), so no override can reach a fixed version; `npm audit --omit=dev` reports the package ABSENT, confirming the scope:dev claim the gate re-checks on every run; and npm's own fixAvailable is @electron-forge/plugin-fuses@6.4.2 with isSemVerMajor:true — a major downgrade of a different package, not a fix. Reached solely at build time via @electron-forge/cli@7.11.2 -> @electron-forge/core@7.11.2 -> @electron/packager@18.4.4 -> extract-zip@2.0.1; never runs at application runtime and is never bundled into renderer or main. What packager extracts with it are Electron's own release archives, downloaded from Electron's CDN and integrity-checked before extraction, so exploitation needs a malicious archive at that step. RE-VISIT TRIGGER is the same as its sibling and is the real signal: a stable @electron-forge/core depending on @electron/packager >= 20.3.0, which switched to @electron-internal/extract-zip. Forge 8 is alpha-only today, and forcing packager ^20.3.0 under forge 7 would put it two majors above its declared range — the exact class override-range-lint exists to catch (PR #2709). review_by is a backstop, not the signal. Approved by Mark 2026-09-08 on PR #3204, which touches no dependency files; the advisory was published mid-flight and blocks every open PR. Tracked with its sibling: https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2734",
+      "review_by": "2026-11-13"
+    },
+    {
       "id": "GHSA-5P2G-FCMC-QVQQ",
       "package": "image-size",
       "scope": "dev",

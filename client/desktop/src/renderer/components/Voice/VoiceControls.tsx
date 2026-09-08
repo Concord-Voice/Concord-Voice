@@ -2,28 +2,25 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { errorMessage } from '../../utils/runtime/redactError';
 import {
-  Mic,
-  MicOff,
-  Headphones,
+  ExternalLink,
   HeadphoneOff,
-  Video,
-  VideoOff,
-  Monitor,
-  MonitorOff,
-  MonitorUp,
-  Volume2,
-  VolumeX,
-  PhoneOff,
+  Headphones,
   MessageSquare,
   MessageSquareOff,
-  PictureInPicture2,
-  Eye,
-  EyeOff,
+  Mic,
+  MicOff,
+  Monitor,
+  MoreHorizontal,
+  PhoneOff,
   Pin,
   PinOff,
-  ExternalLink,
   Tv,
+  Video,
+  VideoOff,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
+import { ShareSegmentedControl } from './ShareSegmentedControl';
 import {
   useVoiceStore,
   type ActiveScreenShare,
@@ -90,16 +87,16 @@ async function getVoiceService() {
 function attachDismissListeners(
   anchorRef: React.RefObject<HTMLElement | null>,
   popupRef: React.RefObject<HTMLElement | null>,
-  dismiss: () => void
+  dismiss: (viaKeyboard: boolean) => void
 ): () => void {
   const handleClick = (e: MouseEvent) => {
     const target = e.target as Node;
     if (anchorRef.current?.contains(target)) return;
     if (popupRef.current?.contains(target)) return;
-    dismiss();
+    dismiss(false);
   };
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Escape') dismiss();
+    if (e.key === 'Escape') dismiss(true);
   };
   document.addEventListener('mousedown', handleClick);
   document.addEventListener('keydown', handleKeyDown);
@@ -161,40 +158,69 @@ async function toggleScreenShareAction(
 
 /* ── Extracted sub-components (reduces cognitive complexity — S3776) ── */
 
-interface PipMenuProps {
-  pipMenuRef: React.RefObject<HTMLDivElement | null>;
+interface UtilityMenuProps {
+  utilityMenuRef: React.RefObject<HTMLDivElement | null>;
   style: React.CSSProperties;
   tunedInIds: string[];
   activeScreenShares: Record<string, ActiveScreenShare>;
   onOpenPip: (mode: 'frames' | 'screen', producerId?: string) => void;
+  /** Live value of the persisted keep-active preference. */
+  keepActive: boolean;
+  onToggleKeepActive: () => void;
+  /** Only meaningful while sharing, so the item is hidden otherwise. */
+  showKeepActive: boolean;
+  /** False on a non-Electron build, where the pop-out targets do not exist. */
+  showPipItems: boolean;
 }
 
 /** Portaled PiP menu — lists pop-out targets for user frames and active screen shares. */
-const PipMenu: React.FC<PipMenuProps> = ({
-  pipMenuRef,
+const UtilityMenu: React.FC<UtilityMenuProps> = ({
+  utilityMenuRef,
   style,
   tunedInIds,
   activeScreenShares,
   onOpenPip,
+  keepActive,
+  onToggleKeepActive,
+  showKeepActive,
+  showPipItems,
 }) => (
-  <div ref={pipMenuRef} className="voice-controls__pip-menu" style={style}>
-    <button className="voice-controls__pip-menu-item" onClick={() => onOpenPip('frames')}>
-      Pop Out User Frames
-    </button>
-    {tunedInIds.map((producerId) => {
-      // Resolve the owner via the producerId → owner metadata seam (#2088)
-      const meta = activeScreenShares[producerId];
-      const name = meta?.displayName || meta?.username || 'User';
-      return (
-        <button
-          key={producerId}
-          className="voice-controls__pip-menu-item"
-          onClick={() => onOpenPip('screen', producerId)}
-        >
-          Pop Out {name}&apos;s Screen
-        </button>
-      );
-    })}
+  <div ref={utilityMenuRef} className="voice-controls__utility-menu" style={style}>
+    {showPipItems && (
+      <button className="voice-controls__utility-menu-item" onClick={() => onOpenPip('frames')}>
+        Pop Out User Frames
+      </button>
+    )}
+    {showPipItems &&
+      tunedInIds.map((producerId) => {
+        // Resolve the owner via the producerId → owner metadata seam (#2088)
+        const meta = activeScreenShares[producerId];
+        const name = meta?.displayName || meta?.username || 'User';
+        return (
+          <button
+            key={producerId}
+            className="voice-controls__utility-menu-item"
+            onClick={() => onOpenPip('screen', producerId)}
+          >
+            Pop Out {name}&apos;s Screen
+          </button>
+        );
+      })}
+    {/* A durable preference (localStorage `concord:keep-active-unfocused`), not a
+        per-moment action — which is the whole reason it left the bar. Plain button
+        with aria-pressed rather than menuitemcheckbox: this container is a div of
+        buttons, not a role="menu", so the checkbox role would promise keyboard
+        semantics nothing here implements. */}
+    {showKeepActive && (
+      <button
+        type="button"
+        className="voice-controls__utility-menu-item"
+        onClick={onToggleKeepActive}
+        aria-pressed={keepActive}
+      >
+        {keepActive ? '\u2713 ' : ''}Keep stream active when unfocused
+      </button>
+    )}
   </div>
 );
 
@@ -229,7 +255,17 @@ const MediaButton: React.FC<MediaButtonProps> = ({
     .join(' ');
 
   return (
-    <button className={classes} onClick={onClick} title={title} disabled={locked}>
+    <button
+      className={classes}
+      onClick={() => {
+        // Load-bearing, exactly as in FontSection: aria-disabled does not stop
+        // activation the way `disabled` does, so the guard IS the enforcement.
+        if (locked) return;
+        onClick();
+      }}
+      title={title}
+      aria-disabled={locked}
+    >
       {isActive ? activeIcon : inactiveIcon}
       <span className="voice-controls__btn-label">{isActive ? activeLabel : inactiveLabel}</span>
     </button>
@@ -348,11 +384,11 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   // Resolved when the picker OPENS rather than read during render: voiceService is a
   // dynamic import here, so there is no synchronous handle to it in the JSX.
   const [pickerCurrentSource, setPickerCurrentSource] = useState<string | null>(null);
-  const [showPipMenu, setShowPipMenu] = useState(false);
+  const [showUtilityMenu, setShowUtilityMenu] = useState(false);
 
   const controlsRef = useRef<HTMLDivElement>(null);
-  const pipWrapRef = useRef<HTMLDivElement>(null);
-  const pipMenuRef = useRef<HTMLDivElement>(null);
+  const utilityWrapRef = useRef<HTMLDivElement>(null);
+  const utilityMenuRef = useRef<HTMLDivElement>(null);
 
   // Electron PiP — check if electron API is available
   const hasElectronPip = !!globalThis.electron?.openPipWindow;
@@ -444,14 +480,21 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
 
   // Close PiP menu on click outside or Escape
   useEffect(() => {
-    if (!showPipMenu) return;
-    return attachDismissListeners(pipWrapRef, pipMenuRef, () => setShowPipMenu(false));
-  }, [showPipMenu]);
+    if (!showUtilityMenu) return;
+    return attachDismissListeners(utilityWrapRef, utilityMenuRef, (viaKeyboard) => {
+      setShowUtilityMenu(false);
+      // WCAG 2.4.3. Escape unmounts the focused item, so without this focus
+      // falls back to <body> and a keyboard user loses their place in the bar.
+      // Deliberately NOT done for an outside click, which would yank focus away
+      // from whatever the user just clicked.
+      if (viaKeyboard) utilityWrapRef.current?.querySelector('button')?.focus();
+    });
+  }, [showUtilityMenu]);
 
   const handleOpenPip = useCallback(async (mode: 'frames' | 'screen', producerId?: string) => {
     if (!globalThis.electron?.openPipWindow) return;
     await globalThis.electron.openPipWindow(buildPipOptions(mode, producerId));
-    setShowPipMenu(false);
+    setShowUtilityMenu(false);
   }, []);
 
   const tunedInIds = Object.keys(tunedInScreenShares);
@@ -475,132 +518,134 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
         )}
 
         <div className="voice-controls__buttons">
-          <MediaButton
-            isActive={isMuted || isServerMuted}
-            onClick={handleToggleMute}
-            title={muteTitle(isServerMuted, isMuted)}
-            activeIcon={<MicOff size={18} />}
-            inactiveIcon={<Mic size={18} />}
-            activeLabel={isServerMuted ? 'Muted' : 'Unmute'}
-            inactiveLabel="Mute"
-            locked={isServerMuted}
-          />
-
-          <MediaButton
-            isActive={isDeafened || isServerDeafened}
-            onClick={handleToggleDeafen}
-            title={deafenTitle(isServerDeafened, isDeafened)}
-            activeIcon={<HeadphoneOff size={18} />}
-            inactiveIcon={<Headphones size={18} />}
-            activeLabel={isServerDeafened ? 'Deafened' : 'Undeafen'}
-            inactiveLabel="Deafen"
-            locked={isServerDeafened}
-          />
-
-          <MediaButton
-            isActive={isVideoOn}
-            onClick={handleToggleVideo}
-            title={isVideoOn ? 'Stop Video' : 'Start Video'}
-            activeIcon={<VideoOff size={18} />}
-            inactiveIcon={<Video size={18} />}
-            activeLabel="Stop Video"
-            inactiveLabel="Video"
-          />
-
-          <MediaButton
-            isActive={isScreenSharing}
-            onClick={handleToggleScreen}
-            title={isScreenSharing ? 'Stop Sharing' : 'Share Screen'}
-            activeIcon={<MonitorOff size={18} />}
-            inactiveIcon={<Monitor size={18} />}
-            activeLabel="Stop"
-            inactiveLabel="Screen"
-          />
-
-          {/* Tune Everywhere + view-mode switch (voiceView context only) */}
-          <StreamControls context={context} />
-
-          {hasLinkedText && (
-            <button
-              className={`voice-controls__btn ${showVoiceTextChat ? 'voice-controls__btn--chat-active' : ''}`}
-              onClick={toggleVoiceTextChat}
-              title={showVoiceTextChat ? 'Hide Text Chat' : 'Show Text Chat'}
-            >
-              {showVoiceTextChat ? <MessageSquareOff size={18} /> : <MessageSquare size={18} />}
-              <span className="voice-controls__btn-label">Chat</span>
-            </button>
-          )}
-
-          {isScreenSharing && (
+          {/* Four clusters — Self, Share, Utility, Danger. The bar had eleven
+              equal-weight pills in one undifferentiated row; grouping by what a
+              control ACTS ON is what makes it scannable. Spacing carries the
+              grouping (Proximity); see the CSS for why there is no divider. */}
+          <div className="voice-controls__cluster">
             <MediaButton
-              isActive={false}
-              onClick={handleSwitchScreen}
-              title="Switch to a different screen or window without stopping"
-              activeIcon={<MonitorUp size={18} />}
-              inactiveIcon={<MonitorUp size={18} />}
-              activeLabel="Switch"
-              inactiveLabel="Switch"
+              isActive={isMuted || isServerMuted}
+              onClick={handleToggleMute}
+              title={muteTitle(isServerMuted, isMuted)}
+              activeIcon={<MicOff size={18} />}
+              inactiveIcon={<Mic size={18} />}
+              activeLabel={isServerMuted ? 'Muted' : 'Unmute'}
+              inactiveLabel="Mute"
+              locked={isServerMuted}
             />
-          )}
 
-          {isScreenSharing && (
             <MediaButton
-              isActive={isScreenAudioOn}
-              onClick={handleToggleScreenAudio}
-              locked={!isScreenAudioCapable}
-              title={screenAudioTitle(isScreenAudioCapable, isScreenAudioOn)}
-              activeIcon={<Volume2 size={18} />}
-              inactiveIcon={<VolumeX size={18} />}
-              activeLabel="Audio On"
-              inactiveLabel="Audio Off"
+              isActive={isDeafened || isServerDeafened}
+              onClick={handleToggleDeafen}
+              title={deafenTitle(isServerDeafened, isDeafened)}
+              activeIcon={<HeadphoneOff size={18} />}
+              inactiveIcon={<Headphones size={18} />}
+              activeLabel={isServerDeafened ? 'Deafened' : 'Undeafen'}
+              inactiveLabel="Deafen"
+              locked={isServerDeafened}
             />
-          )}
 
-          {isScreenSharing && (
             <MediaButton
-              isActive={keepActiveWhileUnfocused}
-              onClick={() => setKeepActiveWhileUnfocused(!keepActiveWhileUnfocused)}
-              title={
-                keepActiveWhileUnfocused
-                  ? 'Stream stays active when unfocused'
-                  : 'Stream pauses when unfocused'
-              }
-              activeIcon={<Eye size={18} />}
-              inactiveIcon={<EyeOff size={18} />}
-              activeLabel="Always On"
-              inactiveLabel="Auto Pause"
+              isActive={isVideoOn}
+              onClick={handleToggleVideo}
+              title={isVideoOn ? 'Stop Video' : 'Start Video'}
+              activeIcon={<VideoOff size={18} />}
+              inactiveIcon={<Video size={18} />}
+              activeLabel="Stop Video"
+              inactiveLabel="Video"
             />
-          )}
+          </div>
 
-          {hasElectronPip && (
-            <div ref={pipWrapRef} className="voice-controls__pip-wrap">
+          {/* Everything scoped to the outgoing share. The two toggles below are
+              literally gated on isScreenSharing, so they cannot belong anywhere
+              else — yet Chat used to sit between them and the Share button. */}
+          <div className="voice-controls__cluster">
+            {/* Idle: one button that starts a share. Live: Switch and Stop as one
+                object — they act on the same share. */}
+            {isScreenSharing ? (
+              <ShareSegmentedControl onSwitch={handleSwitchScreen} onStop={handleToggleScreen} />
+            ) : (
+              <MediaButton
+                isActive={false}
+                onClick={handleToggleScreen}
+                title="Share Screen"
+                activeIcon={<Monitor size={18} />}
+                inactiveIcon={<Monitor size={18} />}
+                activeLabel="Screen"
+                inactiveLabel="Screen"
+              />
+            )}
+
+            {isScreenSharing && (
+              <MediaButton
+                isActive={isScreenAudioOn}
+                onClick={handleToggleScreenAudio}
+                locked={!isScreenAudioCapable}
+                title={screenAudioTitle(isScreenAudioCapable, isScreenAudioOn)}
+                activeIcon={<Volume2 size={18} />}
+                inactiveIcon={<VolumeX size={18} />}
+                activeLabel="Sound shared"
+                inactiveLabel="Share sound"
+              />
+            )}
+          </div>
+
+          {/* Acts on how YOU view the call, not on what you send. Every member is
+              conditional, so this cluster can render empty — see the :empty rule. */}
+          <div className="voice-controls__cluster">
+            {/* Tune Everywhere + view-mode switch (voiceView context only) */}
+            <StreamControls context={context} />
+
+            {hasLinkedText && (
               <button
-                className="voice-controls__btn"
-                onClick={() => setShowPipMenu((v) => !v)}
-                title="Picture-in-Picture"
+                className={`voice-controls__btn ${showVoiceTextChat ? 'voice-controls__btn--chat-active' : ''}`}
+                onClick={toggleVoiceTextChat}
+                title={showVoiceTextChat ? 'Hide Text Chat' : 'Show Text Chat'}
               >
-                <PictureInPicture2 size={18} />
-                <span className="voice-controls__btn-label">PiP</span>
+                {showVoiceTextChat ? <MessageSquareOff size={18} /> : <MessageSquare size={18} />}
+                <span className="voice-controls__btn-label">Chat</span>
               </button>
-            </div>
-          )}
+            )}
 
-          {/* Pop-Out controls button — persistent context only */}
-          {context === 'persistent' && onPopOut && (
-            <button className="voice-controls__btn" onClick={onPopOut} title="Pop out controls">
-              <ExternalLink size={18} />
-              <span className="voice-controls__btn-label">Pop Out</span>
+            {/* `||`, not `&&`: the menu now also carries the keep-active preference,
+                which is share-scoped and has nothing to do with Electron. Gating the
+                trigger on hasElectronPip alone would make that preference
+                unreachable on any build without pop-out windows. */}
+            {(hasElectronPip || isScreenSharing) && (
+              <div ref={utilityWrapRef} className="voice-controls__utility-wrap">
+                <button
+                  className="voice-controls__btn"
+                  onClick={() => setShowUtilityMenu((v) => !v)}
+                  title="More controls"
+                  aria-expanded={showUtilityMenu}
+                >
+                  <MoreHorizontal size={18} />
+                  <span className="voice-controls__btn-label">More</span>
+                </button>
+              </div>
+            )}
+
+            {/* Pop-Out controls button — persistent context only */}
+            {context === 'persistent' && onPopOut && (
+              <button className="voice-controls__btn" onClick={onPopOut} title="Pop out controls">
+                <ExternalLink size={18} />
+                <span className="voice-controls__btn-label">Pop Out</span>
+              </button>
+            )}
+          </div>
+
+          {/* Alone, so the one irreversible action in the bar is never adjacent to
+              a toggle someone meant to press. */}
+          <div className="voice-controls__cluster">
+            <button
+              className="voice-controls__btn voice-controls__btn--danger"
+              onClick={handleLeave}
+              title="Leave Voice"
+            >
+              <PhoneOff size={18} />
+              <span className="voice-controls__btn-label">Leave</span>
             </button>
-          )}
-
-          <button
-            className="voice-controls__btn voice-controls__btn--danger"
-            onClick={handleLeave}
-            title="Leave Voice"
-          >
-            <PhoneOff size={18} />
-            <span className="voice-controls__btn-label">Leave</span>
-          </button>
+          </div>
         </div>
       </div>
 
@@ -618,14 +663,18 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
         )}
 
       {/* Portaled PiP menu — escapes overflow:hidden ancestors */}
-      {showPipMenu &&
+      {showUtilityMenu &&
         createPortal(
-          <PipMenu
-            pipMenuRef={pipMenuRef}
-            style={getPortalStyle(pipWrapRef)}
+          <UtilityMenu
+            utilityMenuRef={utilityMenuRef}
+            style={getPortalStyle(utilityWrapRef)}
             tunedInIds={tunedInIds}
             activeScreenShares={activeScreenShares}
             onOpenPip={handleOpenPip}
+            keepActive={keepActiveWhileUnfocused}
+            onToggleKeepActive={() => setKeepActiveWhileUnfocused(!keepActiveWhileUnfocused)}
+            showKeepActive={isScreenSharing}
+            showPipItems={hasElectronPip}
           />,
           document.body
         )}

@@ -1,9 +1,19 @@
 import React, { useRef, useEffect, useMemo, useState, useId } from 'react';
 import { prefetchEligibility } from '../../services/system/friendEligibility';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
-import { MicOff, HeadphoneOff, Lock, Monitor, MoreVertical, Wrench } from 'lucide-react';
+import {
+  HeadphoneOff,
+  Lock,
+  MicOff,
+  Monitor,
+  MoreVertical,
+  Volume2,
+  VolumeX,
+  Wrench,
+} from 'lucide-react';
 import { VoiceParticipantContextMenu } from './VoiceParticipantContextMenu';
 import MemberProfileCard, { type ProfileCardMember } from '../Members/MemberProfileCard';
+import { useAudioSettingsStore } from '../../stores/audio/audioSettingsStore';
 import { useVoiceStore, type VoiceParticipant } from '../../stores/voice/voiceStore';
 import { useMemberStore } from '../../stores/chat/memberStore';
 import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
@@ -249,6 +259,29 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   }, [participant.videoStream]);
 
   const displayName = participant.displayName || participant.username;
+
+  // The VOICE axis (perParticipantVolume), never perScreenShareVolume — a
+  // participant's mic and their screen's audio are independent, and muting a
+  // person here must not silence the screen they are presenting.
+  const participantVolume = useAudioSettingsStore(
+    (s) => s.perParticipantVolume[participant.userId] ?? 100
+  );
+  const setParticipantVolume = useAudioSettingsStore((s) => s.setParticipantVolume);
+  // Recorded by the store when a volume lands on 0, and persisted alongside the
+  // mute itself — an in-memory hint would be lost on restart while the mute
+  // survived, so unmuting would silently reset a deliberate 40 to full.
+  const previousVolume = useAudioSettingsStore(
+    (s) => s.previousParticipantVolume[participant.userId]
+  );
+  const mutedByMe = participantVolume === 0;
+  // Restores what they were at, not a flat 100 — someone deliberately turned to
+  // 40 should come back to 40. Recorded in the handler rather than during render
+  // so an unrelated re-render cannot capture a transient 0.
+  const handleToggleMute = () => {
+    // The store remembers the pre-mute volume itself, so muting needs no
+    // bookkeeping here and the two values cannot drift apart.
+    setParticipantVolume(participant.userId, mutedByMe ? (previousVolume ?? 100) : 0);
+  };
   // Auto-pause only applies to screen shares (VoiceStage/StreamBar), not camera video
   const hasVideo = participant.isVideoOn && !!participant.videoStream;
   // Stable per-instance key: the same participant can render in several tiles at once
@@ -353,8 +386,26 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
         onNameActivate={handleNameClick}
       />
 
-      {/* Status overlays */}
+      {/* Status overlays, plus the mute control as a flex sibling. The control
+          lived at the same absolute corner as this cluster and, being one
+          stacking level above it, hid every badge behind it whenever visible.
+          As a flex item it cannot overlap them, and since the reveal is opacity
+          rather than display, the badges do not shift when it appears. */}
       <div className="participant-tile__overlays">
+        {!isLocal && (
+          <button
+            type="button"
+            className={`participant-tile__mute-toggle${mutedByMe ? ' participant-tile__mute-toggle--on' : ''}`}
+            onClick={handleToggleMute}
+            aria-label={`${mutedByMe ? 'Unmute' : 'Mute'} ${displayName}`}
+          >
+            {mutedByMe ? (
+              <VolumeX size={14} aria-hidden="true" />
+            ) : (
+              <Volume2 size={14} aria-hidden="true" />
+            )}
+          </button>
+        )}
         <ParticipantStatusOverlay participant={participant} compact={compact} />
         {participant.isTesting && (
           <div
@@ -370,6 +421,8 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
           </div>
         )}
       </div>
+      {/* Not on your own tile: muting yourself locally would silence a stream
+          nobody else is affected by, and the bar's Mute is the real control. */}
       {!isLocal && (
         <button
           type="button"

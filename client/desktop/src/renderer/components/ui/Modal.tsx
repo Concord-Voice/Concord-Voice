@@ -18,7 +18,7 @@ export interface ModalProps {
 // everything (no layout engine), so an offsetParent check would drop every
 // element under test; a hidden focusable inside a modal overlay is not a real
 // case. Disabled/aria-hidden are excluded because those genuinely skip tab order.
-function getFocusable(container: HTMLElement): HTMLElement[] {
+export function getFocusable(container: HTMLElement): HTMLElement[] {
   const selector = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
   return Array.from(container.querySelectorAll<HTMLElement>(selector)).filter(
     (el) => !el.hasAttribute('disabled') && el.getAttribute('aria-hidden') !== 'true'

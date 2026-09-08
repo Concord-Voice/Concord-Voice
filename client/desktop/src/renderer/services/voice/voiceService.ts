@@ -3939,7 +3939,7 @@ class VoiceService {
 
     // Spec §7.3. macOS 14.2+ hands back a LIVE BUT SILENT track when the capture
     // entitlement is missing -- no throw, no warning -- so the try/catch below cannot
-    // see it and we would publish silence while the UI reported "Audio On". Refuse a
+    // see it and we would publish silence while the UI reported sound as shared. Refuse a
     // track that is already ended or muted, and say so, rather than advertising audio
     // nobody can hear.
     const audioTrack = audioTracks[0];
@@ -4683,7 +4683,7 @@ class VoiceService {
    *
    * The AUDIO track can end on its own while the video track and the transport stay live
    * -- the OS revoking the capture, or the tap dying -- and `transportclose` never fires
-   * for that, so without a handler the toolbar reports "Audio On" over silence.
+   * for that, so without a handler the toolbar reports sound as shared over silence.
    *
    * It is a shared helper rather than an inline closure because the track OUTLIVES its
    * producer: `reProduceScreenAudio` swaps in a successor for the same track on a codec,
@@ -4712,8 +4712,8 @@ class VoiceService {
     await this.drainSendTransportQueue(transport);
     this.producers.delete('screen-audio');
     // The flag describes a producer that no longer exists. Leaving it true made the
-    // control read "Audio On" after a switch to a silent source, so the next click
-    // only repaired the state instead of doing what the user asked.
+    // control still read as sharing sound after a switch to a silent source, so the
+    // next click only repaired the state instead of doing what the user asked.
     useVoiceStore.getState().setScreenAudioOn(false);
     this.socket?.emit('close-producer', { producerId: oldAudio.id });
   }

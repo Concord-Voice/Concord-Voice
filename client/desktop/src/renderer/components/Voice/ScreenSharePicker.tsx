@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useId, useRef } from 'react';
 import { Monitor, X, Volume2, VolumeX } from 'lucide-react';
 import {
   useVideoSettingsStore,
@@ -6,6 +6,7 @@ import {
   type ScreenShareOptions,
 } from '../../stores/voice/videoSettingsStore';
 import CustomSelect from '../ui/CustomSelect';
+import { getFocusable } from '../ui/Modal';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { effectiveStreamAxis, clampScreenCapture } from '../../utils/policy/videoLimits';
@@ -22,11 +23,13 @@ interface DesktopSource {
   appIcon: string | null;
 }
 
-type TabId = 'screens' | 'apps' | 'windows';
+// Applications and Windows were one concept shown twice: an application IS its
+// windows, and the split existed because the grouping code existed, not because
+// a user ever needed to choose between the two views.
+type TabId = 'screens' | 'windows';
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'screens', label: 'Screens' },
-  { id: 'apps', label: 'Applications' },
   { id: 'windows', label: 'Windows' },
 ];
 
@@ -126,34 +129,16 @@ const SourcePanel: React.FC<{
       />
     );
   }
-  if (tab === 'windows') {
-    return (
-      <SourceGrid
-        sources={grouped.windows}
-        emptyText="No open windows to share."
-        selected={selected}
-        onSelect={onSelect}
-      />
-    );
-  }
-  if (grouped.apps.length === 0) {
-    return <p className="screen-picker__empty">No open applications to share.</p>;
-  }
+  // Both tabs now render the same flat grid. Applications used to render one
+  // window per row while Windows rendered a grid, which made the same content
+  // look like two different kinds of thing.
   return (
-    <>
-      {grouped.apps.map((app) => (
-        <div key={app.groupKey} className="screen-picker__app-group">
-          <h4 className="screen-picker__section-title">
-            {app.appIcon && <img src={app.appIcon} alt="" className="screen-picker__app-icon" />}
-            {app.appName}
-            {app.windows.length > 1 && (
-              <span className="screen-picker__tab-count">{app.windows.length}</span>
-            )}
-          </h4>
-          <SourceGrid sources={app.windows} selected={selected} onSelect={onSelect} />
-        </div>
-      ))}
-    </>
+    <SourceGrid
+      sources={grouped.windows}
+      emptyText="No open windows to share."
+      selected={selected}
+      onSelect={onSelect}
+    />
   );
 };
 
@@ -178,8 +163,8 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(currentSourceId);
   // Open on the tab that actually contains the pre-selection, or the marking is
-  // invisible. A window's owning app group is not resolved here on purpose: the
-  // Windows tab lists every window flat, so it always contains it.
+  // invisible. Every window is in the Windows tab, so a `window:` id always
+  // resolves -- there is no longer a second tab it could have belonged to.
   const [tab, setTab] = useState<TabId>(
     currentSourceId?.startsWith('window:') ? 'windows' : 'screens'
   );
@@ -239,7 +224,26 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
     fetchSources();
   }, []);
 
-  // Close on Escape
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
+
+  // Dismiss only on a click that landed on the BACKDROP itself. The previous
+  // shape put `onClick={(e) => e.stopPropagation()}` on the picker container so
+  // an inside click would not bubble out to this handler — which meant hanging a
+  // mouse listener on a non-interactive element (sonar typescript:S6847/S1082),
+  // and implying a keyboard affordance that has no meaning: there is no keyboard
+  // equivalent of "clicked the backdrop". Identity-checking the target is what
+  // Modal.tsx already does, and it needs no listener on the dialog.
+  const handleOverlayClick = (e: React.MouseEvent) => {
+    if (e.target === overlayRef.current) onCancel();
+  };
+  const titleId = useId();
+
+  // Escape stays a hand-rolled listener. A native <dialog> runs the browser's
+  // cancel action -- and so closes itself on Escape -- only when opened with
+  // showModal(); this one uses the declarative `open` attribute, exactly as
+  // Modal.tsx does, and a declaratively-open dialog is NON-modal. Deleting this
+  // on the belief that <dialog> handles Escape would silently break it.
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (e.key === 'Escape') onCancel();
@@ -252,6 +256,50 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
+  // Focus custody (WCAG 2.4.3). The picker is mounted only while open, so mount
+  // and unmount ARE open and close.
+  useEffect(() => {
+    const invoker = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    return () => invoker?.focus?.();
+  }, []);
+
+  // Tab containment (WCAG 2.1.2). Document-level rather than an onKeyDown on the
+  // dialog, because the case that matters is focus having ALREADY escaped -- an
+  // element-scoped handler cannot see a keystroke aimed at the bar behind.
+  //
+  // No modal-stack / isTopmost gate, unlike Modal.tsx: that exists to stop nested
+  // modals fighting over the trap, and the picker is opened from the voice bar
+  // rather than from inside another modal. If it ever gains a child modal, this
+  // needs the same gate.
+  useEffect(() => {
+    const handleTab = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return;
+      const container = dialogRef.current;
+      if (!container) return;
+      const focusables = getFocusable(container);
+      if (focusables.length === 0) {
+        e.preventDefault();
+        container.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables.at(-1) ?? first;
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || active === container || !container.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || active === container || !container.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', handleTab);
+    return () => document.removeEventListener('keydown', handleTab);
+  }, []);
+
   // null until resolved; canCarryScreenAudio treats null as the permissive dev/web case.
   const [platform, setPlatform] = useState<string | null>(null);
   useEffect(() => {
@@ -260,7 +308,7 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
       .catch(() => setPlatform(null));
   }, []);
 
-  const { screens, apps, windows } = useMemo(() => groupDesktopSources(sources), [sources]);
+  const { screens, windows } = useMemo(() => groupDesktopSources(sources), [sources]);
 
   // Capability is target AND platform (#2161, ADR-0043) — the prefix alone offered an
   // enabled, default-on control on Linux, where this capture path has no loopback and
@@ -392,7 +440,6 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
 
   const tabCounts: Record<TabId, number> = {
     screens: screens.length,
-    apps: apps.length,
     windows: windows.length,
   };
   const countFor = (id: TabId): number => tabCounts[id];
@@ -436,10 +483,22 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   };
 
   return (
-    <div className="screen-picker-overlay" onClick={onCancel}>
-      <div className="screen-picker" onClick={(e) => e.stopPropagation()}>
+    <div className="screen-picker-overlay" ref={overlayRef} onClick={handleOverlayClick}>
+      {/* Native <dialog> with the declarative `open`, mirroring Modal.tsx: it
+          carries the implicit dialog role and AT semantics while staying in
+          normal flow so the overlay's flex centring still works. aria-modal
+          asserts the modality that `open` alone does not provide; the overlay
+          and the Tab trap above are what actually enforce it. */}
+      <dialog
+        className="screen-picker"
+        ref={dialogRef}
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        open
+      >
         <div className="screen-picker__header">
-          <h3 className="screen-picker__title">
+          <h3 className="screen-picker__title" id={titleId}>
             <Monitor size={18} />
             Share Your Screen
           </h3>
@@ -483,7 +542,7 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
             >
               <SourcePanel
                 tab={tab}
-                grouped={{ screens, apps, windows }}
+                grouped={{ screens, windows }}
                 selected={selected}
                 onSelect={setSelected}
               />
@@ -585,7 +644,7 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
             Share
           </button>
         </div>
-      </div>
+      </dialog>
     </div>
   );
 };

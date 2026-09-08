@@ -1,0 +1,40 @@
+/* The two halves are one object, so only the outer corners round and a seam —
+   not a gap — divides them. A gap would undo the grouping the component exists
+   for: it is the visual join that says Switch and Stop act on the same share. */
+.share-segmented {
+  /* A <fieldset>, so neutralize the UA defaults that would otherwise draw a
+     groove border and pad the pair away from its neighbours: border 2px groove,
+     margin 0 2px, padding 0.35em 0.75em 0.625em, and min-inline-size:
+     min-content — that last one silently prevents the control from shrinking
+     below its content in a flex row. */
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-inline-size: 0;
+  display: inline-flex;
+  /* Contains the z-index raise below, so a focused half cannot escape this
+     stacking context and paint over unrelated bar chrome. */
+  isolation: isolate;
+}
+
+.share-segmented__half {
+  border-radius: 0;
+}
+
+.share-segmented__half--switch {
+  border-radius: var(--radius-md, 6px) 0 0 var(--radius-md, 6px);
+}
+
+.share-segmented__half--stop {
+  border-radius: 0 var(--radius-md, 6px) var(--radius-md, 6px) 0;
+  /* Reads against both halves' backgrounds because it is the bar behind them,
+     not a tint of either. */
+  border-left: 1px solid var(--bg-primary);
+}
+
+/* Lift the focused half so its ring is drawn over its neighbour rather than
+   clipped by it — the halves touch, so without this the ring is half-hidden on
+   whichever side is adjacent. */
+.share-segmented__half:focus-visible {
+  z-index: 1;
+}

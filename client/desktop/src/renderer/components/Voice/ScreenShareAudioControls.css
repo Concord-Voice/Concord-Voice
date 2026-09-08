@@ -1,7 +1,11 @@
 .screenshare-audio-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
+  /* 12px, not 8px. The mute button's pointer target below is expanded to 44x44,
+     which overhangs its 24px box by 10px on each side; at an 8px gap that would
+     reach 2px into the slider and steal the start of a drag. 12px leaves 2px of
+     clearance instead. */
+  gap: 12px;
   padding: 4px 8px;
   border-radius: 8px;
   background: var(--surface-overlay, rgba(0, 0, 0, 0.55));
@@ -16,12 +20,39 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  /* Anchors the expanded hit target below. */
+  position: relative;
   padding: 4px;
   border: none;
   border-radius: 6px;
   background: transparent;
   color: inherit;
   cursor: pointer;
+}
+
+/* Fitts, and the same technique the participant tile's mute uses so the two
+   audio affordances behave alike: the glyph stays 16px in a 24px box, keeping the
+   overlay bar its current height, while the POINTER TARGET is a 44x44 box centred
+   on it.
+   Here the full 44 is real, unlike on the tile. The stage ancestors set
+   overflow:hidden, but this bar sits 8px above the stage's bottom edge inside an
+   overlay with 8px padding, so the target's lower edge clears the clip by ~2px.
+   The horizontal overhang is what the widened gap above pays for. */
+.screenshare-audio-controls__mute::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+}
+
+/* The expanded box must not swallow clicks while the control is unavailable —
+   a disabled button already ignores them, but the pseudo-element would still sit
+   over the slider's clearance. */
+.screenshare-audio-controls__mute:disabled::before {
+  display: none;
 }
 
 .screenshare-audio-controls__mute:hover:not(:disabled) {

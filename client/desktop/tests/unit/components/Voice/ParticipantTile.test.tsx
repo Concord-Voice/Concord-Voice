@@ -16,6 +16,7 @@ vi.mock('@/renderer/hooks/ui/useUserThemeScope', () => ({
 
 import ParticipantTile from '@/renderer/components/Voice/ParticipantTile';
 import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 
 const makeParticipant = (overrides: Partial<VoiceParticipant> = {}): VoiceParticipant => ({
   userId: 'user-1',
@@ -413,5 +414,114 @@ describe('ParticipantTile', () => {
     const { container } = render(<ParticipantTile participant={makeParticipant()} />);
     expect(container.querySelector('.participant-tile--active-speaker')).not.toBeInTheDocument();
     expect(container.querySelector('.participant-tile--inactive')).not.toBeInTheDocument();
+  });
+
+  // -- Per-tile voice mute ---------------------------------------------------
+
+  describe('per-tile voice mute', () => {
+    // Asserted against the REAL store rather than a mocked setter: the claim is
+    // that the participant's volume ends up at 0, not that a spy was called. A
+    // mock would pass even if the component wrote to the wrong axis --
+    // perScreenShareVolume is a separate map, and confusing the two is the most
+    // likely way to get this wrong.
+    it('mutes in one click and unmutes back to the prior volume', () => {
+      useAudioSettingsStore.setState({ perParticipantVolume: { 'user-1': 80 } });
+      render(<ParticipantTile participant={makeParticipant()} />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Mute Test User' }));
+      expect(useAudioSettingsStore.getState().perParticipantVolume['user-1']).toBe(0);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Unmute Test User' }));
+      expect(useAudioSettingsStore.getState().perParticipantVolume['user-1']).toBe(80);
+    });
+
+    it('does not touch the screen-share volume axis', () => {
+      useAudioSettingsStore.setState({
+        perParticipantVolume: { 'user-1': 100 },
+        perScreenShareVolume: { 'producer-1': 100 },
+      });
+      render(<ParticipantTile participant={makeParticipant({ isScreenSharing: true })} />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Mute Test User' }));
+      expect(useAudioSettingsStore.getState().perScreenShareVolume).toEqual({
+        'producer-1': 100,
+      });
+    });
+
+    it('restores the prior volume in a DIFFERENT tile instance for the same user', () => {
+      // The restore value used to live in a useRef, so it died with the tile.
+      // The same person renders in ParticipantGrid, UserFrameBar and PipWindow,
+      // and a remount alone resets a ref — a second tile then initialised from
+      // volume 0, fell back to 100, and unmuting overwrote a deliberate 40.
+      useAudioSettingsStore.setState({ perParticipantVolume: { 'user-1': 40 } });
+
+      const first = render(<ParticipantTile participant={makeParticipant()} />);
+      fireEvent.click(screen.getByRole('button', { name: 'Mute Test User' }));
+      expect(useAudioSettingsStore.getState().perParticipantVolume['user-1']).toBe(0);
+
+      // Tear the tile down entirely, then mount a fresh one for the same user.
+      first.unmount();
+      render(<ParticipantTile participant={makeParticipant()} />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Unmute Test User' }));
+      expect(useAudioSettingsStore.getState().perParticipantVolume['user-1']).toBe(40);
+    });
+
+    it('records the pre-mute volume in the PERSISTED store, not in memory', () => {
+      // perParticipantVolume is persisted (audioSettingsStore has no partialize,
+      // so the whole state goes to localStorage under concord:audio-advanced).
+      // A restore hint held in a module-scoped Map would therefore be lost on
+      // restart while the mute itself survived, turning the next unmute into
+      // "reset to full". Asserting the STORE is what makes the pair durable
+      // together — a component-level assertion cannot distinguish the two.
+      useAudioSettingsStore.setState({
+        perParticipantVolume: { 'user-1': 40 },
+        previousParticipantVolume: {},
+      });
+      render(<ParticipantTile participant={makeParticipant()} />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Mute Test User' }));
+      expect(useAudioSettingsStore.getState().previousParticipantVolume['user-1']).toBe(40);
+    });
+
+    it('does not let a second mute overwrite the remembered volume with 0', () => {
+      useAudioSettingsStore.setState({
+        perParticipantVolume: { 'user-1': 40 },
+        previousParticipantVolume: {},
+      });
+      const { unmount } = render(<ParticipantTile participant={makeParticipant()} />);
+      fireEvent.click(screen.getByRole('button', { name: 'Mute Test User' }));
+      unmount();
+
+      // Muting an already-muted participant must not record the 0.
+      useAudioSettingsStore.getState().setParticipantVolume('user-1', 0);
+      expect(useAudioSettingsStore.getState().previousParticipantVolume['user-1']).toBe(40);
+    });
+
+    it('does not cover the status badges', () => {
+      // The control sat at the same absolute corner as .participant-tile__overlays
+      // and one stacking level above it, hiding the server-muted, self-muted,
+      // testing and screen-share badges. It is a flex sibling of them now.
+      render(<ParticipantTile participant={makeParticipant({ isMuted: true })} />);
+      const overlays = document.querySelector('.participant-tile__overlays');
+      const mute = screen.getByRole('button', { name: 'Mute Test User' });
+      expect(overlays).toContainElement(mute);
+      // The self-muted badge is a sibling, not something rendered underneath it.
+      expect(overlays?.querySelector('.participant-tile__status--muted')).toBeTruthy();
+    });
+
+    it('is not offered on your own tile', () => {
+      render(<ParticipantTile participant={makeParticipant()} isLocal />);
+      expect(screen.queryByRole('button', { name: /^(Mute|Unmute) / })).not.toBeInTheDocument();
+    });
+
+    it('stays distinct from the self-muted badge', () => {
+      // MicOff on this tile already means "they muted themselves". A participant
+      // who has done that, and whom you have NOT muted, must still be offered a
+      // mute -- if one glyph meant both, this state would be unreadable.
+      render(<ParticipantTile participant={makeParticipant({ isMuted: true })} />);
+      expect(document.querySelector('.participant-tile__status--muted')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Mute Test User' })).toBeInTheDocument();
+    });
   });
 });

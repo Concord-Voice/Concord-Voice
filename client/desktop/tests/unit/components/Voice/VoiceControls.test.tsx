@@ -291,16 +291,71 @@ describe('VoiceControls', () => {
     expect(screen.queryByText('Auto Pause')).not.toBeInTheDocument();
   });
 
-  it('shows Auto Pause button when screen sharing and keepActiveWhileUnfocused is false', () => {
+  // These two used to assert the standalone Auto Pause / Always On button. The
+  // control is now an item in the utility menu, so the state it reports moved
+  // from the label text to aria-pressed -- the same fact, read the way an
+  // assistive technology reads it.
+  const KEEP_ACTIVE_ITEM = /Keep stream active when unfocused/;
+
+  it('offers the keep-active preference, unpressed, while sharing', () => {
     setVoiceState({ isScreenSharing: true, keepActiveWhileUnfocused: false });
     render(<VoiceControls />);
-    expect(screen.getByText('Auto Pause')).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle('More controls'));
+    expect(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
   });
 
-  it('shows Always On button when screen sharing and keepActiveWhileUnfocused is true', () => {
+  it('reports the keep-active preference as pressed when it is on', () => {
     setVoiceState({ isScreenSharing: true, keepActiveWhileUnfocused: true });
     render(<VoiceControls />);
-    expect(screen.getByText('Always On')).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle('More controls'));
+    expect(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+  });
+
+  it('returns focus to the More trigger when Escape closes the utility menu', () => {
+    // Escape unmounts the focused menu item, so without an explicit restore
+    // focus falls back to <body> and a keyboard user loses their place.
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+    const trigger = screen.getByTitle('More controls');
+    fireEvent.click(trigger);
+    expect(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM })).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+  });
+
+  it('does not announce a menu popup it has not implemented', () => {
+    // aria-haspopup="true" is a synonym for "menu". UtilityMenu is a plain
+    // container of buttons with no menu keyboard model — the component says so
+    // in its own comment — so announcing one is a promise to assistive tech
+    // that nothing keeps.
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+    expect(screen.getByTitle('More controls')).not.toHaveAttribute('aria-haspopup');
+  });
+
+  it('keeps the utility menu reachable while sharing with no Electron PiP', () => {
+    // The trigger's gate is `hasElectronPip || isScreenSharing`. With `&&` -- its
+    // shape before this control moved into the menu -- the preference would be
+    // unreachable on any build without pop-out windows.
+    const origElectron = globalThis.electron;
+    globalThis.electron = undefined as unknown as typeof globalThis.electron;
+
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+    fireEvent.click(screen.getByTitle('More controls'));
+
+    expect(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM })).toBeInTheDocument();
+    // ...and the pop-out targets, which genuinely need Electron, stay absent.
+    expect(screen.queryByText('Pop Out User Frames')).not.toBeInTheDocument();
+
+    globalThis.electron = origElectron;
   });
 
   // ── Video slot error ─────────────────────────────────────────────────────
@@ -377,10 +432,36 @@ describe('VoiceControls', () => {
     expect(screen.getByTitle('Stop Video').className).toContain('voice-controls__btn--active');
   });
 
-  it('applies active class to screen share button when sharing', () => {
+  // Replaces an `--active` assertion that described the pre-segmented-control bar.
+  // Stop was never a button of its own back then — it was the ACTIVE STATE of the
+  // Share button — so `--active` was the right assertion for a design that no
+  // longer exists, not a weakened one.
+  it('renders Switch and Stop as one segmented control while sharing', () => {
     setVoiceState({ isScreenSharing: true });
     render(<VoiceControls />);
-    expect(screen.getByTitle('Stop Sharing').className).toContain('voice-controls__btn--active');
+
+    // Tinted destructive, not the neutral ON-state and not the filled red that
+    // belongs to Leave alone: Stop ends the share, not the session.
+    const stop = screen.getByTitle('Stop Sharing');
+    expect(stop.className).toContain('voice-controls__btn--danger-soft');
+    expect(stop.className).not.toContain('voice-controls__btn--active');
+
+    // Switch travels WITH Stop. The bar used to put Chat between them.
+    const group = screen.getByRole('group', { name: 'Screen share' });
+    expect(group).toContainElement(stop);
+    expect(group).toContainElement(
+      screen.getByTitle('Switch to a different screen or window without stopping')
+    );
+  });
+
+  it('renders one plain Screen button, and no group, when not sharing', () => {
+    setVoiceState({ isScreenSharing: false });
+    render(<VoiceControls />);
+
+    expect(screen.getByTitle('Share Screen').className).not.toContain(
+      'voice-controls__btn--danger-soft'
+    );
+    expect(screen.queryByRole('group', { name: 'Screen share' })).not.toBeInTheDocument();
   });
 
   it('applies danger class to leave button', () => {
@@ -391,7 +472,7 @@ describe('VoiceControls', () => {
 
   // ── Server-enforced mute/deafen — locked + disabled ────────────────────
 
-  it('renders mute button as disabled when server-muted', () => {
+  it('renders mute button as locked-but-focusable when server-muted', async () => {
     setVoiceState({
       isMuted: true,
       participants: {
@@ -404,8 +485,29 @@ describe('VoiceControls', () => {
 
     render(<VoiceControls />);
     const muteBtn = screen.getByTitle('Server-muted by a moderator');
-    expect(muteBtn).toBeDisabled();
+    // aria-disabled, NOT the native `disabled` attribute. A natively disabled
+    // button leaves the tab order and takes its explanatory title with it, so a
+    // screen-reader user tabbing the bar would never learn WHY they cannot
+    // unmute. Focusability is the whole point, so it is asserted directly — a
+    // native disabled button cannot take focus.
+    expect(muteBtn).toHaveAttribute('aria-disabled', 'true');
+    expect(muteBtn).not.toBeDisabled();
+    muteBtn.focus();
+    expect(muteBtn).toHaveFocus();
     expect(muteBtn.className).toContain('voice-controls__btn--locked');
+
+    // aria-disabled does not block activation the way `disabled` does, so the
+    // guard in MediaButton IS the enforcement. Clicking must be inert.
+    //
+    // The flush is load-bearing, not ceremony: handleToggleMute is async
+    // (`(await getVoiceService()).toggleMute()`), so a bare synchronous
+    // fireEvent + expect passes whether the guard exists or not — the microtask
+    // has not run yet. Verified by mutation: without this await, deleting the
+    // guard left all 74 tests green.
+    await act(async () => {
+      fireEvent.click(muteBtn);
+    });
+    expect(mockToggleMute).not.toHaveBeenCalled();
   });
 
   it('renders deafen button as disabled when server-deafened', () => {
@@ -419,7 +521,10 @@ describe('VoiceControls', () => {
 
     render(<VoiceControls />);
     const deafenBtn = screen.getByTitle('Server-deafened by a moderator');
-    expect(deafenBtn).toBeDisabled();
+    expect(deafenBtn).toHaveAttribute('aria-disabled', 'true');
+    expect(deafenBtn).not.toBeDisabled();
+    deafenBtn.focus();
+    expect(deafenBtn).toHaveFocus();
     expect(deafenBtn.className).toContain('voice-controls__btn--locked');
   });
 
@@ -434,6 +539,7 @@ describe('VoiceControls', () => {
 
     render(<VoiceControls />);
     const muteBtn = screen.getByTitle('Mute');
+    expect(muteBtn).toHaveAttribute('aria-disabled', 'false');
     expect(muteBtn).not.toBeDisabled();
     expect(muteBtn.className).not.toContain('voice-controls__btn--locked');
   });
@@ -581,8 +687,9 @@ describe('VoiceControls', () => {
       setKeepActiveWhileUnfocused: mockSetKeepActive,
     });
     render(<VoiceControls />);
+    fireEvent.click(screen.getByTitle('More controls'));
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Stream pauses when unfocused'));
+      fireEvent.click(screen.getByRole('button', { name: KEEP_ACTIVE_ITEM }));
     });
     expect(mockSetKeepActive).toHaveBeenCalledWith(true);
   });
@@ -598,7 +705,7 @@ describe('VoiceControls', () => {
 
     setVoiceState();
     render(<VoiceControls />);
-    expect(screen.getByTitle('Picture-in-Picture')).toBeInTheDocument();
+    expect(screen.getByTitle('More controls')).toBeInTheDocument();
 
     globalThis.electron = origElectron;
   });
@@ -609,7 +716,7 @@ describe('VoiceControls', () => {
 
     setVoiceState();
     render(<VoiceControls />);
-    expect(screen.queryByTitle('Picture-in-Picture')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('More controls')).not.toBeInTheDocument();
 
     globalThis.electron = origElectron;
   });
@@ -638,7 +745,7 @@ describe('VoiceControls', () => {
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+      fireEvent.click(screen.getByTitle('More controls'));
     });
 
     expect(screen.getByText('Pop Out User Frames')).toBeInTheDocument();
@@ -659,7 +766,7 @@ describe('VoiceControls', () => {
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+      fireEvent.click(screen.getByTitle('More controls'));
     });
     await act(async () => {
       fireEvent.click(screen.getByText('Pop Out User Frames'));
@@ -699,7 +806,7 @@ describe('VoiceControls', () => {
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+      fireEvent.click(screen.getByTitle('More controls'));
     });
     await act(async () => {
       fireEvent.click(screen.getByText(/Pop Out Bob.s Screen/));
@@ -725,7 +832,7 @@ describe('VoiceControls', () => {
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+      fireEvent.click(screen.getByTitle('More controls'));
     });
     expect(screen.getByText('Pop Out User Frames')).toBeInTheDocument();
 
@@ -748,7 +855,7 @@ describe('VoiceControls', () => {
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+      fireEvent.click(screen.getByTitle('More controls'));
     });
     expect(screen.getByText('Pop Out User Frames')).toBeInTheDocument();
 
@@ -826,7 +933,7 @@ describe('VoiceControls', () => {
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle('Picture-in-Picture'));
+      fireEvent.click(screen.getByTitle('More controls'));
     });
 
     // Each menu item labeled with its own producer's owner, not the first sharer.
@@ -1073,7 +1180,8 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     render(<VoiceControls />);
 
     const btn = screen.getByTitle(/cannot carry computer sound/i);
-    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('aria-disabled', 'true');
+    expect(btn).not.toBeDisabled();
 
     fireEvent.click(btn);
     expect(mockSetScreenAudioEnabled).not.toHaveBeenCalled();
@@ -1096,5 +1204,39 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: true });
     render(<VoiceControls />);
     expect(screen.getByTitle(/^Share your computer/)).toBeInTheDocument();
+  });
+
+  // -- Bar clustering: Self / Share / Utility / Danger --------------------
+
+  it('clusters the bar so share controls sit together and Leave sits alone', () => {
+    setVoiceState({ isScreenSharing: true, isScreenAudioOn: true, isScreenAudioCapable: true });
+    // `persistent` + onPopOut is what puts a button in the UTILITY cluster. Without
+    // it Utility renders empty here -- StreamControls returns null outside
+    // voiceView, and this fixture has no linked text channel and no Electron PiP --
+    // and the "Leave sits alone" assertion below passes for the wrong reason:
+    // merging an EMPTY neighbour into Danger still leaves exactly one button.
+    // Verified by mutation: that merge survived until this render gained Pop Out.
+    render(<VoiceControls context="persistent" onPopOut={vi.fn()} />);
+
+    const clusterOf = (el: Element | null) => el?.closest('.voice-controls__cluster') ?? null;
+
+    const leave = screen.getByTitle('Leave Voice');
+    const stop = screen.getByTitle('Stop Sharing');
+    // By LABEL, not title: screenAudioTitle() returns different copy per state,
+    // so a title regex silently depends on which flags this test happens to set.
+    const shareAudio = screen.getByText('Sound shared').closest('button');
+    const mute = screen.getByText('Mute').closest('button');
+
+    // Leave is the only irreversible action in the bar, so it never shares a
+    // cluster with a toggle someone meant to press -- Pop Out included.
+    expect(clusterOf(leave)?.querySelectorAll('button')).toHaveLength(1);
+    expect(clusterOf(screen.getByTitle('Pop out controls'))).not.toBe(clusterOf(leave));
+
+    // Both act on the outgoing share, and both are gated on isScreenSharing.
+    // Chat used to render between them.
+    expect(clusterOf(shareAudio)).toBe(clusterOf(stop));
+
+    // ...and neither belongs with the self-controls.
+    expect(clusterOf(mute)).not.toBe(clusterOf(stop));
   });
 });

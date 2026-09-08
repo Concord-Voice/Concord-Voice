@@ -134,7 +134,7 @@ describe('a dead audio track is never published (spec §7.3)', () => {
 
   // `transportclose` never fires when only the AUDIO track dies -- the OS revoking the
   // capture, or the tap failing -- so without an ended handler the toolbar reported
-  // "Audio On" over silence and the next click cleared a stale flag instead of retrying.
+  // sound as shared over silence and the next click cleared a stale flag instead of retrying.
   it('clears the live state when the audio track ends on its own', async () => {
     const audio = track('audio');
     const producer = { id: 'a1', on: vi.fn(), close: vi.fn() };
@@ -224,7 +224,7 @@ describe('a dead audio track is never published (spec §7.3)', () => {
 
   // `produceEncrypted` is a network round-trip and cleanup cannot cancel one already
   // in flight, so a stop landing inside it would otherwise have this continuation
-  // register a producer and report "Audio On" for a share that no longer exists --
+  // register a producer and report sound as shared for a share that no longer exists --
   // system audio still going out after the user stopped sharing.
   it('discards a producer whose share ended while the produce was in flight', async () => {
     const stream = streamOf([track('audio')]);

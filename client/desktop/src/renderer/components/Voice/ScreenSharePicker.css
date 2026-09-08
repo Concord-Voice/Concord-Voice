@@ -9,6 +9,18 @@
 }
 
 .screen-picker {
+  /* This is a native <dialog open> (B3). Neutralize the UA dialog[open] defaults
+     that would otherwise regress layout and theme: absolute positioning plus auto
+     margins (which break the overlay's flex centring), 1em padding (the header,
+     body and footers own their padding), and color: CanvasText (which would drop
+     theme text-colour inheritance in all 32 schemes). The same set Modal.tsx
+     documents — minus `max-width: none`, because this container has a real
+     720px clamp of its own that must survive. */
+  position: static;
+  inset: auto;
+  margin: 0;
+  padding: 0;
+  color: inherit;
   background-color: var(--bg-secondary);
   border-radius: 12px;
   border: 1px solid var(--border-color);
@@ -66,15 +78,6 @@
 
 .screen-picker__section {
   margin-bottom: 16px;
-}
-
-.screen-picker__section-title {
-  font-size: calc(12px * var(--font-scale, 1));
-  font-weight: 600;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin: 0 0 8px 0;
 }
 
 .screen-picker__grid {
@@ -144,7 +147,18 @@
 
 .screen-picker__quality {
   display: flex;
-  gap: 16px;
+  /* Four `__quality-row` children (Audio, Resolution, Frame Rate, Content) share
+     this one line. Without wrapping, the last of them -- Content -- runs off the
+     modal's right edge at narrow widths and becomes unreachable: it is clipped by
+     the modal, not merely scrolled out of view.
+
+     The wrap belongs HERE, on the container, not on `__quality-row`. Each row is
+     a [label][select] pair, so a min-width floor on a ROW's children would force
+     a ~280px floor per row and make narrow widths worse, not better. */
+  flex-wrap: wrap;
+  /* Asymmetric: the 16px column gap is the original spacing between rows on one
+     line; 10px is the vertical gap that only exists once they wrap. */
+  gap: 10px 16px;
   padding: 10px 20px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-secondary);
@@ -262,22 +276,6 @@
   color: var(--text-muted);
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-}
-
-.screen-picker__app-group {
-  margin-bottom: 16px;
-}
-
-.screen-picker__app-group .screen-picker__section-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  /* App names are proper nouns; uppercasing "iTerm" or "VS Code" misrepresents them,
-     unlike the generic section headings this class was written for. */
-  text-transform: none;
-  letter-spacing: normal;
-  font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-secondary);
 }
 
 .screen-picker__empty {

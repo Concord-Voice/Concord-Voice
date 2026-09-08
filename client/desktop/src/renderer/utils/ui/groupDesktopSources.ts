@@ -1,19 +1,29 @@
 /**
- * Group Electron desktop-capture sources for the share picker (R4).
+ * Split Electron desktop-capture sources for the share picker (R4).
  *
  * Electron's `DesktopCapturerSource` carries only `id`, `name`, `appIcon`,
- * `display_id` and `thumbnail` — there is no application name and no PID. A window's
- * `name` is its WINDOW TITLE, not its app. So "group these windows by application" is
- * necessarily a heuristic, and this module is where that heuristic lives and is tested.
+ * `display_id` and `thumbnail` — there is no application name and no PID. A
+ * window's `name` is its WINDOW TITLE, not its app.
  *
- * Key preference, strongest first:
- *   1. `appIcon` data-URL identity — two windows of one app render the same icon bytes.
- *      Requires `fetchWindowIcons: true` at the getSources call site.
- *   2. The trailing `" - App"` / `" — App"` title segment, when the platform supplies one.
- *   3. The whole title, which yields a single-window group.
+ * This module used to additionally group windows into guessed APPLICATIONS,
+ * keyed on `appIcon` identity with a trailing `" - App"` title segment as a
+ * fallback. That grouping is gone, and deliberately so.
  *
- * Rung 3 is a graceful degradation, not a failure: the picker renders a single-window
- * group as a direct share target, so an ungroupable window stays perfectly usable.
+ * The picker now shows one flat grid of windows, so nothing consumes a group.
+ * But the heuristic was also wrong in a way worth recording, because it reads
+ * as sound: it took the LAST `" - "`-separated segment, on the reasonable
+ * grounds that an app name is conventionally final. A Terminal titles itself
+ * `"<project> - -zsh - 183x62"`, so the last segment is the window's
+ * DIMENSIONS — which became a visible heading AND a grouping key, silently
+ * collapsing unrelated projects' terminals into one phantom application.
+ *
+ * Do not reintroduce grouping by title. `appIcon` identity alone was sound and
+ * could come back on its own if a future picker needs it; the title fallback is
+ * what was unsafe. A test pins the absence of `apps` so this cannot return by
+ * accident.
+ *
+ * The name still says "group" because splitting by kind — screens versus
+ * windows — is the grouping that remains.
  *
  * Pure — no store, React or Electron imports — so it tests without a DOM.
  */
@@ -22,58 +32,15 @@ export interface DesktopSourceLike {
   id: string;
   name: string;
   thumbnail: string;
+  /** Per-window icon, still rendered on the individual card. */
   appIcon: string | null;
-}
-
-export interface AppGroup {
-  /**
-   * The identity this group was built on -- NOT `appName`, which is derived
-   * separately and is not unique. Two groups legitimately share a display name:
-   * one window reporting an appIcon keys on `icon:<data-url>` while a sibling
-   * window of the same app reporting no icon keys on `app:Chrome`, and both
-   * render "Chrome". Keying React off the name collides them.
-   */
-  groupKey: string;
-  /** Best available display name for the owning application. */
-  appName: string;
-  /** First non-null appIcon among the group's windows, or null. */
-  appIcon: string | null;
-  windows: DesktopSourceLike[];
 }
 
 export interface GroupedSources {
   /** `screen:` sources, in the order the platform reported them. */
   screens: DesktopSourceLike[];
-  /** `window:` sources grouped by owning application, sorted by name. */
-  apps: AppGroup[];
-  /** Every `window:` source, flat, for the Windows tab. */
+  /** `window:` sources, flat, in the order the platform reported them. */
   windows: DesktopSourceLike[];
-}
-
-/**
- * Trailing " - App" / " — App" / " – App" segment of a window title, if present.
- *
- * Requires whitespace on BOTH sides of the separator so a hyphenated title
- * ("well-known.txt") is not mistaken for a separator. Takes the LAST separator,
- * because the app name is conventionally the final segment.
- */
-function trailingAppSegment(title: string): string | null {
-  const match = /^.*\s[-–—]\s(.+)$/.exec(title);
-  // `|| null` rather than `?? null`: a title ending in the separator yields an EMPTY
-  // string, which is not a usable app name and must fall through like a missing match.
-  return match?.[1]?.trim() || null;
-}
-
-function groupKeyFor(source: DesktopSourceLike): string {
-  // Namespaced so an icon data-URL can never collide with a title string.
-  if (source.appIcon) return `icon:${source.appIcon}`;
-  const segment = trailingAppSegment(source.name);
-  if (segment) return `app:${segment}`;
-  return `title:${source.name}`;
-}
-
-function displayNameFor(source: DesktopSourceLike): string {
-  return trailingAppSegment(source.name) ?? source.name;
 }
 
 export function groupDesktopSources(sources: DesktopSourceLike[]): GroupedSources {
@@ -87,27 +54,5 @@ export function groupDesktopSources(sources: DesktopSourceLike[]): GroupedSource
     // than guessing which tab it belongs in.
   }
 
-  const byKey = new Map<string, AppGroup>();
-  for (const window of windows) {
-    const key = groupKeyFor(window);
-    const existing = byKey.get(key);
-    if (existing) {
-      existing.windows.push(window);
-      existing.appIcon ??= window.appIcon;
-    } else {
-      byKey.set(key, {
-        groupKey: key,
-        appName: displayNameFor(window),
-        appIcon: window.appIcon,
-        windows: [window],
-      });
-    }
-  }
-
-  // Sorted so the Applications tab does not reshuffle between openings of the picker.
-  const apps = [...byKey.values()].sort((a, b) =>
-    a.appName.localeCompare(b.appName, undefined, { sensitivity: 'base' })
-  );
-
-  return { screens, apps, windows };
+  return { screens, windows };
 }

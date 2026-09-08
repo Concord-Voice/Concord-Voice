@@ -8,11 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **You can now pick what to share from three tabs instead of one long list** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — the share
-  window listed every screen and every open window in two flat piles, which on a busy machine
-  meant scrolling past a dozen browser windows to find the one you wanted. It now has Screens,
-  Applications and Windows tabs, and the Applications tab groups an app's windows together under
-  its name and icon, so finding the right Chrome window takes one glance rather than a hunt.
+- **You can now pick what to share from two tabs instead of one long list** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145), [#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the
+  share window listed every screen and every open window in two flat piles, which on a busy
+  machine meant scrolling past a dozen browser windows to find the one you wanted. There are now
+  Screens and Windows tabs, each a grid of thumbnails, so finding the right Chrome window takes
+  one glance rather than a hunt. There was briefly a third tab, Applications, which tried to
+  gather each app's windows under its name — it never reached a release, because an application
+  is simply its windows, and offering the same windows twice in two different layouts asked you
+  to choose between two views of one thing. Guessing which app a window belonged to also went
+  wrong in a way worth knowing about: a Terminal window is titled with its size, so every
+  terminal that happened to be the same size was filed together under a heading reading
+  "183x62", regardless of which project it was in.
 - **Screen sharing has a sound switch** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — sharing a screen now carries your computer's
   sound by default, and a Stream Audio control lets you turn that off if you would rather show
   video only. Worth knowing what "your computer's sound" means: it is everything playing, not
@@ -27,10 +33,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   everyone watching and made them click back in. A Switch button now swaps the source in place.
   Anyone watching stays watching, and if you change your mind at the picker your original share
   keeps running.
+- **You can mute one person with a single click** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — turning down someone whose
+  microphone was picking up a television meant right-clicking their tile, opening a menu, finding
+  a volume slider and dragging it to zero. Their tile now has a mute button on it. It stays
+  visible while they are muted, so you can see at a glance who you have silenced rather than
+  hovering over each person in turn, and unmuting returns them to the volume you had them at
+  before rather than jumping to full. It is deliberately a different symbol from the crossed-out
+  microphone already on the tile: that one means they muted themselves, and this one means you
+  muted them, and only you hear the difference.
 - **Message expiry groundwork now covers shared chats** ([#3144](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3144), [#2195](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2195)) — the server now stores shared expiry policy and expiry metadata for channels, direct messages, and group DMs, and can apply or clear that policy on existing messages in resumable batches. Settings UI and automatic deletion arrive in later work, so this groundwork does not enable retention by itself.
 
 ### Changed
 
+- **The buttons during a call are grouped by what they do** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the row along the
+  bottom of a call had grown to eleven buttons of equal weight in a single line, with nothing to
+  say which ones affected you, which affected what you were sharing, and which would end the
+  call. They are now in four groups: your own microphone, headphones and camera; everything to do
+  with the screen you are sharing; the things that change your own view; and Leave, on its own.
+  Three specific irritations go with it. Every button turned red when you switched it on, so a
+  muted microphone looked exactly as alarming as the button that hangs up — now only Leave is
+  filled red. Switch and Stop, which both act on the share you already have running, sat at
+  opposite ends of the row with the Chat button between them; they are now two halves of one
+  control. And the switch for sending your computer's sound was labelled "Audio Off", which reads
+  as an instruction to turn audio off rather than a description of what is happening — it now
+  says "Share sound", and "Sound shared" once it is on.
+- **Picture-in-Picture and the stay-active setting moved into a "More" menu** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) —
+  both are things you set once and forget, and neither earned a permanent place in a row you look
+  at during every call.
 - **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. Timer settings UI remains future work; this does not promise instant deletion or secure erasure for clients that were offline.
 - **Busy servers now spread voice calls across CPU cores more evenly** ([#3157](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3157), [#3149](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3149)) — a voice room lives on
   one CPU core for its whole life, and the server used to hand those cores out in strict
@@ -54,6 +83,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   moderator trying to remove them found nobody there. Concord now keeps refreshing each participant
   even when a media server's clock is running ahead of its own, while still letting go of people who
   really have left.
+- **The controls on a video can be reached with a keyboard** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the buttons that
+  switch a stream between the large view and the grid, step between streams, and pop a stream out
+  appeared only when the mouse was over the video. Tabbing to them with a keyboard moved focus
+  onto a button that stayed invisible, so anyone navigating without a mouse had no way to see
+  where they were. They now appear on keyboard focus as well as on hover.
+- **The share window no longer loses your place when you tab through it** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) —
+  pressing Tab past the last control in the "Share your screen" window moved focus out of the
+  window and onto the call controls behind it, while the window stayed open in front. Focus now
+  stays inside until you choose a screen or close the window, and screen readers are told it is a
+  dialog rather than an unnamed piece of the page.
+- **Buttons and badges during a call follow the theme you picked** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — several
+  colours in the call controls were written as fixed values rather than taken from your theme, so
+  they were tuned for one of the thirty-two light and dark schemes and merely tolerable in the
+  rest. The badge shown when a server has muted or deafened someone was worse than that: the
+  colour it asked for did not exist in any theme, so it quietly fell back to ordinary text and a
+  server-enforced mute looked no different from a normal one.
 - **Sharing a screen on a Mac now actually carries sound** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — on macOS 14.2 and later,
   Apple requires an app to declare that it captures system audio before it is allowed to. Concord
   Voice never made that declaration, and macOS did not refuse the request or report an error — it

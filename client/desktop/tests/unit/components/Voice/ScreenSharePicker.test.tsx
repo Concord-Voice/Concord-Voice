@@ -39,7 +39,7 @@ const mockSources = [
 import ScreenSharePicker from '@/renderer/components/Voice/ScreenSharePicker';
 
 /** Sources are behind tabs now; open one by its tab button. */
-const openTab = (name: 'Screens' | 'Applications' | 'Windows') =>
+const openTab = (name: 'Screens' | 'Windows') =>
   fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${name}`) }));
 
 describe('ScreenSharePicker', () => {
@@ -137,15 +137,25 @@ describe('ScreenSharePicker', () => {
     );
   });
 
-  it('groups windows sharing an app icon under the Applications tab', async () => {
+  // Replaces a test that asserted VS Code and Chrome became two application
+  // HEADINGS in an Applications tab. That tab is gone -- it showed the same
+  // windows the Windows tab showed, in a different layout, under names guessed
+  // from window titles. This is the durable form of the same fixture.
+  it('offers exactly two tabs, with every window in one flat grid', async () => {
     render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
     await waitFor(() => {
-      expect(screen.getByRole('tab', { name: /^Applications/ })).toBeInTheDocument();
+      expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
     });
-    openTab('Applications');
-    // mockSources: VS Code has appIcon 'icon1'; Chrome has none. Two distinct groups.
-    expect(screen.getByRole('heading', { name: /VS Code/ })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: /Chrome/ })).toBeInTheDocument();
+
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    expect(screen.queryByRole('tab', { name: /^Applications/ })).not.toBeInTheDocument();
+
+    openTab('Windows');
+    // Both mock windows -- VS Code, which reports an appIcon, and Chrome, which
+    // does not -- sit in the same grid. The icon no longer decides a layout.
+    expect(screen.getByText('VS Code')).toBeInTheDocument();
+    expect(screen.getByText('Chrome')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /VS Code/ })).not.toBeInTheDocument();
   });
 
   it('moves between tabs with the arrow keys (WAI-ARIA tabs pattern)', async () => {
@@ -154,11 +164,14 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
     });
     fireEvent.keyDown(screen.getByRole('tab', { name: /^Screens/ }), { key: 'ArrowRight' });
-    expect(screen.getByRole('tab', { name: /^Applications/ })).toHaveAttribute(
-      'aria-selected',
-      'true'
-    );
-    fireEvent.keyDown(screen.getByRole('tab', { name: /^Applications/ }), { key: 'End' });
+    expect(screen.getByRole('tab', { name: /^Windows/ })).toHaveAttribute('aria-selected', 'true');
+
+    // Wrap-around, which the three-tab version never reached: ArrowRight from the
+    // middle tab just advanced. With two tabs it is the only way back to the first.
+    fireEvent.keyDown(screen.getByRole('tab', { name: /^Windows/ }), { key: 'ArrowRight' });
+    expect(screen.getByRole('tab', { name: /^Screens/ })).toHaveAttribute('aria-selected', 'true');
+
+    fireEvent.keyDown(screen.getByRole('tab', { name: /^Screens/ }), { key: 'End' });
     expect(screen.getByRole('tab', { name: /^Windows/ })).toHaveAttribute('aria-selected', 'true');
   });
 
@@ -734,6 +747,50 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByRole('option', { name: /Source Native/ }).textContent).not.toContain(
         'Premium'
       );
+    });
+  });
+
+  // -- B3: dialog semantics and focus trap ------------------------------------
+
+  describe('dialog semantics (B3)', () => {
+    it('exposes the picker as an aria-modal dialog with an accessible name', async () => {
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => {
+        expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
+      });
+
+      const dialog = screen.getByRole('dialog');
+      expect(dialog).toHaveAttribute('aria-modal', 'true');
+      // Named, or a screen reader announces "dialog" and nothing else.
+      expect(dialog).toHaveAccessibleName();
+    });
+
+    it('pulls Tab back inside instead of letting it reach the voice bar behind', async () => {
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => {
+        expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
+      });
+      const dialog = screen.getByRole('dialog');
+
+      // Focus sitting outside the dialog is precisely the state a trap exists for,
+      // and it is reachable for real: the picker never moved focus in on open.
+      (document.activeElement as HTMLElement | null)?.blur();
+      expect(dialog.contains(document.activeElement)).toBe(false);
+
+      fireEvent.keyDown(document, { key: 'Tab' });
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    });
+
+    it('still closes on Escape', () => {
+      // A guard, not a formality. A native <dialog> only closes itself on Escape
+      // when opened with showModal(); this one uses the declarative `open`
+      // attribute, exactly as Modal.tsx does, and a declaratively-open dialog is
+      // NON-modal -- the browser runs no cancel action for it. So the listener
+      // stays, and this test fails if someone deletes it believing <dialog>
+      // handles Escape natively.
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(mockOnCancel).toHaveBeenCalled();
     });
   });
 });

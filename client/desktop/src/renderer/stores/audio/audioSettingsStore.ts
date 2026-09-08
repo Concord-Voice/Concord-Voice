@@ -45,6 +45,14 @@ export interface AudioSettings {
    */
   perParticipantVolume: Record<string, number>;
   /**
+   * Volume a participant was at before being muted to 0, so unmuting restores it
+   * rather than jumping to 100. Persisted BECAUSE `perParticipantVolume` is: the
+   * mute survives a restart, so a restore hint that did not would silently turn
+   * "unmute" into "reset to full" on the next launch. Written only by
+   * `setParticipantVolume` when it lands on 0, and cleared with its pair.
+   */
+  previousParticipantVolume: Record<string, number>;
+  /**
    * Per-screenshare audio volume overrides, keyed by the SHARER's userId (percent,
    * 0–200). Independent of `perParticipantVolume` (which governs that user's voice/mic
    * audio) so a viewer can tune a screenshare's audio without touching the sharer's
@@ -110,6 +118,7 @@ const defaults: AudioSettings = {
   inputVolume: 100,
   outputVolume: 100,
   perParticipantVolume: {},
+  previousParticipantVolume: {},
   perScreenShareVolume: {},
   quietBoost: false,
   quietBoostThreshold: -35,
@@ -144,24 +153,39 @@ export const useAudioSettingsStore = wrapStore(
         setOutputVolume: (outputVolume) =>
           set({ outputVolume: Math.max(0, Math.min(200, outputVolume)) }),
         setParticipantVolume: (userId, volume) =>
-          set((state) => ({
-            perParticipantVolume: {
-              ...state.perParticipantVolume,
-              [userId]: Math.max(0, Math.min(200, volume)),
-            },
-          })),
+          set((state) => {
+            const next = Math.max(0, Math.min(200, volume));
+            const current = state.perParticipantVolume[userId];
+            // Muting: remember what they were at first. Guarded on > 0 so muting
+            // an already-muted participant cannot overwrite the real value with 0.
+            const previous =
+              next === 0 && typeof current === 'number' && current > 0
+                ? { ...state.previousParticipantVolume, [userId]: current }
+                : state.previousParticipantVolume;
+            return {
+              perParticipantVolume: { ...state.perParticipantVolume, [userId]: next },
+              previousParticipantVolume: previous,
+            };
+          }),
         clearParticipantVolume: (userId) =>
           set((state) => {
-            if (!(userId in state.perParticipantVolume)) return state;
+            const hasVolume = userId in state.perParticipantVolume;
+            const hasPrevious = userId in state.previousParticipantVolume;
+            if (!hasVolume && !hasPrevious) return state;
             const next = { ...state.perParticipantVolume };
             delete next[userId];
-            return { perParticipantVolume: next };
+            // The restore hint is meaningless without its volume, and leaving it
+            // would resurrect a stale value if an override is set again later.
+            const previous = { ...state.previousParticipantVolume };
+            delete previous[userId];
+            return { perParticipantVolume: next, previousParticipantVolume: previous };
           }),
         // Per-participant overrides are keyed by other users' IDs — user-scoped
         // data inside an otherwise device-scoped store. Cleared on logout-class
         // resets (#1603) so a prior account's contact IDs never persist for the
         // next account on this device (#1233 cross-account discipline).
-        clearAllParticipantVolumes: () => set({ perParticipantVolume: {} }),
+        clearAllParticipantVolumes: () =>
+          set({ perParticipantVolume: {}, previousParticipantVolume: {} }),
         setScreenShareVolume: (userId, volume) =>
           set((state) => ({
             perScreenShareVolume: {

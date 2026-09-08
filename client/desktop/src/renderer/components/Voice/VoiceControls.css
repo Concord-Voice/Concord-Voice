@@ -5,7 +5,39 @@
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
+  /* row-gap stays at the old 4px so a wrapped bar keeps its vertical density;
+     only the column-gap widens, and it is what separates one cluster from the
+     next. Asymmetric deliberately — a single `gap: 12px` would also push the
+     wrapped rows apart, which nothing here asked for. */
+  gap: calc(4px * var(--sp, 1)) calc(12px * var(--sp, 1));
+}
+
+/* Four clusters: Self, Share, Utility, Danger. Intra-cluster gap is the bar's
+   ORIGINAL 4px, so nothing inside a cluster moves — the grouping comes entirely
+   from the parent's wider column-gap above (Proximity).
+
+   No divider rule, on purpose. The bar is flex-wrap, so a
+   `.cluster + .cluster::before` line lands at the START of a wrapped row
+   whenever the break falls on a cluster boundary, where it separates nothing
+   and reads as a stray mark. Spacing alone carries the grouping and cannot
+   break that way. */
+.voice-controls__cluster {
+  display: flex;
+  align-items: center;
   gap: calc(4px * var(--sp, 1));
+}
+
+/* Utility is entirely conditional. StreamControls LOOKS unconditional in the
+   JSX, which is why this rule reads as dead code, but it opens with
+   `if (context !== 'voiceView') return null` — so in a `persistent` context
+   with no linked text channel, no Electron PiP and no onPopOut this cluster
+   renders zero children. An
+   empty flex item still consumes a column-gap on BOTH sides, so without this
+   it opens a 24px hole between Share and Leave that looks like a missing
+   control. React renders falsy branches as nothing, so :empty genuinely
+   matches here. */
+.voice-controls__cluster:empty {
+  display: none;
 }
 
 .voice-controls__btn {
@@ -28,34 +60,60 @@
   color: var(--text-primary);
 }
 
+/* Neutral ON-state. This was var(--danger), which is the mechanical reason every
+   toggle in this bar rendered red: Stop, Always On and Leave were all filled red
+   at once, so nothing was emphasised and the destructive action carried the same
+   weight as two preferences. */
 .voice-controls__btn--active {
-  background-color: var(--danger);
+  background-color: var(--accent-primary);
   color: #fff;
 }
 
 .voice-controls__btn--active:hover {
-  background-color: #d83c3c;
+  background-color: var(--accent-hover);
   color: #fff;
 }
 
+/* Server-enforced lock. Both tokens this used were UNDEFINED: --warning-rgb is set
+   nowhere, so every theme silently took the literal 230,126,34 fallback, and
+   --warning has no fallback at all — an invalid declaration, so the text colour
+   fell through to whatever it inherited rather than to anything chosen.
+   --text-warning-strong is the token that actually exists (34 blocks) and is
+   already used by the tooltip below. */
 .voice-controls__btn--locked {
   opacity: 0.7;
   cursor: not-allowed;
-  background-color: rgba(var(--warning-rgb, 230, 126, 34), 0.2);
-  color: var(--warning);
+  background-color: color-mix(in srgb, var(--text-warning-strong) 20%, transparent);
+  color: var(--text-warning-strong);
 }
 
 .voice-controls__btn--locked:hover {
   opacity: 0.7;
-  background-color: rgba(var(--warning-rgb, 230, 126, 34), 0.25);
+  background-color: color-mix(in srgb, var(--text-warning-strong) 25%, transparent);
 }
 
+/* FILLED destructive — Leave, and only Leave. The one control that ends the call.
+   Leave previously carried the TINTED treatment below while Stop was filled, which
+   had the emphasis exactly backwards. */
 .voice-controls__btn--danger {
-  background-color: rgba(240, 71, 71, 0.2);
-  color: var(--danger);
+  background-color: var(--danger);
+  color: #fff;
 }
 
 .voice-controls__btn--danger:hover {
+  background-color: var(--danger-hover);
+  color: #fff;
+}
+
+/* TINTED destructive — Stop. Destructive in kind but not in degree: it ends the
+   share, not the session. Replaces the literal rgba(240, 71, 71, 0.2), which was
+   one hardcoded red in an app carrying 34 theme blocks. */
+.voice-controls__btn--danger-soft {
+  background-color: color-mix(in srgb, var(--danger) 20%, transparent);
+  color: var(--danger);
+}
+
+.voice-controls__btn--danger-soft:hover {
   background-color: var(--danger);
   color: #fff;
 }
@@ -83,8 +141,8 @@
   margin-bottom: 8px;
   padding: 8px 16px;
   border-radius: 6px;
-  background-color: rgba(250, 166, 26, 0.15);
-  border: 1px solid rgba(250, 166, 26, 0.3);
+  background-color: color-mix(in srgb, var(--text-warning-strong) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-warning-strong) 30%, transparent);
   color: var(--text-warning-strong);
   font-size: calc(12px * var(--font-scale, 1));
   white-space: nowrap;
@@ -163,11 +221,11 @@
 
 /* ─── PiP Menu ─────────────────────────────────────────────────── */
 
-.voice-controls__pip-wrap {
+.voice-controls__utility-wrap {
   position: relative;
 }
 
-.voice-controls__pip-menu {
+.voice-controls__utility-menu {
   position: absolute;
   bottom: 100%;
   left: 50%;
@@ -182,7 +240,7 @@
   z-index: 99999;
 }
 
-.voice-controls__pip-menu-item {
+.voice-controls__utility-menu-item {
   display: block;
   width: 100%;
   padding: 8px 12px;
@@ -198,17 +256,17 @@
     color 150ms ease;
 }
 
-.voice-controls__pip-menu-item:hover {
+.voice-controls__utility-menu-item:hover {
   background-color: var(--bg-hover);
   color: var(--text-primary);
 }
 
-.voice-controls__pip-menu-item:disabled {
+.voice-controls__utility-menu-item:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
 
-.voice-controls__pip-menu-item:disabled:hover {
+.voice-controls__utility-menu-item:disabled:hover {
   background: transparent;
   color: var(--text-secondary);
 }
