@@ -6027,6 +6027,15 @@ func (s *NATSSubscriber) handleServerHeartbeat(
 		s.log.Error("Rejected voice.heartbeat with invalid room")
 		return
 	}
+	// Immediately after the channel id is validated, and before every fallible
+	// step. Each later stage can return early -- a nil activity bridge, the
+	// pre-mutation read, the stale-reconciliation loop
+	// exhausting the shared 10 s budget -- and on each of those paths a live
+	// participant whose upsert is being refused would receive no renewal at all
+	// and could be reaped 90 s later. Renewal depends on nothing those stages
+	// produce: the media set is the authority for "still present", and this only
+	// UPDATEs rows that already exist.
+	s.renewObservedLeaseForFutureStampedRows(ctx, channelID, mediaParticipantIDs)
 	s.recheckServerHeartbeatPermissions(room, channelID, mediaParticipantIDs)
 	if s.activity == nil {
 		s.reEnforceServerHeartbeatParticipants(ctx, room, channelID, mediaParticipantIDs)
@@ -6212,6 +6221,141 @@ func (s *NATSSubscriber) reEnforceServerHeartbeatParticipants(
 	forEachServerHeartbeatParticipant(ctx, participantIDs, func(participantID uuid.UUID) {
 		s.reEnforceServer(ctx, room.serverID, channelID.String(), participantID.String())
 	})
+}
+
+// maxVoiceLifecycleForwardSkew is how far ahead of the database clock a producer
+// stamp may sit and still be treated as a clock fault worth leasing against.
+// Two lease windows is generous for NTP jitter while staying far short of the
+// ~year-2255 ceiling presence.IsValidActivitySourceTime actually enforces.
+const maxVoiceLifecycleForwardSkew = 2 * presence.ActivityStateTTL
+
+// renewObservedLeaseForFutureStampedRows re-stamps the database-observed lease
+// for participants this heartbeat reports present whose stored lifecycle clock
+// sits AHEAD of the database clock.
+//
+// The predicate is narrow deliberately, and the boundary is not arbitrary: it is
+// the line between what the Redis lifecycle watermark can adjudicate and what it
+// cannot. A FUTURE-stamped row is the one case the watermark ACCEPTS -- such a
+// stamp is the newest it has seen, by definition -- while
+// moveServerVoiceParticipant's `lifecycle_event_at <= EXCLUDED.lifecycle_event_at`
+// still refuses the upsert, so migration 000133's trigger never fires and the
+// lease expires under a participant still in the SFU. That gap belongs here.
+//
+// Every OTHER refused upsert is a heartbeat the watermark REJECTS as stale, and
+// renewing those would be an end-run around the staleness fence rather than a
+// fix. Widening this to `lifecycle_event_at > eventAt` -- "renew whenever the
+// upsert was refused" -- looks more general and is strictly wrong: after a newer
+// heartbeat advances the row to t2, a publisher replaying an older payload at t1
+// satisfies t2 > t1 on every delivery, so a stale row whose terminal event was
+// lost is renewed indefinitely and defeats the room-empty reconciliation #2907
+// exists to provide. TestRenewObservedLease_DelayedReplayDoesNotExtendTheLease
+// pins that. A behind-clock replacement publisher is real but is watermark
+// territory: its heartbeats are rejected as stale upstream of this statement, so
+// no renewal predicate can distinguish it from the replay above.
+//
+// It runs in handleServerHeartbeat immediately after the channel id is
+// validated -- that parse is the only step ahead of it, and an unparseable
+// channel has no rows to renew -- and before every later fallible stage and the
+// bounded per-participant loop.
+// prioritizeServerHeartbeatParticipants orders existing rows
+// oldest-lifecycle-first, so a future-stamped row sorts LAST, and
+// forEachServerHeartbeatParticipantSequential returns early on ctx.Err() -- a
+// renewal inside that loop would be skipped on every partial pass, for exactly
+// the rows it exists to serve.
+//
+// The UPDATE deliberately does not name lifecycle_event_at, so the 000132/000133
+// trigger does not fire and the observation lands verbatim. Adding that column to
+// the SET list does not fail loudly: the trigger fires, 000133's ELSE branch
+// writes OLD.lifecycle_observed_at straight back, and the statement still returns
+// a nil error and RowsAffected == 1. Nothing at runtime can tell that apart from
+// a successful renewal, so the guard here is the test, not an assertion.
+//
+// A failure is logged rather than returned: returning would abort the heartbeat
+// for the whole room, while losing one renewal returns every affected
+// participant IN THIS ROOM -- not one row -- to the pre-fix behaviour, in which
+// the reconciler may reap a peer still holding SFU transports and no
+// voice.enforce.disconnect is published, so RBAC sweeps cannot reach them. That
+// state is bounded rather than permanent only because the reap is followed by a
+// re-insert whose lifecycle_event_at comes from the CURRENT heartbeat, which
+// destroys the stale stamp; the cost is one flap per skew episode.
+// THREE RESIDUALS, accepted deliberately. Each is bounded by
+// maxVoiceLifecycleForwardSkew and self-expiring: once wall clock passes the
+// stamp, the ordinary upsert and the 000132/000133 trigger resume and none of
+// these can recur for that row. All three are the SAME harm class as the defect
+// this function fixes, and all three are far rarer than it -- before this
+// function existed, a forward-stamped row lost its lease on EVERY heartbeat.
+//
+//  1. Lost race with the reconciler. This UPDATE takes no lifecycle lock. If
+//     reconcileStaleServerVoiceParticipant's DELETE commits first, this affects
+//     zero rows and the participant stays deleted until producer time catches
+//     up. The reverse ordering is safe by construction -- that DELETE re-asserts
+//     the lease predicate in its own WHERE, so a renewal that commits first
+//     makes it match zero rows. Taking tryLockServerVoiceLifecycleTx here would
+//     close the losing order and serialise every heartbeat against the
+//     reconciler for a set of up to maxServerVoiceParticipantIDs; that is a
+//     concurrency change, not a bug fix, and is deliberately out of scope.
+//  2. A replay can hold a STILL-FUTURE row open. The predicate reads the stored
+//     stamp, not the incoming heartbeat's accepted status, so a replayed payload
+//     naming a row whose stamp is still ahead renews it. Retention is bounded at
+//     roughly the ceiling plus one lease window rather than one lease window.
+//     Gating on the Redis claim's verdict instead would mean renewing after the
+//     watermark, which reintroduces the early-return gap this placement exists to
+//     close.
+//  3. resolveRoom precedes this call. It runs first inside handleServerHeartbeat,
+//     but handleHeartbeat resolves the room before dispatching, so a transient
+//     lookup failure skips renewal for that heartbeat. Three consecutive misses
+//     are needed to reach lease expiry.
+func (s *NATSSubscriber) renewObservedLeaseForFutureStampedRows(
+	ctx context.Context,
+	channelID uuid.UUID,
+	participantIDs []uuid.UUID,
+) {
+	if len(participantIDs) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(participantIDs))
+	for _, participantID := range participantIDs {
+		ids = append(ids, participantID.String())
+	}
+	// The upper bound is load-bearing, not defence in depth. Every other path
+	// that can evict or move a row is fenced by `lifecycle_event_at <= $3`
+	// (voice.left, heartbeat stale-removal, moveServerVoiceParticipant's blocked
+	// CTE), and presence.IsValidActivitySourceTime bounds a producer stamp only
+	// at ~year 2255, so a row stamped far ahead already refuses every honest
+	// event. The observed lease is the ONLY eviction path left that acts on wall
+	// clock rather than event order -- renewing it without a ceiling would make
+	// such a row immortal instead of 90 s old. It is measured against the
+	// DATABASE clock, not eventAt, because it bounds how far ahead of OUR clock a
+	// stamp may sit and still be credible.
+	skewSeconds := int64(maxVoiceLifecycleForwardSkew / time.Second)
+	// The result is deliberately discarded, unlike every other row-affecting Exec
+	// in this file. Those capture it to DRIVE something -- a conditional broadcast,
+	// a retry -- and this one has no such branch: zero renewed rows is the ordinary
+	// case and is not a failure. The remaining use would be observability, and this
+	// package forbids it: richPresenceLifecycleLogFindings admits only
+	// failure_class / action / is_dm / context / count, and `count` only as an int
+	// literal or a len() call, never a value read back from the database. A renewed
+	// count is therefore unloggable here by construction, not by oversight.
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE voice_participants
+		SET lifecycle_observed_at = clock_timestamp()
+		WHERE channel_id = $1
+		  AND user_id = ANY($2::uuid[])
+		  AND lifecycle_event_at > clock_timestamp()
+		  AND lifecycle_event_at <=
+		      clock_timestamp() + ($3::bigint * INTERVAL '1 second')
+	`, channelID, pq.Array(ids), skewSeconds); err != nil {
+		// A cancelled or expired context is convergent -- the next heartbeat is
+		// 30 s away against a 90 s lease, so two consecutive misses are free and
+		// nobody should be woken. Any other fault does not self-repair.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.log.Warn("Server voice observed-lease renewal failed",
+				"failure_class", "deadline")
+			return
+		}
+		s.log.Error("Server voice observed-lease renewal failed",
+			"failure_class", "state_write")
+	}
 }
 
 func (s *NATSSubscriber) refreshServerHeartbeatParticipant(

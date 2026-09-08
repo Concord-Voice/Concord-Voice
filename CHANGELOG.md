@@ -46,6 +46,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Voice no longer drops people who are still connected** ([#3187](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3187)) — when one of Concord's
+  media servers reported a time slightly ahead of the real clock, usually a clock that had drifted,
+  the server stopped refreshing that person's place in the room. Ninety seconds later it decided they
+  had left and removed them, while their call was still running. They stayed audible to everyone but
+  disappeared from the participant list, and moderator controls could no longer reach them — a
+  moderator trying to remove them found nobody there. Concord now keeps refreshing each participant
+  even when a media server's clock is running ahead of its own, while still letting go of people who
+  really have left.
 - **Sharing a screen on a Mac now actually carries sound** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — on macOS 14.2 and later,
   Apple requires an app to declare that it captures system audio before it is allowed to. Concord
   Voice never made that declaration, and macOS did not refuse the request or report an error — it

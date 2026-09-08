@@ -313,3 +313,17 @@ func (s *NATSSubscriber) PublishForceDisconnect(channelID, userID string) {
 // StaleServerVoiceDiscoverySQLForTest exposes the lease-discovery statement so
 // the plan-shape guard runs against the exact SQL production issues.
 func StaleServerVoiceDiscoverySQLForTest() string { return staleServerVoiceDiscoverySQL }
+
+// MaxVoiceLifecycleForwardSkewForTest exposes the renewal's forward-skew ceiling
+// so a regression test binds to the constant rather than to a copied literal.
+const MaxVoiceLifecycleForwardSkewForTest = maxVoiceLifecycleForwardSkew
+
+// RenewObservedLeaseForFutureStampedRowsForTest drives the set-based renewal
+// directly, so its predicate and degrade-on-failure branch are both reachable.
+func (s *NATSSubscriber) RenewObservedLeaseForFutureStampedRowsForTest(
+	ctx context.Context,
+	channelID uuid.UUID,
+	participantIDs []uuid.UUID,
+) {
+	s.renewObservedLeaseForFutureStampedRows(ctx, channelID, participantIDs)
+}

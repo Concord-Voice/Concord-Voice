@@ -1,11 +1,14 @@
 package voice_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -564,4 +567,392 @@ func TestReconcileStaleServerVoiceParticipants_ProcessesBoundedLeaseBatch(t *tes
 	require.NoError(t, err)
 	assert.Equal(t, 1, removed)
 	assert.False(t, voiceParticipantExists(t, ts.DB, channel, users[2].ID))
+}
+
+// A lifecycle event stamped ahead of wall-clock makes every later heartbeat lose
+// moveServerVoiceParticipant's `lifecycle_event_at <= EXCLUDED.lifecycle_event_at`
+// comparison. The upsert becomes a no-op, so migration 000133's trigger never
+// fires, the observed lease is never renewed, and the reconciler reaps a
+// participant the media plane is still reporting -- without publishing
+// voice.enforce.disconnect, leaving a peer that keeps its transports and is
+// invisible to RBAC enforcement sweeps.
+//
+// A future stamp needs no client involvement: presence.IsValidActivitySourceTime
+// bounds only version <= MaxActivitySourceVersion, so a media-plane host with a
+// forward clock skew supplies one.
+// leaseHeartbeatFrame builds a voice.heartbeat payload in the media plane's wire
+// shape so tests can drive HandleHeartbeat rather than hand-composing the two
+// calls the production path makes. Hand-composition proves the renewal WORKS but
+// never that anything CALLS it: a call site left textually intact and correctly
+// ordered but made unreachable survives the entire package otherwise.
+func leaseHeartbeatFrame(t *testing.T, channelID string, userIDs []string, at time.Time) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"channelId": channelID,
+		"userIds":   userIDs,
+		"timestamp": at.UTC().Format(time.RFC3339Nano),
+	})
+	require.NoError(t, err)
+	return payload
+}
+
+// ageObservedLease simulates one lease window of wall-clock passing. It does not
+// name lifecycle_event_at, so the 000132/000133 trigger does not fire and the
+// aged value lands verbatim.
+func ageObservedLease(t *testing.T, db *sql.DB, channelID, userID string) {
+	t.Helper()
+	_, err := db.Exec(
+		`UPDATE voice_participants
+		 SET lifecycle_observed_at = clock_timestamp() - interval '91 seconds'
+		 WHERE channel_id = $1 AND user_id = $2`, channelID, userID)
+	require.NoError(t, err)
+}
+
+func TestRenewObservedLease_FutureStampedRowSurvivesTheSweep(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriber(ts)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "lease-future-owner")
+	server := ts.CreateTestServer(t, owner.ID, "lease-future-server")
+	channel := ts.CreateVoiceChannel(t, server, "lease-future-channel")
+	member := ts.CreateTestUser(t, "lease-future-member")
+	ts.AddMemberToServer(t, server, member.ID, "member")
+
+	// Within maxVoiceLifecycleForwardSkew: an ordinary NTP fault, which is the
+	// case this renewal exists to serve. A stamp BEYOND the bound is deliberately
+	// left to the reconciler -- see TestRenewObservedLease_SkewBeyondTheBoundIsNotRenewed.
+	ahead := time.Now().Add(30 * time.Second).UTC()
+	sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, ahead))
+	require.True(t, voiceParticipantExists(t, ts.DB, channel, member.ID))
+	sub.CompleteServerVoiceCleanupGraceForTest()
+
+	ageObservedLease(t, ts.DB, channel, member.ID)
+
+	// One honest heartbeat through the REAL production path. Driving
+	// HandleHeartbeat rather than the renewal directly is the point of this test:
+	// it fails if the call site is deleted, reordered, or made unreachable.
+	sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, time.Now().UTC()))
+
+	// Control: the upsert really was refused, so this exercises the renewal path
+	// rather than a lifecycle clock that quietly started moving.
+	var eventAt time.Time
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT lifecycle_event_at FROM voice_participants WHERE channel_id = $1 AND user_id = $2`,
+		channel, member.ID).Scan(&eventAt))
+	require.WithinDuration(t, ahead, eventAt, time.Second,
+		"control: the conditional upsert must still be refusing to move the clock back")
+
+	removed, err := sub.ReconcileStaleServerVoiceParticipants(ctx, 10)
+	require.NoError(t, err)
+	assert.Zero(t, removed, "a participant the media plane is still reporting must not be reaped")
+	assert.True(t, voiceParticipantExists(t, ts.DB, channel, member.ID))
+}
+
+// A DELAYED REPLAY must not renew, and this is the case that rules out the
+// tempting generalisation. "Renew whenever the upsert was refused"
+// (`lifecycle_event_at > eventAt`) reads as strictly more general than the
+// forward-stamp predicate, and it is strictly wrong: once a newer heartbeat has
+// advanced the row to t2, a publisher replaying an older payload at t1 satisfies
+// t2 > t1 on EVERY delivery. A stale row whose terminal event was lost is then
+// renewed indefinitely, defeating the room-empty reconciliation #2907 provides.
+//
+// This case is red under that generalisation and green under the shipped
+// predicate, which is the whole reason it exists. It is not covered by the
+// normally-stamped replay case above: that one puts the stored stamp BEHIND the
+// incoming one, which is the opposite ordering.
+func TestRenewObservedLease_DelayedReplayDoesNotExtendTheLease(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriber(ts)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "lease-delayed-owner")
+	server := ts.CreateTestServer(t, owner.ID, "lease-delayed-server")
+	channel := ts.CreateVoiceChannel(t, server, "lease-delayed-channel")
+	member := ts.CreateTestUser(t, "lease-delayed-member")
+	ts.AddMemberToServer(t, server, member.ID, "member")
+
+	t1 := time.Now().Add(-5 * time.Minute).UTC()
+	t2 := time.Now().Add(-1 * time.Minute).UTC()
+	h1 := leaseHeartbeatFrame(t, channel, []string{member.ID}, t1)
+
+	sub.HandleHeartbeat(h1)
+	require.True(t, voiceParticipantExists(t, ts.DB, channel, member.ID))
+	sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, t2))
+	sub.CompleteServerVoiceCleanupGraceForTest()
+
+	// The participant leaves and the terminal event is lost, so the row is stale.
+	// A publisher keeps replaying the OLD payload across lease windows.
+	for round := 0; round < 4; round++ {
+		ageObservedLease(t, ts.DB, channel, member.ID)
+		sub.HandleHeartbeat(h1) // byte-identical delayed replay
+		removed, err := sub.ReconcileStaleServerVoiceParticipants(ctx, 10)
+		require.NoError(t, err)
+		if removed == 1 {
+			assert.False(t, voiceParticipantExists(t, ts.DB, channel, member.ID))
+			return
+		}
+	}
+	assert.Fail(t,
+		"a delayed replay of an older heartbeat must not hold the lease open indefinitely")
+}
+
+// The renewal has an UPPER bound as well as a lower one, and the upper bound is
+// load-bearing rather than defensive. Every other path that can evict or move a
+// participant row is fenced by `lifecycle_event_at <= $3` -- voice.left, the
+// heartbeat's own stale-removal, and moveServerVoiceParticipant's blocked CTE --
+// and presence.IsValidActivitySourceTime bounds a producer stamp only at roughly
+// year 2255. The observed lease is therefore the ONLY eviction path that acts on
+// wall clock rather than event order. Renewing it without a ceiling made a
+// far-future-stamped row immortal instead of 90 seconds old: the participant
+// could not be evicted by their own voice.left, could not be moved to another
+// channel, and survived every stale sweep for as long as the room heartbeat
+// named them. Found by an adversarial pass on this fix.
+func TestRenewObservedLease_SkewBeyondTheBoundIsNotRenewed(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriber(ts)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "lease-bound-owner")
+	server := ts.CreateTestServer(t, owner.ID, "lease-bound-server")
+	channel := ts.CreateVoiceChannel(t, server, "lease-bound-channel")
+
+	// The ceiling is a policy, and no behavioural case can pin its WIDTH: any
+	// fixture far enough ahead to survive a widened ceiling is also outside the
+	// honest one, so it passes either way. Widening this constant re-opens the
+	// immortality window in proportion to the widening, so bound it directly.
+	// Stated as a bound rather than an equality so 2x -> 3x needs no test churn.
+	require.LessOrEqual(t, voice.MaxVoiceLifecycleForwardSkewForTest, 4*presence.ActivityStateTTL,
+		"the forward-skew ceiling must stay within a few lease windows: a wider one "+
+			"leases against stamps no real clock fault produces, and keeps a poisoned "+
+			"row un-evictable for that whole span")
+
+	// Two stamps, because they fail to different mutations. The DERIVED one pins
+	// the ceiling's LOCATION -- it goes red if the bound clause is deleted. The
+	// ABSOLUTE one pins that a ceiling exists at all -- a derived fixture moves
+	// with the constant, so widening maxVoiceLifecycleForwardSkew would otherwise
+	// carry this test along with it and prove nothing.
+	for _, tc := range []struct {
+		name      string
+		stampedAt time.Time
+	}{
+		{"one minute past the ceiling", time.Now().Add(voice.MaxVoiceLifecycleForwardSkewForTest + time.Minute).UTC()},
+		{"absurdly far ahead", time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			member := ts.CreateTestUser(t, "lease-bound-"+strings.ReplaceAll(tc.name, " ", "-"))
+			ts.AddMemberToServer(t, server, member.ID, "member")
+
+			sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, tc.stampedAt))
+			require.True(t, voiceParticipantExists(t, ts.DB, channel, member.ID),
+				"setup: the poisoned heartbeat must create the row")
+			sub.CompleteServerVoiceCleanupGraceForTest()
+
+			ageObservedLease(t, ts.DB, channel, member.ID)
+			sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, time.Now().UTC()))
+
+			// Control: the row is still future-stamped, so it is genuinely in the
+			// class the renewal targets -- only the ceiling excludes it. Without
+			// this the case would pass just as well against a converged row.
+			var eventAt time.Time
+			require.NoError(t, ts.DB.QueryRow(
+				`SELECT lifecycle_event_at FROM voice_participants WHERE channel_id = $1 AND user_id = $2`,
+				channel, member.ID).Scan(&eventAt))
+			require.True(t, eventAt.After(time.Now()),
+				"control: the row must still carry a future lifecycle stamp")
+
+			removed, err := sub.ReconcileStaleServerVoiceParticipants(ctx, 10)
+			require.NoError(t, err)
+			assert.Equal(t, 1, removed,
+				"a stamp beyond the skew bound must stay evictable by the observed-lease reconciler")
+			assert.False(t, voiceParticipantExists(t, ts.DB, channel, member.ID),
+				"the reconciler must remain the backstop for an unbounded forward stamp")
+		})
+	}
+}
+
+// The converse, and the reason the renewal is predicated on a future lifecycle
+// clock rather than applied unconditionally: a replayed heartbeat naming a
+// participant whose terminal event was lost must NOT extend the lease. Renewing
+// every reported row would keep that stale row alive forever and defeat the
+// room-empty reconciliation #2907 exists to provide -- the exact protection
+// migration 000133 encodes.
+func TestRenewObservedLease_ReplayedHeartbeatDoesNotExtendANormalLease(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriber(ts)
+	ctx := context.Background()
+
+	owner := ts.CreateTestUser(t, "lease-replay-owner")
+	server := ts.CreateTestServer(t, owner.ID, "lease-replay-server")
+	channel := ts.CreateVoiceChannel(t, server, "lease-replay-channel")
+	skewed := ts.CreateTestUser(t, "lease-replay-skewed")
+	normal := ts.CreateTestUser(t, "lease-replay-normal")
+	ts.AddMemberToServer(t, server, skewed.ID, "member")
+	ts.AddMemberToServer(t, server, normal.ID, "member")
+	channelID := uuid.MustParse(channel)
+
+	// Both rows go into ONE renewal call. Asserting only that a normal row does
+	// not move would pass against an empty function body; pairing it with a row
+	// that MUST move makes the predicate's discrimination the thing under test.
+	//
+	// Each fixture splits into two statements on purpose: naming
+	// lifecycle_event_at fires the 000132/000133 trigger, whose ELSE branch
+	// re-stamps lifecycle_observed_at and would undo the ageing if both columns
+	// were set together. The second UPDATE omits it, so the value lands.
+	stampLifecycle := func(userID, interval string) {
+		t.Helper()
+		insertVoiceParticipant(t, ts.DB, channel, userID)
+		var err error
+		switch interval {
+		case "ahead":
+			_, err = ts.DB.Exec(
+				`UPDATE voice_participants
+				 SET lifecycle_event_at = clock_timestamp() + interval '30 seconds'
+				 WHERE channel_id = $1 AND user_id = $2`, channel, userID)
+		default:
+			_, err = ts.DB.Exec(
+				`UPDATE voice_participants
+				 SET lifecycle_event_at = clock_timestamp() - interval '10 minutes'
+				 WHERE channel_id = $1 AND user_id = $2`, channel, userID)
+		}
+		require.NoError(t, err)
+		ageObservedLease(t, ts.DB, channel, userID)
+	}
+	stampLifecycle(skewed.ID, "ahead")
+	stampLifecycle(normal.ID, "behind")
+
+	observedAt := func(userID string) time.Time {
+		var at time.Time
+		require.NoError(t, ts.DB.QueryRow(
+			`SELECT lifecycle_observed_at FROM voice_participants WHERE channel_id = $1 AND user_id = $2`,
+			channel, userID).Scan(&at))
+		return at
+	}
+	skewedBefore, normalBefore := observedAt(skewed.ID), observedAt(normal.ID)
+
+	sub.RenewObservedLeaseForFutureStampedRowsForTest(
+		ctx, channelID,
+		[]uuid.UUID{uuid.MustParse(skewed.ID), uuid.MustParse(normal.ID)},
+	)
+
+	require.True(t, observedAt(skewed.ID).After(skewedBefore),
+		"the future-stamped row in the same call must be renewed")
+	require.Equal(t, normalBefore, observedAt(normal.ID),
+		"a replayed heartbeat must not extend the lease of a normally-stamped row")
+
+	sub.CompleteServerVoiceCleanupGraceForTest()
+	removed, err := sub.ReconcileStaleServerVoiceParticipants(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed, "#2907 reconciliation must still reap the stale row")
+	assert.False(t, voiceParticipantExists(t, ts.DB, channel, normal.ID))
+	assert.True(t, voiceParticipantExists(t, ts.DB, channel, skewed.ID),
+		"and must not reap the row whose lease was just renewed")
+}
+
+// A failed renewal degrades rather than propagating: returning would abort the
+// heartbeat for every other participant in the room, while losing one renewal
+// only returns that row to pre-fix behaviour.
+func TestRenewObservedLease_FailureDegradesInsteadOfAbortingTheHeartbeat(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	// A subscriber whose log this test can read back. ts.CaptureLogs only reaches
+	// loggers SetupTestServer itself built; newTestSubscriber constructs its own,
+	// so the degrade branch would be unobservable through that helper.
+	var sink bytes.Buffer
+	sub := voice.NewNATSSubscriber(
+		ts.DB, logger.NewWithWriter(&sink), websocket.NewHub(nil, nil), nil, nil, nil, nil,
+	)
+
+	owner := ts.CreateTestUser(t, "lease-degrade-owner")
+	server := ts.CreateTestServer(t, owner.ID, "lease-degrade-server")
+	channel := ts.CreateVoiceChannel(t, server, "lease-degrade-channel")
+	member := ts.CreateTestUser(t, "lease-degrade-member")
+	ts.AddMemberToServer(t, server, member.ID, "member")
+	channelID, memberID := uuid.MustParse(channel), uuid.MustParse(member.ID)
+	insertVoiceParticipant(t, ts.DB, channel, member.ID)
+
+	pinned := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	// Split for the same trigger reason as above: the future stamp first, then the
+	// pinned observation in a statement that does not name lifecycle_event_at.
+	// The stamp stays WITHIN maxVoiceLifecycleForwardSkew so the healthy renewal
+	// at the end is genuinely eligible -- otherwise this test would pass for the
+	// wrong reason, the ceiling rather than the cancelled context.
+	_, err := ts.DB.Exec(
+		`UPDATE voice_participants SET lifecycle_event_at = clock_timestamp() + interval '30 seconds'
+		 WHERE channel_id = $1 AND user_id = $2`, channel, member.ID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`UPDATE voice_participants SET lifecycle_observed_at = $1
+		 WHERE channel_id = $2 AND user_id = $3`, pinned, channel, member.ID)
+	require.NoError(t, err)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	sub.RenewObservedLeaseForFutureStampedRowsForTest(cancelled, channelID, []uuid.UUID{memberID})
+
+	// Control: the write really failed. The row IS future-stamped, so without the
+	// cancelled context this renewal would have succeeded -- which is what makes
+	// the assertion discriminating rather than vacuous.
+	var observed time.Time
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT lifecycle_observed_at FROM voice_participants WHERE channel_id = $1 AND user_id = $2`,
+		channel, member.ID).Scan(&observed))
+	require.Equal(t, pinned, observed.UTC(), "control: the renewal must actually have failed")
+
+	// Degrading is only acceptable while it stays REPORTED. Asserting the write
+	// did not land is equally satisfied by deleting the log line outright, which
+	// would turn this from a degrade into a silent swallow.
+	require.Contains(t, sink.String(), "Server voice observed-lease renewal failed",
+		"a failed renewal must remain operator-visible, not merely non-fatal")
+	require.Contains(t, sink.String(), "deadline",
+		"a cancelled context is the convergent class: the next heartbeat repairs it")
+
+	// The contract: a healthy renewal afterwards still works.
+	sub.RenewObservedLeaseForFutureStampedRowsForTest(context.Background(), channelID, []uuid.UUID{memberID})
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT lifecycle_observed_at FROM voice_participants WHERE channel_id = $1 AND user_id = $2`,
+		channel, member.ID).Scan(&observed))
+	assert.True(t, observed.After(pinned), "a healthy renewal after a failed one must still extend the lease")
+}
+
+// Pins the ORDER of the two calls in finishServerHeartbeatReconciliation. The
+// renewal must run before the bounded per-participant loop:
+// prioritizeServerHeartbeatParticipants sorts existing rows
+// oldest-lifecycle-first, so a future-stamped row sorts LAST, and
+// forEachServerHeartbeatParticipantSequential returns early on ctx.Err() -- so a
+// renewal inside that loop would be skipped on every partial pass, for exactly
+// the rows it exists to serve.
+//
+// This is a source pin because ordering only becomes observable under a PARTIAL
+// pass. That is not a guess: an end-to-end HandleHeartbeat test was written and
+// measured against a mutant that moves the call after the loop, and it does not
+// fail. TestRenewObservedLease_FutureStampedRowSurvivesTheSweep covers
+// reachability through production wiring; this covers the order, which it cannot.
+func TestObservedLeaseRenewalRunsBeforeFallibleStaleWork(t *testing.T) {
+	source, err := os.ReadFile("nats.go")
+	require.NoError(t, err)
+	text := string(source)
+
+	// Scope to the enclosing function. A file-wide byte-offset comparison passes
+	// just as happily when the renewal is hoisted into any function declared
+	// earlier in the file but invoked after the loop.
+	const fn = "func (s *NATSSubscriber) handleServerHeartbeat("
+	start := strings.Index(text, fn)
+	require.NotEqual(t, -1, start, "anchor: handleServerHeartbeat must exist in nats.go")
+	length := strings.Index(text[start:], "\n}\n")
+	require.NotEqual(t, -1, length, "anchor: the function body must terminate")
+	body := text[start : start+length]
+
+	renewal := "s.renewObservedLeaseForFutureStampedRows(ctx, channelID, mediaParticipantIDs)"
+	fallible := "removedAny, databaseEmpty, reconcileErr := s.reconcileServerHeartbeatParticipants("
+	// Both anchors are checked for presence FIRST, each with its own message. A
+	// bare Index comparison reports a rename or a reflow as an ordering failure,
+	// which sends the reader looking for a defect that is not there.
+	require.Equal(t, 1, strings.Count(text, renewal),
+		"the observed-lease renewal must be issued at exactly one heartbeat site")
+	require.Equal(t, 1, strings.Count(body, renewal),
+		"anchor: that site must be inside handleServerHeartbeat")
+	require.Equal(t, 1, strings.Count(body, fallible),
+		"anchor: the stale-reconciliation call must appear exactly once in that body")
+	require.Less(t, strings.Index(body, renewal), strings.Index(body, fallible),
+		"the renewal must run before the fallible stale-reconciliation step, which can return early")
 }
