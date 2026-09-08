@@ -8,6 +8,10 @@
 // This file is test code and is NOT bound by the JSF++ profile — that profile
 // governs rt/, where an allocation is audible. Asserting is what this file is for.
 
+// Ask quantum_ring.h for its test seam BEFORE including it. Done here rather than
+// in the build files so no workflow, gyp target or compile command has to know:
+// a production TU simply never writes this macro.
+#define CONCORD_AUDIOCAP_TEST_SEAM 1
 #include "../rt/quantum_ring.h"
 
 // EVERY include below is here for a symbol this file names directly, and <cstdlib>
@@ -388,6 +392,14 @@ void testConcurrentProducerConsumerNeverTears() {
   CHECK(ring.valid());
 
   std::atomic<bool> producerDone{false};
+  // Every push ATTEMPT, both loops. The conservation assertion below used to read
+  // `accepted + dropped == kQuanta`, which was written when kQuanta was the only
+  // source of pushes. The recovery loop added below breaks that the moment it runs
+  // even once -- a dropped extra inflates ring.dropped() and an accepted one
+  // inflates accepted, so the sum exceeds kQuanta and a CORRECT ring fails. The
+  // commit that added the loop claimed otherwise; that claim was wrong. Found
+  // independently by Gitar, CodeRabbit and Codex on PR #3188.
+  std::atomic<u32>  attempted{0u};
   std::atomic<u32>  accepted{0u};
   std::atomic<u32>  consumed{0u};
   std::atomic<u32>  tears{0u};
@@ -410,17 +422,6 @@ void testConcurrentProducerConsumerNeverTears() {
   // right to add and wrong to leave unsynchronised. Found by CodeRabbit on
   // PR #3155.
   std::atomic<bool> observerReady{false};
-  // The pre-production sample below makes observerSamples >= 1 true by
-  // construction -- which is exactly why it cannot be the liveness assertion. If
-  // the observer is descheduled right after publishing readiness, the producer and
-  // consumer can finish all 200,000 operations before it samples again, and
-  // `observerSamples > 0` passes on the strength of a sample taken when the ring
-  // was empty and no index could move. A reversed depth() load order then survives
-  // by schedule. These two count only samples taken while the workload is in
-  // flight, and the producer refuses to finish until one lands. Found by
-  // CodeRabbit on PR #3155.
-  std::atomic<bool> workPublished{false};
-  std::atomic<u32>  workEraSamples{0u};
 
   auto fill = [](u8* dst, u32 seq) {
     dst[0] = static_cast<u8>(seq & 0xFFu);
@@ -442,21 +443,10 @@ void testConcurrentProducerConsumerNeverTears() {
       fill(payload, seq);
       // A full ring is a DROP, never a block. ADR-0043 D4c: back-pressure inside a
       // real-time callback can only ever be expressed as a drop.
+      attempted.fetch_add(1u, std::memory_order_relaxed);
       if (ring.push(payload, kConcBytes) == RingResult::kOk) {
         accepted.fetch_add(1u, std::memory_order_relaxed);
-        // Read-then-store so the release fence is paid once, not 200,000 times.
-        if (!workPublished.load(std::memory_order_relaxed)) {
-          workPublished.store(true, std::memory_order_release);
-        }
       }
-    }
-    // Hold producerDone until the observer has taken at least one sample with work
-    // in flight. Bounded rather than an open spin: an exhausted budget must surface
-    // as the CHECK below failing with a diagnosis, never as a hung CI job.
-    for (u32 spins = 0u;
-         spins < 50000000u && workEraSamples.load(std::memory_order_acquire) == 0u;
-         ++spins) {
-      std::this_thread::yield();
     }
     producerDone.store(true, std::memory_order_release);
   });
@@ -532,9 +522,6 @@ void testConcurrentProducerConsumerNeverTears() {
     observerReady.store(true, std::memory_order_release);
     while (!producerDone.load(std::memory_order_acquire)) {
       observerSamples.fetch_add(1u, std::memory_order_relaxed);
-      if (workPublished.load(std::memory_order_acquire)) {
-        workEraSamples.fetch_add(1u, std::memory_order_relaxed);
-      }
       for (u32 i = 0u; i < 1000u; ++i) {
         // Threshold is 2^31, not kConcSlots. depth() is an OVER-estimate under
         // concurrency -- true depth plus however many pops landed between its two
@@ -555,11 +542,21 @@ void testConcurrentProducerConsumerNeverTears() {
   CHECK(tears.load() == 0u);
   CHECK(outOfOrder.load() == 0u);
   CHECK(depthUnderflow.load() == 0u);
-  // ...and prove the line above actually observed something WHILE THE INDICES WERE
-  // MOVING. observerSamples alone is satisfied by the pre-production sample, which
-  // no load order can get wrong.
+  // ...and prove the observer ran at all. Safe as a MANDATORY condition because the
+  // observer takes one unconditional sample before publishing readiness, so this is
+  // true by construction rather than by scheduling.
+  //
+  // There used to be a second, stricter gate here — a counter of samples taken while
+  // the indices were moving, plus a bounded recovery loop the producer ran to force
+  // one. Both are gone. That gate DEMANDED a scheduling event, so a correct ring
+  // could abort CI simply by descheduling the observer at the wrong moment, and once
+  // testDepthLoadOrderUnderForcedInterleaving started proving the load order
+  // deterministically it bought nothing. Found by Codex on PR #3188.
+  //
+  // `CHECK(depthUnderflow == 0)` above stays, and the distinction is the whole point:
+  // it is ONE-SIDED. It can only fire when an underflow was actually observed, so it
+  // never fails on a correct ring — it is a free opportunistic catch, not a demand.
   CHECK(observerSamples.load() > 0u);
-  CHECK(workEraSamples.load() > 0u);
   // The consumer must have seen real traffic, or this test asserted nothing at all.
   CHECK(consumed.load() > 0u);
   // EQUALITY, not <=. The consumer drains to empty after producerDone, so every
@@ -571,10 +568,64 @@ void testConcurrentProducerConsumerNeverTears() {
   // accepted were equal every time (111789, 101229, 93466, 119954). Found by
   // @pr-review-toolkit:pr-test-analyzer on PR #3155.
   CHECK(consumed.load() == accepted.load());
-  CHECK(accepted.load() + ring.dropped() == kQuanta);
+  CHECK(accepted.load() + ring.dropped() == attempted.load());
+  // ...and the workload was at least the one this test was written around, so the
+  // assertion above cannot be satisfied by a run that pushed almost nothing.
+  CHECK(attempted.load() >= kQuanta);
 }
 
 }  // namespace
+
+// The depth() load order, proven DETERMINISTICALLY and single-threaded.
+//
+// testConcurrentProducerConsumerNeverTears above is a liveness and tearing test.
+// It can only ever make the underflow interleaving PROBABLE, and Codex measured
+// the gap that leaves: an exact reversed-load-order mutant survived 5/100 normal
+// runs and 37/50 single-CPU runs even with the read-index bracket. This test owns
+// the ordering property instead, with no threads and no scheduler dependence.
+//
+// The mechanism: force the read index to advance PAST the already-loaded write
+// index between depth()'s two loads.
+//   correct order  — r is read first (0), the probe moves r to 2 and w to 2,
+//                    then w is read (2): depth = 2 - 0 = 2. No underflow.
+//   reversed order — w is read first (1), the probe moves r to 2, then r is read
+//                    (2): depth = 1 - 2, which underflows to ~2^32.
+static QuantumRing* g_probeRing = nullptr;
+static bool         g_probeFired = false;
+
+static void advanceReadIndexPastWrite(void*) {
+  // One-shot: the pushes and pops below must not re-enter through depth().
+  if (g_probeRing == nullptr || g_probeFired) { return; }
+  g_probeFired = true;
+  u8  scratch[8] = {0u};
+  u32 got = 0u;
+  (void)g_probeRing->pop(scratch, sizeof(scratch), &got);   // r: 0 -> 1
+  (void)g_probeRing->push(scratch, 4u);                     // w: 1 -> 2
+  (void)g_probeRing->pop(scratch, sizeof(scratch), &got);   // r: 1 -> 2
+}
+
+static void testDepthLoadOrderUnderForcedInterleaving() {
+  std::vector<u8> storage(QuantumRing::storageBytes(4u, 8u), 0u);
+  QuantumRing ring(storage.data(), storage.size(), 4u, 8u);
+  CHECK(ring.valid());
+
+  const u8 payload[4] = {1u, 2u, 3u, 4u};
+  CHECK(ring.push(payload, 4u) == RingResult::kOk);         // w = 1, r = 0
+
+  g_probeRing = &ring;
+  g_probeFired = false;
+  QuantumRing::setDepthProbe(advanceReadIndexPastWrite, nullptr);
+  const u32 observed = ring.depth();
+  QuantumRing::setDepthProbe(nullptr, nullptr);
+  g_probeRing = nullptr;
+
+  // Not vacuous: if the probe never ran, the interleaving never happened and this
+  // test proves nothing about either load order.
+  CHECK(g_probeFired);
+  // The whole property. Reversed loads make this ~2^32.
+  CHECK(observed < (1u << 31));
+}
+
 
 int main() {
   testInvalidGeometryFailsClosed();
@@ -589,6 +640,7 @@ int main() {
   testWrapsAroundManyTimes();
   testCountersSurviveU32Rollover();
   testConcurrentProducerConsumerNeverTears();
+  testDepthLoadOrderUnderForcedInterleaving();
 
   std::printf("quantum_ring_test: %d checks passed\n", g_checks);
   return 0;

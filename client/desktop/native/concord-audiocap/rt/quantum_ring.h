@@ -168,6 +168,16 @@ class QuantumRing {
   // be OBSERVABLE — a bound that fails as quietly as no bound buys nothing.
   u32 dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
 
+#ifdef CONCORD_AUDIOCAP_TEST_SEAM
+  using DepthProbe = void (*)(void*);
+  static inline DepthProbe depthProbe_ = nullptr;
+  static inline void* depthProbeArg_ = nullptr;
+  static void setDepthProbe(DepthProbe fn, void* arg) noexcept {
+    depthProbe_ = fn;
+    depthProbeArg_ = arg;
+  }
+#endif
+
   // APPROXIMATE UNDER CONCURRENCY, and deliberately so -- read the bound before
   // using it for anything but diagnostics.
   //
@@ -187,6 +197,21 @@ class QuantumRing {
   // whether a slot is free -- push() and pop() read the indices themselves.
   u32 depth() const noexcept {
     const u32 r = readIdx_.load(std::memory_order_acquire);
+#ifdef CONCORD_AUDIOCAP_TEST_SEAM
+    // TEST-ONLY, and absent from every production translation unit: nothing under
+    // binding.gyp defines this macro, so the released addon compiles the two loads
+    // back to back exactly as before.
+    //
+    // It exists because the load order cannot be tested by RACING for it. Two
+    // threads plus an observer make the required interleaving merely probable, and
+    // Codex measured what that costs: an exact reversed-load-order mutant survived
+    // 5 of 100 normal runs and 37 of 50 single-CPU runs. A mutation kill that
+    // depends on the scheduler is not a kill. This seam lets one test force the
+    // read index to advance BETWEEN the two loads, which is the whole property,
+    // and turns a probabilistic check into a deterministic one. Found by Codex on
+    // PR #3188.
+    if (depthProbe_ != nullptr) { depthProbe_(depthProbeArg_); }
+#endif
     const u32 w = writeIdx_.load(std::memory_order_acquire);
     return w - r;
   }
