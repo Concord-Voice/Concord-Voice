@@ -1227,6 +1227,48 @@ describe('VoiceService Extended', () => {
       });
     });
 
+    // The audio intent `produceScreen` computes and hands to `captureScreen` needs its
+    // OWN assertions. The capture-seam suite drives `captureScreenElectron` directly and
+    // never reaches this calculation, and the fixtures in this block asserted
+    // `expect.any(Boolean)` on the same argument -- which passed whether the opt-out was
+    // honoured, forced on, or forced off. That is the shape of vacuity that let
+    // `streamAudio` ship with no reader at all.
+    const captureAudioIntentFor = async (options?: Record<string, unknown>) => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const mockTrack = {
+        contentHint: '',
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: vi.fn().mockReturnValue({}),
+      };
+      const spy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
+        stream: {
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+          getAudioTracks: () => [],
+        },
+        sourceId: 'screen:0',
+      });
+      await svc.produceScreen('screen:0', options).catch(() => {});
+      const intent = spy.mock.calls[0]?.[3];
+      spy.mockRestore();
+      return intent;
+    };
+
+    it('produceScreen passes wantAudio=false straight through when the caller opts out', async () => {
+      expect(await captureAudioIntentFor({ streamAudio: false })).toBe(false);
+    });
+
+    it('produceScreen passes wantAudio=true when the caller opts in', async () => {
+      expect(await captureAudioIntentFor({ streamAudio: true })).toBe(true);
+    });
+
+    it('produceScreen falls back to the persisted default when no intent is stated', async () => {
+      useVideoSettingsStore.getState().setScreenStreamAudio(false);
+      expect(await captureAudioIntentFor()).toBe(false);
+    });
+
     it('produceScreen clamps capture dims for a free user', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
@@ -1240,14 +1282,17 @@ describe('VoiceService Extended', () => {
         getSettings: vi.fn().mockReturnValue({}),
       };
       const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
-        getVideoTracks: () => [mockTrack],
-        getTracks: () => [mockTrack],
-        getAudioTracks: () => [],
+        stream: {
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+          getAudioTracks: () => [],
+        },
+        sourceId: 'screen:0',
       });
       // Downstream (codec pick / produce) may throw on the minimal mock — the
       // captureScreen call has already been recorded with the clamped dims.
       await svc.produceScreen('screen:1').catch(() => {});
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
       // Restore the spy on the singleton — vi.clearAllMocks() (beforeEach) clears
       // call history but not the mocked implementation, so it would otherwise leak.
       captureSpy.mockRestore();
@@ -1278,13 +1323,16 @@ describe('VoiceService Extended', () => {
         getSettings: vi.fn().mockReturnValue({}),
       };
       const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
-        getVideoTracks: () => [mockTrack],
-        getTracks: () => [mockTrack],
-        getAudioTracks: () => [],
+        stream: {
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+          getAudioTracks: () => [],
+        },
+        sourceId: 'screen:0',
       });
       await svc.produceScreen('screen:1').catch(() => {});
       // 720p is within the stream height ceiling and admits 60fps — no degradation.
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1280, h: 720 }, 60);
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1280, h: 720 }, 60, true);
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });
@@ -1310,13 +1358,16 @@ describe('VoiceService Extended', () => {
         getSettings: vi.fn().mockReturnValue({}),
       };
       const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
-        getVideoTracks: () => [mockTrack],
-        getTracks: () => [mockTrack],
-        getAudioTracks: () => [],
+        stream: {
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+          getAudioTracks: () => [],
+        },
+        sourceId: 'screen:0',
       });
       await svc.produceScreen('screen:1').catch(() => {});
       // 4K fallback clamped to the free 1080p tier → 30fps.
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });
@@ -1344,12 +1395,15 @@ describe('VoiceService Extended', () => {
         getSettings: vi.fn().mockReturnValue({}),
       };
       const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
-        getVideoTracks: () => [mockTrack],
-        getTracks: () => [mockTrack],
-        getAudioTracks: () => [],
+        stream: {
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+          getAudioTracks: () => [],
+        },
+        sourceId: 'screen:0',
       });
       await svc.produceScreen('screen:1').catch(() => {});
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });
@@ -1379,12 +1433,15 @@ describe('VoiceService Extended', () => {
         getSettings: vi.fn().mockReturnValue({}),
       };
       const captureSpy = vi.spyOn(svc, 'captureScreen').mockResolvedValue({
-        getVideoTracks: () => [mockTrack],
-        getTracks: () => [mockTrack],
-        getAudioTracks: () => [],
+        stream: {
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+          getAudioTracks: () => [],
+        },
+        sourceId: 'screen:0',
       });
       await svc.produceScreen('screen:1').catch(() => {});
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30);
+      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });

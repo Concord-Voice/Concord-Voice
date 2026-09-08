@@ -179,6 +179,12 @@ const config: ForgeConfig = {
       NSMicrophoneUsageDescription:
         'Concord Voice needs microphone access for voice calls and audio communication.',
       NSCameraUsageDescription: 'Concord Voice needs camera access for video calls.',
+      // macOS 14.2+ routes desktop audio capture through Apple's CoreAudio Tap API.
+      // WITHOUT this key capture yields a live-but-SILENT track -- no exception, no
+      // warning -- so captureScreenElectron's try/catch video-only fallback never
+      // fires and the client publishes silence to the SFU. See ADR-0043 D7.
+      NSAudioCaptureUsageDescription:
+        'Concord Voice needs system audio access to share your screen with sound.',
     },
   },
   makers: [

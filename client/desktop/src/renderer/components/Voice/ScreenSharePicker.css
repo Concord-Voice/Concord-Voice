@@ -93,7 +93,12 @@
   transition: border-color 0.15s ease;
 }
 
-.screen-picker__source:hover {
+/* :not(--selected) is load-bearing. `.screen-picker__source:hover` is specificity
+   (0,2,0) and `--selected` is (0,1,0), so without this exclusion hover WINS on a
+   selected tile and repaints it with the muted border -- i.e. the tile you just
+   clicked stops looking selected while your pointer is still on it, which is
+   exactly when you are looking at it. */
+.screen-picker__source:hover:not(.screen-picker__source--selected) {
   border-color: var(--text-muted);
 }
 
@@ -207,4 +212,110 @@
 .screen-picker__btn--confirm:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* ── Tabs (R4) ─────────────────────────────────────────────────────────── */
+
+.screen-picker__tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.screen-picker__tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  /* Transparent, not absent: the active state swaps the colour rather than adding a
+     border, so the tab row does not shift by 2px when the selection moves. */
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.screen-picker__tab:hover {
+  color: var(--text-primary);
+}
+
+.screen-picker__tab--active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent-primary);
+}
+
+/* Roving tabindex means only one tab is focusable; make that focus obvious. */
+.screen-picker__tab:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.screen-picker__tab-count {
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+}
+
+.screen-picker__app-group {
+  margin-bottom: 16px;
+}
+
+.screen-picker__app-group .screen-picker__section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* App names are proper nouns; uppercasing "iTerm" or "VS Code" misrepresents them,
+     unlike the generic section headings this class was written for. */
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-secondary);
+}
+
+.screen-picker__empty {
+  padding: 24px 0;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+/* ── Stream Audio toggle (R5) ──────────────────────────────────────────── */
+
+.screen-picker__audio-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.screen-picker__audio-toggle--on {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.screen-picker__audio-toggle:disabled {
+  opacity: 0.5;
+  /* not-allowed rather than default: the title explains WHY it is off, and the cursor
+     is what prompts a user to hover long enough to read it. */
+  cursor: not-allowed;
+}
+
+.screen-picker__audio-toggle:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
 }

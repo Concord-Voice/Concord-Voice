@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Monitor, X } from 'lucide-react';
+import { Monitor, X, Volume2, VolumeX } from 'lucide-react';
 import {
   useVideoSettingsStore,
   type ScreenContentType,
@@ -10,6 +10,9 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { effectiveStreamAxis, clampScreenCapture } from '../../utils/policy/videoLimits';
 import { resolveScreenDims } from '../../utils/ui/screenResolution';
+import { canCarryScreenAudio } from '../../utils/policy/screenAudioCapability';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { groupDesktopSources, type GroupedSources } from '../../utils/ui/groupDesktopSources';
 import './ScreenSharePicker.css';
 
 interface DesktopSource {
@@ -19,23 +22,186 @@ interface DesktopSource {
   appIcon: string | null;
 }
 
+type TabId = 'screens' | 'apps' | 'windows';
+
+const TABS: { id: TabId; label: string }[] = [
+  { id: 'screens', label: 'Screens' },
+  { id: 'apps', label: 'Applications' },
+  { id: 'windows', label: 'Windows' },
+];
+
 /** Discrete fps choices the screen-share picker offers (ascending). */
 const SCREEN_FPS_OPTIONS = [5, 15, 30, 60] as const;
+
+/**
+ * Why the Stream Audio control is in the state it is in. This string is the ONLY
+ * explanation a user gets for why an application share is silent, so it is a named
+ * function rather than a ternary buried in a JSX attribute (#2161, ADR-0043).
+ */
+function audioToggleHint(
+  selected: string | null,
+  audioCapable: boolean,
+  platform: string | null
+): string {
+  if (selected === null) return 'Choose what to share first';
+  // "on this screen" would be a PRIVACY claim we cannot keep. Electron's desktop audio
+  // capture is a whole-system loopback that ignores the chosen source, so on a
+  // multi-monitor machine a user picking the second monitor still broadcasts sound from
+  // apps on the first. Say what is actually sent.
+  if (audioCapable)
+    return 'Share your computer\u2019s sound \u2014 everything playing, not only this screen';
+  if (platform === 'linux') return 'Sharing computer sound is not supported on Linux yet';
+  return 'Application audio is not available yet \u2014 sharing a whole screen carries your whole computer\u2019s sound';
+}
+
+/**
+ * One selectable capture target. Module-level rather than inline so the three tabs
+ * cannot drift apart visually, and so it is not re-created on every picker render.
+ */
+const SourceTile: React.FC<{
+  source: DesktopSource;
+  selected: boolean;
+  onSelect: (id: string) => void;
+}> = ({ source, selected, onSelect }) => (
+  <button
+    type="button"
+    className={`screen-picker__source ${selected ? 'screen-picker__source--selected' : ''}`}
+    aria-pressed={selected}
+    onClick={() => onSelect(source.id)}
+  >
+    <img src={source.thumbnail} alt="" className="screen-picker__thumbnail" />
+    <div className="screen-picker__source-info">
+      {source.appIcon && <img src={source.appIcon} alt="" className="screen-picker__app-icon" />}
+      <span className="screen-picker__source-name">{source.name}</span>
+    </div>
+  </button>
+);
+
+/** Grid of selectable sources, or an explanation of why there are none. */
+const SourceGrid: React.FC<{
+  sources: DesktopSource[];
+  /** Omitted where the caller cannot produce an empty list (an app group always has windows). */
+  emptyText?: string;
+  selected: string | null;
+  onSelect: (id: string) => void;
+}> = ({ sources, emptyText, selected, onSelect }) => {
+  // Early returns rather than a nested ternary: the empty-with-no-message case is a
+  // third outcome, and expressing three outcomes as one expression is what tripped
+  // S3358 here in the first place.
+  if (sources.length === 0) {
+    if (!emptyText) return null;
+    return <p className="screen-picker__empty">{emptyText}</p>;
+  }
+  return (
+    <div className="screen-picker__grid">
+      {sources.map((source) => (
+        <SourceTile
+          key={source.id}
+          source={source}
+          selected={selected === source.id}
+          onSelect={onSelect}
+        />
+      ))}
+    </div>
+  );
+};
+
+/**
+ * The body of the active tab. Module-level so the picker itself stays under the
+ * cognitive-complexity ceiling, and so each tab's empty state is stated once.
+ */
+const SourcePanel: React.FC<{
+  tab: TabId;
+  grouped: GroupedSources;
+  selected: string | null;
+  onSelect: (id: string) => void;
+}> = ({ tab, grouped, selected, onSelect }) => {
+  if (tab === 'screens') {
+    return (
+      <SourceGrid
+        sources={grouped.screens}
+        emptyText="No screens available to share."
+        selected={selected}
+        onSelect={onSelect}
+      />
+    );
+  }
+  if (tab === 'windows') {
+    return (
+      <SourceGrid
+        sources={grouped.windows}
+        emptyText="No open windows to share."
+        selected={selected}
+        onSelect={onSelect}
+      />
+    );
+  }
+  if (grouped.apps.length === 0) {
+    return <p className="screen-picker__empty">No open applications to share.</p>;
+  }
+  return (
+    <>
+      {grouped.apps.map((app) => (
+        <div key={app.groupKey} className="screen-picker__app-group">
+          <h4 className="screen-picker__section-title">
+            {app.appIcon && <img src={app.appIcon} alt="" className="screen-picker__app-icon" />}
+            {app.appName}
+            {app.windows.length > 1 && (
+              <span className="screen-picker__tab-count">{app.windows.length}</span>
+            )}
+          </h4>
+          <SourceGrid sources={app.windows} selected={selected} onSelect={onSelect} />
+        </div>
+      ))}
+    </>
+  );
+};
 
 interface ScreenSharePickerProps {
   onSelect: (sourceId: string, options: ScreenShareOptions) => void;
   onCancel: () => void;
+  /**
+   * The source already being shared, when the picker is reopened to switch. Marks
+   * that tile as selected so a multi-monitor or many-window list shows which one is
+   * live -- without it every tile renders unselected and the two adjacent monitors
+   * you are choosing between look identical.
+   */
+  currentSourceId?: string | null;
 }
 
-const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({ onSelect, onCancel }) => {
+const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
+  onSelect,
+  onCancel,
+  currentSourceId = null,
+}) => {
   const [sources, setSources] = useState<DesktopSource[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(currentSourceId);
+  // Open on the tab that actually contains the pre-selection, or the marking is
+  // invisible. A window's owning app group is not resolved here on purpose: the
+  // Windows tab lists every window flat, so it always contains it.
+  const [tab, setTab] = useState<TabId>(
+    currentSourceId?.startsWith('window:') ? 'windows' : 'screens'
+  );
 
   // Read persisted defaults from the video settings store
   const savedResolution = useVideoSettingsStore((s) => s.screenResolution);
   const savedFrameRate = useVideoSettingsStore((s) => s.screenFrameRate);
   const savedContentType = useVideoSettingsStore((s) => s.screenContentType);
+  const setSavedStreamAudio = useVideoSettingsStore((s) => s.setScreenStreamAudio);
+  const savedStreamAudio = useVideoSettingsStore((s) => s.screenStreamAudio);
+  // Mid-share the picker is a SWITCH dialog, so the honest default is what the share is
+  // doing now — not the persisted preference. Seeding from the preference silently
+  // re-enabled audio a user had turned off with the live toggle.
+  const isSharing = useVoiceStore((s) => s.isScreenSharing);
+  const isScreenAudioOn = useVoiceStore((s) => s.isScreenAudioOn);
+  // ...but only when the live target COULD carry audio. On a window share
+  // `isScreenAudioOn` is false because the platform forces it, not because the user
+  // chose it, and reading that as an opt-out left the toggle off after switching to a
+  // whole screen -- then persisted the false, quietly clearing a default-on preference.
+  const isScreenAudioCapable = useVoiceStore((s) => s.isScreenAudioCapable);
+  const seedStreamAudio = isSharing && isScreenAudioCapable ? isScreenAudioOn : savedStreamAudio;
+  const [streamAudio, setStreamAudio] = useState<boolean>(seedStreamAudio);
 
   // Local transient state — initialized from saved defaults, not persisted on change
   const [resolution, setResolution] = useState<string>(savedResolution);
@@ -52,8 +218,10 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({ onSelect, onCance
       setFrameRate(savedFrameRate);
       // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: syncs contentType from store when settings rehydrate and no local change has been made; not a render loop
       setContentType(savedContentType);
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: syncs streamAudio from store when settings rehydrate and no local change has been made; not a render loop
+      setStreamAudio(seedStreamAudio);
     }
-  }, [dirty, savedResolution, savedFrameRate, savedContentType]);
+  }, [dirty, savedResolution, savedFrameRate, savedContentType, seedStreamAudio]);
 
   useEffect(() => {
     const fetchSources = async () => {
@@ -84,8 +252,20 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({ onSelect, onCance
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
-  const screens = sources.filter((s) => s.id.startsWith('screen:'));
-  const windows = sources.filter((s) => s.id.startsWith('window:'));
+  // null until resolved; canCarryScreenAudio treats null as the permissive dev/web case.
+  const [platform, setPlatform] = useState<string | null>(null);
+  useEffect(() => {
+    (globalThis.electron?.getPlatform?.() ?? Promise.resolve(null))
+      .then((p) => setPlatform(p ?? null))
+      .catch(() => setPlatform(null));
+  }, []);
+
+  const { screens, apps, windows } = useMemo(() => groupDesktopSources(sources), [sources]);
+
+  // Capability is target AND platform (#2161, ADR-0043) — the prefix alone offered an
+  // enabled, default-on control on Linux, where this capture path has no loopback and
+  // silently falls back to video. Shared with the service so the two cannot drift.
+  const audioCapable = canCarryScreenAudio(selected, platform);
 
   // ── #2163: tier the per-share picker to the stream entitlement ──────────
   // The produce boundary clamps screen capture to the entitlement's tiered
@@ -210,9 +390,49 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({ onSelect, onCance
     setDirty(true);
   };
 
+  const tabCounts: Record<TabId, number> = {
+    screens: screens.length,
+    apps: apps.length,
+    windows: windows.length,
+  };
+  const countFor = (id: TabId): number => tabCounts[id];
+
+  // WAI-ARIA tabs: Left/Right move between tabs and wrap; Home/End jump to the ends.
+  const handleTabKeyDown = (e: React.KeyboardEvent, id: TabId) => {
+    const keys: Record<string, number> = {
+      ArrowLeft: -1,
+      ArrowRight: 1,
+    };
+    let nextIndex: number | null = null;
+    if (e.key in keys) {
+      nextIndex = (TABS.findIndex((t) => t.id === id) + keys[e.key] + TABS.length) % TABS.length;
+    } else if (e.key === 'Home') {
+      nextIndex = 0;
+    } else if (e.key === 'End') {
+      nextIndex = TABS.length - 1;
+    }
+    if (nextIndex === null) return;
+    e.preventDefault();
+    const next = TABS[nextIndex].id;
+    setTab(next);
+    document.getElementById(`screen-picker-tab-${next}`)?.focus();
+  };
+
   const handleConfirm = () => {
     if (!selected) return;
-    onSelect(selected, { resolution, frameRate: effectiveFrameRate, contentType });
+    // Gated on the TARGET KIND, not just the toggle: a window/app target cannot carry
+    // scoped audio (#2161, ADR-0043). captureScreenElectron enforces this too, but
+    // sending `true` here would make the picker's own stated intent wrong.
+    // Persist the choice: without a production writer the preference sat at its default
+    // forever and the toggle reset to On every time the dialog opened. Only recorded for
+    // an audio-capable target, so a window share does not rewrite the user's preference.
+    if (audioCapable) setSavedStreamAudio(streamAudio);
+    onSelect(selected, {
+      resolution,
+      frameRate: effectiveFrameRate,
+      contentType,
+      streamAudio: audioCapable && streamAudio,
+    });
   };
 
   return (
@@ -231,63 +451,77 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({ onSelect, onCance
         {loading ? (
           <div className="screen-picker__loading">Loading sources...</div>
         ) : (
-          <div className="screen-picker__content">
-            {screens.length > 0 && (
-              <div className="screen-picker__section">
-                <h4 className="screen-picker__section-title">Screens</h4>
-                <div className="screen-picker__grid">
-                  {screens.map((source) => (
-                    <button
-                      key={source.id}
-                      className={`screen-picker__source ${
-                        selected === source.id ? 'screen-picker__source--selected' : ''
-                      }`}
-                      onClick={() => setSelected(source.id)}
-                    >
-                      <img
-                        src={source.thumbnail}
-                        alt={source.name}
-                        className="screen-picker__thumbnail"
-                      />
-                      <span className="screen-picker__source-name">{source.name}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+          <>
+            <div className="screen-picker__tabs" role="tablist" aria-label="Share source type">
+              {TABS.map(({ id, label }) => (
+                <button
+                  key={id}
+                  id={`screen-picker-tab-${id}`}
+                  role="tab"
+                  type="button"
+                  aria-selected={tab === id}
+                  aria-controls={`screen-picker-panel-${id}`}
+                  // Roving tabindex: only the active tab is in the tab order, and the
+                  // arrow keys move between tabs. This is the WAI-ARIA tabs pattern;
+                  // without it a keyboard user tabs through every tab button.
+                  tabIndex={tab === id ? 0 : -1}
+                  className={`screen-picker__tab ${tab === id ? 'screen-picker__tab--active' : ''}`}
+                  onClick={() => setTab(id)}
+                  onKeyDown={(e) => handleTabKeyDown(e, id)}
+                >
+                  {label}
+                  <span className="screen-picker__tab-count">{countFor(id)}</span>
+                </button>
+              ))}
+            </div>
 
-            {windows.length > 0 && (
-              <div className="screen-picker__section">
-                <h4 className="screen-picker__section-title">Windows</h4>
-                <div className="screen-picker__grid">
-                  {windows.map((source) => (
-                    <button
-                      key={source.id}
-                      className={`screen-picker__source ${
-                        selected === source.id ? 'screen-picker__source--selected' : ''
-                      }`}
-                      onClick={() => setSelected(source.id)}
-                    >
-                      <img
-                        src={source.thumbnail}
-                        alt={source.name}
-                        className="screen-picker__thumbnail"
-                      />
-                      <div className="screen-picker__source-info">
-                        {source.appIcon && (
-                          <img src={source.appIcon} alt="" className="screen-picker__app-icon" />
-                        )}
-                        <span className="screen-picker__source-name">{source.name}</span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
+            <div
+              className="screen-picker__content"
+              role="tabpanel"
+              id={`screen-picker-panel-${tab}`}
+              aria-labelledby={`screen-picker-tab-${tab}`}
+            >
+              <SourcePanel
+                tab={tab}
+                grouped={{ screens, apps, windows }}
+                selected={selected}
+                onSelect={setSelected}
+              />
+            </div>
+          </>
         )}
 
         <div className="screen-picker__quality">
+          <div className="screen-picker__quality-row">
+            <span className="screen-picker__quality-label" id="screen-audio-label">
+              Stream Audio
+            </span>
+            {/*
+              Disabled for window/application targets, and the title says WHY. This is the
+              one place a user learns that application audio is a platform limitation
+              rather than a missing checkbox -- Electron's desktop audio capture is a
+              whole-system loopback that ignores the chosen source (#2161), so scoping it
+              to one app needs a native addon (ADR-0043). Silence with no explanation is
+              what made this confusing in the first place.
+            */}
+            <button
+              type="button"
+              className={`screen-picker__audio-toggle ${
+                audioCapable && streamAudio ? 'screen-picker__audio-toggle--on' : ''
+              }`}
+              aria-labelledby="screen-audio-label"
+              aria-pressed={audioCapable && streamAudio}
+              disabled={!audioCapable}
+              title={audioToggleHint(selected, audioCapable, platform)}
+              onClick={() => {
+                setStreamAudio((on) => !on);
+                setDirty(true);
+              }}
+            >
+              {audioCapable && streamAudio ? <Volume2 size={16} /> : <VolumeX size={16} />}
+              <span>{audioCapable && streamAudio ? 'On' : 'Off'}</span>
+            </button>
+          </div>
           <div className="screen-picker__quality-row">
             <label htmlFor="screen-resolution" className="screen-picker__quality-label">
               Resolution

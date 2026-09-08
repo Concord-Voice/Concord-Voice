@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 vi.mock('@/renderer/components/Voice/ScreenSharePicker.css', () => ({}));
 
@@ -37,6 +38,10 @@ const mockSources = [
 
 import ScreenSharePicker from '@/renderer/components/Voice/ScreenSharePicker';
 
+/** Sources are behind tabs now; open one by its tab button. */
+const openTab = (name: 'Screens' | 'Applications' | 'Windows') =>
+  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${name}`) }));
+
 describe('ScreenSharePicker', () => {
   const mockOnSelect = vi.fn();
   const mockOnCancel = vi.fn();
@@ -57,15 +62,19 @@ describe('ScreenSharePicker', () => {
     expect(screen.getByText('Loading sources...')).toBeInTheDocument();
   });
 
-  it('renders screens and windows after loading', async () => {
+  it('renders screens on the default tab and windows behind the Windows tab', async () => {
     render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
     await waitFor(() => {
-      expect(screen.getByText('Screens')).toBeInTheDocument();
-      expect(screen.getByText('Windows')).toBeInTheDocument();
+      expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
     });
+    // Screens is the default tab.
     expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    expect(screen.queryByText('VS Code')).not.toBeInTheDocument();
+
+    openTab('Windows');
     expect(screen.getByText('VS Code')).toBeInTheDocument();
     expect(screen.getByText('Chrome')).toBeInTheDocument();
+    expect(screen.queryByText('Entire Screen')).not.toBeInTheDocument();
   });
 
   it('renders title with Share Your Screen', async () => {
@@ -105,7 +114,179 @@ describe('ScreenSharePicker', () => {
       resolution: 'source',
       frameRate: 30,
       contentType: 'auto',
+      streamAudio: true,
     });
+  });
+
+  // #2161 / ADR-0043: Electron's desktop audio capture is a whole-system loopback that
+  // ignores chromeMediaSourceId, so a window target asking for audio would leak every
+  // application's sound to the channel. The picker must never request it, whatever the
+  // persisted preference says.
+  it('never requests audio for a window target, even with the preference on', async () => {
+    useVideoSettingsStore.getState().setScreenStreamAudio(true);
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: /^Windows/ })).toBeInTheDocument();
+    });
+    openTab('Windows');
+    fireEvent.click(screen.getByText('VS Code'));
+    fireEvent.click(screen.getByText('Share'));
+    expect(mockOnSelect).toHaveBeenCalledWith(
+      'window:1',
+      expect.objectContaining({ streamAudio: false })
+    );
+  });
+
+  it('groups windows sharing an app icon under the Applications tab', async () => {
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: /^Applications/ })).toBeInTheDocument();
+    });
+    openTab('Applications');
+    // mockSources: VS Code has appIcon 'icon1'; Chrome has none. Two distinct groups.
+    expect(screen.getByRole('heading', { name: /VS Code/ })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /Chrome/ })).toBeInTheDocument();
+  });
+
+  it('moves between tabs with the arrow keys (WAI-ARIA tabs pattern)', async () => {
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: /^Screens/ })).toBeInTheDocument();
+    });
+    fireEvent.keyDown(screen.getByRole('tab', { name: /^Screens/ }), { key: 'ArrowRight' });
+    expect(screen.getByRole('tab', { name: /^Applications/ })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    );
+    fireEvent.keyDown(screen.getByRole('tab', { name: /^Applications/ }), { key: 'End' });
+    expect(screen.getByRole('tab', { name: /^Windows/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('enables the audio toggle for a screen target and disables it for a window', async () => {
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    const audio = () => screen.getByRole('button', { name: 'Stream Audio' });
+
+    // Nothing selected yet -- inert, and it says why.
+    expect(audio()).toBeDisabled();
+
+    fireEvent.click(screen.getByText('Entire Screen'));
+    expect(audio()).toBeEnabled();
+    expect(audio()).toHaveAttribute('aria-pressed', 'true');
+
+    openTab('Windows');
+    fireEvent.click(screen.getByText('VS Code'));
+    expect(audio()).toBeDisabled();
+    // The disabled reason is user-visible, not just implied by the greyed control.
+    expect(audio()).toHaveAttribute('title', expect.stringContaining('not available'));
+  });
+
+  it('passes the toggled-off audio choice through for a screen target', async () => {
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Entire Screen'));
+    fireEvent.click(screen.getByRole('button', { name: 'Stream Audio' }));
+    fireEvent.click(screen.getByText('Share'));
+    expect(mockOnSelect).toHaveBeenCalledWith(
+      'screen:0',
+      expect.objectContaining({ streamAudio: false })
+    );
+  });
+
+  // Restored in afterEach: without that, the Linux case below leaks into every
+  // subsequent test and silently makes them assert against a platform they never set.
+  let origElectron: typeof globalThis.electron;
+  const withPlatform = (p: string) => {
+    origElectron = globalThis.electron;
+    globalThis.electron = {
+      ...globalThis.electron,
+      getPlatform: vi.fn().mockResolvedValue(p),
+    } as unknown as typeof globalThis.electron;
+  };
+  afterEach(() => {
+    if (origElectron !== undefined) {
+      globalThis.electron = origElectron;
+      origElectron = undefined as unknown as typeof globalThis.electron;
+    }
+  });
+
+  // The spec's capability ladder makes every Linux target audio-incapable: this capture
+  // path has no Linux loopback. Gating on the `screen:` prefix alone offered an enabled,
+  // default-on control there for an operation that cannot succeed.
+  it('disables the audio toggle on Linux even for a screen target', async () => {
+    withPlatform('linux');
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Entire Screen'));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Stream Audio' })).toBeDisabled();
+    });
+    expect(screen.getByRole('button', { name: 'Stream Audio' })).toHaveAttribute(
+      'title',
+      expect.stringContaining('Linux')
+    );
+  });
+
+  // Mid-share the picker is a SWITCH dialog. Seeding from the persisted preference
+  // silently re-enabled audio the user had turned off with the live toggle.
+  it('seeds the toggle from the LIVE share state, not the saved default', async () => {
+    useVideoSettingsStore.getState().setScreenStreamAudio(true);
+    // CAPABLE and off: a real user opt-out, which the picker must carry over.
+    useVoiceStore.setState({
+      isScreenSharing: true,
+      isScreenAudioOn: false,
+      isScreenAudioCapable: true,
+    });
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Entire Screen'));
+    expect(screen.getByRole('button', { name: 'Stream Audio' })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+  });
+
+  // The other half of that rule, and the one that shipped wrong. On a WINDOW share
+  // isScreenAudioOn is false because the platform forces it, not because the user chose
+  // it -- reading that as an opt-out left the toggle off after switching to a whole
+  // screen, and confirming then persisted the false over a default-on preference.
+  it('ignores the live state when the current target could not carry audio anyway', async () => {
+    useVideoSettingsStore.getState().setScreenStreamAudio(true);
+    useVoiceStore.setState({
+      isScreenSharing: true,
+      isScreenAudioOn: false,
+      isScreenAudioCapable: false,
+    });
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Entire Screen'));
+    expect(screen.getByRole('button', { name: 'Stream Audio' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+  });
+
+  // Without a production writer the preference sat at its default forever and the
+  // toggle reset to On every time the dialog opened.
+  it('persists the audio choice so it survives the next share', async () => {
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('Entire Screen'));
+    fireEvent.click(screen.getByRole('button', { name: 'Stream Audio' }));
+    fireEvent.click(screen.getByText('Share'));
+    expect(useVideoSettingsStore.getState().screenStreamAudio).toBe(false);
   });
 
   it('calls onCancel when Cancel button is clicked', async () => {
@@ -173,6 +354,7 @@ describe('ScreenSharePicker', () => {
       resolution: '720p',
       frameRate: 60,
       contentType: 'motion',
+      streamAudio: true,
     });
   });
 

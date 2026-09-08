@@ -34,6 +34,7 @@ import {
   VIDEO_QUALITY_PRESETS,
   type VideoPriority,
   type ScreenShareOptions,
+  type ScreenContentType,
 } from '../../stores/voice/videoSettingsStore';
 import { apiFetch } from '../system/apiClient';
 import {
@@ -103,6 +104,7 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { hasPermission, SPEAK } from '../../utils/policy/permissions';
 import { clampScreenForSubscription } from '../../utils/policy/videoLimits';
 import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/ui/screenResolution';
+import { canCarryScreenAudio } from '../../utils/policy/screenAudioCapability';
 import type { CallState } from './voiceService/callStateMachine';
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
@@ -313,6 +315,38 @@ function isRetryableEncryptRebaseError(err: unknown): boolean {
 }
 
 /** Handle screen capture NotAllowedError — show error and open OS settings. Returns true if handled. */
+/**
+ * Stop every track on a stream, tolerating a null.
+ *
+ * The three-token loop this replaces appears at four bail-out points inside
+ * `switchScreenSourceQueued` alone, and each one is a nested statement that the
+ * cognitive-complexity metric charges twice over -- so the duplication was not
+ * only noise, it was most of that function's score.
+ */
+function stopStreamTracks(stream: MediaStream | null | undefined): void {
+  if (!stream) return;
+  for (const t of stream.getTracks()) t.stop();
+}
+
+/**
+ * Why this share cannot carry audio, in the user's terms.
+ *
+ * THREE causes, not two. The first version asked `!sourceId?.startsWith('screen:')`,
+ * which is `true` for a null id as well as a window id — so a share whose source is
+ * unknown was told to "share a whole screen" when it already was one. That is the same
+ * defect as the Linux-gets-the-window-message bug one revision earlier: a boolean
+ * standing in for a three-way question always mislabels the case it forgot.
+ */
+function screenAudioRefusalMessage(sourceId: string | null | undefined): string {
+  if (!sourceId) {
+    return 'Concord cannot tell what this share is showing, so it cannot add sound — stop the share and start it again to include audio.';
+  }
+  if (!sourceId.startsWith('screen:')) {
+    return 'Sharing audio from a single window is not supported yet — share a whole screen to include sound.';
+  }
+  return 'Sharing computer sound is not supported on Linux yet, so your screen is being shared without it.';
+}
+
 function handleScreenCaptureNotAllowed(captureErr: unknown): boolean {
   if (captureErr instanceof DOMException && captureErr.name === 'NotAllowedError') {
     useVoiceStore
@@ -520,6 +554,27 @@ class VoiceService {
   private resumeInFlight = false;
   private localCameraStream: MediaStream | null = null;
   private localScreenStream: MediaStream | null = null;
+
+  // The source id behind localScreenStream. Needed because re-enabling audio on a
+  // share captured with `audio: false` has no track to produce -- the only honest
+  // way to honour it is to re-capture the SAME source (setScreenAudioEnabled).
+  private currentScreenSourceId: string | null = null;
+
+  // The options the LIVE share was captured with -- not the persisted defaults. Re-enabling
+  // audio on a silent share re-captures, and reading the store there silently promoted a
+  // transient 720p/15fps/detail share to the stored 1080p/60fps/auto during an action that
+  // was only ever about audio.
+  private currentScreenOptions: ScreenShareOptions | null = null;
+
+  // Whether the live capture can carry audio irrespective of its source id. The Electron
+  // path answers this from the id; `getDisplayMedia` (dev/web) has no id at all and is
+  // OS-mediated, so a live audio track IS the capability -- without this the toolbar
+  // locked the audio button on a share that was actively sending sound.
+  private currentScreenAudioCapable = false;
+
+  // Cached because it cannot change while the app runs, and because the audio-capability
+  // check runs on a user click where an await would be an avoidable round trip.
+  private cachedPlatform: string | null = null;
 
   // Pending screen-audio producers from remote users (userId → producerId)
   // Consumed when the local user tunes into the corresponding screen share
@@ -2060,6 +2115,10 @@ class VoiceService {
       const s = useVoiceStore.getState();
       s.setActiveScreenCodec(null);
       s.setScreenSharing(false);
+      s.setScreenAudioOn(false);
+      // The audio producer dies with the transport too; without this the map keeps
+      // a closed entry that a later cleanup re-closes.
+      this.producers.delete('screen-audio');
       const uid = useUserStore.getState().user?.id;
       if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
     });
@@ -2181,12 +2240,23 @@ class VoiceService {
         return;
       }
       this.producers.set('screen-audio', newAudioProducer);
+      // Re-point the track's ended handler at the SUCCESSOR. The track is the same object
+      // across a re-produce, so the binding made for the previous producer would bail on
+      // its identity check and leave this one mapped over a dead track.
+      this.bindScreenAudioTrackEnded(audioTrack, newAudioProducer);
       newAudioProducer.on('transportclose', () => {
         if (this.producers.get('screen-audio') !== newAudioProducer) return;
         this.producers.delete('screen-audio');
+        // Twin of the handler in produceScreenAudioFromStream. Both must clear the flag;
+        // this one did not, so isScreenAudioOn read true with no producer behind it.
+        useVoiceStore.getState().setScreenAudioOn(false);
       });
     } catch (err) {
       if (this.isCurrentVideoReproduce(token, transport)) {
+        // The old producer is already gone (deleted above), so leaving the flag set
+        // reports audio that nothing is sending -- and the next click would spend
+        // itself switching the stale flag off instead of retrying.
+        useVoiceStore.getState().setScreenAudioOn(false);
         console.warn('Failed to re-produce screen audio:', errorMessage(err));
       }
     }
@@ -3214,6 +3284,18 @@ class VoiceService {
     this.localMicStream = null;
     this.localCameraStream = null;
     this.localScreenStream = null;
+    // Closing a producer by hand does NOT fire its `transportclose` handler, so this
+    // teardown is the only thing that can clear the live screen-audio state. Left set,
+    // a stale `isScreenAudioOn: true` survived the reconnect: a user who then started a
+    // share with Stream Audio explicitly OFF got no correction (the zero-audio-track
+    // path returns without writing the flag), the switch picker seeded audio as enabled
+    // from it, and the next source broadcast system audio against an explicit opt-out.
+    this.currentScreenSourceId = null;
+    this.currentScreenOptions = null;
+    this.currentScreenAudioCapable = false;
+    const vs = useVoiceStore.getState();
+    vs.setScreenAudioOn(false);
+    vs.setScreenAudioCapable(false);
 
     for (const [, producer] of this.producers) {
       try {
@@ -3749,10 +3831,11 @@ class VoiceService {
   private async captureScreen(
     sourceId: string | undefined,
     screenRes: { w: number; h: number },
-    screenFps: number
-  ): Promise<MediaStream> {
+    screenFps: number,
+    wantAudio: boolean
+  ): Promise<{ stream: MediaStream; sourceId: string | null }> {
     if (typeof globalThis.electron?.getDesktopSources === 'function') {
-      return this.captureScreenElectron(sourceId, screenRes, screenFps);
+      return this.captureScreenElectron(sourceId, screenRes, screenFps, wantAudio);
     }
     console.debug('produceScreen: using getDisplayMedia fallback');
     // Non-Electron path only (dev/web) — packaged builds always take the
@@ -3760,22 +3843,28 @@ class VoiceService {
     // picker, so `audio: true` captures only the user-selected surface's audio
     // with explicit consent — NOT chromeMediaSource:'desktop' whole-desktop
     // loopback, so this is not the #2161 leak path.
-    return navigator.mediaDevices.getDisplayMedia({
+    // `wantAudio`, not `true`: this path is OS-mediated consent rather than the #2161
+    // whole-desktop loopback, but the user's in-app opt-out still governs what we ASK for.
+    const stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: screenRes.w },
         height: { ideal: screenRes.h },
         frameRate: { ideal: screenFps },
       },
-      audio: true,
+      audio: wantAudio,
     });
+    // The OS picker chose the surface; we never learn an Electron source id here, so
+    // report null rather than inventing one the re-capture path would act on.
+    return { stream, sourceId: null };
   }
 
   /** Electron desktopCapturer path — tries video+audio, falls back to video-only. */
   private async captureScreenElectron(
     sourceId: string | undefined,
     screenRes: { w: number; h: number },
-    screenFps: number
-  ): Promise<MediaStream> {
+    screenFps: number,
+    wantAudio: boolean
+  ): Promise<{ stream: MediaStream; sourceId: string }> {
     const electron = globalThis.electron;
     if (!electron) throw new Error('captureScreenElectron called without Electron bridge');
 
@@ -3785,6 +3874,10 @@ class VoiceService {
       if (sources.length === 0) throw new Error('No screen sources available');
       chosenId = sources.find((s) => s.id.startsWith('screen:'))?.id || sources[0].id;
     }
+    // The RESOLVED id is RETURNED, never assigned here. Assigning at capture time wrote
+    // the field before getUserMedia and replaceTrack could fail, so a failed switch left
+    // it naming a source that was not being shared -- after which the audio toggle's
+    // re-capture path would silently swap the live share to that other target.
     console.debug('produceScreen: capturing desktop source', chosenId);
 
     const videoConstraints = {
@@ -3802,23 +3895,35 @@ class VoiceService {
     // loopback. Request it only for entire-screen ('screen:') shares; a
     // window/app ('window:') share must be video-only or it leaks all system
     // audio to the channel (#2161).
-    if (!chosenId.startsWith('screen:')) {
-      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+    // BOTH conditions, never either: the user must have asked for audio AND the target
+    // must be able to carry it. `wantAudio` alone would reintroduce #2161 on a window;
+    // the prefix check alone would ignore an explicit opt-out.
+    const videoOnly = () =>
+      navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+
+    // `canCarryScreenAudio`, not a bare prefix test. The prefix half alone left the
+    // platform gate in `produceScreen`'s caller-side computation, which
+    // `switchScreenSourceQueued` does not share -- so confirming a switch on Linux
+    // before the picker's async platform probe settled requested a loopback that
+    // cannot work. The guard belongs at the one seam BOTH callers pass through.
+    if (!wantAudio || !canCarryScreenAudio(chosenId, this.cachedPlatform)) {
+      return { stream: await videoOnly(), sourceId: chosenId };
     }
 
     try {
-      return await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: chosenId },
         } as unknown as MediaTrackConstraints,
         video: videoConstraints,
       });
+      return { stream, sourceId: chosenId };
     } catch (audioErr) {
       console.debug(
         'produceScreen: audio capture unavailable, falling back to video-only',
-        audioErr
+        errorMessage(audioErr)
       );
-      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+      return { stream: await videoOnly(), sourceId: chosenId };
     }
   }
 
@@ -3826,10 +3931,32 @@ class VoiceService {
   private async produceScreenAudioFromStream(stream: MediaStream): Promise<void> {
     const audioTracks = stream.getAudioTracks();
     if (audioTracks.length === 0 || !this.sendTransport) return;
+    // Snapshotted for the post-await currentness check below. `produceEncrypted`
+    // round-trips to the SFU, and a stop landing inside that window would otherwise
+    // let this continuation publish desktop audio for a share that no longer exists.
+    const transport = this.sendTransport;
+    const socket = this.socket;
+
+    // Spec §7.3. macOS 14.2+ hands back a LIVE BUT SILENT track when the capture
+    // entitlement is missing -- no throw, no warning -- so the try/catch below cannot
+    // see it and we would publish silence while the UI reported "Audio On". Refuse a
+    // track that is already ended or muted, and say so, rather than advertising audio
+    // nobody can hear.
+    const audioTrack = audioTracks[0];
+    if (audioTrack.readyState !== 'live' || audioTrack.muted) {
+      console.warn('produceScreen: screen-audio track is not live; sharing video only');
+      useVoiceStore
+        .getState()
+        .setVideoSlotError(
+          'Screen audio could not be captured, so your screen is being shared without sound.'
+        );
+      useVoiceStore.getState().setScreenAudioOn(false);
+      return;
+    }
 
     try {
       const audioProducer = await this.produceEncrypted(this.sendTransport, {
-        track: audioTracks[0],
+        track: audioTrack,
         codecOptions: { opusStereo: true, opusDtx: false },
         // Track owned by localScreenStream and reused across re-produces
         // (reProduceScreenAudio); stopTracks:false keeps close() from stopping it.
@@ -3837,11 +3964,32 @@ class VoiceService {
         appData: { source: 'screen-audio' },
       });
 
+      // The await above is a network round-trip. `closeProducer('screen')` or a
+      // transport teardown can complete inside it, and cleanup cannot cancel a
+      // produce already in flight -- so the ONLY thing standing between a stop and
+      // system audio published to a dead share is this check. It fails closed:
+      // anything unrecognised discards the producer rather than registering it.
+      if (
+        this.sendTransport !== transport ||
+        transport.closed ||
+        this.localScreenStream !== stream ||
+        !this.producers.get('screen') ||
+        this.producers.has('screen-audio')
+      ) {
+        this.discardProducedProducer(audioProducer, socket);
+        console.debug('produceScreen: discarding screen audio for a share that ended');
+        return;
+      }
+
       this.producers.set('screen-audio', audioProducer);
+      useVoiceStore.getState().setScreenAudioOn(true);
 
       audioProducer.on('transportclose', () => {
         this.producers.delete('screen-audio');
+        useVoiceStore.getState().setScreenAudioOn(false);
       });
+
+      this.bindScreenAudioTrackEnded(audioTrack, audioProducer);
 
       console.debug('produceScreen: screen audio producer created', audioProducer.id);
     } catch (err) {
@@ -3850,7 +3998,18 @@ class VoiceService {
   }
 
   /** Produce screen share — single-layer, codec-floor compatible publishing for opt-in viewing. */
-  async produceScreen(sourceId?: string, options?: ScreenShareOptions): Promise<void> {
+  async produceScreen(
+    sourceId?: string,
+    options?: ScreenShareOptions,
+    /**
+     * A capture already in hand. The `replaceTrack`-rejection fallback in
+     * `switchScreenSourceQueued` holds a good stream at the moment it decides to
+     * close and re-produce, and acquiring a SECOND one there can fail -- leaving the
+     * user sharing nothing, which is precisely what the acquire-first ordering exists
+     * to prevent. Mirrors `produceAudio`'s `preAcquiredStream` parameter.
+     */
+    preAcquired?: { stream: MediaStream; sourceId: string | null } | null
+  ): Promise<void> {
     if (!this.sendTransport || !this.device) {
       console.warn('produceScreen: no sendTransport or device — cannot share screen');
       return;
@@ -3868,10 +4027,32 @@ class VoiceService {
     const rawRes = await this.resolveCaptureDims(resolution);
     const clampedCap = this.clampScreenToEntitlement(rawRes.w, rawRes.h, screenFps);
     const screenRes = { w: clampedCap.width, h: clampedCap.height };
+    // The user's opt-out is honoured HERE, at the only place that can honour it. It was
+    // previously read off ScreenShareOptions by nobody, so turning Stream Audio off
+    // still published the desktop mix.
+    await this.ensurePlatform();
+    const wantAudio =
+      (options?.streamAudio ?? screenSettings.screenStreamAudio) &&
+      // sourceId may be undefined here (auto-pick); capability is re-checked against the
+      // RESOLVED id inside captureScreenElectron, so this is the platform gate only.
+      this.cachedPlatform !== 'linux';
 
     let stream: MediaStream;
     try {
-      stream = await this.captureScreen(sourceId, screenRes, clampedCap.fps);
+      const captured =
+        preAcquired ?? (await this.captureScreen(sourceId, screenRes, clampedCap.fps, wantAudio));
+      stream = captured.stream;
+      this.currentScreenSourceId = captured.sourceId;
+      // The options the share is ACTUALLY running with, so an audio-only re-capture later
+      // reproduces this share rather than the persisted defaults.
+      this.currentScreenOptions = {
+        resolution,
+        frameRate,
+        contentType,
+        streamAudio: wantAudio,
+      };
+      this.currentScreenAudioCapable = stream.getAudioTracks().length > 0;
+      void this.publishScreenAudioCapability();
     } catch (captureErr) {
       if (handleScreenCaptureNotAllowed(captureErr)) return;
       throw captureErr;
@@ -3934,6 +4115,10 @@ class VoiceService {
         const s = useVoiceStore.getState();
         s.setActiveScreenCodec(null);
         s.setScreenSharing(false);
+        s.setScreenAudioOn(false);
+        // The audio producer dies with the transport too; without this the map keeps
+        // a closed entry that a later cleanup re-closes.
+        this.producers.delete('screen-audio');
         const uid = useUserStore.getState().user?.id;
         if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
       });
@@ -4285,6 +4470,448 @@ class VoiceService {
       await this.produceVideo(store.videoDeviceId || undefined);
       notificationSoundService.play('video-on');
     }
+  }
+
+  /**
+   * Swap the shared source WITHOUT stopping the share (R6).
+   *
+   * The producer is kept and only its track is replaced, so `producer.id` survives.
+   * That is the whole trick: viewer tune-in, dominant/focused share and per-viewer
+   * volume are all keyed by producerId, and a close/re-produce cycle drops every one
+   * of them -- `producer-closed` purges tuned-in state and the replacement announce
+   * only auto-consumes when autoTuneInScreenShares is ON (default OFF). Keeping the
+   * producer means there is no state to snapshot and restore, and no self-echo race
+   * to guard (contrast fastReproduceScreen, which must do both because a codec change
+   * genuinely requires a new producer).
+   *
+   * Capture order is load-bearing: the NEW source is acquired BEFORE the old one is
+   * touched, so a cancelled or denied picker leaves the user still sharing what they
+   * were sharing. Failing the other way round would make this button hostile.
+   *
+   * Audio is not swappable the same way -- its track belongs to the new capture -- so
+   * the old `screen-audio` producer is closed and re-produced from the new stream.
+   */
+  async setScreenAudioEnabled(on: boolean): Promise<void> {
+    // Serialized on the SAME per-screen tail every other screen mutation uses. This is a
+    // user-clickable button, so a double-click is ordinary traffic: two unserialized `on`
+    // calls both find no audio producer and both produce one. It also races the
+    // codec-floor / layering / settings re-produces that already own this tail.
+    return this.enqueueVideoReproduce('screen', (token) =>
+      this.setScreenAudioEnabledQueued(on, token)
+    );
+  }
+
+  private async setScreenAudioEnabledQueued(
+    on: boolean,
+    token: VideoReproduceToken
+  ): Promise<void> {
+    const stream = this.localScreenStream;
+    if (!this.producers.get('screen') || !stream) {
+      console.warn('setScreenAudioEnabled: no active screen share');
+      return;
+    }
+
+    if (!on) {
+      // `retireScreenAudioProducer`, NOT `closeProducer('screen-audio')`. The latter
+      // runs `cleanupScreenAudioState`, which STOPS and removes the audio track --
+      // so a plain On -> Off -> On sequence could not reuse the live capture and fell
+      // through to the re-capture branch, replacing the video track and interrupting
+      // every viewer for a change that was only ever supposed to touch audio.
+      const transport = this.sendTransport;
+      if (transport) await this.retireScreenAudioProducer(transport);
+      const localUserId = useUserStore.getState().user?.id;
+      if (localUserId) {
+        useVoiceStore.getState().updateParticipant(localUserId, { screenAudioStream: undefined });
+      }
+      useVoiceStore.getState().setScreenAudioOn(false);
+      return;
+    }
+
+    // Serialization stops the two calls OVERLAPPING; it does not make the second one a
+    // no-op. Queued back to back, both still find a live track, both produce, and the
+    // second `producers.set` orphans the first -- viewers hear the desktop mix twice
+    // until transport teardown. Idempotence is a separate property from ordering, and
+    // the first version of this fix supplied only the ordering half.
+    const existing = this.producers.get('screen-audio');
+    if (existing && !existing.closed) {
+      useVoiceStore.getState().setScreenAudioOn(true);
+      return;
+    }
+
+    const audioTrack = stream.getAudioTracks()[0];
+    // `!muted` as well as live: produceScreenAudioFromStream now REJECTS a muted track
+    // (the macOS live-but-silent capture), so classifying one as reusable here handed
+    // it the same dead track on every click and never reached the re-capture path
+    // below -- the user could not recover audio without restarting the whole share.
+    if (audioTrack?.readyState === 'live' && !audioTrack.muted) {
+      await this.produceScreenAudioFromStream(stream);
+      return;
+    }
+
+    // A window/application target cannot carry audio at all (#2161, ADR-0043), so
+    // re-capturing would replace the track, glitch every viewer, and still produce
+    // nothing. Tell the user why instead of churning the share on every click.
+    if (!canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform)) {
+      console.debug('setScreenAudioEnabled: target cannot carry audio');
+      // Telling the causes apart matters: on Linux a WHOLE-SCREEN share is refused by
+      // the platform, so the window text would send that user to a remedy that cannot
+      // work — and a share with no known source is neither of those.
+      useVoiceStore
+        .getState()
+        .setVideoSlotError(screenAudioRefusalMessage(this.currentScreenSourceId));
+      return;
+    }
+
+    // The share was captured silent (or its audio track died), so there is nothing to
+    // produce. Re-capture the same source WITH audio; switchScreenSource keeps the
+    // video producer id, so viewers still are not interrupted.
+    if (!this.currentScreenSourceId) {
+      console.warn('setScreenAudioEnabled: cannot re-enable audio without a known source');
+      return;
+    }
+    // The LIVE share's options, falling back to the store only when they are unknown.
+    // Reading the store unconditionally turned an audio-only action into a quality
+    // change: a transient 720p/15fps/detail share silently became the stored
+    // 1080p/60fps/auto the moment the user asked for sound.
+    const live = this.currentScreenOptions;
+    const vs = useVideoSettingsStore.getState();
+    // `switchScreenSourceQueued`, never the public `switchScreenSource`: the public
+    // entry point chains onto `videoReproduceQueues.screen`, which is the promise we
+    // are currently running inside, so awaiting it here would never settle.
+    await this.switchScreenSourceQueued(this.currentScreenSourceId, token, {
+      resolution: live?.resolution ?? vs.screenResolution,
+      frameRate: live?.frameRate ?? vs.screenFrameRate,
+      contentType: live?.contentType ?? vs.screenContentType,
+      streamAudio: true,
+    });
+  }
+
+  /**
+   * Resolve per-share options against the persisted settings and the entitlement
+   * clamp. Shared by produceScreen and switchScreenSource, which must agree: a
+   * switch that resolved dimensions differently from the initial share would
+   * silently change quality mid-stream.
+   */
+  private async resolveScreenCaptureParams(options?: ScreenShareOptions): Promise<{
+    dims: { w: number; h: number };
+    fps: number;
+    contentType: ScreenContentType;
+    streamAudio: boolean;
+  }> {
+    const settings = useVideoSettingsStore.getState();
+    const resolution = options?.resolution ?? settings.screenResolution;
+    const frameRate = options?.frameRate ?? settings.screenFrameRate;
+    const contentType = options?.contentType ?? settings.screenContentType;
+    const streamAudio = options?.streamAudio ?? settings.screenStreamAudio;
+    const rawRes = await this.resolveCaptureDims(resolution);
+    const clamped = this.clampScreenToEntitlement(
+      rawRes.w,
+      rawRes.h,
+      frameRate === 0 ? 60 : frameRate
+    );
+    return {
+      dims: { w: clamped.width, h: clamped.height },
+      fps: clamped.fps,
+      contentType,
+      streamAudio,
+    };
+  }
+
+  /**
+   * Populate the platform cache. Called before any screen capture so the audio-capability
+   * check has a real answer rather than the null (permissive) default. A failure leaves it
+   * null, which canCarryScreenAudio treats as the dev/web path -- deliberately permissive,
+   * because that path reaches getDisplayMedia's OS-mediated consent, not desktop loopback.
+   */
+  private async ensurePlatform(): Promise<void> {
+    if (this.cachedPlatform !== null) return;
+    try {
+      this.cachedPlatform = (await globalThis.electron?.getPlatform?.()) ?? null;
+    } catch (err) {
+      console.debug('ensurePlatform: unavailable', errorMessage(err));
+    }
+  }
+
+  /** 'auto' deliberately leaves contentHint untouched, letting the encoder decide. */
+  private static applyContentHint(track: MediaStreamTrack, contentType: ScreenContentType): void {
+    if (contentType === 'motion') track.contentHint = 'motion';
+    else if (contentType === 'detail') track.contentHint = 'detail';
+  }
+
+  /**
+   * Capture a source and return a stream with a hinted video track, or null if it
+   * could not be acquired. Null is an ORDINARY outcome, not an error: the caller
+   * keeps whatever share it already had. Never throws for a capture failure —
+   * propagating would make a cancelled picker look like a broken share.
+   */
+  private async acquireScreenCapture(
+    sourceId: string,
+    label: string,
+    options?: ScreenShareOptions
+  ): Promise<{ stream: MediaStream; sourceId: string | null } | null> {
+    const { dims, fps, contentType, streamAudio } = await this.resolveScreenCaptureParams(options);
+
+    let captured: { stream: MediaStream; sourceId: string | null };
+    try {
+      captured = await this.captureScreen(sourceId, dims, fps, streamAudio);
+    } catch (captureErr) {
+      if (!handleScreenCaptureNotAllowed(captureErr)) {
+        console.warn(
+          `${label}: capture failed, keeping the current share`,
+          errorMessage(captureErr)
+        );
+      }
+      return null;
+    }
+
+    const track = captured.stream.getVideoTracks()[0];
+    if (!track) {
+      for (const t of captured.stream.getTracks()) t.stop();
+      console.warn(`${label}: capture returned no video track, keeping the current share`);
+      return null;
+    }
+    VoiceService.applyContentHint(track, contentType);
+    return captured;
+  }
+
+  /**
+   * Close the `screen-audio` producer belonging to a capture that is being replaced.
+   * Its track came from the OLD stream and cannot follow a swap.
+   */
+  /**
+   * Bind the screen-audio track's `onended` to the producer CURRENTLY publishing it.
+   *
+   * The AUDIO track can end on its own while the video track and the transport stay live
+   * -- the OS revoking the capture, or the tap dying -- and `transportclose` never fires
+   * for that, so without a handler the toolbar reports "Audio On" over silence.
+   *
+   * It is a shared helper rather than an inline closure because the track OUTLIVES its
+   * producer: `reProduceScreenAudio` swaps in a successor for the same track on a codec,
+   * layering or settings change. A closure bound to the original producer then fails its
+   * own identity check and returns, leaving the successor mapped and the flag stuck true
+   * -- the first version of this fix covered the initial producer and not its replacement.
+   * Every path that maps a `screen-audio` producer must re-bind here.
+   */
+  private bindScreenAudioTrackEnded(
+    track: MediaStreamTrack,
+    producer: mediasoupTypes.Producer
+  ): void {
+    track.onended = () => {
+      if (this.producers.get('screen-audio') !== producer) return;
+      producer.close();
+      this.producers.delete('screen-audio');
+      this.socket?.emit('close-producer', { producerId: producer.id });
+      useVoiceStore.getState().setScreenAudioOn(false);
+    };
+  }
+
+  private async retireScreenAudioProducer(transport: mediasoupTypes.Transport): Promise<void> {
+    const oldAudio = this.producers.get('screen-audio');
+    if (!oldAudio) return;
+    oldAudio.close();
+    await this.drainSendTransportQueue(transport);
+    this.producers.delete('screen-audio');
+    // The flag describes a producer that no longer exists. Leaving it true made the
+    // control read "Audio On" after a switch to a silent source, so the next click
+    // only repaired the state instead of doing what the user asked.
+    useVoiceStore.getState().setScreenAudioOn(false);
+    this.socket?.emit('close-producer', { producerId: oldAudio.id });
+  }
+
+  /**
+   * The source id behind the live share, for the picker to pre-select when it is
+   * reopened to switch. Read-only: the field itself stays private because only the
+   * capture paths may assign it.
+   */
+  getCurrentScreenSourceId(): string | null {
+    return this.currentScreenSourceId;
+  }
+
+  /**
+   * Whether the LIVE share's target can carry audio at all, for the toolbar toggle.
+   * Same `canCarryScreenAudio` authority the picker and the capture path use -- a
+   * control that is enabled for an operation that cannot succeed is a worse answer
+   * than a disabled one that says why.
+   *
+   * Async because the platform is resolved over IPC; `ensurePlatform` is cached and
+   * idempotent, so repeated calls cost nothing after the first.
+   */
+  async canShareScreenAudio(): Promise<boolean> {
+    await this.ensurePlatform();
+    if (canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform)) return true;
+    // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a
+    // share that may be sending audio right now. A live audio track on the capture is
+    // proof of capability that the id cannot express; without this the toolbar locked the
+    // button and the only way to stop sending sound was to end the whole share.
+    return this.currentScreenAudioCapable;
+  }
+
+  /**
+   * Publish the live target's audio capability to the store, so the toolbar can
+   * DISABLE its audio control rather than offer one the service will refuse.
+   *
+   * Pushed from here rather than pulled by a renderer effect: this is the only place
+   * that knows both halves (`currentScreenSourceId` and the platform), and a component
+   * effect resolving it through the dynamic `voiceService` import would race every
+   * other click in the same commit.
+   */
+  private async publishScreenAudioCapability(): Promise<void> {
+    useVoiceStore.getState().setScreenAudioCapable(await this.canShareScreenAudio());
+  }
+
+  async switchScreenSource(sourceId: string, options?: ScreenShareOptions): Promise<void> {
+    // Serialized on the SAME per-source tail every other screen re-produce uses. Without
+    // it, a codec-floor / layering / settings-triggered fastReproduceScreen running during
+    // our capture closes and replaces the producer captured at entry, and the completed
+    // user switch then calls replaceTrack on a dead producer and is silently discarded.
+    return this.enqueueVideoReproduce('screen', (token) =>
+      this.switchScreenSourceQueued(sourceId, token, options)
+    );
+  }
+
+  private async switchScreenSourceQueued(
+    sourceId: string,
+    token: VideoReproduceToken,
+    options?: ScreenShareOptions
+  ): Promise<void> {
+    const producer = this.producers.get('screen');
+    const transport = this.sendTransport;
+    if (!producer || !transport) {
+      console.warn('switchScreenSource: no active screen share to switch');
+      return;
+    }
+
+    // ACQUIRE FIRST. Everything after this point mutates the live share, so a
+    // cancelled or denied picker must return before any of it runs.
+    // Inherit the LIVE audio state unless the caller states an intent. Producing
+    // unconditionally here re-enabled audio a user had explicitly switched off, through
+    // an action with no relationship to audio -- and because the swap preserves
+    // producer.id, viewers got no new-share event telling them sound had returned.
+    const wantAudio = options?.streamAudio ?? useVoiceStore.getState().isScreenAudioOn;
+    const captured = await this.acquireScreenCapture(sourceId, 'switchScreenSource', {
+      resolution: options?.resolution ?? useVideoSettingsStore.getState().screenResolution,
+      frameRate: options?.frameRate ?? useVideoSettingsStore.getState().screenFrameRate,
+      contentType: options?.contentType ?? useVideoSettingsStore.getState().screenContentType,
+      streamAudio: wantAudio,
+    });
+    if (!captured) return;
+    // The capture above awaited; a concurrent re-produce may have replaced the producer
+    // we captured at entry. Bail rather than mutate a producer that is no longer current.
+    if (
+      !this.isCurrentVideoReproduce(token, transport) ||
+      this.producers.get('screen') !== producer
+    ) {
+      stopStreamTracks(captured.stream);
+      return;
+    }
+    const stream = captured.stream;
+    const track = stream.getVideoTracks()[0];
+
+    const oldStream = this.localScreenStream;
+    try {
+      await producer.replaceTrack({ track });
+    } catch (err) {
+      // replaceTrack rejects when the codec cannot accept the new track. Fall back to
+      // close-and-reproduce, per the committed design -- keeping the old source shared
+      // was the first implementation and it is worse than either alternative: the user
+      // picked a new target and the Switch button silently did nothing.
+      //
+      // The cost is real and is why this is the FALLBACK and never the first attempt:
+      // a new producer means a new `producer.id`, and `dominantScreenShareId` /
+      // `perScreenShareVolume` / viewer tune-in are all keyed by it (#1924). So say so
+      // rather than letting viewers discover a dead tile.
+      //
+      // Re-entering `produceScreen` costs one extra capture of an already-granted
+      // source. That buys the entire tested publish path -- codec selection, encodings,
+      // degradation preference, the monitor, the store writes, the transportclose
+      // handler -- instead of a second copy of it that would drift.
+      // FENCE FIRST. `replaceTrack` can reject BECAUSE the producer was closed under us --
+      // a Stop or a transport teardown landing inside that pending await -- and in that
+      // case the token is already invalid. Without this check the fallback below closes a
+      // share that is already gone and then re-produces it, resurrecting the user's screen
+      // AND their system audio after they explicitly stopped sharing. The fallback added
+      // one commit earlier to fix a broken switch is itself the thing that walks past the
+      // fence, which is why every new branch on this path needs the check re-asserted.
+      if (!this.isCurrentVideoReproduce(token, transport)) {
+        stopStreamTracks(stream);
+        console.debug('switchScreenSource: replaceTrack rejected on a share that ended');
+        return;
+      }
+      console.warn(
+        'switchScreenSource: replaceTrack rejected, closing and re-producing',
+        errorMessage(err)
+      );
+      useVoiceStore
+        .getState()
+        .setVideoSlotError(
+          'Switching to this source needed a new stream, so viewers may need to tune back in.'
+        );
+      // The capture in hand is GOOD -- only the in-place swap failed -- so hand it to
+      // produceScreen rather than acquiring a second one. Re-acquiring is itself
+      // fallible, and a failure there would leave the user sharing nothing after we
+      // had already closed the old producer: the exact outcome the acquire-first
+      // ordering exists to prevent, reintroduced by the fallback meant to help.
+      await this.closeProducer('screen');
+      await this.produceScreen(
+        sourceId,
+        {
+          resolution: options?.resolution ?? useVideoSettingsStore.getState().screenResolution,
+          frameRate: options?.frameRate ?? useVideoSettingsStore.getState().screenFrameRate,
+          contentType: options?.contentType ?? useVideoSettingsStore.getState().screenContentType,
+          streamAudio: wantAudio,
+        },
+        { stream, sourceId: captured.sourceId }
+      );
+      return;
+    }
+
+    // Only now, after capture AND replaceTrack have both succeeded, does this name the
+    // source actually being shared.
+    if (!this.isCurrentVideoReproduce(token, transport)) {
+      stopStreamTracks(stream);
+      return;
+    }
+    this.localScreenStream = stream;
+    this.currentScreenSourceId = captured.sourceId;
+    this.currentScreenOptions = {
+      resolution: options?.resolution ?? useVideoSettingsStore.getState().screenResolution,
+      frameRate: options?.frameRate ?? useVideoSettingsStore.getState().screenFrameRate,
+      contentType: options?.contentType ?? useVideoSettingsStore.getState().screenContentType,
+      streamAudio: wantAudio,
+    };
+    this.currentScreenAudioCapable = stream.getAudioTracks().length > 0;
+    void this.publishScreenAudioCapability();
+    if (oldStream !== stream) stopStreamTracks(oldStream);
+
+    // BEFORE the retire await, not after. That await drains the transport queue, and a
+    // source ending or having its permission revoked inside it fires `ended` on a track
+    // with no handler attached — assigning one afterwards does not replay the missed
+    // event, so the screen producer stayed mapped and `isScreenSharing` true over a dead
+    // track.
+    track.onended = () => {
+      this.closeProducer('screen');
+    };
+
+    await this.retireScreenAudioProducer(transport);
+    // That await drains the transport queue, so a stop or a transport close can land
+    // inside it. Without this the continuation restores participant metadata and can
+    // publish a late `screen-audio` producer onto a share teardown already finished.
+    if (!this.isCurrentVideoReproduce(token, transport)) {
+      stopStreamTracks(stream);
+      return;
+    }
+
+    const localUserId = useUserStore.getState().user?.id;
+    if (localUserId) {
+      useVoiceStore.getState().updateParticipant(localUserId, {
+        screenStream: stream,
+        isScreenSharing: true,
+        screenAudioStream: undefined,
+      });
+    }
+
+    if (wantAudio) await this.produceScreenAudioFromStream(stream);
+    console.debug('switchScreenSource: swapped to', sourceId, 'on producer', producer.id);
   }
 
   /** Toggle screen share. Pass sourceId and options from ScreenSharePicker for Electron. */
@@ -5345,6 +5972,7 @@ class VoiceService {
    * cleanupScreenState, which tears the whole stream down when `screen` closes.
    */
   private cleanupScreenAudioState(): void {
+    useVoiceStore.getState().setScreenAudioOn(false);
     if (this.localScreenStream) {
       for (const t of this.localScreenStream.getAudioTracks()) {
         t.stop();
@@ -5390,8 +6018,15 @@ class VoiceService {
       for (const t of this.localScreenStream.getTracks()) t.stop();
       this.localScreenStream = null;
     }
+    // The field's own comment says it names the source behind localScreenStream, so it
+    // must not outlive it.
+    this.currentScreenSourceId = null;
+    this.currentScreenOptions = null;
+    this.currentScreenAudioCapable = false;
+    useVoiceStore.getState().setScreenAudioCapable(false);
     const store = useVoiceStore.getState();
     store.setScreenSharing(false);
+    store.setScreenAudioOn(false);
     store.setActiveScreenCodec(null);
     // #2088: deterministic local-share cleanup (spec §3.1 removal point) —
     // don't rely solely on the media-plane's producer-closed self-echo.

@@ -193,6 +193,40 @@ describe('Packaging Identity (#382)', () => {
       });
     });
 
+    // ADR-0043 D7. Electron 43's desktopCapturer docs: on macOS 14.2+, audio capture
+    // without this key "will create a dead audio stream without warnings or errors".
+    // captureScreenElectron's try/catch -> video-only fallback cannot observe a
+    // live-but-silent track, so the client publishes SILENCE to the SFU and nobody
+    // learns anything is wrong. Pinned here because the failure mode is invisible:
+    // a config refactor could drop the key and no other test would notice.
+    it('declares the media-capture usage descriptions macOS requires', async () => {
+      const config = await loadForgeConfig();
+      const info = config.packagerConfig?.extendInfo as Record<string, unknown> | undefined;
+      expect(info?.NSMicrophoneUsageDescription).toEqual(expect.any(String));
+      expect(info?.NSCameraUsageDescription).toEqual(expect.any(String));
+      expect(info?.NSAudioCaptureUsageDescription).toEqual(expect.any(String));
+    });
+
+    // The PACKAGED app gets these keys from forge.config.ts; a `npm start` DEV launch
+    // gets them only from scripts/patch-electron-plist.sh, which patches Electron's
+    // helper plists. They are a file PAIR, and the audio key shipped in the first half
+    // alone -- so screen-audio was dead on the machine it was being written on, with no
+    // exception and no warning to say why. Assert both halves together.
+    it('patches the same usage descriptions into the dev helper plists', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const script = await readFile(
+        new URL('../../../scripts/patch-electron-plist.sh', import.meta.url),
+        'utf8'
+      );
+      for (const key of [
+        'NSMicrophoneUsageDescription',
+        'NSCameraUsageDescription',
+        'NSAudioCaptureUsageDescription',
+      ]) {
+        expect(script).toContain(`Add :${key} string`);
+      }
+    });
+
     it('has win32metadata.CompanyName set', async () => {
       const config = await loadForgeConfig();
       expect(config.packagerConfig?.win32metadata?.CompanyName).toBeTruthy();

@@ -10,6 +10,9 @@ import {
   VideoOff,
   Monitor,
   MonitorOff,
+  MonitorUp,
+  Volume2,
+  VolumeX,
   PhoneOff,
   MessageSquare,
   MessageSquareOff,
@@ -59,6 +62,18 @@ function muteTitle(serverMuted: boolean, selfMuted: boolean): string {
 }
 
 /** Compute deafen button tooltip based on enforcement state. */
+function screenAudioTitle(capable: boolean, on: boolean): string {
+  if (!capable) {
+    return 'This share cannot carry computer sound \u2014 share a whole screen, on Windows or macOS';
+  }
+  // "this screen's audio" is a claim the loopback cannot keep — it ignores the selected
+  // source, so a multi-monitor user broadcasts the other screen's applications too. Same
+  // correction as the picker hint; this separate live-control tooltip had been missed.
+  return on
+    ? 'Stop sharing your computer\u2019s sound'
+    : 'Share your computer\u2019s sound \u2014 everything playing, not only this screen';
+}
+
 function deafenTitle(serverDeafened: boolean, selfDeafened: boolean): string {
   if (serverDeafened) return 'Server-deafened by a moderator';
   if (selfDeafened) return 'Undeafen';
@@ -304,6 +319,10 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   const isDeafened = useVoiceStore((s) => s.isDeafened);
   const isVideoOn = useVoiceStore((s) => s.isVideoOn);
   const isScreenSharing = useVoiceStore((s) => s.isScreenSharing);
+  const isScreenAudioOn = useVoiceStore((s) => s.isScreenAudioOn);
+  // Published by voiceService, which is the only place that knows both the live source
+  // id and the platform. Read, never derived here.
+  const isScreenAudioCapable = useVoiceStore((s) => s.isScreenAudioCapable);
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
   const toggleVoiceTextChat = useVoiceStore((s) => s.toggleVoiceTextChat);
   const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
@@ -326,6 +345,9 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   const hasLinkedText = !!(activeChannelId && getLinkedTextChannel(activeChannelId));
 
   const [showScreenPicker, setShowScreenPicker] = useState(false);
+  // Resolved when the picker OPENS rather than read during render: voiceService is a
+  // dynamic import here, so there is no synchronous handle to it in the JSX.
+  const [pickerCurrentSource, setPickerCurrentSource] = useState<string | null>(null);
   const [showPipMenu, setShowPipMenu] = useState(false);
 
   const controlsRef = useRef<HTMLDivElement>(null);
@@ -363,13 +385,43 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
     }
   };
 
+  /** Open the picker while a share is live, to change target without stopping (R6). */
+  const handleSwitchScreen = () => {
+    // RESOLVE FIRST, THEN MOUNT. `ScreenSharePicker` reads `currentSourceId` in a
+    // `useState` initializer, so it is consumed once at mount and never again --
+    // opening the picker before the id arrives means the pre-selection can never
+    // land, and the late setState could also restore a value a cancel had cleared.
+    // The wait is a resolved-module microtask in practice: you can only reach this
+    // button while a share is live, which means voiceService is already imported.
+    void getVoiceService()
+      .then((svc) => setPickerCurrentSource(svc.getCurrentScreenSourceId()))
+      // A failed resolve costs the pre-selection, never the picker: the `finally`
+      // opens it either way, because choosing a source is what the button is for.
+      .catch(() => setPickerCurrentSource(null))
+      .finally(() => setShowScreenPicker(true));
+  };
+
+  const handleToggleScreenAudio = async () => {
+    try {
+      await (await getVoiceService()).setScreenAudioEnabled(!isScreenAudioOn);
+    } catch (err) {
+      console.error('Failed to toggle screen audio:', errorMessage(err));
+    }
+  };
+
   const handleScreenSourceSelected = async (
     sourceId: string,
     options?: import('../../stores/voice/videoSettingsStore').ScreenShareOptions
   ) => {
     setShowScreenPicker(false);
+    setPickerCurrentSource(null);
     try {
-      await (await getVoiceService()).toggleScreenShare(sourceId, options);
+      const svc = await getVoiceService();
+      // Already sharing means the user picked a NEW target for a live share. Switching
+      // keeps the producer id, so viewers stay tuned in; toggleScreenShare here would
+      // start a second share on top of the first.
+      if (isScreenSharing) await svc.switchScreenSource(sourceId, options);
+      else await svc.toggleScreenShare(sourceId, options);
     } catch (err) {
       console.error('Failed to start screen share:', errorMessage(err));
       // Surface cap-exceeded (and other start failures) as a slot toast — parity
@@ -481,6 +533,31 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
 
           {isScreenSharing && (
             <MediaButton
+              isActive={false}
+              onClick={handleSwitchScreen}
+              title="Switch to a different screen or window without stopping"
+              activeIcon={<MonitorUp size={18} />}
+              inactiveIcon={<MonitorUp size={18} />}
+              activeLabel="Switch"
+              inactiveLabel="Switch"
+            />
+          )}
+
+          {isScreenSharing && (
+            <MediaButton
+              isActive={isScreenAudioOn}
+              onClick={handleToggleScreenAudio}
+              locked={!isScreenAudioCapable}
+              title={screenAudioTitle(isScreenAudioCapable, isScreenAudioOn)}
+              activeIcon={<Volume2 size={18} />}
+              inactiveIcon={<VolumeX size={18} />}
+              activeLabel="Audio On"
+              inactiveLabel="Audio Off"
+            />
+          )}
+
+          {isScreenSharing && (
+            <MediaButton
               isActive={keepActiveWhileUnfocused}
               onClick={() => setKeepActiveWhileUnfocused(!keepActiveWhileUnfocused)}
               title={
@@ -557,7 +634,14 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
         createPortal(
           <ScreenSharePicker
             onSelect={handleScreenSourceSelected}
-            onCancel={() => setShowScreenPicker(false)}
+            onCancel={() => {
+              setShowScreenPicker(false);
+              // Cleared on close, not on open: the start-a-share path lives in a
+              // module-level helper with no access to this state, so clearing here
+              // is the only point every open path passes through first.
+              setPickerCurrentSource(null);
+            }}
+            currentSourceId={pickerCurrentSource}
           />,
           document.body
         )}

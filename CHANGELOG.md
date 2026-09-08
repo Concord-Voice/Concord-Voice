@@ -8,7 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **You can now pick what to share from three tabs instead of one long list** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — the share
+  window listed every screen and every open window in two flat piles, which on a busy machine
+  meant scrolling past a dozen browser windows to find the one you wanted. It now has Screens,
+  Applications and Windows tabs, and the Applications tab groups an app's windows together under
+  its name and icon, so finding the right Chrome window takes one glance rather than a hunt.
+- **Screen sharing has a sound switch** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — sharing a screen now carries your computer's
+  sound by default, and a Stream Audio control lets you turn that off if you would rather show
+  video only. Worth knowing what "your computer's sound" means: it is everything playing, not
+  only the screen you picked, so on a two-monitor setup the people watching hear the other
+  monitor too. You can flip it mid-share without interrupting what people are watching. When you share
+  a single window or application the control is switched off and says why: sharing sound from one
+  app, and only that app, is not something the desktop app can do yet, and it will not quietly
+  send every other sound on your computer instead. The same applies on Linux, where sharing
+  computer sound is not supported yet at all.
+- **You can change what you are sharing without stopping first** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — switching from your
+  screen to a document used to mean stopping the share and starting a new one, which dropped
+  everyone watching and made them click back in. A Switch button now swaps the source in place.
+  Anyone watching stays watching, and if you change your mind at the picker your original share
+  keeps running.
 - **Message expiry groundwork now covers shared chats** ([#3144](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3144), [#2195](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2195)) — the server now stores shared expiry policy and expiry metadata for channels, direct messages, and group DMs, and can apply or clear that policy on existing messages in resumable batches. Settings UI and automatic deletion arrive in later work, so this groundwork does not enable retention by itself.
+
+### Fixed
+
+- **Sharing a screen on a Mac now actually carries sound** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — on macOS 14.2 and later,
+  Apple requires an app to declare that it captures system audio before it is allowed to. Concord
+  Voice never made that declaration, and macOS did not refuse the request or report an error — it
+  handed back a silent audio track. The app could not tell the difference, so it sent that silence
+  to everyone in the channel. Every Mac screen share since macOS 14.2 has been silent, with
+  nothing to indicate why. The declaration is now in place. Note the floor this does not move:
+  Apple exposed no way to capture system audio until macOS 13, so on macOS 12 and earlier a
+  screen share carries picture only, and the app now falls back to video rather than appearing
+  to send sound it never captured.
 
 ## [0.2.46] — 2026-09-07
 

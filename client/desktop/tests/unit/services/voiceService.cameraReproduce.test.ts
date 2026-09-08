@@ -378,9 +378,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
 
     const screenTrack = makeVideoTrack('pre-publish-screen');
     const screenAudioTrack = makeAudioTrack('pre-publish-screen-audio');
-    svc.captureScreen = vi
-      .fn()
-      .mockResolvedValue(new MockMediaStream([screenTrack, screenAudioTrack]));
+    svc.captureScreen = vi.fn().mockResolvedValue({
+      stream: new MockMediaStream([screenTrack, screenAudioTrack]),
+      sourceId: 'window:pre-publish:0',
+    });
     await svc.produceScreen('window:pre-publish:0');
     await svc.fastReproduceScreen();
 
@@ -458,7 +459,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     });
 
     const screenTrack = makeVideoTrack('screen-profile-track');
-    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    svc.captureScreen = vi.fn().mockResolvedValue({
+      stream: new MockMediaStream([screenTrack]),
+      sourceId: 'screen:0',
+    });
 
     await svc.produceScreen('window:1:0');
     expect(useVoiceStore.getState().activeScreenCodec).toBe('video/h264:640034');
@@ -574,7 +578,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
           encodings: [{ maxBitrate: 1_500_000 }],
           effectiveBitrate: 1_500_000,
         });
-        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        svc.captureScreen = vi.fn().mockResolvedValue({
+          stream: new MockMediaStream([track]),
+          sourceId: 'screen:0',
+        });
         await expect(svc.produceScreen('window:no-codec:0')).rejects.toThrow(
           /eligible screen codec/i
         );
@@ -607,7 +614,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
           encodings: [{ maxBitrate: 1_000_000 }],
         });
       } else {
-        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        svc.captureScreen = vi.fn().mockResolvedValue({
+          stream: new MockMediaStream([track]),
+          sourceId: 'screen:0',
+        });
         await svc.produceScreen('window:fast-no-codec:0');
         svc.pickScreenCodec.mockReturnValue({
           codec: undefined,
@@ -639,7 +649,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
         svc.acquireCameraWithFallback = vi.fn().mockResolvedValue(new MockMediaStream([track]));
         await svc.produceVideo();
       } else {
-        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        svc.captureScreen = vi.fn().mockResolvedValue({
+          stream: new MockMediaStream([track]),
+          sourceId: 'screen:0',
+        });
         await svc.produceScreen('window:reproduce-reject:0');
       }
 
@@ -675,7 +688,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
         await svc.produceVideo();
         if (reproduce) await svc.fastReproduceCamera();
       } else {
-        svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([track]));
+        svc.captureScreen = vi.fn().mockResolvedValue({
+          stream: new MockMediaStream([track]),
+          sourceId: 'screen:0',
+        });
         await svc.produceScreen('window:transport-close:0');
         if (reproduce) await svc.fastReproduceScreen();
       }
@@ -728,7 +744,7 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
 
     const screenTrack = makeVideoTrack('screen-track');
     const screenStream = new MockMediaStream([screenTrack]);
-    svc.captureScreen = vi.fn().mockResolvedValue(screenStream);
+    svc.captureScreen = vi.fn().mockResolvedValue({ stream: screenStream, sourceId: 'screen:0' });
 
     await svc.produceScreen('window:1:0');
     const original = svc.producers.get('screen');
@@ -749,7 +765,7 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
 
     const screenTrack = makeVideoTrack('screen-track-ended');
     const screenStream = new MockMediaStream([screenTrack]);
-    svc.captureScreen = vi.fn().mockResolvedValue(screenStream);
+    svc.captureScreen = vi.fn().mockResolvedValue({ stream: screenStream, sourceId: 'screen:0' });
 
     await svc.produceScreen('window:1:0');
     await svc.fastReproduceScreen();
@@ -825,7 +841,7 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
 
     const screenTrack = makeVideoTrack('screen-track');
     const screenStream = new MockMediaStream([screenTrack]);
-    svc.captureScreen = vi.fn().mockResolvedValue(screenStream);
+    svc.captureScreen = vi.fn().mockResolvedValue({ stream: screenStream, sourceId: 'screen:0' });
 
     await svc.produceScreen('window:1:0');
     const original = svc.producers.get('screen');
@@ -920,7 +936,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     svc.screenLayeringEnabled = false;
 
     const screenTrack = makeVideoTrack('screen-track');
-    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    svc.captureScreen = vi.fn().mockResolvedValue({
+      stream: new MockMediaStream([screenTrack]),
+      sourceId: 'screen:0',
+    });
     await svc.produceScreen('window:1:0');
     const original = svc.producers.get('screen');
     expect(svc.screenLayeringEnabled).toBe(false);
@@ -948,7 +967,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     resetService(svc);
 
     const screenTrack = makeVideoTrack('screen-track');
-    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    svc.captureScreen = vi.fn().mockResolvedValue({
+      stream: new MockMediaStream([screenTrack]),
+      sourceId: 'screen:0',
+    });
     await svc.produceScreen('window:1:0');
     const original = svc.producers.get('screen');
     // Simulcast screen currently live (gate was on).
@@ -1008,7 +1030,10 @@ describe('voiceService camera/screen re-produce track lifecycle', () => {
     svc.screenLayeringEnabled = false;
 
     const screenTrack = makeVideoTrack('screen-track');
-    svc.captureScreen = vi.fn().mockResolvedValue(new MockMediaStream([screenTrack]));
+    svc.captureScreen = vi.fn().mockResolvedValue({
+      stream: new MockMediaStream([screenTrack]),
+      sourceId: 'screen:0',
+    });
     await svc.produceScreen('window:1:0');
 
     const handler = getSocketHandler(svc, 'screen-layering-gate');

@@ -1805,6 +1805,11 @@ ipcMain.handle('media:getDesktopSources', async (event) => {
   const sources = await desktopCapturer.getSources({
     types: ['window', 'screen'],
     thumbnailSize: { width: 320, height: 180 },
+    // Load-bearing, NOT a nicety: DesktopCapturerSource exposes no application name
+    // and no PID, so the picker's Applications tab groups windows by appIcon identity
+    // (groupDesktopSources). With this false every appIcon is null and grouping silently
+    // degrades to a title-suffix heuristic. Do not remove it to save thumbnail work.
+    fetchWindowIcons: true,
   });
   return sources.map((s) => ({
     id: s.id,

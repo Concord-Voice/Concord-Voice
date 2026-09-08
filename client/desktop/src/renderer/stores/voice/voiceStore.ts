@@ -282,6 +282,20 @@ interface VoiceState {
   isDeafened: boolean;
   isVideoOn: boolean;
   isScreenSharing: boolean;
+  /**
+   * Is the LOCAL share currently carrying audio? LIVE producer state, not the
+   * persisted preference (videoSettingsStore.screenStreamAudio) -- a share is silent
+   * whenever its target is a window, however the preference is set.
+   */
+  isScreenAudioOn: boolean;
+  /**
+   * Whether the LIVE share's target can carry audio at all (whole screen, and not
+   * Linux). Distinct from `isScreenAudioOn`, which is whether audio is actually being
+   * sent: a capable target with audio switched off is `true`/`false`, an incapable one
+   * is `false`/`false`. The toolbar needs the first to decide whether to OFFER the
+   * control and the second to decide what it says.
+   */
+  isScreenAudioCapable: boolean;
   localIsTesting: boolean;
 
   // Participants (keyed by userId)
@@ -404,6 +418,8 @@ interface VoiceState {
   setDeafened: (deafened: boolean) => void;
   setVideoOn: (on: boolean) => void;
   setScreenSharing: (sharing: boolean) => void;
+  setScreenAudioOn: (on: boolean) => void;
+  setScreenAudioCapable: (capable: boolean) => void;
   setLocalIsTesting: (testing: boolean) => void;
   setActiveSpeaker: (userId: string | null) => void;
   setAudioInputDevice: (deviceId: string) => void;
@@ -546,6 +562,8 @@ const initialState = {
   isDeafened: false,
   isVideoOn: false,
   isScreenSharing: false,
+  isScreenAudioOn: false,
+  isScreenAudioCapable: false,
   localIsTesting: false,
   participants: {} as Record<string, VoiceParticipant>,
   screenShareMuted: {} as Record<string, boolean>,
@@ -680,6 +698,8 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setDeafened: (isDeafened) => set({ isDeafened }),
   setVideoOn: (isVideoOn) => set({ isVideoOn }),
   setScreenSharing: (isScreenSharing) => set({ isScreenSharing }),
+  setScreenAudioOn: (isScreenAudioOn) => set({ isScreenAudioOn }),
+  setScreenAudioCapable: (isScreenAudioCapable) => set({ isScreenAudioCapable }),
   setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),
   setActiveSpeaker: (activeSpeakerId) => set({ activeSpeakerId }),
   setAudioInputDevice: (audioInputDeviceId) => {

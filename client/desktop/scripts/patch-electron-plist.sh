@@ -9,11 +9,18 @@
 #      postinstall; we trigger it explicitly here.
 #
 #   2. macOS-only: patch Electron's helper-app Info.plist files with
-#      NSMicrophoneUsageDescription and NSCameraUsageDescription. Required
-#      for macOS TCC to allow getUserMedia in dev mode (the renderer helper
-#      process calls getUserMedia, not the main process). Without these keys,
-#      macOS kills the process with SIGABRT before any JS error handling can
-#      kick in.
+#      NSMicrophoneUsageDescription, NSCameraUsageDescription and
+#      NSAudioCaptureUsageDescription. Required for macOS TCC to allow
+#      getUserMedia in dev mode (the renderer helper process calls
+#      getUserMedia, not the main process). Without the first two, macOS kills
+#      the process with SIGABRT before any JS error handling can kick in.
+#
+#      The audio-capture key fails DIFFERENTLY and more quietly: on macOS 14.2+
+#      Chromium routes desktop audio through Apple's CoreAudio Tap API, and a
+#      missing key yields a live-but-SILENT track with no exception and no
+#      warning. The packaged app gets this key from forge.config.ts extendInfo;
+#      a `npm start` dev launch gets it only from here, so omitting it means
+#      screen-audio work cannot be tested on the machine it is written on.
 #
 # Runs automatically via npm postinstall.
 
@@ -165,6 +172,7 @@ sign_component() {
 
 MIC_DESC="This app needs microphone access for voice calls."
 CAM_DESC="This app needs camera access for video calls."
+AUDIO_CAPTURE_DESC="This app needs system audio access to share your screen with sound."
 
 # Process-substitution caveat: `find` runs in a subprocess whose exit code is
 # discarded by `< <(...)`, so a silent find failure would yield an empty loop
@@ -182,6 +190,10 @@ while IFS= read -r -d '' plist; do
   fi
   if ! plist_has_key "$plist" "NSCameraUsageDescription"; then
     /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string '$CAM_DESC'" "$plist"
+    CHANGED=true
+  fi
+  if ! plist_has_key "$plist" "NSAudioCaptureUsageDescription"; then
+    /usr/libexec/PlistBuddy -c "Add :NSAudioCaptureUsageDescription string '$AUDIO_CAPTURE_DESC'" "$plist"
     CHANGED=true
   fi
   if [ "$CHANGED" = true ]; then

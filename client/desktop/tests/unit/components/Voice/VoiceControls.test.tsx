@@ -11,6 +11,9 @@ const mockToggleMute = vi.fn();
 const mockToggleDeafen = vi.fn();
 const mockToggleVideo = vi.fn().mockResolvedValue(undefined);
 const mockToggleScreenShare = vi.fn().mockResolvedValue(undefined);
+const mockSwitchScreenSource = vi.fn().mockResolvedValue(undefined);
+const mockGetCurrentScreenSourceId = vi.fn(() => 'screen:live');
+const mockSetScreenAudioEnabled = vi.fn().mockResolvedValue(undefined);
 const mockLeaveChannel = vi.fn().mockResolvedValue(undefined);
 const mockTuneInAll = vi.fn().mockResolvedValue(undefined);
 const mockTuneOutAll = vi.fn().mockResolvedValue(undefined);
@@ -21,6 +24,9 @@ vi.mock('@/renderer/services/voice/voiceService', () => ({
     toggleDeafen: mockToggleDeafen,
     toggleVideo: mockToggleVideo,
     toggleScreenShare: mockToggleScreenShare,
+    switchScreenSource: mockSwitchScreenSource,
+    getCurrentScreenSourceId: mockGetCurrentScreenSourceId,
+    setScreenAudioEnabled: mockSetScreenAudioEnabled,
     leaveChannel: mockLeaveChannel,
     tuneInAllScreenShares: (...args: unknown[]) => mockTuneInAll(...args),
     tuneOutAllScreenShares: (...args: unknown[]) => mockTuneOutAll(...args),
@@ -40,13 +46,29 @@ vi.mock('@/renderer/stores/voice/osPermissionStore', () => ({
 }));
 
 // ── ScreenSharePicker mock ───────────────────────────────────────────────────
+// Records the `currentSourceId` seen on EVERY render. The real picker consumes that
+// prop in a `useState` initializer, so only the FIRST entry can ever reach the user;
+// a value that arrives on render 2 is discarded. Asserting on `[0]` is what makes
+// "resolve before mounting" testable rather than "resolve eventually".
+const pickerRenders: (string | null | undefined)[] = [];
 vi.mock('@/renderer/components/Voice/ScreenSharePicker', () => ({
-  default: ({ onSelect, onCancel }: { onSelect: (id: string) => void; onCancel: () => void }) => (
-    <div data-testid="screen-share-picker">
-      <button onClick={() => onSelect('source-1')}>Select Source</button>
-      <button onClick={onCancel}>Cancel Picker</button>
-    </div>
-  ),
+  default: ({
+    onSelect,
+    onCancel,
+    currentSourceId,
+  }: {
+    onSelect: (id: string) => void;
+    onCancel: () => void;
+    currentSourceId?: string | null;
+  }) => {
+    pickerRenders.push(currentSourceId);
+    return (
+      <div data-testid="screen-share-picker">
+        <button onClick={() => onSelect('source-1')}>Select Source</button>
+        <button onClick={onCancel}>Cancel Picker</button>
+      </div>
+    );
+  },
 }));
 
 // ── CSS mock ─────────────────────────────────────────────────────────────────
@@ -949,5 +971,130 @@ describe('VoiceControls', () => {
       expect(screen.queryByRole('button', { name: 'Tile view' })).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: "Front 'n Center" })).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () => {
+  beforeEach(() => {
+    mockToggleScreenShare.mockClear();
+    // This `describe` is TOP-LEVEL and inherits no hook from `describe('VoiceControls')`,
+    // so the reset has to be repeated here. Clearing only the spies left live Zustand
+    // state from whichever test ran previously, making every field `setVoiceState` does
+    // not overwrite order-dependent.
+    resetAllStores();
+    mockSwitchScreenSource.mockClear();
+    mockGetCurrentScreenSourceId.mockClear();
+    mockGetCurrentScreenSourceId.mockReturnValue('screen:live');
+    pickerRenders.length = 0;
+    mockSetScreenAudioEnabled.mockClear();
+  });
+
+  // The Stop button keeps its place and meaning; switching is ADDITIVE, so nobody has
+  // to relearn the control they already use.
+  it('offers Switch only while a share is live, alongside Stop', () => {
+    setVoiceState({ isScreenSharing: false });
+    const { rerender } = render(<VoiceControls />);
+    expect(screen.queryByTitle(/Switch to a different screen/)).not.toBeInTheDocument();
+
+    setVoiceState({ isScreenSharing: true });
+    rerender(<VoiceControls />);
+    expect(screen.getByTitle(/Switch to a different screen/)).toBeInTheDocument();
+    expect(screen.getByTitle('Stop Sharing')).toBeInTheDocument();
+  });
+
+  // The core of R6: picking a target mid-share must SWITCH, not start a second share.
+  it('routes a picker selection to switchScreenSource while already sharing', async () => {
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Switch to a different screen/));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Select Source'));
+    });
+
+    expect(mockSwitchScreenSource).toHaveBeenCalledWith('source-1', undefined);
+    expect(mockToggleScreenShare).not.toHaveBeenCalled();
+  });
+
+  // The picker reads `currentSourceId` once, in a `useState` initializer. Mounting it
+  // before the async service import resolves therefore means the pre-selection can
+  // NEVER land -- the feature is inert, not merely late.
+  it('resolves the live source BEFORE mounting the picker, so the first render carries it', async () => {
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Switch to a different screen/));
+    });
+
+    expect(pickerRenders[0]).toBe('screen:live');
+  });
+
+  it('still opens the picker when the source cannot be resolved', async () => {
+    mockGetCurrentScreenSourceId.mockImplementation(() => {
+      throw new Error('service unavailable');
+    });
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Switch to a different screen/));
+    });
+
+    // A failed resolve costs the pre-selection, never the picker itself.
+    expect(screen.getByTestId('screen-share-picker')).toBeInTheDocument();
+    expect(pickerRenders[0]).toBeNull();
+  });
+
+  it('does not restore a pre-selection after the picker is cancelled', async () => {
+    setVoiceState({ isScreenSharing: true });
+    render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Switch to a different screen/));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Cancel Picker'));
+    });
+
+    expect(screen.queryByTestId('screen-share-picker')).not.toBeInTheDocument();
+    // Reopening starts from a freshly resolved value, never a stale one.
+    mockGetCurrentScreenSourceId.mockReturnValue('screen:other');
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Switch to a different screen/));
+    });
+    expect(pickerRenders[pickerRenders.length - 1]).toBe('screen:other');
+  });
+
+  it('disables the audio toggle when the live target cannot carry sound', () => {
+    setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: false });
+    render(<VoiceControls />);
+
+    const btn = screen.getByTitle(/cannot carry computer sound/i);
+    expect(btn).toBeDisabled();
+
+    fireEvent.click(btn);
+    expect(mockSetScreenAudioEnabled).not.toHaveBeenCalled();
+  });
+
+  it('toggles screen audio to the opposite of the live state', async () => {
+    setVoiceState({ isScreenSharing: true, isScreenAudioOn: true, isScreenAudioCapable: true });
+    render(<VoiceControls />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Stop sharing your computer/));
+    });
+
+    expect(mockSetScreenAudioEnabled).toHaveBeenCalledWith(false);
+  });
+
+  it('reflects a silent share as Audio Off, so the button never lies', () => {
+    // Capable but currently off -- the two flags are independent, and this is the case
+    // that distinguishes them: an OFFERED control that happens to be switched off.
+    setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: true });
+    render(<VoiceControls />);
+    expect(screen.getByTitle(/^Share your computer/)).toBeInTheDocument();
   });
 });

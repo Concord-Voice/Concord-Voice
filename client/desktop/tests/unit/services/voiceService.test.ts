@@ -2473,12 +2473,16 @@ describe('VoiceService', () => {
     type CaptureFn = (
       id: string | undefined,
       res: { w: number; h: number },
-      fps: number
+      fps: number,
+      wantAudio: boolean
     ) => Promise<unknown>;
 
+    // wantAudio: true deliberately. These are the #2161 scope tests, so the case that
+    // matters is a caller that DOES ask for audio on a window target and must still be
+    // refused. Passing false would make them pass for the wrong reason.
     function captureElectron(id: string | undefined): Promise<unknown> {
       const svc = voiceService as unknown as { captureScreenElectron: CaptureFn };
-      return svc.captureScreenElectron(id, { w: 1280, h: 720 }, 30);
+      return svc.captureScreenElectron(id, { w: 1280, h: 720 }, 30, true);
     }
 
     let origElectron: typeof globalThis.electron;

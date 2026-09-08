@@ -67,6 +67,18 @@ export interface ScreenShareOptions {
   resolution: string;
   frameRate: number;
   contentType: ScreenContentType;
+  /**
+   * Carry the target's audio with the share. Default ON (R5).
+   *
+   * Honoured ONLY for `screen:` targets: Electron's desktop audio capture is a
+   * whole-system loopback that ignores chromeMediaSourceId, so a `window:` target
+   * requesting audio would leak every application's sound to the channel (#2161).
+   * TWO independent gates, and both are real: the picker refuses to ask (canCarryScreenAudio,
+   * which also covers Linux), and captureScreenElectron requires `wantAudio && screen:`
+   * before requesting loopback — so a renderer that sent `true` for a window target would
+   * still get video only. Per-application audio needs a native addon -- see ADR-0043.
+   */
+  streamAudio: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +99,7 @@ export interface VideoSettings {
   screenResolution: string;
   screenFrameRate: number; // 0 = Native (display refresh rate), or specific FPS value
   screenContentType: ScreenContentType;
+  screenStreamAudio: boolean; // persisted default for ScreenShareOptions.streamAudio
   screenSharePriority: VideoPriority; // DSCP priority for screen share traffic
   screenShareBitrate: number; // bps, 0 = auto (codec-dependent)
 
@@ -128,6 +141,7 @@ interface VideoSettingsState extends VideoSettings {
   setScreenResolution: (res: string) => void;
   setScreenFrameRate: (fps: number) => void;
   setScreenContentType: (type: ScreenContentType) => void;
+  setScreenStreamAudio: (on: boolean) => void;
   setScreenSharePriority: (priority: VideoPriority) => void;
   setScreenShareBitrate: (bitrate: number) => void;
   setDegradationPreference: (pref: DegradationPreference) => void;
@@ -152,6 +166,7 @@ const defaults: VideoSettings = {
   screenResolution: 'source',
   screenFrameRate: 30,
   screenContentType: 'auto',
+  screenStreamAudio: true,
   screenSharePriority: 'medium',
   screenShareBitrate: 0, // Auto
   degradationPreference: 'balanced',
@@ -181,6 +196,7 @@ export const useVideoSettingsStore = wrapStore(
         setScreenResolution: (screenResolution) => set({ screenResolution }),
         setScreenFrameRate: (screenFrameRate) => set({ screenFrameRate }),
         setScreenContentType: (screenContentType) => set({ screenContentType }),
+        setScreenStreamAudio: (screenStreamAudio) => set({ screenStreamAudio }),
         setScreenSharePriority: (screenSharePriority) => set({ screenSharePriority }),
         setScreenShareBitrate: (screenShareBitrate) => set({ screenShareBitrate }),
         setDegradationPreference: (degradationPreference) => set({ degradationPreference }),

@@ -114,3 +114,21 @@ describe('autoTuneInScreenShares (#2088)', () => {
     expect(JSON.parse(raw as string).state.autoTuneInScreenShares).toBe(true);
   });
 });
+
+describe('screenStreamAudio (ADR-0043 / R5)', () => {
+  it('defaults to ON — a share carries its audio unless the user opts out', () => {
+    expect(useVideoSettingsStore.getState().screenStreamAudio).toBe(true);
+  });
+
+  it('setScreenStreamAudio updates the value', () => {
+    useVideoSettingsStore.getState().setScreenStreamAudio(false);
+    expect(useVideoSettingsStore.getState().screenStreamAudio).toBe(false);
+  });
+
+  it('persists, so the choice survives a restart', () => {
+    useVideoSettingsStore.getState().setScreenStreamAudio(false);
+    const raw = localStorage.getItem('concord:video-settings');
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw as string).state.screenStreamAudio).toBe(false);
+  });
+});
