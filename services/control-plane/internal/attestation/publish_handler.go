@@ -48,6 +48,34 @@ func (h *Handler) requireOIDC(c *gin.Context) bool {
 	return true
 }
 
+// maxLoggedErrLen bounds a verification error before it reaches the log sink.
+const maxLoggedErrLen = 512
+
+// truncateForLog caps an unauthenticated caller's influence on log VOLUME.
+//
+// Two library errors on this path interpolate caller- or upstream-controlled
+// bytes verbatim: go-jose's ErrUnexpectedSignatureAlgorithm embeds the raw
+// `alg` header, and go-oidc embeds the entire JWKS response body in a
+// key-decode failure. Nothing bounded either before the slog attribute, so a
+// single unauthenticated 401 could write up to net/http's MaxHeaderBytes
+// (1 MiB) into the logs — measured at 200,087 bytes for a 200,000-byte `alg`
+// header by @red-team on PR #3207.
+//
+// Log FORGING was already contained and is not what this addresses: %q
+// escaping plus the slog handler's own encoding mean CRLF and JSON-injection
+// payloads never reach the sink raw (observability.md principle 5). This is
+// volume only.
+//
+// ToValidUTF8 is not decoration — cutting at a byte offset can split a rune,
+// and the truncated tail is attacker-controlled, so the naive slice is exactly
+// how invalid UTF-8 reaches a JSON log encoder.
+func truncateForLog(s string) string {
+	if len(s) <= maxLoggedErrLen {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxLoggedErrLen], "") + "…[truncated]"
+}
+
 // runOIDCVerify invokes the supplied per-axis verifier function and writes
 // a 401 response on failure. Returns (sub, true) on success or ("", false)
 // after writing the error. Caller short-circuits on !ok.
@@ -66,7 +94,7 @@ func (h *Handler) runOIDCVerify(
 		h.emit(c.Request.Context(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonAttestationRejected})
 		h.log.With("event", "attestation.publish_oidc_rejected",
 			"axis", axis,
-			"error", err.Error()).
+			"error", truncateForLog(err.Error())).
 			Warn("OIDC verify failed")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "OIDC verification failed"})
 		return "", false

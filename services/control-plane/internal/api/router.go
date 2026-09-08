@@ -1376,6 +1376,15 @@ func NewRouter(
 		// Both share the same OIDC verifier (workflow ref / audience / subject).
 		// Authentication is delegated to each handler — no upstream auth middleware.
 		//
+		// WARNING to anyone adding a route here: these two sit on the
+		// UNAUTHENTICATED v1 group, so a new sibling inherits NO gate by
+		// default — it is public until its handler says otherwise. The two
+		// below are safe because each opens with requireOIDC, which 503s on a
+		// nil verifier and 401s on a bad token. Either wire an explicit
+		// middleware onto the new route or open its handler the same way.
+		// Raised by @rbac-reviewer on PR #3207: the enforcement boundary here
+		// is the handler body, not the router, which is easy to miss.
+		//
 		// NOTE: revoke endpoint is intentionally deferred until an admin-auth
 		// middleware exists; the handler is built and tested but not wired
 		// (operators can revoke via direct DB + Redis until then).

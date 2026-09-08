@@ -116,10 +116,18 @@ func (g *GoogleProvider) validateIDToken(ctx context.Context, idToken, expectedN
 	parser := jwt.NewParser(
 		jwt.WithAudience(g.cfg.ClientID),
 		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
 	)
 	claims := &googleClaims{}
 	tok, err := parser.ParseWithClaims(idToken, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+		// RS256 exactly, not the whole RSA family. A bare
+		// *jwt.SigningMethodRSA assertion also admits RS384 and RS512, which
+		// defends algorithm CONFUSION (HS256 keyed on the RSA public key) but
+		// not algorithm BREADTH. Neither issuer signs with anything but RS256.
+		// Mirrors middleware/cfaccess_jwks.go:126,130 and the attestation OIDC
+		// pin, so all three verifiers now answer "which algorithms do we
+		// accept" the same way (#3207 review, @pr-test-analyzer F7).
+		if t.Method == nil || t.Method.Alg() != jwt.SigningMethodRS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method %v", t.Method.Alg())
 		}
 		kid, _ := t.Header["kid"].(string)

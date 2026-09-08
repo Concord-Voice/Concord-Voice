@@ -73,7 +73,35 @@ func NewOIDCVerifier(ctx context.Context, cfg OIDCConfig) (*OIDCVerifier, error)
 	return &OIDCVerifier{
 		cfg:      cfg,
 		provider: p,
-		verifier: p.Verifier(&oidc.Config{ClientID: cfg.Audience}),
+		// SupportedSigningAlgs is pinned explicitly. Leaving it nil does NOT
+		// select go-oidc's RS256 default on this path: Provider.Verifier
+		// backfills an empty list from p.algorithms — the
+		// id_token_signing_alg_values_supported array parsed out of the
+		// issuer's /.well-known/openid-configuration by the NewProvider call
+		// above. The library's hardcoded RS256 fallback fires only when config
+		// AND discovery are both empty, so it is unreachable here.
+		//
+		// Be precise about what this closes. Unpinned, the accepted set is that
+		// advertised list INTERSECTED with go-oidc's own supportedAlgorithms
+		// map, which already excludes HS256 and "none" — so this is not an
+		// alg:none or HMAC-confusion hole. What it closes is a
+		// key-reuse-across-algorithm downgrade: EdDSA, PS256 and RS512 are the
+		// cases where this pin is the sole blocker, each still requiring a
+		// private key present in the issuer's JWKS. p.algorithms is captured
+		// once at NewProvider, so a widening took effect on the next process
+		// start rather than instantly.
+		//
+		// RS256 is the correct pin because the GitHub Actions JWKS publishes
+		// RSA keys exclusively. CWE-757, algorithm downgrade during
+		// negotiation: preventative, bound at Concord's own trust boundary
+		// rather than inherited from the issuer. Verified against go-oidc
+		// v3.21.0 (verify.go, newVerifier) and GitHub's live discovery document
+		// on 2026-09-08; re-check on a dependency bump. The TestOIDCVerifier_*
+		// fixture tests are the enforcement.
+		verifier: p.Verifier(&oidc.Config{
+			ClientID:             cfg.Audience,
+			SupportedSigningAlgs: []string{oidc.RS256},
+		}),
 	}, nil
 }
 
@@ -175,41 +203,46 @@ func (v *OIDCVerifier) VerifyBinary(ctx context.Context, raw string) (string, er
 	return c.Sub, nil
 }
 
-// matchWorkflow returns true if the GitHub OIDC `workflow_ref` claim names
-// the configured workflow as the workflows-path basename (exact match), and
-// false otherwise.
+// matchWorkflowRef reports whether the GitHub OIDC `workflow_ref` claim names
+// the configured workflow running on the configured ref.
 //
-// GitHub's canonical `workflow_ref` claim shape is
+// GitHub's canonical `workflow_ref` shape is
 //
 //	<owner>/<repo>/.github/workflows/<filename>@<ref>
 //
-// where <ref> is e.g. `refs/heads/main`. matchWorkflow splits on the LAST
-// `@` so the basename portion is isolated from the ref suffix (the ref may
-// contain its own `/` segments but never an `@`). It then asserts the
-// basename ENDS with `/.github/workflows/<configured>` — the leading slash
-// anchors the match to a path segment boundary so a malicious workflow named
-// `attacker-main-cd.yml` cannot match a configured `main-cd.yml`.
+// so the check is a single exact-suffix comparison against
+// `/.github/workflows/<configured>@<ref>`. It performs NO split.
 //
-// This replaces the prior strings.Contains gate (finding #10 of the #1264
-// review), which was overly permissive: any claim with the configured name
-// anywhere in its body (e.g., `repo:owner/main-cd.yml-evil/.github/...`)
-// would match.
+// The predecessor, matchWorkflow, split on the LAST `@` and justified that in
+// its own doc comment with the premise that a ref "may contain its own `/`
+// segments but never an `@`". That premise is FALSE — `git check-ref-format
+// refs/heads/feature/a@b` exits 0. Under the split, a claim whose ref portion
+// itself contains `/.github/workflows/<configured>@` relocates the split point
+// and the guard passes for a claim naming a different workflow:
 //
-// Returns false on:
-//   - Empty claim (no `@` present, or empty before `@`)
-//   - Configured workflow not at the canonical workflows path segment
-//   - Substring match without the leading path-segment anchor
-func matchWorkflow(claim, configured string) bool {
-	if claim == "" || configured == "" {
+//	.../.github/workflows/evil.yml@refs/heads/x/.github/workflows/main-cd.yml@y
+//
+// That was never exploitable end-to-end — git forbids a path component
+// beginning with `.`, so no mintable ref carries the anchor, and the separate
+// exact-`ref` equality check held independently. But it was safe only by an
+// external invariant it neither stated nor enforced, one of whose legs is an
+// operator-settable env var. Comparing instead of parsing eliminates the class.
+//
+// Folding the ref into the same literal also closes a second gap: the previous
+// pair of checks never cross-checked each other, so a claim whose workflow_ref
+// embedded one ref while the `ref` claim named another satisfied both.
+//
+// `configured` and `ref` are operator config, never wire data; `claim` is the
+// only attacker-influenced input, and it is compared rather than parsed.
+// Surfaced by @red-team on PR #3207 with an executable PoC.
+//
+// Returns false on any empty argument, and on a claim that does not end in the
+// exact configured workflow-and-ref literal.
+func matchWorkflowRef(claim, configured, ref string) bool {
+	if claim == "" || configured == "" || ref == "" {
 		return false
 	}
-	idx := strings.LastIndex(claim, "@")
-	if idx < 0 {
-		return false
-	}
-	beforeAt := claim[:idx]
-	suffix := githubWorkflowsPathSegment + configured
-	return strings.HasSuffix(beforeAt, suffix)
+	return strings.HasSuffix(claim, githubWorkflowsPathSegment+configured+"@"+ref)
 }
 
 // applySPAPolicy enforces the per-axis workflow + ref policy for the SPA
@@ -225,11 +258,14 @@ func matchWorkflow(claim, configured string) bool {
 // malicious workflow named `attacker-main-cd.yml-foo` impersonate
 // `main-cd.yml`. The exact path-segment anchor closes that gap.
 func (v *OIDCVerifier) applySPAPolicy(c ghOIDCClaims) error {
-	if !matchWorkflow(c.Workflow, v.cfg.SPAWorkflow) {
-		return ErrOIDCInvalidWorkflow
-	}
+	// Ref is checked FIRST: matchWorkflowRef folds the ref into the workflow
+	// literal, so a wrong ref would otherwise surface as ErrOIDCInvalidWorkflow
+	// and lose the diagnostic distinction between the two sentinels.
 	if c.Ref != v.cfg.SPARef {
 		return ErrOIDCInvalidRef
+	}
+	if !matchWorkflowRef(c.Workflow, v.cfg.SPAWorkflow, v.cfg.SPARef) {
+		return ErrOIDCInvalidWorkflow
 	}
 	return nil
 }
@@ -240,11 +276,11 @@ func (v *OIDCVerifier) applySPAPolicy(c ghOIDCClaims) error {
 // shared parameterized check) makes the cross-axis rejection property obvious
 // from the call site in VerifyBinary.
 func (v *OIDCVerifier) applyBinaryPolicy(c ghOIDCClaims) error {
-	if !matchWorkflow(c.Workflow, v.cfg.BinaryWorkflow) {
-		return ErrOIDCInvalidWorkflow
-	}
 	if c.Ref != v.cfg.BinaryRef {
 		return ErrOIDCInvalidRef
+	}
+	if !matchWorkflowRef(c.Workflow, v.cfg.BinaryWorkflow, v.cfg.BinaryRef) {
+		return ErrOIDCInvalidWorkflow
 	}
 	return nil
 }
