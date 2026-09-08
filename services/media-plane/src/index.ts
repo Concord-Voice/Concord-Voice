@@ -18,7 +18,7 @@ import {
   validateChannelAccess,
   resolveParticipantIdentity,
 } from './middleware/auth.js';
-import type { AuthenticatedSocketData, ParticipantIdentity } from './middleware/auth.js';
+import type { AuthenticatedSocketData } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
 import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
 import { RedisService } from './lib/redis.js';
@@ -30,6 +30,7 @@ import type { EmitSecurityEvent } from './lib/securityEvent.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import { handleNatsEnforcementCommand } from './lib/enforcementCommand.js';
+import { getIdentityAuthorityReasonCode } from './lib/identityAuthority.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
 import {
   acknowledgeCloseRecvTransport,
@@ -116,29 +117,6 @@ function logSocketHandlerFailure(event: RoomEventName, userId: string): void {
   logger.error('Socket handler failed', { event, userId });
 }
 
-const rateLimitDeps: RateLimitDeps = {
-  onReject: logRateLimitRejection,
-  onHandlerError: logSocketHandlerFailure,
-};
-
-/**
- * Local binding of the shared #2032 wrapper that supplies the throttled
- * rejection reporter to EVERY registration, so no call site can forget it.
- *
- * Keeping the three-argument shape is deliberate: it leaves the handler as the
- * last argument, which is what lets all 18 conversions stay a pure
- * `socket.on(` → `withRateLimit(socket, ` rename with untouched handler bodies.
- * Passing `rateLimitDeps` positionally at each site would make the handler a
- * non-final argument and force Prettier to re-indent every body.
- */
-function defaultWithRateLimit<H extends SocketListener>(
-  socket: RateLimitedSocket,
-  event: RoomEventName,
-  handler: H
-): void {
-  registerRateLimited(socket, event, handler, rateLimitDeps);
-}
-
 // #1878: extracted from the join-room handler's catch block so that handler
 // stays under the S3776 cognitive-complexity limit. Logs the failure and sends
 // the structured crypto_version_mismatch ack (so a lower-version client can
@@ -170,22 +148,6 @@ function emitJoinError(
     return;
   }
   socket.emit('error', errPayload);
-}
-
-function getIdentityAuthorityReasonCode(
-  authIdentityPresent: boolean | undefined,
-  identity: ParticipantIdentity,
-  handshake: ParticipantIdentity
-): 'identity_authority_missing' | 'identity_authority_mismatch' | undefined {
-  if (!authIdentityPresent) return 'identity_authority_missing';
-  if (
-    identity.username !== handshake.username ||
-    identity.displayName !== handshake.displayName ||
-    identity.avatarUrl !== handshake.avatarUrl
-  ) {
-    return 'identity_authority_mismatch';
-  }
-  return undefined;
 }
 
 function getKeyframeSenderUserId(payload: unknown): string | undefined {
@@ -241,8 +203,15 @@ function registerJoinRoomHandler(
   data: AuthenticatedSocketData,
   roomManager: RoomManager,
   dmJoinFence: KeyedJoinFence,
-  emitSecurityEvent?: EmitSecurityEvent,
-  withRateLimit = defaultWithRateLimit
+  emitSecurityEvent: EmitSecurityEvent | undefined,
+  // Required: the per-connection wrapper carries this socket's security-event
+  // reporter. A module-level default existed and was unreachable -- the sole
+  // call site always passes one -- so it only hid a miswiring (PR #3157).
+  withRateLimit: <H extends SocketListener>(
+    socket: RateLimitedSocket,
+    event: RoomEventName,
+    handler: H
+  ) => void
 ): void {
   const observe = (event: Parameters<EmitSecurityEvent>[0]) => {
     try {
@@ -657,6 +626,11 @@ async function main() {
     onIceTerminalWithoutConnect: () => mediaMetrics.incrementIceTerminalWithoutConnect(),
   });
   roomManager.setSecurityEventEmitter((event) => securityEvents.emit(event));
+
+  // Worker placement reads live consumer counts from RoomManager (#3149).
+  // Installed here rather than injected: mediasoupService is constructed
+  // above, before roomManager exists. The arrow defers the reference.
+  mediasoupService.setRoomConsumerCounts(() => roomManager.getRoomConsumerCounts());
   const opsMetricsPublisher = new OpsMetricsPublisher({
     enabled: config.opsMetrics.enabled,
     nodeId: config.opsMetrics.nodeId,
@@ -771,11 +745,13 @@ async function main() {
     eventField: string
   ) {
     natsService.subscribe(subject, async (natsData) => {
+      let cmd: { channelId?: string; userId?: string; action?: string } = {};
       try {
         await handleNatsEnforcementCommand(
           natsData,
           [applyAction, removeAction],
           async ({ channelId, userId, action }) => {
+            cmd = { channelId, userId, action };
             if (action === applyAction) {
               await applyFn(channelId, userId);
               io.to(channelId).emit(eventName, { userId, [eventField]: true });
@@ -787,7 +763,7 @@ async function main() {
           (event) => securityEvents.emit(event)
         );
       } catch (err) {
-        logger.error(`Failed to handle ${subject}`, { error: err });
+        logger.error(`Failed to handle ${subject}`, { error: err, ...cmd });
       }
     });
   }
@@ -818,11 +794,13 @@ async function main() {
     applyFn: (roomId: string, userId: string) => void | Promise<void>
   ) {
     natsService.subscribe(subject, async (natsData) => {
+      let cmd: { channelId?: string; userId?: string } = {};
       try {
         await handleNatsEnforcementCommand(
           natsData,
           undefined,
           async ({ channelId, userId }) => {
+            cmd = { channelId, userId };
             await applyFn(channelId, userId);
             const participant = roomManager.getParticipant(channelId, userId);
             if (participant) {
@@ -836,7 +814,7 @@ async function main() {
           (event) => securityEvents.emit(event)
         );
       } catch (err) {
-        logger.error(`Failed to handle ${subject}`, { error: err });
+        logger.error(`Failed to handle ${subject}`, { error: err, ...cmd });
       }
     });
   }
@@ -851,18 +829,21 @@ async function main() {
   // moved user's temporary channel access is revoked. We evict the live peer via
   // RoomManager.leaveRoom (which emits user-left -> voice.left over NATS).
   natsService.subscribe('voice.enforce.disconnect', async (natsData) => {
+    let cmd: { channelId?: string; userId?: string } = {};
     try {
       await handleNatsEnforcementCommand(
         natsData,
         undefined,
-        ({ channelId, userId }) =>
-          handleForceDisconnect(roomManager, io, channelId, userId, (event) =>
+        ({ channelId, userId }) => {
+          cmd = { channelId, userId };
+          return handleForceDisconnect(roomManager, io, channelId, userId, (event) =>
             securityEvents.emit(event)
-          ),
+          );
+        },
         (event) => securityEvents.emit(event)
       );
     } catch (err) {
-      logger.error('Failed to handle voice.enforce.disconnect', { error: err });
+      logger.error('Failed to handle voice.enforce.disconnect', { error: err, ...cmd });
     }
   });
 

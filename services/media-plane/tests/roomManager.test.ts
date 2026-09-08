@@ -5881,6 +5881,56 @@ describe('RoomManager', () => {
       expect(stats.totalConsumers).toBe(0);
     });
 
+    describe('getRoomConsumerCounts (#3149)', () => {
+      // Returns the participant so the double-count test can reach consumersByKey.
+      const seedConsumers = (roomId: string, userId: string, n: number) => {
+        const participant = manager.getRoom(roomId)!.participants.get(userId)!;
+        for (let i = 0; i < n; i++) {
+          const consumer = createMockConsumer();
+          participant.consumers.set(consumer.id, consumer as any);
+        }
+        return participant;
+      };
+
+      it('reports zero for a room whose participants hold no consumers', async () => {
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+
+        expect(manager.getRoomConsumerCounts().get('room-1')).toBe(0);
+      });
+
+      it('sums consumers across every participant in a room', async () => {
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
+        seedConsumers('room-1', 'u-1', 3);
+        seedConsumers('room-1', 'u-2', 5);
+
+        expect(manager.getRoomConsumerCounts().get('room-1')).toBe(8);
+      });
+
+      it('reports each room separately', async () => {
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-2', 'u-2', 'sock-2', { username: 'bob' });
+        seedConsumers('room-1', 'u-1', 2);
+        seedConsumers('room-2', 'u-2', 9);
+
+        const counts = manager.getRoomConsumerCounts();
+        expect(counts.get('room-1')).toBe(2);
+        expect(counts.get('room-2')).toBe(9);
+      });
+
+      it('does not double-count consumers indexed in consumersByKey', async () => {
+        // consumersByKey is Map<idempotencyKey, consumer.id> over the SAME
+        // consumers. Summing both indexes would report 4 here, not 2.
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        const participant = seedConsumers('room-1', 'u-1', 2);
+        for (const [id] of participant.consumers) {
+          participant.consumersByKey.set(`key-${id}`, id);
+        }
+
+        expect(manager.getRoomConsumerCounts().get('room-1')).toBe(2);
+      });
+    });
+
     it('getAggregateCounts returns scalar room and unique participant totals without IDs', async () => {
       await joinRoomWithSupportedCrypto(manager, 'private-room-1', 'private-user-1', 'sock-1', {
         username: 'alice',

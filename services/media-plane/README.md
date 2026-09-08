@@ -237,16 +237,9 @@ MEDIASOUP_LOG_LEVEL=warn
   not an integer in `[1, 32]` logs `FATAL:` and exits 1 instead of falling back
   to the default. Both bounds matter. `NUM_WORKERS=0` would otherwise build an
   empty worker pool, let `init()` resolve and `/health` answer 200, and then
-  fail every voice join **without crashing** — `getNextWorker()` returns
-  `undefined`, `worker.createRouter()` throws a TypeError, and that rejected
-  promise is caught by the join handler and converted into an ordinary
-  join-error ack. The process survives indefinitely: every join fails, `/health`
-  keeps answering 200, and nothing restarts the container. An oversized count is
-  the likelier typo and would fail differently — absent the ceiling it would fork
-  more subprocesses than the container cgroup can hold, `init()` would never
-  resolve, `/health` would never answer, and a scoped deploy's `--wait` would
-  time out with the old container already gone. Both are descriptions of what
-  the guard prevents; neither value reaches the worker loop today.
+  fail every voice join **without crashing** — worker placement throws a typed
+  `NoWorkersAvailableError` (`lib/workerSelection.ts`, #3149) that the join handler
+  returns as an ordinary join-error ack.
 
 ## Socket.IO Events
 
@@ -490,7 +483,7 @@ Key metrics to monitor:
 
 ## Current Features ✅
 
-- [x] Multi-worker mediasoup with round-robin routing
+- [x] Multi-worker mediasoup with least-loaded worker placement
 - [x] RoomManager with per-participant transport tracking
 - [x] Audio/video/screen share producing and consuming
 - [x] AudioLevelObserver for active speaker detection

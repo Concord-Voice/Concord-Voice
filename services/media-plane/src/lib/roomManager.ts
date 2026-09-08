@@ -1030,7 +1030,7 @@ function registerProvisionalDMParticipant(
 // RoomManager
 //
 // Manages the lifecycle of voice/video rooms (one per voice channel):
-//   - Router creation (1 per room, assigned round-robin to mediasoup workers)
+//   - Router creation (1 per room, placed on the least-loaded worker — #3149)
 //   - Participant join/leave with proper transport cleanup
 //   - Per-participant send/recv transports (fixes the consumer transport bug)
 //   - Producer/consumer management with source tracking (mic/camera/screen)
@@ -3251,6 +3251,33 @@ export class RoomManager {
       totalProducers,
       totalConsumers,
     };
+  }
+
+  /**
+   * Per-room live consumer counts, for mediasoup worker placement (#3149).
+   *
+   * Derived by enumeration from authoritative room state at call time — no
+   * shadow tallies, no event hooks. Near-identical to the pass getStats()
+   * performs, narrowed to per-room — but NOT equivalent: getStats() skips
+   * rooms with no participants, and this reports them explicitly as 0. The
+   * totals agree; the key sets do not.
+   *
+   * Sums `Participant.consumers` ONLY. `consumersByKey` is an idempotency
+   * index over the same consumers and would double-count.
+   * `pendingDMParticipants` holds no consumers and is excluded structurally.
+   */
+  getRoomConsumerCounts(): ReadonlyMap<string, number> {
+    const counts = new Map<string, number>();
+
+    for (const [roomId, room] of this.rooms) {
+      let total = 0;
+      for (const [, participant] of room.participants) {
+        total += participant.consumers.size;
+      }
+      counts.set(roomId, total);
+    }
+
+    return counts;
   }
 
   /** Aggregate-only current room and participant counts for operations metrics. */

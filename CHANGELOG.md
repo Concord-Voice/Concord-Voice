@@ -32,6 +32,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. Timer settings UI remains future work; this does not promise instant deletion or secure erasure for clients that were offline.
+- **Busy servers now spread voice calls across CPU cores more evenly** ([#3157](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3157), [#3149](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3149)) — a voice room lives on
+  one CPU core for its whole life, and the server used to hand those cores out in strict
+  rotation without looking at how busy each one already was. On a server running several calls
+  that meant a new room could land on the core already carrying the heaviest one while a nearly
+  idle core sat next to it, and a room cannot be moved once it starts, so it stayed crowded
+  until it ended. The server now gives a new room to the least busy core, counting the live
+  audio and video streams each one is already carrying. When several calls start at once and
+  none of them is carrying anything yet, it spreads them across cores rather than stacking
+  them, which is the case that used to go wrong. Worth knowing the one case this does not
+  cover: two calls that start in the very same instant can still pick the same core, which
+  evens out as soon as the next call starts.
 
 ### Fixed
 

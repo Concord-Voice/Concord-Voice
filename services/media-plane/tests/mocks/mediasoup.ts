@@ -127,15 +127,19 @@ export function createMockRouter(overrides: Record<string, unknown> = {}) {
 
 export function createMockWorker(overrides: Record<string, unknown> = {}) {
   const emitter = createEventEmitter();
-  const router = createMockRouter();
   return {
     pid: Math.floor(Math.random() * 100000),
     closed: false,
-    createRouter: vi.fn(() => Promise.resolve(router)),
+    // Real mediasoup mints a NEW Router per createRouter() call. This used to
+    // return one shared instance, which made "created a fresh router"
+    // assertions pass only when placement happened to move the room to a
+    // DIFFERENT worker — so they were really asserting worker rotation. Least
+    // -loaded placement (#3149) can legitimately re-place a room on the same
+    // worker, which exposed it.
+    createRouter: vi.fn(() => Promise.resolve(createMockRouter())),
     close: vi.fn(),
     on: emitter.on,
     _emit: emitter.emit,
-    _router: router,
     ...overrides,
   };
 }

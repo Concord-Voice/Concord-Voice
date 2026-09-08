@@ -298,9 +298,9 @@ const MAX_MEDIASOUP_WORKERS = 32;
  *
  * Below the floor — `NUM_WORKERS=0` builds an empty worker pool, `init()` still
  * resolves, Express still listens and `/health` still answers 200. Then every
- * voice join reaches `MediasoupService.getWorker()` (lib/mediasoup.ts), whose
- * `workers[0]` is undefined, and the resulting TypeError is caught by the join
- * handler and returned as an ordinary join-error ack. The process does NOT
+ * voice join reaches worker placement (lib/workerSelection.ts), which throws a
+ * typed `NoWorkersAvailableError` that the join handler returns as an ordinary
+ * join-error ack. The process does NOT
  * crash: it survives indefinitely, answering /health 200 while failing every
  * join, so nothing restarts it. That silent-black-hole shape is exactly why the
  * guard belongs at config load.
