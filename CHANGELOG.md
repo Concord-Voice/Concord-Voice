@@ -44,6 +44,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Apple exposed no way to capture system audio until macOS 13, so on macOS 12 and earlier a
   screen share carries picture only, and the app now falls back to video rather than appearing
   to send sound it never captured.
+- **The app takes about 37 MB less room once installed, and no longer carries its own source code** ([#3156](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3156)) — every
+  release so far packed the whole desktop project inside the installed app: the source files, the
+  test suite, the build scripts, the configuration used to build it, and a set of type-description
+  files that only a compiler ever reads. None of it was ever read while the app was running, so it
+  was pure weight. The installed app now contains only the parts it actually runs. The download
+  shrinks by about 7 MB rather than the full 37 — the files that went away are text, and text
+  compresses well, so they cost far more on disk than they did over the wire. Nothing about how Concord Voice behaves changes. Two details worth stating plainly
+  rather than leaving to be discovered, because they are not the same thing. The build's generated
+  settings file was among what shipped, and it carried no credentials — only the server address and
+  feature switches already visible inside the app. Alongside it went a second settings file for our
+  own internal test setup, and that one named a private address on our network. Nothing about you
+  was in either file, and no password or key was ever in either, but that internal detail was ours
+  and should not have travelled with the app. Neither ships now.
 
 ### Security
 

@@ -125,7 +125,81 @@ const config: ForgeConfig = {
       // or logic embedded in it.
       unpackDir: undefined,
     },
-    ignore: [/\.map$/],
+    // Only four things belong in the archive: `dist/` (built main, preload and
+    // renderer — everything resolves relative to `__dirname` inside it), the
+    // dev-pruned `node_modules/`, `package.json`, and exactly two icons under
+    // `build/` (see the build/ rule below). @electron/packager's
+    // DEFAULT_IGNORES cover just lockfiles, `.git`, `node_modules/.bin`, `.o`
+    // files and the `out/` directory — NOT an app's own source tree — so
+    // without the entries below the whole working directory ships inside
+    // app.asar: `src/`, the whole test suite, and any untracked `.env` a
+    // developer happens to have sitting there.
+    //
+    // Each path is tested app-dir-relative with a leading slash ('/src/main.ts')
+    // through String.prototype.match, which is UNANCHORED. Every PATH pattern
+    // is therefore `^`-anchored so it cannot also strike a production
+    // dependency under /node_modules/ — an unanchored /tests/ would gut every
+    // packaged module that ships its own tests directory. The two SUFFIX rules
+    // (/\.map$/, /\.d\.[cm]?ts$/) are the deliberate exceptions: both name file
+    // kinds that are compile-time-only wherever they appear, so reaching into
+    // dependencies is the point rather than the hazard.
+    ignore: [
+      /\.map$/,
+      // TypeScript declarations. `tsconfig.main.json` inherits declaration +
+      // declarationMap from tsconfig.json, so `npm run build:main` emits
+      // dist/**/*.d.ts beside the .js it actually runs; /\.map$/ took their
+      // .d.ts.map companions and left the declarations behind. Nothing loads a
+      // .d.ts at runtime — they are compile-time only — so like /\.map$/ this
+      // is deliberately a SUFFIX rule rather than an ^-anchored one: it also
+      // strips the declarations shipped by production dependencies, which are
+      // the overwhelming majority (957 of 1035 entries, ~13.4 MiB, against 78
+      // and ~133 KiB from dist/). The [cm]? covers TypeScript's `.d.cts` and
+      // `.d.mts` variants, which are NOT a hypothetical: 127 of them (~4.96 MiB)
+      // survived the first `.d.ts`-only draft, from dual-published dependencies
+      // such as zod, lucide-react and minisearch. Nothing runtime is caught —
+      // Node executes `.cjs`/`.mjs`, never `.cts`/`.mts` — and in the packaged
+      // tree every single `.cts` and `.mts` entry was in fact a declaration
+      // (108 of 108 and 19 of 19), but the pattern still matches only the
+      // `.d.` form so a genuine TypeScript source file could never be caught.
+      //
+      // Verified before widening it to node_modules: no shipped package
+      // resolves a runtime entry point to a .d.ts. The single apparent
+      // counter-example is upstream mediasoup-client, whose "./enhancedEvents"
+      // export map reads `"ortc": "./lib/enhancedEvents.d.ts"` where it means
+      // `"types"` — a copy-paste slip from the "./ortc" entry above it. `ortc`
+      // is not a Node export condition, so resolution skips the key and falls
+      // through to `"default": "./lib/enhancedEvents.js"`.
+      /\.d\.[cm]?ts$/,
+      // Sources plus build-time-only and report-output trees. Two of these are
+      // duplicates rather than dead weight: `public/` is copied into
+      // dist/renderer by Vite, and `assets/tray` reaches <Resources>/tray via
+      // extraResource (resolveTrayIconPath reads process.resourcesPath when
+      // packaged, and cwd/assets only in dev).
+      /^\/(src|tests|docs|scripts|schemas|functions|public|assets|coverage|playwright-report|test-results)($|\/)/,
+      // `build/` is ALMOST all packaging-time input the makers read from the
+      // source directory — but not quite, so it cannot be excluded wholesale.
+      // Two files are read from inside the archive at runtime via
+      // app.getAppPath():
+      //   src/main/main.ts                 -> build/icon.png   (packaged-only
+      //                                       splash, `if (app.isPackaged)`)
+      //   src/main/applicationsFolderGate.ts -> build/icon.icns (macOS
+      //                                       move-to-Applications dialog)
+      // Both call nativeImage.createFromPath, which NEVER throws: a missing
+      // file yields an empty image and the surfaces silently lose their
+      // branding in release builds only. Keep exactly those two and drop the
+      // rest (splash.gif, icon.ico, dmg backgrounds, icons/, makerNsis.ts,
+      // installer.nsh). The pattern deliberately does not match the bare
+      // `/build` directory entry — the copy filter is asked about a directory
+      // before it descends, so excluding it would prevent the icons from ever
+      // being copied.
+      /^\/build\/(?!icon\.(?:png|icns)$)/,
+      // Every root dotfile, which is how all four `.env` variants are caught.
+      // `.env.staging` was shipping an internal LAN address to end users, and
+      // an untracked local `.env` would ship whatever it holds.
+      /^\/\.[^/]+$/,
+      // Root-level tooling config and docs.
+      /^\/(tsconfig[^/]*\.json|[^/]+\.config\.[cm]?[jt]s|index\.html|README\.md|wrangler\.toml)$/,
+    ],
     name: 'Concord Voice',
     // Per-platform executable name (#1077 follow-up).
     //

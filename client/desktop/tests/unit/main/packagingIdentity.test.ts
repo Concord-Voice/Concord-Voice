@@ -243,6 +243,225 @@ describe('Packaging Identity (#382)', () => {
     });
   });
 
+  // app.asar payload boundary.
+  //
+  // @electron/packager's DEFAULT_IGNORES cover only lockfiles, .git,
+  // node_modules/.bin, .o files and the out/ directory — an app's OWN source
+  // tree is not among them. Before packagerConfig.ignore grew the entries
+  // below, the entire working directory shipped inside app.asar: the released
+  // 0.2.45 archive contains /src, /tests, /docs, /scripts and the build
+  // machine's own .env. A config refactor could drop the entries again and
+  // nothing else in this suite would notice, so pin them here — the same
+  // rationale as the identity fields above.
+  describe('forge.config.ts — app.asar exclusions', () => {
+    /**
+     * Decide a path the way @electron/packager's copy filter does: the array of
+     * RegExps is applied with String.prototype.match against an app-dir-relative
+     * path carrying a LEADING SLASH ('/src/main/main.ts'), and any match excludes
+     * the file. See node_modules/@electron/packager/dist/copy-filter.js.
+     */
+    function isIgnored(config: ForgeConfig, appRelativePath: string): boolean {
+      const ignore = config.packagerConfig?.ignore;
+      // The RegExp[] form is load-bearing: populateIgnoredPaths() merges
+      // DEFAULT_IGNORES only when `ignore` is NOT a function, so switching to a
+      // filter function would silently re-admit package-lock.json and .git.
+      if (!Array.isArray(ignore)) {
+        throw new Error('packagerConfig.ignore must stay an array of RegExps');
+      }
+      return (ignore as RegExp[]).some((re) => appRelativePath.match(re) !== null);
+    }
+
+    // Nothing here is read at runtime. public/ is copied into dist/renderer by
+    // Vite and assets/tray reaches <Resources>/tray via extraResource, so both
+    // are duplicates rather than dead weight; build/ and scripts/ are consumed
+    // from the source directory at packaging time, never from the archive.
+    it.each([
+      '/src',
+      '/src/main/main.ts',
+      '/tests',
+      '/tests/unit/main/packagingIdentity.test.ts',
+      '/docs/STATE_MANAGEMENT.md',
+      '/scripts/build-preload.mjs',
+      '/schemas/update-manifest.json',
+      '/functions/assets/[[path]].js',
+      '/public/favicon.ico',
+      '/build/splash.gif',
+      '/build/dmg-background.png',
+      '/build/makerNsis.ts',
+      '/build/installer.nsh',
+      '/build/icons/512x512.png',
+      '/build/icon.ico',
+      '/assets/tray/icon.png',
+      '/coverage/index.html',
+      '/playwright-report/index.html',
+      '/test-results/results.json',
+      '/.env',
+      '/.env.example',
+      '/.env.staging',
+      '/.prettierrc',
+      '/forge.config.ts',
+      '/vite.config.ts',
+      '/playwright.config.ts',
+      '/eslint.config.mjs',
+      '/tsconfig.json',
+      '/tsconfig.main.json',
+      '/index.html',
+      '/README.md',
+      '/wrangler.toml',
+      '/dist/main/main.js.map',
+      // TypeScript declarations. tsconfig.main.json inherits declaration +
+      // declarationMap, so `npm run build:main` writes these beside the .js it
+      // runs; /\.map$/ took only their .d.ts.map companions and left 1035
+      // declarations (~13.4 MiB) in the archive. The last two are the point of
+      // making this a suffix rule rather than an ^-anchored one: 957 of those
+      // 1035 came from production dependencies.
+      '/dist/main/main.d.ts',
+      '/dist/shared/allowedWindowsPublishers.d.ts',
+      '/dist/main/main.d.ts.map',
+      '/node_modules/zod/index.d.ts',
+      '/node_modules/mediasoup-client/lib/enhancedEvents.d.ts',
+      // TypeScript's dual-publish declaration variants. 127 of these (~4.96 MiB)
+      // survived a `.d.ts`-only rule, from zod, lucide-react, minisearch and
+      // others — so the [cm]? is load-bearing, not defensive.
+      '/node_modules/zod/v3/external.d.cts',
+      '/node_modules/lucide-react/dynamic.d.mts',
+      '/node_modules/minisearch/dist/cjs/index.d.cts',
+    ])('excludes %s from app.asar', async (appRelativePath) => {
+      expect(isIgnored(await loadForgeConfig(), appRelativePath)).toBe(true);
+    });
+
+    // The complete runtime surface: main resolves preload and renderer from
+    // __dirname inside dist/ (main.ts's '../preload/preload.js' and
+    // '../renderer/index.html'), and nothing outside these three entries is
+    // read once packaged.
+    it.each([
+      '/dist/main/main.js',
+      '/dist/preload/preload.js',
+      '/dist/renderer/index.html',
+      '/dist/renderer/assets/index.js',
+      '/dist/shared/allowedWindowsPublishers.js',
+      '/node_modules/zod/package.json',
+      '/package.json',
+      // The runtime sibling of an excluded declaration must survive. This exact
+      // pair is why the .d.ts rule was checked against every shipped
+      // package.json before it was widened to node_modules: upstream
+      // mediasoup-client's "./enhancedEvents" export map reads
+      // `"ortc": "./lib/enhancedEvents.d.ts"` where it means `"types"`. `ortc`
+      // is not a Node export condition, so resolution skips that key and lands
+      // on `"default": "./lib/enhancedEvents.js"` — this file.
+      '/node_modules/mediasoup-client/lib/enhancedEvents.js',
+      // Only the `.d.` form is excluded. Node cannot execute a bare .cts/.mts —
+      // it runs .cjs/.mjs — but the rule still must not reach a TypeScript source
+      // file, and these two pin that boundary.
+      '/node_modules/some-pkg/dist/index.cts',
+      '/node_modules/some-pkg/dist/index.mts',
+    ])('does not exclude %s', async (appRelativePath) => {
+      expect(isIgnored(await loadForgeConfig(), appRelativePath)).toBe(false);
+    });
+
+    // The copy filter runs the SAME patterns over files under /node_modules/,
+    // and String.match is unanchored. An unanchored /tests/ or /build/ would
+    // quietly gut any production dependency shipping a directory of that name —
+    // a node-gyp addon's build/Release/*.node above all — and the failure would
+    // surface as a runtime require() error in a released build, not here.
+    it('leaves production dependencies intact despite sharing excluded names', async () => {
+      const config = await loadForgeConfig();
+      for (const appRelativePath of [
+        '/node_modules/pkg/src/index.js',
+        '/node_modules/pkg/tests/fixture.json',
+        '/node_modules/pkg/build/Release/binding.node',
+        '/node_modules/pkg/public/logo.svg',
+        '/node_modules/pkg/docs/api.md',
+        '/node_modules/pkg/scripts/install.js',
+        '/node_modules/pkg/.env',
+        '/node_modules/pkg/index.html',
+        '/node_modules/pkg/tsconfig.json',
+        '/node_modules/pkg/assets/logo.svg',
+        '/node_modules/pkg/rollup.config.js',
+        '/node_modules/pkg/README.md',
+      ]) {
+        expect(isIgnored(config, appRelativePath), appRelativePath).toBe(false);
+      }
+    });
+
+    // Regression guard for the defect Codex caught on PR #3156. `build/` is
+    // overwhelmingly packaging-time input, but TWO files inside it are read
+    // from within app.asar at runtime via app.getAppPath():
+    //   src/main/main.ts:1648                -> build/icon.png  (splash; the
+    //                                           call is inside `if
+    //                                           (app.isPackaged)`, so it runs
+    //                                           ONLY where the exclusion bites)
+    //   src/main/applicationsFolderGate.ts:94 -> build/icon.icns (macOS
+    //                                           move-to-Applications dialog)
+    // Both go through nativeImage.createFromPath, which never throws — a
+    // missing file yields an empty image, so an over-broad exclusion loses the
+    // branding silently in release builds and in no test.
+    it('keeps the two build/ icons the packaged main process loads', async () => {
+      const config = await loadForgeConfig();
+      for (const appRelativePath of ['/build/icon.png', '/build/icon.icns']) {
+        expect(isIgnored(config, appRelativePath), appRelativePath).toBe(false);
+      }
+    });
+
+    // The copy filter is asked about a DIRECTORY before it descends into it, so
+    // a pattern matching the bare '/build' entry would stop the two icons above
+    // from ever being copied — while every path-level assertion still passed.
+    it('does not exclude the /build directory entry itself', async () => {
+      const config = await loadForgeConfig();
+      expect(isIgnored(config, '/build')).toBe(false);
+    });
+
+    // The same directory-before-descent hazard as the /build case, one directory
+    // over, and far worse: a pattern matching the bare `/node_modules` entry stops
+    // the ENTIRE dependency tree from being copied, and every `/node_modules/pkg/**`
+    // assertion above stays green because the filter is never asked about those
+    // paths once the directory is refused. The packaged app then fails to launch.
+    // CI's required-file probe would not catch it either — it only opens three
+    // files under dist/. Surfaced by @pr-review-toolkit:pr-test-analyzer on #3156.
+    it.each(['/node_modules', '/dist'])('does not exclude the %s directory entry', async (dir) => {
+      expect(isIgnored(await loadForgeConfig(), dir)).toBe(false);
+    });
+
+    // Structural backstop for the case above: a pattern added later for a name
+    // nobody thought to list is still forced to anchor at the app root.
+    //
+    // The exemption is an ALLOWLIST of exact sources, not a test of regex shape.
+    // An earlier draft exempted anything slash-free ending in `$`, reasoning that
+    // it exempted by behaviour and so would keep working if the rule were
+    // rewritten. That is the wrong direction on the one axis that matters: it
+    // also hands a free pass to a future `/\.node$/`, which would strip native
+    // addons out of production dependencies — silently, because the archive
+    // verifier's depth check knows only these same two suffixes and its runtime
+    // probe opens three files under dist/. Rewriting a listed rule now reds this
+    // test, which is a prompt to re-review an unanchored rule rather than a
+    // hazard. Surfaced by Codex on #3156.
+    const COMPILE_ONLY_SUFFIX_RULES = new Set(['\\.map$', '\\.d\\.[cm]?ts$']);
+
+    it('anchors every path pattern at the app root', async () => {
+      const config = await loadForgeConfig();
+      const ignore = config.packagerConfig?.ignore as RegExp[];
+      for (const pattern of ignore) {
+        // @electron/packager accepts strings here too (its own DEFAULT_IGNORES are
+        // strings), so assert the shape before reading `.source` — otherwise a
+        // future string entry fails with an unreadable TypeError.
+        expect(pattern, String(pattern)).toBeInstanceOf(RegExp);
+        if (COMPILE_ONLY_SUFFIX_RULES.has(pattern.source)) continue;
+        expect(pattern.source.startsWith('^\\/'), pattern.source).toBe(true);
+      }
+    });
+
+    // Both allowlisted rules must still BE in the config. Without this the
+    // allowlist above degrades quietly: delete `\.d\.[cm]?ts$` and the anchor
+    // test goes green because there is simply nothing left to exempt.
+    it('still carries both compile-only suffix rules', async () => {
+      const config = await loadForgeConfig();
+      const sources = (config.packagerConfig?.ignore as RegExp[]).map((p) => p.source);
+      for (const allowed of COMPILE_ONLY_SUFFIX_RULES) {
+        expect(sources, allowed).toContain(allowed);
+      }
+    });
+  });
+
   // Per-platform executableName branch coverage in PR CI (#1096).
   //
   // CI test shards run exclusively on ubuntu-latest, so the existing tests
