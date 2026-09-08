@@ -40,6 +40,9 @@ type NATSSubscriber struct {
 	activity            *presence.ActivityService
 	lifecycleDispatchMu sync.Mutex
 	lifecycleDispatcher *voiceLifecycleDispatcher
+
+	serverVoiceCleanupOnce    sync.Once
+	serverVoiceCleanupReadyAt time.Time
 	// voiceLifecycleClaimedHook is a deterministic test seam invoked while the
 	// distributed lifecycle critical section is held, after Redis accepts the
 	// event and before its PostgreSQL mutation begins.
@@ -109,6 +112,12 @@ type NATSSubscriber struct {
 	// recheck sweep ran before this voice_participants row existed would
 	// otherwise hold a stale snapshot no push covers. Optional (nil = no-op).
 	permEnforcer *PermissionEnforcer
+}
+
+type staleServerVoiceParticipant struct {
+	channelID uuid.UUID
+	userID    uuid.UUID
+	serverID  uuid.UUID
 }
 
 var (
@@ -587,6 +596,25 @@ func LockServerVoiceLifecycleTx(ctx context.Context, tx *sql.Tx, senderID uuid.U
 		return fmt.Errorf("lock voice lifecycle mutation: %w", err)
 	}
 	return nil
+}
+
+func tryLockServerVoiceLifecycleTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	senderID uuid.UUID,
+) (bool, error) {
+	if tx == nil {
+		return false, errors.New("server voice lifecycle transaction unavailable")
+	}
+	lockKey, err := voiceLifecycleAdvisoryKey(presence.CategoryServerVoice, senderID)
+	if err != nil {
+		return false, err
+	}
+	var acquired bool
+	if err := tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock($1)`, lockKey).Scan(&acquired); err != nil {
+		return false, fmt.Errorf("try lock voice lifecycle mutation: %w", err)
+	}
+	return acquired, nil
 }
 
 func lockPrivateVoiceScopes(
@@ -3289,6 +3317,232 @@ func NewNATSSubscriber(db *sql.DB, log *logger.Logger, hub *websocket.Hub, nats 
 		erasureSeen:     newErasureSeen(),
 		voiceRoomBudget: newVoiceRoomBudget(),
 	}
+}
+
+// staleServerVoiceDiscoverySQL finds Server Voice rows whose database-observed
+// lease has expired. The cutoff is read ONCE per pass in a MATERIALIZED CTE
+// rather than written inline against the column.
+//
+// clock_timestamp() is VOLATILE, so an inline predicate cannot be an index
+// range bound -- PostgreSQL can only scan the lease index in order and apply
+// the predicate as a Filter. Because LIMIT counts MATCHING rows, the steady
+// state (no expired participants) would then walk the entire active-participant
+// index on every 5s reconcile tick.
+//
+// What restores the bound is the UNCORRELATED SCALAR SUBQUERY -- reading the
+// cutoff as `(SELECT ... FROM cutoff)` makes it an InitPlan the planner
+// evaluates once and treats as a constant, which is index-bindable. Measured,
+// because the distinction is easy to get wrong: dropping MATERIALIZED leaves
+// the plan byte-identical (a CTE containing a volatile function is never
+// inlined anyway), while rewriting the read as `CROSS JOIN cutoff` LOSES the
+// Index Cond and silently reopens the defect. MATERIALIZED is belt-and-braces
+// here; the scalar subquery is load-bearing. Do not "simplify" it to a join.
+//
+// The clock stays server-side either way: the lease is authoritative precisely
+// because PostgreSQL, not a producer, stamps it.
+//
+// TestStaleServerVoiceDiscoveryUsesAnIndexRangeBound pins the plan shape; a
+// behavioural test cannot see this property.
+const staleServerVoiceDiscoverySQL = `
+		WITH cutoff AS MATERIALIZED (
+		    SELECT clock_timestamp() - ($1::bigint * INTERVAL '1 second')
+		           AS observed_before
+		)
+		SELECT participant.channel_id, participant.user_id, channel.server_id
+		FROM voice_participants AS participant
+		JOIN channels AS channel ON channel.id = participant.channel_id
+		WHERE participant.lifecycle_observed_at <= (SELECT observed_before FROM cutoff)
+		ORDER BY participant.lifecycle_observed_at,
+		         participant.channel_id,
+		         participant.user_id
+		LIMIT $2;
+	`
+
+// ReconcileStaleServerVoiceParticipants removes durable Server Voice rows whose
+// database-observed lifecycle lease expired without a terminal event.
+func (s *NATSSubscriber) ReconcileStaleServerVoiceParticipants(
+	ctx context.Context,
+	limit int,
+) (removed int, returnErr error) {
+	s.serverVoiceCleanupOnce.Do(func() {
+		// An initial PostgreSQL-observed lease may predate migration commit, so live rooms
+		// get one heartbeat window before cleanup discovers them.
+		s.serverVoiceCleanupReadyAt = time.Now().Add(presence.ActivityStateTTL)
+	})
+	if time.Now().Before(s.serverVoiceCleanupReadyAt) {
+		return 0, nil
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+	if limit > maxServerVoiceParticipantIDs {
+		limit = maxServerVoiceParticipantIDs
+	}
+	leaseSeconds := int64(presence.ActivityStateTTL / time.Second)
+	rows, err := s.db.QueryContext(ctx, staleServerVoiceDiscoverySQL, leaseSeconds, limit)
+	if err != nil {
+		return 0, fmt.Errorf("discover stale server voice participants: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf("close stale server voice participant discovery: %w", closeErr),
+			)
+		}
+		if removed > 0 {
+			s.hub.BroadcastServerVoiceCounts()
+		}
+	}()
+
+	candidates := make([]staleServerVoiceParticipant, 0, limit)
+	for rows.Next() {
+		var candidate staleServerVoiceParticipant
+		if err := rows.Scan(&candidate.channelID, &candidate.userID, &candidate.serverID); err != nil {
+			return removed, fmt.Errorf("scan stale server voice participant: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return removed, fmt.Errorf("iterate stale server voice participants: %w", err)
+	}
+
+	for _, candidate := range candidates {
+		applied, err := s.reconcileStaleServerVoiceParticipant(ctx, candidate, leaseSeconds)
+		if err != nil {
+			return removed, err
+		}
+		if !applied {
+			continue
+		}
+
+		removed++
+		room := &roomContext{serverID: candidate.serverID.String(), serverUUID: candidate.serverID}
+		if err := s.broadcastStaleServerVoiceParticipantLeft(
+			ctx, room, candidate.channelID, candidate.userID,
+		); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
+// broadcastStaleServerVoiceParticipantLeft holds the lifecycle lock through the
+// post-commit presence recheck and left enqueue, so a same-channel successor
+// cannot enqueue joined between either step.
+func (s *NATSSubscriber) broadcastStaleServerVoiceParticipantLeft(
+	ctx context.Context,
+	room *roomContext,
+	channelID, participantID uuid.UUID,
+) (returnErr error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin stale server voice left handoff: %w", err)
+	}
+	defer func() {
+		returnErr = joinRollbackErr(
+			returnErr,
+			tx.Rollback(),
+			"rollback stale server voice left handoff",
+		)
+	}()
+
+	acquired, err := tryLockServerVoiceLifecycleTx(ctx, tx, participantID)
+	if err != nil {
+		return fmt.Errorf("lock stale server voice left handoff: %w", err)
+	}
+	if !acquired {
+		return nil
+	}
+
+	var present int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1
+		FROM voice_participants
+		WHERE channel_id = $1 AND user_id = $2
+	`, channelID, participantID).Scan(&present)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("recheck stale server voice participant handoff: %w", err)
+	}
+
+	if !s.broadcastServerVoiceParticipantContext(ctx, room, channelID, participantID, "left") {
+		return errors.New("stale server voice left handoff not queued")
+	}
+	return nil
+}
+
+func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
+	ctx context.Context,
+	candidate staleServerVoiceParticipant,
+	leaseSeconds int64,
+) (applied bool, returnErr error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin stale server voice participant cleanup: %w", err)
+	}
+	defer func() {
+		returnErr = joinRollbackErr(
+			returnErr,
+			tx.Rollback(),
+			"rollback stale server voice participant cleanup",
+		)
+	}()
+	acquired, err := tryLockServerVoiceLifecycleTx(ctx, tx, candidate.userID)
+	if err != nil {
+		return false, fmt.Errorf("lock stale server voice participant cleanup: %w", err)
+	}
+	if !acquired {
+		return false, nil
+	}
+
+	var lifecycleObservedAt, cutoff time.Time
+	err = tx.QueryRowContext(ctx, `
+		SELECT lifecycle_observed_at,
+		       clock_timestamp() - ($3::bigint * INTERVAL '1 second')
+		FROM voice_participants
+		WHERE channel_id = $1 AND user_id = $2
+	`, candidate.channelID, candidate.userID, leaseSeconds).Scan(
+		&lifecycleObservedAt, &cutoff,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit stale server voice participant no-op: %w", err)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("re-read stale server voice participant: %w", err)
+	}
+	if lifecycleObservedAt.After(cutoff) {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit fresh server voice participant no-op: %w", err)
+		}
+		return false, nil
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM voice_participants
+		WHERE channel_id = $1 AND user_id = $2
+		  AND lifecycle_observed_at <=
+		      clock_timestamp() - ($3::bigint * INTERVAL '1 second')
+	`, candidate.channelID, candidate.userID, leaseSeconds)
+	if err != nil {
+		return false, fmt.Errorf("delete stale server voice participant: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read stale server voice participant delete result: %w", err)
+	}
+	if rowsAffected != 0 && rowsAffected != 1 {
+		return false, fmt.Errorf("stale server voice participant delete affected %d rows", rowsAffected)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit stale server voice participant cleanup: %w", err)
+	}
+	return rowsAffected == 1, nil
 }
 
 func (s *NATSSubscriber) disconnectAllRichPresenceClients() {

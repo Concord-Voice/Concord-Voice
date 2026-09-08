@@ -129,6 +129,16 @@ func (s *NATSSubscriber) SetActivityServiceForTest(activity *presence.ActivitySe
 	s.activity = activity
 }
 
+// CompleteServerVoiceCleanupGraceForTest expires the one-shot startup grace
+// without resetting its sync.Once. It returns the deadline armed by the first
+// cleanup invocation so tests can assert the lease was bounded correctly.
+func (s *NATSSubscriber) CompleteServerVoiceCleanupGraceForTest() time.Time {
+	s.serverVoiceCleanupOnce.Do(func() {})
+	readyAt := s.serverVoiceCleanupReadyAt
+	s.serverVoiceCleanupReadyAt = time.Now().Add(-time.Nanosecond)
+	return readyAt
+}
+
 // RunVoiceLifecycleMutationForTest exercises the same claim-then-mutate
 // ordering as production. It intentionally mirrors the pre-fence behavior
 // until withVoiceLifecycleClaim replaces this body during the TDD cycle.
@@ -299,3 +309,7 @@ func (s *NATSSubscriber) ReEnforceDM(channelID, userID string) {
 func (s *NATSSubscriber) PublishForceDisconnect(channelID, userID string) {
 	s.publishForceDisconnect(channelID, userID)
 }
+
+// StaleServerVoiceDiscoverySQLForTest exposes the lease-discovery statement so
+// the plan-shape guard runs against the exact SQL production issues.
+func StaleServerVoiceDiscoverySQLForTest() string { return staleServerVoiceDiscoverySQL }

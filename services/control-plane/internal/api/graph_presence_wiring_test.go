@@ -308,6 +308,70 @@ func TestActivePlanRailWired(t *testing.T) {
 	})
 }
 
+func TestServerVoiceCleanupWiredRequiresCleanupCallback(t *testing.T) {
+	attached := activepresence.NewReconciler(nil, nil, nil, nil, nil, nil)
+	attached.SetServerVoiceCleanup(func(context.Context, int) (int, error) {
+		return 0, nil
+	})
+
+	// NATS-independence is now structural rather than asserted: the predicate
+	// takes no NATS client at all, so there is no argument by which a caller
+	// could make cleanup conditional on subscription state. The former table
+	// passed a nil and a non-nil *natsclient.Client to a parameter the body
+	// ignored, which could only ever hold — it documented the intent without
+	// testing it, and could not have caught the body starting to read it.
+	cases := []struct {
+		name       string
+		reconciler *activepresence.Reconciler
+		wantWired  bool
+	}{
+		{
+			name:       "an unwired cleanup callback is rejected",
+			reconciler: activepresence.NewReconciler(nil, nil, nil, nil, nil, nil),
+			wantWired:  false,
+		},
+		{
+			name:       "an attached cleanup callback is accepted",
+			reconciler: attached,
+			wantWired:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.wantWired,
+				serverVoiceCleanupWired(tc.reconciler),
+				"the guard must read the attached callback, not a pointer")
+		})
+	}
+}
+
+func TestServerVoiceCleanupWiredAtConstructionSite(t *testing.T) {
+	sourceBytes, err := os.ReadFile("router.go") // #nosec G304 -- fixed test-only source path
+	require.NoError(t, err)
+	source := string(sourceBytes)
+
+	const callbackWiring = "activePlanReconciler.SetServerVoiceCleanup(voiceSub.ReconcileStaleServerVoiceParticipants)"
+	require.Equal(t, 1, strings.Count(source, callbackWiring),
+		"server voice cleanup must be attached at exactly one construction site")
+
+	natsSubscription := "if natsClient != nil {"
+	presenceRecheck := "voiceSub.SetPresenceRecheck(presenceRecheckExecutor)"
+	// The call text, not the definition: requireServerVoiceCleanupWired is
+	// declared far above NewRouter, so pinning the bare identifier would make
+	// strings.Index find the func declaration and the ordering assertion below
+	// would compare against the wrong offset.
+	guard := "requireServerVoiceCleanupWired(log, activePlanReconciler)"
+	require.Equal(t, 1, strings.Count(source, presenceRecheck),
+		"presence recheck must be attached at exactly one construction site")
+	require.Less(t, strings.Index(source, callbackWiring), strings.Index(source, natsSubscription),
+		"server voice cleanup must be wired before the conditional NATS subscription")
+	require.Less(t, strings.Index(source, presenceRecheck), strings.Index(source, natsSubscription),
+		"presence recheck must be wired before the conditional NATS subscription")
+	require.Less(t, strings.Index(source, callbackWiring), strings.Index(source, guard),
+		"server voice cleanup must be wired before its boot guard")
+}
+
 // TestActivePlanRailIsWiredAtItsConstructionSites pins the three router lines
 // that arm #2448 in a running process, for the reason
 // TestGraphPresenceRailIsWiredAtTheConstructionSite gives below: the unwire

@@ -78,7 +78,7 @@ Expected output:
 Checking migration version...
 Building migrate tool...
 ./bin/migrate -command=version
-Current version: 126 (clean)
+Current version: 133 (clean)
 ```
 
 The number is the highest migration in `migrations/`. Run `ls migrations/*.up.sql | tail -1` to
@@ -104,7 +104,7 @@ make migrate-version
 
 Expected output:
 ```
-Current version: 125 (clean)
+Current version: 132 (clean)
 ```
 
 The version is one lower than the value from the previous step.
@@ -179,15 +179,15 @@ Creating migration: add_test_field
 Building migrate tool...
 ./bin/migrate -command=create -name=add_test_field
 Created migration files:
-  - migrations/000114_add_test_field.up.sql
-  - migrations/000114_add_test_field.down.sql
+  - migrations/000134_add_test_field.up.sql
+  - migrations/000134_add_test_field.down.sql
 ```
 
 The number is the next one after the highest migration in `migrations/`.
 
 Verify files were created:
 ```bash
-ls -l migrations/000114_*
+ls -l migrations/000134_*
 ```
 
 ### 6. Test Server Startup with Auto-Migration

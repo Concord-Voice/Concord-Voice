@@ -458,6 +458,40 @@ func activePlanRailWired(rail *activepresence.Rail) bool {
 	return rail.HasReconciler()
 }
 
+// serverVoiceCleanupWired reports whether the bounded Server Voice reaper is
+// attached to the #2448 reconciler. Like activePlanRailWired it interrogates the
+// constructed value rather than a pointer, because HasServerVoiceCleanup reports
+// whether SetServerVoiceCleanup actually RAN — activepresence.NewReconciler
+// always returns non-nil, so a nil check would be the tautology that boots with
+// the reaper never attached.
+//
+// It takes no NATS client on purpose. Cleanup is required whether or not the bus
+// subscribed: the reaper reads the database directly, and a replica whose NATS
+// URL is misconfigured is exactly the case where stale rows accumulate fastest,
+// because nothing is renewing the lease. Expressing that structurally is why the
+// parameter is absent rather than ignored — an ignored parameter cannot enforce
+// independence, it only documents an intent a later change can quietly violate.
+func serverVoiceCleanupWired(reconciler *activepresence.Reconciler) bool {
+	return reconciler.HasServerVoiceCleanup()
+}
+
+// requireServerVoiceCleanupWired fatal-exits when the reaper is unwired.
+//
+// The branch lives here rather than at the call site for the reason
+// buildActivePlanRail's comment states: NewRouter sits at the go:S3776
+// cognitive-complexity limit of 15, so every addition there has to be
+// branch-free. requireGraphPresenceCaptureWired is the same shape, and this
+// guard reached the limit when it was written as an `if` in NewRouter.
+//
+// Unwired is FATAL rather than a degrade: a room whose final leave was dropped
+// then stays full forever and refuses honest joins, which is the whole defect
+// #2907 exists to close.
+func requireServerVoiceCleanupWired(log *logger.Logger, reconciler *activepresence.Reconciler) {
+	if !serverVoiceCleanupWired(reconciler) {
+		log.Fatal("server voice participant cleanup is not wired")
+	}
+}
+
 // buildActivePlanRail constructs the #2448 rail and hands back both halves: the
 // rail its three consumers hold, and the reconciler cmd/server drives from the
 // Activity History startup pass and its ticker.
@@ -1042,21 +1076,23 @@ func NewRouter(
 	redemptionHandler := buildRedemptionHandler(db, entCache, redemptionEntNotifier, cfg, log)
 
 	// Start NATS voice event subscriber
+	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
+	activePlanReconciler.SetServerVoiceCleanup(voiceSub.ReconcileStaleServerVoiceParticipants)
+	// Temporary-SBAC revoke shares the one #2445 executor with the RBAC
+	// handler, so a presence-triggered revoke captures the same way an
+	// authority write does.
+	voiceSub.SetPresenceRecheck(presenceRecheckExecutor)
 	if natsClient != nil {
-		voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
 		// Close the join-vs-mutation race: re-push fresh permissions when a
 		// voice.joined lands (CV-CAN-007 P1).
 		voiceSub.SetPermissionEnforcer(voicePermEnforcer)
-		// Temporary-SBAC revoke shares the one #2445 executor with the RBAC
-		// handler, so a presence-triggered revoke captures the same way an
-		// authority write does.
-		voiceSub.SetPresenceRecheck(presenceRecheckExecutor)
 		if subErr := voiceSub.Subscribe(); subErr != nil {
 			log.Error("Failed to subscribe to voice NATS events", "error", subErr)
 		} else {
 			voicePermEnforcer.AddCloseHook(voiceSub.Close)
 		}
 	}
+	requireServerVoiceCleanupWired(log, activePlanReconciler)
 	// API v1 routes
 	noStore := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")

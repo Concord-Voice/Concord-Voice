@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000131)
+## Existing Migrations (000001–000133)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -241,6 +241,8 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000129 | dm_messages_expires_at_index | Concurrent partial index on `dm_messages (expires_at)` for non-null expiry timestamps |
 | 000130 | message_purge_expiry_reason | Broaden `message_purges_reason_check` to admit `expiry` and leave it `NOT VALID` |
 | 000131 | validate_message_purge_expiry_reason | Validate `message_purges_reason_check`; down restores the broader `NOT VALID` check |
+| 000132 | add_voice_lifecycle_observed_at | Add PostgreSQL-observed Server Voice lifecycle lease and expiry index (#2907) |
+| 000133 | preserve_voice_lifecycle_replay_lease | Preserve the lease on exact Server Voice lifecycle replays (#2907) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use

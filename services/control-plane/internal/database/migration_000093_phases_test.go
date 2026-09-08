@@ -15,6 +15,7 @@ import (
 func TestMigration000093_PhasedUpgradeFromBase92(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	ctx := context.Background()
+	suspendMigration000132ForLifecycleRollback(t, ts.DB)
 	ups := []string{
 		migration000093ReadFile(t, "000093_voice_lifecycle_watermarks.up.sql"),
 		migration000093ReadFile(t, "000094_backfill_voice_lifecycle_watermarks.up.sql"),

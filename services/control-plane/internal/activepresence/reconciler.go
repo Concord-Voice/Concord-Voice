@@ -81,13 +81,14 @@ var ErrReconcilerNotWired = errors.New("activepresence: reconciler is not wired"
 
 // Reconciler owns the claim/resolve/deliver/ack loop and its ticker.
 type Reconciler struct {
-	db        *sql.DB
-	gate      Gate
-	reader    StateReader
-	deleter   GenerationDeleter
-	deliverer Deliverer
-	log       *logger.Logger
-	interval  time.Duration
+	db                 *sql.DB
+	gate               Gate
+	reader             StateReader
+	deleter            GenerationDeleter
+	deliverer          Deliverer
+	log                *logger.Logger
+	interval           time.Duration
+	serverVoiceCleanup func(context.Context, int) (int, error)
 }
 
 // NewReconciler wires the pass. log may be nil.
@@ -111,14 +112,28 @@ func (r *Reconciler) HasDeliverer() bool {
 	return r != nil && r.deliverer != nil
 }
 
+// SetServerVoiceCleanup attaches bounded Server Voice cleanup to this
+// reconciler's existing pass and ticker.
+func (r *Reconciler) SetServerVoiceCleanup(cleanup func(context.Context, int) (int, error)) {
+	if r != nil {
+		r.serverVoiceCleanup = cleanup
+	}
+}
+
+// HasServerVoiceCleanup reports whether the optional cleanup is wired.
+func (r *Reconciler) HasServerVoiceCleanup() bool {
+	return r != nil && r.serverVoiceCleanup != nil
+}
+
 // PassStats is the aggregate one pass reports. Counts only -- no subject, no
 // category, no payload.
 type PassStats struct {
-	Acked        int
-	Cleared      int
-	Disconnected int
-	Retained     int
-	Quarantined  int
+	Acked              int
+	Cleared            int
+	Disconnected       int
+	Retained           int
+	Quarantined        int
+	ServerVoiceRemoved int
 }
 
 // passState coalesces the anomaly arm. At most ONE fleet-wide disconnect per
@@ -158,6 +173,16 @@ func (r *Reconciler) ReconcilePass(ctx context.Context, limit int) (PassStats, e
 	if r == nil || r.db == nil || r.gate == nil || r.deliverer == nil {
 		return PassStats{}, ErrReconcilerNotWired
 	}
+	stats := PassStats{}
+	if r.serverVoiceCleanup != nil {
+		cleanupCtx, cancelCleanup := context.WithTimeout(ctx, claimTimeout)
+		removed, cleanupErr := r.serverVoiceCleanup(cleanupCtx, limit)
+		cancelCleanup()
+		stats.ServerVoiceRemoved = removed
+		if cleanupErr != nil && r.log != nil {
+			r.log.Error("server voice participant cleanup failed", "failure_class", "server_voice_cleanup")
+		}
+	}
 	keys, err := DiscoverDue(ctx, r.db, limit)
 	if err != nil {
 		// Run discards this error, so without a line here a rail that can no
@@ -173,9 +198,9 @@ func (r *Reconciler) ReconcilePass(ctx context.Context, limit int) (PassStats, e
 		if r.log != nil {
 			r.log.Error("active-category plan discovery failed", "failure_class", "discovery")
 		}
-		return PassStats{}, err
+		return stats, err
 	}
-	pass := &passState{}
+	pass := &passState{stats: stats}
 	for _, key := range keys {
 		subject := key.SubjectID
 		gateErr := r.gate.WithSenders(ctx, []uuid.UUID{subject}, func() error {
@@ -391,5 +416,6 @@ func (r *Reconciler) logPass(stats PassStats) {
 		"disconnected_count", stats.Disconnected,
 		"retained_count", stats.Retained,
 		"quarantined_count", stats.Quarantined,
+		"server_voice_removed_count", stats.ServerVoiceRemoved,
 	)
 }

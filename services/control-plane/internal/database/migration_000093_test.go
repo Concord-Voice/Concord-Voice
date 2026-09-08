@@ -19,6 +19,7 @@ import (
 func TestMigration000093_BackfillDefaultsAndGuardedRollback(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	ctx := context.Background()
+	suspendMigration000132ForLifecycleRollback(t, ts.DB)
 
 	for _, table := range []string{"voice_participants", "dm_voice_participants"} {
 		migration000093AssertColumn(t, ts.DB, table)
@@ -181,6 +182,26 @@ func TestMigration000093_BackfillDefaultsAndGuardedRollback(t *testing.T) {
 	_, err = ts.DB.ExecContext(ctx, upSQL)
 	require.NoError(t, err, "up migration must reapply after rollback")
 	migrationApplied = true
+}
+
+// suspendMigration000132ForLifecycleRollback lets the historical 000093
+// rollback assertions run against the current schema.  Migration 000132
+// depends on the lifecycle watermark introduced by 000093, so it must be
+// temporarily removed before that earlier migration is rolled back.
+func suspendMigration000132ForLifecycleRollback(t *testing.T, db *sql.DB) {
+	t.Helper()
+	downSQL := migration000093ReadFile(t, "000132_add_voice_lifecycle_observed_at.down.sql")
+	upSQL := migration000093ReadFile(t, "000132_add_voice_lifecycle_observed_at.up.sql")
+	observedLeaseGuardSQL := migration000093ReadFile(t, "000133_preserve_voice_lifecycle_replay_lease.up.sql")
+
+	_, err := db.ExecContext(context.Background(), downSQL)
+	require.NoError(t, err, "suspend migration 000132 for lifecycle rollback")
+	t.Cleanup(func() {
+		_, err := db.ExecContext(context.Background(), upSQL)
+		assert.NoError(t, err, "restore migration 000132 after lifecycle rollback")
+		_, err = db.ExecContext(context.Background(), observedLeaseGuardSQL)
+		assert.NoError(t, err, "restore migration 000133 after lifecycle rollback")
+	})
 }
 
 func migration000093AssertColumn(t *testing.T, db *sql.DB, table string) {

@@ -72,6 +72,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Security
 
 - **Application security events are ready for Nightwatch ingestion** ([#2273](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2273)) — the control plane and media plane now emit privacy-safe, closed security records to isolated host streams. The dedicated [Nightwatch repository](https://github.com/Concord-Voice/nightwatch) owns normalization, Wazuh, provider configuration, and commissioning; this change does not modify live infrastructure.
+- **Voice rooms no longer stay full after everyone has left** ([#3116](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3116)) — if every final leave update was lost under queue pressure, the server could keep counting people who were no longer connected and refuse honest joins indefinitely. Concord now records a bounded lease for the last observed room state and reconciles expired participants without waiting for anyone to join elsewhere.
 
 ## [0.2.46] — 2026-09-07
 

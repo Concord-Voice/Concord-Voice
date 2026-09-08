@@ -179,6 +179,41 @@ func TestReconcilePassClearsWithoutDisconnecting(t *testing.T) {
 	require.Zero(t, countPlans(t, db), "a delivered plan is acknowledged by deletion")
 }
 
+func TestReconcilePassRunsBoundedServerVoiceCleanup(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, nil)
+	called := 0
+	r.SetServerVoiceCleanup(func(ctx context.Context, limit int) (int, error) {
+		called++
+		require.Equal(t, maxPlanBatch, limit)
+		_, hasDeadline := ctx.Deadline()
+		require.True(t, hasDeadline, "cleanup must not hold up the active-plan rail indefinitely")
+		return 2, nil
+	})
+
+	stats, err := r.ReconcilePass(context.Background(), maxPlanBatch)
+	require.NoError(t, err)
+	require.Equal(t, 1, called)
+	require.Equal(t, 2, stats.ServerVoiceRemoved)
+}
+
+func TestReconcilePassContinuesAfterServerVoiceCleanupFailure(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subject := dbtest.CreateUser(t, db)
+	insert(t, db, livePlan(subject))
+	deliverer := &recordingDeliverer{}
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, deliverer, nil)
+	r.SetServerVoiceCleanup(func(context.Context, int) (int, error) {
+		return 0, errors.New("voice sweep unavailable")
+	})
+
+	stats, err := r.ReconcilePass(context.Background(), maxPlanBatch)
+	require.NoError(t, err, "a sweep failure must not block active-plan reconciliation")
+	require.Equal(t, 1, stats.Cleared)
+	require.Len(t, deliverer.clears, 1)
+	require.Zero(t, countPlans(t, db))
+}
+
 // B5, absent-but-young: the clear frame still ships, but there is NO generation
 // to delete. Step (a) must be skipped -- activityGenerationKey rejects
 // uuid.Nil, so an ungated call reports a spurious generation_delete failure on
