@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-07-14
+**Generated:** 2026-09-08
 **MinIO distribution addendum updated:** 2026-07-12
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -19,8 +19,8 @@ CVSL application artifact families:
 - **59** Go modules linked into the control-plane runtime binary. The image that
   carries that binary also ships the admin portal bundle below, so the image is
   not Go-only.
-- **188** npm packages in the desktop client production bundle (plus Electron and its bundled components)
-- **147** npm packages in the media-plane production bundle
+- **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
+- **148** npm packages in the media-plane production bundle
 - **4** npm packages in the admin portal production bundle (`client/admin`),
   compiled by the `admin-ui-builder` stage and copied into the control-plane
   runtime image at `/admin-ui` (`services/control-plane/Dockerfile:8,66`)
@@ -33,15 +33,22 @@ also excluded from this linked/bundled application dependency count.)
 
 Application-dependency license distribution:
 
-| License family | Approximate share | Compatible with CVSL 1.0 + AGPL-3.0 |
+| License family | Share | Compatible with CVSL 1.0 + AGPL-3.0 |
 |---|---|---|
-| MIT | ~75% | ✓ |
-| ISC | ~10% | ✓ |
-| Apache-2.0 | ~7% | ✓ |
-| BSD-2-Clause / BSD-3-Clause | ~6% | ✓ |
-| MPL-2.0 (build-time only) | <1% | ✓ |
-| Other permissive (BlueOak-1.0.0, 0BSD, Python-2.0, Unlicense, CC0-1.0, MIT-0) | <2% | ✓ |
-| CC-BY-3.0 / CC-BY-4.0 (build-data only) | <1% | ✓ (attribution required) |
+| MIT | 82.4% (328) | ✓ |
+| ISC | 6.3% (25) | ✓ |
+| Apache-2.0 | 4.5% (18) | ✓ |
+| BSD-2-Clause / BSD-3-Clause | 5.0% (20) | ✓ |
+| BlueOak-1.0.0 | 1.3% (5) | ✓ |
+| Python-2.0 / Unlicense | 0.5% (2) | ✓ |
+| MPL-2.0 (build-time only) | not in the count above | ✓ |
+| CC-BY-3.0 / CC-BY-4.0 (build-data only) | not in the count above | ✓ (attribution required) |
+
+Shares are exact counts over the 398 components tabulated below, not estimates.
+The final two rows cover build-time and build-data dependencies, which are not
+part of that 398 and therefore carry no share of it; see
+[docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
+for their treatment.
 
 No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the four
@@ -137,16 +144,16 @@ The following Go modules are linked into the control-plane runtime binary
 |---|---|---|
 | github.com/boombuler/barcode | v1.1.0 | MIT |
 | github.com/cespare/xxhash/v2 | v2.3.0 | MIT |
-| github.com/coreos/go-oidc/v3 | v3.20.0 | Apache-2.0 |
+| github.com/coreos/go-oidc/v3 | v3.21.0 | Apache-2.0 |
 | github.com/dustin/go-humanize | v1.0.1 | MIT |
-| github.com/fxamacker/cbor/v2 | v2.9.2 | MIT |
-| github.com/gabriel-vasile/mimetype | v1.4.13 | MIT |
-| github.com/gin-contrib/sse | v1.1.1 | MIT |
+| github.com/fxamacker/cbor/v2 | v2.9.3 | MIT |
+| github.com/gabriel-vasile/mimetype | v1.4.15 | MIT |
+| github.com/gin-contrib/sse | v1.1.2 | MIT |
 | github.com/gin-gonic/gin | v1.12.0 | MIT |
-| github.com/go-jose/go-jose/v4 | v4.1.4 | Apache-2.0 |
+| github.com/go-jose/go-jose/v4 | v4.1.5 | Apache-2.0 |
 | github.com/go-playground/locales | v0.14.1 | MIT |
 | github.com/go-playground/universal-translator | v0.18.1 | MIT |
-| github.com/go-playground/validator/v10 | v10.30.3 | MIT |
+| github.com/go-playground/validator/v10 | v10.30.4 | MIT |
 | github.com/go-viper/mapstructure/v2 | v2.5.0 | MIT |
 | github.com/go-webauthn/webauthn | v0.18.0 | BSD-3-Clause |
 | github.com/go-webauthn/x | v0.3.0 | BSD-3-Clause |
@@ -157,42 +164,42 @@ The following Go modules are linked into the control-plane runtime binary
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause |
 | github.com/gorilla/websocket | v1.5.3 | BSD-2-Clause |
 | github.com/joho/godotenv | v1.5.1 | MIT |
-| github.com/klauspost/compress | v1.19.0 | MIT |
+| github.com/klauspost/compress | v1.20.0 | MIT |
 | github.com/klauspost/cpuid/v2 | v2.4.0 | MIT |
 | github.com/klauspost/crc32 | v1.3.0 | BSD-3-Clause |
-| github.com/leodido/go-urn | v1.4.0 | MIT |
+| github.com/leodido/go-urn | v1.5.0 | MIT |
 | github.com/lib/pq | v1.12.3 | MIT |
-| github.com/mattn/go-isatty | v0.0.22 | MIT |
+| github.com/mattn/go-isatty | v0.0.24 | MIT |
 | github.com/minio/crc64nvme | v1.1.1 | Apache-2.0 |
 | github.com/minio/md5-simd | v1.1.2 | Apache-2.0 |
-| github.com/minio/minio-go/v7 | v7.2.1 | Apache-2.0 |
-| github.com/nats-io/nats.go | v1.52.0 | Apache-2.0 |
+| github.com/minio/minio-go/v7 | v7.3.0 | Apache-2.0 |
+| github.com/nats-io/nats.go | v1.53.1 | Apache-2.0 |
 | github.com/nats-io/nkeys | v0.4.16 | Apache-2.0 |
 | github.com/nats-io/nuid | v1.0.1 | Apache-2.0 |
 | github.com/pelletier/go-toml/v2 | v2.4.3 | MIT |
 | github.com/philhofer/fwd | v1.2.0 | MIT |
 | github.com/pquerna/otp | v1.5.0 | Apache-2.0 |
 | github.com/quic-go/qpack | v0.6.0 | MIT |
-| github.com/quic-go/quic-go | v0.60.0 | MIT |
-| github.com/redis/go-redis/v9 | v9.21.0 | BSD-2-Clause |
+| github.com/quic-go/quic-go | v0.62.0 | MIT |
+| github.com/redis/go-redis/v9 | v9.22.0 | BSD-2-Clause |
 | github.com/rs/xid | v1.6.0 | MIT |
 | github.com/tinylib/msgp | v1.6.4 | MIT |
-| github.com/ugorji/go/codec | v1.3.1 | MIT |
+| github.com/ugorji/go/codec | v1.3.2 | MIT |
 | github.com/vmihailenco/msgpack/v5 | v5.4.1 | BSD-2-Clause |
 | github.com/vmihailenco/tagparser/v2 | v2.0.0 | BSD-2-Clause |
 | github.com/x448/float16 | v0.8.4 | MIT |
 | github.com/zeebo/xxh3 | v1.1.0 | BSD-2-Clause |
-| go.mongodb.org/mongo-driver/v2 | v2.8.0 | Apache-2.0 |
+| go.mongodb.org/mongo-driver/v2 | v2.9.0 | Apache-2.0 |
 | go.uber.org/atomic | v1.11.0 | MIT |
-| go.yaml.in/yaml/v3 | v3.0.4 | MIT |
-| golang.org/x/crypto | v0.54.0 | BSD-3-Clause |
-| golang.org/x/image | v0.44.0 | BSD-3-Clause |
-| golang.org/x/net | v0.57.0 | BSD-3-Clause |
+| go.yaml.in/yaml/v3 | v3.0.5 | MIT |
+| golang.org/x/crypto | v0.56.0 | BSD-3-Clause |
+| golang.org/x/image | v0.45.0 | BSD-3-Clause |
+| golang.org/x/net | v0.58.0 | BSD-3-Clause |
 | golang.org/x/oauth2 | v0.36.0 | BSD-3-Clause |
 | golang.org/x/sync | v0.22.0 | BSD-3-Clause |
 | golang.org/x/sys | v0.47.0 | BSD-3-Clause |
-| golang.org/x/text | v0.40.0 | BSD-3-Clause |
-| google.golang.org/protobuf | v1.36.11 | BSD-3-Clause |
+| golang.org/x/text | v0.41.0 | BSD-3-Clause |
+| google.golang.org/protobuf | v1.36.12 | BSD-3-Clause |
 | gopkg.in/ini.v1 | v1.67.3 | Apache-2.0 |
 
 ---
@@ -207,7 +214,7 @@ bundle (client/desktop):
 | @lukeed/csprng | 1.1.0 | MIT | https://github.com/lukeed/csprng |
 | @lukeed/uuid | 2.0.1 | MIT | https://github.com/lukeed/uuid |
 | @msgpack/msgpack | 3.1.3 | ISC | https://github.com/msgpack/msgpack-javascript |
-| @noble/hashes | 2.2.0 | MIT | https://github.com/paulmillr/noble-hashes |
+| @noble/hashes | 2.3.0 | MIT | https://github.com/paulmillr/noble-hashes |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/debug | 4.1.13 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/estree-jsx | 1.0.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
@@ -216,16 +223,16 @@ bundle (client/desktop):
 | @types/hast | 3.0.4 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/mdast | 4.0.4 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ms | 2.1.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/react | 19.2.15 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/react | 19.2.18 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/unist | 2.0.11 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/unist | 3.0.3 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @ungap/structured-clone | 1.3.0 | ISC | https://github.com/ungap/structured-clone |
 | ansi-regex | 5.0.1 | MIT | https://github.com/chalk/ansi-regex |
 | ansi-styles | 4.3.0 | MIT | https://github.com/chalk/ansi-styles |
 | argparse | 2.0.1 | Python-2.0 | https://github.com/nodeca/argparse |
-| awaitqueue | 3.3.0 | ISC | https://github.com/versatica/awaitqueue |
+| awaitqueue | 3.3.1 | ISC | https://github.com/versatica/awaitqueue |
 | bail | 2.0.2 | MIT | https://github.com/wooorm/bail |
-| builder-util-runtime | 9.5.1 | MIT | https://github.com/electron-userland/electron-builder |
+| builder-util-runtime | 9.7.0 | MIT | https://github.com/electron-userland/electron-builder |
 | camelcase | 5.3.1 | MIT | https://github.com/sindresorhus/camelcase |
 | ccount | 2.0.1 | MIT | https://github.com/wooorm/ccount |
 | character-entities-html4 | 2.1.0 | MIT | https://github.com/wooorm/character-entities-html4 |
@@ -236,7 +243,7 @@ bundle (client/desktop):
 | color-convert | 2.0.1 | MIT | https://github.com/Qix-/color-convert |
 | color-name | 1.1.4 | MIT | https://github.com/colorjs/color-name |
 | comma-separated-tokens | 2.0.3 | MIT | https://github.com/wooorm/comma-separated-tokens |
-| cookie | 1.1.1 | MIT | https://github.com/jshttp/cookie |
+| cookie-es | 3.1.1 | MIT | https://github.com/unjs/cookie-es |
 | csstype | 3.2.3 | MIT | https://github.com/frenic/csstype |
 | debug | 2.6.9 | MIT | https://github.com/visionmedia/debug |
 | debug | 4.4.3 | MIT | https://github.com/debug-js/debug |
@@ -246,7 +253,7 @@ bundle (client/desktop):
 | devlop | 1.1.0 | MIT | https://github.com/wooorm/devlop |
 | dijkstrajs | 1.0.3 | MIT | https://github.com/tcort/dijkstrajs |
 | electron-squirrel-startup | 1.0.1 | Apache-2.0 | https://github.com/mongodb-js/electron-squirrel-startup |
-| electron-updater | 6.8.3 | MIT | https://github.com/electron-userland/electron-builder |
+| electron-updater | 6.8.9 | MIT | https://github.com/electron-userland/electron-builder |
 | emoji-regex | 8.0.0 | MIT | https://github.com/mathiasbynens/emoji-regex |
 | engine.io-client | 6.6.5 | MIT | https://github.com/socketio/socket.io |
 | engine.io-parser | 5.2.3 | MIT | https://github.com/socketio/socket.io |
@@ -259,7 +266,7 @@ bundle (client/desktop):
 | fs-extra | 10.1.0 | MIT | https://github.com/jprichardson/node-fs-extra |
 | get-caller-file | 2.0.5 | ISC | https://github.com/stefanpenner/get-caller-file |
 | graceful-fs | 4.2.11 | ISC | https://github.com/isaacs/node-graceful-fs |
-| h264-profile-level-id | 2.3.2 | ISC | https://github.com/versatica/h264-profile-level-id |
+| h264-profile-level-id | 2.3.3 | ISC | https://github.com/versatica/h264-profile-level-id |
 | hash-wasm | 4.12.0 | MIT | https://github.com/Daninet/hash-wasm |
 | hast-util-is-element | 3.0.0 | MIT | https://github.com/syntax-tree/hast-util-is-element |
 | hast-util-sanitize | 5.0.2 | MIT | https://github.com/syntax-tree/hast-util-sanitize |
@@ -275,7 +282,8 @@ bundle (client/desktop):
 | is-fullwidth-code-point | 3.0.0 | MIT | https://github.com/sindresorhus/is-fullwidth-code-point |
 | is-hexadecimal | 2.0.1 | MIT | https://github.com/wooorm/is-hexadecimal |
 | is-plain-obj | 4.1.0 | MIT | https://github.com/sindresorhus/is-plain-obj |
-| js-yaml | 4.1.1 | MIT | https://github.com/nodeca/js-yaml |
+| jose | 6.2.10 | MIT | https://github.com/panva/jose |
+| js-yaml | 4.3.1 | MIT | https://github.com/nodeca/js-yaml |
 | jsonfile | 6.2.0 | MIT | https://github.com/jprichardson/node-jsonfile |
 | lazy-val | 1.0.5 | MIT | https://github.com/develar/lazy-val |
 | locate-path | 5.0.0 | MIT | https://github.com/sindresorhus/locate-path |
@@ -283,7 +291,7 @@ bundle (client/desktop):
 | lodash.isequal | 4.5.0 | MIT | https://github.com/lodash/lodash |
 | longest-streak | 3.1.0 | MIT | https://github.com/wooorm/longest-streak |
 | lowlight | 3.3.0 | MIT | https://github.com/wooorm/lowlight |
-| lucide-react | 1.16.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.38.0 | ISC | https://github.com/lucide-icons/lucide |
 | markdown-table | 3.0.4 | MIT | https://github.com/wooorm/markdown-table |
 | mdast-util-find-and-replace | 3.0.2 | MIT | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | mdast-util-from-markdown | 2.0.3 | MIT | https://github.com/syntax-tree/mdast-util-from-markdown |
@@ -300,7 +308,7 @@ bundle (client/desktop):
 | mdast-util-to-hast | 13.2.1 | MIT | https://github.com/syntax-tree/mdast-util-to-hast |
 | mdast-util-to-markdown | 2.1.2 | MIT | https://github.com/syntax-tree/mdast-util-to-markdown |
 | mdast-util-to-string | 4.0.0 | MIT | https://github.com/syntax-tree/mdast-util-to-string |
-| mediasoup-client | 3.20.0 | ISC | https://github.com/versatica/mediasoup-client |
+| mediasoup-client | 3.23.1 | ISC | https://github.com/versatica/mediasoup-client |
 | micromark-core-commonmark | 2.0.3 | MIT | https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark |
 | micromark-extension-gfm-autolink-literal | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-autolink-literal |
 | micromark-extension-gfm-footnote | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-footnote |
@@ -340,11 +348,10 @@ bundle (client/desktop):
 | pngjs | 5.0.0 | MIT | https://github.com/lukeapage/pngjs |
 | property-information | 7.1.0 | MIT | https://github.com/wooorm/property-information |
 | qrcode | 1.5.4 | MIT | https://github.com/soldair/node-qrcode |
-| react-dom | 19.2.6 | MIT | https://github.com/facebook/react |
+| react-dom | 19.2.8 | MIT | https://github.com/react/react |
 | react-markdown | 10.1.0 | MIT | https://github.com/remarkjs/react-markdown |
-| react-router-dom | 7.15.1 | MIT | https://github.com/remix-run/react-router |
-| react-router | 7.15.1 | MIT | https://github.com/remix-run/react-router |
-| react | 19.2.6 | MIT | https://github.com/facebook/react |
+| react-router | 8.3.1 | MIT | https://github.com/remix-run/react-router |
+| react | 19.2.8 | MIT | https://github.com/react/react |
 | rehype-highlight | 7.0.2 | MIT | https://github.com/rehypejs/rehype-highlight |
 | rehype-sanitize | 6.0.0 | MIT | https://github.com/rehypejs/rehype-sanitize |
 | remark-gfm | 4.0.1 | MIT | https://github.com/remarkjs/remark-gfm |
@@ -358,16 +365,15 @@ bundle (client/desktop):
 | sdp-transform | 3.0.0 | MIT | https://github.com/clux/sdp-transform |
 | semver | 7.7.4 | ISC | https://github.com/npm/node-semver |
 | set-blocking | 2.0.0 | ISC | https://github.com/yargs/set-blocking |
-| set-cookie-parser | 2.7.2 | MIT | https://github.com/nfriedly/set-cookie-parser |
 | socket.io-client | 4.8.3 | MIT | https://github.com/socketio/socket.io |
-| socket.io-parser | 4.2.6 | MIT | https://github.com/socketio/socket.io |
+| socket.io-parser | 4.2.7 | MIT | https://github.com/socketio/socket.io |
 | space-separated-tokens | 2.0.2 | MIT | https://github.com/wooorm/space-separated-tokens |
 | string-width | 4.2.3 | MIT | https://github.com/sindresorhus/string-width |
 | stringify-entities | 4.0.4 | MIT | https://github.com/wooorm/stringify-entities |
 | strip-ansi | 6.0.1 | MIT | https://github.com/chalk/strip-ansi |
 | style-to-js | 1.1.21 | MIT | https://github.com/remarkablemark/style-to-js |
 | style-to-object | 1.0.14 | MIT | https://github.com/remarkablemark/style-to-object |
-| supports-color | 10.2.2 | MIT | https://github.com/chalk/supports-color |
+| supports-color | 11.0.0 | MIT | https://github.com/chalk/supports-color |
 | tiny-typed-emitter | 2.1.0 | MIT | https://github.com/binier/tiny-typed-emitter |
 | trim-lines | 3.0.1 | MIT | https://github.com/wooorm/trim-lines |
 | trough | 2.2.0 | MIT | https://github.com/wooorm/trough |
@@ -384,12 +390,12 @@ bundle (client/desktop):
 | vfile | 6.0.3 | MIT | https://github.com/vfile/vfile |
 | which-module | 2.0.1 | ISC | https://github.com/nexdrew/which-module |
 | wrap-ansi | 6.2.0 | MIT | https://github.com/chalk/wrap-ansi |
-| ws | 8.20.1 | MIT | https://github.com/websockets/ws |
+| ws | 8.21.3 | MIT | https://github.com/websockets/ws |
 | xmlhttprequest-ssl | 2.1.2 | MIT | https://github.com/mjwwit/node-XMLHttpRequest |
 | y18n | 4.0.3 | ISC | https://github.com/yargs/y18n |
 | yargs-parser | 18.1.3 | ISC | https://github.com/yargs/yargs-parser |
 | yargs | 15.4.1 | MIT | https://github.com/yargs/yargs |
-| zod | 4.4.3 | MIT | https://github.com/colinhacks/zod |
+| zod | 4.5.4 | MIT | https://github.com/colinhacks/zod |
 | zustand | 5.0.13 | MIT | https://github.com/pmndrs/zustand |
 | zwitch | 2.0.4 | MIT | https://github.com/wooorm/zwitch |
 
@@ -405,22 +411,22 @@ bundle (services/media-plane):
 | @colors/colors | 1.6.0 | MIT | https://github.com/DABH/colors.js |
 | @dabh/diagnostics | 2.0.8 | MIT | https://github.com/DABH/diagnostics |
 | @isaacs/fs-minipass | 4.0.1 | ISC | https://github.com/npm/fs-minipass |
-| @redis/bloom | 5.12.1 | MIT | https://github.com/redis/node-redis |
-| @redis/client | 5.12.1 | MIT | https://github.com/redis/node-redis |
-| @redis/json | 5.12.1 | MIT | https://github.com/redis/node-redis |
-| @redis/search | 5.12.1 | MIT | https://github.com/redis/node-redis |
-| @redis/time-series | 5.12.1 | MIT | https://github.com/redis/node-redis |
+| @redis/bloom | 6.2.1 | MIT | https://github.com/redis/node-redis |
+| @redis/client | 6.2.1 | MIT | https://github.com/redis/node-redis |
+| @redis/json | 6.2.1 | MIT | https://github.com/redis/node-redis |
+| @redis/search | 6.2.1 | MIT | https://github.com/redis/node-redis |
+| @redis/time-series | 6.2.1 | MIT | https://github.com/redis/node-redis |
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/node | 25.9.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/node | 26.4.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/triple-beam | 1.3.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |
 | accepts | 2.0.0 | MIT | https://github.com/jshttp/accepts |
 | async | 3.2.6 | MIT | https://github.com/caolan/async |
 | base64id | 2.0.0 | MIT | https://github.com/faeldt/base64id |
-| body-parser | 2.2.2 | MIT | https://github.com/expressjs/body-parser |
+| body-parser | 2.3.0 | MIT | https://github.com/expressjs/body-parser |
 | buffer-equal-constant-time | 1.0.1 | BSD-3-Clause | https://github.com/goinstant/buffer-equal-constant-time |
 | bytes | 3.1.2 | MIT | https://github.com/visionmedia/bytes.js |
 | call-bind-apply-helpers | 1.0.2 | MIT | https://github.com/ljharb/call-bind-apply-helpers |
@@ -433,6 +439,7 @@ bundle (services/media-plane):
 | color | 5.0.3 | MIT | https://github.com/Qix-/color |
 | content-disposition | 1.0.1 | MIT | https://github.com/jshttp/content-disposition |
 | content-type | 1.0.5 | MIT | https://github.com/jshttp/content-type |
+| content-type | 2.0.0 | MIT | https://github.com/jshttp/content-type |
 | cookie-signature | 1.2.2 | MIT | https://github.com/visionmedia/node-cookie-signature |
 | cookie | 0.7.2 | MIT | https://github.com/jshttp/cookie |
 | cors | 2.8.6 | MIT | https://github.com/expressjs/cors |
@@ -448,7 +455,7 @@ bundle (services/media-plane):
 | engine.io | 6.6.8 | MIT | https://github.com/socketio/socket.io |
 | es-define-property | 1.0.1 | MIT | https://github.com/ljharb/es-define-property |
 | es-errors | 1.3.0 | MIT | https://github.com/ljharb/es-errors |
-| es-object-atoms | 1.1.1 | MIT | https://github.com/ljharb/es-object-atoms |
+| es-object-atoms | 1.1.2 | MIT | https://github.com/ljharb/es-object-atoms |
 | escape-html | 1.0.3 | MIT | https://github.com/component/escape-html |
 | etag | 1.8.1 | MIT | https://github.com/jshttp/etag |
 | express | 5.2.1 | MIT | https://github.com/expressjs/express |
@@ -464,9 +471,9 @@ bundle (services/media-plane):
 | get-intrinsic | 1.3.0 | MIT | https://github.com/ljharb/get-intrinsic |
 | get-proto | 1.0.1 | MIT | https://github.com/ljharb/get-proto |
 | gopd | 1.2.0 | MIT | https://github.com/ljharb/gopd |
-| h264-profile-level-id | 2.3.2 | ISC | https://github.com/versatica/h264-profile-level-id |
+| h264-profile-level-id | 2.3.3 | ISC | https://github.com/versatica/h264-profile-level-id |
 | has-symbols | 1.1.0 | MIT | https://github.com/inspect-js/has-symbols |
-| hasown | 2.0.2 | MIT | https://github.com/inspect-js/hasOwn |
+| hasown | 2.0.4 | MIT | https://github.com/inspect-js/hasOwn |
 | http-errors | 2.0.1 | MIT | https://github.com/jshttp/http-errors |
 | iconv-lite | 0.7.2 | MIT | https://github.com/pillarjs/iconv-lite |
 | inherits | 2.0.4 | ISC | https://github.com/isaacs/inherits |
@@ -487,7 +494,7 @@ bundle (services/media-plane):
 | logform | 2.7.0 | MIT | https://github.com/winstonjs/logform |
 | math-intrinsics | 1.1.0 | MIT | https://github.com/es-shims/math-intrinsics |
 | media-typer | 1.1.0 | MIT | https://github.com/jshttp/media-typer |
-| mediasoup | 3.20.0 | ISC | https://github.com/versatica/mediasoup |
+| mediasoup | 3.26.0 | ISC | https://github.com/versatica/mediasoup |
 | merge-descriptors | 2.0.0 | MIT | https://github.com/sindresorhus/merge-descriptors |
 | mime-db | 1.52.0 | MIT | https://github.com/jshttp/mime-db |
 | mime-db | 1.54.0 | MIT | https://github.com/jshttp/mime-db |
@@ -509,11 +516,11 @@ bundle (services/media-plane):
 | parseurl | 1.3.3 | MIT | https://github.com/pillarjs/parseurl |
 | path-to-regexp | 8.4.0 | MIT | https://github.com/pillarjs/path-to-regexp |
 | proxy-addr | 2.0.7 | MIT | https://github.com/jshttp/proxy-addr |
-| qs | 6.15.2 | BSD-3-Clause | https://github.com/ljharb/qs |
+| qs | 6.16.0 | BSD-3-Clause | https://github.com/ljharb/qs |
 | range-parser | 1.2.1 | MIT | https://github.com/jshttp/range-parser |
 | raw-body | 3.0.2 | MIT | https://github.com/stream-utils/raw-body |
 | readable-stream | 3.6.2 | MIT | https://github.com/nodejs/readable-stream |
-| redis | 5.12.1 | MIT | https://github.com/redis/node-redis |
+| redis | 6.2.1 | MIT | https://github.com/redis/node-redis |
 | router | 2.2.0 | MIT | https://github.com/pillarjs/router |
 | safe-buffer | 5.2.1 | MIT | https://github.com/feross/safe-buffer |
 | safe-stable-stringify | 2.5.0 | MIT | https://github.com/BridgeAR/safe-stable-stringify |
@@ -522,24 +529,24 @@ bundle (services/media-plane):
 | send | 1.2.1 | MIT | https://github.com/pillarjs/send |
 | serve-static | 2.2.1 | MIT | https://github.com/expressjs/serve-static |
 | setprototypeof | 1.2.0 | ISC | https://github.com/wesleytodd/setprototypeof |
-| side-channel-list | 1.0.0 | MIT | https://github.com/ljharb/side-channel-list |
+| side-channel-list | 1.0.1 | MIT | https://github.com/ljharb/side-channel-list |
 | side-channel-map | 1.0.1 | MIT | https://github.com/ljharb/side-channel-map |
 | side-channel-weakmap | 1.0.2 | MIT | https://github.com/ljharb/side-channel-weakmap |
-| side-channel | 1.1.0 | MIT | https://github.com/ljharb/side-channel |
+| side-channel | 1.1.1 | MIT | https://github.com/ljharb/side-channel |
 | socket.io-adapter | 2.5.7 | MIT | https://github.com/socketio/socket.io |
-| socket.io-parser | 4.2.6 | MIT | https://github.com/socketio/socket.io |
+| socket.io-parser | 4.2.7 | MIT | https://github.com/socketio/socket.io |
 | socket.io | 4.8.3 | MIT | https://github.com/socketio/socket.io |
 | stack-trace | 0.0.10 | MIT | https://github.com/felixge/node-stack-trace |
 | statuses | 2.0.2 | MIT | https://github.com/jshttp/statuses |
 | string_decoder | 1.3.0 | MIT | https://github.com/nodejs/string_decoder |
-| supports-color | 10.2.2 | MIT | https://github.com/chalk/supports-color |
-| tar | 7.5.15 | BlueOak-1.0.0 | https://github.com/isaacs/node-tar |
+| supports-color | 11.0.0 | MIT | https://github.com/chalk/supports-color |
+| tar | 7.5.22 | BlueOak-1.0.0 | https://github.com/isaacs/node-tar |
 | text-hex | 1.0.0 | MIT | https://github.com/3rd-Eden/text-hex |
 | toidentifier | 1.0.1 | MIT | https://github.com/component/toidentifier |
 | triple-beam | 1.4.1 | MIT | https://github.com/winstonjs/triple-beam |
 | tweetnacl | 1.0.3 | Unlicense | https://github.com/dchest/tweetnacl-js |
-| type-is | 2.0.1 | MIT | https://github.com/jshttp/type-is |
-| undici-types | 7.24.6 | MIT | https://github.com/nodejs/undici |
+| type-is | 2.1.0 | MIT | https://github.com/jshttp/type-is |
+| undici-types | 8.3.0 | MIT | https://github.com/nodejs/undici |
 | unpipe | 1.0.0 | MIT | https://github.com/stream-utils/unpipe |
 | util-deprecate | 1.0.2 | MIT | https://github.com/TooTallNate/util-deprecate |
 | vary | 1.1.2 | MIT | https://github.com/jshttp/vary |
@@ -547,7 +554,7 @@ bundle (services/media-plane):
 | winston-transport | 4.9.0 | MIT | https://github.com/winstonjs/winston-transport |
 | winston | 3.19.0 | MIT | https://github.com/winstonjs/winston |
 | wrappy | 1.0.2 | ISC | https://github.com/npm/wrappy |
-| ws | 8.20.1 | MIT | https://github.com/websockets/ws |
+| ws | 8.21.3 | MIT | https://github.com/websockets/ws |
 | yallist | 5.0.0 | BlueOak-1.0.0 | https://github.com/isaacs/yallist |
 
 ---
@@ -561,15 +568,16 @@ The following npm packages are included in the admin portal production bundle
 image even though the image's Go table above lists only linked Go modules.
 
 Versions here are resolved from `client/admin/package-lock.json` and are
-independent of the desktop client's lockfile. Three of the four rows carry a
-different version from the desktop row of the same name, so do not read either
-table as covering the other.
+independent of the desktop client's lockfile: the two are bumped by separate
+Dependabot PRs and may drift apart at any time. They happen to agree on all four
+rows as of this regeneration, but that is a coincidence of timing and not a
+guarantee — do not read either table as covering the other.
 
 | Package | Version | License | Repository |
 |---|---|---|---|
-| lucide-react | 1.31.0 | ISC | https://github.com/lucide-icons/lucide |
-| react | 19.2.8 | MIT | https://github.com/facebook/react |
-| react-dom | 19.2.8 | MIT | https://github.com/facebook/react |
+| lucide-react | 1.38.0 | ISC | https://github.com/lucide-icons/lucide |
+| react-dom | 19.2.8 | MIT | https://github.com/react/react |
+| react | 19.2.8 | MIT | https://github.com/react/react |
 | scheduler | 0.27.0 | MIT | https://github.com/facebook/react |
 
 ---
@@ -618,24 +626,32 @@ build-time-only attributions:
 This NOTICE file should be regenerated whenever dependencies are added,
 removed, or upgraded. Tooling:
 
-```bash
-# Excluded packages: Concord Voice's own packages (private; first-party,
-# not third-party) plus the local node-domexception stub override
-# documented in [internal]rules/media-plane.md "Docker Build Context Invariant".
-EXCLUDES='@concordvoice/desktop;@concordvoice/media-plane;node-domexception-stub'
+`--excludePrivatePackages` is what drops the first-party rows: Concord Voice's
+own packages and the local `node-domexception` stub override (documented in
+`[internal]rules/media-plane.md` "Docker Build Context Invariant") all declare
+`"private": true`. Do **not** substitute `--excludePackages` with a
+semicolon-separated name list — that flag matches on the full `name@version`
+key, so a bare name never matches and the exclusion silently does nothing.
+`.github/workflows/license-check.yml` uses the same flag, so the two paths agree.
 
+```bash
 # Desktop client (npm)
-cd client/desktop && npx license-checker --production --csv --excludePackages "$EXCLUDES" > /tmp/desktop-licenses.csv
+cd client/desktop && npx license-checker --production --csv --excludePrivatePackages > /tmp/desktop-licenses.csv
 
 # Media-plane (npm)
-cd services/media-plane && npx license-checker --production --csv --excludePackages "$EXCLUDES" > /tmp/media-licenses.csv
+cd services/media-plane && npx license-checker --production --csv --excludePrivatePackages > /tmp/media-licenses.csv
 
 # Admin portal (npm) -- bundled into the control-plane runtime image at /admin-ui
-cd client/admin && npx license-checker --production --csv --excludePackages "$EXCLUDES" > /tmp/admin-licenses.csv
+cd client/admin && npx license-checker --production --csv --excludePrivatePackages > /tmp/admin-licenses.csv
 
-# Go control-plane (binary runtime modules)
+# Go control-plane (binary runtime modules). The first line of output is the
+# control-plane's own module path with an empty version -- first-party, drop it.
 cd services/control-plane && go list -deps -e -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/server | sort -u
 ```
+
+Each table below is sorted the way `license-checker` sorts its CSV: by the full
+`name@version` key, which is why `@types/estree-jsx` precedes `@types/estree`
+(`-` sorts before `@`). Preserve that order so regenerated output diffs cleanly.
 
 See [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 for the full audit methodology and license-compatibility framework.
