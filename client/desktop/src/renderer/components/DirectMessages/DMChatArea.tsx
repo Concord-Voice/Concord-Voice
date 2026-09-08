@@ -38,7 +38,15 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [showPinnedPanel, setShowPinnedPanel] = useState(false);
   const [pinnedCount, setPinnedCount] = useState(0);
+  const [pinRefreshKey, setPinRefreshKey] = useState(0);
+  const pinGenerationRef = useRef(0);
   const messageListRef = useRef<MessageListHandle>(null);
+
+  useEffect(() => {
+    return () => {
+      pinGenerationRef.current += 1;
+    };
+  }, [selectedThreadId]);
 
   // Fetch pin count from API when the conversation changes. Degrades
   // gracefully on 404 (getPins returns [] — no console error loop).
@@ -49,16 +57,30 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
       return;
     }
     let cancelled = false;
+    const observedGeneration = pinGenerationRef.current;
     getPins(selectedThreadId)
       .then((pins) => {
-        if (!cancelled) setPinnedCount(pins.length);
+        if (!cancelled && pinGenerationRef.current === observedGeneration)
+          setPinnedCount(pins.length);
       })
       .catch(() => {
-        if (!cancelled) setPinnedCount(0);
+        if (!cancelled && pinGenerationRef.current === observedGeneration) setPinnedCount(0);
       });
     return () => {
       cancelled = true;
     };
+  }, [selectedThreadId, pinRefreshKey]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ scopeId?: string | null }>).detail;
+      if (detail?.scopeId !== selectedThreadId && detail?.scopeId !== null) return;
+      pinGenerationRef.current += 1;
+      setPinnedCount(0);
+      setPinRefreshKey((value) => value + 1);
+    };
+    globalThis.addEventListener('messages-purged', handler);
+    return () => globalThis.removeEventListener('messages-purged', handler);
   }, [selectedThreadId]);
 
   // Close pinned panel when switching threads
@@ -163,9 +185,12 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   // Wrap the generic pin toggle to keep the badge count in sync (mirrors ChatView pattern).
   const handlePinToggle = useCallback(
     async (msg: Parameters<typeof handlePinToggleBase>[0]) => {
+      const observedGeneration = pinGenerationRef.current;
       try {
         await handlePinToggleBase(msg);
-        setPinnedCount((c) => (msg.pinned_at ? Math.max(0, c - 1) : c + 1));
+        if (pinGenerationRef.current === observedGeneration) {
+          setPinnedCount((c) => (msg.pinned_at ? Math.max(0, c - 1) : c + 1));
+        }
       } catch {
         // error already logged by handlePinToggleBase
       }

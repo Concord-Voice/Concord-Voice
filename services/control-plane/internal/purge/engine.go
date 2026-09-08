@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
@@ -31,6 +32,11 @@ const (
 	ContextServer  ContextType = "server"
 	ContextDM      ContextType = "dm"
 	ContextGroup   ContextType = "group"
+
+	// ExpiryReason records deletion by the server-side expiration worker.
+	ExpiryReason = "expiry"
+	// MaxExpiryCandidateIDs bounds one worker-to-engine expiry invocation.
+	MaxExpiryCandidateIDs = 5000
 )
 
 // partialCountSalvageTimeout bounds the best-effort audit update after an
@@ -56,6 +62,16 @@ type Plan struct {
 	Reason      string       // "manual" | "ban" | "kick"
 	RangeFrom   *time.Time   // nil = All Time
 	Deletes     []DeleteSpec // >=1 (server purge = one per channel)
+}
+
+// ExpiryPlan is the restricted, worker-only purge contract. It does not expose
+// tables, scope columns, authors, or arbitrary deletion criteria to its caller.
+type ExpiryPlan struct {
+	ContextType   ContextType
+	ContextID     string
+	ServerID      *string
+	CandidateIDs  []string
+	ExpiresBefore time.Time
 }
 
 // Result is returned to the handler for the HTTP 200 body + WS payload.
@@ -88,6 +104,7 @@ func validateIdentifiers(s DeleteSpec) error {
 
 type deleteQuerySet struct {
 	selectBatch         string
+	selectExpiry        string
 	selectOne           string
 	selectAttachedMedia string
 	deleteParents       string
@@ -102,6 +119,13 @@ WHERE channel_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
   AND ($3::uuid IS NULL OR user_id = $3)
 ORDER BY created_at, id
+LIMIT $4
+FOR UPDATE`,
+		selectExpiry: `SELECT id FROM messages
+WHERE id = ANY($1::uuid[])
+  AND channel_id = $2
+  AND expires_at < $3::timestamptz
+ORDER BY expires_at, id
 LIMIT $4
 FOR UPDATE`,
 		selectOne: `SELECT id FROM messages WHERE id = $1 AND channel_id = $2 FOR UPDATE`,
@@ -123,6 +147,13 @@ WHERE conversation_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
   AND ($3::uuid IS NULL OR user_id = $3)
 ORDER BY created_at, id
+LIMIT $4
+FOR UPDATE`,
+		selectExpiry: `SELECT id FROM dm_messages
+WHERE id = ANY($1::uuid[])
+  AND conversation_id = $2
+  AND expires_at < $3::timestamptz
+ORDER BY expires_at, id
 LIMIT $4
 FOR UPDATE`,
 		selectOne: `SELECT id FROM dm_messages WHERE id = $1 AND conversation_id = $2 FOR UPDATE`,
@@ -207,6 +238,158 @@ func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
 		return Result{PurgeID: purgeID, DeletedCount: total}, err
 	}
 	return Result{PurgeID: purgeID, DeletedCount: total}, nil
+}
+
+// RunExpiryBatch writes one expiry audit, rechecks the discovered candidates
+// under row locks, deletes at most one configured batch, and completes the
+// audit. The recheck is authoritative: discovery may be stale by the time the
+// transaction acquires its locks.
+func (e *Engine) RunExpiryBatch(ctx context.Context, p ExpiryPlan) (Result, error) {
+	p, ds, err := normalizeExpiryPlan(p)
+	if err != nil {
+		return Result{}, err
+	}
+
+	purgeID, err := e.writeExpiryAuditInProgress(ctx, p)
+	if err != nil {
+		return Result{}, err
+	}
+
+	queries := deleteQueries[ds.MessagesTable]
+	limit := min(e.maxBatch, MaxExpiryCandidateIDs, len(p.CandidateIDs))
+
+	affected, refs, err := e.deleteExpiryBatch(ctx, purgeID, p, ds, queries, limit)
+	if err != nil {
+		total := e.recoverPartialCount(ctx, purgeID, affected)
+		return Result{PurgeID: purgeID, DeletedCount: total}, fmt.Errorf("purge expiry batch: %w", err)
+	}
+
+	e.EnqueueBlobDeletes(refs)
+	if err := e.finalizeCompleted(ctx, purgeID, affected); err != nil {
+		total := e.recoverPartialCount(ctx, purgeID, affected)
+		return Result{PurgeID: purgeID, DeletedCount: total}, err
+	}
+	return Result{PurgeID: purgeID, DeletedCount: affected}, nil
+}
+
+func (e *Engine) deleteExpiryBatch(
+	ctx context.Context,
+	purgeID string,
+	p ExpiryPlan,
+	ds DeleteSpec,
+	queries deleteQuerySet,
+	limit int,
+) (int, []media.BlobRef, error) {
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge: begin expiry batch tx: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			e.log.Warn("purge: failed to rollback expiry batch transaction", "error", rollbackErr)
+		}
+	}()
+
+	rows, err := tx.QueryContext(ctx, queries.selectExpiry, pq.Array(p.CandidateIDs), ds.ScopeID, p.ExpiresBefore, limit)
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge: select expiry victims: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			e.log.Warn("purge: failed to close expiry victim rows", "error", closeErr)
+		}
+	}()
+
+	messageIDs := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return 0, nil, fmt.Errorf("purge: scan expiry victim: %w", err)
+		}
+		messageIDs = append(messageIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("purge: iterate expiry victims: %w", err)
+	}
+
+	affected, refs, err := e.deleteMessagesTx(ctx, tx, queries, messageIDs)
+	if err != nil {
+		return 0, nil, err
+	}
+	if affected > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE message_purges SET deleted_count = deleted_count + $2 WHERE id = $1`, purgeID, affected); err != nil {
+			return 0, nil, fmt.Errorf("purge: record expiry batch count: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("purge: commit expiry batch tx: %w", err)
+	}
+	return affected, refs, nil
+}
+
+func normalizeExpiryPlan(p ExpiryPlan) (ExpiryPlan, DeleteSpec, error) {
+	if p.ExpiresBefore.IsZero() {
+		return ExpiryPlan{}, DeleteSpec{}, errors.New("purge: expiry plan requires cutoff")
+	}
+	if len(p.CandidateIDs) == 0 || len(p.CandidateIDs) > MaxExpiryCandidateIDs {
+		return ExpiryPlan{}, DeleteSpec{}, fmt.Errorf("purge: expiry plan requires 1 through %d candidate IDs", MaxExpiryCandidateIDs)
+	}
+	contextID, err := normalizeExpiryUUID("context ID", p.ContextID)
+	if err != nil {
+		return ExpiryPlan{}, DeleteSpec{}, err
+	}
+	p.ContextID = contextID
+	p.CandidateIDs = append([]string(nil), p.CandidateIDs...)
+	for i, candidateID := range p.CandidateIDs {
+		canonicalID, err := normalizeExpiryUUID("candidate ID", candidateID)
+		if err != nil {
+			return ExpiryPlan{}, DeleteSpec{}, err
+		}
+		p.CandidateIDs[i] = canonicalID
+	}
+	if p.ServerID != nil {
+		serverID, err := normalizeExpiryUUID("server ID", *p.ServerID)
+		if err != nil {
+			return ExpiryPlan{}, DeleteSpec{}, err
+		}
+		p.ServerID = &serverID
+	}
+	p.ExpiresBefore = p.ExpiresBefore.UTC().Truncate(time.Microsecond)
+	ds, err := expiryDeleteSpec(p)
+	if err != nil {
+		return ExpiryPlan{}, DeleteSpec{}, err
+	}
+	return p, ds, nil
+}
+
+func normalizeExpiryUUID(name, id string) (string, error) {
+	parsed, err := uuid.Parse(id)
+	if err != nil || parsed == uuid.Nil {
+		return "", fmt.Errorf("purge: expiry plan requires non-nil UUID %s", name)
+	}
+	return parsed.String(), nil
+}
+
+func expiryDeleteSpec(p ExpiryPlan) (DeleteSpec, error) {
+	switch p.ContextType {
+	case ContextChannel:
+		if p.ServerID == nil || *p.ServerID == "" {
+			return DeleteSpec{}, errors.New("purge: expiry channel plan requires server ID")
+		}
+		return DeleteSpec{
+			MessagesTable: "messages", ScopeColumn: "channel_id", ScopeID: p.ContextID, AttachmentsTable: "message_attachments",
+		}, nil
+	case ContextDM, ContextGroup:
+		if p.ServerID != nil {
+			return DeleteSpec{}, errors.New("purge: expiry DM/group plan forbids server ID")
+		}
+		return DeleteSpec{
+			MessagesTable: "dm_messages", ScopeColumn: "conversation_id", ScopeID: p.ContextID, AttachmentsTable: "dm_message_attachments",
+		}, nil
+	default:
+		return DeleteSpec{}, errors.New("purge: expiry plan requires channel, dm, or group context")
+	}
 }
 
 // recoverPartialCount stamps the rows an interrupted purge already deleted onto its
@@ -521,6 +704,24 @@ func (e *Engine) writeAuditInProgress(ctx context.Context, p Plan) (string, erro
 	).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("purge: write in_progress audit: %w", err)
+	}
+	return id, nil
+}
+
+// writeExpiryAuditInProgress records the system-owned expiry action without a
+// synthetic actor. It remains separate from Plan so manual callers cannot opt
+// into the expiry-only audit shape.
+func (e *Engine) writeExpiryAuditInProgress(ctx context.Context, p ExpiryPlan) (string, error) {
+	var id string
+	err := e.db.QueryRowContext(ctx, `
+		INSERT INTO message_purges
+		    (actor_id, context_type, context_id, server_id, target_user_id, range_from, range_to, reason, status)
+		VALUES (NULL, $1, $2, $3, NULL, NULL, $4, $5, 'in_progress')
+		RETURNING id`,
+		string(p.ContextType), p.ContextID, p.ServerID, p.ExpiresBefore, ExpiryReason,
+	).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("purge: write expiry in_progress audit: %w", err)
 	}
 	return id, nil
 }

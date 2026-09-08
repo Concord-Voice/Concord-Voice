@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	controldatabase "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -134,6 +135,60 @@ func runIsolatedMigrationRoundTrip(t *testing.T) {
 	require.False(t, dirty)
 	assertExpirationColumns(t, db)
 	assertExpirationIndexes(t, db)
+
+	// 000130 installs the broader reason check without validation; 000131
+	// validates it separately, and its down restores NOT VALID.
+	require.NoError(t, m.Steps(1))
+	version, dirty = migrationVersion(t, db)
+	require.Equal(t, int64(130), version)
+	require.False(t, dirty)
+	assertPurgeReasonConstraint(t, db, false)
+
+	evidenceID := uuid.NewString()
+	contextID := uuid.NewString()
+	_, err = db.Exec(`
+		INSERT INTO message_purges (id, context_type, context_id, range_to, reason)
+		VALUES ($1, 'channel', $2, $3, 'expiry')`, evidenceID, contextID,
+		time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+
+	require.NoError(t, m.Steps(1))
+	version, dirty = migrationVersion(t, db)
+	require.Equal(t, int64(131), version)
+	require.False(t, dirty)
+	assertPurgeReasonConstraint(t, db, true)
+
+	require.NoError(t, m.Steps(-1))
+	version, dirty = migrationVersion(t, db)
+	require.Equal(t, int64(130), version)
+	require.False(t, dirty)
+	assertPurgeReasonConstraint(t, db, false)
+
+	err = m.Steps(-1)
+	require.Error(t, err, "000130 down must refuse to discard expiry evidence")
+	var evidenceCount int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM message_purges WHERE id = $1`, evidenceID).Scan(&evidenceCount))
+	assert.Equal(t, 1, evidenceCount, "failed downgrade must leave expiry evidence intact")
+	assertPurgeReasonConstraint(t, db, false)
+	// Reset the dirty marker only after asserting preservation, so the existing
+	// 127-129 rollback checks can continue on this disposable database.
+	_, err = db.Exec(`UPDATE schema_migrations SET version = 130, dirty = FALSE`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM message_purges WHERE id = $1`, evidenceID)
+	require.NoError(t, err)
+	require.NoError(t, m.Steps(-1), "000130 down should succeed once expiry evidence is gone")
+	version, dirty = migrationVersion(t, db)
+	require.Equal(t, int64(129), version)
+	require.False(t, dirty)
+	_, err = db.Exec(`
+		INSERT INTO message_purges (context_type, context_id, reason)
+		VALUES ('channel', $1, 'manual')`, uuid.NewString())
+	require.NoError(t, err, "legacy purge reasons must remain accepted after downgrade")
+	_, err = db.Exec(`
+		INSERT INTO message_purges (context_type, context_id, reason)
+		VALUES ('channel', $1, 'expiry')`, uuid.NewString())
+	assert.Error(t, err, "expiry reason must be rejected after downgrade")
+
 	t.Chdir(filepath.Join(filepath.Dir(filename), "..", ".."))
 	for _, dirtyVersion := range []int64{128, 129} {
 		_, err = db.Exec(`UPDATE schema_migrations SET version = $1, dirty = TRUE`, dirtyVersion)
@@ -174,6 +229,17 @@ func migrationVersion(t *testing.T, db *sql.DB) (int64, bool) {
 	err := db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty)
 	require.NoError(t, err)
 	return version, dirty
+}
+
+func assertPurgeReasonConstraint(t *testing.T, db *sql.DB, validated bool) {
+	t.Helper()
+	var got bool
+	require.NoError(t, db.QueryRow(`
+		SELECT convalidated
+		FROM pg_constraint
+		WHERE conrelid = 'message_purges'::regclass AND conname = 'message_purges_reason_check'
+	`).Scan(&got))
+	assert.Equal(t, validated, got)
 }
 
 func assertExpirationObjectsAbsent(t *testing.T, db *sql.DB) {

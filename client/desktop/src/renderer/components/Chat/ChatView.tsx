@@ -109,6 +109,14 @@ const ChatView: React.FC = () => {
   const [showPinnedPanel, setShowPinnedPanel] = useState(false);
   const [showSearchPanel, setShowSearchPanel] = useState(false);
   const [pinnedCount, setPinnedCount] = useState(0);
+  const [pinRefreshKey, setPinRefreshKey] = useState(0);
+  const pinGenerationRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      pinGenerationRef.current += 1;
+    };
+  }, [activeChannelId]);
 
   // Toggle search panel via keyboard shortcut (#176)
   useEffect(() => {
@@ -120,22 +128,49 @@ const ChatView: React.FC = () => {
   // Fetch pin count from API when channel changes
   useEffect(() => {
     if (!activeChannelId) return;
+    let cancelled = false;
+    const observedGeneration = pinGenerationRef.current;
     getChannelPins(activeChannelId)
-      .then((pins) => setPinnedCount(pins.length))
-      .catch(() => setPinnedCount(0));
+      .then((pins) => {
+        if (!cancelled && pinGenerationRef.current === observedGeneration)
+          setPinnedCount(pins.length);
+      })
+      .catch(() => {
+        if (!cancelled && pinGenerationRef.current === observedGeneration) setPinnedCount(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeChannelId, pinRefreshKey]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ scopeId?: string | null }>).detail;
+      if (detail?.scopeId !== activeChannelId && detail?.scopeId !== null) return;
+      pinGenerationRef.current += 1;
+      setPinnedCount(0);
+      setPinRefreshKey((value) => value + 1);
+    };
+    globalThis.addEventListener('messages-purged', handler);
+    return () => globalThis.removeEventListener('messages-purged', handler);
   }, [activeChannelId]);
 
   // Pin toggle with local count tracking (wraps hook's generic handler)
   const handlePinToggle = useCallback(
     async (message: MessageWithStatus) => {
       if (!activeChannelId) return;
+      const observedGeneration = pinGenerationRef.current;
       try {
         if (message.pinned_at) {
           await unpinMessage(message.id);
-          setPinnedCount((c) => Math.max(0, c - 1));
+          if (pinGenerationRef.current === observedGeneration) {
+            setPinnedCount((c) => Math.max(0, c - 1));
+          }
         } else {
           await pinMessage(message.id);
-          setPinnedCount((c) => c + 1);
+          if (pinGenerationRef.current === observedGeneration) {
+            setPinnedCount((c) => c + 1);
+          }
         }
       } catch (err) {
         console.error('Failed to toggle pin:', errorMessage(err));

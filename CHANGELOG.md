@@ -29,6 +29,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   keeps running.
 - **Message expiry groundwork now covers shared chats** ([#3144](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3144), [#2195](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2195)) — the server now stores shared expiry policy and expiry metadata for channels, direct messages, and group DMs, and can apply or clear that policy on existing messages in resumable batches. Settings UI and automatic deletion arrive in later work, so this groundwork does not enable retention by itself.
 
+### Changed
+
+- **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. Timer settings UI remains future work; this does not promise instant deletion or secure erasure for clients that were offline.
+
 ### Fixed
 
 - **Sharing a screen on a Mac now actually carries sound** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — on macOS 14.2 and later,

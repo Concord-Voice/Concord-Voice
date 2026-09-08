@@ -1,4 +1,4 @@
-import { render, screen, act } from '../../../test-utils';
+import { render, screen, act, waitFor } from '../../../test-utils';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -8,6 +8,7 @@ import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPref
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { PIN_MESSAGES } from '@/renderer/utils/policy/permissions';
 import { mockUser, mockChannel, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock apiFetch to prevent hanging fetches
 const mockApiFetch = vi.fn().mockResolvedValue({
@@ -119,15 +120,30 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
     decryptForChannel: vi.fn(),
     getChannelKey: vi.fn(),
     invalidateChannelKey: vi.fn(),
+    revokeChannelAccess: vi.fn(),
     encryptForChannel: vi.fn(),
   },
 }));
 
 import ChatView from '@/renderer/components/Chat/ChatView';
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('ChatView', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
+    mockGetChannelPins.mockReset();
+    mockPinMessage.mockReset();
+    mockUnpinMessage.mockReset();
     capturedMessageListProps = {};
     useUserStore.setState({ user: mockUser });
     useChannelStore.setState({ channels: [mockChannel], activeChannelId: null });
@@ -141,6 +157,12 @@ describe('ChatView', () => {
       json: async () => ({ messages: [] }),
     });
     mockGetChannelPins.mockResolvedValue([]);
+    mockPinMessage.mockResolvedValue({
+      message_id: 'msg-1',
+      pinned_at: '2025-01-01T00:00:00Z',
+      pinned_by: 'user-1',
+    });
+    mockUnpinMessage.mockResolvedValue({ message_id: 'msg-1' });
   });
 
   it('renders nothing when no active channel', () => {
@@ -484,6 +506,113 @@ describe('ChatView', () => {
 
     expect(mockUnpinMessage).toHaveBeenCalledWith('msg-1');
     expect(mockPinMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['matching channel', 'channel-1'],
+    ['server-wide purge', null],
+  ] as const)('clears stale pin counts for a %s purge', async (_label, scopeId) => {
+    const oldLoad = deferred<Array<{ id: string }>>();
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId } }));
+      oldLoad.resolve([{ id: 'old-pin' }]);
+      await oldLoad.promise;
+      expect(mockGetChannelPins).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    expect(document.querySelector('.pin-count-badge')).toBeNull();
+    await act(async () => freshLoad.resolve([]));
+  });
+
+  it('ignores an unrelated explicit purge scope for the pin count', async () => {
+    const oldLoad = deferred<Array<{ id: string }>>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockReturnValueOnce(oldLoad.promise);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(1));
+    act(() => {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'other-channel' } })
+      );
+    });
+    expect(mockGetChannelPins).toHaveBeenCalledTimes(1);
+    await act(async () => oldLoad.resolve([{ id: 'old-pin' }]));
+    await waitFor(() => expect(document.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+  });
+
+  it('clears a loaded pin badge immediately on purge', async () => {
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins
+      .mockReturnValueOnce(Promise.resolve([{ id: 'old-pin' }]))
+      .mockReturnValueOnce(freshLoad.promise);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    await waitFor(() => expect(document.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    expect(document.querySelector('.pin-count-badge')).toBeNull();
+    await act(async () => freshLoad.resolve([]));
+  });
+
+  it('keeps a fresh pin badge when the stale count request rejects afterward', async () => {
+    const oldLoad = deferred<Array<{ id: string }>>();
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    await act(async () => freshLoad.resolve([{ id: 'fresh-pin' }]));
+    await waitFor(() => expect(document.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+    await act(async () => oldLoad.reject(new Error('stale')));
+    expect(document.querySelector('.pin-count-badge')).toHaveTextContent('1');
+  });
+
+  it('keeps the fresh pin count when a pre-purge pin succeeds late', async () => {
+    const pendingPin = deferred<unknown>();
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins
+      .mockReturnValueOnce(Promise.resolve([]))
+      .mockReturnValueOnce(freshLoad.promise);
+    mockPinMessage.mockReturnValue(pendingPin.promise);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(1));
+
+    const toggle = capturedMessageListProps.onPinToggle as (msg: unknown) => Promise<void>;
+    const mutation = toggle({ ...mockMessage, pinned_at: null });
+    await waitFor(() => expect(mockPinMessage).toHaveBeenCalledWith('msg-1'));
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    await act(async () => freshLoad.resolve([{ id: 'fresh-pin' }]));
+    await waitFor(() => expect(document.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+
+    await act(async () => pendingPin.resolve({}));
+    await mutation;
+    expect(document.querySelector('.pin-count-badge')).toHaveTextContent('1');
   });
 
   // ── handleScrollToMessage ──

@@ -1,7 +1,8 @@
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import DMPinnedMessagesPanel from '@/renderer/components/DirectMessages/DMPinnedMessagesPanel';
 import { vi } from 'vitest';
 import type { MessageWithUser } from '@/renderer/types/chat';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 const mockGetPins = vi.fn();
 const mockUnpinMessage = vi.fn();
@@ -33,6 +34,16 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
 async function setE2EEInitialized(value: boolean) {
   const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
   Object.defineProperty(e2eeService, 'isInitialized', { value, writable: true });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 const mockDMPins: MessageWithUser[] = [
@@ -71,7 +82,16 @@ describe('DMPinnedMessagesPanel', () => {
   };
 
   beforeEach(async () => {
+    resetAllStores();
     vi.clearAllMocks();
+    mockGetPins.mockReset();
+    mockUnpinMessage.mockReset();
+    mockGetChannelKey.mockReset();
+    mockGetChannelKeyByVersion.mockReset();
+    mockDecryptWithKey.mockReset();
+    mockDecryptForChannel.mockReset();
+    mockDecryptForChannelWithVersion.mockReset();
+    mockOperationGuard.assertCurrent.mockReset();
     await setE2EEInitialized(false);
     mockGetPins.mockResolvedValue(mockDMPins);
     mockUnpinMessage.mockResolvedValue({ message_id: 'dm-pin-1' });
@@ -96,6 +116,126 @@ describe('DMPinnedMessagesPanel', () => {
       expect(screen.getByText('Pinned DM one')).toBeInTheDocument();
       expect(screen.getByText('Pinned DM two')).toBeInTheDocument();
     });
+  });
+
+  it.each([
+    ['matching conversation', 'conv-1'],
+    ['server-wide purge', null],
+  ] as const)('invalidates stale pin loads for a %s purge', async (_label, scopeId) => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('fresh DM pin');
+    const oldLoad = deferred<MessageWithUser[]>();
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    render(<DMPinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId } }));
+    });
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    await act(async () => oldLoad.resolve([{ ...mockDMPins[0], content: 'stale DM pin' }]));
+    expect(screen.queryByText('stale DM pin')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    await act(async () => freshLoad.resolve([]));
+    await waitFor(() =>
+      expect(screen.getByText('No pinned messages in this conversation.')).toBeInTheDocument()
+    );
+  });
+
+  it('ignores an unrelated explicit purge scope', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('loaded DM pin');
+    const oldLoad = deferred<MessageWithUser[]>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(oldLoad.promise);
+    render(<DMPinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(1));
+    for (const detail of [{ scopeId: 'other-conversation' }, { scopeId: undefined }, {}]) {
+      act(() => globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail })));
+      expect(mockGetPins).toHaveBeenCalledTimes(1);
+    }
+    await act(async () => oldLoad.resolve(mockDMPins.slice(0, 1)));
+    await waitFor(() => expect(screen.getByText('loaded DM pin')).toBeInTheDocument());
+  });
+
+  it('clears loaded pins immediately on purge', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetPins.mockReset();
+    mockGetPins
+      .mockReturnValueOnce(Promise.resolve(mockDMPins.slice(0, 1)))
+      .mockReturnValueOnce(freshLoad.promise);
+    mockDecryptWithKey.mockResolvedValue('old DM pin');
+    render(<DMPinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(screen.getByText('old DM pin')).toBeInTheDocument());
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('old DM pin')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+    await act(async () => freshLoad.resolve([]));
+  });
+
+  it('ignores a decrypt completion that follows a matching purge', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    const oldDecrypt = deferred<string>();
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetPins.mockReset();
+    mockGetPins
+      .mockReturnValueOnce(Promise.resolve(mockDMPins.slice(0, 1)))
+      .mockReturnValueOnce(freshLoad.promise);
+    mockDecryptWithKey.mockReturnValueOnce(oldDecrypt.promise).mockResolvedValue('fresh DM pin');
+    render(<DMPinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(mockDecryptWithKey).toHaveBeenCalledTimes(1));
+
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      oldDecrypt.resolve('stale DM pin');
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('stale DM pin')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    await act(async () => freshLoad.resolve(mockDMPins.slice(0, 1)));
+    await waitFor(() => expect(screen.getByText('fresh DM pin')).toBeInTheDocument());
+  });
+
+  it('keeps fresh pins when a stale request rejects afterward', async () => {
+    await setE2EEInitialized(true);
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('Pinned DM one');
+    const oldLoad = deferred<MessageWithUser[]>();
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    render(<DMPinnedMessagesPanel {...defaultProps} />);
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    await act(async () => freshLoad.resolve(mockDMPins.slice(0, 1)));
+    await waitFor(() => expect(screen.getByText('Pinned DM one')).toBeInTheDocument());
+    await act(async () => oldLoad.reject(new Error('stale')));
+    expect(screen.getByText('Pinned DM one')).toBeInTheDocument();
   });
 
   it('shows empty state with DM-specific copy when no pins', async () => {
@@ -137,6 +277,24 @@ describe('DMPinnedMessagesPanel', () => {
     fireEvent.click(screen.getAllByText('Unpin')[0]);
     await waitFor(() => expect(mockUnpinMessage).toHaveBeenCalledWith('dm-pin-1'));
     await waitFor(() => expect(onUnpin).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not call onUnpin when a matching purge precedes unpin completion', async () => {
+    const onUnpin = vi.fn();
+    const pendingUnpin = deferred<unknown>();
+    mockUnpinMessage.mockReturnValue(pendingUnpin.promise);
+    render(<DMPinnedMessagesPanel {...defaultProps} onUnpin={onUnpin} />);
+    await waitFor(() => expect(screen.getAllByText('Unpin')).toHaveLength(2));
+    fireEvent.click(screen.getAllByText('Unpin')[0]);
+    await waitFor(() => expect(mockUnpinMessage).toHaveBeenCalledWith('dm-pin-1'));
+
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await act(async () => pendingUnpin.resolve({}));
+    expect(onUnpin).not.toHaveBeenCalled();
   });
 
   it('does not call onUnpin when unpin fails', async () => {

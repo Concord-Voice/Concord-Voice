@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import PinnedMessagesPanel from '@/renderer/components/Chat/PinnedMessagesPanel';
 import { vi } from 'vitest';
 import type { MessageWithUser } from '@/renderer/types/chat';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock pin service
 const mockGetChannelPins = vi.fn();
@@ -64,6 +65,16 @@ async function enableE2EE() {
   Object.defineProperty(e2eeService, 'isInitialized', { value: true, writable: true });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('PinnedMessagesPanel', () => {
   const defaultProps = {
     channelId: 'channel-1',
@@ -74,7 +85,16 @@ describe('PinnedMessagesPanel', () => {
   };
 
   beforeEach(async () => {
+    resetAllStores();
     vi.clearAllMocks();
+    mockGetChannelPins.mockReset();
+    mockUnpinMessage.mockReset();
+    mockGetChannelKey.mockReset();
+    mockGetChannelKeyByVersion.mockReset();
+    mockDecryptWithKey.mockReset();
+    mockDecryptForChannel.mockReset();
+    mockDecryptForChannelWithVersion.mockReset();
+    mockOperationGuard.assertCurrent.mockReset();
     // Reset isInitialized to false before each test (enableE2EE persists via defineProperty)
     const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
     Object.defineProperty(e2eeService, 'isInitialized', { value: false, writable: true });
@@ -122,6 +142,124 @@ describe('PinnedMessagesPanel', () => {
     });
 
     expect(mockGetChannelPins).toHaveBeenCalledWith('channel-1');
+  });
+
+  it.each([
+    ['matching channel', 'channel-1'],
+    ['server-wide purge', null],
+  ] as const)('invalidates stale pin loads for a %s purge', async (_label, scopeId) => {
+    await enableE2EE();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('fresh pin');
+    const oldLoad = deferred<MessageWithUser[]>();
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    render(<PinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId } }));
+    });
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    await act(async () => oldLoad.resolve([{ ...mockPins[0], content: 'stale pin' }]));
+    expect(screen.queryByText('stale pin')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    await act(async () => freshLoad.resolve([]));
+    await waitFor(() => expect(screen.getByText('No pinned messages')).toBeInTheDocument());
+  });
+
+  it('ignores an unrelated explicit purge scope', async () => {
+    await enableE2EE();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('loaded pin');
+    const oldLoad = deferred<MessageWithUser[]>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockReturnValueOnce(oldLoad.promise);
+    render(<PinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(1));
+    for (const detail of [{ scopeId: 'other-channel' }, { scopeId: undefined }, {}]) {
+      act(() => globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail })));
+      expect(mockGetChannelPins).toHaveBeenCalledTimes(1);
+    }
+    await act(async () => oldLoad.resolve(mockPins.slice(0, 1)));
+    await waitFor(() => expect(screen.getByText('loaded pin')).toBeInTheDocument());
+  });
+
+  it('clears loaded pins immediately on purge', async () => {
+    await enableE2EE();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins
+      .mockReturnValueOnce(Promise.resolve(mockPins.slice(0, 1)))
+      .mockReturnValueOnce(freshLoad.promise);
+    mockDecryptWithKey.mockResolvedValue('old pin');
+    render(<PinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(screen.getByText('old pin')).toBeInTheDocument());
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('old pin')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+    await act(async () => freshLoad.resolve([]));
+  });
+
+  it('ignores a decrypt completion that follows a matching purge', async () => {
+    await enableE2EE();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    const oldDecrypt = deferred<string>();
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins
+      .mockReturnValueOnce(Promise.resolve(mockPins.slice(0, 1)))
+      .mockReturnValueOnce(freshLoad.promise);
+    mockDecryptWithKey.mockReturnValueOnce(oldDecrypt.promise).mockResolvedValue('fresh pin');
+    render(<PinnedMessagesPanel {...defaultProps} />);
+    await waitFor(() => expect(mockDecryptWithKey).toHaveBeenCalledTimes(1));
+
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      oldDecrypt.resolve('stale pin');
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('stale pin')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    await act(async () => freshLoad.resolve(mockPins.slice(0, 1)));
+    await waitFor(() => expect(screen.getByText('fresh pin')).toBeInTheDocument());
+  });
+
+  it('keeps fresh pins when a stale request rejects afterward', async () => {
+    await enableE2EE();
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockResolvedValue('Pinned message one');
+    const oldLoad = deferred<MessageWithUser[]>();
+    const freshLoad = deferred<MessageWithUser[]>();
+    mockGetChannelPins.mockReset();
+    mockGetChannelPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    render(<PinnedMessagesPanel {...defaultProps} />);
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetChannelPins).toHaveBeenCalledTimes(2));
+    await act(async () => freshLoad.resolve(mockPins.slice(0, 1)));
+    await waitFor(() => expect(screen.getByText('Pinned message one')).toBeInTheDocument());
+    await act(async () => oldLoad.reject(new Error('stale')));
+    expect(screen.getByText('Pinned message one')).toBeInTheDocument();
   });
 
   it('shows empty state when no pins', async () => {

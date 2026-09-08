@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '../../../test-utils';
+import { render, screen, waitFor, fireEvent, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
@@ -218,6 +218,16 @@ vi.mock('@/renderer/components/Voice/VoiceView', () => ({
 
 import DMChatArea from '@/renderer/components/DirectMessages/DMChatArea';
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 // --- Test fixtures ---
 
 const makeConversation = (overrides: Partial<DMConversation> = {}): DMConversation => ({
@@ -239,6 +249,9 @@ describe('DMChatArea', () => {
   beforeEach(() => {
     resetAllStores();
     vi.clearAllMocks();
+    mockGetPins.mockReset();
+    mockPinMessage.mockReset();
+    mockUnpinMessage.mockReset();
     mockGetPins.mockResolvedValue([]);
     mockPinMessage.mockResolvedValue({});
     mockUnpinMessage.mockResolvedValue({});
@@ -1122,6 +1135,111 @@ describe('DMChatArea', () => {
       expect(container.querySelector('.pin-count-badge')).toBeInTheDocument();
       expect(container.querySelector('.pin-count-badge')?.textContent).toBe('2');
     });
+  });
+
+  it.each([
+    ['matching conversation', 'conv-1'],
+    ['server-wide purge', null],
+  ] as const)('clears stale pin counts for a %s purge', async (_label, scopeId) => {
+    const oldLoad = deferred<Array<{ id: string }>>();
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    useDMStore.setState({ conversations: [makeConversation()] });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId } }));
+    });
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    expect(container.querySelector('.pin-count-badge')).toBeNull();
+
+    await act(async () => oldLoad.resolve([{ id: 'old-pin' }]));
+    expect(container.querySelector('.pin-count-badge')).toBeNull();
+    await act(async () => freshLoad.resolve([]));
+  });
+
+  it('ignores an unrelated explicit purge scope for the pin count', async () => {
+    const oldLoad = deferred<Array<{ id: string }>>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(oldLoad.promise);
+    useDMStore.setState({ conversations: [makeConversation()] });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(1));
+    act(() => {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'other-conversation' } })
+      );
+    });
+    expect(mockGetPins).toHaveBeenCalledTimes(1);
+    await act(async () => oldLoad.resolve([{ id: 'old-pin' }]));
+    await waitFor(() => expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+  });
+
+  it('clears a loaded pin badge immediately on purge', async () => {
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetPins.mockReset();
+    mockGetPins
+      .mockReturnValueOnce(Promise.resolve([{ id: 'old-pin' }]))
+      .mockReturnValueOnce(freshLoad.promise);
+    useDMStore.setState({ conversations: [makeConversation()] });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    expect(container.querySelector('.pin-count-badge')).toBeNull();
+    await act(async () => freshLoad.resolve([]));
+  });
+
+  it('keeps a fresh pin badge when the stale count request rejects afterward', async () => {
+    const oldLoad = deferred<Array<{ id: string }>>();
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(oldLoad.promise).mockReturnValueOnce(freshLoad.promise);
+    useDMStore.setState({ conversations: [makeConversation()] });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    await act(async () => freshLoad.resolve([{ id: 'fresh-pin' }]));
+    await waitFor(() => expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+    await act(async () => oldLoad.reject(new Error('stale')));
+    expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1');
+  });
+
+  it('keeps the fresh pin count when a pre-purge pin succeeds late', async () => {
+    const pendingPin = deferred<unknown>();
+    const freshLoad = deferred<Array<{ id: string }>>();
+    mockGetPins.mockReset();
+    mockGetPins.mockReturnValueOnce(Promise.resolve([])).mockReturnValueOnce(freshLoad.promise);
+    mockPinMessage.mockReturnValue(pendingPin.promise);
+    useDMStore.setState({ conversations: [makeConversation()] });
+    const { container } = render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(1));
+
+    const toggle = capturedMLProps.onPinToggle as (msg: unknown) => Promise<void>;
+    const mutation = toggle({ id: 'msg-1', pinned_at: null });
+    await waitFor(() => expect(mockPinMessage).toHaveBeenCalledWith('msg-1'));
+    act(() =>
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'conv-1' } })
+      )
+    );
+    await waitFor(() => expect(mockGetPins).toHaveBeenCalledTimes(2));
+    await act(async () => freshLoad.resolve([{ id: 'fresh-pin' }]));
+    await waitFor(() => expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1'));
+
+    await act(async () => pendingPin.resolve({}));
+    await mutation;
+    expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1');
   });
 
   it('pin toggle on an unpinned message increments pinnedCount badge', async () => {

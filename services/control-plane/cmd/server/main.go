@@ -22,12 +22,14 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
@@ -192,6 +194,11 @@ func runControlPlane() (runErr error) {
 	// aborts boot: a non-legacy backend that will not construct registers as
 	// unavailable and fails closed only for the rows that name it.
 	storageRegistry := storage.NewRegistry(cfg, storageClient, log)
+	purgeReaper := purge.NewReaper(
+		db, log,
+		media.NewDeleterResolver(media.NewRegistryStoreResolver(storageRegistry), mediaStore),
+	)
+	purgeEngine := purge.NewEngine(db, log, purgeReaper, cfg.PurgeMaxBatch)
 
 	// Set Gin mode
 	if cfg.Environment == "production" {
@@ -260,6 +267,7 @@ func runControlPlane() (runErr error) {
 					PresenceHistory:    presenceHistoryService,
 					SecurityEvents:     securityEvents,
 					Tier1ErasureWake:   tier1ErasureReclaimer.Wake,
+					PurgeEngine:        purgeEngine,
 					MediaStoreResolver: media.NewRegistryStoreResolver(storageRegistry),
 					MediaWriteRouter:   media.NewRegistryWriteRouter(storageRegistry),
 					Readiness:          readiness,
@@ -291,9 +299,12 @@ func runControlPlane() (runErr error) {
 	router := runtime.router
 	hub := runtime.hub
 	natsClient := runtime.natsClient
+	var expirySweeper *expiration.Sweeper
+	var expirationWorkers sync.WaitGroup
 	waitActivityHistoryWorkers := runtime.waitWorkers
 	waitTier1ErasureReclaimer := func() {}
 	waitBackgroundWorkers := func() {
+		expirationWorkers.Wait()
 		waitActivityHistoryWorkers()
 		waitTier1ErasureReclaimer()
 		if voicePermissionEnforcer != nil {
@@ -512,6 +523,66 @@ func runControlPlane() (runErr error) {
 			return fmt.Errorf("bind restricted admin operations metrics reader: %w", err)
 		}
 	}
+	expirySweeper, err = expiration.NewSweeper(expiration.SweeperDeps{
+		DB:             db,
+		RunExpiryBatch: purgeEngine.RunExpiryBatch,
+		EmitDMPurged: func(ctx context.Context, conversationID string, cutoff time.Time) {
+			conversation, parseErr := uuid.Parse(conversationID)
+			if parseErr != nil {
+				log.Warn("expiration DM purge notification suppressed", "scope", "dm")
+				return
+			}
+			if delivered := hub.BroadcastToDMParticipantsContext(ctx, conversation, websocket.OutgoingMessage{
+				Type: "dm_purged",
+				Data: map[string]interface{}{
+					"conversation_id": conversationID,
+					"reason":          "expiry",
+					"purged_by":       nil,
+					"expires_before":  cutoff.UTC().Truncate(time.Microsecond),
+				},
+			}); !delivered && ctx.Err() == nil {
+				log.Warn("expiration DM purge notification suppressed", "scope", "dm")
+			}
+		},
+		EmitServerPurged: func(ctx context.Context, serverID string, cutoff time.Time) {
+			server, parseErr := uuid.Parse(serverID)
+			if parseErr != nil {
+				log.Warn("expiration server purge notification suppressed", "scope", "server")
+				return
+			}
+			if delivered := hub.BroadcastToServerContext(ctx, server, websocket.OutgoingMessage{
+				Type: "server_purged",
+				Data: map[string]interface{}{
+					"server_id":      serverID,
+					"reason":         "expiry",
+					"purged_by":      nil,
+					"expires_before": cutoff.UTC().Truncate(time.Microsecond),
+				},
+			}); !delivered && ctx.Err() == nil {
+				log.Warn("expiration server purge notification suppressed", "scope", "server")
+			}
+		},
+		Log: log,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize expiration sweeper: %w", err)
+	}
+	if err := runExpirationPreflight(context.Background(), quit, expirySweeper.RunPreflight); err != nil {
+		return fmt.Errorf("run expiration preflight: %w", err)
+	}
+	expirationWorkers.Add(3)
+	go func() {
+		defer expirationWorkers.Done()
+		purgeReaper.StartWorker(cleanupCtx)
+	}()
+	go func() {
+		defer expirationWorkers.Done()
+		purgeReaper.SweepStragglers(cleanupCtx)
+	}()
+	go func() {
+		defer expirationWorkers.Done()
+		expirySweeper.RunWorker(cleanupCtx, expiration.DefaultExpirySweepInterval)
+	}()
 
 	log.Info("Starting Control Plane server", "port", cfg.Port, "env", cfg.Environment)
 	if err := runControlPlaneServer(func() error { return srv.ListenAndServe() }, quit, cleanupRuntime, readiness.MarkDraining); err != nil {
@@ -519,6 +590,34 @@ func runControlPlane() (runErr error) {
 	}
 	log.Info("Server exited")
 	return nil
+}
+
+// runExpirationPreflight lets a termination signal cancel pre-bind expiry
+// cleanup while preserving the same signal channel for normal server drain.
+func runExpirationPreflight(ctx context.Context, quit <-chan os.Signal, run func(context.Context) error) error {
+	if ctx == nil || quit == nil || run == nil {
+		return errors.New("expiration preflight lifecycle is incomplete")
+	}
+	preflightCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	handoff := make(chan struct{})
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		select {
+		case <-quit:
+			cancel()
+		case <-handoff:
+		}
+	}()
+
+	runErr := run(preflightCtx)
+	close(handoff)
+	<-relayDone
+	if err := preflightCtx.Err(); err != nil {
+		return err
+	}
+	return runErr
 }
 
 // drainSettle is how long the process stays NOT-READY but still LISTENING

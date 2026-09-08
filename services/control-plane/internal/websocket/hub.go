@@ -4406,17 +4406,60 @@ func (h *Hub) BroadcastToDM(conversationID uuid.UUID, msg OutgoingMessage) {
 // ringing state. If participant resolution is unavailable, retain the legacy
 // subscription-scoped broadcast as a graceful fallback.
 func (h *Hub) BroadcastToDMParticipants(conversationID uuid.UUID, msg OutgoingMessage) {
-	if h.db == nil {
-		h.BroadcastToDM(conversationID, msg)
-		return
+	h.BroadcastToDMParticipantsContext(context.Background(), conversationID, msg)
+}
+
+// BroadcastToDMParticipantsContext sends a terminal frame to every current DM
+// participant without allowing a stopped hub, blocked lookup, or full queue to
+// outlive the caller's cancellation. An ordinary lookup fault retains the
+// legacy subscription-scoped fallback.
+func (h *Hub) BroadcastToDMParticipantsContext(
+	ctx context.Context,
+	conversationID uuid.UUID,
+	msg OutgoingMessage,
+) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
 	}
-	participants := h.resolveDMParticipants(conversationID)
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	if h.db == nil {
+		return h.broadcastToDMContext(ctx, conversationID, msg)
+	}
+	participants, err := h.resolveDMParticipantsContext(ctx, conversationID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		log.Printf("Failed to resolve DM participants for terminal delivery: %v", err)
+		return h.broadcastToDMContext(ctx, conversationID, msg)
+	}
 	if len(participants) == 0 {
-		h.BroadcastToDM(conversationID, msg)
-		return
+		return h.broadcastToDMContext(ctx, conversationID, msg)
 	}
 	for userID := range participants {
-		h.BroadcastToUser(userID, msg)
+		select {
+		case h.userBroadcast <- UserBroadcastMessage{UserID: userID, Data: msg}:
+		case <-ctx.Done():
+			return false
+		case <-h.done:
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Hub) broadcastToDMContext(ctx context.Context, conversationID uuid.UUID, msg OutgoingMessage) bool {
+	select {
+	case h.dmBroadcast <- DMBroadcastMessage{ConversationID: conversationID, Data: msg}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-h.done:
+		return false
 	}
 }
 

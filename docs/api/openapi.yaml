@@ -2246,8 +2246,8 @@ paths:
         `set` is valid only for text channels; `clear` and `resume` are also valid when a channel has
         been retyped as non-text. Requires `Manage Channels`. The complete JSON document is limited to
         1 KiB. Each request performs at most five 5,000-row backfill batches; remaining work stays
-        resumable. This foundation exposes policy state only; deletion and retention enforcement are
-        documented separately.'
+        resumable. The endpoint stamps and backfills expiry metadata; the separate startup preflight
+        and five-minute worker remove eligible messages.'
       operationId: updateChannelExpiration
       security:
       - BearerAuth: []
@@ -3573,8 +3573,8 @@ paths:
       description: 'Set, clear, or resume the shared message-expiration policy for a 1:1 or group DM.
         A 1:1 participant or group-DM admin may change the policy. The complete JSON document is limited
         to 1 KiB. Each request performs at most five 5,000-row backfill batches; remaining work stays
-        resumable. This foundation exposes policy state only; deletion and retention enforcement are
-        documented separately.'
+        resumable. The endpoint stamps and backfills expiry metadata; the separate startup preflight
+        and five-minute worker remove eligible messages.'
       operationId: updateDMConversationExpiration
       security:
       - BearerAuth: []
@@ -14732,7 +14732,18 @@ paths:
         | `friend_code_claimed` | `friendship_id`, `code_id`, `status`, `user_id`, `username`, `display_name`,
         `avatar_url`, `created_at` | A friend code was redeemed, sent to the code owner. |
 
+        | `dm_purged` | Legacy: `conversation_id`, `purged_by`, `deleted_count`, `range`. Expiry: `conversation_id` (scope UUID), `reason: expiry`, `purged_by: null`, `expires_before` | DM/group messages were purged. The expiry variant carries no count or range. |
+
+        | `server_purged` | Legacy: `server_id`, `purged_by`, `range`. Expiry: `server_id` (scope UUID), `reason: expiry`, `purged_by: null`, `expires_before` | Server messages were purged. The expiry variant carries no count, range, or channel IDs. |
+
+        | `channel_purged` | `channel_id`, `purged_by`, `deleted_count`, `range` | Channel purge event; unchanged and never uses the expiry variant. |
+
         | `error` | `message` | Error |
+
+        Both legacy and expiry purge `data` objects are strict. Expiry data
+        requires `reason: expiry`, `purged_by: null`, and an ISO date-time
+        `expires_before`; legacy fields cannot be combined with expiry fields,
+        and unknown fields in either `data` object are rejected.
 
         '
       parameters:
@@ -16298,7 +16309,7 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: Server-stamped expiry time; deletion is enforced by a later retention rollout.
+          description: Server-stamped expiry time; eligible rows are removed by the bounded five-minute expiry worker after startup preflight.
     MessageWithUser:
       allOf:
       - $ref: '#/components/schemas/Message'
@@ -16681,7 +16692,7 @@ components:
               type: string
               format: date-time
               nullable: true
-              description: Server-stamped expiry time; deletion is enforced by a later retention rollout.
+              description: Server-stamped expiry time; eligible rows are removed by the bounded five-minute expiry worker after startup preflight.
             user_id:
               type: string
               format: uuid
@@ -16772,7 +16783,7 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: Server-stamped expiry time; deletion is enforced by a later retention rollout.
+          description: Server-stamped expiry time; eligible rows are removed by the bounded five-minute expiry worker after startup preflight.
         username:
           type: string
         display_name:

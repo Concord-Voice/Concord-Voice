@@ -916,6 +916,23 @@ describe('ws-events schemas — happy path (one per event)', () => {
     });
     expect(result.success).toBe(true);
   });
+
+  it.each([
+    ['dm_purged', { conversation_id: UUID_A }],
+    ['server_purged', { server_id: UUID_A }],
+  ] as const)('%s accepts the strict expiry variant', (type, scope) => {
+    expect(
+      WebSocketEventSchema.safeParse({
+        type,
+        data: {
+          ...scope,
+          reason: 'expiry',
+          purged_by: null,
+          expires_before: ISO_NOW,
+        },
+      }).success
+    ).toBe(true);
+  });
 });
 
 describe('rich presence category contracts (#2233)', () => {
@@ -1429,6 +1446,74 @@ describe('ws-events schemas — rejection cases', () => {
     });
     expect(result.success).toBe(false);
   });
+
+  it.each([
+    ['dm_purged', { conversation_id: UUID_A }],
+    ['server_purged', { server_id: UUID_A }],
+  ] as const)('%s rejects malformed expiry variants', (type, scope) => {
+    const base = { ...scope, reason: 'expiry', purged_by: null, expires_before: ISO_NOW };
+    for (const data of [
+      { ...base, reason: 'manual' },
+      { ...base, purged_by: UUID_B },
+      { ...base, expires_before: 'tomorrow' },
+      { ...base, extra: true },
+      { ...base, range: 'all' },
+    ]) {
+      expect(WebSocketEventSchema.safeParse({ type, data }).success).toBe(false);
+    }
+  });
+
+  it.each([
+    ['dm_purged', { conversation_id: UUID_A }],
+    ['server_purged', { server_id: UUID_A }],
+  ] as const)('%s rejects missing reason, malformed UUID, and legacy hybrids', (type, scope) => {
+    const expiry = { ...scope, purged_by: null, expires_before: ISO_NOW };
+    expect(WebSocketEventSchema.safeParse({ type, data: expiry }).success).toBe(false);
+    expect(
+      WebSocketEventSchema.safeParse({
+        type,
+        data: {
+          ...expiry,
+          ...(type === 'dm_purged' ? { conversation_id: 'bad' } : { server_id: 'bad' }),
+          reason: 'expiry',
+        },
+      }).success
+    ).toBe(false);
+    for (const legacyField of [{ deleted_count: 1 }, { range: 'manual' }]) {
+      expect(
+        WebSocketEventSchema.safeParse({
+          type,
+          data: { ...expiry, reason: 'expiry', ...legacyField },
+        }).success
+      ).toBe(false);
+    }
+    const legacy =
+      type === 'dm_purged'
+        ? { ...scope, purged_by: UUID_B, deleted_count: 1, range: 'arbitrary' }
+        : { ...scope, purged_by: UUID_B, range: 'arbitrary' };
+    expect(
+      WebSocketEventSchema.safeParse({
+        type,
+        data: { ...legacy, reason: 'expiry', expires_before: ISO_NOW },
+      }).success
+    ).toBe(false);
+  });
+
+  it.each([
+    [
+      'dm_purged',
+      { conversation_id: UUID_A, purged_by: UUID_B, deleted_count: 1, range: 'arbitrary' },
+    ],
+    ['server_purged', { server_id: UUID_A, purged_by: UUID_B, range: 'arbitrary' }],
+  ] as const)(
+    '%s rejects unknown legacy fields while accepting arbitrary range strings',
+    (type, data) => {
+      expect(WebSocketEventSchema.safeParse({ type, data }).success).toBe(true);
+      expect(
+        WebSocketEventSchema.safeParse({ type, data: { ...data, unexpected: true } }).success
+      ).toBe(false);
+    }
+  );
 });
 
 // ════════════════════════════════════════════════════════════════════════

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { X } from 'lucide-react';
 import { getChannelPins, unpinMessage } from '../../services/messaging/pinService';
 import { PinContent, decryptPins, type DecryptedPin } from './pinnedMessageUtils';
@@ -21,32 +21,57 @@ const PinnedMessagesPanel: React.FC<PinnedMessagesPanelProps> = ({
 }) => {
   const [pins, setPins] = useState<DecryptedPin[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const pinGenerationRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      pinGenerationRef.current += 1;
+    };
+  }, [channelId]);
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
+    const observedGeneration = pinGenerationRef.current;
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: loads pins when panel opens or channelId changes; not a render loop
     setIsLoading(true);
     getChannelPins(channelId)
       .then((rawPins) => decryptPins(channelId, rawPins))
       .then((decrypted) => {
-        if (!cancelled) setPins(decrypted);
+        if (!cancelled && pinGenerationRef.current === observedGeneration) setPins(decrypted);
       })
       .catch(() => {
-        if (!cancelled) setPins([]);
+        if (!cancelled && pinGenerationRef.current === observedGeneration) setPins([]);
       })
       .finally(() => {
-        if (!cancelled) setIsLoading(false);
+        if (!cancelled && pinGenerationRef.current === observedGeneration) setIsLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [isOpen, channelId]);
+  }, [isOpen, channelId, refreshKey]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ scopeId?: string | null }>).detail;
+      if (detail?.scopeId !== channelId && detail?.scopeId !== null) return;
+      pinGenerationRef.current += 1;
+      setPins([]);
+      setIsLoading(true);
+      setRefreshKey((value) => value + 1);
+    };
+    globalThis.addEventListener('messages-purged', handler);
+    return () => globalThis.removeEventListener('messages-purged', handler);
+  }, [channelId]);
 
   const handleUnpin = useCallback(async (messageId: string) => {
+    const observedGeneration = pinGenerationRef.current;
     try {
       await unpinMessage(messageId);
-      setPins((prev) => prev.filter((m) => m.id !== messageId));
+      if (pinGenerationRef.current === observedGeneration) {
+        setPins((prev) => prev.filter((m) => m.id !== messageId));
+      }
     } catch {
       // Silently fail — WS event will correct state
     }

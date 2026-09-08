@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000129)
+## Existing Migrations (000001–000131)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -239,6 +239,8 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000127 | message_expiration_schema | Add nullable message expiry timestamps and shared channel/DM expiration policy state |
 | 000128 | messages_expires_at_index | Concurrent partial index on `messages (expires_at)` for non-null expiry timestamps |
 | 000129 | dm_messages_expires_at_index | Concurrent partial index on `dm_messages (expires_at)` for non-null expiry timestamps |
+| 000130 | message_purge_expiry_reason | Broaden `message_purges_reason_check` to admit `expiry` and leave it `NOT VALID` |
+| 000131 | validate_message_purge_expiry_reason | Validate `message_purges_reason_check`; down restores the broader `NOT VALID` check |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -246,6 +248,13 @@ both values directly and do not repeat a legacy timezone conversion. Migration
 000127 carries the schema changes, while
 000128 and 000129 remain separate one-statement concurrent-index migrations so the
 runner can execute them outside an explicit transaction.
+
+Migration 000130 broadens `message_purges_reason_check` to admit `expiry` and
+leaves the replacement constraint `NOT VALID`. Migration 000131 validates that
+constraint; its down migration restores the broader `NOT VALID` constraint from
+000130. Apply both before starting the expiry writer. A downgrade through
+000130 is refused while expiry audit evidence exists; it does not delete or
+rewrite that evidence.
 
 ## Troubleshooting
 

@@ -1630,41 +1630,71 @@ export const ChannelPurgedSchema = z.object({
 
 /**
  * `dm_purged` — bulk message deletion completed for a DM/group conversation.
- * Server emitter: `services/control-plane/internal/dm/handlers.go`
- * (`emitDMPurged` → `dm_purged`; broadcast to participants + actor's own
- * sessions for multi-device). Carries counts + range only — NO message content.
+ * Server emitters: legacy manual purge in
+ * `services/control-plane/internal/dm/handlers.go` (`emitDMPurged`, broadcast
+ * to participants + actor's own sessions), and expiry in
+ * `services/control-plane/cmd/server/main.go`. Legacy data carries an actor,
+ * count, and range; expiry data carries a null actor and cutoff, with no count
+ * or range. Neither carries message content.
  */
-export const DmPurgedSchema = z.object({
-  type: z.literal('dm_purged'),
-  data: z.object({
+const LegacyDmPurgeData = z
+  .object({
     conversation_id: UUID,
     purged_by: UUID,
     deleted_count: z.number().int().nonnegative(),
     range: z.string(), // "1h".."90d" | "all"
-  }),
+  })
+  .strict();
+
+const ExpiryDmPurgeData = z
+  .object({
+    conversation_id: UUID,
+    reason: z.literal('expiry'),
+    purged_by: z.null(),
+    expires_before: ISOTimestamp,
+  })
+  .strict();
+
+export const DmPurgedSchema = z.object({
+  type: z.literal('dm_purged'),
+  data: z.union([LegacyDmPurgeData, ExpiryDmPurgeData]),
 });
 
 /**
  * `server_purged` — a server-wide purge completed.
- * Server emitter: `services/control-plane/internal/messages/purge.go`
- * (`emitServerPurged` — broadcast to every session subscribed to the SERVER,
- * not to a channel).
+ * Server emitters: legacy manual purge in
+ * `services/control-plane/internal/messages/purge.go` (`emitServerPurged`,
+ * broadcast to every session subscribed to the server), and expiry in
+ * `services/control-plane/cmd/server/main.go`.
  *
  * `channel_purged` reaches only clients subscribed to that one channel — i.e.
  * the channel they currently have mounted — so a server-wide purge would leave
  * every other affected channel's decrypted plaintext in the local search index.
  * This event is the server-scoped invalidation signal that closes that gap.
  *
- * Deliberately carries NO count: a server purge's per-channel `deleted_count`
- * is 0 by design, so a count here would be a lie. Range only — NO message content.
+ * Legacy data carries an actor and range. Expiry data carries a null actor and
+ * cutoff, with no count or range. Neither carries message content.
  */
-export const ServerPurgedSchema = z.object({
-  type: z.literal('server_purged'),
-  data: z.object({
+const LegacyServerPurgeData = z
+  .object({
     server_id: UUID,
     purged_by: UUID,
     range: z.string(), // "1h".."90d" | "all"
-  }),
+  })
+  .strict();
+
+const ExpiryServerPurgeData = z
+  .object({
+    server_id: UUID,
+    reason: z.literal('expiry'),
+    purged_by: z.null(),
+    expires_before: ISOTimestamp,
+  })
+  .strict();
+
+export const ServerPurgedSchema = z.object({
+  type: z.literal('server_purged'),
+  data: z.union([LegacyServerPurgeData, ExpiryServerPurgeData]),
 });
 
 // ════════════════════════════════════════════════════════════════════════

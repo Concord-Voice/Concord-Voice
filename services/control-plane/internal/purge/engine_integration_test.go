@@ -15,7 +15,8 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -141,6 +142,365 @@ func TestEngineRun_DeletesAllAndCompletesAudit(t *testing.T) {
 	assert.Equal(t, "completed", status)
 	assert.Equal(t, 5, deleted)
 	assert.Equal(t, 0, hidden, "engine leaves hidden_count to the DM caller")
+}
+
+func TestEngineRunExpiryBatch_RechecksScopeAndCutoffAndAuditsExpiry(t *testing.T) {
+	f := seedEngineFixture(t)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 123456000, time.UTC).Truncate(time.Microsecond)
+
+	var otherChannelID string
+	require.NoError(t, f.db.QueryRow(
+		`INSERT INTO channels (server_id, name) VALUES ($1, 'other-scope') RETURNING id`, f.serverID,
+	).Scan(&otherChannelID))
+	insert := func(channelID string, expiresAt time.Time) string {
+		var id string
+		require.NoError(t, f.db.QueryRow(`
+			INSERT INTO messages (channel_id, user_id, content, expires_at)
+			VALUES ($1, $2, $3, $4) RETURNING id`, channelID, f.authorID, uuid.NewString(), expiresAt).Scan(&id))
+		return id
+	}
+	expiredID := insert(f.channelID, cutoff.Add(-time.Microsecond))
+	unselectedExpiredID := insert(f.channelID, cutoff.Add(-2*time.Microsecond))
+	otherScopeID := insert(otherChannelID, cutoff.Add(-time.Microsecond))
+	equalCutoffID := insert(f.channelID, cutoff)
+	futureSelectedID := insert(f.channelID, cutoff.Add(time.Microsecond))
+	var nullExpiryID string
+	require.NoError(t, f.db.QueryRow(`
+		INSERT INTO messages (channel_id, user_id, content)
+		VALUES ($1, $2, 'no-expiry') RETURNING id`, f.channelID, f.authorID).Scan(&nullExpiryID))
+
+	res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{
+		ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID,
+		CandidateIDs: []string{expiredID, otherScopeID, equalCutoffID, nullExpiryID}, ExpiresBefore: cutoff,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeletedCount)
+
+	var actorID, reason string
+	var rangeFrom *time.Time
+	var rangeTo time.Time
+	var deleted int
+	require.NoError(t, f.db.QueryRowContext(context.Background(), `
+		SELECT COALESCE(actor_id::text, ''), reason, range_from, range_to, deleted_count
+		FROM message_purges WHERE id = $1`, res.PurgeID,
+	).Scan(&actorID, &reason, &rangeFrom, &rangeTo, &deleted))
+	assert.Equal(t, "", actorID)
+	assert.Equal(t, ExpiryReason, reason)
+	assert.Nil(t, rangeFrom)
+	assert.Equal(t, cutoff, rangeTo.UTC().Truncate(time.Microsecond))
+	assert.Equal(t, 1, deleted)
+
+	var remaining int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = ANY($1::uuid[])`, pq.Array([]string{expiredID})).Scan(&remaining))
+	assert.Zero(t, remaining, "expired in-scope candidate must be deleted")
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = ANY($1::uuid[])`, pq.Array([]string{otherScopeID, equalCutoffID})).Scan(&remaining))
+	assert.Equal(t, 2, remaining, "other scope and exact cutoff candidates must survive")
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, nullExpiryID).Scan(&remaining))
+	assert.Equal(t, 1, remaining, "NULL expiry candidates must survive")
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = ANY($1::uuid[])`, pq.Array([]string{unselectedExpiredID, futureSelectedID})).Scan(&remaining))
+	assert.Equal(t, 2, remaining, "unselected and future-expiry candidates must survive")
+}
+
+func TestEngineRunExpiryBatch_RechecksExpiryAfterRowLockWait(t *testing.T) {
+	f := seedEngineFixture(t)
+	messageID, fileID, _ := f.seedAttachedMessage(t, f.authorID, nil)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	expiredAt := cutoff.Add(-time.Microsecond)
+	futureAt := cutoff.Add(time.Microsecond)
+	_, err := f.db.Exec(`UPDATE messages SET expires_at = $2 WHERE id = $1`, messageID, expiredAt)
+	require.NoError(t, err)
+
+	lockTx, err := f.db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := lockTx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			t.Errorf("rollback expiry lock transaction: %v", rollbackErr)
+		}
+	}()
+	_, err = lockTx.Exec(`UPDATE messages SET expires_at = $2 WHERE id = $1`, messageID, futureAt)
+	require.NoError(t, err)
+	var lockTxID int64
+	require.NoError(t, lockTx.QueryRow(`SELECT txid_current()`).Scan(&lockTxID))
+
+	probe, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	var runResult Result
+	var runErr error
+	finished := make(chan struct{})
+	go func() {
+		runResult, runErr = f.newEngine(5000).RunExpiryBatch(ctx, ExpiryPlan{
+			ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID,
+			CandidateIDs: []string{messageID}, ExpiresBefore: cutoff,
+		})
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if rollbackErr := lockTx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			t.Errorf("rollback expiry lock transaction: %v", rollbackErr)
+		}
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Error("expiry batch did not stop after lock cleanup")
+		}
+		if closeErr := probe.Close(); closeErr != nil {
+			t.Errorf("close lock probe: %v", closeErr)
+		}
+	})
+
+	testdb.WaitForRowLockWaiter(t, probe, lockTxID)
+	require.NoError(t, lockTx.Commit())
+	<-finished
+	require.NoError(t, runErr)
+	assert.Zero(t, runResult.DeletedCount)
+
+	var messageCount int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messageCount))
+	assert.Equal(t, 1, messageCount, "candidate moved past the cutoff must survive")
+	var attachmentCount int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_attachments WHERE message_id = $1 AND file_id = $2`, messageID, fileID).Scan(&attachmentCount))
+	assert.Equal(t, 1, attachmentCount, "surviving message attachment must remain linked")
+	var deletedAt sql.NullTime
+	require.NoError(t, f.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.False(t, deletedAt.Valid, "surviving attachment media must remain active")
+	status, deleted, _ := f.auditRow(t)
+	assert.Equal(t, "completed", status)
+	assert.Zero(t, deleted)
+}
+
+func TestEngineRunExpiryBatch_DMAndGroupScopes(t *testing.T) {
+	db := sweepTestDB(t)
+	uploader := seedUploader(t, db)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	insertConversation := func(group bool) (string, string) {
+		var conversationID, messageID string
+		require.NoError(t, db.QueryRow(`
+			INSERT INTO dm_conversations (is_group, is_personal, created_by)
+			VALUES ($1, false, $2) RETURNING id`, group, uploader).Scan(&conversationID))
+		t.Cleanup(func() {
+			if _, cleanupErr := db.Exec(`DELETE FROM dm_conversations WHERE id = $1`, conversationID); cleanupErr != nil {
+				t.Errorf("cleanup expiry conversation: %v", cleanupErr)
+			}
+		})
+		require.NoError(t, db.QueryRow(`
+			INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2) RETURNING conversation_id`, conversationID, uploader).Scan(new(string)))
+		require.NoError(t, db.QueryRow(`
+			INSERT INTO dm_messages (conversation_id, user_id, content, type, expires_at)
+			VALUES ($1, $2, 'expiry-message', 'text', $3) RETURNING id`, conversationID, uploader, cutoff.Add(-time.Microsecond)).Scan(&messageID))
+		return conversationID, messageID
+	}
+	dmID, dmMessageID := insertConversation(false)
+	groupID, groupMessageID := insertConversation(true)
+	e := NewEngine(db, logger.NewWithWriter(io.Discard), NewReaper(db, logger.NewWithWriter(io.Discard), nil), 5000)
+	for _, tc := range []struct {
+		name, contextID, messageID string
+		typ                        ContextType
+	}{
+		{name: "dm", contextID: dmID, messageID: dmMessageID, typ: ContextDM},
+		{name: "group", contextID: groupID, messageID: groupMessageID, typ: ContextGroup},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := e.RunExpiryBatch(context.Background(), ExpiryPlan{
+				ContextType: tc.typ, ContextID: tc.contextID, CandidateIDs: []string{tc.messageID}, ExpiresBefore: cutoff,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 1, res.DeletedCount)
+		})
+	}
+}
+
+func TestEngineRunExpiryBatch_CapsOnePassAndResumes(t *testing.T) {
+	f := seedEngineFixture(t)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	ids := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		var id string
+		require.NoError(t, f.db.QueryRow(`
+			INSERT INTO messages (channel_id, user_id, content, expires_at)
+			VALUES ($1, $2, 'capped-expiry', $3) RETURNING id`, f.channelID, f.authorID, cutoff.Add(-time.Microsecond)).Scan(&id))
+		ids = append(ids, id)
+	}
+	e := f.newEngine(2)
+	plan := ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: ids, ExpiresBefore: cutoff}
+	first, err := e.RunExpiryBatch(context.Background(), plan)
+	require.NoError(t, err)
+	assert.Equal(t, 2, first.DeletedCount)
+	second, err := e.RunExpiryBatch(context.Background(), ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: ids, ExpiresBefore: cutoff})
+	require.NoError(t, err)
+	assert.Equal(t, 1, second.DeletedCount)
+}
+
+func TestEngineRunExpiryBatch_StaleCandidateCompletesZeroAudit(t *testing.T) {
+	f := seedEngineFixture(t)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	staleID := uuid.NewString()
+	res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{
+		ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: []string{staleID}, ExpiresBefore: cutoff,
+	})
+	require.NoError(t, err)
+	assert.Zero(t, res.DeletedCount)
+	var status, reason string
+	require.NoError(t, f.db.QueryRow(`SELECT status, reason FROM message_purges WHERE id = $1`, res.PurgeID).Scan(&status, &reason))
+	assert.Equal(t, "completed", status)
+	assert.Equal(t, ExpiryReason, reason)
+}
+
+func TestEngineRunExpiryBatch_CancellationBeforeAuditLeavesNoEvidence(t *testing.T) {
+	f := seedEngineFixture(t)
+	var messageID string
+	require.NoError(t, f.db.QueryRow(`
+		INSERT INTO messages (channel_id, user_id, content, expires_at)
+		VALUES ($1, $2, 'cancelled-expiry', NOW() - INTERVAL '1 minute') RETURNING id`, f.channelID, f.authorID).Scan(&messageID))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := f.newEngine(5000).RunExpiryBatch(ctx, ExpiryPlan{
+		ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: []string{messageID}, ExpiresBefore: time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC),
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	var audits int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_purges WHERE context_id = $1`, f.channelID).Scan(&audits))
+	assert.Zero(t, audits)
+	var messages int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messages))
+	assert.Equal(t, 1, messages, "cancelled expiry must not delete the candidate")
+}
+
+func TestEngineRunExpiryBatch_RetiresAndQueuesAttachment(t *testing.T) {
+	f := seedEngineFixture(t)
+	messageID, fileID, key := f.seedAttachedMessage(t, f.authorID, nil)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	_, err := f.db.Exec(`UPDATE messages SET expires_at = $2 WHERE id = $1`, messageID, cutoff.Add(-time.Microsecond))
+	require.NoError(t, err)
+	e := f.newEngine(5000)
+	res, err := e.RunExpiryBatch(context.Background(), ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: []string{messageID}, ExpiresBefore: cutoff})
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.DeletedCount)
+	var deletedAt *time.Time
+	require.NoError(t, f.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.NotNil(t, deletedAt)
+	select {
+	case ref := <-e.reaper.jobs:
+		assert.Equal(t, key, ref.Key)
+	default:
+		t.Fatal("expired attachment was not queued for reaping")
+	}
+}
+
+func TestEngineRunExpiryBatch_FinalizeErrorSalvagesAudit(t *testing.T) {
+	f := seedEngineFixture(t)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	var messageID string
+	require.NoError(t, f.db.QueryRow(`
+		INSERT INTO messages (channel_id, user_id, content, expires_at)
+		VALUES ($1, $2, 'finalize-error', $3) RETURNING id`, f.channelID, f.authorID, cutoff.Add(-time.Microsecond)).Scan(&messageID))
+	_, err := f.db.Exec(`
+		CREATE FUNCTION test_reject_expiry_finalize() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.status = 'completed' THEN RAISE EXCEPTION 'forced expiry finalize failure'; END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER test_reject_expiry_finalize
+		BEFORE UPDATE OF status ON message_purges
+		FOR EACH ROW EXECUTE FUNCTION test_reject_expiry_finalize()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, cleanupErr := f.db.Exec(`DROP TRIGGER IF EXISTS test_reject_expiry_finalize ON message_purges; DROP FUNCTION IF EXISTS test_reject_expiry_finalize()`); cleanupErr != nil {
+			t.Errorf("cleanup expiry finalize trigger: %v", cleanupErr)
+		}
+	})
+	res, err := f.newEngine(5000).RunExpiryBatch(context.Background(), ExpiryPlan{
+		ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: []string{messageID}, ExpiresBefore: cutoff,
+	})
+	require.Error(t, err)
+	assert.Equal(t, 1, res.DeletedCount)
+	var status string
+	var deleted int
+	require.NoError(t, f.db.QueryRow(`SELECT status, deleted_count FROM message_purges WHERE id = $1`, res.PurgeID).Scan(&status, &deleted))
+	assert.Equal(t, "in_progress", status)
+	assert.Equal(t, 1, deleted)
+}
+
+func TestEngineRunExpiryBatch_CommitFailureRollsBackAndDoesNotEnqueue(t *testing.T) {
+	f := seedEngineFixture(t)
+	messageID, fileID, _ := f.seedAttachedMessage(t, f.authorID, nil)
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	_, err := f.db.Exec(`UPDATE messages SET expires_at = $2 WHERE id = $1`, messageID, cutoff.Add(-time.Microsecond))
+	require.NoError(t, err)
+	_, err = f.db.Exec(`
+		CREATE FUNCTION test_reject_expiry_delete_commit() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'forced expiry delete commit failure'; END;
+		$$ LANGUAGE plpgsql;
+		CREATE CONSTRAINT TRIGGER test_reject_expiry_delete_commit
+		AFTER DELETE ON messages
+		DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION test_reject_expiry_delete_commit()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if _, cleanupErr := f.db.Exec(`DROP TRIGGER IF EXISTS test_reject_expiry_delete_commit ON messages; DROP FUNCTION IF EXISTS test_reject_expiry_delete_commit()`); cleanupErr != nil {
+			t.Errorf("cleanup expiry commit failure trigger: %v", cleanupErr)
+		}
+	})
+	e := f.newEngine(5000)
+	res, err := e.RunExpiryBatch(context.Background(), ExpiryPlan{
+		ContextType: ContextChannel, ContextID: f.channelID, ServerID: &f.serverID, CandidateIDs: []string{messageID}, ExpiresBefore: cutoff,
+	})
+	require.Error(t, err)
+	assert.Zero(t, res.DeletedCount)
+	var status string
+	var deleted int
+	require.NoError(t, f.db.QueryRow(`SELECT status, deleted_count FROM message_purges WHERE id = $1`, res.PurgeID).Scan(&status, &deleted))
+	assert.Equal(t, "in_progress", status)
+	assert.Zero(t, deleted)
+	var messageCount, bridgeCount int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messageCount))
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_attachments WHERE message_id = $1`, messageID).Scan(&bridgeCount))
+	assert.Equal(t, 1, messageCount)
+	assert.Equal(t, 1, bridgeCount)
+	var deletedAt *time.Time
+	require.NoError(t, f.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.Nil(t, deletedAt)
+	assert.Empty(t, e.reaper.jobs)
+}
+
+func TestRunExpiryBatch_InvalidPlansWriteNoAudit(t *testing.T) {
+	f := seedEngineFixture(t)
+	validID := uuid.NewString()
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	tooMany := make([]string, MaxExpiryCandidateIDs+1)
+	for i := range tooMany {
+		tooMany[i] = uuid.NewString()
+	}
+	serverID := f.serverID
+	emptyServerID := ""
+	cases := []struct {
+		name string
+		plan ExpiryPlan
+	}{
+		{name: "server context", plan: ExpiryPlan{ContextType: ContextServer, ContextID: f.channelID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "empty UUID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: "", ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "malformed UUID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: "not-a-uuid", ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "nil UUID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &serverID, CandidateIDs: []string{validID, uuid.Nil.String()}, ExpiresBefore: cutoff}},
+		{name: "malformed candidate UUID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &serverID, CandidateIDs: []string{"not-a-uuid"}, ExpiresBefore: cutoff}},
+		{name: "nil candidate list", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &serverID, ExpiresBefore: cutoff}},
+		{name: "too many IDs", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &serverID, CandidateIDs: tooMany, ExpiresBefore: cutoff}},
+		{name: "zero cutoff", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &serverID, CandidateIDs: []string{validID}}},
+		{name: "missing channel server", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "empty channel server", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: f.channelID, ServerID: &emptyServerID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "DM server forbidden", plan: ExpiryPlan{ContextType: ContextDM, ContextID: f.channelID, ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "group server forbidden", plan: ExpiryPlan{ContextType: ContextGroup, ContextID: f.channelID, ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := f.newEngine(5000).RunExpiryBatch(context.Background(), tc.plan)
+			require.Error(t, err)
+			var audits int
+			require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM message_purges WHERE context_id = $1`, f.channelID).Scan(&audits))
+			assert.Zero(t, audits, "invalid plan must fail before audit insertion")
+		})
+	}
 }
 
 func TestEngineDeleteOne_SerializesWithConcurrentAttachmentLink(t *testing.T) {

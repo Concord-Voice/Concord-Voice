@@ -136,6 +136,17 @@ ws://localhost:8080/api/v1/ws?ticket=<ticket>
 
 Do NOT pass raw JWT tokens in the URL.
 
+#### WebSocket expiry events
+
+The OpenAPI WebSocket contract documents both legacy manual purge payloads and
+strict expiry payloads. Expiry `dm_purged` and `server_purged` events identify
+the scope UUID in `conversation_id` or `server_id`, set `reason` to `expiry`, set `purged_by` to `null`,
+and carry `expires_before`; they do not carry counts, ranges, channel IDs, or a
+synthetic system actor. `channel_purged` is unchanged. Known legacy field
+shapes remain accepted, but hybrid legacy/expiry payloads and unknown fields in
+the strict purge `data` objects are rejected. `expires_before` must be an ISO
+timestamp. These events are invalidation signals; clients refetch current data.
+
 ### Rate Limits
 
 | Endpoint class | Limit |

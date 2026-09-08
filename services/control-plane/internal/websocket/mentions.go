@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -462,28 +464,48 @@ func (h *Hub) routeDMMentionNotifications(
 
 // resolveDMParticipants fetches all participants for a DM conversation.
 func (h *Hub) resolveDMParticipants(conversationID uuid.UUID) map[uuid.UUID]bool {
-	participants := make(map[uuid.UUID]bool)
-	rows, err := h.db.Query(
-		`SELECT user_id FROM dm_participants WHERE conversation_id = $1`,
-		conversationID,
-	)
+	participants, err := h.resolveDMParticipantsContext(context.Background(), conversationID)
 	if err != nil {
 		log.Printf("Failed to resolve DM participants for mention routing: %v", err)
-		return participants
+		return make(map[uuid.UUID]bool)
 	}
-	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err == nil {
-			if parsed, parseErr := uuid.Parse(uid); parseErr == nil {
-				participants[parsed] = true
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Error iterating DM participants for mention routing: %v", err)
-	}
-	_ = rows.Close()
 	return participants
+}
+
+func (h *Hub) resolveDMParticipantsContext(
+	ctx context.Context,
+	conversationID uuid.UUID,
+) (participants map[uuid.UUID]bool, err error) {
+	if h.db == nil {
+		return nil, errors.New("DM participant resolver has no database")
+	}
+	rows, err := h.db.QueryContext(ctx,
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("query DM participants: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close DM participant rows: %w", closeErr)
+		}
+	}()
+
+	participants = make(map[uuid.UUID]bool)
+	for rows.Next() {
+		var userID string
+		if scanErr := rows.Scan(&userID); scanErr != nil {
+			return nil, fmt.Errorf("scan DM participant: %w", scanErr)
+		}
+		parsed, parseErr := uuid.Parse(userID)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse DM participant ID: %w", parseErr)
+		}
+		participants[parsed] = true
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("iterate DM participants: %w", rowsErr)
+	}
+	return participants, nil
 }
 
 // resolveDMMentionTargets collects direct user mentions and @here targets,

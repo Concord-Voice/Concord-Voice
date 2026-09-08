@@ -3,11 +3,49 @@ package purge
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 )
+
+func TestRunExpiryBatch_RejectsInvalidPlansBeforeDatabaseAccess(t *testing.T) {
+	validID := uuid.NewString()
+	serverID := uuid.NewString()
+	emptyServerID := ""
+	cutoff := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	tooMany := make([]string, MaxExpiryCandidateIDs+1)
+	for i := range tooMany {
+		tooMany[i] = uuid.NewString()
+	}
+
+	cases := []struct {
+		name string
+		plan ExpiryPlan
+	}{
+		{name: "server context", plan: ExpiryPlan{ContextType: ContextServer, ContextID: validID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "empty context ID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: "", ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "malformed context ID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: "not-a-uuid", ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "nil candidate ID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, ServerID: &serverID, CandidateIDs: []string{validID, uuid.Nil.String()}, ExpiresBefore: cutoff}},
+		{name: "malformed candidate ID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, ServerID: &serverID, CandidateIDs: []string{"not-a-uuid"}, ExpiresBefore: cutoff}},
+		{name: "nil candidate list", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, ServerID: &serverID, ExpiresBefore: cutoff}},
+		{name: "over candidate limit", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, ServerID: &serverID, CandidateIDs: tooMany, ExpiresBefore: cutoff}},
+		{name: "zero cutoff", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, ServerID: &serverID, CandidateIDs: []string{validID}}},
+		{name: "channel without server ID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "channel with empty server ID", plan: ExpiryPlan{ContextType: ContextChannel, ContextID: validID, ServerID: &emptyServerID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "DM with server ID", plan: ExpiryPlan{ContextType: ContextDM, ContextID: validID, ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+		{name: "group with server ID", plan: ExpiryPlan{ContextType: ContextGroup, ContextID: validID, ServerID: &serverID, CandidateIDs: []string{validID}, ExpiresBefore: cutoff}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (&Engine{}).RunExpiryBatch(context.Background(), tc.plan)
+			require.Error(t, err)
+		})
+	}
+}
 
 // The identifier allow-list keeps each DeleteSpec aligned with its fixed query template.
 

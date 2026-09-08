@@ -261,6 +261,9 @@ type RouterDependencies struct {
 	PresenceHistory  *presencehistory.Service
 	SecurityEvents   securityevent.Emitter
 	Tier1ErasureWake func()
+	// PurgeEngine is the process-owned purge terminal. When omitted, NewRouter
+	// retains embedders' construction behavior but does not start reaper loops.
+	PurgeEngine *purge.Engine
 	// MediaStoreResolver resolves a media_files.storage_backend value to the
 	// object store holding that row's object (ADR-0038 / #2759). Typed as the
 	// media consumer interface rather than *storage.Registry so this package
@@ -827,21 +830,14 @@ func NewRouter(
 	// A kick/leave/ban deletes membership but leaves any voice participant on its
 	// join-time snapshot — recheck evicts them from the room (CV-CAN-007 P1).
 	membersHandler.SetVoiceEnforcer(voicePermEnforcer)
-	// Message-purge engine (#1352): batched bulk delete + attachment reaper.
-	// The reaper's worker + straggler sweeper are process-lifetime background
-	// loops, started here like hub.Run above.
-	//
-	// The reaper resolves each blob's backend per row (ADR-0038 / #2759 unit
-	// B2) rather than deleting everything against one client: an S3 DELETE of a
-	// key absent from the target bucket SUCCEEDS, so a single-store reaper would
-	// stamp blob_reaped_at on a vendor-resident object it never touched and drop
-	// that row out of the straggler sweep permanently. `store` is the fallback
-	// for an embedder with no registry; when MediaStoreResolver is wired the
-	// registry wins and reads and deletes resolve through the identical call.
-	purgeReaper := purge.NewReaper(db, log, media.NewDeleterResolver(dependencies.MediaStoreResolver, store))
-	purgeEngine := purge.NewEngine(db, log, purgeReaper, cfg.PurgeMaxBatch)
-	go purgeReaper.StartWorker(context.Background())
-	go purgeReaper.SweepStragglers(context.Background())
+	// Main owns the live engine and reaper so expiry preflight can finish before
+	// any server socket binds. Embedded routers retain a local terminal, without
+	// starting process-lifetime workers they cannot join.
+	purgeEngine := dependencies.PurgeEngine
+	if purgeEngine == nil {
+		purgeReaper := purge.NewReaper(db, log, media.NewDeleterResolver(dependencies.MediaStoreResolver, store))
+		purgeEngine = purge.NewEngine(db, log, purgeReaper, cfg.PurgeMaxBatch)
+	}
 
 	purgeRateLimit, purgeRateWindow := resolvePurgeRateLimit(cfg)
 	messagesHandler := messages.NewHandler(db, log, hub, rbacResolver, entCache, purgeEngine, opsCounters)
@@ -997,7 +993,7 @@ func NewRouter(
 	// Durable erasure wiring: Tier-1 wakes its worker and Tier-2 goes only to
 	// the existing purge queue.
 	accountService.SetErasedMediaReclaimer(
-		newDurableErasedMediaReclaimer(dependencies.Tier1ErasureWake, purgeReaper.EnqueueBlobDeletes))
+		newDurableErasedMediaReclaimer(dependencies.Tier1ErasureWake, purgeEngine.EnqueueBlobDeletes))
 
 	// Runs here, not beside the other wiring: accountService is the last #2447
 	// consumer and is constructed on the line above.

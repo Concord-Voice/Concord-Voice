@@ -224,7 +224,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 | `database`      | PostgreSQL connection + migration runner                                                     |
 | `dm`            | DM conversation CRUD, DM messages, DM voice calls (ring/decline/cancel), DM key distribution |
 | `email`         | Email sending (verification codes, notifications) via SMTP/Resend                            |
-| `expiration`    | Shared channel/DM message-expiration policy and bounded resumable backfill                   |
+| `expiration`    | Shared channel/DM message-expiration policy and bounded resumable backfill; coordinates audited expiry purge through the purge engine, startup preflight, and five-minute live sweeps |
 | `friends`       | Friend requests, acceptance/decline, blocking, friend codes                                  |
 | `invites`       | Server invite code generation, listing, revoking, joining, preview                           |
 | `klipy`         | KLIPY GIF API + media proxy with SSRF egress guard                                           |
@@ -566,6 +566,7 @@ erDiagram
 > - migrations 000093–000097 added, backfilled, validated, and enforced microsecond lifecycle watermarks on both active voice-participant tables
 > - migration 000098 added one privacy-critical pending Rich Presence settings-cleanup marker per user
 > - migrations 000127–000129 added shared channel/DM expiration policy state, nullable message expiry timestamps, and dedicated partial indexes for expiry lookups
+> - migrations 000130–000131 add and validate the audited `expiry` purge reason used by the startup preflight and five-minute sweeper
 
 #### Admin auth surface (#1688)
 
