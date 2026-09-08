@@ -5,7 +5,7 @@
 # the default tag (`node:latest`, currently Debian-based `node:26`). PR #2800
 # did exactly that -- swapping this stage to a 443 MB Debian image with nothing
 # in the diff to show it. Keep tag+digest together on every bump.
-FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS admin-ui-builder
+FROM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS admin-ui-builder
 
 WORKDIR /src
 COPY --from=admin_ui package.json package-lock.json ./
@@ -21,7 +21,7 @@ RUN npm run build && test -f dist/index.html
 # encoding/asn1 and net/url), deterministically, not reliant on Docker Hub
 # tag-float + a GOTOOLCHAIN build-time download. Keep in lockstep with
 # services/control-plane/go.mod's `go` directive.
-FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS builder
+FROM golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS builder
 
 WORKDIR /app
 
