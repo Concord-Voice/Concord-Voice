@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +17,8 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // Bearer authentication must be bound to the ACCESS-token class, not merely to a
@@ -41,8 +44,12 @@ const (
 func realChallengeTokens(t *testing.T) map[string]string {
 	t.Helper()
 
-	login, _, err := mfa.GenerateChallengeToken(
-		tokenClassUser, mfa.PurposeLogin, mfa.JWTSecret(tokenClassSecret), "")
+	mini := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+	issuer := mfa.NewHandler(nil, redisClient, logger.New("test"), nil, tokenClassSecret, nil, "test")
+	login, _, err := issuer.GenerateLoginChallenge(
+		context.Background(), tokenClassUser, false, "", securityevent.AuthPassword)
 	require.NoError(t, err)
 
 	suspicious, _, err := mfa.GenerateChallengeToken(

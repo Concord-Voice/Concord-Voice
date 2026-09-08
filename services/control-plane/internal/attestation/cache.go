@@ -8,6 +8,7 @@ import (
 	natsLib "github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	cpnats "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 )
@@ -45,6 +46,11 @@ type Cache struct {
 	binaries map[binaryKey]*ReleaseBinary
 	spas     map[string]*ReleaseSPA
 	lastSync time.Time
+
+	healthMu         sync.Mutex
+	events           securityevent.Emitter
+	postgresDegraded bool
+	redisDegraded    bool
 }
 
 type binaryKey struct {
@@ -62,7 +68,54 @@ func NewCache(repo Reader, nc *cpnats.Client, rdb *redis.Client, log *logger.Log
 		log:      log,
 		binaries: map[binaryKey]*ReleaseBinary{},
 		spas:     map[string]*ReleaseSPA{},
+		events:   securityevent.Discard,
 	}
+}
+
+// SetSecurityEvents injects bounded cache-health telemetry.
+func (c *Cache) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	c.healthMu.Lock()
+	c.events = events
+	c.healthMu.Unlock()
+}
+
+// setDegraded preserves the package-local test seam for PostgreSQL failures.
+func (c *Cache) setDegraded(ctx context.Context, degraded bool) {
+	c.setPostgresDegraded(ctx, degraded)
+}
+
+func (c *Cache) setPostgresDegraded(ctx context.Context, degraded bool) {
+	c.setDependencyDegraded(ctx, &degraded, nil)
+}
+
+func (c *Cache) setRedisDegraded(ctx context.Context, degraded bool) {
+	c.setDependencyDegraded(ctx, nil, &degraded)
+}
+
+func (c *Cache) setDependencyDegraded(ctx context.Context, postgres, redis *bool) {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	wasDegraded := c.postgresDegraded || c.redisDegraded
+	if postgres != nil {
+		c.postgresDegraded = *postgres
+	}
+	if redis != nil {
+		c.redisDegraded = *redis
+	}
+	degraded := c.postgresDegraded || c.redisDegraded
+	changed := wasDegraded != degraded
+	events := c.events
+	if !changed {
+		return
+	}
+	if degraded {
+		events.Emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAttestationCacheDegraded})
+		return
+	}
+	events.Emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeRestored, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonDependencyRecovered})
 }
 
 // Hydrate replaces in-memory state with current DB rows. Safe to call
@@ -70,15 +123,16 @@ func NewCache(repo Reader, nc *cpnats.Client, rdb *redis.Client, log *logger.Log
 func (c *Cache) Hydrate(ctx context.Context) error {
 	bins, err := c.repo.ListActiveBinaries(ctx)
 	if err != nil {
+		c.setPostgresDegraded(ctx, true)
 		return err
 	}
 	spas, err := c.repo.ListActiveSPAs(ctx)
 	if err != nil {
+		c.setPostgresDegraded(ctx, true)
 		return err
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.binaries = make(map[binaryKey]*ReleaseBinary, len(bins))
 	for i := range bins {
@@ -89,6 +143,8 @@ func (c *Cache) Hydrate(ctx context.Context) error {
 		c.spas[spas[i].SpaVersion] = &spas[i]
 	}
 	c.lastSync = time.Now()
+	c.mu.Unlock()
+	c.setPostgresDegraded(ctx, false)
 	return nil
 }
 
@@ -123,8 +179,9 @@ func (c *Cache) LookupSPA(spaVersion string) (ReleaseSPA, bool) {
 }
 
 // IsRevoked reports whether the given version is in the Redis revoked_versions
-// set. Fail-closed: returns true (treated as revoked) on Redis error,
-// matching the auth fail-closed posture throughout this service.
+// set. On Redis error it returns true plus the underlying error so the caller
+// can preserve the fail-closed decision while distinguishing dependency loss
+// from a genuinely revoked release.
 // Returns false when rdb is nil (test / dev environments without Redis).
 //
 // On Redis error a WARN log is emitted so operators can distinguish
@@ -134,12 +191,13 @@ func (c *Cache) LookupSPA(spaVersion string) (ReleaseSPA, bool) {
 // (here: blocking a non-revoked version) must be observable, not silent.
 // The version field is the application-level version string, not user PII,
 // so it is safe to include in the log line.
-func (c *Cache) IsRevoked(ctx context.Context, version string) bool {
+func (c *Cache) IsRevoked(ctx context.Context, version string) (bool, error) {
 	if c.rdb == nil {
-		return false
+		return false, nil
 	}
 	isMember, err := c.rdb.SIsMember(ctx, revokedVersionsKey, version).Result()
 	if err != nil {
+		c.setRedisDegraded(ctx, true)
 		if c.log != nil {
 			c.log.With(
 				"event", "attestation.is_revoked_redis_error",
@@ -147,9 +205,10 @@ func (c *Cache) IsRevoked(ctx context.Context, version string) bool {
 				"error", err.Error(),
 			).Warn("attestation IsRevoked Redis error; failing closed")
 		}
-		return true // fail-closed
+		return true, err // caller must fail closed without classifying as revoked
 	}
-	return isMember
+	c.setRedisDegraded(ctx, false)
+	return isMember, nil
 }
 
 // Start subscribes to NATS registry-change events and spawns the

@@ -241,6 +241,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 | `presencehistory` | Opt-in self-only activity ledger, disclosure, retention, reconciliation, and admin controls |
 | `privacy`       | GDPR Article 17 account-erasure endpoint                                                     |
 | `rbac`          | Role-based access control: resolver, cache, middleware, audit log                            |
+| `securityevent` | Closed-schema security-event emission for Nightwatch collection                               |
 | `servers`       | Server CRUD, unread-status aggregation                                                       |
 | `sessions`      | Session listing, per-session and all-session revocation                                      |
 | `storage`       | S3-compatible (MinIO) client wrapper                                                         |
@@ -1002,7 +1003,7 @@ Successful POST proof verification marks that exact handoff as admitted, without
 
 If an unadmitted room is empty, and no competing local admission remains, a DELETE-bound proof atomically tombstones only the exact short, ringless reservation. It never tombstones an accepted ring, a promoted call, or a successor ID. Once participant history exists, rollback follows the normal terminal lifecycle instead.
 
-Removing another group-DM member, or self-leaving, commits membership revocation first, then unconditionally publishes `voice.enforce.disconnect`. The media-plane consumer resolves both the user's admitted socket and any exact provisional reconnect socket. It removes the captured candidate before it force-closes either socket, and then runs normal admitted teardown. That ordering stops an already-issued A2 response from promoting after committed revocation, while still letting synchronous admitted disconnect cleanup terminalize a history-bearing call.
+Removing another group-DM member, or self-leaving, commits membership revocation first, then unconditionally publishes `voice.enforce.disconnect`. The media-plane consumer resolves both the user's admitted socket and any exact provisional reconnect socket. It removes the exact provisional candidate, runs exact admitted teardown for the captured admitted socket, and then force-closes the captured sockets. That ordering stops an already-issued A2 response from promoting after committed revocation, while preserving synchronous admitted teardown and terminal telemetry for a history-bearing call.
 
 If the admitted socket already left, the enforcement-specific candidate removal closes the now-empty room silently when it was never admitted. It publishes normal terminal lifecycle when admitted history exists. Each successful DM heartbeat also retries disconnects for media-reported users who no longer remain members.
 
@@ -1159,6 +1160,29 @@ closed at capacity. Successful deletes may retire only provably published obliga
 The desktop client discovers its runtime config — it is **not** hardcoded. `clientConfigService.ts` polls the public (pre-auth) `GET /api/v1/client/config` (`internal/clientconfig`) every ~5 minutes for: `minVersion` (a client-gate enforced regardless of auth state), server-toggled `featureFlags` (currently `gifsEnabled` only — the inert `voice`/`video`/`e2ee` members were removed under #1649), the **media-plane URL**, **TURN** host/realm, the `spaUrl`, and `spaIpcContract`. This is how the media-plane and TURN endpoints reach the client. The `gifsEnabled` flag mirrors the server-side `KLIPY_API_KEY` gate.
 
 ## Deployment Models
+
+### Nightwatch application integration
+
+Concord Voice's control plane and media plane emit only closed
+`security-event.v1` records to separate host streams. Generic stdout, request,
+error, message-content, and activity logs do not cross this boundary. The
+production Compose override mounts only each service's own pre-created stream;
+the host provisioner owns the directories, modes, writer group, and collector
+identity check. A compromised producer can still forge, truncate, or flood its
+own stream, so this boundary is isolation and pathname protection rather than a
+tamper-proof transport.
+
+The host adapter consumes a reviewed, commit-pinned Nightwatch release through
+a stable installed interface. The dedicated Nightwatch repository owns
+normalization, Wazuh and provider configuration, recovery, response, and
+commissioning; its production runbook is the operational source of truth. This
+Alpha integration neither commissions Nightwatch nor changes live OVH,
+Cloudflare, Infisical, R2, or Wazuh resources.
+
+The closed event and action boundary is intentionally suitable for future SOAR
+or AI consumers without changing application emitters. Any automated mutation
+remains a Nightwatch-side decision and must preserve its independent approval
+and exact-target controls. See [ADR-0041](adr/0041-nightwatch-security-operations.md).
 
 ### SaaS (Cloud-Hosted)
 

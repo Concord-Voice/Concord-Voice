@@ -15,6 +15,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -63,11 +64,11 @@ func (*ambiguousRecoveryMFAChecker) GetLoginMethods(context.Context, string) ([]
 	return nil, nil
 }
 
-func (*ambiguousRecoveryMFAChecker) GenerateLoginChallenge(context.Context, string, bool, string) (string, string, error) {
+func (*ambiguousRecoveryMFAChecker) GenerateLoginChallenge(context.Context, string, bool, string, securityevent.AuthMethod) (string, string, error) {
 	return "", "", nil
 }
 
-func (*ambiguousRecoveryMFAChecker) GenerateUpgradeChallenge(context.Context, string, bool) (string, string, error) {
+func (*ambiguousRecoveryMFAChecker) GenerateUpgradeChallenge(context.Context, string, string) (string, string, error) {
 	return "", "", nil
 }
 

@@ -30,6 +30,8 @@ func TestOpsMetricsRuntimeWiresAccountActivityAfterSuccessfulSetup(t *testing.T)
 	source := string(sourceBytes)
 	needles := []string{
 		"if err := natsClient.Flush(); err != nil",
+		"receiver.MarkDependencyDegraded()",
+		"if unsubscribeErr := receiver.Unsubscribe(); unsubscribeErr != nil",
 		"tracker := opsmetrics.NewActivityTracker()",
 		"hub.SetActivityObserver(tracker)",
 		"accounts := opsmetrics.NewAccountProvider(db, tracker)",
@@ -42,6 +44,7 @@ func TestOpsMetricsRuntimeWiresAccountActivityAfterSuccessfulSetup(t *testing.T)
 		require.Greater(t, position, prior, needle)
 		prior = position
 	}
+	require.NotContains(t, source, "_ = receiver.Unsubscribe()")
 }
 
 func TestWireOpsMetricsRuntimeDegradesWithSanitizedStartupReason(t *testing.T) {

@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
 // extractBearer extracts the raw OIDC token from the Authorization header.
@@ -19,6 +21,7 @@ func (h *Handler) extractBearer(c *gin.Context) (string, bool) {
 	raw := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 	if raw == "" || raw == c.GetHeader("Authorization") {
 		// Either empty header or Bearer prefix missing.
+		h.emit(c.Request.Context(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonAttestationRejected})
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing bearer token"})
 		return "", false
 	}
@@ -36,6 +39,7 @@ func (h *Handler) extractBearer(c *gin.Context) (string, bool) {
 // and the caller must short-circuit.
 func (h *Handler) requireOIDC(c *gin.Context) bool {
 	if h.oidc == nil {
+		h.emit(c.Request.Context(), securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error": "attestation publish endpoint disabled — OIDC verifier unavailable",
 		})
@@ -59,6 +63,7 @@ func (h *Handler) runOIDCVerify(
 ) (string, bool) {
 	sub, err := verify(c.Request.Context(), raw)
 	if err != nil {
+		h.emit(c.Request.Context(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonAttestationRejected})
 		h.log.With("event", "attestation.publish_oidc_rejected",
 			"axis", axis,
 			"error", err.Error()).
@@ -112,6 +117,7 @@ func (h *Handler) PublishSPA(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	if err := h.repo.InsertSPA(ctx, p, sub); err != nil {
+		h.emit(ctx, publishFailureEvent(err))
 		if errors.Is(err, ErrConflict) {
 			h.log.With("event", "attestation.publish_conflict",
 				"axis", "spa",
@@ -138,6 +144,7 @@ func (h *Handler) PublishSPA(c *gin.Context) {
 		"spa_version", p.SpaVersion,
 		"oidc_sub", sub,
 	).Info("SPA publish accepted")
+	h.emit(ctx, securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonAttestationIssued})
 
 	c.JSON(http.StatusCreated, gin.H{
 		"spa_version": p.SpaVersion,
@@ -197,6 +204,7 @@ func (h *Handler) PublishBinary(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	if err := h.repo.InsertBinary(ctx, p, sub); err != nil {
+		h.emit(ctx, publishFailureEvent(err))
 		if errors.Is(err, ErrConflict) {
 			h.log.With("event", "attestation.publish_conflict",
 				"axis", "binary",
@@ -226,9 +234,17 @@ func (h *Handler) PublishBinary(c *gin.Context) {
 		"platform", string(p.Platform),
 		"oidc_sub", sub,
 	).Info("binary publish accepted")
+	h.emit(ctx, securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonAttestationIssued})
 
 	c.JSON(http.StatusCreated, gin.H{
 		"version":  p.Version,
 		"platform": string(p.Platform),
 	})
+}
+
+func publishFailureEvent(err error) securityevent.Event {
+	if errors.Is(err, ErrConflict) {
+		return securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAttestationRejected}
+	}
+	return securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable}
 }

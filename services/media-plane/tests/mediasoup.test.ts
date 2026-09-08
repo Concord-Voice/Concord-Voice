@@ -75,6 +75,58 @@ describe('MediasoupService', () => {
         expect(process.exit).toHaveBeenCalledWith(1);
       });
     });
+
+    it('flushes an injected security writer before a worker-death exit', async () => {
+      const worker = createMockWorker();
+      const emit = vi.fn();
+      const flush = vi.fn();
+      service.setSecurityEventEmitter(emit, flush);
+      mockCreateWorker.mockResolvedValueOnce(worker).mockResolvedValueOnce(createMockWorker());
+      await service.init();
+      worker._emit('died');
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'dependency',
+        outcome: 'failure',
+        severity: 'critical',
+        reasonCode: 'dependency_unavailable',
+      });
+      expect(flush).toHaveBeenCalledOnce();
+    });
+
+    it('orders emit, synchronous flush, and exit even when an observer throws', async () => {
+      const worker = createMockWorker();
+      const order: string[] = [];
+      const exit = vi.mocked(process.exit).mockImplementationOnce((() => {
+        order.push('exit');
+        return undefined as never;
+      }) as never);
+      service.setSecurityEventEmitter(
+        () => {
+          order.push('emit');
+          throw new Error('observer failure');
+        },
+        () => order.push('flush')
+      );
+      mockCreateWorker.mockResolvedValueOnce(worker).mockResolvedValueOnce(createMockWorker());
+      await service.init();
+      expect(() => worker._emit('died')).not.toThrow();
+      expect(order).toEqual(['emit', 'flush', 'exit']);
+      expect(exit).toHaveBeenCalledWith(1);
+    });
+
+    it('still exits when the synchronous flush observer throws', async () => {
+      const worker = createMockWorker();
+      const exit = vi
+        .mocked(process.exit)
+        .mockImplementationOnce((() => undefined as never) as never);
+      service.setSecurityEventEmitter(vi.fn(), () => {
+        throw new Error('flush failure');
+      });
+      mockCreateWorker.mockResolvedValueOnce(worker).mockResolvedValueOnce(createMockWorker());
+      await service.init();
+      expect(() => worker._emit('died')).not.toThrow();
+      expect(exit).toHaveBeenCalledWith(1);
+    });
   });
 
   describe('getOrCreateRouter', () => {

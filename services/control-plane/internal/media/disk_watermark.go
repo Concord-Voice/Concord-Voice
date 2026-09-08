@@ -18,10 +18,13 @@ package media
 // is owned by a parallel workstream this wave, and the ADR that introduces
 // this gate fixes these numbers deliberately.
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"syscall"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -74,6 +77,9 @@ type DiskWatermark struct {
 	statFS     diskStatFSFunc
 	selfHosted bool
 	log        *logger.Logger
+	mu         sync.Mutex
+	events     securityevent.Emitter
+	refusing   bool
 }
 
 // NewDiskWatermark builds a watermark check for the shared MinIO disk using
@@ -87,7 +93,36 @@ func NewDiskWatermark(selfHosted bool, log *logger.Logger) *DiskWatermark {
 
 // newDiskWatermark is the injectable-seam constructor for tests.
 func newDiskWatermark(path string, selfHosted bool, statFS diskStatFSFunc, log *logger.Logger) *DiskWatermark {
-	return &DiskWatermark{path: path, statFS: statFS, selfHosted: selfHosted, log: log}
+	return &DiskWatermark{path: path, statFS: statFS, selfHosted: selfHosted, log: log, events: securityevent.Discard}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the watermark constructor.
+func (w *DiskWatermark) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	w.mu.Lock()
+	w.events = events
+	w.mu.Unlock()
+}
+
+// transitionRefusing changes the refusal state and snapshots the configured
+// emitter. Callers must emit after this method returns so an external emitter
+// cannot run while the watermark lock is held.
+func (w *DiskWatermark) transitionRefusing(refusing bool) (securityevent.Emitter, bool) {
+	w.mu.Lock()
+	changed := w.refusing != refusing
+	w.refusing = refusing
+	events := w.events
+	w.mu.Unlock()
+	return events, changed
+}
+
+func (w *DiskWatermark) recoverRefusal() {
+	events, recovered := w.transitionRefusing(false)
+	if recovered {
+		events.Emit(context.Background(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeRestored, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonDiskWatermark})
+	}
 }
 
 // occupancyPercent reads current disk occupancy as a 0-100 value, using the
@@ -135,12 +170,15 @@ func (w *DiskWatermark) Check() error {
 				w.log.Warn("Shared-disk occupancy at or above the refuse threshold; self-hosted deployments never refuse attachment writes",
 					"occupancy_percent", percent, "threshold_percent", diskWatermarkRefusePercent)
 			}
+			w.recoverRefusal()
 			return nil
 		}
 		if w.log != nil {
 			w.log.Warn("Refusing attachment write: shared-disk occupancy at or above the refuse threshold",
 				"occupancy_percent", percent, "threshold_percent", diskWatermarkRefusePercent)
 		}
+		events, _ := w.transitionRefusing(true)
+		events.Emit(context.Background(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDiskWatermark})
 		return ErrAttachmentStorageAtCapacity
 	}
 
@@ -148,5 +186,6 @@ func (w *DiskWatermark) Check() error {
 		w.log.Warn("Shared-disk occupancy at or above the warn threshold",
 			"occupancy_percent", percent, "threshold_percent", diskWatermarkWarnPercent)
 	}
+	w.recoverRefusal()
 	return nil
 }

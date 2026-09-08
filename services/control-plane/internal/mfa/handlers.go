@@ -17,10 +17,12 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
@@ -35,18 +37,19 @@ const (
 	redisKeyWebAuthnReg            = "webauthn_reg:%s"
 
 	// Error messages
-	errMsgPasswordRequired       = "Password is required"
-	errMsgIncorrectPassword      = "Incorrect password"
-	errMsgCodeRequired           = "Code is required"
-	errMsgFailedBackupCodes      = "Failed to generate backup codes"
-	errMsgFailedStartReg         = "Failed to start registration"
-	errMsgInvalidSessionData     = "Invalid session data"
-	errMsgFailedListDevices      = "Failed to list trusted devices"
-	errMsgFailedListRecoveryReqs = "Failed to list recovery requests"
-	errMsgFailedLoadCircle       = "Failed to load recovery circle"
-	errMsgFailedConfigCircle     = "Failed to configure recovery circle"
-	errMsgFailedListSocialReqs   = "Failed to list social recovery requests"
-	errMsgFailedSubmitResponse   = "Failed to submit response"
+	errMsgPasswordRequired           = "Password is required"
+	errMsgIncorrectPassword          = "Incorrect password"
+	errMsgCodeRequired               = "Code is required"
+	errMsgFailedBackupCodes          = "Failed to generate backup codes"
+	errMsgFailedStartReg             = "Failed to start registration"
+	errMsgInvalidSessionData         = "Invalid session data"
+	errMsgFailedListDevices          = "Failed to list trusted devices"
+	errMsgFailedListRecoveryReqs     = "Failed to list recovery requests"
+	errMsgFailedLoadCircle           = "Failed to load recovery circle"
+	errMsgFailedConfigCircle         = "Failed to configure recovery circle"
+	errMsgFailedListSocialReqs       = "Failed to list social recovery requests"
+	errMsgFailedSubmitResponse       = "Failed to submit response"
+	errMsgMFAVerificationUnavailable = "MFA verification unavailable"
 )
 
 // LoginCompleter completes the login flow after MFA verification.
@@ -54,7 +57,10 @@ const (
 // expectedEpoch is the credential epoch stamped into the challenge at issuance
 // (#2418); the implementation refuses to mint if the durable epoch advanced past it.
 type LoginCompleter interface {
-	CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string)
+	// CompleteLogin reports true only after its authoritative session-mint
+	// transaction has committed. MFA must not record challenge verification
+	// before that point.
+	CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string, primaryAuthMethod securityevent.AuthMethod) bool
 }
 
 // Handler implements MFA API endpoints and the Verifier interface.
@@ -68,6 +74,7 @@ type Handler struct {
 	loginCompleter LoginCompleter
 	emailSvc       *email.Service
 	environment    string // "development", "staging", "production"
+	securityEvents securityevent.Emitter
 }
 
 // Ensure Handler implements Verifier at compile time.
@@ -76,14 +83,35 @@ var _ Verifier = (*Handler)(nil)
 // NewHandler creates a new MFA handler.
 func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, keyring *Keyring, jwtSecret string, webauthnSvc *WebAuthnService, environment string) *Handler {
 	return &Handler{
-		db:          db,
-		redis:       redisClient,
-		log:         log,
-		keyring:     keyring,
-		jwtSecret:   jwtSecret,
-		webauthn:    webauthnSvc,
-		environment: environment,
+		db:             db,
+		redis:          redisClient,
+		log:            log,
+		keyring:        keyring,
+		jwtSecret:      jwtSecret,
+		webauthn:       webauthnSvc,
+		environment:    environment,
+		securityEvents: securityevent.Discard,
 	}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the
+// public constructor used by existing callers.
+func (h *Handler) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	h.securityEvents = events
+}
+
+func (h *Handler) emitSecurityEvent(ctx context.Context, event securityevent.Event) {
+	if h.securityEvents != nil {
+		h.securityEvents.Emit(ctx, event)
+	}
+}
+
+func (h *Handler) emitHTTPEvent(c *gin.Context, event securityevent.Event) {
+	h.emitSecurityEvent(c.Request.Context(), event)
+	middleware.MarkNightwatchHandled(c)
 }
 
 // SetLoginCompleter sets the login completer (called after both handlers are initialized).
@@ -127,55 +155,100 @@ func (h *Handler) VerifyCodeTx(ctx context.Context, tx *sql.Tx, userID string, c
 }
 
 func (h *Handler) verifyCode(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, error) {
+	verified, _, err := h.verifyCodeMatchedMethod(ctx, store, userID, code)
+	return verified, err
+}
+
+// verifyCodeMatchedMethod preserves VerifyCode's public boolean contract while
+// retaining the server-observed factor for success telemetry. A submitted
+// method is only an attempted method: a backup-code submission can validate a
+// TOTP value (and vice versa), so it must not choose the success event label.
+func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, string, error) {
 	// Check for WebAuthn inline verification token first (from WebAuthnVerifyInlineFinish)
-	if len(code) > 20 {
-		tokenKey := fmt.Sprintf("mfa_inline_token:%s:%s", userID, code)
-		if h.redis.Exists(ctx, tokenKey).Val() > 0 {
-			h.redis.Del(ctx, tokenKey) // Single-use: delete immediately
-			return true, nil
-		}
+	inlineVerified, err := h.consumeWebAuthnInlineToken(ctx, userID, code)
+	if err != nil {
+		return false, "", err
+	}
+	if inlineVerified {
+		return true, "webauthn", nil
 	}
 
 	// Try TOTP
 	var secretEnc, secretNonce []byte
 	var keyVersion int
 	var totpEnabled, totpConfirmed bool
-	err := store.QueryRowContext(ctx,
+	err = store.QueryRowContext(ctx,
 		`SELECT totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
 	).Scan(&secretEnc, &secretNonce, &keyVersion, &totpEnabled, &totpConfirmed)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, "", fmt.Errorf("read TOTP MFA state: %w", err)
+	}
 
 	if err == nil && totpEnabled && totpConfirmed {
 		secret, decErr := h.keyring.Open(secretEnc, secretNonce, keyVersion)
 		if decErr != nil {
 			h.log.Error("TOTP secret decryption failed — likely encryption key mismatch",
 				"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
-			return false, fmt.Errorf("TOTP secret decryption failed: %w", decErr)
+			return false, "", fmt.Errorf("TOTP secret decryption failed: %w", decErr)
 		}
 		if ValidateCode(string(secret), code) {
-			return true, nil
+			return true, "totp", nil
 		}
 
-		// Try as backup code
-		var hashes []string
-		var used []bool
-		_ = store.QueryRowContext(ctx,
-			`SELECT backup_codes_hash, backup_codes_used FROM user_mfa_totp WHERE user_id = $1`,
-			userID,
-		).Scan(pq.Array(&hashes), pq.Array(&used))
-
-		if idx, matched := VerifyBackupCode(code, hashes, used); matched {
-			// Mark backup code as used
-			used[idx] = true
-			_, _ = store.ExecContext(ctx,
-				`UPDATE user_mfa_totp SET backup_codes_used = $1, updated_at = NOW() WHERE user_id = $2`,
-				pq.Array(used), userID,
-			)
-			return true, nil
+		backupVerified, backupErr := consumeBackupCode(ctx, store, userID, code)
+		if backupVerified {
+			return true, "backup_code", nil
 		}
+		return false, "", backupErr
 	}
 
-	return false, nil
+	return false, "", nil
+}
+
+func (h *Handler) consumeWebAuthnInlineToken(ctx context.Context, userID, code string) (bool, error) {
+	if len(code) <= 20 {
+		return false, nil
+	}
+	token, err := h.redis.GetDel(ctx, fmt.Sprintf("mfa_inline_token:%s:%s", userID, code)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("consume WebAuthn inline verification token: %w", err)
+	}
+	return token != "", nil
+}
+
+func consumeBackupCode(ctx context.Context, store codeVerificationStore, userID string, code string) (bool, error) {
+	var hashes []string
+	var used []bool
+	if err := store.QueryRowContext(ctx,
+		`SELECT backup_codes_hash, backup_codes_used FROM user_mfa_totp WHERE user_id = $1`,
+		userID,
+	).Scan(pq.Array(&hashes), pq.Array(&used)); err != nil {
+		return false, fmt.Errorf("read backup codes: %w", err)
+	}
+
+	idx, matched := VerifyBackupCode(code, hashes, used)
+	if !matched {
+		return false, nil
+	}
+
+	updatedUsed := append([]bool(nil), used...)
+	updatedUsed[idx] = true
+	result, err := store.ExecContext(ctx,
+		`UPDATE user_mfa_totp SET backup_codes_used = $1, updated_at = NOW() WHERE user_id = $2 AND backup_codes_used = $3`,
+		pq.Array(updatedUsed), userID, pq.Array(used),
+	)
+	if err != nil {
+		return false, fmt.Errorf("consume backup code: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read backup-code consumption result: %w", err)
+	}
+	return rows == 1, nil
 }
 
 // GetEnabledMethods returns the list of active MFA methods for a user.
@@ -221,8 +294,12 @@ func (h *Handler) GetLoginMethods(ctx context.Context, userID string) ([]string,
 // the remember_me preference in Redis keyed by JTI for retrieval after MFA verify.
 // credEpoch is stamped into the challenge and re-checked at CompleteLogin (#2418),
 // so a challenge issued before a destructive reset cannot complete after it.
-func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string) (string, string, error) {
-	token, jti, err := GenerateChallengeToken(userID, PurposeLogin, JWTSecret(h.jwtSecret), CredEpoch(credEpoch))
+func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string, primaryAuthMethod securityevent.AuthMethod) (string, string, error) {
+	primaryAuthMethod, err := normalizePrimaryAuthMethod(primaryAuthMethod)
+	if err != nil {
+		return "", "", err
+	}
+	token, jti, err := generateChallengeTokenWithTTL(userID, PurposeLogin, JWTSecret(h.jwtSecret), CredEpoch(credEpoch), primaryAuthMethod, "", challengeTTL)
 	if err != nil {
 		return "", "", err
 	}
@@ -233,30 +310,23 @@ func (h *Handler) GenerateLoginChallenge(ctx context.Context, userID string, rem
 		rememberVal = "1"
 	}
 	key := fmt.Sprintf(redisKeyMFAChallengeRememberMe, jti)
-	h.redis.Set(ctx, key, rememberVal, challengeTTL)
+	if err := h.redis.Set(ctx, key, rememberVal, challengeTTL).Err(); err != nil {
+		return "", "", fmt.Errorf("store MFA challenge remember state: %w", err)
+	}
 
 	return token, jti, nil
 }
 
 // GenerateUpgradeChallenge creates a challenge token for pre-MFA session upgrades.
 // On successful MFA verification, fresh tokens are issued (same as login).
-func (h *Handler) GenerateUpgradeChallenge(ctx context.Context, userID string, rememberMe bool) (string, string, error) {
+func (h *Handler) GenerateUpgradeChallenge(_ context.Context, userID, refreshSessionID string) (string, string, error) {
 	// PurposeMFAUpgrade completes into a 30s Redis bypass key (completeVerifyPurpose),
 	// never a session mint — the subsequent refresh mints via rotateAndRespond, which
 	// is already epoch-fenced. So this challenge carries no epoch (#2418).
-	token, jti, err := GenerateChallengeToken(userID, PurposeMFAUpgrade, JWTSecret(h.jwtSecret), "")
-	if err != nil {
-		return "", "", err
+	if refreshSessionID == "" {
+		return "", "", errors.New("MFA upgrade challenge requires a refresh session")
 	}
-
-	rememberVal := "0"
-	if rememberMe {
-		rememberVal = "1"
-	}
-	key := fmt.Sprintf(redisKeyMFAChallengeRememberMe, jti)
-	h.redis.Set(ctx, key, rememberVal, challengeTTL)
-
-	return token, jti, nil
+	return generateChallengeTokenWithTTL(userID, PurposeMFAUpgrade, JWTSecret(h.jwtSecret), "", "", RefreshSessionID(refreshSessionID), challengeTTL)
 }
 
 // BeginWebAuthnLogin starts a WebAuthn assertion ceremony for login.
@@ -688,6 +758,7 @@ func (h *Handler) TOTPConfirmSetup(c *gin.Context) {
 		h.log.Error("Failed to update user MFA flags", "error", err)
 	}
 
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled, AuthMethod: securityevent.AuthTOTP})
 	c.JSON(http.StatusOK, gin.H{"message": "MFA is now active"})
 }
 
@@ -719,7 +790,12 @@ func (h *Handler) TOTPDisable(c *gin.Context) {
 
 	// Verify password
 	match, err := h.verifyUserPassword(ctx, userID, req.Password)
-	if err != nil || !match {
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
+		return
+	}
+	if !match {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword})
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
 		return
 	}
@@ -732,17 +808,23 @@ func (h *Handler) TOTPDisable(c *gin.Context) {
 		return
 	}
 	if !valid {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid})
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code. Make sure the code hasn't expired."})
 		return
 	}
 
 	// Delete TOTP enrollment
-	_, _ = h.db.ExecContext(ctx, `DELETE FROM user_mfa_totp WHERE user_id = $1`, userID)
+	if _, err := h.db.ExecContext(ctx, `DELETE FROM user_mfa_totp WHERE user_id = $1`, userID); err != nil {
+		h.log.Error("Failed to disable TOTP MFA", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disable MFA"})
+		return
+	}
 
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
 		h.log.Error("Failed to update user MFA flags after TOTP disable", "error", err)
 	}
 
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled, AuthMethod: securityevent.AuthTOTP})
 	c.JSON(http.StatusOK, gin.H{"message": "TOTP MFA has been disabled"})
 }
 
@@ -966,6 +1048,7 @@ func (h *Handler) WebAuthnRegisterFinish(c *gin.Context) {
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
 		h.log.Error("Failed to update user MFA flags after WebAuthn register", "error", err)
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled, AuthMethod: securityevent.AuthWebAuthn})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":         "Security key registered successfully",
@@ -1034,7 +1117,12 @@ func (h *Handler) WebAuthnDeleteCredential(c *gin.Context) {
 	}
 
 	match, err := h.verifyUserPassword(ctx, userID, req.Password)
-	if err != nil || !match {
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
+		return
+	}
+	if !match {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword})
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
 		return
 	}
@@ -1054,6 +1142,7 @@ func (h *Handler) WebAuthnDeleteCredential(c *gin.Context) {
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
 		h.log.Error("Failed to update user MFA flags after WebAuthn delete", "error", err)
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled, AuthMethod: securityevent.AuthWebAuthn})
 
 	// Return remaining credential IDs so the client can signal the authenticator
 	var remainingIDs [][]byte
@@ -1101,8 +1190,13 @@ func (h *Handler) Verify(c *gin.Context) {
 		return
 	}
 
-	claims, purpose := h.parseChallengeToken(req.ChallengeToken)
+	claims, purpose, expired := h.parseChallengeToken(req.ChallengeToken)
 	if claims == nil {
+		if expired {
+			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeExpired, RouteTemplate: securityevent.RouteAuthMFAVerify})
+		} else {
+			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify})
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired MFA challenge token"})
 		return
 	}
@@ -1112,6 +1206,7 @@ func (h *Handler) Verify(c *gin.Context) {
 	// Check single-use: ensure this JTI hasn't been consumed
 	usedKey := fmt.Sprintf("mfa_challenge_used:%s", claims.ID)
 	if h.redis.Exists(ctx, usedKey).Val() > 0 {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify})
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA challenge already used"})
 		return
 	}
@@ -1120,68 +1215,133 @@ func (h *Handler) Verify(c *gin.Context) {
 	attemptsKey := fmt.Sprintf("mfa_verify_attempts:%s", claims.UserID)
 	lockoutKey := fmt.Sprintf("mfa_verify_lockout:%s", claims.UserID)
 	if h.redis.Exists(ctx, lockoutKey).Val() > 0 {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeLocked, RouteTemplate: securityevent.RouteAuthMFAVerify})
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many failed attempts. Try again later."})
 		return
 	}
 
-	verified, responded := h.verifyByMethod(ctx, c, req, claims)
+	verified, matchedMethod, responded := h.verifyByMethod(ctx, c, req, claims)
 	if responded {
 		return // Early return already sent a response (e.g. bad request)
 	}
 
 	if !verified {
 		h.recordVerifyFailure(ctx, attemptsKey, lockoutKey)
-		middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		h.emitHTTPEvent(c, mfaChallengeInvalidEvent(req.Method))
+		middleware.MarkAuthFailureOutcome(c, outcome)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code"})
 		return
 	}
 
-	// Mark challenge as used (single-use)
-	h.redis.Set(ctx, usedKey, "1", 10*time.Minute)
-	h.redis.Del(ctx, attemptsKey)
-	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
-
-	h.completeVerifyPurpose(ctx, c, claims, purpose)
+	h.completeVerifiedChallenge(ctx, c, claims, purpose, matchedMethod)
 }
 
-// parseChallengeToken tries all valid purposes and returns the claims and matched purpose.
-func (h *Handler) parseChallengeToken(tokenStr string) (*ChallengeClaims, ChallengePurpose) {
+// completeVerifiedChallenge records only the outcome of a completed challenge
+// purpose. For login, the completer returns false until its session-mint
+// transaction commits, so this path cannot report an MFA success for a failed
+// login transaction.
+func (h *Handler) completeVerifiedChallenge(ctx context.Context, c *gin.Context, claims *ChallengeClaims, purpose ChallengePurpose, method string) {
+	// Atomically claim the verified challenge before any session mint. A
+	// check-then-set permits two successful factor verifications to mint two
+	// sessions from one challenge.
+	usedKey := fmt.Sprintf("mfa_challenge_used:%s", claims.ID)
+	attemptsKey := fmt.Sprintf("mfa_verify_attempts:%s", claims.UserID)
+	claimed, err := h.redis.SetNX(ctx, usedKey, "1", challengeTTL).Result()
+	if err != nil {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+		return
+	}
+	if !claimed {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA challenge already used"})
+		return
+	}
+	h.redis.Del(ctx, attemptsKey)
+	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
+	if h.completeVerifyPurpose(ctx, c, claims, purpose) {
+		h.emitHTTPEvent(c, mfaChallengeVerifiedEvent(method))
+	}
+}
+
+func mfaChallengeInvalidEvent(method string) securityevent.Event {
+	switch method {
+	case "totp":
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, AuthMethod: securityevent.AuthTOTP, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	case "backup_code":
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, AuthMethod: securityevent.AuthBackupCode, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	case "webauthn":
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, AuthMethod: securityevent.AuthWebAuthn, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	default:
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	}
+}
+
+func mfaChallengeVerifiedEvent(method string) securityevent.Event {
+	switch method {
+	case "totp":
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeVerified, AuthMethod: securityevent.AuthTOTP, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	case "backup_code":
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeVerified, AuthMethod: securityevent.AuthBackupCode, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	case "webauthn":
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeVerified, AuthMethod: securityevent.AuthWebAuthn, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	default:
+		return securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeVerified, RouteTemplate: securityevent.RouteAuthMFAVerify}
+	}
+}
+
+// parseChallengeToken tries all valid purposes and returns the claims, matched
+// purpose, and whether every rejected parse established expiration. A malformed,
+// incorrectly signed, or purpose-bound token is invalid, not expired.
+func (h *Handler) parseChallengeToken(tokenStr string) (*ChallengeClaims, ChallengePurpose, bool) {
+	expired := true
 	for _, p := range []ChallengePurpose{PurposeLogin, PurposeSuspiciousRefresh, PurposeMFAUpgrade} {
 		if parsed, err := ValidateChallengeToken(tokenStr, h.jwtSecret, p); err == nil {
-			return parsed, p
+			if p == PurposeMFAUpgrade && parsed.RefreshSessionID == "" {
+				expired = false
+				continue
+			}
+			return parsed, p, false
+		} else if !errors.Is(err, jwt.ErrTokenExpired) {
+			expired = false
 		}
 	}
-	return nil, ""
+	return nil, "", expired
 }
 
 // verifyByMethod dispatches verification to the appropriate method handler.
-// Returns (verified, responded) — responded is true if an HTTP response was already written.
-func (h *Handler) verifyByMethod(ctx context.Context, c *gin.Context, req verifyRequest, claims *ChallengeClaims) (bool, bool) {
+// Returns (verified, matchedMethod, responded) — responded is true if an HTTP
+// response was already written.
+func (h *Handler) verifyByMethod(ctx context.Context, c *gin.Context, req verifyRequest, claims *ChallengeClaims) (bool, string, bool) {
 	switch req.Method {
 	case "totp", "backup_code":
 		return h.verifyTOTPOrBackup(ctx, c, req.Code, claims.UserID)
 	case "webauthn":
-		return h.verifyWebAuthnChallenge(ctx, c, req.Assertion, claims)
+		verified, responded := h.verifyWebAuthnChallenge(ctx, c, req.Assertion, claims)
+		return verified, "webauthn", responded
 	case "email":
-		return h.verifyEmailCode(ctx, c, req.Code, claims)
+		verified, responded := h.verifyEmailCode(ctx, c, req.Code, claims)
+		return verified, "", responded
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid method. Use 'totp', 'backup_code', 'webauthn', or 'email'"})
-		return false, true
+		return false, "", true
 	}
 }
 
 // verifyTOTPOrBackup verifies a TOTP or backup code.
-func (h *Handler) verifyTOTPOrBackup(ctx context.Context, c *gin.Context, code, userID string) (bool, bool) {
+func (h *Handler) verifyTOTPOrBackup(ctx context.Context, c *gin.Context, code, userID string) (bool, string, bool) {
 	if code == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgCodeRequired})
-		return false, true
+		return false, "", true
 	}
-	valid, err := h.VerifyCode(ctx, userID, code)
+	valid, matchedMethod, err := h.verifyCodeMatchedMethod(ctx, h.db, userID, code)
 	if err != nil {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Verification failed"})
-		return false, true
+		return false, "", true
 	}
-	return valid, false
+	return valid, matchedMethod, false
 }
 
 // verifyWebAuthnChallenge verifies a WebAuthn assertion.
@@ -1275,25 +1435,59 @@ func (h *Handler) recordVerifyFailure(ctx context.Context, attemptsKey, lockoutK
 }
 
 // completeVerifyPurpose performs the action associated with the MFA challenge purpose.
-func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, claims *ChallengeClaims, purpose ChallengePurpose) {
+func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, claims *ChallengeClaims, purpose ChallengePurpose) bool {
 	switch purpose {
 	case PurposeLogin:
 		if h.loginCompleter == nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Login completion not configured"})
-			return
+			return false
 		}
 		rememberKey := fmt.Sprintf(redisKeyMFAChallengeRememberMe, claims.ID)
-		rememberMe := h.redis.Get(ctx, rememberKey).Val() == "1"
-		h.redis.Del(ctx, rememberKey)
-		h.loginCompleter.CompleteLogin(c, claims.UserID, rememberMe, claims.CredentialEpoch)
+		rememberValue, err := h.redis.Get(ctx, rememberKey).Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+			return false
+		}
+		rememberMe := rememberValue == "1"
+		if err == nil {
+			h.redis.Del(ctx, rememberKey)
+		}
+		primaryAuthMethod, err := normalizePrimaryAuthMethod(claims.PrimaryAuthMethod)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid MFA challenge"})
+			return false
+		}
+		return h.loginCompleter.CompleteLogin(c, claims.UserID, rememberMe, claims.CredentialEpoch, primaryAuthMethod)
 
 	case PurposeMFAUpgrade:
-		bypassKey := fmt.Sprintf("mfa_upgrade_bypass:%s", claims.UserID)
-		h.redis.Set(ctx, bypassKey, "1", 30*time.Second)
+		bypassKey := auth.MFAUpgradeBypassKey(claims.UserID, claims.RefreshSessionID)
+		if err := h.redis.Set(ctx, bypassKey, "1", 30*time.Second).Err(); err != nil {
+			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
+			return false
+		}
 		c.JSON(http.StatusOK, gin.H{"verified": true, "purpose": string(purpose), "user_id": claims.UserID})
+		return true
 
 	default:
 		c.JSON(http.StatusOK, gin.H{"verified": true, "purpose": string(purpose), "user_id": claims.UserID})
+		return true
+	}
+}
+
+// normalizePrimaryAuthMethod accepts only methods issued by server-authenticated
+// paths. Empty is the pre-claim token format and retains password semantics for
+// backward compatibility; unknown nonempty claims fail closed rather than
+// acquiring SSO provenance.
+func normalizePrimaryAuthMethod(method securityevent.AuthMethod) (securityevent.AuthMethod, error) {
+	switch method {
+	case "", securityevent.AuthPassword:
+		return securityevent.AuthPassword, nil
+	case securityevent.AuthSSO, securityevent.AuthSession:
+		return method, nil
+	default:
+		return "", errors.New("invalid primary authentication method")
 	}
 }
 
@@ -1904,6 +2098,7 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to activate MFA methods"})
 		return
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":  "MFA methods activated",
@@ -1964,10 +2159,17 @@ func (h *Handler) EmailSmsDisable(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
 
-	// Remove enabled flags
-	for _, m := range []string{"email", "sms"} {
-		h.redis.Del(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, m))
-		h.redis.Del(ctx, fmt.Sprintf(redisKeyEmailSmsSetup, userID, m))
+	// Remove every email/SMS state key in one Redis command so a transport
+	// failure cannot leave a partial disable reported as successful.
+	if err := h.redis.Del(ctx,
+		fmt.Sprintf(redisKeyEmailSmsEnabled, userID, "email"),
+		fmt.Sprintf(redisKeyEmailSmsEnabled, userID, "sms"),
+		fmt.Sprintf(redisKeyEmailSmsSetup, userID, "email"),
+		fmt.Sprintf(redisKeyEmailSmsSetup, userID, "sms"),
+	).Err(); err != nil {
+		h.log.Error("Failed to disable email/SMS MFA methods in Redis")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MFA service temporarily unavailable"})
+		return
 	}
 
 	// Also clear from recovery-only if present
@@ -1979,6 +2181,7 @@ func (h *Handler) EmailSmsDisable(c *gin.Context) {
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
 		h.log.Error("Failed to update MFA flags after email/sms disable", "error", err)
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorDisabled})
 
 	c.JSON(http.StatusOK, gin.H{"message": "Email/SMS MFA methods disabled"})
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -27,6 +28,12 @@ type OpsMetricsRuntime struct {
 	now      func() time.Time
 }
 
+func newOpsMetricsReceiverWithSecurityEvents(subscriber opsmetrics.Subscriber, nodeID string, secret []byte, counters *opsmetrics.Counters, log *logger.Logger, events securityevent.Emitter) *opsmetrics.Receiver {
+	receiver := opsmetrics.NewReceiver(subscriber, nodeID, secret, counters, log, nil)
+	receiver.SetSecurityEvents(events)
+	return receiver
+}
+
 func wireOpsMetricsRuntime(
 	db *sql.DB,
 	natsClient *natsclient.Client,
@@ -35,7 +42,11 @@ func wireOpsMetricsRuntime(
 	cfg config.OpsMetricsConfig,
 	log *logger.Logger,
 ) *OpsMetricsRuntime {
-	runtime, err := startOpsMetricsRuntime(db, natsClient, hub, counters, cfg, log)
+	return wireOpsMetricsRuntimeWithSecurityEvents(db, natsClient, hub, counters, cfg, log, securityevent.Discard)
+}
+
+func wireOpsMetricsRuntimeWithSecurityEvents(db *sql.DB, natsClient *natsclient.Client, hub *websocket.Hub, counters *opsmetrics.Counters, cfg config.OpsMetricsConfig, log *logger.Logger, events securityevent.Emitter) *OpsMetricsRuntime {
+	runtime, err := startOpsMetricsRuntimeWithSecurityEvents(db, natsClient, hub, counters, cfg, log, events)
 	if err != nil {
 		log.Error("Operations metrics runtime disabled", "reason", "startup_failed")
 		return nil
@@ -43,14 +54,7 @@ func wireOpsMetricsRuntime(
 	return runtime
 }
 
-func startOpsMetricsRuntime(
-	db *sql.DB,
-	natsClient *natsclient.Client,
-	hub *websocket.Hub,
-	counters *opsmetrics.Counters,
-	cfg config.OpsMetricsConfig,
-	log *logger.Logger,
-) (*OpsMetricsRuntime, error) {
+func startOpsMetricsRuntimeWithSecurityEvents(db *sql.DB, natsClient *natsclient.Client, hub *websocket.Hub, counters *opsmetrics.Counters, cfg config.OpsMetricsConfig, log *logger.Logger, events securityevent.Emitter) (*OpsMetricsRuntime, error) {
 	if !cfg.Enabled {
 		return nil, nil
 	}
@@ -62,20 +66,24 @@ func startOpsMetricsRuntime(
 	if err != nil {
 		return nil, err
 	}
-	receiver := opsmetrics.NewReceiver(
+	receiver := newOpsMetricsReceiverWithSecurityEvents(
 		natsClient,
 		cfg.NodeID,
 		[]byte(cfg.SharedSecret),
 		counters,
 		log,
-		nil,
+		events,
 	)
 	if err := receiver.Subscribe(); err != nil {
 		return nil, fmt.Errorf("subscribe to operations metrics snapshots: %w", err)
 	}
 	if err := natsClient.Flush(); err != nil {
-		_ = receiver.Unsubscribe()
-		return nil, fmt.Errorf("activate operations metrics subscriptions: %w", err)
+		receiver.MarkDependencyDegraded()
+		activationErr := fmt.Errorf("activate operations metrics subscriptions: %w", err)
+		if unsubscribeErr := receiver.Unsubscribe(); unsubscribeErr != nil {
+			return nil, errors.Join(activationErr, fmt.Errorf("unsubscribe operations metrics subscriptions: %w", unsubscribeErr))
+		}
+		return nil, activationErr
 	}
 
 	tracker := opsmetrics.NewActivityTracker()

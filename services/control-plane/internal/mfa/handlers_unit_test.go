@@ -1,9 +1,19 @@
 package mfa
 
 import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- hasEmailOrSms ---
@@ -160,6 +170,58 @@ func TestDecodeCircleSharesMultiple(t *testing.T) {
 	assert.Equal(t, []byte("abc"), decoded[0].EncryptedShare)
 	assert.Equal(t, "b", decoded[1].ContactID)
 	assert.Equal(t, []byte("def"), decoded[1].EncryptedShare)
+}
+
+func TestVerifyCodeFailsClosedWhenWebAuthnTokenStoreIsUnavailable(t *testing.T) {
+	h := &Handler{redis: redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})}
+	t.Cleanup(func() { require.NoError(t, h.redis.Close()) })
+
+	verified, err := h.VerifyCode(context.Background(), "user-fixture", "webauthn-inline-token-123456")
+
+	require.False(t, verified)
+	require.ErrorContains(t, err, "consume WebAuthn inline verification token")
+}
+
+// conflictingBackupCodeStore simulates another consumer committing after this
+// verifier reads the unused flags but before its conditional update executes.
+type conflictingBackupCodeStore struct {
+	*sql.DB
+	userID string
+}
+
+func (s *conflictingBackupCodeStore) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE user_mfa_totp SET backup_codes_used[1] = TRUE WHERE user_id = $1`, s.userID); err != nil {
+		return nil, fmt.Errorf("simulate competing backup-code consumer: %w", err)
+	}
+	return s.DB.ExecContext(ctx, query, args...)
+}
+
+func TestVerifyCodeRejectsBackupCodeCASConflict(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	userID := dbtest.CreateUser(t, db)
+	keyring, err := ParseKeyring(strings.Repeat("00", 32), 1, "")
+	require.NoError(t, err)
+	secretEnc, secretNonce, keyVersion, err := keyring.Seal([]byte("invalid-totp-seed"))
+	require.NoError(t, err)
+
+	const backupCode = "RECOV123" //nolint:gosec // one-time test fixture, not a deployed credential
+	backupHash := sha256.Sum256([]byte(backupCode))
+	_, err = db.Exec(`
+		INSERT INTO user_mfa_totp
+			(user_id, totp_secret_enc, totp_secret_nonce, key_version, enabled, confirmed, backup_codes_hash, backup_codes_used)
+		VALUES ($1, $2, $3, $4, TRUE, TRUE, $5, $6)`,
+		userID, secretEnc, secretNonce, keyVersion,
+		pq.Array([]string{fmt.Sprintf("%x", backupHash)}), pq.Array([]bool{false}))
+	require.NoError(t, err)
+
+	handler := NewHandler(db, nil, logger.New("test"), keyring, "test", nil, "test")
+	verified, err := handler.verifyCode(
+		context.Background(), &conflictingBackupCodeStore{DB: db, userID: userID.String()}, userID.String(), backupCode)
+
+	require.NoError(t, err)
+	require.False(t, verified, "the stale consumer must not redeem a backup code consumed by its competitor")
 }
 
 // --- socialRecoveryRequestInfo ---

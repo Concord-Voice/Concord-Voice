@@ -33,6 +33,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // authPackageDir is the directory the test scans. When `go test` runs the
@@ -163,6 +165,435 @@ func TestRecoveryForcedClearLogPrivacy(t *testing.T) {
 			return true
 		})
 	}
+}
+
+// securityEventProducerFiles is the complete Task 3 production surface. Keep
+// this explicit rather than walking internal/: a new security-event producer
+// must be deliberately added to the privacy review boundary.
+var securityEventProducerFiles = []string{
+	"handlers.go",
+	"oauth_adapter.go",
+	"../mfa/handlers.go",
+	"../sessions/handlers.go",
+	"../credepoch/credepoch.go",
+	"../middleware/ratelimit.go",
+	"../middleware/authban.go",
+	"../middleware/cfaccess.go",
+	"../middleware/attestation.go",
+	"../api/router.go",
+	"../admin/audit.go",
+	"../rbac/audit.go",
+	"../opsmetrics/receiver.go",
+	"../websocket/hub.go",
+	"../media/disk_watermark.go",
+	"../attestation/cache.go",
+	"../attestation/publish_handler.go",
+	"../attestation/verify_handler.go",
+}
+
+// TestSecurityEventsUseOnlyClosedConstants keeps Nightwatch's producer surface
+// free of request, identity, credential, and error data. Every explicitly set
+// Event field must be a securityevent constant, except the three closed,
+// server-derived identifier tuples below. Their exact use counts prevent either
+// a copied or removed exception from silently broadening the boundary.
+func TestSecurityEventsUseOnlyClosedConstants(t *testing.T) {
+	fset := token.NewFileSet()
+	var violations []string
+	allowedUses := make(map[closedEventIdentifierAllowance]int)
+	literals := 0
+	for _, path := range securityEventProducerFiles {
+		fileLiterals := 0
+		file, parseErr := parser.ParseFile(fset, path, nil, parser.AllErrors)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", path, parseErr)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			lit, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			if isNightwatchVerdictLiteral(lit) {
+				literals++
+				fileLiterals++
+				validateClosedEventLiteral(fset, path, lit, &violations, allowedUses)
+				return true
+			}
+			if !isSecurityEventLiteral(lit) {
+				return true
+			}
+			literals++
+			fileLiterals++
+			validateClosedEventLiteral(fset, path, lit, &violations, allowedUses)
+			return true
+		})
+		scanClosedEventAssignments(fset, path, file, &violations, allowedUses)
+		if fileLiterals == 0 {
+			t.Errorf("security-event privacy guard scanned no producer literals in %s", path)
+		}
+	}
+	if literals == 0 {
+		t.Fatal("security-event privacy guard scanned no producer literals")
+	}
+	for _, allowance := range closedEventIdentifierAllowances {
+		if actual := allowedUses[allowance]; actual != allowance.count {
+			violations = append(violations, "closed security-event identifier "+allowance.path+"."+allowance.field+"="+allowance.identifier+" used "+strconv.Itoa(actual)+" times, want "+strconv.Itoa(allowance.count))
+		}
+	}
+	if len(violations) != 0 {
+		t.Error(strings.Join(violations, "\n"))
+	}
+}
+
+func TestSecurityEventPrivacyGuardRejectsRequestDerivedField(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "request_derived.go", `package producer
+import "securityevent"
+func emit(routeFromRequest func() string) {
+	_ = securityevent.Event{ReasonCode: securityevent.ReasonCode(routeFromRequest())}
+}`, parser.AllErrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	ast.Inspect(file, func(node ast.Node) bool {
+		lit, ok := node.(*ast.CompositeLit)
+		if !ok || !isSecurityEventLiteral(lit) {
+			return true
+		}
+		for _, entry := range lit.Elts {
+			field, ok := entry.(*ast.KeyValueExpr)
+			if ok && !isSecurityEventConstant(field.Value) {
+				found = true
+			}
+		}
+		return true
+	})
+	if !found {
+		t.Fatal("privacy guard must reject a request-derived Event field")
+	}
+}
+
+func TestSecurityEventPrivacyGuardRejectsRequestDerivedVerdict(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "request_derived_verdict.go", `package producer
+import (
+  "middleware"
+  "securityevent"
+)
+func emit(requestValue func() string) {
+  _ = middleware.NightwatchVerdict{Reason: securityevent.ReasonCode(requestValue())}
+}`, parser.AllErrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var violations []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		lit, ok := node.(*ast.CompositeLit)
+		if ok && isNightwatchVerdictLiteral(lit) {
+			validateClosedEventLiteral(fset, "request_derived_verdict.go", lit, &violations, nil)
+		}
+		return true
+	})
+	if len(violations) == 0 {
+		t.Fatal("privacy guard must reject a request-derived NightwatchVerdict field")
+	}
+}
+
+func TestSecurityEventPrivacyGuardRejectsAssignmentForm(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "assignment.go", `package producer
+import (
+  "middleware"
+  "securityevent"
+)
+func emit(requestValue func() string) {
+  var event securityevent.Event
+  event.ReasonCode = securityevent.ReasonCode(requestValue())
+  var verdict middleware.NightwatchVerdict
+  verdict.Reason = securityevent.ReasonCode(requestValue())
+}`, parser.AllErrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var violations []string
+	scanClosedEventAssignments(fset, "assignment.go", file, &violations, nil)
+	joined := strings.Join(violations, "\n")
+	require.Contains(t, joined, "ReasonCode must be a securityevent constant")
+	require.Contains(t, joined, "Reason must be a securityevent constant")
+}
+
+type closedEventIdentifierAllowance struct {
+	path       string
+	field      string
+	identifier string
+	count      int
+}
+
+var closedEventIdentifierAllowances = []closedEventIdentifierAllowance{
+	{path: "handlers.go", field: "AuthMethod", identifier: "primaryAuthMethod", count: 2},
+	{path: "../admin/audit.go", field: "Outcome", identifier: "outcome", count: 5},
+	{path: "../rbac/audit.go", field: "EvidenceRef", identifier: "evidenceRef", count: 1},
+	// authenticateForRevoke receives only closed route constants from its three callers.
+	{path: "../sessions/handlers.go", field: "RouteTemplate", identifier: "route", count: 2},
+}
+
+func TestSecurityEventPrivacyGuardRejectsNonExactClosedIdentifier(t *testing.T) {
+	tests := []struct {
+		name  string
+		path  string
+		field string
+		expr  ast.Expr
+	}{
+		{name: "renamed", path: "handlers.go", field: "AuthMethod", expr: ast.NewIdent("primaryMethod")},
+		{name: "cross field", path: "handlers.go", field: "Outcome", expr: ast.NewIdent("primaryAuthMethod")},
+		{name: "cross file", path: "../admin/audit.go", field: "AuthMethod", expr: ast.NewIdent("primaryAuthMethod")},
+		{name: "call expression", path: "handlers.go", field: "AuthMethod", expr: &ast.CallExpr{Fun: ast.NewIdent("primaryAuthMethod")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, ok := closedEventIdentifierAllowanceFor(test.path, test.field, test.expr); ok {
+				t.Fatal("privacy guard accepted a non-exact identifier")
+			}
+		})
+	}
+}
+
+func validateClosedEventLiteral(fset *token.FileSet, path string, lit *ast.CompositeLit, violations *[]string, allowedUses map[closedEventIdentifierAllowance]int) {
+	for _, entry := range lit.Elts {
+		field, ok := entry.(*ast.KeyValueExpr)
+		if !ok {
+			*violations = append(*violations, fset.Position(entry.Pos()).String()+": unkeyed security-event composite literal is prohibited")
+			continue
+		}
+		key, _ := field.Key.(*ast.Ident)
+		if key != nil {
+			validateClosedEventField(fset, path, key.Name, field.Value, violations, allowedUses)
+		}
+	}
+}
+
+// scanClosedEventAssignments extends the composite-literal guard to typed
+// Event and NightwatchVerdict variables populated field-by-field. Scanning
+// each function independently prevents a same-named local in another function
+// from inheriting an Event classification.
+func scanClosedEventAssignments(fset *token.FileSet, path string, file *ast.File, violations *[]string, allowedUses map[closedEventIdentifierAllowance]int) {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		eventVariables := make(map[string]bool)
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			switch statement := node.(type) {
+			case *ast.DeclStmt:
+				declaration, ok := statement.Decl.(*ast.GenDecl)
+				if !ok || declaration.Tok != token.VAR {
+					return true
+				}
+				for _, specification := range declaration.Specs {
+					valueSpec, ok := specification.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for index, name := range valueSpec.Names {
+						if isClosedEventType(valueSpec.Type) || isClosedEventLiteralAt(valueSpec.Values, index, len(valueSpec.Names)) {
+							eventVariables[name.Name] = true
+						}
+					}
+				}
+			case *ast.AssignStmt:
+				for index, left := range statement.Lhs {
+					right, ok := assignmentValue(statement.Rhs, index, len(statement.Lhs))
+					if !ok {
+						continue
+					}
+					if name, ok := left.(*ast.Ident); ok && isClosedEventLiteralExpression(right) {
+						eventVariables[name.Name] = true
+						continue
+					}
+					selector, ok := left.(*ast.SelectorExpr)
+					if !ok || !eventVariables[identifierName(selector.X)] {
+						continue
+					}
+					validateClosedEventAssignmentField(fset, path, function.Name.Name, selector.Sel.Name, right, violations, allowedUses)
+				}
+			}
+			return true
+		})
+	}
+}
+
+func validateClosedEventAssignmentField(fset *token.FileSet, path, functionName, fieldName string, value ast.Expr, violations *[]string, allowedUses map[closedEventIdentifierAllowance]int) {
+	if isClosedNightwatchVerdictTransfer(path, functionName, fieldName, value) {
+		return
+	}
+	validateClosedEventField(fset, path, fieldName, value, violations, allowedUses)
+}
+
+// isClosedNightwatchVerdictTransfer permits exactly the typed boundary adapter
+// in router.go. It does not exempt the function: a new field or any value that
+// is not one of these already-closed verdict fields remains a violation.
+func isClosedNightwatchVerdictTransfer(path, functionName, fieldName string, value ast.Expr) bool {
+	if path != "../api/router.go" || functionName != "nightwatchVerdictEvent" {
+		return false
+	}
+	if fieldName == "RouteTemplate" {
+		identifier, ok := value.(*ast.Ident)
+		return ok && identifier.Name == "route"
+	}
+	selector, ok := value.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	if !ok || receiver.Name != "verdict" {
+		return false
+	}
+	return map[string]string{
+		"EventType":  "EventType",
+		"Outcome":    "Outcome",
+		"Severity":   "Severity",
+		"ReasonCode": "Reason",
+		"AuthMethod": "AuthMethod",
+	}[fieldName] == selector.Sel.Name
+}
+
+func validateClosedEventField(fset *token.FileSet, path, fieldName string, value ast.Expr, violations *[]string, allowedUses map[closedEventIdentifierAllowance]int) {
+	if isSecurityEventConstant(value) {
+		return
+	}
+	if allowance, ok := closedEventIdentifierAllowanceFor(path, fieldName, value); ok {
+		if allowedUses != nil {
+			allowedUses[allowance]++
+		}
+		return
+	}
+	*violations = append(*violations, fset.Position(value.Pos()).String()+": "+fieldName+" must be a securityevent constant")
+	ast.Inspect(value, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if !ok || !forbiddenSecurityEventIdentifier(identifier.Name) {
+			return true
+		}
+		*violations = append(*violations, fset.Position(identifier.Pos()).String()+": prohibited security-event data identifier "+identifier.Name)
+		return true
+	})
+}
+
+func assignmentValue(values []ast.Expr, index, count int) (ast.Expr, bool) {
+	if len(values) != count || index >= len(values) {
+		return nil, false
+	}
+	return values[index], true
+}
+
+func isClosedEventLiteralAt(values []ast.Expr, index, count int) bool {
+	value, ok := assignmentValue(values, index, count)
+	return ok && isClosedEventLiteralExpression(value)
+}
+
+func isClosedEventLiteralExpression(expression ast.Expr) bool {
+	literal, ok := expression.(*ast.CompositeLit)
+	return ok && (isSecurityEventLiteral(literal) || isNightwatchVerdictLiteral(literal))
+}
+
+func identifierName(expression ast.Expr) string {
+	identifier, _ := expression.(*ast.Ident)
+	if identifier == nil {
+		return ""
+	}
+	return identifier.Name
+}
+
+func TestSecurityEventPrivacyGuardRejectsUnkeyedCompositeLiterals(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "unkeyed.go", `package producer
+import ("middleware"; "securityevent")
+func emit() {
+  _ = securityevent.Event{securityevent.EventAuthentication}
+  _ = middleware.NightwatchVerdict{securityevent.EventAuthentication}
+}`, parser.AllErrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var violations []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		lit, ok := node.(*ast.CompositeLit)
+		if ok && (isSecurityEventLiteral(lit) || isNightwatchVerdictLiteral(lit)) {
+			validateClosedEventLiteral(fset, "unkeyed.go", lit, &violations, nil)
+		}
+		return true
+	})
+	require.Contains(t, strings.Join(violations, "\n"), "unkeyed security-event composite literal is prohibited")
+}
+
+func closedEventIdentifierAllowanceFor(path, field string, expr ast.Expr) (closedEventIdentifierAllowance, bool) {
+	identifier, ok := expr.(*ast.Ident)
+	if !ok {
+		return closedEventIdentifierAllowance{}, false
+	}
+	for _, allowance := range closedEventIdentifierAllowances {
+		if allowance.path == path && allowance.field == field && allowance.identifier == identifier.Name {
+			return allowance, true
+		}
+	}
+	return closedEventIdentifierAllowance{}, false
+}
+
+func isSecurityEventLiteral(lit *ast.CompositeLit) bool {
+	return isSecurityEventType(lit.Type)
+}
+
+func isSecurityEventType(expression ast.Expr) bool {
+	typeName, ok := expression.(*ast.SelectorExpr)
+	if !ok || typeName.Sel.Name != "Event" {
+		return false
+	}
+	pkg, ok := typeName.X.(*ast.Ident)
+	return ok && pkg.Name == "securityevent"
+}
+
+func isNightwatchVerdictLiteral(lit *ast.CompositeLit) bool {
+	return isNightwatchVerdictType(lit.Type)
+}
+
+func isNightwatchVerdictType(expression ast.Expr) bool {
+	switch typeName := expression.(type) {
+	case *ast.Ident:
+		// Middleware producers instantiate their local type directly; auth's
+		// synthetic regression fixture qualifies it as middleware.NightwatchVerdict.
+		return typeName.Name == "NightwatchVerdict"
+	case *ast.SelectorExpr:
+		if typeName.Sel.Name != "NightwatchVerdict" {
+			return false
+		}
+		pkg, ok := typeName.X.(*ast.Ident)
+		return ok && pkg.Name == "middleware"
+	default:
+		return false
+	}
+}
+
+func isClosedEventType(expression ast.Expr) bool {
+	return isSecurityEventType(expression) || isNightwatchVerdictType(expression)
+}
+
+func isSecurityEventConstant(expr ast.Expr) bool {
+	selector, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == "securityevent"
+}
+
+func forbiddenSecurityEventIdentifier(name string) bool {
+	lower := strings.ToLower(name)
+	for _, forbidden := range []string{"user", "email", "ip", "token", "device", "machine", "socket", "server", "channel", "error", "cause", "stack", "code", "credential"} {
+		if strings.Contains(lower, forbidden) {
+			return true
+		}
+	}
+	return false
 }
 
 // loggerMethod returns "Info"/"Warn"/"Error"/"Debug"/"Fatal" if fun has the

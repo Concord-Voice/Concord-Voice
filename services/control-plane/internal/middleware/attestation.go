@@ -12,6 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
@@ -206,6 +207,7 @@ func rejectAtt(c *gin.Context, log *logger.Logger, rdb *redis.Client, code attes
 // from any reject path that has loaded the TokenRecord (currently:
 // ensureNotRevoked). Per finding #24 of #1264 review.
 func rejectAttForVersion(c *gin.Context, log *logger.Logger, rdb *redis.Client, code attestation.ErrorCode, version string) {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonAttestationRejected})
 	// LogRejected best-effort writes an hourly Redis counter + structured log.
 	// Platform remains "" — the middleware doesn't know it (would require
 	// hydrating the cache from this layer, which would duplicate the lookup

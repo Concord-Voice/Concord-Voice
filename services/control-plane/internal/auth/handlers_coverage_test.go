@@ -1876,12 +1876,13 @@ func TestCompleteLoginViaRefreshAfterMFABypass(t *testing.T) {
 	var loginBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &loginBody)
 	refreshToken := loginBody["refresh_token"].(string)
+	refreshSessionID := sessionIDForRefreshToken(t, ts, refreshToken)
 
 	// Enable MFA
 	enableMFA(t, ts, user.ID, []string{"email"})
 
 	// Set the MFA upgrade bypass key (simulates MFA verification completing)
-	bypassKey := fmt.Sprintf("mfa_upgrade_bypass:%s", user.ID)
+	bypassKey := auth.MFAUpgradeBypassKey(user.ID, refreshSessionID)
 	ts.Redis.Set(context.Background(), bypassKey, "1", 5*time.Minute)
 
 	// Refresh should succeed — bypass key is consumed

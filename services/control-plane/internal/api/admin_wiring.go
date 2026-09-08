@@ -12,6 +12,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/admin"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -37,14 +38,19 @@ import (
 // flips ADMIN_CONSOLE_ENABLED=true once the console is ready (validate() then
 // requires a real RP config).
 func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, metricsReader opsmetrics.Reader, cfg *config.Config, log *logger.Logger) {
+	wireAdminRoutesWithSecurityEvents(router, db, rdb, metricsReader, cfg, log, securityevent.Discard)
+}
+
+func wireAdminRoutesWithSecurityEvents(router *gin.Engine, db *sql.DB, rdb *redis.Client, metricsReader opsmetrics.Reader, cfg *config.Config, log *logger.Logger, events securityevent.Emitter) *admin.Handler {
 	if !cfg.AdminConsoleEnabled {
 		log.Info("Admin console disabled (ADMIN_CONSOLE_ENABLED=false); /admin routes not mounted")
-		return
+		return nil
 	}
 	handler, err := admin.NewHandler(db, rdb, log, cfg)
 	if err != nil {
 		log.Fatal("Failed to create admin auth handler", "error", err)
 	}
+	handler.SetSecurityEvents(events)
 	var metricsNodeID string
 	var metricsInterval time.Duration
 	if cfg.OpsMetrics.Enabled {
@@ -62,4 +68,5 @@ func wireAdminRoutes(router *gin.Engine, db *sql.DB, rdb *redis.Client, metricsR
 	})
 	edgeGated.Use(middleware.RequireCloudflareAccessFromConfig(cfg, log.Logger))
 	admin.RegisterRoutes(edgeGated, handler, metricsHandler, rdb, admin.NewUI(os.DirFS("/home/appuser/admin-ui")))
+	return handler
 }

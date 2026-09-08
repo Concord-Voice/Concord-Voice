@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 )
@@ -221,6 +222,7 @@ func resolveRateLimitTTL(
 }
 
 func abortRateLimitExceeded(c *gin.Context, config RateLimitConfig, ttl time.Duration) {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonRateLimitExceeded})
 	c.Header("Retry-After", fmt.Sprintf("%d", int(ttl.Seconds())))
 	if config.ExceededHandler != nil {
 		config.ExceededHandler(c)
@@ -234,6 +236,7 @@ func abortRateLimitExceeded(c *gin.Context, config RateLimitConfig, ttl time.Dur
 }
 
 func abortOnRateLimitBackendError(c *gin.Context, config RateLimitConfig) bool {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonRateLimitBackendUnavailable})
 	if !config.FailClosed {
 		return false
 	}

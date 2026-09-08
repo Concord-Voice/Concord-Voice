@@ -52,6 +52,24 @@ function signToken(payload: Record<string, unknown>, options: jwt.SignOptions = 
 describe('createAuthMiddleware', () => {
   const middleware = createAuthMiddleware();
 
+  it('emits a fixed denial event for rejected handshakes', () => {
+    const emit = vi.fn();
+    const rejectingMiddleware = createAuthMiddleware(emit);
+    const socket = createMockSocket({ username: 'alice' });
+    const next = vi.fn();
+
+    rejectingMiddleware(socket as any, next);
+
+    expect(emit).toHaveBeenCalledWith({
+      eventType: 'authentication',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'invalid_credentials',
+      authMethod: 'session',
+      routeTemplate: 'socket.join',
+    });
+  });
+
   it('rejects when no token is provided', () => {
     const socket = createMockSocket({ username: 'alice' });
     const next = vi.fn();
@@ -1258,7 +1276,11 @@ describe('service-hop proof on control-plane calls', () => {
     // the failure is quieter and the coverage matters more, not less.
     mockFetch().mockResolvedValueOnce({ ok: true });
 
-    await releaseDMVoiceAuthorization('conv-1', 'jwt-token', '11111111-1111-4111-8111-111111111111');
+    await releaseDMVoiceAuthorization(
+      'conv-1',
+      'jwt-token',
+      '11111111-1111-4111-8111-111111111111'
+    );
 
     const headers = (mockFetch().mock.calls[0][1] as RequestInit).headers as Record<string, string>;
     expect(headers['X-Concord-Service-Proof']).toBe(
@@ -1280,7 +1302,7 @@ describe('service-hop proof on control-plane calls', () => {
     expect(headers).not.toHaveProperty('X-Concord-Client-Version');
   });
 
-  it('signs a path with no query string, matching the control plane\'s RequestURI binding', async () => {
+  it("signs a path with no query string, matching the control plane's RequestURI binding", async () => {
     // The control plane verifies against c.Request.URL.RequestURI(), which
     // includes the query string. These calls carry none, so the two coincide —
     // asserted rather than assumed, because a future query parameter here would
@@ -1358,7 +1380,10 @@ describe('control-plane denial diagnosability', () => {
       error: 'Client version too old',
     });
 
-    expect(meta).toMatchObject({ status: 403, reason: 'CLIENT_VERSION_TOO_OLD: Client version too old' });
+    expect(meta).toMatchObject({
+      status: 403,
+      reason: 'CLIENT_VERSION_TOO_OLD: Client version too old',
+    });
     // The user-facing string must stay status-derived: it must not disclose
     // which gate rejected the caller.
     expect(result.error).toBe('Not authorized to access this channel');

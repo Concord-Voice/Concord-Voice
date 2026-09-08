@@ -29,6 +29,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -58,11 +59,13 @@ type MFAChecker interface {
 	// Returns the signed JWT and the JTI. Stores remember_me in Redis keyed by JTI.
 	// credEpoch is the user's durable credential epoch at authorization time (#2418);
 	// CompleteLogin re-checks it before minting, so an unstamped challenge is refused
-	// for any user who has rotated.
-	GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string) (token string, jti string, err error)
+	// for any user who has rotated. primaryAuthMethod is the server-authenticated
+	// password, SSO, or session path whose provenance must survive MFA completion.
+	GenerateLoginChallenge(ctx context.Context, userID string, rememberMe bool, credEpoch string, primaryAuthMethod securityevent.AuthMethod) (token string, jti string, err error)
 	// GenerateUpgradeChallenge creates a challenge token for pre-MFA sessions that
-	// need to verify MFA before continuing. Issues fresh tokens on success.
-	GenerateUpgradeChallenge(ctx context.Context, userID string, rememberMe bool) (token string, jti string, err error)
+	// need to verify MFA before continuing. The signed challenge is bound to the
+	// refresh session that requested it.
+	GenerateUpgradeChallenge(ctx context.Context, userID, refreshSessionID string) (token string, jti string, err error)
 	// BeginWebAuthnLogin starts a WebAuthn assertion ceremony and stores session data
 	// in Redis keyed by the challenge JTI. Returns credential request options for the client.
 	// Returns nil options if user has no WebAuthn credentials.
@@ -151,6 +154,46 @@ type Handler struct {
 	credFence                 *credepoch.Fence
 	keyBroadcaster            keyrotation.Broadcaster
 	initialDistributorChecker keyrotation.InitialDistributorChecker
+	securityEvents            securityevent.Emitter
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without widening this
+// high-fanout constructor. Telemetry never changes the authentication result.
+func (h *Handler) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	h.securityEvents = events
+}
+
+func (h *Handler) emitSecurityEvent(ctx context.Context, event securityevent.Event) {
+	if h.securityEvents != nil {
+		h.securityEvents.Emit(ctx, event)
+	}
+}
+
+func (h *Handler) emitHTTPEvent(c *gin.Context, event securityevent.Event) {
+	h.emitSecurityEvent(c.Request.Context(), event)
+	middleware.MarkNightwatchHandled(c)
+}
+
+// loginInvalidCredentialsEvent is deliberately shared by the unknown-user and
+// wrong-password branches. Their serialized telemetry must remain identical so
+// the event stream cannot become an account-enumeration oracle.
+func loginInvalidCredentialsEvent() securityevent.Event {
+	return securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword, RouteTemplate: securityevent.RouteAuthLogin}
+}
+
+func recoveryInvalidCredentialsEvent() securityevent.Event {
+	return securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryVerifyCode}
+}
+
+func accountDisabledEvent() securityevent.Event {
+	return securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonAccountDisabled, AuthMethod: securityevent.AuthPassword, RouteTemplate: securityevent.RouteAuthLogin}
+}
+
+func accountLockedEvent() securityevent.Event {
+	return securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonAccountLocked, AuthMethod: securityevent.AuthPassword, RouteTemplate: securityevent.RouteAuthLogin}
 }
 
 // SetCredentialFence injects the per-user credential-epoch fence (#2201).
@@ -239,13 +282,14 @@ func NewHandler(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSe
 // deployment-mode entitlement seam used for JWT tier claims.
 func NewHandlerForInstance(db *sql.DB, redisClient *redis.Client, log *logger.Logger, jwtSecret string, hub SessionDisconnector, instanceType string) *Handler {
 	return &Handler{
-		db:        db,
-		redis:     redisClient,
-		log:       log,
-		jwtSecret: jwtSecret,
-		hub:       hub,
-		pending:   NewPendingRepo(db),
-		entCache:  entitlements.NewCacheForInstance(redisClient, db, instanceType),
+		db:             db,
+		redis:          redisClient,
+		log:            log,
+		jwtSecret:      jwtSecret,
+		hub:            hub,
+		pending:        NewPendingRepo(db),
+		entCache:       entitlements.NewCacheForInstance(redisClient, db, instanceType),
+		securityEvents: securityevent.Discard,
 	}
 }
 
@@ -1060,7 +1104,9 @@ func (h *Handler) verifyCredentials(ctx context.Context, c *gin.Context, email, 
 	}
 	if !valid {
 		h.recordFailedLogin(ctx, email)
-		middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		h.emitHTTPEvent(c, loginInvalidCredentialsEvent())
+		middleware.MarkAuthFailureOutcome(c, outcome)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
 		return false
 	}
@@ -1069,7 +1115,7 @@ func (h *Handler) verifyCredentials(ctx context.Context, c *gin.Context, email, 
 
 // credEpoch is the epoch the password was verified under; it is stamped into the
 // challenge so CompleteLogin can refuse a completion that races a reset (#2418).
-func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID string, rememberMe bool, credEpoch string) {
+func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID string, rememberMe bool, credEpoch string, primaryAuthMethod securityevent.AuthMethod) bool {
 	// #2450: these were blank-discarded. errcheck honors an explicit `_`, so the
 	// linter never flagged them (the review-only class in [internal]rules/backend.md,
 	// founding incidents #1142/#1154). On error the response shipped
@@ -1080,22 +1126,26 @@ func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID
 	// loginMethods is load-bearing for the response, so its failure is fatal.
 	// allMethods only feeds the recovery-only hint, so a failure there degrades
 	// to an empty hint rather than blocking a login that can still proceed.
-	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
-	if err != nil {
-		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
-	}
 	loginMethods, err := h.mfaChecker.GetLoginMethods(ctx, userID)
 	if err != nil {
 		h.log.Error("Failed to read MFA login methods", "error", err, "user_id", userID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return true
 	}
-	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, userID, rememberMe, credEpoch)
+	if len(loginMethods) == 0 {
+		return false
+	}
+	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
+	if err != nil {
+		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
+	}
+	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, userID, rememberMe, credEpoch, primaryAuthMethod)
 	if mfaErr != nil {
 		h.log.Error("Failed to generate MFA challenge", "error", mfaErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return true
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: primaryAuthMethod, RouteTemplate: securityevent.RouteAuthLogin})
 
 	recoveryOnly := computeRecoveryOnlyMethods(allMethods, loginMethods)
 
@@ -1110,6 +1160,7 @@ func (h *Handler) handleMFAChallenge(ctx context.Context, c *gin.Context, userID
 	}
 	addWebAuthnOptions(ctx, h, resp, loginMethods, userID, jti)
 	c.JSON(http.StatusOK, resp)
+	return true
 }
 
 func addWebAuthnOptions(ctx context.Context, h *Handler, resp gin.H, loginMethods []string, userID, jti string) {
@@ -1143,6 +1194,7 @@ func (h *Handler) Login(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	if h.checkLoginLockout(ctx, req.Email) {
+		h.emitHTTPEvent(c, accountLockedEvent())
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
 		return
 	}
@@ -1150,7 +1202,9 @@ func (h *Handler) Login(c *gin.Context) {
 	user, loginEpoch, err := h.lookupUserForLogin(req.Email)
 	if err == sql.ErrNoRows {
 		h.recordFailedLogin(ctx, req.Email)
-		middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		h.emitHTTPEvent(c, loginInvalidCredentialsEvent())
+		middleware.MarkAuthFailureOutcome(c, outcome)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
 		return
 	}
@@ -1205,6 +1259,7 @@ func (h *Handler) Login(c *gin.Context) {
 	// prober. CompleteLogin re-checks this (closing the disable-between-MFA-challenge
 	// -and-verify race for MFA accounts).
 	if user.Disabled {
+		h.emitHTTPEvent(c, accountDisabledEvent())
 		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
 		return
 	}
@@ -1212,17 +1267,22 @@ func (h *Handler) Login(c *gin.Context) {
 	h.clearLoginAttempts(ctx, req.Email)
 	rememberMe := resolveRememberMe(&req)
 
-	if h.mfaChecker != nil && h.mfaChecker.IsEnabled(ctx, user.ID) {
-		h.handleMFAChallenge(ctx, c, user.ID, rememberMe, loginEpoch)
+	if h.mfaChecker != nil && h.handleMFAChallenge(ctx, c, user.ID, rememberMe, loginEpoch, securityevent.AuthPassword) {
 		return
 	}
 
-	h.CompleteLogin(c, user.ID, rememberMe, loginEpoch)
+	h.CompleteLogin(c, user.ID, rememberMe, loginEpoch, securityevent.AuthPassword)
 }
 
 // CompleteLogin issues tokens and creates a session for the given user.
 // Called directly from Login (no MFA) or from the MFA verify handler after successful verification.
-func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string) {
+func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, expectedEpoch string, primaryAuthMethod securityevent.AuthMethod) bool {
+	primaryAuthMethod, valid := loginPrimaryAuthMethod(primaryAuthMethod)
+	if !valid {
+		h.log.Warn("Login mint refused: invalid primary authentication method")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
+		return false
+	}
 	// #2418: bind this mint to the epoch the login was AUTHORIZED under — the epoch
 	// read alongside the password verification (direct path) or stamped into the MFA
 	// challenge at issuance (MFA path). The whole mint runs in ONE transaction holding
@@ -1244,7 +1304,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	if err != nil {
 		h.log.Error("Failed to begin login mint tx", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -1265,11 +1325,12 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	); err != nil {
 		h.log.Error("Failed to lock user for login mint", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 	if user.Disabled {
+		h.emitHTTPEvent(c, accountDisabledEvent())
 		c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
-		return
+		return false
 	}
 
 	// Refuse if the durable epoch advanced past the one this login was authorized
@@ -1277,8 +1338,9 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	// user who has rotated — fail closed. Log the outcome only, never epoch values.
 	if err := credepoch.MatchEpoch(credEpoch, expectedEpoch); err != nil {
 		h.log.Warn("Login mint refused: credential epoch superseded", "user_id", userID)
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventCredentialEpoch, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonCredentialEpochMismatch})
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidCredentials})
-		return
+		return false
 	}
 
 	// Read the E2EE keys BEFORE minting anything. This ordering is load-bearing:
@@ -1293,7 +1355,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	).Scan(&keys.UserID, &keys.WrappedPrivateKey, &keys.KeyDerivationSalt, &keys.KeyVersion, &keys.KeyDerivationAlg); err != nil {
 		h.log.Error("Failed to fetch user keys", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 
 	// Generate access token (JWT, 15 min). tokenID (the refresh-session id) is
@@ -1303,7 +1365,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	if err != nil {
 		h.log.Error(errMsgFailedAccessToken, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 
 	// Generate refresh token (random, 30 days)
@@ -1311,7 +1373,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	if err != nil {
 		h.log.Error(errMsgFailedRefreshToken, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 
 	// Store refresh token in database
@@ -1341,7 +1403,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 		); err != nil {
 			h.log.Error("Failed to revoke same-device sessions", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-			return
+			return false
 		}
 	} else if _, err := tx.ExecContext(ctx,
 		`UPDATE refresh_tokens SET revoked_at = NOW()
@@ -1350,7 +1412,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	); err != nil {
 		h.log.Error("Failed to revoke same-origin sessions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 
 	if _, err := tx.ExecContext(ctx,
@@ -1360,13 +1422,13 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	); err != nil {
 		h.log.Error("Failed to store refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit login mint", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgLoginFailed})
-		return
+		return false
 	}
 
 	// Cookie MaxAge: 30 days if remember_me, session-scoped otherwise
@@ -1382,6 +1444,7 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 	// (credentials + MFA if enabled). This prevents resetting the counter
 	// by repeatedly passing the credential step while brute-forcing MFA.
 	middleware.ClearAuthFailures(c.Request.Context(), h.redis, c.ClientIP())
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonAuthenticationSucceeded, AuthMethod: primaryAuthMethod, RouteTemplate: securityevent.RouteAuthLogin})
 
 	h.log.Info("User logged in (MFA verified)", "user_id", userID)
 
@@ -1399,6 +1462,21 @@ func (h *Handler) CompleteLogin(c *gin.Context, userID string, rememberMe bool, 
 			"key_derivation_alg":  keys.KeyDerivationAlg,
 		},
 	})
+	return true
+}
+
+// loginPrimaryAuthMethod admits only values issued by the server's primary
+// authentication paths. Empty is the legacy MFA-challenge format and maps to
+// password; unknown nonempty values are rejected before any session mint.
+func loginPrimaryAuthMethod(method securityevent.AuthMethod) (securityevent.AuthMethod, bool) {
+	switch method {
+	case "", securityevent.AuthPassword:
+		return securityevent.AuthPassword, true
+	case securityevent.AuthSSO, securityevent.AuthSession:
+		return method, true
+	default:
+		return "", false
+	}
 }
 
 // Refresh handles access token refresh with token rotation.
@@ -1528,6 +1606,7 @@ func (h *Handler) attemptGracePeriodRecovery(c *gin.Context, tokenHash string) b
 		"user_id", revokedUserID,
 		"same_ip", revokedIP == requestIP, "same_ua", revokedUA == requestUA,
 		"revoked_ago_ms", time.Since(revokedAt).Milliseconds())
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonRefreshReplay, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgInvalidRefreshToken})
 	return true
 }
@@ -1598,6 +1677,7 @@ func (h *Handler) handleTokenTheft(c *gin.Context, token models.RefreshToken) bo
 		h.hub.DisconnectUser(uid)
 	}
 	h.triggerTheftKeyRevocations(token.UserID)
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonTokenTheftSuspected, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 
 	c.JSON(http.StatusUnauthorized, gin.H{
 		"error": "Session terminated: potential token theft detected", "error_code": "session_theft_detected"})
@@ -1607,7 +1687,7 @@ func (h *Handler) handleTokenTheft(c *gin.Context, token models.RefreshToken) bo
 // handleSuspiciousMachineID handles same-IP but different machine ID — suspicious but not theft.
 // Returns true if the response was written (MFA challenge sent), false to allow.
 func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.RefreshToken, requestMachineID string) bool {
-	if h.mfaChecker == nil || !h.mfaChecker.IsEnabled(c.Request.Context(), token.UserID) {
+	if h.mfaChecker == nil {
 		h.log.Warn("Refresh from different machine_id but same IP (no MFA: allowing)",
 			"user_id", token.UserID, "stored_machine_id", token.MachineID,
 			"request_machine_id", requestMachineID)
@@ -1615,6 +1695,26 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 	}
 
 	ctx := c.Request.Context()
+	loginMethods, loginMethodsErr := h.mfaChecker.GetLoginMethods(ctx, token.UserID)
+	if loginMethodsErr != nil {
+		h.log.Error("Failed to read MFA login methods for suspicious refresh", "error", loginMethodsErr, "user_id", token.UserID)
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return true
+	}
+	if len(loginMethods) == 0 {
+		h.log.Warn("Refresh from different machine_id but same IP (no MFA: allowing)",
+			"user_id", token.UserID, "stored_machine_id", token.MachineID,
+			"request_machine_id", requestMachineID)
+		return false
+	}
+	if _, methodsErr := h.mfaChecker.GetEnabledMethods(ctx, token.UserID); methodsErr != nil {
+		h.log.Error("Failed to read MFA methods for suspicious refresh", "error", methodsErr, "user_id", token.UserID)
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return true
+	}
+
 	// #2418: stamp the epoch into the challenge. Unlike the GenerateLoginChallenge
 	// failure below, this one does NOT degrade-to-allow: passing "" would mint a
 	// claimless challenge that CompleteLogin rejects for a rotated user, turning a
@@ -1624,13 +1724,16 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 	if epochErr != nil {
 		h.log.Error("Failed to read credential epoch for suspicious-refresh challenge",
 			"error", epochErr, "user_id", token.UserID)
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 		return true
 	}
-	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, token.UserID, token.RememberMe, suspiciousEpoch)
+	challengeToken, jti, mfaErr := h.mfaChecker.GenerateLoginChallenge(ctx, token.UserID, token.RememberMe, suspiciousEpoch, securityevent.AuthSession)
 	if mfaErr != nil {
 		h.log.Error("Failed to generate suspicious refresh MFA challenge", "error", mfaErr)
-		return false // Graceful degradation — allow
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return true
 	}
 
 	h.log.Warn("Suspicious refresh: different machine_id, same IP — MFA required",
@@ -1639,11 +1742,12 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 
 	resp, respErr := h.buildMFAChallengeResponse(ctx, "suspicious_session_mfa", "Session verification required", challengeToken, token.UserID, jti)
 	if respErr != nil {
-		// Same graceful degradation as the GenerateLoginChallenge failure above — better to
-		// allow the refresh than to hand back a challenge with no selectable method (#2450).
 		h.log.Error("Failed to build suspicious refresh MFA challenge", "error", respErr)
-		return false
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
+		return true
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusForbidden, resp)
 	return true
 }
@@ -1651,28 +1755,39 @@ func (h *Handler) handleSuspiciousMachineID(c *gin.Context, token models.Refresh
 // checkPreMFASessionLock checks if a pre-MFA session needs an upgrade challenge.
 // Returns true if the response was written (MFA upgrade required).
 func (h *Handler) checkPreMFASessionLock(c *gin.Context, token models.RefreshToken) bool {
-	if h.mfaChecker == nil || !h.mfaChecker.IsEnabled(c.Request.Context(), token.UserID) {
+	if h.mfaChecker == nil {
 		return false
 	}
 
 	ctx := c.Request.Context()
-	bypassKey := fmt.Sprintf("mfa_upgrade_bypass:%s", token.UserID)
-	if h.redis.Exists(ctx, bypassKey).Val() > 0 {
-		h.redis.Del(ctx, bypassKey)
+	loginMethods, err := h.mfaChecker.GetLoginMethods(ctx, token.UserID)
+	if err != nil {
+		return h.failPreMFASessionLock(c, "Failed to read MFA login methods for pre-MFA session", err, token.UserID)
+	}
+	if len(loginMethods) == 0 {
+		return false
+	}
+	bypassKey := MFAUpgradeBypassKey(token.UserID, token.ID)
+	bypassConsumed, err := h.redis.Del(ctx, bypassKey).Result()
+	if err != nil {
+		return h.failPreMFASessionLock(c, "Failed to consume pre-MFA session bypass", err, token.UserID)
+	}
+	if bypassConsumed == 1 {
 		h.log.Info("Pre-MFA session bypass consumed", "user_id", token.UserID)
 		return false
 	}
 
 	var mfaEnabledAt sql.NullTime
-	_ = h.db.QueryRow(`SELECT mfa_enabled_at FROM users WHERE id = $1`, token.UserID).Scan(&mfaEnabledAt)
+	if err := h.db.QueryRow(`SELECT mfa_enabled_at FROM users WHERE id = $1`, token.UserID).Scan(&mfaEnabledAt); err != nil {
+		return h.failPreMFASessionLock(c, "Failed to read MFA enablement time for pre-MFA session", err, token.UserID)
+	}
 	if !mfaEnabledAt.Valid || !token.CreatedAt.Before(mfaEnabledAt.Time) {
 		return false
 	}
 
-	challengeToken, jti, mfaErr := h.mfaChecker.GenerateUpgradeChallenge(ctx, token.UserID, token.RememberMe)
+	challengeToken, jti, mfaErr := h.mfaChecker.GenerateUpgradeChallenge(ctx, token.UserID, token.ID)
 	if mfaErr != nil {
-		h.log.Error("Failed to generate pre-MFA session challenge", "error", mfaErr)
-		return false // Don't block on failure
+		return h.failPreMFASessionLock(c, "Failed to generate pre-MFA session challenge", mfaErr, token.UserID)
 	}
 
 	h.log.Info("Pre-MFA session requires MFA verification",
@@ -1682,12 +1797,23 @@ func (h *Handler) checkPreMFASessionLock(c *gin.Context, token models.RefreshTok
 		"This session was created before MFA was enabled. Please verify your identity.",
 		challengeToken, token.UserID, jti)
 	if respErr != nil {
-		// Matches the GenerateUpgradeChallenge failure above — don't block, and don't ship
-		// a challenge the user cannot answer (#2450).
-		h.log.Error("Failed to build pre-MFA session challenge", "error", respErr)
-		return false
+		return h.failPreMFASessionLock(c, "Failed to build pre-MFA session challenge", respErr, token.UserID)
 	}
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusForbidden, resp)
+	return true
+}
+
+// MFAUpgradeBypassKey binds a completed upgrade challenge to the exact refresh
+// session that requested it. The MFA package writes this key; Refresh consumes it.
+func MFAUpgradeBypassKey(userID, refreshSessionID string) string {
+	return fmt.Sprintf("mfa_upgrade_bypass:%s:%s", userID, refreshSessionID)
+}
+
+func (h *Handler) failPreMFASessionLock(c *gin.Context, message string, err error, userID string) bool {
+	h.log.Error(message, "error", err, "user_id", userID)
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgRefreshFailed})
 	return true
 }
 
@@ -1702,22 +1828,24 @@ func (h *Handler) checkPreMFASessionLock(c *gin.Context, token models.RefreshTok
 // challenge token: the client renders an MFA prompt with nothing selectable, the challenge
 // JTI is burned, and nothing is logged.
 //
-// It now returns an error rather than a half-built response. Callers already degrade to
-// `return false` on their sibling GenerateChallenge error, so they keep that exact posture
-// — the point is to never ship an unusable challenge, not to add a new failure mode.
+// It now returns an error rather than a half-built response. Refresh callers fail closed
+// before rotation; the point is to never ship an unusable challenge.
 // ctx is the request context (was context.Background(), which discarded cancellation and
 // deadline across three backing calls).
 func (h *Handler) buildMFAChallengeResponse(ctx context.Context, errorCode, message, challengeToken, userID, jti string) (gin.H, error) {
-	// allMethods only feeds the recovery-only hint, so it degrades to an empty hint.
-	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
-	if err != nil {
-		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
-	}
 	// loginMethods is load-bearing for the response — an empty list is the hard-stuck bug.
 	loginMethods, err := h.mfaChecker.GetLoginMethods(ctx, userID)
 	if err != nil {
 		h.log.Error("Failed to read MFA login methods", "error", err, "user_id", userID)
 		return nil, fmt.Errorf("read MFA login methods: %w", err)
+	}
+	if len(loginMethods) == 0 {
+		return nil, errors.New("no login-eligible MFA methods")
+	}
+	// allMethods only feeds the recovery-only hint, so it degrades to an empty hint.
+	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
+	if err != nil {
+		h.log.Error("Failed to read enabled MFA methods", "error", err, "user_id", userID)
 	}
 
 	resp := gin.H{
@@ -1869,6 +1997,7 @@ func (h *Handler) rotateAndRespond(c *gin.Context, token models.RefreshToken, re
 		return
 	}
 
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRefreshRotated, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusOK, gin.H{
 		"access_token":        accessToken,
 		"refresh_token":       newRefreshToken,
@@ -2014,6 +2143,7 @@ func (h *Handler) handleGracePeriodRefresh(c *gin.Context, userID string, revoke
 	h.log.Info("Session recovered via grace period refresh",
 		"user_id", userID, "new_session_id", newTokenID)
 
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRefreshRotated, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthRefresh})
 	c.JSON(http.StatusOK, gin.H{
 		"access_token":        accessToken,
 		"refresh_token":       newRefreshToken,
@@ -2177,6 +2307,9 @@ func (h *Handler) Logout(c *gin.Context) {
 
 	if revoked.cookieAuthorized && revokedSessionID != "" {
 		SetRefreshCookie(c, "", -1)
+	}
+	if revokedSessionID != "" {
+		h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteAuthLogout})
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
@@ -2411,7 +2544,9 @@ func validateRecoveryCodeFormat(raw string) (string, string) {
 func (h *Handler) fetchRecoveryRecord(ctx context.Context, c *gin.Context, redisKey string) *recoveryRecord {
 	data, err := h.redis.Get(ctx, redisKey).Bytes()
 	if err == redis.Nil {
-		middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
+		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		middleware.MarkAuthFailureOutcome(c, outcome)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryCode, "attempts_remaining": 0})
 		return nil
 	}
@@ -2430,7 +2565,9 @@ func (h *Handler) fetchRecoveryRecord(ctx context.Context, c *gin.Context, redis
 
 	if record.Attempts >= recoveryMaxAttempts {
 		h.redis.Del(ctx, redisKey)
-		middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
+		outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+		middleware.MarkAuthFailureOutcome(c, outcome)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryCode, "attempts_remaining": 0})
 		return nil
 	}
@@ -2449,7 +2586,9 @@ func (h *Handler) verifyRecoveryCode(ctx context.Context, c *gin.Context, code s
 	if ttl > 0 {
 		h.redis.Set(ctx, redisKey, updated, ttl)
 	}
-	middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+	h.emitHTTPEvent(c, recoveryInvalidCredentialsEvent())
+	outcome := middleware.RecordAuthFailure(ctx, h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+	middleware.MarkAuthFailureOutcome(c, outcome)
 	c.JSON(http.StatusUnauthorized, gin.H{
 		"error":              errInvalidExpiredRecoveryCode,
 		"attempts_remaining": 0,
@@ -2557,6 +2696,7 @@ func (h *Handler) RecoveryVerifyCode(c *gin.Context) {
 	}
 
 	h.log.Info("Recovery code verified, token issued", "user_id", record.UserID)
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRecoveryVerified, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryVerifyCode})
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -2571,7 +2711,7 @@ func (h *Handler) validateAndConsumeRecoveryToken(c *gin.Context, tokenStr strin
 	claims, err := h.mfaChecker.ValidateRecoveryToken(tokenStr)
 	if err != nil {
 		if recordAuthFailure {
-			middleware.RecordAuthFailure(c.Request.Context(), h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig())
+			middleware.MarkAuthFailureOutcome(c, middleware.RecordAuthFailure(c.Request.Context(), h.redis, c.ClientIP(), middleware.DefaultAuthBanConfig()))
 		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errInvalidExpiredRecoveryToken})
 		return nil, ""
@@ -3017,6 +3157,7 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 
 	middleware.ClearAuthFailures(ctx, h.redis, c.ClientIP())
 	h.log.Info("Password reset via recovery", "operation", "forced_security_clear")
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonRecoveryReset, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryResetPassword})
 	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully. Please sign in with your new password."})
 }
 
@@ -3105,6 +3246,7 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 	}
 
 	h.log.Info("Account reset via recovery (data loss acknowledged)", "operation", "forced_security_clear")
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonRecoveryReset, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryResetAccount})
 	c.JSON(http.StatusOK, gin.H{"message": "Account reset successfully. All encrypted message history has been permanently lost. Please sign in with your new password."})
 }
 

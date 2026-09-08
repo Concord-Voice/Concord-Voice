@@ -1,11 +1,13 @@
 package opsmetrics
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/nats-io/nats.go"
 )
@@ -47,6 +49,9 @@ type Receiver struct {
 	latest    map[Source]Envelope
 	positions map[Source]AcceptedPosition
 	subs      []*nats.Subscription
+	eventsMu  sync.RWMutex
+	events    securityevent.Emitter
+	degraded  bool
 }
 
 // NewReceiver creates a signed snapshot receiver.
@@ -63,30 +68,75 @@ func NewReceiver(subscriber Subscriber, nodeID string, secret []byte, counters *
 		now:        now,
 		latest:     make(map[Source]Envelope, 2),
 		positions:  make(map[Source]AcceptedPosition, 2),
+		events:     securityevent.Discard,
+	}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the receiver constructor.
+func (r *Receiver) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	r.eventsMu.Lock()
+	r.events = events
+	r.eventsMu.Unlock()
+}
+
+func (r *Receiver) securityEventEmitter() securityevent.Emitter {
+	r.eventsMu.RLock()
+	events := r.events
+	r.eventsMu.RUnlock()
+	return events
+}
+
+func (r *Receiver) setDependencyState(degraded bool) {
+	r.mu.Lock()
+	changed := r.degraded != degraded
+	r.degraded = degraded
+	r.mu.Unlock()
+	if !changed {
+		return
+	}
+	if degraded {
+		r.securityEventEmitter().Emit(context.Background(), securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
+		return
+	}
+	r.securityEventEmitter().Emit(context.Background(), securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeRestored, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonDependencyRecovered})
+}
+
+// MarkDependencyDegraded reports a dependency failure after subscriptions have
+// been registered but before they became active.
+func (r *Receiver) MarkDependencyDegraded() {
+	if r != nil {
+		r.setDependencyState(true)
 	}
 }
 
 // Subscribe installs handlers for the two fixed v1 operations subjects.
 func (r *Receiver) Subscribe() error {
 	if r.subscriber == nil {
+		r.setDependencyState(true)
 		return errors.New("operations metrics subscriber is required")
 	}
 	hostSubscription, err := r.subscriber.Subscribe(HostSnapshotSubject, func(raw []byte) {
 		r.receive(SourceHost, raw)
 	})
 	if err != nil {
+		r.setDependencyState(true)
 		return fmt.Errorf("subscribe %s: %w", HostSnapshotSubject, err)
 	}
 	mediaSubscription, err := r.subscriber.Subscribe(MediaSnapshotSubject, func(raw []byte) {
 		r.receive(SourceMedia, raw)
 	})
 	if err != nil {
+		r.setDependencyState(true)
 		if hostSubscription != nil {
 			_ = hostSubscription.Unsubscribe()
 		}
 		return fmt.Errorf("subscribe %s: %w", MediaSnapshotSubject, err)
 	}
 	r.subs = []*nats.Subscription{hostSubscription, mediaSubscription}
+	r.setDependencyState(false)
 	return nil
 }
 
@@ -124,18 +174,20 @@ func (r *Receiver) receive(expectedSource Source, raw []byte) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if err := VerifyEnvelope(envelope, r.secret, r.now(), r.positions[expectedSource]); err != nil {
+		r.mu.Unlock()
 		r.reject(expectedSource, RejectionVerification)
 		return
 	}
 
 	r.positions[expectedSource] = AcceptedPosition{ObservedAt: envelope.ObservedAt, Sequence: envelope.Sequence}
 	r.latest[expectedSource] = cloneEnvelope(envelope)
+	r.mu.Unlock()
 }
 
 func (r *Receiver) reject(source Source, reason RejectionReason) {
 	r.counters.Increment(MetricSnapshotRejectionsTotal)
+	r.securityEventEmitter().Emit(context.Background(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonSignedTelemetryRejected})
 	if r.log != nil {
 		r.log.Warn("Rejected operations snapshot", "source", source, "reason", reason)
 	}

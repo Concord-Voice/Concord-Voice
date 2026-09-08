@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
 // Audit result values — mirror the CHECK constraint on admin_audit_log.result.
@@ -42,12 +45,32 @@ type AuditEvent struct {
 
 // AuditLog writes append-only entries to admin_audit_log.
 type AuditLog struct {
-	db *sql.DB
+	db               *sql.DB
+	securityEventsMu sync.RWMutex
+	securityEvents   securityevent.Emitter
 }
 
 // NewAuditLog wires an AuditLog against the given DB.
 func NewAuditLog(db *sql.DB) *AuditLog {
-	return &AuditLog{db: db}
+	return &AuditLog{db: db, securityEvents: securityevent.Discard}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the
+// established admin constructors.
+func (a *AuditLog) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	a.securityEventsMu.Lock()
+	a.securityEvents = events
+	a.securityEventsMu.Unlock()
+}
+
+func (a *AuditLog) securityEventEmitter() securityevent.Emitter {
+	a.securityEventsMu.RLock()
+	events := a.securityEvents
+	a.securityEventsMu.RUnlock()
+	return events
 }
 
 // Write inserts exactly one audit row. It opens a transaction, adopts the
@@ -60,6 +83,7 @@ func (a *AuditLog) Write(ctx context.Context, ev AuditEvent) error {
 	if ev.Detail != nil {
 		b, err := json.Marshal(ev.Detail)
 		if err != nil {
+			a.emitAuditWriteFailure(ctx)
 			return fmt.Errorf("marshal audit detail: %w", err)
 		}
 		detailJSON = b
@@ -67,6 +91,7 @@ func (a *AuditLog) Write(ctx context.Context, ev AuditEvent) error {
 
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
+		a.emitAuditWriteFailure(ctx)
 		return fmt.Errorf("begin audit tx: %w", err)
 	}
 	// Roll back on any error path; a successful Commit makes Rollback a no-op.
@@ -76,6 +101,7 @@ func (a *AuditLog) Write(ctx context.Context, ev AuditEvent) error {
 	// identifier, not a bind parameter, so the role name is a fixed constant
 	// (never user input).
 	if _, err := tx.ExecContext(ctx, "SET LOCAL ROLE "+auditRole); err != nil {
+		a.emitAuditWriteFailure(ctx)
 		return fmt.Errorf("adopt audit role: %w", err)
 	}
 
@@ -91,13 +117,50 @@ func (a *AuditLog) Write(ctx context.Context, ev AuditEvent) error {
 		toNullString(ev.SourceRef),
 		detailJSONOrNil(detailJSON),
 	); err != nil {
+		a.emitAuditWriteFailure(ctx)
 		return fmt.Errorf("insert audit row: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
+		a.emitAuditWriteFailure(ctx)
 		return fmt.Errorf("commit audit row: %w", err)
 	}
+	a.emitAuditCommitted(ctx, ev.EventType, ev.Result)
 	return nil
+}
+
+func (a *AuditLog) emitAuditCommitted(ctx context.Context, eventType, result string) {
+	outcome := securityevent.OutcomeFailure
+	switch result {
+	case AuditSuccess:
+		outcome = securityevent.OutcomeSuccess
+	case AuditDenied:
+		outcome = securityevent.OutcomeDenied
+	}
+
+	var event securityevent.Event
+	switch eventType {
+	case EventLoginSuccess:
+		event = securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: outcome, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAuthenticationSucceeded}
+	case EventLoginFailure:
+		event = securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: outcome, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonInvalidCredentials}
+	case EventLogout:
+		event = securityevent.Event{EventType: securityevent.EventSession, Outcome: outcome, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonSessionRevoked}
+	case EventLockout:
+		event = securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: outcome, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAccountLocked}
+	case EventEnrollComplete, EventCredentialRevoked, EventBootstrap:
+		event = securityevent.Event{EventType: securityevent.EventPrivilegedAction, Outcome: outcome, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAuditCommitted}
+	default:
+		return
+	}
+	a.securityEventEmitter().Emit(ctx, event)
+}
+
+func (a *AuditLog) emitAuditWriteFailure(ctx context.Context) {
+	a.securityEventEmitter().Emit(ctx, securityevent.Event{
+		EventType: securityevent.EventAudit, Outcome: securityevent.OutcomeFailure,
+		Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAuditWriteFailed,
+	})
 }
 
 // adminIDValue dereferences a nullable admin id pointer to a string ("" => NULL).

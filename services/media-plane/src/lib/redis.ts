@@ -2,6 +2,7 @@ import { createClient, RedisClientType } from 'redis';
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
 import type { RoomEvent, RoomEventHandler } from './roomManager.js';
+import type { EmitSecurityEvent } from './securityEvent.js';
 
 // ---------------------------------------------------------------------------
 // Redis room state — cross-instance awareness + control plane queries.
@@ -29,22 +30,61 @@ export function redisLogTarget(redisUrl: string): { endpoint: string } {
 
 export class RedisService {
   private client: RedisClientType | null = null;
+  private emitSecurityEvent: EmitSecurityEvent | undefined;
+  private securityDegraded = false;
+
+  setSecurityEventEmitter(emit: EmitSecurityEvent | undefined): void {
+    this.emitSecurityEvent = emit;
+  }
+  private security(
+    outcome: 'degraded' | 'restored',
+    reasonCode: 'dependency_unavailable' | 'dependency_recovered'
+  ): void {
+    try {
+      this.emitSecurityEvent?.({
+        eventType: 'dependency',
+        outcome,
+        severity: outcome === 'degraded' ? 'high' : 'informational',
+        reasonCode,
+      });
+    } catch {
+      // The observer is intentionally outside Redis availability semantics.
+    }
+  }
+  private degraded(): void {
+    if (this.securityDegraded) return;
+    this.security('degraded', 'dependency_unavailable');
+    this.securityDegraded = true;
+  }
+  private restored(): void {
+    if (!this.securityDegraded) return;
+    this.security('restored', 'dependency_recovered');
+    this.securityDegraded = false;
+  }
 
   async connect(): Promise<void> {
     try {
       this.client = createClient({ url: config.redisUrl });
 
       this.client.on('error', (err) => {
+        this.degraded();
         logger.error('Redis client error', { error: err });
       });
 
       this.client.on('reconnecting', () => {
+        this.degraded();
         logger.info('Redis reconnecting');
       });
 
+      this.client.on('ready', () => {
+        this.restored();
+      });
+
       await this.client.connect();
+      this.restored();
       logger.info('Connected to Redis', redisLogTarget(config.redisUrl));
     } catch (err) {
+      this.degraded();
       logger.error('Failed to connect to Redis', { error: err });
       throw err;
     }
@@ -52,7 +92,10 @@ export class RedisService {
 
   /** Add a user to a voice room in Redis */
   async addParticipant(channelId: string, userId: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.client) {
+      this.degraded();
+      return;
+    }
 
     try {
       const roomKey = `voice:room:${channelId}`;
@@ -65,28 +108,38 @@ export class RedisService {
         .hSet(userKey, { channelId, joinedAt: new Date().toISOString() })
         .expire(userKey, USER_TTL)
         .exec();
+      this.restored();
     } catch (err) {
+      this.degraded();
       logger.error('Redis addParticipant failed', { channelId, userId, error: err });
     }
   }
 
   /** Remove a user from a voice room in Redis */
   async removeParticipant(channelId: string, userId: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.client) {
+      this.degraded();
+      return;
+    }
 
     try {
       const roomKey = `voice:room:${channelId}`;
       const userKey = `voice:user:${userId}`;
 
       await this.client.multi().sRem(roomKey, userId).del(userKey).exec();
+      this.restored();
     } catch (err) {
+      this.degraded();
       logger.error('Redis removeParticipant failed', { channelId, userId, error: err });
     }
   }
 
   /** Remove all participants from a room (room empty) */
   async clearRoom(channelId: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.client) {
+      this.degraded();
+      return;
+    }
 
     try {
       const roomKey = `voice:room:${channelId}`;
@@ -99,18 +152,26 @@ export class RedisService {
       } else {
         await this.client.del(roomKey);
       }
+      this.restored();
     } catch (err) {
+      this.degraded();
       logger.error('Redis clearRoom failed', { channelId, error: err });
     }
   }
 
   /** Get all user IDs in a voice room */
   async getRoomParticipants(channelId: string): Promise<string[]> {
-    if (!this.client) return [];
+    if (!this.client) {
+      this.degraded();
+      return [];
+    }
 
     try {
-      return await this.client.sMembers(`voice:room:${channelId}`);
+      const participants = await this.client.sMembers(`voice:room:${channelId}`);
+      this.restored();
+      return participants;
     } catch (err) {
+      this.degraded();
       logger.error('Redis getRoomParticipants failed', { channelId, error: err });
       return [];
     }
@@ -118,11 +179,17 @@ export class RedisService {
 
   /** Get which room a user is in */
   async getUserRoom(userId: string): Promise<string | null> {
-    if (!this.client) return null;
+    if (!this.client) {
+      this.degraded();
+      return null;
+    }
 
     try {
-      return (await this.client.hGet(`voice:user:${userId}`, 'channelId')) ?? null;
+      const room = (await this.client.hGet(`voice:user:${userId}`, 'channelId')) ?? null;
+      this.restored();
+      return room;
     } catch (err) {
+      this.degraded();
       logger.error('Redis getUserRoom failed', { userId, error: err });
       return null;
     }

@@ -15,6 +15,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -85,22 +86,44 @@ func maskIPAddress(ip string) string {
 
 // Handler handles session-related requests for managing user authentication sessions.
 type Handler struct {
-	db          *sql.DB
-	redis       *redis.Client
-	log         *logger.Logger
-	hub         SessionDisconnector
-	mfaVerifier MFAVerifier
+	db             *sql.DB
+	redis          *redis.Client
+	log            *logger.Logger
+	hub            SessionDisconnector
+	mfaVerifier    MFAVerifier
+	securityEvents securityevent.Emitter
 }
 
 // NewHandler creates a new session handler.
 func NewHandler(db *sql.DB, redis *redis.Client, log *logger.Logger, hub SessionDisconnector, mfaVerifier MFAVerifier) *Handler {
 	return &Handler{
-		db:          db,
-		redis:       redis,
-		log:         log,
-		hub:         hub,
-		mfaVerifier: mfaVerifier,
+		db:             db,
+		redis:          redis,
+		log:            log,
+		hub:            hub,
+		mfaVerifier:    mfaVerifier,
+		securityEvents: securityevent.Discard,
 	}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the
+// public constructor used by the router and tests.
+func (h *Handler) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	h.securityEvents = events
+}
+
+func (h *Handler) emitSecurityEvent(ctx context.Context, event securityevent.Event) {
+	if h.securityEvents != nil {
+		h.securityEvents.Emit(ctx, event)
+	}
+}
+
+func (h *Handler) emitHTTPEvent(c *gin.Context, event securityevent.Event) {
+	h.emitSecurityEvent(c.Request.Context(), event)
+	middleware.MarkNightwatchHandled(c)
 }
 
 // ── Revocation Policy Helpers ────────────────────────────────────────────────
@@ -332,7 +355,7 @@ func (h *Handler) RevokeSession(c *gin.Context) {
 	}
 
 	if needsPassword {
-		if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "revoke this session") {
+		if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "revoke this session", securityevent.RouteSessionDelete) {
 			return
 		}
 		if mode == "simple" {
@@ -387,7 +410,7 @@ func (h *Handler) determineAuthRequired(ctx context.Context, uid string) (needsP
 
 // authenticateForRevoke verifies the user's identity via MFA or password for session revocation.
 // Returns true if the request was blocked (response written), false if authentication passed.
-func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid, password, mfaCode, actionDesc string) bool {
+func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid, password, mfaCode, actionDesc string, route securityevent.RouteTemplate) bool {
 	hasMFA := h.mfaVerifier != nil && h.mfaVerifier.IsEnabled(ctx, uid)
 
 	if hasMFA && mfaCode != "" {
@@ -398,6 +421,7 @@ func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid
 			return true
 		}
 		if !valid {
+			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: route})
 			c.JSON(http.StatusForbidden, gin.H{"error": errMsgInvalidMFACode})
 			return true
 		}
@@ -412,6 +436,7 @@ func (h *Handler) authenticateForRevoke(ctx context.Context, c *gin.Context, uid
 			return true
 		}
 		if !match {
+			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthPassword, RouteTemplate: route})
 			c.JSON(http.StatusForbidden, gin.H{"error": errMsgIncorrectPassword})
 			return true
 		}
@@ -457,6 +482,7 @@ func (h *Handler) executeRevocation(ctx context.Context, c *gin.Context, uid, se
 	h.hub.DisconnectSession(sessionID)
 
 	h.log.Info("Session revoked", "user_id", uid, "session_id", sessionID, "password_used", needsPassword)
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionDelete})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":    "Session revoked successfully",
@@ -488,7 +514,7 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 	uid := userID.(string)
 	ctx := c.Request.Context()
 
-	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "revoke all sessions") {
+	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "revoke all sessions", securityevent.RouteSessionsRevokeAll) {
 		return
 	}
 
@@ -515,6 +541,7 @@ func (h *Handler) RevokeAllSessions(c *gin.Context) {
 
 	h.resetRevokeTracking(ctx, uid)
 	h.log.Info("Sessions revoked", "user_id", uid, "count", rowsAffected, "include_current", req.IncludeCurrent)
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonSessionsRevoked, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionsRevokeAll})
 
 	message := "All other sessions revoked successfully"
 	if req.IncludeCurrent {
@@ -579,7 +606,7 @@ func (h *Handler) UpdateRevocationMode(c *gin.Context) {
 	uid := userID.(string)
 	ctx := c.Request.Context()
 
-	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "change revocation mode") {
+	if h.authenticateForRevoke(ctx, c, uid, req.Password, req.MFACode, "change revocation mode", securityevent.RouteSessionsRevocationMode) {
 		return
 	}
 
@@ -598,6 +625,7 @@ func (h *Handler) UpdateRevocationMode(c *gin.Context) {
 	}
 
 	h.log.Info("Revocation mode changed", "user_id", uid, "mode", req.Mode)
+	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventSession, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonRevocationModeChanged, AuthMethod: securityevent.AuthSession, RouteTemplate: securityevent.RouteSessionsRevocationMode})
 
 	c.JSON(http.StatusOK, gin.H{
 		"revocation_mode": req.Mode,

@@ -29,6 +29,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/storage/probe"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/subscriptions"
@@ -109,6 +110,19 @@ func runControlPlane() (runErr error) {
 
 	// Initialize logger
 	log := logger.New(cfg.Environment)
+	securityEvents := securityevent.Discard
+	if cfg.Environment == "production" {
+		writer, openErr := securityevent.Open(securityevent.ControlPlanePath, securityevent.ServiceControlPlane, log)
+		if openErr != nil {
+			return fmt.Errorf("open security event writer: %w", openErr)
+		}
+		securityEvents = writer
+		defer func() {
+			if closeErr := writer.Close(); closeErr != nil {
+				log.Error("Security event writer close failed")
+			}
+		}()
+	}
 
 	// Initialize database
 	db, err := database.New(cfg.DatabaseURL)
@@ -244,6 +258,7 @@ func runControlPlane() (runErr error) {
 				api.RouterDependencies{
 					OpsMetricsReader:   adminMetricsRouterReader,
 					PresenceHistory:    presenceHistoryService,
+					SecurityEvents:     securityEvents,
 					Tier1ErasureWake:   tier1ErasureReclaimer.Wake,
 					MediaStoreResolver: media.NewRegistryStoreResolver(storageRegistry),
 					MediaWriteRouter:   media.NewRegistryWriteRouter(storageRegistry),

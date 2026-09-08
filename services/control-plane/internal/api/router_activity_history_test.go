@@ -76,13 +76,13 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 	require.NoError(t, err)
 	source := string(sourceBytes)
 	needles := []string{
-		"hub := websocket.NewHub",
+		"hub := newHubWithSecurityEvents(",
 		"bindPresenceHistoryRuntime(hub, presenceHistoryService)",
 		"authHandler.SetPresenceHistory(presenceHistoryService)",
 		"usersHandler.SetPresenceHistory(presenceHistoryService)",
 		"presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)",
 		"presenceHistoryHandler.RegisterRoutes(",
-		"opsRuntime := wireOpsMetricsRuntime(",
+		"opsRuntime := wireOpsMetricsRuntimeWithSecurityEvents(",
 		"go hub.Run()",
 		// #2445 added a 7th return value (the shared presence-recheck executor);
 		// #2738 added an 8th, the closer that drains BOTH presence dispatch

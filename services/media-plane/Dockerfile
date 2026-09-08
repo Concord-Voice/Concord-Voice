@@ -44,6 +44,11 @@ COPY --from=builder /app/package*.json ./
 # Run as non-root user
 RUN addgroup -S appuser && adduser -S appuser -G appuser
 RUN chown -R appuser:appuser /app
+
+# GID 10001 is reserved for the host security-event bind mounts. Keep any
+# image-local inode from inheriting that runtime supplementary identity.
+RUN matches="$(find / -xdev -group 10001 -print -quit)" && test -z "$matches"
+
 USER appuser
 
 # Expose ports

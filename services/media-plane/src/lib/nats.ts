@@ -3,6 +3,7 @@ import type { NatsConnection } from 'nats';
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
 import type { RoomEvent, RoomEventHandler } from './roomManager.js';
+import type { EmitSecurityEvent } from './securityEvent.js';
 
 // ---------------------------------------------------------------------------
 // NATS client — publishes voice events for the control plane to consume.
@@ -22,6 +23,50 @@ export class NatsService {
   private connected = false;
   private readonly subscriptions: Array<{ unsubscribe(): void }> = [];
   private lastVoiceLifecycleMicroseconds = 0n;
+  private emitSecurityEvent: EmitSecurityEvent | undefined;
+  private securityDegraded = false;
+  private readonly failedSubscriptions = new Set<string>();
+  private closing = false;
+
+  private observe(event: Parameters<EmitSecurityEvent>[0]): void {
+    try {
+      this.emitSecurityEvent?.(event);
+    } catch {
+      // An observer cannot terminate NATS subscription processing.
+    }
+  }
+
+  setSecurityEventEmitter(emit: EmitSecurityEvent | undefined): void {
+    this.emitSecurityEvent = emit;
+  }
+
+  private security(
+    outcome: 'degraded' | 'restored',
+    reasonCode: 'dependency_unavailable' | 'dependency_recovered'
+  ): void {
+    try {
+      this.observe({
+        eventType: 'dependency',
+        outcome,
+        severity: outcome === 'degraded' ? 'high' : 'informational',
+        reasonCode,
+      });
+    } catch {
+      // The observer is intentionally outside NATS availability semantics.
+    }
+  }
+
+  private degraded(): void {
+    if (this.securityDegraded) return;
+    this.security('degraded', 'dependency_unavailable');
+    this.securityDegraded = true;
+  }
+
+  private restored(): void {
+    if (!this.connected || this.failedSubscriptions.size > 0 || !this.securityDegraded) return;
+    this.security('restored', 'dependency_recovered');
+    this.securityDegraded = false;
+  }
 
   /**
    * Return a strictly increasing RFC3339 timestamp for lifecycle messages
@@ -46,6 +91,7 @@ export class NatsService {
 
   async connect(): Promise<void> {
     try {
+      this.closing = false;
       this.nc = await connect({
         servers: config.natsUrl,
         name: 'media-plane',
@@ -54,23 +100,41 @@ export class NatsService {
         reconnectTimeWait: 2000,
       });
       this.connected = true;
+      this.restored();
 
       logger.info('Connected to NATS', { server: config.natsUrl });
 
-      // Monitor connection status
-      (async () => {
-        if (!this.nc) return;
-        for await (const status of this.nc.status()) {
-          if (status.type === 'disconnect' || status.type === 'reconnecting') {
-            this.connected = false;
-          } else if (status.type === 'reconnect') {
-            this.connected = true;
+      // Monitor connection status. A completed or failed iterator cannot leave
+      // the last connected state asserted: only connect/reconnect confirms it.
+      const nc = this.nc;
+      void (async () => {
+        try {
+          for await (const status of nc.status()) {
+            if (status.type === 'disconnect' || status.type === 'reconnecting') {
+              this.connected = false;
+              this.degraded();
+            } else if (status.type === 'reconnect') {
+              this.connected = true;
+              this.restored();
+            }
+            logger.info('NATS status', { type: status.type, data: status.data });
           }
-          logger.info('NATS status', { type: status.type, data: status.data });
+          if (this.nc === nc && this.connected) {
+            this.connected = false;
+            this.degraded();
+            logger.error('NATS status iterator ended');
+          }
+        } catch {
+          if (this.nc === nc && this.connected) {
+            this.connected = false;
+            this.degraded();
+          }
+          logger.error('NATS status iterator failed', { error: 'nats_status_iterator_failed' });
         }
-      })().catch(() => {});
+      })();
     } catch (err) {
       this.connected = false;
+      this.degraded();
       logger.error('Failed to connect to NATS', { error: err, server: config.natsUrl });
       throw err;
     }
@@ -79,14 +143,17 @@ export class NatsService {
   /** Publish a JSON message to a NATS subject */
   publish(subject: string, data: Record<string, unknown>): boolean {
     if (!this.nc || !this.connected || this.nc.isClosed()) {
+      this.degraded();
       logger.warn('NATS not connected, dropping message', { subject });
       return false;
     }
 
     try {
       this.nc.publish(subject, jsonCodec.encode(data));
+      this.restored();
       return true;
     } catch (err) {
+      this.degraded();
       logger.error('Failed to publish NATS message', { subject, error: err });
       return false;
     }
@@ -106,6 +173,7 @@ export class NatsService {
             userId: event.userId,
             username: event.username,
             displayName: event.displayName,
+            avatarUrl: event.avatarUrl,
             callId: event.callId,
             timestamp: this.nextVoiceLifecycleTimestamp(),
           });
@@ -165,26 +233,56 @@ export class NatsService {
     handler: (data: Record<string, unknown>) => void | Promise<void>
   ): void {
     if (!this.nc) {
+      this.degraded();
       logger.warn('NATS not connected, cannot subscribe', { subject });
       return;
     }
-    const sub = this.nc.subscribe(subject);
+    const nc = this.nc;
+    const sub = nc.subscribe(subject);
     this.subscriptions.push(sub);
-    (async () => {
+    if (this.failedSubscriptions.delete(subject)) this.restored();
+    void (async () => {
       for await (const msg of sub) {
+        let decoded: Record<string, unknown>;
         try {
-          const decoded = jsonCodec.decode(msg.data) as Record<string, unknown>;
-          handler(decoded);
+          const value = jsonCodec.decode(msg.data);
+          if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+            throw new TypeError('NATS message must decode to an object');
+          }
+          decoded = value as Record<string, unknown>;
+        } catch {
+          this.observe({
+            eventType: 'media_integrity',
+            outcome: 'denied',
+            severity: 'medium',
+            reasonCode: 'media_schema_rejected',
+          });
+          logger.warn('Rejected malformed NATS message', { subject });
+          continue;
+        }
+        try {
+          await handler(decoded);
         } catch (err) {
-          logger.error('Failed to handle NATS message', { subject, error: err });
+          logger.error('NATS message handler failed', { subject, error: err });
         }
       }
+      if (!this.closing && this.nc === nc) {
+        this.failedSubscriptions.add(subject);
+        this.degraded();
+        logger.error('NATS subscription ended', { subject });
+      }
     })().catch((err) => {
-      logger.error('NATS subscription error', { subject, error: err });
+      if (!this.closing && this.nc === nc) {
+        this.failedSubscriptions.add(subject);
+        this.degraded();
+        logger.error('NATS subscription error', { subject, error: err });
+      }
     });
   }
 
   async close(): Promise<void> {
+    this.closing = true;
+    this.connected = false;
     // Drain subscriptions before closing
     for (const sub of this.subscriptions) {
       try {
@@ -194,9 +292,9 @@ export class NatsService {
       }
     }
     this.subscriptions.length = 0;
+    this.failedSubscriptions.clear();
 
     if (this.nc) {
-      this.connected = false;
       await this.nc.drain();
       logger.info('NATS connection closed');
       this.nc = null;

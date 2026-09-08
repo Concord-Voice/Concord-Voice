@@ -1,5 +1,6 @@
 import type { RoomManager } from './roomManager.js';
 import { logger } from './logger.js';
+import type { EmitSecurityEvent } from './securityEvent.js';
 
 /**
  * Minimal RoomManager surface needed to force-disconnect a peer. Declared as an
@@ -8,7 +9,7 @@ import { logger } from './logger.js';
 export interface ForceDisconnectRoomManager {
   getParticipant: RoomManager['getParticipant'];
   getProvisionalParticipantSocketId: RoomManager['getProvisionalParticipantSocketId'];
-  leaveRoom: RoomManager['leaveRoom'];
+  leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
 }
 
@@ -32,9 +33,11 @@ export interface ForceDisconnectIO {
  * peer from the SFU. The handler:
  *   1. Silently removes the exact provisional candidate before disconnecting
  *      either socket, so synchronous admitted cleanup can terminalize the room.
- *   2. Notifies every admitted or provisional live socket for the user (so the
+ *   2. Delegates exact admitted teardown to RoomManager before force-closing that
+ *      socket, so synchronous disconnect cleanup cannot erase its ownership.
+ *   3. Notifies every admitted or provisional live socket for the user (so the
  *      client tears down its WebRTC state) and force-disconnects each socket.
- *   3. Delegates room teardown to RoomManager.leaveRoom — which closes the peer's
+ *      RoomManager teardown closes the peer's
  *      transports/producers/consumers and emits `user-left`. The NATS room-event
  *      bridge turns that into the normal `voice.left` published back to the control
  *      plane, so `voice_participants` is cleaned and `voice_state_update` broadcasts.
@@ -47,7 +50,8 @@ export async function handleForceDisconnect(
   roomManager: ForceDisconnectRoomManager,
   io: ForceDisconnectIO,
   channelId: string,
-  userId: string
+  userId: string,
+  emit?: EmitSecurityEvent
 ): Promise<void> {
   const participant = roomManager.getParticipant(channelId, userId);
   const provisionalSocketId = roomManager.getProvisionalParticipantSocketId(channelId, userId);
@@ -62,12 +66,22 @@ export async function handleForceDisconnect(
   // a room that was already pending-only: silently without admitted history, or
   // through normal terminal lifecycle with history. Exact ownership prevents
   // this command from deleting a successor session.
+  let changed = false;
   if (provisionalSocketId) {
-    await roomManager.removeProvisionalParticipantForEnforcement(
+    changed = await roomManager.removeProvisionalParticipantForEnforcement(
       channelId,
       userId,
       provisionalSocketId
     );
+  }
+
+  // Tear down the captured admitted session before force-closing its socket.
+  // Socket.IO dispatches disconnect cleanup synchronously, which would otherwise
+  // erase exact ownership before this authoritative RoomManager call can run.
+  if (participant) {
+    changed =
+      (await roomManager.leaveRoomIfSocketOwned(channelId, userId, participant.socketId)) ||
+      changed;
   }
 
   // Tell every admitted/provisional session to leave, then force each socket
@@ -82,9 +96,19 @@ export async function handleForceDisconnect(
     socket.disconnect(true);
   }
 
-  // Authoritative SFU-side teardown (closes transports/producers/consumers,
-  // removes the participant, emits user-left -> voice.left via the NATS bridge).
-  if (participant) await roomManager.leaveRoom(channelId, userId);
+  if (changed) {
+    try {
+      emit?.({
+        eventType: 'media_authorization',
+        outcome: 'success',
+        severity: 'high',
+        reasonCode: 'revocation_enforced',
+        routeTemplate: 'socket.force_disconnect',
+      });
+    } catch {
+      // An audit observer cannot alter an authoritative teardown.
+    }
+  }
 
   logger.info('Force-disconnected participant via voice.enforce.disconnect', {
     channelId,

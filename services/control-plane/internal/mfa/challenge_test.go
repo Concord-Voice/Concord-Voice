@@ -10,7 +10,7 @@ import (
 const testJWTSecret = "test-secret-for-mfa-challenges" // #nosec G101
 
 func TestGenerateChallengeToken(t *testing.T) {
-	token, jti, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
+	token, jti, err := GenerateChallengeToken("user-123", PurposeMFAUpgrade, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
@@ -23,13 +23,23 @@ func TestGenerateChallengeToken(t *testing.T) {
 	}
 }
 
+func TestGenerateChallengeTokenRejectsLogin(t *testing.T) {
+	token, jti, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "epoch-abc")
+	if err == nil {
+		t.Fatal("expected login challenge generation to fail")
+	}
+	if token != "" || jti != "" {
+		t.Fatalf("rejected login challenge returned token material: token=%q jti=%q", token, jti)
+	}
+}
+
 func TestValidateChallengeToken(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
+	token, _, err := GenerateChallengeToken("user-123", PurposeMFAUpgrade, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
 
-	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeLogin)
+	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeMFAUpgrade)
 	if err != nil {
 		t.Fatalf("ValidateChallengeToken failed: %v", err)
 	}
@@ -37,8 +47,8 @@ func TestValidateChallengeToken(t *testing.T) {
 	if claims.UserID != "user-123" {
 		t.Errorf("UserID = %q, want %q", claims.UserID, "user-123")
 	}
-	if claims.Purpose != PurposeLogin {
-		t.Errorf("Purpose = %q, want %q", claims.Purpose, PurposeLogin)
+	if claims.Purpose != PurposeMFAUpgrade {
+		t.Errorf("Purpose = %q, want %q", claims.Purpose, PurposeMFAUpgrade)
 	}
 	if claims.Issuer != "concordvoice-mfa" {
 		t.Errorf("Issuer = %q, want %q", claims.Issuer, "concordvoice-mfa")
@@ -46,7 +56,7 @@ func TestValidateChallengeToken(t *testing.T) {
 }
 
 func TestValidateChallengeTokenWrongPurpose(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
+	token, _, err := GenerateChallengeToken("user-123", PurposeMFAUpgrade, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
@@ -58,12 +68,12 @@ func TestValidateChallengeTokenWrongPurpose(t *testing.T) {
 }
 
 func TestValidateChallengeTokenWrongSecret(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
+	token, _, err := GenerateChallengeToken("user-123", PurposeMFAUpgrade, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
 
-	_, err = ValidateChallengeToken(token, "wrong-secret", PurposeLogin)
+	_, err = ValidateChallengeToken(token, "wrong-secret", PurposeMFAUpgrade)
 	if err == nil {
 		t.Error("expected error for wrong secret")
 	}
@@ -147,12 +157,12 @@ func TestValidateChallengeTokenExpired(t *testing.T) {
 }
 
 func TestGenerateChallengeTokenStampsCredentialEpoch(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "epoch-abc")
+	token, _, err := GenerateChallengeToken("user-123", PurposeSuspiciousRefresh, testJWTSecret, "epoch-abc")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
 
-	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeLogin)
+	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeSuspiciousRefresh)
 	if err != nil {
 		t.Fatalf("ValidateChallengeToken failed: %v", err)
 	}
@@ -162,12 +172,12 @@ func TestGenerateChallengeTokenStampsCredentialEpoch(t *testing.T) {
 }
 
 func TestGenerateChallengeTokenEmptyEpochOmitsClaim(t *testing.T) {
-	token, _, err := GenerateChallengeToken("user-123", PurposeLogin, testJWTSecret, "")
+	token, _, err := GenerateChallengeToken("user-123", PurposeMFAUpgrade, testJWTSecret, "")
 	if err != nil {
 		t.Fatalf("GenerateChallengeToken failed: %v", err)
 	}
 
-	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeLogin)
+	claims, err := ValidateChallengeToken(token, testJWTSecret, PurposeMFAUpgrade)
 	if err != nil {
 		t.Fatalf("ValidateChallengeToken failed: %v", err)
 	}

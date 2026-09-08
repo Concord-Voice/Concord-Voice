@@ -85,6 +85,20 @@ function createMockMediasoupService(router = createMockRouter()) {
   };
 }
 
+function expectSecurityDeny(
+  emit: ReturnType<typeof vi.fn>,
+  reasonCode: 'structural_limit_exceeded' | 'permission_denied'
+): void {
+  expect(emit).toHaveBeenCalledTimes(1);
+  expect(emit).toHaveBeenCalledWith({
+    eventType: reasonCode === 'permission_denied' ? 'media_authorization' : 'media_admission',
+    outcome: 'denied',
+    severity: reasonCode === 'permission_denied' ? 'high' : 'medium',
+    reasonCode,
+    routeTemplate: 'socket.produce',
+  });
+}
+
 type JoinRoomResult = Awaited<ReturnType<RoomManager['joinRoom']>>;
 
 type TestDMParticipantPromotion = {
@@ -238,6 +252,8 @@ describe('RoomManager', () => {
     });
 
     it('admits at most 1000 channel participants and still allows reconnect at capacity (#2231)', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       const roomId = 'room-participant-cap';
       for (let index = 0; index < 999; index++) {
         await joinRoomWithSupportedCrypto(manager, roomId, `u-${index}`, `sock-${index}`, {
@@ -261,6 +277,14 @@ describe('RoomManager', () => {
       expect(rejected).toHaveLength(1);
       expect(rejected[0].reason.message).toContain('Voice participant limit reached (max 1000)');
       expect(manager.getRoom(roomId)?.participants.size).toBe(1000);
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_admission',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'structural_limit_exceeded',
+        routeTemplate: 'socket.join',
+      });
 
       await joinRoomWithSupportedCrypto(manager, roomId, 'u-0', 'sock-reconnected', {
         username: 'user-0',
@@ -638,6 +662,39 @@ describe('RoomManager', () => {
             callId: 'call-stale',
           })
         ).toThrow('DM call ID does not match the provisional admission');
+      });
+
+      it('emits one closed authorization verdict for a stale DM promotion socket', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
+        await manager.joinRoom(
+          'dm-security',
+          'u-1',
+          'sock-current',
+          { username: 'alice' },
+          undefined,
+          {
+            mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+            roomContext: { roomKind: 'dm', callId },
+          }
+        );
+        expect(() =>
+          promoteDMParticipant(manager, 'dm-security', 'u-1', 'sock-stale', callId, {
+            callId,
+            identity: { username: 'alice' },
+            entitlement: freeEntitlement,
+            serverMuted: false,
+            serverDeafened: false,
+          })
+        ).toThrow('DM provisional participant is not owned by this socket');
+        expect(emit).toHaveBeenCalledTimes(1);
+        expect(emit).toHaveBeenCalledWith({
+          eventType: 'media_authorization',
+          outcome: 'denied',
+          severity: 'medium',
+          reasonCode: 'authorization_denied',
+          routeTemplate: 'socket.join',
+        });
       });
 
       it('rolls back a sole provisional socket without terminal lifecycle (#2407)', async () => {
@@ -1102,6 +1159,24 @@ describe('RoomManager', () => {
 
       expect(room.participants.has('u-missing')).toBe(false);
       expect(room.e2eeEpoch).toBe(epochBefore);
+    });
+
+    it('emits one closed crypto verdict at the RoomManager admission boundary', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      await expect(
+        manager.joinRoom('room-1', 'u-crypto', 'sock-crypto', { username: 'crypto' }, undefined, {
+          mediaFrameCryptoVersion: 1,
+        })
+      ).rejects.toThrow('Unsupported media frame crypto version 1');
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_integrity',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'crypto_version_invalid',
+        routeTemplate: 'socket.join',
+      });
     });
 
     it('rejects legacy reconnect attempts before replacing the existing participant', async () => {
@@ -1849,6 +1924,8 @@ describe('RoomManager', () => {
     });
 
     it('enforces camera limit (free cap = 8 from config mock)', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       // Add 8 camera producers across multiple participants
       for (let i = 0; i < 8; i++) {
         const uid = `u-cam-${i}`;
@@ -1876,6 +1953,23 @@ describe('RoomManager', () => {
           'camera'
         )
       ).rejects.toThrow('Video participant limit reached (max 8)');
+      expectSecurityDeny(emit, 'structural_limit_exceeded');
+    });
+
+    it('emits one structural verdict for invalid source schema without duplicates', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      await expect(
+        manager.produce('room-1', 'u-1', transport.id, 'video', createRtpParameters() as any, 'mic')
+      ).rejects.toThrow('Invalid media source for producer kind');
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_integrity',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'media_schema_rejected',
+        routeTemplate: 'socket.produce',
+      });
     });
 
     /**
@@ -2091,6 +2185,8 @@ describe('RoomManager', () => {
 
     describe('screen produce guards — simulcast gate + one-per-participant (#1924)', () => {
       it('rejects a simulcast (>1 encoding) screen produce when the sharer gate is OFF', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         const p = createMockProducer({ kind: 'video' });
         transport.produce.mockResolvedValueOnce(p);
         await expect(
@@ -2105,6 +2201,7 @@ describe('RoomManager', () => {
         ).rejects.toThrow('Screen simulcast not authorized (screen-layering-gate disabled)');
         // Rejected BEFORE the produce() await — no producer was ever created.
         expect(transport.produce).not.toHaveBeenCalled();
+        expectSecurityDeny(emit, 'permission_denied');
       });
 
       it('allows a simulcast screen produce when the sharer gate is ON', async () => {
@@ -2137,6 +2234,8 @@ describe('RoomManager', () => {
       });
 
       it('rejects a SECOND screen producer for the same participant (one-per-participant)', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         const p1 = createMockProducer({ kind: 'video', id: 'scr-1' });
         transport.produce.mockResolvedValueOnce(p1);
         await manager.produce(
@@ -2164,6 +2263,7 @@ describe('RoomManager', () => {
           )
         ).rejects.toThrow('Participant already has an active screen producer');
         expect(transport.produce).not.toHaveBeenCalled();
+        expectSecurityDeny(emit, 'structural_limit_exceeded');
       });
     });
 
@@ -2190,18 +2290,24 @@ describe('RoomManager', () => {
       }
 
       it('rejects a second live microphone producer', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         await produceForU1('audio', 'mic', 'mic-1');
 
         await expect(produceForU1('audio', 'mic', 'mic-2')).rejects.toThrow(
           'Participant already has an active microphone producer'
         );
+        expectSecurityDeny(emit, 'structural_limit_exceeded');
       });
 
       it('re-allows a microphone producer once the first is closed', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         const first = await produceForU1('audio', 'mic', 'mic-1');
         await manager.closeProducer('room-1', 'u-1', first.producerId);
 
         await expect(produceForU1('audio', 'mic', 'mic-2')).resolves.toBeDefined();
+        expect(emit).not.toHaveBeenCalled();
       });
 
       it('yields exactly one under a concurrent mic burst (TOCTOU lock)', async () => {
@@ -2262,6 +2368,8 @@ describe('RoomManager', () => {
       });
 
       it('releases the reservation when the per-ROOM cap rejects', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         // Fill the room's free screen cap (1) from another participant, so u-1's
         // screen produce passes the participant slot and then fails the room cap.
         await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-scr-full', 'sock-scr-full', {
@@ -2283,6 +2391,7 @@ describe('RoomManager', () => {
         await expect(produceForU1('video', 'screen', 'scr-u1-a')).rejects.toThrow(
           'Screen share limit reached (max 1)'
         );
+        expectSecurityDeny(emit, 'structural_limit_exceeded');
 
         // Free the room slot. Without the release on the per-room reject path,
         // u-1 would now be rejected by its own leaked participant reservation.
@@ -2453,6 +2562,8 @@ describe('RoomManager', () => {
       });
 
       it('yields exactly the camera limit under a concurrent burst (TOCTOU lock)', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         let pid = 0;
         transport.produce.mockImplementation(async () =>
           createMockProducer({ kind: 'video', id: `burst-own-cam-${pid++}` })
@@ -2481,6 +2592,16 @@ describe('RoomManager', () => {
         expect(rejected[0].reason.message).toBe(
           `Participant camera producer limit reached (max ${MAX_PARTICIPANT_CAMERA_PRODUCERS})`
         );
+        expect(emit).toHaveBeenCalledTimes(3);
+        for (const [event] of emit.mock.calls) {
+          expect(event).toEqual({
+            eventType: 'media_admission',
+            outcome: 'denied',
+            severity: 'medium',
+            reasonCode: 'structural_limit_exceeded',
+            routeTemplate: 'socket.produce',
+          });
+        }
       });
 
       it('leaves exactly one camera live when two produces interleave (mutual eviction)', async () => {
@@ -2554,6 +2675,8 @@ describe('RoomManager', () => {
       });
 
       it('yields exactly one under a concurrent screen-audio burst (TOCTOU lock)', async () => {
+        const emit = vi.fn();
+        manager.setSecurityEventEmitter(emit);
         // The sequential duplicate is caught earlier by validateScreenAudioSource
         // (unchanged, asserted by "rejects duplicate screen-audio" above); the
         // reservation is what closes the concurrent window it left open.
@@ -2581,6 +2704,16 @@ describe('RoomManager', () => {
         expect(rejected[0].reason.message).toBe(
           'Participant already has an active screen audio producer'
         );
+        expect(emit).toHaveBeenCalledTimes(2);
+        for (const [event] of emit.mock.calls) {
+          expect(event).toEqual({
+            eventType: 'media_admission',
+            outcome: 'denied',
+            severity: 'medium',
+            reasonCode: 'structural_limit_exceeded',
+            routeTemplate: 'socket.produce',
+          });
+        }
       });
 
       it('leaves camera bounded only per-room (deliberate — camera has no participant slot)', async () => {
@@ -2593,6 +2726,8 @@ describe('RoomManager', () => {
     });
 
     it('rejects screen-audio when kind is not audio', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       // Add screen producer first
       const sp = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(sp);
@@ -2615,9 +2750,18 @@ describe('RoomManager', () => {
           'screen-audio'
         )
       ).rejects.toThrow('screen-audio source must be audio kind');
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_integrity',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'media_schema_rejected',
+        routeTemplate: 'socket.produce',
+      });
     });
 
     it('rejects screen-audio when no screen producer exists', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       await expect(
         manager.produce(
           'room-1',
@@ -2628,9 +2772,18 @@ describe('RoomManager', () => {
           'screen-audio'
         )
       ).rejects.toThrow('screen-audio requires an active screen producer');
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_authorization',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'authorization_denied',
+        routeTemplate: 'socket.produce',
+      });
     });
 
     it('rejects duplicate screen-audio', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       // Screen producer
       const sp = createMockProducer({ kind: 'video' });
       transport.produce.mockResolvedValueOnce(sp);
@@ -2666,6 +2819,7 @@ describe('RoomManager', () => {
           'screen-audio'
         )
       ).rejects.toThrow('Only one active screen-audio producer allowed');
+      expectSecurityDeny(emit, 'structural_limit_exceeded');
     });
 
     it('throws if send transport does not match', async () => {
@@ -3165,6 +3319,9 @@ describe('RoomManager', () => {
     });
 
     it('unwinds an in-flight produce whose permission was revoked during the await (TOCTOU)', async () => {
+      manager.setSecurityEventEmitter(() => {
+        throw new Error('observer failure');
+      });
       await joinChannelWithPerms('u-race', 'sock-race', PERM_SPEAK | PERM_VOICE);
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
@@ -3291,6 +3448,8 @@ describe('RoomManager', () => {
     });
 
     it('unwinds a mic produce whose permission was revoked during the audioLevelObserver await (TOCTOU #2)', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       await joinChannelWithPerms('u-race2', 'sock-race2', PERM_SPEAK | PERM_VOICE);
       const transport = createMockTransport();
       mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
@@ -3321,9 +3480,42 @@ describe('RoomManager', () => {
 
       expect(producer.close).toHaveBeenCalled();
       expect(manager.getParticipant('room-1', 'u-race2')?.producers.size).toBe(0);
+      expectSecurityDeny(emit, 'permission_denied');
+    });
+
+    it('does not report a permission denial when a mic is closed during the audioLevelObserver await', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
+      await joinChannelWithPerms('u-race-close', 'sock-race-close', PERM_SPEAK | PERM_VOICE);
+      const transport = createMockTransport();
+      mockRouter.createWebRtcTransport.mockResolvedValueOnce(transport);
+      await manager.createTransport('room-1', 'u-race-close', 'send');
+
+      const producer = createMockProducer({ kind: 'audio' });
+      transport.produce.mockResolvedValueOnce(producer);
+      mockRouter._audioLevelObserver.addProducer.mockImplementationOnce(async () => {
+        await manager.closeProducer('room-1', 'u-race-close', producer.id);
+      });
+
+      await expect(
+        manager.produce(
+          'room-1',
+          'u-race-close',
+          transport.id,
+          'audio',
+          createRtpParameters() as any,
+          'mic'
+        )
+      ).rejects.toThrow('publish permission denied');
+
+      expect(producer.close).toHaveBeenCalledOnce();
+      expect(manager.getParticipant('room-1', 'u-race-close')?.producers.size).toBe(0);
+      expect(emit).not.toHaveBeenCalled();
     });
 
     it('closeForbiddenProducers returns empty for DM rooms and absent participants', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       await joinRoomWithSupportedCrypto(
         manager,
         'room-dm3',
@@ -3336,6 +3528,7 @@ describe('RoomManager', () => {
       );
       await expect(manager.closeForbiddenProducers('room-dm3', 'u-dm3')).resolves.toEqual([]);
       await expect(manager.closeForbiddenProducers('room-1', 'u-nobody')).resolves.toEqual([]);
+      expect(emit).not.toHaveBeenCalled();
     });
   });
 
@@ -3371,6 +3564,8 @@ describe('RoomManager', () => {
     });
 
     it('REJECTS a free-tier mic producer with ptime below 20 ms (and never creates the producer)', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       await expect(
         manager.produce(
           'room-1',
@@ -3385,6 +3580,7 @@ describe('RoomManager', () => {
       // The producer is rejected BEFORE the await — transport.produce never ran.
       expect(freeTransport.produce).not.toHaveBeenCalled();
       expect(manager.getParticipant('room-1', 'u-1')?.producers.size).toBe(0);
+      expectSecurityDeny(emit, 'structural_limit_exceeded');
     });
 
     it('REJECTS a free-tier mic producer whose opus bitrate exceeds the standard ceiling (96 kbps)', async () => {
@@ -3767,6 +3963,8 @@ describe('RoomManager', () => {
     });
 
     it('allows the first 4 receive transports and rejects the 5th', async () => {
+      const emit = vi.fn();
+      manager.setSecurityEventEmitter(emit);
       for (let i = 0; i < MAX_RECV_TRANSPORTS_PER_PARTICIPANT; i += 1) {
         await expect(manager.createTransport('room-1', 'u-1', 'recv')).resolves.toBeDefined();
       }
@@ -3777,6 +3975,13 @@ describe('RoomManager', () => {
       expect(manager.getParticipant('room-1', 'u-1')!.recvTransports.size).toBe(
         MAX_RECV_TRANSPORTS_PER_PARTICIPANT
       );
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith({
+        eventType: 'media_admission',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'structural_limit_exceeded',
+      });
     });
 
     it('yields exactly 4 under a concurrent burst of 8 (TOCTOU lock)', async () => {

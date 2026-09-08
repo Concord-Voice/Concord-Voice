@@ -8,8 +8,8 @@ import {
   type EnforcePermissionsIO,
 } from '../src/lib/enforcePermissions.js';
 
-const CHANNEL_ID = 'ch-1';
-const USER_ID = 'u-1';
+const CHANNEL_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const USER_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const SOCKET_ID = 'socket-abc';
 const PERM_VIEW_VOICE = 1n << 9n;
 const PERM_JOIN_VOICE = 1n << 16n;
@@ -30,6 +30,7 @@ function makeRoomManager(opts: {
   const updateParticipantPermissions = vi.fn().mockReturnValue(opts.updateResult ?? true);
   const closeForbiddenProducers = vi.fn().mockResolvedValue(opts.closedSources ?? []);
   const leaveRoom = vi.fn().mockResolvedValue(undefined);
+  const leaveRoomIfSocketOwned = vi.fn().mockResolvedValue(Boolean(opts.participant));
   const getProvisionalParticipantSocketId = vi.fn().mockReturnValue(undefined);
   const removeProvisionalParticipantIfSocketOwned = vi.fn().mockResolvedValue(false);
   return {
@@ -39,12 +40,14 @@ function makeRoomManager(opts: {
       updateParticipantPermissions,
       closeForbiddenProducers,
       leaveRoom,
+      leaveRoomIfSocketOwned,
       removeProvisionalParticipantIfSocketOwned,
     } as unknown as EnforcePermissionsRoomManager,
     getParticipant,
     updateParticipantPermissions,
     closeForbiddenProducers,
     leaveRoom,
+    leaveRoomIfSocketOwned,
   };
 }
 
@@ -71,11 +74,12 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
         closedSources: ['camera', 'screen'],
       });
     const { io, emit } = makeIO(SOCKET_ID);
+    const security = vi.fn();
 
     // Voice access retained (only a publish bit like Video/ScreenShare was
     // revoked), so the peer stays in the room and its producers are audited.
     const perms = PERM_VOICE_ACCESS | PERM_SPEAK;
-    await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, perms);
+    await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, perms, security);
 
     expect(updateParticipantPermissions).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, perms);
     expect(closeForbiddenProducers).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
@@ -87,10 +91,41 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
       permissions: perms.toString(),
       closedSources: ['camera', 'screen'],
     });
+    expect(security).toHaveBeenCalledTimes(1);
+    expect(security).toHaveBeenCalledWith({
+      eventType: 'media_authorization',
+      outcome: 'success',
+      severity: 'high',
+      reasonCode: 'revocation_enforced',
+      routeTemplate: 'socket.permissions_update',
+    });
+  });
+
+  it('does not emit a revocation verdict when no producer closes', async () => {
+    const { rm } = makeRoomManager({ participant: { socketId: SOCKET_ID }, closedSources: [] });
+    const { io } = makeIO(SOCKET_ID);
+    const security = vi.fn();
+    await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, PERM_VOICE_ACCESS, security);
+    expect(security).not.toHaveBeenCalled();
+  });
+
+  it('still closes producers and notifies the peer when its emitter throws', async () => {
+    const { rm, closeForbiddenProducers } = makeRoomManager({
+      participant: { socketId: SOCKET_ID },
+      closedSources: ['camera'],
+    });
+    const { io, emit } = makeIO(SOCKET_ID);
+    await expect(
+      handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, PERM_VOICE_ACCESS, () => {
+        throw new Error('observer failure');
+      })
+    ).resolves.toBeUndefined();
+    expect(closeForbiddenProducers).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
+    expect(emit).toHaveBeenCalledWith('permissions-changed', expect.anything());
   });
 
   it('force-disconnects the peer when ViewVoiceChannels is revoked', async () => {
-    const { rm, closeForbiddenProducers, leaveRoom } = makeRoomManager({
+    const { rm, closeForbiddenProducers, leaveRoomIfSocketOwned } = makeRoomManager({
       participant: { socketId: SOCKET_ID },
     });
     const { io, emit, disconnect } = makeIO(SOCKET_ID);
@@ -99,7 +134,7 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
     // fresh AuthorizeJoin would reject; closing producers is insufficient.
     await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, PERM_JOIN_VOICE | PERM_SPEAK);
 
-    expect(leaveRoom).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
     expect(emit).toHaveBeenCalledWith('force-disconnect', {
       channelId: CHANNEL_ID,
       reason: 'access_revoked',
@@ -111,7 +146,7 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
   });
 
   it('force-disconnects the peer when JoinVoice is revoked', async () => {
-    const { rm, closeForbiddenProducers, leaveRoom } = makeRoomManager({
+    const { rm, closeForbiddenProducers, leaveRoomIfSocketOwned } = makeRoomManager({
       participant: { socketId: SOCKET_ID },
     });
     const { io, disconnect } = makeIO(SOCKET_ID);
@@ -119,7 +154,7 @@ describe('handlePermissionsUpdate (CV-CAN-007 P1 mid-session enforcement)', () =
     // Only ViewVoiceChannels remains.
     await handlePermissionsUpdate(rm, io, CHANNEL_ID, USER_ID, PERM_VIEW_VOICE | PERM_SPEAK);
 
-    expect(leaveRoom).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
     expect(disconnect).toHaveBeenCalledWith(true);
     expect(closeForbiddenProducers).not.toHaveBeenCalled();
   });
@@ -194,7 +229,10 @@ describe('handleEnforcePermissionsMessage (NATS payload validation)', () => {
     ['negative bitfield', { channelId: CHANNEL_ID, userId: USER_ID, permissions: '-1' }],
     ['numeric bitfield', { channelId: CHANNEL_ID, userId: USER_ID, permissions: 131072 }],
     ['array bitfield', { channelId: CHANNEL_ID, userId: USER_ID, permissions: ['131072'] }],
-    ['out-of-range decimal', { channelId: CHANNEL_ID, userId: USER_ID, permissions: '18446744073709551615' }],
+    [
+      'out-of-range decimal',
+      { channelId: CHANNEL_ID, userId: USER_ID, permissions: '18446744073709551615' },
+    ],
     ['missing bitfield', { channelId: CHANNEL_ID, userId: USER_ID }],
   ])('ignores a malformed payload: %s', async (_label, payload) => {
     const { rm, getParticipant, updateParticipantPermissions, closeForbiddenProducers } =
@@ -229,6 +267,61 @@ describe('handleEnforcePermissionsMessage (NATS payload validation)', () => {
     expect(closeForbiddenProducers).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
   });
 
+  it('emits a fixed-shape verdict for malformed enforcement input', async () => {
+    const { rm } = makeRoomManager({ participant: { socketId: SOCKET_ID } });
+    const { io } = makeIO(SOCKET_ID);
+    const emit = vi.fn();
+    await handleEnforcePermissionsMessage(rm, io, { channelId: CHANNEL_ID }, emit);
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({ reasonCode: 'media_schema_rejected' })
+    );
+  });
+
+  it.each([
+    ['whitespace', ` ${CHANNEL_ID}`, USER_ID],
+    ['socket-like', 'socket-abc', USER_ID],
+    ['socket-like user', CHANNEL_ID, 'socket-abc'],
+    ['uppercase', CHANNEL_ID.toUpperCase(), USER_ID],
+    ['nil', '00000000-0000-0000-0000-000000000000', USER_ID],
+    ['invalid variant', '11111111-1111-4111-7111-111111111111', USER_ID],
+    ['invalid version', '11111111-1111-0111-8111-111111111111', USER_ID],
+    ['oversized', `${CHANNEL_ID}0`, USER_ID],
+  ])(
+    'rejects a %s enforcement identifier before a permissions mutation',
+    async (_label, channelId, userId) => {
+      const { rm, getParticipant, updateParticipantPermissions, closeForbiddenProducers } =
+        makeRoomManager({ participant: { socketId: SOCKET_ID } });
+      const { io } = makeIO(SOCKET_ID);
+      const emit = vi.fn();
+
+      await handleEnforcePermissionsMessage(
+        rm,
+        io,
+        { channelId, userId, permissions: PERM_VOICE_ACCESS.toString() },
+        emit
+      );
+
+      expect(getParticipant).not.toHaveBeenCalled();
+      expect(updateParticipantPermissions).not.toHaveBeenCalled();
+      expect(closeForbiddenProducers).not.toHaveBeenCalled();
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith(
+        expect.objectContaining({ reasonCode: 'media_schema_rejected' })
+      );
+    }
+  );
+
+  it('ignores malformed input when its optional observer throws', async () => {
+    const { rm, getParticipant } = makeRoomManager({ participant: { socketId: SOCKET_ID } });
+    const { io } = makeIO(SOCKET_ID);
+    await expect(
+      handleEnforcePermissionsMessage(rm, io, { channelId: CHANNEL_ID }, () => {
+        throw new Error('observer failure');
+      })
+    ).resolves.toBeUndefined();
+    expect(getParticipant).not.toHaveBeenCalled();
+  });
+
   it('serializes concurrent pushes for the same participant so the last bitfield wins', async () => {
     // closeForbiddenProducers on the FIRST push blocks on a manual deferred so
     // the two updates are forced to overlap the way the un-awaited NATS handler
@@ -238,10 +331,7 @@ describe('handleEnforcePermissionsMessage (NATS payload validation)', () => {
     const firstClose = new Promise<string[]>((resolve) => {
       releaseFirstClose = () => resolve([]);
     });
-    const closeForbiddenProducers = vi
-      .fn()
-      .mockReturnValueOnce(firstClose)
-      .mockResolvedValue([]);
+    const closeForbiddenProducers = vi.fn().mockReturnValueOnce(firstClose).mockResolvedValue([]);
     const updateParticipantPermissions = vi.fn().mockReturnValue(true);
     const rm = {
       getParticipant: vi.fn().mockReturnValue({ socketId: SOCKET_ID }),
@@ -252,7 +342,7 @@ describe('handleEnforcePermissionsMessage (NATS payload validation)', () => {
     const { io } = makeIO(SOCKET_ID);
 
     // Both pushes retain voice access, so each reaches the audit path.
-    const revoke = (PERM_VOICE_ACCESS).toString();
+    const revoke = PERM_VOICE_ACCESS.toString();
     const grant = (PERM_VOICE_ACCESS | PERM_SPEAK).toString();
 
     const first = handleEnforcePermissionsMessage(rm, io, {

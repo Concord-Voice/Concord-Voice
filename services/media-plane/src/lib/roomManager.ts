@@ -25,6 +25,7 @@ import {
   type StoredCameraLayerDemand,
 } from './cameraLayerGovernor.js';
 import { computeScreenLayeringGate, type StoredScreenLayerDemand } from './screenLayerGovernor.js';
+import type { EmitSecurityEvent, SecurityReasonCode } from './securityEvent.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -753,6 +754,7 @@ export type RoomEvent =
       userId: string;
       username: string;
       displayName?: string;
+      avatarUrl?: string;
       e2eeEpoch: number;
       callId?: string;
     }
@@ -1042,6 +1044,7 @@ export class RoomManager {
   private readonly closedDMCallIds: Map<string, number> = new Map();
   private readonly mediasoup: MediasoupService;
   private readonly eventHandlers: RoomEventHandler[] = [];
+  private emitSecurityEvent: EmitSecurityEvent | undefined;
 
   constructor(
     mediasoup: MediasoupService,
@@ -1053,6 +1056,49 @@ export class RoomManager {
   /** Register an event handler for room events (used by NATS/Redis integration) */
   onEvent(handler: RoomEventHandler): void {
     this.eventHandlers.push(handler);
+  }
+
+  /** Explicitly injected best-effort telemetry; never participates in media decisions. */
+  setSecurityEventEmitter(emit: EmitSecurityEvent | undefined): void {
+    this.emitSecurityEvent = emit;
+  }
+
+  private securityDeny(
+    reasonCode: SecurityReasonCode,
+    routeTemplate?: 'socket.join' | 'socket.produce' | 'socket.consume'
+  ): void {
+    let eventType: 'media_integrity' | 'media_admission' | 'media_authorization';
+    if (reasonCode === 'media_schema_rejected' || reasonCode === 'crypto_version_invalid') {
+      eventType = 'media_integrity';
+    } else if (reasonCode === 'structural_limit_exceeded') {
+      eventType = 'media_admission';
+    } else {
+      eventType = 'media_authorization';
+    }
+    try {
+      this.emitSecurityEvent?.({
+        eventType,
+        outcome: 'denied',
+        severity: reasonCode === 'permission_denied' ? 'high' : 'medium',
+        reasonCode,
+        ...(routeTemplate ? { routeTemplate } : {}),
+      });
+    } catch {
+      // Security telemetry never controls an admission or media decision.
+    }
+  }
+
+  private guardSecurityDecision<T>(
+    decision: () => T,
+    reasonCode: SecurityReasonCode,
+    routeTemplate?: 'socket.join' | 'socket.produce' | 'socket.consume'
+  ): T {
+    try {
+      return decision();
+    } catch (error) {
+      this.securityDeny(reasonCode, routeTemplate);
+      throw error;
+    }
   }
 
   private emitEvent(event: RoomEvent): void {
@@ -1111,6 +1157,7 @@ export class RoomManager {
           roomContext?.callId &&
           roomContext.callId !== room.callId
         ) {
+          this.securityDeny('authorization_denied', 'socket.join');
           throw new Error('DM call ID does not match the active room');
         }
         // NOTE (#1542): this early return means `room.roomKind` is intentionally
@@ -1301,7 +1348,13 @@ export class RoomManager {
   ): Promise<JoinRoomResult> {
     const { entitlement, mediaFrameCryptoVersion, roomContext, permissions } = options;
     this.assertDMCallOpen(roomContext);
-    const parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+    let parsedMediaFrameCryptoVersion: number;
+    try {
+      parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+    } catch (error) {
+      this.securityDeny('crypto_version_invalid', 'socket.join');
+      throw error;
+    }
     const { username, displayName, avatarUrl } = identity;
     const room = await this.getOrCreateRoom(roomId, roomContext);
     // An existing-room lookup still yields; the last leave can close it meanwhile.
@@ -1326,6 +1379,7 @@ export class RoomManager {
       !existing &&
       room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS
     ) {
+      this.securityDeny('structural_limit_exceeded', 'socket.join');
       throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
     }
 
@@ -1367,7 +1421,17 @@ export class RoomManager {
       // A1 records only an exact-socket candidate. It is deliberately absent
       // from participants, call history, cap/codec inputs, heartbeats, epochs,
       // and lifecycle events until the synchronous A2 promotion below.
-      registerProvisionalDMParticipant(room, participant, roomContext);
+      try {
+        registerProvisionalDMParticipant(room, participant, roomContext);
+      } catch (error) {
+        this.securityDeny(
+          error instanceof CryptoVersionMismatchError
+            ? 'crypto_version_invalid'
+            : 'authorization_denied',
+          'socket.join'
+        );
+        throw error;
+      }
 
       return joinRoomResult(
         room,
@@ -1378,10 +1442,16 @@ export class RoomManager {
 
     // Media-frame crypto-version admission gate for authoritative channel
     // membership. A DM candidate does not seed an empty room until promotion.
-    const activeMediaFrameCryptoVersion = admitMediaFrameCryptoVersion(
-      room,
-      parsedMediaFrameCryptoVersion
-    );
+    let activeMediaFrameCryptoVersion: number;
+    try {
+      activeMediaFrameCryptoVersion = admitMediaFrameCryptoVersion(
+        room,
+        parsedMediaFrameCryptoVersion
+      );
+    } catch (error) {
+      this.securityDeny('crypto_version_invalid', 'socket.join');
+      throw error;
+    }
 
     if (existing) {
       logger.warn('User already in room, cleaning up old session', {
@@ -1415,6 +1485,7 @@ export class RoomManager {
       userId,
       username,
       displayName,
+      avatarUrl,
       e2eeEpoch: room.e2eeEpoch,
       callId: room.callId,
     });
@@ -1433,9 +1504,11 @@ export class RoomManager {
   ): JoinRoomResult {
     const room = this.rooms.get(roomId);
     if (room?.roomKind !== 'dm' || room.router.closed) {
+      this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('DM provisional room is not available');
     }
     if (!expectedCallId || promotion.callId !== expectedCallId) {
+      this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('DM call ID does not match the provisional admission');
     }
 
@@ -1443,21 +1516,25 @@ export class RoomManager {
     if (!pending) {
       const admitted = room.participants.get(userId);
       if (admitted?.socketId !== socketId) {
+        this.securityDeny('authorization_denied', 'socket.join');
         throw new Error('DM provisional participant is not owned by this socket');
       }
       if (room.callId !== expectedCallId) {
+        this.securityDeny('authorization_denied', 'socket.join');
         throw new Error('DM call ID does not match the provisional admission');
       }
       commitSocketMembership();
       return joinRoomResult(room, userId, admitted.mediaFrameCryptoVersion);
     }
     if (pending.participant.socketId !== socketId) {
+      this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('DM provisional participant is not owned by this socket');
     }
     if (
       pending.callId !== expectedCallId ||
       (room.callId !== undefined && room.callId !== expectedCallId)
     ) {
+      this.securityDeny('authorization_denied', 'socket.join');
       throw new Error('DM call ID does not match the provisional admission');
     }
 
@@ -1466,6 +1543,7 @@ export class RoomManager {
       room.mediaFrameCryptoVersion !== null &&
       room.mediaFrameCryptoVersion !== participant.mediaFrameCryptoVersion
     ) {
+      this.securityDeny('crypto_version_invalid', 'socket.join');
       throw new CryptoVersionMismatchError(
         room.mediaFrameCryptoVersion,
         participant.mediaFrameCryptoVersion
@@ -1488,9 +1566,10 @@ export class RoomManager {
     // authoritative room mutation or lifecycle publication.
     commitSocketMembership();
 
-    const activeMediaFrameCryptoVersion = admitMediaFrameCryptoVersion(
-      room,
-      participant.mediaFrameCryptoVersion
+    const activeMediaFrameCryptoVersion = this.guardSecurityDecision(
+      () => admitMediaFrameCryptoVersion(room, participant.mediaFrameCryptoVersion),
+      'crypto_version_invalid',
+      'socket.join'
     );
 
     applyDMCallContext(
@@ -1536,6 +1615,7 @@ export class RoomManager {
       userId,
       username: participant.username,
       displayName: participant.displayName,
+      avatarUrl: participant.avatarUrl,
       e2eeEpoch: room.e2eeEpoch,
       callId: room.callId,
     });
@@ -1803,7 +1883,12 @@ export class RoomManager {
     // Receive-transport cap (#2032 / VULN-009). Synchronous check-and-reserve
     // with no intervening await, the #1539 TOCTOU-safe shape — otherwise N
     // concurrent create-transport calls all pass a stale pre-await count.
-    if (direction === 'recv') this.reserveRecvTransportSlot(participant);
+    if (direction === 'recv') {
+      this.guardSecurityDecision(
+        () => this.reserveRecvTransportSlot(participant),
+        'structural_limit_exceeded'
+      );
+    }
 
     let transport: WebRtcTransport;
     try {
@@ -2017,6 +2102,7 @@ export class RoomManager {
       !publishPermitted(participant.permissions, kind, source)
     ) {
       await this.closeProducer(roomId, userId, producer.id);
+      this.securityDeny('permission_denied', 'socket.produce');
       logger.warn('produce rejected: permission revoked mid-produce', {
         userId,
         kind,
@@ -2055,13 +2141,14 @@ export class RoomManager {
       // producer. Re-verify it is still present and permitted before announcing
       // it. Otherwise we would emit `producer-added` and ack the caller for a
       // producer the server already tore down.
-      if (
-        producer.closed ||
-        !participant.producers.has(producer.id) ||
-        (participant.permissions !== undefined &&
-          !publishPermitted(participant.permissions, kind, source))
-      ) {
+      const permissionRevoked =
+        participant.permissions !== undefined &&
+        !publishPermitted(participant.permissions, kind, source);
+      if (producer.closed || !participant.producers.has(producer.id) || permissionRevoked) {
         await this.closeProducer(roomId, userId, producer.id);
+        if (permissionRevoked) {
+          this.securityDeny('permission_denied', 'socket.produce');
+        }
         logger.warn('produce rejected: permission revoked mid-produce', {
           userId,
           kind,
@@ -2085,7 +2172,10 @@ export class RoomManager {
     if (!room) throw new Error('Room not found');
 
     const participant = room.participants.get(userId);
-    if (!participant) throw new Error('Participant not found');
+    if (!participant) {
+      this.securityDeny('authorization_denied', 'socket.produce');
+      throw new Error('Participant not found');
+    }
 
     if (participant.sendTransport?.id !== transportId) {
       throw new Error('Send transport not found or mismatch');
@@ -2096,7 +2186,11 @@ export class RoomManager {
     // participant. Ordered before the generic kind/source check so a video-kind
     // screen-audio mislabel gets the specific "must be audio kind" message.
     if (source === 'screen-audio') {
-      this.validateScreenAudioSource(participant, kind);
+      this.guardSecurityDecision(
+        () => this.validateScreenAudioSource(participant, kind),
+        this.screenAudioRejectionReason(participant, kind),
+        'socket.produce'
+      );
     }
 
     // Validate the client-declared source. It selects which per-room cap applies,
@@ -2109,6 +2203,7 @@ export class RoomManager {
     const allowedSources: MediaSource[] =
       kind === 'video' ? ['camera', 'screen'] : ['mic', 'screen-audio'];
     if (!allowedSources.includes(source)) {
+      this.securityDeny('media_schema_rejected', 'socket.produce');
       throw new Error('Invalid media source for producer kind');
     }
 
@@ -2121,12 +2216,20 @@ export class RoomManager {
     // pure synchronous check before the `await produce()`, so a rejected stream
     // never yields a (briefly-existing) producer.
     if (kind === 'audio' && source === 'mic') {
-      this.enforceAudioTierGate(participant, rtpParameters, source);
+      this.guardSecurityDecision(
+        () => this.enforceAudioTierGate(participant, rtpParameters, source),
+        'structural_limit_exceeded',
+        'socket.produce'
+      );
     }
 
     // CV-CAN-007: enforce the joining user's server-authoritative publish
     // permissions before reserving a producer slot (throws on denial).
-    assertPublishPermitted(participant, kind, source);
+    this.guardSecurityDecision(
+      () => assertPublishPermitted(participant, kind, source),
+      'permission_denied',
+      'socket.produce'
+    );
 
     // Screen-video simulcast guard (#1924 fix A): simulcast requires the
     // sharer's server-authoritative screen-layering gate. Synchronous, BEFORE
@@ -2134,14 +2237,22 @@ export class RoomManager {
     // yields a briefly-existing producer. The one-screen-per-participant half
     // of #1924 now rides the per-participant reservation below (#2032).
     if (kind === 'video' && source === 'screen') {
-      this.validateScreenVideoSource(room, userId, rtpParameters);
+      this.guardSecurityDecision(
+        () => this.validateScreenVideoSource(room, userId, rtpParameters),
+        'permission_denied',
+        'socket.produce'
+      );
     }
 
     // Enforce per-PARTICIPANT concurrent-producer slots (#2032): one live mic,
     // one screen-audio, one screen. Ordered BEFORE the per-room reservation so a
     // participant-level reject reports the participant-level reason, and inside
     // the same no-await section so the two reservations cannot interleave.
-    const participantSlotReserved = this.reserveParticipantProducerSlot(participant, source);
+    const participantSlotReserved = this.guardSecurityDecision(
+      () => this.reserveParticipantProducerSlot(participant, source),
+      'structural_limit_exceeded',
+      'socket.produce'
+    );
 
     // Enforce per-room concurrent-producer caps (#1542 tier-resolved: camera
     // free 8 / premium 25; screen free 1 / premium 3). TOCTOU-safe (#1539): the
@@ -2155,6 +2266,7 @@ export class RoomManager {
       // The per-room cap rejected after the participant slot was taken. Release
       // it here or the participant leaks a pending slot for the whole session.
       this.releaseParticipantProducerReservation(participant, source, participantSlotReserved);
+      this.securityDeny('structural_limit_exceeded', 'socket.produce');
       throw err;
     }
 
@@ -2471,19 +2583,16 @@ export class RoomManager {
       hasRtpCapabilities: !!consumer.rtpCapabilities,
     });
 
-    if (!recvTransport) {
-      throw new Error('No receive transport — create one first');
-    }
+    if (!recvTransport) throw new Error('No receive transport — create one first');
 
     if (!consumer.rtpCapabilities) {
+      this.securityDeny('media_schema_rejected', 'socket.consume');
       throw new Error('RTP capabilities not set — provide them on join');
     }
 
     // Find the producer and its owner
     const producerResult = this.findProducerInRoom(room, producerId);
-    if (!producerResult) {
-      throw new Error('Producer not found in room');
-    }
+    if (!producerResult) throw new Error('Producer not found in room');
     const { entry: producerEntry, userId: producerUserId } = producerResult;
 
     // Check if the router can route this producer to this consumer
@@ -3896,6 +4005,17 @@ export class RoomManager {
     if (hasActiveScreenAudio) {
       throw new Error('Only one active screen-audio producer allowed per participant');
     }
+  }
+
+  private screenAudioRejectionReason(
+    participant: Participant,
+    kind: MediaKind
+  ): SecurityReasonCode {
+    if (kind !== 'audio') return 'media_schema_rejected';
+    const hasScreenProducer = [...participant.producers.values()].some(
+      (info) => info.source === 'screen'
+    );
+    return hasScreenProducer ? 'structural_limit_exceeded' : 'authorization_denied';
   }
 
   private findProducerInRoom(

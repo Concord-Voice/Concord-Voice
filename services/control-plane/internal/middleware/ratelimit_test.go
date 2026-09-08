@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -193,6 +195,30 @@ func TestRateLimitByIPFailClosedWithHandlersRejectsTTLAndExpireErrors(t *testing
 			response := doRateLimitRequest(router)
 			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 			assert.JSONEq(t, `{"error":"metrics_unavailable"}`, response.Body.String())
+		})
+	}
+}
+
+func TestRateLimitByIPFailOpenMarksEveryBackendErrorBeforeAllowingRequest(t *testing.T) {
+	for _, command := range []string{"incr", "ttl", "expire"} {
+		t.Run(command, func(t *testing.T) {
+			mini := miniredis.RunT(t)
+			rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+			t.Cleanup(func() { require.NoError(t, rdb.Close()) })
+			rdb.AddHook(rateLimitCommandErrorHook{command: command})
+			var verdict middleware.NightwatchVerdict
+			var found bool
+			router := gin.New()
+			router.GET(pathRateTest, middleware.RateLimitByIP(rdb, 10, time.Minute), func(c *gin.Context) {
+				verdict, found = middleware.NightwatchVerdictFromContext(c)
+				c.Status(http.StatusNoContent)
+			})
+
+			response := doRateLimitRequest(router)
+
+			require.Equal(t, http.StatusNoContent, response.Code)
+			require.True(t, found)
+			require.Equal(t, middleware.NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonRateLimitBackendUnavailable}, verdict)
 		})
 	}
 }

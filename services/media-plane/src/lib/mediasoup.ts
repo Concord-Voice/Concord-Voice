@@ -2,11 +2,19 @@ import * as mediasoup from 'mediasoup';
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
 import type { Worker, Router, RouterRtpCodecCapability } from 'mediasoup/types';
+import type { EmitSecurityEvent } from './securityEvent.js';
 
 export class MediasoupService {
   private workers: Worker[] = [];
   private nextWorkerIdx = 0;
   private readonly routers: Map<string, Router> = new Map();
+  private emitSecurityEvent: EmitSecurityEvent | undefined;
+  private flushSecurityEvents: (() => void) | undefined;
+
+  setSecurityEventEmitter(emit: EmitSecurityEvent | undefined, flush?: () => void): void {
+    this.emitSecurityEvent = emit;
+    this.flushSecurityEvents = flush;
+  }
 
   async init() {
     logger.info('Initializing mediasoup workers', {
@@ -22,7 +30,22 @@ export class MediasoupService {
       });
 
       worker.on('died', () => {
-        logger.error('Mediasoup worker died', { pid: worker.pid });
+        try {
+          this.emitSecurityEvent?.({
+            eventType: 'dependency',
+            outcome: 'failure',
+            severity: 'critical',
+            reasonCode: 'dependency_unavailable',
+          });
+        } catch {
+          // An observer must not change the mandatory worker-death exit path.
+        }
+        try {
+          this.flushSecurityEvents?.();
+        } catch {
+          // Best effort: exit remains authoritative after a worker death.
+        }
+        logger.error('Mediasoup worker died');
         process.exit(1);
       });
 

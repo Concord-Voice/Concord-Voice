@@ -9,6 +9,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
 // Verify validates client signals and issues an attestation token bound to
@@ -100,9 +102,16 @@ func (h *Handler) checkVerifySignals(ctx context.Context, c *gin.Context, p Veri
 		return false
 	}
 
-	// Revocation check — O(1) against Redis revoked_versions SET.
-	// Fail-closed: IsRevoked returns true on Redis error.
-	if h.cache.IsRevoked(ctx, p.Version) {
+	// Revocation check — O(1) against Redis revoked_versions SET. Redis loss
+	// is fail-closed, but is a dependency outage (503), not a hostile revoked
+	// attestation rejection.
+	revoked, err := h.cache.IsRevoked(ctx, p.Version)
+	if err != nil {
+		h.emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "attestation registry temporarily unavailable"})
+		return false
+	}
+	if revoked {
 		h.reject(c, ErrRevoked, p.Version, p.Platform)
 		return false
 	}
@@ -134,17 +143,20 @@ func (h *Handler) issueToken(ctx context.Context, c *gin.Context, sessionID stri
 		// Self-hosted mode without Redis is not a supported attestation path
 		// — REQUIRE_CLIENT_ATTESTATION should be false. Fail loudly so the
 		// operator sees the misconfiguration immediately.
+		h.emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "attestation requires Redis"})
 		return
 	}
 	key := tokenKey(sessionID, p)
 	if err := h.rdb.Set(ctx, key, bs, ttl).Err(); err != nil {
 		// Fail-closed per D2.
+		h.emit(ctx, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable})
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "attestation registry temporarily unavailable"})
 		return
 	}
 
 	LogIssued(ctx, h.log, h.rdb, p.Version, p.SpaVersion, p.Platform)
+	h.emit(ctx, securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonAttestationIssued})
 	c.JSON(http.StatusOK, VerifyResponse{
 		AttestationToken: token,
 		TTLSeconds:       int(ttl.Seconds()),
@@ -165,6 +177,11 @@ func tokenKey(sessionID string, p VerifyPayload) string {
 // UpdateAvailable hint set for UNKNOWN_RELEASE and VERSION_TOO_OLD.
 func (h *Handler) reject(c *gin.Context, code ErrorCode, version string, platform Platform) {
 	LogRejected(c.Request.Context(), h.log, h.rdb, code, version, platform)
+	if code == ErrRevoked {
+		h.emit(c.Request.Context(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAttestationRejected})
+	} else {
+		h.emit(c.Request.Context(), securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonAttestationRejected})
+	}
 	body := ErrorResponse{
 		Error: "Attestation failed",
 		Code:  code,

@@ -203,6 +203,17 @@ in [Section 8](#8-how-do-we-handle-your-single-sign-on).
 
 ### Application Data
 
+Concord Voice may process a limited, pseudonymous security record when needed
+to protect the Services. These records use the closed `security-event.v1`
+contract and may include an event type, severity, bounded outcome, opaque
+correlation or evidence reference, and coarse service scope. They do not
+include message or voice content, general activity history, request bodies,
+raw credentials, raw network addresses, attacker-controlled text, raw errors,
+or stack traces. Generic stdout, request, and error logs are not security
+telemetry inputs. Wazuh alerts and indexes are retained for 30 days, subject
+to a documented incident or legal hold; normalized staging is size-bounded and
+is not the long-term retention store.
+
 If you use our application(s), we may also collect the following
 information if you choose to provide us with access or permission:
 

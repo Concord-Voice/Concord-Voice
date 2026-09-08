@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -76,14 +77,30 @@ type Logger interface {
 
 // Fence verifies and mutates per-user credential-epoch state.
 type Fence struct {
-	db    RowQuerier
-	redis *redis.Client
-	log   Logger
+	db             RowQuerier
+	redis          *redis.Client
+	log            Logger
+	securityEvents securityevent.Emitter
 }
 
 // New constructs the process-wide Fence over the shared DB pool and Redis client.
 func New(db RowQuerier, redisClient *redis.Client, log Logger) *Fence {
-	return &Fence{db: db, redis: redisClient, log: log}
+	return &Fence{db: db, redis: redisClient, log: log, securityEvents: securityevent.Discard}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the
+// fence constructor shared by request and write paths.
+func (f *Fence) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	f.securityEvents = events
+}
+
+func (f *Fence) emitSecurityEvent(ctx context.Context, event securityevent.Event) {
+	if f.securityEvents != nil {
+		f.securityEvents.Emit(ctx, event)
+	}
 }
 
 // Key returns the Redis key for a user's epoch state — the single source of
@@ -106,6 +123,13 @@ func NewEpoch() (string, error) {
 func (f *Fence) Check(ctx context.Context, userID, tokenEpoch string) error {
 	authoritative, err := f.authoritativeEpoch(ctx, userID)
 	if err != nil {
+		if errors.Is(err, ErrUnavailable) {
+			f.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventCredentialEpoch, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonCredentialEpochBackendUnavailable})
+		} else if errors.Is(err, ErrBlocked) {
+			f.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventCredentialEpoch, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonCredentialEpochOperationInProgress})
+		} else {
+			f.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventCredentialEpoch, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonCredentialEpochMismatch})
+		}
 		return err
 	}
 	if authoritative == "" { // no epoch marker yet — pre-first-rotation
@@ -114,6 +138,7 @@ func (f *Fence) Check(ctx context.Context, userID, tokenEpoch string) error {
 	if tokenEpoch == authoritative {
 		return nil
 	}
+	f.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventCredentialEpoch, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonCredentialEpochMismatch})
 	return ErrEpochMismatch
 }
 

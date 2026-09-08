@@ -1,8 +1,10 @@
 import type { RoomManager } from './roomManager.js';
 import { hasVoiceAccess } from './roomManager.js';
 import { handleForceDisconnect } from './forceDisconnect.js';
+import { isCanonicalEnforcementUUID } from './enforcementCommand.js';
 import { logger } from './logger.js';
 import { parsePermissionBitfield } from '../middleware/auth.js';
+import type { EmitSecurityEvent } from './securityEvent.js';
 
 /**
  * Minimal RoomManager surface needed to apply a mid-session permission push.
@@ -16,7 +18,7 @@ export interface EnforcePermissionsRoomManager {
   getProvisionalParticipantSocketId: RoomManager['getProvisionalParticipantSocketId'];
   updateParticipantPermissions: RoomManager['updateParticipantPermissions'];
   closeForbiddenProducers: RoomManager['closeForbiddenProducers'];
-  leaveRoom: RoomManager['leaveRoom'];
+  leaveRoomIfSocketOwned: RoomManager['leaveRoomIfSocketOwned'];
   removeProvisionalParticipantForEnforcement: RoomManager['removeProvisionalParticipantForEnforcement'];
 }
 
@@ -32,6 +34,17 @@ export interface EnforcePermissionsIO {
       { emit: (event: string, ...args: unknown[]) => void; disconnect: (close?: boolean) => void }
     >;
   };
+}
+
+function safeObserveSecurityEvent(
+  emit: EmitSecurityEvent | undefined,
+  event: Parameters<EmitSecurityEvent>[0]
+): void {
+  try {
+    emit?.(event);
+  } catch {
+    // Permission enforcement remains authoritative over its observer.
+  }
 }
 
 /**
@@ -66,7 +79,8 @@ export async function handlePermissionsUpdate(
   io: EnforcePermissionsIO,
   channelId: string,
   userId: string,
-  permissions: bigint
+  permissions: bigint,
+  emit?: EmitSecurityEvent
 ): Promise<void> {
   const participant = roomManager.getParticipant(channelId, userId);
   if (!participant) {
@@ -89,7 +103,7 @@ export async function handlePermissionsUpdate(
   // (leaveRoom closes transports/producers/consumers and emits user-left).
   // Administrator bypasses (mirrors publishPermitted / rbac.Permission.Has).
   if (!hasVoiceAccess(permissions)) {
-    await handleForceDisconnect(roomManager, io, channelId, userId);
+    await handleForceDisconnect(roomManager, io, channelId, userId, emit);
     logger.info('Force-disconnected peer on mid-session voice-access revocation', {
       channelId,
       userId,
@@ -109,6 +123,13 @@ export async function handlePermissionsUpdate(
   }
 
   if (closedSources.length > 0) {
+    safeObserveSecurityEvent(emit, {
+      eventType: 'media_authorization',
+      outcome: 'success',
+      severity: 'high',
+      reasonCode: 'revocation_enforced',
+      routeTemplate: 'socket.permissions_update',
+    });
     logger.info('Closed producers on mid-session permission revocation', {
       channelId,
       userId,
@@ -131,8 +152,8 @@ const permissionUpdateChains = new Map<string, Promise<void>>();
 
 /**
  * Message-level entry point for the `voice.enforce.permissions` subscription:
- * validates the raw NATS payload (string channelId/userId, strict fail-closed
- * decimal bitfield via parsePermissionBitfield) before dispatching to
+ * validates the raw NATS payload (canonical UUID channelId/userId, strict
+ * fail-closed decimal bitfield via parsePermissionBitfield) before dispatching to
  * handlePermissionsUpdate. A malformed payload is IGNORED — enforcement never
  * fails open, and a bad message never strips a legitimate peer. Well-formed
  * pushes are serialized per participant so the last published bitfield wins even
@@ -141,13 +162,30 @@ const permissionUpdateChains = new Map<string, Promise<void>>();
 export async function handleEnforcePermissionsMessage(
   roomManager: EnforcePermissionsRoomManager,
   io: EnforcePermissionsIO,
-  natsData: Record<string, unknown>
+  natsData: Record<string, unknown>,
+  emit?: EmitSecurityEvent
 ): Promise<void> {
   const channelId = natsData.channelId;
   const userId = natsData.userId;
-  if (typeof channelId !== 'string' || typeof userId !== 'string') return;
+  if (!isCanonicalEnforcementUUID(channelId) || !isCanonicalEnforcementUUID(userId)) {
+    safeObserveSecurityEvent(emit, {
+      eventType: 'media_integrity',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'media_schema_rejected',
+      routeTemplate: 'socket.permissions_update',
+    });
+    return;
+  }
   const permissions = parsePermissionBitfield(natsData.permissions);
   if (permissions === undefined) {
+    safeObserveSecurityEvent(emit, {
+      eventType: 'media_integrity',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'media_schema_rejected',
+      routeTemplate: 'socket.permissions_update',
+    });
     logger.warn('Ignoring malformed voice.enforce.permissions payload', { channelId, userId });
     return;
   }
@@ -159,7 +197,7 @@ export async function handleEnforcePermissionsMessage(
   const prior = permissionUpdateChains.get(key) ?? Promise.resolve();
   const next = prior
     .catch(() => undefined)
-    .then(() => handlePermissionsUpdate(roomManager, io, channelId, userId, permissions));
+    .then(() => handlePermissionsUpdate(roomManager, io, channelId, userId, permissions, emit));
   permissionUpdateChains.set(key, next);
   try {
     await next;

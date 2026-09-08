@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
 // AuthAdapter wrappers on *Handler — production binding for the
@@ -142,6 +143,7 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 	if err := tx.Commit(); err != nil {
 		return "", "", "", fmt.Errorf("commit: %w", err)
 	}
+	h.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonAuthenticationSucceeded, AuthMethod: securityevent.AuthSSO})
 
 	return accessToken, refreshToken, tokenID, nil
 }
@@ -185,7 +187,7 @@ func (h *Handler) lockSSOMintUser(ctx context.Context, tx *sql.Tx, userID string
 // user has trust_sso_security=FALSE but no MFA factors enrolled. The caller
 // (respondExistingSSO) treats this as "fall through to direct token issuance"
 // rather than "issue an unverifiable challenge token". This matches the
-// password path's IsEnabled gate in handlers.go before handleMFAChallenge.
+// password path's enrollment gate in handlers.go before handleMFAChallenge.
 func (h *Handler) IssueMFAChallenge(ctx context.Context, userID string) (
 	challengeToken string,
 	loginMethods []string,
@@ -197,21 +199,19 @@ func (h *Handler) IssueMFAChallenge(ctx context.Context, userID string) (
 	if h.mfaChecker == nil {
 		return "", nil, nil, nil, false, errors.New("mfa checker not wired")
 	}
-	// Pre-flight IsEnabled gate — the password path checks this before issuing
-	// a challenge. Without the gate, a user with trust_sso_security=FALSE but
-	// no MFA enrolled would be served a challenge token they can never
-	// complete (no methods to verify against), deadlocking SSO sign-in.
-	if !h.mfaChecker.IsEnabled(ctx, userID) {
-		return "", nil, nil, nil, false, nil
-	}
-
-	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
-	if err != nil {
-		return "", nil, nil, nil, false, fmt.Errorf("get enabled methods: %w", err)
-	}
+	// Use the error-returning login-method lookup as the enrollment gate.
+	// Recovery-only methods cannot satisfy an SSO challenge and must not turn
+	// an already-authorized SSO login into an unanswerable methods:[] response.
 	loginMethods, err = h.mfaChecker.GetLoginMethods(ctx, userID)
 	if err != nil {
 		return "", nil, nil, nil, false, fmt.Errorf("get login methods: %w", err)
+	}
+	if len(loginMethods) == 0 {
+		return "", nil, nil, nil, false, nil
+	}
+	allMethods, err := h.mfaChecker.GetEnabledMethods(ctx, userID)
+	if err != nil {
+		return "", nil, nil, nil, false, fmt.Errorf("get enabled methods: %w", err)
 	}
 	recoveryOnlyMethods = computeRecoveryOnlyMethods(allMethods, loginMethods)
 
@@ -224,10 +224,11 @@ func (h *Handler) IssueMFAChallenge(ctx context.Context, userID string) (
 		return "", nil, nil, nil, false, fmt.Errorf("read credential epoch for SSO MFA challenge: %w", epochErr)
 	}
 
-	token, jti, err := h.mfaChecker.GenerateLoginChallenge(ctx, userID, true, ssoEpoch)
+	token, jti, err := h.mfaChecker.GenerateLoginChallenge(ctx, userID, true, ssoEpoch, securityevent.AuthSSO)
 	if err != nil {
 		return "", nil, nil, nil, false, fmt.Errorf("generate login challenge: %w", err)
 	}
+	h.emitSecurityEvent(ctx, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired, AuthMethod: securityevent.AuthSSO})
 
 	// WebAuthn options when applicable — same posture as addWebAuthnOptions in
 	// handlers.go. We log and continue on BeginWebAuthnLogin errors; the

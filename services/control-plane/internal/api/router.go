@@ -37,6 +37,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servercapabilities"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/servers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/sessions"
@@ -258,6 +259,7 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 type RouterDependencies struct {
 	OpsMetricsReader opsmetrics.Reader
 	PresenceHistory  *presencehistory.Service
+	SecurityEvents   securityevent.Emitter
 	Tier1ErasureWake func()
 	// MediaStoreResolver resolves a media_files.storage_backend value to the
 	// object store holding that row's object (ADR-0038 / #2759). Typed as the
@@ -555,7 +557,9 @@ func wireMediaHandler(
 	// selfHosted comes from the existing InstanceType seam rather than a
 	// new flag: self-hosted/dev/air-gapped deployments only ever warn,
 	// they never refuse (MinIO is their sole, permanent backend).
-	handler.SetDiskWatermark(media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log))
+	watermark := media.NewDiskWatermark(config.IsSelfHostedInstance(cfg.InstanceType), log)
+	watermark.SetSecurityEvents(dependencies.SecurityEvents)
+	handler.SetDiskWatermark(watermark)
 	// Per-object backend resolution for the attachment download path
 	// (ADR-0038 / #2759). Left nil by a caller that has no registry, in
 	// which case legacy rows still resolve to the process-wide store and
@@ -572,6 +576,18 @@ func wireMediaHandler(
 	}
 }
 
+func newHubWithSecurityEvents(db *sql.DB, redis *redis.Client, counters *opsmetrics.Counters, events securityevent.Emitter) *websocket.Hub {
+	hub := websocket.NewHub(db, redis, counters)
+	hub.SetSecurityEvents(events)
+	return hub
+}
+
+func newAuditWriterWithSecurityEvents(db *sql.DB, log *logger.Logger, events securityevent.Emitter) *rbac.AuditWriter {
+	audit := rbac.NewAuditWriter(db, log)
+	audit.SetSecurityEvents(events)
+	return audit
+}
+
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
 	db *sql.DB,
@@ -584,12 +600,17 @@ func NewRouter(
 ) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Reconciler, func(context.Context), error) {
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
+	securityEvents := dependencies.SecurityEvents
+	if securityEvents == nil {
+		securityEvents = securityevent.Discard
+	}
 	router := gin.New()
 	configureTrustedProxies(router, cfg, log)
 
 	// Middleware
 	opsCounters := configureOpsMetricsAndRecovery(router, cfg.OpsMetrics.Enabled)
 	router.Use(middleware.RequestID())
+	router.Use(nightwatchSecurityObserver(securityEvents))
 	router.Use(middleware.Logger(log))
 	router.Use(middleware.SecurityHeaders(cfg.Environment, cfg.HSTSHeaderValue))
 	router.Use(middleware.CORS(cfg.AllowedOrigins))
@@ -602,7 +623,7 @@ func NewRouter(
 	router.HEAD("/health", healthHandler)
 
 	// Initialize WebSocket hub
-	hub := websocket.NewHub(db, redis, opsCounters)
+	hub := newHubWithSecurityEvents(db, redis, opsCounters, securityEvents)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
 		return nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
@@ -705,6 +726,7 @@ func NewRouter(
 		log.Fatal("Failed to create WebAuthn service", "error", err)
 	}
 	mfaHandler := mfa.NewHandler(db, redis, log, mfaKeyring, cfg.JWTSecret, webauthnSvc, cfg.Environment)
+	mfaHandler.SetSecurityEvents(securityEvents)
 
 	// Initialize RBAC components (before handlers that depend on resolver)
 	permCache := rbac.NewPermissionCache(redis)
@@ -747,7 +769,7 @@ func NewRouter(
 		newRichPresenceHiddenSuppressor(activityService, presenceHistoryService, log, true),
 	)
 
-	auditWriter := rbac.NewAuditWriter(db, log)
+	auditWriter := newAuditWriterWithSecurityEvents(db, log, securityEvents)
 	rbacHandler := rbac.NewHandler(db, log, redis, hub, rbacResolver, permCache, auditWriter)
 	// Mid-session voice permission push (CV-CAN-007 review P1): permission
 	// mutations re-resolve and publish voice.enforce.permissions for
@@ -774,9 +796,11 @@ func NewRouter(
 	// for users.credential_epoch. Injected into AuthRequired, the WS surfaces,
 	// and the destructive credential flows.
 	credFence := credepoch.New(db, redis, log)
+	credFence.SetSecurityEvents(securityEvents)
 
 	// Initialize handlers
 	authHandler := auth.NewHandlerForInstance(db, redis, log, cfg.JWTSecret, hub, cfg.InstanceType)
+	authHandler.SetSecurityEvents(securityEvents)
 	authHandler.SetPresenceHistory(presenceHistoryService)
 	authHandler.SetEmailService(emailSvc)
 	authHandler.SetCredentialFence(credFence)
@@ -789,6 +813,7 @@ func NewRouter(
 	entCache := entitlements.NewCacheForInstance(redis, db, cfg.InstanceType)
 	serverEntCache := entitlements.NewServerCacheForInstance(redis, db, cfg.InstanceType)
 	sessionsHandler := sessions.NewHandler(db, redis, log, hub, mfaHandler)
+	sessionsHandler.SetSecurityEvents(securityEvents)
 	usersHandler := users.NewHandler(db, log, hub, mfaHandler, entCache, credFence, authHandler)
 	usersHandler.SetRedis(redis)
 	usersHandler.SetTier1ErasureWake(dependencies.Tier1ErasureWake)
@@ -995,7 +1020,7 @@ func NewRouter(
 	// When true, the OIDC verifier is constructed eagerly and a failed
 	// discovery (network down at startup) is treated as fatal — that matches
 	// the fail-closed posture required by D2.
-	attestationHandler := buildAttestationHandler(db, redis, natsClient, cfg, log)
+	attestationHandler := buildAttestationHandlerWithSecurityEvents(db, redis, natsClient, cfg, log, securityEvents)
 
 	// Age-verification claim handler (#1623). hub satisfies age.SessionDisconnector
 	// for the terminal-disable live-session kick on valid_age=false.
@@ -2738,9 +2763,9 @@ func NewRouter(
 	// group, fully isolated from the user `/api/v1` JWT path (separate WebAuthn
 	// RP, opaque Redis sessions, append-only audit, AdminAuthRequired middleware).
 	// Host/path gating of this surface is #1692/#1693.
-	wireAdminRoutes(router, db, redis, metricsReader, cfg, log)
+	wireAdminRoutesWithSecurityEvents(router, db, redis, metricsReader, cfg, log, securityEvents)
 
-	opsRuntime := wireOpsMetricsRuntime(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log)
+	opsRuntime := wireOpsMetricsRuntimeWithSecurityEvents(db, natsClient, hub, opsCounters, cfg.OpsMetrics, log, securityEvents)
 	// Start only after every dependency, observer, and route has been injected.
 	go hub.Run()
 	// Fold the readiness prober's cancel into the presence closer IN PLACE,
@@ -2756,6 +2781,97 @@ func NewRouter(
 	}
 
 	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, ownershipHandler.CompleteExpiredTransfers, nil
+}
+
+// nightwatchSecurityObserver records only a closed route template or a closed
+// middleware verdict after the application has selected its response.
+func nightwatchSecurityObserver(events securityevent.Emitter) gin.HandlerFunc {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	return func(c *gin.Context) {
+		if ctx, err := securityevent.WithNewCorrelation(c.Request.Context()); err == nil {
+			c.Request = c.Request.WithContext(ctx)
+		}
+		c.Next()
+
+		route, allowed := nightwatchRouteTemplate(c.Request.Method, c.FullPath())
+		if verdict, ok := middleware.NightwatchVerdictFromContext(c); ok {
+			events.Emit(c.Request.Context(), nightwatchVerdictEvent(verdict, route))
+			// The verdict is the closed middleware/control outcome. It is not a
+			// coarse route fallback, so emitting both would duplicate one decision.
+			return
+		}
+		if !allowed || middleware.NightwatchHandled(c) || (c.Writer.Status() != http.StatusUnauthorized && c.Writer.Status() != http.StatusForbidden) {
+			return
+		}
+		events.Emit(c.Request.Context(), nightwatchFallbackEvent(route))
+	}
+}
+
+// nightwatchVerdictEvent is the sole adapter from middleware's already-closed
+// verdict type. It copies no request values: middleware selects every verdict
+// field from securityevent constants, while the observer supplies the route
+// from its closed route allowlist.
+func nightwatchVerdictEvent(verdict middleware.NightwatchVerdict, route securityevent.RouteTemplate) securityevent.Event {
+	var event securityevent.Event
+	event.EventType = verdict.EventType
+	event.Outcome = verdict.Outcome
+	event.Severity = verdict.Severity
+	event.ReasonCode = verdict.Reason
+	event.AuthMethod = verdict.AuthMethod
+	event.RouteTemplate = route
+	return event
+}
+
+func nightwatchRouteTemplate(method, fullPath string) (securityevent.RouteTemplate, bool) {
+	route, ok := nightwatchRoutes[method+" "+fullPath]
+	return route, ok
+}
+
+func nightwatchFallbackEvent(route securityevent.RouteTemplate) securityevent.Event {
+	if event, ok := nightwatchFallbackEvents[route]; ok {
+		return event
+	}
+	return securityevent.Event{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPermissionDenied}
+}
+
+var nightwatchFallbackEvents = map[securityevent.RouteTemplate]securityevent.Event{
+	securityevent.RouteAuthLogin:                 {EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, RouteTemplate: securityevent.RouteAuthLogin},
+	securityevent.RouteAuthRefresh:               {EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, RouteTemplate: securityevent.RouteAuthRefresh},
+	securityevent.RouteAuthMFAVerify:             {EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonChallengeInvalid, RouteTemplate: securityevent.RouteAuthMFAVerify},
+	securityevent.RouteAuthLogout:                {EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPermissionDenied, RouteTemplate: securityevent.RouteAuthLogout},
+	securityevent.RouteSessionDelete:             {EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPermissionDenied, RouteTemplate: securityevent.RouteSessionDelete},
+	securityevent.RouteSessionsRevokeAll:         {EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPermissionDenied, RouteTemplate: securityevent.RouteSessionsRevokeAll},
+	securityevent.RouteSessionsRevocationMode:    {EventType: securityevent.EventSession, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPermissionDenied, RouteTemplate: securityevent.RouteSessionsRevocationMode},
+	securityevent.RouteRecoveryVerifyCode:        {EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryVerifyCode},
+	securityevent.RouteRecoveryResetPassword:     {EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryResetPassword},
+	securityevent.RouteRecoveryResetAccount:      {EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonInvalidCredentials, AuthMethod: securityevent.AuthRecovery, RouteTemplate: securityevent.RouteRecoveryResetAccount},
+	securityevent.RouteServerMemberPatch:         {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMemberPatch},
+	securityevent.RouteServerMemberDelete:        {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMemberDelete},
+	securityevent.RouteServerBanCreate:           {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerBanCreate},
+	securityevent.RouteServerBanDelete:           {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerBanDelete},
+	securityevent.RouteServerRoleCreate:          {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerRoleCreate},
+	securityevent.RouteServerRolePatch:           {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerRolePatch},
+	securityevent.RouteServerRoleDelete:          {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerRoleDelete},
+	securityevent.RouteServerMemberRoleCreate:    {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMemberRoleCreate},
+	securityevent.RouteServerMemberRoleDelete:    {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerMemberRoleDelete},
+	securityevent.RouteServerTransferOwnership:   {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerTransferOwnership},
+	securityevent.RouteServerTransferOwnershipOK: {EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, ReasonCode: securityevent.ReasonPrivilegedRouteDenied, RouteTemplate: securityevent.RouteServerTransferOwnershipOK},
+}
+
+var nightwatchRoutes = map[string]securityevent.RouteTemplate{
+	"POST /api/v1/auth/login": securityevent.RouteAuthLogin, "POST /api/v1/auth/refresh": securityevent.RouteAuthRefresh,
+	"POST /api/v1/auth/logout": securityevent.RouteAuthLogout, "POST /api/v1/auth/mfa/verify": securityevent.RouteAuthMFAVerify,
+	"POST /api/v1/auth/recovery/verify-code": securityevent.RouteRecoveryVerifyCode, "POST /api/v1/auth/recovery/reset-password": securityevent.RouteRecoveryResetPassword,
+	"POST /api/v1/auth/recovery/reset-account": securityevent.RouteRecoveryResetAccount, "DELETE /api/v1/sessions/:id": securityevent.RouteSessionDelete,
+	"POST /api/v1/sessions/revoke-all": securityevent.RouteSessionsRevokeAll, "PUT /api/v1/sessions/revocation-mode": securityevent.RouteSessionsRevocationMode,
+	"PATCH /api/v1/servers/:id/members/:user_id": securityevent.RouteServerMemberPatch, "DELETE /api/v1/servers/:id/members/:user_id": securityevent.RouteServerMemberDelete,
+	"POST /api/v1/servers/:id/bans/:user_id": securityevent.RouteServerBanCreate, "DELETE /api/v1/servers/:id/bans/:user_id": securityevent.RouteServerBanDelete,
+	"POST /api/v1/servers/:id/roles": securityevent.RouteServerRoleCreate, "PATCH /api/v1/servers/:id/roles/:role_id": securityevent.RouteServerRolePatch,
+	"DELETE /api/v1/servers/:id/roles/:role_id": securityevent.RouteServerRoleDelete, "POST /api/v1/servers/:id/members/:user_id/roles": securityevent.RouteServerMemberRoleCreate,
+	"DELETE /api/v1/servers/:id/members/:user_id/roles/:role_id": securityevent.RouteServerMemberRoleDelete, "POST /api/v1/servers/:id/transfer-ownership": securityevent.RouteServerTransferOwnership,
+	"POST /api/v1/servers/:id/transfer-ownership/confirm": securityevent.RouteServerTransferOwnershipOK,
 }
 
 // healthHandler responds with 200 + control-plane health JSON. Registered

@@ -20,6 +20,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/lib/pq"
@@ -96,6 +97,11 @@ const (
 	// clears in hundreds of milliseconds or is not going to clear at all.
 	presenceAudienceMaxAttempts  = 3
 	presenceAudienceRetryBackoff = 250 * time.Millisecond
+	// A blocked telemetry emitter must not let health transition flaps consume
+	// unbounded memory. One queued value is sufficient: the in-flight emission
+	// precedes it, and replacing the queued value preserves eventual delivery of
+	// the final authoritative health state.
+	securityEventEmissionQueueLimit = 1
 
 	// presenceAudienceMaxHandoff bounds how long a computed audience may sit
 	// between the query returning and Run applying it. Under ordinary load the
@@ -373,7 +379,18 @@ type Hub struct {
 	mentionChecker MentionPermissionChecker
 
 	// Channel permission checker (injected after construction via SetChannelPermissionChecker)
-	channelPermissionChecker ChannelPermissionChecker
+	channelPermissionChecker         ChannelPermissionChecker
+	securityEvents                   securityevent.Emitter
+	securityEventsDegraded           bool
+	securityEventsMu                 sync.Mutex
+	securityEventEmissionQueue       []securityEventEmission
+	securityEventsDraining           bool
+	securityEventsClosing            bool
+	securityEventsDrainDone          chan struct{}
+	securityEventSourceGeneration    [securityEventSourceCount]uint64
+	securityEventSourceFailureEpoch  [securityEventSourceCount]uint64
+	securityEventSourceFailureActive [securityEventSourceCount]bool
+	securityEventSourceSuccess       [securityEventSourceCount]uint64
 
 	// DM voice ring canceller (injected after construction via
 	// SetDMRingCanceller). When the user's LAST WS connection drops,
@@ -448,11 +465,12 @@ type channelDeliveryDecision struct {
 }
 
 type channelDeliveryResult struct {
-	kind      channelDeliveryKind
-	serverID  uuid.UUID
-	channelID uuid.UUID
-	data      []byte
-	decisions []channelDeliveryDecision
+	kind          channelDeliveryKind
+	serverID      uuid.UUID
+	channelID     uuid.UUID
+	data          []byte
+	decisions     []channelDeliveryDecision
+	deliveryProbe *securityEventProbe
 }
 
 // NewHub creates a new Hub
@@ -495,6 +513,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		presenceAudienceSlots:    make(chan struct{}, presenceAudienceConcurrency),
 		suppressorPending:        make(map[uuid.UUID]struct{}),
 		clientBootstrapTimeout:   clientBootstrapTimeout,
+		securityEvents:           securityevent.Discard,
 	}
 	if len(opsCounters) > 0 {
 		hub.opsCounter = opsCounters[0]
@@ -573,6 +592,138 @@ func (h *Hub) SetMentionChecker(checker MentionPermissionChecker) {
 // SetChannelPermissionChecker injects the RBAC checker for channel WebSocket authorization.
 func (h *Hub) SetChannelPermissionChecker(checker ChannelPermissionChecker) {
 	h.channelPermissionChecker = checker
+}
+
+// SetSecurityEvents injects bounded control-health telemetry without changing
+// the high-fanout Hub constructor.
+func (h *Hub) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	h.securityEventsMu.Lock()
+	h.securityEvents = events
+	h.securityEventsMu.Unlock()
+}
+
+// A source recovers only its own failures observed before the probe began.
+type securityEventSource uint8
+
+const (
+	securityEventSourcePermissionAuthority securityEventSource = iota
+	securityEventSourceChannelDelivery
+	securityEventSourceCount
+)
+
+type securityEventProbe struct {
+	source              securityEventSource
+	generation          uint64
+	failureEpochAtStart uint64
+}
+
+type securityEventEmission struct {
+	emitter securityevent.Emitter
+	event   securityevent.Event
+}
+
+func (h *Hub) beginSecurityEventProbe(source securityEventSource) securityEventProbe {
+	h.securityEventsMu.Lock()
+	defer h.securityEventsMu.Unlock()
+	h.securityEventSourceGeneration[source]++
+	return securityEventProbe{
+		source:              source,
+		generation:          h.securityEventSourceGeneration[source],
+		failureEpochAtStart: h.securityEventSourceFailureEpoch[source],
+	}
+}
+
+func (h *Hub) completeSecurityEventProbeFailure(probe securityEventProbe) {
+	h.securityEventsMu.Lock()
+	if probe.generation < h.securityEventSourceSuccess[probe.source] {
+		h.securityEventsMu.Unlock()
+		return
+	}
+	h.securityEventSourceFailureEpoch[probe.source]++
+	h.securityEventSourceFailureActive[probe.source] = true
+	initial, drain := h.updateSecurityEventsDegradedLocked()
+	h.securityEventsMu.Unlock()
+	if drain {
+		go h.drainSecurityEventEmissions(initial)
+	}
+}
+
+func (h *Hub) completeSecurityEventProbeSuccess(probe securityEventProbe) {
+	h.securityEventsMu.Lock()
+	if probe.generation < h.securityEventSourceSuccess[probe.source] {
+		h.securityEventsMu.Unlock()
+		return
+	}
+	h.securityEventSourceSuccess[probe.source] = probe.generation
+	if h.securityEventSourceFailureActive[probe.source] && h.securityEventSourceFailureEpoch[probe.source] <= probe.failureEpochAtStart {
+		h.securityEventSourceFailureActive[probe.source] = false
+	}
+	initial, drain := h.updateSecurityEventsDegradedLocked()
+	h.securityEventsMu.Unlock()
+	if drain {
+		go h.drainSecurityEventEmissions(initial)
+	}
+}
+
+func (h *Hub) updateSecurityEventsDegradedLocked() (securityEventEmission, bool) {
+	if h.securityEventsClosing {
+		return securityEventEmission{}, false
+	}
+	degraded := false
+	for _, failed := range h.securityEventSourceFailureActive {
+		degraded = degraded || failed
+	}
+	changed := h.securityEventsDegraded != degraded
+	h.securityEventsDegraded = degraded
+	if !changed {
+		return securityEventEmission{}, false
+	}
+	event := securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeRestored, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonDependencyRecovered}
+	if degraded {
+		event = securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable}
+	}
+	emission := securityEventEmission{emitter: h.securityEvents, event: event}
+	if len(h.securityEventEmissionQueue) < securityEventEmissionQueueLimit {
+		h.securityEventEmissionQueue = append(h.securityEventEmissionQueue, emission)
+	} else {
+		h.securityEventEmissionQueue[len(h.securityEventEmissionQueue)-1] = emission
+	}
+	if h.securityEventsDraining {
+		return securityEventEmission{}, false
+	}
+	h.securityEventsDraining = true
+	h.securityEventsDrainDone = make(chan struct{})
+	// Reserve the first transition before the asynchronous drain begins. A
+	// concurrent transition may replace only the pending latest state, never
+	// this initial transition.
+	initial := h.securityEventEmissionQueue[0]
+	h.securityEventEmissionQueue = h.securityEventEmissionQueue[1:]
+	return initial, true
+}
+
+// drainSecurityEventEmissions serializes transition delivery without holding
+// securityEventsMu across untrusted emitter code. Reentrant and concurrent
+// transitions append under the state mutex; this owner drains them in state
+// order after each Emit returns.
+func (h *Hub) drainSecurityEventEmissions(emission securityEventEmission) {
+	for {
+		emission.emitter.Emit(context.Background(), emission.event)
+
+		h.securityEventsMu.Lock()
+		if len(h.securityEventEmissionQueue) == 0 {
+			h.securityEventsDraining = false
+			close(h.securityEventsDrainDone)
+			h.securityEventsDrainDone = nil
+			h.securityEventsMu.Unlock()
+			return
+		}
+		emission = h.securityEventEmissionQueue[0]
+		h.securityEventEmissionQueue = h.securityEventEmissionQueue[1:]
+		h.securityEventsMu.Unlock()
+	}
 }
 
 // RevalidateChannelSubscriptions queues a visibility recheck for one channel.
@@ -868,6 +1019,13 @@ func (h *Hub) Shutdown() {
 		close(h.done)
 	})
 	<-h.stopped
+	h.securityEventsMu.Lock()
+	h.securityEventsClosing = true
+	drainDone := h.securityEventsDrainDone
+	h.securityEventsMu.Unlock()
+	if drainDone != nil {
+		<-drainDone
+	}
 }
 
 // Stopped returns a channel that is closed when the Run loop has exited.
@@ -1426,7 +1584,9 @@ func (h *Hub) authorizeChannelPermissions(
 	deniedMessage string,
 	uncached bool,
 ) bool {
+	probe := h.beginSecurityEventProbe(securityEventSourcePermissionAuthority)
 	if h.channelPermissionChecker == nil {
+		h.completeSecurityEventProbeFailure(probe)
 		log.Printf("Channel permission checker not configured")
 		h.sendError(msg.ClientID, "Failed to verify channel access")
 		return false
@@ -1447,9 +1607,15 @@ func (h *Hub) authorizeChannelPermissions(
 		)
 	}
 	if err != nil {
+		h.completeSecurityEventProbeFailure(probe)
 		log.Printf("Failed to check channel permission: %v", err)
 		h.sendError(msg.ClientID, "Failed to verify channel access")
 		return false
+	}
+	// A cache hit does not prove the permission authority recovered. Only the
+	// uncached path crosses that dependency boundary.
+	if uncached {
+		h.completeSecurityEventProbeSuccess(probe)
 	}
 	if !hasPerm {
 		h.sendError(msg.ClientID, deniedMessage)
@@ -1462,7 +1628,9 @@ func (h *Hub) clientHasChannelPermission(ctx context.Context, serverID, channelI
 	if perm == 0 || serverID == uuid.Nil {
 		return true, true
 	}
+	probe := h.beginSecurityEventProbe(securityEventSourcePermissionAuthority)
 	if h.channelPermissionChecker == nil {
+		h.completeSecurityEventProbeFailure(probe)
 		log.Printf("Channel permission checker not configured")
 		return false, false
 	}
@@ -1474,6 +1642,7 @@ func (h *Hub) clientHasChannelPermission(ctx context.Context, serverID, channelI
 		perm,
 	)
 	if err != nil {
+		h.completeSecurityEventProbeFailure(probe)
 		log.Printf("Failed to check channel delivery permission: %v", err)
 		return false, false
 	}
@@ -1491,6 +1660,7 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) {
 
 	checker := h.channelPermissionChecker
 	if checker == nil {
+		h.completeSecurityEventProbeFailure(h.beginSecurityEventProbe(securityEventSourcePermissionAuthority))
 		log.Printf("Channel permission checker not configured")
 		h.handleChannelDeliveryResult(denyAllChannelDelivery(req))
 		return
@@ -1498,13 +1668,17 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) {
 
 	results := h.channelDeliveryResults
 	if results == nil {
+		h.completeSecurityEventProbeFailure(h.beginSecurityEventProbe(securityEventSourceChannelDelivery))
 		log.Printf("Channel delivery result queue not configured")
 		return
 	}
 
 	done := h.done
+	permissionProbe := h.beginSecurityEventProbe(securityEventSourcePermissionAuthority)
+	deliveryProbe := h.beginSecurityEventProbe(securityEventSourceChannelDelivery)
 	go func() {
-		result := checkChannelDeliveryPermissions(req, checker)
+		result := h.checkChannelDeliveryPermissions(req, checker, permissionProbe)
+		result.deliveryProbe = &deliveryProbe
 		select {
 		case results <- result:
 		case <-done:
@@ -1550,7 +1724,7 @@ func denyAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 	return result
 }
 
-func checkChannelDeliveryPermissions(req channelDeliveryRequest, checker ChannelPermissionChecker) channelDeliveryResult {
+func (h *Hub) checkChannelDeliveryPermissions(req channelDeliveryRequest, checker ChannelPermissionChecker, permissionProbe securityEventProbe) channelDeliveryResult {
 	result := channelDeliveryResult{
 		kind:      req.kind,
 		serverID:  req.serverID,
@@ -1562,6 +1736,7 @@ func checkChannelDeliveryPermissions(req channelDeliveryRequest, checker Channel
 	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
 	defer cancel()
 
+	hadFailure := false
 	for _, recipient := range req.recipients {
 		hasPerm, err := checker.HasChannelPermission(
 			ctx,
@@ -1571,6 +1746,7 @@ func checkChannelDeliveryPermissions(req channelDeliveryRequest, checker Channel
 			req.viewPerm,
 		)
 		if err != nil {
+			hadFailure = true
 			log.Printf("Failed to check channel delivery permission: %v", err)
 			result.decisions = append(result.decisions, channelDeliveryDecision{
 				clientID:   recipient.clientID,
@@ -1587,10 +1763,16 @@ func checkChannelDeliveryPermissions(req channelDeliveryRequest, checker Channel
 			definitive: true,
 		})
 	}
+	if hadFailure {
+		h.completeSecurityEventProbeFailure(permissionProbe)
+	}
 	return result
 }
 
 func (h *Hub) handleChannelDeliveryResult(result channelDeliveryResult) {
+	if result.deliveryProbe != nil {
+		h.completeSecurityEventProbeSuccess(*result.deliveryProbe)
+	}
 	switch result.kind {
 	case channelDeliveryBroadcast:
 		h.applyBroadcastDeliveryResult(result)

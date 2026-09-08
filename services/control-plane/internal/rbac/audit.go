@@ -4,23 +4,46 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/google/uuid"
 )
 
 // AuditWriter logs permission-related administrative actions to the audit_log table
 type AuditWriter struct {
-	db  *sql.DB
-	log *logger.Logger
+	db               *sql.DB
+	log              *logger.Logger
+	securityEventsMu sync.RWMutex
+	securityEvents   securityevent.Emitter
 }
 
 // NewAuditWriter creates a new audit log writer
 func NewAuditWriter(db *sql.DB, log *logger.Logger) *AuditWriter {
 	return &AuditWriter{
-		db:  db,
-		log: log,
+		db:             db,
+		log:            log,
+		securityEvents: securityevent.Discard,
 	}
+}
+
+// SetSecurityEvents injects bounded Nightwatch telemetry without changing the
+// high-fanout audit-writer constructor.
+func (a *AuditWriter) SetSecurityEvents(events securityevent.Emitter) {
+	if events == nil {
+		events = securityevent.Discard
+	}
+	a.securityEventsMu.Lock()
+	a.securityEvents = events
+	a.securityEventsMu.Unlock()
+}
+
+func (a *AuditWriter) securityEventEmitter() securityevent.Emitter {
+	a.securityEventsMu.RLock()
+	events := a.securityEvents
+	a.securityEventsMu.RUnlock()
+	return events
 }
 
 // Log writes an audit log entry
@@ -34,6 +57,7 @@ func (a *AuditWriter) Log(ctx context.Context, serverID string, actorID *string,
 	metadataJSON, err := json.Marshal(metadata)
 	if err != nil {
 		a.log.Error("Failed to marshal audit metadata", "error", err)
+		a.emitAuditWriteFailure(ctx)
 		return err
 	}
 
@@ -46,11 +70,34 @@ func (a *AuditWriter) Log(ctx context.Context, serverID string, actorID *string,
 	_, err = a.db.ExecContext(ctx, query, id, serverID, actorID, action, targetType, targetID, metadataJSON)
 	if err != nil {
 		a.log.Error("Failed to write audit log", "error", err, "action", action, "server_id", serverID)
+		a.emitAuditWriteFailure(ctx)
 		return err
 	}
 
+	a.emitAuditCommitted(ctx, action, id)
 	a.log.Info("Audit log entry created", "action", action, "server_id", serverID, "actor_id", actorID, "target_type", targetType)
 	return nil
+}
+
+func (a *AuditWriter) emitAuditCommitted(ctx context.Context, action, evidenceRef string) {
+	switch action {
+	case "role_created", "role_updated", "role_deleted", "roles_reordered", "role_assigned", "role_unassigned",
+		"channel_override_created", "channel_override_updated", "channel_override_deleted",
+		"category_override_created", "category_override_updated", "category_override_deleted", "channel_sync_updated",
+		"member_timed_out", "member_timeout_removed", "member_banned", "member_updated", "member_removed", "member_left", "member_unbanned",
+		"ownership_transfer_initiated", "ownership_transfer_cancelled", "ownership_transfer_reversed", "ownership_transferred", "voice_member_moved":
+		a.securityEventEmitter().Emit(ctx, securityevent.Event{
+			EventType: securityevent.EventAudit, Outcome: securityevent.OutcomeSuccess,
+			Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAuditCommitted, EvidenceRef: evidenceRef,
+		})
+	}
+}
+
+func (a *AuditWriter) emitAuditWriteFailure(ctx context.Context) {
+	a.securityEventEmitter().Emit(ctx, securityevent.Event{
+		EventType: securityevent.EventAudit, Outcome: securityevent.OutcomeFailure,
+		Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonAuditWriteFailed,
+	})
 }
 
 // AuditEntry represents a single audit log entry (for API responses)

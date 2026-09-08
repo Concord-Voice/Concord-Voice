@@ -17,7 +17,9 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 // verbResetEnrollment is the break-glass recovery subcommand name (extracted to
@@ -38,6 +40,15 @@ type adminCtlDeps struct {
 	stdin         io.Reader
 	stdout        io.Writer
 }
+
+type discardSecurityEvents struct{}
+
+func (discardSecurityEvents) Emit(context.Context, securityevent.Event) {
+	// Intentionally discard telemetry outside production.
+}
+func (discardSecurityEvents) Close() error { return nil }
+
+type securityEventsOpener func() (securityevent.Emitter, io.Closer, error)
 
 // RunAdminCtl is the entrypoint for the `control-plane admin <verb>` subcommand
 // (bootstrap / reset-enrollment). It is invoked out-of-band via `docker exec` on
@@ -73,6 +84,16 @@ func RunAdminCtl(args []string) int {
 	}
 	defer func() { _ = rdb.Close() }()
 
+	openSecurityEvents := func() (securityevent.Emitter, io.Closer, error) {
+		if cfg.Environment != "production" {
+			return discardSecurityEvents{}, discardSecurityEvents{}, nil
+		}
+		writer, openErr := securityevent.Open(securityevent.ControlPlanePath, securityevent.ServiceControlPlane, adminCtlSecurityEventLogger(cfg.Environment))
+		if openErr != nil {
+			return nil, nil, openErr
+		}
+		return writer, writer, nil
+	}
 	deps := adminCtlDeps{
 		repo:          NewAdminRepo(db),
 		audit:         NewAuditLog(db),
@@ -81,8 +102,27 @@ func RunAdminCtl(args []string) int {
 		stdin:         os.Stdin,
 		stdout:        os.Stdout,
 	}
+	return runAdminCtlWithSecurityEvents(context.Background(), deps, args, openSecurityEvents)
+}
 
-	return runAdminCtl(context.Background(), deps, args)
+func adminCtlSecurityEventLogger(environment string) *logger.Logger {
+	return logger.New(environment)
+}
+
+func runAdminCtlWithSecurityEvents(ctx context.Context, deps adminCtlDeps, args []string, open securityEventsOpener) (code int) {
+	events, closer, err := open()
+	if err != nil {
+		outf(deps.stdout, "admin: open security events: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if closeErr := closer.Close(); closeErr != nil {
+			outf(deps.stdout, "admin: close security events: %v\n", closeErr)
+			code = 1
+		}
+	}()
+	deps.audit.SetSecurityEvents(events)
+	return runAdminCtl(ctx, deps, args)
 }
 
 // enrollBaseURL picks the console origin for the printed enrollment URL: the

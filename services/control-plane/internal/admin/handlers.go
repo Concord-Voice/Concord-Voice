@@ -20,6 +20,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -75,6 +76,12 @@ type Handler struct {
 	// allowedAAGUIDs is the resolved ADMIN_WEBAUTHN_ALLOWED_AAGUIDS list checked at
 	// enrollment.
 	allowedAAGUIDs []string
+}
+
+// SetSecurityEvents forwards bounded Nightwatch telemetry to this handler's
+// authoritative audit writer.
+func (h *Handler) SetSecurityEvents(events securityevent.Emitter) {
+	h.audit.SetSecurityEvents(events)
 }
 
 // NewHandler builds the admin Handler, wiring every Task 4–9 component from the

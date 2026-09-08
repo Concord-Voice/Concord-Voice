@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +17,9 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -319,6 +322,8 @@ func TestRevokeAllRefreshTokens_CanceledContext_ReturnsError(t *testing.T) {
 
 func TestCompleteLoginRejectsSupersededEpoch(t *testing.T) {
 	h, db, userID := newRejectPathHandler(t)
+	recorder := &securityEventRecorder{}
+	h.SetSecurityEvents(recorder)
 
 	// The login was authorized under E1; a destructive reset then advanced the
 	// durable epoch to E2 before the mint could run.
@@ -326,10 +331,22 @@ func TestCompleteLoginRejectsSupersededEpoch(t *testing.T) {
 	require.NoError(t, err)
 
 	c, rec := newLoginContext()
-	h.CompleteLogin(c, userID.String(), true, "epoch-E1")
+	h.CompleteLogin(c, userID.String(), true, "epoch-E1", securityevent.AuthPassword)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code,
 		"a login authorized under a superseded epoch must be refused")
+	require.Equal(t, []securityevent.Event{{
+		EventType:  securityevent.EventCredentialEpoch,
+		Outcome:    securityevent.OutcomeDenied,
+		Severity:   securityevent.SeverityHigh,
+		ReasonCode: securityevent.ReasonCredentialEpochMismatch,
+	}}, recorder.events)
+	require.True(t, middleware.NightwatchHandled(c))
+	serialized, err := json.Marshal(recorder.events)
+	require.NoError(t, err)
+	require.NotContains(t, string(serialized), userID.String())
+	require.NotContains(t, string(serialized), "epoch-E1")
+	require.NotContains(t, string(serialized), "epoch-E2")
 
 	var live int
 	require.NoError(t, db.QueryRow(
@@ -349,7 +366,7 @@ func TestCompleteLoginRejectsClaimlessChallengeForRotatedUser(t *testing.T) {
 	require.NoError(t, err)
 
 	c, rec := newLoginContext()
-	h.CompleteLogin(c, userID.String(), true, "")
+	h.CompleteLogin(c, userID.String(), true, "", securityevent.AuthPassword)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code,
 		"a claimless legacy challenge must be refused for a rotated user")
@@ -363,7 +380,7 @@ func TestCompleteLoginAdmitsCurrentEpoch(t *testing.T) {
 	require.NoError(t, err)
 
 	c, rec := newLoginContext()
-	h.CompleteLogin(c, userID.String(), true, "epoch-E1")
+	h.CompleteLogin(c, userID.String(), true, "epoch-E1", securityevent.AuthPassword)
 
 	assert.Equal(t, http.StatusOK, rec.Code, "an uncontended login must succeed")
 
@@ -384,7 +401,7 @@ func TestCompleteLoginAdmitsNeverRotatedUser(t *testing.T) {
 	require.NoError(t, err)
 
 	c, rec := newLoginContext()
-	h.CompleteLogin(c, userID.String(), true, "")
+	h.CompleteLogin(c, userID.String(), true, "", securityevent.AuthPassword)
 
 	assert.Equal(t, http.StatusOK, rec.Code,
 		"a never-rotated user (NULL epoch) admits any expected epoch")
@@ -400,7 +417,7 @@ func TestCompleteLoginRefusesDisabledAccount(t *testing.T) {
 	require.NoError(t, err)
 
 	c, rec := newLoginContext()
-	h.CompleteLogin(c, userID.String(), true, "")
+	h.CompleteLogin(c, userID.String(), true, "", securityevent.AuthPassword)
 
 	assert.Equal(t, http.StatusForbidden, rec.Code, "a disabled account must not mint a session")
 

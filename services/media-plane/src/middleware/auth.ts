@@ -3,6 +3,7 @@ import { createHash, createHmac } from 'node:crypto';
 import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
 import { logger } from '../lib/logger.js';
+import type { SecurityEventInput } from '../lib/securityEvent.js';
 import type { TokenBucket } from '../lib/rateLimit.js';
 
 // CV-CAN-007: upper bound of a valid effective-permission bitfield. The
@@ -69,12 +70,27 @@ export interface AuthenticatedSocketData {
 //   auth.displayName — optional display name
 //   auth.avatarUrl  — optional avatar URL
 // ---------------------------------------------------------------------------
-export function createAuthMiddleware() {
+export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInput) => void) {
+  const deny = () => {
+    try {
+      onSecurityEvent?.({
+        eventType: 'authentication',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'invalid_credentials',
+        authMethod: 'session',
+        routeTemplate: 'socket.join',
+      });
+    } catch {
+      // Telemetry must never affect the authentication decision.
+    }
+  };
   return (socket: Socket, next: (err?: ExtendedError) => void) => {
     const { token, username, displayName, avatarUrl } = socket.handshake.auth;
 
     // Require token
     if (!token || typeof token !== 'string') {
+      deny();
       logger.warn('Socket connection rejected: missing token', {
         socketId: socket.id,
         address: socket.handshake.address,
@@ -84,6 +100,7 @@ export function createAuthMiddleware() {
 
     // Require username (JWT only carries user_id)
     if (!username || typeof username !== 'string') {
+      deny();
       logger.warn('Socket connection rejected: missing username', {
         socketId: socket.id,
       });
@@ -98,6 +115,7 @@ export function createAuthMiddleware() {
       }) as JwtClaims;
 
       if (!decoded.user_id) {
+        deny();
         logger.warn('Socket connection rejected: missing user_id in token', {
           socketId: socket.id,
         });
@@ -124,6 +142,7 @@ export function createAuthMiddleware() {
       next();
     } catch (err) {
       if (err instanceof jwt.TokenExpiredError) {
+        deny();
         logger.warn('Socket connection rejected: token expired', {
           socketId: socket.id,
         });
@@ -131,6 +150,7 @@ export function createAuthMiddleware() {
       }
 
       if (err instanceof jwt.JsonWebTokenError) {
+        deny();
         logger.warn('Socket connection rejected: invalid token', {
           socketId: socket.id,
           error: (err as Error).message,
@@ -142,6 +162,7 @@ export function createAuthMiddleware() {
         socketId: socket.id,
         error: err,
       });
+      deny();
       return next(new Error('Authentication failed'));
     }
   };
@@ -521,7 +542,6 @@ function serviceHopProofHeaders(
   };
 }
 
-
 function deniedChannelAccess(channelId: string, error: string): ChannelAccessResult {
   return {
     allowed: false,
@@ -712,12 +732,7 @@ export async function validateChannelAccess(
     // join returns full channel + enforcement state; DM authorize returns
     // only { authorized, is_group }). Both serve the same purpose:
     // defense-in-depth re-validation of the user's access to the room.
-    const { endpoint, request } = channelAccessRequest(
-      channelId,
-      token,
-      roomKind,
-      requestedCallId
-    );
+    const { endpoint, request } = channelAccessRequest(channelId, token, roomKind, requestedCallId);
     const channelRes = await fetch(endpoint, request);
 
     if (!channelRes.ok) {

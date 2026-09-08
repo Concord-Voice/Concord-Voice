@@ -2,14 +2,32 @@ package rbac_test
 
 import (
 	"context"
+	"database/sql"
+	"math"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type securityEventRecorder struct{ events []securityevent.Event }
+
+func (r *securityEventRecorder) Emit(_ context.Context, event securityevent.Event) {
+	r.events = append(r.events, event)
+}
+
+type concurrentSecurityEventEmitter struct{ emitted atomic.Uint64 }
+
+func (e *concurrentSecurityEventEmitter) Emit(_ context.Context, _ securityevent.Event) {
+	e.emitted.Add(1)
+}
 
 func setupAudit(t *testing.T) (*rbac.AuditWriter, *testhelpers.TestServer) {
 	t.Helper()
@@ -40,6 +58,86 @@ func TestAuditLogCreate(t *testing.T) {
 	assert.Equal(t, "role", entries[0].TargetType)
 	assert.Equal(t, &actorID, entries[0].ActorID)
 	assert.Equal(t, "Moderator", entries[0].Metadata["role_name"])
+}
+
+func TestAuditMirrorOnlyAfterAuthoritativeWrite(t *testing.T) {
+	audit, ts := setupAudit(t)
+	recorder := &securityEventRecorder{}
+	audit.SetSecurityEvents(recorder)
+	owner := ts.CreateTestUser(t, "nightwatch-audit-owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Nightwatch audit")
+
+	require.NoError(t, audit.Log(context.Background(), serverID, &owner.ID, "role_created", "role", nil, map[string]any{}))
+	require.Len(t, recorder.events, 1)
+	require.Equal(t, securityevent.ReasonAuditCommitted, recorder.events[0].ReasonCode)
+	require.NoError(t, uuid.Validate(recorder.events[0].EvidenceRef))
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.Error(t, audit.Log(cancelled, serverID, &owner.ID, "role_deleted", "role", nil, map[string]any{}))
+	require.Len(t, recorder.events, 2)
+	require.Equal(t, securityevent.ReasonAuditWriteFailed, recorder.events[1].ReasonCode)
+	require.NoError(t, audit.Log(context.Background(), serverID, &owner.ID, "unregistered_action", "role", nil, map[string]any{}))
+	require.Len(t, recorder.events, 2)
+}
+
+func TestAuditMirrorRegisteredActionsHaveExactEvents(t *testing.T) {
+	audit, ts := setupAudit(t)
+	recorder := &securityEventRecorder{}
+	audit.SetSecurityEvents(recorder)
+	owner := ts.CreateTestUser(t, "nightwatch-audit-actions-owner")
+	serverID := ts.CreateTestServer(t, owner.ID, "Nightwatch audit actions")
+
+	registered := []string{
+		"role_created", "role_updated", "role_deleted", "roles_reordered", "role_assigned", "role_unassigned",
+		"channel_override_created", "channel_override_updated", "channel_override_deleted",
+		"category_override_created", "category_override_updated", "category_override_deleted", "channel_sync_updated",
+		"member_timed_out", "member_timeout_removed", "member_banned", "member_updated", "member_removed", "member_unbanned",
+		"ownership_transfer_initiated", "ownership_transfer_cancelled", "ownership_transfer_reversed", "ownership_transferred", "voice_member_moved",
+	}
+	for _, action := range registered {
+		t.Run(action, func(t *testing.T) {
+			before := len(recorder.events)
+			require.NoError(t, audit.Log(context.Background(), serverID, &owner.ID, action, "test", nil, map[string]any{}))
+			require.Len(t, recorder.events, before+1)
+			event := recorder.events[before]
+			require.Equal(t, securityevent.EventAudit, event.EventType)
+			require.Equal(t, securityevent.OutcomeSuccess, event.Outcome)
+			require.Equal(t, securityevent.SeverityHigh, event.Severity)
+			require.Equal(t, securityevent.ReasonAuditCommitted, event.ReasonCode)
+			require.NoError(t, uuid.Validate(event.EvidenceRef))
+		})
+	}
+
+	before := len(recorder.events)
+	require.NoError(t, audit.Log(context.Background(), serverID, &owner.ID, "nightwatch_unknown_action", "test", nil, map[string]any{}))
+	require.Len(t, recorder.events, before, "unregistered actions must not emit a mirror")
+}
+
+func TestAuditSecurityEventSetterIsRaceSafe(t *testing.T) {
+	audit := rbac.NewAuditWriter(&sql.DB{}, logger.New("test"))
+	emitter := &concurrentSecurityEventEmitter{}
+	audit.SetSecurityEvents(emitter)
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		<-start
+		for range 500 {
+			audit.SetSecurityEvents(emitter)
+		}
+	}()
+	go func() {
+		defer group.Done()
+		<-start
+		for range 500 {
+			_ = audit.Log(context.Background(), "server", nil, "role_created", "role", nil, map[string]any{"invalid": math.Inf(1)})
+		}
+	}()
+	close(start)
+	group.Wait()
+	require.Equal(t, uint64(500), emitter.emitted.Load())
 }
 
 func TestAuditLogCreateWithNilActor(t *testing.T) {

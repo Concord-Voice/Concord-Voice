@@ -1,6 +1,7 @@
 import express from 'express';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { config } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { MediasoupService } from './lib/mediasoup.js';
@@ -17,15 +18,18 @@ import {
   validateChannelAccess,
   resolveParticipantIdentity,
 } from './middleware/auth.js';
-import type { AuthenticatedSocketData } from './middleware/auth.js';
+import type { AuthenticatedSocketData, ParticipantIdentity } from './middleware/auth.js';
 import { NatsService } from './lib/nats.js';
 import { OpsMetricsPublisher } from './lib/opsMetricsPublisher.js';
 import { RedisService } from './lib/redis.js';
 import { createExpressErrorHandler } from './lib/expressErrorHandler.js';
 import { createOriginGate } from './lib/originGate.js';
 import { createAdmissionGate } from './lib/admissionGate.js';
+import { SecurityEventWriter } from './lib/securityEvent.js';
+import type { EmitSecurityEvent } from './lib/securityEvent.js';
 import { handleForceDisconnect } from './lib/forceDisconnect.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
+import { handleNatsEnforcementCommand } from './lib/enforcementCommand.js';
 import { handleSetDeafen } from './lib/setDeafen.js';
 import {
   acknowledgeCloseRecvTransport,
@@ -127,7 +131,7 @@ const rateLimitDeps: RateLimitDeps = {
  * Passing `rateLimitDeps` positionally at each site would make the handler a
  * non-final argument and force Prettier to re-indent every body.
  */
-function withRateLimit<H extends SocketListener>(
+function defaultWithRateLimit<H extends SocketListener>(
   socket: RateLimitedSocket,
   event: RoomEventName,
   handler: H
@@ -166,6 +170,22 @@ function emitJoinError(
     return;
   }
   socket.emit('error', errPayload);
+}
+
+function getIdentityAuthorityReasonCode(
+  authIdentityPresent: boolean | undefined,
+  identity: ParticipantIdentity,
+  handshake: ParticipantIdentity
+): 'identity_authority_missing' | 'identity_authority_mismatch' | undefined {
+  if (!authIdentityPresent) return 'identity_authority_missing';
+  if (
+    identity.username !== handshake.username ||
+    identity.displayName !== handshake.displayName ||
+    identity.avatarUrl !== handshake.avatarUrl
+  ) {
+    return 'identity_authority_mismatch';
+  }
+  return undefined;
 }
 
 function getKeyframeSenderUserId(payload: unknown): string | undefined {
@@ -220,8 +240,17 @@ function registerJoinRoomHandler(
   socket: Socket,
   data: AuthenticatedSocketData,
   roomManager: RoomManager,
-  dmJoinFence: KeyedJoinFence
+  dmJoinFence: KeyedJoinFence,
+  emitSecurityEvent?: EmitSecurityEvent,
+  withRateLimit = defaultWithRateLimit
 ): void {
+  const observe = (event: Parameters<EmitSecurityEvent>[0]) => {
+    try {
+      emitSecurityEvent?.(event);
+    } catch {
+      // The join result/ack is authoritative over best-effort telemetry.
+    }
+  };
   const socketRoomClaim = new SocketRoomClaim();
 
   // Client sends: { roomId, rtpCapabilities, mediaFrameCryptoVersion, callId? }
@@ -234,6 +263,13 @@ function registerJoinRoomHandler(
       // concurrent or subsequent admission must not create an untracked ghost.
       const releaseSocketRoomClaim = socketRoomClaim.claim(data.roomId, roomId);
       if (!releaseSocketRoomClaim) {
+        observe({
+          eventType: 'media_integrity',
+          outcome: 'denied',
+          severity: 'medium',
+          reasonCode: 'room_claim_conflict',
+          routeTemplate: 'socket.join',
+        });
         const error = { error: 'Socket is already joining or joined to a voice room' };
         if (callback) callback(error);
         else socket.emit('error', error);
@@ -291,8 +327,19 @@ function registerJoinRoomHandler(
             await cleanupDMJoin(dmCallId.current());
             return;
           }
-          const parsedMediaFrameCryptoVersion =
-            parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+          let parsedMediaFrameCryptoVersion: number;
+          try {
+            parsedMediaFrameCryptoVersion = parseMediaFrameCryptoVersion(mediaFrameCryptoVersion);
+          } catch (error) {
+            observe({
+              eventType: 'media_integrity',
+              outcome: 'denied',
+              severity: 'medium',
+              reasonCode: 'crypto_version_invalid',
+              routeTemplate: 'socket.join',
+            });
+            throw error;
+          }
           // room_kind is only a routing hint: every endpoint independently
           // authorizes the JWT-derived user before any room mutation.
 
@@ -439,6 +486,14 @@ function registerJoinRoomHandler(
           });
 
           if (outcome.status === 'denied' || outcome.status === 'revoked') {
+            observe({
+              eventType: 'media_authorization',
+              outcome: 'denied',
+              severity: 'high',
+              reasonCode:
+                outcome.status === 'revoked' ? 'authorization_revoked' : 'authorization_denied',
+              routeTemplate: 'socket.join',
+            });
             if (outcome.status === 'denied') {
               await cleanupDMJoinSafely('Failed to clean up a queued DM room join');
             }
@@ -448,8 +503,11 @@ function registerJoinRoomHandler(
               error: outcome.access.error,
             });
             const error = { error: outcome.access.error || 'Access denied' };
-            if (callback) callback(error);
-            else socket.emit('error', error);
+            if (!callback) {
+              socket.emit('error', error);
+              return;
+            }
+            callback(error);
             return;
           }
           if (outcome.status === 'canceled') {
@@ -463,6 +521,20 @@ function registerJoinRoomHandler(
 
           const { access, value } = outcome;
           const { identity, result } = value;
+          const identityReasonCode = getIdentityAuthorityReasonCode(
+            access.authIdentityPresent,
+            identity,
+            data
+          );
+          if (identityReasonCode) {
+            observe({
+              eventType: 'media_authorization',
+              outcome: 'denied',
+              severity: 'medium',
+              reasonCode: identityReasonCode,
+              routeTemplate: 'socket.join',
+            });
+          }
           const joinedParticipant = result.participants.find(
             (participant) => participant.userId === data.userId
           );
@@ -516,11 +588,11 @@ function registerJoinRoomHandler(
             })),
           });
 
-          if (callback) {
-            callback(response);
-          } else {
+          if (!callback) {
             socket.emit('room-joined', response);
+            return;
           }
+          callback(response);
         } catch (error) {
           await cleanupDMJoinSafely('Failed to clean up an errored DM room join');
           emitJoinError(socket, roomId, data.userId, error, callback);
@@ -541,12 +613,17 @@ async function main() {
   // Create Express app
   const app = express();
   const httpServer = createServer(app);
+  const securityEvents = new SecurityEventWriter({ enabled: config.environment === 'production' });
 
   // Middleware
   app.use(express.json());
 
   // Initialize mediasoup
   const mediasoupService = new MediasoupService();
+  mediasoupService.setSecurityEventEmitter(
+    (event) => securityEvents.emit(event),
+    () => securityEvents.flush()
+  );
   await mediasoupService.init();
 
   logger.info('Mediasoup initialized', {
@@ -555,6 +632,7 @@ async function main() {
 
   // Initialize NATS (inter-service messaging)
   const natsService = new NatsService();
+  natsService.setSecurityEventEmitter((event) => securityEvents.emit(event));
   try {
     await natsService.connect();
   } catch {
@@ -563,6 +641,7 @@ async function main() {
 
   // Initialize Redis (room state)
   const redisService = new RedisService();
+  redisService.setSecurityEventEmitter((event) => securityEvents.emit(event));
   try {
     await redisService.connect();
   } catch {
@@ -577,6 +656,7 @@ async function main() {
     onIceSelected: (protocol) => mediaMetrics.incrementIceSelected(protocol),
     onIceTerminalWithoutConnect: () => mediaMetrics.incrementIceTerminalWithoutConnect(),
   });
+  roomManager.setSecurityEventEmitter((event) => securityEvents.emit(event));
   const opsMetricsPublisher = new OpsMetricsPublisher({
     enabled: config.opsMetrics.enabled,
     nodeId: config.opsMetrics.nodeId,
@@ -627,16 +707,35 @@ async function main() {
   // Initialize Socket.IO
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: createOriginGate(config.allowedOrigins),
+      origin: createOriginGate(config.allowedOrigins, (event) => securityEvents.emit(event)),
       credentials: true,
     },
     // #2032 admission layer — bounds what per-socket budgets structurally
     // cannot: connection establishment, message size, and idle half-joins.
     allowRequest: createAdmissionGate({
       trustedProxies: config.trustedProxies,
-      onReject: () => mediaMetrics.incrementAdmissionRejected(),
+      onReject: () => {
+        mediaMetrics.incrementAdmissionRejected();
+        securityEvents.emit({
+          eventType: 'media_admission',
+          outcome: 'denied',
+          severity: 'medium',
+          reasonCode: 'admission_rejected',
+          routeTemplate: 'socket.join',
+        });
+      },
       // Startup-only configuration warnings (empty/invalid TRUSTED_PROXIES).
-      warn: (message) => logger.warn(message),
+      warn: (message) => {
+        logger.warn(message);
+        if (message.startsWith('Admission gate INACTIVE:')) {
+          securityEvents.emit({
+            eventType: 'security_control',
+            outcome: 'degraded',
+            severity: 'high',
+            reasonCode: 'admission_gate_inactive',
+          });
+        }
+      },
     }),
     // 256 KB. Measured against production 2026-08-19: the largest inbound
     // frame is `update-rtp-capabilities` at 4,505 B. `join-room` does NOT
@@ -657,7 +756,7 @@ async function main() {
   });
 
   // Socket.IO JWT authentication middleware (A2)
-  io.use(createAuthMiddleware());
+  io.use(createAuthMiddleware((event) => securityEvents.emit(event)));
 
   // ── NATS subscriptions for enforcement commands from control plane ────
 
@@ -672,22 +771,23 @@ async function main() {
     eventField: string
   ) {
     natsService.subscribe(subject, async (natsData) => {
-      const channelId = natsData.channelId as string;
-      const userId = natsData.userId as string;
-      const action = natsData.action as string;
-      if (typeof channelId !== 'string' || typeof userId !== 'string' || typeof action !== 'string')
-        return;
-
       try {
-        if (action === applyAction) {
-          await applyFn(channelId, userId);
-          io.to(channelId).emit(eventName, { userId, [eventField]: true });
-        } else if (action === removeAction) {
-          await removeFn(channelId, userId);
-          io.to(channelId).emit(eventName, { userId, [eventField]: false });
-        }
+        await handleNatsEnforcementCommand(
+          natsData,
+          [applyAction, removeAction],
+          async ({ channelId, userId, action }) => {
+            if (action === applyAction) {
+              await applyFn(channelId, userId);
+              io.to(channelId).emit(eventName, { userId, [eventField]: true });
+            } else {
+              await removeFn(channelId, userId);
+              io.to(channelId).emit(eventName, { userId, [eventField]: false });
+            }
+          },
+          (event) => securityEvents.emit(event)
+        );
       } catch (err) {
-        logger.error(`Failed to handle ${subject}`, { error: err, channelId, userId, action });
+        logger.error(`Failed to handle ${subject}`, { error: err });
       }
     });
   }
@@ -718,23 +818,25 @@ async function main() {
     applyFn: (roomId: string, userId: string) => void | Promise<void>
   ) {
     natsService.subscribe(subject, async (natsData) => {
-      const channelId = natsData.channelId as string;
-      const userId = natsData.userId as string;
-      if (!channelId || !userId) return;
-      if (typeof channelId !== 'string' || typeof userId !== 'string') return;
-
       try {
-        await applyFn(channelId, userId);
-        const participant = roomManager.getParticipant(channelId, userId);
-        if (participant) {
-          for (const [producerId, entry] of participant.producers) {
-            if (entry.kind === 'audio') {
-              io.to(channelId).emit('producer-paused', { producerId, userId });
+        await handleNatsEnforcementCommand(
+          natsData,
+          undefined,
+          async ({ channelId, userId }) => {
+            await applyFn(channelId, userId);
+            const participant = roomManager.getParticipant(channelId, userId);
+            if (participant) {
+              for (const [producerId, entry] of participant.producers) {
+                if (entry.kind === 'audio') {
+                  io.to(channelId).emit('producer-paused', { producerId, userId });
+                }
+              }
             }
-          }
-        }
+          },
+          (event) => securityEvents.emit(event)
+        );
       } catch (err) {
-        logger.error(`Failed to handle ${subject}`, { error: err, channelId, userId });
+        logger.error(`Failed to handle ${subject}`, { error: err });
       }
     });
   }
@@ -749,14 +851,18 @@ async function main() {
   // moved user's temporary channel access is revoked. We evict the live peer via
   // RoomManager.leaveRoom (which emits user-left -> voice.left over NATS).
   natsService.subscribe('voice.enforce.disconnect', async (natsData) => {
-    const channelId = natsData.channelId as string;
-    const userId = natsData.userId as string;
-    if (typeof channelId !== 'string' || typeof userId !== 'string') return;
-
     try {
-      await handleForceDisconnect(roomManager, io, channelId, userId);
+      await handleNatsEnforcementCommand(
+        natsData,
+        undefined,
+        ({ channelId, userId }) =>
+          handleForceDisconnect(roomManager, io, channelId, userId, (event) =>
+            securityEvents.emit(event)
+          ),
+        (event) => securityEvents.emit(event)
+      );
     } catch (err) {
-      logger.error('Failed to handle voice.enforce.disconnect', { error: err, channelId, userId });
+      logger.error('Failed to handle voice.enforce.disconnect', { error: err });
     }
   });
 
@@ -769,7 +875,9 @@ async function main() {
   // a bad message never strips a legitimate peer).
   natsService.subscribe('voice.enforce.permissions', async (natsData) => {
     try {
-      await handleEnforcePermissionsMessage(roomManager, io, natsData);
+      await handleEnforcePermissionsMessage(roomManager, io, natsData, (event) =>
+        securityEvents.emit(event)
+      );
     } catch (err) {
       logger.error('Failed to handle voice.enforce.permissions', { error: err });
     }
@@ -783,6 +891,44 @@ async function main() {
 
   io.on('connection', (socket) => {
     const data = socket.data as AuthenticatedSocketData;
+    let correlationRef = 'correlation_ref_missing';
+    try {
+      correlationRef = randomUUID().replaceAll('-', '');
+    } catch {
+      // The best-effort observer must not perturb an accepted voice socket.
+    }
+    const emitSocketSecurityEvent: EmitSecurityEvent = (event) => {
+      try {
+        return securityEvents.emit({ ...event, correlationRef });
+      } catch {
+        return false;
+      }
+    };
+    const socketRateLimitDeps: RateLimitDeps = {
+      onReject: (event, userId) => {
+        emitSocketSecurityEvent({
+          eventType: 'media_admission',
+          outcome: 'denied',
+          severity: 'medium',
+          reasonCode: 'socket_rate_limited',
+        });
+        logRateLimitRejection(event, userId);
+      },
+      onHandlerError: (event, userId) => {
+        emitSocketSecurityEvent({
+          eventType: 'media_integrity',
+          outcome: 'failure',
+          severity: 'medium',
+          reasonCode: 'socket_handler_failed',
+        });
+        logSocketHandlerFailure(event, userId);
+      },
+    };
+    const withRateLimit = <H extends SocketListener>(
+      limitedSocket: RateLimitedSocket,
+      event: RoomEventName,
+      handler: H
+    ): void => registerRateLimited(limitedSocket, event, handler, socketRateLimitDeps);
     logger.info('Client connected', {
       socketId: socket.id,
       userId: data.userId,
@@ -790,7 +936,14 @@ async function main() {
     });
 
     // ── join-room ────────────────────────────────────────────────────
-    registerJoinRoomHandler(socket, data, roomManager, dmJoinFence);
+    registerJoinRoomHandler(
+      socket,
+      data,
+      roomManager,
+      dmJoinFence,
+      emitSocketSecurityEvent,
+      withRateLimit
+    );
 
     // ── update-rtp-capabilities ─────────────────────────────────────
     // Client sends this after device.load() to provide its actual RTP capabilities
@@ -1461,6 +1614,10 @@ async function main() {
 
     // Close mediasoup workers
     await mediasoupService.close();
+    // Close last so preceding shutdown work remains observable.
+    if (!(await securityEvents.close())) {
+      logger.error('Security event sink retained records during shutdown');
+    }
 
     httpServer.close(() => {
       logger.info('Server closed');

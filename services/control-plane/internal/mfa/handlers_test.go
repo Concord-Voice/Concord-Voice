@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
@@ -1933,6 +1934,26 @@ func TestBackupCodeSingleUse(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
+// VerifyCode is also used by sensitive transaction callers, so backup-code
+// single-use must hold independently of the HTTP challenge flow.
+func TestVerifyCodeBackupCodeIsSingleUse(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "backupcas")
+	_, backupCodes := enrollTOTP(t, ts, user)
+	ring, err := mfa.ParseKeyring(strings.Repeat("00", 32), 1, "")
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
+	code := backupCodes[0].(string)
+
+	verified, err := handler.VerifyCode(context.Background(), user.ID, code)
+	require.NoError(t, err)
+	require.True(t, verified)
+
+	verified, err = handler.VerifyCode(context.Background(), user.ID, code)
+	require.NoError(t, err)
+	require.False(t, verified, "a consumed backup code must not pass a second VerifyCode call")
+}
+
 // --- TOTP Verify Setup: Full flow with backup codes returned ---
 
 func TestTOTPVerifySetupReturnsBackupCodes(t *testing.T) {
@@ -2952,7 +2973,8 @@ func TestVerifyWithMFAUpgradePurpose(t *testing.T) {
 	secret, _ := enrollTOTP(t, ts, user)
 
 	ctx := context.Background()
-	token, jti, err := generateUpgradeToken(t, user.ID)
+	const refreshSessionID = "11111111-1111-4111-8111-111111111111"
+	token, jti, err := generateUpgradeToken(t, user.ID, refreshSessionID)
 	require.NoError(t, err)
 
 	ts.Redis.Set(ctx, fmt.Sprintf("mfa_challenge:%s:remember_me", jti), "0", 5*time.Minute)
@@ -2974,7 +2996,7 @@ func TestVerifyWithMFAUpgradePurpose(t *testing.T) {
 	assert.Equal(t, "mfa_upgrade", body["purpose"])
 
 	// Check that bypass key was set in Redis
-	bypassKey := fmt.Sprintf("mfa_upgrade_bypass:%s", user.ID)
+	bypassKey := auth.MFAUpgradeBypassKey(user.ID, refreshSessionID)
 	exists := ts.Redis.Exists(ctx, bypassKey).Val()
 	assert.Equal(t, int64(1), exists)
 }
@@ -2987,12 +3009,12 @@ func generateSuspiciousRefreshToken(t *testing.T, userID string) (string, string
 	return generateChallengeTokenForTest(userID, "suspicious_refresh")
 }
 
-func generateUpgradeToken(t *testing.T, userID string) (string, string, error) {
+func generateUpgradeToken(t *testing.T, userID, refreshSessionID string) (string, string, error) {
 	t.Helper()
-	return generateChallengeTokenForTest(userID, "mfa_upgrade")
+	return generateChallengeTokenForTest(userID, "mfa_upgrade", refreshSessionID)
 }
 
-func generateChallengeTokenForTest(userID, purpose string) (string, string, error) {
+func generateChallengeTokenForTest(userID, purpose string, refreshSessionIDs ...string) (string, string, error) {
 	jti := uuid.New().String()
 	now := time.Now()
 
@@ -3004,6 +3026,9 @@ func generateChallengeTokenForTest(userID, purpose string) (string, string, erro
 		"iss":     "concordvoice-mfa",
 		"user_id": userID,
 		"purpose": purpose,
+	}
+	if len(refreshSessionIDs) == 1 {
+		claims["refresh_session_id"] = refreshSessionIDs[0]
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

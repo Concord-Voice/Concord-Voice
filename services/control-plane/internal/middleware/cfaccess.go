@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/gin-gonic/gin"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
@@ -37,12 +38,16 @@ func RequireCloudflareAccess(v *accessVerifier, log *slog.Logger) gin.HandlerFun
 }
 
 func denyAccess(c *gin.Context, log *slog.Logger, reason error) {
-	reasonText := "invalid"
-	if reason != nil {
-		reasonText = reason.Error()
-	}
-	log.Warn("admin: cf-access assertion rejected", "reason", reasonText)
+	// All verifier sentinels intentionally collapse to one client and event
+	// decision. Unknown errors are also denied, so malformed infrastructure
+	// details never become part of the application event schema.
+	log.Warn("admin: cf-access assertion rejected", "reason", cloudflareAccessFailure(reason))
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonCloudflareAccessDenied})
 	c.AbortWithStatus(http.StatusForbidden)
+}
+
+func cloudflareAccessFailure(_ error) string {
+	return "cloudflare_access_denied"
 }
 
 // RequireCloudflareAccessFromConfig builds the Cloudflare Access gate from runtime config.

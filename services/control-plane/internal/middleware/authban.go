@@ -6,8 +6,22 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+)
+
+// AuthFailureOutcome is the closed result of recording one authentication
+// failure. It is intentionally independent of Redis errors and source values.
+type AuthFailureOutcome uint8
+
+const (
+	// AuthFailureRecorded means the failure counter accepted the attempt.
+	AuthFailureRecorded AuthFailureOutcome = iota
+	// AuthFailureBanCreated means this failure durably created a source ban.
+	AuthFailureBanCreated
+	// AuthFailureBackendUnavailable means the counter backend could not answer.
+	AuthFailureBackendUnavailable
 )
 
 // AuthBanConfig defines the IP-based cumulative auth failure ban parameters.
@@ -51,6 +65,7 @@ func AuthBanCheck(redisClient *redis.Client) gin.HandlerFunc {
 		ttl, err := redisClient.TTL(ctx, key).Result()
 		if err != nil {
 			// Redis down — fail open to prevent total outage
+			MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonRateLimitBackendUnavailable})
 			c.Next()
 			return
 		}
@@ -59,6 +74,7 @@ func AuthBanCheck(redisClient *redis.Client) gin.HandlerFunc {
 		// TTL == -1: key exists without expiry (shouldn't happen, treat as banned)
 		// TTL == -2: key does not exist (not banned)
 		if ttl > 0 || ttl == -1 {
+			MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonSourceBanned})
 			retryAfter := int(ttl.Seconds())
 			if retryAfter <= 0 {
 				retryAfter = 60 // fallback for TTL == -1
@@ -79,9 +95,9 @@ func AuthBanCheck(redisClient *redis.Client) gin.HandlerFunc {
 // RecordAuthFailure increments the cumulative failure counter for an IP.
 // When the counter reaches the configured threshold, the IP is banned for
 // the configured duration and the counter is reset atomically via a pipeline.
-func RecordAuthFailure(ctx context.Context, redisClient *redis.Client, ip string, cfg AuthBanConfig) {
+func RecordAuthFailure(ctx context.Context, redisClient *redis.Client, ip string, cfg AuthBanConfig) AuthFailureOutcome {
 	if redisClient == nil {
-		return
+		return AuthFailureBackendUnavailable
 	}
 
 	failureKey := authFailureKeyPrefix + ip
@@ -89,13 +105,13 @@ func RecordAuthFailure(ctx context.Context, redisClient *redis.Client, ip string
 
 	count, err := redisClient.Incr(ctx, failureKey).Result()
 	if err != nil {
-		return // Redis down — silently skip
+		return AuthFailureBackendUnavailable
 	}
 
 	// Set TTL on first failure; bail if Expire fails to prevent permanent counters
 	if count == 1 {
 		if err := redisClient.Expire(ctx, failureKey, cfg.Window).Err(); err != nil {
-			return
+			return AuthFailureBackendUnavailable
 		}
 	}
 
@@ -104,8 +120,21 @@ func RecordAuthFailure(ctx context.Context, redisClient *redis.Client, ip string
 		pipe.Set(ctx, banKey, "1", cfg.Duration)
 		pipe.Del(ctx, failureKey) // Reset counter after ban
 		if _, err := pipe.Exec(ctx); err != nil {
-			return
+			return AuthFailureBackendUnavailable
 		}
+		return AuthFailureBanCreated
+	}
+	return AuthFailureRecorded
+}
+
+// MarkAuthFailureOutcome makes the closed control result available to the
+// post-response observer; the caller still owns its domain authentication event.
+func MarkAuthFailureOutcome(c *gin.Context, outcome AuthFailureOutcome) {
+	switch outcome {
+	case AuthFailureBanCreated:
+		MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonSourceBanCreated})
+	case AuthFailureBackendUnavailable:
+		MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventSecurityControl, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonRateLimitBackendUnavailable})
 	}
 }
 

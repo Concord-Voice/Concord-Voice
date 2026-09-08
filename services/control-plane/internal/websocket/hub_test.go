@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
@@ -476,6 +477,7 @@ func newMinimalHub() *Hub {
 		dmBroadcast:            make(chan DMBroadcastMessage, 256),
 		channelDeliveryResults: make(chan channelDeliveryResult, 256),
 		onlineCountPending:     make(map[uuid.UUID]bool),
+		securityEvents:         securityevent.Discard,
 	}
 }
 

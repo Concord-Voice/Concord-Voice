@@ -7,6 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
@@ -31,10 +32,22 @@ func buildAttestationHandler(
 	cfg *config.Config,
 	log *logger.Logger,
 ) *attestation.Handler {
+	return buildAttestationHandlerWithSecurityEvents(db, rdb, nc, cfg, log, securityevent.Discard)
+}
+
+func buildAttestationHandlerWithSecurityEvents(
+	db *sql.DB,
+	rdb *redis.Client,
+	nc *natsclient.Client,
+	cfg *config.Config,
+	log *logger.Logger,
+	events securityevent.Emitter,
+) *attestation.Handler {
 	ctx := context.Background()
 	repo := attestation.NewRepository(db)
 	oidcVerifier := buildOIDCVerifier(ctx, cfg, log)
 	cache := attestation.NewCache(repo, nc, rdb, log)
+	cache.SetSecurityEvents(events)
 	hydrateCache(ctx, cache, cfg, log)
 	startCache(ctx, cache, cfg, log)
 	// Normalize typed-nil to interface-nil: in degraded mode buildOIDCVerifier
@@ -44,9 +57,13 @@ func buildAttestationHandler(
 	// real interface-nil so PublishSPA/PublishBinary can guard via h.oidc==nil
 	// and refuse cleanly with 503.
 	if oidcVerifier == nil {
-		return attestation.NewHandler(repo, cache, nil, nc, rdb, log)
+		handler := attestation.NewHandler(repo, cache, nil, nc, rdb, log)
+		handler.SetSecurityEvents(events)
+		return handler
 	}
-	return attestation.NewHandler(repo, cache, oidcVerifier, nc, rdb, log)
+	handler := attestation.NewHandler(repo, cache, oidcVerifier, nc, rdb, log)
+	handler.SetSecurityEvents(events)
+	return handler
 }
 
 // buildOIDCVerifier constructs the per-axis OIDC verifier. On failure,

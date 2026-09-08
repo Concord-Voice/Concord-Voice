@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ func TestVerifyLiveTokenState(t *testing.T) {
 
 		assert.False(t, emailVerified)
 		require.Error(t, err)
+		assert.True(t, errors.Is(err, errAccountDisabled))
 		assert.Contains(t, err.Error(), "account disabled")
 	})
 
@@ -51,6 +53,7 @@ func TestVerifyLiveTokenState(t *testing.T) {
 
 		assert.False(t, emailVerified)
 		require.Error(t, err)
+		assert.False(t, errors.Is(err, errAccountDisabled))
 		assert.Contains(t, err.Error(), "check disabled user")
 	})
 
@@ -81,4 +84,19 @@ func TestVerifyLiveTokenState(t *testing.T) {
 			assert.True(t, emailVerified)
 		})
 	}
+}
+
+func TestTokenBlacklistLookupPreservesDependencyFailure(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 100 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	t.Cleanup(func() { assert.NoError(t, rdb.Close()) })
+
+	blacklisted, err := isTokenBlacklisted(context.Background(), rdb, jwt.MapClaims{"jti": "token-fixture"})
+
+	assert.False(t, blacklisted)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "check token blacklist")
 }

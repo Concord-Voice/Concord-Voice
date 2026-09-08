@@ -183,7 +183,9 @@ func TestCache_IsRevoked_NilRedis_ReturnsFalse(t *testing.T) {
 	log := logger.New("development")
 	c := attestation.NewCache(&fakeReader{}, nil, nil, log)
 	// With nil rdb, IsRevoked should fail-open (false) since we can't check Redis.
-	require.False(t, c.IsRevoked(ctx, "0.2.7"))
+	revoked, err := c.IsRevoked(ctx, "0.2.7")
+	require.NoError(t, err)
+	require.False(t, revoked)
 }
 
 func TestCache_Hydrate_ReplacesExistingEntries(t *testing.T) {
@@ -262,9 +264,11 @@ func TestCache_IsRevoked_RedisError_FailClosed(t *testing.T) {
 	log := logger.NewWithWriter(&buf)
 	c := attestation.NewCache(&fakeReader{}, nil, rdb, log)
 
-	// fail-closed: error means treat as revoked
-	require.True(t, c.IsRevoked(context.Background(), "0.2.7"),
-		"IsRevoked on Redis error must fail-closed (return true)")
+	// Redis loss remains fail-closed, but callers can classify it as a
+	// dependency outage rather than a hostile revocation.
+	revoked, err := c.IsRevoked(context.Background(), "0.2.7")
+	require.Error(t, err)
+	require.True(t, revoked, "IsRevoked on Redis error must retain the fail-closed result")
 
 	output := buf.String()
 	require.Contains(t, output, "attestation.is_revoked_redis_error",
@@ -289,8 +293,12 @@ func TestCache_IsRevoked_Found_NoLog(t *testing.T) {
 	log := logger.NewWithWriter(&buf)
 	c := attestation.NewCache(&fakeReader{}, nil, rdb, log)
 
-	require.True(t, c.IsRevoked(ctx, "0.2.5"))
-	require.False(t, c.IsRevoked(ctx, "0.2.7"))
+	revoked, err := c.IsRevoked(ctx, "0.2.5")
+	require.NoError(t, err)
+	require.True(t, revoked)
+	revoked, err = c.IsRevoked(ctx, "0.2.7")
+	require.NoError(t, err)
+	require.False(t, revoked)
 
 	require.NotContains(t, buf.String(), "is_revoked_redis_error",
 		"happy-path IsRevoked must not emit the Redis-error WARN log")

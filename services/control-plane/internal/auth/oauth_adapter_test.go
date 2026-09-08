@@ -22,6 +22,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -295,41 +296,48 @@ func TestVerifyPassword_UnknownUser_ReturnsInvalidCredentials(t *testing.T) {
 
 // =============================================================================
 // IssueMFAChallenge — exercises the production binding against a stubbed
-// MFAChecker. The wrapper checks IsEnabled before issuing a challenge, then
-// hydrates methods + recovery-only methods + WebAuthn options for the
+// MFAChecker. The wrapper checks login-eligible methods before issuing a
+// challenge, then hydrates recovery-only methods + WebAuthn options for the
 // renderer's MFAChallengeModal.
 // =============================================================================
 
 // stubMFAChecker is the hand-rolled MFAChecker for adapter tests. Each method
 // is driven by a public field so individual tests can choose:
-//   - IsEnabledResult        — pre-flight gate (false ⇒ mfaEnabled=false)
 //   - LoginMethodsResult/Err — methods array surfaced to the renderer
 //   - EnabledMethodsResult   — superset used to compute recovery-only diff
 //   - WebAuthnOptions        — non-nil when "webauthn" is in LoginMethodsResult
 //   - GenerateChallengeErr   — drives the error path on the actual issuance
 type stubMFAChecker struct {
-	IsEnabledResult      bool
-	LoginMethodsResult   []string
-	LoginMethodsErr      error
-	EnabledMethodsResult []string
-	EnabledMethodsErr    error
-	WebAuthnOptions      interface{}
-	WebAuthnErr          error
-	GenerateChallengeJTI string
-	GenerateChallengeTok string
-	GenerateChallengeErr error
-	RecoveryTokenStub    string
-	RecoveryTokenJTI     string
+	IsEnabledResult         bool
+	LoginMethodsResult      []string
+	LoginMethodsErr         error
+	LoginMethodsCalls       int
+	EnabledMethodsResult    []string
+	EnabledMethodsErr       error
+	EnabledMethodsCalls     int
+	WebAuthnOptions         interface{}
+	WebAuthnErr             error
+	GenerateChallengeJTI    string
+	GenerateChallengeTok    string
+	GenerateChallengeErr    error
+	GenerateChallengeMethod securityevent.AuthMethod
+	GenerateChallengeCalls  int
+	RecoveryTokenStub       string
+	RecoveryTokenJTI        string
 }
 
 func (s *stubMFAChecker) IsEnabled(_ context.Context, _ string) bool { return s.IsEnabledResult }
 func (s *stubMFAChecker) GetEnabledMethods(_ context.Context, _ string) ([]string, error) {
+	s.EnabledMethodsCalls++
 	return s.EnabledMethodsResult, s.EnabledMethodsErr
 }
 func (s *stubMFAChecker) GetLoginMethods(_ context.Context, _ string) ([]string, error) {
+	s.LoginMethodsCalls++
 	return s.LoginMethodsResult, s.LoginMethodsErr
 }
-func (s *stubMFAChecker) GenerateLoginChallenge(_ context.Context, _ string, _ bool, _ string) (string, string, error) {
+func (s *stubMFAChecker) GenerateLoginChallenge(_ context.Context, _ string, _ bool, _ string, primaryAuthMethod securityevent.AuthMethod) (string, string, error) {
+	s.GenerateChallengeCalls++
+	s.GenerateChallengeMethod = primaryAuthMethod
 	if s.GenerateChallengeErr != nil {
 		return "", "", s.GenerateChallengeErr
 	}
@@ -343,7 +351,7 @@ func (s *stubMFAChecker) GenerateLoginChallenge(_ context.Context, _ string, _ b
 	}
 	return tok, jti, nil
 }
-func (s *stubMFAChecker) GenerateUpgradeChallenge(_ context.Context, _ string, _ bool) (string, string, error) {
+func (s *stubMFAChecker) GenerateUpgradeChallenge(_ context.Context, _, _ string) (string, string, error) {
 	return "", "", nil
 }
 func (s *stubMFAChecker) BeginWebAuthnLogin(_ context.Context, _ string, _ string) (interface{}, error) {
@@ -356,16 +364,33 @@ func (s *stubMFAChecker) ValidateRecoveryToken(_ string) (*auth.RecoveryClaims, 
 	return nil, nil //nolint:nilnil // deliberate stub
 }
 
+type adapterSecurityEventRecorder struct {
+	events []securityevent.Event
+}
+
+func (r *adapterSecurityEventRecorder) Emit(_ context.Context, event securityevent.Event) {
+	r.events = append(r.events, event)
+}
+
+// newMFAOnlyAdapterHandler exercises the MFA boundary without a database. These
+// paths must return before the epoch lookup when there is no login-eligible
+// factor or a method lookup fails.
+func newMFAOnlyAdapterHandler() *auth.Handler {
+	return auth.NewHandler(nil, nil, logger.New("test"), "", nil)
+}
+
 // TestIssueMFAChallenge_NotEnrolled_ReturnsMFAEnabledFalse verifies the
-// IsEnabled pre-flight gate: a user with no MFA enrolled must surface
+// login-method pre-flight gate: a user with no MFA enrolled must surface
 // mfaEnabled=false (and zero-valued challenge / methods) rather than serving
 // an unverifiable challenge token. respondExistingSSO uses this to decide to
 // fall through to direct token issuance.
 func TestIssueMFAChallenge_NotEnrolled_ReturnsMFAEnabledFalse(t *testing.T) {
-	rig := newAdapterRig(t)
-	rig.Handler.SetMFAChecker(&stubMFAChecker{IsEnabledResult: false})
+	h := newMFAOnlyAdapterHandler()
+	h.SetMFAChecker(&stubMFAChecker{})
+	recorder := &adapterSecurityEventRecorder{}
+	h.SetSecurityEvents(recorder)
 
-	tok, methods, recoveryOnly, webauthn, mfaEnabled, err := rig.Handler.IssueMFAChallenge(
+	tok, methods, recoveryOnly, webauthn, mfaEnabled, err := h.IssueMFAChallenge(
 		context.Background(), uuid.New().String(),
 	)
 	require.NoError(t, err)
@@ -374,6 +399,68 @@ func TestIssueMFAChallenge_NotEnrolled_ReturnsMFAEnabledFalse(t *testing.T) {
 	assert.Empty(t, methods)
 	assert.Empty(t, recoveryOnly)
 	assert.Nil(t, webauthn)
+	assert.Empty(t, recorder.events, "a no-MFA SSO path must not emit challenge_required")
+}
+
+func TestIssueMFAChallenge_RecoveryOnlyMethodsFallThrough(t *testing.T) {
+	h := newMFAOnlyAdapterHandler()
+	checker := &stubMFAChecker{EnabledMethodsResult: []string{"backup_code"}}
+	h.SetMFAChecker(checker)
+	recorder := &adapterSecurityEventRecorder{}
+	h.SetSecurityEvents(recorder)
+
+	token, methods, recoveryOnly, webauthn, mfaEnabled, err := h.IssueMFAChallenge(context.Background(), uuid.NewString())
+
+	require.NoError(t, err)
+	assert.False(t, mfaEnabled, "recovery-only factors must not produce an unanswerable SSO MFA challenge")
+	assert.Empty(t, token)
+	assert.Empty(t, methods)
+	assert.Empty(t, recoveryOnly)
+	assert.Nil(t, webauthn)
+	assert.Equal(t, 1, checker.LoginMethodsCalls)
+	assert.Zero(t, checker.EnabledMethodsCalls, "recovery-only factors must stop before optional enabled-method lookup")
+	assert.Zero(t, checker.GenerateChallengeCalls)
+	assert.Empty(t, recorder.events)
+}
+
+func TestIssueMFAChallenge_LoginMethodsLookupErrorFailsClosed(t *testing.T) {
+	h := newMFAOnlyAdapterHandler()
+	checker := &stubMFAChecker{
+		LoginMethodsErr:   errors.New("database unavailable"),
+		EnabledMethodsErr: errors.New("must not be read"),
+	}
+	h.SetMFAChecker(checker)
+
+	_, _, _, _, mfaEnabled, err := h.IssueMFAChallenge(context.Background(), uuid.NewString())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "get login methods")
+	assert.False(t, mfaEnabled)
+	assert.Equal(t, 1, checker.LoginMethodsCalls)
+	assert.Zero(t, checker.EnabledMethodsCalls)
+}
+
+func TestIssueMFAChallenge_EnabledMethodsLookupErrorFailsClosed(t *testing.T) {
+	h := newMFAOnlyAdapterHandler()
+	h.SetMFAChecker(&stubMFAChecker{
+		LoginMethodsResult: []string{"totp"},
+		EnabledMethodsErr:  errors.New("database unavailable"),
+	})
+	recorder := &adapterSecurityEventRecorder{}
+	h.SetSecurityEvents(recorder)
+
+	token, methods, recoveryOnly, webauthn, mfaEnabled, err := h.IssueMFAChallenge(
+		context.Background(), uuid.NewString(),
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "get enabled methods")
+	assert.Empty(t, token)
+	assert.Empty(t, methods)
+	assert.Empty(t, recoveryOnly)
+	assert.Nil(t, webauthn)
+	assert.False(t, mfaEnabled, "a lookup error must not be reported as a direct-mint no-MFA outcome")
+	assert.Empty(t, recorder.events)
 }
 
 // TestIssueMFAChallenge_TOTPEnrolled_HydratesMethods verifies the happy-path:
@@ -382,12 +469,15 @@ func TestIssueMFAChallenge_NotEnrolled_ReturnsMFAEnabledFalse(t *testing.T) {
 // "webauthn" is not in loginMethods.
 func TestIssueMFAChallenge_TOTPEnrolled_HydratesMethods(t *testing.T) {
 	rig := newAdapterRig(t)
-	rig.Handler.SetMFAChecker(&stubMFAChecker{
+	checker := &stubMFAChecker{
 		IsEnabledResult:      true,
 		EnabledMethodsResult: []string{"totp", "backup_code"},
 		LoginMethodsResult:   []string{"totp"},
 		GenerateChallengeTok: "ch-totp",
-	})
+	}
+	rig.Handler.SetMFAChecker(checker)
+	recorder := &adapterSecurityEventRecorder{}
+	rig.Handler.SetSecurityEvents(recorder)
 	// A real users row is required since #2418: IssueMFAChallenge reads the
 	// credential epoch to stamp into the challenge, and fails closed if absent.
 	userID := insertAdapterUser(t, rig, "mfachallenge@test.concord.chat", "mfachallengeuser", "Test-Password-1!")
@@ -402,6 +492,12 @@ func TestIssueMFAChallenge_TOTPEnrolled_HydratesMethods(t *testing.T) {
 	assert.Equal(t, []string{"backup_code"}, recoveryOnly,
 		"backup_code is enrolled but excluded from login methods → recovery-only")
 	assert.Nil(t, webauthn, "no webauthn in loginMethods ⇒ options not populated")
+	assert.Equal(t, securityevent.AuthSSO, checker.GenerateChallengeMethod)
+	assert.Equal(t, []securityevent.Event{{
+		EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess,
+		Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonChallengeRequired,
+		AuthMethod: securityevent.AuthSSO,
+	}}, recorder.events)
 }
 
 // TestIssueMFAChallenge_GenerateError_PropagatesError verifies the
@@ -415,6 +511,8 @@ func TestIssueMFAChallenge_GenerateError_PropagatesError(t *testing.T) {
 		EnabledMethodsResult: []string{"totp"},
 		GenerateChallengeErr: errors.New("redis unavailable"),
 	})
+	recorder := &adapterSecurityEventRecorder{}
+	rig.Handler.SetSecurityEvents(recorder)
 	// Seeded so the #2418 epoch read succeeds and execution actually reaches
 	// GenerateLoginChallenge — otherwise the epoch read would fail first and this
 	// test would assert on the wrong error.
@@ -425,6 +523,7 @@ func TestIssueMFAChallenge_GenerateError_PropagatesError(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "generate login challenge")
+	assert.Empty(t, recorder.events, "a failed SSO challenge issuance must not emit challenge_required")
 }
 
 // TestIssueMFAChallenge_EpochReadFailure_PropagatesError covers the #2418

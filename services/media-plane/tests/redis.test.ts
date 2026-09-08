@@ -247,4 +247,34 @@ describe('RedisService', () => {
       expect(mockClient.close).toHaveBeenCalled();
     });
   });
+
+  it('emits a fixed dependency event after a Redis write failure', async () => {
+    const emit = vi.fn();
+    service.setSecurityEventEmitter(emit);
+    await service.connect();
+    mockMulti.exec.mockRejectedValueOnce(new Error('secret'));
+    await service.addParticipant('channel-1', 'user-1');
+    expect(emit).toHaveBeenCalledWith({
+      eventType: 'dependency',
+      outcome: 'degraded',
+      severity: 'high',
+      reasonCode: 'dependency_unavailable',
+    });
+  });
+
+  it('deduplicates missing-client failures and restores after a normal write', async () => {
+    const emit = vi.fn();
+    service.setSecurityEventEmitter(emit);
+    await service.addParticipant('private-channel', 'private-user');
+    await service.getUserRoom('private-user');
+    expect(emit).toHaveBeenCalledTimes(1);
+    await service.connect();
+    await service.addParticipant('private-channel', 'private-user');
+    expect(emit).toHaveBeenLastCalledWith({
+      eventType: 'dependency',
+      outcome: 'restored',
+      severity: 'informational',
+      reasonCode: 'dependency_recovered',
+    });
+  });
 });

@@ -857,6 +857,9 @@ func (h *Handler) UpdateMember(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMember})
 		return
 	}
+	if err := h.audit.Log(c.Request.Context(), serverID, &userID, "member_updated", "member", &targetUserID, nil); err != nil {
+		h.log.Warn("Member update audit write failed", "error", err)
+	}
 
 	h.log.Info("Member role updated", "server_id", serverID, "target_user", targetUserID, "new_role", req.Role, "updated_by", userID)
 
@@ -1268,8 +1271,13 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 	}
 
 	action := "removed"
+	auditAction := "member_removed"
 	if auth.isSelfRemoval {
 		action = "left"
+		auditAction = "member_left"
+	}
+	if err := h.audit.Log(c.Request.Context(), serverID, &userID, auditAction, "member", &targetUserID, nil); err != nil {
+		h.log.Warn("Member removal audit write failed", "error", err)
 	}
 
 	serverUUID, _ := uuid.Parse(serverID)
@@ -1666,10 +1674,17 @@ func (h *Handler) UnbanMember(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unban member"})
 		return
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unban member"})
+		return
+	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User is not banned"})
 		return
+	}
+	if err := h.audit.Log(c.Request.Context(), serverID, &userID, "member_unbanned", "member", &targetUserID, nil); err != nil {
+		h.log.Warn("Member unban audit write failed", "error", err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Member unbanned"})

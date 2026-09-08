@@ -114,4 +114,45 @@ describe('createOriginGate', () => {
     expect(err).toBeInstanceOf(Error);
     // Secure-by-default: empty config means no origin is allowlisted, not "allow all".
   });
+
+  it('emits only rejected origin verdicts', () => {
+    const emit = vi.fn();
+    const hooked = createOriginGate(ALLOWLIST, emit);
+    hooked('app://concord', makeCallback());
+    hooked('https://evil.example', makeCallback());
+    expect(emit).toHaveBeenCalledOnce();
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ reasonCode: 'origin_rejected' }));
+  });
+
+  it('still rejects through its callback when the observer throws', () => {
+    const callback = makeCallback();
+    const hooked = createOriginGate(ALLOWLIST, () => {
+      throw new Error('observer failure');
+    });
+    expect(() => hooked('https://evil.example', callback)).not.toThrow();
+    expect(callback).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it('still emits and rejects when its optional rejection reporter throws', () => {
+    const callback = makeCallback();
+    const emit = vi.fn();
+    const hooked = createOriginGate(ALLOWLIST, emit, () => {
+      throw new Error('reporter failure');
+    });
+    expect(() => hooked('https://evil.example', callback)).not.toThrow();
+    expect(emit).toHaveBeenCalledOnce();
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ reasonCode: 'origin_rejected' }));
+    expect(callback).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it('reports only a closed origin-rejection reason', () => {
+    const reasons = vi.fn();
+    const hooked = createOriginGate(ALLOWLIST, undefined, reasons);
+    hooked('null', makeCallback());
+    hooked('file://', makeCallback());
+    hooked('https://evil.example', makeCallback());
+    expect(reasons).toHaveBeenNthCalledWith(1, 'opaque_origin');
+    expect(reasons).toHaveBeenNthCalledWith(2, 'file_origin');
+    expect(reasons).toHaveBeenNthCalledWith(3, 'not_allowlisted');
+  });
 });

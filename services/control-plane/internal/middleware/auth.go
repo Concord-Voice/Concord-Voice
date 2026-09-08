@@ -4,6 +4,7 @@ package middleware
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 )
 
 const (
@@ -65,22 +67,31 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 			return
 		}
 
-		if isTokenBlacklisted(c, redisClient, claims) {
+		blacklisted, err := isTokenBlacklisted(c.Request.Context(), redisClient, claims)
+		if err != nil {
+			abortAuthDependency(c)
+			return
+		}
+		if blacklisted {
 			abortUnauthorized(c)
 			return
 		}
 
 		emailVerified, err := VerifyLiveTokenState(c.Request.Context(), redisClient, userID, claims)
 		if err != nil {
-			abortAccountDisabled(c)
+			abortLiveTokenStateError(c, err)
 			return
 		}
 
 		// Credential-epoch fence (#2201): fail closed while a destructive
 		// credential operation is blocked-in-flight, on a superseded epoch, or
 		// when neither Redis nor the DB can answer.
-		if credentialEpochRejected(c, fence, claims, userID) {
-			abortUnauthorized(c)
+		if err := credentialEpochError(c, fence, claims, userID); err != nil {
+			if errors.Is(err, credepoch.ErrBlocked) || errors.Is(err, credepoch.ErrEpochMismatch) {
+				abortUnauthorized(c)
+			} else {
+				abortAuthDependency(c)
+			}
 			return
 		}
 
@@ -91,14 +102,22 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 	}
 }
 
-// credentialEpochRejected runs the fence check for AuthRequired. A nil fence
+// credentialEpochError runs the fence check for AuthRequired. A nil fence
 // disables the check (tests that construct the middleware directly).
-func credentialEpochRejected(c *gin.Context, fence *credepoch.Fence, claims jwt.MapClaims, userID string) bool {
+func credentialEpochError(c *gin.Context, fence *credepoch.Fence, claims jwt.MapClaims, userID string) error {
 	if fence == nil {
-		return false
+		return nil
 	}
 	tokenEpoch, _ := claims["cred_epoch"].(string)
-	return fence.Check(c.Request.Context(), userID, tokenEpoch) != nil
+	return fence.Check(c.Request.Context(), userID, tokenEpoch)
+}
+
+func abortLiveTokenStateError(c *gin.Context, err error) {
+	if errors.Is(err, errAccountDisabled) {
+		abortAccountDisabled(c)
+		return
+	}
+	abortAuthDependency(c)
 }
 
 // TokenCredentialEpoch returns the cred_epoch claim AuthRequired stored on the
@@ -133,12 +152,20 @@ func TokenSessionID(c *gin.Context) string {
 }
 
 func abortUnauthorized(c *gin.Context) {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonInvalidCredentials})
 	c.JSON(http.StatusUnauthorized, gin.H{"error": authError})
 	c.Abort()
 }
 
 func abortAccountDisabled(c *gin.Context) {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonAccountDisabled})
 	c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
+	c.Abort()
+}
+
+func abortAuthDependency(c *gin.Context) {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, Reason: securityevent.ReasonDependencyUnavailable})
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Authentication temporarily unavailable"})
 	c.Abort()
 }
 
@@ -147,6 +174,8 @@ func abortAccountDisabled(c *gin.Context) {
 // middleware (the reader) call it, so the writer and reader can never drift apart and
 // silently break the denylist.
 func UserDisabledKey(userID string) string { return "user_disabled:" + userID }
+
+var errAccountDisabled = errors.New("account disabled")
 
 // VerifyLiveTokenState evaluates shared post-parse bearer-token state. A present
 // disabled-user key or a Redis error rejects fail closed; otherwise it returns
@@ -160,7 +189,7 @@ func VerifyLiveTokenState(ctx context.Context, redisClient *redis.Client, userID
 		return false, fmt.Errorf("check disabled user: %w", err)
 	}
 	if exists > 0 {
-		return false, fmt.Errorf("account disabled")
+		return false, errAccountDisabled
 	}
 	return emailVerifiedFromClaims(claims), nil
 }
@@ -247,18 +276,18 @@ func IsAccessToken(claims jwt.MapClaims) bool {
 	return IsAccessTokenClass(iss, hasPurpose)
 }
 
-func isTokenBlacklisted(c *gin.Context, redisClient *redis.Client, claims jwt.MapClaims) bool {
+func isTokenBlacklisted(ctx context.Context, redisClient *redis.Client, claims jwt.MapClaims) (bool, error) {
 	jti, ok := claims["jti"].(string)
 	if !ok || jti == "" {
-		return false
+		return false, nil
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	exists, err := redisClient.Exists(ctx, fmt.Sprintf("blacklist:%s", jti)).Result()
 	if err != nil {
-		return true // fail closed: treat as blacklisted when Redis is unavailable
+		return false, fmt.Errorf("check token blacklist: %w", err)
 	}
-	return exists > 0
+	return exists > 0, nil
 }
 
 func emailVerifiedFromClaims(claims jwt.MapClaims) bool {

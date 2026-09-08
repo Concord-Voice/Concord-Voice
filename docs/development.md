@@ -147,6 +147,18 @@ API from the control plane at the same origin. See
 [`client/admin/README.md`](../client/admin/README.md) for the full command set
 and the named `admin_ui` Docker build context.
 
+### Nightwatch application integration
+
+The control plane and media plane emit closed `security-event.v1` records to
+their own restricted host streams. Application-side producers live under
+[`services/control-plane/internal/securityevent/`](../services/control-plane/internal/securityevent/)
+and [`services/media-plane/src/lib/securityEvent.ts`](../services/media-plane/src/lib/securityEvent.ts);
+[`provision-production.sh`](../[internal]provision-production.sh)
+owns the host write boundary. Nightwatch deployment, hardening, normalization,
+verification, and commissioning live in the dedicated
+[Nightwatch repository](https://github.com/Concord-Voice/nightwatch) and its
+[production runbook](https://github.com/Concord-Voice/nightwatch/blob/32c0845831c23734169c745b0fa090f6a0cdda69/[internal]nightwatch.md).
+
 ## Development Workflow
 
 ### Making Changes

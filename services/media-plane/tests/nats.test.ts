@@ -17,6 +17,7 @@ const { mockNc, mockConnect, mockEncode, mockDecode } = vi.hoisted(() => {
     status: vi.fn(() => ({
       async *[Symbol.asyncIterator]() {
         yield { type: 'update', data: {} };
+        await new Promise<void>(() => {});
       },
     })),
     subscribe: vi.fn(),
@@ -43,6 +44,7 @@ describe('NatsService', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    mockNc.isClosed.mockReturnValue(false);
   });
 
   describe('connect', () => {
@@ -64,6 +66,29 @@ describe('NatsService', () => {
       mockConnect.mockRejectedValueOnce(new Error('ECONNREFUSED'));
       await expect(service.connect()).rejects.toThrow('ECONNREFUSED');
     });
+
+    it.each(['ends', 'throws'])(
+      'degrades when the status iterator %s after external close',
+      async (mode) => {
+        mockNc.isClosed.mockReturnValue(true);
+        mockNc.status.mockReturnValueOnce({
+          async *[Symbol.asyncIterator]() {
+            if (mode === 'throws') throw new Error('status failed');
+            if (mode === 'ends') return;
+            yield { type: 'update', data: {} };
+          },
+        });
+        const emit = vi.fn();
+        service.setSecurityEventEmitter(emit);
+
+        await service.connect();
+
+        await vi.waitFor(() =>
+          expect(emit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'degraded' }))
+        );
+        expect(service.publish('voice.joined', {})).toBe(false);
+      }
+    );
   });
 
   describe('publish', () => {
@@ -143,6 +168,7 @@ describe('NatsService', () => {
         userId: 'u-1',
         username: 'alice',
         displayName: 'Alice',
+        avatarUrl: 'https://example.test/alice.png',
         e2eeEpoch: 1,
         callId: 'call-1',
       });
@@ -154,6 +180,7 @@ describe('NatsService', () => {
         userId: 'u-1',
         username: 'alice',
         displayName: 'Alice',
+        avatarUrl: 'https://example.test/alice.png',
         callId: 'call-1',
       });
       expect(encodedData).toHaveProperty('timestamp');
@@ -305,6 +332,31 @@ describe('NatsService', () => {
   });
 
   describe('subscribe', () => {
+    it('does not restore dependency health when a handler finishes while disconnected', async () => {
+      mockNc.status.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'disconnect', data: 'nats://localhost:4222' };
+          await new Promise<void>(() => {});
+        },
+      });
+      const emit = vi.fn();
+      service.setSecurityEventEmitter(emit);
+      await service.connect();
+      const handler = vi.fn().mockResolvedValue(undefined);
+      mockNc.subscribe.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { data: JSON.stringify({ action: 'enforce' }) };
+        },
+      });
+
+      await vi.waitFor(() =>
+        expect(emit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'degraded' }))
+      );
+      service.subscribe('voice.enforcement', handler);
+      await vi.waitFor(() => expect(handler).toHaveBeenCalled());
+      expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: 'restored' }));
+    });
+
     it('calls nc.subscribe and processes decoded messages', async () => {
       await service.connect();
 
@@ -314,7 +366,7 @@ describe('NatsService', () => {
       ];
 
       // Create an async iterable that yields the messages then completes
-      mockNc.subscribe.mockReturnValue({
+      mockNc.subscribe.mockReturnValueOnce({
         async *[Symbol.asyncIterator]() {
           for (const msg of messages) {
             yield msg;
@@ -339,7 +391,7 @@ describe('NatsService', () => {
     it('handles decode errors gracefully without crashing', async () => {
       await service.connect();
 
-      mockNc.subscribe.mockReturnValue({
+      mockNc.subscribe.mockReturnValueOnce({
         async *[Symbol.asyncIterator]() {
           yield { data: 'invalid-json' };
         },
@@ -362,6 +414,93 @@ describe('NatsService', () => {
       expect(handler).not.toHaveBeenCalled();
     });
 
+    it.each([[null], [[]], ['scalar'], [1], [true]])(
+      'rejects a decoded non-object payload without invoking the handler: %j',
+      async (payload) => {
+        await service.connect();
+        mockNc.subscribe.mockReturnValueOnce({
+          async *[Symbol.asyncIterator]() {
+            yield { data: 'valid-json' };
+          },
+        });
+        mockDecode.mockReturnValueOnce(payload);
+        const emit = vi.fn();
+        const handler = vi.fn();
+        service.setSecurityEventEmitter(emit);
+
+        service.subscribe('voice.enforcement', handler);
+
+        await vi.waitFor(() => expect(mockDecode).toHaveBeenCalledOnce());
+        expect(handler).not.toHaveBeenCalled();
+        const rejections = emit.mock.calls
+          .map(([event]) => event)
+          .filter((event) => event.reasonCode === 'media_schema_rejected');
+        expect(rejections).toEqual([
+          {
+            eventType: 'media_integrity',
+            outcome: 'denied',
+            severity: 'medium',
+            reasonCode: 'media_schema_rejected',
+          },
+        ]);
+      }
+    );
+
+    it('continues with a later valid message when the invalid-message observer throws', async () => {
+      await service.connect();
+      mockNc.subscribe.mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { data: 'invalid-json' };
+          yield { data: JSON.stringify({ action: 'later' }) };
+        },
+      });
+      mockDecode.mockImplementationOnce(() => {
+        throw new Error('invalid');
+      });
+      const handler = vi.fn();
+      service.setSecurityEventEmitter(() => {
+        throw new Error('observer failure');
+      });
+      service.subscribe('voice.enforcement', handler);
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledWith({ action: 'later' }));
+    });
+
+    it.each(['ends', 'throws'])(
+      'keeps subscription degradation across a successful publish when the iterator %s',
+      async (mode) => {
+        const emit = vi.fn();
+        service.setSecurityEventEmitter(emit);
+        await service.connect();
+        mockNc.subscribe.mockReturnValueOnce({
+          [Symbol.asyncIterator]() {
+            return {
+              next: () =>
+                mode === 'throws'
+                  ? Promise.reject(new Error('subscription iterator failed'))
+                  : Promise.resolve({ done: true as const, value: undefined }),
+            };
+          },
+        });
+
+        service.subscribe('voice.enforcement', vi.fn());
+        await vi.waitFor(() =>
+          expect(emit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'degraded' }))
+        );
+
+        expect(service.publish('voice.joined', { channelId: 'ch-1' })).toBe(true);
+        expect(emit).toHaveBeenCalledTimes(1);
+        expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: 'restored' }));
+
+        mockNc.subscribe.mockReturnValueOnce({
+          [Symbol.asyncIterator]() {
+            return { next: () => new Promise<never>(() => {}) };
+          },
+        });
+        service.subscribe('voice.enforcement', vi.fn());
+        expect(emit).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: 'restored' }));
+      }
+    );
+
     it('is a no-op when not connected (nc is null)', () => {
       // Don't call connect — nc stays null
       const handler = vi.fn();
@@ -377,6 +516,70 @@ describe('NatsService', () => {
       await service.connect();
       await service.close();
       expect(mockNc.drain).toHaveBeenCalled();
+    });
+
+    it('clears failed subscriptions so a later reconnect can restore degradation', async () => {
+      const emit = vi.fn();
+      service.setSecurityEventEmitter(emit);
+      await service.connect();
+      mockNc.subscribe.mockReturnValueOnce({
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => Promise.resolve({ done: true as const, value: undefined }),
+          };
+        },
+      });
+      service.subscribe('voice.enforcement', vi.fn());
+      await vi.waitFor(() =>
+        expect(emit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'degraded' }))
+      );
+
+      await service.close();
+      mockNc.status.mockReturnValueOnce({
+        [Symbol.asyncIterator]() {
+          return { next: () => new Promise<never>(() => {}) };
+        },
+      });
+      await service.connect();
+
+      expect(emit).toHaveBeenLastCalledWith({
+        eventType: 'dependency',
+        outcome: 'restored',
+        severity: 'informational',
+        reasonCode: 'dependency_recovered',
+      });
+    });
+  });
+
+  it('emits fixed dependency state without subject, payload, or error', async () => {
+    const emit = vi.fn();
+    service.setSecurityEventEmitter(emit);
+    await service.connect();
+    mockNc.publish.mockImplementationOnce(() => {
+      throw new Error('secret');
+    });
+    service.publish('private.subject', { token: 'secret' });
+    expect(emit).toHaveBeenCalledWith({
+      eventType: 'dependency',
+      outcome: 'degraded',
+      severity: 'high',
+      reasonCode: 'dependency_unavailable',
+    });
+  });
+
+  it('deduplicates degraded state and restores after a successful operation', async () => {
+    const emit = vi.fn();
+    service.setSecurityEventEmitter(emit);
+    service.publish('private.subject', { token: 'secret' });
+    service.publish('private.subject', { token: 'secret' });
+    expect(emit).toHaveBeenCalledTimes(1);
+    await service.connect();
+    service.publish('private.subject', { token: 'secret' });
+    expect(emit).toHaveBeenLastCalledWith({
+      eventType: 'dependency',
+      outcome: 'restored',
+      severity: 'informational',
+      reasonCode: 'dependency_recovered',
     });
   });
 });

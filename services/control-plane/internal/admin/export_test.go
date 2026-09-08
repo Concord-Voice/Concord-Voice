@@ -7,6 +7,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/securityevent"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 )
 
@@ -50,4 +51,18 @@ func RunAdminCtlForTest(
 		stdout:        stdout,
 	}
 	return runAdminCtl(ctx, deps, args)
+}
+
+// RunAdminCtlWithWriterForTest exercises the production entry ordering with a
+// controllable security-event writer opener.
+func RunAdminCtlWithWriterForTest(ctx context.Context, db *sql.DB, rdb *redis.Client, stdin io.Reader, stdout io.Writer, baseURL string, args []string, open func() (securityevent.Emitter, io.Closer, error)) int {
+	deps := adminCtlDeps{
+		repo:          NewAdminRepo(db),
+		audit:         NewAuditLog(db),
+		enroll:        NewEnrollmentStore(rdb),
+		enrollBaseURL: baseURL,
+		stdin:         stdin,
+		stdout:        stdout,
+	}
+	return runAdminCtlWithSecurityEvents(ctx, deps, args, open)
 }

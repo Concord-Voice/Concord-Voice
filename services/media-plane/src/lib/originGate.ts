@@ -18,7 +18,29 @@
  * depth against bypass. The allowlist check remains exact-match for parity with
  * control-plane CORS (cors.go:32).
  */
-export function createOriginGate(allowedOrigins: string[]) {
+import type { EmitSecurityEvent } from './securityEvent.js';
+
+export type OriginRejection = 'opaque_origin' | 'file_origin' | 'not_allowlisted';
+
+export function createOriginGate(
+  allowedOrigins: string[],
+  emit?: EmitSecurityEvent,
+  onReject?: (reason: OriginRejection) => void
+) {
+  const observe = (event: Parameters<EmitSecurityEvent>[0]) => {
+    try {
+      emit?.(event);
+    } catch {
+      // A security observer cannot change the CORS verdict.
+    }
+  };
+  const reportReject = (reason: OriginRejection) => {
+    try {
+      onReject?.(reason);
+    } catch {
+      // The auxiliary reporter cannot alter the CORS verdict or audit record.
+    }
+  };
   return (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
     // Allow no-origin requests (native clients like curl, internal test harnesses).
     // Browser-based clients always carry an Origin header.
@@ -32,11 +54,27 @@ export function createOriginGate(allowedOrigins: string[]) {
     // on this check only to defend against non-browser-client casing variants.
     const normalized = origin.trim().toLowerCase();
     if (normalized === 'null' || normalized === 'file://') {
+      reportReject(normalized === 'null' ? 'opaque_origin' : 'file_origin');
+      observe({
+        eventType: 'media_admission',
+        outcome: 'denied',
+        severity: 'medium',
+        reasonCode: 'origin_rejected',
+        routeTemplate: 'socket.join',
+      });
       return callback(new Error(`Origin ${origin} not allowed`));
     }
     if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
+    reportReject('not_allowlisted');
+    observe({
+      eventType: 'media_admission',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'origin_rejected',
+      routeTemplate: 'socket.join',
+    });
     callback(new Error(`Origin ${origin} not allowed`));
   };
 }

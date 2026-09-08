@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -302,9 +303,13 @@ func TestRequireCloudflareAccessLogsPIISafeReason(t *testing.T) {
 
 	require.Equal(t, http.StatusForbidden, rec.Code)
 	out := logs.String()
-	require.Contains(t, out, "aud_mismatch")
+	require.Contains(t, out, "cloudflare_access_denied")
 	require.NotContains(t, out, token)
 	require.NotContains(t, out, "admin@example.test")
+}
+
+func TestCloudflareAccessFailureNormalizesUnknownVerifierErrors(t *testing.T) {
+	require.Equal(t, "cloudflare_access_denied", cloudflareAccessFailure(errors.New("unexpected verifier detail")))
 }
 
 func newRSAKey(t *testing.T) *rsa.PrivateKey {
