@@ -119,11 +119,21 @@ vi.mock('@/renderer/services/e2ee/mediaEncryption', () => ({
   // (sender advertises === ack confirms) stays self-consistent.
   MEDIA_E2EE_FRAME_CRYPTO_VERSION: 5,
   MediaEncryption: class MockMediaEncryption {
+    // Stateful key id, per review on PR #3150. A constant `mockReturnValue(0)` made the
+    // decision-23 assertion below unfalsifiable in one direction: a regression that built a
+    // FRESH instance but seeded it at a non-zero epoch would still read 0 and pass. Tracking
+    // what `initFromKey`/`setCurrentKeyId` were actually called with makes the epoch the
+    // production code chose observable, which is the whole point of that test.
+    private currentKeyId = 0;
     init = vi.fn().mockResolvedValue(undefined);
-    initFromKey = vi.fn();
+    initFromKey = vi.fn().mockImplementation((_key: unknown, keyId: number = 0) => {
+      this.currentKeyId = keyId;
+    });
     destroy = vi.fn();
-    getCurrentKeyId = vi.fn().mockReturnValue(0);
-    setCurrentKeyId = vi.fn();
+    getCurrentKeyId = vi.fn(() => this.currentKeyId);
+    setCurrentKeyId = vi.fn((keyId: number) => {
+      this.currentKeyId = keyId;
+    });
     // #1878: encrypt-version binding.
     setKeyVersion = vi.fn();
     getKeyVersion = vi.fn().mockReturnValue(0);
@@ -436,7 +446,8 @@ function makeRecvTransport() {
 async function joinVoiceChannel(
   co?: Record<string, unknown>,
   joinType: 'channel' | 'dm' = 'channel',
-  response?: Record<string, unknown>
+  response?: Record<string, unknown>,
+  opts?: { internalRebuild?: boolean }
 ) {
   setupAuth();
   mockApiFetch.mockResolvedValueOnce({
@@ -464,7 +475,7 @@ async function joinVoiceChannel(
   const micProducer = createMockProducer('prod-mic', 'mic');
   sendTransport.produce.mockResolvedValue(micProducer);
 
-  await voiceService.joinChannel('channel-1', joinType);
+  await voiceService.joinChannel('channel-1', joinType, opts);
   return { sendTransport, recvTransport, micProducer };
 }
 
@@ -1433,6 +1444,55 @@ describe('VoiceService', () => {
     it('safe when not connected', async () => {
       await voiceService.leaveChannel();
       expect(useVoiceStore.getState().connectionState).toBe('disconnected');
+    });
+  });
+
+  // ===== ADR-0042 owner decision 23: internalRebuild leave/join mediaEncryption teardown =====
+
+  describe('internalRebuild leave/join — mediaEncryption teardown (ADR-0042 decision 23)', () => {
+    it('nulls mediaEncryption across an internalRebuild leave, so getCurrentKeyId() does not carry state into the rejoin', async () => {
+      await joinVoiceChannel();
+
+      const firstMediaEncryption = (voiceService as any).mediaEncryption;
+      expect(firstMediaEncryption).not.toBeNull();
+      // Simulate a mid-call key rotation having advanced this session's epoch
+      // (a real MediaEncryption would report this via getCurrentKeyId()).
+      firstMediaEncryption.setCurrentKeyId(42);
+      expect(firstMediaEncryption.getCurrentKeyId()).toBe(42);
+
+      // D12's one-shot rebuild leave (voiceService.ts:8150, inside
+      // engageLegacyFallback) calls this exact public method with
+      // internalRebuild: true.
+      await voiceService.leaveChannel({ internalRebuild: true });
+
+      // leaveChannel() awaits cleanup() UNCONDITIONALLY (opts.internalRebuild
+      // gates only the notification sound, never the teardown call). cleanup()
+      // calls teardownSharedE2EEState(), which destroys and nulls
+      // `mediaEncryption` (voiceService.ts:3265-3266) with no
+      // opts.internalRebuild branch anywhere in that path.
+      expect((voiceService as any).mediaEncryption).toBeNull();
+      expect(firstMediaEncryption.destroy).toHaveBeenCalledTimes(1);
+
+      // D12's one-shot rebuild rejoin (voiceService.ts:8161) calls joinChannel
+      // with internalRebuild: true on the freshly (re)connected session.
+      await joinVoiceChannel(undefined, 'channel', undefined, { internalRebuild: true });
+
+      const secondMediaEncryption = (voiceService as any).mediaEncryption;
+      expect(secondMediaEncryption).not.toBeNull();
+      // A genuinely PRESERVED mediaEncryption would be the same object and
+      // would still report the pre-leave epoch (42). It is neither: the
+      // rejoin's initEncryptionCore always constructs `new MediaEncryption()`
+      // and calls `initFromKey(encryptKey, 0)` (voiceService.ts:7078-7079).
+      // The mock is stateful, so this 0 is the epoch PRODUCTION passed — not a
+      // constant the mock returns regardless. A rejoin that seeded a non-zero
+      // epoch would fail here.
+      expect(secondMediaEncryption).not.toBe(firstMediaEncryption);
+      // Observe the initialization directly, not just its effect: the rejoin must seed the NEW
+      // instance at epoch 0. Asserting only getCurrentKeyId() would still pass if `initFromKey`
+      // were never called at all, because a fresh instance's field initializer is also 0.
+      expect(secondMediaEncryption.initFromKey).toHaveBeenCalledWith(expect.anything(), 0);
+      expect(secondMediaEncryption.getCurrentKeyId()).toBe(0);
+      expect(secondMediaEncryption.getCurrentKeyId()).not.toBe(42);
     });
   });
 
