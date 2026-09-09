@@ -36,6 +36,7 @@ ENTRIES=$("$ASAR_BIN" list "$ASAR" | tr '\134' '/')
 # stays green (the app then fails to launch with nothing red).
 REQUIRED_TOP='/build
 /dist
+/native
 /node_modules
 /package.json'
 
@@ -81,6 +82,25 @@ ACTUAL_BUILD=$(grep '^/build/' <<<"$ENTRIES" | sort || true)
 if [ "$ACTUAL_BUILD" != "$EXPECTED_BUILD" ]; then
   echo "::error::build/ in app.asar must contain exactly the two runtime icons. Found:"
   printf '%s\n' "${ACTUAL_BUILD:-(nothing)}"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# native/ is the same shape as build/ above, and for the same reason: a PARTIAL
+# exclusion needs assertions in BOTH directions (ADR-0043 PR 5, #3194). Exactly one
+# file is admitted -- the concord-audiocap loader -- while the addon source (C++,
+# binding.gyp, tests, the fuzzer) and the compiled .node stay out. The .node ships
+# via extraResource instead, because dlopen needs a real path on disk.
+#
+# Admitting /native to REQUIRED_TOP without this check would be strictly worse than
+# not admitting it at all: the top-level loop would then wave through the ENTIRE
+# addon tree, which is precisely the regression the ignore lookahead exists to
+# prevent, and every per-file assertion elsewhere would stay green.
+EXPECTED_NATIVE='/native/concord-audiocap
+/native/concord-audiocap/index.js'
+ACTUAL_NATIVE=$(grep '^/native/' <<<"$ENTRIES" | sort || true)
+if [ "$ACTUAL_NATIVE" != "$EXPECTED_NATIVE" ]; then
+  echo "::error::native/ in app.asar must contain exactly the concord-audiocap loader. Found:"
+  printf '%s\n' "${ACTUAL_NATIVE:-(nothing)}"
   FAILURES=$((FAILURES + 1))
 fi
 

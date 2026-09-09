@@ -359,6 +359,42 @@ describe('Packaging Identity (#382)', () => {
       expect(isIgnored(await loadForgeConfig(), appRelativePath)).toBe(false);
     });
 
+    // ADR-0043 PR 5 (#3194). The addon's SOURCE stays out of the archive, but the
+    // loader `index.js` ships INSIDE it, so executable JS entering a
+    // Node-privileged process stays under EnableEmbeddedAsarIntegrityValidation.
+    // The opaque .node goes the other way, via extraResource, because dlopen
+    // needs a real path.
+    //
+    // THE DESCEND TRAP IS THE WHOLE POINT OF THIS TABLE. The copy filter is asked
+    // about a DIRECTORY before it descends, so a pattern matching `/native` or
+    // `/native/concord-audiocap` suppresses the entire subtree and index.js is
+    // never copied — while every per-file assertion above stays green. Same
+    // mechanic the `/^\/build\/(?!icon\.(?:png|icns)$)/` rule documents, and the
+    // reason the first two rows below assert NOT-excluded on bare directories.
+    //
+    // This table is the SPECIFICATION; the regex is one implementation of it.
+    // Rewrite the pattern freely, but every row must still hold.
+    it.each<[string, boolean]>([
+      ['/native', false],
+      ['/native/concord-audiocap', false],
+      ['/native/concord-audiocap/index.js', false],
+      ['/native/concord-audiocap/rt', true],
+      ['/native/concord-audiocap/rt/quantum_ring.h', true],
+      ['/native/concord-audiocap/napi/addon.cc', true],
+      ['/native/concord-audiocap/test/ring_test.cc', true],
+      ['/native/concord-audiocap/binding.gyp', true],
+      ['/native/concord-audiocap/README.md', true],
+      // Ships via extraResource; a second, unloadable copy inside the archive is
+      // dead weight and would also defeat the asar-list assertion pair in CI.
+      ['/native/concord-audiocap/build/Release/concord_audiocap.node', true],
+      // A future second addon must not become implicitly shippable by sitting
+      // next to this one.
+      ['/native/some-future-addon', true],
+      ['/native/some-future-addon/index.js', true],
+    ])('native lookahead: %s → excluded=%s', async (appRelativePath, expected) => {
+      expect(isIgnored(await loadForgeConfig(), appRelativePath)).toBe(expected);
+    });
+
     // The copy filter runs the SAME patterns over files under /node_modules/,
     // and String.match is unanchored. An unanchored /tests/ or /build/ would
     // quietly gut any production dependency shipping a directory of that name —
@@ -907,5 +943,140 @@ describe('loadForgeConfigForPlatform helper integrity', () => {
     // cache — both are needed to fully restore.)
     vi.doUnmock('../../../forge.config');
     vi.resetModules();
+  });
+});
+
+// ── concord-audiocap extraResource + CI guard (#3194) ─────────────────────
+//
+// ADR-0043 PR 5. The .node ships OUTSIDE app.asar via extraResource because
+// dlopen/LoadLibrary need a real path; the loader JS stays inside (see the
+// `native lookahead` table above).
+describe('native addon extraResource + CI guard (#3194)', () => {
+  const NODE_REL = './native/concord-audiocap/build/Release/concord_audiocap.node';
+
+  /**
+   * Load forge.config.ts with existsSync, process.argv, CI and platform forced.
+   *
+   * RESTORATION COVERS FOUR PIECES OF STATE, and every one matters. Note the wording:
+   * elsewhere in this file "Layer 1 / Layer 2" means two INDEPENDENT mechanisms (a
+   * helper `finally` plus a caller-side `afterAll` re-restoring
+   * PRISTINE_PLATFORM_DESCRIPTOR). This helper has ONE mechanism restoring four values,
+   * so calling it "four-layer" borrowed the louder word for a weaker property and read
+   * as more defended than it is.
+   *
+   * This is the first test in the repo to force `electron-forge` into process.argv, and
+   * forge.config.ts has one OTHER fail-loud guard gated on exactly that — buildtag.json.
+   * Leaking argv would make it throw in every later re-import in this file on a CI
+   * runner, where CI=true. That is precisely the failure mode
+   * loadForgeConfigForPlatform's own JSDoc warns about, and it is why the restore lives
+   * in a `finally` rather than an afterEach.
+   *
+   * The googleClientSecret.json guard is deliberately NOT in that list: it is gated on
+   * `CI === 'true' && GOOGLE_SSO_DESKTOP_REQUIRED === 'true'` (forge.config.ts:107), not
+   * on argv. An earlier revision of this comment grouped it with buildtag.json as
+   * "gated on exactly that", contradicting the inline note further down which had it
+   * right. Because that guard reads an ambient variable, this helper PINS it rather than
+   * assuming it is unset — otherwise a shell or CI job that exports it turns every case
+   * in this describe into an unrelated throw.
+   */
+  async function loadWith(opts: {
+    platform: NodeJS.Platform;
+    ci: boolean;
+    nodePresent: boolean;
+  }): Promise<ForgeConfig> {
+    const argv = process.argv;
+    const ci = process.env.CI;
+    // PINNED, not assumed. The googleClientSecret guard reads this variable, so a
+    // caller's shell (or a future CI job) that exports it would arm a guard these cases
+    // do not name and turn every one of them into an unrelated throw — a fixture with a
+    // second way to fail pins none of them ([internal]rules/tests.md § Vacuity).
+    const ssoRequired = process.env.GOOGLE_SSO_DESKTOP_REQUIRED;
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const realExists = fs.existsSync;
+    try {
+      process.argv = [...argv, 'electron-forge'];
+      process.env.CI = opts.ci ? 'true' : 'false';
+      delete process.env.GOOGLE_SSO_DESKTOP_REQUIRED;
+      Object.defineProperty(process, 'platform', {
+        ...platformDescriptor,
+        value: opts.platform,
+      });
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+        const s = String(p);
+        if (s.endsWith('concord_audiocap.node')) return opts.nodePresent;
+        // NEUTRALISE THE OTHER TWO CI FAIL-LOUD GUARDS, or none of the cases
+        // below pins the branch it names. Forcing CI=true plus `electron-forge`
+        // in argv arms all three guards at once — buildtag.json,
+        // googleClientSecret.json and this PR's addon guard — so the fixture
+        // acquires more than one way to throw and the assertions stop being
+        // attached to the code they name ([internal]rules/tests.md § Vacuity).
+        //
+        // Measured, not theorised: without this the buildtag guard fired first
+        // and reddened the LINUX case, which expects no throw at all.
+        // googleClientSecret needs no stub — its guard additionally requires
+        // GOOGLE_SSO_DESKTOP_REQUIRED='true', which this helper PINS unset above
+        // (it used to merely assume the ambient environment had it unset).
+        if (s.endsWith('buildtag.json')) return true;
+        return realExists(s);
+      });
+      vi.resetModules();
+      return (await import('../../../forge.config')).default;
+    } finally {
+      vi.restoreAllMocks();
+      process.argv = argv;
+      if (ci === undefined) delete process.env.CI;
+      else process.env.CI = ci;
+      if (ssoRequired === undefined) delete process.env.GOOGLE_SSO_DESKTOP_REQUIRED;
+      else process.env.GOOGLE_SSO_DESKTOP_REQUIRED = ssoRequired;
+      Object.defineProperty(process, 'platform', platformDescriptor);
+      vi.resetModules();
+    }
+  }
+
+  it('pushes the .node onto extraResource when it is present', async () => {
+    const config = await loadWith({ platform: 'darwin', ci: false, nodePresent: true });
+    expect(config.packagerConfig?.extraResource).toContain(NODE_REL);
+  });
+
+  // THE GUARD MUST BE PROVEN TO FIRE. The defect this whole PR closes is that a
+  // guard-only existsSync push ships NOTHING, silently, on every leg, with every
+  // leg green. Replacing it with a hard-fail guard that is itself never exercised
+  // reproduces that one level up — nobody learns the guard is inert until a
+  // release ships with no addon. A guard nobody has watched fail is
+  // indistinguishable from no guard.
+  it.each(['darwin', 'win32'] as const)(
+    'hard-fails in CI packaging on %s when the .node is missing',
+    async (platform) => {
+      await expect(loadWith({ platform, ci: true, nodePresent: false })).rejects.toThrow(
+        /concord_audiocap\.node missing/
+      );
+    }
+  );
+
+  // The row people skip, and the expensive one to get wrong. release-build is a
+  // static six-platform matrix including linux x64/arm64, where the addon's
+  // ABSENCE IS CORRECT — ADR-0043 puts Linux/PipeWire out of scope. A guard
+  // written one clause too broadly turns every Linux release leg red for being
+  // right, and it surfaces at release time rather than in the PR that caused it.
+  it('does NOT fail on linux in CI when the .node is missing', async () => {
+    const config = await loadWith({ platform: 'linux', ci: true, nodePresent: false });
+    expect(config.packagerConfig?.extraResource).not.toContain(NODE_REL);
+  });
+
+  it('does not fail locally when the .node is missing', async () => {
+    const config = await loadWith({ platform: 'darwin', ci: false, nodePresent: false });
+    expect(config.packagerConfig?.extraResource).not.toContain(NODE_REL);
+  });
+
+  // Restoration check, in the shape of the platform-descriptor test above. If
+  // argv leaked, the NEXT re-import in this file would trip the buildtag guard.
+  it('restores argv, CI and platform after a throwing load', async () => {
+    const argvBefore = [...process.argv];
+    const ciBefore = process.env.CI;
+    const platformBefore = Object.getOwnPropertyDescriptor(process, 'platform');
+    await expect(loadWith({ platform: 'darwin', ci: true, nodePresent: false })).rejects.toThrow();
+    expect(process.argv).toEqual(argvBefore);
+    expect(process.env.CI).toBe(ciBefore);
+    expect(Object.getOwnPropertyDescriptor(process, 'platform')).toEqual(platformBefore);
   });
 });

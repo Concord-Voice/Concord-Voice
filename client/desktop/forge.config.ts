@@ -110,6 +110,35 @@ if (fs.existsSync('./googleClientSecret.json')) {
       'Run `npm run build:gclientsecret` before forge make/package (see build-desktop.yml).'
   );
 }
+// concord-audiocap native addon (ADR-0043 PR 5, #3194). The .node ships OUTSIDE
+// app.asar because dlopen/LoadLibrary need a real path on disk and everything
+// inside the archive is virtual; the loader JS stays INSIDE it so executable code
+// entering a Node-privileged process remains under
+// EnableEmbeddedAsarIntegrityValidation. See the ignore lookahead below for the
+// other half of that split, and note extraResource does NOT pass through the
+// ignore array — which is what lets the two halves be placed independently.
+//
+// PLATFORM-AWARE ON PURPOSE, and this is the clause that is easy to get wrong.
+// release-build is a static six-platform matrix including linux x64/arm64, and
+// the addon is win32+darwin only (ADR-0043 § Consequences puts Linux/PipeWire out
+// of scope). On a Linux leg the binary's ABSENCE IS CORRECT, so an unconditional
+// CI hard-fail would turn a correct state into a red release.
+const NATIVE_ADDON = './native/concord-audiocap/build/Release/concord_audiocap.node';
+const nativeAddonExpected = process.platform === 'darwin' || process.platform === 'win32';
+if (fs.existsSync(NATIVE_ADDON)) {
+  extraResource.push(NATIVE_ADDON);
+} else if (nativeAddonExpected && process.env.CI === 'true' && isForgePackaging) {
+  // Fail-loud, following the buildtag.json idiom above. Without this the
+  // existsSync guard ALONE ships nothing, on every platform, with every leg
+  // green — the packaging equivalent of a silent no-op, and precisely the defect
+  // #3194 exists to close. The build-desktop.yml step that produces this file is
+  // "Build the native addon (win32/darwin only)"; if we are here, it did not run.
+  throw new Error(
+    'forge.config.ts: concord_audiocap.node missing in CI packaging context. ' +
+      'Run `npm run build:native` before electron-forge make/package — see the ' +
+      '"Build the native addon" step in build-desktop.yml (#3194).'
+  );
+}
 
 const linuxIconConfig = () => ({
   '128x128': './build/icons/128x128.png',
@@ -124,12 +153,21 @@ const config: ForgeConfig = {
       // any secrets or logic embedded in it. That exclusion is `ignore` below;
       // this block is about what stays OUTSIDE the archive.
       //
-      // DO NOT SET `unpack` OR `unpackDir` HERE UNTIL THE BLOCKER BELOW IS FIXED.
+      // NEVER SET `unpack` OR `unpackDir` HERE. The blocker below is PERMANENT —
+      // it is not waiting on a fix, and #3194 routed around it rather than
+      // clearing it. (Full route ruling in the block further down.)
       // Both options are currently NON-FUNCTIONAL in this repo, and the failure is
       // a packaging crash rather than a silent no-op:
       //
       //     TypeError: (0 , minimatch_1.default) is not a function
-      //         at shouldUnpackPath (@electron/asar/lib/asar.js:147)
+      //         at shouldUnpackPath (@electron/asar/lib/asar.js:147)   // via `unpack`
+      //         at isUnpackedDir     (@electron/asar/lib/asar.js:54)   // via `unpackDir`
+      //
+      // TWO frames, because the two options crash in different places and the
+      // single frame recorded here originally would not reproduce for whoever
+      // tried `unpackDir`. Setting `unpackDir` ALONE leaves `unpack` undefined, so
+      // :147 is guarded by `if (unpack)` and never runs — the throw comes from
+      // isUnpackedDir at :54, and only once its `startsWith` short-circuit fails.
       //
       // @electron/asar@3.4.1 declares minimatch ^3.0.4 and calls its DEFAULT
       // export. This package overrides minimatch globally to ^10.2.6, and
@@ -146,16 +184,28 @@ const config: ForgeConfig = {
       // unpack glob work would invert all of that.
       //
       // ADR-0043 D1 needs a .node OUTSIDE the archive — dlopen/LoadLibrary needs a
-      // real path on disk and everything inside app.asar is virtual. Three ways to
-      // get there, for whoever takes PR 5:
-      //   1. Override @electron/asar to ^4.3.0, which declares minimatch ^10.0.1.
-      //      Fixes it at the source and the skew is upward — but @electron/packager
-      //      declares ^3.2.13, so it forces a MAJOR onto the release path and needs
-      //      its own validation.
-      //   2. Ship the addon via `extraResource` (already used in this config)
-      //      instead of unpacking it. Touches no dependency at all; the loader
-      //      resolves through process.resourcesPath rather than a relative require.
-      //   3. Wait for @electron/packager to move to asar 4.
+      // real path on disk and everything inside app.asar is virtual.
+      //
+      // ROUTE CHOSEN, PR 5 / #3194: ship it via `extraResource`, which this config
+      // already uses for five other payloads and which does NOT pass through the
+      // ignore array. It touches no dependency at all. See the extraResource block
+      // above for the push and its platform-aware CI guard.
+      //
+      // Rejected, and CLOSED rather than pending:
+      //   1. Override @electron/asar to ^4.3.0 (declares minimatch ^10.0.1). Fixes
+      //      it at the source and the skew is upward — but @electron/packager@18.4.4
+      //      declares ^3.2.13, so it forces a MAJOR onto the release packaging path
+      //      to buy what extraResource already provides.
+      //   3. Wait for @electron/packager to move to asar 4 — no owner, and it would
+      //      block the whole epic indefinitely.
+      //   4. Forge's plugin-auto-unpack-natives — it writes this same `asar.unpack`
+      //      key, so it hits the identical crash. Also not installed, making it a
+      //      new dependency against D1's own supply-chain reasoning.
+      //
+      // Electron's own asar docs name `--unpack *.node` as the canonical way to ship
+      // a native module. We deliberately diverge, because in THIS repo it does not
+      // run. Recorded so the next reader does not find those docs, reach for
+      // `unpack`, and rediscover the crash above.
       unpackDir: undefined,
     },
     // Only four things belong in the archive: `dist/` (built main, preload and
@@ -208,22 +258,34 @@ const config: ForgeConfig = {
       // dist/renderer by Vite, and `assets/tray` reaches <Resources>/tray via
       // extraResource (resolveTrayIconPath reads process.resourcesPath when
       // packaged, and cwd/assets only in dev).
-      /^\/(src|tests|docs|scripts|schemas|functions|public|assets|coverage|playwright-report|test-results|native|spikes)($|\/)/,
-      // `native` and `spikes` were added by the payload-boundary guard's own
-      // finding on PR #3155: both were shipping their full source into app.asar.
-      // `spikes/` is a throwaway Windows measurement probe (s2probe.cpp and its
-      // WAV output) that has no business in a user's install at all. `native/`
-      // is the concord-audiocap addon SOURCE — C++, binding.gyp, tests, the
-      // fuzzer — none of which runs at runtime.
+      /^\/(src|tests|docs|scripts|schemas|functions|public|assets|coverage|playwright-report|test-results|spikes)($|\/)/,
+      // `spikes` was added by the payload-boundary guard's own finding on PR
+      // #3155: it was shipping its full source into app.asar. It is a throwaway
+      // Windows measurement probe (s2probe.cpp and its WAV output) that has no
+      // business in a user's install at all.
       //
-      // NOTE FOR ADR-0043 PR 5: excluding the tree is correct TODAY precisely
-      // because nothing is compiled during packaging yet. When the .node is
-      // actually built, it needs to be OUTSIDE the archive anyway (dlopen and
-      // LoadLibrary need a real path, and everything inside app.asar is
-      // virtual), so it should arrive via extraResource or an unpack route --
-      // see the long asar comment above for why `unpackDir` is currently
-      // non-functional. Do NOT "fix" this by deleting the exclusion: that ships
-      // the source and still leaves the binary unloadable.
+      // `native` was in that same alternation until ADR-0043 PR 5 (#3194), which
+      // needed ONE file out of it. The addon SOURCE still goes nowhere near the
+      // archive — C++, binding.gyp, tests, the fuzzer, none of which runs at
+      // runtime — but the loader `index.js` now ships INSIDE it, so executable JS
+      // entering a Node-privileged process stays under
+      // EnableEmbeddedAsarIntegrityValidation. The opaque .node goes the OTHER
+      // way, via extraResource, because dlopen and LoadLibrary need a real path
+      // and everything inside app.asar is virtual.
+      //
+      // BOTH DIRECTORY LEVELS MUST BE ADMITTED, and this is the whole reason the
+      // rule is a lookahead rather than another alternation arm. The copy filter
+      // is asked about a directory BEFORE it descends, so a pattern matching
+      // `/native` or `/native/concord-audiocap` suppresses the entire subtree and
+      // index.js is never copied — with every per-file assertion still green.
+      // `^\/native\/` cannot match `/native` at all, and the lookahead's
+      // `concord-audiocap$` arm covers the second level.
+      //
+      // Do NOT "fix" this by dropping the rule: that ships the whole addon source.
+      // Do NOT widen it past index.js either — the archive's top-level set is an
+      // asserted invariant (see verify-asar-payload.sh and [internal]rules/electron.md
+      // § app.asar payload boundary), and the verifier's depth check will red.
+      /^\/native\/(?!concord-audiocap($|\/index\.js$))/,
       // `build/` is ALMOST all packaging-time input the makers read from the
       // source directory — but not quite, so it cannot be excluded wholesale.
       // Two files are read from inside the archive at runtime via
