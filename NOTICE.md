@@ -16,9 +16,11 @@ contributions of these projects to the Concord Voice platform.
 Concord Voice distributes 398 third-party software components across its four
 CVSL application artifact families:
 
-- **59** Go modules linked into the control-plane runtime binary. The image that
-  carries that binary also ships the admin portal bundle below, so the image is
-  not Go-only.
+- **59** Go modules linked into the control-plane runtime binaries. The image
+  ships **three** Go binaries — `main` (`./cmd/server`), `migrate-media` and
+  `mfa-rekey` (`services/control-plane/Dockerfile:39-41,57-59`) — and the table
+  is the union of what all three link. The image also carries the admin portal
+  bundle below, so it is not Go-only.
 - **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
 - **148** npm packages in the media-plane production bundle
 - **4** npm packages in the admin portal production bundle (`client/admin`),
@@ -38,9 +40,11 @@ Application-dependency license distribution:
 | MIT | 82.4% (328) | ✓ |
 | ISC | 6.3% (25) | ✓ |
 | Apache-2.0 | 4.5% (18) | ✓ |
-| BSD-2-Clause / BSD-3-Clause | 5.0% (20) | ✓ |
+| BSD-3-Clause | 3.8% (15) | ✓ |
+| BSD-2-Clause | 1.3% (5) | ✓ |
 | BlueOak-1.0.0 | 1.3% (5) | ✓ |
-| Python-2.0 / Unlicense | 0.5% (2) | ✓ |
+| Python-2.0 | 0.3% (1) | ✓ |
+| Unlicense | 0.3% (1) | ✓ |
 | MPL-2.0 (build-time only) | not in the count above | ✓ |
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | not in the count above | ✓ (attribution required) |
 
@@ -137,8 +141,13 @@ Electron and Chromium teams are gratefully acknowledged.
 
 ## Go Control-Plane Runtime Dependencies
 
-The following Go modules are linked into the control-plane runtime binary
-(services/control-plane):
+The following Go modules are linked into the control-plane runtime binaries
+(services/control-plane). The set is the **union across all three shipped
+binaries** — `./cmd/server`, `./cmd/migrate-media` and `./cmd/mfa-rekey` — not
+the server alone; a module reachable from any of them is distributed and owes an
+attribution row. The other two currently link strict subsets of the server's
+set, so the union equals the server's today, but that is a fact about the
+current tree rather than a guarantee.
 
 | Module | Version | License |
 |---|---|---|
@@ -626,6 +635,39 @@ build-time-only attributions:
 This NOTICE file should be regenerated whenever dependencies are added,
 removed, or upgraded. Tooling:
 
+**Prefer the script.** [`scripts/update-notice-md.py`](scripts/update-notice-md.py)
+runs everything below and rewrites the four tables and the summary counts in one
+step. It is dry-run by default; `--apply` writes.
+
+```bash
+(cd client/desktop && npm ci) && (cd services/media-plane && npm ci) && \
+(cd client/admin && npm ci) && ./scripts/update-notice-md.py --apply
+```
+
+It exits **2** rather than writing when a Go module is linked into **any of the
+three shipped binaries** with no licence recorded here: `go list` reports no
+licence, and inventing one would assert a licence determination, which is an
+audit action. Determine it from the module's own `LICENSE` file and add the row
+by hand. It also exits 2 for a licence outside the compatibility allowlist, and
+for any field containing a `|` that would forge a table column.
+
+`.github/workflows/license-check.yml` runs the same script with `--check`, which
+FAILS on an attribution defect — a shipped component with no row, a row for
+something no longer shipped, a changed licence (**npm only**, see below), or a
+stated count that disagrees with its own table — and merely warns on version
+drift, which [`/weekly-deps`]([internal]skills/weekly-deps/SKILL.md) Phase 6.3
+clears weekly. A red guard is visible but does **not** block merge: only
+`Gitar` and `SonarCloud Code Analysis` are required status checks.
+
+A Go upstream **relicence is structurally invisible** to the script. `go list`
+reports no licence, so each module's licence is carried forward from the table
+above rather than re-read; only npm licences are re-derived every run. The
+compensating control is manual and lives in `/weekly-deps` Phase 6.3 — diff the
+module cache's `LICENSE` across the two versions whenever a Go pin moves.
+
+The commands the script runs, for reference and for regenerating one family by
+hand:
+
 `--excludePrivatePackages` is what drops the first-party rows: Concord Voice's
 own packages and the local `node-domexception` stub override (documented in
 `[internal]rules/media-plane.md` "Docker Build Context Invariant") all declare
@@ -644,9 +686,10 @@ cd services/media-plane && npx license-checker --production --csv --excludePriva
 # Admin portal (npm) -- bundled into the control-plane runtime image at /admin-ui
 cd client/admin && npx license-checker --production --csv --excludePrivatePackages > /tmp/admin-licenses.csv
 
-# Go control-plane (binary runtime modules). The first line of output is the
-# control-plane's own module path with an empty version -- first-party, drop it.
-cd services/control-plane && go list -deps -e -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/server | sort -u
+# Go control-plane (binary runtime modules). All THREE shipped binaries, not
+# just the server -- a module reachable from any of them is distributed. Lines
+# with an empty version are first-party module paths; drop them.
+cd services/control-plane && go list -deps -e -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/server ./cmd/migrate-media ./cmd/mfa-rekey | sort -u
 ```
 
 Each table below is sorted the way `license-checker` sorts its CSV: by the full
