@@ -568,6 +568,31 @@ docker-compose logs postgres
 docker-compose restart postgres
 ```
 
+### Containers exist but `concord-dev.sh status` cannot see them
+
+`status` shows part of the stack missing, `up` reports a container name already in
+use, or `down` reports success while the containers keep running. All three are the
+same cause: those containers carry a different **compose project** from the one
+`docker-compose.dev.yml` declares (`name: concordvoice-dev`), so compose does not
+consider them part of this stack at all.
+
+It happens when compose is invoked without the dev overlay — a bare
+`docker-compose up -d` derives the project name from the directory instead of reading
+the `name:` key. `./scripts/concord-dev.sh` always passes both `-f` files, so the
+script itself cannot produce the split.
+
+`up`, `status` and `down` warn when they see it, listing each container and the
+project it actually carries. To clear it, when no other session is mid-test:
+
+```bash
+docker rm -f <the names the warning listed>   # named volumes survive; data is kept
+./scripts/concord-dev.sh up
+```
+
+Read the listed names before removing any: a container from the `tools` or `services`
+profile, or another worktree's isolated stack, is correctly separate and none of this
+stack's business.
+
 ### "Port already in use"
 
 ```bash
