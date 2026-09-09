@@ -40,19 +40,24 @@ cd concord
 
 ### 2. Start Infrastructure Services
 
-Start PostgreSQL and Redis using Docker Compose:
+Start PostgreSQL, Redis, and NATS using Docker Compose:
+
+> **Pass both `-f` flags every time.** `docker-compose.dev.yml` carries the
+> `name: concordvoice-dev` project key. Omit it and Compose falls back to the
+> directory name, splitting the stack across two projects — `./scripts/concord-dev.sh`
+> then sees only half of it, and its `down` orphans the rest.
 
 ```bash
-docker-compose up -d postgres redis nats
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis nats
 ```
 
 Check their status:
 
 ```bash
-docker-compose ps
+./scripts/concord-dev.sh status
 ```
 
-You should see `concord-postgres`, `concord-redis`, and `concord-nats` running.
+You should see `concordvoice-postgres`, `concordvoice-redis`, and `concordvoice-nats` running.
 
 ### 3. Set Up Control Plane (Go)
 
@@ -204,12 +209,12 @@ migrate -path services/control-plane/migrations -database "postgres://concord:co
 
 **Via psql**:
 ```bash
-docker exec -it concord-postgres psql -U concord -d concord
+docker exec -it concordvoice-postgres psql -U concord -d concord
 ```
 
 **Via pgAdmin** (Web UI):
 ```bash
-docker-compose --profile tools up -d pgadmin
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile tools up -d pgadmin
 ```
 
 Then open http://localhost:5050
@@ -220,12 +225,12 @@ Then open http://localhost:5050
 
 **Via redis-cli**:
 ```bash
-docker exec -it concord-redis redis-cli
+docker exec -it concordvoice-redis redis-cli
 ```
 
 **Via Redis Commander** (Web UI):
 ```bash
-docker-compose --profile tools up -d redis-commander
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile tools up -d redis-commander
 ```
 
 Then open http://localhost:8081
@@ -430,8 +435,8 @@ The Electron app automatically opens DevTools in development mode.
 ### Reset Database
 
 ```bash
-docker-compose down -v postgres
-docker-compose up -d postgres
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v postgres
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
 # Wait a few seconds for postgres to start
 cd services/control-plane && go run cmd/server/main.go
 # Migrations will run automatically
@@ -440,18 +445,18 @@ cd services/control-plane && go run cmd/server/main.go
 ### Clear Redis
 
 ```bash
-docker exec -it concord-redis redis-cli FLUSHALL
+docker exec -it concordvoice-redis redis-cli FLUSHALL
 ```
 
 ### View Logs
 
 ```bash
-# All services
-docker-compose logs -f
+# All containers
+./scripts/concord-dev.sh logs docker
 
-# Specific service
-docker-compose logs -f postgres
-docker-compose logs -f redis
+# Specific container
+./scripts/concord-dev.sh logs docker postgres
+./scripts/concord-dev.sh logs docker redis
 ```
 
 ### Port Conflicts
@@ -559,13 +564,13 @@ Staging and production deployments use these ports, with an nginx reverse proxy 
 
 ```bash
 # Check if postgres is running
-docker-compose ps postgres
+./scripts/concord-dev.sh status
 
 # Check logs
-docker-compose logs postgres
+./scripts/concord-dev.sh logs docker postgres
 
-# Restart postgres
-docker-compose restart postgres
+# Restart postgres (concord-dev.sh restart cycles the whole stack, not one container)
+docker compose -f docker-compose.yml -f docker-compose.dev.yml restart postgres
 ```
 
 ### Containers exist but `concord-dev.sh status` cannot see them

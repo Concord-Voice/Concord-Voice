@@ -84,10 +84,13 @@ access token and returns an `Authorization: Bearer <token>` header.
 
 ### Prerequisites
 
-Integration tests require running PostgreSQL and Redis:
+Integration tests require running PostgreSQL and Redis. Run this **from the
+repository root** — the `-f` paths are root-relative:
 
 ```bash
-docker-compose up -d postgres redis
+# Both -f flags are required — docker-compose.dev.yml carries the
+# `name: concordvoice-dev` compose project key.
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 ```
 
 ### Environment Variables

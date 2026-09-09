@@ -49,7 +49,9 @@ For the high-level system design, see **[docs/architecture.md](./docs/architectu
 git clone https://github.com/Concord-Voice/Concord-Voice.git
 cd Concord-Voice
 pip install pre-commit
-docker compose up
+# Both -f flags are required — docker-compose.dev.yml carries the
+# `name: concordvoice-dev` compose project key.
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 ```
 
 For detailed setup, see [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) and [docs/development.md](./docs/development.md).

@@ -15,12 +15,14 @@ From the project root:
 
 ```bash
 cd /path/to/Concord
-docker-compose up -d postgres
+# Both -f flags are required — docker-compose.dev.yml carries the
+# `name: concordvoice-dev` compose project key.
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
 ```
 
 Wait for postgres to be healthy:
 ```bash
-docker-compose ps postgres
+docker compose -f docker-compose.yml -f docker-compose.dev.yml ps postgres
 ```
 
 ### 2. Set Environment Variables
@@ -119,7 +121,7 @@ make migrate-up
 Connect to postgres and check tables:
 
 ```bash
-docker exec -it concord-postgres psql -U concord -d concord
+docker exec -it concordvoice-postgres psql -U concord -d concord
 ```
 
 Then run:
@@ -211,8 +213,11 @@ Destroy the volume. This is the supported reset path — do not roll back more t
 one at a time.
 
 ```bash
-docker-compose down -v
-docker-compose up -d postgres
+# Step 2 left you in services/control-plane; the -f paths are root-relative.
+cd ../..
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
+cd services/control-plane
 
 # Verify
 make migrate-version
@@ -229,7 +234,7 @@ No migrations applied yet
 ### 8. Verify Clean State
 
 ```bash
-docker exec -it concord-postgres psql -U concord -d concord -c "\dt"
+docker exec -it concordvoice-postgres psql -U concord -d concord -c "\dt"
 ```
 
 Should only show `schema_migrations` table (or possibly empty).
@@ -251,14 +256,17 @@ Server should start successfully with all tables created.
 To reset database completely:
 
 ```bash
+# The -f paths are root-relative; step 9 left you in services/control-plane.
+cd ../..
+
 # Stop containers
-docker-compose down
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 
 # Remove volumes (WARNING: destroys all data)
-docker-compose down -v
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
 
 # Start fresh
-docker-compose up -d postgres
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
 ```
 
 ## Common Issues

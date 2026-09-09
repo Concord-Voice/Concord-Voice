@@ -83,19 +83,25 @@ This installs 22 hooks covering security scanning, linting, formatting, and comm
 
 ### Step 3: Start Infrastructure (2 min)
 
-Start PostgreSQL, Redis, and NATS:
+Start PostgreSQL, Redis, NATS, coturn, and MinIO:
+
+> **Pass both `-f` flags every time.** `docker-compose.dev.yml` carries the
+> `name: concordvoice-dev` project key. Omit it and Compose falls back to the
+> directory name, splitting the stack across two projects — `./scripts/concord-dev.sh`
+> then sees only half of it, and its `down` orphans the rest.
 
 ```bash
-docker-compose up -d
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
 Wait about 30 seconds for services to start, then verify:
 
 ```bash
-docker-compose ps
+./scripts/concord-dev.sh status
 ```
 
-You should see `healthy` status for postgres, redis, and nats.
+Under `--- Containers ---` you should see `healthy` for postgres, redis, and nats.
+The native processes are all listed as not running — Steps 4-6 start those.
 
 ### Step 4: Start Control Plane (2 min)
 
@@ -155,7 +161,7 @@ The Electron app should launch automatically!
 
 You should have **4 terminals** running:
 
-1. **Docker** - `docker-compose up`
+1. **Docker** - the infrastructure containers from Step 3
 2. **Control Plane** - Go server on port 8080
 3. **Media Plane** - Node server on port 3000
 4. **Desktop Client** - Electron app with Vite dev server
@@ -187,11 +193,11 @@ curl http://localhost:3000/health
 # Expected: {"service":"media-plane","status":"healthy"}
 
 # Check database
-docker exec -it concord-postgres psql -U concord -d concord -c "SELECT 1;"
+docker exec -it concordvoice-postgres psql -U concord -d concord -c "SELECT 1;"
 # Expected: Returns "1"
 
 # Check Redis
-docker exec -it concord-redis redis-cli ping
+docker exec -it concordvoice-redis redis-cli ping
 # Expected: "PONG"
 ```
 
@@ -376,9 +382,10 @@ relevant `.env` file.
 ### Docker not starting
 
 ```bash
-# Reset Docker
-docker-compose down -v
-docker-compose up -d
+# Reset the dev stack. WIPES all dev data (database, Redis, client state),
+# force-removes containers left behind by any other compose project, then
+# restarts everything. Prompts for confirmation first.
+./scripts/concord-dev.sh freshstart
 
 # Or restart Docker Desktop
 ```

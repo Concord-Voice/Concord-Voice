@@ -578,8 +578,11 @@ npm test
 **Current workaround** (for developers):
 
 ```bash
-# Use Docker Compose for local deployment (from project root)
-docker-compose up -d
+# Use Docker Compose for local deployment (from project root).
+# Both -f flags are required: docker-compose.dev.yml carries the
+# `name: concordvoice-dev` project key, and dropping it starts a
+# second, differently-named compose project.
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 # Or use the dev script for the full stack
 ./scripts/concord-dev.sh up
@@ -784,7 +787,7 @@ make migrate-down
 **If migrations fail**, ensure PostgreSQL is running and accessible:
 
 ```bash
-docker exec -it concord-postgres psql -U concord -d concord -c "SELECT version FROM schema_migrations;"
+docker exec -it concordvoice-postgres psql -U concord -d concord -c "SELECT version FROM schema_migrations;"
 ```
 
 ---
@@ -833,14 +836,9 @@ npm test
 **WARNING:** This deletes all local data.
 
 ```bash
-# Stop services
-./scripts/concord-dev.sh down
-
-# Remove Docker volumes (from project root)
-docker-compose down -v
-
-# Restart
-./scripts/concord-dev.sh up
+# Stops the stack, removes its containers and volumes, then restarts.
+# Prompts for confirmation first.
+./scripts/concord-dev.sh freshstart
 ```
 
 ---

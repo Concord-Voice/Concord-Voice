@@ -113,7 +113,9 @@ Run `ls internal/` for the current package set. The packages group as follows.
 3. **Start infrastructure** (using Docker Compose from project root)
    ```bash
    cd ../..
-   docker-compose up -d postgres redis
+   # Both -f flags are required — docker-compose.dev.yml carries the
+   # `name: concordvoice-dev` compose project key.
+   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
    ```
 
 4. **Run the service**
