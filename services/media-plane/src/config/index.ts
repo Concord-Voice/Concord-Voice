@@ -561,6 +561,68 @@ if (config.environment === 'production' && config.allowedOrigins.includes('*')) 
   process.exit(1);
 }
 
+/** Shape of one entry from `os.networkInterfaces()`, narrowed to what we read. */
+export interface HostAddress {
+  address: string;
+  family: string | number;
+  internal: boolean;
+}
+
+/**
+ * Advisory for the ANNOUNCED_IP trap.
+ *
+ * mediasoup's RTC sockets always bind 0.0.0.0, but ICE candidates advertise
+ * `ANNOUNCED_IP` (default 127.0.0.1). When loopback is advertised on a host
+ * that is actually reached over a routable interface, the kernel answers the
+ * browser's STUN connectivity check from that routable address. The browser
+ * sent the request to 127.0.0.1, so the reply is non-symmetric and is
+ * discarded (RFC 8445 s7.2.5.2.1). The pair never validates, is never
+ * nominated, DTLS is therefore never started, and no media flows — with no
+ * error raised by any component, because each behaved correctly given what it
+ * was told.
+ *
+ * Returns the warning text, or null when the situation cannot arise: the
+ * operator set ANNOUNCED_IP explicitly, or this host exposes no routable IPv4
+ * address at all — a loopback-only container, or an IPv6-only host — where
+ * peers can only be reaching the SFU over loopback anyway.
+ *
+ * The message NAMES the candidate addresses but deliberately does NOT pick one.
+ * Interface enumeration order carries no meaning, and a VPN, VM or
+ * container-bridge address passes these filters as readily as the LAN address
+ * a client actually uses. Prescribing the first would confidently point an
+ * operator at the wrong interface, which is worse than the silence this
+ * advisory replaces.
+ *
+ * Link-local (169.254/16) addresses are excluded — they are self-assigned and
+ * never the address a peer reaches this host on, so suggesting one would be
+ * worse than saying nothing.
+ */
+export function announcedIpAdvisory(
+  announcedIpEnv: string | undefined,
+  hostAddresses: readonly HostAddress[]
+): string | null {
+  if (announcedIpEnv) return null;
+
+  const routable = hostAddresses
+    .filter((i) => (i.family === 'IPv4' || i.family === 4) && !i.internal)
+    .map((i) => i.address)
+    .filter((address) => !address.startsWith('169.254.'));
+
+  if (routable.length === 0) return null;
+
+  return (
+    'ANNOUNCED_IP is unset, so mediasoup advertises 127.0.0.1 in its ICE ' +
+    'candidates while the RTC sockets bind 0.0.0.0. Any peer that does not ' +
+    "reach this host over loopback will discard the SFU's STUN replies as " +
+    'non-symmetric, never nominate a candidate pair, and never start DTLS — ' +
+    'media fails silently with no error logged. Set ANNOUNCED_IP to the ' +
+    'address your clients actually reach this host on. Addresses seen here, ' +
+    `in no meaningful order: ${routable.join(', ')} — verify before choosing, ` +
+    'since a VPN, VM or container-bridge address can appear in this list and ' +
+    'is usually the wrong one. See services/media-plane/.env.example.'
+  );
+}
+
 // Re-export mediasoup types for convenience
 import * as mediasoup from 'mediasoup';
 export type * as mediasoupTypes from 'mediasoup';

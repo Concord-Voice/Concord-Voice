@@ -107,8 +107,12 @@ PORT=3000
 REDIS_URL=redis://:concord_dev_redis@localhost:6379
 CONTROL_PLANE_URL=http://localhost:8080
 
-# WebRTC settings
-ANNOUNCED_IP=127.0.0.1
+# WebRTC settings. ANNOUNCED_IP is what mediasoup ADVERTISES in ICE
+# candidates -- the sockets bind 0.0.0.0 either way. 127.0.0.1 is correct only
+# where every client reaches this host at 127.0.0.1; anywhere else it makes
+# media fail silently. Left blank, the service warns at startup and lists the
+# routable IPv4 addresses it sees, without choosing one for you.
+ANNOUNCED_IP=
 RTC_MIN_PORT=40000
 # Must stay INSIDE the range the compose file publishes — mediasoup does not
 # bound a bind to the published window, so a wider range here binds ports
@@ -123,7 +127,7 @@ MEDIASOUP_LOG_LEVEL=warn
 
 **Important for Docker/Cloud:**
 
-- Set `ANNOUNCED_IP` to your server's public IP
+- Set `ANNOUNCED_IP` to the address clients reach this host on — the server's public IP in production, your LAN address in local development. Leaving loopback advertised on a multi-interface host fails silently: ICE reaches `connected`, DTLS never leaves `connecting`, and no media flows
 - Open the UDP range your compose file publishes — `40000-40099` (dev), `40000-40199`
   (staging), `40000-41999` (production) — in your firewall. UDP-only, by design, per ADR-0040 (not an
   oversight): see [ADR-0040](../../[internal]0040-ice-tcp-ingress-posture.md). ICE-TCP is

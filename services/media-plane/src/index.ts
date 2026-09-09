@@ -2,7 +2,8 @@ import express from 'express';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { config } from './config/index.js';
+import { networkInterfaces } from 'node:os';
+import { announcedIpAdvisory, config } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { MediasoupService } from './lib/mediasoup.js';
 import {
@@ -598,6 +599,14 @@ async function main() {
   logger.info('Mediasoup initialized', {
     workers: mediasoupService.getWorkerCount(),
   });
+
+  // Media dies silently when loopback is advertised on a multi-interface host
+  // (see announcedIpAdvisory). Nothing downstream can detect it, so say it here.
+  const ipAdvisory = announcedIpAdvisory(
+    process.env.ANNOUNCED_IP,
+    Object.values(networkInterfaces()).flat().filter((i) => i !== undefined)
+  );
+  if (ipAdvisory) logger.warn(ipAdvisory);
 
   // Initialize NATS (inter-service messaging)
   const natsService = new NatsService();

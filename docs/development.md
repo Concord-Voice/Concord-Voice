@@ -100,7 +100,17 @@ npm install
 # Create .env file (optional)
 cat > .env << EOF
 PORT=3000
-ANNOUNCED_IP=127.0.0.1
+# The address mediasoup ADVERTISES in ICE candidates; the RTC sockets always
+# bind 0.0.0.0 regardless. 127.0.0.1 is correct ONLY where every peer reaches
+# the media plane over loopback -- i.e. the clients run on this same machine.
+# Anywhere else it makes media fail silently. Set it to the address your
+# clients actually reach this host on.
+#
+# Left unset, the media plane warns at startup and lists the routable IPv4
+# addresses it can see. It stays quiet when there are none to list (a
+# loopback-only container, an IPv6-only host, or link-local addresses only),
+# so no warning is not the same as a correct setting.
+ANNOUNCED_IP=
 RTC_MIN_PORT=40000
 RTC_MAX_PORT=49999
 EOF
@@ -523,7 +533,7 @@ opt-in unavailable. It does not prevent existing history reads or deletion.
 |----------|---------|-------------|
 | `ENVIRONMENT` | `development` | Environment mode |
 | `PORT` | `3000` | HTTP server port |
-| `ANNOUNCED_IP` | `127.0.0.1` | Public IP for WebRTC |
+| `ANNOUNCED_IP` | `127.0.0.1` | Address advertised in ICE candidates; the RTC sockets always bind `0.0.0.0`. The default is correct **only** where every peer reaches the media plane over loopback (clients on this same host, or a loopback-only container) — a host having just one non-loopback interface does **not** make `127.0.0.1` reachable to a remote peer. Anywhere else it makes every call fail silently: the kernel answers the browser's STUN check from the routable interface, the browser discards the non-symmetric reply (RFC 8445 §7.2.5.2.1), no candidate pair is nominated, and DTLS never starts. Left unset or empty, the media plane logs a startup warning listing the routable IPv4 addresses it can see; it does **not** pick one for you, because a VPN, VM or container-bridge address passes the same test as your LAN address. It stays silent when there is nothing routable to list (IPv6-only or link-local-only hosts), and an explicitly configured value is never validated |
 | `RTC_MIN_PORT` | `40000` | Min RTC port |
 | `RTC_MAX_PORT` | `49999` | Max RTC port |
 | `MEDIASOUP_ENABLE_TCP` | `false` | Opens mediasoup ICE-TCP. Binds a TCP listener per transport. Only the exact string `true` (trimmed, case-insensitive) enables it. Do not set without publishing the RTC range for TCP and allowing it on both firewall surfaces — see [ADR-0040](adr/0040-ice-tcp-ingress-posture.md) |
@@ -649,7 +659,7 @@ npm install --global windows-build-tools
 ### WebRTC connection issues
 
 - Check the firewall allows **UDP** ports 40000-49999. UDP-only is by design ([ADR-0040](adr/0040-ice-tcp-ingress-posture.md)) — ICE-TCP is gated off, and clients on UDP-blocking networks reach voice via TURN/TURNS (3478/tcp, 5349/tcp)
-- Verify `ANNOUNCED_IP` is correct
+- Verify `ANNOUNCED_IP` is correct — on a host with a LAN interface it must be that address, not `127.0.0.1`. This failure is silent and distinctive: the SFU reports ICE `connected` but `dtlsState` never leaves `connecting`, and no consumer receives a packet
 - Test with localhost first before remote connections
 - Check browser console for ICE errors
 

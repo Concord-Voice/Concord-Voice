@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import type { RouterRtpCodecCapability } from 'mediasoup/types';
 
 // Mock mediasoup types import (used by config module)
@@ -452,5 +452,74 @@ describe('config', () => {
       await loadConfig({ ENVIRONMENT: 'development' });
       expect(process.exit).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('announcedIpAdvisory', () => {
+  const LOOPBACK = { address: '127.0.0.1', family: 'IPv4', internal: true };
+  const LAN = { address: '192.168.0.113', family: 'IPv4', internal: false };
+  const LINK_LOCAL = { address: '169.254.48.155', family: 'IPv4', internal: false };
+  const VPN = { address: '10.8.0.6', family: 'IPv4', internal: false };
+  const IPV6 = { address: 'fe80::1', family: 'IPv6', internal: false };
+
+  // Loaded ONCE, not per test: announcedIpAdvisory is pure, so re-importing per
+  // case bought nothing (Gitar, PR #3237). Still the DYNAMIC import though — a
+  // static one is hoisted above this file's `vi.spyOn(process, 'loadEnvFile')`,
+  // and the real loader then leaks services/media-plane/.env into process.env.
+  // Measured, not assumed: a static-import probe read back
+  // ANNOUNCED_IP='192.168.0.113' and MEDIASOUP_LOG_LEVEL='debug' from a
+  // developer's local file — exactly what the spy at the top exists to prevent.
+  let advisory: typeof import('../src/config/index.js').announcedIpAdvisory;
+  beforeAll(async () => {
+    ({ announcedIpAdvisory: advisory } = await loadConfig());
+  });
+
+  it('stays silent when the operator set ANNOUNCED_IP explicitly', () => {
+    expect(advisory('192.168.0.113', [LAN])).toBeNull();
+  });
+
+  it('stays silent when loopback is the only address (loopback-only container)', () => {
+    expect(advisory(undefined, [LOOPBACK])).toBeNull();
+  });
+
+  it('stays silent when the only routable address is link-local', () => {
+    // 169.254/16 is self-assigned; no peer reaches this host on it, so
+    // suggesting it would be worse than saying nothing.
+    expect(advisory(undefined, [LOOPBACK, LINK_LOCAL])).toBeNull();
+  });
+
+  it('stays silent on an IPv6-only host', () => {
+    expect(advisory(undefined, [LOOPBACK, IPV6])).toBeNull();
+  });
+
+  it('warns and names the routable address when ANNOUNCED_IP is unset', () => {
+    const msg = advisory(undefined, [LOOPBACK, LAN]);
+    expect(msg).toContain('ANNOUNCED_IP is unset');
+    expect(msg).toContain('192.168.0.113');
+  });
+
+  it('treats an empty ANNOUNCED_IP as unset', () => {
+    // `process.env.X || default` already falls back on '', so an operator who
+    // copied .env.example verbatim is in the failing configuration.
+    expect(advisory('', [LAN])).not.toBeNull();
+  });
+
+  it('recognises the numeric family Node reports on some versions', () => {
+    expect(advisory(undefined, [{ address: '10.0.0.5', family: 4, internal: false }])).toContain(
+      '10.0.0.5'
+    );
+  });
+
+  it('never prescribes an address, even when a VPN enumerates before the LAN', () => {
+    // Interface order carries no meaning, and a VPN/VM/container-bridge address
+    // passes the same filters as the LAN address a client actually uses
+    // (CodeRabbit + Gitar, PR #3237). Naming the first would confidently point
+    // the operator at the wrong interface.
+    const msg = advisory(undefined, [LOOPBACK, VPN, LAN]) ?? '';
+    expect(msg).toContain('10.8.0.6');
+    expect(msg).toContain('192.168.0.113');
+    expect(msg).not.toContain('ANNOUNCED_IP=10.8.0.6');
+    expect(msg).not.toContain('ANNOUNCED_IP=192.168.0.113');
+    expect(msg).toContain('actually reach this host on');
   });
 });
