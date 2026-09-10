@@ -96,7 +96,8 @@ func TestPrivateHeartbeatTerminalFencePreventsPostTerminalResurrection(t *testin
 	})
 	go func() {
 		defer close(terminalDone)
-		terminalReplica.HandleDMRoomEmptyReplicaForTest(terminalPayload, conversationID)
+		terminalReplica.HandleDMRoomEmptyReplicaForTest(
+			terminalPayload, conversationID, time.Now())
 	}()
 
 	fencedBeforeRelease := false

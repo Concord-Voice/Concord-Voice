@@ -622,9 +622,20 @@ func TestRenewObservedLease_FutureStampedRowSurvivesTheSweep(t *testing.T) {
 	// Within maxVoiceLifecycleForwardSkew: an ordinary NTP fault, which is the
 	// case this renewal exists to serve. A stamp BEYOND the bound is deliberately
 	// left to the reconciler -- see TestRenewObservedLease_SkewBeyondTheBoundIsNotRenewed.
+	//
+	// #3205 seeds the future stamp DIRECTLY rather than through the heartbeat.
+	// The ingress clamp bounds every arriving stamp by NATS receipt time, so a
+	// future-stamped row can no longer be created through this path at all --
+	// it is now written only by a straggler old replica during a rolling deploy
+	// or by CP<->DB drift. That is the renewal's demoted role, and the reason it
+	// is kept rather than deleted.
 	ahead := time.Now().Add(30 * time.Second).UTC()
-	sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, ahead))
+	sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, time.Now().UTC()))
 	require.True(t, voiceParticipantExists(t, ts.DB, channel, member.ID))
+	_, err := ts.DB.Exec(
+		`UPDATE voice_participants SET lifecycle_event_at = $1
+		 WHERE channel_id = $2 AND user_id = $3`, ahead, channel, member.ID)
+	require.NoError(t, err)
 	sub.CompleteServerVoiceCleanupGraceForTest()
 
 	ageObservedLease(t, ts.DB, channel, member.ID)
@@ -743,9 +754,19 @@ func TestRenewObservedLease_SkewBeyondTheBoundIsNotRenewed(t *testing.T) {
 			member := ts.CreateTestUser(t, "lease-bound-"+strings.ReplaceAll(tc.name, " ", "-"))
 			ts.AddMemberToServer(t, server, member.ID, "member")
 
-			sub.HandleHeartbeat(leaseHeartbeatFrame(t, channel, []string{member.ID}, tc.stampedAt))
+			// Seeded directly for the #3205 reason given on
+			// TestRenewObservedLease_FutureStampedRowSurvivesTheSweep: the
+			// ingress clamp will not WRITE a stamp ahead of receipt, so the
+			// poisoned row now arrives only from an old replica -- which is
+			// precisely the class this ceiling must keep evictable.
+			sub.HandleHeartbeat(
+				leaseHeartbeatFrame(t, channel, []string{member.ID}, time.Now().UTC()))
 			require.True(t, voiceParticipantExists(t, ts.DB, channel, member.ID),
-				"setup: the poisoned heartbeat must create the row")
+				"setup: the heartbeat must create the row")
+			_, err := ts.DB.Exec(
+				`UPDATE voice_participants SET lifecycle_event_at = $1
+				 WHERE channel_id = $2 AND user_id = $3`, tc.stampedAt, channel, member.ID)
+			require.NoError(t, err)
 			sub.CompleteServerVoiceCleanupGraceForTest()
 
 			ageObservedLease(t, ts.DB, channel, member.ID)
@@ -955,4 +976,52 @@ func TestObservedLeaseRenewalRunsBeforeFallibleStaleWork(t *testing.T) {
 		"anchor: the stale-reconciliation call must appear exactly once in that body")
 	require.Less(t, strings.Index(body, renewal), strings.Index(body, fallible),
 		"the renewal must run before the fallible stale-reconciliation step, which can return early")
+}
+
+// TestObservedLeaseRenewalUsesAStatementStableClock pins the #3205 correction.
+//
+// PostgreSQL documents clock_timestamp() as returning the actual time at the
+// moment of the call, so its value can change within a single statement. The
+// renewal references the clock three times -- once in SET, twice to bound the
+// predicate -- so under clock_timestamp() the bound it applied was negligibly
+// inconsistent, not self-consistent as an earlier comment claimed.
+//
+// A source pin rather than a behavioural test, deliberately and with its limit
+// stated: the divergence is the statement's own execution time, which is
+// microseconds against a 180 s window, so no assertion over observable rows can
+// distinguish the two functions. What this test CAN protect is the deliberate
+// choice, which is otherwise a one-word edit away from silently reverting.
+// Scoped to the enclosing function for the same reason the ordering pin above
+// is -- a file-wide count would pass while the renewal used a different clock.
+func TestObservedLeaseRenewalUsesAStatementStableClock(t *testing.T) {
+	source, err := os.ReadFile("nats.go")
+	require.NoError(t, err)
+	text := string(source)
+
+	const fn = "func (s *NATSSubscriber) renewObservedLeaseForFutureStampedRows("
+	start := strings.Index(text, fn)
+	require.NotEqual(t, -1, start, "anchor: the renewal function must exist in nats.go")
+	length := strings.Index(text[start:], "\n}\n")
+	require.NotEqual(t, -1, length, "anchor: the function body must terminate")
+	body := text[start : start+length]
+
+	// Count CODE, not prose. The function's own comment names both functions in
+	// order to explain the choice, so a raw body count reads 4 and 1 rather than
+	// 3 and 0 -- and a test that forced the comment to avoid the words it is
+	// about would be the tail wagging the dog.
+	var code strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		code.WriteString(line)
+		code.WriteString("\n")
+	}
+	sql := code.String()
+
+	require.Equal(t, 3, strings.Count(sql, "statement_timestamp()"),
+		"the renewal must bound and stamp on one statement-stable clock")
+	require.Equal(t, 0, strings.Count(sql, "clock_timestamp()"),
+		"a clock that can change within a single statement must not appear in a "+
+			"predicate that references the clock more than once")
 }

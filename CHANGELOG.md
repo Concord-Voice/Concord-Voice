@@ -75,6 +75,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **One media server with a badly wrong clock can no longer wedge the rooms it serves** ([#3205](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3205)) —
+  the previous fix kept people in the participant list when a media server's clock ran slightly
+  ahead. A clock that is wrong by hours rather than seconds caused something worse. Every event
+  from that server carried a timestamp far in the future, and because Concord uses those
+  timestamps to decide what happened in what order, every later event looked older and was
+  ignored. People could not leave a call, could not be moved to another channel, and the room
+  would not clear once everyone had gone. It did not fix itself when the clock was corrected
+  either: the server kept counting forward from the wrong time. Concord now caps an incoming
+  timestamp at the moment it actually arrives, so a wrong clock costs a little ordering accuracy
+  instead of freezing the room. Direct-message calls, which had no way to recover at all, are
+  repaired on upgrade. Capping the timestamp turned out to need care in one more place: a
+  direct-message call records when it started and when it ended, and capping only the end left
+  a call that appeared to finish before it began, which the history record refused — so the call
+  simply vanished from your history with nothing shown to say so. Both ends now move together, so
+  a call placed through a badly-clocked server still lands in your history with the length it
+  actually ran. Capping also had to be done to the right precision, which sounds like a detail and
+  was not. Concord stores these times to the microsecond, and the capped time was being measured
+  more finely than that, so writing one down and reading it back gave an answer a fraction later
+  than what was written. That was enough for a direct-message call with more than one person in it
+  to leave the last person behind: the first person's departure stamped the other's record, and the
+  other's departure then read that stamp as newer than itself and declined to act. Nobody saw an
+  error, because declining was not treated as a failure, and this is the one place in Concord with
+  nothing running behind it to tidy up afterwards — so that person stayed listed in the call
+  indefinitely. It happened about half the time on Linux and never on a Mac, whose clock is already
+  only as fine as the stored value.
 - **Voice no longer drops people who are still connected** ([#3187](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3187)) — when one of Concord's
   media servers reported a time slightly ahead of the real clock, usually a clock that had drifted,
   the server stopped refreshing that person's place in the room. Ninety seconds later it decided they

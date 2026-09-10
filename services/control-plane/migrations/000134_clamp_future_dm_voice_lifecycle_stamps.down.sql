@@ -1,0 +1,13 @@
+-- #3205 down: a deliberate no-op, not an oversight.
+--
+-- The up migration overwrote far-future lifecycle_event_at values with the
+-- transaction clock. Those pre-clamp values are unrecoverable -- nothing records
+-- them -- and restoring them would be wrong even if it were possible: a stamp
+-- ahead of the consuming replica's receipt clock never described a real event
+-- time, and re-applying one would re-wedge exactly the DM rooms the up
+-- migration unwedged.
+--
+-- A `SELECT 1` rather than an empty file so the migration runner has a
+-- statement to execute and the pair stays symmetric in the tooling that checks
+-- every up has a down.
+SELECT 1;

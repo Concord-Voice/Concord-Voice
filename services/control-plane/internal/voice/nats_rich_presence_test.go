@@ -3282,6 +3282,32 @@ func TestVoiceJoinedRejectsUnsafeSourceVersionBeforeAnyMutation(t *testing.T) {
 			context.Background(), "voice:lifecycle:private:"+caller.ID,
 		).Val())
 	})
+
+	// #3205. The two cases above must reach the REPRESENTABILITY branch, not the
+	// clamp: their year-9999 stamp fails IsValidActivitySourceTime's upper half,
+	// and it would ALSO have been clamped, which on its own would make the guard
+	// look deletable. This third case is far-future but representable, so it is
+	// clamped and ACCEPTED -- deleting !presence.IsValidActivitySourceTime now
+	// fails the two cases above, and deleting the clamp fails this one. Neither
+	// guard can be removed while the other is present.
+	t.Run("representable far-future stamp is clamped, not rejected", func(t *testing.T) {
+		receivedAt := time.Now()
+		at, skew, err := voice.ParseVoiceEventTimeForTest(
+			time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+			receivedAt)
+		require.NoError(t, err)
+		require.Positive(t, skew, "a far-future stamp must report a forward skew")
+		// Compare against the TRUNCATION, not receivedAt itself. The clamp returns
+		// a microsecond-granular stamp (see TestClampTruncatesToStorablePrecision
+		// for why that is a correctness requirement, not tidiness), and time.Now()
+		// is nanosecond-granular on Linux and microsecond-granular on macOS -- so
+		// an exact comparison here passes on a developer's Mac and fails ~100% of
+		// the time in CI. Discrimination is unaffected: deleting the clamp makes
+		// `at` the year-2200 stamp, which fails this just as it failed the old
+		// form.
+		wantAt := receivedAt.Truncate(time.Microsecond)
+		require.True(t, at.Equal(wantAt), "got %s want the receipt time %s", at, wantAt)
+	})
 }
 
 func TestDMVoiceDependencyErrorsDisconnectExistingRichPresenceClients(t *testing.T) {

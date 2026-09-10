@@ -58,6 +58,22 @@ type NATSSubscriber struct {
 	dmHeartbeatPostCommitHook      func()
 	privateVoiceStateBroadcastHook func(uuid.UUID, uuid.UUID, string)
 	dmRoomEmptyVerificationHook    func() error
+	// dmTerminalDeleteObservedHook reports the outcome of ONE DM terminal
+	// participant delete: whether the row was actually removed, and the error
+	// the clear path returned.
+	//
+	// It exists because those two facts are not otherwise recoverable, and their
+	// absence cost a long investigation (#3205). The delete is a callback the
+	// presence service invokes, and clearAlreadyGated runs it BEFORE validating
+	// the old activity -- so the observable signals are inverted from what you
+	// would expect: a delete that ran and matched nothing returns nil and logs
+	// NOTHING, while a delete that succeeded routinely logs a post-validation
+	// error. A test therefore cannot tell "the terminal completed" from "the row
+	// vanished for some other reason", and a CI-only failure cannot be
+	// attributed at all. `applied` is the value that separates them.
+	//
+	// Observation only: production leaves it nil and behaviour is unchanged.
+	dmTerminalDeleteObservedHook func(participantID uuid.UUID, applied bool, err error)
 	// Deterministic test seam for conservative reconnect assertions.
 	disconnectAllRichPresenceClientsHook func()
 
@@ -98,6 +114,11 @@ type NATSSubscriber struct {
 	// every later test in the package the leftover (CodeRabbit, PR #2871). This
 	// one dies with the subscriber, like its two siblings.
 	voiceDropShedState ingressShedState
+	// voiceSkewShedState aggregates lifecycle stamps CLAMPED beyond
+	// maxVoiceLifecycleForwardSkew, separately from voiceShedState so a clamp
+	// storm cannot be mistaken for an admission-control shed (#3205). Its events
+	// were applied, not refused -- the two must stay distinguishable in a log.
+	voiceSkewShedState ingressShedState
 	// erasureExistenceProbedHook counts existence queries, which is how the
 	// dedup-ahead-of-the-database ordering is asserted rather than assumed.
 	erasureExistenceProbedHook func()
@@ -3615,11 +3636,104 @@ type voiceHeartbeatEvent struct {
 	Timestamp    string   `json:"timestamp"`
 }
 
-func parseVoiceEventTime(raw string) (time.Time, error) {
-	eventAt, err := time.Parse(time.RFC3339Nano, raw)
-	if err != nil || !presence.IsValidActivitySourceTime(eventAt) {
-		return time.Time{}, errors.New("invalid voice lifecycle timestamp")
+// parseVoiceEventTime validates a producer stamp and bounds it above by the
+// consuming replica's NATS receipt time (#3205).
+//
+// Order is load-bearing: parse, then check representability, THEN clamp.
+// Clamping first would make presence.IsValidActivitySourceTime's year-2255
+// ceiling unreachable and would re-vacuate
+// TestVoiceJoinedRejectsUnsafeSourceVersionBeforeAnyMutation, which is exactly
+// what PR #3201 did.
+//
+// Pure by construction -- receivedAt is supplied by the caller and there is no
+// package-level clock. The reference is NATS receipt time, never a handler's
+// own time.Now(): drain-time clamping turns dispatcher lateness into a stamp
+// ADVANCE, which lets DELETE ... lifecycle_event_at <= $3 remove a live row.
+//
+// The returned skew is producedAt - receivedAt as PARSED, before the clamp:
+// positive means the stamp was ahead and was clamped, zero or negative means it
+// passed through verbatim. Returning it rather than a bool spares the four
+// callers a second time.Parse of the same string on the join/leave/heartbeat
+// hot path, and makes the reporting threshold an ordinary comparison whose
+// == boundary is exactly zero. Overflow is not a hazard: a representable stamp
+// is at most ~285 years from the Unix epoch, inside a Duration, and Time.Sub
+// saturates rather than wrapping in any case.
+//
+// The returned stamp is TRUNCATED to microsecond precision, and that is a
+// correctness requirement rather than tidiness. lifecycle_event_at is
+// timestamptz -- integer microseconds -- and PostgreSQL ROUNDS a finer value on
+// write, so a stamp carrying nanoseconds reads back up to 500ns LATER than the
+// Go value that wrote it. Seven sites then compare that round-trip against the
+// original in Go (participant.lifecycleEventAt.After(eventAt)) and conclude the
+// row is newer than the event that stamped it, rejecting the frame with
+// applied=false and a nil error. The DELETE fence is unaffected -- it compares
+// inside PostgreSQL, where both operands round identically -- so the mismatch is
+// between the two comparison engines, not in either one.
+//
+// Every producer stamp is already microsecond-aligned: the media plane mints
+// them from a monotonic microsecond counter formatted with a six-digit fraction
+// (nextVoiceLifecycleTimestamp, services/media-plane/src/lib/nats.ts), so the
+// invariant held implicitly until the clamp began substituting a
+// nanosecond-granular time.Now(). Truncating restores it explicitly.
+//
+// TRUNCATE, never round. Rounding can advance a stamp, and advancing is the one
+// direction that lets DELETE ... lifecycle_event_at <= $3 remove a live row --
+// the CWE-863 breach this change exists to prevent. Truncation is also what
+// makes the value exactly representable, so the round-trip is the identity.
+func parseVoiceEventTime(
+	raw string, receivedAt time.Time,
+) (eventAt time.Time, skew time.Duration, err error) {
+	producedAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || !presence.IsValidActivitySourceTime(producedAt) {
+		return time.Time{}, 0, errors.New("invalid voice lifecycle timestamp")
 	}
+	skew = producedAt.Sub(receivedAt)
+	if skew > 0 {
+		return receivedAt.Truncate(time.Microsecond), skew, nil
+	}
+	return producedAt.Truncate(time.Microsecond), skew, nil
+}
+
+// noteVoiceStampSkew reports a stamp the clamp bounded by more than
+// maxVoiceLifecycleForwardSkew.
+//
+// A THRESHOLD, not zero tolerance: a sub-bound clamp is NTP jitter, and
+// reporting it turns every voice event on a healthy fleet into a log line. The
+// CLAMP itself stays zero-tolerance -- only the report is gated, so the
+// threshold can only cost visibility, never correctness. == is deliberately
+// silent: skew is measured before the clamp, so two clocks in exact agreement
+// produce exactly zero and nothing else has to be special-cased.
+//
+// maxVoiceLifecycleForwardSkew is deliberately not an environment variable: an
+// operator cannot act on the number, and a misconfiguration would silence the
+// only signal that a media host's clock is wrong (same reasoning as
+// presenceAudienceConcurrency, #1654).
+func (s *NATSSubscriber) noteVoiceStampSkew(skew time.Duration) {
+	if skew > maxVoiceLifecycleForwardSkew {
+		s.voiceSkewShed("clock_skew")
+	}
+}
+
+// clampVoiceEventTime parses a producer stamp, clamps it to receipt time and
+// reports the pre-clamp skew -- in ONE step, because the two must not come
+// apart.
+//
+// parseVoiceEventTime stays pure (spec 3.1) and directly unit-tested; this is
+// the thin method that binds it to the reporter. Before the fold every handler
+// ran `parse` and then `noteVoiceStampSkew(skew)` as two statements, and nothing
+// made the second mandatory -- a fifth subject added later could parse and
+// forget to note, silently losing the only signal that a media host's clock is
+// wrong. No test would go red for it, because skipping the report changes no
+// behaviour. Returning eventAt alone makes that omission unrepresentable at the
+// call site.
+func (s *NATSSubscriber) clampVoiceEventTime(
+	raw string, receivedAt time.Time,
+) (time.Time, error) {
+	eventAt, skew, err := parseVoiceEventTime(raw, receivedAt)
+	if err != nil {
+		return time.Time{}, err
+	}
+	s.noteVoiceStampSkew(skew)
 	return eventAt, nil
 }
 
@@ -3647,6 +3761,34 @@ func completedCallSummaryFromRoomEmpty(
 	startedAt, err := time.Parse(time.RFC3339Nano, event.StartedAt)
 	if err != nil {
 		return dm.CompletedCallSummary{}, true, fmt.Errorf("invalid startedAt: %w", err)
+	}
+	// #3205: endedAt arrives CLAMPED to NATS receipt time; startedAt is still the
+	// producer's raw clock. On exactly the skewed producer this clamp exists for,
+	// that leaves EndedAt BEFORE StartedAt, which InsertCompletedCallEvent
+	// refuses outright (dm/call_events.go, "invalid completed call summary") --
+	// and persistDMRoomEmptySummary swallows the refusal into a log line, so the
+	// user's call-history row disappears with no error surfaced. Before the clamp
+	// both ends came from ONE clock and were consistent by construction; clamping
+	// one end is what broke that, so the repair belongs here rather than at the
+	// insert.
+	//
+	// Shift startedAt by the SAME correction the clamp applied to the end. The
+	// producer's two stamps are mutually consistent even when its clock is wrong,
+	// so this preserves the duration it actually measured. The sibling fallbacks
+	// in dm/call_events.go clamp startedAt up to endedAt instead; that is the
+	// right FLOOR (kept below) but on its own records a zero-second row for a
+	// real call. Re-parsing event.Timestamp is affordable here -- this is the DM
+	// terminal, once per completed call, not the heartbeat hot path that 8a's
+	// skew-return deviation exists to protect.
+	if producedEnd, perr := time.Parse(time.RFC3339Nano, event.Timestamp); perr == nil {
+		if shift := producedEnd.Sub(endedAt); shift > 0 {
+			startedAt = startedAt.Add(-shift)
+		}
+	}
+	if startedAt.After(endedAt) {
+		// Floor, matching the sibling fallbacks: never persist a negative
+		// duration, whatever the two stamps claimed.
+		startedAt = endedAt
 	}
 
 	participants, err := parseCompletedCallParticipants(event.ParticipantUserIDs)
@@ -4092,16 +4234,24 @@ func (s *NATSSubscriber) Close() {
 	}
 }
 
-func (s *NATSSubscriber) handleVoiceLifecycleEvent(subject string, data []byte) {
+// handleVoiceLifecycleEvent fans one dispatched frame out to its handler.
+//
+// receivedAt is the dispatcher's NATS-receipt stamp (#3205) and is threaded
+// through unchanged. No handler may substitute its own time.Now(): that is
+// drain time, and drain time turns dispatcher lateness into a stamp ADVANCE.
+
+func (s *NATSSubscriber) handleVoiceLifecycleEvent(
+	subject string, data []byte, receivedAt time.Time,
+) {
 	switch subject {
 	case natsSubjectVoiceJoined:
-		s.handleJoined(data)
+		s.handleJoined(data, receivedAt)
 	case natsSubjectVoiceLeft:
-		s.handleLeft(data)
+		s.handleLeft(data, receivedAt)
 	case natsSubjectVoiceRoomEmpty:
-		s.handleRoomEmpty(data)
+		s.handleRoomEmpty(data, receivedAt)
 	case natsSubjectVoiceHeartbeat:
-		s.handleHeartbeat(data)
+		s.handleHeartbeat(data, receivedAt)
 	}
 }
 
@@ -4197,13 +4347,13 @@ func (s *NATSSubscriber) dmCallEventMayMutateLiveState(
 	return !hasLease || lease.CallID == callID, nil
 }
 
-func (s *NATSSubscriber) handleJoined(data []byte) {
+func (s *NATSSubscriber) handleJoined(data []byte, receivedAt time.Time) {
 	var event voiceJoinedEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		s.log.Error("Rejected voice.joined", "failure_class", "invalid_event")
 		return
 	}
-	eventAt, err := parseVoiceEventTime(event.Timestamp)
+	eventAt, err := s.clampVoiceEventTime(event.Timestamp, receivedAt)
 	if err != nil {
 		s.log.Error("Rejected voice.joined with invalid timestamp")
 		return
@@ -4563,13 +4713,13 @@ func (s *NATSSubscriber) serverVoiceJoinHasCapacity(
 	return true
 }
 
-func (s *NATSSubscriber) handleLeft(data []byte) {
+func (s *NATSSubscriber) handleLeft(data []byte, receivedAt time.Time) {
 	var event voiceLeftEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		s.log.Error("Rejected voice.left", "failure_class", "invalid_event")
 		return
 	}
-	eventAt, err := parseVoiceEventTime(event.Timestamp)
+	eventAt, err := s.clampVoiceEventTime(event.Timestamp, receivedAt)
 	if err != nil {
 		s.log.Error("Rejected voice.left with invalid timestamp")
 		return
@@ -5240,6 +5390,7 @@ func (s *NATSSubscriber) clearDMRoomEmptyParticipant(
 			s.log.Error("Private Call legacy terminal participant clear failed",
 				"failure_class", "state_write")
 		}
+		s.observeDMTerminalDelete(participant.userID, applied, deleteErr)
 		return applied
 	}
 	clearErr := s.activity.ClearPrivateCallTerminal(
@@ -5257,7 +5408,18 @@ func (s *NATSSubscriber) clearDMRoomEmptyParticipant(
 			"failure_class", presence.PolicyErrorClass(clearErr))
 		s.disconnectAllRichPresenceClients()
 	}
+	s.observeDMTerminalDelete(participant.userID, applied, clearErr)
 	return applied
+}
+
+// observeDMTerminalDelete reports one DM terminal delete outcome to a test.
+// Nil in production, so this is a single nil check on the terminal path.
+func (s *NATSSubscriber) observeDMTerminalDelete(
+	participantID uuid.UUID, applied bool, err error,
+) {
+	if s.dmTerminalDeleteObservedHook != nil {
+		s.dmTerminalDeleteObservedHook(participantID, applied, err)
+	}
 }
 
 func (s *NATSSubscriber) deleteDMVoiceParticipantWithRetry(
@@ -5425,7 +5587,12 @@ func (s *NATSSubscriber) handleEmptyDMHeartbeat(
 		CallID:       event.CallID,
 		RingID:       event.RingID,
 		CallerUserID: event.CallerUserID,
-		Timestamp:    event.Timestamp,
+		// Carried for CORRELATION ONLY. The caller's clamped eventAt is
+		// authoritative and nothing downstream re-parses this string; a parse
+		// added here would silently UNCLAMP the DM terminal, which on this
+		// rail is the room_empty itself -- an empty heartbeat is the edge
+		// (#3205).
+		Timestamp: event.Timestamp,
 	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(
 		context.Background(), dmRoomEmptyCleanupTimeout,
@@ -5470,7 +5637,7 @@ func (s *NATSSubscriber) handleEmptyDMHeartbeat(
 	)
 }
 
-func (s *NATSSubscriber) handleRoomEmpty(data []byte) {
+func (s *NATSSubscriber) handleRoomEmpty(data []byte, receivedAt time.Time) {
 	var event voiceRoomEmptyEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		s.log.Error("Rejected voice.room_empty", "failure_class", "invalid_event")
@@ -5481,7 +5648,7 @@ func (s *NATSSubscriber) handleRoomEmpty(data []byte) {
 			"failure_class", "invalid_event")
 		return
 	}
-	eventAt, err := parseVoiceEventTime(event.Timestamp)
+	eventAt, err := s.clampVoiceEventTime(event.Timestamp, receivedAt)
 	if err != nil {
 		s.log.Error("Rejected voice.room_empty with invalid timestamp")
 		return
@@ -5954,13 +6121,13 @@ func (s *NATSSubscriber) refreshDMHeartbeatParticipants(
 // handleHeartbeat reconciles voice_participants against the media plane's
 // ground-truth room state. Any DB entries not present in the heartbeat are
 // stale (client crashed / network dropped) and get cleaned up.
-func (s *NATSSubscriber) handleHeartbeat(data []byte) {
+func (s *NATSSubscriber) handleHeartbeat(data []byte, receivedAt time.Time) {
 	var event voiceHeartbeatEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		s.log.Error("Rejected voice.heartbeat", "failure_class", "invalid_event")
 		return
 	}
-	eventAt, err := parseVoiceEventTime(event.Timestamp)
+	eventAt, err := s.clampVoiceEventTime(event.Timestamp, receivedAt)
 	if err != nil {
 		s.log.Error("Rejected voice.heartbeat with invalid timestamp")
 		return
@@ -6336,14 +6503,21 @@ func (s *NATSSubscriber) renewObservedLeaseForFutureStampedRows(
 	// failure_class / action / is_dm / context / count, and `count` only as an int
 	// literal or a len() call, never a value read back from the database. A renewed
 	// count is therefore unloggable here by construction, not by oversight.
+	// statement_timestamp(), not clock_timestamp(): this statement references the
+	// clock THREE times -- once in SET and twice to bound the predicate -- and
+	// PostgreSQL documents clock_timestamp() as returning the time at the moment
+	// of the call, so its value can change WITHIN a single statement. The three
+	// references were therefore negligibly inconsistent rather than self-consistent
+	// (#3205). statement_timestamp() is fixed for the statement, which is the
+	// semantic this predicate always intended: one instant, three comparisons.
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE voice_participants
-		SET lifecycle_observed_at = clock_timestamp()
+		SET lifecycle_observed_at = statement_timestamp()
 		WHERE channel_id = $1
 		  AND user_id = ANY($2::uuid[])
-		  AND lifecycle_event_at > clock_timestamp()
+		  AND lifecycle_event_at > statement_timestamp()
 		  AND lifecycle_event_at <=
-		      clock_timestamp() + ($3::bigint * INTERVAL '1 second')
+		      statement_timestamp() + ($3::bigint * INTERVAL '1 second')
 	`, channelID, pq.Array(ids), skewSeconds); err != nil {
 		// A cancelled or expired context is convergent -- the next heartbeat is
 		// 30 s away against a 90 s lease, so two consecutive misses are free and

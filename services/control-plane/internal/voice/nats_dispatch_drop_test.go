@@ -46,7 +46,7 @@ func parkedDispatcher(
 	release := func() { releaseOnce.Do(func() { close(blocked) }) }
 	started := make(chan struct{}, voiceLifecycleDispatchWorkerCount)
 	dispatcher := newVoiceLifecycleDispatcher(
-		func(_ string, _ []byte) {
+		func(_ string, _ []byte, _ time.Time) {
 			// Non-blocking: after release the parked workers drain the fill
 			// through this same handler, and a blocking send on a full channel
 			// nobody is reading would deadlock close().

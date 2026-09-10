@@ -1,0 +1,33 @@
+-- #3205: clamp already-poisoned far-future dm_voice_participants stamps.
+--
+-- The ingress clamp added in this change bounds every ARRIVING stamp by the
+-- consuming replica's NATS receipt time, but it cannot reach rows a
+-- wrong-clocked producer already wrote. On the server rail that is tolerable
+-- because those rows self-heal: a row within maxVoiceLifecycleForwardSkew is
+-- held alive by renewObservedLeaseForFutureStampedRows until wall clock passes
+-- its stamp, and a row beyond the ceiling is declined by the renewal, ages out
+-- of its lease, and is reaped by #2907's reconciler.
+--
+-- The DM rail has neither mechanism. dm_voice_participants never received the
+-- lifecycle_observed_at column (000132 added it to voice_participants only) and
+-- staleServerVoiceDiscoverySQL queries only voice_participants, so there is no
+-- lease to age and no sweeper to reap. A far-future dm_voice_participants row is
+-- refused by the `lifecycle_event_at <= $3` delete fence, refused by the `<=`
+-- conditional upsert, and reachable by nothing else -- permanent without this.
+--
+-- CURRENT_TIMESTAMP (transaction start), not clock_timestamp(): one consistent
+-- instant for the whole repair is the honest semantic and keeps the migration
+-- deterministic under review.
+--
+-- Idempotent by construction -- the predicate is self-negating, so a second
+-- application matches zero rows. Takes RowExclusiveLock only: no DDL, no NOT
+-- NULL transition, no phased rollout. CONCURRENTLY is not applicable and would
+-- be rejected anyway, since migrations run inside a transaction.
+--
+-- This does NOT close the window on its own. Migrations apply at control-plane
+-- boot, so the first new replica runs this while straggler old replicas may
+-- still publish unclamped stamps. [internal]deploys.md carries the same
+-- statement as a post-drain verification step; that is what closes it.
+UPDATE dm_voice_participants
+   SET lifecycle_event_at = CURRENT_TIMESTAMP
+ WHERE lifecycle_event_at > CURRENT_TIMESTAMP;

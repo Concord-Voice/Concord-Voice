@@ -33,7 +33,7 @@ func TestVoiceLifecycleDispatcherPreservesPerRoomOrder(t *testing.T) {
 	var mu sync.Mutex
 	got := make([]int, 0, 3)
 	done := make(chan struct{})
-	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte) {
+	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte, _ time.Time) {
 		mu.Lock()
 		got = append(got, lifecycleDispatchSequence(t, data))
 		if len(got) == 3 {
@@ -64,7 +64,7 @@ func TestVoiceLifecycleDispatcherRunsIndependentRoomsConcurrently(t *testing.T) 
 	release := func() { releaseOnce.Do(func() { close(blocked) }) }
 	started := make(chan struct{})
 	independentDone := make(chan struct{})
-	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte) {
+	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte, _ time.Time) {
 		var payload struct {
 			ChannelID string `json:"channelId"`
 		}
@@ -117,7 +117,7 @@ func TestVoiceLifecycleDispatcherCoalescesOnlyAdjacentPendingHeartbeats(t *testi
 	release := func() { releaseOnce.Do(func() { close(blocked) }) }
 	started := make(chan struct{}, voiceLifecycleDispatchWorkerCount)
 	sequences := make(chan int, 4)
-	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte) {
+	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte, _ time.Time) {
 		var payload struct {
 			ChannelID string `json:"channelId"`
 		}
@@ -158,7 +158,7 @@ func TestVoiceLifecycleDispatcherDoesNotCoalesceAcrossRoomBoundary(t *testing.T)
 	release := func() { releaseOnce.Do(func() { close(blocked) }) }
 	started := make(chan struct{}, voiceLifecycleDispatchWorkerCount)
 	sequences := make(chan int, 4)
-	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte) {
+	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte, _ time.Time) {
 		var payload struct {
 			ChannelID string `json:"channelId"`
 		}
@@ -204,7 +204,7 @@ func TestVoiceLifecycleDispatcherSaturatedRoomDoesNotBlockIngress(t *testing.T) 
 	independentDone := make(chan struct{})
 	var overflowCount atomic.Int32
 	dispatcher := newVoiceLifecycleDispatcher(
-		func(_ string, data []byte) {
+		func(_ string, data []byte, _ time.Time) {
 			var payload struct {
 				ChannelID string `json:"channelId"`
 			}
@@ -273,7 +273,7 @@ func TestVoiceLifecycleDispatcherCloseDropsQueuedWork(t *testing.T) {
 	blocked := make(chan struct{})
 	started := make(chan struct{}, voiceLifecycleDispatchWorkerCount)
 	var queuedProcessed atomic.Int32
-	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte) {
+	dispatcher := newVoiceLifecycleDispatcher(func(_ string, data []byte, _ time.Time) {
 		var payload struct {
 			ChannelID string `json:"channelId"`
 		}
@@ -378,7 +378,7 @@ func TestVoiceLifecycleDispatcherCoalescingDoesNotMaskADropClass(t *testing.T) {
 	release := make(chan struct{})
 	reported := make(chan voiceLifecycleDropCounts, 4)
 	dispatcher := newVoiceLifecycleDispatcher(
-		func(_ string, _ []byte) { <-blocked },
+		func(_ string, _ []byte, _ time.Time) { <-blocked },
 		func(counts voiceLifecycleDropCounts) {
 			select {
 			case parked <- struct{}{}:
@@ -432,4 +432,90 @@ func TestVoiceLifecycleDispatcherCoalescingDoesNotMaskADropClass(t *testing.T) {
 	if total[voiceLifecycleDropConvergent] != 2 || total[voiceLifecycleDropTerminal] != 1 {
 		t.Fatalf("counts not exact: %v", total)
 	}
+}
+
+// #3205. receivedAt must be the NATS RECEIPT stamp, taken on the callback
+// goroutine, and never a stamp taken when a worker finally drains the event.
+//
+// The discrimination is the blocked worker: event B is enqueued while the room's
+// only worker is parked inside event A's handler, so B's drain provably happens
+// after enqueuedB was read. A drain-time stamp is therefore strictly greater
+// than enqueuedB, and an enqueue-time stamp is never greater than it. Nothing
+// here depends on how LONG the worker is parked -- only on the ordering, which
+// the channel handshake makes total.
+func TestVoiceLifecycleDispatcherStampsReceiptTimeAtEnqueue(t *testing.T) {
+	var mu sync.Mutex
+	stamps := make([]time.Time, 0, 2)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+
+	dispatcher := newVoiceLifecycleDispatcher(
+		func(_ string, _ []byte, receivedAt time.Time) {
+			mu.Lock()
+			stamps = append(stamps, receivedAt)
+			first := len(stamps) == 1
+			mu.Unlock()
+			entered <- struct{}{}
+			if first {
+				<-release
+			}
+		},
+		func(voiceLifecycleDropCounts) {})
+	t.Cleanup(dispatcher.close)
+
+	const roomID = "receipt-stamp-room"
+	before := time.Now()
+	dispatcher.enqueue(natsSubjectVoiceJoined, lifecycleDispatchPayload(roomID, 1))
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the first handler to park")
+	}
+
+	// Same room, so the parked worker owns it and B cannot be drained until the
+	// release below.
+	dispatcher.enqueue(natsSubjectVoiceLeft, lifecycleDispatchPayload(roomID, 2))
+	enqueuedB := time.Now()
+	close(release)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the second handler")
+	}
+	after := time.Now()
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, stamps, 2)
+	require.False(t, stamps[0].Before(before), "receipt time predates the enqueue call")
+	require.False(t, stamps[1].After(after), "receipt time postdates the drain")
+	require.False(t, stamps[1].After(enqueuedB),
+		"the second event was stamped when it DRAINED, not when it was received: "+
+			"dispatcher lateness would be carried into the clamp as a stamp advance")
+}
+
+// coalescePendingVoiceHeartbeat replaces the whole event struct, so the newer
+// receipt time rides along for free today. Pinned so a refactor that copies
+// fields individually cannot silently strand the older stamp on a live room --
+// an older receipt clamps HARDER, which is the direction that loses a
+// comparison the event should have won (#3205).
+func TestCoalescedHeartbeatCarriesTheNewerReceiptTime(t *testing.T) {
+	older := time.Now().Add(-time.Minute)
+	room := &voiceLifecycleDispatchRoom{
+		queue: []voiceLifecycleDispatchEvent{{
+			subject:    natsSubjectVoiceHeartbeat,
+			data:       lifecycleDispatchPayload("coalesce-room", 1),
+			receivedAt: older,
+		}},
+	}
+	incoming := voiceLifecycleDispatchEvent{
+		subject:    natsSubjectVoiceHeartbeat,
+		data:       lifecycleDispatchPayload("coalesce-room", 2),
+		receivedAt: time.Now(),
+	}
+
+	require.True(t, coalescePendingVoiceHeartbeat(room, incoming))
+	require.Equal(t, incoming, room.queue[0])
+	require.True(t, room.queue[0].receivedAt.After(older),
+		"a coalesced heartbeat must carry the NEWER receipt time")
 }

@@ -124,6 +124,17 @@ func (s *NATSSubscriber) SetDMRoomEmptyVerificationHookForTest(hook func() error
 	s.dmRoomEmptyVerificationHook = hook
 }
 
+// SetDMTerminalDeleteObservedHookForTest observes each DM terminal participant
+// delete: (participantID, applied, err). `applied` is the only value that
+// distinguishes "the terminal completed" from "the row went away for some other
+// reason" -- see the field comment in nats.go for why neither the return value
+// nor the logs can do it.
+func (s *NATSSubscriber) SetDMTerminalDeleteObservedHookForTest(
+	hook func(participantID uuid.UUID, applied bool, err error),
+) {
+	s.dmTerminalDeleteObservedHook = hook
+}
+
 // SetActivityServiceForTest injects RP bridge availability for security-order tests.
 func (s *NATSSubscriber) SetActivityServiceForTest(activity *presence.ActivityService) {
 	s.activity = activity
@@ -248,26 +259,52 @@ func (s *TempGrantSweeper) SweepOrphanedTempGrants(ctx context.Context) (int, er
 	return s.sweepOrphanedTempGrants(ctx)
 }
 
+// The four bare wrappers below stamp receipt at the moment the test calls them,
+// which for a DIRECT handler call is exactly what the dispatcher would have
+// stamped: there is no queue between the two, so there is no lateness to carry.
+// Use the *At forms whenever the clamp reference is what the test is about --
+// a fixture that needs a receipt clock distinct from wall clock, or one that
+// must prove a handler did not substitute its own time.Now() (#3205).
+
 // HandleJoined exposes handleJoined for testing.
-func (s *NATSSubscriber) HandleJoined(data []byte) { s.handleJoined(data) }
+func (s *NATSSubscriber) HandleJoined(data []byte) { s.handleJoined(data, time.Now()) }
+
+// HandleJoinedAt exposes handleJoined with an explicit NATS receipt time.
+func (s *NATSSubscriber) HandleJoinedAt(data []byte, receivedAt time.Time) {
+	s.handleJoined(data, receivedAt)
+}
 
 // HandleLeft exposes handleLeft for testing.
-func (s *NATSSubscriber) HandleLeft(data []byte) { s.handleLeft(data) }
+func (s *NATSSubscriber) HandleLeft(data []byte) { s.handleLeft(data, time.Now()) }
+
+// HandleLeftAt exposes handleLeft with an explicit NATS receipt time.
+func (s *NATSSubscriber) HandleLeftAt(data []byte, receivedAt time.Time) {
+	s.handleLeft(data, receivedAt)
+}
 
 // HandleRoomEmpty exposes handleRoomEmpty for testing.
-func (s *NATSSubscriber) HandleRoomEmpty(data []byte) { s.handleRoomEmpty(data) }
+func (s *NATSSubscriber) HandleRoomEmpty(data []byte) { s.handleRoomEmpty(data, time.Now()) }
+
+// HandleRoomEmptyAt exposes handleRoomEmpty with an explicit NATS receipt time.
+func (s *NATSSubscriber) HandleRoomEmptyAt(data []byte, receivedAt time.Time) {
+	s.handleRoomEmpty(data, receivedAt)
+}
 
 // HandleDMRoomEmptyReplicaForTest exercises one remote replica's terminal path
 // without the process-local lifecycle lock shared by in-process test replicas.
+//
+// receivedAt is a REQUIRED parameter rather than a time.Now() taken inside, so
+// no test path can model drain-time clamping (#3205).
 func (s *NATSSubscriber) HandleDMRoomEmptyReplicaForTest(
 	data []byte,
 	conversationID uuid.UUID,
+	receivedAt time.Time,
 ) bool {
 	var event voiceRoomEmptyEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return false
 	}
-	eventAt, err := parseVoiceEventTime(event.Timestamp)
+	eventAt, _, err := parseVoiceEventTime(event.Timestamp, receivedAt)
 	if err != nil {
 		return false
 	}
@@ -275,7 +312,12 @@ func (s *NATSSubscriber) HandleDMRoomEmptyReplicaForTest(
 }
 
 // HandleHeartbeat exposes handleHeartbeat for testing.
-func (s *NATSSubscriber) HandleHeartbeat(data []byte) { s.handleHeartbeat(data) }
+func (s *NATSSubscriber) HandleHeartbeat(data []byte) { s.handleHeartbeat(data, time.Now()) }
+
+// HandleHeartbeatAt exposes handleHeartbeat with an explicit NATS receipt time.
+func (s *NATSSubscriber) HandleHeartbeatAt(data []byte, receivedAt time.Time) {
+	s.handleHeartbeat(data, receivedAt)
+}
 
 // TestRoomContext is an exported wrapper around roomContext for testing.
 type TestRoomContext struct {
@@ -313,6 +355,16 @@ func (s *NATSSubscriber) PublishForceDisconnect(channelID, userID string) {
 // StaleServerVoiceDiscoverySQLForTest exposes the lease-discovery statement so
 // the plan-shape guard runs against the exact SQL production issues.
 func StaleServerVoiceDiscoverySQLForTest() string { return staleServerVoiceDiscoverySQL }
+
+// ParseVoiceEventTimeForTest exposes the clamp so its branches are reachable
+// without a database or a dispatcher. #3205: nothing pinned this function
+// before, and the clamp changes a return VALUE rather than an error, so no
+// existing test could have failed on it.
+func ParseVoiceEventTimeForTest(
+	raw string, receivedAt time.Time,
+) (time.Time, time.Duration, error) {
+	return parseVoiceEventTime(raw, receivedAt)
+}
 
 // MaxVoiceLifecycleForwardSkewForTest exposes the renewal's forward-skew ceiling
 // so a regression test binds to the constant rather than to a copied literal.

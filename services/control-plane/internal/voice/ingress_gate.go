@@ -274,6 +274,27 @@ func (s *NATSSubscriber) voiceShed(class string) {
 	s.reportShed(&s.voiceShedState, "Voice lifecycle event shed at the ingress gate", class)
 }
 
+const voiceSkewShedMessage = "Voice lifecycle stamp clamped at ingress"
+
+// voiceSkewShed records a producer stamp clamped beyond the forward-skew bound.
+//
+// reportShed, whose counter is recordN and NOT recordNReportFirst: a clamp is
+// APPLIED rather than dropped, so there is no lost event whose first occurrence
+// must wake someone. A single stray clamp arms the interval silently, and a
+// genuine clock fault -- which produces a stream, not one frame -- flushes on
+// the next one.
+//
+// The EMISSION lives here rather than at the nats.go call site for the same
+// reason voiceDropShed's does. nats_rich_presence_log_guard_test walks nats.go
+// for structured log values and admits only a string literal for failure_class
+// and only an int literal or len() for a count, so an aggregated report -- whose
+// entire payload is a class name and a running total -- cannot be emitted from
+// that file at all. Neither value is wire-derived: the class is the single
+// literal "clock_skew", and the count is an integer this package produced.
+func (s *NATSSubscriber) voiceSkewShed(class string) {
+	s.reportShed(&s.voiceSkewShedState, voiceSkewShedMessage, class)
+}
+
 func (s *NATSSubscriber) reportShed(state *ingressShedState, msg, class string) {
 	if s.ingressShedObservedHook != nil {
 		s.ingressShedObservedHook(class)

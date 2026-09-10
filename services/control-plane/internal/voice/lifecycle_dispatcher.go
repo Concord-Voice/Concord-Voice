@@ -4,14 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"sync"
+	"time"
 )
 
 // voiceLifecycleDispatchRoomCount bounds CONCURRENTLY BACKLOGGED rooms, not
 // concurrently active ones: finishEvent deletes a room as soon as its queue
 // drains, so a room appears here only while a handler is still running for it.
-// At the ceiling the map costs 1024 rooms * cap(64) * sizeof(event) = 4.0 MiB.
-// The event struct is 64 B since #2868 added dropClass (it was 56 B; the byte
-// lands in alignment padding but the eager cap-64 allocation multiplies it).
+// At the ceiling the map costs 1024 rooms * cap(64) * sizeof(event) = 5.5 MiB.
+// The event struct is 88 B since #3205 added receivedAt (it was 64 B; a
+// time.Time is 24 B and the eager cap-64 allocation multiplies it).
 //
 // Raising it moves the cliff rather than removing it, and bounding is #2757's
 // scope. Since #2868 the cliff is no longer destructive: crossing it drops and
@@ -80,6 +81,11 @@ type voiceLifecycleDispatchEvent struct {
 	data      []byte
 	roomKey   string
 	dropClass voiceLifecycleDropClass
+	// receivedAt is stamped on the NATS callback goroutine, which IS receipt.
+	// #3205: it is the clamp reference for parseVoiceEventTime. Handler-drain
+	// time would turn dispatcher lateness into a stamp ADVANCE, the one
+	// direction that lets DELETE ... lifecycle_event_at <= $3 remove a live row.
+	receivedAt time.Time
 }
 
 type voiceLifecycleDispatchRoom struct {
@@ -100,7 +106,7 @@ type voiceLifecycleDispatcher struct {
 	readyIDs        []string
 	pending         int
 	closed          bool
-	handler         func(string, []byte)
+	handler         func(string, []byte, time.Time)
 	overflow        func(voiceLifecycleDropCounts)
 	overflowCounts  voiceLifecycleDropCounts
 	overflowPending bool
@@ -115,7 +121,7 @@ type voiceLifecycleDispatcher struct {
 // -- compiling, all-green, and byte-identical to a replica that never overflows.
 // Same failure shape ingress_gate_test.go already pins for a disabled gate.
 func newVoiceLifecycleDispatcher(
-	handler func(string, []byte),
+	handler func(string, []byte, time.Time),
 	overflow func(voiceLifecycleDropCounts),
 ) *voiceLifecycleDispatcher {
 	dispatcher := &voiceLifecycleDispatcher{
@@ -146,6 +152,10 @@ func (d *voiceLifecycleDispatcher) enqueue(subject string, data []byte) {
 		data:      append([]byte(nil), data...),
 		roomKey:   roomKey,
 		dropClass: classifyVoiceLifecycleDrop(subject, resolved),
+		// Stamped HERE and nowhere later. enqueue runs on the NATS callback
+		// goroutine, so this is receipt; a stamp taken once the event reaches a
+		// worker would carry the queue's own lateness into the clamp (#3205).
+		receivedAt: time.Now(),
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -241,7 +251,7 @@ func (d *voiceLifecycleDispatcher) runWorker() {
 		if !ok {
 			return
 		}
-		d.handler(event.subject, event.data)
+		d.handler(event.subject, event.data, event.receivedAt)
 		d.finishEvent(event.roomKey)
 	}
 }
