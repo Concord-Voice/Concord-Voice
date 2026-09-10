@@ -12,6 +12,7 @@
 //   clang++ -std=c++17 -g -O1 -fsanitize=fuzzer,address,undefined \
 //       test/fuzz_quantum_ring.cc -o fuzz_quantum_ring
 
+#include "../rt/quantum_header.h"
 #include "../rt/quantum_ring.h"
 
 // No <cassert>: this target signals with __builtin_trap() rather than assert(), so
@@ -22,12 +23,109 @@
 #include <deque>
 #include <vector>
 
+using concord::audiocap::rt::encodeQuantumHeader;
+using concord::audiocap::rt::QuantumHeader;
 using concord::audiocap::rt::QuantumRing;
 using concord::audiocap::rt::RingResult;
+using concord::audiocap::rt::u16;
 using concord::audiocap::rt::u32;
+using concord::audiocap::rt::u64;
 using concord::audiocap::rt::u8;
 
+namespace hdr = concord::audiocap::rt;
+
+namespace {
+
+// A LOCAL little-endian reader. Deliberately not a decoder shipped next to the
+// encoder: a decoder that mirrors the encoder agrees with every mistake it makes,
+// which is the one thing an oracle may not do.
+u16 readU16(const std::vector<u8>& b, u32 off) {
+  return static_cast<u16>(static_cast<u16>(b[off]) |
+                          static_cast<u16>(static_cast<u16>(b[off + 1u]) << 8));
+}
+
+u32 readU32(const std::vector<u8>& b, u32 off) {
+  u32 v = 0u;
+  for (u32 i = 0u; i < 4u; ++i) { v |= static_cast<u32>(b[off + i]) << (8u * i); }
+  return v;
+}
+
+u64 readU64(const std::vector<u8>& b, u32 off) {
+  u64 v = 0u;
+  for (u32 i = 0u; i < 8u; ++i) { v |= static_cast<u64>(b[off + i]) << (8u * i); }
+  return v;
+}
+
+// THE HEADER ENCODER IS THE BYTE SEQUENCE THAT CROSSES THE TRUST BOUNDARY.
+// The ring below is fuzzed because it is reachable across that boundary; these
+// 32 bytes ARE the boundary -- a mis-encoded length or offset is ADR-0043 D4b
+// risk 4 in its exact shape, and the consumer three processes away decides
+// accept-or-close on them.
+//
+// The destination CAPACITY is drawn from the input, so the refusal arm is
+// reached as often as the success arm rather than only in a unit test that
+// remembers to try it. Every non-header byte of the destination carries a canary
+// and is checked after every call, in both arms.
+void fuzzHeaderEncoder(const uint8_t* data, size_t size) {
+  if (size < 17u) { return; }
+
+  QuantumHeader h = {};
+  h.seq = static_cast<u32>(data[0]) | (static_cast<u32>(data[1]) << 8) |
+          (static_cast<u32>(data[2]) << 16) | (static_cast<u32>(data[3]) << 24);
+  h.captureTimestampNs = 0u;
+  for (u32 i = 0u; i < 8u; ++i) {
+    h.captureTimestampNs |= static_cast<u64>(data[4u + i]) << (8u * i);
+  }
+  h.overrunTotal = static_cast<u32>(data[12]) | (static_cast<u32>(data[13]) << 8) |
+                   (static_cast<u32>(data[14]) << 16) | (static_cast<u32>(data[15]) << 24);
+
+  // 0 .. kQuantumBytes, so short buffers, exactly-the-header, and a full quantum
+  // all occur. A fixed capacity would make the refusal arm unreachable.
+  const u32 capacity = static_cast<u32>(data[16]) % (hdr::kQuantumBytes + 1u);
+
+  const u8 kCanary = 0xA5u;
+  std::vector<u8> dst(hdr::kQuantumBytes, kCanary);
+  const bool wrote = encodeQuantumHeader(dst.data(), capacity, h);
+  if (wrote != (capacity >= hdr::kHeaderBytes)) { __builtin_trap(); }
+
+  if (!wrote) {
+    // A refusal writes NOTHING. An encoder that filled what it could before
+    // discovering the buffer was short would emit a torn header that the far end
+    // has no way to distinguish from a truncated one.
+    for (std::size_t i = 0u; i < dst.size(); ++i) {
+      if (dst[i] != kCanary) { __builtin_trap(); }
+    }
+    if (encodeQuantumHeader(nullptr, hdr::kQuantumBytes, h)) { __builtin_trap(); }
+    return;
+  }
+
+  // Fixed fields are constants of the protocol, never arguments: no input may
+  // move them.
+  if (readU16(dst, hdr::kOffMagic) != hdr::kMagic) { __builtin_trap(); }
+  if (dst[hdr::kOffVersion] != hdr::kHeaderVersion) { __builtin_trap(); }
+  if (dst[hdr::kOffFlags] != 0u) { __builtin_trap(); }
+  if (readU32(dst, hdr::kOffSampleRate) != hdr::kSampleRate) { __builtin_trap(); }
+  if (readU16(dst, hdr::kOffChannels) != hdr::kChannels) { __builtin_trap(); }
+  if (readU16(dst, hdr::kOffFrameCount) != hdr::kFrameCount) { __builtin_trap(); }
+  if (readU32(dst, hdr::kOffReserved) != 0u) { __builtin_trap(); }
+
+  // Variable fields round-trip exactly, for every value of a u32 and a u64.
+  if (readU32(dst, hdr::kOffSeq) != h.seq) { __builtin_trap(); }
+  if (readU64(dst, hdr::kOffCaptureTimestampNs) != h.captureTimestampNs) { __builtin_trap(); }
+  if (readU32(dst, hdr::kOffOverrunTotal) != h.overrunTotal) { __builtin_trap(); }
+
+  // The encoder owns bytes 0..31 and no others, whatever capacity it was given.
+  for (std::size_t i = hdr::kHeaderBytes; i < dst.size(); ++i) {
+    if (dst[i] != kCanary) { __builtin_trap(); }
+  }
+}
+
+}  // namespace
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+  // Runs against the WHOLE input, before the geometry bytes are consumed below.
+  fuzzHeaderEncoder(data, size);
+
   if (size < 4) { return 0; }
 
   // Geometry from the input. Unconstrained on purpose: most draws are INVALID, and

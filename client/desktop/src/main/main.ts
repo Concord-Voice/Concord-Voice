@@ -9,6 +9,7 @@ import { cancelActiveGoogleFlow } from './oauth/google/googleFlow';
 import { registerAttestationIpc } from './ipc/attestation';
 import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/windowControls';
 import { initTray, destroyTray, isTrayActive } from './tray';
+import { killAudiocapHost, probeAudiocapCapability } from './audiocapHost';
 import { registerVersionInfoIpc } from './ipc/versionInfo';
 import { buildBrowserWindowConfig } from './browserWindowConfig';
 import { PRODUCTION_API_BASE } from './apiBaseUrl';
@@ -1494,6 +1495,16 @@ let rollbackResult: SentinelResult | null = null;
 app.whenReady().then(async () => {
   if (maybePromptMove()) return;
 
+  // ADR-0043's capability probe is NOT called here. It is scheduled off the ready
+  // path with `setImmediate` at the end of this handler -- one call site, not two.
+  //
+  // There were two until PR #3245 review. `probeInFlight ??= runCapabilityProbe()`
+  // memoizes, so the second was a harmless no-op and nothing failed; what it did do
+  // was start `utilityProcess.fork` HERE, on the critical path of every launch,
+  // which contradicts the probe's own documented P1 ("it never delays app start.
+  // Nothing awaits it; `main.ts` schedules it OFF the ready path"). The redundant
+  // call was the one that broke the property, so removing it fixes the contradiction
+  // rather than merely tidying a duplicate.
   registerInviteProtocolClient();
 
   // app:// protocol handler (#830) — serves the bundled SPA from the asar
@@ -1735,6 +1746,27 @@ app.whenReady().then(async () => {
       createWindow();
     }
   });
+
+  // ─── concord-audiocap capability probe (#3195, ADR-0043) ──────────
+  // Fork the capture child once, take its handshake, record the rung it implies,
+  // and kill it. This is the production caller that makes the host reachable on a
+  // path a user actually takes rather than only from a test.
+  //
+  // NOTHING AWAITS IT, and it is scheduled off the ready path with setImmediate:
+  // the fork is a process spawn, and a child that never answers costs
+  // HANDSHAKE_TIMEOUT_MS. Neither may sit between whenReady and first paint.
+  // Same reasoning as the Squirrel sweep above, one tick later than the window.
+  //
+  // It cannot reject and cannot surface anything to the user — every outcome,
+  // including an unsupported OS or a fork that could not be issued, becomes a
+  // recorded degrade mechanism inside audiocapHost. C9 holds: a fault is
+  // video-only with a reason, never a system mix.
+  //
+  // The answer deliberately stays in main. #3198 adds the renderer-facing rung
+  // and the channel that carries it.
+  setImmediate(() => {
+    void probeAudiocapCapability();
+  });
 });
 
 // Quit when all windows are closed — except on macOS (platform convention)
@@ -1753,6 +1785,10 @@ app.on('window-all-closed', () => {
 electronAutoUpdater.on('before-quit-for-update', () => {
   isQuitting = true;
   destroyPipWindowsForQuit();
+  // Reap the concord-audiocap capture child (#3195). Synchronous and
+  // fire-and-forget: utilityProcess.kill() takes no handshake, and an await
+  // anywhere on a quit path re-enters the #1383 veto window.
+  killAudiocapHost();
 });
 
 // Clean up scheduled update checks on quit; flush update log (#383)
@@ -1761,6 +1797,9 @@ app.on('before-quit', () => {
   // the quit can complete — without this, app.quit() deadlocks (#1383).
   isQuitting = true;
   destroyPipWindowsForQuit();
+  // Reap the concord-audiocap capture child (#3195), on the same no-await terms
+  // as the update hook above.
+  killAudiocapHost();
   // Release the OS tray resource so no orphaned icon outlives the app (#1099).
   destroyTray();
   const ul = getUpdateLogger();
@@ -1769,12 +1808,29 @@ app.on('before-quit', () => {
   stopAutoUpdater();
 });
 
+// REDUNDANCY, NOT A DISTINCT PATH (#3195). Electron's own docs recommend
+// reaping a utilityProcess at 'will-quit', and it is registered here so a reader
+// who checks against those docs finds it. In THIS app it covers no case the two
+// hooks above miss: 'will-quit' always follows 'before-quit', and it would miss
+// quitAndInstall() outright — the exact gap #1897 patched with the
+// 'before-quit-for-update' hook. Do not go hunting for the case it uniquely
+// closes; there isn't one. killAudiocapHost() is idempotent, so a second call
+// on the ordinary quit path is a no-op.
+app.on('will-quit', () => {
+  killAudiocapHost();
+});
+
 // Crash-safe logging: flush update log before unhandled exceptions terminate the process (#383).
 // Registering this listener disables Node's default crash behavior, so we must exit explicitly.
 process.on('uncaughtException', (error) => {
   const ul = getUpdateLogger();
   ul?.error(`Uncaught exception: ${error.message}\n${error.stack ?? ''}`);
   ul?.flush();
+  // THE LOAD-BEARING HOOK (#3195). app.exit() fires NEITHER 'before-quit' NOR
+  // 'will-quit', so without this line an unhandled exception orphans the capture
+  // child by construction — a native-code process outliving the app that forked
+  // it. Must precede setImmediate: the exit is scheduled, the kill is not.
+  killAudiocapHost();
   setImmediate(() => app.exit(1));
 });
 

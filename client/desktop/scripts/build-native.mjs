@@ -68,6 +68,20 @@ if (!KNOWN_ARCHES.includes(arch)) {
   console.error(`unknown --arch "${arch}". Expected one of: ${KNOWN_ARCHES.join(', ')}.`);
   process.exit(1);
 }
+// --synthetic adds the CI/TEST-ONLY second gyp target (#3245 review). It does NOT
+// change what the shipped addon contains: `-Daudiocap_synthetic=1` makes gyp
+// APPEND `concord_audiocap_synthetic` to the targets list, and the
+// CONCORD_AUDIOCAP_SYNTHETIC define lives only on that target. The default
+// `concord_audiocap` is built from the same sources with the macro undefined,
+// exactly as it is without this flag.
+//
+// It lives here rather than as a raw `node-gyp rebuild -- -D...` in a workflow,
+// and that is not tidiness. A hand-rolled invocation loses --runtime/--target/
+// --dist-url (so it compiles against the wrong headers) and, on Windows, re-enters
+// the node-gyp.cmd EINVAL trap this whole file exists to avoid. Both failures are
+// documented at length above; do not reintroduce them in YAML.
+const synthetic = process.argv.includes('--synthetic');
+
 const args = ['rebuild', `--arch=${arch}`];
 
 if (runtime === 'electron') {
@@ -81,6 +95,13 @@ if (runtime === 'electron') {
 } else {
   console.log(`building concord-audiocap for Node ${process.versions.node} (${arch})`);
 }
+// Gyp defines go after a `--` separator, which node-gyp forwards verbatim to gyp.
+// Appended LAST so it cannot be swallowed by the runtime flags above.
+if (synthetic) {
+  args.push('--', '-Daudiocap_synthetic=1');
+  console.log('  + synthetic target (concord_audiocap_synthetic.node) — CI/test only');
+}
+
 // Spawn node-gyp's JS ENTRY POINT with this Node, never the node_modules/.bin
 // shim. That is not stylistic:
 //

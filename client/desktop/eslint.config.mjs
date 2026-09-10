@@ -84,16 +84,6 @@ export default [
             'vite.config.ts',
             'forge.config.ts',
             'playwright.config.ts',
-            // scripts/ — build helpers + their colocated tests
-            'scripts/generate-update-manifest.test.ts',
-            'scripts/generate-buildtag.test.ts',
-            'scripts/generate-google-client-secret.test.ts',
-            'scripts/generate-app-update.test.ts',
-            'scripts/patch-rpm-sandbox-spec.test.ts',
-            'scripts/verify-update-manifest.test.ts',
-            'scripts/classify-playwright-results.test.ts',
-            'scripts/generate-tray-icons.test.ts',
-            'scripts/csp-prod-strip.ts',
             // #2402: the Forge 7 NSIS maker. Lives in build/ (excluded from
             // tsconfig.json's include, like forge.config.ts above) because it is
             // build tooling, not app source — so it belongs to no TS project and
@@ -108,21 +98,44 @@ export default [
             'native/concord-audiocap/index.js',
             'native/concord-audiocap/index.d.ts',
           ],
-          // The 15 on-disk allowDefaultProject files (3 root configs + 8
-          // scripts/*.test.ts + csp-prod-strip.ts + build/makerNsis.ts + the two
-          // native/concord-audiocap entries) exceed typescript-eslint's
-          // default cap of 8 default-project files, so a full-tree `npm run lint`
-          // (`eslint .`) fails with "Too many files (>8) have matched the default
-          // project". The per-file pre-commit eslint hook never trips this (it
-          // lints only staged files), so the breakage was invisible to both gates
-          // until a manual `npm run lint`. These tooling files are intentionally
-          // kept out of every tsconfig (see the note above), so raising the
-          // bounded cap is the right-sized fix; the perf caveat in the option's
-          // name is immaterial for ~9 tiny tooling files. If this set grows much
-          // larger, prefer moving scripts/ into a dedicated scripts/tsconfig.json.
-          // At 15 that advice is close to due: the next addition should create the
-          // dedicated tsconfig rather than bump this number a third time.
-          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 15,
+          // `scripts/` HAS ITS OWN PROJECT: scripts/tsconfig.json. It carries no
+          // comments of its own — check-json rejects JSONC and no other tsconfig
+          // in this repo has them — so its three non-obvious settings are
+          // explained here, at its only consumer. Each was wrong once:
+          //
+          //   rootDir: ".."  — the DESKTOP ROOT, not ".". Several scripts import
+          //     out of ../src/, which is TS6059 under a rootDir of "."; OMITTING
+          //     it is worse, because the option is then inherited from
+          //     ../tsconfig.json as "./src" and every file in scripts/ becomes
+          //     the violation instead. noEmit means it never places an output.
+          //   allowJs — why the project exists at all. scripts/audiocap-host-probe
+          //     is `electron .`-launched plain JS and cannot be TS without a build
+          //     step. Inherited from ../tsconfig.json; do not turn it off.
+          //   allowImportingTsExtensions — these scripts already import each other
+          //     as ../src/constants/foo.mts. Without it that is TS5097 nine times.
+          //
+          // WHY A BOUNDED CAP AT ALL. These entries are tooling that belongs
+          // to no TS project, so typescript-eslint parses each against the DEFAULT
+          // project — and it caps that at 8, failing a full-tree `npm run lint`
+          // with "Too many files (>8) have matched the default project". The
+          // per-file pre-commit eslint hook lints only STAGED files and so never
+          // reaches the cap: the breakage is invisible to both gates until someone
+          // runs `npm run lint` by hand. That is how it shipped twice before.
+          //
+          // #3195: the list is back UNDER the default cap because `scripts/` now
+          // has its own project. It had been bumped to 15, and the note here said
+          // the next addition should create a dedicated tsconfig rather than bump
+          // a third time; `scripts/audiocap-host-probe/main.js` was that addition,
+          // so `scripts/tsconfig.json` exists and the nine `scripts/*` entries
+          // (8 colocated tests + csp-prod-strip.ts) left this list with it.
+          //
+          // Six remain on disk — 3 root configs + build/makerNsis.ts + the two
+          // native/concord-audiocap entries; the two __lint-fixture__ paths are
+          // deliberately absent from the tree, which is why the old count read 15
+          // against a 17-entry list. The cap is left EXPLICIT at the default 8
+          // rather than deleted, so the next person to add tooling sees the
+          // number and this note instead of an unexplained parse error.
+          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 8,
         },
         tsconfigRootDir: import.meta.dirname,
       },

@@ -104,7 +104,10 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { hasPermission, SPEAK } from '../../utils/policy/permissions';
 import { clampScreenForSubscription } from '../../utils/policy/videoLimits';
 import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/ui/screenResolution';
-import { canCarryScreenAudio } from '../../utils/policy/screenAudioCapability';
+import {
+  canCarryScreenAudio,
+  type ScreenAudioVerdict,
+} from '../../utils/policy/screenAudioCapability';
 import type { CallState } from './voiceService/callStateMachine';
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
@@ -2119,6 +2122,11 @@ class VoiceService {
       // The audio producer dies with the transport too; without this the map keeps
       // a closed entry that a later cleanup re-closes.
       this.producers.delete('screen-audio');
+      // LOCAL teardown: the transport carrying this client's own share is gone, so
+      // the durable screen-audio verdict must go with it. The boolean flag above
+      // has no auto-clear twin -- `screenAudio.mode` persists until something
+      // writes it, so without this the badge keeps describing a dead share.
+      this.stopScreenAudioHost();
       const uid = useUserStore.getState().user?.id;
       if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
     });
@@ -2250,13 +2258,17 @@ class VoiceService {
         // Twin of the handler in produceScreenAudioFromStream. Both must clear the flag;
         // this one did not, so isScreenAudioOn read true with no producer behind it.
         useVoiceStore.getState().setScreenAudioOn(false);
+        this.stopScreenAudioHost();
       });
     } catch (err) {
       if (this.isCurrentVideoReproduce(token, transport)) {
         // The old producer is already gone (deleted above), so leaving the flag set
         // reports audio that nothing is sending -- and the next click would spend
-        // itself switching the stale flag off instead of retrying.
+        // itself switching the stale flag off instead of retrying. The durable
+        // verdict owes the same write: this is a LOCAL re-produce that failed, so
+        // the share is video-only from here.
         useVoiceStore.getState().setScreenAudioOn(false);
+        this.stopScreenAudioHost();
         console.warn('Failed to re-produce screen audio:', errorMessage(err));
       }
     }
@@ -3906,24 +3918,44 @@ class VoiceService {
     // `switchScreenSourceQueued` does not share -- so confirming a switch on Linux
     // before the picker's async platform probe settled requested a loopback that
     // cannot work. The guard belongs at the one seam BOTH callers pass through.
-    if (!wantAudio || !canCarryScreenAudio(chosenId, this.cachedPlatform)) {
-      return { stream: await videoOnly(), sourceId: chosenId };
-    }
+    //
+    // The VERDICT, never its truthiness: every verdict but 'none' is a non-empty and
+    // therefore truthy string, so a bare `if (!canCarryScreenAudio(...))` would wave a
+    // future mechanism straight into the whole-desktop request below. The opt-out folds
+    // in as 'none' so the switch is the single decision this seam makes.
+    const audioVerdict: ScreenAudioVerdict = wantAudio
+      ? canCarryScreenAudio(chosenId, this.cachedPlatform)
+      : 'none';
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: chosenId },
-        } as unknown as MediaTrackConstraints,
-        video: videoConstraints,
-      });
-      return { stream, sourceId: chosenId };
-    } catch (audioErr) {
-      console.debug(
-        'produceScreen: audio capture unavailable, falling back to video-only',
-        errorMessage(audioErr)
-      );
-      return { stream: await videoOnly(), sourceId: chosenId };
+    // The `chromeMediaSource: 'desktop'` request lives INSIDE the 'system-loopback' arm
+    // and nowhere else, so a rung added to `ScreenAudioVerdict` without its own capture
+    // shape is a compile error at the `never` below, not a silently widened capture.
+    switch (audioVerdict) {
+      case 'none':
+        return { stream: await videoOnly(), sourceId: chosenId };
+      case 'system-loopback':
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: chosenId },
+            } as unknown as MediaTrackConstraints,
+            video: videoConstraints,
+          });
+          return { stream, sourceId: chosenId };
+        } catch (audioErr) {
+          console.debug(
+            'produceScreen: audio capture unavailable, falling back to video-only',
+            errorMessage(audioErr)
+          );
+          return { stream: await videoOnly(), sourceId: chosenId };
+        }
+      default: {
+        // Unreachable while the union has two members; C9 keeps the degraded answer
+        // video-only rather than a system mix.
+        const unhandled: never = audioVerdict;
+        console.debug('captureScreenElectron: unhandled screen-audio verdict', unhandled);
+        return { stream: await videoOnly(), sourceId: chosenId };
+      }
     }
   }
 
@@ -3983,10 +4015,17 @@ class VoiceService {
 
       this.producers.set('screen-audio', audioProducer);
       useVoiceStore.getState().setScreenAudioOn(true);
+      // The only capture path that exists today is the whole-desktop mix
+      // (`chromeMediaSource: 'desktop'`), so this is `system` and not `per-process`.
+      // #3198 adds the per-process rung; it sets the mode where it creates the track,
+      // not here. Overrun starts at zero for every new producer -- the counter belongs
+      // to the share, not to the session.
+      useVoiceStore.getState().setScreenAudioState({ mode: 'system', overrun: 0 });
 
       audioProducer.on('transportclose', () => {
         this.producers.delete('screen-audio');
         useVoiceStore.getState().setScreenAudioOn(false);
+        this.stopScreenAudioHost();
       });
 
       this.bindScreenAudioTrackEnded(audioTrack, audioProducer);
@@ -3994,6 +4033,26 @@ class VoiceService {
       console.debug('produceScreen: screen audio producer created', audioProducer.id);
     } catch (err) {
       console.warn('Failed to produce screen audio:', errorMessage(err));
+      // A refusal used to end at that console line, so the SFU's `Only one active
+      // screen-audio producer allowed per participant` reached a log and nothing
+      // else: the user shared a screen that silently had no sound and was told
+      // nothing. `degraded` is the durable verdict for exactly this -- video-only
+      // WITH a reason (C9), which is why the union refuses a reason-less degrade.
+      //
+      // Fenced on the same currentness the success path checks above, and for the
+      // same reason: `produceEncrypted` is a round trip, a stop can land inside it,
+      // and `ScreenAudioState` has no auto-clear -- so writing `degraded` for a
+      // share that already ended leaves a permanent badge describing nothing.
+      const shareStillLive =
+        this.sendTransport === transport &&
+        !transport.closed &&
+        this.localScreenStream === stream &&
+        !!this.producers.get('screen');
+      if (shareStillLive) {
+        useVoiceStore
+          .getState()
+          .setScreenAudioState({ mode: 'degraded', reason: 'produce-rejected', overrun: 0 });
+      }
     }
   }
 
@@ -4119,6 +4178,9 @@ class VoiceService {
         // The audio producer dies with the transport too; without this the map keeps
         // a closed entry that a later cleanup re-closes.
         this.producers.delete('screen-audio');
+        // Twin of the handler in fastReproduceScreenQueued: LOCAL teardown, so the
+        // durable verdict is retired here too.
+        this.stopScreenAudioHost();
         const uid = useUserStore.getState().user?.id;
         if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
       });
@@ -4524,6 +4586,7 @@ class VoiceService {
         useVoiceStore.getState().updateParticipant(localUserId, { screenAudioStream: undefined });
       }
       useVoiceStore.getState().setScreenAudioOn(false);
+      this.stopScreenAudioHost();
       return;
     }
 
@@ -4551,7 +4614,8 @@ class VoiceService {
     // A window/application target cannot carry audio at all (#2161, ADR-0043), so
     // re-capturing would replace the track, glitch every viewer, and still produce
     // nothing. Tell the user why instead of churning the share on every click.
-    if (!canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform)) {
+    const liveVerdict = canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform);
+    if (liveVerdict !== 'system-loopback') {
       console.debug('setScreenAudioEnabled: target cannot carry audio');
       // Telling the causes apart matters: on Linux a WHOLE-SCREEN share is refused by
       // the platform, so the window text would send that user to a remedy that cannot
@@ -4702,7 +4766,52 @@ class VoiceService {
       this.producers.delete('screen-audio');
       this.socket?.emit('close-producer', { producerId: producer.id });
       useVoiceStore.getState().setScreenAudioOn(false);
+      // The OS killed the capture out from under us -- a permission revoke, a tap
+      // failure, the source going away. Nothing else observes it (`transportclose`
+      // does not fire when only the audio track dies), so this is the ONLY path
+      // that can retire the durable verdict for it.
+      this.stopScreenAudioHost();
     };
+  }
+
+  /**
+   * THE SINGLE TEARDOWN CHOKE POINT FOR THE **LOCAL** SCREEN-AUDIO CAPTURE
+   * (#3195, ADR-0043, design section 6c teardown rails 1 and 2).
+   *
+   * THE INVARIANT, STATED BEFORE THE CODE: this runs only on a path that is tearing
+   * down THIS CLIENT'S OWN capture. The screen-audio teardown paths in this file split
+   * local/remote, and the split is not where intuition puts it -- `screen-audio`
+   * appears in remote-participant code as often as in local code:
+   *
+   *   LOCAL  (routed here)      setScreenAudioEnabledQueued's off-branch;
+   *                             switchScreenSourceQueued's post-retire continuation;
+   *                             cleanupScreenAudioState; cleanupScreenState.
+   *   REMOTE (NOT routed)       closeScreenAudioConsumerForUser closes a CONSUMER for
+   *                             somebody else's producer; routeConsumerToStore's
+   *                             'screen-audio' entry is a SETTER for a remote stream;
+   *                             the `producer-closed` socket handler fires for an
+   *                             ARBITRARY userId and is routed here only behind an
+   *                             equality test against the local user.
+   *
+   * WHAT BREAKS IT: a call added from a path whose `userId` is not proven to be the
+   * local user. The failure is silent and asymmetric -- the local capture child dies
+   * whenever a REMOTE peer stops sharing audio, so audio drops for the one participant
+   * who did nothing, and every log line describes the peer who did.
+   *
+   * Idempotent, because several routed paths run in sequence: `closeProducer('screen')`
+   * reaches `cleanupScreenState`, and the media-plane's `producer-closed` self-echo for
+   * the same share lands moments later on rail 2.
+   *
+   * IT RELEASES NO HOST LEASE, and there is none to release. #3195 forks exactly one
+   * child -- main's app-start capability probe, which main kills itself -- so there is
+   * no capturing child for a renderer path to reap. The watchdog rail that would have
+   * been driven from here was DELETED rather than shipped inert (spec section 6c: an
+   * unwired watchdog is unfinished, not defence). #3198 brings back both together.
+   */
+  private stopScreenAudioHost(): void {
+    const { screenAudio, setScreenAudioState } = useVoiceStore.getState();
+    if (screenAudio.mode === 'off' && screenAudio.overrun === 0) return;
+    setScreenAudioState({ mode: 'off', overrun: 0 });
   }
 
   private async retireScreenAudioProducer(transport: mediasoupTypes.Transport): Promise<void> {
@@ -4738,7 +4847,8 @@ class VoiceService {
    */
   async canShareScreenAudio(): Promise<boolean> {
     await this.ensurePlatform();
-    if (canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform)) return true;
+    const verdict = canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform);
+    if (verdict === 'system-loopback') return true;
     // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a
     // share that may be sending audio right now. A live audio track on the capture is
     // proof of capability that the id cannot express; without this the toolbar locked the
@@ -4900,6 +5010,12 @@ class VoiceService {
       stopStreamTracks(stream);
       return;
     }
+
+    // AFTER the currentness guard, not before it: on the superseded branch a NEWER
+    // reproduce already owns the screen-audio state, and stopping from here would
+    // clobber the successor's. The old share's audio is gone either way -- the retire
+    // above closed its producer.
+    this.stopScreenAudioHost();
 
     const localUserId = useUserStore.getState().user?.id;
     if (localUserId) {
@@ -5217,7 +5333,14 @@ class VoiceService {
     this.socket?.emit('close-consumer', { consumerId });
   }
 
-  /** Close the screen-audio consumer for a specific user. */
+  /**
+   * Close the screen-audio consumer for a specific user.
+   *
+   * REMOTE. This closes a CONSUMER of somebody else's producer, so it must NOT reach
+   * `stopScreenAudioHost()` -- doing so would tear down the LOCAL capture whenever a
+   * remote peer stopped sharing audio. Named here because the symmetry with the local
+   * teardown paths is the trap.
+   */
   private closeScreenAudioConsumerForUser(
     userId: string,
     store: ReturnType<typeof useVoiceStore.getState>
@@ -5973,6 +6096,7 @@ class VoiceService {
    */
   private cleanupScreenAudioState(): void {
     useVoiceStore.getState().setScreenAudioOn(false);
+    this.stopScreenAudioHost();
     if (this.localScreenStream) {
       for (const t of this.localScreenStream.getAudioTracks()) {
         t.stop();
@@ -6027,6 +6151,7 @@ class VoiceService {
     const store = useVoiceStore.getState();
     store.setScreenSharing(false);
     store.setScreenAudioOn(false);
+    this.stopScreenAudioHost();
     store.setActiveScreenCodec(null);
     // #2088: deterministic local-share cleanup (spec §3.1 removal point) —
     // don't rely solely on the media-plane's producer-closed self-echo.
@@ -6898,6 +7023,12 @@ class VoiceService {
       } else if (source === 'screen-audio') {
         store.updateParticipant(userId, { screenAudioStream: undefined });
         this.pendingScreenAudioProducers.delete(userId);
+        // Teardown rail 2: the SFU closes the paired `screen-audio` producer when the
+        // `screen` producer closes and echoes it back here, which catches a local share
+        // that ended without any of rail 1's local paths running. GATED ON THE LOCAL
+        // USER -- this handler fires for every participant, and an ungated call would
+        // tear down THIS client's capture whenever a REMOTE peer stopped sharing audio.
+        if (userId === useUserStore.getState().user?.id) this.stopScreenAudioHost();
       }
 
       // Notify PiP proxy so open PiP windows can close their consumers

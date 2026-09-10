@@ -67,6 +67,52 @@ const { mockShowMessageBox, mockResolveForDisplay, approvalStore } = vi.hoisted(
 const { mockMaybePromptMove } = vi.hoisted(() => ({
   mockMaybePromptMove: vi.fn(() => false),
 }));
+
+// ── concord-audiocap capability probe (#3195) ──────────────────────────
+// The app-start probe forks a real utilityProcess, so the electron mock needs
+// one. The stub delivers a valid `hello` as soon as the host subscribes to
+// 'message', which makes the probe settle inside beforeAll's 100 ms drain and
+// therefore before any test reads it -- rather than leaving the outcome to
+// whichever test happens to run before the 10 s handshake timer.
+//
+// `protocol: 1` restates AUDIOCAP_PROTOCOL because a vi.hoisted factory runs
+// before this file's imports are evaluated. It is self-checking: were the
+// constant to move, the strict `isAudiocapHello` narrowing would refuse this
+// payload and the probe would record `protocol-fault`, reddening the assertion
+// below rather than passing on a stale literal.
+const { mockUtilityFork, audiocapChildStub } = vi.hoisted(() => {
+  const handlers: Record<string, (...args: unknown[]) => void> = {};
+  const hello = {
+    kind: 'hello',
+    protocol: 1,
+    capability: {
+      platform: 'darwin',
+      osVersion: '15.0',
+      perProcessAudio: true,
+      reason: 'ok',
+    },
+    resourcesPathPresent: true,
+    envKeys: ['PATH'],
+  };
+  const stub = {
+    handlers,
+    // `kill` returns TRUE, matching a child that HAS spawned. Returning
+    // `undefined` sent `reapChild` down its not-yet-spawned branch, which calls
+    // `child.once` -- absent from this stub -- and surfaced as an unhandled
+    // rejection inside a teardown hook (#3245). `UtilityProcess` is an
+    // EventEmitter in production, so `once` belongs here regardless.
+    kill: vi.fn(() => true),
+    once: vi.fn(),
+    postMessage: vi.fn(),
+    pid: 4242,
+    on(event: string, cb: (...args: unknown[]) => void) {
+      handlers[event] = cb;
+      if (event === 'message') queueMicrotask(() => cb(hello));
+      return this;
+    },
+  };
+  return { mockUtilityFork: vi.fn(() => stub), audiocapChildStub: stub };
+});
 vi.mock('../../../src/main/oauth/apple/appleFlow', () => ({
   cancelActiveAppleFlow: mockCancelAppleFlow,
   runAppleSignIn: vi.fn(),
@@ -114,6 +160,7 @@ vi.mock('electron', () => ({
     ),
   },
   ipcMain: { handle: vi.fn(), on: vi.fn() },
+  utilityProcess: { fork: mockUtilityFork },
   clipboard: { writeText: vi.fn() },
   desktopCapturer: {
     getSources: vi.fn(() =>
@@ -4960,6 +5007,38 @@ describe('main.ts', () => {
       getDidFailLoadHandler()({}, -3, 'ERR_ABORTED', 'app://concord/index.html', true);
 
       expect(mockRevealLoadFailure).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // THE APP-START CAPABILITY PROBE (#3195, ADR-0043)
+  //
+  // This is the case that distinguishes #3195 from #3194: the host is reachable
+  // from app start, not only from a test. The whole suite around it is the
+  // second half of the claim -- every other case in this file exercises work the
+  // same `whenReady` handler did, so their passing IS the evidence that the
+  // probe neither delayed nor broke startup.
+  // ─────────────────────────────────────────────────────────────────────
+  describe('concord-audiocap capability probe', () => {
+    it('forks the capture child exactly once during app start', () => {
+      // The outermost observable: an OS process was spawned by the ready path.
+      // A spy on our own module boundary would pass against a probe that main
+      // imported and never called.
+      expect(mockUtilityFork).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the capability the child reported, and kills it', async () => {
+      const { audiocapProbeResult, currentAudiocapGeneration } =
+        await import('../../../src/main/audiocapHost');
+
+      // Settled during beforeAll's drain: `null` here would mean the probe was
+      // never driven, which is the "shipped code with no caller" condition.
+      expect(audiocapProbeResult()).toEqual({ ok: true, perProcessAudio: true });
+      // P3 -- the probe child is short-lived by construction. A validated hello
+      // deliberately does NOT kill the child (that is the share path's contract),
+      // so a surviving child here would be a leak with nothing to reap it.
+      expect(audiocapChildStub.kill).toHaveBeenCalled();
+      expect(currentAudiocapGeneration()).toBe(0);
     });
   });
 });

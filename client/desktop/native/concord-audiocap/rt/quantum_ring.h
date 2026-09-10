@@ -55,6 +55,10 @@ class QuantumRing {
   // sets for the MessagePort transport downstream.
   static constexpr u32 kMaxSlots = 64u;
 
+  // The value overrun() sticks at. Spelled here rather than as UINT32_MAX at the
+  // use site so the ceiling and the accessor cannot drift apart.
+  static constexpr u32 kOverrunSaturated = 0xFFFFFFFFu;
+
   // slotCount must be a power of two in [2, kMaxSlots] so the wrap is a mask.
   // Anything else yields a ring whose valid() is false and whose every operation
   // returns kInvalid — it fails closed rather than half-working.
@@ -75,7 +79,7 @@ class QuantumRing {
         valid_(false),
         writeIdx_(0u),
         readIdx_(0u),
-        dropped_(0u),
+        overrun_(0u),
         lengths_() {
     // AV 142: lengths_() above value-initializes the whole array before any use.
     // The last clause is a 32-bit BACKSTOP, and is deliberately NOT the fix for the
@@ -119,7 +123,29 @@ class QuantumRing {
     // Unsigned wraparound makes this correct across the u32 rollover; it is the
     // difference that matters, never the absolute values.
     if ((w - r) >= slotCount_) {
-      dropped_.fetch_add(1u, std::memory_order_relaxed);
+      // THE ONE DROP SITE (design section 4d). The transport downstream has no
+      // second one: the consumer refusing to drain past its credit bound IS this
+      // ring filling, because ringSlots == creditBound, so credit exhaustion and
+      // ring overflow are the same event and are counted here exactly once.
+      //
+      // SATURATING, NOT WRAPPING. This counter is the drop WITNESS -- it is
+      // stamped into every quantum header and surfaced in the UI -- and a wrapped
+      // u32 reads as "no drops", which is the one answer it must never be able to
+      // give. 2^32 drops is 497 days of a permanently full ring, so the ceiling is
+      // unreachable in service and is seeded in the test rather than reached.
+      //
+      // A load/store pair rather than fetch_add or a CAS loop, and the reason is
+      // the thread this runs on. push() is the PRODUCER side of an SPSC ring: the
+      // producer is the only writer of this counter (the consumer only reads it),
+      // so no other thread can interleave and a read-modify-write buys nothing. It
+      // does cost something -- a CAS loop is lock-free but not wait-free, and this
+      // executes inside an OS audio callback where an unbounded retry is a dropout.
+      // A second producer would corrupt writeIdx_ long before it mattered here, so
+      // the single-writer assumption is the class's, not this counter's.
+      const u32 prior = overrun_.load(std::memory_order_relaxed);
+      if (prior != kOverrunSaturated) {
+        overrun_.store(prior + 1u, std::memory_order_relaxed);
+      }
       return RingResult::kFull;
     }
 
@@ -164,9 +190,16 @@ class QuantumRing {
     return RingResult::kOk;
   }
 
-  // Number of pushes refused because the ring was full. ADR-0043 D4c requires this
-  // be OBSERVABLE — a bound that fails as quietly as no bound buys nothing.
-  u32 dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+  // Pushes refused because the ring was full, saturating at kOverrunSaturated.
+  // ADR-0043 D4c requires this be OBSERVABLE — a bound that fails as quietly as no
+  // bound buys nothing.
+  //
+  // Named `overrun` and not `dropped` because it is the same number the wire
+  // header calls `overrunTotal` and the store calls `screenAudio.overrun`. One
+  // event, one counter, one name the whole way across: there is nothing to
+  // reconcile between the native drop site and the transport, and a second name
+  // would invite a second counter.
+  u32 overrun() const noexcept { return overrun_.load(std::memory_order_relaxed); }
 
 #ifdef CONCORD_AUDIOCAP_TEST_SEAM
   using DepthProbe = void (*)(void*);
@@ -251,7 +284,7 @@ class QuantumRing {
 
   std::atomic<u32> writeIdx_;
   std::atomic<u32> readIdx_;
-  std::atomic<u32> dropped_;
+  std::atomic<u32> overrun_;
 
   u32 lengths_[kMaxSlots];
 };

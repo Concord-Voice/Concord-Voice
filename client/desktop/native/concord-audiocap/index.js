@@ -56,7 +56,8 @@ const DEV_FALLBACK = path.resolve(__dirname, 'build', 'Release', BINARY);
 //
 // THE ADDON LOADS ONLY IN A utilityProcess (ADR-0043 D5).
 //
-// This guard used to live only in src/main/audiocapSmokeChild.ts, which made it a
+// This guard used to live only in the child entry point (then
+// src/main/audiocapSmokeChild.ts, now src/main/audiocapChild.ts), which made it a
 // property of ONE CALL SITE rather than of the artifact. Any future
 // `require('../../native/concord-audiocap')` from src/main would have loaded a
 // memory-unsafe addon into the process holding SSO tokens and the update path,
@@ -94,7 +95,7 @@ if (process.versions.electron && process.type !== 'utility') {
 // com.apple.security.cs.disable-library-validation). This route is the one way that
 // local write becomes execution here, so R6 is false for it too.
 //
-// main sets the variable only when packaged (see audiocapSmoke.ts); dev uses
+// main sets the variable only when packaged (see audiocapHost.ts); dev uses
 // DEV_FALLBACK.
 const requested = process.env[ENV_PATH];
 let target = DEV_FALLBACK;
@@ -180,4 +181,43 @@ function capability() {
   return binding.capability();
 }
 
-module.exports = { capability };
+/**
+ * Begin capture. See index.d.ts for the contract; the two properties that matter
+ * at every call site are that `onQuantumAvailable` carries NO DATA and that it is
+ * COALESCED, so a signal means "there may be something to drain" and never "there
+ * is exactly one thing to drain".
+ *
+ * A release build has no producer compiled in and returns
+ * `{ ok: false, reason: 'NoBackend' }`. That resolves to video-only with a reason —
+ * never to a system mix (#2161).
+ *
+ * @param {{quantumMs: number, sampleRate: number, channels: number, frameCount: number, ringSlots: number}} options
+ * @param {() => void} onQuantumAvailable
+ * @returns {{ok: true} | {ok: false, reason: string}}
+ */
+function start(options, onQuantumAvailable) {
+  return binding.start(options, onQuantumAvailable);
+}
+
+/**
+ * Fill `into` with one whole 3872-byte quantum, in place. Returns `{ ok: false }`
+ * on an empty ring, a wrong-sized or detached buffer, or a call after `stop()`.
+ *
+ * @param {ArrayBuffer} into
+ * @returns {{ok: boolean}}
+ */
+function drain(into) {
+  return binding.drain(into);
+}
+
+/** Stop capture, join the producer, discard anything still queued. Idempotent. */
+function stop() {
+  binding.stop();
+}
+
+// The loader resolves ONLY `concord_audiocap.node` (see BINARY above), and that is
+// the second half of constraint C10: the CI/test build produces a separately named
+// `concord_audiocap_synthetic.node`, which nothing here can reach. A synthetic
+// binary sitting beside the release one in a dev tree is therefore unreachable
+// through this module, not merely absent from the packaged payload.
+module.exports = { capability, start, drain, stop };

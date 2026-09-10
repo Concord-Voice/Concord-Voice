@@ -36,6 +36,23 @@ the point: direct recursion (AV 119), `return p + 1;` (AV 215) and a 250-line
 function (AV 1) all pass the guard today. Those are review obligations, not
 guarantees.
 
+## Where it loads, and who drives it
+
+`index.js` **throws** unless `process.type === 'utility'` (ADR-0043 D5): a
+memory-safety bug in `rt/` must not own the process holding SSO tokens and the
+update path. The guard is gated on `process.versions.electron`, so unit tests
+importing this module under plain Node still exercise the path logic — which also
+means CI's `node -e "require(...)"` load step proves nothing about the guard. The
+job that does is `electron-host-probe` in `build.yml`, a main-only Electron app
+asserting the require **fails** (#3195).
+
+The `utilityProcess` that hosts it, the control channel main uses to drive
+`start`/`stop`, and the PCM path out to the renderer are all TypeScript and live
+outside this package: `src/main/audiocapHost.ts`, `src/main/audiocapChild.ts`,
+`src/preload/audiocapRelay.ts`, `src/renderer/services/voice/screenAudioBridge.ts`.
+See [`docs/architecture.md`](../../../../docs/architecture.md) § "Per-process
+screen-share audio".
+
 ## What exists today
 
 `capability()` — the input to ADR-0043 D6's capability ladder.
@@ -51,7 +68,38 @@ only, and say so in the UI.** It never means fall back to a system mix — a win
 target must never obtain one. That is #2161's invariant, and widening the capture
 on a capability miss is that same defect wearing native clothes.
 
-Capture itself is not implemented yet. The Windows floor constant in
+`start(options, onQuantumAvailable)` / `drain(into)` / `stop()` — the PCM transport
+seam (#3195).
+
+```js
+const { start, drain, stop } = require('./native/concord-audiocap');
+start({ quantumMs: 10, sampleRate: 48000, channels: 2, frameCount: 480, ringSlots: 8 },
+      onQuantumAvailable);
+// { ok: true }  in a CI/test build
+// { ok: false, reason: 'NoBackend' }  in a RELEASE build -- see below
+```
+
+`options` is checked for **exact equality** with the constants compiled into
+[`rt/quantum_header.h`](rt/quantum_header.h), which mirror
+`src/shared/audiocapProtocol.ts`. It is not a negotiation: a mismatch means the two
+ends of the transport disagree about the wire, which is a fault to report
+(`BadOptions`) rather than a geometry to adopt.
+
+`onQuantumAvailable` is a **bare availability edge with no payload**. It is a
+threadsafe function with `max_queue_size = 1`, always called non-blocking, so
+signals coalesce; audio flows through the ring, never through that queue. Drain in a
+loop until `drain()` returns `{ ok: false }` or you reach your credit bound — a
+missing signal is not a missing quantum.
+
+`drain(into)` takes a 3872-byte `ArrayBuffer` and fills it in place. It allocates
+nothing on the payload path, and it **fails closed when capture is not running**, so
+a signal still pending when `stop()` lands cannot deliver audio for a share that has
+ended.
+
+**The real backend is not implemented.** A release build has no producer at all and
+`start()` returns `NoBackend`, which the host resolves to video-only with a reason —
+never to a system mix (#2161). Windows ProcessLoopback is #3196 and the macOS Core
+Audio process tap is #3197. The Windows floor constant in
 [`napi/addon.cc`](napi/addon.cc) is **provisional** and is the single line spike S2
 changes; it is written alone and named so that settling risk 3 on hardware is a
 one-line edit rather than a hunt. The probe that settles it is in
@@ -67,6 +115,20 @@ npm run build:native:node     # Node ABI
 
 Both produce `native/concord-audiocap/build/Release/concord_audiocap.node`, which is
 gitignored — it is per-platform build output, never committed.
+
+**The synthetic source is opt-in at CONFIGURE time, and that is constraint C10.**
+
+```bash
+npx node-gyp rebuild -- -Daudiocap_synthetic=1   # adds concord_audiocap_synthetic.node
+```
+
+A default build produces one target. The CI/test variant is a second `.node` with a
+second name, and `index.js` can only ever resolve `concord_audiocap.node` — so the
+synthetic binary is not merely excluded from `app.asar`, it is never compiled on the
+release path and is unreachable through the shipped loader even in a dev tree. If a
+change here ever requires editing `EXPECTED_NATIVE` in `scripts/verify-asar-payload.sh`
+or the `native/` lookahead in `forge.config.ts`, the gyp gate is wrong — not the
+allowlist.
 
 **One build serves both runtimes, and that is measured rather than assumed.** This
 is an N-API addon (`NAPI_VERSION=8`), and N-API is ABI-stable across runtimes: the
@@ -153,5 +215,24 @@ reachable across a trust boundary that trade is the right way round.
 
 A full ring is a **drop, never a block** — ADR-0043 D4c: back-pressure inside a
 real-time callback can only ever be expressed as a drop, and the drop is the newest
-quantum. `dropped()` counts them, because a bound that fails as quietly as no bound
+quantum. `overrun()` counts them, because a bound that fails as quietly as no bound
 buys nothing.
+
+It **saturates rather than wrapping**, and that is the whole reason it is not a
+plain `fetch_add`: this counter is the drop *witness* — it is stamped into every
+quantum header and surfaced in the UI — and a wrapped `u32` reads as "no drops",
+which is the one answer it must never be able to give.
+
+**There is exactly one drop site, by construction.** `ringSlots == creditBound == 8`,
+so a consumer that refuses to drain past its credit bound *is* a ring that fills:
+credit exhaustion and ring overflow are the same event, counted once, with nothing
+to reconcile between them. A second bound anywhere — a queue behind the signal, a
+free list, a catch-up batch on the sender — would create a second drop site that
+nothing counts.
+
+**The counter reaches the consumer up to `ringSlots` quanta late, and the `seq` gap
+does not.** `overrunTotal` is stamped at *capture* time, beside a capture-time
+timestamp, so the quanta already queued when a drop happens still carry the older
+count; a consumer resuming after a stall drains those first. The independent witness
+— a gap in `seq` — is visible on the very first quantum after the stall. Both
+observers are required, and this is why: neither is a substitute for the other.

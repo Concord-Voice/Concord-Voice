@@ -313,7 +313,11 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   // Capability is target AND platform (#2161, ADR-0043) — the prefix alone offered an
   // enabled, default-on control on Linux, where this capture path has no loopback and
   // silently falls back to video. Shared with the service so the two cannot drift.
-  const audioCapable = canCarryScreenAudio(selected, platform);
+  //
+  // Compared against the exact verdict, never coerced: every verdict but 'none' is a
+  // truthy string, so a future mechanism would otherwise light this control up claiming
+  // a capture shape the service has not been taught to request.
+  const audioCapable = canCarryScreenAudio(selected, platform) === 'system-loopback';
 
   // ── #2163: tier the per-share picker to the stream entitlement ──────────
   // The produce boundary clamps screen capture to the entitlement's tiered

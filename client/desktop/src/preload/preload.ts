@@ -11,6 +11,17 @@ import type {
 } from '../shared/sso';
 import type { SpaFallbackDiagnostic } from '../shared/spaIpcTypes';
 
+// The ONLY runtime local import in this file. `scripts/build-preload.mjs` runs
+// esbuild with `bundle: true, external: ['electron']`, so it is inlined into
+// `dist/preload/preload.js` rather than becoming a `require` — which is what
+// keeps `tests/integration/preload-sandbox-contract.test.ts` green.
+import { AUDIOCAP_PORT_TAG, installAudiocapRelay, type AudiocapRelayWindow } from './audiocapRelay';
+
+// `tsconfig.preload.json` pins `lib` to ES2022 with no DOM, so the global
+// `window` has no type in this build leg. Declare exactly the slice the relay
+// needs; the runtime object is the same one either way.
+declare const window: AudiocapRelayWindow;
+
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 // Desktop source info for screen share picker
@@ -517,7 +528,25 @@ contextBridge.exposeInMainWorld('electron', {
       rejected?: boolean;
     }> => ipcRenderer.invoke('spa:reloadLatest'),
   },
+
+  // Per-process screen-share audio (#3195, ADR-0043). The PCM `MessagePort`
+  // cannot cross `contextBridge` (C2) — it arrives on a one-shot `window`
+  // message tagged with this value, transferred by `installAudiocapRelay`
+  // below. What crosses the bridge is the CAPABILITY, not the port: the
+  // renderer feature-detects with
+  // `typeof window.electron?.audiocap?.getPortMessageTag !== 'function'`, so a
+  // shell without the relay loses per-process audio and falls back to
+  // video-only — never to a system mix (C9). Capability, not demand (#2967):
+  // SPA_MIN_CONTRACT stays 19.
+  audiocap: {
+    getPortMessageTag: (): string => AUDIOCAP_PORT_TAG,
+  },
 });
+
+// Installed at module scope, immediately after the bridge, so the relay's
+// `load` listener is registered before the document's load event can fire.
+// Deferring this races app startup into an intermittent no-audio bug.
+installAudiocapRelay(ipcRenderer, window);
 
 // Type definitions for the exposed API
 export interface ElectronAPI {
@@ -787,6 +816,15 @@ export interface ElectronAPI {
       changed: boolean;
       rejected?: boolean;
     }>;
+  };
+
+  /**
+   * Per-process screen-share audio (#3195). The PRESENCE of this function is
+   * the capability probe; its value is the discriminator on the one-shot
+   * `window` message that carries the relay's main-world `MessagePort`.
+   */
+  audiocap: {
+    getPortMessageTag: () => string;
   };
 }
 

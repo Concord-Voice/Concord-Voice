@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.resolve(__dirname, 'classify-playwright-results.mjs');
 
-function runClassify(reportContent) {
+function runClassify(reportContent: string | null) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'classify-'));
   try {
     const reportDir = path.join(tmpDir, 'client/desktop');

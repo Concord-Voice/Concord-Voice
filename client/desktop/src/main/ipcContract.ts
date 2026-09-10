@@ -215,8 +215,22 @@
  *        them. The SERVER's spaIpcContract stays 19: a shell without these
  *        channels yields `undefined` from `getPipSession`, which the renderer
  *        treats as "no PiP voice" — degraded, never unauthenticated.
+ * - v27: audiocap PCM relay (#3195, ADR-0043): one main -> preload channel,
+ *        `audiocap:port`, carrying `port2` of the capture child's
+ *        `MessageChannelMain`. The preload relay validates every quantum and
+ *        forwards it to the main world over a SECOND, preload-created
+ *        `MessageChannel` (design §5 Q6 "Option B′"), so the main world is
+ *        structurally unable to send anything to the process that loads native
+ *        code. A `MessagePort` cannot cross `contextBridge`, so the bridge
+ *        carries only `audiocap.getPortMessageTag()` — the tag on the one-shot
+ *        `window` message that delivers the main-world end.
+ *
+ *        The SERVER's spaIpcContract stays 19: the renderer feature-detects
+ *        that function with `typeof fn !== 'function'`, and a shell without the
+ *        relay loses per-process screen-share audio and falls back to
+ *        video-only — never to a system mix (C9). Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 26;
+export const IPC_CONTRACT_VERSION = 27;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.

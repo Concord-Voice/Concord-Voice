@@ -179,6 +179,37 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
   - Socket.IO → Media Plane (signaling)
   - WebRTC (DTLS-SRTP carrying E2EE frames) → Media Plane (audio/video)
 
+#### Per-process screen-share audio: a third process (ADR-0043, #3195)
+
+The desktop topology is main / renderer plus a third, narrowly-scoped process: an Electron
+**`utilityProcess`** that hosts the first-party `concord-audiocap` native addon
+(`client/desktop/native/concord-audiocap/`). It exists so a memory-safety bug in that native code
+cannot own the main process, which holds SSO tokens and the update path (ADR-0043 D5); the
+renderer is not a candidate host either, since `nodeIntegration` stays off there. **This PR ships
+the mechanism dark** — `canCarryScreenAudio` returns only `'none' | 'system-loopback'`, and the
+capture backend is compiled out of release builds — so no per-process audio track is reachable by
+a user yet; the real Windows/macOS backends and the reachable rung are #3196/#3197/#3198.
+
+Two independent `MessagePort` pairs carry the two things that cross this boundary:
+
+- **Main ↔ child, control only, never PCM** — a `MessageChannelMain` pair created at fork. A
+  closed `hello` / `fault` / `start` / `stop` message set; anything else kills the child
+  (`src/main/audiocapHost.ts`, `src/main/audiocapChild.ts`).
+- **Child → preload → main world, PCM only** — the child hands its PCM port to **preload**
+  (`audiocap:port`, `IPC_CONTRACT_VERSION = 27`), which validates every 3872-byte quantum and
+  relays it over a **second, preload-created `MessageChannel`** to the main world, delivered
+  exactly once (`src/preload/audiocapRelay.ts`). The main world builds the `AudioData` and
+  `MediaStreamTrackGenerator` (`src/renderer/services/voice/screenAudioBridge.ts`); it never holds
+  a port into the child. A raw `MessagePort` cannot cross `contextBridge` (C2), so the bridge
+  exposes only `audiocap.getPortMessageTag()` — the discriminator on the one-shot `window` message
+  that carries the main-world port end.
+
+The property this buys: the main world is **structurally unable to send anything to the process
+that loads native code**, not that it cannot see the audio — it has to decode every quantum to
+build the track. See [ADR-0043](adr/0043-per-process-screen-share-audio-capture.md) § As-built
+addendum for the wire format, the flow-control policy, and why a third teardown rail was deleted
+rather than shipped unwired.
+
 #### SPA Deploy Lifecycle (ADR-0001, ADR-0015)
 
 **Cloudflare Pages** serves the SPA bundle at the CONSTANT URL `https://spa.concordvoice.chat/index.html`. Serving stays decoupled from the Go control-plane. The per-deploy SHA no longer appears in the URL. Pages publishes each deployment atomically and serves the latest at the constant host. The bundle stays decoupled from its serving origin at build time: Vite's `base: './'` makes every chunk resolve relative to the URL that loaded `index.html`.

@@ -201,6 +201,19 @@ vi.mock('../../../src/main/spaLoader', () => ({
 vi.mock('../../../src/main/ipcContract', () => ({ IPC_CONTRACT_VERSION: '1.0' }));
 vi.mock('../../../src/main/permissionManager', () => ({ registerIpcHandlers: vi.fn() }));
 
+// #3195 Task 8 step 4: `killAudiocapHost` is a real module import from
+// `audiocapHost.ts`, mocked (not left to fall through the electron
+// `utilityProcess` gap this file leaves undefined) so its call order and
+// argument-free signature are directly observable per case, matching the
+// mocking convention every other main.ts submodule above already uses.
+const { mockKillAudiocapHost } = vi.hoisted(() => ({ mockKillAudiocapHost: vi.fn() }));
+vi.mock('../../../src/main/audiocapHost', () => ({
+  killAudiocapHost: mockKillAudiocapHost,
+  // Never settles: this suite does not exercise the probe itself, and a
+  // hanging promise is the correct stand-in for "started, no reason to await".
+  probeAudiocapCapability: vi.fn(() => new Promise(() => {})),
+}));
+
 // ── Per-platform re-import harness ─────────────────────────────────────────
 type HandlerFn = (...args: unknown[]) => unknown;
 const PLATFORMS = ['darwin', 'win32', 'linux'] as const;
@@ -215,6 +228,7 @@ async function importMainUnderPlatform(platform: (typeof PLATFORMS)[number]): Pr
   mockMainWindow.on.mockClear();
   mockApp.on.mockClear();
   mockElectronAutoUpdater.on.mockClear();
+  mockKillAudiocapHost.mockClear();
   Object.defineProperty(process, 'platform', { value: platform, configurable: true });
 
   // Import re-runs main.ts module init under this platform; createWindow runs

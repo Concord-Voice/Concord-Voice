@@ -1,5 +1,10 @@
 import { createStore } from '../../utils/runtime/createStore';
 import type { CallState } from '../../services/voice/voiceService/callStateMachine';
+// Type-only, so nothing from the main process is pulled into the renderer bundle --
+// the same layering the `CredentialOwner` imports from `main/ipcContract` already use.
+// The degrade reasons are AUTHORED in the host because the host is what produces them;
+// re-declaring them here would let the two lists drift silently.
+import type { ScreenAudioDegradeReason } from '../../../main/audiocapHost';
 
 // ---------------------------------------------------------------------------
 // Persisted device settings (per-machine via localStorage)
@@ -33,6 +38,50 @@ function savePersistedSettings(settings: PersistedVoiceSettings): void {
     // localStorage full or unavailable — ignore
   }
 }
+
+// ---------------------------------------------------------------------------
+// Local screen-share audio state (#3195, ADR-0043)
+// ---------------------------------------------------------------------------
+
+/**
+ * How the LOCAL share's audio is being carried right now, and -- when it is not --
+ * the mechanism that stopped it.
+ *
+ * WHY THIS EXISTS RATHER THAN A TOAST. `setVideoSlotError` is auto-dismissed after
+ * 5000 ms by `VoiceControls.tsx`, which is right for "that click did nothing" and
+ * wrong for "this share has been video-only for the last forty minutes". A share
+ * that silently lost its audio needs a DURABLE indicator, so this is store state
+ * with no timer attached to it. The transient error path is untouched; the two are
+ * complementary, not alternatives.
+ *
+ * WHY IT IS A UNION AND NOT `{ mode; reason?; overrun }`. C9: degrading NEVER falls
+ * back to a system mix -- `degraded` means video-only WITH A REASON. Making `reason`
+ * optional across every mode would let a `degraded` state with no reason typecheck,
+ * which is precisely the state the user cannot be told anything about. Here the
+ * compiler refuses it, and it equally refuses a `reason` riding along on a healthy
+ * mode, so a stale mechanism string cannot survive a recovery.
+ *
+ * `reason` is a closed enum of MECHANISMS. It is a label on a state, never a
+ * dimension on a counter -- splitting a metric by cause would be a privacy-decision
+ * discriminator under `observability.md` principle 7 (C8).
+ */
+export type ScreenAudioState =
+  | {
+      /**
+       * `off` no audio in this share · `system` the whole-desktop mix
+       * (`chromeMediaSource: 'desktop'`, today's only capture path) ·
+       * `per-process` the concord-audiocap tap.
+       */
+      mode: 'off' | 'system' | 'per-process';
+      reason?: undefined;
+      /**
+       * Quanta the capture child had to drop because the consumer fell behind
+       * (design 4c/4f). Surfaced as a VISIBLE FAULT rather than a log line;
+       * scalar and deliberately undimensioned.
+       */
+      overrun: number;
+    }
+  | { mode: 'degraded'; reason: ScreenAudioDegradeReason; overrun: number };
 
 // ---------------------------------------------------------------------------
 // Voice participant state
@@ -296,6 +345,12 @@ interface VoiceState {
    * control and the second to decide what it says.
    */
   isScreenAudioCapable: boolean;
+  /**
+   * The LOCAL share's audio transport and its health -- durable, unlike the 5000 ms
+   * `videoSlotError` toast. Orthogonal to `isScreenAudioOn`: that flag answers "is a
+   * screen-audio producer live", this answers "by what path, and if none, why".
+   */
+  screenAudio: ScreenAudioState;
   localIsTesting: boolean;
 
   // Participants (keyed by userId)
@@ -420,6 +475,11 @@ interface VoiceState {
   setScreenSharing: (sharing: boolean) => void;
   setScreenAudioOn: (on: boolean) => void;
   setScreenAudioCapable: (capable: boolean) => void;
+  /**
+   * Replace the whole screen-audio state. A REPLACE, not a merge: a merge would let a
+   * `reason` from a previous degrade survive into the state that succeeded it.
+   */
+  setScreenAudioState: (next: ScreenAudioState) => void;
   setLocalIsTesting: (testing: boolean) => void;
   setActiveSpeaker: (userId: string | null) => void;
   setAudioInputDevice: (deviceId: string) => void;
@@ -564,6 +624,7 @@ const initialState = {
   isScreenSharing: false,
   isScreenAudioOn: false,
   isScreenAudioCapable: false,
+  screenAudio: { mode: 'off', overrun: 0 } as ScreenAudioState,
   localIsTesting: false,
   participants: {} as Record<string, VoiceParticipant>,
   screenShareMuted: {} as Record<string, boolean>,
@@ -700,6 +761,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setScreenSharing: (isScreenSharing) => set({ isScreenSharing }),
   setScreenAudioOn: (isScreenAudioOn) => set({ isScreenAudioOn }),
   setScreenAudioCapable: (isScreenAudioCapable) => set({ isScreenAudioCapable }),
+  setScreenAudioState: (screenAudio) => set({ screenAudio }),
   setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),
   setActiveSpeaker: (activeSpeakerId) => set({ activeSpeakerId }),
   setAudioInputDevice: (audioInputDeviceId) => {
