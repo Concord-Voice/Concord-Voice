@@ -242,11 +242,13 @@ const mediaCodecs: RouterRtpCodecCapability[] = [
     rtcpFeedback: VIDEO_RTCP_FEEDBACK,
   },
 
-  // NOTE: H265/HEVC is NOT usable. mediasoup lacks support (as of 3.13.x),
-  // Chrome/Firefox refuse to ship it in WebRTC, and HEVC carries patent
-  // royalty obligations (MPEG LA, HEVC Advance, Access Advance) that
-  // require legal review before any implementation. AV1 covers the same
-  // use case royalty-free with better compression.
+  // NOTE: H265/HEVC is deliberately absent here. Policy is ADR-0044
+  // ([internal]0044-codec-admission-policy.md): Concord admits HARDWARE HEVC
+  // and never ships, vendors, or writes a software implementation. It is not
+  // routable yet either -- mediasoup 3.26.0's supportedRtpCapabilities lists
+  // only AV1, H264, VP8, and VP9, with no H265 worker codec class. #3241 adds
+  // one behind a router flag and #3242 adds the HEVC arm of media frame
+  // crypto v5; both must land before an entry belongs in this list.
 
   // ── VIDEO: AV1 — Best compression, SVC capable ────────────────────────
   // Chrome 90+ encode (software libaom), Chrome 113+ improved real-time.
