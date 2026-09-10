@@ -581,6 +581,7 @@ func testActivityPolicySettings(
 // the action the user took in order not to be observed.
 func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
 	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = true // a live generation was published and is now retracted
 	var gotBefore, gotAfter ActivityPolicySettings
 	service.settingsRecipients = func(
 		_ context.Context, _ uuid.UUID, before ActivityPolicySettings, after ActivityPolicySettings,
@@ -616,6 +617,7 @@ func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
 
 func TestForceSuppressHiddenSenderActivity_BypassesVisibleRecheckAndClearsBothCategories(t *testing.T) {
 	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = true // a live generation was published and is now retracted
 	service.senderPresence = alwaysPermitPresence{}
 
 	err := service.ForceSuppressHiddenSenderActivityAlreadyGated(
@@ -664,6 +666,10 @@ func TestSuppressHiddenSenderActivity_VisibleSenderDoesNothing(t *testing.T) {
 
 func TestSuppressHiddenSenderActivity_ResolutionErrorDisconnects(t *testing.T) {
 	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	// A live generation exists, so the probe finds one and the escalation stands.
+	// This is now a Get-shaped precondition, not a Delete-shaped one: the
+	// resolver-failure path never reaches a delete.
+	store.getFound = true
 	resolverErr := errors.New("hidden-sender recipient resolution failed")
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
@@ -680,11 +686,15 @@ func TestSuppressHiddenSenderActivity_ResolutionErrorDisconnects(t *testing.T) {
 		"an unresolvable audience must fail closed to a disconnect")
 	assert.Empty(t, delivery.plans, "no partial clear may be delivered")
 	assert.Empty(t, store.exactDeletes,
-		"the audience is resolved before deletion, so a resolver failure deletes nothing")
+		"a resolver failure must DELETE NOTHING -- the stored generation is the "+
+			"only evidence of what was published, and a caller whose audience we "+
+			"cannot name still owns its state (see the voice cross-scope move)")
 }
 
 func TestSuppressHiddenSenderActivity_EmptyAudienceIsQuiet(t *testing.T) {
 	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = true // otherwise the !deletedAny guard returns first
+	// and this never reaches the empty-audience path
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
 	) (map[uuid.UUID]bool, error) {

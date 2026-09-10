@@ -110,7 +110,8 @@ func TestActivityService_HiddenSenderClearDeliveryFailureDisconnectsOnlyRecipien
 	})
 
 	t.Run("edge arm", func(t *testing.T) {
-		service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+		service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+		store.exactDeleteResult = true // a clear only has meaning if something was published
 		deliverErr := errors.New("forced hidden-sender edge delivery failure")
 		delivery.deliverErr = deliverErr
 
@@ -132,6 +133,7 @@ func TestActivityService_HiddenSenderClearDeliveryFailureDisconnectsOnlyRecipien
 // are deleted and both audiences cleared in a single pass.
 func TestActivityService_HiddenSenderEdgeCoversBothCategoriesInOnePass(t *testing.T) {
 	service, _, store, delivery, coordinator := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = true // a live generation was published and is now retracted
 
 	err := service.SuppressHiddenSenderActivityAlreadyGated(
 		context.Background(), activityServiceSender,
@@ -339,4 +341,149 @@ func TestActivityService_HiddenSenderLevelArmSteadyStateIgnoresResolveError(t *t
 	assert.Zero(t, delivery.disconnectAllCalls,
 		"a discarded steady-state resolve error must not disconnect anyone")
 	assert.Empty(t, delivery.plans)
+}
+
+// The 1006 storm (#2444 follow-on). `hiddenSenderWidestPriorSettings` makes
+// priorEligible unconditionally true, so a sender that published nothing
+// resolves to "settings evidence unavailable for prior-eligible policy" on EVERY
+// suppressed edge. Escalating that to a replica-wide disconnect was
+// self-sustaining: each disconnect is some user's last connection, which fires
+// transitionUserOffline -> this suppressor -> another replica-wide disconnect.
+//
+// Nothing was stored, so no recipient holds a badge for a published generation
+// and there is nothing an unnameable audience could be holding.
+func TestSuppressHiddenSenderActivity_NothingStoredNeverDisconnectsOnResolverFailure(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.getFound = false // the steady state: this sender published nothing
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		return nil, errors.New(
+			"rich-presence server_voice settings evidence unavailable for prior-eligible policy",
+		)
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err, "an unnameable audience for an unpublished generation is not an error")
+	assert.Zero(t, delivery.disconnectAllCalls,
+		"this is the arm that dropped every client on the replica on a fixed cadence")
+	assert.Empty(t, delivery.plans, "nothing was published, so there is nothing to clear")
+	assert.Empty(t, delivery.disconnects)
+	assert.Empty(t, store.exactDeletes,
+		"the resolver-failure path must reach no delete at all")
+	assert.Len(t, store.gets, 2,
+		"it answers 'was anything published' with a READ, which does not destroy "+
+			"the evidence a delete would")
+}
+
+// Control for the test above: the !deletedAny guard is scoped to the resolver
+// arm alone. A delete that FAILED tells us nothing about whether a generation
+// was published, so it must still fail closed -- otherwise the guard would be a
+// blanket "never disconnect when deletedAny is false" and this whole path would
+// go fail-open.
+func TestSuppressHiddenSenderActivity_DeleteFailureStillFailsClosedWithNothingStored(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = false // a failed DEL reports no rows removed
+	deleteErr := errors.New("forced hidden-sender delete failure")
+	store.deleteErr = deleteErr
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.ErrorIs(t, err, deleteErr)
+	assert.Equal(t, 1, delivery.disconnectAllCalls,
+		"an unknown store state must still fail closed")
+	assert.Empty(t, delivery.plans)
+}
+
+// With nothing stored the arm terminates benignly even when the audience RESOLVES
+// cleanly -- it does not broadcast clear frames for a generation that was never
+// published. This mirrors suppressHiddenSenderGeneration's `!deleted` terminal in
+// activity_service.go, which has behaved this way since #2444; the edge arm was
+// the twin that never got the distinction.
+func TestSuppressHiddenSenderActivity_NothingStoredDeliversNoClears(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = false
+	resolved := false
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		resolved = true
+		return map[uuid.UUID]bool{activityServiceViewer: true}, nil
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, resolved,
+		"the audience is still resolved first -- deleting would erase the evidence it reads")
+	assert.Empty(t, delivery.plans)
+	assert.Zero(t, delivery.disconnectAllCalls)
+	assert.Empty(t, delivery.disconnects)
+}
+
+// The invariant PR #3238 initially broke and CI caught: a recipient-resolution
+// failure must destroy nothing. The stored generation is the only evidence of
+// what was published, so a caller whose audience we cannot name still owns its
+// state. `TestPrivateCrossScopeMoveWithoutOldLeasePreservesUnknownOldPeer` in
+// internal/voice depends on exactly this -- a cross-scope move with a missing
+// old lease reaches here for a peer whose ActivityState the move must leave
+// untouched, and an unconditional delete silently erased it.
+func TestSuppressHiddenSenderActivity_ResolverFailureDeletesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		published       bool
+		wantDisconnects int
+	}{
+		{name: "nothing published", published: false, wantDisconnects: 0},
+		{name: "a live generation exists", published: true, wantDisconnects: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+			store.getFound = tc.published
+			store.exactDeleteResult = true // would be observable IF a delete ran
+			service.settingsRecipients = func(
+				context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+			) (map[uuid.UUID]bool, error) {
+				return nil, errors.New("forced hidden-sender resolution failure")
+			}
+
+			_ = service.SuppressHiddenSenderActivityAlreadyGated(
+				context.Background(), activityServiceSender,
+			)
+
+			assert.Empty(t, store.exactDeletes,
+				"no delete may run on the resolver-failure path, in either direction")
+			assert.Equal(t, tc.wantDisconnects, delivery.disconnectAllCalls)
+			assert.Empty(t, delivery.plans, "no partial clear may be delivered")
+		})
+	}
+}
+
+// The probe itself failing is an UNKNOWN store state stacked on an unnameable
+// audience. That must fail closed -- it is the one case where we genuinely
+// cannot rule out a live badge.
+func TestSuppressHiddenSenderActivity_ProbeFailureFailsClosed(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.getErr = errors.New("forced hidden-sender probe failure")
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (map[uuid.UUID]bool, error) {
+		return nil, errors.New("forced hidden-sender resolution failure")
+	}
+
+	err := service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.ErrorIs(t, err, store.getErr)
+	assert.Equal(t, 1, delivery.disconnectAllCalls,
+		"an unknown store state cannot rule out a live badge")
+	assert.Empty(t, store.exactDeletes)
 }

@@ -75,6 +75,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Going invisible no longer knocks everyone else offline** ([#3238](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3238)) — one person setting
+  themselves invisible while sitting in a voice channel could disconnect every other person on the
+  same server, over and over, for as long as anyone stayed connected. Each disconnect triggered the
+  next one, so once it started it kept going on its own. What you saw was the app dropping its
+  connection and reconnecting on a steady rhythm, with no error and nothing in the app to explain
+  it, which is the part that made it hard to recognise as a single fault rather than a flaky
+  network. Underneath, the server was clearing the "in a call" badge that invisible people are
+  meant not to show, and when it could not work out who had been able to see that badge, it took
+  the safe-looking route of disconnecting everyone so nobody could be left seeing something stale.
+  The flaw was that it did this even when the person had never shown a badge in the first place —
+  which is the normal case, so the safe-looking route ran constantly. It now checks whether there
+  was ever anything to hide before reaching for that measure. When there genuinely is a live badge
+  and the audience cannot be determined, it still disconnects, because showing your activity to
+  someone who should not see it is worse than a reconnect.
+
 - **One media server with a badly wrong clock can no longer wedge the rooms it serves** ([#3205](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3205)) —
   the previous fix kept people in the participant list when a media server's clock ran slightly
   ahead. A clock that is wrong by hours rather than seconds caused something worse. Every event

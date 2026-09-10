@@ -806,7 +806,8 @@ func TestActivitySnapshotFinalizationSerializesTerminalAndMoveBeforeExactReload(
 				); err != nil {
 					return err
 				}
-				return store.Delete(ctx, senderID, CategoryServerVoice)
+				_, delErr := store.Delete(ctx, senderID, CategoryServerVoice)
+				return delErr
 			},
 		},
 		{

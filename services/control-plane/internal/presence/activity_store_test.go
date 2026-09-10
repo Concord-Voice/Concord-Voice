@@ -177,13 +177,26 @@ func TestActivityStoreCurrentState(t *testing.T) {
 			require.NoError(t, rdb.Set(ctx, exactKey, `{}`, time.Minute).Err())
 		}
 
-		require.NoError(t, store.Delete(ctx, userID, CategoryServerVoice))
+		removed, err := store.Delete(ctx, userID, CategoryServerVoice)
+		require.NoError(t, err)
+		assert.True(t, removed,
+			"a key that existed reports removed=true -- activity_settings.go feeds "+
+				"this straight into deletedAny, which decides whether a clear is delivered")
 		assert.Equal(t, int64(0), rdb.Exists(ctx, key).Val())
+
+		// The absent-key direction is the one the storm turns on: DEL returns 0,
+		// so removed must be false rather than "no error, therefore fine".
+		removedAgain, err := store.Delete(ctx, userID, CategoryServerVoice)
+		require.NoError(t, err, "deleting an absent key is not an error")
+		assert.False(t, removedAgain,
+			"an absent key reports removed=false; reporting true here would make "+
+				"every invisible sender look like a live generation being revoked")
+
 		assert.Equal(t, int64(1), rdb.Exists(ctx, otherCategoryKey).Val())
 		assert.Equal(t, int64(1), rdb.Exists(ctx, otherUserKey).Val())
 
-		assert.ErrorIs(t, store.Delete(ctx, userID, Category("server_voice:*")), ErrInvalidActivityState)
-		assert.ErrorIs(t, store.Delete(ctx, uuid.Nil, CategoryServerVoice), ErrInvalidActivityState)
+		assert.ErrorIs(t, deleteActivityErr(ctx, store, userID, Category("server_voice:*")), ErrInvalidActivityState)
+		assert.ErrorIs(t, deleteActivityErr(ctx, store, uuid.Nil, CategoryServerVoice), ErrInvalidActivityState)
 	})
 
 	t.Run("malformed state is deleted and never returned", func(t *testing.T) {
@@ -286,7 +299,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 		deleted, err := unavailable.CompareAndDelete(ctx, userID, CategoryServerVoice, token, state.SourceVersion)
 		assert.False(t, deleted)
 		assert.Error(t, err)
-		assert.Error(t, unavailable.Delete(ctx, userID, CategoryServerVoice))
+		assert.Error(t, func() error { _, e := unavailable.Delete(ctx, userID, CategoryServerVoice); return e }())
 	})
 
 	t.Run("caller context cancellation prevents every operation", func(t *testing.T) {
@@ -311,7 +324,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 		deleted, err := store.CompareAndDelete(canceled, userID, CategoryServerVoice, token, state.SourceVersion)
 		assert.False(t, deleted)
 		assert.ErrorIs(t, err, context.Canceled)
-		assert.ErrorIs(t, store.Delete(canceled, userID, CategoryServerVoice), context.Canceled)
+		assert.ErrorIs(t, deleteActivityErr(canceled, store, userID, CategoryServerVoice), context.Canceled)
 		assert.Equal(t, int64(1), rdb.Exists(ctx, key).Val())
 	})
 
@@ -339,7 +352,7 @@ func TestActivityStoreCurrentState(t *testing.T) {
 		deleted, err := broken.CompareAndDelete(ctx, userID, CategoryServerVoice, token, state.SourceVersion)
 		assert.False(t, deleted)
 		assert.Error(t, err)
-		assert.Error(t, broken.Delete(ctx, userID, CategoryServerVoice))
+		assert.Error(t, func() error { _, e := broken.Delete(ctx, userID, CategoryServerVoice); return e }())
 	})
 }
 
@@ -793,4 +806,15 @@ func mapKeys(values map[string]json.RawMessage) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+// deleteActivityErr drops Delete's "did a row actually exist" boolean so a test
+// asserting only on the error keeps reading as one expression. Tests that care
+// about the boolean — the ones covering the hidden-sender escalation guard —
+// call store.Delete directly.
+func deleteActivityErr(
+	ctx context.Context, store *ActivityStore, userID uuid.UUID, category Category,
+) error {
+	_, err := store.Delete(ctx, userID, category)
+	return err
 }

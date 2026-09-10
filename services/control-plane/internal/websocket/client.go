@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -449,7 +451,16 @@ func (c *Client) readPump() {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
+				log.Printf("WebSocket error: %s", describeSocketFailure(err))
+			} else {
+				// The branch above logs only codes OUTSIDE its expected list, and
+				// CloseAbnormalClosure (1006) is IN that list. A plain TCP reset,
+				// EOF or read-deadline is not a CloseError at all, so it misses
+				// those too. Between them that was every way a socket dies
+				// unexpectedly, and all of it was silent -- which is why a
+				// self-sustaining disconnect storm (#2444 follow-on) presented as
+				// client-side 1006s with no server-side trace whatsoever.
+				log.Printf("WebSocket closed: %s", describeSocketFailure(err))
 			}
 			break
 		}
@@ -484,7 +495,12 @@ func (c *Client) writePump() {
 		case message, ok := <-c.Send:
 			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// Hub closed the channel
+				// Hub closed the channel. The close frame below carries an EMPTY
+				// payload, i.e. no status code, which a browser surfaces as 1006
+				// "reason: none" -- indistinguishable from a dead TCP connection.
+				// Log it so a deliberate server-side close can be told apart from
+				// a network failure without attaching a debugger.
+				log.Print("WebSocket closed: hub closed the send channel")
 				_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
@@ -501,4 +517,39 @@ func (c *Client) writePump() {
 			}
 		}
 	}
+}
+
+// describeSocketFailure renders a socket death in a fixed shape that contains no
+// bytes the peer or the network chose. Never log the raw error here.
+//
+// Two distinct leaks make `%v` wrong on this path, and only one of them is
+// obvious:
+//
+//   - A *websocket.CloseError formats as "websocket: close <code> (<label>): <Text>",
+//     and Text is the close frame's reason string -- chosen by the peer. Logging it
+//     hands any client a write primitive into the log sink. sanitizeLogValue is not
+//     applied on this path, so that includes CRLF log forging (CWE-117); even with
+//     it, arbitrary attacker text in an operator's log is not something to keep.
+//     The code is the whole diagnostic value, so the Text is simply dropped.
+//
+//   - A *net.OpError formats with the remote address, i.e. the client's IP. In a
+//     product whose premise is that the operator learns as little as possible
+//     about who is talking to whom, that does not belong in a disconnect log line
+//     that fires on every dropped socket (CWE-532).
+//
+// %T is a Go type name, fixed at compile time, so it carries neither. Timeout is
+// surfaced separately because it is the one distinction the type name loses that
+// an operator actually needs -- an idle-client read deadline and a peer reset are
+// the same *net.OpError.
+func describeSocketFailure(err error) string {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		// Text deliberately omitted: peer-controlled.
+		return fmt.Sprintf("close code=%d", closeErr.Code)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Sprintf("type=%T timeout=true", err)
+	}
+	return fmt.Sprintf("type=%T", err)
 }

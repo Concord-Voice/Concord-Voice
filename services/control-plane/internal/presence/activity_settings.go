@@ -48,7 +48,7 @@ func (s *ActivityService) SuppressAllActivityAlreadyGated(
 	defer cancelCleanup()
 	var cleanupErrors []error
 	for _, category := range []Category{CategoryServerVoice, CategoryPrivateCall} {
-		if err := s.store.Delete(cleanupCtx, userID, category); err != nil {
+		if _, err := s.store.Delete(cleanupCtx, userID, category); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf(
 				"delete account %s rich-presence activity: %w", category, err,
 			))
@@ -88,7 +88,10 @@ func (s *ActivityService) ApplySettingsSuppressionAlreadyGated(
 	cleanupErrors := s.disconnectActivitySettingsRecipients(
 		workCtx, ctx, userID, before, after,
 	)
-	cleanupErrors = append(cleanupErrors, s.deleteSuppressedActivity(workCtx, userID, after)...)
+	// This caller only aggregates errors: the settings-change arm already knows a
+	// policy transition occurred, so the removal count adds nothing here.
+	_, suppressionErrors := s.deleteSuppressedActivity(workCtx, userID, after)
+	cleanupErrors = append(cleanupErrors, suppressionErrors...)
 	return errors.Join(cleanupErrors...)
 }
 
@@ -147,23 +150,33 @@ func (s *ActivityService) disconnectActivitySettingsRecipients(
 	return cleanupErrors
 }
 
+// deleteSuppressedActivity removes each newly-suppressed category and reports
+// whether ANY row actually existed. That boolean is what separates a real
+// revocation (an audience may still hold a badge) from a no-op suppression of a
+// user who had published nothing -- the distinction the sibling in
+// activity_service.go already makes via CompareAndDelete's `deleted`.
 func (s *ActivityService) deleteSuppressedActivity(
 	ctx context.Context,
 	userID uuid.UUID,
 	after ActivityPolicySettings,
-) []error {
+) (bool, []error) {
 	var cleanupErrors []error
+	deletedAny := false
 	if !after.MasterEnabled || after.ServerVoiceTier == TierOff {
-		if err := s.store.Delete(ctx, userID, CategoryServerVoice); err != nil {
+		removed, err := s.store.Delete(ctx, userID, CategoryServerVoice)
+		if err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete suppressed server-voice activity: %w", err))
 		}
+		deletedAny = deletedAny || removed
 	}
 	if !after.MasterEnabled {
-		if err := s.store.Delete(ctx, userID, CategoryPrivateCall); err != nil {
+		removed, err := s.store.Delete(ctx, userID, CategoryPrivateCall)
+		if err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete suppressed private-call activity: %w", err))
 		}
+		deletedAny = deletedAny || removed
 	}
-	return cleanupErrors
+	return deletedAny, cleanupErrors
 }
 
 func validActivityPolicySettings(settings ActivityPolicySettings) bool {
@@ -767,26 +780,101 @@ func (s *ActivityService) suppressHiddenSenderActivityAlreadyGated(
 	// Resolve the audience BEFORE deleting: the resolver reconstructs each
 	// category's scope from the stored generation, so deleting first would erase
 	// the evidence it needs.
-	recipients, err := s.settingsRecipients(
+	recipients, resolveErr := s.settingsRecipients(
 		ctx, userID, hiddenSenderWidestPriorSettings, hiddenSenderSuppressedSettings,
 	)
-	if err != nil {
+
+	if resolveErr != nil {
+		// A resolver failure must NOT delete anything. The stored generation is
+		// the ONLY evidence of what was published, and an unrelated caller's
+		// state has to survive our inability to name its audience -- a voice
+		// cross-scope move with a missing old lease reaches here for a peer whose
+		// state the move is required to leave untouched.
+		//
+		// But escalating unconditionally was a replica-wide outage generator.
+		// `hiddenSenderWidestPriorSettings` makes priorEligible ALWAYS true, so a
+		// sender with no published row resolves to "settings evidence
+		// unavailable" every single time -- and this arm then disconnected every
+		// Rich Presence client on the replica. Each of those disconnects is some
+		// user's last connection, which fires transitionUserOffline -> this same
+		// suppressor, so the storm sustained itself indefinitely.
+		//
+		// Probe instead. A read tells us whether an audience could be holding a
+		// badge without destroying the evidence, which a delete cannot do.
+		published, probeErr := s.hasPublishedActivity(ctx, userID)
+		if probeErr != nil {
+			// Unknown store state on top of an unnameable audience: fail closed.
+			return errors.Join(
+				wrapActivityError("resolve hidden-sender activity recipients", resolveErr),
+				probeErr,
+				s.disconnectAllWithinBudget(ctx),
+			)
+		}
+		if !published {
+			// Nothing was ever published, so no recipient holds a badge and there
+			// is nothing an unnameable audience could be holding. This is the
+			// steady state for every invisible sender, and the storm's origin.
+			return nil
+		}
+		// A live generation exists and we cannot name who can see it.
 		return errors.Join(
-			wrapActivityError("resolve hidden-sender activity recipients", err),
+			wrapActivityError("resolve hidden-sender activity recipients", resolveErr),
 			s.disconnectAllWithinBudget(ctx),
 		)
 	}
 
-	if deleteErrs := s.deleteSuppressedActivity(
+	deletedAny, deleteErrs := s.deleteSuppressedActivity(
 		ctx, userID, hiddenSenderSuppressedSettings,
-	); len(deleteErrs) > 0 {
+	)
+	if len(deleteErrs) > 0 {
 		return errors.Join(
 			errors.Join(deleteErrs...),
 			s.disconnectAllWithinBudget(ctx),
 		)
 	}
 
+	if !deletedAny {
+		// Nothing was stored, so there is no badge to retract. The sibling
+		// suppressHiddenSenderGeneration in activity_service.go already draws
+		// exactly this distinction via CompareAndDelete's `deleted`; the #2444
+		// fix was applied to one twin and not the other.
+		//
+		// Safe because a live badge implies a live row: voice.heartbeat
+		// republishes every 30s (media-plane/src/index.ts) against a 90s
+		// ActivityStateTTL, so a row cannot silently lapse under a sender who is
+		// still broadcasting. Client badges never self-expire
+		// (richPresenceStore.ts), which is why that 3x margin carries this.
+		return nil
+	}
+
 	return s.deliverHiddenSenderClears(ctx, userID, recipients)
+}
+
+// hasPublishedActivity reports whether the sender has a stored generation in
+// EITHER suppressible category. It is a read, deliberately: it answers the same
+// "was anything published" question the delete answers, without destroying the
+// state that answers it. A store error is surfaced rather than folded into
+// false, so an unknown store can fail closed at the call site.
+func (s *ActivityService) hasPublishedActivity(
+	ctx context.Context, userID uuid.UUID,
+) (bool, error) {
+	var probeErrors []error
+	for _, category := range []Category{CategoryServerVoice, CategoryPrivateCall} {
+		_, found, err := s.store.Get(ctx, userID, category)
+		if err != nil {
+			probeErrors = append(probeErrors, fmt.Errorf(
+				"probe stored %s rich-presence activity: %w", category, err,
+			))
+			continue
+		}
+		if found {
+			return true, nil
+		}
+	}
+	if len(probeErrors) > 0 {
+		return false, errors.Join(probeErrors...)
+	}
+	return false, nil
 }
 
 // deliverHiddenSenderClears aims one clear frame per category at the resolved

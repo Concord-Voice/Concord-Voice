@@ -1321,17 +1321,18 @@ type activityStoreCall struct {
 }
 
 type activityServiceStoreStub struct {
-	setResult        bool
-	setErr           error
-	deleteResult     bool
-	deleteErr        error
-	sets             []activityStoreCall
-	deletes          []activityStoreCall
-	exactDeletes     []activityStoreCall
-	onSet            func()
-	onDelete         func()
-	delete           func(context.Context, uuid.UUID, Category) error
-	compareAndDelete func(
+	setResult         bool
+	setErr            error
+	deleteResult      bool
+	deleteErr         error
+	exactDeleteResult bool
+	sets              []activityStoreCall
+	deletes           []activityStoreCall
+	exactDeletes      []activityStoreCall
+	onSet             func()
+	onDelete          func()
+	delete            func(context.Context, uuid.UUID, Category) error
+	compareAndDelete  func(
 		context.Context, uuid.UUID, Category, uuid.UUID, int64,
 	) (bool, error)
 	getState ActivityState
@@ -1380,16 +1381,16 @@ func (s *activityServiceStoreStub) Delete(
 	ctx context.Context,
 	userID uuid.UUID,
 	category Category,
-) error {
+) (bool, error) {
 	s.exactDeleteContexts = append(s.exactDeleteContexts, ctx)
 	s.exactDeletes = append(s.exactDeletes, activityStoreCall{userID: userID, category: category})
 	if s.onDelete != nil {
 		s.onDelete()
 	}
 	if s.delete != nil {
-		return s.delete(ctx, userID, category)
+		return s.exactDeleteResult, s.delete(ctx, userID, category)
 	}
-	return s.deleteErr
+	return s.exactDeleteResult, s.deleteErr
 }
 
 func (s *activityServiceStoreStub) CompareAndSet(

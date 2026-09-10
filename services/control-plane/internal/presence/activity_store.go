@@ -679,23 +679,28 @@ func (s *ActivityStore) CompareAndDelete(
 }
 
 // Delete removes the one validated sender/category key regardless of lifecycle
-// generation. It is reserved for explicit category suppression.
+// generation. It is reserved for explicit category suppression, and reports
+// whether a row actually existed. That count is load-bearing, not informational: a suppression
+// that removed nothing has no audience holding a badge, and callers use that to
+// distinguish "nothing was ever published" from "a live generation was revoked"
+// (#2444). Redis DEL already returns the count; it was previously discarded.
 func (s *ActivityStore) Delete(
 	ctx context.Context,
 	userID uuid.UUID,
 	category Category,
-) error {
+) (bool, error) {
 	key, err := activityKey(userID, category)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if s == nil || s.redis == nil {
-		return errors.New("rich-presence activity store unavailable")
+		return false, errors.New("rich-presence activity store unavailable")
 	}
-	if err := s.redis.Del(ctx, key).Err(); err != nil {
-		return fmt.Errorf("delete exact rich-presence activity state: %w", err)
+	removed, err := s.redis.Del(ctx, key).Result()
+	if err != nil {
+		return false, fmt.Errorf("delete exact rich-presence activity state: %w", err)
 	}
-	return nil
+	return removed > 0, nil
 }
 
 func activityGenerationKey(

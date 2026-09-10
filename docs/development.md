@@ -111,8 +111,13 @@ PORT=3000
 # loopback-only container, an IPv6-only host, or link-local addresses only),
 # so no warning is not the same as a correct setting.
 ANNOUNCED_IP=
+# The code default is 40000-49999 and its width is deliberate (it is the
+# envelope the production firewall opens and ADR-0042 allocates inside). This
+# block runs the media plane directly on the host, where that full range
+# overlaps coturn's published 49152-49252/udp -- not fatal, coturn binds first
+# and mediasoup retries, but it wastes binds. Match dev compose instead.
 RTC_MIN_PORT=40000
-RTC_MAX_PORT=49999
+RTC_MAX_PORT=40099
 EOF
 
 # Run the service

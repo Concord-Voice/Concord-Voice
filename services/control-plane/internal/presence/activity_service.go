@@ -36,7 +36,7 @@ type activityStateStore interface {
 	IsActiveGeneration(context.Context, uuid.UUID, Category, uuid.UUID, int64) (bool, error)
 	CompareAndDelete(context.Context, uuid.UUID, Category, uuid.UUID, int64) (bool, error)
 	Get(context.Context, uuid.UUID, Category) (ActivityState, bool, error)
-	Delete(context.Context, uuid.UUID, Category) error
+	Delete(context.Context, uuid.UUID, Category) (bool, error)
 }
 
 type activityAuthorizer func(context.Context, PolicyInput) (Decision, error)
