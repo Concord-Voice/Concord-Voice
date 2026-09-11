@@ -96,7 +96,55 @@ export type ScreenAudioDegradeReason =
   | 'capability-fault'
   | 'protocol-fault'
   | 'produce-rejected'
+  // The tap is alive and delivering, and nothing has ever been audible.
+  //
+  // ADVISORY, AND DELIBERATELY NOT `consent-denied`. R9 measured that a
+  // TCC-denied Core Audio tap returns noErr from every call and delivers ~94
+  // correctly-shaped callbacks a second carrying only zeros -- byte-identical
+  // to a granted tap on a paused app. Nothing at the capture seam distinguishes
+  // them, so a `consent-denied` member would be a mechanism string the
+  // mechanism cannot detect, which is the same defect as inventing a reason to
+  // describe a caller bug. See the #3197 PR 2 spec amendment, section 9.0.
+  //
+  // DECLARED AND UNREACHABLE IN THIS PR, stated here for the same reason
+  // `kPermissionDenied` and `ThreadStartFailed` state it at their own
+  // declarations: nothing produces it. The route the design names is
+  // `status().faulted` -> `fault{stage:'run'}` -> here, and neither leg exists
+  // yet -- `QuantumPump::fault()` has no production caller and
+  // `AudiocapFaultStage` has no `'run'` member. #3198 owns both, alongside the
+  // watchdog that reads the counters this reason would be derived from. A
+  // reader who assumed a live path would go looking for a producer that is not
+  // there.
+  | 'capture-starved'
   | 'unsupported-os';
+
+/**
+ * THE EXHAUSTIVENESS ANCHOR for `ScreenAudioDegradeReason`, and it exists
+ * because a test cannot supply one.
+ *
+ * `tsconfig.json` includes only `src/**` (verified: zero files under `tests/`
+ * are in the type program), so a union enumerated as a typed array inside a
+ * test file is NEVER type-checked — it reads like a gate and can never fail.
+ * Declaring the set HERE makes a missing member a compile error and gives the
+ * test something real to assert against at runtime. Same reasoning, and the
+ * same shape, as `START_FAILURE_REASONS` in audiocapChild.ts.
+ *
+ * A MEMBERSHIP SET, NOT A PHRASE MAP. #3197 PR 2 ships no user-facing copy for
+ * these — the renderer has no consumer for the union yet, and adding one would
+ * be new UI in a PR that ships dark. #3198 owns the copy alongside the ladder
+ * rung that makes these states reachable.
+ */
+export const SCREEN_AUDIO_DEGRADE_REASONS: Readonly<Record<ScreenAudioDegradeReason, true>> = {
+  'no-backend': true,
+  'handshake-timeout': true,
+  'child-crash': true,
+  'load-fault': true,
+  'capability-fault': true,
+  'protocol-fault': true,
+  'produce-rejected': true,
+  'capture-starved': true,
+  'unsupported-os': true,
+};
 
 export type AudiocapStartResult =
   | {
@@ -412,8 +460,46 @@ export function startAudiocapHost(generation: number): Promise<AudiocapStartResu
       // which are charset-restricted and length-capped by the protocol.
       stdio: 'pipe',
     });
+    // C8, AND ITS ONE DEV-ONLY EXCEPTION.
+    //
+    // Piping and draining without a 'data' listener discards the child's stdout
+    // and stderr, which is what stops a loader failure carrying an
+    // `Error.cause` from becoming a log line nobody sanitised. That is a
+    // PRODUCTION concern, and it had a cost nobody priced: it also discarded the
+    // consent/liveness line design §6.2 says a developer must be able to read,
+    // so `signalTotal` and `silentSinceStart` were computed on every callback
+    // and reached no human at all. R9 measured state B precisely so that a
+    // developer would stop inferring denial from silence; with the child's only
+    // voice muted, they still had to.
+    //
+    // In a packaged build nothing changes. Unpackaged, the child's stderr is
+    // echoed — it is the developer's own machine, the addon is their own build,
+    // and a raw `Error.cause` in a dev console is the thing they are debugging.
     child.stdout?.resume();
-    child.stderr?.resume();
+    if (app.isPackaged) {
+      child.stderr?.resume();
+    } else {
+      // BOUNDED, because an unbounded echo is a new failure mode rather than a
+      // diagnostic: a native crash loop or verbose logging left on by mistake
+      // would flood a dev console and bury the one line this exists to show.
+      // Same posture as the rest of this surface — PCM_PROTOCOL_FAULT_LIMIT in
+      // audiocapChild.ts caps repeats, FAULT_MESSAGE_MAX_CHARS caps length.
+      //
+      // Dropping the tail rather than the head is deliberate: the liveness line
+      // is written at teardown, so a run that hits the cap has already gone
+      // wrong in a way the first chunks describe better than the last.
+      let echoed = 0;
+      child.stderr?.on('data', (chunk: Buffer) => {
+        if (echoed >= CHILD_STDERR_ECHO_LIMIT) return;
+        const text = chunk.toString('utf8').trimEnd();
+        if (text.length === 0) return;
+        echoed += 1;
+        console.debug('[audiocap:child]', text.slice(0, CHILD_STDERR_ECHO_MAX_CHARS));
+        if (echoed === CHILD_STDERR_ECHO_LIMIT) {
+          console.debug('[audiocap:child] …further output suppressed (echo cap reached)');
+        }
+      });
+    }
 
     const live: HostSession = {
       generation,
@@ -466,6 +552,17 @@ export function startAudiocapHost(generation: number): Promise<AudiocapStartResu
  * generations, and a collision with this one is harmless because I2 fences on
  * session IDENTITY rather than on the number.
  */
+/// Bounds on the dev-only child-stderr echo. Neither exists in a packaged build,
+/// where nothing listens at all.
+///
+/// The cap is not paranoia about volume: it is that an unbounded echo turns a
+/// native crash loop into a flooded console, burying the single liveness line
+/// this channel was opened to carry. Shaped after the rest of this surface --
+/// `PCM_PROTOCOL_FAULT_LIMIT` (audiocapChild.ts) caps repeats and
+/// `FAULT_MESSAGE_MAX_CHARS` (audiocapProtocol.ts) caps length.
+const CHILD_STDERR_ECHO_LIMIT = 200;
+const CHILD_STDERR_ECHO_MAX_CHARS = 4096;
+
 const PROBE_GENERATION = 1;
 
 /**

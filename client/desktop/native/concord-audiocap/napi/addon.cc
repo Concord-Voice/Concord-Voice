@@ -21,7 +21,7 @@
 #include <atomic>
 #include <cstddef>  // size_t, named directly in the macOS sysctl branch
 #include <cstdint>
-#include <cstdio>   // std::snprintf, std::sscanf
+#include <cstdio>   // std::snprintf
 #include <cstring>
 
 #include "../rt/capture_backend.h"
@@ -40,6 +40,7 @@
 #  include <windows.h>
 #elif defined(__APPLE__)
 #  include <sys/sysctl.h>
+#  include "../rt/platform/macos/tap_floor.h"
 #endif
 
 namespace {
@@ -63,12 +64,11 @@ namespace {
 constexpr unsigned long kWindowsProcessLoopbackFloorBuild = 20348ul;
 #endif
 
-#if defined(__APPLE__)
-// CoreAudio process taps: AudioHardwareCreateProcessTap + CATapDescription arrived
-// in macOS 14.2 and matured in 14.4. ADR-0043 D6 takes 14.4 as the floor.
-constexpr int kMacOsTapFloorMajor = 14;
-constexpr int kMacOsTapFloorMinor = 4;
-#endif
+// THE macOS FLOOR IS NOT DECLARED HERE ANY MORE. It lives in
+// rt/platform/macos/tap_floor.h as a pure predicate, because after #3197 PR 2
+// there are TWO readers -- this probe, and rt::platformBackend(), which is the
+// actual enforcement point -- and two copies of a version comparison are two
+// chances to disagree about which machines may capture. Design section 9.3.
 
 struct Capability {
   const char*   platform;
@@ -137,15 +137,32 @@ Capability probeCapability() {
     // walks to a NUL -- a future node or a partial write turns a defensive gap
     // into an over-read.
     cap.osVersion[sizeof(cap.osVersion) - 1] = '\0';
-    int major = 0;
-    int minor = 0;
-    // A patch component may or may not be present ("14.4" and "14.4.1" both occur).
-    const int parsed = std::sscanf(cap.osVersion, "%d.%d", &major, &minor);
-    if (parsed < 1) {
-      cap.reason = "could not parse the macOS version";
-    } else if (major > kMacOsTapFloorMajor ||
-               (major == kMacOsTapFloorMajor && minor >= kMacOsTapFloorMinor)) {
+    // ONE predicate, shared with rt::platformBackend(). It handles the optional
+    // patch component ("14.4" and "14.4.1" both occur) itself.
+    //
+    // A DELIBERATE BEHAVIOUR CHANGE from the std::sscanf("%d.%d") this replaces,
+    // and it is a TIGHTENING: sscanf reads "14.4x" as 14.4 and reports CAPABLE,
+    // while the predicate refuses anything it cannot fully parse. Neither form is
+    // reachable today -- kern.osproductversion is plain numeric, measured
+    // "26.6.2" -- but the two differ, and the predicate fails CLOSED where sscanf
+    // failed open, which is the posture every other refusal in this addon takes.
+    // The cost if Apple ever adds a suffix is a capable machine denied capture
+    // rather than an unreadable one granted it.
+    // Fully qualified: the `namespace rt =` alias is declared further down
+    // (addon.cc:312), after this probe.
+    //
+    // ONE PREDICATE, TWO REASONS. meetsTapFloor answers the DECISION and
+    // collapses "below the floor" with "unreadable", which is right -- both must
+    // refuse. The DIAGNOSTIC must not collapse them: an unparseable string
+    // reported as "below the floor" tells a user on macOS 26 that their OS is
+    // too old, which may be flatly untrue, and index.d.ts documents `reason` as
+    // words fit to show a user. The sibling sysctl-failure branch above already
+    // keeps its own distinct reason; this one lost its when the sscanf form was
+    // replaced by the predicate, and the two now match again.
+    if (concord::audiocap::rt::macos::meetsTapFloor(cap.osVersion)) {
       cap.perProcessAudio = true;
+    } else if (!concord::audiocap::rt::macos::parsesAsVersion(cap.osVersion)) {
+      cap.reason = "could not read the macOS version";
     } else {
       cap.reason = "macOS is below the CoreAudio process-tap floor";
     }
@@ -483,8 +500,14 @@ void hostJoin(void* /*handle*/) noexcept {
 
 std::uint64_t hostNowNs() noexcept { return uv_hrtime(); }
 
+// The bounded-wait hook a callback-driven backend uses INSTEAD of a join.
+// uv_sleep rather than std::this_thread::sleep_for: libuv is already linked
+// through N-API, and this keeps <thread> out of a translation unit compiled
+// with -fno-exceptions.
+void hostSleepMs(rt::u32 ms) noexcept { uv_sleep(static_cast<unsigned int>(ms)); }
+
 #ifdef CONCORD_AUDIOCAP_SYNTHETIC
-const rt::HostServices kHostServices = {&hostSpawn, &hostJoin, &hostNowNs};
+const rt::HostServices kHostServices = {&hostSpawn, &hostJoin, &hostNowNs, &hostSleepMs};
 #else
 // NO SPAWN AND NO JOIN IN A SHIPPED BINARY. Null rather than absent, because the
 // struct is the contract and it does not change shape between builds; a backend
@@ -492,7 +515,11 @@ const rt::HostServices kHostServices = {&hostSpawn, &hostJoin, &hostNowNs};
 // fail-closed answer and the one SyntheticBackend already gives for it. There is
 // no such backend on this path today -- platformBackend() is nullptr in PR 1 --
 // and #3196 / PR 2 are both callback-driven.
-const rt::HostServices kHostServices = {nullptr, nullptr, &hostNowNs};
+//
+// sleepMs IS SUPPLIED IN BOTH BUILDS, unlike spawn/join: it is what a
+// callback-driven backend uses to prove its own quiescence, so a shipped binary
+// is exactly where it is needed.
+const rt::HostServices kHostServices = {nullptr, nullptr, &hostNowNs, &hostSleepMs};
 #endif
 
 #ifdef CONCORD_AUDIOCAP_SYNTHETIC
@@ -614,11 +641,29 @@ rt::CaptureBackend* selectBackend() noexcept {
 // that must name N-API and uv.
 // ---------------------------------------------------------------------------
 
+/// THE BACKEND'S EVIDENCE, SNAPSHOTTED BEFORE THE POINTER GOES AWAY.
+///
+/// teardownStopBackend nulls g_capture.backend once it has stopped it, so a
+/// status() call after a share -- which is the ONLY time anyone asks these
+/// questions -- would otherwise read the base-class defaults and report a clean
+/// teardown no matter what happened. Copying three scalars here is also what
+/// keeps status()'s documented promise literally true: it touches neither the
+/// gate, the backend, nor the handle.
+struct BackendEvidence {
+  bool quiesceProved;
+  rt::u32 destroyFailures;
+  rt::u32 lastDeviceStatus;
+};
+BackendEvidence g_backendEvidence = {false, 0u, 0u};
+
 // STEP 2. The OS artefact dies here, BEFORE the gate wait, because the invariant
 // is about the tap existing and not about bytes moving.
 void teardownStopBackend(void* /*ctx*/) noexcept {
   if (g_capture.backend == nullptr) { return; }
   g_capture.backend->stop();
+  g_backendEvidence.quiesceProved    = g_capture.backend->quiesceProved();
+  g_backendEvidence.destroyFailures  = g_capture.backend->destroyFailures();
+  g_backendEvidence.lastDeviceStatus = g_capture.backend->lastDeviceStatus();
   g_capture.backend = nullptr;
 }
 
@@ -994,11 +1039,46 @@ napi_value Status_JS(napi_env env, napi_callback_info /*info*/) {
   NAPI_CALL(env, setBoolProp(env, result, "running", running));
   NAPI_CALL(env, setUint32Prop(env, result, "callbackTotal", counters.callbackTotal));
   NAPI_CALL(env, setUint32Prop(env, result, "quantaTotal", counters.quantaTotal));
+  // THE PAIR R9 FORCED. callbackTotal alone cannot see consent denial: measured,
+  // a denied Core Audio tap delivers ~94 correctly-shaped callbacks a second
+  // with every API returning noErr and every sample zero. signalTotal answers
+  // the different question, and silentSinceStart is the native evaluation of
+  // "callbacks arriving, nothing audible, budget elapsed".
+  //
+  // ADVISORY. It is not a fault, it does not stop a capture, and it cannot
+  // distinguish denial from a user sharing a paused app -- nothing at this seam
+  // can. #3198 owns whatever consumes it.
+  NAPI_CALL(env, setUint32Prop(env, result, "signalTotal", counters.signalTotal));
+  NAPI_CALL(env, setBoolProp(env, result, "silentSinceStart", counters.silentSinceStart));
   NAPI_CALL(env, setUint32Prop(env, result, "overrunTotal", overrun));
   NAPI_CALL(env, setBoolProp(env, result, "faulted", counters.faulted));
   NAPI_CALL(env, setStringProp(env, result, "faultReason",
                                faultReasonName(counters.faultReason)));
   NAPI_CALL(env, setBoolProp(env, result, "poisoned", poisoned));
+
+  // THE BACKEND'S OWN EVIDENCE ABOUT ITS TEARDOWN. Read from the backend rather
+  // than the pump because these are facts about OS artefacts, which the pump
+  // never sees. Defaults on the base class mean a backend that declines to
+  // answer reads as "proved nothing, reported no failures" -- and a NULL
+  // backend, which is every platform without one compiled in, reads the same.
+  //
+  // destroyTapFailures is the one that matters: the destroy status used to be
+  // discarded and the handle cleared on the next line, so a live OS tap on
+  // another application's audio could survive a share with nothing in the
+  // process able to observe it. #3198's watchdog reads this alongside poisoned.
+  // Read live while a capture is running, from the snapshot afterwards. The
+  // snapshot is the load-bearing half: teardownStopBackend nulls the pointer,
+  // and after a share is exactly when these are asked.
+  const rt::CaptureBackend* backend = g_capture.backend;
+  const bool    proved  = backend != nullptr ? backend->quiesceProved()
+                                             : g_backendEvidence.quiesceProved;
+  const rt::u32 failed  = backend != nullptr ? backend->destroyFailures()
+                                             : g_backendEvidence.destroyFailures;
+  const rt::u32 devStat = backend != nullptr ? backend->lastDeviceStatus()
+                                             : g_backendEvidence.lastDeviceStatus;
+  NAPI_CALL(env, setBoolProp(env, result, "quiesceProved", proved));
+  NAPI_CALL(env, setUint32Prop(env, result, "destroyFailures", failed));
+  NAPI_CALL(env, setUint32Prop(env, result, "lastDeviceStatus", devStat));
   return result;
 }
 

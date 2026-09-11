@@ -224,6 +224,26 @@ export interface AudioCapStatus {
   callbackTotal: number;
   /** Saturating; whole quanta actually pushed to the ring. */
   quantaTotal: number;
+  /**
+   * Saturating; callbacks that admitted AT LEAST ONE non-zero sample.
+   *
+   * THE COUNTER STATE B FORCED. Measured on macOS 26.6.2: a TCC-denied process
+   * tap delivers ~94 correctly-shaped callbacks a second, every API returning
+   * `noErr`, every sample zero. So `callbackTotal` answers "is the tap alive"
+   * and this answers "is audio arriving" — different questions, and only the
+   * second one can see denial.
+   */
+  signalTotal: number;
+  /**
+   * Callbacks arrived, `signalTotal` stayed 0, and the budget elapsed.
+   *
+   * ADVISORY, AND IT MUST NOT BE ACTED ON AS A PERMISSION VERDICT. A granted tap
+   * on a PAUSED or muted app is byte-identical to a denied one — also measured —
+   * so nothing at this seam distinguishes them. It never faults, never stops a
+   * capture, and is cleared permanently by the first non-zero sample, so a share
+   * that goes quiet later is never accused.
+   */
+  silentSinceStart: boolean;
   /** Saturating; mirrors the ring's drop counter. */
   overrunTotal: number;
   faulted: boolean;
@@ -246,6 +266,48 @@ export interface AudioCapStatus {
    * process cannot capture again by construction.
    */
   poisoned: boolean;
+
+  /**
+   * Did the backend OBSERVE its own callbacks stop before `stop()` returned?
+   *
+   * `false` means two things that are deliberately not separated: the bounded
+   * wait ran and expired, or it could not run at all because the host supplied
+   * no clock. Both are "this backend did not prove its callbacks stopped", and
+   * a caller that told them apart would be claiming the second one proved
+   * something.
+   *
+   * NOT a fault and NOT a reason to retry. `poisoned` is the signal that the
+   * SEAM could not prove quiescence; this is the narrower claim about the
+   * backend's own barrier, one layer below it.
+   */
+  quiesceProved: boolean;
+
+  /**
+   * OS artefacts whose destroy call REPORTED FAILURE during teardown.
+   *
+   * Non-zero on macOS means `AudioHardwareDestroyProcessTap`,
+   * `AudioHardwareDestroyAggregateDevice` or `AudioDeviceDestroyIOProcID` said
+   * no — and the handle was released regardless, because a failed destroy must
+   * never skip the next one. So a non-zero value here is the only evidence
+   * anywhere in the process that an OS artefact may have outlived the share.
+   * For a process tap that is ADR-0043's privacy invariant failing, and until
+   * this counter existed it failed silently.
+   *
+   * The correct response is to KILL THE CHILD — process exit is what actually
+   * reaps the tap. #3198's watchdog reads this beside `poisoned`.
+   */
+  destroyFailures: number;
+
+  /**
+   * The platform status of the call that refused the last `start()`, or 0.
+   *
+   * PLATFORM-OPAQUE: on macOS it is a Core Audio `OSStatus`, usually a
+   * four-character code. It exists because five different Core Audio calls
+   * collapse into the single `DeviceError` reason, which left an operator
+   * debugging a failed share knowing only that one of them failed. Diagnostic
+   * only — never branch on it; branch on the `AudioCapStartFailure`.
+   */
+  lastDeviceStatus: number;
 }
 
 /**

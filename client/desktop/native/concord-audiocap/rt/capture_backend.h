@@ -96,6 +96,19 @@ struct HostServices {
   bool (*spawn)(void (*entry)(void*), void* arg) noexcept;  // thread-driven backends only
   void (*join)(void* handle) noexcept;
   u64  (*nowNs)() noexcept;
+  /// Bounded wait, for a CALLBACK-DRIVEN backend that has no thread to join and
+  /// must still satisfy stop()'s post-condition itself.
+  ///
+  /// FAILS CLOSED: a null hook means the wait cannot be performed, so the
+  /// backend takes its TIMEOUT arm rather than assuming quiescence -- the same
+  /// posture rt/teardown.h's four hooks take, for the same reason.
+  ///
+  /// A PURE SPIN ON nowNs() IS THE REJECTED ALTERNATIVE. It burns the JS thread
+  /// at the end of every share and, on a contended machine, can keep the audio
+  /// thread from being scheduled to finish -- delaying the very thing it waits
+  /// for. Declared once here rather than twice because #3196's WASAPI backend is
+  /// callback-driven and needs exactly this.
+  void (*sleepMs)(u32 ms) noexcept;
 };
 
 /// The one place the admission rule for a source format is written down.
@@ -205,6 +218,31 @@ class CaptureBackend {
   /// optional, which is why rt/teardown.h watches a counter the PUMP moves on
   /// every entry rather than one the backend volunteers — a witness a conforming
   /// backend can decline to move is not a witness.
+  ///
+  /// AND A HAL / DEVICE-NOTIFICATION CALLBACK MAY NOT TOUCH THE SINK AT ALL --
+  /// not submit(), not noteCallback(), not fault(). This binds every
+  /// callback-driven backend, not just macOS: a Core Audio property listener
+  /// runs on a dispatch queue and #3196's IAudioSessionEvents on an MTA thread,
+  /// and either is a SECOND CONCURRENT WRITER to the pump's non-atomic partial_
+  /// and frameCursor_. That is a data race, not a design choice.
+  ///
+  /// They also move the teardown witness, so a listener firing inside the settle
+  /// window makes an HONEST backend read as a lying one: false abandon, false
+  /// poisoned, a child the host then kills.
+  ///
+  /// fault() IS INCLUDED even though it does not move the witness. A rule of
+  /// "listeners may call fault() but nothing else" obliges every future editor
+  /// to know which pump methods move activityTotal_ -- an internal this header
+  /// deliberately does not expose. "Listeners never touch the pump" is checkable
+  /// by reading one line.
+  ///
+  /// A listener stores into the BACKEND's own atomics and the single producer
+  /// reads them on its next entry. THE COST, NAMED: a device-loss event is
+  /// reported on the next callback rather than instantly, and if the device is
+  /// truly gone there may be no next callback -- which is precisely the case
+  /// callbackTotal and PumpFault::kNoCallbacks already own, with an independent
+  /// witness. The listener was only ever a latency optimisation on a signal that
+  /// already has one.
   virtual BackendStart start(const CaptureTarget& target, QuantumPump& sink,
                              const HostServices& host) noexcept = 0;
 
@@ -247,6 +285,30 @@ class CaptureBackend {
   /// can guarantee about a backend that does not.
   virtual void stop() noexcept = 0;
 
+  /// EVIDENCE, NOT CONTROL. Nothing in rt/ branches on any of these -- they
+  /// exist because stop() is `void` by contract and a backend that could not
+  /// keep its post-condition had no way to say so. Defaults are what a backend
+  /// that declines to answer means, and they are the pessimistic readings.
+  ///
+  /// Did this backend OBSERVE its own callbacks stop before stop() returned?
+  /// FALSE is both "I waited and they did not" and "I could not wait" -- the
+  /// same fact, and a caller that told them apart would be claiming the second
+  /// one proved something.
+  virtual bool quiesceProved() const noexcept { return false; }
+
+  /// OS artefacts whose destroy call REPORTED FAILURE. Non-zero means an
+  /// artefact this backend created may still exist -- for a process tap that is
+  /// the privacy invariant of ADR-0043 failing, and before this existed it
+  /// failed silently: the destroy status was discarded and the handle cleared on
+  /// the next line, so nothing in the process could observe it.
+  virtual u32 destroyFailures() const noexcept { return 0u; }
+
+  /// The platform status of the call that refused the last start(), or 0. The
+  /// VALUE is platform-opaque and must not be interpreted here; it exists so an
+  /// operator debugging a failed share sees the OS's own four-character code
+  /// rather than only the closed-vocabulary BackendStart it collapsed into.
+  virtual u32 lastDeviceStatus() const noexcept { return 0u; }
+
  protected:
   ~CaptureBackend() = default;      // never deleted through the base; never heap
 };
@@ -258,7 +320,15 @@ class CaptureBackend {
 /// step in native-audiocap.yml. #3196 and PR 2 each replace this body with a
 /// platform-conditional one returning their own statically-stored singleton;
 /// nothing here is ever heap-allocated (AV 206).
+#if defined(__APPLE__)
+/// DEFINED IN rt/platform/macos/tap_backend.mm. Returns the Core Audio tap
+/// backend at or above macOS 14.4 and nullptr below it -- which Start_JS
+/// resolves to "NoBackend" through the existing selectBackend() null check, so
+/// the below-floor case needs no new failure member.
+CaptureBackend* platformBackend() noexcept;
+#else
 inline CaptureBackend* platformBackend() noexcept { return nullptr; }
+#endif
 
 }  // namespace rt
 }  // namespace audiocap

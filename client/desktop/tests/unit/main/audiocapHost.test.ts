@@ -23,6 +23,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AUDIOCAP_PROTOCOL, HANDSHAKE_TIMEOUT_MS } from '../../../src/shared/audiocapProtocol';
 import { NATIVE_ADDON_ENV } from '../../../src/main/nativeAddonPath';
+import { SCREEN_AUDIO_DEGRADE_REASONS } from '../../../src/main/audiocapHost';
 
 const fork = vi.fn();
 /**
@@ -571,5 +572,38 @@ describe('audiocap host reaping a child that has not spawned yet (#3245)', () =>
     // would kill its successor's process if the handle were ever reused.
     expect(child.kill).toHaveBeenCalledTimes(1);
     expect(child.onceHandlers.spawn).toBeUndefined();
+  });
+});
+
+describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
+  // ASSERTED AT RUNTIME, AGAINST A SET DECLARED IN src/, and that is the whole
+  // point. tsconfig.json includes only src/** — zero files under tests/ are in
+  // the type program — so a union enumerated as a typed array HERE would never
+  // be type-checked and could never fail. The Readonly<Record<Union, true>> in
+  // audiocapHost.ts is what makes a missing member a compile error; this asserts
+  // the set that error protects.
+  it('has exactly the nine members, including capture-starved', () => {
+    expect(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS).sort()).toEqual(
+      [
+        'capability-fault',
+        'capture-starved',
+        'child-crash',
+        'handshake-timeout',
+        'load-fault',
+        'no-backend',
+        'produce-rejected',
+        'protocol-fault',
+        'unsupported-os',
+      ].sort()
+    );
+  });
+
+  it('does not carry consent-denied', () => {
+    // Not an omission. R9 measured that TCC denial is byte-identical to a
+    // paused app at this seam — every Core Audio call returns noErr and the
+    // callbacks arrive on schedule carrying zeros — so nothing in PR 2 can
+    // honestly produce it. A mechanism string the mechanism cannot detect is
+    // worse than no string at all.
+    expect(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS)).not.toContain('consent-denied');
   });
 });

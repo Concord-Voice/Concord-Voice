@@ -18,6 +18,7 @@
 #include "../rt/quantum_pump.h"
 #include "../rt/capture_backend.h"
 #include "../rt/sink_gate.h"
+#include "../rt/platform/macos/tap_floor.h"
 #include "../rt/teardown.h"
 
 // EVERY include below is here for a symbol this file names directly, and <cstdlib>
@@ -1069,8 +1070,12 @@ struct FakeHost {
   }
 };
 
+// sleepMs is NULL here on purpose: every existing case in this file drives a
+// thread-driven backend that joins, so it never needs a bounded wait, and a null
+// hook is exactly what a callback-driven backend must fail closed on. PR 2's
+// macOS cases supply their own host with the hook populated.
 static const rt::HostServices kFakeHost = {&FakeHost::spawn, &FakeHost::join,
-                                           &FakeHost::nowNs};
+                                           &FakeHost::nowNs, nullptr};
 
 static rt::CaptureTarget oneTarget(rt::u32 pid) {
   rt::CaptureTarget t = {};
@@ -1597,12 +1602,29 @@ static void test_backendContract_aSystemMixIsOnlyReachableByAffirmativeRequest()
   wholeSystem.stop();
 }
 
-static void test_backendContract_platformBackendIsAbsentInPr1() {
-  // PR 1 compiles no platform backend on ANY platform, which is what keeps a
-  // release build's start() returning NoBackend -- the dark-ship gate the
-  // define-separation step in native-audiocap.yml asserts. PR 2 and #3196 each
-  // replace this body; until then a nullptr here IS the feature being off.
+static void test_backendContract_platformBackendIsAbsentWhereNoBackendIsCompiledIn() {
+  // A release build's start() must return NoBackend on any platform that has no
+  // backend compiled in -- the dark-ship gate the define-separation step in
+  // native-audiocap.yml asserts.
+  //
+  // #3197 PR 2 GAVE macOS ONE, so this is now platform-conditional rather than
+  // universal. On Apple, platformBackend() is declared extern and DEFINED IN
+  // rt/platform/macos/tap_backend.mm, which this translation unit does not link
+  // -- asserting here would require compiling Objective-C++ and linking
+  // CoreAudio into a test whose entire purpose is to be platform-neutral and
+  // runnable under the Linux sanitizers.
+  //
+  // The macOS answer is asserted TWICE elsewhere, so nothing is lost:
+  //   - test/macos_tap_test.cc drives TapBackend directly through a fake HAL,
+  //     including the below-floor arm that platformBackend() consults; and
+  //   - native-audiocap.yml's define-separation step loads the real .node on a
+  //     macos runner and requires start() to answer NoTarget, which is only
+  //     reachable when platformBackend() returned a backend.
+#if defined(__APPLE__)
+  CHECK(true);
+#else
   CHECK(rt::platformBackend() == nullptr);
+#endif
 }
 
 static void test_backendContract_targetIsCopiedByValueAndBounded() {
@@ -2623,6 +2645,348 @@ static void test_teardown_boundedWaitOutlastsALateLeaver() {
   holder.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Design section 9.1 -- the silence detector State B forced.
+//
+// R9 measured that a TCC-denied Core Audio tap delivers ~94 correctly-shaped
+// callbacks a second, every API returning noErr, every sample zero. So
+// callbackTotal cannot see denial, and signalTotal exists to answer the
+// different question "is audio arriving" rather than "is the tap alive".
+//
+// These cases pin the property that makes the latch safe to ship: it is
+// ADVISORY and one-shot. A granted tap on a PAUSED app is byte-identical to a
+// denied one -- also measured -- so nothing here may ever act on it.
+// ---------------------------------------------------------------------------
+
+// One quantum of interleaved stereo silence, plus a single settable sample.
+struct SilenceFrames {
+  float s[static_cast<std::size_t>(rt::kFrameCount) * 2u];
+  SilenceFrames() : s() {}
+  const rt::u8* const* planes() {
+    plane_[0] = reinterpret_cast<const rt::u8*>(s);
+    return plane_;
+  }
+ private:
+  const rt::u8* plane_[1];
+};
+
+static void test_silence_latchesOnlyAfterTheBudget() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  SilenceFrames f;
+
+  // 999 quanta of silence is 9.99 s -- still inside the 10 s budget, so the
+  // latch must stay clear. A latch that fired here would accuse every share
+  // with a lead-in.
+  for (rt::u32 i = 0u; i < 999u; ++i) {
+    CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount,
+                        static_cast<rt::u64>(i) * 10000000ull));
+  }
+  CHECK(h.pump.counters().signalTotal == 0u);
+  CHECK(h.pump.counters().silentSinceStart == false);
+
+  // The quantum that crosses 10 s latches it.
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, 10000000000ull));
+  CHECK(h.pump.counters().silentSinceStart == true);
+}
+
+static void test_silence_oneNonZeroSamplePreventsTheLatchForever() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  SilenceFrames f;
+  f.s[17] = 1.0f;                       // exactly one non-zero sample, once
+
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, 0u));
+  CHECK(h.pump.counters().signalTotal == 1u);
+
+  // Silent for the rest of a capture that runs well past the budget. THE
+  // ONE-SHOT PROPERTY: once any audio has ever flowed, the latch can never fire
+  // again for this capture, so a share that goes quiet later is never accused.
+  f.s[17] = 0.0f;
+  for (rt::u32 i = 1u; i <= 2000u; ++i) {
+    CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount,
+                        static_cast<rt::u64>(i) * 10000000ull));
+  }
+  CHECK(h.pump.counters().signalTotal == 1u);
+  CHECK(h.pump.counters().silentSinceStart == false);
+}
+
+static void test_silence_negativeZeroIsNotSignal() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  SilenceFrames f;
+  f.s[3] = -0.0f;                       // 0x80000000, which IS silence
+
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, 0u));
+  // An integer test that only compared against 0x00000000 would call this
+  // signal and would then never latch on a source that emits negative zero.
+  CHECK(h.pump.counters().signalTotal == 0u);
+}
+
+static void test_silence_signalTotalCountsCallbacksNotSamples() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  SilenceFrames f;
+  for (std::size_t i = 0u; i < 64u; ++i) { f.s[i] = 0.5f; }
+
+  // 64 non-zero samples in ONE callback is one unit of signal, not 64: the
+  // counter answers "how many callbacks carried audio", which is what a
+  // consumer comparing it against callbackTotal needs.
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, 0u));
+  CHECK(h.pump.counters().signalTotal == 1u);
+}
+
+static void test_silence_lateFirstSampleClearsAnAlreadyLatchedSilence() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  SilenceFrames f;
+
+  // Silent past the budget: the latch SETS.
+  for (rt::u32 i = 0u; i <= 1000u; ++i) {
+    CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount,
+                        static_cast<rt::u64>(i) * 10000000ull));
+  }
+  CHECK(h.pump.counters().silentSinceStart == true);
+
+  // ...and THEN audio arrives, at t = 12 s. This is the ordering the submit-time
+  // guard structurally cannot handle -- it only ever prevents a latch that has
+  // not happened yet -- so the AND in counters() is the only thing that clears
+  // it. A mutant that drops the AND survives every other case in this file and
+  // is killed here: without it, a share with a long lead-in is reported as
+  // never-audible for the rest of its life.
+  f.s[9] = 0.25f;
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, 12000000000ull));
+  CHECK(h.pump.counters().signalTotal == 1u);
+  CHECK(h.pump.counters().silentSinceStart == false);
+}
+
+// THE CLOCK BASE IS AN INPUT TOO, and every test above holds it at zero.
+//
+// With captureStartNs_ == 0 the budget comparison reduces to
+// `timestampNs >= kSilenceBudgetNs`, so deleting `captureStartNs_ +` from it
+// changes nothing any of them can see -- a surviving mutant, and not a harmless
+// one. Production seeds reset(uv_hrtime()) and stamps from mach_absolute_time,
+// both ~1e13-1e14 ns since boot, so under that mutant EVERY capture latches on
+// its first callback and reports the exact opposite of reality for every user
+// on every share.
+//
+// Same vacuity shape as the audio-then-silence gap this file already closed:
+// one input varied, a second sat at the value that makes the arithmetic
+// disappear.
+static void test_silence_theBudgetIsMeasuredFromTheCaptureStartNotFromZero() {
+  PumpHarness h;
+  const rt::u64 base = 987654321000000ull;   // ~11 days of uptime, as shipped
+  h.pump.reset(base);
+  SilenceFrames f;
+
+  // First callback at the capture's own start: nowhere near the budget.
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, base));
+  CHECK(h.pump.counters().silentSinceStart == false);
+
+  // One nanosecond inside the budget: still clear.
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount,
+                      base + 10000000000ull - 1ull));
+  CHECK(h.pump.counters().silentSinceStart == false);
+
+  // On the budget: latched.
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount,
+                      base + 10000000000ull));
+  CHECK(h.pump.counters().silentSinceStart == true);
+}
+
+// A tap that is ALIVE AND STARVED is what the latch exists to name, and the
+// degenerate callback is the shape that says so most clearly: tap_backend.mm
+// emits fn(ctx, nullptr, 0, true, 0, stamp) whenever Core Audio hands it an
+// empty buffer list. submit() refuses those before it touches the ring, so the
+// budget has to be evaluated ahead of the guards or this capture is invisible.
+static void test_silence_degenerateCallbacksStillLatchTheBudget() {
+  PumpHarness h;
+  const rt::u64 base = 500000000000000ull;
+  h.pump.reset(base);
+
+  // Every one of these is refused by submit()'s own validation -- null planes,
+  // zero channels, zero frames -- and every one of them is a real callback from
+  // a real tap that produced no audio.
+  for (rt::u32 i = 0u; i < 1001u; ++i) {
+    CHECK(h.pump.submit(nullptr, 0u, true, 0u,
+                        base + (static_cast<rt::u64>(i) * 10000000ull)) == false);
+  }
+  CHECK(h.pump.counters().signalTotal == 0u);
+  CHECK(h.pump.counters().silentSinceStart == true);
+}
+
+// ONE CALLBACK, TWO QUANTA, ONE UNIT OF SIGNAL.
+//
+// This is the only case that can tell a per-callback counter from a per-quantum
+// one: every other submit here carries at most kFrameCount frames, so the
+// packing loop runs once and the two are identical. signalTotal is documented as
+// counting CALLBACKS that admitted a non-zero sample, and a consumer compares it
+// against callbackTotal -- so a per-quantum bump could report more
+// signal-bearing callbacks than there were callbacks.
+static void test_silence_signalTotalCountsOnePerCallbackAcrossAQuantumBoundary() {
+  PumpHarness h;
+  h.pump.reset(0u);
+
+  // Two whole quanta of continuous audio delivered as ONE callback.
+  static float twoQuanta[static_cast<std::size_t>(rt::kFrameCount) * 4u];
+  for (std::size_t i = 0u; i < sizeof(twoQuanta) / sizeof(twoQuanta[0]); ++i) {
+    twoQuanta[i] = 0.5f;
+  }
+  const rt::u8* planes[1] = {reinterpret_cast<const rt::u8*>(twoQuanta)};
+
+  CHECK(h.pump.submit(planes, 2u, true,
+                      static_cast<rt::u32>(rt::kFrameCount) * 2u, 0u));
+  CHECK(h.pump.counters().callbackTotal == 0u);   // noteCallback() is the backend's
+  CHECK(h.pump.counters().quantaTotal == 2u);     // two quanta really were packed
+  CHECK(h.pump.counters().signalTotal == 1u);     // ...from ONE callback
+}
+
+// The scan's EXTENT. Every other case puts its non-zero sample in the first few
+// slots, so a half-length scan and a first-64-samples-only scan both survive.
+static void test_silence_signalIsFoundInTheLastSampleOfTheQuantum() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  SilenceFrames f;
+  f.s[(static_cast<std::size_t>(rt::kFrameCount) * 2u) - 1u] = 0.5f;
+
+  CHECK(h.pump.submit(f.planes(), 2u, true, rt::kFrameCount, 0u));
+  CHECK(h.pump.counters().signalTotal == 1u);
+}
+
+// The scan's OFFSET. No other case submits with a non-empty accumulator, so a
+// scan anchored at the head of partial_ rather than at the slice just written
+// survives -- and that mutant is a real bug shape: on a split quantum it
+// re-reads already-scanned silence and misses the new audio entirely.
+static void test_silence_signalIsFoundInASliceThatCompletesAPartialQuantum() {
+  PumpHarness h;
+  h.pump.reset(0u);
+  const rt::u32 half = static_cast<rt::u32>(rt::kFrameCount) / 2u;
+
+  SilenceFrames quiet;
+  CHECK(h.pump.submit(quiet.planes(), 2u, true, half, 0u));
+  CHECK(h.pump.counters().signalTotal == 0u);
+
+  // The accumulator now holds `half` frames of silence, so this slice lands at a
+  // non-zero offset. Its signal sits in the FIRST frame of the source, which is
+  // exactly where a head-anchored scan would not look.
+  SilenceFrames loud;
+  loud.s[0] = 0.75f;
+  CHECK(h.pump.submit(loud.planes(), 2u, true, half, 5000000ull));
+  CHECK(h.pump.counters().signalTotal == 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Design section 9.3 -- ONE floor, read by capability() and platformBackend().
+//
+// The predicate is pure and takes the version as a STRING, which is what makes
+// the below-floor arm provable: no machine in the local or CI fleet runs below
+// 14.4, so injecting "14.3" is the only way to reach that branch at all.
+// ---------------------------------------------------------------------------
+// THE DECISION AND THE DIAGNOSTIC ARE DIFFERENT QUESTIONS, and the second one
+// only exists because collapsing them produced a false statement: an unparseable
+// version reported as "below the floor" tells a user on macOS 26 their OS is too
+// old. meetsTapFloor must still refuse both -- that is the fail-closed half.
+static void test_tapFloor_unparseableIsRefusedButIsNotCalledBelowTheFloor() {
+  using rt::macos::meetsTapFloor;
+  using rt::macos::parsesAsVersion;
+
+  // READABLE AND GENUINELY BELOW: both agree it parsed, the floor said no. These
+  // are the cases where "below the floor" is a true statement to show a user.
+  const char* readableBelow[] = {"14.3", "14", "14.0", "13.9", "0.0"};
+  for (const char* v : readableBelow) {
+    CHECK(meetsTapFloor(v)   == false);
+    CHECK(parsesAsVersion(v) == true);
+  }
+
+  // READABLE AND ABOVE. "26.6.2-beta" belongs here rather than with the
+  // unreadable strings: the scan stops at the PATCH separator and never reads
+  // what follows, so a suffix there is ignored by design. A suffix inside the
+  // major or minor is a different matter -- see "14.4x" below.
+  const char* readableAbove[] = {"26.6.2", "14.4", "14.4.1", "14.10", "26.6.2-beta"};
+  for (const char* v : readableAbove) {
+    CHECK(meetsTapFloor(v)   == true);
+    CHECK(parsesAsVersion(v) == true);
+  }
+
+  // UNREADABLE. Every one of these is refused by the decision -- the safe
+  // direction -- and none of them is evidence about the OS's age.
+  const char* unreadable[] = {"", "14.", ".14.4", "14..4",
+                              "fourteen.four", "14.4x"};
+  for (const char* v : unreadable) {
+    CHECK(meetsTapFloor(v)   == false);
+    CHECK(parsesAsVersion(v) == false);
+  }
+  CHECK(meetsTapFloor(nullptr)   == false);
+  CHECK(parsesAsVersion(nullptr) == false);
+}
+
+static void test_tapFloor_acceptsAtAndAboveRefusesBelow() {
+  using rt::macos::meetsTapFloor;
+  CHECK(meetsTapFloor("14.4")      == true);
+  CHECK(meetsTapFloor("14.4.0")    == true);
+  CHECK(meetsTapFloor("14.4.1")    == true);
+  // NUMERIC, NOT LEXICAL. A string compare puts "14.10" below "14.4".
+  CHECK(meetsTapFloor("14.10")     == true);
+  CHECK(meetsTapFloor("15.0")      == true);
+  CHECK(meetsTapFloor("26.6.2")    == true);   // the machine this was measured on
+  CHECK(meetsTapFloor("14.3")      == false);
+  // 14.2 HAS the tap symbols and is still refused: the @available(macos 14.2)
+  // guard is a SYMBOL floor and sits strictly inside this PRODUCT floor.
+  CHECK(meetsTapFloor("14.2")      == false);
+  CHECK(meetsTapFloor("13.99")     == false);
+}
+
+static void test_tapFloor_anythingUnparseableIsBelowTheFloor() {
+  using rt::macos::meetsTapFloor;
+  CHECK(meetsTapFloor(nullptr)     == false);
+  CHECK(meetsTapFloor("")          == false);
+  CHECK(meetsTapFloor("garbage")   == false);
+  CHECK(meetsTapFloor("14")        == false);  // no minor component -> 14.0
+  CHECK(meetsTapFloor("14.")       == false);
+  CHECK(meetsTapFloor("14.x")      == false);
+  CHECK(meetsTapFloor(".4")        == false);
+  CHECK(meetsTapFloor("14..4")     == false);
+  // KILLS a mutant that treats an unparseable character as end-of-string:
+  // with that bug a malformed version BEGINNING with a valid one is admitted.
+  CHECK(meetsTapFloor("14.4x")     == false);
+  CHECK(meetsTapFloor("14.4-beta") == false);
+}
+
+static void test_tapFloor_patchComponentIsNotFoldedIntoTheMinor() {
+  using rt::macos::meetsTapFloor;
+  // KILLS a mutant that keeps reading past the second dot: 14.3.9 would become
+  // minor 39 and clear a floor of 4 that this version is genuinely below. The
+  // other cases in this file cannot see that bug -- 14.4.1 and 26.6.2 answer
+  // the same either way -- which is why this one exists.
+  CHECK(meetsTapFloor("14.3.9")    == false);
+  CHECK(meetsTapFloor("14.4.9")    == true);
+}
+
+// ---------------------------------------------------------------------------
+// Design section 9.4 -- the bounded-wait hook a callback-driven backend needs.
+//
+// It exists because HostServices::spawn/join are nullptr in a shipped binary,
+// so a Core Audio (or WASAPI) backend has no thread to join and must build its
+// own barrier -- and rt/ may not name a sleep (AV 22/25).
+// ---------------------------------------------------------------------------
+static rt::u32 g_sleptMs = 0u;
+
+static void test_hostServices_sleepHookIsPartOfTheContract() {
+  // A HOST THAT OMITS IT LEAVES IT NULL, and a backend must read that as "the
+  // wait cannot be performed" and take its timeout arm -- the same fail-closed
+  // posture rt/teardown.h's four hooks take. Aggregate-initialising all four
+  // members is what pins the struct's shape against an accidental reorder.
+  const rt::HostServices omitted = {nullptr, nullptr, nullptr, nullptr};
+  CHECK(omitted.sleepMs == nullptr);
+
+  g_sleptMs = 0u;
+  rt::HostServices supplied = {nullptr, nullptr, nullptr, nullptr};
+  supplied.sleepMs = [](rt::u32 ms) noexcept { g_sleptMs += ms; };
+  supplied.sleepMs(5u);
+  supplied.sleepMs(7u);
+  CHECK(g_sleptMs == 12u);
+}
+
 int main() {
   test_packFrames_interleavedStereoIsAStraightCopy();
   test_packFrames_planarStereoInterleaves();
@@ -2647,7 +3011,7 @@ int main() {
   test_gate_entrantIsCountedBeforeItTestsTheClosedBit();
   test_gate_concurrentEnterLeaveVersusClose();
 
-  test_backendContract_platformBackendIsAbsentInPr1();
+  test_backendContract_platformBackendIsAbsentWhereNoBackendIsCompiledIn();
   test_backendContract_aSystemMixIsOnlyReachableByAffirmativeRequest();
   test_backendContract_targetIsCopiedByValueAndBounded();
   test_buildTarget_admitsOneThroughEightAndRefusesNine();
@@ -2672,6 +3036,24 @@ int main() {
   test_teardown_aProducerThatSitsOutTheWindowIsStillRefusedByTheGate();
   test_teardown_runTearsDownABackendThatFailedItsStart();
   test_teardown_boundedWaitOutlastsALateLeaver();
+
+  test_silence_latchesOnlyAfterTheBudget();
+  test_silence_oneNonZeroSamplePreventsTheLatchForever();
+  test_silence_negativeZeroIsNotSignal();
+  test_silence_signalTotalCountsCallbacksNotSamples();
+  test_silence_lateFirstSampleClearsAnAlreadyLatchedSilence();
+  test_silence_signalTotalCountsOnePerCallbackAcrossAQuantumBoundary();
+  test_silence_theBudgetIsMeasuredFromTheCaptureStartNotFromZero();
+  test_silence_degenerateCallbacksStillLatchTheBudget();
+  test_silence_signalIsFoundInTheLastSampleOfTheQuantum();
+  test_silence_signalIsFoundInASliceThatCompletesAPartialQuantum();
+
+  test_tapFloor_acceptsAtAndAboveRefusesBelow();
+  test_tapFloor_unparseableIsRefusedButIsNotCalledBelowTheFloor();
+  test_tapFloor_anythingUnparseableIsBelowTheFloor();
+  test_tapFloor_patchComponentIsNotFoldedIntoTheMinor();
+
+  test_hostServices_sleepHookIsPartOfTheContract();
 
   std::printf("rt_contract_test: %d checks passed\n", g_checks);
   return 0;

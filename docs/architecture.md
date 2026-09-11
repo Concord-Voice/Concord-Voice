@@ -179,16 +179,25 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
   - Socket.IO → Media Plane (signaling)
   - WebRTC (DTLS-SRTP carrying E2EE frames) → Media Plane (audio/video)
 
-#### Per-process screen-share audio: a third process (ADR-0043, #3195)
+#### Per-process screen-share audio: a third process (ADR-0043, #3195, #3197)
 
 The desktop topology is main / renderer plus a third, narrowly-scoped process: an Electron
 **`utilityProcess`** that hosts the first-party `concord-audiocap` native addon
 (`client/desktop/native/concord-audiocap/`). It exists so a memory-safety bug in that native code
 cannot own the main process, which holds SSO tokens and the update path (ADR-0043 D5); the
-renderer is not a candidate host either, since `nodeIntegration` stays off there. **This PR ships
-the mechanism dark** — `canCarryScreenAudio` returns only `'none' | 'system-loopback'`, and the
-capture backend is compiled out of release builds — so no per-process audio track is reachable by
-a user yet; the real Windows/macOS backends and the reachable rung are #3196/#3197/#3198.
+renderer is not a candidate host either, since `nodeIntegration` stays off there.
+
+**The mechanism still ships dark, but it is no longer empty.** `canCarryScreenAudio` returns only
+`'none' | 'system-loopback'`, so no per-process audio track is reachable by a user — that rung, and
+the PID resolution that feeds it, are #3198. What changed with #3197 PR 2 is what sits behind it:
+**macOS 14.4+ now has a real Core Audio process-tap backend** compiled into release builds
+(`rt/platform/macos/`), so `start()` there reaches target validation and refuses with `NoTarget`
+rather than `NoBackend`. Windows still has no producer at all (#3196), and below the macOS 14.4
+product floor `platformBackend()` returns `nullptr`, so `NoBackend` remains correct on both.
+
+The distinction matters for reading the code: "dark" now means *no caller supplies a target*, not
+*no backend exists*. A grep that concludes the macOS path is unimplemented is reading the #3195
+state.
 
 Two independent `MessagePort` pairs carry the two things that cross this boundary:
 

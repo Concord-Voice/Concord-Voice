@@ -71,6 +71,25 @@ on a capability miss is that same defect wearing native clothes.
 `start(options, onQuantumAvailable)` / `drain(into)` / `stop()` / `status()` — the
 PCM transport seam (#3195, #3197).
 
+**macOS has a real backend since #3197 PR 2.** `start()` on a macOS 14.4+ machine
+no longer answers `NoBackend`; with no target supplied it answers `NoTarget`,
+which is the refusal happening *before* any Core Audio call. The state machine
+lives in `rt/platform/macos/tap_backend.h` — header-only and free of any Apple
+header, over a POD of function pointers in `hal_api.h` — so all of it runs on the
+Linux ASAN/UBSAN/TSAN legs against a fake HAL. `tap_backend.mm` is ten wrappers,
+a version read and the singleton, and is the only file here that names Core Audio.
+
+**`status()` carries two counters R9 forced.** Consent denial does not fail
+`start()`: every Core Audio call returns `noErr` and the IOProc fires on schedule
+carrying zeros, so `callbackTotal` cannot see it. `signalTotal` counts callbacks
+that admitted at least one non-zero sample, and `silentSinceStart` latches once
+callbacks have arrived, `signalTotal` is still zero and a 10 s budget has elapsed.
+
+**`silentSinceStart` is ADVISORY and must not be read as a permission verdict.**
+A granted tap on a paused or muted app produces byte-identical all-zero output —
+measured — so nothing at this seam distinguishes the two. It never faults, never
+stops a capture, and is cleared permanently by the first non-zero sample.
+
 ```js
 const { start, drain, stop } = require('./native/concord-audiocap');
 start(
@@ -78,7 +97,11 @@ start(
   onQuantumAvailable
 );
 // { ok: true }  in a CI/test build
-// { ok: false, reason: 'NoBackend' }  in a RELEASE build -- see below
+// RELEASE build, and it is PLATFORM-DEPENDENT since #3197 PR 2:
+//   macOS 14.4+ -> { ok: false, reason: 'NoTarget' }  (a real backend refused
+//                  this target -- the options above carry no targetPids)
+//   elsewhere   -> { ok: false, reason: 'NoBackend' } (no producer compiled in)
+// -- see below
 ```
 
 `options` is checked for **exact equality** with the constants compiled into
@@ -123,10 +146,18 @@ stereo by a byte shuffle, never mixed or resampled. Neither file does
 floating-point arithmetic on a sample, which keeps both inside the JSF++ profile
 with no new deviation.
 
-**The real backend is not implemented.** A release build has no producer at all and
-`start()` returns `NoBackend`, which the host resolves to video-only with a reason —
-never to a system mix (#2161). Windows ProcessLoopback is #3196 and the macOS Core
-Audio process tap is #3197. The Windows floor constant in
+**Windows has no real backend yet; macOS does.** On Windows and Linux a release
+build has no producer at all and `start()` returns `NoBackend`, which the host
+resolves to video-only with a reason — never to a system mix (#2161). Windows
+ProcessLoopback is #3196.
+
+On **macOS 14.4 and above** the Core Audio process tap shipped with #3197 PR 2, so
+a release build there has a real producer: `platformBackend()` returns it and
+`start()` reaches target validation, answering `NoTarget` when no target is
+supplied rather than `NoBackend`. Below the 14.4 product floor `platformBackend()`
+returns `nullptr` and `NoBackend` is still the answer. Nothing is reachable from
+the UI on either platform until #3198 wires the ladder rung that supplies a
+target. The Windows floor constant in
 [`napi/addon.cc`](napi/addon.cc) is **provisional** and is the single line spike S2
 changes; it is written alone and named so that settling risk 3 on hardware is a
 one-line edit rather than a hunt. The probe that settles it is in

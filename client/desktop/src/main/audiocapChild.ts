@@ -620,6 +620,59 @@ function handleStop(addon: AudiocapAddon): void {
   capturing = false;
   closePcmPort();
   addon.stop();
+  reportLiveness(addon);
+}
+
+/**
+ * DESIGN §6.2's CONSENT/LIVENESS LINE — the one reader `status()` has.
+ *
+ * R9 measured that TCC denial on macOS 26 yields on-schedule, correctly-shaped,
+ * ZERO-FILLED callbacks with every Core Audio API returning `noErr`. There is no
+ * error code to report, so `signalTotal` and `silentSinceStart` are the only
+ * witnesses that a tap is alive and starved rather than alive and working.
+ * Without this call they were computed on every callback and read by nobody:
+ * `status()` had no caller anywhere in the desktop tree.
+ *
+ * WHY IT IS A LOG AND NOT A MESSAGE. The host protocol is a closed set —
+ * `hello`, `fault`, `start`, `stop` — and nothing in it carries counters. Adding
+ * a fifth kind would be the watchdog surface #3198 owns, and this epic has
+ * already decided that question once: #3195 DELETED an unwired watchdog rather
+ * than ship it inert. So this reports through the channel that already exists
+ * and stays a developer diagnostic until there is something to consume it.
+ *
+ * It is read only in an unpackaged build — `audiocapHost.ts` echoes this child's
+ * stderr there and discards it otherwise — so this is a dev diagnostic by
+ * construction, with no UI and therefore no visual-verification obligation.
+ *
+ * The specific thing it prevents: the Electron postinstall re-sign resets the
+ * developer's audio-capture TCC grant on every Electron bump, and the symptom is
+ * a dead-silent stream with no error — byte-identical to the revocation case
+ * they would be debugging.
+ */
+function reportLiveness(addon: AudiocapAddon): void {
+  let snapshot: unknown;
+  try {
+    snapshot = addon.status();
+  } catch {
+    // A throw here must never become the child's cause of death. The capture is
+    // already stopped and main is about to kill us; a diagnostic that killed the
+    // process it was diagnosing would be worse than no diagnostic.
+    return;
+  }
+  if (!isRecord(snapshot)) return;
+  // Counters and booleans only — no key material, no PII, no raw error (C8).
+  console.debug('[audiocap] liveness', {
+    callbackTotal: snapshot.callbackTotal,
+    quantaTotal: snapshot.quantaTotal,
+    signalTotal: snapshot.signalTotal,
+    silentSinceStart: snapshot.silentSinceStart,
+    overrunTotal: snapshot.overrunTotal,
+    faulted: snapshot.faulted,
+    poisoned: snapshot.poisoned,
+    quiesceProved: snapshot.quiesceProved,
+    destroyFailures: snapshot.destroyFailures,
+    lastDeviceStatus: snapshot.lastDeviceStatus,
+  });
 }
 
 /**

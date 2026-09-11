@@ -1367,6 +1367,17 @@ _up_clients() {
     npm install >/dev/null
   fi
 
+  # The native addon is a BUILD ARTEFACT, not a checked-in binary, so a fresh
+  # clone has no concord_audiocap.node at all and the audiocap host reports
+  # `load-fault` -- which reads as a packaging defect and is not one. Gated
+  # exactly like npm install above: skipped under --no-rebuild UNLESS the
+  # artefact is actually missing, because "I asked you not to rebuild" cannot
+  # sensibly mean "leave the client unable to start".
+  if [[ "$no_rebuild" -eq 0 || ! -f native/concord-audiocap/build/Release/concord_audiocap.node ]]; then
+    [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 npm run build:native (client/desktop)${NC}"
+    npm run build:native >/dev/null
+  fi
+
   # Always rebuild preload + main (Electron requires fresh JS).
   npm run build:preload >/dev/null
   npx tsc -p tsconfig.main.json >/dev/null

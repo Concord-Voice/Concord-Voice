@@ -37,12 +37,36 @@
 
     'conditions': [
       [ "OS=='mac'", {
+        # The Core Audio backend. The .mm is thin by design -- ten HAL wrappers
+        # and the singleton -- because the state machine above it lives in
+        # rt/platform/macos/tap_backend.h and is compiled by the LINUX sanitizer
+        # legs against a fake HAL. That is the only coverage it can have:
+        # client/desktop/native/** is outside sonar.sources.
+        'sources': [ 'rt/platform/macos/tap_backend.mm' ],
         'xcode_settings': {
           'CLANG_CXX_LANGUAGE_STANDARD': 'c++17',
           'CLANG_CXX_LIBRARY': 'libc++',
           'GCC_ENABLE_CPP_EXCEPTIONS': 'NO',
           'GCC_ENABLE_CPP_RTTI': 'NO',
-          'MACOSX_DEPLOYMENT_TARGET': '11.0'
+          'CLANG_ENABLE_OBJC_ARC': 'YES',
+          # DEPLOYMENT TARGET STAYS 11.0. The tap symbols are
+          # API_AVAILABLE(macos(14.2)) and weak-linked; the @available guard in
+          # tap_backend.mm is what makes that correct, and it sits strictly
+          # inside the 14.4 product floor.
+          'MACOSX_DEPLOYMENT_TARGET': '11.0',
+          # MEASURED JUSTIFICATION, not a style preference: this flag caught a
+          # real unguarded availability call while the R9 spike was being built.
+          # Without it the omission is a WARNING and the shipped binary
+          # null-derefs a weak symbol at runtime on macOS 11-13. This target
+          # otherwise sets no warning flags at all. It is a warning flag, not a
+          # link flag, so the "no new link flag" property is unaffected.
+          'WARNING_CFLAGS': [ '-Werror=unguarded-availability-new' ]
+        },
+        'link_settings': {
+          'libraries': [
+            '$(SDKROOT)/System/Library/Frameworks/CoreAudio.framework',
+            '$(SDKROOT)/System/Library/Frameworks/Foundation.framework'
+          ]
         }
       } ],
       [ "OS=='win'", {
