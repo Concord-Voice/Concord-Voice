@@ -39,6 +39,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { settled } from '../../helpers/settled';
+
 // ---------------------------------------------------------------------------
 // node:module interception -- see file header. Must be declared at module
 // scope; vi.mock is hoisted above imports by the Vitest transform.
@@ -236,6 +238,15 @@ interface CreditGateHarness {
   send: (msg: unknown) => void;
   /** Flush one macrotask so async continuations in the child settle. */
   flush: () => Promise<void>;
+  /**
+   * Gate on `count()` REACHING `atLeast`, then on it going quiet. Prefer this
+   * over `flush()` wherever the assertion is about a count: `flush()` is a bare
+   * `setTimeout(0)` queued before the child's posts exist, so it races their
+   * delivery (this is what reddened `main` in the sibling creditFloor test).
+   * `flush()` survives only for the two assertions below that have no positive
+   * signal to gate on.
+   */
+  settle: (count: () => number, atLeast: number) => Promise<void>;
 }
 
 async function startChildHarness(): Promise<CreditGateHarness> {
@@ -291,6 +302,7 @@ async function startChildHarness(): Promise<CreditGateHarness> {
     ack: () => testEnd.postMessage({ c: 1 }),
     send: (msg: unknown) => testEnd.postMessage(msg),
     flush: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    settle: (count: () => number, atLeast: number) => settled(count, atLeast),
   };
 }
 
@@ -299,14 +311,14 @@ describe('audiocap child credit gate', () => {
     const c = await startChildHarness();
 
     for (let i = 0; i < 20; i++) c.signalQuantumAvailable();
-    await c.flush();
+    await c.settle(() => c.posted.length, 8);
     // Value obeyed: CREDIT_BOUND (8) caps the drain regardless of how many
     // times the addon signals availability -- credit exhaustion and ring
     // overflow are the same event (spec §4d), never a queue behind the port.
     expect(c.posted.length).toBe(8);
 
     c.ack();
-    await c.flush();
+    await c.settle(() => c.posted.length, 9);
     // A freed credit slot resumes the ALREADY-SIGNALLED availability; this
     // is not the producer asking for more (spec §4d forbids a timer doing
     // that), it is the child finishing what it already knew was there.
@@ -317,11 +329,16 @@ describe('audiocap child credit gate', () => {
     const c = await startChildHarness();
 
     c.send({ c: 2 });
+    // Deliberately still `flush()`: this asserts NO fault, so there is no
+    // arrival to gate on and `settle()` would add nothing. It is sound only
+    // because the NEXT block gates on the fault that the second violation does
+    // produce -- if the child were faulting on the first violation, that gate
+    // would see 1 here and the count below would be 2.
     await c.flush();
     expect(c.faults).toHaveLength(0);
 
     c.send({ c: 2 });
-    await c.flush();
+    await c.settle(() => c.faults.length, 1);
     expect(c.faults).toHaveLength(1);
     expect(c.faults[0]).toEqual({
       kind: 'fault',
@@ -332,6 +349,11 @@ describe('audiocap child credit gate', () => {
     // Value obeyed: the second violation also CLOSES the port (spec §4b) --
     // a signal arriving after the fault must not still reach the far end.
     c.signalQuantumAvailable();
+    // Deliberately still `flush()`: asserting the port is CLOSED means asserting
+    // nothing arrives, and there is no positive signal for that. The preceding
+    // `settle()` on the fault is the gate that makes it non-vacuous -- it proves
+    // the child processed the violation before we check that the signal produced
+    // nothing.
     await c.flush();
     expect(c.posted.length).toBe(0);
   });

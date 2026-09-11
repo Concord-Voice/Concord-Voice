@@ -24,6 +24,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { settled } from '../../helpers/settled';
+
 let addonRequireImpl: (specifier: string) => unknown = () => {
   throw new Error('audiocapChild.creditFloor.test.ts: addonRequireImpl not configured');
 };
@@ -108,7 +110,10 @@ describe('audiocap child credit floor (#3195 C5)', () => {
     // acknowledges a quantum that does not exist. The child must treat it as a
     // no-op on the counter, not as a free slot.
     testEnd.postMessage({ c: 1 });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Gate on the drain having ARRIVED, then on it having stopped. A bare
+    // `setTimeout(0)` here was the flake: it is queued before the eight posts
+    // exist, so it raced their delivery and read zero on a loaded runner.
+    await settled(() => posted.length, 8);
 
     // Nothing has been drained yet at this point in the pristine implementation,
     // because the credit's own resume ran with `outstanding` already at zero and
@@ -119,7 +124,10 @@ describe('audiocap child credit floor (#3195 C5)', () => {
     // And it is still the bound after the producer signals again: the unearned
     // credit bought nothing that a later signal can spend.
     (onQuantumAvailable as unknown as () => void)();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // `atLeast` stays 8: this assertion is that the count did NOT grow, so there
+    // is no higher arrival to gate on. The quiescence phase is what makes it
+    // non-vacuous — it gives a ninth post the chance to land before we look.
+    await settled(() => posted.length, 8);
     expect(posted.length).toBe(8);
   });
 });
