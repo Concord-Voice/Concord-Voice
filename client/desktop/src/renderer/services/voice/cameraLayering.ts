@@ -72,6 +72,20 @@ function midBitrate(maxBitrate: number): number {
   return Math.min(800_000, Math.max(300_000, Math.round(maxBitrate * 0.32)));
 }
 
+/**
+ * Per-RID caps for a 3-layer simulcast ladder seeded from ONE user-facing ceiling.
+ *
+ * The ceiling is the `f`-layer cap; `q` and `h` are derived from it. Exported because
+ * the live-update path (`voiceService.liveUpdateScreenBitrate`) must produce the same
+ * ladder a fresh produce would — #2208 shipped a flat cap that wrote the `f` value to
+ * every layer, which raised the aggregate ceiling ~2.5x and, on a LOWERED setting,
+ * raised `q` and `h` above what produce-time gives them. Both paths call this, so the
+ * ratios cannot drift apart again.
+ */
+export function simulcastLadderBitrates(maxBitrate: number): Record<'q' | 'h' | 'f', number> {
+  return { q: lowBitrate(maxBitrate), h: midBitrate(maxBitrate), f: maxBitrate };
+}
+
 export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): CameraEncodingPlan {
   const mime = codecMime(input.codec);
   const base = { ...input.priority };
@@ -100,11 +114,14 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
   if (kind === 'simulcast') {
     return {
       kind: 'simulcast',
-      encodings: [
-        { ...base, rid: 'q', scaleResolutionDownBy: 4, maxBitrate: lowBitrate(input.maxBitrate) },
-        { ...base, rid: 'h', scaleResolutionDownBy: 2, maxBitrate: midBitrate(input.maxBitrate) },
-        { ...base, rid: 'f', scaleResolutionDownBy: 1, maxBitrate: input.maxBitrate },
-      ],
+      encodings: (() => {
+        const ladder = simulcastLadderBitrates(input.maxBitrate);
+        return [
+          { ...base, rid: 'q', scaleResolutionDownBy: 4, maxBitrate: ladder.q },
+          { ...base, rid: 'h', scaleResolutionDownBy: 2, maxBitrate: ladder.h },
+          { ...base, rid: 'f', scaleResolutionDownBy: 1, maxBitrate: ladder.f },
+        ];
+      })(),
     };
   }
 

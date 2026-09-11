@@ -89,7 +89,7 @@ import {
   type SelectedDecoderStatsReport,
 } from './decoderBudgetSampler';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
-import { buildCameraEncodingPlan } from './cameraLayering';
+import { buildCameraEncodingPlan, simulcastLadderBitrates } from './cameraLayering';
 import {
   computeRemoteVideoLayerRequest,
   type RemoteVideoLayerRequest,
@@ -1636,12 +1636,15 @@ class VoiceService {
     if (!producer?.rtpSender) return;
     try {
       const params = producer.rtpSender.getParameters();
+      if (!params.encodings?.length) return;
       const effectivePriority = priority === 'off' ? 'low' : priority;
       for (const enc of params.encodings) {
         enc.priority = effectivePriority;
         (enc as Record<string, unknown>).networkPriority = effectivePriority;
       }
-      producer.rtpSender.setParameters(params).catch(() => {});
+      producer.rtpSender.setParameters(params).catch((err: unknown) => {
+        console.warn('[video-settings] Video priority update failed:', errorMessage(err));
+      });
     } catch {
       /* rtpSender may not be available */
     }
@@ -1651,11 +1654,36 @@ class VoiceService {
     if (!producer?.rtpSender) return;
     try {
       const params = producer.rtpSender.getParameters();
-      if (!params.encodings?.[0]) return;
+      if (!params.encodings?.length) return;
       // When bitrate is 0 (auto), recalculate from current screen settings
-      const effectiveBitrate = bitrate > 0 ? bitrate : this.calculateScreenBitrate();
-      params.encodings[0].maxBitrate = effectiveBitrate;
-      producer.rtpSender.setParameters(params).catch(() => {});
+      // Infer the codec the way produce-time does (pickScreenCodec passes the layering
+      // codec explicitly). A bare call falls back to activeScreenCodec ?? preferred,
+      // which flips the bits-per-pixel constant when those disagree.
+      const effectiveBitrate =
+        bitrate > 0
+          ? bitrate
+          : this.calculateScreenBitrate(this.pickLayeringCodec()?.mimeType ?? null);
+      // Screen simulcast (#2185) publishes q/h/f, and EVERY layer moves — writing only
+      // encodings[0] left h and f on their prior caps (#2208). The setting is the
+      // f-layer ceiling, not a per-layer value: q and h are derived from it by the same
+      // helper produceScreen seeds the plan with, so a live update and a fresh produce
+      // land on identical caps. A flat cap here would raise the aggregate ceiling ~2.5x
+      // and, on a LOWERED setting, push q and h above what produce-time gives them.
+      // One setParameters transaction; order, rid, scaling and activity flags untouched.
+      const ladder = simulcastLadderBitrates(effectiveBitrate);
+      for (const enc of params.encodings) {
+        // Key on rid, never index: only a simulcast plan carries rids, and a
+        // single-encoding sender (SVC, or the layering gate off) has none — it is the
+        // f-equivalent and takes the ceiling verbatim, exactly as before.
+        const rid = enc.rid as 'q' | 'h' | 'f' | undefined;
+        enc.maxBitrate = rid && rid in ladder ? ladder[rid] : effectiveBitrate;
+      }
+      producer.rtpSender.setParameters(params).catch((err: unknown) => {
+        // Never swallow this. A rejection (stale transactionId after an intervening
+        // renegotiation, or a per-encoding validation failure) leaves the slider moved
+        // and the wire unchanged — the same silent divergence #2208 exists to close.
+        console.warn('[video-settings] Screen bitrate update failed:', errorMessage(err));
+      });
     } catch {
       /* rtpSender may not be available */
     }

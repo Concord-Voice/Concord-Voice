@@ -296,6 +296,7 @@ import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { simulcastLadderBitrates } from '@/renderer/services/voice/cameraLayering';
 import { deferred } from '../../helpers/deferred';
 import {
   useSubscriptionStore,
@@ -962,11 +963,65 @@ describe('VoiceService Extended', () => {
       const producer = { ...createMockProducer('cam-1', 'camera'), rtpSender: null };
       expect(() => svc.liveUpdateVideoPriority(producer, 'high')).not.toThrow();
     });
+
+    it('is a safe no-op when encodings is empty', async () => {
+      // The guard was added alongside #2208 so the two live helpers converge. Without
+      // a test, removing it again is invisible: the bare call throws inside the
+      // existing try/catch and still "passes" a not.toThrow() assertion.
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('cam-1', 'camera');
+      producer.rtpSender.getParameters.mockReturnValue({ encodings: [] });
+      expect(() => svc.liveUpdateVideoPriority(producer, 'high')).not.toThrow();
+      expect(producer.rtpSender.setParameters).not.toHaveBeenCalled();
+    });
+
+    it('warns instead of silently swallowing a rejected setParameters', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const producer = createMockProducer('cam-1', 'camera');
+        producer.rtpSender.getParameters.mockReturnValue({
+          encodings: [{ maxBitrate: 1_000_000 }],
+        });
+        producer.rtpSender.setParameters.mockRejectedValueOnce(new Error('setParameters failed'));
+        expect(() => svc.liveUpdateVideoPriority(producer, 'high')).not.toThrow();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(
+          warn,
+          'a rejected setParameters must not be swallowed silently'
+        ).toHaveBeenCalledWith(
+          expect.stringContaining('Video priority update failed'),
+          expect.stringContaining('setParameters failed')
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   // ===== liveUpdateScreenBitrate =====
 
   describe('liveUpdateScreenBitrate', () => {
+    // Distinct priors per rid — load-bearing: equal priors can't distinguish
+    // "updated all three" from "updated none". Returns a fresh array per call
+    // so in-place mutation in one test never leaks into another.
+    function threeSimulcastEncodings() {
+      return [
+        // `active: false` on q is load-bearing: with every layer already active the
+        // "leaves untouched" assertion below cannot distinguish "left alone" from
+        // "written true", and a loop that forced enc.active = true survived the suite.
+        { rid: 'q', maxBitrate: 300_000, scaleResolutionDownBy: 4, active: false },
+        { rid: 'h', maxBitrate: 900_000, scaleResolutionDownBy: 2, active: true },
+        { rid: 'f', maxBitrate: 2_500_000, scaleResolutionDownBy: 1, active: true },
+      ];
+    }
+
+    // The ladder produceScreen seeds. Imported rather than hardcoded so a future
+    // change to the ratios cannot leave these tests asserting stale numbers.
+    const ladderOf = (cap: number) => simulcastLadderBitrates(cap);
+
     it('applies explicit bitrate', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
@@ -998,6 +1053,197 @@ describe('VoiceService Extended', () => {
       const producer = createMockProducer('screen-1', 'screen');
       producer.rtpSender.getParameters.mockReturnValue({ encodings: [] });
       expect(() => svc.liveUpdateScreenBitrate(producer, 1000000)).not.toThrow();
+      // not.toThrow() alone also passes with the guard REMOVED — this is what pins it.
+      expect(producer.rtpSender.setParameters).not.toHaveBeenCalled();
+    });
+
+    it('updates maxBitrate on all three simulcast encodings (q/h/f), not just encodings[0]', async () => {
+      // regression for #2208
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: threeSimulcastEncodings(),
+      });
+      svc.liveUpdateScreenBitrate(producer, 5_000_000);
+      const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
+      const want = ladderOf(5_000_000);
+      expect(
+        params.encodings[0].maxBitrate,
+        'q encoding did not receive its ladder-derived cap'
+      ).toBe(want.q);
+      expect(
+        params.encodings[1].maxBitrate,
+        'h encoding maxBitrate was not updated to the new screen bitrate'
+      ).toBe(want.h);
+      expect(
+        params.encodings[2].maxBitrate,
+        'f encoding maxBitrate was not updated to the new screen bitrate'
+      ).toBe(want.f);
+      // The whole point of #2208: every layer moved, none kept a prior cap.
+      expect(params.encodings.map((e: { maxBitrate: number }) => e.maxBitrate)).not.toEqual([
+        300_000, 900_000, 2_500_000,
+      ]);
+    });
+
+    it('leaves rid, scaleResolutionDownBy, active, encoding order, and sibling params fields untouched', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({
+        transactionId: 'txn-abc',
+        codecs: [{ mimeType: 'video/H264' }],
+        encodings: threeSimulcastEncodings(),
+      });
+      svc.liveUpdateScreenBitrate(producer, 5_000_000);
+      const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
+      expect(params.encodings.map((e: { rid: string }) => e.rid)).toEqual(['q', 'h', 'f']);
+      // q is INACTIVE in the fixture — a loop that wrote enc.active would fail here.
+      expect(params.encodings[0]).toMatchObject({ scaleResolutionDownBy: 4, active: false });
+      expect(params.encodings[1]).toMatchObject({ scaleResolutionDownBy: 2, active: true });
+      expect(params.encodings[2]).toMatchObject({ scaleResolutionDownBy: 1, active: true });
+      expect(params.transactionId).toBe('txn-abc');
+      expect(params.codecs).toEqual([{ mimeType: 'video/H264' }]);
+    });
+
+    it('calls setParameters exactly once with the same object getParameters returned', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      const returnedParams = {
+        encodings: threeSimulcastEncodings(),
+      };
+      producer.rtpSender.getParameters.mockReturnValue(returnedParams);
+      svc.liveUpdateScreenBitrate(producer, 5_000_000);
+      expect(producer.rtpSender.setParameters).toHaveBeenCalledTimes(1);
+      expect(producer.rtpSender.setParameters.mock.calls[0][0]).toBe(returnedParams);
+    });
+
+    it('auto-calculates and applies the same positive bitrate to all encodings when 0', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: threeSimulcastEncodings(),
+      });
+      // Cross-path oracle: assert the live update lands on the caps a FRESH PRODUCE
+      // would choose, not on a value re-derived the same way the method derives it.
+      // pickScreenCodec is the produce-time seam, so this pins the actual invariant
+      // #2208 is about — live and produce agreeing — including the codec the auto
+      // bitrate is computed against, which the two paths used to infer differently.
+      const auto = svc.pickScreenCodec().effectiveBitrate;
+      svc.liveUpdateScreenBitrate(producer, 0);
+      const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
+      const [q, h, f] = params.encodings;
+      const want = ladderOf(auto);
+      expect(auto, 'auto bitrate should be positive').toBeGreaterThan(0);
+      expect(q.maxBitrate, 'q encoding did not receive the auto-calculated bitrate').toBe(want.q);
+      expect(h.maxBitrate, 'h encoding did not receive the auto-calculated bitrate').toBe(want.h);
+      expect(f.maxBitrate, 'f encoding did not receive the auto-calculated bitrate').toBe(want.f);
+    });
+
+    it('does not close or replace the producer track as part of a live bitrate update', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: threeSimulcastEncodings(),
+      });
+      svc.liveUpdateScreenBitrate(producer, 5_000_000);
+      expect(producer.close).not.toHaveBeenCalled();
+      expect(producer.replaceTrack).not.toHaveBeenCalled();
+    });
+
+    it('is a safe no-op when encodings is undefined', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({ encodings: undefined });
+      expect(() => svc.liveUpdateScreenBitrate(producer, 5_000_000)).not.toThrow();
+      expect(producer.rtpSender.setParameters).not.toHaveBeenCalled();
+    });
+
+    it('is a safe no-op when rtpSender is null', async () => {
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = { ...createMockProducer('screen-1', 'screen'), rtpSender: null };
+      expect(() => svc.liveUpdateScreenBitrate(producer, 5_000_000)).not.toThrow();
+    });
+
+    it('LOWERS the cap on every encoding, including layers already below the new value', async () => {
+      // Gap found in review: every other case RAISES the cap, so
+      // `enc.maxBitrate = Math.max(prior, next)` passed the whole suite. Lowering is
+      // the production path — clampToFreeTier drops 12 Mbps to 5 Mbps (#2163) — and is
+      // the main reason anyone touches this setting mid-share.
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: threeSimulcastEncodings(),
+      });
+      svc.liveUpdateScreenBitrate(producer, 500_000);
+      const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
+      const want = ladderOf(500_000);
+      expect(
+        params.encodings.map((e: { maxBitrate: number }) => e.maxBitrate),
+        'lowering the cap must lower every layer, not raise-to-max'
+      ).toEqual([want.q, want.h, want.f]);
+      // f started at 2.5 Mbps and the new ceiling is 500 kbps — it must come DOWN.
+      expect(params.encodings[2].maxBitrate).toBeLessThan(2_500_000);
+    });
+
+    it('is reached from a screenShareBitrate change via applyScreenShareSettingsChange', async () => {
+      // Gap found in review: every other case calls the private method directly, so a
+      // correct fix that was never wired to the settings subscription would ship green.
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const producer = createMockProducer('screen-1', 'screen');
+      producer.rtpSender.getParameters.mockReturnValue({
+        encodings: threeSimulcastEncodings(),
+      });
+      svc.producers.set('screen', producer);
+      const prev = { ...useVideoSettingsStore.getState(), screenShareBitrate: 2_000_000 };
+      const next = { ...prev, screenShareBitrate: 5_000_000 };
+      svc.applyScreenShareSettingsChange(next, prev);
+      expect(
+        producer.rtpSender.setParameters,
+        'a screenShareBitrate change did not reach liveUpdateScreenBitrate'
+      ).toHaveBeenCalledTimes(1);
+      const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
+      const want = ladderOf(5_000_000);
+      expect(params.encodings.map((e: { maxBitrate: number }) => e.maxBitrate)).toEqual([
+        want.q,
+        want.h,
+        want.f,
+      ]);
+    });
+
+    it('warns instead of silently swallowing a rejected setParameters', async () => {
+      // The previous version of this test claimed to cover the unhandled-rejection
+      // path but asserted nothing that could fail — deleting the .catch left it green.
+      // The observable worth pinning is the WARNING: without it the slider moves, the
+      // wire does not, and nothing anywhere says so.
+      await joinVoiceChannel();
+      const svc = voiceService as any;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const producer = createMockProducer('screen-1', 'screen');
+        producer.rtpSender.getParameters.mockReturnValue({
+          encodings: threeSimulcastEncodings(),
+        });
+        producer.rtpSender.setParameters.mockRejectedValueOnce(new Error('setParameters failed'));
+        expect(() => svc.liveUpdateScreenBitrate(producer, 5_000_000)).not.toThrow();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(
+          warn,
+          'a rejected setParameters must not be swallowed silently'
+        ).toHaveBeenCalledWith(
+          expect.stringContaining('Screen bitrate update failed'),
+          expect.stringContaining('setParameters failed')
+        );
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 

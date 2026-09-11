@@ -75,6 +75,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Changing the screen-share quality mid-share now reaches everyone watching** ([#3260](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3260), [#2208](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2208)) — a screen
+  share can be sent in three qualities at once, so that someone watching in a small tile, or on a
+  connection that cannot take the full thing, gets a lighter version instead of a stuttering one.
+  Moving the Screen Share Cap slider, or switching Automatic Bitrate on or off, while the share was
+  already running only changed the highest of the three. The two lighter versions kept whatever
+  limit they were handed when the share began. Raising the cap therefore did nothing for anyone not
+  already watching at full size, and lowering it to go easier on your upload did not lower theirs —
+  the share ended up in a state where the number in Settings and the number actually being sent
+  disagreed, with nothing on screen to say so. All three now move together, each keeping its share
+  of the total the way it does when a share first starts: the number you pick is the ceiling for the
+  full-size version, and the two lighter ones sit proportionally below it. Nothing about the share is
+  interrupted to do it: people watching stay watching, at the size they were. Only shares sent in
+  several qualities were affected — that is an H.264 and VP8 arrangement your server has to enable —
+  and a share sent as a single stream was always correct.
+
 - **Going invisible no longer knocks everyone else offline** ([#3238](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3238)) — one person setting
   themselves invisible while sitting in a voice channel could disconnect every other person on the
   same server, over and over, for as long as anyone stayed connected. Each disconnect triggered the
