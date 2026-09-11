@@ -407,3 +407,129 @@ describe('audiocapChild process boundary (#3194, migrated)', () => {
     ]);
   });
 });
+
+/**
+ * THE FAILED START IS A TEARDOWN, NOT A RETURN (#3197 PR 1; PR #3262 review F3).
+ *
+ * `handleStart` used to set `capturing = true` only AFTER `addon.start()`
+ * returned, and its failure paths closed the PCM port without calling
+ * `addon.stop()`. Both halves of that are one defect: a `start` that threw out of
+ * the N-API seam, or returned `ok:false` from a backend that had already acquired
+ * an OS artefact before the step that failed, left the addon live while this
+ * child believed no capture existed -- so the `stop` main sends next hit
+ * `if (!capturing) return;` and did nothing at all. The tap outlives the share,
+ * which is the privacy invariant the whole epic is about.
+ *
+ * These cases pin the repair from the outside: a failed start CALLS stop, and the
+ * teardown it performs is the same one a `stop` control message performs, so the
+ * `stop` that follows is an idempotent no-op rather than a second one.
+ */
+describe('audiocap child start-failure unwind', () => {
+  function installAddon(start: () => unknown): { stop: ReturnType<typeof vi.fn> } {
+    const stop = vi.fn();
+    addonRequireImpl = () => ({
+      capability: () => ({
+        platform: 'darwin',
+        osVersion: '14.4',
+        perProcessAudio: true,
+        reason: '',
+      }),
+      start,
+      drain: () => ({ ok: false }),
+      stop,
+      status: () => ({
+        running: false,
+        callbackTotal: 0,
+        quantaTotal: 0,
+        overrunTotal: 0,
+        faulted: false,
+        faultReason: 'None',
+        poisoned: false,
+      }),
+    });
+    return { stop };
+  }
+
+  async function startChild(start: () => unknown): Promise<{
+    stop: ReturnType<typeof vi.fn>;
+    posted: unknown[];
+    sendStop: () => void;
+  }> {
+    setProcessType('utility');
+    const addon = installAddon(start);
+    const { posted, handlers } = installParentPort();
+    vi.resetModules();
+    await import('../../../src/main/audiocapChild');
+
+    // Precondition, not an optional-chained fire: without a registered listener
+    // every assertion below would be vacuous.
+    expect(typeof handlers.message).toBe('function');
+    const { port1: childEnd } = new MessageChannel();
+    handlers.message({
+      data: {
+        kind: 'start',
+        quantumMs: 10,
+        sampleRate: 48000,
+        channels: 2,
+        frameCount: 480,
+        creditBound: 8,
+        ringSlots: 8,
+      },
+      ports: [childEnd],
+    });
+    return {
+      stop: addon.stop,
+      posted,
+      sendStop: () => {
+        handlers.message({ data: { kind: 'stop' } });
+      },
+    };
+  }
+
+  it('stops the addon when start returns ok:false', async () => {
+    const c = await startChild(() => ({ ok: false, reason: 'NoTarget' }));
+
+    // Value passed, value obeyed: the addon refused, and this child tore the
+    // capture down rather than merely closing its port.
+    expect(c.stop).toHaveBeenCalledTimes(1);
+    expect(c.posted).toEqual([
+      expect.objectContaining({ kind: 'hello' }),
+      {
+        kind: 'fault',
+        stage: 'start',
+        message: 'capture did not start - no capture target was supplied',
+      },
+    ]);
+
+    // ...and the `stop` main sends next is the idempotent no-op, not a second
+    // teardown: the unwind already dropped `capturing`.
+    c.sendStop();
+    expect(c.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops the addon when start throws', async () => {
+    const c = await startChild(() => {
+      throw new Error('the seam threw after arming');
+    });
+
+    expect(c.stop).toHaveBeenCalledTimes(1);
+    expect(c.posted).toEqual([
+      expect.objectContaining({ kind: 'hello' }),
+      { kind: 'fault', stage: 'start', message: 'the seam threw after arming' },
+    ]);
+  });
+
+  it('stops the addon when a SUCCESSFUL capture is asked to stop', async () => {
+    // THE CONTROL for both cases above. Without it they pass just as well against
+    // a child that calls `addon.stop()` unconditionally on every path, and the
+    // ordinary end of a share -- the one that must still work -- would be untested.
+    const c = await startChild(() => ({ ok: true }));
+    expect(c.stop).not.toHaveBeenCalled();
+    expect(c.posted).toEqual([expect.objectContaining({ kind: 'hello' })]);
+
+    c.sendStop();
+    expect(c.stop).toHaveBeenCalledTimes(1);
+    c.sendStop();
+    expect(c.stop).toHaveBeenCalledTimes(1);
+  });
+});

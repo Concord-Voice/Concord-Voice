@@ -68,13 +68,15 @@ only, and say so in the UI.** It never means fall back to a system mix — a win
 target must never obtain one. That is #2161's invariant, and widening the capture
 on a capability miss is that same defect wearing native clothes.
 
-`start(options, onQuantumAvailable)` / `drain(into)` / `stop()` — the PCM transport
-seam (#3195).
+`start(options, onQuantumAvailable)` / `drain(into)` / `stop()` / `status()` — the
+PCM transport seam (#3195, #3197).
 
 ```js
 const { start, drain, stop } = require('./native/concord-audiocap');
-start({ quantumMs: 10, sampleRate: 48000, channels: 2, frameCount: 480, ringSlots: 8 },
-      onQuantumAvailable);
+start(
+  { quantumMs: 10, sampleRate: 48000, channels: 2, frameCount: 480, ringSlots: 8 },
+  onQuantumAvailable
+);
 // { ok: true }  in a CI/test build
 // { ok: false, reason: 'NoBackend' }  in a RELEASE build -- see below
 ```
@@ -95,6 +97,31 @@ missing signal is not a missing quantum.
 nothing on the payload path, and it **fails closed when capture is not running**, so
 a signal still pending when `stop()` lands cannot deliver audio for a share that has
 ended.
+
+`stop()` does **not** join a producer thread. Teardown is a POST-CONDITION —
+"when `stop()` returns, no further sink call occurs from any thread and every OS
+artefact is destroyed" — rather than a mechanism, so a thread-driven backend can
+satisfy it by joining and a callback-driven one (a Core Audio `IOProc`, a WASAPI
+callback) by stopping and destroying the OS artefact directly. `rt/sink_gate.h`
+enforces the post-condition independently of whether a backend keeps its word:
+`stop()` calls the backend's own stop, closes the gate, and waits bounded for
+in-flight sink calls to quiesce **and for the pump's activity witness
+(`QuantumPump::activityTotal()`, moved by both `noteCallback()` and `submit()`) to
+hold still** — the gate alone answers "is anyone inside right now", never "does a
+producer still exist". The release-or-abandon decision is then read from the
+`poisoned` latch rather than from what that wait saw: the handle is released only
+when the wait quiesced AND the process is not already poisoned, because `stop()` is
+idempotent and a later run finding a quiet gate must not release a handle an earlier
+one deliberately abandoned. On timeout it abandons the threadsafe-function
+handle rather than releasing it and latches a process-lifetime `poisoned` flag
+(`rt/teardown.h`); a poisoned process answers every later `start()` with
+`Poisoned` and can only be killed. `rt/capture_backend.h` is the platform-neutral
+contract both #3196 and #3197 implement against, `rt/quantum_pump.h` regroups
+whatever-sized OS callback deliveries into fixed 480-frame quanta, and
+`rt/frame_pack.h` is the pure channel/layout repacketizer — mono is duplicated to
+stereo by a byte shuffle, never mixed or resampled. Neither file does
+floating-point arithmetic on a sample, which keeps both inside the JSF++ profile
+with no new deviation.
 
 **The real backend is not implemented.** A release build has no producer at all and
 `start()` returns `NoBackend`, which the host resolves to video-only with a reason —
@@ -138,7 +165,7 @@ differs from Electron 43's. A NAN or raw-V8 addon would have been rejected. So
 not make the artifact runtime-specific. Do not add a per-runtime rebuild step on the
 assumption that one is required.
 
-**No new runtime dependency, and one new *declaration*.** The seam uses the plain C
+**No new runtime dependency, and one new _declaration_.** The seam uses the plain C
 `node_api.h` rather than `node-addon-api`, which is ADR-0043 D1's own supply-chain
 argument applied to our own build, and satisfies AV 208 at the seam by construction —
 the C API has no exceptions to disable.
@@ -155,10 +182,17 @@ a change a reviewer should see rather than one the wording glosses over.
 cd client/desktop/native/concord-audiocap
 clang++ -std=c++17 -Wall -Wextra -Werror -g -O1 -pthread \
     test/quantum_ring_test.cc -o /tmp/quantum_ring_test && /tmp/quantum_ring_test
+clang++ -std=c++17 -Wall -Wextra -Werror -g -O1 -pthread \
+    test/rt_contract_test.cc -o /tmp/rt_contract_test && /tmp/rt_contract_test
 ```
 
+`rt_contract_test.cc` is the backend-contract, gate and teardown suite; it uses a bare
+`CHECK` macro and no framework, and **only its exit status is a signal**. Its printed
+check count varies between runs by design — the concurrent cases `CHECK` inside spin
+loops, so the total tracks machine load, not coverage.
+
 **A local macOS compile is not sufficient verification.** macOS uses libc++ and the
-CI runners use libstdc++, and the two differ in what they supply *transitively*.
+CI runners use libstdc++, and the two differ in what they supply _transitively_.
 `std::abort()` compiled clean here and failed both sanitizer legs on the first CI run
 because `<cstdlib>` was missing — libc++ happened to pull it in, libstdc++ did not. So
 every include in these files names the symbols it is there for, and adding a `std::`
@@ -175,8 +209,11 @@ obvious workaround, `shell: true`, is precisely what that CVE was about.
 **Sanitizers run in CI, not here.** ASAN and TSAN map large fixed shadow regions,
 which a sandboxed local shell can refuse — the runtime then hangs or segfaults with
 no diagnostic, which looks like a test failure and is not one. `native-audiocap.yml`
-runs three configurations on Linux runners: `address+undefined`,
-`thread`, and a 120-second libFuzzer smoke run over the ring.
+runs two sanitizer configurations on Linux runners — `address+undefined` and
+`thread`, each compiling and running BOTH `test/quantum_ring_test.cc` and
+`test/rt_contract_test.cc` under the same flags — plus a libFuzzer smoke leg of two
+targets at 60 seconds each, `fuzz_quantum_ring` and `fuzz_quantum_pump`. That budget
+was **split, not doubled**: adding the pump target did not lengthen the job.
 
 `-fno-sanitize-recover=all` is set on the UBSAN leg deliberately. UBSAN's default is
 to print and continue, which exits 0 and reports a green job while having found the
@@ -202,7 +239,7 @@ Two findings came out of it:
   unsigned subtraction in two's complement, so for the small differences this ring
   deals in it returns an identical answer — UB under the standard, but not a
   behavioural defect. The wrap-safety property is genuinely broken by comparing
-  *absolute* values (`|| w < r`), and that is what the rollover test pins.
+  _absolute_ values (`|| w < r`), and that is what the rollover test pins.
 
 ## Why the ring is slot-oriented
 
@@ -219,19 +256,19 @@ quantum. `overrun()` counts them, because a bound that fails as quietly as no bo
 buys nothing.
 
 It **saturates rather than wrapping**, and that is the whole reason it is not a
-plain `fetch_add`: this counter is the drop *witness* — it is stamped into every
+plain `fetch_add`: this counter is the drop _witness_ — it is stamped into every
 quantum header and surfaced in the UI — and a wrapped `u32` reads as "no drops",
 which is the one answer it must never be able to give.
 
 **There is exactly one drop site, by construction.** `ringSlots == creditBound == 8`,
-so a consumer that refuses to drain past its credit bound *is* a ring that fills:
+so a consumer that refuses to drain past its credit bound _is_ a ring that fills:
 credit exhaustion and ring overflow are the same event, counted once, with nothing
 to reconcile between them. A second bound anywhere — a queue behind the signal, a
 free list, a catch-up batch on the sender — would create a second drop site that
 nothing counts.
 
 **The counter reaches the consumer up to `ringSlots` quanta late, and the `seq` gap
-does not.** `overrunTotal` is stamped at *capture* time, beside a capture-time
+does not.** `overrunTotal` is stamped at _capture_ time, beside a capture-time
 timestamp, so the quanta already queued when a drop happens still carry the older
 count; a consumer resuming after a stall drains those first. The independent witness
 — a gap in `seq` — is visible on the very first quantum after the stall. Both

@@ -1,3 +1,11 @@
 # node-gyp output. The .node binary is built per platform and per ABI; it is never
 # committed.
 build/
+
+# Local rt/ test and fuzz binaries -- built ad hoc per the commands in each
+# test file's own header comment, never committed.
+rt_contract_test
+quantum_ring_test
+fuzz_quantum_ring
+fuzz_quantum_pump
+*.dSYM/

@@ -49,8 +49,11 @@ constexpr u8  kHeaderVersion = 1u;
 constexpr u32 kHeaderBytes   = 32u;
 
 // Pinned, not negotiated: the encoder is Opus with opusStereo, and the repo
-// standardises on a 48 kHz AudioContext. Any resampling belongs upstream of this
-// header, never in a branch taken off one of its fields.
+// standardises on a 48 kHz AudioContext. NOTHING RESAMPLES AND NOTHING
+// DOWNMIXES, upstream of this header or anywhere else -- a source that is not
+// 48 kHz binary32 mono/stereo is refused with kUnsupportedFormat
+// (rt::acceptsSourceFormat, capture_backend.h). Mono is duplicated to stereo by
+// a byte shuffle, which is not a downmix.
 constexpr u32 kSampleRate     = 48000u;
 constexpr u16 kChannels       = 2u;
 constexpr u16 kFrameCount     = 480u;

@@ -45,8 +45,11 @@ export const MAGIC = 0xca57;
 
 /**
  * Pinned, not negotiated: the encoder is Opus with `opusStereo: true` and the
- * repo standardises on `new AudioContext({ sampleRate: 48000 })`. Any
- * resampling belongs in `rt/`, never in a branch taken off a header field.
+ * repo standardises on `new AudioContext({ sampleRate: 48000 })`. NOTHING
+ * RESAMPLES AND NOTHING DOWNMIXES, in `rt/` or anywhere else — a source that is
+ * not 48 kHz binary32 mono/stereo is refused with `UnsupportedFormat`
+ * (`rt::acceptsSourceFormat`, `rt/capture_backend.h`). Mono is duplicated to
+ * stereo by a byte shuffle, which is not a downmix.
  */
 export const SAMPLE_RATE = 48000;
 export const CHANNELS = 2;

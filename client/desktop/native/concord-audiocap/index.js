@@ -191,7 +191,17 @@ function capability() {
  * `{ ok: false, reason: 'NoBackend' }`. That resolves to video-only with a reason —
  * never to a system mix (#2161).
  *
- * @param {{quantumMs: number, sampleRate: number, channels: number, frameCount: number, ringSlots: number}} options
+ * ONCE PER PROCESS: the sink gate is armed at the first start() and never replaced,
+ * so any later start() — after a clean stop(), or after a start() that failed —
+ * returns `{ ok: false, reason: 'Poisoned' }`. The host forks one child per share,
+ * so a restart is not a capability production has.
+ *
+ * `options.targetPids` is OPTIONAL and validated exactly — 1..8 positive
+ * integers, nothing truncated, nothing coerced. Absent means no target, which a
+ * real backend refuses with `NoTarget`; that IS the feature being dark until
+ * #3198 supplies a list.
+ *
+ * @param {{quantumMs: number, sampleRate: number, channels: number, frameCount: number, ringSlots: number, targetPids?: number[], allowDescendants?: boolean}} options
  * @param {() => void} onQuantumAvailable
  * @returns {{ok: true} | {ok: false, reason: string}}
  */
@@ -210,9 +220,38 @@ function drain(into) {
   return binding.drain(into);
 }
 
-/** Stop capture, join the producer, discard anything still queued. Idempotent. */
+/**
+ * Stop capture, destroy every OS artefact the backend created, show that nobody is
+ * inside the sink and that the producer stopped, and discard anything still
+ * queued. Idempotent.
+ *
+ * Does NOT join a producer thread — teardown is a post-condition ("no further
+ * sink call occurs from any thread, and every OS artefact is destroyed"), not a
+ * mechanism. It calls the backend's own stop(), closes the sink gate, and then
+ * waits bounded for TWO things: an empty gate, and a callback counter that does
+ * not move for 50 ms. A counter that moves is a backend that broke its
+ * post-condition; an expired budget is a callback that never left. Either one
+ * abandons the threadsafe-function handle rather than releasing it and latches a
+ * process-lifetime `poisoned` flag, after which every later start() returns
+ * `{ ok: false, reason: 'Poisoned' }`.
+ */
 function stop() {
   binding.stop();
+}
+
+/**
+ * What the producer has done, as counters. A PULL with no data path: it cannot
+ * carry audio, and it is safe to call after `stop()` — that is what makes it a
+ * post-mortem rather than a monitor.
+ *
+ * The counters are cumulative for the life of the process and saturate rather
+ * than wrap. See index.d.ts for why `overrunTotal` and a `seq` gap are two
+ * independent drop witnesses and why both are needed.
+ *
+ * @returns {{running: boolean, callbackTotal: number, quantaTotal: number, overrunTotal: number, faulted: boolean, faultReason: string}}
+ */
+function status() {
+  return binding.status();
 }
 
 // The loader resolves ONLY `concord_audiocap.node` (see BINARY above), and that is
@@ -220,4 +259,4 @@ function stop() {
 // `concord_audiocap_synthetic.node`, which nothing here can reach. A synthetic
 // binary sitting beside the release one in a dev tree is therefore unreachable
 // through this module, not merely absent from the packaged payload.
-module.exports = { capability, start, drain, stop };
+module.exports = { capability, start, drain, stop, status };
