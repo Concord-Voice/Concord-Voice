@@ -88,6 +88,14 @@ import {
   selectInboundVideoDecoderReport,
   type SelectedDecoderStatsReport,
 } from './decoderBudgetSampler';
+import {
+  createAvSyncDriftDetector,
+  mergeAvSyncStats,
+  FIELD_ABSENCE_STREAK_TO_REPORT,
+  AMBIGUOUS_STREAK_TO_REPORT,
+  SAMPLE_INTERVAL_MS as AV_SYNC_SAMPLE_INTERVAL_MS,
+  type AvSyncObservation,
+} from './avSyncDriftDetector';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan, simulcastLadderBitrates } from './cameraLayering';
 import {
@@ -109,6 +117,10 @@ import {
   type ScreenAudioVerdict,
 } from '../../utils/policy/screenAudioCapability';
 import type { CallState } from './voiceService/callStateMachine';
+
+/** Ceiling for the saturating production-observation witness. Any non-zero value proves the
+ *  sampler ran; the cap only stops a multi-hour call from growing the field without bound. */
+const AV_SYNC_OBSERVATION_COUNT_CEILING = 1_000;
 
 // Toggle for verbose E2EE/SDP diagnostics — set to true when debugging
 // frame drops, BUNDLE collisions, or key rotation issues. When false,
@@ -2468,6 +2480,34 @@ class VoiceService {
   private decoderProfilingInFlight = false;
   private readonly decoderBudgetSampler = new DecoderBudgetSampler();
 
+  // A/V sync-drift sampler (#2941). Report-only diagnostic — deliberately its OWN timer
+  // and single-flight rather than sharing decoderProfilingTimer/decoderProfilingInFlight:
+  // that loop feeds classifyAndHandleDecoderZone, which PAUSES consumers, and a
+  // report-only diagnostic must never live inside the one loop that can degrade a live
+  // call. See `[internal]rules/frontend.md` § Platform-behavior register, row 5.
+  private avSyncSamplingTimer: ReturnType<typeof setInterval> | null = null;
+  /** Bumped at every sampler teardown. A tick that started before a teardown must not let its
+   *  post-await continuation touch the NEXT session's detector, latches or in-flight flag. */
+  private avSyncSessionGeneration = 0;
+  private avSyncSamplingInFlight = false;
+  private readonly avSyncDetector = createAvSyncDriftDetector();
+  private avSyncDriftEmitted = false; // latch: once per pairing epoch
+  private avSyncUnavailableEmitted = false; // latch: once per session, field-absence class only
+  // latch: once per session, `ambiguous-streams` only. Deliberately SEPARATE from the
+  // field-absence latch -- see AMBIGUOUS_STREAK_TO_REPORT for why the two never merge.
+  private avSyncUnmeasuredEmitted = false;
+  /** Consecutive ambiguous-streams observations; see AMBIGUOUS_STREAK_TO_REPORT. */
+  private avSyncAmbiguousStreak = 0;
+  /** Saturating count of observations the PRODUCTION tick actually handed to `observe()`.
+   *  A witness that builds its own detector and drives its own getStats() loop proves the
+   *  MODULE works on live stats -- it does not prove this sampler is running, because the tick
+   *  returns early when a transport is missing, when getStats() rejects, or when the session
+   *  changed mid-await. This counter is the only thing that distinguishes those. Saturating so
+   *  a long call cannot grow it without bound; `> 0` is the whole question. */
+  private avSyncObservationCount = 0;
+  /** Consecutive field-absence observations; see FIELD_ABSENCE_STREAK_TO_REPORT. */
+  private avSyncFieldAbsentStreak = 0;
+
   /** Number of consecutive green profileDecoders() cycles required before recovering a paused consumer. */
   private static readonly IGNIS_RECOVERY_GREEN_INTERVALS = 3;
 
@@ -2930,6 +2970,7 @@ class VoiceService {
       // Step 10: Start decoder budget profiling (IGNIS insight)
       // Profiles decode performance and adjusts SVC layers to avoid queue buildup
       this.startDecoderBudgetProfiling();
+      this.startAvSyncSampling();
     } catch (err) {
       if (shouldRecoverJoinFailure) await this.handleJoinFailure(err);
       throw err;
@@ -3290,6 +3331,7 @@ class VoiceService {
 
       useVoiceStore.getState().setConnectionState('connected');
       this.startDecoderBudgetProfiling();
+      this.startAvSyncSampling();
       // PII-safe diagnostic: distinguishes an expected network-transition
       // recovery from a fatal voice disconnect (issue acceptance criterion).
       console.warn('Voice media session resumed after network change');
@@ -3401,6 +3443,19 @@ class VoiceService {
       this.decoderProfilingTimer = null;
     }
     this.decoderProfilingInFlight = false;
+    this.avSyncSessionGeneration += 1;
+    if (this.avSyncSamplingTimer) {
+      clearInterval(this.avSyncSamplingTimer);
+      this.avSyncSamplingTimer = null;
+    }
+    this.avSyncSamplingInFlight = false;
+    this.avSyncDetector.reset();
+    this.avSyncDriftEmitted = false;
+    this.avSyncUnavailableEmitted = false;
+    this.avSyncUnmeasuredEmitted = false;
+    this.avSyncFieldAbsentStreak = 0;
+    this.avSyncAmbiguousStreak = 0;
+    this.avSyncObservationCount = 0;
     this.unregisterDocumentVisibilityListener();
     this.pauseCoordinator.reset();
     this.consecutiveGreenIntervals = 0;
@@ -7354,6 +7409,193 @@ class VoiceService {
     }
   }
 
+  // ─── A/V sync-drift sampler (#2941) ────────────────────────────────
+  // Report-only diagnostic over the SR-offset differential (avSyncDriftDetector.ts).
+  // Own timer, own single-flight, fixed cadence, no decay — parity with
+  // startDecoderBudgetProfiling()'s call sites, but deliberately NOT sharing its timer
+  // or in-flight flag: that loop feeds classifyAndHandleDecoderZone, which PAUSES
+  // consumers, and this diagnostic must never live inside the loop that can degrade a
+  // live call. All decision logic lives in the pure module; this stays a thin caller.
+
+  /** Arm the fixed-cadence sampler. Called alongside startDecoderBudgetProfiling().
+   *  IDEMPOTENT: `joinChannel()` and `resumeAfterReconnect()` hold independent in-flight
+   *  guards, so they can interleave and both reach this method. A second bare assignment
+   *  would overwrite the first handle, orphaning an interval that no teardown path can then
+   *  clear -- two samplers running for the rest of the call, one of them unstoppable. */
+  private startAvSyncSampling(): void {
+    if (this.avSyncSamplingTimer !== null) return;
+    this.avSyncSamplingTimer = setInterval(() => {
+      void this.runAvSyncSamplingTick();
+    }, AV_SYNC_SAMPLE_INTERVAL_MS);
+  }
+
+  /** One sampling tick: both recv transports or neither, one stamp before both awaits. */
+  private async runAvSyncSamplingTick(): Promise<void> {
+    if (this.avSyncSamplingInFlight) return;
+    const a = this.recvTransportAudio;
+    const v = this.recvTransportVideo;
+    // BOTH or neither. A one-report frame yields `kind-incomplete`, which is correct
+    // but indistinguishable from the normal camera-off peer -- so a half-torn-down
+    // transport would hide behind an ordinary reason. Skip the tick instead.
+    if (!a || !v || a.closed || v.closed) return;
+    const generation = this.avSyncSessionGeneration;
+    this.avSyncSamplingInFlight = true;
+    try {
+      const observedAtMs = performance.timeOrigin + performance.now(); // BEFORE the awaits
+      // The try/catch is scoped to ONLY this getStats() pair -- a closing transport rejects
+      // here, and that is not a contract break, so the rejection is swallowed with nothing to
+      // log. merge/observe/dispatch run OUTSIDE this inner try: they are pure and payload
+      // construction, and a throw from any of them is a real defect in a diagnostic whose whole
+      // point is not to fail silently, so it must propagate rather than be swallowed alongside
+      // the transport-closing case.
+      let reports: [RTCStatsReport, RTCStatsReport];
+      try {
+        reports = await Promise.all([a.getStats(), v.getStats()]);
+      } catch {
+        return;
+      }
+      // Teardown may have run while the two getStats() promises were pending. Feeding a
+      // dead session's sample into the NEW session's detector would corrupt its history,
+      // its field-absence streak and its once-per-session latches -- and the transports the
+      // stats came from are not the ones now installed. Identity is checked alongside the
+      // generation because a teardown/re-arm pair could leave the counter matching while the
+      // transports themselves were replaced.
+      if (
+        generation !== this.avSyncSessionGeneration ||
+        this.recvTransportAudio !== a ||
+        this.recvTransportVideo !== v
+      ) {
+        return;
+      }
+      const [audioReport, videoReport] = reports;
+      const merged = mergeAvSyncStats(audioReport.values(), videoReport.values());
+      const observation = this.avSyncDetector.observe(merged, observedAtMs);
+      // Stamped BEFORE dispatch and counting EVERY observation, usable or not: the question it
+      // answers is "did this sampler reach observe()", not "did it like what it saw".
+      if (this.avSyncObservationCount < AV_SYNC_OBSERVATION_COUNT_CEILING) {
+        this.avSyncObservationCount += 1;
+      }
+      this.handleAvSyncObservation(observation, audioReport, videoReport);
+    } finally {
+      // A stale continuation must NOT clear the live session's flag: doing so would admit a
+      // second concurrent tick into the new session.
+      if (generation === this.avSyncSessionGeneration) this.avSyncSamplingInFlight = false;
+    }
+  }
+
+  /**
+   * Dispatch one observation to at most one console line. All decision logic already
+   * ran inside `observe()`; this only decides whether THIS observation clears a latch.
+   */
+  private handleAvSyncObservation(
+    observation: AvSyncObservation,
+    audioReport: RTCStatsReport,
+    videoReport: RTCStatsReport
+  ): void {
+    if (observation.usable) {
+      // FIRST statement in this branch, before either early return below -- both
+      // `!== 'drift'` (steady) and `avSyncDriftEmitted` (already-latched drift) are usable
+      // observations, and each must clear the field-absence streak. Sequencing this after
+      // either return let a `field-absent x5 -> steady x200 -> field-absent` run spend the
+      // once-per-session `fields-unavailable` latch on a streak that was never consecutive.
+      this.avSyncFieldAbsentStreak = 0;
+      this.avSyncAmbiguousStreak = 0;
+      if (observation.verdict !== 'drift' || this.avSyncDriftEmitted) return;
+      this.avSyncDriftEmitted = true;
+      // Existing helper, existing reports -- no extra getStats() call (#3104's NC-1
+      // permits this closed enum value from any call site, not only the ICE path).
+      const pairAudio = extractSelectedCandidatePairType(audioReport);
+      const pairVideo = extractSelectedCandidatePairType(videoReport);
+      console.warn('[avsync] drift-detected', {
+        slopeMsPerSec: Math.round(observation.slopeMsPerSec * 100) / 100,
+        spanSec: Math.round(observation.spanSec),
+        samples: observation.samples,
+        jbSkewMs:
+          observation.jbSkewMs === null ? null : Math.round(observation.jbSkewMs * 100) / 100,
+        pairAudio,
+        pairVideo,
+      });
+      return;
+    }
+
+    // The drift latch re-arms on exactly these three reasons -- stream-changed, counter-reset,
+    // and offset-step -- each a genuine pairing/discontinuity reset, so the NEXT trip describes
+    // a fresh measurement epoch rather than replaying a stale one. clock-regression ALSO clears
+    // history in observe(), but is deliberately excluded here: it is a raw clock anomaly (a
+    // report's timestamp moving backwards), not a stream re-pairing, so it does not start a new
+    // measurement epoch in the sense this latch tracks.
+    if (
+      observation.reason === 'stream-changed' ||
+      observation.reason === 'counter-reset' ||
+      observation.reason === 'offset-step'
+    ) {
+      this.avSyncDriftEmitted = false;
+    }
+
+    // Every other not-usable reason is routine (first-sample, a camera-off peer,
+    // insufficient-samples, ...) and is counted, never logged. Only the engine
+    // ceasing to emit the fields at all gets one latched debug line per session.
+    // `ambiguous-streams` is its OWN persistent class, tracked and latched separately from
+    // field-absence. Without this a 3+-party call refuses on every tick for the whole session
+    // and emits nothing at all, so a triager reading a group-call bug report sees the same
+    // empty log as a healthy 2-party call and can reasonably conclude the detector ran and
+    // found nothing -- a false negative across a large share of real usage. The detector is
+    // deliberately quiet in group calls; it should not be INDISTINGUISHABLE from broken.
+    if (observation.reason === 'ambiguous-streams') {
+      this.avSyncFieldAbsentStreak = 0;
+      this.avSyncAmbiguousStreak += 1;
+      if (
+        this.avSyncAmbiguousStreak >= AMBIGUOUS_STREAK_TO_REPORT &&
+        !this.avSyncUnmeasuredEmitted
+      ) {
+        this.avSyncUnmeasuredEmitted = true;
+        // Reason ONLY. No peer count: this line reaches a PUBLIC repo through the feedback
+        // pipeline (observability.md principle 6), and the count is call-composition detail
+        // the triager does not need -- "declined to measure" is the whole signal.
+        console.debug('[avsync] unmeasured', { reason: observation.reason });
+      }
+      return;
+    }
+    this.avSyncAmbiguousStreak = 0;
+
+    const isFieldAbsenceClass =
+      observation.reason === 'field-absent' || observation.reason === 'unpaired';
+    if (!isFieldAbsenceClass) {
+      this.avSyncFieldAbsentStreak = 0;
+      return;
+    }
+    // Require the absence to PERSIST. Every healthy call starts field-absent, because
+    // libwebrtc cannot build a remote-outbound-rtp object before the first RTCP SR
+    // lands -- emitting on the first one would spend the once-per-session latch during
+    // normal startup and leave a real later regression silent.
+    this.avSyncFieldAbsentStreak += 1;
+    if (
+      this.avSyncFieldAbsentStreak >= FIELD_ABSENCE_STREAK_TO_REPORT &&
+      !this.avSyncUnavailableEmitted
+    ) {
+      this.avSyncUnavailableEmitted = true;
+      console.debug('[avsync] fields-unavailable', { reason: observation.reason });
+    }
+  }
+
+  /**
+   * Full IGNIS decoder budget profiling.
+   *
+   * Zone thresholds:
+   *   Green:  rho < 0.80  (inside the safe decoder budget)
+   *   Yellow: 0.80 <= rho < 0.925 (approaching limit)
+   *   Red:    rho >= 0.925 (near-critical, 92.5% capacity)
+   *
+   * Formulas:
+   *   Load Ratio:  rho = T_d_p95 / T_f = (T_d_p95 × FPS) / 1000
+   *   Safe FPS:    FPS_safe = margin × (1000 / T_d_p95)
+   *   Risk Score:  R = (FPS × T_d_p95) / 1000
+   *
+   * Actions:
+   *   Green:  full quality, no intervention
+   *   Yellow: lower temporal layer by 1
+   *   Red:    lower spatial layer by 1, if already lowest → pause lowest-priority consumer
+   */
   /** Handle RED zone decoder overload: request a layer step down, else pause. */
   private handleRedZone(
     consumer: mediasoupTypes.Consumer,
@@ -9031,6 +9273,22 @@ class VoiceService {
       this.decoderProfilingTimer = null;
     }
     this.decoderProfilingInFlight = false;
+
+    // Stop A/V sync-drift sampling (#2941). Duplicated deliberately, same reasoning as
+    // the ICE-servers null-site above: cleanup() does not call cleanupTimersAndE2EE().
+    this.avSyncSessionGeneration += 1;
+    if (this.avSyncSamplingTimer) {
+      clearInterval(this.avSyncSamplingTimer);
+      this.avSyncSamplingTimer = null;
+    }
+    this.avSyncSamplingInFlight = false;
+    this.avSyncDetector.reset();
+    this.avSyncDriftEmitted = false;
+    this.avSyncUnavailableEmitted = false;
+    this.avSyncUnmeasuredEmitted = false;
+    this.avSyncFieldAbsentStreak = 0;
+    this.avSyncAmbiguousStreak = 0;
+    this.avSyncObservationCount = 0;
 
     // Clear screen share opt-in list
     useVoiceStore.getState().clearAvailableScreenShares();
