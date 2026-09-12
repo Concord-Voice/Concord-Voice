@@ -17,7 +17,18 @@ export interface EmojiPickerProps {
   onSelect: (emoji: string) => void;
   onClose: () => void;
   mode?: 'popover' | 'inline';
-  position?: { x: number; y: number };
+  /**
+   * Popover-mode placement (#2370). When `anchorCenterX` is present (the
+   * composer only), `x`/`y` describe the ANCHOR button's bounding-rect right
+   * edge and top edge — the picker measures itself and places ABOVE the
+   * anchor via `resolveAnchoredPlacement` (`utils/ui/pickerAnchor.ts`), with
+   * a caret pointing down at it. When `anchorCenterX` is absent (the other
+   * consumers), `x`/`y` are the picker's own desired top-left corner and the
+   * pre-#2370 clamp-and-flip placement runs byte-identically, with no arrow.
+   * One optional field switches the meaning of both — see EmojiPicker.tsx's
+   * placement `useLayoutEffect`.
+   */
+  position?: { x: number; y: number; anchorCenterX?: number };
 }
 
 export type SkinTone = '' | '\u{1F3FB}' | '\u{1F3FC}' | '\u{1F3FD}' | '\u{1F3FE}' | '\u{1F3FF}';

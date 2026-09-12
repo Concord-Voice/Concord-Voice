@@ -45,9 +45,6 @@ src/renderer/components/DirectMessages/DMProfileModal.css --status-online
 src/renderer/components/DirectMessages/DMProfileModal.css --text-link
 src/renderer/components/DirectMessages/DirectMessages.css --accent
 src/renderer/components/DirectMessages/DirectMessages.css --text-on-accent
-src/renderer/components/GifPicker/GifPicker.css --border-primary
-src/renderer/components/GifPicker/GifPicker.css --border-secondary
-src/renderer/components/GifPicker/GifPicker.css --gif-picker-arrow-x
 src/renderer/components/Markdown/MarkdownContent.css --accent
 src/renderer/components/Markdown/MarkdownContent.css --border-subtle
 src/renderer/components/Markdown/MarkdownContent.css --code-font

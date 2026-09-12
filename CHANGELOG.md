@@ -75,6 +75,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **The GIF and emoji pickers now sit against the button that opened them, with an arrow
+  pointing at it** ([#3278](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3278), [#2370](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2370)) — both panels used to float
+  above the toolbar with a gap under them and nothing tying them to the icon you clicked, which
+  on a wide window left you glancing between the panel and the row of buttons to work out which
+  one you had opened. Each now measures itself and settles just above its own button with a small
+  caret pointing down at it. In a window too short or too narrow to place the panel against its
+  button, the panel moves to stay on screen and the caret is hidden rather than left pointing at
+  the wrong thing. Both are also about 15% larger, so there is more to see without
+  scrolling. The reason the gap was there is worth stating plainly: the code placed each panel
+  using a fixed guess at its height that was 19 pixels too big, and had been for as long as the
+  feature existed. The panels now measure themselves rather than being guessed at, so the gap
+  cannot drift back.
+  The GIF picker's caret is new in a stricter sense than it sounds — the code to draw one has
+  been there all along, but it was being clipped away in full by the panel's own edge, and what
+  survived was the same colour as the panel behind it. Nothing could catch that: the tests
+  checked the caret was positioned correctly, which it was, and the tools that run them do not
+  draw anything.
+  On the light themes this also fixes a hairline: the GIF picker's border and caret outline were
+  painted a fixed dark grey rather than following your theme, because they referred to a colour
+  that was never defined anywhere. They now follow the theme like every other border.
 - **Server-enforced mutes look enforced again, and some hover highlights came back** ([#3270](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3270)) — when a
   moderator mutes or deafens someone, the marker on that person is meant to be amber, so you can
   tell at a glance that the server did it rather than they did. In the channel list, and in the

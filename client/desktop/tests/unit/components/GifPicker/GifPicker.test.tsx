@@ -617,10 +617,35 @@ describe('GifPicker.css layout invariants (#2371 B)', () => {
   }
 
   it('.gif-picker-body declares one deterministic height, not a min/max pair', () => {
+    // #2371's guarantee: `.gif-picker-body`'s height is the SAME value across
+    // loading / empty / error / populated states at a given viewport size --
+    // the picker's total size never depends on what is currently inside it.
+    // #2370 changed the declared value from a flat 360px literal to
+    // `min(414px, calc(100vh - 240px))` (viewport-capped, monotonic never-
+    // worse-than-360px) -- that formula still resolves to exactly ONE number
+    // at any given viewport height, so the #2371 guarantee is untouched; only
+    // the CSS *shape* of the value changed, from a literal to a closed-form
+    // viewport expression. A regex pinned to the literal `360px` no longer
+    // expresses the guarantee (it would fail on the new, correct value)
+    // without weakening it.
+    //
+    // What must still be caught: (a) a min-height/max-height PAIR
+    // reappearing -- that is what lets an element's rendered height vary
+    // with its own content against separately-set floor/ceiling bounds, the
+    // exact regression #2371 fixed -- and (b) the declared height ceasing to
+    // be a single closed-form expression (e.g. reverting to `auto`, which
+    // resolves against content size).
     const body = ruleBody('.gif-picker-body');
-    expect(body).toMatch(/height:\s*360px/);
     expect(body).not.toMatch(/min-height/);
     expect(body).not.toMatch(/max-height/);
+    // The property is "ONE value per viewport", not "looks like a formula".
+    // A bare `min(` also accepted `min(414px, var(--content-height))`, which is
+    // content-dependent and is precisely what #2371 forbids. Pull the declared
+    // value out and allow only operands that cannot vary with content.
+    const heightValue = /(?:^|[;{])\s*height:\s*([^;]+)/.exec(body)?.[1];
+    expect(heightValue, '.gif-picker-body must declare a height').toBeDefined();
+    expect(heightValue).not.toMatch(/\bauto\b|\b(?:min|max|fit)-content\b|%|\bvar\(/);
+    expect(heightValue).toMatch(/\b\d+(?:\.\d+)?(?:px|vh)\b/);
   });
 
   it('.gif-picker-body does NOT declare flex: 1', () => {
@@ -642,7 +667,124 @@ describe('GifPicker.css layout invariants (#2371 B)', () => {
   it('does not pin a height on .gif-picker itself (that value belongs to #2370)', () => {
     const picker = ruleBody('.gif-picker');
     expect(picker).not.toMatch(/(^|\s)height:/);
-    expect(picker).toMatch(/max-height:\s*520px/);
-    expect(picker).toMatch(/width:\s*370px/);
+    expect(picker).toMatch(/max-height:\s*598px/);
+    expect(picker).toMatch(/width:\s*426px/);
+  });
+});
+
+// ── Picker geometry / arrow linkage (#2370 A7, A8) ────────────────────────
+describe('GifPicker.css picker geometry (#2370 A7/A8)', () => {
+  const css = readFileSync(
+    resolve(__dirname, '../../../../src/renderer/components/GifPicker/GifPicker.css'),
+    'utf-8'
+  ).replace(/\/\*[\s\S]*?\*\//g, '');
+
+  function ruleBody(selector: string): string {
+    const m = new RegExp(`(^|\\n)${selector.replace('.', '\\.')}\\s*\\{([^}]*)\\}`).exec(css);
+    if (!m) throw new Error(`selector ${selector} not found in GifPicker.css`);
+    return m[2];
+  }
+
+  // A7 -- the single most important test in this PR. `.gif-picker`'s arrow
+  // `::after` is `position: absolute` inside a `position: fixed` ancestor,
+  // which makes `.gif-picker` its own containing block -- so the arrow is
+  // clipped by whatever `.gif-picker` declares for `overflow`.
+  // `overflow: hidden` clips at the padding-box edge with NO margin, and
+  // that clipped the arrow away in FULL for the entire life of the GIF
+  // picker feature (spec §0): the caret never rendered once, and nothing in
+  // this suite could have caught it, because jsdom computes no clipping and
+  // no paint -- a green suite only ever proved `--gif-picker-arrow-x` was
+  // *set*, a property adjacent to the one that mattered. This stylesheet
+  // assertion is the ONLY automatable guard against that regression
+  // recurring.
+  it('declares overflow: clip with overflow-clip-margin >= 9px -- never overflow: hidden', () => {
+    const picker = ruleBody('.gif-picker');
+    expect(
+      picker,
+      'REGRESSION: .gif-picker reverted to overflow: hidden. This clips the arrow ' +
+        "caret away in full -- the caret never rendered for the GIF picker's entire " +
+        'lifetime before #2370 (spec §0), and jsdom cannot detect it (no clipping, no ' +
+        'paint), so this stylesheet assertion is the only thing that can catch it.'
+    ).toMatch(/overflow:\s*clip\b/);
+    expect(picker).not.toMatch(/overflow:\s*hidden\b/);
+
+    const marginMatch = /overflow-clip-margin:\s*(\d+(?:\.\d+)?)px/.exec(picker);
+    expect(
+      marginMatch,
+      '.gif-picker must declare overflow-clip-margin alongside overflow: clip, or the ' +
+        'clip boundary reverts to the border-box edge with zero margin -- the same ' +
+        'defect overflow: hidden caused.'
+    ).not.toBeNull();
+    // ARROW_HALF_CHORD (~8.4853px, utils/ui/pickerAnchor.ts) is how far the
+    // 12x12 rotated caret protrudes past the border-box edge; the margin
+    // must clear it with headroom.
+    expect(Number(marginMatch![1])).toBeGreaterThanOrEqual(9);
+  });
+
+  // A8 -- both `--border-primary` and `--border-secondary` are undefined
+  // custom properties nowhere else in the codebase (spec R8); the token fix
+  // and the arrow are one feature, not a bug fix plus a feature, because the
+  // arrow's own border reuses `--border-color`.
+  it('has zero occurrences of the undefined --border-primary / --border-secondary tokens', () => {
+    const matches = css.match(/--border-(primary|secondary)\b/g) ?? [];
+    expect(matches).toEqual([]);
+  });
+});
+
+describe('GifPicker non-selection close focus restore (#2370 §2.5, WCAG 2.4.3)', () => {
+  const position = { x: 100, y: 200, anchorCenterX: 150 };
+
+  beforeEach(() => {
+    resetAllStores();
+  });
+
+  /**
+   * Opens the picker from a real focused trigger and waits until the picker's
+   * own autofocused search input has genuinely taken focus AWAY from it --
+   * without that wait every assertion below would pass trivially.
+   */
+  const openFromTrigger = async () => {
+    const trigger = document.createElement('button');
+    trigger.textContent = 'GIF';
+    document.body.append(trigger);
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+
+    const onClose = vi.fn();
+    const { unmount } = render(
+      <GifPicker onSelect={vi.fn()} onClose={onClose} position={position} />
+    );
+    await waitFor(() => expect(document.activeElement).not.toBe(trigger));
+
+    return {
+      trigger,
+      onClose,
+      cleanup: () => {
+        unmount();
+        trigger.remove();
+      },
+    };
+  };
+
+  // All four non-selection closes route through the one `handleDismiss`, so a
+  // single break now costs every one of them -- which is why each gets its own
+  // pin rather than the close button standing in for the rest. Wired straight
+  // to `onClose` a path unmounts while focused and drops focus to <body>,
+  // stranding a keyboard user at the top of the document. Selection is the one
+  // close that deliberately does NOT restore: MessageInput owns that focus.
+  it.each([
+    ['the close button', () => fireEvent.click(screen.getByLabelText('Close'))],
+    ['Escape', () => fireEvent.keyDown(document, { key: 'Escape' })],
+    ['an outside click', () => fireEvent.mouseDown(document.body)],
+    ['a viewport resize', () => fireEvent(globalThis, new Event('resize'))],
+  ])('returns focus to the element that opened it on %s', async (_label, dismiss) => {
+    const { trigger, onClose, cleanup } = await openFromTrigger();
+
+    dismiss();
+
+    expect(onClose).toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+
+    cleanup();
   });
 });

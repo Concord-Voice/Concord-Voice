@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
 import { Save, X, Search, AlertTriangle } from 'lucide-react';
 import {
   gifProvider,
@@ -9,13 +9,27 @@ import {
 import { useSavedGifsStore } from '../../stores/chat/savedGifsStore';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
+import { resolveAnchoredPlacement } from '../../utils/ui/pickerAnchor';
 import './GifPicker.css';
 
 interface GifPickerProps {
   onSelect: (slug: string) => void;
   onClose: () => void;
+  /**
+   * Anchor geometry, not the picker's own position (#2370) — `x`/`y` are the
+   * GIF button's bounding-rect right/top edges and `anchorCenterX` its
+   * horizontal centre. GifPicker is single-mode (one consumer, the
+   * composer), so this is unconditional, unlike EmojiPicker's dual-mode
+   * `position`. The picker measures itself and computes placement + arrow
+   * via `resolveAnchoredPlacement` below.
+   */
   position: { x: number; y: number; anchorCenterX: number };
 }
+
+/** Border width and corner radius baked into GifPicker.css's `.gif-picker`
+ *  rule — kept in sync with the stylesheet, not read from it (#2370). */
+const GIF_PICKER_BORDER_WIDTH = 1;
+const GIF_PICKER_CORNER_RADIUS = 10;
 
 type Tab = 'trending' | 'recent' | 'categories' | 'saved';
 
@@ -236,6 +250,59 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
 
   const pickerRef = useRef<HTMLDialogElement>(null);
 
+  // Placement + arrow, resolved once after mount by measuring this dialog's
+  // actual box (#2370 §2.1). Left `null` (dialog hidden) until then so the
+  // first frame never flashes at the raw anchor coordinates in `position`.
+  const [placement, setPlacement] = useState<{
+    left: number;
+    top: number;
+    arrowX: number;
+    showArrow: boolean;
+  } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = pickerRef.current;
+    if (!el) return;
+    // offsetWidth/offsetHeight, NOT getBoundingClientRect(): the offset*
+    // properties are layout values and ignore transforms, so an entry
+    // animation cannot corrupt the measurement. This picker has no animation
+    // today, which is exactly why the trap is worth closing here -- the emoji
+    // picker DOES have one, measured its transformed box at the `scale(0.95)`
+    // keyframe, and placed itself ~20px too low as a result (#2370).
+    setPlacement(
+      resolveAnchoredPlacement({
+        anchorTop: position.y,
+        anchorRight: position.x,
+        anchorCenterX: position.anchorCenterX,
+        measuredWidth: el.offsetWidth,
+        measuredHeight: el.offsetHeight,
+        viewportWidth: globalThis.innerWidth,
+        viewportHeight: globalThis.innerHeight,
+        borderWidth: GIF_PICKER_BORDER_WIDTH,
+        cornerRadius: GIF_PICKER_CORNER_RADIUS,
+      })
+    );
+  }, [position]);
+
+  // Captured once, synchronously, during the FIRST render — before the
+  // search input's `autoFocus` (below) can move focus away from whatever
+  // triggered this picker (normally the composer's GIF button). This is who
+  // focus returns to on any NON-selection close (Escape, outside-click,
+  // resize); selection closes through handleGifClick, which does not call
+  // restoreFocus and relies on the caller's own focus handling (#2370 §2.5).
+  const [triggerEl] = useState<HTMLElement | null>(() =>
+    document.activeElement instanceof HTMLElement ? document.activeElement : null
+  );
+  const restoreFocus = useCallback(() => {
+    if (triggerEl?.isConnected) triggerEl.focus({ preventScroll: true });
+  }, [triggerEl]);
+
+  /** The ONE non-selection close path: ✕, Escape, outside-click and resize all route here. */
+  const handleDismiss = useCallback(() => {
+    onClose();
+    restoreFocus();
+  }, [onClose, restoreFocus]);
+
   // Debounce search term
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearchTerm(searchTerm.trim()), SEARCH_DEBOUNCE_MS);
@@ -371,21 +438,33 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (e.target instanceof Node && pickerRef.current && !pickerRef.current.contains(e.target)) {
-        onClose();
+        handleDismiss();
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [onClose]);
+  }, [handleDismiss]);
 
   // Escape to close
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        handleDismiss();
+      }
     };
     document.addEventListener('keydown', handleKey);
     return () => document.removeEventListener('keydown', handleKey);
-  }, [onClose]);
+  }, [handleDismiss]);
+
+  // Close on resize (R10/T8) — the anchor's position may now be stale, and
+  // continuous tracking (scroll/ResizeObserver) is a deliberately recorded
+  // residual, not implemented. A SEPARATE effect: MessageInput's own resize
+  // listener (`:552-557` there) re-registers on every keystroke
+  // (`useCallback([content])`) and must not be reused for this.
+  useEffect(() => {
+    globalThis.addEventListener('resize', handleDismiss);
+    return () => globalThis.removeEventListener('resize', handleDismiss);
+  }, [handleDismiss]);
 
   const visibleTabs = useMemo<Tab[]>(() => {
     const tabs: Tab[] = ['trending'];
@@ -414,13 +493,15 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
     <dialog
       ref={pickerRef}
       open
-      className={`gif-picker ${reduceAnimations ? 'reduce-motion' : ''}`}
+      className={`gif-picker ${reduceAnimations ? 'reduce-motion' : ''} ${placement && !placement.showArrow ? 'gif-picker--no-arrow' : ''}`}
       style={
         {
-          left: position.x,
-          top: position.y,
-          // Arrow tail x position relative to the picker's left edge.
-          ['--gif-picker-arrow-x' as string]: `${position.anchorCenterX - position.x}px`,
+          left: placement?.left ?? position.x,
+          top: placement?.top ?? position.y,
+          // Hidden until measured/placed to avoid a one-frame flash at the
+          // raw anchor coordinates (#2370 §2.1).
+          visibility: placement ? 'visible' : 'hidden',
+          ['--gif-picker-arrow-x' as string]: `${placement?.arrowX ?? 0}px`,
         } as React.CSSProperties
       }
       aria-label="GIF picker"
@@ -441,7 +522,11 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
             </button>
           ))}
         </div>
-        <button className="gif-picker-close" onClick={onClose} aria-label="Close">
+        {/* Routed through handleDismiss, not onClose directly: the ✕ is a
+            NON-selection close, so it owes the same focus restore as Escape,
+            outside-click and resize (#2370 §2.5). Wired straight to onClose it
+            unmounted while focused and dropped focus to <body>. */}
+        <button className="gif-picker-close" onClick={handleDismiss} aria-label="Close">
           <X size={16} />
         </button>
       </div>

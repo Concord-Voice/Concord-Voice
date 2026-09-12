@@ -1,14 +1,40 @@
 /* ─── Emoji Picker Container ──────────────────────────────────────── */
 
 .emoji-picker {
-  width: 374px;
+  /* Declared, not merely referenced: GifPicker.tsx / EmojiPicker.tsx write this
+     as an INLINE style, which wins over this rule, so the declaration only ever
+     supplies the pre-measurement default (the picker is `visibility: hidden`
+     then anyway). It exists because an undeclared `var()` -- even one carrying a
+     fallback -- is what tests/unit/styles/css-var-references.test.ts ratchets
+     against, and that allowlist is explicitly not a place to silence a new
+     reference. 50% + the -6px margin centres the 12px caret. */
+  --emoji-picker-arrow-x: 50%;
+  /* 422px = 1 (border-left) + 8 (padding-left) + 8*50 (cell grid) + 12
+     (right slack, 6px of which is the scrollbar gutter) + 1 (border-right),
+     under global box-sizing: border-box — preserves today's 12px slack at
+     the bumped 50px cell pitch (#2370 §2.3). */
+  width: 422px;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* `overflow: clip` (not `hidden`) plus a 10px clip margin — same
+     containing-block hazard `GifPicker.css`'s `.gif-picker` has; see #2370
+     §0 and utils/ui/pickerAnchor.ts. Only `.emoji-picker--anchored`
+     instances grow the `::after` arrow this clears room for, but the rule
+     lives on the base selector so it costs nothing to carry everywhere. */
+  overflow: clip;
+  overflow-clip-margin: 10px;
+  /* Consumed by both `.emoji-picker-grid-viewport` and `.emoji-picker-loading`
+     below — a single source so the two heights cannot drift apart (#2370
+     §2.3): the picker is measured at mount WHILE loading, so a divergent
+     `.emoji-picker-loading` height would mean the measured height is not the
+     final one. min(322px, calc(100vh - 320px)): 100vh = 600 (the supported
+     floor) yields today's 280px exactly; the full +15% (322px) arrives at
+     any window >= 642px tall — monotonic, never worse than today. */
+  --emoji-grid-height: min(322px, calc(100vh - 320px));
   font-family:
     'SourceSans',
     -apple-system,
@@ -29,6 +55,40 @@
   box-shadow: none;
   border: none;
   border-radius: 0;
+}
+
+/* Arrow tail pointing down at the composer's emoji button. Reuses
+   GifPicker.css's `.gif-picker::after` shape verbatim, with this picker's
+   own fill/border tokens. The horizontal position is --emoji-picker-arrow-x,
+   computed by resolveAnchoredPlacement() (utils/ui/pickerAnchor.ts) in
+   PADDING-BOX coordinates. `display: none` by default: anchored (composer)
+   popover mode only (#2370) turns it on below — legacy popover instances
+   (the other consumers) never carry the `--anchored` modifier class, so
+   they never see it, matching pre-#2370 behavior byte-for-byte. */
+.emoji-picker::after {
+  content: '';
+  position: absolute;
+  left: var(--emoji-picker-arrow-x);
+  bottom: -7px;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+  transform: rotate(45deg);
+  pointer-events: none;
+  display: none;
+}
+
+.emoji-picker--anchored::after {
+  display: block;
+}
+
+/* Suppression touches nothing but this one declaration — no DOM reorder, no
+   tabindex change, no conditional handler (#2370 §2.2). */
+.emoji-picker--anchored.emoji-picker--no-arrow::after {
+  display: none;
 }
 
 @keyframes emojiPickerIn {
@@ -112,10 +172,17 @@
   color: var(--text-primary);
 }
 
+/* 2.4.7 — no UA focus ring was set for this control; several of the 32
+   themes render it near-invisibly. */
+.emoji-picker-category-tab:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
 /* ─── Emoji Grid ──────────────────────────────────────────────────── */
 
 .emoji-picker-grid-viewport {
-  height: 280px;
+  height: var(--emoji-grid-height);
   overflow-y: auto;
   overflow-x: hidden;
   position: relative;
@@ -148,12 +215,15 @@
 }
 
 .emoji-picker-cell {
-  width: 44px;
-  height: 44px;
+  /* Kept in lockstep with EmojiGrid.tsx's CELL_SIZE — CELL_SIZE is pitch
+     only (it drives the row's own height/top, not cell width), so bumping
+     it alone would yield 50px rows holding 44px buttons (#2370 §2.3). */
+  width: 50px;
+  height: 50px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 24px;
+  font-size: 28px;
   border-radius: 6px;
   cursor: pointer;
   border: none;
@@ -235,6 +305,13 @@
   border-color: var(--border-color);
 }
 
+/* 2.4.7 — no UA focus ring was set for this control; several of the 32
+   themes render it near-invisibly. */
+.emoji-picker-skin-toggle:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
 .emoji-picker-skin-tones {
   position: absolute;
   bottom: 100%;
@@ -278,10 +355,15 @@
 /* ─── Loading State ───────────────────────────────────────────────── */
 
 .emoji-picker-loading {
+  /* Placement invariant, not a cosmetic duplicate — this is what EmojiGrid
+     renders while loading AND when empty, and the picker is measured at
+     mount while loading. Both height sites must consume the same
+     --emoji-grid-height custom property, or the measured height stops being
+     the final one (#2370 §2.3). */
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 280px;
+  height: var(--emoji-grid-height);
   color: var(--text-muted);
   font-size: calc(13px * var(--font-scale, 1));
 }

@@ -447,22 +447,15 @@ const MessageInput: React.FC<MessageInputProps> = ({
     [content]
   );
 
-  const getPickerPosition = useCallback((anchor: HTMLButtonElement | null, width: number) => {
+  // Anchor geometry only (#2370) — the picker itself measures its own size
+  // and computes final placement + arrow via resolveAnchoredPlacement
+  // (utils/ui/pickerAnchor.ts). This function no longer predicts a picker
+  // box, so it carries no picker width/height literal (the old 352/370/520
+  // constants are gone) and no longer needs one per caller.
+  const getPickerPosition = useCallback((anchor: HTMLButtonElement | null) => {
     if (!anchor) return { x: 0, y: 0, anchorCenterX: 0 };
     const rect = anchor.getBoundingClientRect();
-    const pickerHeight = 520;
-    const anchorCenterX = rect.left + rect.width / 2;
-
-    // Position above the button, right-aligned to the button so the arrow
-    // tail can point down at the anchor. 12px gap leaves room for the tail.
-    let x = rect.right - width;
-    let y = rect.top - pickerHeight - 12;
-
-    // Viewport clamping
-    x = Math.max(8, Math.min(x, globalThis.innerWidth - width - 8));
-    y = Math.max(8, y);
-
-    return { x, y, anchorCenterX };
+    return { x: rect.right, y: rect.top, anchorCenterX: rect.left + rect.width / 2 };
   }, []);
 
   const getInvitePickerPosition = useCallback((anchor: HTMLButtonElement | null) => {
@@ -480,7 +473,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
       setShowEmojiPicker(false);
     } else {
       setShowGifPicker(false);
-      setEmojiPickerPos(getPickerPosition(emojiBtnRef.current, 352));
+      setEmojiPickerPos(getPickerPosition(emojiBtnRef.current));
       setShowEmojiPicker(true);
     }
   }, [showEmojiPicker, getPickerPosition]);
@@ -490,7 +483,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
       setShowGifPicker(false);
     } else {
       setShowEmojiPicker(false);
-      setGifPickerPos(getPickerPosition(gifBtnRef.current, 370));
+      setGifPickerPos(getPickerPosition(gifBtnRef.current));
       setShowGifPicker(true);
     }
   }, [showGifPicker, getPickerPosition]);
@@ -512,6 +505,12 @@ const MessageInput: React.FC<MessageInputProps> = ({
       onSendMessage(' ', undefined, replyingTo?.id, undefined, undefined, gifSlug);
       setShowGifPicker(false);
       onCancelReply?.();
+      // Selection is the ONE close path the picker does not restore focus for
+      // (#2370 §2.5) -- it defers to the caller, which is here. Without this the
+      // focused GifTile unmounts and focus falls to <body>, stranding a keyboard
+      // user at the top of the document (WCAG 2.4.3). `handleEmojiSelect` above
+      // already does this; the GIF path simply never did.
+      requestAnimationFrame(() => textareaRef.current?.focus());
     },
     [onSendMessage, replyingTo, onCancelReply]
   );

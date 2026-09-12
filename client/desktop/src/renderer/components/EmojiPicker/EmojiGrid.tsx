@@ -2,9 +2,16 @@ import React, { useRef, useState, useCallback, useEffect } from 'react';
 import { EmojiEntry, SkinTone } from './types';
 
 const COLS = 8;
-const CELL_SIZE = 44;
+// PITCH ONLY — this sets the row's own height/top below, not cell width.
+// Cell width/height/font live in EmojiPicker.css's `.emoji-picker-cell` and
+// must be bumped together, or the grid renders 50px rows holding 44px
+// buttons (#2370 §2.3).
+const CELL_SIZE = 50;
 const ROW_HEIGHT = CELL_SIZE;
-const VIEWPORT_HEIGHT = 280;
+// Upper arm of EmojiPicker.css's `--emoji-grid-height: min(322px, ...)` — the
+// CSS height can now be BELOW this at short viewports, so virtualization
+// only ever over-renders (the safe direction); see #2370 §2.3.
+const VIEWPORT_HEIGHT = 322;
 const BUFFER_ROWS = 2;
 
 interface EmojiGridProps {
