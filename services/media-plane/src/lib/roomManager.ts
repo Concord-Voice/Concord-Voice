@@ -791,7 +791,7 @@ export type RoomEvent =
       kind: MediaKind;
       source: MediaSource;
     }
-  | { type: 'camera-layering-gate'; roomId: string; enabled: boolean }
+  | { type: 'camera-layering-gate'; roomId: string; enabled: boolean; targetSocketId?: string }
   | { type: 'screen-layering-gate'; roomId: string; targetSocketId: string; enabled: boolean }
   | { type: 'active-speaker'; roomId: string; userId: string; volume: number };
 
@@ -1489,7 +1489,6 @@ export class RoomManager {
       e2eeEpoch: room.e2eeEpoch,
       callId: room.callId,
     });
-
     return joinRoomResult(room, userId, activeMediaFrameCryptoVersion);
   }
 
@@ -3916,6 +3915,89 @@ export class RoomManager {
    * it, never a room broadcast. If the sharer has left, there is nobody to
    * notify.
    */
+  /**
+   * Send the CURRENT camera-gate state to one arriving participant, AFTER that
+   * participant's socket has joined the Socket.IO room.
+   *
+   * The ordering is the whole correctness argument, and the first version of
+   * this fix got it wrong. Emitting from inside `joinRoom` looked right — it is
+   * where the state lives — but four `await`s separate that point from
+   * `commitSocketMembership()` in index.ts, and another participant's in-flight
+   * `produce()` can flip the gate in that gap. The resulting room-wide
+   * transition cannot reach a socket that has not joined yet, so the joiner
+   * keeps a stale snapshot (possibly `false` once the authoritative gate is
+   * `true`) and publishes a single-encoding camera anyway — the very defect
+   * this method exists to close. Found by Codex on #3275.
+   *
+   * Called from `commitSocketMembership` rather than merely after it: joining
+   * the room and learning the room's gate state are one operation, and making
+   * them one function is what stops the ordering from being a convention
+   * somebody has to remember.
+   *
+   * Takes the SOCKET id, never a user id — and that is the second correction
+   * this method has needed, for the same underlying reason as the first. The
+   * previous signature resolved the target through
+   * `room.participants.get(userId).socketId`, which re-introduced an ordering
+   * dependency one layer down: `promoteDMParticipant` calls
+   * `commitSocketMembership()` (`:1566`) thirty lines BEFORE
+   * `room.participants.set(userId, participant)` (`:1596`), because the
+   * potentially-throwing `socket.join` boundary must run before any
+   * authoritative room mutation. So for a fresh DM promotion the lookup found
+   * nothing and the guard silently returned — every newly-promoted DM
+   * participant, the exact population this method exists for, got no snapshot;
+   * and on a same-user reconnect through that branch the lookup found the
+   * OUTGOING session (deleted at `:1590`) and aimed the snapshot at a dead
+   * socket. Found by Gitar on #3275 (the first half; the reconnect half was
+   * found verifying it).
+   *
+   * Do NOT "fix" that by moving the `.set` above `commitSocketMembership()` —
+   * that is the ordering the throwing-boundary comment at `:1563` exists to
+   * protect, and it would leave a participant committed to a room whose
+   * `socket.join` threw. The caller already holds the socket; asking it for the
+   * id it is standing on removes the lookup that can fail rather than
+   * re-sequencing around it.
+   *
+   * Returns whether it emitted, so a caller naming a room that does not exist
+   * is observable rather than silent — the remaining no-op, and the shape of
+   * both bugs above.
+   *
+   * The camera gate is room-wide STATE but was only ever announced on a
+   * TRANSITION, and those two do not compose for someone who arrives after the
+   * transition: a joiner inherits a gate nobody tells them about, keeps the
+   * client default `false`, and therefore (a) publishes a SINGLE-encoding camera
+   * into a layered room (`voiceService.ts:1352`) and (b) cannot step down under
+   * decoder pressure, so IGNIS pauses them instead (#3094 L1).
+   *
+   * Broadcasting harder would not have fixed it. `joinRoom` runs BEFORE
+   * `commitSocketMembership()` calls `socket.join(roomId)` (`index.ts:336` vs
+   * `:512`), so an `io.to(roomId)` emit from here cannot reach this socket at all
+   * — not even when the joiner's own arrival is what flips the gate. A targeted
+   * emit is the only one that lands, and Socket.IO's per-socket room needs no
+   * application-room membership.
+   *
+   * Sends the ACTUAL state rather than only `true`. Emitting just the enabled
+   * case would silently depend on the client's `false` default holding forever;
+   * the handler is idempotent (`voiceService.ts:7192`), so a `false` to an
+   * already-false client costs one event and triggers no reproduce.
+   *
+   * Screen needs no equivalent: its gate is keyed per sharer, so a new sharer
+   * starts from an absent entry and their first gate-ON is itself a transition,
+   * emitted straight to them by `emitScreenGate` below.
+   */
+  emitCameraGateSnapshotFor(roomId: string, socketId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    this.emitEvent({
+      type: 'camera-layering-gate',
+      roomId,
+      targetSocketId: socketId,
+      // Read HERE, not at join time: this is the first moment the socket is in
+      // the room, so this value and every later transition both reach it.
+      enabled: room.cameraLayeringGateEnabled,
+    });
+    return true;
+  }
+
   private emitScreenGate(room: Room, sharerUserId: string, enabled: boolean): void {
     const sharer = room.participants.get(sharerUserId);
     if (!sharer) return;

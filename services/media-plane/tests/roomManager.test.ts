@@ -127,7 +127,13 @@ function promoteDMParticipant(
   userId: string,
   socketId: string,
   expectedCallId: string,
-  promotion: TestDMParticipantPromotion
+  promotion: TestDMParticipantPromotion,
+  // Defaults to a no-op, matching every pre-existing caller. Pass the real
+  // shape — `() => manager.emitCameraGateSnapshotFor(roomId, socketId)` — to
+  // exercise what index.ts's closure actually does at this point. The gate
+  // snapshot silently missed every DM promotion for a whole PR precisely
+  // because no test here supplied anything but the no-op (Gitar, #3275).
+  commitSocketMembership: () => void = () => undefined
 ): JoinRoomResult {
   return (
     manager as RoomManager & {
@@ -140,7 +146,14 @@ function promoteDMParticipant(
         commitSocketMembership: () => void
       ): JoinRoomResult;
     }
-  ).promoteDMParticipant(roomId, userId, socketId, expectedCallId, promotion, () => undefined);
+  ).promoteDMParticipant(
+    roomId,
+    userId,
+    socketId,
+    expectedCallId,
+    promotion,
+    commitSocketMembership
+  );
 }
 
 async function removeProvisionalParticipantIfSocketOwned(
@@ -4285,10 +4298,21 @@ describe('RoomManager', () => {
       return producer;
     }
 
+    // TRANSITIONS only. Every join now also emits a TARGETED snapshot of the
+    // current gate state to the arriving socket, which is a different fact: these
+    // suites are about when the gate FLIPS, and folding a per-join state sync into
+    // them would make each assertion depend on how many participants the fixture
+    // happened to create. `gateSnapshots` is the lens for the other half.
     function gateEvents(handler: ReturnType<typeof vi.fn>) {
       return handler.mock.calls
         .map((call: any[]) => call[0])
-        .filter((event) => event.type === 'camera-layering-gate');
+        .filter((event) => event.type === 'camera-layering-gate' && !event.targetSocketId);
+    }
+
+    function gateSnapshots(handler: ReturnType<typeof vi.fn>) {
+      return handler.mock.calls
+        .map((call: any[]) => call[0])
+        .filter((event) => event.type === 'camera-layering-gate' && event.targetSocketId);
     }
 
     it('rejects a consumer not owned by the caller', async () => {
@@ -4476,6 +4500,202 @@ describe('RoomManager', () => {
 
       expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
       expect(gateEvents(handler)).toEqual([]);
+    });
+
+    // The late-joiner gate snapshot. Before this, a room-wide gate was announced
+    // only on TRANSITION, so anyone arriving afterwards inherited a state nobody
+    // told them about: the client kept its `false` default, published a
+    // single-encoding camera into a layered room, and could not step down under
+    // decoder pressure (#3094 L1 fires -> IGNIS pauses them instead).
+    it('hands a late joiner the gate state it arrived too late to hear', async () => {
+      const fallbackCodecs = ['video/H264', 'video/VP8'];
+      await addCameraProducer('u-1', 'p1', fallbackCodecs);
+      await addCameraProducer('u-2', 'p2', fallbackCodecs);
+      await addCameraProducer('u-3', 'p3', fallbackCodecs);
+      await addCameraConsumer('u-1', 'c1');
+      await addCameraConsumer('u-1', 'c2');
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+      );
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+
+      // Listen only from here: the gate flipped BEFORE this participant existed,
+      // so a transition-only design has nothing left to tell them.
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'late', 'sock-late', {
+        username: 'late',
+      });
+      // Emitted at COMMIT time, not join time: index.ts calls this from
+      // commitSocketMembership, after socket.join(roomId). Joining alone must
+      // NOT emit, because a snapshot sent before the socket is in the room can
+      // be overtaken by a transition it then cannot receive (Codex, #3275 P1).
+      expect(gateSnapshots(handler)).toEqual([]);
+      manager.emitCameraGateSnapshotFor('room-1', 'sock-late');
+
+      expect(gateEvents(handler)).toEqual([]); // no transition — the gate did not move
+      expect(gateSnapshots(handler)).toEqual([
+        {
+          type: 'camera-layering-gate',
+          roomId: 'room-1',
+          targetSocketId: 'sock-late',
+          enabled: true,
+        },
+      ]);
+    });
+
+    // The snapshot is a state SYNC, not a notification of the interesting case.
+    // Emitting only `enabled: true` would make correctness depend on the client's
+    // `false` default holding forever; the client handler is idempotent, so a
+    // `false` costs one event and triggers no reproduce.
+    it('hands a joiner enabled:false when the room is not layered', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'solo', 'sock-solo', {
+        username: 'solo',
+      });
+      manager.emitCameraGateSnapshotFor('room-1', 'sock-solo');
+
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(false);
+      expect(gateSnapshots(handler)).toEqual([
+        {
+          type: 'camera-layering-gate',
+          roomId: 'room-1',
+          targetSocketId: 'sock-solo',
+          enabled: false,
+        },
+      ]);
+    });
+
+    // Targeting is the load-bearing half, not a detail. `joinRoom` runs before
+    // `commitSocketMembership()` calls `socket.join(roomId)` (index.ts:336 vs :512),
+    // so a room-wide emit from this point cannot reach the joining socket at all.
+    it('targets the arriving socket rather than broadcasting to the room', async () => {
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-u-1', {
+        username: 'alice',
+      });
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-u-2', {
+        username: 'bob',
+      });
+      manager.emitCameraGateSnapshotFor('room-1', 'sock-u-2');
+
+      const snapshots = gateSnapshots(handler);
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0].targetSocketId).toBe('sock-u-2');
+      // Never the already-present participant, and never an untargeted broadcast.
+      expect(snapshots[0].targetSocketId).not.toBe('sock-u-1');
+      expect(gateEvents(handler)).toEqual([]);
+    });
+
+    // The race Codex found on #3275. The snapshot must read the gate at CALL
+    // time, not at join time: four awaits separate joinRoom from
+    // commitSocketMembership in index.ts, and another participant's in-flight
+    // produce() can flip the gate in that gap. A value captured at join would
+    // hand the joiner a stale `false` that no later broadcast corrects, because
+    // the transition fires while the socket is still outside the room.
+    it('reads the gate at call time, so a flip during the join window is not missed', async () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'late', 'sock-late', {
+        username: 'late',
+      });
+
+      // The gate flips AFTER the join and BEFORE membership commits.
+      const fallbackCodecs = ['video/H264', 'video/VP8'];
+      await addCameraProducer('u-1', 'p1', fallbackCodecs);
+      await addCameraProducer('u-2', 'p2', fallbackCodecs);
+      await addCameraProducer('u-3', 'p3', fallbackCodecs);
+      await addCameraConsumer('u-1', 'c1');
+      await addCameraConsumer('u-1', 'c2');
+      await manager.setPreferredLayers('room-1', 'u-1', validLayerDemand('c1'));
+      await manager.setPreferredLayers(
+        'room-1',
+        'u-1',
+        validLayerDemand('c2', { cssWidth: 1920, cssHeight: 1080 })
+      );
+      expect(manager.getRoom('room-1')!.cameraLayeringGateEnabled).toBe(true);
+
+      manager.emitCameraGateSnapshotFor('room-1', 'sock-late');
+
+      const snapshots = gateSnapshots(handler).filter((e) => e.targetSocketId === 'sock-late');
+      expect(snapshots).toHaveLength(1);
+      // `true`, not the `false` that was current when this participant joined.
+      expect(snapshots[0].enabled).toBe(true);
+    });
+
+    // The bug Gitar found on #3275, and the reason this method no longer looks
+    // its target up. `promoteDMParticipant` calls `commitSocketMembership()`
+    // THIRTY LINES before `room.participants.set(userId, participant)`, because
+    // the potentially-throwing `socket.join` boundary must precede every
+    // authoritative room mutation. A userId-keyed lookup therefore found
+    // nothing and returned silently, so every newly-promoted DM participant —
+    // the exact population this method exists for — got no snapshot.
+    //
+    // Nothing in this file supplied a real `commitSocketMembership` before, so
+    // the DM half shipped inert with the whole suite green. That is why the
+    // helper's parameter now defaults rather than being hardcoded to a no-op.
+    it('emits for a fresh DM promotion, whose participant is not in the room map yet', async () => {
+      await manager.joinRoom('dm-gate', 'u-dm', 'sock-dm', { username: 'dm' }, undefined, {
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm', callId: 'call-dm' },
+      });
+      const handler = vi.fn();
+      manager.onEvent(handler);
+
+      promoteDMParticipant(
+        manager,
+        'dm-gate',
+        'u-dm',
+        'sock-dm',
+        'call-dm',
+        {
+          callId: 'call-dm',
+          identity: { username: 'dm' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+        },
+        // Exactly index.ts's closure: it holds the socket, never the room map.
+        () => manager.emitCameraGateSnapshotFor('dm-gate', 'sock-dm')
+      );
+
+      expect(gateSnapshots(handler).map((event) => event.targetSocketId)).toEqual(['sock-dm']);
+    });
+
+    // The structural half, stated directly: the snapshot must not depend on
+    // `room.participants` at all. This is also the second, unreported bug the
+    // old lookup carried — on a same-user DM reconnect it found the OUTGOING
+    // session (deleted moments later) and aimed the snapshot at the very socket
+    // being replaced, so the arriving one still learned nothing.
+    it('emits to a socket that is not in the participant map', async () => {
+      // A real, occupied room — so the only thing 'sock-unmapped' is missing is
+      // a `room.participants` entry, which is precisely what used to be fatal.
+      await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-u-1', {
+        username: 'alice',
+      });
+      const handler = vi.fn();
+      manager.onEvent(handler);
+
+      expect(manager.emitCameraGateSnapshotFor('room-1', 'sock-unmapped')).toBe(true);
+      expect(gateSnapshots(handler).map((event) => event.targetSocketId)).toEqual([
+        'sock-unmapped',
+      ]);
+    });
+
+    // The one no-op that remains, now observable rather than silent — the shape
+    // of both bugs above was a guard returning nothing and telling nobody.
+    it('reports false for an unknown room rather than failing silently', () => {
+      const handler = vi.fn();
+      manager.onEvent(handler);
+
+      expect(manager.emitCameraGateSnapshotFor('no-such-room', 'sock-x')).toBe(false);
+      expect(gateSnapshots(handler)).toEqual([]);
     });
 
     it('enables fallback simulcast gate at three camera producers', async () => {
@@ -5893,13 +6113,17 @@ describe('RoomManager', () => {
       };
 
       it('reports zero for a room whose participants hold no consumers', async () => {
-        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
 
         expect(manager.getRoomConsumerCounts().get('room-1')).toBe(0);
       });
 
       it('sums consumers across every participant in a room', async () => {
-        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-2', 'sock-2', { username: 'bob' });
         seedConsumers('room-1', 'u-1', 3);
         seedConsumers('room-1', 'u-2', 5);
@@ -5908,7 +6132,9 @@ describe('RoomManager', () => {
       });
 
       it('reports each room separately', async () => {
-        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         await joinRoomWithSupportedCrypto(manager, 'room-2', 'u-2', 'sock-2', { username: 'bob' });
         seedConsumers('room-1', 'u-1', 2);
         seedConsumers('room-2', 'u-2', 9);
@@ -5921,7 +6147,9 @@ describe('RoomManager', () => {
       it('does not double-count consumers indexed in consumersByKey', async () => {
         // consumersByKey is Map<idempotencyKey, consumer.id> over the SAME
         // consumers. Summing both indexes would report 4 here, not 2.
-        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
+        await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', {
+          username: 'alice',
+        });
         const participant = seedConsumers('room-1', 'u-1', 2);
         for (const [id] of participant.consumers) {
           participant.consumersByKey.set(`key-${id}`, id);

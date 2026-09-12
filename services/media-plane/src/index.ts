@@ -12,6 +12,7 @@ import {
   RoomManager,
 } from './lib/roomManager.js';
 import type { DMParticipantPromotion, MediaSource } from './lib/roomManager.js';
+import { emitCameraLayeringGate } from './lib/layeringGateBroadcast.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import {
   createAuthMiddleware,
@@ -248,6 +249,17 @@ function registerJoinRoomHandler(
       const commitSocketMembership = () => {
         socket.join(roomId);
         data.roomId = roomId;
+        // Deliberately INSIDE this function, not after its call sites. The
+        // camera gate is room-wide state announced only on a transition, so a
+        // joiner needs the current value — and it must be read after the socket
+        // is in the room, or a transition landing in between reaches everyone
+        // except the joiner. Both the channel and DM paths commit through here,
+        // so one line covers both and the ordering cannot drift.
+        //
+        // `socket.id`, not `data.userId`: the room-membership map is not
+        // populated yet on the DM promotion path, so resolving the target
+        // through it silently missed exactly the participants this exists for.
+        roomManager.emitCameraGateSnapshotFor(roomId, socket.id);
       };
 
       const roomKind: 'channel' | 'dm' =
@@ -604,7 +616,9 @@ async function main() {
   // (see announcedIpAdvisory). Nothing downstream can detect it, so say it here.
   const ipAdvisory = announcedIpAdvisory(
     process.env.ANNOUNCED_IP,
-    Object.values(networkInterfaces()).flat().filter((i) => i !== undefined)
+    Object.values(networkInterfaces())
+      .flat()
+      .filter((i) => i !== undefined)
   );
   if (ipAdvisory) logger.warn(ipAdvisory);
 
@@ -1500,7 +1514,10 @@ async function main() {
     }
 
     if (event.type === 'camera-layering-gate') {
-      io.to(event.roomId).emit('camera-layering-gate', { enabled: event.enabled });
+      // Routing lives in lib/layeringGateBroadcast so it is reachable by a test:
+      // this file is excluded from coverage, and the RoomManager tests can only
+      // see the emitter's half of the contract.
+      emitCameraLayeringGate(io, event);
     }
 
     if (event.type === 'screen-layering-gate') {

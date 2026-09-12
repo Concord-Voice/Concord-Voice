@@ -116,6 +116,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tells you anything true — roughly ten seconds in the opening half-minute of a call, and roughly
   a minute after that, once Concord settles into checking less often.
 
+- **Joining a call late no longer leaves your camera stuck at one quality** ([#3275](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3275)) — in calls
+  where Concord sends video at several sizes, the server tells everyone once, at the moment it
+  starts doing so. Anyone who joined afterwards never heard, so they sent their camera at a
+  single size — which meant people watching them were stuck with whatever that size happened to
+  be, whether they were looking at a small tile or a full-screen view. The same gap also meant
+  that when their own computer struggled, Concord could only pause someone's video rather than
+  shrink it first. Joining now tells you the current state, so a late arrival behaves exactly
+  like someone who was there from the start.
+
 - **Saving a GIF no longer sends you back to the top** ([#3266](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3266), [#2370](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2370)) — clicking the save
   icon on a GIF reloaded the whole picker and lost your place in whatever you were scrolling
   through. A few seconds later it did it again, so scrolling back was not enough: you would reach
