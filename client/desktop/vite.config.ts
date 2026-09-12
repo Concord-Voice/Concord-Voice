@@ -45,6 +45,16 @@ export default defineConfig(() => {
     },
     test: {
       globals: true,
+      // vitest 5 flipped this default to true. Explicit false, because a large
+      // part of this suite asserts on module-IMPORT-time side effects -- the
+      // Electron main process registers its ipcMain handlers and command-line
+      // switches at import, and the test imports the module and then checks
+      // what it registered. Clearing mocks before each test erases that record
+      // between the import and the assertion, which fails 31 tests across
+      // main.test.ts and apiClient-ipc.test.ts. That is one architectural
+      // assumption, not 31 sloppy tests, so the default is pinned rather than
+      // the tests rewritten.
+      clearMocks: false,
       environment: 'jsdom',
       // Node 26 defines both storage globals -- `localStorage` as an accessor returning
       // `undefined` without --localstorage-file (so .clear() throws), `sessionStorage` as
