@@ -239,6 +239,40 @@ describe('GifPicker', () => {
     await waitFor(() => expect(getBySlugMock).toHaveBeenCalledWith('saved-slug-1'));
   });
 
+  // Every other Saved-tab test populates the store BEFORE rendering, so savedFetchKey is
+  // only ever evaluated on ENTRY to the tab -- never on a change while the tab is already
+  // showing. That is exactly where the effect's getState() read at GifPicker.tsx:325 is
+  // load-bearing.
+  it('unsaving a GIF WHILE the Saved tab is showing re-fetches and drops it (pins the documented residual)', async () => {
+    useSavedGifsStore.getState().saveGif('gif-1');
+    useSavedGifsStore.getState().saveGif('video-1');
+    getBySlugMock.mockImplementation((slug: string) =>
+      Promise.resolve(slug === 'video-1' ? sampleVideoGif : sampleImageGif)
+    );
+
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+    fireEvent.click(screen.getByText('Saved'));
+    await waitFor(() => expect(document.querySelectorAll('.gif-tile')).toHaveLength(2));
+    expect(getBySlugMock).toHaveBeenCalledTimes(2);
+
+    const videoTile = Array.from(document.querySelectorAll('.gif-tile')).find((t) =>
+      t.querySelector('video')
+    ) as HTMLElement;
+    fireEvent.click(videoTile.querySelector('.gif-save-overlay') as HTMLElement);
+    expect(useSavedGifsStore.getState().isGifSaved('video-1')).toBe(false);
+
+    // This pins BOTH directions at once, deliberately: if the fetch effect stops
+    // re-running here, the Saved tab goes STALE (the unsaved GIF stays on screen) --
+    // a regression, not a documented residual. If it DOES re-run (today's behaviour),
+    // getBySlug is re-invoked for the surviving slug only. Do not "simplify" the effect's
+    // dependency array to drop this extra call -- that is the stale-tab regression.
+    await waitFor(() => expect(getBySlugMock).toHaveBeenCalledTimes(3));
+    expect(getBySlugMock).toHaveBeenLastCalledWith('gif-1');
+    await waitFor(() => expect(document.querySelectorAll('.gif-tile')).toHaveLength(1));
+    expect(document.querySelector('.gif-tile video')).toBeNull();
+  });
+
   it('typing in the search input debounces and calls gifProvider.search', async () => {
     searchMock.mockResolvedValue({ items: [sampleImageGif], hasMore: false });
     render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
@@ -411,6 +445,66 @@ describe('GifPicker', () => {
     expect(useSavedGifsStore.getState().isGifSaved('video-1')).toBe(true);
     expect(onSelect).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // GifPicker.tsx:57 (removeGif) had zero coverage in the whole suite before this test --
+  // every prior save-overlay test only ever clicks in the SAVE direction, never toggles back.
+  it('clicking the save overlay again (unsave) removes the GIF and flips the label back to Save GIF', async () => {
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+    await waitFor(() => expect(document.querySelectorAll('.gif-tile')).toHaveLength(1));
+
+    fireEvent.click(document.querySelector('.gif-save-overlay') as HTMLElement);
+    expect(useSavedGifsStore.getState().isGifSaved('video-1')).toBe(true);
+    expect(screen.getByRole('button', { name: 'Remove from saved' })).toBeInTheDocument();
+
+    fireEvent.click(document.querySelector('.gif-save-overlay') as HTMLElement);
+    expect(useSavedGifsStore.getState().isGifSaved('video-1')).toBe(false);
+    expect(screen.getByRole('button', { name: 'Save GIF' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove from saved' })).not.toBeInTheDocument();
+
+    // NON-VACUITY CONTROL -- exercises the real (unmutated) store to show what a broken
+    // "always saveGif" toggle would produce: saveGif's own already-saved guard is a no-op
+    // on a repeat call, so the slug would STAY saved. That is the failure mode the two
+    // assertions above are pinned against. This calls the real store directly rather than
+    // mutating GifPicker.tsx, which the test-only constraint on this change forbids.
+    useSavedGifsStore.getState().saveGif('control-slug');
+    useSavedGifsStore.getState().saveGif('control-slug'); // what a non-toggling handleClick would do
+    expect(useSavedGifsStore.getState().isGifSaved('control-slug')).toBe(true);
+  });
+
+  // regression for #2370
+  it('saving a GIF from the trending tab does not clear the picker grid or refetch trending', async () => {
+    render(<GifPicker onSelect={onSelect} onClose={onClose} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+    // Gate on the rendered tile existing BEFORE the save — a zero-load harness
+    // (trending never resolved / grid never rendered) must fail loudly here,
+    // not silently satisfy the later "tiles still present" assertion by
+    // never having rendered anything in the first place.
+    await waitFor(() => expect(document.querySelectorAll('.gif-tile')).toHaveLength(1));
+
+    const saveBtn = document.querySelector('.gif-save-overlay') as HTMLElement;
+    // `saveGif` is a synchronous zustand `set`, and `fireEvent.click` flushes
+    // the resulting re-render (and the fetch effect's synchronous
+    // `setItems([])` opener) inside its own `act()` before returning. Assert
+    // immediately, with no intervening `await` — an `await waitFor(...)` here
+    // would let the re-triggered `trendingMock` promise's `.then` resolve and
+    // silently re-populate the grid before the check runs, masking the very
+    // window this test exists to catch.
+    fireEvent.click(saveBtn);
+    expect(useSavedGifsStore.getState().isGifSaved('video-1')).toBe(true);
+
+    // Dimension 1: no refetch was triggered by the save. `savedGifSlugs` is
+    // subscribed by IDENTITY in the fetch effect's dependency array, so a new
+    // array from `saveGif` re-runs it on whatever tab is active — including
+    // Trending, which has nothing to do with the Saved tab at all.
+    expect(trendingMock).toHaveBeenCalledTimes(1);
+
+    // Dimension 2: the grid was not emptied. The fetch effect's re-run opens
+    // with `setItems([])`, which — combined with dimension 1 firing on the
+    // unmodified tree — empties the grid on every save, on every tab.
+    expect(document.querySelectorAll('.gif-tile')).toHaveLength(1);
+    expect(document.querySelector('video')).not.toBeNull();
   });
 
   // ── Error states, retry, and a11y (#2371 A3) ──────────────────────────

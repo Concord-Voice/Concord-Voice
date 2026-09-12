@@ -195,7 +195,13 @@ function PickerBody({
 const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) => {
   const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
   const themeMode = useSettingsStore((s) => s.appearance.theme);
-  const savedGifSlugs = useSavedGifsStore((s) => s.gifs);
+  // Subscribed by CONTENT, not by array identity: the saved array is re-minted
+  // both by a local save and by the server's echo of that same write, and the
+  // fetch effect below should react to neither (#2370). A joined string
+  // compares by value, so an identity-only write is invisible here. The
+  // separator is NUL because isValidGifSlug admits only [A-Za-z0-9-], so no
+  // slug can contain one and two different lists cannot collide on one key.
+  const savedSlugKey = useSavedGifsStore((s) => s.gifs.map((g) => g.slug).join('\u0000'));
   const sharePersonalization = usePrivacyStore(
     (s) => s.settings.sharePersonalizationWithGifProvider
   );
@@ -237,6 +243,15 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
   }, [searchTerm]);
 
   const isSearching = debouncedSearchTerm.length > 0;
+
+  // The saved list drives a fetch only while the Saved tab is the thing
+  // rendering it. On any other tab, saving must not disturb what is on screen.
+  // '' is deliberately overloaded: it means both "not the Saved tab" and "the
+  // Saved tab with nothing saved". That is safe ONLY because activeTab and
+  // isSearching are separate entries in the dependency array below, so every
+  // transition through the collision re-runs the effect regardless. Keep all
+  // three deps together.
+  const savedFetchKey = activeTab === 'saved' && !isSearching ? savedSlugKey : '';
 
   // Fetch content based on active tab + search state
   useEffect(() => {
@@ -300,7 +315,15 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
         })
         .catch(() => fail("Couldn't load categories."));
     } else if (activeTab === 'saved') {
-      Promise.allSettled(savedGifSlugs.map((sg) => gifProvider.getBySlug(sg.slug)))
+      // Read the array here rather than subscribing to it. getState() can be
+      // NEWER than the savedFetchKey that scheduled this run — a write landing
+      // between the render that computed the key and the effect flush does
+      // exactly that. Harmless in that direction: the pending render commits
+      // the new key, this run's cleanup sets `cancelled`, and the re-run
+      // fetches the same list. Correctness rests on that cancelled guard, not
+      // on the read being "fresh".
+      const savedSlugs = useSavedGifsStore.getState().gifs;
+      Promise.allSettled(savedSlugs.map((sg) => gifProvider.getBySlug(sg.slug)))
         .then((results) => {
           // allSettled FULFILLS even when every request rejects, so the
           // .catch() below never sees individual failures. Without this branch
@@ -324,7 +347,7 @@ const GifPicker: React.FC<GifPickerProps> = ({ onSelect, onClose, position }) =>
     return () => {
       cancelled = true;
     };
-  }, [activeTab, isSearching, debouncedSearchTerm, savedGifSlugs, retryNonce]);
+  }, [activeTab, isSearching, debouncedSearchTerm, savedFetchKey, retryNonce]);
 
   const handleGifClick = useCallback(
     (gif: GifResolved) => {

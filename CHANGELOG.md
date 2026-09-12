@@ -75,6 +75,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Saving a GIF no longer sends you back to the top** ([#3266](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3266), [#2370](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2370)) — clicking the save
+  icon on a GIF reloaded the whole picker and lost your place in whatever you were scrolling
+  through. A few seconds later it did it again, so scrolling back was not enough: you would reach
+  the GIF you had just saved and be thrown to the top a second time. Both resets had one cause
+  seen from two sides. Saving rebuilds the list of GIFs you have kept, and the picker treated any
+  rebuild as a reason to discard what it was showing and fetch the first page again — even on the
+  Trending tab, which has nothing to do with your saved GIFs. The second reset was your own save
+  arriving back from the server a moment later, carrying nothing that had actually changed.
+  Saving now leaves the picker where it was: the save icon fills in under your cursor, and your
+  search, your tab and your scroll position all stay put. One case is still to come — removing a
+  GIF while you are looking at the Saved tab reloads that list, because there its contents really
+  did change.
+
 - **Changing the screen-share quality mid-share now reaches everyone watching** ([#3260](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3260), [#2208](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2208)) — a screen
   share can be sent in three qualities at once, so that someone watching in a small tile, or on a
   connection that cannot take the full thing, gets a lighter version instead of a stuttering one.
