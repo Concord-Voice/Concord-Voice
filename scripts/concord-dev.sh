@@ -1362,7 +1362,13 @@ _up_clients() {
 
   cd "$PROJECT_ROOT/client/desktop"
   # See _up_media_plane note — install when missing node_modules even with --no-rebuild.
-  if [[ "$no_rebuild" -eq 0 || ! -d node_modules ]]; then
+  # A tree with no node_modules is where dependency RESOLUTION actually happens, so
+  # that path is lock-exact (`npm ci`). An existing tree keeps `npm install` so the
+  # normal dev loop does not pay for a full wipe-and-reinstall on every `up`.
+  if [[ ! -d node_modules ]]; then
+    [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 npm ci (client/desktop)${NC}"
+    npm ci >/dev/null
+  elif [[ "$no_rebuild" -eq 0 ]]; then
     [[ "$QUIET" -eq 0 ]] && echo -e "${YELLOW}🔧 npm install (client/desktop)${NC}"
     npm install >/dev/null
   fi

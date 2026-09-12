@@ -117,6 +117,22 @@ async function errorTextOf(res: Response): Promise<string> {
  *  non-safe-integer index) BEFORE building the URL. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 
+/**
+ * Open a chunked-upload session and return the server's session id.
+ *
+ * Every size in the request body is derived from `header` — the SAME header this
+ * upload will seal with — never from the write-version constant, because v2 and v3
+ * disagree about where the header bytes live and a size computed from the wrong one
+ * produces a session the chunks cannot fill.
+ *
+ * The returned id is validated against `SESSION_ID_RE` before any caller builds a URL
+ * from it; see that constant for why the traversal defence cannot be left implicit.
+ *
+ * @param ctx - carries exactly one of `conversationId` / `channelId`. That is enforced
+ *   by the discriminated union rather than by a runtime check, which is what lets the
+ *   body spread pick a key without guarding against both being present.
+ * @returns the session id, already shape-validated.
+ */
 async function openSession(
   file: File,
   ctx: UploadSessionContext,
@@ -129,9 +145,9 @@ async function openSession(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       // Exactly one, never both -- the union above is what keeps this honest.
-      ...(ctx.conversationId !== undefined
-        ? { conversation_id: ctx.conversationId }
-        : { channel_id: ctx.channelId }),
+      ...(ctx.conversationId === undefined
+        ? { channel_id: ctx.channelId }
+        : { conversation_id: ctx.conversationId }),
       key_version: ctx.keyVersion,
       file_type: ctx.fileType,
       mime_type: ctx.mimeType,

@@ -177,9 +177,10 @@ func grantPremiumSubscription(ctx context.Context, tx *sql.Tx, userID uuid.UUID,
 		// code must never silently rewrite the billing source of record. Today
 		// every active sub is source='code' (no Stripe integration yet) so the
 		// CASE is a no-op; it is forward-safe for when Stripe (C1/C2, #1305/#1306)
-		// lands. TODO(#1305/#1306): define full reconciliation when a paying
-		// Stripe subscriber redeems a code (period stacking vs. the Stripe
-		// billing period) — for now we extend the period and keep the source.
+		// lands. Full reconciliation for a paying Stripe subscriber redeeming a
+		// code (period stacking vs. the Stripe billing period) is defined by
+		// #1305/#1306 and lands with them; until then we extend the period and
+		// keep the source, which is correct for every subscription that exists.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE subscriptions
 			   SET tier = $1, status = 'active',

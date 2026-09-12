@@ -28,7 +28,7 @@ const BINARY = 'concord_audiocap.node';
  * ADR-0043 § Consequences puts Linux/PipeWire out of scope, so there is no addon
  * to find there. That makes `null` a legitimate outcome rather than an error.
  */
-const SUPPORTED: readonly NodeJS.Platform[] = ['darwin', 'win32'];
+const SUPPORTED: ReadonlySet<NodeJS.Platform> = new Set(['darwin', 'win32']);
 
 /**
  * Resolve the native addon's path, mirroring `resolveTrayIconPath` in tray.ts.
@@ -51,7 +51,7 @@ export function resolveNativeAddonPath(
   resourcesPath: string | undefined,
   cwd: string
 ): string | null {
-  if (!SUPPORTED.includes(platform)) return null;
+  if (!SUPPORTED.has(platform)) return null;
   if (isPackaged && resourcesPath) {
     return path.join(resourcesPath, BINARY);
   }

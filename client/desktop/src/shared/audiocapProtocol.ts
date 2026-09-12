@@ -132,13 +132,13 @@ const OFFSET = {
  */
 export type AudiocapFaultStage = 'guard' | 'load' | 'capability' | 'start' | 'protocol';
 
-const AUDIOCAP_FAULT_STAGES: readonly string[] = [
+const AUDIOCAP_FAULT_STAGES: ReadonlySet<string> = new Set([
   'guard',
   'load',
   'capability',
   'start',
   'protocol',
-];
+]);
 
 export interface AudiocapCapability {
   platform: string;
@@ -252,7 +252,7 @@ export function isAudiocapFault(v: unknown): v is AudiocapFault {
     isRecord(v) &&
     v.kind === 'fault' &&
     typeof v.stage === 'string' &&
-    AUDIOCAP_FAULT_STAGES.includes(v.stage) &&
+    AUDIOCAP_FAULT_STAGES.has(v.stage) &&
     typeof v.message === 'string'
   );
 }

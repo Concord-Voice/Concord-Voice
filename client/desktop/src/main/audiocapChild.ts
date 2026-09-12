@@ -500,7 +500,7 @@ function matchesCompiledGeometry(message: Record<string, unknown>): boolean {
 /**
  * An `ok:false` reason, named only when it is one this build knows.
  *
- * `hasOwnProperty`, NOT a bare `START_FAILURE_REASONS[reason]`. The map is an
+ * `Object.hasOwn`, NOT a bare `START_FAILURE_REASONS[reason]`. The map is an
  * object literal and therefore inherits `constructor`, `toString`, `valueOf` and
  * the rest of `Object.prototype`; the addon is an unvalidated source, and a
  * `reason` of `'constructor'` would make a bare lookup return a FUNCTION —
@@ -509,16 +509,29 @@ function matchesCompiledGeometry(message: Record<string, unknown>): boolean {
  * supposed to shut.
  */
 export function startFailureMessage(reason: unknown): string {
-  if (
-    typeof reason === 'string' &&
-    Object.prototype.hasOwnProperty.call(START_FAILURE_REASONS, reason)
-  ) {
+  if (typeof reason === 'string' && Object.hasOwn(START_FAILURE_REASONS, reason)) {
     const phrase = (START_FAILURE_REASONS as Record<string, string>)[reason];
     return `capture did not start - ${phrase}`;
   }
   return 'capture did not start - the addon gave no recognised reason';
 }
 
+/**
+ * Handle a `start` control message: validate it, then hand the PCM port to the addon.
+ *
+ * All four validation rejections call `postFault` and return; nothing propagates out
+ * of this function, including a throw from `addon.start()`, which is caught below.
+ * That is deliberate — this runs in the utility process, so an escaping throw would
+ * reach the host as an opaque child exit rather than a named stage it can report.
+ *
+ * The `capturing = true` ordering around the addon call is the load-bearing part and
+ * is explained at the assignment; do not move it without reading that comment.
+ *
+ * @param addon - the loaded native addon; owns the OS tap once `start` succeeds.
+ * @param port - the PCM port from the control channel, `null` if the message carried
+ *   none. A missing port is a fault, not a degraded start: there is nowhere to send
+ *   audio, and starting the tap anyway would open a capture nothing drains.
+ */
 function handleStart(
   addon: AudiocapAddon,
   message: Record<string, unknown>,
@@ -598,7 +611,6 @@ function handleStart(
     // cannot be affected by anything teardown does.
     const reason = isRecord(result) ? result.reason : undefined;
     unwindFailedStart(addon, startFailureMessage(reason));
-    return;
   }
 }
 

@@ -59,7 +59,7 @@ func IsRateLimited(ctx context.Context, rdb *redis.Client, key string, limit int
 		// same -1, and once it passes the limit the key blocks that resource
 		// permanently — there is no window left to roll over. Fail open instead:
 		// an unbounded counter is not evidence the caller is over budget.
-		if expErr := rdb.Expire(ctx, key, window).Err(); expErr != nil {
+		if rdb.Expire(ctx, key, window).Err() != nil {
 			return false, 0
 		}
 	} else if redisTTL >= 0 {

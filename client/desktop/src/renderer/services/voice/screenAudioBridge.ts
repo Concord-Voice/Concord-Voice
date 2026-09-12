@@ -128,23 +128,31 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
   // already killed the child the older bridge was reading from.
   if (generation > currentGeneration) currentGeneration = generation;
 
+  // The three throws below are TypeError, not Error (typescript:S7786). That was
+  // free to change here only because #3195 ships this module dark — it has no
+  // production caller yet, so nothing exists to discriminate on the constructor.
+  // #3196-#3198 give it one. Any catch written then must branch on TypeError (or
+  // on `instanceof Error`, which still matches); a `err.constructor === Error`
+  // check would silently never fire. The contract moved ahead of its first
+  // consumer, which is exactly when it is easy to miss.
+  //
   // C4 feature detection: the PRESENCE of the function is the capability probe,
   // its VALUE is the discriminator. Never a hardcoded tag — a literal would
   // silently keep matching a tag the preload had moved on from, and there is no
   // second surface for this bridge to fall back to.
   const getPortMessageTag = globalThis.electron?.audiocap?.getPortMessageTag;
   if (typeof getPortMessageTag !== 'function') {
-    throw new Error('screen-audio relay unavailable');
+    throw new TypeError('screen-audio relay unavailable');
   }
   const tag = getPortMessageTag();
   if (typeof tag !== 'string' || tag.length === 0) {
-    throw new Error('screen-audio relay unavailable');
+    throw new TypeError('screen-audio relay unavailable');
   }
 
   const Generator = (globalThis as { MediaStreamTrackGenerator?: AudioTrackGeneratorConstructor })
     .MediaStreamTrackGenerator;
   if (typeof Generator !== 'function') {
-    throw new Error('screen-audio generator unavailable');
+    throw new TypeError('screen-audio generator unavailable');
   }
 
   const generator = new Generator({ kind: 'audio' });
@@ -338,7 +346,12 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
     // ANY opaque origin satisfies. There the source check is doing all the work.
     // Conversely a same-document attacker can dispatch an event carrying our own
     // origin string, and only the source check refuses that.
-    if (event.origin !== window.location.origin) return;
+    if (event.origin !== globalThis.location.origin) return;
+    // `window` here, unlike the origin check above, because `globalThis` does not
+    // typecheck against `MessageEventSource` (TS2367 — lib.dom merges `Window` into
+    // the `window` declaration, not into `typeof globalThis`). The only way to the
+    // globalThis spelling is a double cast, and blinding the compiler on the one
+    // check that refuses a same-document attacker is not worth the consistency.
     if (event.source !== window) return;
     const data: unknown = event.data;
     if (typeof data !== 'object' || data === null) return;
@@ -349,14 +362,14 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
 
   // Registered before returning, so a handoff that lands in the same task as
   // construction is not missed.
-  window.addEventListener('message', onWindowMessage);
+  globalThis.addEventListener('message', onWindowMessage);
 
   return {
     track: generator,
     stop(): void {
       if (stopped) return;
       stopped = true;
-      window.removeEventListener('message', onWindowMessage);
+      globalThis.removeEventListener('message', onWindowMessage);
       closePort();
       writer.releaseLock();
       generator.stop();

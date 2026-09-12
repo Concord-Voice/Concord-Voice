@@ -75,13 +75,13 @@ async function runPreflightDiagnostics(wsService: ReturnType<typeof getWebSocket
   if (voiceState.connectionState !== 'disconnected') {
     import('../../services/voice/voiceService')
       .then(({ voiceService }) => {
-        if (useVoiceStore.getState().connectionState !== 'disconnected') {
-          voiceService.emergencyCleanup();
-        } else {
+        if (useVoiceStore.getState().connectionState === 'disconnected') {
           // User left voice during the import window — teardown is a no-op, so
           // retract the stash or the reconnect rejoins a channel they left.
           store.setLastVoiceChannelId(null);
+          return;
         }
+        voiceService.emergencyCleanup();
       })
       .catch(() => {
         // Voice module never loaded — no teardown happened, so the session is

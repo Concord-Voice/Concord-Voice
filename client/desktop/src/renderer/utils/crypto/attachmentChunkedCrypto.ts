@@ -229,7 +229,7 @@ export class AttachmentKeyEpochError extends Error {
  */
 export function parseKeyVersionHeader(raw: string | null): number | null {
   if (raw === null) return null;
-  if (!/^[0-9]+$/.test(raw)) {
+  if (!/^\d+$/.test(raw)) {
     throw new AttachmentKeyEpochError(`unparseable attachment key epoch ${JSON.stringify(raw)}`);
   }
   const n = Number(raw);
