@@ -1,5 +1,5 @@
 .ctx-enforcement-icon--active-hard {
-  color: var(--warning);
+  color: var(--text-warning-strong);
 }
 
 .ctx-enforcement-icon--active-user {

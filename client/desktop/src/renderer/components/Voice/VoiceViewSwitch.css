@@ -64,7 +64,7 @@
 
 .voice-view-switch__seg:hover {
   color: var(--text-primary);
-  background: var(--bg-modifier-hover);
+  background: var(--bg-hover);
 }
 
 /* Active = accent (a "current selection" signal), deliberately NOT --danger:

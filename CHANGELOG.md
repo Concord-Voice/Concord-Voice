@@ -75,6 +75,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Server-enforced mutes look enforced again, and some hover highlights came back** ([#3270](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3270)) — when a
+  moderator mutes or deafens someone, the marker on that person is meant to be amber, so you can
+  tell at a glance that the server did it rather than they did. In the channel list, and in the
+  menu you get from right-clicking someone, that marker was being given a colour that does not
+  exist, so it fell back to the same grey as everything around it and the enforced state read as
+  ordinary. The same fault took the highlight off three controls that are supposed to light up
+  under the pointer — the layout toggle in a call's text chat, and the two view switches — and
+  removed the line under the heading of the category manager in your direct messages. All six
+  were the same mistake: a colour named in the stylesheet that no theme actually defines, which
+  does not fall back to something sensible but throws the whole instruction away. A test now
+  fails the build if anyone writes another one of those. Colours that name a missing token but
+  supply a spare are left for later: those still paint, just not the colour your theme asked
+  for.
+
+- **The documents in Settings ▸ About are set apart from one another** ([#3270](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3270)) — the
+  Third-party services and Legal and attribution headings are each meant to sit below a dividing
+  line, and the four documents listed under the second of them — the licence, the privacy policy,
+  the terms of service and the notices — are each meant to sit in a box you can open. None of
+  those lines were drawn, on any theme, so the section ran together as one unbroken block of text
+  with nothing to show that the documents were separate things or that they opened at all.
+  Opening one made it worse: its contents ran straight on from its title with no line between
+  them. All of it is now drawn, in the same colour the rest of the app uses for such lines, so it
+  follows whichever theme you are on. The placeholder that stands in for a GIF you have not
+  loaded yet had the same cause with the opposite symptom — its dashed outline was drawn, but
+  always in one fixed dark grey. On the dark themes that passed for correct, which is why it
+  lasted; on the fifteen light ones it was a charcoal rectangle on a white panel. It now takes
+  its colour from the theme like everything else.
+
 - **Video drops to a smaller size before it freezes when your computer is struggling** ([#3268](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3268), [#3094](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3094)) — Concord
   watches how long your computer takes to decode each incoming video, and when it starts falling
   behind it has to give something up. Until now it had one move: pause somebody's camera outright,

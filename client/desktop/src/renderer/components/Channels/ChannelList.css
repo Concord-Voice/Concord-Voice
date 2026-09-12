@@ -627,7 +627,7 @@
   display: inline-flex;
   align-items: center;
   position: relative;
-  color: var(--warning);
+  color: var(--text-warning-strong);
 }
 
 .voice-channel-participant__lock {

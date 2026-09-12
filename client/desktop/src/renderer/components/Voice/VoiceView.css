@@ -193,7 +193,7 @@
 }
 
 .voice-view__section-toggle:hover {
-  background: var(--bg-modifier-hover);
+  background: var(--bg-hover);
   color: var(--text-primary);
 }
 

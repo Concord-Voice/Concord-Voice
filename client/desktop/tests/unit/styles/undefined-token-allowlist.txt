@@ -1,0 +1,90 @@
+# Frozen inventory of undefined-token references that CARRY A FALLBACK.
+#
+# These paint, but always the literal in the fallback, ignoring the theme -- a dark
+# grey on fifteen light schemes. Cosmetic rather than structural, which is why
+# css-var-references.test.ts fails the build only on the no-fallback class.
+#
+# This file is the ratchet for the cosmetic class. The guard asserts the live set
+# matches these lines EXACTLY, so:
+#   - a NEW undefined-with-fallback reference fails the build
+#   - FIXING one also fails the build until its line is deleted here
+# The second half is the point. Without it a future no-fallback bug could be
+# "fixed" by adding a fallback, and the guard would go green over a live defect.
+#
+# Deleting lines is the goal. Do not add one to silence a failure: a reference
+# belongs here only if it already existed when this file was frozen (PR #3270).
+#
+# Several of these have NO declared equivalent today -- --accent-primary-rgb,
+# --font-mono, --status-dnd/-online/-offline, --elevation-high, the --spoiler-*
+# set -- so closing them means DECLARING a token across all 34 blocks, which is a
+# design decision about the token system, not a rename. That is why they are
+# frozen here rather than guessed at.
+#
+# Format: <path relative to client/desktop> <token>
+src/renderer/components/AttestationFailedModal.css --accent-color-hover
+src/renderer/components/Auth/KeyRecoveryPrompt.css --color-surface
+src/renderer/components/Auth/KeyRecoveryPrompt.css --color-text
+src/renderer/components/Auth/SSOAccountLinkConfirm.css --accent-primary-hover
+src/renderer/components/Auth/SSOEagerUnlock.css --accent-primary-hover
+src/renderer/components/Auth/SSOPassphraseSetup.css --accent-primary-hover
+src/renderer/components/Auth/ServerInput.css --font-mono
+src/renderer/components/Auth/TOTPInput.css --font-mono
+src/renderer/components/Channels/SendToFriendModal.css --background-modifier-hover
+src/renderer/components/Channels/SendToFriendModal.css --background-tertiary
+src/renderer/components/Channels/SendToFriendModal.css --text-danger
+src/renderer/components/Chat/AttachmentUploadPreview.css --text-muted-color
+src/renderer/components/Chat/InviteEmbed.css --accent
+src/renderer/components/Chat/MessageInput.css --error
+src/renderer/components/DirectMessages/CallEventMessage.css --surface-muted
+src/renderer/components/DirectMessages/CategoryManagerPanel.css --button-danger-background
+src/renderer/components/DirectMessages/CategoryManagerPanel.css --button-danger-background-hover
+src/renderer/components/DirectMessages/DMProfileModal.css --accent
+src/renderer/components/DirectMessages/DMProfileModal.css --status-dnd
+src/renderer/components/DirectMessages/DMProfileModal.css --status-offline
+src/renderer/components/DirectMessages/DMProfileModal.css --status-online
+src/renderer/components/DirectMessages/DMProfileModal.css --text-link
+src/renderer/components/DirectMessages/DirectMessages.css --accent
+src/renderer/components/DirectMessages/DirectMessages.css --text-on-accent
+src/renderer/components/GifPicker/GifPicker.css --border-primary
+src/renderer/components/GifPicker/GifPicker.css --border-secondary
+src/renderer/components/GifPicker/GifPicker.css --gif-picker-arrow-x
+src/renderer/components/Markdown/MarkdownContent.css --accent
+src/renderer/components/Markdown/MarkdownContent.css --border-subtle
+src/renderer/components/Markdown/MarkdownContent.css --code-font
+src/renderer/components/Markdown/MarkdownContent.css --surface-2
+src/renderer/components/Markdown/Spoiler.css --focus-ring
+src/renderer/components/Markdown/Spoiler.css --spoiler-bg
+src/renderer/components/Markdown/Spoiler.css --spoiler-bg-hover
+src/renderer/components/Markdown/Spoiler.css --spoiler-bg-revealed
+src/renderer/components/Markdown/SyntaxHelpModal.css --code-font
+src/renderer/components/Profile/profileForms.css --warning
+src/renderer/components/Settings/CodecProfilesModal.css --code-font
+src/renderer/components/Settings/LinkedAccountsList.css --background-secondary
+src/renderer/components/Settings/LinkedAccountsList.css --border-subtle
+src/renderer/components/Settings/LinkedAccountsList.css --danger-background
+src/renderer/components/Settings/LinkedAccountsList.css --danger-border
+src/renderer/components/Settings/LinkedAccountsList.css --danger-text
+src/renderer/components/Settings/MFA.css --background-secondary
+src/renderer/components/Settings/MFA.css --bg-input
+src/renderer/components/Settings/MFA.css --border-subtle
+src/renderer/components/Settings/MFA.css --danger-text
+src/renderer/components/Settings/MFA.css --font-mono
+src/renderer/components/Settings/MFA.css --warning-color
+src/renderer/components/Settings/NsfwContentGate.css --input-bg
+src/renderer/components/Settings/PresenceExceptions.css --elevation-high
+src/renderer/components/Settings/SettingsPage.css --accent-primary-rgb
+src/renderer/components/Voice/IncomingCallBanner.css --border-accent
+src/renderer/components/Voice/IncomingCallBanner.css --surface-elevated
+src/renderer/components/Voice/IncomingCallBanner.css --surface-muted
+src/renderer/components/Voice/OutgoingCallModal.css --border-accent
+src/renderer/components/Voice/OutgoingCallModal.css --surface-elevated
+src/renderer/components/Voice/OutgoingCallModal.css --surface-muted
+src/renderer/components/Voice/ScreenShareAudioControls.css --surface-overlay
+src/renderer/components/Voice/ScreenShareAudioControls.css --surface-overlay-hover
+src/renderer/components/Voice/ScreenShareAudioControls.css --text-on-overlay
+src/renderer/components/Voice/ShareSegmentedControl.css --radius-md
+src/renderer/components/Voice/VoiceControls.css --bg-floating
+src/renderer/components/ui/ChannelSwitcher.css --accent-color-alpha
+src/renderer/components/ui/ConnectionLostOverlay.css --bg-quaternary
+src/renderer/components/ui/ConnectionLostOverlay.css --danger-color
+src/renderer/components/ui/ImageCropEditor.css --warning
