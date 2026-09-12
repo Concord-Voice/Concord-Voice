@@ -792,4 +792,69 @@ describe('IGNIS decoder recovery (#1540)', () => {
     expect(setPreferredLayerEmits()).toHaveLength(1);
     expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(true);
   });
+
+  // Multi-tile pressure. registerCameraPressureContext models ONE tile, but
+  // production renders the same participant in several at once (grid + focus,
+  // thumbnail strip + stage), and computePreferredLayerPayloadForUser picks the
+  // best VISIBLE tile across them. So a tile with no step left must not be able
+  // to speak for the participant: the L2 guard asks whether the POLICY has a step,
+  // and the answer belongs to the winning tile.
+  // BOTH insertion orders, and the second case is the one with teeth. With the
+  // focus tile added last, "pick the last visible tile" passes this test exactly
+  // as "pick the best visible tile" does — so the original fixture could not
+  // tell the property it names from a trivially wrong implementation that
+  // happens to agree on one ordering (CodeRabbit, #3277). Map iteration order is
+  // insertion order, so reversing it is the whole control.
+  it.each([
+    ['thumbnail inserted first', false],
+    ['focus inserted first', true],
+  ])(
+    'takes the step the best visible tile still has, not the one a thumbnail lacks (%s)',
+    async (_label, focusFirst) => {
+      const svc = voiceService as any;
+      const cursor = makeCursor('mt-cam-report', 90);
+      const cam = makeVideoConsumer('mt-cam', () => statsMap(cursor), { negotiatedSsrc: 90 });
+      const other = makeVideoConsumer('mt-other', () => new Map());
+      svc.consumers.set(cam.id, cam);
+      svc.consumers.set(other.id, other);
+      // One tile at thumbnail (forced to spatial 0 — no step), one at focus (has one).
+      registerCameraPressureContext(svc, 'mt-user', cam.id, { role: 'thumbnail' });
+      const thumbnail = svc.remoteVideoRenderStateByUser.get('mt-user').get('tile-1');
+      const focus = {
+        visible: true,
+        cssWidth: 1920,
+        cssHeight: 1080,
+        role: 'focus' as const,
+        focusedWindow: true,
+      };
+      svc.remoteVideoRenderStateByUser.set(
+        'mt-user',
+        focusFirst
+          ? new Map([
+              ['tile-focus', focus],
+              ['tile-1', thumbnail],
+            ])
+          : new Map([
+              ['tile-1', thumbnail],
+              ['tile-focus', focus],
+            ])
+      );
+      const setPreferredLayerEmits = () =>
+        mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers');
+
+      await svc.profileDecoders(); // baseline
+      addInterval(cursor, elapse(), 40);
+      await svc.profileDecoders(); // classified RED
+
+      // L2 must NOT fire: the focus tile still has a step, so this is an emit, not a pause.
+      expect(setPreferredLayerEmits()).toHaveLength(1);
+      expect(setPreferredLayerEmits()[0][1]).toMatchObject({ pressureStepDown: true });
+      expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(false);
+      // And the demand is the FOCUS tile's pressured layer, strictly below its own
+      // unpressured value — the thumbnail's 0 never becomes the participant's answer.
+      const unpressured = svc.computePreferredLayerPayloadForUser('mt-user', false);
+      expect(setPreferredLayerEmits()[0][1].spatialLayer).toBeLessThan(unpressured.spatialLayer);
+      expect(setPreferredLayerEmits()[0][1].spatialLayer).toBeGreaterThan(0);
+    }
+  );
 });
