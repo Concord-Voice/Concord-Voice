@@ -267,7 +267,6 @@ function makeVideoConsumer(
   options: {
     producerId?: string;
     negotiatedSsrc?: number;
-    currentLayers?: { spatialLayer: number; temporalLayer: number };
   } = {}
 ) {
   const state = { paused: false };
@@ -293,9 +292,48 @@ function makeVideoConsumer(
     rtpParameters: {
       encodings: options.negotiatedSsrc === undefined ? [] : [{ ssrc: options.negotiatedSsrc }],
     },
-    currentLayers: options.currentLayers,
-    setPreferredLayers: vi.fn(),
   };
+}
+
+/** Opt-in: give a consumer the production context camera pressure needs.
+ *  Without this call, tryEmitCameraPressureLayerRequest bails at its first guard —
+ *  which is what makes a vacuous test visible at the call site. */
+function registerCameraPressureContext(
+  svc: any,
+  userId: string,
+  consumerId: string,
+  opts: {
+    gateEnabled?: boolean;
+    role?: 'thumbnail' | 'grid' | 'focus';
+    cssWidth?: number;
+    cssHeight?: number;
+  } = {}
+) {
+  // consumerMeta's value shape is exactly these three fields (voiceService.ts:542-545).
+  svc.consumerMeta.set(consumerId, {
+    source: 'camera',
+    producerUserId: userId,
+    producerId: `producer-${consumerId}`,
+  });
+  // RemoteVideoTileRenderState is exactly these FIVE fields. devicePixelRatio is NOT
+  // one of them — layerPayloadForTileState supplies it from remoteVideoDevicePixelRatio()
+  // at call time. Adding it here would model a shape production never stores.
+  svc.remoteVideoRenderStateByUser.set(
+    userId,
+    new Map([
+      [
+        'tile-1',
+        {
+          visible: true,
+          cssWidth: opts.cssWidth ?? 640,
+          cssHeight: opts.cssHeight ?? 360,
+          role: opts.role ?? 'grid',
+          focusedWindow: true,
+        },
+      ],
+    ])
+  );
+  svc.cameraLayeringEnabled = opts.gateEnabled ?? true;
 }
 
 function setupAuth() {
@@ -332,6 +370,15 @@ describe('IGNIS decoder recovery (#1540)', () => {
     svc.decoderProfilingTimer = null;
     svc.decoderProfilingInFlight = false;
     svc.consecutiveGreenIntervals = 0;
+    // IGNIS camera-pressure context (#3094): a real socket spy so
+    // tryEmitCameraPressureLayerRequest's `!this.socket` guard doesn't fallback
+    // vacuously, plus a clean slate for the per-user pressure/render-state/gate
+    // state registerCameraPressureContext writes into.
+    svc.socket = mockSocket;
+    svc.remoteVideoPressureByUser?.clear();
+    svc.remoteVideoRenderStateByUser?.clear();
+    svc.lastPreferredLayerKeyByConsumer?.clear();
+    svc.cameraLayeringEnabled = false;
   });
 
   afterEach(() => {
@@ -344,6 +391,11 @@ describe('IGNIS decoder recovery (#1540)', () => {
     svc.decoderProfilingTimer = null;
     svc.decoderProfilingInFlight = false;
     svc.consecutiveGreenIntervals = 0;
+    svc.socket = null;
+    svc.remoteVideoPressureByUser?.clear();
+    svc.remoteVideoRenderStateByUser?.clear();
+    svc.lastPreferredLayerKeyByConsumer?.clear();
+    svc.cameraLayeringEnabled = false;
     vi.useRealTimers();
   });
 
@@ -394,9 +446,12 @@ describe('IGNIS decoder recovery (#1540)', () => {
     const cursor = makeCursor('sole-red-report', 25);
     const consumer = makeVideoConsumer('sole-camera', () => statsMap(cursor), {
       negotiatedSsrc: 25,
-      currentLayers: { spatialLayer: 0, temporalLayer: 0 },
     });
     svc.consumers.set(consumer.id, consumer);
+    // Thumbnail role forces spatial 0 unconditionally (L2: no step left), so the
+    // render-demand path falls back and pauseLowestPriorityConsumer is genuinely
+    // reached — not vacuously, via a missing-consumerMeta bail at tryEmit's first guard.
+    registerCameraPressureContext(svc, 'sole-user', consumer.id, { role: 'thumbnail' });
 
     await svc.profileDecoders();
     addInterval(cursor, elapse(), 40);
@@ -548,23 +603,30 @@ describe('IGNIS decoder recovery (#1540)', () => {
     const cursor = makeCursor('layered-report', 60);
     const consumer = makeVideoConsumer('layered-camera', () => statsMap(cursor), {
       negotiatedSsrc: 60,
-      currentLayers: { spatialLayer: 1, temporalLayer: 0 },
     });
     svc.consumers.set(consumer.id, consumer);
+    // Headroom available (default grid role, 640x360): the render-demand path emits
+    // instead of the deleted client-side setPreferredLayers clamp this test used to
+    // witness. deleteConsumer(consumer.id) on that emit is what resets the sampler
+    // segment — the reset is witnessed below through the tick-3 decoderHealth
+    // transition (was already asserted pre-#3094) plus the absence of a repeat emit.
+    registerCameraPressureContext(svc, 'layered-user', consumer.id);
+    const setPreferredLayerEmits = () =>
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers');
 
     await svc.profileDecoders();
     addInterval(cursor, elapse(), 40);
     await svc.profileDecoders();
-    expect(consumer.setPreferredLayers).toHaveBeenCalledTimes(1);
+    expect(setPreferredLayerEmits()).toHaveLength(1);
 
     addInterval(cursor, elapse(), 5);
-    await svc.profileDecoders(); // fresh baseline: stale RED history must not fire again
-    expect(consumer.setPreferredLayers).toHaveBeenCalledTimes(1);
+    await svc.profileDecoders(); // fresh baseline (blind tick): stale RED history must not fire again
+    expect(setPreferredLayerEmits()).toHaveLength(1);
     expect(useVoiceStore.getState().decoderHealth).toBe('red');
 
     addInterval(cursor, elapse(), 5);
     await svc.profileDecoders();
-    expect(consumer.setPreferredLayers).toHaveBeenCalledTimes(1);
+    expect(setPreferredLayerEmits()).toHaveLength(1);
     expect(useVoiceStore.getState().decoderHealth).toBe('green');
   });
 
@@ -589,5 +651,145 @@ describe('IGNIS decoder recovery (#1540)', () => {
     await svc.cleanup();
     expect(clearSpy).toHaveBeenCalled();
     expect(svc.decoderProfilingInFlight).toBe(false);
+  });
+
+  // #3094 — camera decoder pressure now runs through the server-authoritative
+  // render-demand path instead of the dead browser-side layer cast. Each case pairs
+  // the value PASSED (the emit) with the value OBEYED (pauseCoordinator.hasReason),
+  // per [internal]rules/tests.md's founding rule.
+  it('emits one pressure request, then escalates to pause on the next classified red tick', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('esc-cam-report', 80);
+    const cam = makeVideoConsumer('esc-cam', () => statsMap(cursor), { negotiatedSsrc: 80 });
+    const other = makeVideoConsumer('esc-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    registerCameraPressureContext(svc, 'esc-user', cam.id);
+    const setPreferredLayerEmits = () =>
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers');
+
+    await svc.profileDecoders(); // baseline — unknown
+
+    addInterval(cursor, elapse(), 40);
+    await svc.profileDecoders(); // classified RED, tick 1 — headroom available, emits
+
+    expect(setPreferredLayerEmits()).toHaveLength(1);
+    expect(setPreferredLayerEmits()[0][1]).toMatchObject({ pressureStepDown: true });
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(false);
+
+    addInterval(cursor, elapse(), 40); // blind tick — sampler was reset by the emit
+    await svc.profileDecoders();
+
+    expect(setPreferredLayerEmits()).toHaveLength(1);
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(false);
+
+    addInterval(cursor, elapse(), 40); // next classified RED tick — pressure already spent (O2)
+    await svc.profileDecoders();
+
+    expect(setPreferredLayerEmits()).toHaveLength(1);
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(true);
+  });
+
+  it('pauses on the FIRST red tick when the room camera-layering gate is off (L1)', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('l1-cam-report', 82);
+    const cam = makeVideoConsumer('l1-cam', () => statsMap(cursor), { negotiatedSsrc: 82 });
+    const other = makeVideoConsumer('l1-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    registerCameraPressureContext(svc, 'l1-user', cam.id, { gateEnabled: false });
+
+    await svc.profileDecoders();
+    addInterval(cursor, elapse(), 40);
+    await svc.profileDecoders();
+
+    expect(
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers')
+    ).toHaveLength(0);
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(true);
+  });
+
+  it('pauses on the FIRST red tick when policy has no step left (L2)', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('l2-cam-report', 84);
+    const cam = makeVideoConsumer('l2-cam', () => statsMap(cursor), { negotiatedSsrc: 84 });
+    const other = makeVideoConsumer('l2-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    // Thumbnail role forces spatial 0 unconditionally: pressured === unpressured by
+    // construction, independent of size or device-pixel ratio.
+    registerCameraPressureContext(svc, 'l2-user', cam.id, { role: 'thumbnail' });
+
+    await svc.profileDecoders();
+    addInterval(cursor, elapse(), 40);
+    await svc.profileDecoders();
+
+    expect(
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers')
+    ).toHaveLength(0);
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(true);
+  });
+
+  // #3094 YELLOW — the arm this change actually alters. Pre-#3094 handleYellowZone was a
+  // guaranteed no-op (it called the dead clampRemoteVideoLayer path and returned); it now
+  // emits a real demand AND spends the same one-step-per-user budget red's escalation reads.
+  // Nothing in the repo drove rho into [0.80, 0.925) before these two, so reverting the body
+  // to `return mergeDecoderZones(worstZone, 'yellow')` passed the whole suite.
+  // 28 ms/frame at 30 fps ⇒ rho = 28 × 30 / 1000 = 0.84 — inside the yellow band.
+  it('steps down without pausing on a yellow tick', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('yellow-cam-report', 86);
+    const cam = makeVideoConsumer('yellow-cam', () => statsMap(cursor), { negotiatedSsrc: 86 });
+    const other = makeVideoConsumer('yellow-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    registerCameraPressureContext(svc, 'yellow-user', cam.id, { role: 'focus' });
+    const setPreferredLayerEmits = () =>
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers');
+
+    await svc.profileDecoders(); // baseline — unknown
+
+    addInterval(cursor, elapse(), 28);
+    await svc.profileDecoders(); // classified YELLOW
+
+    // Value PASSED: exactly one demand, carrying the pressure flag.
+    expect(setPreferredLayerEmits()).toHaveLength(1);
+    expect(setPreferredLayerEmits()[0][1]).toMatchObject({ pressureStepDown: true });
+    // Value OBEYED: yellow steps down and never pauses — that distinction is the whole arm.
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(false);
+    expect(useVoiceStore.getState().decoderHealth).toBe('yellow');
+    // Monotone: the pressured demand may only ask for a SMALLER layer, never a larger one.
+    const unpressured = svc.computePreferredLayerPayloadForUser('yellow-user', false);
+    expect(setPreferredLayerEmits()[0][1].spatialLayer).toBeLessThan(unpressured.spatialLayer);
+  });
+
+  it('spends the pressure budget on yellow, so the next classified red tick pauses at once', async () => {
+    const svc = voiceService as any;
+    const cursor = makeCursor('y2r-cam-report', 88);
+    const cam = makeVideoConsumer('y2r-cam', () => statsMap(cursor), { negotiatedSsrc: 88 });
+    const other = makeVideoConsumer('y2r-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    registerCameraPressureContext(svc, 'y2r-user', cam.id, { role: 'focus' });
+    const setPreferredLayerEmits = () =>
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers');
+
+    await svc.profileDecoders(); // baseline — unknown
+
+    addInterval(cursor, elapse(), 28);
+    await svc.profileDecoders(); // classified YELLOW — emits, spends O2, resets the sampler
+
+    expect(setPreferredLayerEmits()).toHaveLength(1);
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(false);
+
+    addInterval(cursor, elapse(), 40); // blind tick — re-baselines after the reset
+    await svc.profileDecoders();
+
+    addInterval(cursor, elapse(), 40);
+    await svc.profileDecoders(); // FIRST classified RED since yellow — no step left to take
+
+    // No second emit, and the pause lands on that first red tick rather than a later one.
+    expect(setPreferredLayerEmits()).toHaveLength(1);
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(true);
   });
 });

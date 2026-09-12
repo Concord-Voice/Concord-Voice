@@ -2966,70 +2966,9 @@ describe('VoiceService Extended', () => {
     });
   });
 
-  // ===== IGNIS profiling zones: yellow zone =====
-
-  describe('IGNIS profiling: yellow zone', () => {
-    it('lowers temporal layer on yellow zone', async () => {
-      await joinVoiceChannel();
-      const svc = voiceService as any;
-
-      const consumer = createMockConsumer('cons-yellow', 'video', 'prod-yellow');
-      mockIntervalDecoderStats(consumer, 28); // rho = 28ms × 30fps / 1000 = 0.84
-
-      // Add currentLayers and setPreferredLayers
-      (consumer as any).currentLayers = { spatialLayer: 2, temporalLayer: 2 };
-      (consumer as any).setPreferredLayers = vi.fn();
-
-      svc.consumers.set('cons-yellow', consumer);
-
-      await vi.advanceTimersByTimeAsync(10_500);
-
-      expect((consumer as any).setPreferredLayers).toHaveBeenCalledWith({
-        spatialLayer: 2,
-        temporalLayer: 1,
-      });
-    });
-  });
-
   // ===== IGNIS profiling zones: red zone with layers =====
 
   describe('IGNIS profiling: red zone with layers', () => {
-    it('lowers spatial layer in red zone', async () => {
-      await joinVoiceChannel();
-      const svc = voiceService as any;
-
-      const consumer = createMockConsumer('cons-red2', 'video', 'prod-red2');
-      mockIntervalDecoderStats(consumer, 40); // rho = 1.2
-      (consumer as any).currentLayers = { spatialLayer: 2, temporalLayer: 2 };
-      (consumer as any).setPreferredLayers = vi.fn();
-      svc.consumers.set('cons-red2', consumer);
-
-      await vi.advanceTimersByTimeAsync(10_500);
-
-      expect((consumer as any).setPreferredLayers).toHaveBeenCalledWith({
-        spatialLayer: 1,
-        temporalLayer: 2,
-      });
-    });
-
-    it('lowers temporal layer when spatial is 0 in red zone', async () => {
-      await joinVoiceChannel();
-      const svc = voiceService as any;
-
-      const consumer = createMockConsumer('cons-red3', 'video', 'prod-red3');
-      mockIntervalDecoderStats(consumer, 40);
-      (consumer as any).currentLayers = { spatialLayer: 0, temporalLayer: 2 };
-      (consumer as any).setPreferredLayers = vi.fn();
-      svc.consumers.set('cons-red3', consumer);
-
-      await vi.advanceTimersByTimeAsync(10_500);
-
-      expect((consumer as any).setPreferredLayers).toHaveBeenCalledWith({
-        spatialLayer: 0,
-        temporalLayer: 1,
-      });
-    });
-
     it('pauses camera consumer instead of screen share in red zone', async () => {
       await joinVoiceChannel();
       const svc = voiceService as any;
@@ -3038,8 +2977,6 @@ describe('VoiceService Extended', () => {
       const cameraConsumer = createMockConsumer('cons-cam', 'video', 'prod-cam');
 
       mockIntervalDecoderStats(screenConsumer, 40);
-      (screenConsumer as any).currentLayers = { spatialLayer: 0, temporalLayer: 0 };
-      (screenConsumer as any).setPreferredLayers = vi.fn();
 
       svc.consumers.set('cons-screen', screenConsumer);
       svc.consumers.set('cons-cam', cameraConsumer);

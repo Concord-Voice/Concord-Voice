@@ -132,14 +132,6 @@ interface RtpSenderWithEncodedStreams extends RTCRtpSender {
 
 /** Decoder health zone classification for IGNIS profiling. */
 type DecoderHealthZone = 'green' | 'yellow' | 'red';
-type ConsumerLayerSelection = { spatialLayer: number; temporalLayer: number };
-
-/** SFU-layer-aware consumer — mediasoup-client exposes currentLayers/setPreferredLayers
- *  on the server but not in the public client type definitions. */
-interface ConsumerWithLayers {
-  currentLayers?: ConsumerLayerSelection;
-  setPreferredLayers(layers: ConsumerLayerSelection): void;
-}
 
 interface RemoteVideoTileRenderState {
   visible: boolean;
@@ -201,7 +193,9 @@ interface RemoteVideoLayerPayload extends RemoteVideoTileRenderState, RemoteVide
   pressureStepDown: boolean;
 }
 
-type CameraPressureLayerRequestResult = 'emitted' | 'handled' | 'fallback';
+/** Result of a camera decoder-pressure layer request.
+ *  'fallback' means: this path has nothing (more) to offer — apply your own fallback. */
+type CameraPressureLayerRequestResult = 'emitted' | 'fallback';
 
 /** Which layered video surface a render-state report / demand emit targets (#1924).
  *  Camera and screen keep independent demand maps + server gates. */
@@ -5693,12 +5687,6 @@ class VoiceService {
     return bestVisible ?? hidden;
   }
 
-  private clampRemoteVideoLayer(layer: number): 0 | 1 | 2 {
-    if (layer <= 0) return 0;
-    if (layer >= 2) return 2;
-    return 1;
-  }
-
   private emitPreferredLayers(consumerId: string, payload: RemoteVideoLayerPayload): void {
     if (!this.socket) return;
     const key = [
@@ -5760,10 +5748,7 @@ class VoiceService {
     this.emitPreferredLayers(consumerId, payload);
   }
 
-  private tryEmitCameraPressureLayerRequest(
-    consumerId: string,
-    currentLayers: ConsumerLayerSelection | undefined
-  ): CameraPressureLayerRequestResult {
+  private tryEmitCameraPressureLayerRequest(consumerId: string): CameraPressureLayerRequestResult {
     const meta = this.consumerMeta.get(consumerId);
     if (meta?.source !== 'camera' || !this.socket) return 'fallback';
 
@@ -5773,34 +5758,29 @@ class VoiceService {
     const states = this.remoteVideoRenderStateByUser.get(meta.producerUserId);
     if (!states || states.size === 0) return 'fallback';
 
-    const payload = this.computePreferredLayerPayloadForUser(meta.producerUserId, true);
-    if (!payload) return 'handled';
+    // L1 (landability) — with the room camera-layering gate off, producers are
+    // single-encoding and consumers are 'simple', so the SFU records the demand and
+    // applies nothing. A step that cannot land is not a step: fall through to pause.
+    if (!this.cameraLayeringEnabled) return 'fallback';
 
-    if (currentLayers) {
-      const spatialLayer = this.clampRemoteVideoLayer(
-        Math.min(payload.spatialLayer, currentLayers.spatialLayer)
-      );
-      const temporalLayer = this.clampRemoteVideoLayer(
-        Math.min(payload.temporalLayer, currentLayers.temporalLayer)
-      );
-      if (
-        spatialLayer >= currentLayers.spatialLayer &&
-        temporalLayer >= currentLayers.temporalLayer
-      ) {
-        return 'handled';
-      }
+    // O2 (budget) — the render-demand path expresses exactly one step of pressure,
+    // and this bit records whether that step is already spent.
+    if (this.remoteVideoPressureByUser.get(meta.producerUserId) === true) return 'fallback';
 
-      this.remoteVideoPressureByUser.set(meta.producerUserId, true);
-      this.emitPreferredLayers(targetConsumerId, {
-        ...payload,
-        spatialLayer,
-        temporalLayer,
-      });
-      return 'emitted';
+    // L2 (landability) — policy has no step left for this tile. Pass `false`
+    // explicitly: the default parameter re-reads the pressure map.
+    const pressured = this.computePreferredLayerPayloadForUser(meta.producerUserId, true);
+    const unpressured = this.computePreferredLayerPayloadForUser(meta.producerUserId, false);
+    if (!pressured || !unpressured) return 'fallback';
+    if (
+      pressured.spatialLayer === unpressured.spatialLayer &&
+      pressured.temporalLayer === unpressured.temporalLayer
+    ) {
+      return 'fallback';
     }
 
     this.remoteVideoPressureByUser.set(meta.producerUserId, true);
-    this.emitPreferredLayers(targetConsumerId, payload);
+    this.emitPreferredLayers(targetConsumerId, pressured);
     return 'emitted';
   }
 
@@ -7374,56 +7354,16 @@ class VoiceService {
     }
   }
 
-  /**
-   * Full IGNIS decoder budget profiling.
-   *
-   * Zone thresholds:
-   *   Green:  rho < 0.80  (inside the safe decoder budget)
-   *   Yellow: 0.80 <= rho < 0.925 (approaching limit)
-   *   Red:    rho >= 0.925 (near-critical, 92.5% capacity)
-   *
-   * Formulas:
-   *   Load Ratio:  rho = T_d_p95 / T_f = (T_d_p95 × FPS) / 1000
-   *   Safe FPS:    FPS_safe = margin × (1000 / T_d_p95)
-   *   Risk Score:  R = (FPS × T_d_p95) / 1000
-   *
-   * Actions:
-   *   Green:  full quality, no intervention
-   *   Yellow: lower temporal layer by 1
-   *   Red:    lower spatial layer by 1, if already lowest → pause lowest-priority consumer
-   */
-  /** Handle RED zone decoder overload: reduce layers or pause lowest-priority consumer */
+  /** Handle RED zone decoder overload: request a layer step down, else pause. */
   private handleRedZone(
     consumer: mediasoupTypes.Consumer,
-    consumerWithLayers: ConsumerWithLayers,
-    currentLayers: ConsumerLayerSelection | undefined,
     rho: number,
     p95DecodeMs: number,
     currentFps: number
   ): void {
-    if (currentLayers && currentLayers.spatialLayer > 0) {
-      const pressureResult = this.tryEmitCameraPressureLayerRequest(consumer.id, currentLayers);
-      if (pressureResult === 'emitted') {
-        console.warn(
-          'IGNIS RED: lowering camera layers via render policy for consumer:',
-          consumer.id,
-          'rho:',
-          rho.toFixed(2),
-          'decode p95ms:',
-          p95DecodeMs.toFixed(1),
-          'fps:',
-          currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
-        );
-        this.decoderBudgetSampler.deleteConsumer(consumer.id);
-        return;
-      }
-      if (pressureResult === 'handled') return;
-      consumerWithLayers.setPreferredLayers({
-        spatialLayer: currentLayers.spatialLayer - 1,
-        temporalLayer: currentLayers.temporalLayer,
-      });
+    if (this.tryEmitCameraPressureLayerRequest(consumer.id) === 'emitted') {
       console.warn(
-        'IGNIS RED: lowering spatial layer for consumer:',
+        'IGNIS RED: lowering camera layers via render policy for consumer:',
         consumer.id,
         'rho:',
         rho.toFixed(2),
@@ -7436,35 +7376,8 @@ class VoiceService {
       return;
     }
 
-    if (currentLayers && currentLayers.temporalLayer > 0) {
-      const pressureResult = this.tryEmitCameraPressureLayerRequest(consumer.id, currentLayers);
-      if (pressureResult === 'emitted') {
-        console.warn(
-          'IGNIS RED: lowering camera temporal demand via render policy for consumer:',
-          consumer.id,
-          'rho:',
-          rho.toFixed(2)
-        );
-        this.decoderBudgetSampler.deleteConsumer(consumer.id);
-        return;
-      }
-      if (pressureResult === 'handled') return;
-      consumerWithLayers.setPreferredLayers({
-        spatialLayer: currentLayers.spatialLayer,
-        temporalLayer: currentLayers.temporalLayer - 1,
-      });
-      console.warn(
-        'IGNIS RED: lowering temporal layer for consumer:',
-        consumer.id,
-        'rho:',
-        rho.toFixed(2)
-      );
-      this.decoderBudgetSampler.deleteConsumer(consumer.id);
-      return;
-    }
-
-    // Already at lowest layers — pause lowest-priority consumer when another
-    // active video remains available to supply recovery evidence.
+    // The render-demand path has nothing to offer — pause the lowest-priority
+    // consumer when another active video remains to supply recovery evidence.
     if (this.pauseLowestPriorityConsumer(consumer)) {
       this.decoderBudgetSampler.deleteConsumer(consumer.id);
     }
@@ -7489,7 +7402,9 @@ class VoiceService {
 
     if (!isScreenShare) {
       this.pauseCoordinator.addReason(consumer.id, 'ignis');
-      console.warn(`IGNIS RED: pausing camera consumer ${consumer.id} — no layers to reduce`);
+      console.warn(
+        `IGNIS RED: pausing camera consumer ${consumer.id} — render-demand path had no step to offer`
+      );
       return true;
     }
 
@@ -7509,7 +7424,29 @@ class VoiceService {
     return true;
   }
 
-  /** Classify decoder load into a health zone and apply layer adjustments. */
+  /**
+   * Classify one consumer's decoder load into a health zone and apply the response.
+   *
+   * Zone thresholds:
+   *   Green:  rho < 0.80  (inside the safe decoder budget)
+   *   Yellow: 0.80 <= rho < 0.925 (approaching limit)
+   *   Red:    rho >= 0.925 (near-critical, 92.5% capacity)
+   *
+   * Formulas:
+   *   Load Ratio:  rho = T_d_p95 / T_f = (T_d_p95 × FPS) / 1000
+   *   Safe FPS:    FPS_safe = margin × (1000 / T_d_p95)
+   *   Risk Score:  R = (FPS × T_d_p95) / 1000
+   *
+   * Actions:
+   *   Green:  full quality, no intervention
+   *   Yellow: request one spatial step down via the server-authoritative render-demand
+   *           path (set-preferred-layers, pressureStepDown: true)
+   *   Red:    same request; when the path has nothing to offer (gate off, pressure
+   *           already spent, or no step left) → pause lowest-priority consumer
+   *
+   * Yellow and red draw on the SAME one-step-per-user budget (O2), so a yellow tick
+   * that spends it makes the next red tick pause immediately rather than step down.
+   */
   private classifyAndHandleDecoderZone(
     consumer: mediasoupTypes.Consumer,
     rho: number,
@@ -7517,42 +7454,24 @@ class VoiceService {
     currentFps: number,
     worstZone: DecoderHealthZone
   ): DecoderHealthZone {
-    const consumerWithLayers = consumer as unknown as ConsumerWithLayers;
-    const currentLayers = consumerWithLayers.currentLayers;
-
     if (rho >= 0.925) {
-      this.handleRedZone(consumer, consumerWithLayers, currentLayers, rho, p95DecodeMs, currentFps);
+      this.handleRedZone(consumer, rho, p95DecodeMs, currentFps);
       return 'red';
     }
     if (rho >= 0.8) {
-      return this.handleYellowZone(
-        consumer,
-        consumerWithLayers,
-        currentLayers,
-        rho,
-        p95DecodeMs,
-        currentFps,
-        worstZone
-      );
+      return this.handleYellowZone(consumer, rho, p95DecodeMs, currentFps, worstZone);
     }
     return worstZone;
   }
 
   private handleYellowZone(
     consumer: mediasoupTypes.Consumer,
-    consumerWithLayers: ConsumerWithLayers,
-    currentLayers: ConsumerLayerSelection | undefined,
     rho: number,
     p95DecodeMs: number,
     currentFps: number,
     worstZone: DecoderHealthZone
   ): DecoderHealthZone {
-    if (!currentLayers || currentLayers.temporalLayer <= 0) {
-      return VoiceService.mergeDecoderZones(worstZone, 'yellow');
-    }
-
-    const pressureResult = this.tryEmitCameraPressureLayerRequest(consumer.id, currentLayers);
-    if (pressureResult === 'emitted') {
+    if (this.tryEmitCameraPressureLayerRequest(consumer.id) === 'emitted') {
       console.warn(
         'IGNIS YELLOW: lowering camera layers via render policy for consumer:',
         consumer.id,
@@ -7564,25 +7483,8 @@ class VoiceService {
         currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
       );
       this.decoderBudgetSampler.deleteConsumer(consumer.id);
-      return VoiceService.mergeDecoderZones(worstZone, 'yellow');
     }
-    if (pressureResult === 'handled') return VoiceService.mergeDecoderZones(worstZone, 'yellow');
-
-    consumerWithLayers.setPreferredLayers({
-      spatialLayer: currentLayers.spatialLayer,
-      temporalLayer: currentLayers.temporalLayer - 1,
-    });
-    console.warn(
-      'IGNIS YELLOW: lowering temporal layer for consumer:',
-      consumer.id,
-      'rho:',
-      rho.toFixed(2),
-      'decode p95ms:',
-      p95DecodeMs.toFixed(1),
-      'fps:',
-      currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
-    );
-    this.decoderBudgetSampler.deleteConsumer(consumer.id);
+    // 'fallback' does nothing — yellow never invents a client control API.
     return VoiceService.mergeDecoderZones(worstZone, 'yellow');
   }
 

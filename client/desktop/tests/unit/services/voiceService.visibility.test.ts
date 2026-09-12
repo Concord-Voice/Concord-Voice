@@ -39,6 +39,9 @@ describe('voiceService visibility-pause (#1541)', () => {
     svc.remoteVideoPressureByUser?.clear();
     svc.lastPreferredLayerKeyByConsumer?.clear();
     svc.remoteVideoRenderStateByUser?.clear();
+    // The room camera-layering gate is pressure-path state like the three maps above;
+    // omitting it let an arming test leak `true` into whatever was inserted after it.
+    svc.cameraLayeringEnabled = false;
     svc.documentHidden = false;
     svc.consecutiveGreenIntervals = 0;
     (globalThis as any).devicePixelRatio = 1;
@@ -291,41 +294,10 @@ describe('voiceService visibility-pause (#1541)', () => {
     });
   });
 
-  it('camera pressure layer requests never raise a current decoder layer', () => {
+  it('returns fallback when policy has no step left', () => {
+    // thumbnail role forces spatial 0 unpressured; pressured clamps back to 0,
+    // so pressured === unpressured and L2 fires
     seedCameraConsumer(svc, 'cam-1', 'user-A');
-    svc.setRemoteVideoRenderState('user-A', 'focus', {
-      visible: true,
-      cssWidth: 1920,
-      cssHeight: 1080,
-      role: 'focus',
-      focusedWindow: true,
-    });
-    emit.mockClear();
-
-    const result = svc.tryEmitCameraPressureLayerRequest('cam-1', {
-      spatialLayer: 2,
-      temporalLayer: 0,
-    });
-
-    expect(result).toBe('emitted');
-    expect(emit).toHaveBeenCalledWith('set-preferred-layers', {
-      consumerId: 'cam-1',
-      spatialLayer: 1,
-      temporalLayer: 0,
-      visible: true,
-      cssWidth: 1920,
-      cssHeight: 1080,
-      devicePixelRatio: 1,
-      role: 'focus',
-      focusedWindow: true,
-      pressureStepDown: true,
-    });
-  });
-
-  it('camera pressure no-op stays on policy path without setting pressure or local fallback', () => {
-    const c = seedCameraConsumer(svc, 'cam-1', 'user-A') as any;
-    c.currentLayers = { spatialLayer: 0, temporalLayer: 1 };
-    c.setPreferredLayers = vi.fn();
     svc.setRemoteVideoRenderState('user-A', 'thumb', {
       visible: true,
       cssWidth: 160,
@@ -335,19 +307,14 @@ describe('voiceService visibility-pause (#1541)', () => {
     });
     emit.mockClear();
 
-    const result = svc.tryEmitCameraPressureLayerRequest('cam-1', c.currentLayers);
+    svc.cameraLayeringEnabled = true;
 
-    expect(result).toBe('handled');
+    expect(svc.tryEmitCameraPressureLayerRequest('cam-1')).toBe('fallback');
     expect(svc.remoteVideoPressureByUser.has('user-A')).toBe(false);
     expect(emit).not.toHaveBeenCalledWith(
       'set-preferred-layers',
       expect.objectContaining({ pressureStepDown: true })
     );
-
-    svc.handleRedZone(c, c, c.currentLayers, 1, 20, 30);
-
-    expect(c.setPreferredLayers).not.toHaveBeenCalled();
-    expect(svc.remoteVideoPressureByUser.has('user-A')).toBe(false);
   });
 
   it('green recovery clears camera pressure after hysteresis and re-emits normal demand', () => {
@@ -359,7 +326,22 @@ describe('voiceService visibility-pause (#1541)', () => {
       role: 'focus',
       focusedWindow: true,
     });
-    svc.tryEmitCameraPressureLayerRequest('cam-1', { spatialLayer: 2, temporalLayer: 2 });
+    svc.cameraLayeringEnabled = true;
+    const unpressured = svc.computePreferredLayerPayloadForUser('user-A', false);
+    // setRemoteVideoRenderState already emitted ordinary demand; clear so the assertion
+    // below reads the PRESSURE emit rather than that earlier unpressured one.
+    emit.mockClear();
+    svc.tryEmitCameraPressureLayerRequest('cam-1');
+    // Pin the pressured payload itself, not just the flag: this is the only assertion in
+    // the suite on what a SUCCESSFUL pressure emit actually asks the SFU for, and the
+    // inequality is directional — pressure may only ever request a smaller layer.
+    const pressured = emit.mock.calls.find(([event]) => event === 'set-preferred-layers')?.[1];
+    expect(pressured).toMatchObject({
+      consumerId: 'cam-1',
+      spatialLayer: 1,
+      pressureStepDown: true,
+    });
+    expect(pressured.spatialLayer).toBeLessThan(unpressured.spatialLayer);
     emit.mockClear();
 
     svc.updateDecoderRecoveryState('green');

@@ -75,6 +75,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Video drops to a smaller size before it freezes when your computer is struggling** ([#3268](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3268), [#3094](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3094)) — Concord
+  watches how long your computer takes to decode each incoming video, and when it starts falling
+  behind it has to give something up. Until now it had one move: pause somebody's camera outright,
+  which is abrupt and takes a person off your screen completely. It now asks the server for a
+  smaller version of that video first, and only falls back to pausing when there is nothing
+  smaller left to ask for. Two things worth knowing. The gentler behaviour applies only in calls
+  where the server is already sending video in several sizes; in a call where it sends just one,
+  pausing is still the only option and happens exactly as it did before. And where the step-down
+  does apply, a pause that follows because things stayed bad arrives two measurement cycles later
+  than it used to, because the smaller video needs a moment to take effect before measuring again
+  tells you anything true — roughly ten seconds in the opening half-minute of a call, and roughly
+  a minute after that, once Concord settles into checking less often.
+
 - **Saving a GIF no longer sends you back to the top** ([#3266](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3266), [#2370](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2370)) — clicking the save
   icon on a GIF reloaded the whole picker and lost your place in whatever you were scrolling
   through. A few seconds later it did it again, so scrolling back was not enough: you would reach
