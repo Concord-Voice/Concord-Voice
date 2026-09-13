@@ -794,8 +794,11 @@ notify you of the reason and extension period as permitted by law.
 
 **15.5 Data Retention.** Concord retains personal data only for as long
 as necessary to provide the service and fulfill the purposes described
-in our Privacy Policy. Account data is deleted within 30 days of account
-deletion, except where retention is required by law.
+in our Privacy Policy. Account data is deleted from the active database
+within 30 days of account deletion, except where retention is required
+by law. This deadline does not apply to every backup copy. The maximum
+retention period for message-database backups has not yet been finalized;
+see Section 10 of our Privacy Policy for backup and restore limitations.
 
 **15.6 Supervisory Authority.** If you believe Concord Voice has
 violated your data protection rights, you have the right to lodge a

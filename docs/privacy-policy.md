@@ -900,15 +900,29 @@ you to a notification list for material privacy-program updates.
 We will only keep your personal information for as long as it is
 necessary for the purposes set out in this Privacy Notice, unless a
 longer retention period is required or permitted by law (such as tax,
-accounting, or other legal requirements). No purpose in this notice
-will require us to keep your personal information for longer than the
-period of time in which you have an account with us.
+accounting, or other legal requirements). Backup copies may remain after
+data is deleted from the active database, as explained below.
 
-**Account data is deleted within 30 days of account deletion**, except
-where retention is required by law. End-to-end encrypted message
-content stored on our servers is also deleted within this window
-(though ciphertext is, by construction, not readable by us — only the
-deletion of the ciphertext copies is meaningful from our perspective).
+**Account data is deleted from the active database within 30 days of
+account deletion**, except where retention is required by law. This
+includes the account's stored end-to-end encrypted message content
+(ciphertext, which we cannot read). This active-database deadline does
+not apply to every backup copy.
+
+| Data category | Retention and deletion |
+| --- | --- |
+| Messages (ciphertext) | Messages remain in the active database until deleted manually or through automatic expiration. Text channels, direct messages and group direct messages can have a shared expiration timer that applies to all participants. Expiration cleanup runs periodically, normally every five minutes while the service is healthy; reaching the timer's deadline does not mean immediate physical deletion. |
+| Backups containing messages | Messages deleted manually or through expiration may remain in backup archives. The maximum retention period for message-database backups has not yet been finalized under our Data Retention policy. We cannot currently promise that every backup copy will be deleted within a fixed period. |
+
+When a database backup is restored, the service removes message records
+whose stored expiration time has already passed before accepting live
+traffic. If that check cannot complete, startup fails. This safeguard
+does not reconstruct manual deletions made after the backup was taken:
+a manually deleted message may reappear after a restore if the restored
+record has not expired. Deleting an expired message record also queues
+separate attachment-file cleanup; it does not confirm immediate deletion
+of every attachment or rewrite existing backup archives. Copies already
+saved by participants are outside this server-side deletion process.
 
 **Activity History has a user-selected 7, 30, 90, or 365 day retention
 period** (30 days by default). Each row expires from its recording time. Reads
