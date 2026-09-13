@@ -24,7 +24,6 @@
 // 10 override is permanent security work that is not capped back. The blocker is
 // therefore permanent, and Route 2 routes AROUND it rather than clearing it.
 
-const fs = require('node:fs');
 const path = require('node:path');
 
 const ENV_PATH = 'CONCORD_AUDIOCAP_PATH';
@@ -78,22 +77,12 @@ if (process.versions.electron && process.type !== 'utility') {
 // An allowlist of one, not sanitization -- there is no traversal to scrub and no way
 // to express a second target.
 //
-// PINNING THE PATH IS NOT PINNING WHAT IS AT IT (#3194 red-team, VULN-1). An earlier
-// version of this comment added "no extension to check", and that reasoning is what
-// missed the following: require() resolves a MODULE, not a file. A DIRECTORY named
-// concord_audiocap.node resolves index.js inside it as a CommonJS package; a SYMLINK
-// resolves to its realpath, so the .js handler runs instead of the .node one. Either
-// executes attacker JS in this privileged process with capability() attacker-authored
-// -- the identical F1 sink, entered through the ACCEPTED branch of this allowlist,
-// and again with no Mach-O loaded, so library validation, Authenticode and asar
-// integrity are all bypassed.
-//
-// It costs local write into <Resources>/ rather than `launchctl setenv`. ADR-0043 R6
-// dismissed that as "a restatement of pre-existing local-write risk" -- true of the
-// Mach-O swap, which macOS library validation genuinely blocks (the utility host is
-// the plain Helper.app, signed against default.darwin.plist, which does NOT carry
-// com.apple.security.cs.disable-library-validation). This route is the one way that
-// local write becomes execution here, so R6 is false for it too.
+// PINNING THE PATH IS NOT PINNING WHAT IS AT IT (#3194 red-team, VULN-1). The former
+// require() sink resolved a MODULE: a directory named concord_audiocap.node could run
+// index.js, and a symlink could redirect to JavaScript. process.dlopen below consumes
+// the canonical target as a native addon instead, so either hostile object can fail
+// native loading but cannot become CommonJS. This closes the JavaScript-resolution
+// route, not arbitrary native-code replacement by an actor who can write <Resources>/.
 //
 // main sets the variable only when packaged (see audiocapHost.ts); dev uses
 // DEV_FALLBACK.
@@ -114,44 +103,11 @@ if (requested) {
   target = permitted;
 }
 
-// lstatSync, NEVER statSync: stat FOLLOWS the link, so the symlink arm survives a
-// stat-based guard entirely. A missing file falls through deliberately -- absent is a
-// packaging defect and must produce the load error below, not a trust refusal.
-//
-// KNOWN RESIDUAL, stated rather than hidden: this is a check-then-use, so an attacker
-// who ALREADY has write access to <Resources>/ can swap the file between the lstat and
-// the require. Both the red-team pass and Gitar's review found it independently.
-//
-// It is not closable at this layer, and the obvious remedy does not work. Opening the
-// file with O_NOFOLLOW and fstat-ing the descriptor -- the suggested alternative --
-// closes that descriptor and then calls require(target), which re-resolves the path
-// string from scratch; the window moves from after-lstat to after-close and is the same
-// width. O_NOFOLLOW is also redundant with the symlink rejection lstat already performs.
-// Eliminating it outright would need require() to load FROM a descriptor, which Node
-// does not offer.
-//
-// What the guard does buy is the UN-RACED primitive, which is the whole of what the
-// proof-of-concept used: planting a directory or symlink and waiting. The residual needs
-// the attacker to win a race they can only enter by already holding the local write that
-// ADR-0043 R6 treats as the threat boundary. Do not "fix" this with O_NOFOLLOW and call
-// it closed.
-let targetStat;
-try {
-  targetStat = fs.lstatSync(target);
-} catch {
-  targetStat = null;
-}
-if (targetStat && !targetStat.isFile()) {
-  throw new Error(
-    `concord-audiocap: ${target} is not a regular file. ` +
-      'A directory or a symlink there is resolved by require() as a JavaScript module, ' +
-      'which is the #3194 F1 sink wearing a different hat. Refusing to load it.'
-  );
-}
-
 let binding;
 try {
-  binding = require(target);
+  const nativeModule = { exports: {} };
+  process.dlopen(nativeModule, path.toNamespacedPath(target));
+  binding = nativeModule.exports;
 } catch (cause) {
   // A load failure is a PACKAGING DEFECT, not a capability outcome. It must never
   // collapse into perProcessAudio:false -- that is a legitimate silent video-only

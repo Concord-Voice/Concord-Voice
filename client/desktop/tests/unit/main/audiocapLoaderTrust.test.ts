@@ -57,6 +57,7 @@ async function loadWith(opts: { resourcesPath?: string; envPath?: string }) {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.resetModules();
 });
 
@@ -105,6 +106,20 @@ describe('concord-audiocap loader trust boundary (#3194 F1)', () => {
     );
   });
 
+  it('preserves Node Windows namespaced-path handling at the native load boundary', async () => {
+    const namespaced = `\\\\?\\${DERIVED}`;
+    const toNamespacedPath = vi.spyOn(path, 'toNamespacedPath').mockReturnValue(namespaced);
+    const dlopen = vi.spyOn(process, 'dlopen').mockImplementation(() => {
+      throw new Error('fixture load failure');
+    });
+
+    await expect(loadWith({ resourcesPath: RES, envPath: DERIVED })).rejects.toThrow(
+      /not built or not loadable/
+    );
+    expect(toNamespacedPath).toHaveBeenCalledWith(DERIVED);
+    expect(dlopen).toHaveBeenCalledWith(expect.any(Object), namespaced);
+  });
+
   // CONTROL — dev, where main deliberately sets nothing and the loader uses its
   // own node-gyp output path.
   //
@@ -130,11 +145,10 @@ describe('concord-audiocap loader trust boundary (#3194 F1)', () => {
 });
 
 /**
- * VULN-1 — pinning the PATH is not pinning WHAT IS AT IT (#3194 red-team pass).
+ * VULN-1 — the native load boundary must not become a CommonJS resolver (#3194 red-team pass).
  *
  * The F1 fix above demotes CONCORD_AUDIOCAP_PATH to a cross-check, so the env var can
- * no longer choose a target. It left the OBJECT at the derived path unconstrained, and
- * `require()` resolves a MODULE rather than a file: a DIRECTORY named
+ * no longer choose a target. The old `require()` sink resolved a MODULE rather than a file: a DIRECTORY named
  * `concord_audiocap.node` resolves `index.js` inside it as a CommonJS package, and a
  * SYMLINK resolves to its realpath so the `.js` handler runs instead of the `.node`
  * one. Either executes attacker JS in the utilityProcess with `capability()`
@@ -148,7 +162,7 @@ describe('concord-audiocap loader trust boundary (#3194 F1)', () => {
  * exact shape `[internal]rules/tests.md` calls testing the handshake instead of the
  * consumer.
  */
-describe('concord-audiocap loader object-type guard (#3194 VULN-1)', () => {
+describe('concord-audiocap loader direct native-load boundary (#3194 VULN-1)', () => {
   let dir: string;
 
   beforeEach(() => {
@@ -160,7 +174,7 @@ describe('concord-audiocap loader object-type guard (#3194 VULN-1)', () => {
     vi.resetModules();
   });
 
-  it('refuses a DIRECTORY at the derived path, and no attacker module is evaluated', async () => {
+  it('requires native loading for a DIRECTORY at the derived path, without evaluating its marker', async () => {
     const res = path.join(dir, 'Resources');
     const pkg = path.join(res, BINARY);
     fs.mkdirSync(pkg, { recursive: true });
@@ -173,13 +187,13 @@ describe('concord-audiocap loader object-type guard (#3194 VULN-1)', () => {
     );
 
     await expect(loadWith({ resourcesPath: res, envPath: pkg })).rejects.toThrow(
-      /is not a regular file/
+      /not built or not loadable/
     );
-    // The assertion that actually matters: refusing is worthless if it ran first.
+    // Native-load failure proves the object was not accepted as a CommonJS module.
     expect(fs.existsSync(marker)).toBe(false);
   });
 
-  it('refuses a SYMLINK at the derived path — lstat, not stat', async () => {
+  it('requires native loading for a SYMLINK at the derived path, without evaluating its marker', async () => {
     const res = path.join(dir, 'Resources');
     fs.mkdirSync(res, { recursive: true });
     const payload = path.join(dir, 'payload.js');
@@ -193,7 +207,7 @@ describe('concord-audiocap loader object-type guard (#3194 VULN-1)', () => {
     fs.symlinkSync(payload, link);
 
     await expect(loadWith({ resourcesPath: res, envPath: link })).rejects.toThrow(
-      /is not a regular file/
+      /not built or not loadable/
     );
     expect(fs.existsSync(marker)).toBe(false);
   });

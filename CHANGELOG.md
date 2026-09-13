@@ -79,6 +79,10 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **Screen-share audio loading no longer accepts a substituted JavaScript module as its native helper** ([#3300](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3300)) — the
+  desktop now loads the packaged audio-capture helper through the native-addon boundary directly,
+  so a directory or JavaScript symlink at that path fails instead of being executed.
+
 - **SSO sessions now survive refresh when optional session metadata is absent** ([#3290](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3290)) — the control plane now reads nullable device, IP, and User-Agent fields safely, keeps Active Sessions visible, and refuses an uncorroborated grace replay quietly instead of raising a false security alert. Known stored signals still have to agree before grace recovery proceeds.
 
 - **Chats come back to where you left them, and "Return to Latest" means it** ([#2006](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2006), [#3282](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3282)) — leaving a conversation and coming back could land you a few messages above the bottom, with
