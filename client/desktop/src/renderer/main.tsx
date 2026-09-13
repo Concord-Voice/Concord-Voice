@@ -5,6 +5,11 @@ import App from './App';
 import { installSelfHealHandlers } from './spaSelfHealClient';
 import { ModalProvider } from './components/ui/ModalContext';
 import { configureRefreshFailureReset } from './services/system/apiClient';
+// Side-effect import (#3198, contract 28): subscribes the voice store to main's
+// machine-capability push at module scope. Imported HERE, beside apiClient's own
+// module-scope IPC subscription, because the push can arrive on `did-finish-load` —
+// before any React tree mounts, so a component effect would miss it.
+import './services/voice/machineAudioCapability';
 import { install as installLogBuffer } from './services/system/logBufferService';
 import { gracefulReset, nuclearReset } from './services/system/resetService';
 import './styles/index.css';

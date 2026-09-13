@@ -540,6 +540,34 @@ contextBridge.exposeInMainWorld('electron', {
   // SPA_MIN_CONTRACT stays 19.
   audiocap: {
     getPortMessageTag: (): string => AUDIOCAP_PORT_TAG,
+
+    /**
+     * Machine per-process-audio capability (#3198, contract 28). One bit, pushed by main
+     * on handshake settle and on `did-finish-load`. Its PRESENCE is the capability probe;
+     * a shell below 28 lacks it and the renderer stays on the pre-addon rungs — video-only,
+     * never a system mix (C9).
+     *
+     * Pure pass-through. The value authorises nothing: it feeds the renderer's affordance
+     * ladder, and every enforcement decision MAIN MAKES is re-derived from inputs main
+     * re-validates — so a renderer that lies to itself about this bit gains nothing.
+     *
+     * Read that qualifier literally. The unqualified form this comment carried ("every
+     * enforcement decision is re-derived in main") was false, and the distinction matters:
+     * there is no `setDisplayMediaRequestHandler` and no `permissionRequestHandler` anywhere
+     * in `src/main/`, so the `chromeMediaSource: 'desktop'` loopback is NOT main-enforced.
+     * For the #2161 path the renderer-side verdict switches are the WHOLE enforcement,
+     * exactly as `screenAudioD6.test.ts` says. The claim applies to what main itself
+     * decides — #3198 PR 2's `audiocap:start` invoke — never to the Electron loopback.
+     * (#3198 Phase-8 review.)
+     */
+    onCapability: (callback: (data: { perProcessAudio: boolean }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { perProcessAudio: boolean }) =>
+        callback(data);
+      ipcRenderer.on('audiocap:capability', handler);
+      return () => {
+        ipcRenderer.removeListener('audiocap:capability', handler);
+      };
+    },
   },
 });
 
@@ -825,6 +853,7 @@ export interface ElectronAPI {
    */
   audiocap: {
     getPortMessageTag: () => string;
+    onCapability: (callback: (data: { perProcessAudio: boolean }) => void) => () => void;
   };
 }
 

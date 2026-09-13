@@ -607,3 +607,203 @@ describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
     expect(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS)).not.toContain('consent-denied');
   });
 });
+
+/** `validHello()` with the capability bit flipped — everything else stays valid. */
+function helloWithCapability(perProcessAudio: boolean): unknown {
+  const hello = validHello() as { capability: Record<string, unknown> };
+  return { ...hello, capability: { ...hello.capability, perProcessAudio } };
+}
+
+describe('machine-capability snapshot (#3198)', () => {
+  it('is null before any handshake settles', async () => {
+    const { audiocapMachineCapability } = await loadHost();
+    // Nothing observed yet, so a later non-null value cannot be the module's
+    // initial value read back (tests.md § Vacuity).
+    expect(audiocapMachineCapability()).toBeNull();
+  });
+
+  it('is set from a validated hello', async () => {
+    const { startAudiocapHost, audiocapMachineCapability } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(validHello());
+    await started;
+
+    expect(audiocapMachineCapability()).toBe(true);
+  });
+
+  it('records false when the child claims no per-process backend', async () => {
+    const { startAudiocapHost, audiocapMachineCapability } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(helloWithCapability(false));
+    await started;
+
+    expect(audiocapMachineCapability()).toBe(false);
+  });
+
+  it('is not written by a child that exits without a hello', async () => {
+    const { startAudiocapHost, audiocapMachineCapability } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.exit(1);
+    await started;
+
+    expect(audiocapMachineCapability()).toBeNull();
+  });
+
+  it('notifies the registered listener on every validated hello', async () => {
+    const { startAudiocapHost, setAudiocapCapabilityListener } = await loadHost();
+    const seen: boolean[] = [];
+    setAudiocapCapabilityListener((v: boolean) => seen.push(v));
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(validHello());
+    await started;
+
+    expect(seen).toEqual([true]);
+  });
+
+  // THE COLLISION THIS TASK EXISTS FOR. A share starting while the app-start
+  // probe is still handshaking reaps the probe's child (I3 supersedes, then
+  // forks). The probe records a FAILURE for a machine that is fully capable, and
+  // `probeInFlight ??=` guarantees it never recomputes. The SNAPSHOT must not
+  // inherit that: null is "unknown", which the ladder reads as the pre-addon
+  // rungs, and the share's own hello then sets it truthfully — self-healing in
+  // one share, with no second child and no re-probe path.
+  it('stays null when a probe is reaped mid-handshake, and the reaping share sets it', async () => {
+    const {
+      probeAudiocapCapability,
+      startAudiocapHost,
+      audiocapMachineCapability,
+      audiocapProbeResult,
+    } = await loadHost();
+    const probeChild = makeChild();
+    const shareChild = makeChild();
+    fork.mockReturnValueOnce(probeChild).mockReturnValueOnce(shareChild);
+
+    const probe = probeAudiocapCapability();
+    expect(audiocapMachineCapability()).toBeNull();
+
+    const share = startAudiocapHost(2);
+    expect(probeChild.kill).toHaveBeenCalled();
+    probeChild.handlers.exit(0);
+
+    shareChild.handlers.message(validHello());
+    await share;
+    await probe;
+
+    // The probe's own diagnostic still records the false negative — unchanged.
+    expect(audiocapProbeResult()?.ok).toBe(false);
+    // The snapshot does not inherit it. It was never false; it was null, then true.
+    expect(audiocapMachineCapability()).toBe(true);
+  });
+});
+
+describe('capability listener cannot abort the handshake (#3198 red-team, area 4)', () => {
+  // FOUND BY THE PRE-PR ADVERSARIAL PASS, and it is a defect this PR INTRODUCED.
+  //
+  // `handleChildMessage` clears the handshake timer, writes the snapshot, notifies the
+  // listener, sets `ready`, then settles. The notify was added by #3198 and sits BEFORE
+  // the settle — so a listener that throws leaves the promise unsettled with its recovery
+  // timer already cleared: the host wedges in 'handshaking' forever and never reaps its
+  // child. The registered listener calls `webContents.send`, which THROWS on a disposed
+  // render frame, and the `mainWindow?.` null check does not cover a disposed frame on a
+  // live BrowserWindow.
+  //
+  // In the fleet as shipped the throw reaches main.ts's uncaughtException handler, which
+  // calls app.exit(1) — so the observable failure is an app termination on a narrow race.
+  it('settles the handshake even when the listener throws', async () => {
+    const { startAudiocapHost, setAudiocapCapabilityListener, audiocapMachineCapability } =
+      await loadHost();
+    setAudiocapCapabilityListener(() => {
+      throw new Error('render frame was disposed');
+    });
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(validHello());
+
+    await expect(started).resolves.toMatchObject({ ok: true, perProcessAudio: true });
+    // The snapshot is still written — only the NOTIFY is allowed to fail.
+    expect(audiocapMachineCapability()).toBe(true);
+  });
+
+  // CONTROL. Without this, the case above could pass against an implementation that
+  // simply stopped calling the listener at all.
+  it('notifies a well-behaved listener on a validated hello', async () => {
+    const { startAudiocapHost, setAudiocapCapabilityListener } = await loadHost();
+    const seen: boolean[] = [];
+    setAudiocapCapabilityListener((v: boolean) => seen.push(v));
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(validHello());
+    await started;
+
+    expect(seen).toEqual([true]);
+  });
+
+  // PINS THE ORDERING HALF, WHICH NOTHING PINNED BEFORE (#3198 Phase-8 review).
+  //
+  // The production comment says "both halves are load-bearing: the ORDERING guarantees the
+  // handshake completes; the CATCH guarantees a dead send cannot kill the app after it
+  // has." The throw-tolerance case above does not prove the first half. Measured: move the
+  // notify back BEFORE `settleOnce` while leaving the try/catch in place, and that case
+  // plus its control both stay GREEN -- the listener throws, the catch swallows it, and
+  // `settleOnce` runs normally. A false kill, and the PR body's mutation table asserted it
+  // as a real one.
+  //
+  // This case discriminates by making the listener RE-ENTER the host rather than throw.
+  // `killAudiocapHost` settles `{ok: false, reason: 'child-crash'}`, and `settleOnce` is
+  // first-settle-wins:
+  //   notify AFTER settle (correct)  -> {ok:true} already delivered -> green
+  //   notify BEFORE settle (mutant)  -> the kill's {ok:false} lands first -> RED
+  // The catch cannot mask it, because nothing throws.
+  it('settles ok even when the listener re-enters the host synchronously', async () => {
+    const { startAudiocapHost, setAudiocapCapabilityListener, killAudiocapHost } = await loadHost();
+    setAudiocapCapabilityListener(() => {
+      killAudiocapHost();
+    });
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(validHello());
+
+    await expect(started).resolves.toMatchObject({ ok: true, perProcessAudio: true });
+  });
+
+  // The drop is LOGGED. `observability.md` principle 3 constrains the ERROR OBJECT, not the
+  // fact that a push was dropped -- a fixed string carries no `cause`, no PII and no
+  // privacy discriminator. Without it, a listener throwing on EVERY invocation is
+  // indistinguishable from a machine with no per-process backend, permanently.
+  it('logs a fixed string when the notify throws, and never the caught value', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { startAudiocapHost, setAudiocapCapabilityListener } = await loadHost();
+    setAudiocapCapabilityListener(() => {
+      throw new Error('SECRET-CAUSE-SHOULD-NOT-BE-LOGGED');
+    });
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1);
+    child.handlers.message(validHello());
+    await started;
+
+    expect(warn).toHaveBeenCalledWith('[audiocap] capability push dropped');
+    const logged = warn.mock.calls.flat().map(String).join(' ');
+    expect(logged).not.toContain('SECRET-CAUSE-SHOULD-NOT-BE-LOGGED');
+    warn.mockRestore();
+  });
+});

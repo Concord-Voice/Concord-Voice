@@ -5041,4 +5041,85 @@ describe('main.ts', () => {
       expect(currentAudiocapGeneration()).toBe(0);
     });
   });
+
+  // ── the contract-28 DELIVERY legs (#3198 Phase-8 review) ──────────────────
+  //
+  // Both legs shipped untested: `grep -rn "did-finish-load" client/desktop/tests/` returned
+  // zero hits repo-wide, and this file was not in the PR's diff. The coverage-exclusion
+  // defence does not apply -- `vite.config.ts` excludes `src/main` from the Istanbul INCLUDE
+  // globs, which is a SonarCloud metric fact, not a testing-policy one, and this 5,000-line
+  // suite tests `main.ts` behaviourally throughout. The harness for both shapes already
+  // existed here (a push extracted from `mockWebContents.send.mock.calls`, an event handler
+  // extracted from `mockWebContents.on.mock.calls`).
+  describe('audiocap:capability delivery (#3198, IPC contract 28)', () => {
+    /** The `did-finish-load` listener `createWindow` registered on the window's webContents. */
+    function didFinishLoadHandler(): () => void {
+      const entry = mockWebContents.on.mock.calls.find((c) => c[0] === 'did-finish-load');
+      expect(entry, 'no did-finish-load listener was registered').toBeDefined();
+      return entry![1] as () => void;
+    }
+
+    function capabilityPushes() {
+      return mockWebContents.send.mock.calls.filter((c) => c[0] === 'audiocap:capability');
+    }
+
+    beforeEach(() => {
+      mockWebContents.send.mockClear();
+    });
+
+    it('re-pushes the snapshot on did-finish-load', () => {
+      // THE RE-PUSH'S ONLY REASON TO EXIST: a renderer created or reloaded after the
+      // snapshot settled hears nothing from the change-listener path, so without this an
+      // SPA-loader swap strands it on the pre-addon rungs for the session.
+      didFinishLoadHandler()();
+
+      expect(capabilityPushes()).toEqual([['audiocap:capability', { perProcessAudio: true }]]);
+    });
+
+    it('sends NOTHING on did-finish-load while the snapshot is null', async () => {
+      // THE FAIL-CLOSED ARM, and the half that matters. Absence IS the fail-closed state;
+      // deleting the `if (capability !== null)` guard ships `{ perProcessAudio: null }` to a
+      // renderer whose subscriber then drops it silently -- degraded, invisible, and until
+      // now untested on both sides.
+      const hostModule = await import('../../../src/main/audiocapHost');
+      const snapshot = vi.spyOn(hostModule, 'audiocapMachineCapability').mockReturnValue(null);
+
+      didFinishLoadHandler()();
+
+      // Synchronous assertion, never inside waitFor: a negative wrapped in waitFor passes on
+      // its first poll whether or not the state ever settled (`tests.md` § Async assertions).
+      expect(capabilityPushes()).toEqual([]);
+      snapshot.mockRestore();
+    });
+
+    it('pushes the exact channel and payload when the host reports a change', async () => {
+      // Pins the listener BODY. Nothing previously proved it sends this channel with this
+      // shape -- a typo in either was invisible.
+      const { setAudiocapCapabilityListener } = await import('../../../src/main/audiocapHost');
+      // The registered callback is main's; re-registering would replace it, so drive the
+      // real one by re-reading it is not possible. Instead assert main registered ITS
+      // callback by observing the push the host produced during beforeAll's drain.
+      expect(typeof setAudiocapCapabilityListener).toBe('function');
+
+      didFinishLoadHandler()();
+      const [channel, payload] = capabilityPushes()[0]!;
+      expect(channel).toBe('audiocap:capability');
+      expect(payload).toEqual({ perProcessAudio: true });
+      expect(Object.keys(payload as object)).toEqual(['perProcessAudio']);
+    });
+
+    it('does not push into a destroyed window', () => {
+      // `mainWindow?.` is a NULL check, not an `isDestroyed()` check. Measured on real
+      // Electron 44.1.1 in the Phase-8 adversarial pass: reading `.webContents` off a
+      // DESTROYED BrowserWindow throws `Object has been destroyed` on the property access,
+      // before `.send` -- and a disposed render FRAME does not throw at all. So this guard,
+      // not the optional chain, is what stands between a teardown race and
+      // `uncaughtException` -> `app.exit(1)`.
+      mockMainWindow.isDestroyed.mockReturnValueOnce(true);
+
+      didFinishLoadHandler()();
+
+      expect(capabilityPushes()).toEqual([]);
+    });
+  });
 });

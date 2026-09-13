@@ -396,12 +396,52 @@ function handleChildMessage(live: HostSession, message: unknown): void {
       live.handshakeTimer = null;
     }
     live.capability = message.capability;
+    // THE SNAPSHOT'S ONLY WRITER (#3198 spec §4.1). `isAudiocapHello` has already
+    // refused a truthy non-boolean, so this is a real boolean — and I5 still holds:
+    // a necessary input main ANDs with facts it owns, never a grant.
+    machineCapability = message.capability.perProcessAudio;
     hostState = 'ready';
     settleOnce(live, {
       ok: true,
       generation: live.generation,
       perProcessAudio: message.capability.perProcessAudio,
     });
+    // NOTIFY LAST, AND NEVER LET IT ABORT THE HANDSHAKE. Found by #3198's pre-PR
+    // adversarial pass. The listener reaches `webContents.send`; called before
+    // `settleOnce`, a throw there left the promise unsettled with `live.handshakeTimer`
+    // already cleared -- the host wedged in 'handshaking' forever and never reaped its
+    // child, and the throw then reached main's uncaughtException handler, which calls
+    // `app.exit(1)`.
+    //
+    // THE MECHANISM IS NOT "A DISPOSED RENDER FRAME", WHICH IS WHAT THIS COMMENT SAID
+    // UNTIL THE PHASE-8 PASS MEASURED IT. On real Electron 44.1.1, a disposed frame does
+    // not throw at all: neither a crashed renderer nor a saved `webContents` handle used
+    // after the window is destroyed. What throws is reading `.webContents` off a DESTROYED
+    // `BrowserWindow` -- on the property access, before `.send` -- and a `?.` null check
+    // does not cover that, which is why `main.ts` now guards both push sites with
+    // `isDestroyed()`. The fix here was right; its stated cause was not.
+    //
+    // Both halves are load-bearing, and each is pinned by its own test. The ORDERING
+    // guarantees the handshake completes -- proven by the re-entrant-listener case, not by
+    // the throwing-listener case, which the catch alone satisfies. The CATCH guarantees a
+    // send into a destroyed window cannot kill the app after it has.
+    //
+    // Swallowing is correct here rather than lossy: the value is monotone (a machine
+    // fact, identical on every hello), and `did-finish-load` re-pushes it on the next
+    // load -- so a dropped push self-heals against the very frame that could not take it.
+    //
+    // The drop is LOGGED, and the earlier "nothing is logged" rule over-read its own
+    // justification: observability.md principle 3 constrains the ERROR OBJECT (an
+    // `Error.cause` must not reach a sink), not the fact that a push was dropped. A fixed
+    // string carries no cause, no PII and no privacy discriminator. Without it, a listener
+    // that throws on EVERY invocation is indistinguishable from a machine with no
+    // per-process backend, permanently and with no signal anywhere.
+    try {
+      onMachineCapabilityChange?.(message.capability.perProcessAudio);
+    } catch {
+      // Fixed string only -- never the caught value. See above.
+      console.warn('[audiocap] capability push dropped');
+    }
     return;
   }
 
@@ -577,6 +617,47 @@ export type AudiocapProbeResult =
 
 let probeResult: AudiocapProbeResult | null = null;
 let probeInFlight: Promise<AudiocapProbeResult> | null = null;
+
+/**
+ * THE MACHINE-CAPABILITY SNAPSHOT (#3198 spec §4.1) — one bit, pushed to the renderer.
+ *
+ * `null` means "no child has completed a handshake yet" and the renderer reads it as the
+ * PRE-ADDON rungs. Absence IS the fail-closed state (C9); there is no failure mode to
+ * model here, because there is nothing a missing answer could widen.
+ *
+ * WRITTEN ONLY FROM A VALIDATED `hello`, and deliberately NOT from `runCapabilityProbe`.
+ * The probe records `{ok:false,'child-crash'}` when a share reaps its child mid-handshake
+ * — for a machine that is fully capable — and `probeInFlight ??=` guarantees that value
+ * is never recomputed. Routing the snapshot through the probe would publish that false
+ * negative to the renderer and keep it for the life of the process. This way a reaped
+ * probe leaves `null`, and the very share that reaped it sets the snapshot from its own
+ * `hello`. Self-healing in one share, with no second child and no re-probe path, so I1
+ * (one session), I3 (supersede-and-kill) and I4 are untouched.
+ *
+ * MONOTONE IN INFORMATION: a machine fact, identical on every `hello`, so a duplicate
+ * push is idempotent and ordering-insensitive.
+ */
+let machineCapability: boolean | null = null;
+
+/** The machine's per-process claim, or `null` while no handshake has completed. */
+export function audiocapMachineCapability(): boolean | null {
+  return machineCapability;
+}
+
+/**
+ * Notified whenever the snapshot changes, so main can push it to the renderer.
+ *
+ * A callback rather than a direct `webContents.send` because this module owns no window
+ * handle and must not acquire one: `main.ts` owns window lifecycle, and importing it here
+ * would invert the dependency and make this module untestable in a `node` environment.
+ */
+let onMachineCapabilityChange: ((perProcessAudio: boolean) => void) | null = null;
+
+export function setAudiocapCapabilityListener(
+  listener: ((perProcessAudio: boolean) => void) | null
+): void {
+  onMachineCapabilityChange = listener;
+}
 
 /** The recorded answer, or `null` while the probe is still in flight. */
 export function audiocapProbeResult(): AudiocapProbeResult | null {

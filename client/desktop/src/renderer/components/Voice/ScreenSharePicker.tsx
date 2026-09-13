@@ -11,7 +11,7 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { effectiveStreamAxis, clampScreenCapture } from '../../utils/policy/videoLimits';
 import { resolveScreenDims } from '../../utils/ui/screenResolution';
-import { canCarryScreenAudio } from '../../utils/policy/screenAudioCapability';
+import { canCarryScreenAudio, verdictOffersAudio } from '../../utils/policy/screenAudioCapability';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { groupDesktopSources, type GroupedSources } from '../../utils/ui/groupDesktopSources';
 import './ScreenSharePicker.css';
@@ -314,10 +314,15 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   // enabled, default-on control on Linux, where this capture path has no loopback and
   // silently falls back to video. Shared with the service so the two cannot drift.
   //
-  // Compared against the exact verdict, never coerced: every verdict but 'none' is a
-  // truthy string, so a future mechanism would otherwise light this control up claiming
-  // a capture shape the service has not been taught to request.
-  const audioCapable = canCarryScreenAudio(selected, platform) === 'system-loopback';
+  // Routed through `verdictOffersAudio` rather than compared here, because the equality
+  // test this line used to carry defended exactly one direction. `=== 'system-loopback'`
+  // does stop a future verdict from lighting the control up claiming a capture shape the
+  // service cannot request — but it also compiles silently when the union widens, and then
+  // leaves the control DARK on a machine that can carry audio. Widening to `'per-process'`
+  // produced zero compile errors here while the other three consumers were converted to
+  // exhaustive switches (#3198 Phase-8 review). The helper is exhaustive, so the next rung
+  // is a compile error rather than a silent default.
+  const audioCapable = verdictOffersAudio(canCarryScreenAudio(selected, platform));
 
   // ── #2163: tier the per-share picker to the stream entitlement ──────────
   // The produce boundary clamps screen capture to the entitlement's tiered

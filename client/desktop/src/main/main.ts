@@ -9,7 +9,12 @@ import { cancelActiveGoogleFlow } from './oauth/google/googleFlow';
 import { registerAttestationIpc } from './ipc/attestation';
 import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/windowControls';
 import { initTray, destroyTray, isTrayActive } from './tray';
-import { killAudiocapHost, probeAudiocapCapability } from './audiocapHost';
+import {
+  audiocapMachineCapability,
+  killAudiocapHost,
+  probeAudiocapCapability,
+  setAudiocapCapabilityListener,
+} from './audiocapHost';
 import { registerVersionInfoIpc } from './ipc/versionInfo';
 import { buildBrowserWindowConfig } from './browserWindowConfig';
 import { PRODUCTION_API_BASE } from './apiBaseUrl';
@@ -1330,6 +1335,44 @@ const createWindow = async (): Promise<void> => {
     resetDeepLinkDelivery();
   });
 
+  // A RENDERER CREATED OR RELOADED AFTER THE SNAPSHOT SETTLED HEARS NOTHING FROM THE
+  // change listener in the ready path — the push already happened. Re-send on every load:
+  // the value is a machine fact, identical on every hello, so a duplicate is idempotent
+  // and ordering-insensitive. Without this, an SPA-loader swap leaves the renderer on the
+  // pre-addon rungs for the life of the session (spec §4.1 delivery). Registered here,
+  // with the window's first webContents listener, because the initial load is issued
+  // further down this same function.
+  //
+  // `null` sends nothing: absence IS the fail-closed state, and the renderer's initial
+  // store value already represents it.
+  //
+  // GUARDED WITH `isDestroyed()`, NOT `mainWindow?.`, AND THE MECHANISM IS NOT THE ONE THIS
+  // PR FIRST WROTE DOWN. #3198's Phase-8 adversarial pass measured it on real Electron
+  // 44.1.1 (10 scenarios, `redteam/poc/electron-send-throw-probe.js`) and the result
+  // corrects us: reading `.webContents` off a DESTROYED `BrowserWindow` throws
+  // `Object has been destroyed` on the PROPERTY ACCESS, before `.send` is reached, and a
+  // `?.` null check does not cover it. A disposed render FRAME does not throw at all --
+  // neither a crashed renderer nor a saved `webContents` handle used after destroy. So the
+  // check that matters is `isDestroyed()`, which is what `main.ts:885`/`:896`/`:1291`
+  // already use. The try/catch stays as the backstop for the state no synchronous check can
+  // exclude, and swallowing is safe because the value is a machine fact the next load
+  // re-pushes.
+  //
+  // `win`, not the module-scope `mainWindow`: this listener belongs to THIS window's
+  // webContents, and the same pass measured a second-window case where the module variable
+  // had already been nulled while this window was alive -- the push was dropped silently.
+  const win = mainWindow;
+  win.webContents.on('did-finish-load', () => {
+    const capability = audiocapMachineCapability();
+    if (capability === null) return;
+    if (win.isDestroyed()) return;
+    try {
+      win.webContents.send('audiocap:capability', { perProcessAudio: capability });
+    } catch {
+      /* destroyed between the check and the send; the next load re-pushes. See above. */
+    }
+  });
+
   // Wire resize/move/maximize/unmaximize/close listeners that persist
   // bounds to window-state.json with 500ms debounce (#806).
   attachWindowState(mainWindow);
@@ -1745,6 +1788,20 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
     }
+  });
+
+  // Publish the machine-capability snapshot to the renderer whenever it changes (#3198,
+  // contract 28). Registered BEFORE the probe is scheduled so a fast handshake cannot
+  // settle before there is a listener to hear it.
+  // Same `isDestroyed()` guard as the `did-finish-load` re-push, for the same measured
+  // reason (see that comment). `audiocapHost.ts` already wraps its call to this listener in
+  // a try/catch, so a throw here cannot wedge the handshake -- but relying on the CALLER's
+  // catch is what left the two copies asymmetric in the first place, and the check is one
+  // line. Here the module-scope `mainWindow` IS the right target: this runs once in
+  // `whenReady`, not per window.
+  setAudiocapCapabilityListener((perProcessAudio) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('audiocap:capability', { perProcessAudio });
   });
 
   // ─── concord-audiocap capability probe (#3195, ADR-0043) ──────────

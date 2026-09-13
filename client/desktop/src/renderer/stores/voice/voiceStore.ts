@@ -346,6 +346,15 @@ interface VoiceState {
    */
   isScreenAudioCapable: boolean;
   /**
+   * The MACHINE's per-process-audio claim (#3198), pushed by main over contract 28.
+   * `null` = not yet known, which the ladder reads as the pre-addon rungs (I-FC).
+   *
+   * Distinct from `isScreenAudioCapable`, which is about THIS SHARE's live track.
+   * NOT PERSISTED: a machine fact that would survive an OS upgrade or a driver change
+   * and become a stale grant.
+   */
+  machineScreenAudioCapable: boolean | null;
+  /**
    * The LOCAL share's audio transport and its health -- durable, unlike the 5000 ms
    * `videoSlotError` toast. Orthogonal to `isScreenAudioOn`: that flag answers "is a
    * screen-audio producer live", this answers "by what path, and if none, why".
@@ -475,6 +484,7 @@ interface VoiceState {
   setScreenSharing: (sharing: boolean) => void;
   setScreenAudioOn: (on: boolean) => void;
   setScreenAudioCapable: (capable: boolean) => void;
+  setMachineScreenAudioCapable: (capable: boolean | null) => void;
   /**
    * Replace the whole screen-audio state. A REPLACE, not a merge: a merge would let a
    * `reason` from a previous degrade survive into the state that succeeded it.
@@ -624,6 +634,7 @@ const initialState = {
   isScreenSharing: false,
   isScreenAudioOn: false,
   isScreenAudioCapable: false,
+  machineScreenAudioCapable: null as boolean | null,
   screenAudio: { mode: 'off', overrun: 0 } as ScreenAudioState,
   localIsTesting: false,
   participants: {} as Record<string, VoiceParticipant>,
@@ -761,6 +772,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setScreenSharing: (isScreenSharing) => set({ isScreenSharing }),
   setScreenAudioOn: (isScreenAudioOn) => set({ isScreenAudioOn }),
   setScreenAudioCapable: (isScreenAudioCapable) => set({ isScreenAudioCapable }),
+  setMachineScreenAudioCapable: (machineScreenAudioCapable) => set({ machineScreenAudioCapable }),
   setScreenAudioState: (screenAudio) => set({ screenAudio }),
   setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),
   setActiveSpeaker: (activeSpeakerId) => set({ activeSpeakerId }),
@@ -1167,6 +1179,11 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       ...initialState,
       // Preserve server-wide voice member data (sidebar display) across join/leave
       channelVoiceMembers: state.channelVoiceMembers,
+      // Preserve the machine's per-process-audio claim (#3198). It is a per-SESSION
+      // machine fact, not call state: main pushes it once on handshake settle and on
+      // `did-finish-load`, so wiping it here would leave the ladder on the pre-addon
+      // rungs for every call after the first -- degraded (never widened), but wrong.
+      machineScreenAudioCapable: state.machineScreenAudioCapable,
       // Preserve device settings across join/leave (they're persisted to localStorage)
       audioInputDeviceId: state.audioInputDeviceId,
       audioOutputDeviceId: state.audioOutputDeviceId,

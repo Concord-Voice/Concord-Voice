@@ -212,6 +212,20 @@ vi.mock('../../../src/main/audiocapHost', () => ({
   // Never settles: this suite does not exercise the probe itself, and a
   // hanging promise is the correct stand-in for "started, no reason to await".
   probeAudiocapCapability: vi.fn(() => new Promise(() => {})),
+  // Contract-28 capability push (#3198). The two bindings are NOT equally required, and
+  // the commit that added them claimed "a factory that omits these throws on import" —
+  // measured wrong in the Phase-8 review. A missing mock export throws on ACCESS, not on
+  // import: a consumer whose `import` names an omitted export loads and runs fine, and
+  // only the call site that uses it throws.
+  //
+  // So: `setAudiocapCapabilityListener` IS required — `main.ts` calls it unconditionally in
+  // the `app.whenReady()` body, which this suite drives. `audiocapMachineCapability` is not
+  // required today — it is reached only inside the `did-finish-load` handler, and this
+  // suite's `mockWebContents.on` is inert and never fires it. Kept anyway: keeping the
+  // mock's surface equal to the module's costs a line and stops the next handler that
+  // reaches for it from failing somewhere unrelated.
+  setAudiocapCapabilityListener: vi.fn(),
+  audiocapMachineCapability: vi.fn(() => null),
 }));
 
 // ── Per-platform re-import harness ─────────────────────────────────────────

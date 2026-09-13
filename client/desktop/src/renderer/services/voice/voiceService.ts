@@ -4026,9 +4026,16 @@ class VoiceService {
           );
           return { stream: await videoOnly(), sourceId: chosenId };
         }
+      case 'per-process':
+        // PR 1 OF 2 (#3198): UNREACHABLE. No production call site passes the
+        // machine-capability argument yet, so the verdict function cannot return this.
+        // The arm exists so the union compiles and so PR 2's change is a one-line swap
+        // of this body for start({ targetPids }) rather than a new arm nobody reviewed.
+        // Video-only is the correct behaviour if it IS somehow reached: it never widens.
+        return { stream: await videoOnly(), sourceId: chosenId };
       default: {
-        // Unreachable while the union has two members; C9 keeps the degraded answer
-        // video-only rather than a system mix.
+        // Unreachable while every reachable verdict has its own arm above; C9 keeps
+        // the degraded answer video-only rather than a system mix.
         const unhandled: never = audioVerdict;
         console.debug('captureScreenElectron: unhandled screen-audio verdict', unhandled);
         return { stream: await videoOnly(), sourceId: chosenId };
@@ -4692,15 +4699,41 @@ class VoiceService {
     // re-capturing would replace the track, glitch every viewer, and still produce
     // nothing. Tell the user why instead of churning the share on every click.
     const liveVerdict = canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform);
-    if (liveVerdict !== 'system-loopback') {
-      console.debug('setScreenAudioEnabled: target cannot carry audio');
-      // Telling the causes apart matters: on Linux a WHOLE-SCREEN share is refused by
-      // the platform, so the window text would send that user to a remedy that cannot
-      // work — and a share with no known source is neither of those.
-      useVoiceStore
-        .getState()
-        .setVideoSlotError(screenAudioRefusalMessage(this.currentScreenSourceId));
-      return;
+    switch (liveVerdict) {
+      case 'system-loopback':
+        break;
+      case 'per-process':
+        // PR 1 OF 2 (#3198): unreachable, as at the capture seam. PR 2 replaces this
+        // with the per-process re-capture; refusing is the safe answer meanwhile.
+        //
+        // ITS OWN MESSAGE, not `screenAudioRefusalMessage`. That helper keys on the id,
+        // so a window target returns "share a whole screen to include sound" — which in
+        // the era that makes this arm reachable tells a user whose machine CAN do
+        // per-process audio to do the one thing the feature exists to make unnecessary
+        // (#3198 Phase-8 review). The `console.debug` matches the `'none'` sibling; its
+        // absence here was an inconsistency, not a decision.
+        console.debug('setScreenAudioEnabled: per-process rung not wired yet');
+        useVoiceStore
+          .getState()
+          .setVideoSlotError(
+            'Per-app audio for this window is not available yet — share a whole screen to include sound for now.'
+          );
+        return;
+      case 'none': {
+        console.debug('setScreenAudioEnabled: target cannot carry audio');
+        // Telling the causes apart matters: on Linux a WHOLE-SCREEN share is refused by
+        // the platform, so the window text would send that user to a remedy that cannot
+        // work — and a share with no known source is neither of those.
+        useVoiceStore
+          .getState()
+          .setVideoSlotError(screenAudioRefusalMessage(this.currentScreenSourceId));
+        return;
+      }
+      default: {
+        const unhandled: never = liveVerdict;
+        console.debug('setScreenAudioEnabled: unhandled verdict', unhandled);
+        return;
+      }
     }
 
     // The share was captured silent (or its audio track died), so there is nothing to
@@ -4925,12 +4958,34 @@ class VoiceService {
   async canShareScreenAudio(): Promise<boolean> {
     await this.ensurePlatform();
     const verdict = canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform);
-    if (verdict === 'system-loopback') return true;
-    // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a
-    // share that may be sending audio right now. A live audio track on the capture is
-    // proof of capability that the id cannot express; without this the toolbar locked the
-    // button and the only way to stop sending sound was to end the whole share.
-    return this.currentScreenAudioCapable;
+    switch (verdict) {
+      case 'system-loopback':
+        return true;
+      case 'per-process':
+        // FALSE, and it was `true` until the #3198 Phase-8 review. `setScreenAudioEnabled`
+        // REFUSES this verdict until PR 2 wires `start({ targetPids })`, so `true` here
+        // meant the toolbar reporting "audio available" and the click producing a refusal
+        // toast — the exact outcome this PR's description argues against making reachable,
+        // already encoded in the arm the toolbar reads. Unreachable today (no call site
+        // passes the third argument), so the two answers cost nothing to align now and are
+        // expensive to discover misaligned later. PR 2 flips BOTH in one change;
+        // `voiceService.captureSeam.test.ts` fails if it flips only one.
+        return false;
+      case 'none':
+        // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a
+        // share that may be sending audio right now. A live audio track on the capture is
+        // proof of capability that the id cannot express; without this the toolbar locked the
+        // button and the only way to stop sending sound was to end the whole share.
+        //
+        // THIS FALL-THROUGH IS LOAD-BEARING. A `default: return false` conversion silently
+        // locks the toolbar on every non-Electron share (#3198 spec R8).
+        return this.currentScreenAudioCapable;
+      default: {
+        const unhandled: never = verdict;
+        console.debug('canShareScreenAudio: unhandled verdict', unhandled);
+        return false;
+      }
+    }
   }
 
   /**

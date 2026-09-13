@@ -187,9 +187,12 @@ The desktop topology is main / renderer plus a third, narrowly-scoped process: a
 cannot own the main process, which holds SSO tokens and the update path (ADR-0043 D5); the
 renderer is not a candidate host either, since `nodeIntegration` stays off there.
 
-**The mechanism still ships dark, but it is no longer empty.** `canCarryScreenAudio` returns only
-`'none' | 'system-loopback'`, so no per-process audio track is reachable by a user — that rung, and
-the PID resolution that feeds it, are #3198. What changed with #3197 PR 2 is what sits behind it:
+**The mechanism still ships dark, but it is no longer empty.** `canCarryScreenAudio` now returns
+`'none' | 'system-loopback' | 'per-process'` — #3198 PR 1 widened it — but no per-process audio
+track is reachable by a user, because **no production call site passes the third
+(`machineCapability`) argument**, so the new rung cannot be selected. Dark here means unreachable
+by construction rather than absent from the type; the PID resolution that would feed it is #3198
+PR 2. What changed with #3197 PR 2 is what sits behind it:
 **macOS 14.4+ now has a real Core Audio process-tap backend** compiled into release builds
 (`rt/platform/macos/`), so `start()` there reaches target validation and refuses with `NoTarget`
 rather than `NoBackend`. Windows still has no producer at all (#3196), and below the macOS 14.4

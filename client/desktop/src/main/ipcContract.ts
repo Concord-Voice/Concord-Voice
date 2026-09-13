@@ -229,8 +229,23 @@
  *        that function with `typeof fn !== 'function'`, and a shell without the
  *        relay loses per-process screen-share audio and falls back to
  *        video-only — never to a system mix (C9). Capability, not demand.
+ * - v28: audiocap machine capability (#3198, ADR-0043 D6): one main -> renderer push,
+ *        `audiocap:capability`, carrying `{ perProcessAudio: boolean }` — one bit, and
+ *        nothing else. `osVersion` is deliberately NOT carried: it would put an OS build
+ *        string into a main world that may be remote-SPA code served from a CDN origin,
+ *        and it would be a second copy of a floor `platformBackend()` already enforces.
+ *
+ *        The push AUTHORISES NOTHING. It feeds the renderer's affordance ladder, which
+ *        decides what to offer and what to say; enforcement lives in main and in `rt/`.
+ *        That is why this channel has no sender check (a push has no sender) while
+ *        #3198 PR 2's `audiocap:start` invoke does.
+ *
+ *        The SERVER's spaIpcContract stays 19: the renderer feature-detects with
+ *        `typeof globalThis.electron?.audiocap?.onCapability !== 'function'`, and a shell
+ *        without the push never leaves the pre-addon rungs — video-only, never a system
+ *        mix (C9). Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 27;
+export const IPC_CONTRACT_VERSION = 28;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.
