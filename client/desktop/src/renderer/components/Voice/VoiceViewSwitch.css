@@ -72,7 +72,7 @@
 .voice-view-switch__seg--active,
 .voice-view-switch__seg--active:hover {
   background: var(--accent-primary);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .voice-view-switch__seg:focus-visible {

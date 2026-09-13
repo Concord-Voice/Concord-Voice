@@ -69,7 +69,7 @@
 
 .pip-header__btn--close:hover {
   background-color: var(--danger, #ed4245);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 /* ─── Frames PiP Grid ─────────────────────────────────────────── */
@@ -125,7 +125,7 @@
 
 .pip-control-btn--active {
   background-color: var(--accent-primary, #5865f2);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .pip-control-btn--active:hover {
@@ -134,20 +134,20 @@
 
 .pip-control-btn--danger {
   background-color: var(--danger, #ed4245);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .pip-control-btn--danger:hover {
-  background-color: #c93b3e;
+  background-color: var(--danger-hover);
 }
 
 .pip-control-btn--leave {
   background-color: var(--danger, #ed4245);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .pip-control-btn--leave:hover {
-  background-color: #c93b3e;
+  background-color: var(--danger-hover);
 }
 
 .pip-controls-status {

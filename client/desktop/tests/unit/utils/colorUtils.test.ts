@@ -7,6 +7,8 @@ import {
   contrastColor,
   isValidHex,
   deriveThemeVariables,
+  applyCustomThemeVariables,
+  clearCustomThemeVariables,
   type CustomColors,
 } from '@/renderer/utils/ui/colorUtils';
 
@@ -194,16 +196,33 @@ describe('deriveThemeVariables', () => {
     accentSecondary: '#ffe13f',
   };
 
-  it('returns all 24 expected CSS property keys', () => {
+  it('returns all 26 expected CSS property keys', () => {
     const vars = deriveThemeVariables(defaultColors, true);
     const keys = Object.keys(vars);
-    expect(keys).toHaveLength(24);
+    expect(keys).toHaveLength(26);
     expect(keys).toContain('--bg-primary');
     expect(keys).toContain('--text-primary');
     expect(keys).toContain('--accent-primary');
     expect(keys).toContain('--gradient-brand');
     expect(keys).toContain('--on-accent');
     expect(keys).toContain('--status-connected');
+    // A custom theme that derives --danger without --on-danger inherits :root's
+    // foreground against a fill :root never saw. Both halves ship together.
+    expect(keys).toContain('--on-danger');
+    expect(keys).toContain('--on-success');
+  });
+
+  it('clears every key it applies', () => {
+    // apply writes Object.entries(vars); clear walks the SEPARATE
+    // THEME_VARIABLE_KEYS list. A key in one and not the other survives a theme
+    // switch as a stale inline style on documentElement, outranking the scheme
+    // that replaced it. This fails if the two lists drift apart.
+    const vars = deriveThemeVariables(defaultColors, true);
+    applyCustomThemeVariables(vars);
+    clearCustomThemeVariables();
+    for (const key of Object.keys(vars)) {
+      expect(document.documentElement.style.getPropertyValue(key)).toBe('');
+    }
   });
 
   describe('dark mode', () => {

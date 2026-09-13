@@ -12,9 +12,9 @@
   gap: 12px;
   width: 320px;
   padding: 12px 14px;
-  background: var(--surface-elevated, #2a2d33);
+  background: var(--bg-secondary);
   color: var(--text-primary, #ffffff);
-  border: 1px solid var(--border-accent, #5865f2);
+  border: 1px solid var(--accent-color);
   border-radius: 8px;
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
   animation: incoming-call-pulse 2s ease-in-out infinite;
@@ -23,11 +23,11 @@
 @keyframes incoming-call-pulse {
   0%,
   100% {
-    border-color: var(--border-accent, #5865f2);
+    border-color: var(--accent-color);
   }
   50% {
-    border-color: var(--accent-primary, #5865f2);
-    box-shadow: 0 6px 20px rgba(88, 101, 242, 0.5);
+    border-color: var(--accent-color);
+    box-shadow: 0 6px 20px color-mix(in srgb, var(--accent-color) 50%, transparent);
   }
 }
 
@@ -37,7 +37,7 @@
   height: 40px;
   border-radius: 50%;
   overflow: hidden;
-  background: var(--surface-muted, #3a3d45);
+  background: var(--bg-tertiary);
   display: flex;
   align-items: center;
   justify-content: center;

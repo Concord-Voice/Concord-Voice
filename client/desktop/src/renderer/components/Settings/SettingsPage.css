@@ -1067,7 +1067,7 @@
   background: var(--danger);
   border: 1px solid var(--danger);
   border-radius: 6px;
-  color: #fff;
+  color: var(--on-danger);
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 600;
   font-family: 'SourceSans', sans-serif;
@@ -1242,7 +1242,7 @@
 
 .os-perm-actions .btn-primary {
   background: var(--accent-primary, #4f46e5);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .os-perm-actions .btn-primary:hover:not(:disabled) {

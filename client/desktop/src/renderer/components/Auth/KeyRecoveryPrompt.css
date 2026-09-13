@@ -11,8 +11,8 @@
   background: rgba(0, 0, 0, 0.5);
 }
 .key-recovery-prompt__card {
-  background: var(--color-surface, #1e1e24);
-  color: var(--color-text, #e8e8ea);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
   padding: 24px;
   border-radius: 12px;
 }

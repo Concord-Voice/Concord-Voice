@@ -324,7 +324,7 @@ kbd {
 }
 
 .counter.error {
-  color: var(--error, #c72a28);
+  color: var(--text-error-strong);
   font-weight: 600;
 }
 

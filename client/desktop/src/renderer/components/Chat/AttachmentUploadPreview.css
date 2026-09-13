@@ -237,10 +237,15 @@
   color: var(--error-color);
 }
 
+/* --text-secondary, for the third time in this file. The comment above already
+   works out that --text-muted and --text-tertiary fail in the dark schemes, and
+   this PR still repointed .upload-status at --text-muted -- 2.00:1 in Midnight
+   Sky Dark, where the replaced literal held 3.47:1. This line is the only place
+   "Long message sent as a .md attachment." is ever shown. */
 .upload-status {
   padding: 4px 12px;
   font-size: 12px;
-  color: var(--text-muted-color, #6b7280);
+  color: var(--text-secondary);
 }
 
 .message-input-wrapper.drag-over {

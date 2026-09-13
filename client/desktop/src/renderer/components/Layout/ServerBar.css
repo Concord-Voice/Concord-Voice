@@ -253,7 +253,7 @@
   padding: 0 4px;
   border-radius: 8px;
   background: var(--danger);
-  color: #ffffff;
+  color: var(--on-danger);
   font-size: 10px;
   font-weight: 700;
   display: flex;

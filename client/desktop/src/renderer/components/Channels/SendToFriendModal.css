@@ -5,9 +5,9 @@
   width: 100%;
   margin-bottom: 8px;
   padding: 8px 10px;
-  border: 1px solid var(--background-tertiary, #1e1f22);
+  border: 1px solid var(--border-color);
   border-radius: 4px;
-  background: var(--background-tertiary, #1e1f22);
+  background: var(--bg-tertiary);
   color: inherit;
   font-size: 0.875rem;
 }
@@ -53,7 +53,7 @@
 }
 
 .send-to-friend-modal__avatar--placeholder {
-  background: var(--background-tertiary, #1e1f22);
+  background: var(--bg-tertiary);
 }
 
 .send-to-friend-modal__name {

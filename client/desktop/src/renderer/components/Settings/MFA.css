@@ -47,7 +47,7 @@
   padding: 2px 8px;
   border-radius: 10px;
   background: var(--success-color, #2d7d46);
-  color: #fff;
+  color: var(--on-success);
   font-weight: 500;
 }
 
@@ -288,12 +288,12 @@
 
 .btn-danger {
   background: var(--error-color, #c0392b);
-  color: #fff;
+  color: var(--on-danger);
   border: none;
 }
 
 .btn-danger:hover:not(:disabled) {
-  background: #d63739;
+  background: var(--danger-hover);
 }
 
 .btn-danger:disabled {
@@ -658,7 +658,7 @@
 
 .btn-reset-danger:hover:not(:disabled) {
   background: var(--error-color, #c0392b);
-  color: #fff;
+  color: var(--on-danger);
   border-color: var(--error-color, #c0392b);
 }
 
@@ -747,7 +747,7 @@
 }
 
 .sso-toggle-error {
-  color: var(--danger-text, #c0392b);
+  color: var(--text-error-strong);
   font-size: 12px;
   margin: 0;
 }

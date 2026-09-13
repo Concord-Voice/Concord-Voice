@@ -6,7 +6,7 @@
   gap: 8px;
   padding: 8px 12px;
   margin: 4px 0;
-  background: var(--surface-muted, #2a2d33);
+  background: var(--bg-tertiary);
   border-radius: 6px;
   font-size: 13px;
   color: var(--text-secondary, #aab);

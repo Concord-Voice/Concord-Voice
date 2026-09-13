@@ -379,8 +379,8 @@
 }
 
 .category-delete-confirm-btn {
-  background: var(--button-danger-background, #d83c3e);
-  color: #fff;
+  background: var(--danger);
+  color: var(--on-danger);
   border: none;
   border-radius: 4px;
   padding: 8px 16px;
@@ -390,7 +390,7 @@
 }
 
 .category-delete-confirm-btn:hover {
-  background: var(--button-danger-background-hover, #c03537);
+  background: var(--danger-hover);
 }
 
 @media (max-width: 640px) {

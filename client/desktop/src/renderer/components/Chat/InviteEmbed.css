@@ -50,8 +50,8 @@
   padding: 6px 16px;
   border: none;
   border-radius: 6px;
-  background: var(--accent, #5865f2);
-  color: #fff;
+  background: var(--accent-color);
+  color: var(--on-accent);
   font-weight: 600;
   cursor: pointer;
 }

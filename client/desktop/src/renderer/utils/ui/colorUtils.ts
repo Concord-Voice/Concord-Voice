@@ -34,6 +34,8 @@ export interface DerivedThemeVariables {
   '--gradient-brand': string;
   '--border-color': string;
   '--on-accent': string;
+  '--on-danger': string;
+  '--on-success': string;
   '--success': string;
   '--danger': string;
   '--danger-hover': string;
@@ -62,6 +64,8 @@ const THEME_VARIABLE_KEYS: (keyof DerivedThemeVariables)[] = [
   '--gradient-brand',
   '--border-color',
   '--on-accent',
+  '--on-danger',
+  '--on-success',
   '--success',
   '--danger',
   '--danger-hover',
@@ -218,7 +222,16 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
     '--on-accent': contrastColor(a1),
     '--success': '#43b581',
     '--danger': '#f04747',
-    '--danger-hover': '#d43b3b',
+    // Lighter than the fill, not darker. Every other hover this function derives
+    // lightens (--accent-hover, --bg-hover); #d43b3b darkened, which is what put
+    // the black label at 4.488 against the fill's 5.697 and left the pair just
+    // under the floor. Lightening clears it: black measures 6.65 here, so the
+    // pair is now bound by the fill at 5.70 rather than by its own hover.
+    '--danger-hover': '#f45f5f',
+    // Chosen against BOTH the fill and its hover rather than the fill alone:
+    // black holds 5.70 across #f04747/#f45f5f where white bottoms out at 3.69.
+    '--on-danger': '#000000',
+    '--on-success': '#000000',
     '--error-color': 'var(--danger)',
     '--success-color': 'var(--success)',
     '--status-connected': '#1aaa55',
@@ -260,6 +273,15 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
     '--success': '#2d9f6f',
     '--danger': '#e03e3e',
     '--danger-hover': '#c83232',
+    // White wins here where black wins in dark mode: 4.26 against #e03e3e/#c83232
+    // versus black's 3.96. The pair is measured per mode rather than assumed.
+    // 4.26 is short of 4.5, and the binding value is the FILL, not the hover, so
+    // unlike dark mode this cannot be fixed by adjusting the hover — it needs a
+    // darker --danger, which is a palette change rather than a pairing one. The
+    // literal #fff these call sites used before measured the same 4.26, so this
+    // is inherited rather than introduced, and it is recorded rather than rounded.
+    '--on-danger': '#ffffff',
+    '--on-success': '#000000',
     '--error-color': 'var(--danger)',
     '--success-color': 'var(--success)',
     '--status-connected': '#1a9a4a',

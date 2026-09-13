@@ -131,7 +131,7 @@
 .permission-tristate-btn.allow-active {
   background: var(--success-color);
   border-color: var(--success-color);
-  color: #fff;
+  color: var(--on-success);
 }
 
 .permission-tristate-btn.neutral-active {
@@ -143,5 +143,5 @@
 .permission-tristate-btn.deny-active {
   background: var(--error-color);
   border-color: var(--error-color);
-  color: #fff;
+  color: var(--on-danger);
 }

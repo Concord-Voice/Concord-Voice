@@ -66,12 +66,12 @@
    weight as two preferences. */
 .voice-controls__btn--active {
   background-color: var(--accent-primary);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .voice-controls__btn--active:hover {
   background-color: var(--accent-hover);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* Server-enforced lock. Both tokens this used were UNDEFINED: --warning-rgb is set
@@ -97,12 +97,12 @@
    had the emphasis exactly backwards. */
 .voice-controls__btn--danger {
   background-color: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .voice-controls__btn--danger:hover {
   background-color: var(--danger-hover);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 /* TINTED destructive — Stop. Destructive in kind but not in degree: it ends the
@@ -115,20 +115,20 @@
 
 .voice-controls__btn--danger-soft:hover {
   background-color: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 /* Chat toggle active state (accent instead of danger) */
 
 .voice-controls__btn--chat-active {
   background-color: var(--accent-primary);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .voice-controls__btn--chat-active:hover {
   background-color: var(--accent-primary);
   opacity: 0.85;
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* ─── Video Slot Error Toast ──────────────────────────────────── */
@@ -232,7 +232,7 @@
   transform: translateX(-50%);
   margin-bottom: 8px;
   min-width: 200px;
-  background-color: var(--bg-floating, #111214);
+  background-color: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 4px;

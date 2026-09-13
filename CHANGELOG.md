@@ -106,6 +106,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   On the light themes this also fixes a hairline: the GIF picker's border and caret outline were
   painted a fixed dark grey rather than following your theme, because they referred to a colour
   that was never defined anywhere. They now follow the theme like every other border.
+
+- **Parts of the app stopped ignoring your theme** ([#3270 follow-up](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3270)) — twenty-three
+  colours across the call banners, the outgoing-call window, the friend-picker, the category
+  manager, the key-recovery prompt, the two-factor screens and the attachment preview were written
+  into the stylesheet as fixed values rather than as a reference to your theme. They were chosen
+  for the dark themes, so on a dark theme they looked right and nobody noticed. On any of the
+  fifteen light themes they stayed dark: a near-black panel over the call controls, a charcoal
+  surround on the friend-picker, a dark slab behind a call event in your messages. All of them now
+  take their colour from the theme you picked. Two of them were a different kind of wrong — an
+  invite embed and a direct-message profile painted their highlight in the blue Concord used to
+  borrow from elsewhere, which is not the colour of anything else in the app; those now use
+  Concord's own accent, which you will notice on dark themes too.
+
+- **Buttons drawn in the accent colour keep a readable label, High Contrast included** ([#3285](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3285)) — the Join
+  button on an invite, the primary action on a profile card, the download link on the attestation
+  warning and the active mic and chat toggles in a call all painted their label pure white on a
+  background taken from the theme's accent. That reads well while the accent stays dark, which it
+  is on most themes, so it went unnoticed. Switch High Contrast on and the accent becomes yellow —
+  and a white label on a yellow button is close to invisible, in the one mode you would turn on
+  precisely because you need to see things. The label now takes the theme's own on-accent colour,
+  black where the accent is light, which is what the thirty-five other buttons in the app already
+  did. The same pass caught the key-recovery prompt, whose warning text was pinned to a pale grey
+  that only worked over a dark card, and the floating menu in the call controls, which was sitting
+  on the page colour rather than a raised one and so had nothing but a shadow to separate it from
+  the page on light themes.
+
+- **Text on red and green buttons is legible on every theme** ([#3285](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3285)) — destructive buttons
+  (Leave a call, delete a category, remove a server) and the small success badges wrote their
+  label as fixed white, while the button underneath took its colour from your theme. Most themes
+  use a deep red, where white reads well, so this held up. Some do not: the two-factor "enabled"
+  badge is green, and on the high-contrast theme that green is `#00ff00` — white on it measures
+  1.37, which is not a low contrast so much as no contrast at all. The label now follows two new
+  theme values, one for red fills and one for green, each picked so it stays readable against
+  that theme's own shades. Green badges go from a worst case of 1.37 to 4.66. Red buttons go from
+  2.43 to 3.83, which is the most a single colour can do against reds that range from near-maroon
+  to salmon within one theme; that is fine for button-sized text and short of the standard for
+  body text, and it is recorded rather than glossed.
+
+  Four themes also had an accent text colour that had drifted into decoration — Cotton Candy put
+  pale blue on a pale pink button, at 1.91 — and those are corrected. The wider question of
+  Concord's own pink accent carrying white text, which measures 2.68, is left alone deliberately:
+  that is the brand's colour and changing it is a decision about how the app looks, not a defect
+  to fix in passing.
 - **Server-enforced mutes look enforced again, and some hover highlights came back** ([#3270](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3270)) — when a
   moderator mutes or deafens someone, the marker on that person is meant to be amber, so you can
   tell at a glance that the server did it rather than they did. In the channel list, and in the

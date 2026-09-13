@@ -144,7 +144,7 @@
 .custom-status-save-btn {
   border: none;
   background: var(--accent-primary);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .custom-status-save-btn:hover:not(:disabled) {

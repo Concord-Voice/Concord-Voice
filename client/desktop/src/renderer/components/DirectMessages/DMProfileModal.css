@@ -213,8 +213,8 @@
 }
 
 .dm-profile-modal-action-primary {
-  background: var(--accent, #5865f2);
-  color: #fff;
+  background: var(--accent-color);
+  color: var(--on-accent);
 }
 
 .dm-profile-modal-action-primary:hover {

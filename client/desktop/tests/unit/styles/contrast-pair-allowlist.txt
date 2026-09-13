@@ -1,0 +1,210 @@
+# Foreground/background pairs that currently measure below 4.5:1 in at least one
+# theme block. A frozen inventory, not an approval: every line is a real contrast
+# failure somewhere. Format is TAB-separated, three fields:
+#
+#   <path relative to client/desktop>\t<CSS selector>\t<accepted worst ratio>
+#
+# This list is a RATCHET in all three directions, and the third is the one that
+# makes the other two mean anything:
+#   * a failing pair NOT listed here fails the build;
+#   * a listed pair that has been FIXED fails the build until its line is deleted;
+#   * a listed pair that has got WORSE than its recorded ratio fails the build.
+#
+# Without that last rule an entry is a permanent excuse at any ratio, and a listed
+# failure could slide from 4.4:1 to 1:1 unnoticed. Shrink this list; do not grow it,
+# and never raise a number without saying why in the commit message.
+src/renderer/components/AttestationFailedModal.css	.attestation-modal__download-link	2.68
+src/renderer/components/AttestationFailedModal.css	.attestation-modal__download-link:hover	2.14
+src/renderer/components/Auth/ChangeEmail.css	.change-email-form .buttons button[type='submit']	2.68
+src/renderer/components/Auth/EmailVerification.css	.email-verification-change-form button	2.68
+src/renderer/components/Auth/SSOAccountLinkConfirm.css	.sso-link-confirm__submit	2.68
+src/renderer/components/Auth/SSOAccountLinkConfirm.css	.sso-link-confirm__submit:hover:not(:disabled)	2.68
+src/renderer/components/Auth/SSOEagerUnlock.css	.sso-eager-unlock__submit	2.68
+src/renderer/components/Auth/SSOEagerUnlock.css	.sso-eager-unlock__submit:hover:not(:disabled)	2.68
+src/renderer/components/Auth/SSOPassphraseSetup.css	.sso-passphrase-setup__submit	2.68
+src/renderer/components/Auth/SSOPassphraseSetup.css	.sso-passphrase-setup__submit:hover:not(:disabled)	2.68
+src/renderer/components/Channels/ChannelList.css	.channel-group-header__count	2.46
+src/renderer/components/Channels/ChannelList.css	.channel-item--compact .channel-draft-indicator	2.36
+src/renderer/components/Channels/ChannelList.css	.channel-unread-badge	2.46
+src/renderer/components/Channels/ChannelSettingsModal.css	.channel-settings-purge-btn	3.83
+src/renderer/components/Channels/ChannelSettingsModal.css	.channel-settings-purge-btn:hover:not(:disabled)	4.04
+src/renderer/components/Channels/ChannelSettingsModal.css	.synced-notice	2.00
+src/renderer/components/Channels/CreateChannelModal.css	.btn-primary	2.68
+src/renderer/components/Channels/CreateChannelModal.css	.emoji-clear-btn:hover:not(:disabled)	2.63
+src/renderer/components/Channels/CreateChannelModal.css	.emoji-picker-button	2.00
+src/renderer/components/Channels/CreateChannelModal.css	.emoji-picker-button:hover:not(:disabled)	3.92
+src/renderer/components/Channels/ServerActionBar.css	.invite-popup-action-btn.secondary	4.31
+src/renderer/components/Channels/ServerActionBar.css	.invite-popup-action-btn.secondary:hover:not(:disabled)	4.31
+src/renderer/components/Chat/AttachmentDisplay.css	.attachment-download-btn:hover	2.19
+src/renderer/components/Chat/AttachmentDisplay.css	.attachment-load-btn:hover:not(:disabled)	4.31
+src/renderer/components/Chat/AttachmentUploadPreview.css	.attachment-remove-btn	4.31
+src/renderer/components/Chat/AttachmentUploadPreview.css	.attachment-remove-btn:hover	2.69
+src/renderer/components/Chat/DeleteMessageModal.css	.delete-message-confirm-btn	3.83
+src/renderer/components/Chat/DeleteMessageModal.css	.delete-message-confirm-btn:hover	4.04
+src/renderer/components/Chat/GifEmbed.css	.gif-embed-error	2.22
+src/renderer/components/Chat/GifEmbed.css	.gif-embed-placeholder:hover	4.31
+src/renderer/components/Chat/InviteEmbed.css	.invite-embed__join	2.68
+src/renderer/components/Chat/Message.css	.btn-edit-save	2.46
+src/renderer/components/Chat/Message.css	.btn-edit-save:hover:not(:disabled)	2.01
+src/renderer/components/Chat/Message.css	.message-quick-delete	3.45
+src/renderer/components/Chat/MessageInput.css	.media-btn.active	2.19
+src/renderer/components/Chat/MessageInput.css	kbd	4.31
+src/renderer/components/Chat/MessageList.css	.new-message-badge	2.68
+src/renderer/components/Chat/PinnedMessagesPanel.css	.pinned-message-jump:hover	1.98
+src/renderer/components/Chat/PinnedMessagesPanel.css	.pinned-message-unpin:hover	2.63
+src/renderer/components/Chat/SearchPanel.css	.search-result-jump:hover	1.98
+src/renderer/components/Chat/ThemedMediaPlayer.css	.media-controls-btn:focus-visible	2.19
+src/renderer/components/Chat/ThemedMediaPlayer.css	.media-controls-btn:hover	2.19
+src/renderer/components/common/audioQualitySlider.css	.settings-tier-description	4.31
+src/renderer/components/common/audioQualitySlider.css	.settings-tier-kbps-label	2.19
+src/renderer/components/common/PremiumChip.css	.premium-chip	1.20
+src/renderer/components/DirectMessages/CallEventMessage.css	.call-event-message	4.31
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-delete-confirm-btn	3.83
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-delete-confirm-btn:hover	4.04
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .create-role-btn	4.31
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .create-role-btn:hover	1.98
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .emoji-clear-btn:hover	2.63
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .emoji-picker-button	4.31
+src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .server-settings-cancel-btn:hover	2.63
+src/renderer/components/DirectMessages/DirectMessages.css	.add-friend-action-btn	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.add-friend-revoke-btn:hover	3.23
+src/renderer/components/DirectMessages/DirectMessages.css	.conversation-compact-draft	2.22
+src/renderer/components/DirectMessages/DirectMessages.css	.conversation-in-call-badge.group	4.31
+src/renderer/components/DirectMessages/DirectMessages.css	.conversation-unread-badge	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.create-group-add-btn	4.31
+src/renderer/components/DirectMessages/DirectMessages.css	.create-group-add-btn:hover:not(:disabled)	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.create-group-btn	4.31
+src/renderer/components/DirectMessages/DirectMessages.css	.create-group-btn:hover	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.create-group-create-btn	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.dm-chat-header-join-call-btn	1.14
+src/renderer/components/DirectMessages/DirectMessages.css	.dm-disabled-notice	2.00
+src/renderer/components/DirectMessages/DirectMessages.css	.friend-category-drag-handle:hover	4.31
+src/renderer/components/DirectMessages/DirectMessages.css	.friend-category-drag-handle[aria-pressed='true']	2.19
+src/renderer/components/DirectMessages/DirectMessages.css	.friend-request-accept:hover:not(:disabled)	3.04
+src/renderer/components/DirectMessages/DirectMessages.css	.friend-request-decline:hover:not(:disabled)	3.23
+src/renderer/components/DirectMessages/DirectMessages.css	.friends-add-btn	4.31
+src/renderer/components/DirectMessages/DirectMessages.css	.friends-add-btn:hover	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.friends-compact-trigger-count	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.group-member-role-badge	2.46
+src/renderer/components/DirectMessages/DirectMessages.css	.personal-thread-avatar	2.46
+src/renderer/components/DirectMessages/DMProfileModal.css	.dm-profile-modal-action-primary	2.68
+src/renderer/components/EmojiPicker/EmojiPicker.css	.emoji-picker-category-tab:hover	3.92
+src/renderer/components/Layout/AppLayout.css	.dock-shell__lip	2.00
+src/renderer/components/Layout/FolderBar.css	.folder-chip	4.31
+src/renderer/components/Layout/FolderBar.css	.folder-chip-badge	3.83
+src/renderer/components/Layout/ServerBar.css	.server-bar-add	2.22
+src/renderer/components/Layout/ServerBar.css	.server-bar-badge	3.83
+src/renderer/components/Layout/ServerBar.css	.server-bar-pm-icon	2.22
+src/renderer/components/Layout/ServerBar.css	.server-bar-scroll-arrow	2.00
+src/renderer/components/Members/MemberList.css	.member-compact-trigger-count	2.46
+src/renderer/components/Members/MemberList.css	.member-list-error .retry-btn:hover	2.19
+src/renderer/components/Members/MemberProfileCard.css	.member-profile-role-badge.role-admin	1.69
+src/renderer/components/Members/MemberProfileCard.css	.member-profile-role-badge.role-member	4.31
+src/renderer/components/Members/MemberProfileCard.css	.member-profile-role-badge.role-owner	2.68
+src/renderer/components/Members/MemberProfileCard.css	.member-profile-view-full-btn	4.31
+src/renderer/components/Members/MemberProfileCard.css	.member-profile-view-full-btn:hover	2.68
+src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn	2.68
+src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn--error	2.96
+src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn--inert	2.00
+src/renderer/components/Members/MemberProfileCard.css	.send-friend-request-btn:hover:not(:disabled)	2.14
+src/renderer/components/Members/UserProfileModal.css	.user-profile-modal-role-badge.role-admin	1.69
+src/renderer/components/Members/UserProfileModal.css	.user-profile-modal-role-badge.role-member	4.31
+src/renderer/components/Members/UserProfileModal.css	.user-profile-modal-role-badge.role-owner	2.68
+src/renderer/components/Permissions/OverridePanel.css	.override-delete-btn:hover	3.45
+src/renderer/components/Permissions/PermissionGrid.css	.permission-category-header	4.31
+src/renderer/components/Permissions/PermissionGrid.css	.permission-tristate-btn	2.00
+src/renderer/components/Permissions/PermissionGrid.css	.permission-tristate-btn.deny-active	3.83
+src/renderer/components/Purge/purgeMessages.css	.purge-modal__confirm	3.83
+src/renderer/components/Purge/purgeMessages.css	.purge-modal__confirm:hover:not(:disabled)	4.04
+src/renderer/components/Servers/DeleteServerModal.css	.delete-server-confirm-btn	3.83
+src/renderer/components/Servers/DeleteServerModal.css	.delete-server-confirm-btn:hover:not(:disabled)	4.04
+src/renderer/components/Servers/InviteToServerModal.css	.invite-code-copy-btn	4.31
+src/renderer/components/Servers/ServerList.css	.add-server-btn	2.22
+src/renderer/components/Servers/ServerList.css	.server-error-btn	3.45
+src/renderer/components/Servers/ServerSettingsPage.css	.create-role-btn	4.31
+src/renderer/components/Servers/ServerSettingsPage.css	.invite-copy-btn:hover	2.19
+src/renderer/components/Servers/ServerSettingsPage.css	.invite-generate-btn:hover:not(:disabled)	2.19
+src/renderer/components/Servers/ServerSettingsPage.css	.member-enforcement-badge	4.31
+src/renderer/components/Servers/ServerSettingsPage.css	.role-default-note	2.00
+src/renderer/components/Servers/ServerSettingsPage.css	.role-reorder-apply-btn	2.19
+src/renderer/components/Servers/ServerSettingsPage.css	.role-reorder-apply-btn:hover:not(:disabled)	2.68
+src/renderer/components/Servers/ServerSettingsPage.css	.role-reorder-notice	2.00
+src/renderer/components/Settings/AboutUpdateSection.css	.about-info-copy-btn	3.92
+src/renderer/components/Settings/AboutUpdateSection.css	.about-info-copy-btn:hover	2.68
+src/renderer/components/Settings/AboutUpdateSection.css	.about-update-action-btn--primary	2.68
+src/renderer/components/Settings/AboutUpdateSection.css	.about-update-action-btn:hover	2.68
+src/renderer/components/Settings/AboutUpdateSection.css	.about-update-btn	2.68
+src/renderer/components/Settings/AboutUpdateSection.css	.about-update-chip:focus-visible	2.68
+src/renderer/components/Settings/AboutUpdateSection.css	.about-update-chip:hover	2.68
+src/renderer/components/Settings/ActivityHistory.css	.activity-history-card__danger-button:hover:not(:disabled)	2.63
+src/renderer/components/Settings/ActivityHistory.css	.activity-history-card__notice	4.31
+src/renderer/components/Settings/ClientBehaviorSection.css	.client-behavior-option	4.31
+src/renderer/components/Settings/FontSection.css	.font-option-theme-badge	2.68
+src/renderer/components/Settings/MFA.css	.btn-danger	3.83
+src/renderer/components/Settings/MFA.css	.btn-danger:hover:not(:disabled)	4.04
+src/renderer/components/Settings/MFA.css	.btn-reset-danger:hover:not(:disabled)	3.83
+src/renderer/components/Settings/MFA.css	.mfa-tier-method	4.31
+src/renderer/components/Settings/PresenceExceptions.css	.presence-exception-button--primary	2.46
+src/renderer/components/Settings/PresenceExceptions.css	.presence-exception-button--primary:hover:not(:disabled)	2.01
+src/renderer/components/Settings/PresenceSettingsSection.css	.presence-tier-option.active	2.68
+src/renderer/components/Settings/SettingsPage.css	.color-scheme-circle.custom-add	2.00
+src/renderer/components/Settings/SettingsPage.css	.font-size-option	4.31
+src/renderer/components/Settings/SettingsPage.css	.os-perm-actions .btn-primary	2.68
+src/renderer/components/Settings/SettingsPage.css	.revocation-mode-btn.active	2.68
+src/renderer/components/Settings/SettingsPage.css	.revoke-all-modal-confirm-btn	3.83
+src/renderer/components/Settings/SettingsPage.css	.session-card-badge	2.46
+src/renderer/components/Settings/SettingsPage.css	.session-card-icon	2.22
+src/renderer/components/Settings/SettingsPage.css	.session-revoke-btn.confirm	3.34
+src/renderer/components/Settings/SettingsPage.css	.session-revoke-btn.confirm:hover:not(:disabled)	3.34
+src/renderer/components/Settings/SettingsPage.css	.settings-codec-info-badge	2.19
+src/renderer/components/Settings/SettingsPage.css	.settings-estimated-bitrate	2.19
+src/renderer/components/Settings/SettingsPage.css	.settings-gpu-badge	2.00
+src/renderer/components/Settings/SettingsPage.css	.settings-nav-badge	2.00
+src/renderer/components/Settings/SettingsPage.css	.settings-notification-permission-btn	2.68
+src/renderer/components/Settings/SettingsPage.css	.settings-pending-blob-apply	2.68
+src/renderer/components/Settings/SettingsPage.css	.settings-quality-premium-badge	1.20
+src/renderer/components/Settings/SettingsPage.css	.settings-rotate-id-btn:hover:not(:disabled)	2.46
+src/renderer/components/Settings/SettingsPage.css	.theme-option	4.31
+src/renderer/components/Settings/SettingsPage.css	.ui-scale-reset-btn	4.31
+src/renderer/components/Settings/SettingsPreviewPanel.css	.settings-preview-reaction	4.31
+src/renderer/components/Settings/subscription/subscription.css	.subscription-redeem-submit	2.68
+src/renderer/components/Settings/subscription/subscription.css	.subscription-redeem-submit:hover:not(:disabled)	2.14
+src/renderer/components/Settings/SubscriptionResetModal.css	.subscription-reset-modal__primary	2.46
+src/renderer/components/ui/ChannelSwitcher.css	.channel-switcher-type-badge.channel	2.22
+src/renderer/components/ui/ConnectionLostOverlay.css	.connection-lost-btn.primary	2.68
+src/renderer/components/ui/ConnectionLostOverlay.css	.connection-lost-btn.secondary	4.31
+src/renderer/components/ui/ForceUpdateOverlay.css	.force-update-btn.primary	2.68
+src/renderer/components/ui/ForceUpdateOverlay.css	.force-update-btn.secondary	4.31
+src/renderer/components/ui/ShortcutOverlay.css	.shortcut-kbd	4.31
+src/renderer/components/ui/UpdateBanner.css	.update-banner__btn.primary	2.68
+src/renderer/components/User/BugReportPanel.css	.bug-report-disclosure	2.00
+src/renderer/components/User/BugReportPanel.css	.bug-report-submit	2.68
+src/renderer/components/User/BugReportPanel.css	.bug-report-submit:hover:not(:disabled)	2.14
+src/renderer/components/User/CustomStatusPopover.css	.custom-status-save-btn	2.68
+src/renderer/components/User/FeatureRequestPanel.css	.feature-request-submit	2.68
+src/renderer/components/User/FeatureRequestPanel.css	.feature-request-submit:hover:not(:disabled)	2.14
+src/renderer/components/User/FeedbackModal.css	.feedback-known-issues	4.31
+src/renderer/components/Voice/OutgoingCallModal.css	.outgoing-call-modal__cancel	2.69
+src/renderer/components/Voice/PipWindow.css	.pip-control-btn--active	2.68
+src/renderer/components/Voice/PipWindow.css	.pip-control-btn--active:hover	2.14
+src/renderer/components/Voice/PipWindow.css	.pip-control-btn--danger	3.83
+src/renderer/components/Voice/PipWindow.css	.pip-control-btn--danger:hover	4.04
+src/renderer/components/Voice/PipWindow.css	.pip-control-btn--leave	3.83
+src/renderer/components/Voice/PipWindow.css	.pip-control-btn--leave:hover	4.04
+src/renderer/components/Voice/PipWindow.css	.pip-header__btn--close:hover	3.83
+src/renderer/components/Voice/ScreenSharePicker.css	.screen-picker__audio-toggle	4.31
+src/renderer/components/Voice/ScreenSharePicker.css	.screen-picker__btn--cancel	4.31
+src/renderer/components/Voice/ScreenSharePicker.css	.screen-picker__tab-count	2.00
+src/renderer/components/Voice/StreamBar.css	.stream-thumbnail__close:hover	2.69
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn	4.31
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--active	2.68
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--active:hover	2.14
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--chat-active	2.68
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--chat-active:hover	2.68
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--danger	3.83
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--danger-soft:hover	3.83
+src/renderer/components/Voice/VoiceControls.css	.voice-controls__btn--danger:hover	4.04
+src/renderer/components/Voice/VoiceView.css	.voice-view__badge	2.00
+src/renderer/components/Voice/VoiceView.css	.voice-view__section-toggle	2.00
+src/renderer/components/Voice/VoiceViewSwitch.css	.voice-view-switch__seg--active	2.68
+src/renderer/components/Voice/VoiceViewSwitch.css	.voice-view-switch__seg--active:hover	2.68

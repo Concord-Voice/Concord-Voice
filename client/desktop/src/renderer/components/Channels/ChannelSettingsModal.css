@@ -83,7 +83,7 @@
   border: none;
   border-radius: 8px;
   background: var(--danger);
-  color: var(--on-accent);
+  color: var(--on-danger);
   font-family: var(--font-display-stack);
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 700;
