@@ -23,6 +23,7 @@ interface DMConversationContextMenuProps {
   onUnfriend?: (conversation: DMConversation) => void;
   onViewProfile?: (conversation: DMConversation) => void;
   onPurgeMessages?: (conversation: DMConversation) => void;
+  onMessageExpiration?: (conversation: DMConversation) => void;
 }
 
 const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
@@ -34,6 +35,7 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
   onUnfriend,
   onViewProfile,
   onPurgeMessages,
+  onMessageExpiration,
 }) => {
   const canRotateKey = !conversation.isGroup || conversation.createdBy === currentUserId;
 
@@ -291,6 +293,17 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
           label={getRotateLabel()}
           disabled={rotateStatus === 'success'}
           onClick={handleRotate}
+        />
+      )}
+
+      {isOneOnOne && onMessageExpiration && (
+        <ContextMenu.Item
+          icon={<span aria-hidden="true">⏱</span>}
+          label="Message expiration"
+          onClick={() => {
+            onMessageExpiration(conversation);
+            onClose();
+          }}
         />
       )}
 

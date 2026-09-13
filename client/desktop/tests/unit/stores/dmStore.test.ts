@@ -12,6 +12,7 @@ import { server } from '../../mocks/server';
 import { mockMessage } from '../../mocks/fixtures';
 import { http, HttpResponse } from 'msw';
 import { deferred } from '../../helpers/deferred';
+import { captureAuthLifecycle } from '@/renderer/services/system/postLoginHydrationLifecycle';
 
 const mockInvalidateChannelKey = vi.fn();
 
@@ -555,6 +556,17 @@ describe('dmStore', () => {
       server.use(
         http.get(`${API_BASE}/api/v1/dm/conversations`, () => {
           return HttpResponse.json({}, { status: 500 });
+        })
+      );
+
+      await useDMStore.getState().fetchConversations();
+      expect(useDMStore.getState().error).toBe('Failed to load conversations');
+    });
+
+    it('uses generic error message when an error response is not JSON', async () => {
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, () => {
+          return new HttpResponse('<html></html>', { status: 502 });
         })
       );
 
@@ -1838,6 +1850,25 @@ describe('dmStore', () => {
       await useDMStore.getState().fetchConversations();
       expect(useDMStore.getState().conversations).toEqual([]);
     });
+
+    it('rejects conversation rows without a valid id before reconciliation', async () => {
+      useDMStore.setState({
+        isLoading: false,
+        conversations: [mockConversation],
+        activeConversationId: mockConversation.id,
+      });
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, () =>
+          HttpResponse.json({ conversations: [{}] })
+        )
+      );
+
+      await useDMStore.getState().fetchConversations();
+
+      expect(useDMStore.getState().conversations).toEqual([mockConversation]);
+      expect(useDMStore.getState().activeConversationId).toBe(mockConversation.id);
+      expect(useDMStore.getState().error).toBe('Failed to load conversations');
+    });
   });
 
   // ── E2EE key distribution paths ─────────────────────────────────────
@@ -2643,5 +2674,373 @@ describe('dmStore', () => {
       );
       consoleSpy.mockRestore();
     });
+  });
+});
+
+describe('dmStore expiration policy contract', () => {
+  beforeEach(() => {
+    resetAllStores();
+    clearIndex();
+    useAuthStore.getState().setAccessToken('mock-token');
+  });
+
+  const row = (revision = 4, pending = false) => ({
+    id: 'conv-1',
+    is_group: false,
+    is_personal: false,
+    name: null,
+    participants: [],
+    last_message: null,
+    unread_count: 0,
+    created_at: '2025-01-01T00:00:00Z',
+    expiration_window_seconds: 86400,
+    expiration_updated_at: '2026-09-08T05:00:00Z',
+    expiration_revision: revision,
+    expiration_backfill_pending: pending,
+  });
+
+  it('waits for the trailing GET that serves a queued policy read', async () => {
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    let calls = 0;
+    server.use(
+      http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+        calls++;
+        if (calls === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return HttpResponse.json({ conversations: [row(calls)] });
+      })
+    );
+    const first = useDMStore.getState().fetchConversations();
+    await firstStarted.promise;
+    const read = useDMStore.getState().fetchConversations({
+      targetId: 'conv-1',
+      lifecycle: captureAuthLifecycle(),
+    });
+    try {
+      releaseFirst.resolve();
+      await first;
+      await expect(read).resolves.toEqual({
+        kind: 'fresh',
+        policy: {
+          windowSeconds: 86400,
+          updatedAt: '2026-09-08T05:00:00Z',
+          revision: 2,
+          backfillPending: false,
+        },
+      });
+    } finally {
+      releaseFirst.resolve();
+    }
+  });
+
+  it('returns unavailable from a failed trailing GET and keeps a later reader for the next GET', async () => {
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const secondStarted = deferred();
+    const releaseSecond = deferred();
+    let calls = 0;
+    server.use(
+      http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+        calls++;
+        if (calls === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+          return HttpResponse.json({ conversations: [row(4)] });
+        }
+        if (calls === 2) {
+          secondStarted.resolve();
+          await releaseSecond.promise;
+          return HttpResponse.json({ error: 'temporary' }, { status: 503 });
+        }
+        return HttpResponse.json({ conversations: [row(6)] });
+      })
+    );
+    const first = useDMStore.getState().fetchConversations();
+    await firstStarted.promise;
+    const firstRead = useDMStore
+      .getState()
+      .fetchConversations({ targetId: 'conv-1', lifecycle: captureAuthLifecycle() });
+    try {
+      releaseFirst.resolve();
+      await secondStarted.promise;
+      const secondRead = useDMStore
+        .getState()
+        .fetchConversations({ targetId: 'conv-1', lifecycle: captureAuthLifecycle() });
+      expect(await Promise.race([firstRead, Promise.resolve('pending')])).toBe('pending');
+      releaseSecond.resolve();
+      await expect(firstRead).resolves.toEqual({ kind: 'unavailable' });
+      await first;
+      await expect(secondRead).resolves.toMatchObject({ kind: 'fresh', policy: { revision: 6 } });
+    } finally {
+      releaseFirst.resolve();
+      releaseSecond.resolve();
+    }
+  });
+
+  it.each([
+    ['newer', 6, false, 6],
+    ['older', 4, true, 5],
+    ['equal pending', 5, true, 5],
+  ])(
+    'keeps live fields while applying %s GET policy ordering',
+    async (_label, fetchedRevision, fetchedPending, expectedRevision) => {
+      useDMStore.getState().addConversation({
+        ...mockConversation,
+        expirationPolicy: {
+          windowSeconds: 3600,
+          updatedAt: '2026-09-08T04:00:00Z',
+          revision: 5,
+          backfillPending: false,
+        },
+      });
+      const started = deferred();
+      const release = deferred();
+      server.use(
+        http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json({
+            conversations: [{ ...row(fetchedRevision, fetchedPending), name: 'server name' }],
+          });
+        })
+      );
+      const fetch = useDMStore.getState().fetchConversations();
+      await started.promise;
+      useDMStore.getState().updateConversation('conv-1', { name: 'live name' });
+      try {
+        release.resolve();
+        await fetch;
+      } finally {
+        release.resolve();
+      }
+      const conversation = useDMStore.getState().conversations[0];
+      expect(conversation.name).toBe('live name');
+      expect(conversation.expirationPolicy?.revision).toBe(expectedRevision);
+      expect(conversation.expirationPolicy?.backfillPending).toBe(false);
+    }
+  );
+
+  it('supersedes a queued reader when auth generation changes during the trailing GET', async () => {
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const trailingStarted = deferred();
+    const releaseTrailing = deferred();
+    let calls = 0;
+    server.use(
+      http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+        calls++;
+        if (calls === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        } else {
+          trailingStarted.resolve();
+          await releaseTrailing.promise;
+        }
+        return HttpResponse.json({ conversations: [row(calls === 1 ? 4 : 6)] });
+      })
+    );
+    const first = useDMStore.getState().fetchConversations();
+    await firstStarted.promise;
+    const read = useDMStore
+      .getState()
+      .fetchConversations({ targetId: 'conv-1', lifecycle: captureAuthLifecycle() });
+    try {
+      releaseFirst.resolve();
+      await trailingStarted.promise;
+      expect(useDMStore.getState().conversations[0].expirationPolicy?.revision).toBe(4);
+      const queuedRead = useDMStore
+        .getState()
+        .fetchConversations({ targetId: 'conv-1', lifecycle: captureAuthLifecycle() });
+      useAuthStore.getState().clearAccessToken();
+      releaseTrailing.resolve();
+      await expect(read).resolves.toEqual({ kind: 'superseded' });
+      await expect(queuedRead).resolves.toEqual({ kind: 'superseded' });
+      await first;
+      expect(calls).toBe(2);
+      expect(useDMStore.getState().conversations[0].expirationPolicy?.revision).toBe(4);
+    } finally {
+      releaseFirst.resolve();
+      releaseTrailing.resolve();
+    }
+  });
+
+  it('resolves a queued policy reader as superseded when DMs are cleared', async () => {
+    const started = deferred();
+    const release = deferred();
+    server.use(
+      http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+        started.resolve();
+        await release.promise;
+        return HttpResponse.json({ conversations: [row()] });
+      })
+    );
+    const fetch = useDMStore.getState().fetchConversations();
+    await started.promise;
+    const read = useDMStore.getState().fetchConversations({
+      targetId: 'conv-1',
+      lifecycle: captureAuthLifecycle(),
+    });
+    try {
+      useDMStore.getState().clearDMs();
+      await expect(read).resolves.toEqual({ kind: 'superseded' });
+    } finally {
+      release.resolve();
+      await fetch;
+    }
+  });
+
+  it('reconciles policy atomically and keeps a completed equal revision over pending', () => {
+    useDMStore.getState().addConversation(mockConversation);
+    useDMStore.getState().applyExpirationPolicy('conv-1', {
+      windowSeconds: 86400,
+      updatedAt: '2026-09-08T05:00:00Z',
+      revision: 4,
+      backfillPending: false,
+    });
+    useDMStore.getState().applyExpirationPolicy('conv-1', {
+      windowSeconds: 86400,
+      updatedAt: '2026-09-08T05:00:00Z',
+      revision: 4,
+      backfillPending: true,
+    });
+    expect(useDMStore.getState().conversations[0].expirationPolicy?.backfillPending).toBe(false);
+  });
+
+  it('merges newer GET policy into a conversation added while the GET was live', async () => {
+    const started = deferred();
+    const release = deferred();
+    server.use(
+      http.get(`${API_BASE}/api/v1/dm/conversations`, async () => {
+        started.resolve();
+        await release.promise;
+        return HttpResponse.json({ conversations: [{ ...row(5), name: 'server name' }] });
+      })
+    );
+    const fetch = useDMStore.getState().fetchConversations();
+    await started.promise;
+    useDMStore.getState().addConversation({
+      ...mockConversation,
+      name: 'live name',
+      expirationPolicy: {
+        windowSeconds: 3600,
+        updatedAt: '2026-09-08T04:00:00Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    });
+    try {
+      release.resolve();
+      await fetch;
+    } finally {
+      release.resolve();
+    }
+    const conversation = useDMStore.getState().conversations.find((item) => item.id === 'conv-1');
+    expect(conversation?.name).toBe('live name');
+    expect(conversation?.expirationPolicy?.revision).toBe(5);
+  });
+
+  it('keeps seen markers account-scoped and monotonic, then clears them', () => {
+    useDMStore.getState().markExpirationSeen('account-a', 'conv-1', 7);
+    useDMStore.getState().markExpirationSeen('account-a', 'conv-1', 6);
+    useDMStore.getState().markExpirationSeen('account-b', 'conv-1', 2);
+    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({
+      'account-a': { 'conv-1': 7 },
+      'account-b': { 'conv-1': 2 },
+    });
+    useDMStore.getState().clearDMs();
+    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({});
+  });
+
+  it('does not throw or lose a definitive policy when persistence repeatedly fails', () => {
+    useDMStore.getState().addConversation(mockConversation);
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota', 'QuotaExceededError');
+    });
+    try {
+      expect(() =>
+        useDMStore.getState().applyExpirationPolicy('conv-1', {
+          windowSeconds: 86400,
+          updatedAt: '2026-09-08T05:00:00Z',
+          revision: 4,
+          backfillPending: false,
+        })
+      ).not.toThrow();
+      expect(setItem).toHaveBeenCalled();
+      expect(useDMStore.getState().conversations[0].expirationPolicy?.revision).toBe(4);
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
+  it('rehydrates valid markers and preserves active navigation, but discards corrupt maps', async () => {
+    localStorage.setItem(
+      'concord:dm-store',
+      JSON.stringify({
+        state: {
+          activeConversationId: 'conv-1',
+          seenExpirationRevisionsByAccount: { 'account-a': { 'conv-1': 4 } },
+        },
+        version: 0,
+      })
+    );
+    await useDMStore.persist.rehydrate();
+    expect(useDMStore.getState().activeConversationId).toBe('conv-1');
+    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({
+      'account-a': { 'conv-1': 4 },
+    });
+
+    localStorage.setItem(
+      'concord:dm-store',
+      JSON.stringify({
+        state: {
+          activeConversationId: 'conv-2',
+          seenExpirationRevisionsByAccount: { bad: { conv: 'four' } },
+        },
+        version: 0,
+      })
+    );
+    await useDMStore.persist.rehydrate();
+    expect(useDMStore.getState().activeConversationId).toBe('conv-2');
+    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({});
+  });
+
+  it.each([
+    ['missing list', {}],
+    ['non-array list', { conversations: 'nope' }],
+    ['non-object row', { conversations: [null] }],
+  ])('reports %s unavailable and preserves cached policy', async (_label, body) => {
+    useDMStore.getState().addConversation({
+      ...mockConversation,
+      expirationPolicy: {
+        windowSeconds: 86400,
+        updatedAt: '2026-09-08T05:00:00Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    });
+    server.use(http.get(`${API_BASE}/api/v1/dm/conversations`, () => HttpResponse.json(body)));
+    await expect(
+      useDMStore
+        .getState()
+        .fetchConversations({ targetId: 'conv-1', lifecycle: captureAuthLifecycle() })
+    ).resolves.toEqual({ kind: 'unavailable' });
+    expect(useDMStore.getState().conversations[0].expirationPolicy?.revision).toBe(4);
+    expect(useDMStore.getState().error).toBe('Failed to load conversations');
+  });
+
+  it('reports a valid empty list as missing', async () => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/dm/conversations`, () =>
+        HttpResponse.json({ conversations: [] })
+      )
+    );
+    await expect(
+      useDMStore
+        .getState()
+        .fetchConversations({ targetId: 'conv-1', lifecycle: captureAuthLifecycle() })
+    ).resolves.toEqual({ kind: 'missing' });
   });
 });

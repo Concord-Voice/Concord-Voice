@@ -1,4 +1,4 @@
-import { render, screen, act, waitFor } from '../../../test-utils';
+import { render, screen, act, waitFor, userEvent, within } from '../../../test-utils';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -6,7 +6,7 @@ import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useNotificationPrefsStore } from '@/renderer/stores/ui/notificationPrefsStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
-import { PIN_MESSAGES } from '@/renderer/utils/policy/permissions';
+import { MANAGE_CHANNELS, PIN_MESSAGES } from '@/renderer/utils/policy/permissions';
 import { mockUser, mockChannel, mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 import { resetAllStores } from '../../../helpers/store-helpers';
 
@@ -148,6 +148,7 @@ describe('ChatView', () => {
     useUserStore.setState({ user: mockUser });
     useChannelStore.setState({ channels: [mockChannel], activeChannelId: null });
     useServerStore.setState({ activeServerId: 'server-1' });
+    useChannelStore.setState({ currentServerId: 'server-1' });
     useChatStore.setState({
       messagesByChannel: new Map(),
       isConnected: true,
@@ -660,5 +661,306 @@ describe('ChatView', () => {
     });
 
     expect(searchBtn).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('opens the header editor for a channel manager while preserving the first-observation baseline', async () => {
+    const channel = {
+      ...mockChannel,
+      expirationPolicy: {
+        windowSeconds: 86400 as const,
+        updatedAt: '2026-09-08T05:00:00.000Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    };
+    useChannelStore.setState({ channels: [channel], activeChannelId: channel.id });
+    usePermissionStore.setState({
+      channelPermissions: { [channel.id]: MANAGE_CHANNELS },
+      serverPermissions: { 'server-1': 0n },
+    });
+    const reopenedRead = deferred<Response>();
+    let holdReopenedRead = false;
+    let channelReads = 0;
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/servers/server-1/channels')) {
+        channelReads += 1;
+        if (holdReopenedRead) return reopenedRead.promise;
+        return {
+          ok: true,
+          json: async () => ({
+            channels: [
+              {
+                ...mockChannel,
+                expiration_window_seconds: 86400,
+                expiration_updated_at: '2026-09-08T05:00:00.000Z',
+                expiration_revision: 4,
+                expiration_backfill_pending: false,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({ messages: [] }) } as Response;
+    });
+    render(<ChatView />);
+    const user = userEvent.setup();
+    await screen.findByText('Messages expire after 24 hours');
+    expect(screen.queryByRole('button', { name: 'Review policy' })).not.toBeInTheDocument();
+    expect(
+      useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]?.[channel.id]
+    ).toBe(4);
+    const baselineReads = channelReads;
+    await user.click(await screen.findByRole('button', { name: 'Message expiration' }));
+    await waitFor(() => expect(channelReads).toBeGreaterThan(baselineReads));
+    await user.click(screen.getByRole('button', { name: '7 days' }));
+    const childDialog = await screen.findByRole('dialog', { name: 'Change message expiration' });
+    expect(childDialog).toBeInTheDocument();
+    await user.click(within(childDialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Change message expiration' })
+      ).not.toBeInTheDocument()
+    );
+    const parentDialog = screen.getByRole('dialog', { name: 'Message expiration' });
+    await user.click(within(parentDialog).getByRole('button', { name: 'Close' }));
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'Message expiration' })).not.toBeInTheDocument()
+    );
+    expect(screen.queryByRole('button', { name: 'Review policy' })).not.toBeInTheDocument();
+
+    holdReopenedRead = true;
+    await user.click(screen.getByRole('button', { name: 'Message expiration' }));
+    await waitFor(() => expect(channelReads).toBeGreaterThan(baselineReads + 1));
+    expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute('aria-disabled', 'true');
+    try {
+      await act(async () => {
+        reopenedRead.resolve({
+          ok: true,
+          json: async () => ({
+            channels: [
+              {
+                ...mockChannel,
+                expiration_window_seconds: 86400,
+                expiration_updated_at: '2026-09-08T05:00:00.000Z',
+                expiration_revision: 4,
+                expiration_backfill_pending: false,
+              },
+            ],
+          }),
+        } as Response);
+        await reopenedRead.promise;
+      });
+    } finally {
+      reopenedRead.resolve({ ok: true, json: async () => ({ channels: [] }) } as Response);
+      await reopenedRead.promise;
+    }
+    await user.click(screen.getByRole('button', { name: '7 days' }));
+    expect(
+      await screen.findByRole('dialog', { name: 'Change message expiration' })
+    ).toBeInTheDocument();
+  });
+
+  it('keeps the successor channel editor isolated from a held timer save', async () => {
+    const channelA = {
+      ...mockChannel,
+      id: 'channel-a',
+      name: 'alpha',
+      expirationPolicy: {
+        windowSeconds: 3600 as const,
+        updatedAt: '2026-09-08T05:00:00.000Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    };
+    const channelB = {
+      ...mockChannel,
+      id: 'channel-b',
+      name: 'beta',
+      expirationPolicy: {
+        windowSeconds: 86400 as const,
+        updatedAt: '2026-09-08T05:00:00.000Z',
+        revision: 7,
+        backfillPending: false,
+      },
+    };
+    const pendingPatch = deferred<Response>();
+    let patchBody: unknown;
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/servers/server-1/channels')) {
+        return {
+          ok: true,
+          json: async () => ({
+            channels: [
+              {
+                ...channelA,
+                expiration_window_seconds: 3600,
+                expiration_updated_at: channelA.expirationPolicy.updatedAt,
+                expiration_revision: 4,
+                expiration_backfill_pending: false,
+              },
+              {
+                ...channelB,
+                expiration_window_seconds: 86400,
+                expiration_updated_at: channelB.expirationPolicy.updatedAt,
+                expiration_revision: 7,
+                expiration_backfill_pending: false,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (url.includes('/api/v1/channels/channel-a/expiration')) {
+        patchBody = JSON.parse(String(init?.body));
+        return pendingPatch.promise;
+      }
+      return { ok: true, json: async () => ({ messages: [] }) } as Response;
+    });
+    useChannelStore.setState({ channels: [channelA, channelB], activeChannelId: channelA.id });
+    usePermissionStore.setState({
+      channelPermissions: { [channelA.id]: MANAGE_CHANNELS, [channelB.id]: MANAGE_CHANNELS },
+      serverPermissions: { 'server-1': 0n },
+    });
+    const user = userEvent.setup();
+    render(<ChatView />);
+    await user.click(await screen.findByRole('button', { name: 'Message expiration' }));
+    await user.click(await screen.findByRole('button', { name: '7 days' }));
+    const dialogA = await screen.findByRole('dialog', { name: 'Change message expiration' });
+    await user.click(within(dialogA).getByRole('radio', { name: 'Only new messages' }));
+    await user.click(within(dialogA).getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(within(dialogA).getByRole('button', { name: 'Apply timer' }));
+    await waitFor(() =>
+      expect(patchBody).toEqual({ mode: 'set', window_seconds: 604800, retroactive: 'new_only' })
+    );
+
+    act(() => useChannelStore.setState({ activeChannelId: channelB.id }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Change message expiration' })
+      ).not.toBeInTheDocument()
+    );
+    await user.click(await screen.findByRole('button', { name: 'Message expiration' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
+        'aria-pressed',
+        'true'
+      )
+    );
+    await user.click(await screen.findByRole('button', { name: '30 days' }));
+    const dialogB = await screen.findByRole('dialog', { name: 'Change message expiration' });
+    expect(within(dialogB).getByRole('button', { name: 'Apply timer' })).toBeInTheDocument();
+    await user.click(within(dialogB).getByRole('radio', { name: 'Only new messages' }));
+    await user.click(within(dialogB).getByRole('checkbox', { name: /cannot be recovered/i }));
+    expect(
+      useChannelStore.getState().channels.find((item) => item.id === channelB.id)?.expirationPolicy
+    ).toMatchObject({
+      windowSeconds: 86400,
+      revision: 7,
+    });
+    try {
+      await act(async () => {
+        pendingPatch.resolve({
+          status: 200,
+          ok: true,
+          json: async () => ({
+            window_seconds: 604800,
+            updated_at: channelA.expirationPolicy.updatedAt,
+            revision: 5,
+            backfill_pending: false,
+          }),
+        } as Response);
+        await pendingPatch.promise;
+      });
+    } finally {
+      pendingPatch.resolve({ ok: true, json: async () => ({}) } as Response);
+      await pendingPatch.promise;
+    }
+    expect(screen.getByRole('dialog', { name: 'Change message expiration' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    expect(screen.getByRole('radio', { name: 'Only new messages' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: /cannot be recovered/i })).toBeChecked();
+    expect(
+      useChannelStore.getState().channels.find((item) => item.id === channelB.id)?.expirationPolicy
+    ).toMatchObject({
+      windowSeconds: 86400,
+      revision: 7,
+    });
+  });
+
+  it('opens the real channel purge dialog with own-message scope', async () => {
+    useChannelStore.setState({
+      channels: [{ ...mockChannel, expirationPolicy: undefined }],
+      activeChannelId: mockChannel.id,
+      currentServerId: 'server-1',
+    });
+    usePermissionStore.setState({
+      channelPermissions: { [mockChannel.id]: 1n << 13n },
+      serverPermissions: { 'server-1': 0n },
+    });
+    render(<ChatView />);
+    const manage = await screen.findByRole('button', { name: 'Manage messages' });
+    const user = userEvent.setup();
+    await user.click(manage);
+    const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
+    await user.click(screen.getByLabelText('Last hour'));
+    expect(dialog).toHaveTextContent('your messages');
+  });
+
+  it('keeps the channel purge dialog pinned to the opened channel row', async () => {
+    const channel = { ...mockChannel, name: 'general', expirationPolicy: undefined };
+    useChannelStore.setState({
+      channels: [channel],
+      activeChannelId: channel.id,
+      currentServerId: 'server-1',
+    });
+    usePermissionStore.setState({
+      channelPermissions: { [channel.id]: 1n << 14n },
+      serverPermissions: { 'server-1': 0n },
+    });
+    render(<ChatView />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
+    await user.click(screen.getByLabelText('Last hour'));
+
+    act(() =>
+      useChannelStore.setState({
+        channels: [{ ...channel, name: 'renamed' }],
+      })
+    );
+
+    expect(dialog).toHaveTextContent('#general');
+    expect(dialog).not.toHaveTextContent('#renamed');
+  });
+
+  it('closes channel purge consent when the effective purge scope changes', async () => {
+    const channel = { ...mockChannel, name: 'general', expirationPolicy: undefined };
+    useChannelStore.setState({
+      channels: [channel],
+      activeChannelId: channel.id,
+      currentServerId: 'server-1',
+    });
+    usePermissionStore.setState({
+      channelPermissions: { [channel.id]: 1n << 13n },
+      serverPermissions: { 'server-1': 0n },
+    });
+    render(<ChatView />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    expect(await screen.findByRole('dialog', { name: 'Purge Messages' })).toBeInTheDocument();
+
+    act(() =>
+      usePermissionStore.setState({
+        channelPermissions: { [channel.id]: 1n << 14n },
+        serverPermissions: { 'server-1': 0n },
+      })
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'Purge Messages' })).not.toBeInTheDocument()
+    );
   });
 });

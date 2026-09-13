@@ -1,3 +1,5 @@
+import type { ExpirationPolicy } from '../services/messaging/expirationPolicyApi';
+
 // --- Chat Context ---
 
 /** Identifies the rendering context so display logic can enforce isolation boundaries.
@@ -127,6 +129,7 @@ export interface Channel {
   position: number;
   created_at: string;
   updated_at: string;
+  expirationPolicy?: ExpirationPolicy;
 }
 
 export interface ChannelGroup {

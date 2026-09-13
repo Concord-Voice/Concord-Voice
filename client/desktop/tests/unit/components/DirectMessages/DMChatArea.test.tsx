@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent, act } from '../../../test-utils';
+import { render, screen, waitFor, fireEvent, act, userEvent, within } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
@@ -320,6 +320,225 @@ describe('DMChatArea', () => {
     });
     render(<DMChatArea selectedThreadId="conv-1" />);
     expect(screen.getByText('Alice')).toBeInTheDocument();
+  });
+
+  it('keeps a non-admin group policy review read-only', async () => {
+    const group = makeConversation({
+      id: 'group-1',
+      isGroup: true,
+      name: 'Team',
+      participants: [
+        { userId: 'user-1', username: 'me', role: 'member' },
+        { userId: 'user-2', username: 'alice', role: 'member' },
+      ],
+      expirationPolicy: {
+        windowSeconds: 86400,
+        updatedAt: '2026-09-08T05:00:00.000Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    });
+    useDMStore.setState({
+      conversations: [group],
+      seenExpirationRevisionsByAccount: { 'user-1': { 'group-1': 3 } },
+    });
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/dm/conversations')) {
+        return {
+          ok: true,
+          json: async () => ({
+            conversations: [
+              {
+                id: 'group-1',
+                is_group: true,
+                is_personal: false,
+                name: 'Team',
+                participants: [
+                  { user_id: 'user-1', username: 'me', role: 'member' },
+                  { user_id: 'user-2', username: 'alice', role: 'member' },
+                ],
+                last_message: null,
+                unread_count: 0,
+                created_at: '2026-09-08T05:00:00.000Z',
+                expiration_window_seconds: 86400,
+                expiration_updated_at: '2026-09-08T05:00:00.000Z',
+                expiration_revision: 4,
+                expiration_backfill_pending: false,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({ messages: [] }) } as Response;
+    });
+    const user = userEvent.setup();
+    render(<DMChatArea selectedThreadId="group-1" />);
+
+    const summary = await screen.findByLabelText('Message expiration');
+    expect(screen.getByText('Messages expire after 24 hours')).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: 'Review policy' }));
+
+    expect(screen.queryByRole('dialog', { name: 'Message expiration' })).not.toBeInTheDocument();
+    expect(summary).toHaveFocus();
+  });
+
+  it('keeps a successor DM editor isolated from a held timer save', async () => {
+    const policyA = {
+      windowSeconds: 86400 as const,
+      updatedAt: '2026-09-08T05:00:00.000Z',
+      revision: 4,
+      backfillPending: false,
+    };
+    const policyB = {
+      windowSeconds: 3600 as const,
+      updatedAt: '2026-09-08T05:00:00.000Z',
+      revision: 6,
+      backfillPending: false,
+    };
+    const conversationA = makeConversation({
+      id: 'conv-a',
+      isGroup: true,
+      name: 'Alpha',
+      participants: [
+        { userId: 'user-1', username: 'me', displayName: 'Me', role: 'admin' },
+        { userId: 'user-2', username: 'alice', displayName: 'Alice', role: 'member' },
+      ],
+      expirationPolicy: policyA,
+    });
+    const conversationB = makeConversation({
+      id: 'conv-b',
+      isGroup: true,
+      name: 'Beta',
+      participants: [
+        { userId: 'user-1', username: 'me', displayName: 'Me', role: 'admin' },
+        { userId: 'user-2', username: 'alice', displayName: 'Alice', role: 'member' },
+      ],
+      expirationPolicy: policyB,
+    });
+    const pendingPatch = deferred<Response>();
+    let patchBody: unknown;
+    mockApiFetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/v1/dm/conversations/conv-a/expiration')) {
+        patchBody = JSON.parse(String(init?.body));
+        return pendingPatch.promise;
+      }
+      if (url.endsWith('/api/v1/dm/conversations')) {
+        return {
+          ok: true,
+          json: async () => ({
+            conversations: [
+              {
+                id: 'conv-a',
+                is_group: true,
+                is_personal: false,
+                name: 'Alpha',
+                participants: [
+                  { user_id: 'user-1', username: 'me', display_name: 'Me', role: 'admin' },
+                  { user_id: 'user-2', username: 'alice', display_name: 'Alice', role: 'member' },
+                ],
+                expiration_window_seconds: 86400,
+                expiration_updated_at: policyA.updatedAt,
+                expiration_revision: 4,
+                expiration_backfill_pending: false,
+              },
+              {
+                id: 'conv-b',
+                is_group: true,
+                is_personal: false,
+                name: 'Beta',
+                participants: [
+                  { user_id: 'user-1', username: 'me', display_name: 'Me', role: 'admin' },
+                  { user_id: 'user-2', username: 'alice', display_name: 'Alice', role: 'member' },
+                ],
+                expiration_window_seconds: 3600,
+                expiration_updated_at: policyB.updatedAt,
+                expiration_revision: 6,
+                expiration_backfill_pending: false,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({ messages: [] }) } as Response;
+    });
+    useDMStore.setState({
+      conversations: [conversationA, conversationB],
+      seenExpirationRevisionsByAccount: { 'user-1': { 'conv-a': 4, 'conv-b': 4 } },
+    });
+    const user = userEvent.setup();
+    const { rerender } = render(<DMChatArea selectedThreadId="conv-a" />);
+    await waitFor(() =>
+      expect(screen.getByText('Messages expire after 24 hours')).toBeInTheDocument()
+    );
+    act(() =>
+      useDMStore.getState().applyExpirationPolicy('conv-a', {
+        ...policyA,
+        windowSeconds: 604800,
+        revision: 5,
+      })
+    );
+    await user.click(await screen.findByRole('button', { name: 'Review policy' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '7 days' })).toHaveAttribute(
+        'aria-disabled',
+        'false'
+      )
+    );
+    await user.click(screen.getByRole('button', { name: '30 days' }));
+    const dialogA = await screen.findByRole('dialog', { name: 'Change message expiration' });
+    await user.click(within(dialogA).getByRole('radio', { name: 'Only new messages' }));
+    await user.click(within(dialogA).getByRole('checkbox', { name: /cannot be recovered/i }));
+    await user.click(within(dialogA).getByRole('button', { name: 'Apply timer' }));
+    await waitFor(() =>
+      expect(patchBody).toEqual({ mode: 'set', window_seconds: 2592000, retroactive: 'new_only' })
+    );
+
+    rerender(<DMChatArea selectedThreadId="conv-b" />);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Change message expiration' })
+      ).not.toBeInTheDocument()
+    );
+    await user.click(await screen.findByRole('button', { name: 'Review policy' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute(
+        'aria-disabled',
+        'false'
+      )
+    );
+    await user.click(screen.getByRole('button', { name: '30 days' }));
+    const dialogB = await screen.findByRole('dialog', { name: 'Change message expiration' });
+    await user.click(within(dialogB).getByRole('radio', { name: 'Only new messages' }));
+    await user.click(within(dialogB).getByRole('checkbox', { name: /cannot be recovered/i }));
+    try {
+      await act(async () => {
+        pendingPatch.resolve({
+          status: 200,
+          ok: true,
+          json: async () => ({
+            window_seconds: 2592000,
+            updated_at: policyA.updatedAt,
+            revision: 5,
+            backfill_pending: false,
+          }),
+        } as Response);
+        await pendingPatch.promise;
+      });
+    } finally {
+      pendingPatch.resolve({ status: 200, ok: true, json: async () => ({}) } as Response);
+      await pendingPatch.promise;
+    }
+    expect(screen.getByRole('dialog', { name: 'Change message expiration' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'Only new messages' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: /cannot be recovered/i })).toBeChecked();
+    expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute('aria-pressed', 'true');
+    expect(
+      useDMStore.getState().conversations.find((item) => item.id === 'conv-b')?.expirationPolicy
+    ).toMatchObject({
+      windowSeconds: 3600,
+      revision: 6,
+    });
   });
 
   it('renders "Conversation" when conversation is not found in store', () => {
@@ -1281,6 +1500,67 @@ describe('DMChatArea', () => {
     await act(async () => pendingPin.resolve({}));
     await mutation;
     expect(container.querySelector('.pin-count-badge')).toHaveTextContent('1');
+  });
+
+  it('keeps the group purge dialog pinned to the opened conversation row', async () => {
+    const group = makeConversation({
+      id: 'group-1',
+      isGroup: true,
+      name: 'Team',
+      participants: [
+        { userId: 'user-1', username: 'me', role: 'admin' },
+        { userId: 'user-2', username: 'alice', role: 'member' },
+      ],
+    });
+    useDMStore.setState({ conversations: [group] });
+    const user = userEvent.setup();
+    render(<DMChatArea selectedThreadId="group-1" />);
+    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
+    await user.click(screen.getByLabelText('Last hour'));
+
+    act(() =>
+      useDMStore.setState({
+        conversations: [{ ...group, name: 'Renamed team' }],
+      })
+    );
+
+    expect(dialog).toHaveTextContent('Team');
+    expect(dialog).not.toHaveTextContent('Renamed team');
+  });
+
+  it('closes group purge consent when the local role changes', async () => {
+    const group = makeConversation({
+      id: 'group-1',
+      isGroup: true,
+      name: 'Team',
+      participants: [
+        { userId: 'user-1', username: 'me', role: 'member' },
+        { userId: 'user-2', username: 'alice', role: 'member' },
+      ],
+    });
+    useDMStore.setState({ conversations: [group] });
+    const user = userEvent.setup();
+    render(<DMChatArea selectedThreadId="group-1" />);
+    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    expect(await screen.findByRole('dialog', { name: 'Purge Messages' })).toBeInTheDocument();
+
+    act(() =>
+      useDMStore.setState({
+        conversations: [
+          {
+            ...group,
+            participants: group.participants.map((participant) =>
+              participant.userId === 'user-1' ? { ...participant, role: 'admin' } : participant
+            ),
+          },
+        ],
+      })
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'Purge Messages' })).not.toBeInTheDocument()
+    );
   });
 
   it('pin toggle on an unpinned message increments pinnedCount badge', async () => {

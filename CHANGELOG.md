@@ -36,6 +36,8 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   everyone watching and made them click back in. A Switch button now swaps the source in place.
   Anyone watching stays watching, and if you change your mind at the picker your original share
   keeps running.
+- **Message expiry groundwork now covers shared chats** ([#3144](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3144), [#2195](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2195)) — the server now stores shared expiry policy and expiry metadata for channels, direct messages, and group DMs, and can apply or clear that policy on existing messages in resumable batches.
+- **You can now view and manage message expiration in shared chats** ([#2197](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2197)) — eligible text channels, 1:1 DMs, and group DMs show the shared policy to everyone in the conversation. Who can edit follows the chat's existing permissions, and eligible participants can choose Off, 1 hour, 24 hours, 7 days, or 30 days. When setting or changing a timer, you choose whether it applies to existing messages or only new ones. Every change requires acknowledgement that deleted messages cannot be recovered. Turning the timer off lets you cancel or keep already scheduled deletions.
 - **You can mute one person with a single click** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — turning down someone whose
   microphone was picking up a television meant right-clicking their tile, opening a menu, finding
   a volume slider and dragging it to zero. Their tile now has a mute button on it. It stays
@@ -44,10 +46,10 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   before rather than jumping to full. It is deliberately a different symbol from the crossed-out
   microphone already on the tile: that one means they muted themselves, and this one means you
   muted them, and only you hear the difference.
-- **Message expiry groundwork now covers shared chats** ([#3144](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3144), [#2195](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2195)) — the server now stores shared expiry policy and expiry metadata for channels, direct messages, and group DMs, and can apply or clear that policy on existing messages in resumable batches. Settings UI and automatic deletion arrive in later work, so this groundwork does not enable retention by itself.
 
 ### Changed
 
+- **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. This does not promise instant deletion or secure erasure for clients that were offline.
 - **The buttons during a call are grouped by what they do** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the row along the
   bottom of a call had grown to eleven buttons of equal weight in a single line, with nothing to
   say which ones affected you, which affected what you were sharing, and which would end the
@@ -63,7 +65,6 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 - **Picture-in-Picture and the stay-active setting moved into a "More" menu** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) —
   both are things you set once and forget, and neither earned a permanent place in a row you look
   at during every call.
-- **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. Timer settings UI remains future work; this does not promise instant deletion or secure erasure for clients that were offline.
 - **Busy servers now spread voice calls across CPU cores more evenly** ([#3157](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3157), [#3149](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3149)) — a voice room lives on
   one CPU core for its whole life, and the server used to hand those cores out in strict
   rotation without looking at how busy each one already was. On a server running several calls

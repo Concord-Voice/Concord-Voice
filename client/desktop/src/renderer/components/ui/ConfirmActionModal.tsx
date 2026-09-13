@@ -13,11 +13,13 @@ interface ConfirmActionModalProps {
   onConfirm: () => Promise<void>;
   /**
    * Optional caller-owned content rendered between the message and the
-   * confirmation input — e.g. the kick/ban purge opt-in (#1354). Rendered bare
-   * so an undefined value leaves the markup byte-identical for the consumers
-   * that don't pass it.
+   * confirmation input — e.g. the kick/ban purge opt-in (#1354). Defined
+   * content is frozen with the modal's native processing state; an undefined
+   * value leaves markup byte-identical for consumers that do not pass it.
    */
   extraContent?: React.ReactNode;
+  /** Additional caller-owned confirmation gate. */
+  confirmDisabled?: boolean;
   /** When provided, user must type expectedValue to enable the confirm button */
   confirmationInput?: {
     label: React.ReactNode;
@@ -65,6 +67,7 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
   loadingLabel,
   onConfirm,
   extraContent,
+  confirmDisabled = false,
   confirmationInput,
 }) => {
   const inputId = useId();
@@ -88,7 +91,7 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
   const isConfirmed = !confirmationInput || inputValue === confirmationInput.expectedValue;
 
   const handleConfirm = async () => {
-    if (!isConfirmed) return;
+    if (!isConfirmed || confirmDisabled || isProcessing) return;
     setIsProcessing(true);
     setError(null);
 
@@ -109,7 +112,11 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
           <div className="confirm-action-message">{message}</div>
         </div>
 
-        {extraContent}
+        {extraContent !== undefined && (
+          <fieldset className="confirm-action-extra-content" disabled={isProcessing}>
+            {extraContent}
+          </fieldset>
+        )}
 
         {confirmationInput && (
           <div className="delete-server-confirm">
@@ -133,7 +140,7 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
         )}
 
         {error && (
-          <div className="form-error-banner">
+          <div className="form-error-banner" role="alert">
             <span>{error}</span>
           </div>
         )}
@@ -151,7 +158,7 @@ const ConfirmActionModal: React.FC<ConfirmActionModalProps> = ({
             type="button"
             className="delete-server-confirm-btn"
             onClick={handleConfirm}
-            disabled={!isConfirmed || isProcessing}
+            disabled={!isConfirmed || confirmDisabled || isProcessing}
           >
             {isProcessing ? (
               <>

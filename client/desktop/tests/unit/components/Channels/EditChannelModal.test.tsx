@@ -1,8 +1,13 @@
 import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
+import { StrictMode } from 'react';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
-import { mockChannel, mockServer } from '../../../mocks/fixtures';
+import { mockChannel, mockServer, mockUser } from '../../../mocks/fixtures';
+import { deferred } from '../../../helpers/deferred';
+import { Permissions } from '@/renderer/utils/policy/permissions';
 
 vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
@@ -41,12 +46,14 @@ describe('EditChannelModal', () => {
 
   it('renders form with current channel data', () => {
     render(
-      <EditChannelModal
-        isOpen={true}
-        channel={mockChannel}
-        onClose={mockOnClose}
-        onSuccess={mockOnSuccess}
-      />
+      <StrictMode>
+        <EditChannelModal
+          isOpen={true}
+          channel={mockChannel}
+          onClose={mockOnClose}
+          onSuccess={mockOnSuccess}
+        />
+      </StrictMode>
     );
     expect(screen.getByText('Edit Channel')).toBeInTheDocument();
     expect(screen.getByDisplayValue('general')).toBeInTheDocument();
@@ -54,12 +61,14 @@ describe('EditChannelModal', () => {
 
   it('disables Save when no changes made', () => {
     render(
-      <EditChannelModal
-        isOpen={true}
-        channel={mockChannel}
-        onClose={mockOnClose}
-        onSuccess={mockOnSuccess}
-      />
+      <StrictMode>
+        <EditChannelModal
+          isOpen={true}
+          channel={mockChannel}
+          onClose={mockOnClose}
+          onSuccess={mockOnSuccess}
+        />
+      </StrictMode>
     );
     const saveBtn = screen.getByText('Save Changes');
     expect(saveBtn).toBeDisabled();
@@ -90,12 +99,14 @@ describe('EditChannelModal', () => {
     } as Response);
 
     render(
-      <EditChannelModal
-        isOpen={true}
-        channel={mockChannel}
-        onClose={mockOnClose}
-        onSuccess={mockOnSuccess}
-      />
+      <StrictMode>
+        <EditChannelModal
+          isOpen={true}
+          channel={mockChannel}
+          onClose={mockOnClose}
+          onSuccess={mockOnSuccess}
+        />
+      </StrictMode>
     );
 
     fireEvent.change(screen.getByDisplayValue('general'), {
@@ -141,6 +152,117 @@ describe('EditChannelModal', () => {
     await waitFor(() => {
       expect(screen.getByText('Not allowed')).toBeInTheDocument();
     });
+  });
+
+  it('ignores a held save after the same channel is closed and reopened', async () => {
+    const oldSave = deferred<Response>();
+    mockedApiFetch.mockReturnValueOnce(oldSave.promise);
+    const { rerender } = render(
+      <EditChannelModal
+        isOpen={true}
+        channel={mockChannel}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+      />
+    );
+
+    fireEvent.change(screen.getByDisplayValue('general'), {
+      target: { value: 'old-name' },
+    });
+    fireEvent.click(screen.getByText('Save Changes'));
+    await waitFor(() => expect(mockedApiFetch).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <EditChannelModal
+        isOpen={false}
+        channel={mockChannel}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+      />
+    );
+    rerender(
+      <EditChannelModal
+        isOpen={true}
+        channel={mockChannel}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+      />
+    );
+    fireEvent.change(screen.getByDisplayValue('general'), {
+      target: { value: 'successor-name' },
+    });
+
+    try {
+      await act(async () => {
+        oldSave.resolve({
+          ok: true,
+          json: async () => ({ channel: { ...mockChannel, name: 'old-name' } }),
+        } as Response);
+        await oldSave.promise;
+      });
+    } finally {
+      oldSave.resolve({ ok: true, json: async () => ({}) } as Response);
+      await oldSave.promise;
+    }
+
+    expect(screen.getByDisplayValue('successor-name')).toBeInTheDocument();
+    expect(screen.queryByText('Channel updated successfully!')).not.toBeInTheDocument();
+    expect(mockOnClose).not.toHaveBeenCalled();
+    expect(mockOnSuccess).not.toHaveBeenCalled();
+  });
+
+  it('locks expiration controls while a channel save is held', async () => {
+    const save = deferred<Response>();
+    useUserStore.getState().setUser({ id: mockUser.id, username: mockUser.username });
+    useChannelStore.setState({ currentServerId: 'server-1' });
+    usePermissionStore.setState({
+      channelPermissions: { [mockChannel.id]: Permissions.MANAGE_CHANNELS },
+    });
+    mockedApiFetch.mockImplementation(async (url, init) => {
+      if (String(url).endsWith('/api/v1/servers/server-1/channels')) {
+        return {
+          ok: true,
+          json: async () => ({
+            channels: [
+              {
+                ...mockChannel,
+                expiration_window_seconds: 86400,
+                expiration_updated_at: '2026-09-08T05:00:00Z',
+                expiration_revision: 4,
+                expiration_backfill_pending: false,
+              },
+            ],
+          }),
+        } as Response;
+      }
+      if (init?.method === 'PATCH') return save.promise;
+      return { ok: true, json: async () => ({}) } as Response;
+    });
+    render(
+      <EditChannelModal
+        isOpen={true}
+        channel={mockChannel}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+      />
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute(
+        'aria-disabled',
+        'false'
+      )
+    );
+    fireEvent.change(screen.getByDisplayValue('general'), {
+      target: { value: 'held-save' },
+    });
+    fireEvent.click(screen.getByText('Save Changes'));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      )
+    );
+    save.resolve({ ok: true, json: async () => ({ channel: mockChannel }) } as Response);
   });
 
   it('validates short name', () => {

@@ -9,6 +9,7 @@ import { mockChannel, mockEncryptedChannel, mockMessage } from '../../mocks/fixt
 import { server } from '../../mocks/server';
 import { http, HttpResponse } from 'msw';
 import { deferred } from '../../helpers/deferred';
+import { captureAuthLifecycle } from '@/renderer/services/system/postLoginHydrationLifecycle';
 
 const API_BASE = 'http://localhost:8080';
 
@@ -229,6 +230,38 @@ describe('channelStore', () => {
       expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
     });
 
+    it('ignores malformed channel rows without purging cached channel state', async () => {
+      useChannelStore.setState({
+        channels: [mockChannel, mockEncryptedChannel],
+        channelIdsByServer: { 'server-1': ['channel-1', 'channel-2'] },
+        currentServerId: 'server-1',
+        activeChannelId: 'channel-1',
+      });
+      useChatStore.getState().addMessage('channel-2', {
+        ...mockMessage,
+        id: 'retained-channel-message',
+        channel_id: 'channel-2',
+      });
+      useUnreadStore.getState().setUnreadCount('channel-2', 3);
+      indexMessage('retained-channel-message', 'retained plaintext', 'channel-2');
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () =>
+          HttpResponse.json({ channels: [{}] })
+        )
+      );
+
+      await useChannelStore.getState().fetchChannels('server-1');
+
+      expect(useChannelStore.getState().channelIdsByServer['server-1']).toEqual([
+        'channel-1',
+        'channel-2',
+      ]);
+      expect(useChatStore.getState().messagesByChannel.has('channel-2')).toBe(true);
+      expect(useUnreadStore.getState().unreadCounts.get('channel-2')).toBe(3);
+      expect(isIndexed('retained-channel-message')).toBe(true);
+      expect(useChannelStore.getState().isLoading).toBe(false);
+    });
+
     it('purges channels removed by an authoritative re-fetch', async () => {
       let requestCount = 0;
       server.use(
@@ -423,5 +456,427 @@ describe('channelStore', () => {
       expect(useChannelStore.getState().channelIdsByServer['server-1']).toEqual(['channel-1']);
       expect(isIndexed('retained-during-fetch')).toBe(true);
     });
+  });
+});
+
+describe('channelStore expiration policy contract', () => {
+  beforeEach(() => {
+    resetAllStores();
+    clearIndex();
+    useAuthStore.getState().setAccessToken('mock-token');
+  });
+
+  it('returns a fresh result only after the requested GET and preserves a live selection', async () => {
+    useChannelStore.setState({ currentServerId: 'server-1', activeChannelId: 'channel-1' });
+    const started = deferred();
+    const release = deferred();
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, async () => {
+        started.resolve();
+        await release.promise;
+        return HttpResponse.json({
+          channels: [
+            {
+              ...mockChannel,
+              id: 'channel-1',
+              expiration_window_seconds: 86400,
+              expiration_updated_at: '2026-09-08T05:00:00Z',
+              expiration_revision: 4,
+              expiration_backfill_pending: false,
+            },
+            {
+              ...mockChannel,
+              id: 'channel-2',
+              expiration_window_seconds: 86400,
+              expiration_updated_at: '2026-09-08T05:00:00Z',
+              expiration_revision: 4,
+              expiration_backfill_pending: false,
+            },
+          ],
+        });
+      })
+    );
+    const fetchPromise = useChannelStore.getState().fetchChannels('server-1', {
+      targetId: 'channel-1',
+      lifecycle: captureAuthLifecycle(),
+    });
+    await started.promise;
+    useChannelStore.getState().setActiveChannel('channel-2');
+    try {
+      release.resolve();
+      await expect(fetchPromise).resolves.toEqual({
+        kind: 'fresh',
+        policy: {
+          windowSeconds: 86400,
+          updatedAt: '2026-09-08T05:00:00Z',
+          revision: 4,
+          backfillPending: false,
+        },
+      });
+    } finally {
+      release.resolve();
+    }
+    expect(useChannelStore.getState().activeChannelId).toBe('channel-2');
+  });
+
+  it('reports malformed channel rows as a fetch error for the active server view', async () => {
+    const serverAChannel = { ...mockChannel, id: 'channel-a', server_id: 'server-a' };
+    useChannelStore.setState({
+      channels: [serverAChannel],
+      currentServerId: 'server-a',
+      activeChannelId: 'channel-a',
+      channelIdsByServer: { 'server-a': ['channel-a'] },
+    });
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-b/channels`, () =>
+        HttpResponse.json({ channels: [{}] })
+      )
+    );
+
+    const result = await useChannelStore.getState().fetchChannels('server-b', {
+      targetId: 'channel-b',
+      lifecycle: captureAuthLifecycle(),
+    });
+
+    expect(result).toEqual({ kind: 'unavailable' });
+    expect(useChannelStore.getState().currentServerId).toBe('server-b');
+    expect(useChannelStore.getState().channels).toEqual([serverAChannel]);
+    expect(useChannelStore.getState().error).toBe('Failed to load channels');
+    expect(useChannelStore.getState().isLoading).toBe(false);
+  });
+
+  it.each([
+    ['malformed 200', { channels: 'malformed' }],
+    ['valid channel list', { channels: [{ ...mockChannel, server_id: 'server-a' }] }],
+  ])(
+    'supersedes a stale server-A read after selecting server-B (%s)',
+    async (_label, staleResponse) => {
+      const started = deferred();
+      const release = deferred();
+      const serverAChannel = { ...mockChannel, id: 'channel-a', server_id: 'server-a' };
+      const serverBChannel = { ...mockChannel, id: 'channel-b', server_id: 'server-b' };
+      useChannelStore.setState({
+        channels: [serverAChannel],
+        currentServerId: 'server-a',
+        activeChannelId: 'channel-a',
+        channelIdsByServer: { 'server-a': ['channel-a'] },
+      });
+      indexMessage('server-a-message', 'retained server A message', 'channel-a');
+      server.use(
+        http.get(`${API_BASE}/api/v1/servers/server-a/channels`, async () => {
+          started.resolve();
+          await release.promise;
+          return HttpResponse.json(staleResponse);
+        }),
+        http.get(`${API_BASE}/api/v1/servers/server-b/channels`, () =>
+          HttpResponse.json({ channels: [serverBChannel] })
+        )
+      );
+
+      const staleRead = useChannelStore.getState().fetchChannels('server-a', {
+        targetId: 'channel-a',
+        lifecycle: captureAuthLifecycle(),
+      });
+      await started.promise;
+      try {
+        await useChannelStore.getState().fetchChannels('server-b');
+        expect(useChannelStore.getState().currentServerId).toBe('server-b');
+        expect(useChannelStore.getState().activeChannelId).toBe('channel-b');
+        release.resolve();
+        await expect(staleRead).resolves.toEqual({ kind: 'superseded' });
+      } finally {
+        release.resolve();
+      }
+      expect(useChannelStore.getState().currentServerId).toBe('server-b');
+      expect(useChannelStore.getState().activeChannelId).toBe('channel-b');
+      expect(useChannelStore.getState().channelIdsByServer['server-a']).toEqual(['channel-a']);
+      expect(isIndexed('server-a-message')).toBe(true);
+    }
+  );
+
+  it('keeps the current policy when a lower revision is applied', () => {
+    useChannelStore.getState().addChannel(mockChannel);
+    useChannelStore.getState().applyExpirationPolicy('channel-1', {
+      windowSeconds: 86400,
+      updatedAt: '2026-09-08T05:00:00Z',
+      revision: 4,
+      backfillPending: false,
+    });
+    useChannelStore.getState().applyExpirationPolicy('channel-1', {
+      windowSeconds: 3600,
+      updatedAt: '2026-09-08T04:00:00Z',
+      revision: 3,
+      backfillPending: true,
+    });
+    expect(useChannelStore.getState().channels[0].expirationPolicy).toEqual({
+      windowSeconds: 86400,
+      updatedAt: '2026-09-08T05:00:00Z',
+      revision: 4,
+      backfillPending: false,
+    });
+  });
+
+  it.each([
+    ['missing target', { channels: [{ ...mockChannel, id: 'channel-2' }] }, 'missing'],
+    [
+      'invalid policy',
+      {
+        channels: [
+          {
+            ...mockChannel,
+            expiration_window_seconds: 300,
+            expiration_updated_at: 'bad',
+            expiration_revision: 4,
+            expiration_backfill_pending: false,
+          },
+        ],
+      },
+      'unavailable',
+    ],
+  ])('reports optional read %s', async (_label, body, expected) => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () => HttpResponse.json(body))
+    );
+    await expect(
+      useChannelStore.getState().fetchChannels('server-1', {
+        targetId: 'channel-1',
+        lifecycle: captureAuthLifecycle(),
+      })
+    ).resolves.toEqual({ kind: expected });
+  });
+
+  it('supersedes a stale generation but accepts ordinary credential rotation', async () => {
+    const started = deferred();
+    const release = deferred();
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, async () => {
+        started.resolve();
+        await release.promise;
+        return HttpResponse.json({ channels: [mockChannel] });
+      })
+    );
+    const staleLifecycle = captureAuthLifecycle();
+    const staleRead = useChannelStore
+      .getState()
+      .fetchChannels('server-1', { targetId: 'channel-1', lifecycle: staleLifecycle });
+    await started.promise;
+    useAuthStore.getState().clearAccessToken();
+    try {
+      release.resolve();
+      await expect(staleRead).resolves.toEqual({ kind: 'superseded' });
+    } finally {
+      release.resolve();
+    }
+
+    resetAllStores();
+    useAuthStore.getState().setAccessToken('mock-token');
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () =>
+        HttpResponse.json({
+          channels: [
+            {
+              ...mockChannel,
+              expiration_window_seconds: 86400,
+              expiration_updated_at: '2026-09-08T05:00:00Z',
+              expiration_revision: 4,
+              expiration_backfill_pending: false,
+            },
+          ],
+        })
+      )
+    );
+    const lifecycle = captureAuthLifecycle();
+    useAuthStore
+      .getState()
+      .rotateAuthCredentials(lifecycle.authGeneration, 'rotated-token', 'rotated-session');
+    await expect(
+      useChannelStore.getState().fetchChannels('server-1', { targetId: 'channel-1', lifecycle })
+    ).resolves.toEqual({
+      kind: 'fresh',
+      policy: {
+        windowSeconds: 86400,
+        updatedAt: '2026-09-08T05:00:00Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    });
+  });
+
+  it('acknowledges seen revisions monotonically and clears markers with channels', () => {
+    useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 4);
+    useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 3);
+    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({
+      'account-a': { 'channel-1': 4 },
+    });
+    useChannelStore.getState().clearChannels();
+    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({});
+  });
+
+  it('persists only markers/navigation and survives a storage quota failure in memory', () => {
+    useChannelStore.setState({ currentServerId: 'server-1', activeChannelId: 'channel-1' });
+    useChannelStore.getState().addChannel({
+      ...mockChannel,
+      expirationPolicy: {
+        windowSeconds: 86400,
+        updatedAt: '2026-09-08T05:00:00Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    });
+    useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 4);
+    const stored = JSON.parse(localStorage.getItem('concord-channels') ?? '{}');
+    expect(stored.state).toMatchObject({
+      activeChannelId: 'channel-1',
+      currentServerId: 'server-1',
+      seenExpirationRevisionsByAccount: { 'account-a': { 'channel-1': 4 } },
+    });
+    expect(stored.state).not.toHaveProperty('channels');
+
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
+      throw new DOMException('quota', 'QuotaExceededError');
+    });
+    try {
+      expect(() =>
+        useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 5)
+      ).not.toThrow();
+      expect(setItem).toHaveBeenCalled();
+      expect(
+        useChannelStore.getState().seenExpirationRevisionsByAccount['account-a']['channel-1']
+      ).toBe(5);
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
+  it('does not throw or lose a definitive policy when persistence repeatedly fails', () => {
+    useChannelStore.getState().addChannel(mockChannel);
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota', 'QuotaExceededError');
+    });
+    try {
+      expect(() =>
+        useChannelStore.getState().applyExpirationPolicy('channel-1', {
+          windowSeconds: 86400,
+          updatedAt: '2026-09-08T05:00:00Z',
+          revision: 4,
+          backfillPending: false,
+        })
+      ).not.toThrow();
+      expect(setItem).toHaveBeenCalled();
+      expect(useChannelStore.getState().channels[0].expirationPolicy?.revision).toBe(4);
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
+  it('rehydrates valid markers and preserves navigation, but discards corrupt marker maps', async () => {
+    localStorage.setItem(
+      'concord-channels',
+      JSON.stringify({
+        state: {
+          activeChannelId: 'channel-1',
+          currentServerId: 'server-1',
+          seenExpirationRevisionsByAccount: { 'account-a': { 'channel-1': 4 } },
+        },
+        version: 0,
+      })
+    );
+    await useChannelStore.persist.rehydrate();
+    expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
+    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({
+      'account-a': { 'channel-1': 4 },
+    });
+
+    localStorage.setItem(
+      'concord-channels',
+      JSON.stringify({
+        state: {
+          activeChannelId: 'channel-2',
+          currentServerId: 'server-1',
+          seenExpirationRevisionsByAccount: { bad: { channel: 'four' } },
+        },
+        version: 0,
+      })
+    );
+    await useChannelStore.persist.rehydrate();
+    expect(useChannelStore.getState().activeChannelId).toBe('channel-2');
+    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({});
+  });
+
+  it.each([
+    ['missing list', {}],
+    ['non-array list', { channels: 'nope' }],
+    ['non-object row', { channels: [null] }],
+  ])('reports %s unavailable and preserves cached rows', async (_label, body) => {
+    useChannelStore.getState().addChannel({
+      ...mockChannel,
+      expirationPolicy: {
+        windowSeconds: 86400,
+        updatedAt: '2026-09-08T05:00:00Z',
+        revision: 4,
+        backfillPending: false,
+      },
+    });
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () => HttpResponse.json(body))
+    );
+    await expect(
+      useChannelStore
+        .getState()
+        .fetchChannels('server-1', { targetId: 'channel-1', lifecycle: captureAuthLifecycle() })
+    ).resolves.toEqual({ kind: 'unavailable' });
+    expect(useChannelStore.getState().channels[0].expirationPolicy?.revision).toBe(4);
+  });
+
+  it('reports a valid empty list as missing', async () => {
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () =>
+        HttpResponse.json({ channels: [] })
+      )
+    );
+    await expect(
+      useChannelStore
+        .getState()
+        .fetchChannels('server-1', { targetId: 'channel-1', lifecycle: captureAuthLifecycle() })
+    ).resolves.toEqual({ kind: 'missing' });
+  });
+
+  it('supersedes an obsolete snapshot before making a network request', async () => {
+    let called = false;
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, () => {
+        called = true;
+        return HttpResponse.json({ channels: [mockChannel] });
+      })
+    );
+    const lifecycle = captureAuthLifecycle();
+    useAuthStore.getState().clearAccessToken();
+    await expect(
+      useChannelStore.getState().fetchChannels('server-1', { targetId: 'channel-1', lifecycle })
+    ).resolves.toEqual({ kind: 'superseded' });
+    expect(called).toBe(false);
+  });
+
+  it('supersedes a discarded view even when its HTTP request fails', async () => {
+    const started = deferred();
+    const release = deferred();
+    server.use(
+      http.get(`${API_BASE}/api/v1/servers/server-1/channels`, async () => {
+        started.resolve();
+        await release.promise;
+        return HttpResponse.json({ error: 'down' }, { status: 503 });
+      })
+    );
+    const read = useChannelStore
+      .getState()
+      .fetchChannels('server-1', { targetId: 'channel-1', lifecycle: captureAuthLifecycle() });
+    await started.promise;
+    try {
+      useChannelStore.getState().clearChannelView();
+      release.resolve();
+      await expect(read).resolves.toEqual({ kind: 'superseded' });
+    } finally {
+      release.resolve();
+    }
   });
 });

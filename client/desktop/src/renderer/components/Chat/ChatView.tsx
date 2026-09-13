@@ -7,21 +7,43 @@ import SearchPanel from './SearchPanel';
 import { pinMessage, unpinMessage, getChannelPins } from '../../services/messaging/pinService';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useUserStore } from '../../stores/auth/userStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import { useChannelSubscription } from '../../hooks/messaging/useChannelSubscription';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
 import { useServerStore } from '../../stores/chat/serverStore';
+import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { isChannelMuted } from '../../stores/ui/notificationPrefsStore';
+import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
+import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
+import MessageExpirationPolicySummary from '../Expiration/MessageExpirationPolicySummary';
+import Modal from '../ui/Modal';
+import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import {
+  MANAGE_ALL_MESSAGES,
+  MANAGE_OWN_MESSAGES,
+  hasPermission,
+} from '../../utils/policy/permissions';
 import type { ChatContext, MessageWithStatus } from '../../types/chat';
 import './ChatView.css';
+
+interface ChannelPurgeTarget {
+  id: string;
+  name: string;
+  selfScopeOnly: boolean;
+}
 
 const ChatView: React.FC = () => {
   const activeChannelId = useChannelStore((s) => s.activeChannelId);
   const channels = useChannelStore((s) => s.channels);
   const user = useUserStore((s) => s.user);
   const activeServerId = useServerStore((s) => s.activeServerId);
+  const authGeneration = useAuthStore((s) => s.authGeneration);
+  const [showExpirationEditor, setShowExpirationEditor] = useState(false);
+  const [purgeTarget, setPurgeTarget] = useState<ChannelPurgeTarget | null>(null);
+  const expirationSummaryRef = useRef<HTMLElement>(null);
 
   // Subscribe to active channel for full message delivery
   useChannelSubscription(activeChannelId);
@@ -34,6 +56,55 @@ const ChatView: React.FC = () => {
   // Active channel info
   const activeChannel = channels.find((c) => c.id === activeChannelId);
   const currentUserId = user?.id || '';
+  const expirationScope =
+    activeChannelId && activeChannel?.type === 'text'
+      ? { kind: 'channel' as const, id: activeChannelId }
+      : null;
+  const expiration = useExpirationPolicy(expirationScope, activeChannel?.server_id);
+  const channelPermissions = usePermissionStore((s) =>
+    activeChannelId ? s.channelPermissions[activeChannelId] : undefined
+  );
+  const serverPermissions = usePermissionStore((s) =>
+    activeChannel?.server_id ? s.serverPermissions[activeChannel.server_id] : undefined
+  );
+  const purgePermissions = channelPermissions ?? serverPermissions ?? 0n;
+  const canPurge =
+    hasPermission(purgePermissions, MANAGE_OWN_MESSAGES) ||
+    hasPermission(purgePermissions, MANAGE_ALL_MESSAGES);
+  const purgeSelfScopeOnly = canPurge && !hasPermission(purgePermissions, MANAGE_ALL_MESSAGES);
+
+  useEffect(() => {
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- close local controls when their channel or auth owner changes
+    setShowExpirationEditor(false);
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- close local controls when their channel or auth owner changes
+    setPurgeTarget(null);
+  }, [activeChannelId, authGeneration]);
+
+  useEffect(() => {
+    if (!purgeTarget) return;
+    if (
+      !canPurge ||
+      purgeTarget.id !== activeChannelId ||
+      purgeTarget.selfScopeOnly !== purgeSelfScopeOnly
+    ) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- close destructive consent when the permission-derived scope no longer matches the consented scope
+      setPurgeTarget(null);
+    }
+  }, [activeChannelId, canPurge, purgeSelfScopeOnly, purgeTarget]);
+
+  const openExpirationEditor = () => {
+    if (!expirationScope || !expiration.canEdit) return;
+    setShowExpirationEditor(true);
+    void expiration.onRefresh();
+  };
+
+  const reviewExpiration = () => {
+    if (expiration.canEdit) {
+      openExpirationEditor();
+      return;
+    }
+    expirationSummaryRef.current?.focus();
+  };
 
   // Chat controller — unified send/edit/delete/reply/pin/typing
   const ctx: ChatContext = useMemo(
@@ -207,6 +278,15 @@ const ChatView: React.FC = () => {
           </svg>
         )}
         <span className="chat-header-name">{activeChannel?.name || 'Channel'}</span>
+        {expirationScope && expiration.canEdit && (
+          <button
+            type="button"
+            className="chat-header-search-button message-expiration-header-action"
+            onClick={openExpirationEditor}
+          >
+            Message expiration
+          </button>
+        )}
         <button
           className="chat-header-search-button"
           onClick={() => setShowSearchPanel(!showSearchPanel)}
@@ -247,6 +327,30 @@ const ChatView: React.FC = () => {
           {pinnedCount > 0 && <span className="pin-count-badge">{pinnedCount}</span>}
         </button>
       </div>
+
+      {expirationScope && (
+        <MessageExpirationPolicySummary
+          ref={expirationSummaryRef}
+          policy={expiration.policy}
+          policyState={expiration.policyState}
+          showChangedNotice={expiration.showChangedNotice}
+          onReview={reviewExpiration}
+          onDismissNotice={expiration.onDismissNotice}
+          onManageMessages={
+            canPurge && activeChannel
+              ? () =>
+                  setPurgeTarget({
+                    id: activeChannel.id,
+                    name: activeChannel.name,
+                    selfScopeOnly: purgeSelfScopeOnly,
+                  })
+              : undefined
+          }
+          manageMessagesUnavailableDescription={
+            canPurge ? undefined : 'You do not have permission to manage messages in this channel.'
+          }
+        />
+      )}
 
       {error && <div className="chat-error">{error}</div>}
 
@@ -304,6 +408,37 @@ const ChatView: React.FC = () => {
           .map((c) => c.id)}
         showServerWideToggle={!!activeChannel?.server_id}
       />
+
+      {expirationScope && (
+        <Modal
+          isOpen={showExpirationEditor}
+          onClose={() => setShowExpirationEditor(false)}
+          title="Message expiration"
+        >
+          <MessageExpirationEditor
+            scope={expirationScope}
+            policy={expiration.policy}
+            policyState={expiration.policyState}
+            canEdit={expiration.canEdit}
+            lockedDescription={expiration.lockedDescription}
+            onRefresh={expiration.onRefresh}
+            onApplyPolicy={expiration.onApplyPolicy}
+            onMarkSeen={expiration.onMarkSeen}
+            onClose={() => setShowExpirationEditor(false)}
+          />
+        </Modal>
+      )}
+
+      {purgeTarget && (
+        <PurgeMessagesModal
+          context="channel"
+          isOpen={true}
+          onClose={() => setPurgeTarget(null)}
+          scopeId={purgeTarget.id}
+          scopeName={purgeTarget.name}
+          selfScopeOnly={purgeTarget.selfScopeOnly}
+        />
+      )}
     </div>
   );
 };

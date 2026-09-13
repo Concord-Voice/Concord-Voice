@@ -6,6 +6,7 @@ import {
   isEntryCurrentlyMuted,
 } from '../../stores/ui/notificationPrefsStore';
 import { useUserStore } from '../../stores/auth/userStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useFriendStore, type Friend } from '../../stores/chat/friendStore';
 import { e2eeService } from '../../services/e2ee/e2eeService';
@@ -21,6 +22,9 @@ import { DIRECT_MESSAGES_CONTEXT_AREA } from '../ui/ContextMenuProvider';
 import DMConversationContextMenu from './DMConversationContextMenu';
 import DMProfileModal from './DMProfileModal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import Modal from '../ui/Modal';
+import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
+import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
 import { AttributedPopover } from '../Layout/AttributedPopover';
 import './DirectMessages.css';
 
@@ -387,6 +391,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
   // Purge target — same lifted-state pattern; the purge dialog outlives the
   // context menu that opened it (#1354).
   const [purgeTarget, setPurgeTarget] = useState<DMConversation | null>(null);
+  const [expirationTarget, setExpirationTarget] = useState<DMConversation | null>(null);
   const [unfriendTarget, setUnfriendTarget] = useState<DMConversation | null>(null);
   // DM Profile modal target (#1208). Same lifted-state pattern as block/unfriend
   // so the modal continues rendering after the context menu unmounts.
@@ -401,6 +406,39 @@ const ConversationList: React.FC<ConversationListProps> = ({
   const fetchConversations = useDMStore((s) => s.fetchConversations);
   const openPersonalThread = useDMStore((s) => s.openPersonalThread);
   const currentUserId = useUserStore((s) => s.user?.id) || '';
+  const authGeneration = useAuthStore((s) => s.authGeneration);
+  const currentExpirationTarget = expirationTarget
+    ? (conversations.find((conversation) => conversation.id === expirationTarget.id) ?? null)
+    : null;
+  const expiration = useExpirationPolicy(
+    currentExpirationTarget &&
+      !currentExpirationTarget.isGroup &&
+      !currentExpirationTarget.isPersonal &&
+      currentExpirationTarget.participants.some(
+        (participant) => participant.userId === currentUserId
+      )
+      ? { kind: 'dm', id: currentExpirationTarget.id }
+      : null
+  );
+
+  useEffect(() => {
+    if (
+      expirationTarget &&
+      (!currentExpirationTarget ||
+        currentExpirationTarget.isGroup ||
+        currentExpirationTarget.isPersonal ||
+        !currentExpirationTarget.participants.some(
+          (participant) => participant.userId === currentUserId
+        ))
+    )
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- close an expired context-menu target after account or list reconciliation
+      setExpirationTarget(null);
+  }, [currentExpirationTarget, currentUserId, expirationTarget]);
+
+  useEffect(() => {
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- a new active conversation or auth owner invalidates a lifted timer modal
+    setExpirationTarget(null);
+  }, [authGeneration, selectedThreadId]);
 
   // In-call indicator (#1209 plan task F5): returns the convId IF the
   // local user is currently in a DM voice call, else null. The selector
@@ -549,6 +587,7 @@ const ConversationList: React.FC<ConversationListProps> = ({
       onUnfriend={(conv) => setUnfriendTarget(conv)}
       onViewProfile={(conv) => setProfileTarget(conv)}
       onPurgeMessages={(conv) => setPurgeTarget(conv)}
+      onMessageExpiration={(conv) => setExpirationTarget(conv)}
     />
   ) : null;
 
@@ -677,6 +716,22 @@ const ConversationList: React.FC<ConversationListProps> = ({
           ))}
       <CreateGroupModal isOpen={isCreateGroupOpen} onClose={() => setIsCreateGroupOpen(false)} />
       {contextMenuElement}
+
+      {currentExpirationTarget && (
+        <Modal isOpen={true} onClose={() => setExpirationTarget(null)} title="Message expiration">
+          <MessageExpirationEditor
+            scope={{ kind: 'dm', id: currentExpirationTarget.id }}
+            policy={expiration.policy}
+            policyState={expiration.policyState}
+            canEdit={expiration.canEdit}
+            lockedDescription={expiration.lockedDescription}
+            onRefresh={expiration.onRefresh}
+            onApplyPolicy={expiration.onApplyPolicy}
+            onMarkSeen={expiration.onMarkSeen}
+            onClose={() => setExpirationTarget(null)}
+          />
+        </Modal>
+      )}
 
       {/* Block-user confirmation (#984). The peer is computed from the
           conversation's participants by filtering out the current user. The

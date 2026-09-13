@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useFormState } from '../../hooks/ui/useFormState';
 import {
   NAME_MAX,
@@ -14,6 +14,13 @@ import { useServerStore } from '../../stores/chat/serverStore';
 import { apiFetch } from '../../services/system/apiClient';
 import ChannelAudioQualitySlider from './ChannelAudioQualitySlider';
 import { Channel } from '../../types/chat';
+import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
+import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
+import { useAuthStore } from '../../stores/auth/authStore';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
 import './CreateChannelModal.css';
 
 interface EditChannelModalProps {
@@ -40,6 +47,7 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
   const [audioQualityTier, setAudioQualityTier] = useState<string | null>(
     channel.audio_quality_tier ?? null
   );
+  const [closePending, setClosePending] = useState(false);
   const {
     errors,
     setErrors,
@@ -55,6 +63,23 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
   const serverTier = useServerStore(
     (s) => s.servers.find((sv) => sv.id === channel.server_id)?.server_tier
   );
+  const authGeneration = useAuthStore((state) => state.authGeneration);
+  const expiration = useExpirationPolicy(
+    isOpen && channel.type === 'text' ? { kind: 'channel', id: channel.id } : null,
+    channel.server_id
+  );
+  const operationRef = useRef(0);
+  const mountedRef = useRef(true);
+  const viewRef = useRef({ channelId: channel.id, authGeneration, isOpen });
+  viewRef.current = { channelId: channel.id, authGeneration, isOpen };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      operationRef.current += 1;
+    };
+  }, []);
 
   // Reset form when channel changes
   useEffect(() => {
@@ -66,14 +91,42 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
     setGroupId(channel.group_id || '');
     // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets audioQualityTier from channel prop when channel changes; not a render loop
     setAudioQualityTier(channel.audio_quality_tier ?? null);
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- channel/auth changes cancel the delayed success close state
+    setClosePending(false);
     resetFormState();
-  }, [channel, resetFormState]);
+  }, [
+    channel.id,
+    channel.name,
+    channel.emoji,
+    channel.group_id,
+    channel.audio_quality_tier,
+    isOpen,
+    authGeneration,
+    resetFormState,
+  ]);
+
+  useEffect(() => {
+    operationRef.current += 1;
+    if (!isOpen) return;
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- opening a fresh modal must clear stale delayed-close state
+    setClosePending(false);
+    setIsSubmitting(false);
+  }, [authGeneration, channel.id, isOpen, setIsSubmitting]);
 
   const handleClose = () => {
-    if (!isSubmitting) {
+    if (!isSubmitting && !closePending) {
+      operationRef.current += 1;
+      setClosePending(false);
       resetFormState();
       onClose();
     }
+  };
+
+  const closeExpirationEditor = () => {
+    operationRef.current += 1;
+    setClosePending(false);
+    resetFormState();
+    onClose();
   };
 
   const validateForm = (): boolean => {
@@ -109,6 +162,16 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
 
     setIsSubmitting(true);
     setErrors({});
+    const operation = ++operationRef.current;
+    const lifecycle = captureAuthLifecycle();
+    const channelId = channel.id;
+    const stillCurrent = () =>
+      mountedRef.current &&
+      operation === operationRef.current &&
+      viewRef.current.channelId === channelId &&
+      viewRef.current.authGeneration === authGeneration &&
+      viewRef.current.isOpen &&
+      isSameAuthLifecycle(lifecycle);
 
     try {
       const response = await apiFetch(`/api/v1/channels/${channel.id}`, {
@@ -129,7 +192,8 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
         throw new Error(data.error || 'Failed to update channel');
       }
 
-      // Update channel in store
+      if (!stillCurrent()) return;
+
       updateChannel(channel.id, data.channel);
 
       // Show success message
@@ -140,16 +204,18 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
         onSuccess(data.channel);
       }
 
+      setClosePending(true);
       // Close modal after short delay
       setTimeout(() => {
-        handleClose();
+        if (stillCurrent()) closeExpirationEditor();
       }, 1000);
     } catch (error) {
-      setErrors({
-        general: error instanceof Error ? error.message : 'Failed to update channel',
-      });
+      if (stillCurrent())
+        setErrors({
+          general: error instanceof Error ? error.message : 'Failed to update channel',
+        });
     } finally {
-      setIsSubmitting(false);
+      if (stillCurrent()) setIsSubmitting(false);
     }
   };
 
@@ -175,7 +241,7 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
             onChange={(e) => setName(e.target.value)}
             placeholder="general-chat"
             maxLength={NAME_MAX}
-            disabled={isSubmitting}
+            disabled={isSubmitting || closePending}
             autoFocus
           />
           {errors.name && <span className="channel-form-error">{errors.name}</span>}
@@ -184,7 +250,11 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
           </span>
         </div>
 
-        <ChannelEmojiField emoji={emoji} onChange={setEmoji} disabled={isSubmitting} />
+        <ChannelEmojiField
+          emoji={emoji}
+          onChange={setEmoji}
+          disabled={isSubmitting || closePending}
+        />
 
         {/* Channel Type (read-only) */}
         <div className="channel-form-group">
@@ -276,6 +346,22 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
           </button>
         </div>
       </form>
+      {channel.type === 'text' && (
+        <>
+          <h3 className="channel-form-label">Message expiration</h3>
+          <MessageExpirationEditor
+            scope={{ kind: 'channel', id: channel.id }}
+            policy={expiration.policy}
+            policyState={expiration.policyState}
+            canEdit={expiration.canEdit && !isSubmitting && !closePending}
+            lockedDescription={expiration.lockedDescription}
+            onRefresh={expiration.onRefresh}
+            onApplyPolicy={expiration.onApplyPolicy}
+            onMarkSeen={expiration.onMarkSeen}
+            onClose={closeExpirationEditor}
+          />
+        </>
+      )}
     </Modal>
   );
 };

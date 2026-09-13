@@ -1,6 +1,8 @@
-import { render, screen, cleanup } from '../../../test-utils';
+import { render, screen, cleanup, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import ConfirmActionModal from '@/renderer/components/ui/ConfirmActionModal';
+import { vi } from 'vitest';
+import { deferred } from '../../../helpers/deferred';
 
 const noop = () => {};
 
@@ -109,5 +111,92 @@ describe('ConfirmActionModal extraContent (#1354)', () => {
     const without = normalizeIds(screen.getByRole('dialog').innerHTML);
 
     expect(withProp).toBe(without);
+  });
+});
+
+describe('ConfirmActionModal confirmDisabled gate', () => {
+  beforeEach(() => resetAllStores());
+
+  it('preserves the existing gate when confirmDisabled is omitted', async () => {
+    const user = (await import('@testing-library/user-event')).default.setup();
+    const onConfirm = vi.fn(async () => {});
+    render(<ConfirmActionModal {...baseProps} onConfirm={onConfirm} />);
+    await user.click(screen.getByRole('button', { name: 'Ban' }));
+    expect(onConfirm).toHaveBeenCalledOnce();
+  });
+
+  it('blocks activation and disables the button when confirmDisabled is true', async () => {
+    const user = (await import('@testing-library/user-event')).default.setup();
+    const onConfirm = vi.fn(async () => {});
+    render(<ConfirmActionModal {...baseProps} onConfirm={onConfirm} confirmDisabled />);
+    const button = screen.getByRole('button', { name: 'Ban' });
+    expect(button).toBeDisabled();
+    await user.click(button);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it('combines confirmDisabled with typed confirmation and processing gates', async () => {
+    const user = (await import('@testing-library/user-event')).default.setup();
+    const pending = deferred<void>();
+    const onConfirm = vi.fn(() => pending.promise);
+    const props = {
+      ...baseProps,
+      onConfirm,
+      confirmationInput: { label: 'Type it', expectedValue: 'YES' },
+    };
+    try {
+      render(<ConfirmActionModal {...props} confirmDisabled />);
+      const button = screen.getByRole('button', { name: 'Ban' });
+      expect(button).toBeDisabled();
+      await user.type(screen.getByRole('textbox'), 'YES');
+      expect(button).toBeDisabled();
+      expect(onConfirm).not.toHaveBeenCalled();
+      // Re-enable the caller-owned gate, then prove processing disables the same button.
+      cleanup();
+      render(<ConfirmActionModal {...props} confirmDisabled={false} />);
+      await user.type(screen.getByRole('textbox'), 'YES');
+      await user.click(screen.getByRole('button', { name: 'Ban' }));
+      expect(onConfirm).toHaveBeenCalledOnce();
+      expect(screen.getByRole('button', { name: /Banning/ })).toBeDisabled();
+    } finally {
+      pending.resolve();
+    }
+  });
+
+  it('disables supplied native controls during confirmation and re-enables them after rejection', async () => {
+    const user = (await import('@testing-library/user-event')).default.setup();
+    const pending = deferred<void>();
+    const onConfirm = vi.fn(() => pending.promise);
+
+    render(
+      <ConfirmActionModal
+        {...baseProps}
+        onConfirm={onConfirm}
+        extraContent={
+          <>
+            <label>
+              <input type="radio" name="scope" defaultChecked /> All messages
+            </label>
+            <label>
+              <input type="checkbox" defaultChecked /> I understand
+            </label>
+          </>
+        }
+      />
+    );
+
+    const radio = screen.getByRole('radio', { name: 'All messages' });
+    const checkbox = screen.getByRole('checkbox', { name: 'I understand' });
+    await user.click(screen.getByRole('button', { name: 'Ban' }));
+    expect(onConfirm).toHaveBeenCalledOnce();
+    expect(radio).toBeDisabled();
+    expect(checkbox).toBeDisabled();
+    expect(radio).toBeChecked();
+    expect(checkbox).toBeChecked();
+
+    pending.reject(new Error('request rejected'));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('request rejected'));
+    expect(radio).not.toBeDisabled();
+    expect(checkbox).not.toBeDisabled();
   });
 });

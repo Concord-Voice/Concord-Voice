@@ -1,0 +1,65 @@
+.message-expiration-editor,
+.message-expiration-summary {
+  font: inherit;
+  color: var(--text-primary);
+}
+.message-expiration-stops .settings-tier-label.message-expiration-stop {
+  color: var(--text-primary);
+  transition: none;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+.message-expiration-stops .settings-tier-label.message-expiration-stop:focus-visible {
+  color: var(--text-primary);
+  outline-color: currentColor;
+}
+.message-expiration-stops .settings-tier-label.message-expiration-stop[aria-disabled='true'] {
+  color: var(--text-muted);
+  cursor: default;
+}
+.chat-header .chat-header-search-button.message-expiration-header-action {
+  font: inherit;
+  color: var(--text-primary);
+}
+.chat-header .chat-header-search-button.message-expiration-header-action:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.message-expiration-notice {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--text-secondary);
+}
+.message-expiration-notice button,
+.message-expiration-summary button {
+  font: inherit;
+  color: var(--text-primary);
+}
+.message-expiration-summary .message-expiration-notice-action {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--text-muted);
+  border-radius: 4px;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 3px 6px;
+  white-space: normal;
+}
+.message-expiration-summary .message-expiration-notice-action:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.message-expiration-options {
+  display: grid;
+  gap: 8px;
+}
+.message-expiration-error {
+  color: var(--danger);
+}
+
+.message-expiration-summary:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}

@@ -8,6 +8,20 @@ import { removeScope } from '../../services/messaging/searchService';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useChatStore } from './chatStore';
 import type { CallEventPayload } from '../../types/chat';
+import {
+  createExpirationPolicyStorage,
+  hasMalformedExpirationPolicyListRow,
+  mergeExpirationPolicy,
+  parseExpirationPolicyFromListRow,
+  parseSeenExpirationRevisions,
+  type ExpirationPolicy,
+  type ExpirationPolicyReadRequest,
+  type ExpirationPolicyReadResult,
+} from '../../services/messaging/expirationPolicyApi';
+import {
+  captureAuthLifecycle,
+  isSameAuthLifecycle,
+} from '../../services/system/postLoginHydrationLifecycle';
 
 function purgeConversationAccessState(conversationId: string): void {
   e2eeService.revokeChannelAccess(conversationId);
@@ -20,12 +34,23 @@ interface ConversationFetchJournal {
   removedIds: Set<string>;
   changedFieldsById: Map<string, Set<MutableConversationField>>;
   cleared: boolean;
+  expirationReaders: ExpirationReadWaiter[];
+}
+
+interface ExpirationReadWaiter {
+  read: ExpirationPolicyReadRequest;
+  resolve: (result: ExpirationPolicyReadResult) => void;
 }
 
 const conversationFetchJournals = new Set<ConversationFetchJournal>();
 let conversationRefetchQueued = false;
+let pendingExpirationReaders: ExpirationReadWaiter[] = [];
 const hasLiveConversationFetch = () =>
   Array.from(conversationFetchJournals).some((journal) => !journal.cleared);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 function markConversationFetchMutation(
   conversationId: string,
@@ -79,16 +104,17 @@ export interface DMConversation {
   lastMessage: DMLastMessage | null;
   unreadCount: number;
   createdAt: string;
+  expirationPolicy?: ExpirationPolicy;
 }
 
-type MutableConversationField = Exclude<keyof DMConversation, 'id'>;
+type MutableConversationField = Exclude<keyof DMConversation, 'id' | 'expirationPolicy'>;
 
 function markConversationFetchUpdate(
   conversationId: string,
   updates: Partial<DMConversation>
 ): void {
   const fields = (Object.keys(updates) as (keyof DMConversation)[]).filter(
-    (field): field is MutableConversationField => field !== 'id'
+    (field): field is MutableConversationField => field !== 'id' && field !== 'expirationPolicy'
   );
   markConversationFetchMutation(conversationId, ...fields);
 }
@@ -468,13 +494,19 @@ interface DMState {
   activeConversationId: string | null;
   isLoading: boolean;
   error: string | null;
+  seenExpirationRevisionsByAccount: Record<string, Record<string, number>>;
+  invalidExpirationPolicyIds: Record<string, true>;
 
   // Removed in #1209: dmCallActive / dmCallConversationId / setDMCallActive
   // were never read by any component. DM call state lives on voiceStore
   // (isDMCall, dmConversationId, callState). Single source of truth.
 
   // API actions
-  fetchConversations: () => Promise<void>;
+  fetchConversations: (
+    read?: ExpirationPolicyReadRequest
+  ) => Promise<ExpirationPolicyReadResult | undefined>;
+  applyExpirationPolicy: (targetId: string, policy: ExpirationPolicy) => void;
+  markExpirationSeen: (accountId: string, targetId: string, revision: number) => void;
   openDM: (userId: string) => Promise<DMConversation>;
   createGroupDM: (userIds: string[], name?: string) => Promise<DMConversation>;
   openPersonalThread: () => Promise<DMConversation>;
@@ -522,28 +554,178 @@ function queueConversationRefetchIfLoading(isLoading: boolean): boolean {
   return true;
 }
 
-function reconcileConversationResponse(
-  data: { conversations?: Record<string, unknown>[] },
+function queueConversationFetch(
+  read: ExpirationPolicyReadRequest | undefined,
+  isLoading: boolean
+):
+  | { queued: false }
+  | {
+      queued: true;
+      result: Promise<ExpirationPolicyReadResult> | ExpirationPolicyReadResult | undefined;
+    } {
+  if (!queueConversationRefetchIfLoading(isLoading)) return { queued: false };
+  if (!read) return { queued: true, result: undefined };
+  if (!hasLiveConversationFetch()) return { queued: true, result: { kind: 'superseded' } };
+  return {
+    queued: true,
+    result: new Promise<ExpirationPolicyReadResult>((resolve) => {
+      pendingExpirationReaders.push({ read, resolve });
+    }),
+  };
+}
+
+function isConversationFetchSuperseded(
   journal: ConversationFetchJournal,
-  currentState: Pick<DMState, 'conversations' | 'activeConversationId'>
-): Pick<DMState, 'conversations' | 'activeConversationId'> {
+  lifecycle: ReturnType<typeof captureAuthLifecycle>
+): boolean {
+  return journal.cleared || !isSameAuthLifecycle(lifecycle);
+}
+
+function supersededConversationFetchResult(
+  journal: ConversationFetchJournal,
+  read: ExpirationPolicyReadRequest | undefined
+): ExpirationPolicyReadResult | undefined {
+  resolveExpirationReaders(journal.expirationReaders, () => ({ kind: 'superseded' }));
+  return read ? { kind: 'superseded' } : undefined;
+}
+
+function unavailableConversationFetchResult(
+  journal: ConversationFetchJournal,
+  read: ExpirationPolicyReadRequest | undefined
+): ExpirationPolicyReadResult | undefined {
+  resolveExpirationReaders(journal.expirationReaders, (queuedRead) =>
+    isSameAuthLifecycle(queuedRead.lifecycle) ? { kind: 'unavailable' } : { kind: 'superseded' }
+  );
+  return read ? { kind: 'unavailable' } : undefined;
+}
+
+async function responseError(
+  response: Response,
+  journal: ConversationFetchJournal,
+  lifecycle: ReturnType<typeof captureAuthLifecycle>
+): Promise<Error | undefined> {
+  const data: unknown = await response.json().catch(() => undefined);
+  if (isConversationFetchSuperseded(journal, lifecycle)) return undefined;
+  const message = isRecord(data) && typeof data.error === 'string' ? data.error : '';
+  return new Error(message || 'Failed to load conversations');
+}
+
+function expirationReadResult(
+  read: ExpirationPolicyReadRequest,
+  rows: Record<string, unknown>[],
+  conversations: DMConversation[]
+): ExpirationPolicyReadResult {
+  if (!isSameAuthLifecycle(read.lifecycle)) return { kind: 'superseded' };
+  const row = rows.find((conversation) => conversation.id === read.targetId);
+  if (!row) return { kind: 'missing' };
+  if (!parseExpirationPolicyFromListRow(row)) return { kind: 'unavailable' };
+  const policy = conversations.find(
+    (conversation) => conversation.id === read.targetId
+  )?.expirationPolicy;
+  return policy ? { kind: 'fresh', policy } : { kind: 'superseded' };
+}
+
+function resolveExpirationReaders(
+  readers: ExpirationReadWaiter[],
+  result: (read: ExpirationPolicyReadRequest) => ExpirationPolicyReadResult
+): void {
+  for (const { read, resolve } of readers) resolve(result(read));
+}
+
+function completeConversationFetch(
+  data: unknown,
+  journal: ConversationFetchJournal,
+  read: ExpirationPolicyReadRequest | undefined,
+  set: (
+    state: Partial<
+      Pick<
+        DMState,
+        'conversations' | 'activeConversationId' | 'error' | 'invalidExpirationPolicyIds'
+      >
+    >
+  ) => void,
+  get: () => Pick<DMState, 'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds'>
+): ExpirationPolicyReadResult | undefined {
+  if (!isRecord(data) || !Array.isArray(data.conversations)) {
+    set({ error: 'Failed to load conversations' });
+    return unavailableConversationFetchResult(journal, read);
+  }
+  if (
+    data.conversations.some(
+      (conversation) =>
+        !isRecord(conversation) || typeof conversation.id !== 'string' || conversation.id === ''
+    )
+  ) {
+    set({ error: 'Failed to load conversations' });
+    return unavailableConversationFetchResult(journal, read);
+  }
+  const rows = data.conversations.map((conversation) => conversation as Record<string, unknown>);
+  set(reconcileConversationResponse(rows, journal, get()));
+  const servedState = get();
+  resolveExpirationReaders(journal.expirationReaders, (queuedRead) =>
+    expirationReadResult(queuedRead, rows, servedState.conversations)
+  );
+  return read ? expirationReadResult(read, rows, servedState.conversations) : undefined;
+}
+
+function failedConversationFetch(
+  journal: ConversationFetchJournal,
+  lifecycle: ReturnType<typeof captureAuthLifecycle>,
+  read: ExpirationPolicyReadRequest | undefined,
+  error: unknown,
+  set: (state: Pick<DMState, 'error'>) => void
+): ExpirationPolicyReadResult | undefined {
+  if (isConversationFetchSuperseded(journal, lifecycle)) {
+    return supersededConversationFetchResult(journal, read);
+  }
+  set({ error: error instanceof Error ? error.message : 'Failed to load conversations' });
+  return unavailableConversationFetchResult(journal, read);
+}
+
+function reconcileConversationResponse(
+  rows: Record<string, unknown>[],
+  journal: ConversationFetchJournal,
+  currentState: Pick<
+    DMState,
+    'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds'
+  >
+): Pick<DMState, 'conversations' | 'activeConversationId' | 'invalidExpirationPolicyIds'> {
   const currentById = new Map(
     currentState.conversations.map((conversation) => [conversation.id, conversation])
   );
-  const conversations = (data.conversations || [])
+  const invalidExpirationPolicyIds = { ...currentState.invalidExpirationPolicyIds };
+  for (const row of rows) {
+    if (hasMalformedExpirationPolicyListRow(row))
+      invalidExpirationPolicyIds[row.id as string] = true;
+    else delete invalidExpirationPolicyIds[row.id as string];
+  }
+
+  const conversations = rows
     .map((conversation) => mapConversation(conversation))
     .filter((conversation) => !journal.removedIds.has(conversation.id))
     .map((fetched) => {
       const current = currentById.get(fetched.id);
       if (!current) return fetched;
+      const invalidExpirationPolicy = invalidExpirationPolicyIds[fetched.id] === true;
       const addedAfterFetchStarted = !journal.baselineIds.has(fetched.id);
-      if (addedAfterFetchStarted) return current;
+      if (addedAfterFetchStarted) {
+        if (invalidExpirationPolicy) return { ...current, expirationPolicy: undefined };
+        const expirationPolicy = mergeExpirationPolicy(
+          current.expirationPolicy,
+          fetched.expirationPolicy
+        );
+        return expirationPolicy ? { ...current, expirationPolicy } : current;
+      }
 
+      const expirationPolicy = invalidExpirationPolicy
+        ? undefined
+        : mergeExpirationPolicy(current.expirationPolicy, fetched.expirationPolicy);
+      const withExpirationPolicy = expirationPolicy ? { ...fetched, expirationPolicy } : fetched;
       const changedFields = journal.changedFieldsById.get(fetched.id);
-      if (!changedFields) return fetched;
+      if (!changedFields) return withExpirationPolicy;
       return Array.from(changedFields).reduce<DMConversation>(
         (conversation, field) => ({ ...conversation, [field]: current[field] }),
-        fetched
+        withExpirationPolicy
       );
     });
   const fetchedIds = new Set(conversations.map((conversation) => conversation.id));
@@ -574,7 +756,7 @@ function reconcileConversationResponse(
       ? currentState.activeConversationId
       : null;
 
-  return { conversations, activeConversationId };
+  return { conversations, activeConversationId, invalidExpirationPolicyIds };
 }
 
 function finishConversationFetch(journal: ConversationFetchJournal): {
@@ -597,39 +779,87 @@ export const useDMStore = wrapStore(
           activeConversationId: null,
           isLoading: false,
           error: null,
+          seenExpirationRevisionsByAccount: {},
+          invalidExpirationPolicyIds: {},
 
-          fetchConversations: async () => {
-            if (queueConversationRefetchIfLoading(get().isLoading)) return;
+          fetchConversations: async (read?: ExpirationPolicyReadRequest) => {
+            if (read && !isSameAuthLifecycle(read.lifecycle)) return { kind: 'superseded' };
+            const queued = queueConversationFetch(read, get().isLoading);
+            if (queued.queued) return queued.result;
+            const expirationReaders = pendingExpirationReaders;
+            pendingExpirationReaders = [];
+            const requestLifecycle = captureAuthLifecycle();
             const journal: ConversationFetchJournal = {
               baselineIds: new Set(get().conversations.map((conversation) => conversation.id)),
               removedIds: new Set(),
               changedFieldsById: new Map(),
               cleared: false,
+              expirationReaders,
             };
             conversationFetchJournals.add(journal);
             set({ isLoading: true, error: null });
 
             try {
               const response = await apiFetch('/api/v1/dm/conversations');
+              if (isConversationFetchSuperseded(journal, requestLifecycle)) {
+                return supersededConversationFetchResult(journal, read);
+              }
               if (!response.ok) {
-                const data = await response.json();
-                throw new Error(data.error || 'Failed to load conversations');
+                const error = await responseError(response, journal, requestLifecycle);
+                if (!error) return supersededConversationFetchResult(journal, read);
+                throw error;
               }
 
-              const data = await response.json();
-              if (journal.cleared) return;
-              set(reconcileConversationResponse(data, journal, get()));
-            } catch (error) {
-              if (!journal.cleared) {
-                set({
-                  error: error instanceof Error ? error.message : 'Failed to load conversations',
-                });
+              const data: unknown = await response.json();
+              if (isConversationFetchSuperseded(journal, requestLifecycle)) {
+                return supersededConversationFetchResult(journal, read);
               }
+              return completeConversationFetch(data, journal, read, set, get);
+            } catch (error) {
+              return failedConversationFetch(journal, requestLifecycle, read, error, set);
             } finally {
               const { isLoading, shouldRefetch } = finishConversationFetch(journal);
               set({ isLoading });
-              if (shouldRefetch) await get().fetchConversations();
+              if (shouldRefetch) {
+                if (isSameAuthLifecycle(requestLifecycle)) {
+                  await get().fetchConversations();
+                } else {
+                  resolveExpirationReaders(pendingExpirationReaders, () => ({
+                    kind: 'superseded',
+                  }));
+                  pendingExpirationReaders = [];
+                }
+              }
             }
+          },
+
+          applyExpirationPolicy: (targetId: string, policy: ExpirationPolicy) => {
+            set((state) => ({
+              conversations: state.conversations.map((conversation) => {
+                if (conversation.id !== targetId) return conversation;
+                const expirationPolicy = mergeExpirationPolicy(
+                  conversation.expirationPolicy,
+                  policy
+                );
+                return expirationPolicy ? { ...conversation, expirationPolicy } : conversation;
+              }),
+            }));
+          },
+
+          markExpirationSeen: (accountId: string, targetId: string, revision: number) => {
+            if (!accountId || !targetId || !Number.isSafeInteger(revision) || revision < 0) return;
+            set((state) => ({
+              seenExpirationRevisionsByAccount: {
+                ...state.seenExpirationRevisionsByAccount,
+                [accountId]: {
+                  ...state.seenExpirationRevisionsByAccount[accountId],
+                  [targetId]: Math.max(
+                    state.seenExpirationRevisionsByAccount[accountId]?.[targetId] ?? 0,
+                    revision
+                  ),
+                },
+              },
+            }));
           },
 
           openDM: async (userId: string) => {
@@ -805,6 +1035,8 @@ export const useDMStore = wrapStore(
 
           clearDMs: () => {
             conversationRefetchQueued = false;
+            resolveExpirationReaders(pendingExpirationReaders, () => ({ kind: 'superseded' }));
+            pendingExpirationReaders = [];
             // Module-scope, so `set()` cannot reach it and no store reset would
             // have. gracefulReset() calls clearDMs() on every login-screen and
             // reload transition, which is the account boundary this needs to
@@ -814,7 +1046,11 @@ export const useDMStore = wrapStore(
             distributionRateLimitedUntil.clear();
             distributionRateLimitedUntilAll = 0;
             distributionLifecycleGeneration++;
-            for (const journal of conversationFetchJournals) journal.cleared = true;
+            for (const journal of conversationFetchJournals) {
+              journal.cleared = true;
+              resolveExpirationReaders(journal.expirationReaders, () => ({ kind: 'superseded' }));
+              journal.expirationReaders = [];
+            }
             for (const conversation of get().conversations) {
               purgeConversationAccessState(conversation.id);
             }
@@ -822,6 +1058,8 @@ export const useDMStore = wrapStore(
               conversations: [],
               activeConversationId: null,
               isLoading: false,
+              seenExpirationRevisionsByAccount: {},
+              invalidExpirationPolicyIds: {},
             });
           },
 
@@ -922,7 +1160,19 @@ export const useDMStore = wrapStore(
           name: 'concord:dm-store',
           partialize: (state) => ({
             activeConversationId: state.activeConversationId,
+            seenExpirationRevisionsByAccount: state.seenExpirationRevisionsByAccount,
           }),
+          merge: (persistedState, currentState) => {
+            const persisted = isRecord(persistedState) ? persistedState : {};
+            return {
+              ...currentState,
+              ...persisted,
+              seenExpirationRevisionsByAccount: parseSeenExpirationRevisions(
+                persisted.seenExpirationRevisionsByAccount
+              ),
+            };
+          },
+          storage: createExpirationPolicyStorage<Partial<DMState>>(),
         }
       ),
       { name: 'DMStore' }
@@ -945,6 +1195,7 @@ function mapConversation(c: Record<string, unknown>): DMConversation {
     : [];
 
   const lastMsg = c.last_message as Record<string, unknown> | null;
+  const expirationPolicy = parseExpirationPolicyFromListRow(c);
 
   return {
     id: c.id as string,
@@ -966,5 +1217,6 @@ function mapConversation(c: Record<string, unknown>): DMConversation {
       : null,
     unreadCount: (c.unread_count as number) || 0,
     createdAt: c.created_at as string,
+    ...(expirationPolicy ? { expirationPolicy } : {}),
   };
 }

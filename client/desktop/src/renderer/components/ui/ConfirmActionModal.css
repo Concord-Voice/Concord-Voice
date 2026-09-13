@@ -2,3 +2,10 @@
    Class names kept as-is (delete-server-*) for backward compatibility with
    DeleteServerModal, LeaveServerModal, DeleteChannelModal, DeleteCategoryModal. */
 @import '../Servers/DeleteServerModal.css';
+
+.confirm-action-extra-content {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
+}

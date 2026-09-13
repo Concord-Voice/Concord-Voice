@@ -7,6 +7,7 @@ import MessageInput from '../Chat/MessageInput';
 import TypingIndicator from '../Chat/TypingIndicator';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useUserStore } from '../../stores/auth/userStore';
+import { useAuthStore } from '../../stores/auth/authStore';
 import { useDMSubscription } from '../../hooks/messaging/useDMSubscription';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
@@ -19,6 +20,11 @@ import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { getThreadName } from '../../utils/messaging/dmThreadName';
 import GroupInfoPanel from './GroupInfoPanel';
 import VoiceView from '../Voice/VoiceView';
+import Modal from '../ui/Modal';
+import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
+import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
+import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
+import MessageExpirationPolicySummary from '../Expiration/MessageExpirationPolicySummary';
 import type { ChatContext } from '../../types/chat';
 import './DirectMessages.css';
 
@@ -27,6 +33,13 @@ interface DMChatAreaProps {
 }
 
 type VoiceJoinAvailability = 'available' | 'joining' | 'busy';
+
+interface DMPurgeTarget {
+  id: string;
+  name: string;
+  context: 'dm' | 'group';
+  role: 'admin' | 'member';
+}
 
 function voiceJoinButtonTitle(availability: VoiceJoinAvailability): string {
   if (availability === 'busy') return 'Another voice call is already in progress';
@@ -39,8 +52,11 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const [showPinnedPanel, setShowPinnedPanel] = useState(false);
   const [pinnedCount, setPinnedCount] = useState(0);
   const [pinRefreshKey, setPinRefreshKey] = useState(0);
+  const [showExpirationEditor, setShowExpirationEditor] = useState(false);
+  const [purgeTarget, setPurgeTarget] = useState<DMPurgeTarget | null>(null);
   const pinGenerationRef = useRef(0);
   const messageListRef = useRef<MessageListHandle>(null);
+  const expirationSummaryRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     return () => {
@@ -96,6 +112,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const conversations = useDMStore((s) => s.conversations);
   const clearUnread = useDMStore((s) => s.clearUnread);
   const user = useUserStore((s) => s.user);
+  const authGeneration = useAuthStore((s) => s.authGeneration);
   const dmPrivacyLevel = usePrivacyStore((s) => s.settings.dmPrivacyLevel);
 
   // Active-DM-call roster for the open conversation (#1219 R5). Drives the
@@ -122,6 +139,36 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const activeConv = conversations.find((c) => c.id === selectedThreadId);
   const currentUserId = user?.id || '';
   const threadName = getThreadName(activeConv, currentUserId);
+  const expirationScope =
+    activeConv && !activeConv.isPersonal ? { kind: 'dm' as const, id: activeConv.id } : null;
+  const expiration = useExpirationPolicy(expirationScope);
+  const currentParticipant = activeConv?.participants.find((p) => p.userId === currentUserId);
+  const canPurge = currentParticipant !== undefined;
+  const purgeRole = currentParticipant?.role === 'admin' ? 'admin' : 'member';
+
+  useEffect(() => {
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- close local controls when their conversation or auth owner changes
+    setShowExpirationEditor(false);
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- close local controls when their conversation or auth owner changes
+    setPurgeTarget(null);
+  }, [authGeneration, selectedThreadId]);
+
+  useEffect(() => {
+    if (!purgeTarget) return;
+    if (!canPurge || purgeTarget.id !== selectedThreadId || purgeTarget.role !== purgeRole) {
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- close destructive consent when the local role no longer matches the consented scope
+      setPurgeTarget(null);
+    }
+  }, [canPurge, purgeRole, purgeTarget, selectedThreadId]);
+
+  const reviewExpiration = () => {
+    if (expiration.canEdit) {
+      setShowExpirationEditor(true);
+      void expiration.onRefresh();
+      return;
+    }
+    expirationSummaryRef.current?.focus();
+  };
 
   // Hydrate the active-DM-call roster on conversation open (#1219 R4 / G4).
   // Live `dm_voice_state_update` deltas only populate the roster for events
@@ -368,6 +415,31 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
           )}
         </div>
 
+        {expirationScope && (
+          <MessageExpirationPolicySummary
+            ref={expirationSummaryRef}
+            policy={expiration.policy}
+            policyState={expiration.policyState}
+            showChangedNotice={expiration.showChangedNotice}
+            onReview={reviewExpiration}
+            onDismissNotice={expiration.onDismissNotice}
+            onManageMessages={
+              canPurge && activeConv
+                ? () =>
+                    setPurgeTarget({
+                      id: activeConv.id,
+                      name: threadName,
+                      context: activeConv.isGroup ? 'group' : 'dm',
+                      role: purgeRole,
+                    })
+                : undefined
+            }
+            manageMessagesUnavailableDescription={
+              canPurge ? undefined : 'You must be a member of this conversation to manage messages.'
+            }
+          />
+        )}
+
         {error && <div className="chat-error">{error}</div>}
 
         <div className="chat-messages" style={{ flex: 1, minHeight: 0 }}>
@@ -425,6 +497,37 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
         canPin={true}
         onUnpin={() => setPinnedCount((c) => Math.max(0, c - 1))}
       />
+
+      {expirationScope && (
+        <Modal
+          isOpen={showExpirationEditor}
+          onClose={() => setShowExpirationEditor(false)}
+          title="Message expiration"
+        >
+          <MessageExpirationEditor
+            scope={expirationScope}
+            policy={expiration.policy}
+            policyState={expiration.policyState}
+            canEdit={expiration.canEdit}
+            lockedDescription={expiration.lockedDescription}
+            onRefresh={expiration.onRefresh}
+            onApplyPolicy={expiration.onApplyPolicy}
+            onMarkSeen={expiration.onMarkSeen}
+            onClose={() => setShowExpirationEditor(false)}
+          />
+        </Modal>
+      )}
+
+      {purgeTarget && (
+        <PurgeMessagesModal
+          context={purgeTarget.context}
+          isOpen={true}
+          onClose={() => setPurgeTarget(null)}
+          scopeId={purgeTarget.id}
+          scopeName={purgeTarget.name}
+          role={purgeTarget.role}
+        />
+      )}
     </div>
   );
 };
