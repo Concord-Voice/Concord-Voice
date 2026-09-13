@@ -5,6 +5,7 @@ import {
   type PresenceTier,
   useRichPresenceStore,
 } from '../../stores/ui/richPresenceStore';
+import { getPresenceActivityAudience } from '../../utils/ui/richPresencePresentation';
 import CategoryManagerPanel from '../DirectMessages/CategoryManagerPanel';
 import CollapsibleSection from './CollapsibleSection';
 import PresenceExceptions from './PresenceExceptions';
@@ -62,23 +63,6 @@ const ACTIVITY_COPY: Record<ActivityCategory, ActivityCopy> = {
 const PRIVATE_CALL_WARNING =
   'Choosing Servers lets people who share a server with you learn that you are in a private call. It never shares participant names.';
 
-function activityAudience(category: ActivityCategory, tier: PresenceTier): string {
-  if (category === 'serverVoice') {
-    if (tier === 1) {
-      return 'Friends—and eligible friends-of-friends—who are in this server and can view this voice channel.';
-    }
-    if (tier === 2) return 'People in this server who can view this voice channel.';
-    return 'Nobody';
-  }
-  if (tier === 1) {
-    return 'People currently in this call, plus your friends and eligible friends-of-friends.';
-  }
-  if (tier === 2) {
-    return 'People currently in this call, plus your friends, eligible friends-of-friends, and people who share a server with you.';
-  }
-  return 'People currently in this private call.';
-}
-
 function activityExample(category: ActivityCategory, tier: PresenceTier, details: boolean): string {
   if (category === 'serverVoice') {
     if (tier === 0) return 'Nothing is broadcast.';
@@ -106,7 +90,10 @@ const ActivityCard: React.FC<ActivityCardProps> = ({
   const tier = category === 'serverVoice' ? settings.serverVoiceTier : settings.privateCallTier;
   const details =
     category === 'serverVoice' ? settings.serverVoiceShowDetails : settings.privateCallShowDetails;
-  const audience = settings.masterEnabled ? activityAudience(category, tier) : 'Nobody';
+  const audience = getPresenceActivityAudience(
+    category === 'serverVoice' ? 'server_voice' : 'private_call',
+    settings
+  );
   const example = settings.masterEnabled
     ? activityExample(category, tier, details)
     : 'Nothing is broadcast.';

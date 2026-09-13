@@ -1,11 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useId } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import { Settings } from 'lucide-react';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useSettingsOverlayStore } from '../../stores/ui/settingsOverlayStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useMemberStore, PresenceStatus } from '../../stores/chat/memberStore';
-import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import {
+  selectLocalRichPresenceActivity,
+  useRichPresenceStore,
+} from '../../stores/ui/richPresenceStore';
+import { useVoiceStore } from '../../stores/voice/voiceStore';
+import { presentSelfActivity } from '../../utils/ui/richPresencePresentation';
 import UserPopover from './UserPopover';
 import FeedbackModal from './FeedbackModal';
 import CustomStatusPopover from './CustomStatusPopover';
@@ -30,6 +36,51 @@ interface UserPanelProps {
   compact?: boolean;
 }
 
+interface UserPanelStatusProps {
+  activity: ReturnType<typeof presentSelfActivity>;
+  customText?: string;
+  customTextEmoji?: string;
+  status: PresenceStatus;
+  activityDescriptionId: string;
+}
+
+const UserPanelStatus: React.FC<UserPanelStatusProps> = ({
+  activity,
+  customText,
+  customTextEmoji,
+  status,
+  activityDescriptionId,
+}) => {
+  if (activity) {
+    return (
+      <span className="user-panel-activity" id={activityDescriptionId}>
+        <span className="user-panel-activity-headline">{activity.headline}</span>
+        <span className="user-panel-activity-policy">
+          <span>Eligible audience: {activity.eligibility}</span>
+          {activity.deliveryNote && (
+            <span className="user-panel-activity-note">{activity.deliveryNote}</span>
+          )}
+        </span>
+      </span>
+    );
+  }
+
+  if (customText) {
+    return (
+      <span className="user-panel-custom-status">
+        {customTextEmoji && (
+          <span className="user-panel-custom-status-emoji">{customTextEmoji}</span>
+        )}
+        <span className="user-panel-custom-status-text">{customText}</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className={`user-panel-status ${statusClassMap[status]}`}>{statusLabelMap[status]}</span>
+  );
+};
+
 const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
   const [isPopoverOpen, setIsPopoverOpen] = useState(false);
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
@@ -39,8 +90,23 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
   const isLoading = useUserStore((state) => state.isLoading);
   const fetchUser = useUserStore((state) => state.fetchUser);
   const selfStatus = useMemberStore((state) => state.selfStatus);
+  const confirmedPresenceSettings = useRichPresenceStore(
+    (state) => state.confirmedPresenceSettings
+  );
   const selfCustomText = useRichPresenceStore((state) => state.self.customText);
   const selfCustomTextEmoji = useRichPresenceStore((state) => state.self.customTextEmoji);
+  const selfActivityDescriptionId = useId();
+  const selfActivity = useVoiceStore(
+    useShallow((state) => {
+      if (compact) return null;
+
+      return presentSelfActivity(
+        selectLocalRichPresenceActivity(state),
+        confirmedPresenceSettings,
+        selfStatus
+      );
+    })
+  );
 
   // Fetch user data if not already loaded (e.g., on page refresh)
   useEffect(() => {
@@ -106,6 +172,7 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
               onClick={handleTogglePopover}
               title={user.username}
               aria-label={`User menu for ${user.username}`}
+              aria-describedby={selfActivity ? selfActivityDescriptionId : undefined}
             >
               <span className={avatarClassName} aria-hidden="true">
                 {avatarContent}
@@ -113,20 +180,13 @@ const UserPanel: React.FC<UserPanelProps> = ({ compact = false }) => {
               <span className="user-panel-info">
                 <span className="user-panel-username">{user.username}</span>
                 <span className="user-panel-status-line">
-                  {selfCustomText ? (
-                    <span className="user-panel-custom-status">
-                      {selfCustomTextEmoji && (
-                        <span className="user-panel-custom-status-emoji">
-                          {selfCustomTextEmoji}
-                        </span>
-                      )}
-                      <span className="user-panel-custom-status-text">{selfCustomText}</span>
-                    </span>
-                  ) : (
-                    <span className={`user-panel-status ${statusClassMap[selfStatus]}`}>
-                      {statusLabelMap[selfStatus]}
-                    </span>
-                  )}
+                  <UserPanelStatus
+                    activity={selfActivity}
+                    customText={selfCustomText}
+                    customTextEmoji={selfCustomTextEmoji}
+                    status={selfStatus}
+                    activityDescriptionId={selfActivityDescriptionId}
+                  />
                 </span>
               </span>
             </button>

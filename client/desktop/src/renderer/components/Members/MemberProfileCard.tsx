@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
+import React, { useEffect, useId, useRef, useState, useLayoutEffect } from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { PresenceStatus } from '../../stores/chat/memberStore';
-import { selectCustomText, useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { useUserStore } from '../../stores/auth/userStore';
 import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
 import { EMPTY_USER_THEME_SCOPE, useUserThemeScope } from '../../hooks/ui/useUserThemeScope';
+import { presentRemoteActivities } from '../../utils/ui/richPresencePresentation';
 import SendFriendRequestButton from './SendFriendRequestButton';
 import { useFriendRequestState } from '../../hooks/messaging/useFriendRequestState';
 import './MemberProfileCard.css';
@@ -40,8 +41,9 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
   onViewFullProfile,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
-  // Selective subscription: this member's custom-text status (undefined if none).
-  const customText = useRichPresenceStore(selectCustomText(member.user_id));
+  const presenceEntries = useRichPresenceStore((state) => state.otherByUser[member.user_id]);
+  const activities = presentRemoteActivities(presenceEntries);
+  const nowHeadingId = useId();
   const currentUserId = useUserStore((s) => s.user?.id);
   // Drives whether the friend-request row renders at all (hidden for self).
   const { visible: friendActionVisible } = useFriendRequestState(member.user_id);
@@ -80,9 +82,9 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
 
   useLayoutEffect(() => {
     if (!cardRef.current) return;
-    const rect = cardRef.current.getBoundingClientRect();
-    const cardW = rect.width;
-    const cardH = rect.height;
+    // Use layout dimensions so the entry scale transform cannot make the clamp stale.
+    const cardW = cardRef.current.offsetWidth;
+    const cardH = cardRef.current.offsetHeight;
     const vw = globalThis.innerWidth;
     const vh = globalThis.innerHeight;
 
@@ -111,9 +113,9 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
       top = PADDING;
     }
 
-    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: clamps card position to viewport after layout measurement; fires in useLayoutEffect on position change, not on every render
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: clamps card position to viewport after layout measurement; fires in useLayoutEffect on position or presence-entry changes, not on every render
     setAdjustedPos({ top, left });
-  }, [position]);
+  }, [position, presenceEntries]);
 
   const formatDate = (dateStr: string): string => {
     const date = new Date(dateStr);
@@ -225,16 +227,46 @@ const MemberProfileCard: React.FC<MemberProfileCardProps> = ({
             </span>
           </div>
 
-          {customText && (
-            <div className="member-profile-detail-row">
-              <span className="member-profile-detail-label">Custom Status</span>
-              <span className="member-profile-detail-value member-profile-custom-status">
-                {customText.emoji && (
-                  <span className="member-profile-custom-status-emoji">{customText.emoji}</span>
-                )}
-                <span className="member-profile-custom-status-text">{customText.text}</span>
-              </span>
-            </div>
+          {activities.length > 0 && (
+            <section className="member-profile-now" aria-labelledby={nowHeadingId}>
+              <h2 id={nowHeadingId} className="member-profile-detail-label">
+                Now
+              </h2>
+              <ul className="member-profile-now-list">
+                {activities.map((activity) => (
+                  <li className="member-profile-detail-row" key={activity.category}>
+                    <span className="member-profile-detail-label">{activity.label}</span>
+                    {activity.category === 'custom_text' ? (
+                      <span className="member-profile-detail-value member-profile-custom-status">
+                        {activity.emoji && (
+                          <span className="member-profile-custom-status-emoji">
+                            {activity.emoji}
+                          </span>
+                        )}
+                        <span className="member-profile-custom-status-text">
+                          {activity.headline}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="member-profile-detail-value member-profile-activity-value">
+                        <span className="member-profile-activity-headline">
+                          {activity.headline}
+                        </span>
+                        {activity.minimized ? (
+                          <span className="member-profile-activity-marker">Details hidden</span>
+                        ) : (
+                          activity.detail && (
+                            <span className="member-profile-activity-detail">
+                              {activity.detail}
+                            </span>
+                          )
+                        )}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
           )}
 
           {member.joined_at && (

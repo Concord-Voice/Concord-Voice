@@ -1,9 +1,13 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { act, render, screen, fireEvent } from '../../../test-utils';
+import { Profiler } from 'react';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useMemberStore } from '@/renderer/stores/chat/memberStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useRichPresenceStore } from '@/renderer/stores/ui/richPresenceStore';
 import { useSettingsOverlayStore } from '@/renderer/stores/ui/settingsOverlayStore';
 import { mockUser } from '../../../mocks/fixtures';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock UserPopover — minimal stub exposing the close + onOpenFeedback paths.
 // The onOpenFeedback button mirrors the real popover's "Bug Report / Feature
@@ -68,6 +72,7 @@ import UserPanel from '@/renderer/components/User/UserPanel';
 describe('UserPanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAllStores();
     useAuthStore.getState().setAccessToken('mock-token');
     useUserStore.setState({ user: mockUser, isLoading: false });
     useMemberStore.setState({ selfStatus: 'online' });
@@ -86,6 +91,160 @@ describe('UserPanel', () => {
   it('renders status text', () => {
     render(<UserPanel />);
     expect(screen.getByText('Online')).toBeInTheDocument();
+  });
+
+  it('renders confirmed audience copy for connected server voice activity', () => {
+    render(<UserPanel />);
+    const button = screen.getByRole('button', { name: 'User menu for testuser' });
+    button.focus();
+    expect(button).toHaveFocus();
+
+    const settings = {
+      masterEnabled: true,
+      serverVoiceTier: 2 as const,
+      serverVoiceShowDetails: true,
+      privateCallTier: 1 as const,
+      privateCallShowDetails: false,
+      customTextTier: 0 as const,
+    };
+    act(() => {
+      useMemberStore.setState({ selfStatus: 'online' });
+      useVoiceStore.setState({
+        activeChannelId: '11111111-1111-4111-8111-111111111111',
+        activeChannelName: 'Lobby',
+        activeServerId: '22222222-2222-4222-8222-222222222222',
+        connectionState: 'connected',
+        callState: { kind: 'idle' },
+      });
+      useRichPresenceStore.setState({
+        presenceSettings: settings,
+        confirmedPresenceSettings: settings,
+      });
+    });
+
+    expect(screen.getByText('In voice')).toBeInTheDocument();
+    expect(
+      screen.getByText('Eligible audience: People in this server who can view this voice channel.')
+    ).toBeInTheDocument();
+    const descriptionId = button.getAttribute('aria-describedby');
+    expect(descriptionId).toBeTruthy();
+    expect(document.getElementById(descriptionId as string)?.textContent).toContain(
+      'Eligible audience: People in this server who can view this voice channel.'
+    );
+    expect(screen.getByRole('button', { name: 'User menu for testuser' })).not.toHaveTextContent(
+      'Lobby'
+    );
+    expect(document.body.textContent).not.toContain('11111111-1111-4111-8111-111111111111');
+    expect(document.body.textContent).not.toContain('22222222-2222-4222-8222-222222222222');
+    expect(button).toHaveFocus();
+  });
+
+  it('uses confirmed settings and fixed delivery notes for Invisible activity', () => {
+    useMemberStore.setState({ selfStatus: 'invisible' });
+    useVoiceStore.setState({
+      activeChannelId: '11111111-1111-4111-8111-111111111111',
+      activeChannelName: 'Lobby',
+      activeServerId: '22222222-2222-4222-8222-222222222222',
+      connectionState: 'connected',
+      callState: { kind: 'idle' },
+    });
+    useRichPresenceStore.setState({
+      presenceSettings: {
+        masterEnabled: true,
+        serverVoiceTier: 2,
+        serverVoiceShowDetails: true,
+        privateCallTier: 1,
+        privateCallShowDetails: false,
+        customTextTier: 0,
+      },
+      confirmedPresenceSettings: null,
+    });
+
+    render(<UserPanel />);
+
+    expect(screen.getByText('Eligible audience: Audience unavailable')).toBeInTheDocument();
+    expect(screen.getByText('Not currently shared while Invisible')).toBeInTheDocument();
+  });
+
+  it('uses confirmed settings for an active group call and reports the Offline note', () => {
+    useMemberStore.setState({ selfStatus: 'offline' });
+    useVoiceStore.getState().setDMCall(true, 'group-1');
+    useVoiceStore.getState().setGroupDMInfo(true, 'caller');
+    useVoiceStore.getState().setCallState({ kind: 'in-call' });
+    useVoiceStore.setState({
+      connectionState: 'connected',
+      participants: { peer1: {}, peer2: {} },
+    });
+    const confirmed = {
+      masterEnabled: true,
+      serverVoiceTier: 2 as const,
+      serverVoiceShowDetails: true,
+      privateCallTier: 0 as const,
+      privateCallShowDetails: false,
+      customTextTier: 0 as const,
+    };
+    useRichPresenceStore.setState({
+      presenceSettings: { ...confirmed, privateCallTier: 2 },
+      confirmedPresenceSettings: confirmed,
+    });
+
+    render(<UserPanel />);
+
+    expect(screen.getByText('In a group call')).toBeInTheDocument();
+    expect(
+      screen.getByText('Eligible audience: People currently in this private call.')
+    ).toBeInTheDocument();
+    expect(screen.getByText('Not currently shared while Offline')).toBeInTheDocument();
+  });
+
+  it('avoids voice metadata renders while retaining activity and compact transitions', () => {
+    let normalCommits = 0;
+    render(
+      <Profiler id="normal-user-panel" onRender={() => normalCommits++}>
+        <UserPanel />
+      </Profiler>
+    );
+    const normalBaseline = normalCommits;
+
+    act(() => {
+      useVoiceStore.getState().upsertParticipant('peer-1', { username: 'Peer' });
+      useVoiceStore.getState().updateParticipant('peer-1', { isMuted: true });
+      useVoiceStore.getState().setActiveSpeaker('peer-1');
+    });
+    expect(normalCommits).toBe(normalBaseline);
+
+    act(() => {
+      useVoiceStore.setState({
+        activeChannelId: 'channel-1',
+        activeChannelName: 'Lobby',
+        activeServerId: 'server-1',
+        connectionState: 'connected',
+        callState: { kind: 'idle' },
+      });
+    });
+    expect(normalCommits).toBeGreaterThan(normalBaseline);
+    expect(screen.getByText('In voice')).toBeInTheDocument();
+
+    const connectedNormalBaseline = normalCommits;
+    act(() => {
+      useVoiceStore.getState().updateParticipant('peer-1', { isMuted: false });
+      useVoiceStore.getState().setActiveSpeaker(null);
+    });
+    expect(normalCommits).toBe(connectedNormalBaseline);
+
+    let compactCommits = 0;
+    render(
+      <Profiler id="compact-user-panel" onRender={() => compactCommits++}>
+        <UserPanel compact />
+      </Profiler>
+    );
+    const compactBaseline = compactCommits;
+    act(() => {
+      useVoiceStore.getState().updateParticipant('peer-1', { isDeafened: true });
+      useVoiceStore.getState().setActiveSpeaker(null);
+      useVoiceStore.setState({ activeChannelId: null, callState: { kind: 'idle' } });
+    });
+    expect(compactCommits).toBe(compactBaseline);
   });
 
   it('shows DND status', () => {

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { act, render, screen, fireEvent } from '../../../test-utils';
 import MemberProfileCard from '@/renderer/components/Members/MemberProfileCard';
 import { mockMember } from '../../../mocks/fixtures';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -206,6 +206,261 @@ describe('MemberProfileCard', () => {
     expect(screen.getByText('Custom Status')).toBeInTheDocument();
     expect(screen.getByText('Listening to music')).toBeInTheDocument();
     expect(screen.getByText('🎧')).toBeInTheDocument();
+  });
+
+  it('renders the ordered Now activity list without duplicating Custom Status', () => {
+    useRichPresenceStore.getState().setOtherPresence(mockMember.user_id, {
+      category: 'server_voice',
+      minimized: false,
+      payload: {
+        channel_id: '11111111-1111-4111-8111-111111111111',
+        channel_name: 'Lobby',
+        server_id: '22222222-2222-4222-8222-222222222222',
+        server_name: 'Concord',
+      },
+      updated_at: 1,
+    });
+    useRichPresenceStore.getState().setOtherPresence(mockMember.user_id, {
+      category: 'private_call',
+      minimized: false,
+      payload: { call_type: 'group', participant_count: 3 },
+      updated_at: 1,
+    });
+    useRichPresenceStore.getState().setCustomText(mockMember.user_id, {
+      emoji: '🎧',
+      text: 'Listening to music',
+    });
+
+    render(<MemberProfileCard {...defaultProps} />);
+
+    const section = screen.getByRole('region', { name: 'Now' });
+    expect(section).toBeInTheDocument();
+    expect(screen.getAllByText('Custom Status')).toHaveLength(1);
+    expect(Array.from(section.querySelectorAll('li')).map((item) => item.textContent)).toEqual([
+      expect.stringContaining('In voice'),
+      expect.stringContaining('In a group call'),
+      expect.stringContaining('Listening to music'),
+    ]);
+  });
+
+  it('gives each mounted Now section its own labelled heading', () => {
+    const secondMember = { ...defaultProps.member, user_id: 'other-user', username: 'otheruser' };
+    useRichPresenceStore.getState().setOtherPresence(mockMember.user_id, {
+      category: 'server_voice',
+      minimized: false,
+      payload: {
+        channel_id: 'channel-1',
+        channel_name: 'Lobby',
+        server_id: 'server-1',
+        server_name: 'Concord',
+      },
+      updated_at: 1,
+    });
+    useRichPresenceStore.getState().setOtherPresence(secondMember.user_id, {
+      category: 'private_call',
+      minimized: false,
+      payload: { call_type: 'dm' },
+      updated_at: 1,
+    });
+
+    render(
+      <>
+        <MemberProfileCard {...defaultProps} />
+        <MemberProfileCard {...defaultProps} member={secondMember} />
+      </>
+    );
+
+    const sections = screen.getAllByRole('region', { name: 'Now' });
+    expect(sections).toHaveLength(2);
+    const headingIds = sections.map((section) => section.getAttribute('aria-labelledby'));
+    expect(new Set(headingIds).size).toBe(2);
+    for (const [index, section] of sections.entries()) {
+      const headingId = headingIds[index];
+      expect(headingId).toBeTruthy();
+      const heading = document.getElementById(headingId as string);
+      expect(heading).toHaveTextContent('Now');
+      expect(section.contains(heading)).toBe(true);
+    }
+  });
+
+  it('reclamps a subscribed card when a live snapshot increases measured height', () => {
+    const measuredHeight = vi
+      .spyOn(HTMLElement.prototype, 'offsetHeight', 'get')
+      .mockImplementation(function () {
+        if (!this.classList.contains('member-profile-card')) return 0;
+        return this.querySelector('.member-profile-now-list') ? 500 : 100;
+      });
+    const measuredWidth = vi
+      .spyOn(HTMLElement.prototype, 'offsetWidth', 'get')
+      .mockImplementation(function () {
+        return this.classList.contains('member-profile-card') ? 300 : 0;
+      });
+    try {
+      const { container } = render(
+        <MemberProfileCard {...defaultProps} position={{ x: 300, y: 600 }} />
+      );
+      const card = container.querySelector('.member-profile-card') as HTMLElement;
+      const initialTop = Number.parseFloat(card.style.top);
+
+      act(() => {
+        useRichPresenceStore.getState().replaceOtherPresence({
+          [mockMember.user_id]: {
+            server_voice: {
+              category: 'server_voice',
+              minimized: false,
+              payload: {
+                channel_id: 'channel-1',
+                channel_name: 'Lobby',
+                server_id: 'server-1',
+                server_name: 'Concord',
+              },
+              updated_at: 1,
+            },
+            private_call: {
+              category: 'private_call',
+              minimized: false,
+              payload: { call_type: 'group', participant_count: 3 },
+              updated_at: 1,
+            },
+          },
+        });
+      });
+
+      const updatedTop = Number.parseFloat(card.style.top);
+      expect(updatedTop).toBeLessThan(initialTop);
+      expect(updatedTop + 500).toBeLessThanOrEqual(globalThis.innerHeight - 8);
+    } finally {
+      measuredHeight.mockRestore();
+      measuredWidth.mockRestore();
+    }
+  });
+
+  it('uses a fixed minimized marker and omits source detail values', () => {
+    useRichPresenceStore.getState().setOtherPresence(mockMember.user_id, {
+      category: 'server_voice',
+      minimized: true,
+      payload: {
+        channel_id: '11111111-1111-4111-8111-111111111111',
+        channel_name: 'Hidden Lobby',
+        server_id: '22222222-2222-4222-8222-222222222222',
+        server_name: 'Hidden Server',
+      },
+      updated_at: 1,
+    });
+
+    const { container } = render(<MemberProfileCard {...defaultProps} />);
+
+    expect(screen.getByText('Details hidden')).toBeInTheDocument();
+    expect(container.textContent).not.toContain('Hidden Lobby');
+    expect(container.textContent).not.toContain('Hidden Server');
+    expect(screen.queryByText('11111111-1111-4111-8111-111111111111')).not.toBeInTheDocument();
+    expect(screen.queryByText('22222222-2222-4222-8222-222222222222')).not.toBeInTheDocument();
+    for (const element of document.querySelectorAll('*')) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toContain('11111111-1111-4111-8111-111111111111');
+        expect(attribute.value).not.toContain('22222222-2222-4222-8222-222222222222');
+        expect(attribute.value).not.toContain('Hidden Lobby');
+        expect(attribute.value).not.toContain('Hidden Server');
+      }
+    }
+    expect(screen.queryByText('Hidden Lobby')).not.toBeInTheDocument();
+    expect(screen.queryByText('Hidden Server')).not.toBeInTheDocument();
+  });
+
+  it('does not expose private-call identities or minimized participant counts', () => {
+    useRichPresenceStore.getState().setOtherPresence(mockMember.user_id, {
+      category: 'private_call',
+      minimized: true,
+      payload: Object.assign(
+        { call_type: 'group' as const, participant_count: 7 },
+        { participant_names: ['Alice Example', 'Bob Example'], participant_ids: ['alice-id'] }
+      ),
+      updated_at: 1,
+    });
+
+    const { container } = render(<MemberProfileCard {...defaultProps} />);
+
+    expect(container.textContent).not.toContain('Alice Example');
+    expect(container.textContent).not.toContain('Bob Example');
+    expect(container.textContent).not.toContain('alice-id');
+    expect(container.textContent).not.toContain('With 7 people');
+    for (const element of container.querySelectorAll('*')) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toContain('Alice Example');
+        expect(attribute.value).not.toContain('Bob Example');
+        expect(attribute.value).not.toContain('alice-id');
+        expect(attribute.value).not.toContain('With 7 people');
+      }
+    }
+  });
+
+  it('removes the Now section when the replacement snapshot has no activities', () => {
+    useRichPresenceStore.getState().setCustomText(mockMember.user_id, { text: 'Available' });
+    render(<MemberProfileCard {...defaultProps} />);
+    expect(screen.getByText('Custom Status')).toBeInTheDocument();
+
+    act(() => {
+      useRichPresenceStore.getState().replaceOtherPresence({});
+    });
+
+    expect(screen.queryByRole('region', { name: 'Now' })).not.toBeInTheDocument();
+  });
+
+  it('tracks category replacement, clear, and store reset without stale activity', () => {
+    const userId = mockMember.user_id;
+    useRichPresenceStore.getState().setOtherPresence(userId, {
+      category: 'server_voice',
+      minimized: false,
+      payload: {
+        channel_id: '11111111-1111-4111-8111-111111111111',
+        channel_name: 'Old Lobby',
+        server_id: '22222222-2222-4222-8222-222222222222',
+        server_name: 'Old Server',
+      },
+      updated_at: 1,
+    });
+    render(<MemberProfileCard {...defaultProps} />);
+    expect(screen.getByText('Old Lobby · Old Server')).toBeInTheDocument();
+
+    act(() => {
+      useRichPresenceStore.getState().setOtherPresence(userId, {
+        category: 'server_voice',
+        minimized: false,
+        payload: {
+          channel_id: '33333333-3333-4333-8333-333333333333',
+          channel_name: 'New Lobby',
+          server_id: '44444444-4444-4444-8444-444444444444',
+          server_name: 'New Server',
+        },
+        updated_at: 2,
+      });
+    });
+    expect(screen.getByText('New Lobby · New Server')).toBeInTheDocument();
+    expect(screen.queryByText('Old Lobby · Old Server')).not.toBeInTheDocument();
+
+    act(() => {
+      useRichPresenceStore.getState().clearOtherPresence(userId, 'server_voice');
+    });
+    expect(screen.queryByRole('region', { name: 'Now' })).not.toBeInTheDocument();
+
+    act(() => {
+      useRichPresenceStore.getState().setCustomText(userId, { text: 'Reset me' });
+    });
+    expect(screen.getByRole('region', { name: 'Now' })).toBeInTheDocument();
+    act(() => {
+      useRichPresenceStore.getState().reset();
+    });
+    expect(screen.queryByRole('region', { name: 'Now' })).not.toBeInTheDocument();
+  });
+
+  it('keeps markup-looking Custom Status text as literal React text', () => {
+    const literal = '<img src=x onerror=alert(1)>';
+    useRichPresenceStore.getState().setCustomText(mockMember.user_id, { text: literal });
+
+    const { container } = render(<MemberProfileCard {...defaultProps} />);
+
+    expect(screen.getByText(literal)).toBeInTheDocument();
+    expect(container.querySelector('img[src="x"]')).not.toBeInTheDocument();
   });
 
   it('does not render a Custom Status row when the store has no entry', () => {

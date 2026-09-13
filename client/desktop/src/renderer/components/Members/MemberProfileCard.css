@@ -1,7 +1,10 @@
 /* ─── Member Profile Card ───────────────────────────────────────────────── */
 
 .member-profile-card {
+  display: flex;
+  flex-direction: column;
   width: 280px;
+  max-height: calc(100vh - (16px * var(--sp, 1)));
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -25,6 +28,7 @@
 
 .member-profile-banner {
   height: 60px;
+  flex-shrink: 0;
   background: var(--gradient-brand);
   opacity: 0.6;
 }
@@ -44,6 +48,7 @@
 
 .member-profile-header {
   display: flex;
+  flex-shrink: 0;
   padding: 0 calc(16px * var(--sp, 1));
   margin-top: -24px;
 }
@@ -106,7 +111,28 @@
 /* ─── Body ──────────────────────────────────────────────────────────────── */
 
 .member-profile-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: calc(12px * var(--sp, 1)) calc(16px * var(--sp, 1)) calc(16px * var(--sp, 1));
+}
+
+.member-profile-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.member-profile-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.member-profile-body::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.member-profile-body::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
 }
 
 .member-profile-name {
@@ -170,14 +196,71 @@
   color: var(--text-muted);
 }
 
-/* Custom Status detail row (#1233) — emoji + text, right-aligned, clamped. */
+.member-profile-now {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+}
+
+.member-profile-now .member-profile-detail-label {
+  color: var(--text-secondary);
+}
+
+.member-profile-now h2 {
+  margin: 0;
+}
+
+.member-profile-now-list {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--sp, 1));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.member-profile-now-list .member-profile-detail-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: calc(4px * var(--sp, 1));
+}
+
+.member-profile-activity-value {
+  display: flex;
+  flex-direction: column;
+  gap: calc(4px * var(--sp, 1));
+  min-width: 0;
+  max-width: none;
+  width: 100%;
+  align-items: flex-start;
+  justify-content: flex-start;
+  overflow-wrap: anywhere;
+}
+
+.member-profile-activity-headline,
+.member-profile-activity-detail,
+.member-profile-activity-marker {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.member-profile-activity-detail {
+  color: var(--text-secondary);
+}
+
+.member-profile-activity-marker {
+  color: var(--text-secondary);
+}
+
+/* Custom Status detail row (#1233) — emoji + text, full-width with text clamping. */
 .member-profile-custom-status {
   display: flex;
   align-items: center;
   gap: 4px;
   min-width: 0;
-  max-width: 60%;
-  justify-content: flex-end;
+  max-width: none;
+  width: 100%;
+  justify-content: flex-start;
 }
 
 .member-profile-custom-status-emoji {

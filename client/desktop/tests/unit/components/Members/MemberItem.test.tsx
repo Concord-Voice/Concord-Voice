@@ -147,6 +147,88 @@ describe('MemberItem', () => {
     expect(container.querySelector('.member-custom-status-emoji')).not.toBeInTheDocument();
   });
 
+  it('renders the highest-priority remote activity and the delivered remainder count', () => {
+    useRichPresenceStore.getState().setOtherPresence('u1', {
+      category: 'private_call',
+      minimized: true,
+      payload: { call_type: 'dm' },
+      updated_at: 1,
+    });
+    useRichPresenceStore.getState().setOtherPresence('u1', {
+      category: 'server_voice',
+      minimized: false,
+      payload: {
+        channel_id: '11111111-1111-4111-8111-111111111111',
+        channel_name: 'Lobby',
+        server_id: '22222222-2222-4222-8222-222222222222',
+        server_name: 'Concord',
+      },
+      updated_at: 1,
+    });
+    useRichPresenceStore.getState().setCustomText('u1', { emoji: '🎮', text: 'Gaming' });
+
+    render(<MemberItem {...defaultProps} member={makeMember({ user_id: 'u1' })} />);
+
+    expect(screen.getByText('In voice')).toBeInTheDocument();
+    expect(screen.getByText('+2')).toHaveAttribute('aria-hidden', 'true');
+    expect(
+      screen.getByRole('button', { name: /plus 2 additional activities/ })
+    ).toBeInTheDocument();
+  });
+
+  it('does not expose private-call identities or minimized participant counts', () => {
+    useRichPresenceStore.getState().setOtherPresence('u1', {
+      category: 'private_call',
+      minimized: true,
+      payload: Object.assign(
+        { call_type: 'group' as const, participant_count: 7 },
+        { participant_names: ['Alice Example', 'Bob Example'], participant_ids: ['alice-id'] }
+      ),
+      updated_at: 1,
+    });
+
+    const { container } = render(
+      <MemberItem {...defaultProps} member={makeMember({ user_id: 'u1' })} />
+    );
+
+    expect(container.textContent).not.toContain('Alice Example');
+    expect(container.textContent).not.toContain('Bob Example');
+    expect(container.textContent).not.toContain('alice-id');
+    expect(container.textContent).not.toContain('With 7 people');
+    for (const element of container.querySelectorAll('*')) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toContain('Alice Example');
+        expect(attribute.value).not.toContain('Bob Example');
+        expect(attribute.value).not.toContain('alice-id');
+        expect(attribute.value).not.toContain('With 7 people');
+      }
+    }
+  });
+
+  it('keeps compact rows avatar-only even when activities are delivered', () => {
+    useRichPresenceStore.getState().setOtherPresence('u1', {
+      category: 'server_voice',
+      minimized: false,
+      payload: {
+        channel_id: '11111111-1111-4111-8111-111111111111',
+        channel_name: 'Lobby',
+        server_id: '22222222-2222-4222-8222-222222222222',
+        server_name: 'Concord',
+      },
+      updated_at: 1,
+    });
+    useRichPresenceStore.getState().setCustomText('u1', {
+      text: '<img src=x onerror=alert(1)>',
+    });
+
+    const { container } = render(
+      <MemberItem {...defaultProps} member={makeMember({ user_id: 'u1' })} compact />
+    );
+
+    expect(container.textContent).not.toContain('In voice');
+    expect(container.textContent).not.toContain('+1');
+  });
+
   it('renders nothing for custom status when the store has no entry (#1233)', () => {
     const { container } = render(
       <MemberItem {...defaultProps} member={makeMember({ user_id: 'u1' })} />

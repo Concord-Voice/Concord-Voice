@@ -1,8 +1,9 @@
 import React from 'react';
 import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { ServerMember, PresenceStatus } from '../../stores/chat/memberStore';
-import { selectCustomText, useRichPresenceStore } from '../../stores/ui/richPresenceStore';
+import { useRichPresenceStore } from '../../stores/ui/richPresenceStore';
 import { resolveUserAccentColors } from '../../utils/ui/schemeColors';
+import { presentRemoteActivities } from '../../utils/ui/richPresencePresentation';
 
 interface MemberItemProps {
   member: ServerMember;
@@ -26,8 +27,10 @@ const MemberItem: React.FC<MemberItemProps> = ({
   compact = false,
 }) => {
   const memberColors = resolveUserAccentColors(member.color_scheme);
-  // Selective subscription: only this member's custom-text status (undefined if none).
-  const customText = useRichPresenceStore(selectCustomText(member.user_id));
+  const presenceEntries = useRichPresenceStore((state) => state.otherByUser[member.user_id]);
+  const activities = presentRemoteActivities(presenceEntries);
+  const primaryActivity = activities[0];
+  const additionalActivityCount = Math.max(activities.length - 1, 0);
   const topDisplayRole = member.roles?.length
     ? ([...member.roles]
         .filter((r) => r.display_separately)
@@ -68,12 +71,35 @@ const MemberItem: React.FC<MemberItemProps> = ({
           <span className="member-username" style={roleColor ? { color: roleColor } : undefined}>
             {displayName}
           </span>
-          {customText && (
-            <span className="member-custom-status">
-              {customText.emoji && (
-                <span className="member-custom-status-emoji">{customText.emoji}</span>
+          {primaryActivity && (
+            <span className="member-rich-presence">
+              <span className="member-rich-presence-main">
+                {primaryActivity.category === 'custom_text' ? (
+                  <span className="member-custom-status">
+                    {primaryActivity.emoji && (
+                      <span className="member-custom-status-emoji">{primaryActivity.emoji}</span>
+                    )}
+                    <span className="member-custom-status-text">{primaryActivity.headline}</span>
+                  </span>
+                ) : (
+                  <>
+                    <span className="member-rich-presence-headline">
+                      {primaryActivity.headline}
+                    </span>
+                    {primaryActivity.detail && (
+                      <span className="member-rich-presence-detail">{primaryActivity.detail}</span>
+                    )}
+                  </>
+                )}
+              </span>
+              {additionalActivityCount > 0 && (
+                <span className="member-rich-presence-count">
+                  <span aria-hidden="true">+{additionalActivityCount}</span>
+                  <span className="sr-only">
+                    plus {additionalActivityCount} additional activities
+                  </span>
+                </span>
               )}
-              <span className="member-custom-status-text">{customText.text}</span>
             </span>
           )}
         </div>
