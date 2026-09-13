@@ -239,7 +239,11 @@ func (h *Handler) ListSessions(c *gin.Context) {
 		return
 	}
 
-	pastSessions := h.fetchPastSessions(userID.(string))
+	pastSessions, err := h.fetchPastSessions(userID.(string))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchSessions})
+		return
+	}
 	mode := h.getUserRevocationMode(c.Request.Context(), userID.(string))
 
 	c.JSON(http.StatusOK, gin.H{
@@ -252,8 +256,21 @@ func (h *Handler) ListSessions(c *gin.Context) {
 
 // fetchActiveSessions queries active (non-revoked, non-expired) sessions for a user.
 func (h *Handler) fetchActiveSessions(uid, currentTokenHash string) ([]gin.H, error) {
+	// Absent metadata normalizes to "" — the DISPLAY treatment, which
+	// maskIPAddress then renders as "unknown". The SSO adapter inserts rows
+	// omitting device_name, ip_address and user_agent, and database/sql refuses
+	// NULL -> string, so before #3290 every SSO session was silently dropped by
+	// the scan-error path below while this endpoint still returned 200.
+	//
+	// host() rather than ::text, measured through lib/pq: a bare inet column
+	// renders via inet_out as "192.168.1.42", while ip_address::text yields
+	// "192.168.1.42/32" — which net.ParseIP rejects, making maskIPAddress
+	// return "unknown" for every session on the list. host() is byte-identical
+	// to what this reader receives today, so only the NULL case changes.
 	rows, err := h.db.Query(
-		`SELECT id, token_hash, device_name, ip_address, user_agent, expires_at, created_at, last_used_at, remember_me, COALESCE(machine_id, '')
+		`SELECT id, token_hash,
+		        COALESCE(device_name, ''), COALESCE(host(ip_address), ''), COALESCE(user_agent, ''),
+		        expires_at, created_at, last_used_at, remember_me, COALESCE(machine_id, '')
 		 FROM refresh_tokens
 		 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
 		 ORDER BY last_used_at DESC`,
@@ -270,8 +287,11 @@ func (h *Handler) fetchActiveSessions(uid, currentTokenHash string) ([]gin.H, er
 		var s models.RefreshToken
 		if err := rows.Scan(&s.ID, &s.TokenHash, &s.DeviceName, &s.IPAddress, &s.UserAgent,
 			&s.ExpiresAt, &s.CreatedAt, &s.LastUsedAt, &s.RememberMe, &s.MachineID); err != nil {
+			// Fail closed. A session the user cannot see is a session they
+			// cannot revoke, so a truncated list rendered as complete is a
+			// worse outcome than a 500 (#3290).
 			h.log.Error("Failed to scan session", "error", err)
-			continue
+			return nil, err
 		}
 		activeSessions = append(activeSessions, gin.H{
 			"id": s.ID, "device_name": s.DeviceName, "ip_address": maskIPAddress(s.IPAddress),
@@ -288,9 +308,12 @@ func (h *Handler) fetchActiveSessions(uid, currentTokenHash string) ([]gin.H, er
 }
 
 // fetchPastSessions queries recently-revoked sessions (last 30 days) for a user.
-func (h *Handler) fetchPastSessions(uid string) []gin.H {
+func (h *Handler) fetchPastSessions(uid string) ([]gin.H, error) {
+	// Same normalization and the same host() reasoning as fetchActiveSessions
+	// above (#3290).
 	pastRows, err := h.db.Query(
-		`SELECT id, device_name, ip_address, user_agent, created_at, last_used_at, revoked_at
+		`SELECT id, COALESCE(device_name, ''), COALESCE(host(ip_address), ''), COALESCE(user_agent, ''),
+		        created_at, last_used_at, revoked_at
 		 FROM refresh_tokens
 		 WHERE user_id = $1 AND revoked_at IS NOT NULL AND revoked_at > NOW() - INTERVAL '30 days'
 		 ORDER BY revoked_at DESC
@@ -299,7 +322,7 @@ func (h *Handler) fetchPastSessions(uid string) []gin.H {
 	)
 	if err != nil {
 		h.log.Error("Failed to fetch past sessions", "error", err)
-		return []gin.H{}
+		return nil, err
 	}
 	defer func() { _ = pastRows.Close() }()
 
@@ -308,8 +331,10 @@ func (h *Handler) fetchPastSessions(uid string) []gin.H {
 		var s models.RefreshToken
 		if err := pastRows.Scan(&s.ID, &s.DeviceName, &s.IPAddress, &s.UserAgent,
 			&s.CreatedAt, &s.LastUsedAt, &s.RevokedAt); err != nil {
+			// Fail closed, for the same reason as the active list: a partial
+			// history rendered as complete is the same lie in a quieter place.
 			h.log.Error("Failed to scan past session", "error", err)
-			continue
+			return nil, err
 		}
 		pastSessions = append(pastSessions, gin.H{
 			"id": s.ID, "device_name": s.DeviceName, "ip_address": maskIPAddress(s.IPAddress),
@@ -317,7 +342,13 @@ func (h *Handler) fetchPastSessions(uid string) []gin.H {
 			"revoked_at": s.RevokedAt,
 		})
 	}
-	return pastSessions
+	// This loop had no rows.Err() check at all, unlike its sibling above — an
+	// independent backend.md violation fixed alongside (#3290).
+	if err := pastRows.Err(); err != nil {
+		h.log.Error("Error iterating past sessions", "error", err)
+		return nil, err
+	}
+	return pastSessions, nil
 }
 
 // RevokeSession revokes a specific session by ID with server-authoritative

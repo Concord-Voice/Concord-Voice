@@ -25,9 +25,20 @@ import (
 //
 // One consequence: the SSO refresh-token row is stored without device_name,
 // IP, or user-agent. Those columns are nullable; the missing metadata is the
-// trade-off for the cleaner adapter signature. WS ticket flow + /auth/refresh
-// stamp them on first use, so SSO-issued sessions get full device metadata
-// once the renderer connects WebSocket.
+// trade-off for the cleaner adapter signature.
+//
+// An earlier version of this comment claimed "/auth/refresh stamps them on
+// first use". BOTH halves of that were false and it cost every SSO user their
+// session (#3290). Refresh must READ the row before it could stamp anything,
+// and the read is exactly what the NULLs broke — the recovery path was
+// circular. No writer anywhere UPDATEs these columns on an existing row;
+// rotation INSERTs a NEW row carrying real ip_address / user_agent /
+// machine_id taken from the refresh request, while device_name is copied
+// forward and therefore stays "" for the life of the lineage.
+//
+// Every reader coalesces these to "" — see signalMatch in signal.go for the
+// equality convention that governs comparing them. Closing the divergence at
+// the source (stamping real metadata here) is tracked separately.
 
 // SSOIdentityLink is the provider identity CompleteLink must persist with its
 // epoch-bound session mint.
@@ -130,8 +141,10 @@ func (h *Handler) issueAccessAndRefresh(ctx context.Context, userID string, expe
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
 
 	// device_name / ip_address / user_agent / machine_id deliberately omitted —
-	// the adapter signature is ctx-only. SSO-issued sessions accept the missing
-	// metadata; subsequent /auth/refresh + WS ticket flows will stamp it.
+	// the adapter signature is ctx-only, so there is no *gin.Context here to
+	// read them from. They are stored NULL and are NEVER stamped onto this row
+	// later; see the package comment above for why the previous claim that
+	// /auth/refresh would stamp them was false in both halves (#3290).
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, remember_me)
 		 VALUES ($1, $2, $3, $4, $5)`,

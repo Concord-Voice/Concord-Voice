@@ -335,6 +335,8 @@ PostgreSQL 16 (schema under `services/control-plane/migrations/`). Under E2EE-ev
 
 **Identity, auth, RBAC & server structure:**
 
+SSO-issued refresh-token rows may initially have NULL device, IP, and User-Agent metadata. The control plane normalizes those absent values at read time, so the first refresh succeeds, rotates the lineage with request metadata, and keeps the session visible in Active Sessions. A retry of a revoked token within the 30-second grace window needs at least one known matching signal and agreement across all known signals; a no-known-signal retry receives a quiet 401, while an outside-window retry retains the replay alert.
+
 ```mermaid
 erDiagram
     users ||--o| user_keys : "has"

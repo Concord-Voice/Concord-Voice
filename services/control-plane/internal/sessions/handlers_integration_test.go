@@ -1,13 +1,24 @@
 package sessions_test
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/sessions"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,6 +36,74 @@ const (
 	ipAddr2       = "2.2.2.2"
 	ipAddr3       = "3.3.3.3"
 )
+
+const sessionsRowsDriverName = "sessions-list-past-error-test"
+
+var sessionsRowsDriverOnce sync.Once
+
+var errPastSessionsRows = errors.New("forced past sessions rows error")
+
+type sessionsRowsDriver struct{}
+
+func (sessionsRowsDriver) Open(string) (driver.Conn, error) { return sessionsRowsConn{}, nil }
+
+type sessionsRowsConn struct{}
+
+func (sessionsRowsConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare not supported")
+}
+func (sessionsRowsConn) Close() error { return nil }
+func (sessionsRowsConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions not supported")
+}
+func (sessionsRowsConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "revoked_at IS NOT NULL") {
+		return sessionsPastErrorRows{}, nil
+	}
+	return sessionsEmptyRows{}, nil
+}
+
+type sessionsEmptyRows struct{}
+
+func (sessionsEmptyRows) Columns() []string         { return []string{"id"} }
+func (sessionsEmptyRows) Close() error              { return nil }
+func (sessionsEmptyRows) Next([]driver.Value) error { return io.EOF }
+
+type sessionsPastErrorRows struct{}
+
+func (sessionsPastErrorRows) Columns() []string {
+	return []string{"id", "device_name", "ip_address", "user_agent", "created_at", "last_used_at", "revoked_at"}
+}
+func (sessionsPastErrorRows) Close() error              { return nil }
+func (sessionsPastErrorRows) Next([]driver.Value) error { return errPastSessionsRows }
+
+func openSessionsRowsErrorDB(t *testing.T) *sql.DB {
+	t.Helper()
+	sessionsRowsDriverOnce.Do(func() { sql.Register(sessionsRowsDriverName, sessionsRowsDriver{}) })
+	db, err := sql.Open(sessionsRowsDriverName, "past-error")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return db
+}
+
+func TestListSessions_PastRowsErrorReturns500(t *testing.T) {
+	db := openSessionsRowsErrorDB(t)
+	h := sessions.NewHandler(db, nil, logger.New("test"), nil, nil)
+	r := gin.New()
+	r.GET(sessionsPath, func(c *gin.Context) {
+		c.Set("user_id", "00000000-0000-0000-0000-000000000001")
+		h.ListSessions(c)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, sessionsPath, nil)
+	rw := httptest.NewRecorder()
+	r.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusInternalServerError, rw.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, rw, &body)
+	assert.Equal(t, "Failed to fetch sessions", testhelpers.JSONField[string](t, body, "error"))
+}
 
 // createSession inserts a refresh_token row for a user and returns its ID.
 func createSession(t *testing.T, ts *testhelpers.TestServer, userID, deviceName, ip string) string {
@@ -46,6 +125,122 @@ func hashStr(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// createNullMetadataSession inserts a refresh_tokens row shaped exactly like the
+// SSO adapter's: device_name, ip_address and user_agent omitted, therefore NULL.
+// It asserts that premise, because without it these tests prove nothing.
+func createNullMetadataSession(t *testing.T, ts *testhelpers.TestServer, userID string) string {
+	t.Helper()
+	var id string
+	err := ts.DB.QueryRow(
+		`INSERT INTO refresh_tokens (user_id, token_hash, expires_at, remember_me)
+		 VALUES ($1, $2, NOW() + INTERVAL '30 days', true)
+		 RETURNING id`,
+		userID, hashStr(userID+"sso-null-metadata"),
+	).Scan(&id)
+	require.NoError(t, err)
+
+	var nullCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT (device_name IS NULL)::int + (ip_address IS NULL)::int + (user_agent IS NULL)::int
+		 FROM refresh_tokens WHERE id = $1`, id).Scan(&nullCount))
+	require.Equal(t, 3, nullCount,
+		"premise: the fixture must reproduce the SSO adapter's all-NULL insert")
+	return id
+}
+
+// regression for #3290
+//
+// An SSO session was silently dropped from this list by a swallowed scan error
+// while the endpoint still returned 200 — so the user could neither see it nor
+// revoke it. A session you cannot see is a session you cannot revoke.
+func TestListSessions_IncludesNullMetadataSession(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "ssolist")
+	id := createNullMetadataSession(t, ts, user.ID)
+
+	w := ts.DoRequest("GET", sessionsPath, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	sessions := testhelpers.JSONField[[]interface{}](t, body, "sessions")
+
+	var found map[string]interface{}
+	for i := range sessions {
+		sess := testhelpers.JSONElem[map[string]interface{}](t, sessions, i)
+		if sess["id"] == id {
+			found = sess
+		}
+	}
+	require.NotNil(t, found,
+		"a session with absent device metadata must still be listed, or it cannot be revoked")
+	assert.Equal(t, "", found["device_name"])
+	assert.Equal(t, "unknown", found["ip_address"], "absent IP renders as unknown, not as a value")
+	assert.Equal(t, "", found["user_agent"])
+}
+
+// regression for #3290
+func TestPastSessions_IncludesNullMetadataSession(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "ssopast")
+	id := createNullMetadataSession(t, ts, user.ID)
+	_, err := ts.DB.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, id)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("GET", sessionsPath, nil, testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	past := testhelpers.JSONField[[]interface{}](t, body, "past_sessions")
+
+	ids := make([]interface{}, 0, len(past))
+	for i := range past {
+		sess := testhelpers.JSONElem[map[string]interface{}](t, past, i)
+		ids = append(ids, sess["id"])
+	}
+	assert.Contains(t, ids, id, "a revoked session with absent metadata must appear in history")
+}
+
+// regression for #3290: the session returned by the SSO adapter must remain
+// reachable through the same authorized revoke endpoint as any other session.
+func TestRevokeSession_NullMetadataSession(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "revokenull")
+	id := createNullMetadataSession(t, ts, user.ID)
+
+	w := ts.DoRequest("DELETE", sessionsPath+"/"+id,
+		map[string]interface{}{"password": sessTestPassword},
+		testhelpers.AuthHeaders(user.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var revokedAt time.Time
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT revoked_at FROM refresh_tokens WHERE id = $1`, id).Scan(&revokedAt))
+	assert.False(t, revokedAt.IsZero(), "authorized revoke must persist revocation for the NULL-metadata session")
+}
+
+// regression for #3290
+//
+// The fixture above hard-codes three column names. This derives the real set
+// from the live schema so a NEW nullable-no-default column on refresh_tokens —
+// the exact shape an omitting INSERT can produce — forces a deliberate
+// DISPLAY-or-EQUALITY decision instead of silently going untested.
+func TestRefreshTokensNullableColumns(t *testing.T) {
+	ts := setupTS(t)
+	cols := testhelpers.NullableNoDefaultColumns(t, ts.DB, "refresh_tokens")
+
+	require.NotEmpty(t, cols, "introspection returned nothing — the query or table name is wrong")
+	for _, want := range []string{"device_name", "ip_address", "user_agent"} {
+		assert.Contains(t, cols, want,
+			"a rename or query typo must fail loudly here, not silently narrow the fixture")
+	}
+	assert.Len(t, cols, 6,
+		"a new nullable-no-default column on refresh_tokens needs a DISPLAY-or-EQUALITY "+
+			"ruling — see signalMatch in internal/auth/signal.go. Do not edit this number "+
+			"to match; find out which column appeared and rule on it.")
+}
+
 // ── ListSessions (extended) ──────────────────────────────────────────────────
 
 func TestListSessions_MasksIPAddress(t *testing.T) {
@@ -59,12 +254,19 @@ func TestListSessions_MasksIPAddress(t *testing.T) {
 
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
-	sessions := body["sessions"].([]interface{})
-	for _, s := range sessions {
-		sess := s.(map[string]interface{})
-		ip := sess["ip_address"].(string)
-		assert.NotContains(t, ip, ".42", "IP last octet should be masked")
-	}
+	sessions := testhelpers.JSONField[[]interface{}](t, body, "sessions")
+	require.Len(t, sessions, 1)
+
+	sess := testhelpers.JSONElem[map[string]interface{}](t, sessions, 0)
+	ip := testhelpers.JSONField[string](t, sess, "ip_address")
+
+	// POSITIVE assertion (#3290). This previously read
+	// assert.NotContains(ip, ".42"), which "unknown" satisfies just as well as
+	// the correct mask — so it could not distinguish a working masker from a
+	// broken one, and would have stayed green through an inet-rendering change
+	// (e.g. ::text appending /32, which net.ParseIP rejects). Assert the shape
+	// we actually want.
+	assert.Equal(t, "192.168.1.x", ip)
 }
 
 func TestListSessions_IncludesPastSessions(t *testing.T) {
