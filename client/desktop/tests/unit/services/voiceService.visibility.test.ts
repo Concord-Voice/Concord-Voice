@@ -309,7 +309,7 @@ describe('voiceService visibility-pause (#1541)', () => {
 
     svc.cameraLayeringEnabled = true;
 
-    expect(svc.tryEmitCameraPressureLayerRequest('cam-1')).toBe('fallback');
+    expect(svc.tryEmitCameraPressureLayerRequest('cam-1', 'red')).toBe('fallback');
     expect(svc.remoteVideoPressureByUser.has('user-A')).toBe(false);
     expect(emit).not.toHaveBeenCalledWith(
       'set-preferred-layers',
@@ -331,7 +331,7 @@ describe('voiceService visibility-pause (#1541)', () => {
     // setRemoteVideoRenderState already emitted ordinary demand; clear so the assertion
     // below reads the PRESSURE emit rather than that earlier unpressured one.
     emit.mockClear();
-    svc.tryEmitCameraPressureLayerRequest('cam-1');
+    svc.tryEmitCameraPressureLayerRequest('cam-1', 'red');
     // Pin the pressured payload itself, not just the flag: this is the only assertion in
     // the suite on what a SUCCESSFUL pressure emit actually asks the SFU for, and the
     // inequality is directional — pressure may only ever request a smaller layer.
@@ -347,7 +347,9 @@ describe('voiceService visibility-pause (#1541)', () => {
     svc.updateDecoderRecoveryState('green');
     svc.updateDecoderRecoveryState('green');
 
-    expect(svc.remoteVideoPressureByUser.get('user-A')).toBe(true);
+    // The map holds the STEP COUNT, not a bit: pinning 1 says how deep the
+    // pressure went, which `toBe(true)` could not distinguish from step 2.
+    expect(svc.remoteVideoPressureByUser.get('user-A')).toBe(1);
     expect(emit).not.toHaveBeenCalledWith(
       'set-preferred-layers',
       expect.objectContaining({ pressureStepDown: false })

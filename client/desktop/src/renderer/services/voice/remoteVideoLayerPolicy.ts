@@ -31,7 +31,13 @@ function layerForPixels(width: number, height: number): 0 | 1 | 2 {
 }
 
 export function computeRemoteVideoLayerRequest(
-  state: RemoteVideoRenderState
+  state: RemoteVideoRenderState,
+  // The SFU's own ceiling for THIS viewer. Defaults to the full ladder so every
+  // existing caller and the server-side parity sweep are unchanged; the desktop
+  // passes the entitlement-derived value. Clamping HERE rather than in the step
+  // arithmetic is what makes the first pressure step land: it moves the base the
+  // ladder counts down from, instead of merely counting the steps differently.
+  maxSpatialLayer: RemoteVideoLayer = 2
 ): RemoteVideoLayerRequest {
   if (!state.visible) return { visible: false, spatialLayer: 0, temporalLayer: 0 };
 
@@ -48,6 +54,39 @@ export function computeRemoteVideoLayerRequest(
   if (!state.focusedWindow) spatialLayer -= 1;
   if (state.pressureStepDown) spatialLayer -= 1;
 
-  const layer = clampLayer(spatialLayer);
+  const layer = clampLayer(Math.min(spatialLayer, maxSpatialLayer));
   return { visible: true, spatialLayer: layer, temporalLayer: layer === 0 ? 1 : 2 };
+}
+
+/**
+ * Apply N steps of decoder pressure to an already-computed request.
+ *
+ * `computeRemoteVideoLayerRequest` expresses exactly ONE step, because that is
+ * what the media-plane's `layerForRender` mirrors and what the wire's boolean
+ * `pressureStepDown` can say. Deeper pressure is expressed by asking for a LOWER
+ * `spatialLayer` outright: the server clamps with
+ * `Math.min(demand.spatialLayer, layerForRender(demand), maxSpatialLayer)`, so a
+ * request below its own cap is honoured, and `maxUsefulSpatialLayer` deliberately
+ * excludes the request, so stepping deeper cannot flip the room gate off.
+ *
+ * Keeping the arithmetic here rather than in voiceService is the point: the ladder
+ * already exists twice (renderer + governor) and is pinned by a parity suite. A
+ * third copy is what that suite exists to prevent.
+ */
+export function stepDownLayerRequest(
+  request: RemoteVideoLayerRequest,
+  steps: number
+): RemoteVideoLayerRequest {
+  if (!request.visible || steps <= 0) return request;
+  const layer = clampLayer(request.spatialLayer - steps);
+  return { visible: true, spatialLayer: layer, temporalLayer: layer === 0 ? 1 : 2 };
+}
+
+/**
+ * How many pressure steps this request can still absorb before it would fall
+ * below layer 0 — i.e. before a step stops being a step and pausing is the only
+ * remaining move. A hidden tile offers none.
+ */
+export function maxPressureSteps(request: RemoteVideoLayerRequest): number {
+  return request.visible ? request.spatialLayer : 0;
 }

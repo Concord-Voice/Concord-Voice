@@ -35,7 +35,11 @@ import {
   parseCameraLayerDemand,
   storedDemand,
 } from '@/lib/cameraLayerGovernor';
-import { computeRemoteVideoLayerRequest } from '../../../client/desktop/src/renderer/services/voice/remoteVideoLayerPolicy';
+import {
+  computeRemoteVideoLayerRequest,
+  maxPressureSteps,
+  stepDownLayerRequest,
+} from '../../../client/desktop/src/renderer/services/voice/remoteVideoLayerPolicy';
 
 const ROLES = ['thumbnail', 'grid', 'focus'] as const;
 // Sizes straddle BOTH ladder edges (540, 1280) from either side, so an
@@ -246,7 +250,18 @@ describe('camera layer policy parity (client renderer vs media-plane governor)',
   // cap), so it does not belong in a test-only PR. Pinning it here means the next
   // change to that policy cannot land silently: it will fail this test and have
   // to say what it did.
-  it('OVERSTATES the available pressure steps for a free viewer (known #3094 L2 gap)', () => {
+  // This test used to pin the DIVERGENCE as a known gap. #3279 closed it, so it
+  // now pins the CLOSURE — and the distinction is the whole point of having
+  // written it: the fix is at the integration seam, not inside the policy, so a
+  // test calling the policy with its default cap would have gone on passing with
+  // the unwelcome narrative intact.
+  //
+  // `computeRemoteVideoLayerRequest` still returns the unclamped ladder value by
+  // DEFAULT — that is correct and is what the server-side sweep above compares
+  // against. What changed is that the desktop now passes the viewer's own cap
+  // (`effectiveCameraSpatialCap`), so given the same cap the two agree exactly
+  // and a free viewer's first pressure step lowers the forwarded layer.
+  it('agrees with the server once the client is given the same entitlement cap', () => {
     const largeFocusedTile = {
       visible: true,
       cssWidth: 1920,
@@ -256,31 +271,28 @@ describe('camera layer policy parity (client renderer vs media-plane governor)',
       focusedWindow: true,
       pressureStepDown: false,
     };
+    const FREE_CAP = 1; // maxCameraSpatialLayerForParticipant, free branch
 
-    const client = computeRemoteVideoLayerRequest(largeFocusedTile);
-    expect(client.spatialLayer).toBe(2); // what L2 counts its steps against
+    // Uncapped, the client still computes the full ladder — unchanged, and the
+    // reason the default must stay 2.
+    expect(computeRemoteVideoLayerRequest(largeFocusedTile).spatialLayer).toBe(2);
 
-    const freeCap = 1; // maxCameraSpatialLayerForParticipant, free branch
-    const unpressuredServer = storedDemand(
+    // Given the cap, client and server land on the same layer.
+    const cappedClient = computeRemoteVideoLayerRequest(largeFocusedTile, FREE_CAP);
+    const server = storedDemand(
       { consumerId: 'c1', spatialLayer: 2, temporalLayer: 2, ...largeFocusedTile },
-      freeCap
+      FREE_CAP
     ).maxUsefulSpatialLayer;
-    const pressuredServer = storedDemand(
-      {
-        consumerId: 'c1',
-        spatialLayer: 2,
-        temporalLayer: 2,
-        ...largeFocusedTile,
-        pressureStepDown: true,
-      },
-      freeCap
-    ).maxUsefulSpatialLayer;
+    expect(cappedClient.spatialLayer).toBe(server);
+    expect(server).toBe(1);
 
-    // The whole finding in two assertions: the client thinks it has a step to
-    // spend, and spending it changes nothing the SFU forwards.
-    expect(unpressuredServer).toBe(1);
-    expect(pressuredServer).toBe(1);
-    expect(client.spatialLayer).toBeGreaterThan(unpressuredServer);
+    // And the step now BITES: one step off the capped base reaches 0, which is
+    // strictly below what the SFU was forwarding. Under the old behaviour the
+    // first step recomputed to 1 and the server forwarded 1 — a step that moved
+    // nothing.
+    const steppedOnce = stepDownLayerRequest(cappedClient, 1);
+    expect(steppedOnce.spatialLayer).toBeLessThan(server);
+    expect(maxPressureSteps(cappedClient)).toBe(1);
   });
 
   it('is the PARSER that keeps the two in agreement, not the arithmetic', () => {

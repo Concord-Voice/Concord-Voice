@@ -177,18 +177,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   lasted; on the fifteen light ones it was a charcoal rectangle on a white panel. It now takes
   its colour from the theme like everything else.
 
-- **Video drops to a smaller size before it freezes when your computer is struggling** ([#3268](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3268), [#3094](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3094)) — Concord
+- **Video drops to a smaller size before it freezes when your computer is struggling** ([#3268](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3268), [#3279](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3279), [#3094](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3094)) — Concord
   watches how long your computer takes to decode each incoming video, and when it starts falling
   behind it has to give something up. Until now it had one move: pause somebody's camera outright,
   which is abrupt and takes a person off your screen completely. It now asks the server for a
-  smaller version of that video first, and only falls back to pausing when there is nothing
-  smaller left to ask for. Two things worth knowing. The gentler behaviour applies only in calls
-  where the server is already sending video in several sizes; in a call where it sends just one,
-  pausing is still the only option and happens exactly as it did before. And where the step-down
-  does apply, a pause that follows because things stayed bad arrives two measurement cycles later
-  than it used to, because the smaller video needs a moment to take effect before measuring again
-  tells you anything true — roughly ten seconds in the opening half-minute of a call, and roughly
-  a minute after that, once Concord settles into checking less often.
+  smaller version of that video first, and keeps asking for smaller ones as long as there is
+  anything smaller left; only when there is not does it fall back to pausing. On a large tile
+  that means two reductions before anyone disappears, where previously there was one — though
+  how many you actually get depends on your plan, because the server will only send a free
+  account video up to a certain size in the first place. On a free account that is one
+  reduction rather than two, and it now happens on the first attempt: previously the first
+  attempt asked for a size the server was already sending, so nothing changed and you waited
+  through another round of measurements before anything improved. Two further
+  things worth knowing. The gentler behaviour applies only in calls where the server is already
+  sending video in several sizes; in a call where it sends just one, pausing is still the only
+  option and happens exactly as it did before. And where the step-down does apply, a pause that
+  follows because things stayed bad now arrives several measurement cycles later than it used
+  to — two per reduction, because the smaller video needs a moment to take effect before
+  measuring again tells you anything true. That is roughly ten seconds per step in the opening
+  half-minute of a call, and roughly a minute per step after that, once Concord settles into
+  checking less often.
 
 - **Joining a call late no longer leaves your camera stuck at one quality** ([#3275](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3275)) — in calls
   where Concord sends video at several sizes, the server tells everyone once, at the moment it

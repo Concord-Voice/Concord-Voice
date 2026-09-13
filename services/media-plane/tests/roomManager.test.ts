@@ -4315,6 +4315,55 @@ describe('RoomManager', () => {
         .filter((event) => event.type === 'camera-layering-gate' && event.targetSocketId);
     }
 
+    // The cap the SFU ADVERTISES on the join ack must be the cap it later CLAMPS
+    // to (#3279). The client predicts its remaining IGNIS pressure steps from the
+    // advertised number, so any gap between the two spends a step moving the
+    // forwarded layer to where it already was. Both now read
+    // `cameraSpatialCapForParticipant`, and this is the test that would notice if
+    // one of them stopped.
+    //
+    // 1080p demand on purpose: at the 720p default the useful layer is below the
+    // premium cap anyway, so the premium half would agree for a reason that has
+    // nothing to do with entitlement and the case would pass with the cap ignored.
+    it.each([
+      ['free', 5_000_000, 1],
+      ['premium', 10_000_000, 2],
+    ])(
+      'advertises the same camera cap on the join ack that it clamps %s demand to',
+      async (label, maxManualBitrateBps, expected) => {
+        const userId = `u-${label}`;
+        const joined = await joinRoomWithSupportedCrypto(
+          manager,
+          'room-1',
+          userId,
+          `sock-${userId}`,
+          { username: userId },
+          undefined,
+          {
+            tier: label,
+            allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard'],
+            minPtimeMs: 20,
+            maxManualBitrateBps,
+          }
+        );
+        expect(joined.cameraSpatialCap).toBe(expected);
+
+        // ensureParticipant inside addCameraConsumer is a no-op now that the
+        // entitlement-bearing join above created this participant.
+        const { consumer } = await addCameraConsumer(userId, `c-${label}`);
+        const result = await manager.setPreferredLayers(
+          'room-1',
+          userId,
+          validLayerDemand(`c-${label}`, { cssWidth: 1920, cssHeight: 1080 })
+        );
+
+        expect(result.effectiveLayers.spatialLayer).toBe(joined.cameraSpatialCap);
+        expect(consumer.setPreferredLayers).toHaveBeenCalledWith(
+          expect.objectContaining({ spatialLayer: expected })
+        );
+      }
+    );
+
     it('rejects a consumer not owned by the caller', async () => {
       await joinRoomWithSupportedCrypto(manager, 'room-1', 'u-1', 'sock-1', { username: 'alice' });
 

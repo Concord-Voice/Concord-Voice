@@ -550,6 +550,7 @@ function registerJoinRoomHandler(
             participants: result.participants,
             channelName: access.channelName,
             e2eeEpoch: result.e2eeEpoch,
+            cameraSpatialCap: result.cameraSpatialCap,
           };
 
           logger.info('Room join response', {

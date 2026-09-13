@@ -100,6 +100,8 @@ import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan, simulcastLadderBitrates } from './cameraLayering';
 import {
   computeRemoteVideoLayerRequest,
+  maxPressureSteps,
+  stepDownLayerRequest,
   type RemoteVideoLayerRequest,
   type RemoteVideoRole,
 } from './remoteVideoLayerPolicy';
@@ -110,7 +112,11 @@ import {
 } from '../e2ee/voiceE2eeTransforms';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { hasPermission, SPEAK } from '../../utils/policy/permissions';
-import { clampScreenForSubscription } from '../../utils/policy/videoLimits';
+import {
+  clampScreenForSubscription,
+  effectiveCameraSpatialCap,
+  resolveSessionCameraCap,
+} from '../../utils/policy/videoLimits';
 import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/ui/screenResolution';
 import {
   canCarryScreenAudio,
@@ -207,7 +213,20 @@ interface RemoteVideoLayerPayload extends RemoteVideoTileRenderState, RemoteVide
 
 /** Result of a camera decoder-pressure layer request.
  *  'fallback' means: this path has nothing (more) to offer — apply your own fallback. */
-type CameraPressureLayerRequestResult = 'emitted' | 'fallback';
+/**
+ * 'emitted'  — a step was taken this pass.
+ * 'fallback' — the policy has no step left; the caller should pause.
+ * 'deferred' — this producing user ALREADY stepped in this profiling pass.
+ *
+ * `deferred` exists because it is emphatically NOT a pressure failure, and
+ * collapsing it into `fallback` is the bug it was added to fix: one user can
+ * legitimately have several camera consumers (the PiP window consumes the same
+ * producer on a second recv transport), `profileDecoders` classifies each in
+ * turn, and the per-user step budget is shared. Two red consumers for one user
+ * would spend two steps in a single pass, and a third would read "no step left"
+ * and pause somebody who had just been stepped down twice (CodeRabbit, #3279).
+ */
+type CameraPressureLayerRequestResult = 'emitted' | 'fallback' | 'deferred';
 
 /** Which layered video surface a render-state report / demand emit targets (#1924).
  *  Camera and screen keep independent demand maps + server gates. */
@@ -431,6 +450,8 @@ interface JoinResponse {
   // self-hosted instance on turn.go's STUN-only fallback, legitimately omits it.
   // Always read it through normalizeIceServers — never index into it directly (#3104).
   ice_servers?: unknown;
+  /** #1300 server-authoritative media caps; same payload as ice_servers. */
+  media_entitlements?: unknown;
   // Server-channel responses include `channel`; DM voice responses omit it
   // and include `conversation` with {id, is_group, caller_role} instead.
   // The renderer synthesizes a channel-like object for DM at join time
@@ -453,6 +474,10 @@ interface JoinResponse {
 
 interface RoomJoinedResponse {
   rtpCapabilities: mediasoupTypes.RtpCapabilities;
+  /** #3279: the camera spatial cap the SFU admitted this participant under.
+   *  Absent on a media plane predating the field -- the client then keeps its
+   *  own fallback chain rather than being handed a guess. */
+  cameraSpatialCap?: unknown;
   mediaFrameCryptoVersion?: number;
   existingProducers: Array<{
     producerId: string;
@@ -538,6 +563,24 @@ class VoiceService {
    * in [internal]rules/frontend.md § ICE-server threading.
    */
   private iceServers: RTCIceServer[] | null = null;
+
+  /**
+   * The camera spatial cap this MEDIA SESSION was admitted under (#3279).
+   *
+   * `Participant.tier` and `maxManualBitrateBps` are written once, at join
+   * (`roomManager.ts:1412-1413`), and a mid-call tier change deliberately does
+   * not touch the SFU session — `tierchange.go` broadcasts the new entitlement
+   * to every connected client and says so in as many words, leaving media-plane
+   * enforcement to #1300/#1542. So on an UPGRADE the store flips to premium, a
+   * live read here raises the client cap to 2, and the SFU still clamps to 1:
+   * the first red step asks for the layer already being forwarded and records a
+   * step that reduced nothing. That is precisely the defect the cap was added to
+   * close, arriving through the upgrade path instead (Codex, #3279).
+   *
+   * Null outside a session, which is also the fail-open value — the live store
+   * is consulted only before one is established.
+   */
+  private cameraSpatialCapForSession: 0 | 1 | 2 | null = null;
 
   // Local producers: source → Producer
   private readonly producers: Map<string, mediasoupTypes.Producer> = new Map();
@@ -2548,7 +2591,18 @@ class VoiceService {
   private screenLayeringEnabled = false;
   private screenLayeringReproduceInFlight = false;
   private screenLayeringReproducePending = false;
-  private readonly remoteVideoPressureByUser = new Map<string, boolean>();
+  /** Decoder-pressure steps currently applied per producing user (0 = none).
+   *  Was a single boolean: one step, spent once, then the only move left was a
+   *  pause. Yellow may reach step 1; red escalates one step per classified tick
+   *  and pauses only once the policy has no step left. */
+  private readonly remoteVideoPressureByUser = new Map<string, number>();
+
+  /**
+   * Producing users that have already taken a pressure step in the CURRENT
+   * `profileDecoders` pass. Cleared at the top of each pass — it bounds one
+   * pass, never the session, so it must not be pruned on consumer teardown.
+   */
+  private readonly pressureSteppedThisPass = new Set<string>();
   private readonly lastPreferredLayerKeyByConsumer = new Map<string, string>();
   private readonly remoteVideoRenderStateByUser = new Map<
     string,
@@ -3177,6 +3231,7 @@ class VoiceService {
     // joinChannel (initial join) and resumeAfterReconnect. Setting it here is
     // what makes the reconnect rebuild use the re-minted credentials (#3104).
     this.iceServers = normalizeIceServers(joinData.ice_servers);
+
     // Scheme + count ONLY. The list itself carries live HMAC TURN credentials and
     // every console method is captured into the bug-report buffer (NC-1, #3104).
     console.debug('[ice] servers', describeIceServers(this.iceServers));
@@ -3190,6 +3245,16 @@ class VoiceService {
     if (roomJoined.mediaFrameCryptoVersion !== MEDIA_E2EE_FRAME_CRYPTO_VERSION) {
       throw new Error('Media frame crypto version mismatch');
     }
+
+    // Pin the camera cap for this session. Resolved once, here rather than beside
+    // iceServers, because the most authoritative source is the SFU's own admitted
+    // value and it only arrives with this ack. `resolveSessionCameraCap` owns the
+    // precedence and is unit-tested; this line is the whole of the wiring.
+    this.cameraSpatialCapForSession = resolveSessionCameraCap({
+      ackCap: roomJoined.cameraSpatialCap,
+      joinMediaEntitlements: joinData.media_entitlements,
+      subscription: useSubscriptionStore.getState(),
+    });
 
     // Load device with router capabilities
     this.device = new Device();
@@ -3407,6 +3472,7 @@ class VoiceService {
     this.recvTransportVideo = null;
     // Credentials must not outlive the transports they were minted for (#3104).
     this.iceServers = null;
+    this.cameraSpatialCapForSession = null;
   }
 
   /** Tear down already-invalidated shared E2EE state synchronously. */
@@ -5687,15 +5753,16 @@ class VoiceService {
     }
   }
 
-  private findCameraConsumerIdForUser(userId: string): string | null {
-    for (const [id, meta] of this.consumerMeta) {
-      if (meta.source === 'camera' && meta.producerUserId === userId) return id;
-    }
-    return null;
-  }
+  // `findCameraConsumerIdForUser` was deleted with the restore fan-out (#3279).
+  // It returned the FIRST camera consumer for a user, and every remaining camera
+  // caller needs all of them -- demand is consumer-scoped, so addressing one and
+  // leaving its siblings is precisely the defect the fan-out closed, twice. Use
+  // `cameraConsumerIdsForUser`. Do not reintroduce a singular camera lookup.
 
-  /** First remote SCREEN consumer id for a producing user (#1924). Mirrors
-   *  findCameraConsumerIdForUser; feeds screen set-preferred-layers demand. */
+  /** First remote SCREEN consumer id for a producing user (#1924); feeds screen
+   *  set-preferred-layers demand. Deliberately SINGULAR where camera is plural
+   *  (#3279): the PiP screen path bypasses it via emitPreferredLayersForConsumer,
+   *  because this lookup resolves the main window's PAUSED screen consumer. */
   private findScreenConsumerIdForUser(userId: string): string | null {
     for (const [id, meta] of this.consumerMeta) {
       if (meta.source === 'screen' && meta.producerUserId === userId) return id;
@@ -5742,26 +5809,50 @@ class VoiceService {
   private layerPayloadForTileState(
     userId: string,
     state: RemoteVideoTileRenderState,
-    pressureStepDown = this.remoteVideoPressureByUser.get(userId) === true
+    pressureSteps = this.remoteVideoPressureByUser.get(userId) ?? 0,
+    // The entitlement cap below is CAMERA-only. `validateAndClampLayerDemand`
+    // (roomManager.ts:2804) reads `source === 'screen' ? 2 : maxCameraSpatialLayerForParticipant(...)`,
+    // so the SFU deliberately gives screen consumers the full range regardless of
+    // the viewer's camera entitlement. Applying the camera cap here pinned a free
+    // viewer's full-stage and PiP screen shares one layer below what was on offer
+    // — two of this helper's three callers are screen paths (Codex, #3279).
+    source: RemoteVideoSource = 'camera'
   ): RemoteVideoLayerPayload {
     const devicePixelRatio = this.remoteVideoDevicePixelRatio();
-    const request = computeRemoteVideoLayerRequest({
-      ...state,
-      devicePixelRatio,
-      pressureStepDown,
-    });
+    // Compute the UNPRESSURED request through the shared policy, then subtract the
+    // steps. At one step this is identical to the old `pressureStepDown: true`
+    // path (which also subtracted exactly 1), so single-step behaviour is
+    // unchanged. The wire flag stays boolean because the SFU hard-requires that
+    // shape; depth is carried by the requested spatialLayer itself.
+    const base = computeRemoteVideoLayerRequest(
+      {
+        ...state,
+        devicePixelRatio,
+        pressureStepDown: false,
+      },
+      // The SFU's ceiling for THIS viewer. Clamping the BASE is what makes a
+      // free viewer's first pressure step land: without it the base is the
+      // unclamped ladder value, the server clamps the request back to the same
+      // layer it was already forwarding, and IGNIS records a step that reduced
+      // nothing (Codex, #3279).
+      source === 'screen'
+        ? 2
+        : (this.cameraSpatialCapForSession ??
+            effectiveCameraSpatialCap(useSubscriptionStore.getState()))
+    );
+    const request = stepDownLayerRequest(base, pressureSteps);
 
     return {
       ...state,
       ...request,
       devicePixelRatio,
-      pressureStepDown,
+      pressureStepDown: pressureSteps > 0,
     };
   }
 
   private computePreferredLayerPayloadForUser(
     userId: string,
-    pressureStepDown?: boolean,
+    pressureSteps?: number,
     source: RemoteVideoSource = 'camera'
   ): RemoteVideoLayerPayload | null {
     const stateMap =
@@ -5772,13 +5863,13 @@ class VoiceService {
     // Screen has no BWE pressure machinery in v1 — force pressureStepDown=false so a
     // user's camera pressure can never bleed into their screen demand. Camera keeps
     // the passed value (undefined → per-user pressure lookup in layerPayloadForTileState).
-    const effectivePressure = source === 'screen' ? false : pressureStepDown;
+    const effectivePressure = source === 'screen' ? 0 : pressureSteps;
 
     let bestVisible: RemoteVideoLayerPayload | null = null;
     let hidden: RemoteVideoLayerPayload | null = null;
 
     for (const state of states.values()) {
-      const payload = this.layerPayloadForTileState(userId, state, effectivePressure);
+      const payload = this.layerPayloadForTileState(userId, state, effectivePressure, source);
       if (!payload.visible) {
         hidden ??= payload;
         continue;
@@ -5827,16 +5918,31 @@ class VoiceService {
   }
 
   private emitPreferredLayersForUser(userId: string, source: RemoteVideoSource = 'camera'): void {
-    const consumerId =
+    // CAMERA fans out; SCREEN stays singular, and the asymmetry is deliberate.
+    //
+    // SFU layer demand is consumer-scoped, and one producing user legitimately has
+    // several camera consumers (a PiP window consumes the same producer on a second
+    // recv transport; a camera replacement overlaps two briefly). The pressure
+    // step-down already addresses every one of them. This emit is the RESTORE side
+    // of that same ledger -- `clearRemoteVideoPressureAndEmit` calls it after three
+    // green cycles -- so addressing only the first left every sibling pinned at the
+    // stepped-down layer for the rest of the session, with the ledger reading zero.
+    // Stepping down as a group and restoring one is the bug (Codex, #3279).
+    //
+    // Screen keeps `findScreenConsumerIdForUser` because its single-consumer
+    // resolution is a documented design rather than an oversight: the PiP screen
+    // path deliberately bypasses this function via `emitPreferredLayersForConsumer`,
+    // since this lookup resolves the main window's PAUSED screen consumer.
+    const consumerIds =
       source === 'screen'
-        ? this.findScreenConsumerIdForUser(userId)
-        : this.findCameraConsumerIdForUser(userId);
-    if (!consumerId) return;
+        ? [this.findScreenConsumerIdForUser(userId)].filter((id): id is string => id !== null)
+        : this.cameraConsumerIdsForUser(userId);
+    if (consumerIds.length === 0) return;
 
     const payload = this.computePreferredLayerPayloadForUser(userId, undefined, source);
     if (!payload) return;
 
-    this.emitPreferredLayers(consumerId, payload);
+    for (const consumerId of consumerIds) this.emitPreferredLayers(consumerId, payload);
   }
 
   /**
@@ -5847,23 +5953,34 @@ class VoiceService {
    * the PiP's OWN consumer id passed in — deliberately NOT via emitPreferredLayersForUser /
    * findScreenConsumerIdForUser, which resolve to the main window's now-PAUSED screen
    * consumer (the wrong one, and paused, so its demand would never reach the SFU).
-   * Screen has no BWE pressure machinery in v1, so pressureStepDown is forced false and
-   * the userId arg to layerPayloadForTileState is inert.
+   * Screen has no BWE pressure machinery in v1, so pressure is forced to ZERO steps
+   * and the userId arg to layerPayloadForTileState is inert.
    */
   emitPreferredLayersForConsumer(
     consumerId: string,
     renderState: RemoteVideoTileRenderState
   ): void {
-    const payload = this.layerPayloadForTileState('', renderState, false);
+    const payload = this.layerPayloadForTileState('', renderState, 0, 'screen');
     this.emitPreferredLayers(consumerId, payload);
   }
 
-  private tryEmitCameraPressureLayerRequest(consumerId: string): CameraPressureLayerRequestResult {
+  private tryEmitCameraPressureLayerRequest(
+    consumerId: string,
+    zone: 'yellow' | 'red'
+  ): CameraPressureLayerRequestResult {
     const meta = this.consumerMeta.get(consumerId);
     if (meta?.source !== 'camera' || !this.socket) return 'fallback';
 
-    const targetConsumerId = this.findCameraConsumerIdForUser(meta.producerUserId);
-    if (!targetConsumerId) return 'fallback';
+    // EVERY camera consumer this viewer holds for that producer, not the first.
+    // During a camera replacement the media plane announces the new producer
+    // before superseding the old one (`index.ts`, and media-plane.md states the
+    // ordering is deliberate), so one VoiceService briefly holds two camera
+    // consumers for one user. SFU layer demand is CONSUMER-scoped, so stepping
+    // only the id this lookup happened to return leaves the sibling decoding at
+    // full quality while the user-keyed ledger records that a step landed
+    // (Codex, #3279).
+    const targetConsumerIds = this.cameraConsumerIdsForUser(meta.producerUserId);
+    if (targetConsumerIds.length === 0) return 'fallback';
 
     const states = this.remoteVideoRenderStateByUser.get(meta.producerUserId);
     if (!states || states.size === 0) return 'fallback';
@@ -5873,30 +5990,45 @@ class VoiceService {
     // applies nothing. A step that cannot land is not a step: fall through to pause.
     if (!this.cameraLayeringEnabled) return 'fallback';
 
-    // O2 (budget) — the render-demand path expresses exactly one step of pressure,
-    // and this bit records whether that step is already spent.
-    if (this.remoteVideoPressureByUser.get(meta.producerUserId) === true) return 'fallback';
+    // Per-pass budget, checked BEFORE the zone arithmetic below: a second
+    // consumer for this user must neither spend another step nor be reported as
+    // a pressure failure that pauses them.
+    if (this.pressureSteppedThisPass.has(meta.producerUserId)) return 'deferred';
 
-    // L2 (landability) — policy has no step left for this tile. Pass `false`
-    // explicitly: the default parameter re-reads the pressure map.
-    const pressured = this.computePreferredLayerPayloadForUser(meta.producerUserId, true);
-    const unpressured = this.computePreferredLayerPayloadForUser(meta.producerUserId, false);
-    if (!pressured || !unpressured) return 'fallback';
-    if (
-      pressured.spatialLayer === unpressured.spatialLayer &&
-      pressured.temporalLayer === unpressured.temporalLayer
-    ) {
-      return 'fallback';
+    const currentSteps = this.remoteVideoPressureByUser.get(meta.producerUserId) ?? 0;
+
+    // O2 (budget) — yellow is a warning, not an escalation ladder: it may reach
+    // step 1 and no further. This is also what makes the two zones DISTINGUISHABLE
+    // on the wire, which the single-bit design could not be (R4): any payload at
+    // step 2 or deeper can only have come from red.
+    const nextSteps = zone === 'yellow' ? 1 : currentSteps + 1;
+    if (nextSteps <= currentSteps) return 'fallback';
+
+    // L2 (landability) — ask the policy, not the pressure map, whether a step of
+    // this depth still lands. `0` is passed explicitly: the default parameter
+    // re-reads the map we are about to write.
+    const unpressured = this.computePreferredLayerPayloadForUser(meta.producerUserId, 0);
+    if (!unpressured) return 'fallback';
+    if (nextSteps > maxPressureSteps(unpressured)) return 'fallback';
+
+    const pressured = this.computePreferredLayerPayloadForUser(meta.producerUserId, nextSteps);
+    if (!pressured) return 'fallback';
+
+    this.remoteVideoPressureByUser.set(meta.producerUserId, nextSteps);
+    this.pressureSteppedThisPass.add(meta.producerUserId);
+    for (const id of targetConsumerIds) {
+      this.emitPreferredLayers(id, pressured);
+      // Drop each stepped consumer's sample segment, not just the one that
+      // classified red. A sibling left holding pre-reduction history lets the
+      // next pass jump straight to step 2 on evidence gathered before step 1.
+      this.decoderBudgetSampler.deleteConsumer(id);
     }
-
-    this.remoteVideoPressureByUser.set(meta.producerUserId, true);
-    this.emitPreferredLayers(targetConsumerId, pressured);
     return 'emitted';
   }
 
   private clearRemoteVideoPressureAndEmit(): void {
     const pressuredUserIds = [...this.remoteVideoPressureByUser.entries()]
-      .filter(([, pressured]) => pressured)
+      .filter(([, steps]) => steps > 0)
       .map(([userId]) => userId);
 
     for (const userId of pressuredUserIds) {
@@ -6010,7 +6142,14 @@ class VoiceService {
     const consumerId = this.findScreenConsumerIdForUser(userId);
     if (!consumerId) return;
     this.emitPreferredLayers(consumerId, {
-      ...this.layerPayloadForTileState(userId, removedState),
+      // 0 EXPLICITLY, never the default parameter. The default re-reads
+      // `remoteVideoPressureByUser`, which is keyed by producing user and not by
+      // source — so a user under camera IGNIS pressure had those steps applied to
+      // their SCREEN release payload, persisting a skewed storedDemand on the SFU.
+      // The invariant is already stated at `computePreferredLayerPayloadForUser`:
+      // screen has no BWE pressure machinery in v1. This call site was the one
+      // place that did not honour it (Gitar, #3279).
+      ...this.layerPayloadForTileState(userId, removedState, 0, 'screen'),
       visible: false,
     });
   }
@@ -7646,10 +7785,25 @@ class VoiceService {
    *   Safe FPS:    FPS_safe = margin × (1000 / T_d_p95)
    *   Risk Score:  R = (FPS × T_d_p95) / 1000
    *
-   * Actions:
-   *   Green:  full quality, no intervention
-   *   Yellow: lower temporal layer by 1
-   *   Red:    lower spatial layer by 1, if already lowest → pause lowest-priority consumer
+   * Actions (multi-step ladder, #3279 -- this block described the single-step
+   * behaviour that preceded it and was left stale by the ladder itself):
+   *   Green:  no intervention. Three consecutive green cycles release ONE
+   *           IGNIS-paused consumer (gradual step-up).
+   *   Yellow: at most ONE step, ever. Yellow may reach step 1 and never
+   *           escalates past it, which is also what makes the two zones
+   *           distinguishable on the wire -- any request at step 2 or deeper can
+   *           only have come from red.
+   *   Red:    escalate to `currentSteps + 1`. A pause is the LAST resort, not the
+   *           response to a spent budget at yellow's depth: it happens only when
+   *           no further step can land -- the room camera-layering gate is off
+   *           (L1), the next step is not an increase (O2), or the policy has no
+   *           step left at this tile size (L2).
+   *
+   * Two consequences worth stating because they invert the old contract: red
+   * DOES advance beyond yellow's first step, so yellow followed by red steps
+   * again rather than pausing immediately; and a second consumer for a user
+   * already stepped in this pass is DEFERRED, never paused -- relief is in
+   * flight for it.
    */
   /** Handle RED zone decoder overload: request a layer step down, else pause. */
   private handleRedZone(
@@ -7658,7 +7812,12 @@ class VoiceService {
     p95DecodeMs: number,
     currentFps: number
   ): void {
-    if (this.tryEmitCameraPressureLayerRequest(consumer.id) === 'emitted') {
+    const outcome = this.tryEmitCameraPressureLayerRequest(consumer.id, 'red');
+    // A deferral is this user's step already having landed on an earlier
+    // consumer in this same pass — relief is in flight, so pausing would undo
+    // the point of the ladder.
+    if (outcome === 'deferred') return;
+    if (outcome === 'emitted') {
       console.warn(
         'IGNIS RED: lowering camera layers via render policy for consumer:',
         consumer.id,
@@ -7734,15 +7893,24 @@ class VoiceService {
    *   Safe FPS:    FPS_safe = margin × (1000 / T_d_p95)
    *   Risk Score:  R = (FPS × T_d_p95) / 1000
    *
-   * Actions:
-   *   Green:  full quality, no intervention
-   *   Yellow: request one spatial step down via the server-authoritative render-demand
-   *           path (set-preferred-layers, pressureStepDown: true)
-   *   Red:    same request; when the path has nothing to offer (gate off, pressure
-   *           already spent, or no step left) → pause lowest-priority consumer
+   * Actions (multi-step ladder, #3279 -- the TWIN of the block above
+   * `handleRedZone`, and it went stale the same way; correcting one copy and not
+   * the other is what made a second review round necessary):
+   *   Green:  full quality, no intervention. Three consecutive green cycles
+   *           release one IGNIS-paused consumer.
+   *   Yellow: request ONE spatial step down via the server-authoritative
+   *           render-demand path (set-preferred-layers, pressureStepDown: true),
+   *           and never more than one.
+   *   Red:    request `currentSteps + 1` -- red ESCALATES past yellow's step
+   *           rather than repeating it. Pause only when the path has nothing left
+   *           to offer: gate off (L1), the step is not an increase (O2), or the
+   *           policy has no step left at this tile size (L2).
    *
-   * Yellow and red draw on the SAME one-step-per-user budget (O2), so a yellow tick
-   * that spends it makes the next red tick pause immediately rather than step down.
+   * Yellow and red share the per-user LEDGER but not a one-step cap: yellow is
+   * capped at step 1 while red keeps climbing, so a yellow tick that reaches step 1
+   * does NOT make the next red tick pause -- red steps to 2. That inversion is
+   * also what makes the two zones distinguishable on the wire (R4): a request at
+   * step 2 or deeper can only have come from red.
    */
   private classifyAndHandleDecoderZone(
     consumer: mediasoupTypes.Consumer,
@@ -7768,7 +7936,7 @@ class VoiceService {
     currentFps: number,
     worstZone: DecoderHealthZone
   ): DecoderHealthZone {
-    if (this.tryEmitCameraPressureLayerRequest(consumer.id) === 'emitted') {
+    if (this.tryEmitCameraPressureLayerRequest(consumer.id, 'yellow') === 'emitted') {
       console.warn(
         'IGNIS YELLOW: lowering camera layers via render policy for consumer:',
         consumer.id,
@@ -7781,7 +7949,8 @@ class VoiceService {
       );
       this.decoderBudgetSampler.deleteConsumer(consumer.id);
     }
-    // 'fallback' does nothing — yellow never invents a client control API.
+    // Neither 'fallback' nor 'deferred' does anything here — yellow never invents
+    // a client control API, and unlike red it has no pause arm to guard.
     return VoiceService.mergeDecoderZones(worstZone, 'yellow');
   }
 
@@ -7834,6 +8003,9 @@ class VoiceService {
 
   private async profileDecoders(): Promise<void> {
     let worstZone: DecoderHealthZone | null = null;
+    // One pressure step per producing user per pass. Cleared HERE rather than
+    // after the loop so an early return cannot leave a stale ledger behind.
+    this.pressureSteppedThisPass.clear();
 
     for (const consumer of this.consumers.values()) {
       if (consumer.kind !== 'video') continue;
@@ -9312,6 +9484,7 @@ class VoiceService {
     this.recvTransportVideo = null;
     // Duplicated deliberately: cleanup() does not call cleanupMediaAndTransports() (#3104).
     this.iceServers = null;
+    this.cameraSpatialCapForSession = null;
 
     // Stop local VAD, noise gate, input volume, and live subscriptions
     this.stopLocalVAD();

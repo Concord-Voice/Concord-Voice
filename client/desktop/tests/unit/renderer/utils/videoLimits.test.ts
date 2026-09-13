@@ -6,6 +6,9 @@ import {
   clampScreenForSubscription,
   effectiveStreamAxis,
   shouldEnforceForSubscription,
+  cameraSpatialCapFromJoin,
+  cameraSpatialCapFromAck,
+  resolveSessionCameraCap,
 } from '@/renderer/utils/policy/videoLimits';
 import { FREE_ENTITLEMENT, type Entitlement } from '@/renderer/stores/auth/subscriptionStore';
 
@@ -220,5 +223,139 @@ describe('#2163 tiered screenshare limits — videoLimits', () => {
         })
       ).toBe(false);
     });
+  });
+});
+
+// The camera cap read from the SERVER's own join payload (#3279).
+//
+// This is not a client-side guess at the SFU's decision: `media_entitlements`
+// rides the renderer join response, and `maxCameraSpatialLayerForParticipant`
+// (roomManager.ts) derives the participant cap from this exact field. Reading it
+// here makes client and SFU agree by construction, which neither a live store
+// read nor a store snapshot taken at join can do -- the first is wrong on a
+// mid-call upgrade, the second on a recovery rejoin that deliberately preserves a
+// stale subscription snapshot (Codex, #3279).
+describe('#3279 camera spatial cap from the join payload', () => {
+  const PREMIUM_BPS = FREE_ENTITLEMENT.maxManualBitrateBps * 2;
+
+  it('mirrors the SFU rule for a premium session', () => {
+    expect(cameraSpatialCapFromJoin({ tier: 'premium', max_manual_bitrate_bps: PREMIUM_BPS })).toBe(
+      2
+    );
+  });
+
+  it('caps a free session at layer 1', () => {
+    expect(
+      cameraSpatialCapFromJoin({
+        tier: 'free',
+        max_manual_bitrate_bps: FREE_ENTITLEMENT.maxManualBitrateBps,
+      })
+    ).toBe(1);
+  });
+
+  // The media plane's atomic-free clamp: only an explicit premium tier may carry a
+  // premium cap, so a cross-field-inconsistent response (a control-plane bug, or a
+  // downgrade race) cannot raise the cap on its bitrate alone.
+  it('refuses a premium bitrate that arrives on a non-premium tier', () => {
+    expect(cameraSpatialCapFromJoin({ tier: 'free', max_manual_bitrate_bps: PREMIUM_BPS })).toBe(1);
+    expect(cameraSpatialCapFromJoin({ max_manual_bitrate_bps: PREMIUM_BPS })).toBe(1);
+  });
+
+  // null means "no answer" and is distinct from 1 -- the caller falls back to the
+  // store on null, and would wrongly clamp a premium viewer if this returned 1.
+  it.each([
+    ['undefined', undefined],
+    ['null', null],
+    ['a non-object', 'premium'],
+    ['a missing bitrate', { tier: 'premium' }],
+    ['a non-numeric bitrate', { tier: 'premium', max_manual_bitrate_bps: '9999999' }],
+    ['a non-finite bitrate', { tier: 'premium', max_manual_bitrate_bps: Number.NaN }],
+  ])('returns null for %s so the caller can fall back', (_label, payload) => {
+    expect(cameraSpatialCapFromJoin(payload)).toBeNull();
+  });
+
+  // Total over unknown: a malformed field must degrade, never throw inside the
+  // join path -- same contract as normalizeIceServers.
+  // The bitrate is VALID here on purpose. Without it the function returns null at
+  // the bitrate guard and never reads `tier`, so the case passes with no try/catch
+  // anywhere -- it asserted totality while testing an early return.
+  it('does not throw on a hostile payload, and still declines to answer', () => {
+    const hostile = {
+      max_manual_bitrate_bps: PREMIUM_BPS,
+      get tier() {
+        throw new Error('boom');
+      },
+    };
+    expect(() => cameraSpatialCapFromJoin(hostile)).not.toThrow();
+    expect(cameraSpatialCapFromJoin(hostile)).toBeNull();
+  });
+});
+
+// Precedence for the session cap (#3279).
+//
+// The wiring line inside establishMediaSession had no test and could not easily
+// get one -- that function needs a socket, a device and transports (Gitar,
+// #3279). The decision was therefore extracted here, which is the part worth
+// pinning; what remains at the call site is a single assignment.
+describe('#3279 session camera cap precedence', () => {
+  const PREMIUM_BPS = FREE_ENTITLEMENT.maxManualBitrateBps * 2;
+  const freeStore = { hydrated: true, degraded: false, entitlement: { ...FREE_ENTITLEMENT } };
+  const premiumStore = {
+    hydrated: true,
+    degraded: false,
+    entitlement: { ...FREE_ENTITLEMENT, maxManualBitrateBps: PREMIUM_BPS },
+  };
+  const premiumJoin = { tier: 'premium', max_manual_bitrate_bps: PREMIUM_BPS };
+
+  it('prefers the SFU admitted cap over both the REST join payload and the store', () => {
+    expect(
+      resolveSessionCameraCap({
+        ackCap: 1,
+        joinMediaEntitlements: premiumJoin,
+        subscription: premiumStore,
+      })
+    ).toBe(1);
+  });
+
+  it('falls back to the REST join payload when the media plane omits the field', () => {
+    expect(
+      resolveSessionCameraCap({
+        ackCap: undefined,
+        joinMediaEntitlements: premiumJoin,
+        subscription: freeStore,
+      })
+    ).toBe(2);
+  });
+
+  it('falls back to the store when neither wire source carries it', () => {
+    expect(
+      resolveSessionCameraCap({
+        ackCap: undefined,
+        joinMediaEntitlements: undefined,
+        subscription: premiumStore,
+      })
+    ).toBe(2);
+  });
+
+  // 0 is a legitimate cap and is FALSY, so a `||` chain silently discards it and
+  // falls through to a lower-authority source. The guard has to be `??`.
+  it('respects an admitted cap of 0 rather than treating it as absent', () => {
+    expect(cameraSpatialCapFromAck(0)).toBe(0);
+    expect(
+      resolveSessionCameraCap({
+        ackCap: 0,
+        joinMediaEntitlements: premiumJoin,
+        subscription: premiumStore,
+      })
+    ).toBe(0);
+  });
+
+  it.each([
+    ['a missing field', undefined],
+    ['null', null],
+    ['an out-of-range layer', 3],
+    ['a numeric string', '1'],
+  ])('treats %s as no answer so a lower-authority source is used', (_l, cap) => {
+    expect(cameraSpatialCapFromAck(cap)).toBeNull();
   });
 });

@@ -1,4 +1,4 @@
-import type { Entitlement } from '../../stores/auth/subscriptionStore';
+import { type Entitlement, FREE_ENTITLEMENT } from '../../stores/auth/subscriptionStore';
 
 /**
  * Per-axis video ceiling used for client-side settings gating (#1602). A negative
@@ -181,6 +181,130 @@ export function shouldEnforceForSubscription(sub: SubscriptionSnapshot): boolean
  *
  * Pure (store snapshot passed in).
  */
+/**
+ * The camera SPATIAL-LAYER ceiling the SFU will actually honour for this viewer.
+ *
+ * Mirrors `maxCameraSpatialLayerForParticipant` in the media plane
+ * (`roomManager.ts`), which reads the viewer's own entitlement:
+ * `maxManualBitrateBps > free ? 2 : 1`. The client has to know this number
+ * because IGNIS predicts, client-side, how many pressure steps remain — and a
+ * prediction against the unclamped ladder is wrong for every free viewer.
+ * Without it a free viewer on a large focus tile believes it holds two steps,
+ * spends the first moving the forwarded layer from 1 to 1, and waits a whole
+ * red segment for relief that the first step should have delivered
+ * (Codex, #3279).
+ *
+ * Fails OPEN through the shared `shouldEnforceForSubscription` gate, and the
+ * direction matters: clamping is the harmful guess here. A premium viewer whose
+ * entitlement has not arrived yet would otherwise be held at layer 1 — a
+ * visible quality regression during the pre-hydrate window — whereas failing
+ * open merely reproduces today's behaviour until the real value lands.
+ *
+ * Pure (store snapshot passed in).
+ */
+export function effectiveCameraSpatialCap(sub: SubscriptionSnapshot): 0 | 1 | 2 {
+  if (!shouldEnforceForSubscription(sub)) return 2;
+  return sub.entitlement.maxManualBitrateBps > FREE_ENTITLEMENT.maxManualBitrateBps ? 2 : 1;
+}
+
+/**
+ * The camera spatial cap the SFU itself computed for THIS media session, read
+ * from the join response rather than from any client store.
+ *
+ * `media_entitlements` rides the same renderer join payload as `ice_servers`
+ * (`internal/voice/handlers.go`), and the media plane derives the participant's
+ * cap from exactly this field — `maxCameraSpatialLayerForParticipant` is
+ * `participant.maxManualBitrateBps > FREE.maxManualBitrateBps ? 2 : 1`, where
+ * `participant.maxManualBitrateBps` was set from this very number at join. So
+ * this is not a client-side approximation of the server's decision; it is the
+ * server's own input to it.
+ *
+ * That closes a defect class the store cannot, in BOTH directions. A live store
+ * read is wrong on a mid-call upgrade (the store moves, the SFU session does
+ * not). A snapshot taken from the store at join is wrong during connection
+ * recovery, where `recoveryReset()` deliberately preserves the previous
+ * subscription snapshot while voice rejoins before hydration completes — so a
+ * premium subscription that expired during the outage pins a stale cap 2 against
+ * a session the SFU freshly admitted at 1 (Codex, #3279).
+ *
+ * The `tier` gate mirrors the media plane's own atomic-free clamp: only an
+ * explicit `premium` tier may carry a premium cap, so a cross-field-inconsistent
+ * response cannot raise the cap on its bitrate alone.
+ *
+ * Total over `unknown`, like `normalizeIceServers`: the field is optional on the
+ * wire and a malformed one must degrade to `null` (caller falls back) rather
+ * than throw inside the join path.
+ */
+export function cameraSpatialCapFromJoin(mediaEntitlements: unknown): 0 | 1 | 2 | null {
+  if (typeof mediaEntitlements !== 'object' || mediaEntitlements === null) return null;
+  try {
+    const ent = mediaEntitlements as { tier?: unknown; max_manual_bitrate_bps?: unknown };
+    const bitrate = ent.max_manual_bitrate_bps;
+    if (typeof bitrate !== 'number' || !Number.isFinite(bitrate)) return null;
+    if (ent.tier !== 'premium') return 1;
+    return bitrate > FREE_ENTITLEMENT.maxManualBitrateBps ? 2 : 1;
+  } catch {
+    // A throwing accessor cannot come from `res.json()`, which yields plain data.
+    // The guard is here because this runs inside the join path, where the cost of
+    // being wrong is a failed join rather than a mis-read cap — and because the
+    // doc comment above claims totality, which is worth actually holding.
+    return null;
+  }
+}
+
+/**
+ * The camera spatial cap the SFU reports it ADMITTED this participant under,
+ * read off the `join-room` acknowledgement (#3279).
+ *
+ * This is the end of a chain of four. Each earlier source mirrored the SFU's
+ * RULE against a different client-visible input and disagreed somewhere: a live
+ * store read on a mid-call upgrade; a store snapshot on a recovery rejoin, where
+ * `recoveryReset()` deliberately preserves a stale subscription; and even the
+ * renderer's own REST join payload, because the media plane performs a SEPARATE
+ * `validateChannelAccess` re-authorization at join-room, so a tier change in
+ * that window resolves twice to two answers.
+ *
+ * The class only closes by asking the party that does the clamping. This value
+ * is `cameraSpatialCapForParticipant` in roomManager.ts -- the same expression
+ * `validateAndClampLayerDemand` clamps against -- evaluated on the participant
+ * the SFU actually admitted.
+ *
+ * Returns null for anything but 0, 1 or 2 so an older media plane (which omits
+ * the field) falls back rather than being handed a guess.
+ */
+export function cameraSpatialCapFromAck(cap: unknown): 0 | 1 | 2 | null {
+  return cap === 0 || cap === 1 || cap === 2 ? cap : null;
+}
+
+/**
+ * The camera spatial cap to pin for a media session, resolved from every source
+ * in order of authority (#3279).
+ *
+ * Extracted as a pure function because the wiring line inside
+ * `establishMediaSession` had no test and could not easily get one -- that
+ * function needs a socket, a device and transports. A guard that cannot be
+ * exercised is a guard nobody can trust (Gitar, #3279). What is worth testing is
+ * the PRECEDENCE, not the assignment, so the precedence lives here and
+ * `establishMediaSession` keeps a single call.
+ *
+ *  1. the SFU's admitted cap from the join-room ack -- the party that clamps;
+ *  2. the control plane's `media_entitlements` on the renderer REST join;
+ *  3. the subscription store, for a control plane that sends neither.
+ *
+ * Uses `??` and not `||` deliberately: 0 is a legitimate cap and is falsy.
+ */
+export function resolveSessionCameraCap(input: {
+  ackCap: unknown;
+  joinMediaEntitlements: unknown;
+  subscription: SubscriptionSnapshot;
+}): 0 | 1 | 2 {
+  return (
+    cameraSpatialCapFromAck(input.ackCap) ??
+    cameraSpatialCapFromJoin(input.joinMediaEntitlements) ??
+    effectiveCameraSpatialCap(input.subscription)
+  );
+}
+
 export function effectiveStreamAxis(sub: SubscriptionSnapshot): VideoAxisLimit {
   return shouldEnforceForSubscription(sub)
     ? videoLimitsFromEntitlement(sub.entitlement).stream

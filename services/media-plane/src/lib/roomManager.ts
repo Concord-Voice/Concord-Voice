@@ -392,6 +392,17 @@ export interface ProducerInfo {
   source: MediaSource;
 }
 
+/**
+ * The camera spatial cap this participant was ADMITTED under (#3279).
+ *
+ * Module-level and shared with `maxCameraSpatialLayerForParticipant`, so the
+ * value put on the wire and the value `validateAndClampLayerDemand` clamps
+ * against are the same expression rather than two copies of one rule.
+ */
+export function cameraSpatialCapForParticipant(participant: Participant): LayerValue {
+  return participant.maxManualBitrateBps > FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps ? 2 : 1;
+}
+
 export interface JoinRoomResult {
   rtpCapabilities: RtpCapabilities;
   mediaFrameCryptoVersion: number;
@@ -405,6 +416,23 @@ export interface JoinRoomResult {
     isTesting: boolean;
   }>;
   e2eeEpoch: number;
+  /**
+   * The camera spatial cap the SFU admitted this participant under (#3279).
+   *
+   * The client predicts client-side how many IGNIS pressure steps remain, and a
+   * prediction against a different cap than the one the SFU clamps to spends a
+   * step moving the forwarded layer to where it already was. Every client-side
+   * derivation of this number disagreed somewhere -- a live store read on a
+   * mid-call upgrade, a store snapshot on a recovery rejoin, and the renderer's
+   * own REST join payload when a tier changes in the window before the media
+   * plane's separate `validateChannelAccess` re-authorization (Codex, #3279).
+   * Sending the admitted value is what ends that: it is resolved by the party
+   * that clamps against it, at the moment it clamps.
+   *
+   * Optional so an admitted participant that cannot be resolved omits it and the
+   * client keeps its own fallback chain rather than being handed a guess.
+   */
+  cameraSpatialCap?: LayerValue;
 }
 
 /** Absolute per-room camera-producer ceiling — hard upper bound, not tier-tunable. */
@@ -989,7 +1017,17 @@ function joinRoomResult(
     existingProducers: existingProducerInfo(room, joiningUserId),
     participants: participantInfo(room),
     e2eeEpoch: room.e2eeEpoch,
+    ...cameraSpatialCapField(room, joiningUserId),
   };
+}
+
+/** The admitted cap for the joining participant, or nothing when unresolvable. */
+function cameraSpatialCapField(
+  room: Room,
+  joiningUserId: string
+): { cameraSpatialCap?: LayerValue } {
+  const participant = room.participants.get(joiningUserId);
+  return participant ? { cameraSpatialCap: cameraSpatialCapForParticipant(participant) } : {};
 }
 
 /** Keep an A1-authorized DM socket local until exact A2 promotion. */
@@ -3838,7 +3876,7 @@ export class RoomManager {
   }
 
   private maxCameraSpatialLayerForParticipant(participant: Participant): LayerValue {
-    return participant.maxManualBitrateBps > FREE_MEDIA_ENTITLEMENT.maxManualBitrateBps ? 2 : 1;
+    return cameraSpatialCapForParticipant(participant);
   }
 
   private clearCameraLayerDemand(room: Room, consumerId: string): void {
