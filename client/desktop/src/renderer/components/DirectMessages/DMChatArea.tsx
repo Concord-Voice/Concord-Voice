@@ -207,11 +207,10 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     apiFetch(`/api/v1/dm/conversations/${selectedThreadId}/read`, { method: 'POST' }).catch(
       (error) => {
         console.error('[DMChatArea] Failed to mark conversation as read:', errorMessage(error));
-        if (previousUnread > 0) {
-          useDMStore
-            .getState()
-            .updateConversation(selectedThreadId, { unreadCount: previousUnread });
-        }
+        // The server still counts these; ADD them back on top of whatever has
+        // landed since (the leave-time count, if the user already left) — a
+        // set from either writer would discard the other.
+        useDMStore.getState().incrementUnread(selectedThreadId, previousUnread);
       }
     );
   }, [selectedThreadId, clearUnread]);
@@ -222,11 +221,13 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     { type: 'dm', onFetchComplete: handleFetchComplete }
   );
 
-  // Unseen count on leave (DM-specific: uses dmStore, not unreadStore)
+  // Unseen count on leave (DM-specific: uses dmStore, not unreadStore).
+  // `count` is how many messages arrived while the user was scrolled up; it
+  // is ADDED because the open-time clear may be rolled back above, and "+1"
+  // (the old form) reported 1 for a thread left with three unseen.
   const handleUnseenOnLeave = useCallback(
     (count: number) => {
-      if (!selectedThreadId || count <= 0) return;
-      useDMStore.getState().incrementUnread(selectedThreadId);
+      if (selectedThreadId) useDMStore.getState().incrementUnread(selectedThreadId, count);
     },
     [selectedThreadId]
   );

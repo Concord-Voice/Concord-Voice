@@ -83,7 +83,7 @@ export function resetAllStores(): void {
   useSettingsStore.getState().setAllowNsfwContent(false);
   useMFAChallengeStore.getState().clearChallenge();
   useSavedGifsStore.setState({ gifs: [] });
-  useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });
+  useChannelScrollStore.setState({ anchors: {} });
   useVoiceStore.getState().reset();
   // reset() intentionally preserves layout prefs (incl. voiceViewMode) — pin
   // the view-mode default here so tests never order-depend on a prior toggle.

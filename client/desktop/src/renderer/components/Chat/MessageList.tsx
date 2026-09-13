@@ -10,7 +10,7 @@ import React, {
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
 import Message from './Message';
 import { CallEventMessage } from '../DirectMessages/CallEventMessage';
-import { useChannelScrollStore } from '../../stores/chat/channelScrollStore';
+import { useChannelScrollStore, type ScrollAnchor } from '../../stores/chat/channelScrollStore';
 import { useDMStore } from '../../stores/chat/dmStore';
 import './MessageList.css';
 
@@ -30,10 +30,14 @@ export interface MessageListProps {
   canPin?: boolean;
   onScrollToMessage?: (messageId: string) => void;
   /**
-   * Optional key for scroll-position preservation across remounts.
+   * Optional key for reading-position preservation across remounts.
    * Pass the active channel ID for server channels or the DM conversation ID
-   * for DM threads. When provided, scroll offset is saved on unmount and
-   * restored on mount from channelScrollStore.
+   * for DM threads. When provided, the topmost visible message is saved as an
+   * anchor on unmount (only when the user was above the Return to Latest
+   * threshold) and restored on mount from channelScrollStore. Both callers
+   * key the component by this id, so a change remounts it; a key change on a
+   * surviving instance is handled the same way (the old key's anchor is
+   * saved, the new key lands fresh).
    */
   persistenceKey?: string;
 }
@@ -44,6 +48,49 @@ export interface MessageListHandle {
 }
 
 const NEAR_BOTTOM_THRESHOLD = 150;
+
+/** Single definition of "following the latest message": inside this band the
+ *  Return to Latest button is hidden, new messages auto-scroll, and leaving
+ *  the thread clears its saved anchor. */
+function isNearBottom(list: HTMLElement): boolean {
+  return list.scrollHeight - list.scrollTop - list.clientHeight < NEAR_BOTTOM_THRESHOLD;
+}
+
+/** isNearBottom for one row: its bottom edge sits inside the band above the
+ *  viewport's bottom edge. Asked of the previous latest row once a new one
+ *  has already grown the content, when scrollHeight no longer tells. */
+function rowNearBottom(list: HTMLElement, row: HTMLElement): boolean {
+  return (
+    row.getBoundingClientRect().bottom - list.getBoundingClientRect().bottom < NEAR_BOTTOM_THRESHOLD
+  );
+}
+
+/** Attribute comparison, not a built selector: ids are server-issued, but a
+ *  quote in one must never reach querySelector as syntax. */
+function findRow(list: HTMLElement, messageId: string): HTMLElement | null {
+  for (const row of list.querySelectorAll<HTMLElement>('[data-message-id]')) {
+    if (row.dataset.messageId === messageId) return row;
+  }
+  return null;
+}
+
+/** The message row nearest the top edge of the viewport, with how far its top
+ *  sits above that edge. Null when no row is in view (empty or detached list). */
+function findTopAnchor(list: HTMLElement): ScrollAnchor | null {
+  const listTop = list.getBoundingClientRect().top;
+  for (const row of list.querySelectorAll<HTMLElement>('[data-message-id]')) {
+    const rect = row.getBoundingClientRect();
+    const messageId = row.dataset.messageId;
+    if (messageId && rect.bottom > listTop) return { messageId, offset: listTop - rect.top };
+  }
+  return null;
+}
+
+/** Scroll so `row`'s top sits `offset` px above the viewport's top edge — the
+ *  inverse of findTopAnchor. Relative, so it is correct whatever scrollTop is. */
+function alignRowToTop(list: HTMLElement, row: HTMLElement, offset: number): void {
+  list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top + offset;
+}
 
 // eslint-disable-next-line @eslint-react/no-forward-ref -- forwardRef is intentional here; refactoring to prop-based ref would require updating all callers and is deferred
 const MessageList = forwardRef<MessageListHandle, MessageListProps>(
@@ -80,10 +127,9 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     onUnseenOnLeaveRef.current = onUnseenOnLeave;
     const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
     const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const restoredPersistenceKeyRef = useRef<string | null>(null);
-    const postLoadingRestoreCheckKeyRef = useRef<string | null>(null);
-    const latestMessage = messages.at(-1);
-    const latestMessageId = latestMessage?.clientMessageId ?? latestMessage?.id;
+    const landedKeyRef = useRef<string | null>(null);
+    // scrollTop the landing left the list at, until its scroll event echoes.
+    const landingScrollTopRef = useRef<number | null>(null);
 
     // Real group flag for DM call-event rendering (#1568): when this list is a
     // DM thread, look up the conversation by persistenceKey (its id) and read
@@ -104,7 +150,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
 
     useImperativeHandle(ref, () => ({
       scrollToMessage: (messageId: string) => {
-        const el = listRef.current?.querySelector(`[data-message-id="${messageId}"]`);
+        const el = listRef.current ? findRow(listRef.current, messageId) : null;
         if (el) {
           el.scrollIntoView({ behavior: 'smooth', block: 'center' });
           setHighlightedMessageId(messageId);
@@ -148,57 +194,81 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       };
     }, []);
 
-    // Scroll-position preservation across channel/DM switches.
+    // Reading position across channel/DM switches (persistenceKey).
     //
-    // Uses useLayoutEffect so restoration happens after layout but before
-    // paint, avoiding a one-frame jump. Restore only when the saved offset was
-    // captured against the current latest message; otherwise open at latest.
+    // Landing runs once per key, the first time the list has rows: a saved
+    // anchor puts that message back where it was and marks the list as not
+    // following; otherwise the list opens at the latest row and follows it as
+    // media resolves. Leaving saves an anchor only when the user was above
+    // the Return to Latest threshold; from the bottom it clears the entry, so
+    // the next visit lands on the latest row. The cleanup pairs every landing
+    // with a leave, so a key change on a surviving instance, a StrictMode
+    // replay, and a list that empties and refills all land afresh.
+    // There is no pixel offset anywhere: GIF and image rows are skeletons
+    // until their bytes resolve, so a scrollTop measured after they settled
+    // lands short when replayed before they do, and pinning isNearBottom=false
+    // on top of that disabled the re-pin that would have corrected it — the
+    // recurring "soft-lock above the bottom".
+    //
+    // A first-unread landing was tried here and pulled: the server read marker
+    // advances only when a thread is opened, so anything that arrived while
+    // the user was viewing reads as unread after a refresh, and the landing
+    // reproduced the soft-lock on messages they had already seen.
+    const hasRows = messages.length > 0;
     useLayoutEffect(() => {
-      if (!persistenceKey || !latestMessageId) return;
+      if (!persistenceKey || !hasRows) return;
       const list = listRef.current;
       if (!list) return;
 
-      const saveCurrentScroll = () => {
-        // Use the element captured at setup so cleanup records scroll on the
-        // same node; listRef.current may have changed by the time this runs.
-        useChannelScrollStore
-          .getState()
-          .saveScroll(persistenceKey, list.scrollTop, latestMessageId);
-      };
+      if (landedKeyRef.current !== persistenceKey) {
+        landedKeyRef.current = persistenceKey;
+        const anchor = useChannelScrollStore.getState().getAnchor(persistenceKey);
+        const anchorRow = anchor ? findRow(list, anchor.messageId) : null;
 
-      if (isLoading) {
-        if (restoredPersistenceKeyRef.current === persistenceKey) {
-          postLoadingRestoreCheckKeyRef.current = persistenceKey;
-          return saveCurrentScroll;
-        }
-        return;
-      }
-
-      const shouldRestoreSavedScroll = restoredPersistenceKeyRef.current !== persistenceKey;
-      const shouldValidateAfterLoading = postLoadingRestoreCheckKeyRef.current === persistenceKey;
-
-      if (shouldRestoreSavedScroll || shouldValidateAfterLoading) {
-        const scrollStore = useChannelScrollStore.getState();
-        const saved = scrollStore.getScroll(persistenceKey);
-        const savedLatestMessageId = scrollStore.getScrollLatestMessageId(persistenceKey);
-        if (
-          typeof saved === 'number' &&
-          (!savedLatestMessageId || savedLatestMessageId === latestMessageId)
-        ) {
-          if (shouldRestoreSavedScroll) {
-            list.scrollTop = saved;
-            isNearBottomRef.current = false;
-          }
-        } else if (typeof saved === 'number') {
-          list.scrollTop = list.scrollHeight;
+        if (anchor && anchorRow) {
+          const before = list.scrollTop;
+          alignRowToTop(list, anchorRow, anchor.offset);
+          // An anchor exists only because the user left from above the
+          // threshold, so a restore is never "following". The ref is set from
+          // that fact, not from geometry: at skeleton height the viewport can
+          // read near the bottom, and a ref derived from it re-pinned the list
+          // on the next media resize. Geometry decides only the button, here
+          // and again on every resize.
+          isNearBottomRef.current = false;
+          setShowScrollButton(!isNearBottom(list));
+          // The assignment above fires a scroll event a frame later. The
+          // handler must recognise that echo and not re-decide from whatever
+          // geometry the viewport has at that instant (siblings below the list
+          // are still settling their mount-time layout; StrictMode replays
+          // every one of them in dev). Armed only when the list moved, and
+          // never cleared here, so a StrictMode replay that lands on the same
+          // scrollTop keeps the first landing's pending echo armed. Not armed
+          // for a bottom landing: there the ref is true, and eating the first
+          // user scroll-up would keep it true.
+          if (list.scrollTop !== before) landingScrollTopRef.current = list.scrollTop;
+        } else {
+          // Explicit, not assumed: the ref survives a key change on a mounted
+          // instance and a StrictMode replay. Pin here rather than leaving it
+          // to the messages effect, whose deps do not change on a key change.
           isNearBottomRef.current = true;
+          setShowScrollButton(false);
+          list.scrollTop = list.scrollHeight;
         }
-        restoredPersistenceKeyRef.current = persistenceKey;
-        postLoadingRestoreCheckKeyRef.current = null;
       }
 
-      return saveCurrentScroll;
-    }, [persistenceKey, latestMessageId, isLoading]);
+      // Use the element captured at setup so cleanup measures the same node;
+      // it is still attached when a deleted component's layout cleanup runs.
+      // A detached node has no geometry to decide from, so it writes nothing:
+      // neither a bogus anchor nor a clear that would drop a real one.
+      return () => {
+        landedKeyRef.current = null;
+        if (!list.isConnected) return;
+        const store = useChannelScrollStore.getState();
+        const anchor = isNearBottomRef.current ? null : findTopAnchor(list);
+        if (anchor) store.saveAnchor(persistenceKey, anchor);
+        else store.clearAnchor(persistenceKey);
+      };
+    }, [persistenceKey, hasRows]);
 
     // Auto-scroll when messages change (new message arrives) if user is near bottom.
     // Also track new messages arriving while the user is scrolled up.
@@ -213,18 +283,25 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       const lastMessage = messages.at(-1);
       if (!lastMessage) return; // unreachable: length check above guarantees at-least-one
       const lastId = lastMessage.id;
+      const list = listRef.current;
+      const prevId = prevLastMessageIdRef.current;
+      const arrived = prevId !== null && lastId !== prevId;
+      const prevLast = arrived && list ? findRow(list, prevId) : null;
 
-      if (isNearBottomRef.current) {
-        // User is at the bottom — auto-scroll and reset counter
-        if (listRef.current) {
-          listRef.current.scrollTop = listRef.current.scrollHeight;
-        }
+      // Follow the latest row, or start following when a message lands while
+      // the bottom was already in view: a restored anchor can sit inside the
+      // band at skeleton height, and content can shrink under a still
+      // viewport. "Was" is measured on the previous latest row, because the
+      // new one has already grown the content by the time this runs. Only an
+      // arrival may promote geometry to following — on mount the geometry is
+      // skeleton-height and the landing has decided.
+      if (isNearBottomRef.current || (list && prevLast && rowNearBottom(list, prevLast))) {
+        isNearBottomRef.current = true;
+        if (list) list.scrollTop = list.scrollHeight;
         setNewMessageCount(0);
-      } else if (prevLastMessageIdRef.current !== null && lastId !== prevLastMessageIdRef.current) {
-        // User is scrolled up and a new message arrived — only count others' messages
-        if (lastMessage.user_id !== currentUserId) {
-          setNewMessageCount((c) => c + 1);
-        }
+      } else if (arrived && lastMessage.user_id !== currentUserId) {
+        // Scrolled up and someone else's message arrived — count it.
+        setNewMessageCount((c) => c + 1);
       }
 
       prevLastMessageIdRef.current = lastId;
@@ -237,11 +314,14 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // was at the bottom when the message arrived — exactly the "have to
     // manually scroll" symptom on send.
     //
-    // We observe an inner content wrapper rather than the scroll container
-    // because the scroll container itself is fixed by flex (its content rect
-    // never changes), and observing the bottom sentinel <div> is also a
-    // no-op. Only the inner wrapper grows when child message rows grow, so
-    // it's the one element whose ResizeObserver actually fires on media load.
+    // Two elements are observed. The inner content wrapper grows when child
+    // message rows grow (the scroll container's own content rect never does,
+    // and the bottom sentinel <div> is a no-op). The scroll container itself
+    // resizes when a sibling below it — composer, banner, typing row —
+    // changes height. Either moves the bottom WITHOUT a scroll event, so the
+    // Return to Latest state is re-derived from geometry here as well; a
+    // state refreshed only by scroll events goes stale the moment layout
+    // moves under a still viewport.
     useEffect(() => {
       const list = listRef.current;
       const content = contentRef.current;
@@ -249,9 +329,12 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       const observer = new ResizeObserver(() => {
         if (isNearBottomRef.current) {
           list.scrollTop = list.scrollHeight;
+        } else {
+          setShowScrollButton(!isNearBottom(list));
         }
       });
       observer.observe(content);
+      observer.observe(list);
       return () => observer.disconnect();
     }, [messages.length]);
 
@@ -268,12 +351,29 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     }, []);
 
     const handleScroll = useCallback(() => {
-      if (!listRef.current) return;
+      const list = listRef.current;
+      if (!list) return;
 
-      const { scrollTop, scrollHeight, clientHeight } = listRef.current;
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+      // Load more when scrolled near the top. Before the echo skip below: an
+      // anchor restored within 50px of the top of the loaded page must still
+      // fetch the page above it, and its own echo may be the only scroll
+      // event that position ever produces.
+      if (hasMore && onLoadMore && list.scrollTop < 50 && !isLoading) {
+        onLoadMore();
+      }
 
-      isNearBottomRef.current = distanceFromBottom < NEAR_BOTTOM_THRESHOLD;
+      // First event after a landing: the echo of the landing's own scrollTop
+      // assignment (possibly clamped lower by a viewport that was transiently
+      // taller). A user scrolling up from the landing reads the same way and
+      // loses nothing — they are moving away from the bottom, which is the
+      // state the landing already set. A scroll DOWN is never the echo.
+      if (landingScrollTopRef.current !== null) {
+        const echo = list.scrollTop <= landingScrollTopRef.current;
+        landingScrollTopRef.current = null;
+        if (echo) return;
+      }
+
+      isNearBottomRef.current = isNearBottom(list);
 
       if (isNearBottomRef.current) {
         setNewMessageCount(0);
@@ -282,11 +382,6 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       const shouldShow = !isNearBottomRef.current;
       if (shouldShow !== showScrollButton) {
         setShowScrollButton(shouldShow);
-      }
-
-      // Load more messages when scrolled near top
-      if (hasMore && onLoadMore && scrollTop < 50 && !isLoading) {
-        onLoadMore();
       }
     }, [hasMore, onLoadMore, isLoading, showScrollButton]);
 
@@ -362,9 +457,10 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     return (
       <div className="message-list-container">
         <div className="message-list" ref={listRef} onScroll={handleScroll}>
-          {/* Inner content wrapper exists so the ResizeObserver above can
-              fire on media-load growth. The scroll container itself never
-              resizes (fixed by flex), but this wrapper grows with content. */}
+          {/* Inner content wrapper: the ResizeObserver above watches it for
+              media-load growth, since a scroll container's own box does not
+              grow with its content. The container is observed too, for
+              siblings changing the viewport's height. */}
           <div className="message-list-content" ref={contentRef}>
             {isLoading && hasMore && (
               <div className="loading-more">
@@ -388,12 +484,13 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
                 const isGroupConversation =
                   dmIsGroup ?? (message.call_event_payload.participant_user_ids?.length ?? 0) > 2;
                 return (
-                  <CallEventMessage
-                    key={message.id}
-                    payload={message.call_event_payload}
-                    isGroup={isGroupConversation}
-                    currentUserId={currentUserId}
-                  />
+                  <div key={message.id} data-message-id={message.id}>
+                    <CallEventMessage
+                      payload={message.call_event_payload}
+                      isGroup={isGroupConversation}
+                      currentUserId={currentUserId}
+                    />
+                  </div>
                 );
               }
               return (

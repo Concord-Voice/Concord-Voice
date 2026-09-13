@@ -491,7 +491,10 @@ interface DMState {
    * No-ops if the conversation isn't in state yet (covers initial-load races).
    */
   bumpConversation: (conversationId: string, message: DMLastMessage | null) => void;
-  incrementUnread: (convId: string) => void;
+  /** Add `by` (default 1) to a conversation's unread count. Both the failed
+   *  open-time /read rollback and the leave-time unseen count ADD rather than
+   *  set, so the order the two asynchronous writers land in cannot matter. */
+  incrementUnread: (convId: string, by?: number) => void;
   clearUnread: (convId: string) => void;
 
   updateParticipantProfile: (
@@ -781,11 +784,12 @@ export const useDMStore = wrapStore(
               return { conversations: sortConversationsByActivity(updated) };
             }),
 
-          incrementUnread: (convId: string) => {
+          incrementUnread: (convId: string, by = 1) => {
+            if (by <= 0) return;
             markConversationFetchMutation(convId, 'unreadCount');
             set((state) => ({
               conversations: state.conversations.map((c) =>
-                c.id === convId ? { ...c, unreadCount: c.unreadCount + 1 } : c
+                c.id === convId ? { ...c, unreadCount: c.unreadCount + by } : c
               ),
             }));
           },

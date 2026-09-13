@@ -329,6 +329,21 @@ describe('dmStore', () => {
       expect(useDMStore.getState().conversations[0].unreadCount).toBe(2);
     });
 
+    it('incrementUnread adds the given amount', () => {
+      useDMStore.getState().addConversation(mockConversation);
+      useDMStore.getState().incrementUnread('conv-1', 3);
+      useDMStore.getState().incrementUnread('conv-1', 5);
+      expect(useDMStore.getState().conversations[0].unreadCount).toBe(8);
+    });
+
+    it('incrementUnread ignores a non-positive amount', () => {
+      useDMStore.getState().addConversation({ ...mockConversation, unreadCount: 2 });
+      const before = useDMStore.getState().conversations;
+      useDMStore.getState().incrementUnread('conv-1', 0);
+      useDMStore.getState().incrementUnread('conv-1', -2);
+      expect(useDMStore.getState().conversations).toBe(before);
+    });
+
     it('incrementUnread is a no-op for non-existent conversation', () => {
       useDMStore.getState().addConversation(mockConversation);
       useDMStore.getState().incrementUnread('conv-999');

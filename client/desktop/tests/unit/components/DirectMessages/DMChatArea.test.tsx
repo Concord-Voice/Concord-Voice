@@ -55,6 +55,9 @@ vi.mock('@/renderer/components/Chat/MessageList', () => ({
           Delete
         </button>
         <button data-testid="trigger-unseen" onClick={() => props.onUnseenOnLeave?.(3)}>
+          unseen
+        </button>
+        <button data-testid="trigger-unseen-zero" onClick={() => props.onUnseenOnLeave?.(0)}>
           Unseen
         </button>
       </div>
@@ -945,33 +948,71 @@ describe('DMChatArea', () => {
 
   // --- handleUnseenOnLeave ---
 
-  it('increments unread count when unseen messages on leave', () => {
-    const mockIncrementUnread = vi.fn();
-    useDMStore.setState({
-      conversations: [makeConversation()],
-      incrementUnread: mockIncrementUnread,
-    });
+  const readPosted = () =>
+    waitFor(() =>
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/dm/conversations/conv-1/read'),
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
 
+  it('adds the unseen count to the conversation when leaving', async () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
     render(<DMChatArea selectedThreadId="conv-1" />);
+    await readPosted(); // open-time clear has happened
     fireEvent.click(screen.getByTestId('trigger-unseen'));
-
-    expect(mockIncrementUnread).toHaveBeenCalledWith('conv-1');
+    // The trigger reports 3 unseen; the sidebar must show 3, not 1. The count
+    // was cleared on open, and the list reports how many arrived while
+    // scrolled up, so "+1" under-reports.
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(3);
   });
 
-  it('does not increment unread when count is 0', () => {
-    const mockIncrementUnread = vi.fn();
-    useDMStore.setState({
-      conversations: [makeConversation()],
-      incrementUnread: mockIncrementUnread,
-    });
-
+  it('adds over a count restored by a failed open-time read instead of replacing it', async () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
     render(<DMChatArea selectedThreadId="conv-1" />);
-    // The trigger-unseen button sends count=3; test the guard by checking 0 isn't sent
-    // We can't easily trigger 0 from the mock button, but the guard is covered by
-    // the positive test above plus the no-thread test.
-    // Let's just verify the positive case works.
+    await readPosted();
+    // The open-time /read failed and the five the server still counts were
+    // put back; three more arrived while scrolled up. The badge owes eight.
+    act(() => useDMStore.getState().updateConversation('conv-1', { unreadCount: 5 }));
     fireEvent.click(screen.getByTestId('trigger-unseen'));
-    expect(mockIncrementUnread).toHaveBeenCalled();
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(8);
+  });
+
+  it('a late open-time read failure adds the restored count over the leave-time count', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let rejectRead: (e: Error) => void = () => {};
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        return new Promise((_resolve, reject) => {
+          rejectRead = reject;
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    // The file-level beforeEach stubs clearUnread to a no-op; this scenario
+    // needs the open-time clear to actually happen (5 → 0) before the restore.
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 5 })],
+      clearUnread: (id: string) => useDMStore.getState().updateConversation(id, { unreadCount: 0 }),
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(useDMStore.getState().conversations[0].unreadCount).toBe(0));
+
+    fireEvent.click(screen.getByTestId('trigger-unseen')); // left with 3 unseen
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(3);
+    await act(async () => {
+      rejectRead(new Error('boom')); // the open-time read fails only now
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(8);
+    consoleSpy.mockRestore();
+  });
+
+  it('does not touch the unread count when nothing was unseen', () => {
+    // clearUnread is stubbed file-wide, so the open-time clear cannot move it.
+    useDMStore.setState({ conversations: [makeConversation({ unreadCount: 2 })] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    fireEvent.click(screen.getByTestId('trigger-unseen-zero'));
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(2);
   });
 
   // --- handleTyping ---

@@ -2,62 +2,70 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { useChannelScrollStore } from '@/renderer/stores/chat/channelScrollStore';
 
 beforeEach(() => {
-  useChannelScrollStore.setState({ positions: {}, latestMessageIds: {} });
+  useChannelScrollStore.setState({ anchors: {} });
 });
 
 describe('channelScrollStore', () => {
-  it('starts with empty positions', () => {
-    expect(useChannelScrollStore.getState().positions).toEqual({});
+  it('starts with no anchors', () => {
+    expect(useChannelScrollStore.getState().anchors).toEqual({});
   });
 
-  it('saveScroll stores a scrollTop for a given id', () => {
-    useChannelScrollStore.getState().saveScroll('channel-1', 420);
-    expect(useChannelScrollStore.getState().getScroll('channel-1')).toBe(420);
+  it('saveAnchor stores an anchor for a given id', () => {
+    useChannelScrollStore.getState().saveAnchor('channel-1', { messageId: 'm-1', offset: 12 });
+    expect(useChannelScrollStore.getState().getAnchor('channel-1')).toEqual({
+      messageId: 'm-1',
+      offset: 12,
+    });
   });
 
-  it('getScroll returns undefined for unknown id', () => {
-    expect(useChannelScrollStore.getState().getScroll('missing')).toBeUndefined();
+  it('getAnchor returns undefined for unknown id', () => {
+    expect(useChannelScrollStore.getState().getAnchor('missing')).toBeUndefined();
   });
 
-  it('saveScroll overwrites previous value', () => {
-    const { saveScroll, getScroll } = useChannelScrollStore.getState();
-    saveScroll('channel-1', 100);
-    saveScroll('channel-1', 250);
-    expect(useChannelScrollStore.getState().getScroll('channel-1')).toBe(250);
-    // Make sure getScroll reads from current state, not snapshot
-    expect(getScroll('channel-1')).toBe(250);
+  it('saveAnchor overwrites the previous anchor', () => {
+    const { saveAnchor, getAnchor } = useChannelScrollStore.getState();
+    saveAnchor('channel-1', { messageId: 'm-1', offset: 0 });
+    saveAnchor('channel-1', { messageId: 'm-2', offset: 40 });
+    expect(useChannelScrollStore.getState().getAnchor('channel-1')).toEqual({
+      messageId: 'm-2',
+      offset: 40,
+    });
+    // Make sure getAnchor reads from current state, not a snapshot
+    expect(getAnchor('channel-1')).toEqual({ messageId: 'm-2', offset: 40 });
   });
 
-  it('keeps per-key positions independent', () => {
-    const { saveScroll } = useChannelScrollStore.getState();
-    saveScroll('channel-1', 100);
-    saveScroll('channel-2', 200);
-    saveScroll('dm-conv-1', 300);
+  it('keeps per-key anchors independent', () => {
+    const { saveAnchor } = useChannelScrollStore.getState();
+    saveAnchor('channel-1', { messageId: 'a', offset: 0 });
+    saveAnchor('channel-2', { messageId: 'b', offset: 0 });
+    saveAnchor('dm-conv-1', { messageId: 'c', offset: 0 });
     const s = useChannelScrollStore.getState();
-    expect(s.getScroll('channel-1')).toBe(100);
-    expect(s.getScroll('channel-2')).toBe(200);
-    expect(s.getScroll('dm-conv-1')).toBe(300);
+    expect(s.getAnchor('channel-1')?.messageId).toBe('a');
+    expect(s.getAnchor('channel-2')?.messageId).toBe('b');
+    expect(s.getAnchor('dm-conv-1')?.messageId).toBe('c');
   });
 
-  it('clearScroll removes the saved position for an id', () => {
-    const { saveScroll, clearScroll } = useChannelScrollStore.getState();
-    saveScroll('channel-1', 100);
-    saveScroll('channel-2', 200);
-    clearScroll('channel-1');
+  it('clearAnchor removes the saved anchor for an id', () => {
+    const { saveAnchor, clearAnchor } = useChannelScrollStore.getState();
+    saveAnchor('channel-1', { messageId: 'a', offset: 0 });
+    saveAnchor('channel-2', { messageId: 'b', offset: 0 });
+    clearAnchor('channel-1');
     const s = useChannelScrollStore.getState();
-    expect(s.getScroll('channel-1')).toBeUndefined();
-    expect(s.getScroll('channel-2')).toBe(200);
+    expect(s.getAnchor('channel-1')).toBeUndefined();
+    expect(s.getAnchor('channel-2')?.messageId).toBe('b');
   });
 
-  it('clearScroll on unknown id is a no-op', () => {
-    const { saveScroll, clearScroll } = useChannelScrollStore.getState();
-    saveScroll('channel-1', 100);
-    clearScroll('missing');
-    expect(useChannelScrollStore.getState().positions).toEqual({ 'channel-1': 100 });
+  it('clearAnchor on unknown id is a no-op', () => {
+    const { saveAnchor, clearAnchor } = useChannelScrollStore.getState();
+    saveAnchor('channel-1', { messageId: 'a', offset: 0 });
+    clearAnchor('missing');
+    expect(useChannelScrollStore.getState().anchors).toEqual({
+      'channel-1': { messageId: 'a', offset: 0 },
+    });
   });
 
-  it('supports scrollTop value 0', () => {
-    useChannelScrollStore.getState().saveScroll('channel-1', 0);
-    expect(useChannelScrollStore.getState().getScroll('channel-1')).toBe(0);
+  it('supports a negative offset (divider between the row and the top edge)', () => {
+    useChannelScrollStore.getState().saveAnchor('channel-1', { messageId: 'a', offset: -28 });
+    expect(useChannelScrollStore.getState().getAnchor('channel-1')?.offset).toBe(-28);
   });
 });

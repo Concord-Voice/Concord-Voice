@@ -58,7 +58,7 @@ Full analysis was performed during Phase 1A architecture decisions (internal).
 | **notificationStore**           | Desktop notification preferences and queue                   | ✅                   | 2A    |
 | **osPermissionStore**           | OS-level permission states (mic, camera, screen)             | ❌                   | 2A    |
 | **permissionStore**             | RBAC permission state for current server/channel             | ❌                   | 2A    |
-| **channelScrollStore**          | Per-channel scroll position tracking                         | ❌                   | 2B    |
+| **channelScrollStore**          | Per-channel/DM reading-position anchor (message id + offset) | ❌                   | 2B    |
 | **draftMessageStore**           | Per-channel unsent message drafts                            | ❌                   | 2B    |
 | **keyboardShortcutStore**       | Keyboard shortcut configuration and state                    | ✅                   | 2B    |
 | **notificationNavigationStore** | Notification click navigation targets                        | ❌                   | 2B    |

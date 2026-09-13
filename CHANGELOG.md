@@ -75,6 +75,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Chats come back to where you left them, and "Return to Latest" means it** ([#2006](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2006), [#3282](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3282)) — leaving a conversation and coming back could land you a few messages above the bottom, with
+  Return to Latest showing, and clicking it or scrolling down did not stick: the next visit put you
+  back in the same spot. The app remembered your place as a pixel distance measured after every
+  GIF had loaded, then replayed it before they had, so "the bottom" came up short by exactly the
+  height those GIFs grow. It now remembers the message at the top of your view instead, which
+  survives anything loading late. Leaving from the bottom forgets your place on purpose, so the
+  next visit opens at the newest message and follows it as media resolves; leaving from higher up
+  brings you back to that message, with Return to Latest already showing rather than waiting
+  for you to nudge the scroll. Leaving a direct message with unread replies now marks the real
+  number unread in the sidebar instead of always one.
+
 - **The GIF and emoji pickers now sit against the button that opened them, with an arrow
   pointing at it** ([#3278](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3278), [#2370](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2370)) — both panels used to float
   above the toolbar with a gap under them and nothing tying them to the icon you clicked, which
