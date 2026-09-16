@@ -64,6 +64,18 @@ export interface AggregateMediaMetrics {
   readonly participantHoursAudio: number;
   readonly participantHoursWebcam: number;
   readonly participantHoursScreenshare: number;
+  /**
+   * #3094 witnesses, and the two members of this interface that are cumulative
+   * COUNTERS rather than gauges or interval accumulations.
+   *
+   * Unlike admissionRejected and the ICE counters above, these DO belong on
+   * AggregateMediaMetrics: they are in the closed ops-metrics catalog as of
+   * migration 000135, because each makes a consequence #3094 accepted in writing
+   * observable rather than merely recorded — a room-wide gate one viewer can
+   * flap, and a pressure path with no aggregate witness that it is live.
+   */
+  readonly cameraLayeringGateFlipsTotal: number;
+  readonly cameraPressureDemandsTotal: number;
 }
 
 /**
@@ -84,6 +96,8 @@ export class MediaMetrics {
   private iceSelectedUdp = 0;
   private iceSelectedTcp = 0;
   private iceTerminalWithoutConnect = 0;
+  private cameraLayeringGateFlips = 0;
+  private cameraPressureDemands = 0;
 
   /**
    * Count one admission-gate rejection (#2032). Not fed by `ingest` because it
@@ -92,6 +106,21 @@ export class MediaMetrics {
    */
   incrementAdmissionRejected(): void {
     this.admissionRejected += 1;
+  }
+
+  /**
+   * Count one transition of a room's camera-layering gate (#3094). Event-driven
+   * like the ICE counters, not sampled: a flip is an instant, and a gauge read
+   * on the 30s heartbeat would miss every flap shorter than the interval —
+   * which is precisely the shape of the flapping this exists to reveal.
+   */
+  incrementCameraLayeringGateFlip(): void {
+    this.cameraLayeringGateFlips += 1;
+  }
+
+  /** Count one accepted camera layer demand carrying pressureStepDown (#3094). */
+  incrementCameraPressureDemand(): void {
+    this.cameraPressureDemands += 1;
   }
 
   /**
@@ -170,6 +199,8 @@ export class MediaMetrics {
       participantHoursAudio: snapshot.participantHoursByKind.audio,
       participantHoursWebcam: snapshot.participantHoursByKind.webcam,
       participantHoursScreenshare: snapshot.participantHoursByKind.screenshare,
+      cameraLayeringGateFlipsTotal: this.cameraLayeringGateFlips,
+      cameraPressureDemandsTotal: this.cameraPressureDemands,
     };
   }
 
@@ -185,5 +216,7 @@ export class MediaMetrics {
     this.iceSelectedUdp = 0;
     this.iceSelectedTcp = 0;
     this.iceTerminalWithoutConnect = 0;
+    this.cameraLayeringGateFlips = 0;
+    this.cameraPressureDemands = 0;
   }
 }

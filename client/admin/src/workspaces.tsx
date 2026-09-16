@@ -132,6 +132,8 @@ const METRIC_COPY: Partial<Record<MetricKey, string>> = {
   dm_messages_total: "Direct messages",
   ops_snapshot_rejections_total: "Rejected operations snapshots",
   presence_audience_suppressed_total: "Suppressed presence broadcasts",
+  media_camera_layering_gate_flips_total: "Camera layering gate flips",
+  media_camera_pressure_demands_total: "Camera pressure demands",
   registered_users_current: "Registered users",
   pending_registrations_current: "Pending registrations",
   users_online_current: "Users online",

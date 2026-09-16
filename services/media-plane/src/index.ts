@@ -648,6 +648,8 @@ async function main() {
   const roomManager = new RoomManager(mediasoupService, {
     onIceSelected: (protocol) => mediaMetrics.incrementIceSelected(protocol),
     onIceTerminalWithoutConnect: () => mediaMetrics.incrementIceTerminalWithoutConnect(),
+    onCameraLayeringGateFlip: () => mediaMetrics.incrementCameraLayeringGateFlip(),
+    onCameraPressureDemand: () => mediaMetrics.incrementCameraPressureDemand(),
   });
   roomManager.setSecurityEventEmitter((event) => securityEvents.emit(event));
 

@@ -53,6 +53,8 @@ export class OpsMetricsPublisher {
       media_egress_current_bps: mediaMetrics.egressCurrentBps,
       media_egress_peak_bps: mediaMetrics.egressPeakBps,
       media_egress_cumulative_bytes: mediaMetrics.egressCumulativeBytes,
+      media_camera_layering_gate_flips_total: mediaMetrics.cameraLayeringGateFlipsTotal,
+      media_camera_pressure_demands_total: mediaMetrics.cameraPressureDemandsTotal,
       media_participant_hours_audio: mediaMetrics.participantHoursAudio,
       media_participant_hours_webcam: mediaMetrics.participantHoursWebcam,
       media_participant_hours_screenshare: mediaMetrics.participantHoursScreenshare,

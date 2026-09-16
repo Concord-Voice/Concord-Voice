@@ -82,7 +82,7 @@ func TestAdminMetricsOpenAPICounterKeysMatchCatalog(t *testing.T) {
 		assert.Truef(t, exists, "counter metric %q missing from admin OpenAPI", definition.Key)
 	}
 	require.Len(t, documented, expectedCount)
-	assert.Contains(t, contents, "maxItems: 12\n          items:\n            $ref: '#/components/schemas/AdminCounterPoint'")
+	assert.Contains(t, contents, "maxItems: 14\n          items:\n            $ref: '#/components/schemas/AdminCounterPoint'")
 }
 
 func TestAdminMetricsOpenAPISeriesBoundsMatchHandlers(t *testing.T) {
@@ -512,4 +512,24 @@ func TestOpenAPIMetricBoundsMatchTheCatalog(t *testing.T) {
 		"/metrics/current emits at most one point per catalog key, so a bound below "+
 			"CatalogSize() rejects a VALID response — this is the assertion the literal "+
 			"doc-pins above could not make")
+
+	// The counter rail had only the literal maxItems pin above, and a literal cannot
+	// notice that the catalog grew. #3094 admitted two counters and the pin still read
+	// 12, which would have bounded /metrics/counters BELOW the number of counters it
+	// can emit — a schema that rejects a valid response. Derive it, as the metric rail
+	// already does, so the next admitted counter fails here rather than in production.
+	counters := 0
+	for _, definition := range Catalog() {
+		if definition.Kind == KindCounter {
+			counters++
+		}
+	}
+	require.Positive(t, counters, "a zero counter set would make both assertions below vacuous")
+
+	assert.Equal(t, counters, enumSize("CounterMetricKey"),
+		"every counter key must be expressible in the API, or a served counter is "+
+			"unrepresentable in the schema")
+	assert.Equal(t, counters, boundAfter("AdminCountersResponse", "counters"),
+		"/metrics/counters emits at most one point per counter key, so a bound below "+
+			"the counter count rejects a VALID response")
 }

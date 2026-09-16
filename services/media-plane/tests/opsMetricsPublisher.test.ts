@@ -46,6 +46,8 @@ function createDependencies() {
         participantHoursAudio: 12.5,
         participantHoursWebcam: 4.25,
         participantHoursScreenshare: 1.5,
+        cameraLayeringGateFlipsTotal: 7,
+        cameraPressureDemandsTotal: 3,
       })),
     },
   };
@@ -98,6 +100,11 @@ describe('OpsMetricsPublisher', () => {
       media_participant_hours_audio: 12.5,
       media_participant_hours_webcam: 4.25,
       media_participant_hours_screenshare: 1.5,
+      // Carried straight from the aggregate fixture (7 and 3), which is what
+      // makes this assertion evidence that the whole chain is wired rather
+      // than only that the keys exist.
+      media_camera_layering_gate_flips_total: 7,
+      media_camera_pressure_demands_total: 3,
     });
     expect(Object.values(snapshot).every((value) => typeof value === 'number')).toBe(true);
   });

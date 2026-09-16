@@ -20,6 +20,12 @@ export const MEDIA_METRIC_DEFINITIONS = {
   media_participant_hours_audio: { source: 'media', min: 0, max: 1e12 },
   media_participant_hours_webcam: { source: 'media', min: 0, max: 1e12 },
   media_participant_hours_screenshare: { source: 'media', min: 0, max: 1e12 },
+  // #3094 witnesses. Gate flips make the accepted "one viewer can flap the room
+  // gate" consequence diagnosable; pressure demands close the accepted
+  // "production blindness" consequence — no client sent pressureStepDown before
+  // that change, so any non-zero value proves the activated path is live.
+  media_camera_layering_gate_flips_total: { source: 'media', min: 0, max: 1e15 },
+  media_camera_pressure_demands_total: { source: 'media', min: 0, max: 1e15 },
 } as const satisfies Record<string, MetricDefinition>;
 
 export type MediaMetricKey = keyof typeof MEDIA_METRIC_DEFINITIONS;

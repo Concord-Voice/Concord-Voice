@@ -12,6 +12,8 @@ import {
   parseSeries,
 } from "./contracts";
 import {
+  NODE_ID,
+  SAMPLED_AT,
   countersFixture,
   currentFixture,
   healthFixture,
@@ -27,7 +29,7 @@ describe("metric catalog", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
     expect(PRIMARY_METRIC_MAP.control).toHaveLength(8);
-    expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(7);
+    expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(9);
     expect(PRIMARY_METRIC_MAP.mediaEgress).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.participantHours).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.usersActivity).toEqual(
@@ -35,9 +37,9 @@ describe("metric catalog", () => {
     );
 
     const assigned = Object.values(PRIMARY_METRIC_MAP).flat();
-    expect(assigned).toHaveLength(62);
+    expect(assigned).toHaveLength(64);
     expect(new Set(assigned)).toEqual(new Set(METRIC_KEYS));
-    expect(COUNTER_METRIC_KEYS).toHaveLength(12);
+    expect(COUNTER_METRIC_KEYS).toHaveLength(14);
   });
 });
 
@@ -234,5 +236,63 @@ describe("parseSeries", () => {
       ).toISOString(),
     }));
     expect(() => parseSeries(week)).toThrow(ContractError);
+  });
+});
+
+describe("media metric definitions", () => {
+  // No other test in this suite reaches mediaMetricDefinition's fallback, which is
+  // how #3094 shipped two media COUNTERS into a fallback that hardcoded
+  // kind: "gauge". parseMetricPoint compares kind against that definition and
+  // rejects the WHOLE payload on a mismatch, so those two keys blanked every
+  // counter in the console behind a generic error while the server answered 200.
+  // The e2e caught it; nothing here did.
+  function mediaPoint(metricKey: string, kind: "counter" | "gauge") {
+    return {
+      metric_key: metricKey,
+      source: "media",
+      unit: "count",
+      kind,
+      value: 7,
+      sampled_at: SAMPLED_AT,
+    };
+  }
+
+  it("accepts the camera counters as counters", () => {
+    expect(() =>
+      parseCounters({
+        node_id: NODE_ID,
+        counters: [
+          mediaPoint("media_camera_layering_gate_flips_total", "counter"),
+          mediaPoint("media_camera_pressure_demands_total", "counter"),
+        ],
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects a camera counter served as a gauge", () => {
+    // The falsifier for the test above: without it, a definition that still said
+    // "gauge" would pass that one by agreeing with a gauge-shaped payload.
+    expect(() =>
+      parseCurrent({
+        node_id: NODE_ID,
+        metrics: [
+          mediaPoint("media_camera_layering_gate_flips_total", "gauge"),
+        ],
+      }),
+    ).toThrow(ContractError);
+  });
+
+  it("leaves ordinary media keys as gauges", () => {
+    expect(() =>
+      parseCurrent({
+        node_id: NODE_ID,
+        metrics: [
+          mediaPoint("media_rooms_current", "gauge"),
+          // Same kind, different rollup arm - the only non-counter key that is
+          // "last" rather than "average".
+          mediaPoint("media_peak_video_publishers_per_room", "gauge"),
+        ],
+      }),
+    ).not.toThrow();
   });
 });

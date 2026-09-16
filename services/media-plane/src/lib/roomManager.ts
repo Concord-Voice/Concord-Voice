@@ -834,14 +834,27 @@ export interface AggregateRoomCounts {
 }
 
 /**
- * Narrow ICE outcome hooks (#3104). Deliberately the SAME shape discipline as
- * admissionGate's `onReject`: the callback is given the wire protocol and
- * nothing else — no transport id, no room, no user, no address — so /health
- * stays aggregate-only (index.ts:595-602).
+ * Narrow aggregate-counter hooks. Deliberately the SAME shape discipline as
+ * admissionGate's `onReject`: each callback is given the one fact it counts and
+ * nothing else — no transport id, no room, no user, no address — so /health and
+ * the ops-metrics catalog stay aggregate-only (index.ts:595-602).
+ *
+ * Renamed from `IceCounters` when the camera-layering hooks joined: ICE was the
+ * founding case (#3104), not the category. Keeping the old name would have made
+ * the next reader look for an ICE connection that does not exist.
  */
-export interface IceCounters {
+export interface RoomCounterHooks {
   onIceSelected?: (protocol: 'udp' | 'tcp') => void;
   onIceTerminalWithoutConnect?: () => void;
+  /** One transition of the ROOM-WIDE camera-layering gate. Carries no direction:
+   *  an on/off split says nothing a flap rate does not, and every dimension in
+   *  this catalog is one an operator could correlate against a room. */
+  onCameraLayeringGateFlip?: () => void;
+  /** One accepted camera layer demand carrying pressureStepDown. Carries no
+   *  depth — the wire flag is boolean, so depth is not observable here, and
+   *  deriving it from the requested spatialLayer would smuggle in a
+   *  render-state dimension. */
+  onCameraPressureDemand?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,7 +1099,7 @@ export class RoomManager {
 
   constructor(
     mediasoup: MediasoupService,
-    private readonly iceCounters: IceCounters = {}
+    private readonly counterHooks: RoomCounterHooks = {}
   ) {
     this.mediasoup = mediasoup;
   }
@@ -1979,7 +1992,7 @@ export class RoomManager {
     // the transport to a detached object that nothing ever closes and that the
     // recv cap cannot see. Close the orphan and fail closed (#2032).
     if (room.participants.get(userId) !== participant) {
-      this.iceCounters.onIceTerminalWithoutConnect?.();
+      this.counterHooks.onIceTerminalWithoutConnect?.();
       if (!transport.closed) transport.close();
       if (direction === 'recv') this.releaseRecvTransportReservation(participant);
       throw new Error('Participant left during transport creation');
@@ -2021,7 +2034,7 @@ export class RoomManager {
       if (iceState !== 'disconnected' && iceState !== 'closed') return;
       if (everConnected || terminalCounted) return;
       terminalCounted = true;
-      this.iceCounters.onIceTerminalWithoutConnect?.();
+      this.counterHooks.onIceTerminalWithoutConnect?.();
     });
 
     // Fires after ICE reaches `completed`, and again on every tuple change.
@@ -2032,7 +2045,7 @@ export class RoomManager {
       const protocol = tuple?.protocol;
       if (protocol !== 'udp' && protocol !== 'tcp') return;
       tupleCounted = true;
-      this.iceCounters.onIceSelected?.(protocol);
+      this.counterHooks.onIceSelected?.(protocol);
     });
 
     transport.on('dtlsstatechange', (dtlsState) => {
@@ -2878,6 +2891,10 @@ export class RoomManager {
     const source = (consumer.appData as { source?: unknown } | undefined)?.source;
     if (source === 'camera') {
       room.cameraLayerDemands.set(stored.consumerId, stored);
+      // After validation and clamping, so this counts demands the SFU ACCEPTED
+      // rather than every arriving payload. Before #3094 no client ever sent the
+      // flag, so any non-zero total is itself proof the activated path is live.
+      if (stored.pressureStepDown) this.counterHooks.onCameraPressureDemand?.();
       this.recomputeCameraLayeringGate(room);
     } else if (source === 'screen') {
       // The watched screen producer's owner (server-set on consume, appData) is
@@ -3872,6 +3889,10 @@ export class RoomManager {
     });
     if (enabled === room.cameraLayeringGateEnabled) return;
     room.cameraLayeringGateEnabled = enabled;
+    // Counted HERE rather than at the emit subscriber: this is the one place a
+    // transition is decided, and the snapshot emitted to a joining participant
+    // (#3275) is deliberately not a flip.
+    this.counterHooks.onCameraLayeringGateFlip?.();
     this.emitEvent({ type: 'camera-layering-gate', roomId: room.id, enabled });
   }
 

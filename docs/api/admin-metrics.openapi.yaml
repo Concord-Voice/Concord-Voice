@@ -348,6 +348,8 @@ components:
         - media_participant_hours_audio
         - media_participant_hours_webcam
         - media_participant_hours_screenshare
+        - media_camera_layering_gate_flips_total
+        - media_camera_pressure_demands_total
     CounterMetricKey:
       type: string
       enum:
@@ -363,6 +365,8 @@ components:
         - media_participant_hours_webcam
         - media_participant_hours_screenshare
         - presence_audience_suppressed_total
+        - media_camera_layering_gate_flips_total
+        - media_camera_pressure_demands_total
     MetricSource:
       type: string
       enum:
@@ -479,7 +483,7 @@ components:
           # MUST equal the number of MetricKey enum entries: /metrics/current can
           # emit one point per catalog key, so a bound below the enum size rejects
           # a valid response. Pinned by TestOpenAPIMetricBoundsMatchTheEnums.
-          maxItems: 62
+          maxItems: 64
           items:
             $ref: '#/components/schemas/AdminMetricPoint'
     AdminCounterPoint:
@@ -520,7 +524,11 @@ components:
           $ref: '#/components/schemas/NodeId'
         counters:
           type: array
-          maxItems: 12
+          # MUST equal the number of CounterMetricKey enum entries: /metrics/counters
+          # can emit one point per counter key, so a bound below the enum size rejects
+          # a valid response. Same invariant as AdminCurrentResponse.metrics above,
+          # which carried this note while this one did not.
+          maxItems: 14
           items:
             $ref: '#/components/schemas/AdminCounterPoint'
     AdminSeriesMetric:

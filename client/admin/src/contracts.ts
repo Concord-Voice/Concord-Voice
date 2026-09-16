@@ -79,6 +79,12 @@ const MEDIA_ACTIVITY_METRIC_KEYS = [
   "media_camera_publishers_current",
   "media_screen_publishers_current",
   "media_peak_video_publishers_per_room",
+  // #3094 witnesses. Counters in a gauge-shaped group, following
+  // media_egress_cumulative_bytes: COUNTER_METRIC_KEYS carries the kind, so a new
+  // workspace panel would be presentation churn for two values an operator reads
+  // alongside the publisher counts they explain.
+  "media_camera_layering_gate_flips_total",
+  "media_camera_pressure_demands_total",
 ] as const;
 
 const MEDIA_EGRESS_METRIC_KEYS = [
@@ -128,6 +134,8 @@ export const COUNTER_METRIC_KEYS = [
   "media_participant_hours_audio",
   "media_participant_hours_webcam",
   "media_participant_hours_screenshare",
+  "media_camera_layering_gate_flips_total",
+  "media_camera_pressure_demands_total",
 ] as const satisfies readonly MetricKey[];
 
 export type CounterMetricKey = (typeof COUNTER_METRIC_KEYS)[number];
@@ -372,11 +380,25 @@ function mediaMetricDefinition(key: MetricKey): MetricDefinition {
   if (key.startsWith("media_participant_hours_")) {
     return { source: "media", unit: "hours", kind: "counter", rollup: "last" };
   }
+  // Derive kind from COUNTER_METRIC_KEYS, exactly as controlMetricDefinition
+  // already does. This fallback hardcoded "gauge", so the moment #3094 admitted
+  // two count-unit COUNTERS here they were classified as gauges, and
+  // parseMetricPoint rejects a point whose kind disagrees with its definition.
+  // That rejection is not scoped to the offending point - it throws the WHOLE
+  // /counters and /current parse, so two new keys blanked EVERY counter in the
+  // console behind a generic "Unable to load counters", with the server still
+  // answering 200 and nothing in the backend contradicting it
+  // ([internal]rules/opsmetrics.md, "A server-only key makes /current and
+  // /counters fail closed in the browser").
+  const counter = counterMetricKeySet.has(key);
   return {
     source: "media",
     unit: "count",
-    kind: "gauge",
-    rollup: key === "media_peak_video_publishers_per_room" ? "last" : "average",
+    kind: counter ? "counter" : "gauge",
+    rollup:
+      counter || key === "media_peak_video_publishers_per_room"
+        ? "last"
+        : "average",
   };
 }
 

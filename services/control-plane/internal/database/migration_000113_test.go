@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,17 +24,22 @@ var migration000113MetricLiteral = regexp.MustCompile(
 
 const migration000113NewKey = "presence_audience_suppressed_total"
 
-// TestMigration000113_FilesAndSchemaLock pins the SQL against the Go catalog.
-// 000113 is now the newest catalog migration, so it owns the LIVE-catalog
-// assertion that 000091 used to carry; 000091's own list is frozen.
+// TestMigration000113_FilesAndSchemaLock pins the SQL against the 62-key set
+// 000113 itself admitted.
+//
+// FROZEN by 000135, following the 000086 and 000091 precedent: the newest
+// catalog migration owns the LIVE-catalog pin and older ones freeze their own
+// list. Left reading the live catalog, this test would fail the moment any
+// later migration admitted a key — asserting that a 2026 SQL file already
+// contains something added after it was written.
 func TestMigration000113_FilesAndSchemaLock(t *testing.T) {
 	up := migration000113SQL(t, "up")
 	down := migration000113SQL(t, "down")
 	readme := migrationReadFile(t, filepath.Join("..", "..", "migrations", "README.md"))
 
-	catalogKeys := migration000113CatalogKeys()
+	catalogKeys := migration000113FrozenKeys()
 	require.Contains(t, catalogKeys, migration000113NewKey,
-		"the Go catalog must carry the key this migration admits, or the two have drifted")
+		"the frozen list must carry the key this migration admits, or the freeze was taken wrong")
 	assert.Equal(t, catalogKeys, migration000113ConstraintKeys(up, "ops_metric_samples_metric_key_check"))
 	assert.Equal(t, catalogKeys, migration000113ConstraintKeys(up, "ops_metric_rollups_metric_key_check"))
 
@@ -173,11 +177,81 @@ func migration000113ConstraintKeys(contents, constraint string) []string {
 	return keys
 }
 
-func migration000113CatalogKeys() []string {
-	definitions := opsmetrics.Catalog()
-	keys := make([]string, 0, len(definitions))
-	for _, definition := range definitions {
-		keys = append(keys, string(definition.Key))
+// migration000113FrozenKeys is the catalog AS OF 000113 — the exact 62 keys this
+// migration's own CHECK admits, sorted.
+//
+// Deliberately a literal rather than a read of opsmetrics.Catalog(). The live
+// catalog is now 64 keys and will keep growing; this SQL file is finished and
+// will not. Deriving it would make this test assert that a file written in 2026
+// already contains every key added since, which is false by construction and is
+// exactly the failure 000135 would otherwise have caused here.
+//
+// Nothing may be added to this list. A new catalog key belongs in the newest
+// migration's test, which owns the live pin.
+func migration000113FrozenKeys() []string {
+	keys := []string{
+		"active_sessions_current",
+		"active_users_15d",
+		"active_users_24h",
+		"active_users_30d",
+		"active_users_7d",
+		"channel_messages_total",
+		"dm_messages_total",
+		"host_cpu_percent",
+		"host_disk_percent",
+		"host_load_1m",
+		"host_memory_percent",
+		"http_client_errors_total",
+		"http_requests_total",
+		"http_server_errors_total",
+		"media_camera_publishers_current",
+		"media_egress_cumulative_bytes",
+		"media_egress_current_bps",
+		"media_egress_peak_bps",
+		"media_participant_hours_audio",
+		"media_participant_hours_screenshare",
+		"media_participant_hours_webcam",
+		"media_participants_audio_current",
+		"media_participants_screenshare_current",
+		"media_participants_webcam_current",
+		"media_peak_video_publishers_per_room",
+		"media_rooms_current",
+		"media_screen_publishers_current",
+		"media_uploads_total",
+		"ops_snapshot_rejections_total",
+		"pending_registrations_current",
+		"presence_audience_suppressed_total",
+		"registered_users_current",
+		"service_control_plane_cpu_percent",
+		"service_control_plane_healthy",
+		"service_control_plane_memory_bytes",
+		"service_control_plane_running",
+		"service_coturn_cpu_percent",
+		"service_coturn_healthy",
+		"service_coturn_memory_bytes",
+		"service_coturn_running",
+		"service_media_plane_cpu_percent",
+		"service_media_plane_healthy",
+		"service_media_plane_memory_bytes",
+		"service_media_plane_running",
+		"service_minio_cpu_percent",
+		"service_minio_healthy",
+		"service_minio_memory_bytes",
+		"service_minio_running",
+		"service_nats_cpu_percent",
+		"service_nats_healthy",
+		"service_nats_memory_bytes",
+		"service_nats_running",
+		"service_postgres_cpu_percent",
+		"service_postgres_healthy",
+		"service_postgres_memory_bytes",
+		"service_postgres_running",
+		"service_redis_cpu_percent",
+		"service_redis_healthy",
+		"service_redis_memory_bytes",
+		"service_redis_running",
+		"users_online_current",
+		"websocket_connections_current",
 	}
 	sort.Strings(keys)
 	return keys

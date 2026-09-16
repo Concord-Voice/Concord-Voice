@@ -60,6 +60,8 @@ describe('MediaMetrics', () => {
       participantHoursAudio: 1 / 60,
       participantHoursWebcam: 1 / 90,
       participantHoursScreenshare: 1 / 360,
+      cameraLayeringGateFlipsTotal: 0,
+      cameraPressureDemandsTotal: 0,
     });
     expect(Object.values(aggregate).every((value) => typeof value === 'number')).toBe(true);
     expect(JSON.stringify(aggregate)).not.toContain('transport-private-id');
@@ -155,7 +157,13 @@ describe('MediaMetrics', () => {
     expect(Object.keys(agg)).not.toContain('iceSelectedUdp');
     expect(Object.keys(agg)).not.toContain('iceSelectedTcp');
     expect(Object.keys(agg)).not.toContain('iceTerminalWithoutConnect');
-    expect(Object.keys(agg)).toHaveLength(9);
+    // The closed count is the half of this guard that catches an ADDITION, and it
+    // did its job: it failed when #3094's two witnesses were added, forcing the
+    // justification rather than letting them slip in. 11, not 9, because
+    // media_camera_layering_gate_flips_total and media_camera_pressure_demands_total
+    // ARE in the closed catalog as of migration 000135 — which is exactly what the
+    // ICE counters and admissionRejected are not, and why they stay off this shape.
+    expect(Object.keys(agg)).toHaveLength(11);
   });
 
   // observability.md principle 7: no reason/cause dimension. An unexpected

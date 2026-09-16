@@ -115,6 +115,31 @@ const (
 	MetricMediaParticipantHoursAudio          MetricKey = "media_participant_hours_audio"
 	MetricMediaParticipantHoursWebcam         MetricKey = "media_participant_hours_webcam"
 	MetricMediaParticipantHoursScreenshare    MetricKey = "media_participant_hours_screenshare"
+
+	// MetricMediaCameraLayeringGateFlipsTotal counts transitions of the ROOM-WIDE
+	// camera-layering gate. #3094 accepted, in writing, that a single overloaded
+	// viewer's `pressureStepDown: true` now reaches computeCameraLayeringGate and
+	// can hold or release that gate for everyone — and a gate transition broadcasts
+	// `camera-layering-gate`, which every member answers with fastReproduceCamera().
+	// That consequence was recorded so the first production flap would be diagnosed
+	// rather than investigated from scratch; this is the witness that makes the
+	// diagnosis possible instead of only the note.
+	//
+	// Scalar and dimension-free: no room, no user, and deliberately no direction —
+	// an on/off split would say nothing a flap rate does not, and every dimension
+	// added to this catalog is one an operator could correlate against a room.
+	MetricMediaCameraLayeringGateFlipsTotal MetricKey = "media_camera_layering_gate_flips_total"
+
+	// MetricMediaCameraPressureDemandsTotal counts accepted camera layer demands
+	// carrying pressureStepDown. #3094's accepted consequence 5 was "production
+	// blindness": no aggregate witness that yellow started emitting or that red
+	// still escalates. Before that change no client ever sent the flag, so a
+	// non-zero value here is itself the signal that the activated path is live.
+	//
+	// Counts DEMANDS, not steps: the wire flag is boolean, so depth is not
+	// observable at this seam, and inferring it from the requested spatialLayer
+	// would reintroduce a render-state dimension this catalog does not carry.
+	MetricMediaCameraPressureDemandsTotal MetricKey = "media_camera_pressure_demands_total"
 )
 
 // MetricDefinition declares ownership, units, bounds, and rollup behavior.
@@ -193,6 +218,8 @@ var catalog = func() map[MetricKey]MetricDefinition {
 		metric(MetricMediaParticipantHoursAudio, SourceMedia, UnitHours, KindCounter, RollupLast, 0, maxHours),
 		metric(MetricMediaParticipantHoursWebcam, SourceMedia, UnitHours, KindCounter, RollupLast, 0, maxHours),
 		metric(MetricMediaParticipantHoursScreenshare, SourceMedia, UnitHours, KindCounter, RollupLast, 0, maxHours),
+		metric(MetricMediaCameraLayeringGateFlipsTotal, SourceMedia, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricMediaCameraPressureDemandsTotal, SourceMedia, UnitCount, KindCounter, RollupLast, 0, maxCount),
 	)
 
 	definitions = append(definitions,

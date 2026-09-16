@@ -138,10 +138,20 @@ function metricDefinition(metricKey: MetricKey): {
       unit: "hours",
     };
   }
+  // Mirrors mediaMetricDefinition in src/contracts.ts. This fixture hardcoded
+  // "gauge" too, so it agreed with the implementation's own bug and /current
+  // looked healthy; only countersResponse, which forces kind to "counter",
+  // disagreed. A fixture that copies the code it checks can only catch a defect
+  // where something else forces the two apart.
+  const counter = COUNTER_METRIC_KEYS.includes(
+    metricKey as (typeof COUNTER_METRIC_KEYS)[number],
+  );
   return {
-    kind: "gauge",
+    kind: counter ? "counter" : "gauge",
     rollup:
-      metricKey === "media_peak_video_publishers_per_room" ? "last" : "average",
+      counter || metricKey === "media_peak_video_publishers_per_room"
+        ? "last"
+        : "average",
     source: "media",
     unit: "count",
   };
