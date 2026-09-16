@@ -242,7 +242,7 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	require.Equal(t, float64(1), values[MetricHTTPRequestsTotal])
 	require.Equal(t, float64(1), values[MetricChannelMessagesTotal])
 	require.Zero(t, values[MetricMediaUploadsTotal])
-	require.Len(t, values, 11)
+	require.Len(t, values, 13)
 	require.Eventually(t, func() bool {
 		return !collector.busy.Load()
 	}, time.Second, time.Millisecond)
@@ -260,7 +260,7 @@ func TestCollectorWritesOneBatchAndRollsUpBeforePruning(t *testing.T) {
 	secondValues := samplesByKey(batches[1])
 	require.NotContains(t, secondValues, MetricHostCPUPercent)
 	require.NotContains(t, secondValues, MetricMediaRoomsCurrent)
-	require.Len(t, secondValues, 9)
+	require.Len(t, secondValues, 11)
 
 	cancel()
 	require.Eventually(t, func() bool {
@@ -300,7 +300,7 @@ func TestCollectorAddsDistinctUsersAndAccountMetrics(t *testing.T) {
 	for key, value := range accountMetrics {
 		require.Equal(t, value, values[key])
 	}
-	require.Len(t, values, 17)
+	require.Len(t, values, 19)
 }
 
 func TestCollectorSnapshotDoesNotReportMoreOnlineUsersThanConnectionsDuringClientChange(t *testing.T) {

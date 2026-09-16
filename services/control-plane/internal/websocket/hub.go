@@ -3368,9 +3368,38 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 	if _, connected := h.userClients[userID]; !connected {
 		return
 	}
+	// Counted here, above the restore-or-fail-closed decision: the observable is
+	// that the key lapsed under a live connection, not which way the hub resolved it.
+	h.countPresenceTTLLapsed()
 	selfStatus, hidden := h.hiddenPresence[userID]
 	recovery, known := h.presenceRecovery[userID]
-	canRestore := known && recovery.pending && isVisibleStatus(recovery.status)
+	// canRestore deliberately does NOT require recovery.pending.
+	//
+	// pending is set only when a previous refresh FAILED, so requiring it conflated
+	// "Redis told us the key was gone" with "restoration is permitted" -- and a key
+	// that lapsed on its own AFTER a successful refresh reads as pending == false.
+	// That made an expired key indistinguishable from a user this hub had never
+	// seen, so the renderer-throttling case (#3328) fell through to
+	// failClosedPresenceHeartbeat, which latches hiddenPresence to offline; every
+	// later heartbeat then returned early and the user stayed offline to everyone
+	// for the REST of that connection. Chromium's network service answers the hub's
+	// pings without renderer JS, so such a connection can outlive the lapse
+	// indefinitely.
+	//
+	// Dropping it is safe because nothing DELETES presence:<uuid> as a privacy
+	// action. The only deleter in the tree is cleanupStalePresence's PTTL == -1
+	// reaper (cmd/server/main.go), which #3328 put out of reach of any live key by
+	// making every writer and the sweeper install a TTL. An absent key therefore
+	// means expiry or Redis data loss -- never a decision about this user. The
+	// fence this path clears is documented as holding "until the next visible
+	// presence write" (000101, #2461), and a connected user's heartbeat carrying a
+	// known visible status IS that write.
+	//
+	// What still fails closed, and must: an unknown user (!known -- no recovery
+	// state, so the hub holds no status it can vouch for) and any non-visible
+	// status. isVisibleStatus admits online and DND only, so invisible and offline
+	// are never resurrected here, and invisible keeps its own explicit branch below.
+	canRestore := known && isVisibleStatus(recovery.status)
 	if !hidden && !canRestore {
 		h.failClosedPresenceHeartbeat(userID)
 		return
@@ -5301,6 +5330,40 @@ func (h *Hub) retryPresenceAudience(result presenceAudienceResult) bool {
 func (h *Hub) countPresenceAudienceSuppressed() {
 	if h.opsCounter != nil {
 		h.opsCounter.Increment(opsmetrics.MetricPresenceAudienceSuppressedTotal)
+	}
+}
+
+// countPresenceTTLLapsed records that a heartbeat arrived to find presence:<uuid>
+// already gone.
+//
+// Deliberately counted BEFORE the restore-or-fail-closed decision, so it measures
+// the lapse itself rather than the outcome. Splitting it by outcome would be a
+// privacy-decision discriminator (observability.md principle 7): restorable versus
+// fail-closed is exactly the branch the #2444/#2461 fence keeps indistinguishable.
+// It carries no user for the same reason -- which user lapsed is presence data.
+//
+// Call site runs on the Run goroutine (handleIncoming -> handleHeartbeat).
+func (h *Hub) countPresenceTTLLapsed() {
+	if h.opsCounter != nil {
+		h.opsCounter.Increment(opsmetrics.MetricPresenceTTLLapsedTotal)
+	}
+}
+
+// countWebSocketAbnormalClose records a socket that died without a clean close
+// handshake.
+//
+// No close-code dimension: a code would partition users by why their connection
+// died, which is both a per-user attribute and externally observable.
+// describeSocketFailure already carries the cause for a human reading logs, in a
+// fixed shape holding no bytes the peer chose.
+//
+// Unlike every other counter here the call site runs on the readPump goroutine,
+// not Run. That is safe without a lock on both halves: opsCounter is assigned once
+// in NewHub before any pump exists and never mutated, and Counters.Increment is an
+// atomic add.
+func (h *Hub) countWebSocketAbnormalClose() {
+	if h.opsCounter != nil {
+		h.opsCounter.Increment(opsmetrics.MetricWebSocketAbnormalClosesTotal)
 	}
 }
 

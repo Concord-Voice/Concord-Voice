@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000135)
+## Existing Migrations (000001–000136)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -245,6 +245,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000133 | preserve_voice_lifecycle_replay_lease | Preserve the lease on exact Server Voice lifecycle replays (#2907) |
 | 000134 | clamp_future_dm_voice_lifecycle_stamps | Data repair, not schema: clamp already-poisoned far-future `dm_voice_participants` stamps the ingress clamp cannot reach (#3205) |
 | 000135 | camera_layering_ops_metrics | Admit the camera-layering gate-flip and pressure-demand counters to the closed operations metric catalog (#3094) |
+| 000136 | presence_liveness_ops_metrics | Admit the presence-TTL-lapse and abnormal-socket-close counters to the closed operations metric catalog, so the two failure modes #3328 separated are countable rather than only described (#3328) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use

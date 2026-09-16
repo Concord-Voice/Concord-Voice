@@ -92,15 +92,42 @@ const (
 	// Deliberately carries NO reason dimension: which failure produced the
 	// suppression is a privacy-decision discriminator (observability.md #7).
 	MetricPresenceAudienceSuppressedTotal MetricKey = "presence_audience_suppressed_total"
-	MetricRegisteredUsersCurrent          MetricKey = "registered_users_current"
-	MetricPendingRegistrationsCurrent     MetricKey = "pending_registrations_current"
-	MetricUsersOnlineCurrent              MetricKey = "users_online_current"
-	MetricActiveSessionsCurrent           MetricKey = "active_sessions_current"
-	MetricActiveUsers24H                  MetricKey = "active_users_24h"
-	MetricActiveUsers7D                   MetricKey = "active_users_7d"
-	MetricActiveUsers15D                  MetricKey = "active_users_15d"
-	MetricActiveUsers30D                  MetricKey = "active_users_30d"
-	MetricMediaUploadsTotal               MetricKey = "media_uploads_total"
+
+	// MetricPresenceTTLLapsedTotal counts heartbeats that arrived to find
+	// presence:<uuid> already gone. That is the renderer-throttling case #3328
+	// exists to contain, and this is the witness for the grace band that change
+	// widened from a deterministic 120s to 210-240s: a non-zero rate means clients
+	// are still outrunning the window, and a rate that FALLS after a client change
+	// is how the fix gets confirmed rather than assumed.
+	//
+	// Scalar and dimension-free, and the omission is the point. No user -- which
+	// user lapsed is presence data. No outcome split either: restorable versus
+	// fail-closed is precisely the branch the #2444/#2461 fence exists to keep
+	// indistinguishable, so partitioning the counter by it would be a
+	// privacy-decision discriminator under observability.md principle 7.
+	MetricPresenceTTLLapsedTotal MetricKey = "presence_ttl_lapsed_total"
+
+	// MetricWebSocketAbnormalClosesTotal counts sockets that died without a clean
+	// close handshake -- the 1006 shape the Cloudflare edge produced before #3328
+	// gave the server its own unsolicited keepalive. Paired with the counter above
+	// it separates two failure modes that are indistinguishable from a support
+	// ticket: a transport the edge is reaping, versus a renderer too throttled to
+	// hold its own presence.
+	//
+	// Scalar and dimension-free. A close CODE would partition users by why their
+	// connection died -- both a per-user attribute and an externally observable
+	// branch -- and describeSocketFailure already carries the cause for a human
+	// reading logs, in a fixed shape that contains no bytes the peer chose.
+	MetricWebSocketAbnormalClosesTotal MetricKey = "websocket_abnormal_closes_total"
+	MetricRegisteredUsersCurrent       MetricKey = "registered_users_current"
+	MetricPendingRegistrationsCurrent  MetricKey = "pending_registrations_current"
+	MetricUsersOnlineCurrent           MetricKey = "users_online_current"
+	MetricActiveSessionsCurrent        MetricKey = "active_sessions_current"
+	MetricActiveUsers24H               MetricKey = "active_users_24h"
+	MetricActiveUsers7D                MetricKey = "active_users_7d"
+	MetricActiveUsers15D               MetricKey = "active_users_15d"
+	MetricActiveUsers30D               MetricKey = "active_users_30d"
+	MetricMediaUploadsTotal            MetricKey = "media_uploads_total"
 
 	MetricMediaRoomsCurrent                   MetricKey = "media_rooms_current"
 	MetricMediaParticipantsAudioCurrent       MetricKey = "media_participants_audio_current"
@@ -182,7 +209,7 @@ func serviceMetrics(running, healthy, cpu, memory MetricKey) []MetricDefinition 
 }
 
 var catalog = func() map[MetricKey]MetricDefinition {
-	definitions := make([]MetricDefinition, 0, 62)
+	definitions := make([]MetricDefinition, 0, 66)
 	definitions = append(definitions,
 		metric(MetricHostCPUPercent, SourceHost, UnitPercent, KindGauge, RollupAverage, 0, 100),
 		metric(MetricHostMemoryPercent, SourceHost, UnitPercent, KindGauge, RollupAverage, 0, 100),
@@ -196,6 +223,8 @@ var catalog = func() map[MetricKey]MetricDefinition {
 		metric(MetricDMMessagesTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricSnapshotRejectionsTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricPresenceAudienceSuppressedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricPresenceTTLLapsedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricWebSocketAbnormalClosesTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricRegisteredUsersCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricPendingRegistrationsCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricUsersOnlineCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),

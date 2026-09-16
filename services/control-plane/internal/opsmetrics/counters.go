@@ -16,6 +16,8 @@ type Counters struct {
 	dmMessages         atomic.Uint64
 	snapshotRejections atomic.Uint64
 	presenceSuppressed atomic.Uint64
+	presenceTTLLapsed  atomic.Uint64
+	wsAbnormalCloses   atomic.Uint64
 	mediaUploads       atomic.Uint64
 
 	routesMu sync.RWMutex
@@ -48,6 +50,10 @@ func (c *Counters) Increment(key MetricKey) {
 		c.snapshotRejections.Add(1)
 	case MetricPresenceAudienceSuppressedTotal:
 		c.presenceSuppressed.Add(1)
+	case MetricPresenceTTLLapsedTotal:
+		c.presenceTTLLapsed.Add(1)
+	case MetricWebSocketAbnormalClosesTotal:
+		c.wsAbnormalCloses.Add(1)
 	case MetricMediaUploadsTotal:
 		c.mediaUploads.Add(1)
 	}
@@ -66,6 +72,8 @@ func (c *Counters) Snapshot() map[MetricKey]float64 {
 		MetricDMMessagesTotal:                 float64(c.dmMessages.Load()),
 		MetricSnapshotRejectionsTotal:         float64(c.snapshotRejections.Load()),
 		MetricPresenceAudienceSuppressedTotal: float64(c.presenceSuppressed.Load()),
+		MetricPresenceTTLLapsedTotal:          float64(c.presenceTTLLapsed.Load()),
+		MetricWebSocketAbnormalClosesTotal:    float64(c.wsAbnormalCloses.Load()),
 		MetricMediaUploadsTotal:               float64(c.mediaUploads.Load()),
 	}
 }

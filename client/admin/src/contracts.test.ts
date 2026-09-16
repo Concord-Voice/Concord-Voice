@@ -28,7 +28,7 @@ describe("metric catalog", () => {
   it("assigns every fixed metric key to one primary home", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
-    expect(PRIMARY_METRIC_MAP.control).toHaveLength(8);
+    expect(PRIMARY_METRIC_MAP.control).toHaveLength(10);
     expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(9);
     expect(PRIMARY_METRIC_MAP.mediaEgress).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.participantHours).toHaveLength(3);
@@ -37,9 +37,9 @@ describe("metric catalog", () => {
     );
 
     const assigned = Object.values(PRIMARY_METRIC_MAP).flat();
-    expect(assigned).toHaveLength(64);
+    expect(assigned).toHaveLength(66);
     expect(new Set(assigned)).toEqual(new Set(METRIC_KEYS));
-    expect(COUNTER_METRIC_KEYS).toHaveLength(14);
+    expect(COUNTER_METRIC_KEYS).toHaveLength(16);
   });
 });
 

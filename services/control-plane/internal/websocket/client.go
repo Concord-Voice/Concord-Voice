@@ -450,6 +450,29 @@ func (c *Client) readPump() {
 	for {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
+			// "Abnormal" is the complement of a completed close handshake, which is
+			// narrower than either log branch below: IsCloseError is false for 1006,
+			// for an explicit error code such as 1002 or 1008, AND for the errors
+			// that are not CloseErrors at all (TCP reset, EOF, read deadline).
+			//
+			// 1005 is excluded even though it names no clean exit of ours. Gorilla
+			// synthesizes it for a Close frame whose payload is under two bytes
+			// (conn.go advanceFrame), which RFC 6455 permits and which a browser
+			// produces from a bare `ws.close()` -- the peer completed the handshake
+			// and simply declined to state a reason. Our own renderer always passes
+			// 1000 explicitly, so this is not a path we generate, but an
+			// intermediary or a future client can. Counting it would report a
+			// graceful close as a dead socket, and this counter is deliberately
+			// dimension-free (a close CODE would partition users by why their
+			// connection died), so a miscount here can never be disambiguated
+			// afterwards -- the predicate is the only place the boundary exists.
+			if !websocket.IsCloseError(err,
+				websocket.CloseNormalClosure,
+				websocket.CloseGoingAway,
+				websocket.CloseNoStatusReceived,
+			) {
+				c.Hub.countWebSocketAbnormalClose()
+			}
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("WebSocket error: %s", describeSocketFailure(err))
 			} else {

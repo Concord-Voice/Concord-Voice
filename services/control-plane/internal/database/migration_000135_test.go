@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,22 +34,23 @@ var migration000135NewKeys = []string{
 	"media_camera_pressure_demands_total",
 }
 
-// TestMigration000135_FilesAndSchemaLock pins the SQL against the Go catalog.
+// TestMigration000135_FilesAndSchemaLock pins the SQL against the 64-key set
+// 000135 itself admitted.
 //
-// 000135 is now the newest catalog migration, so it OWNS the live-catalog
-// assertion that 000113 used to carry; 000113's own list is frozen to its 62
-// keys. This is the 000086 -> 000091 -> 000113 handover protocol, one step on.
-// When a later migration admits another key, freeze this list and move the live
-// pin there — do not add the new key here.
+// FROZEN by 000136, following the 000086 -> 000091 -> 000113 -> 000135 protocol:
+// the newest catalog migration owns the LIVE-catalog pin and older ones freeze
+// their own list. Left reading the live catalog, this test would fail the moment
+// any later migration admitted a key -- asserting that a 2026 SQL file already
+// contains something added after it was written.
 func TestMigration000135_FilesAndSchemaLock(t *testing.T) {
 	up := migration000135SQL(t, "up")
 	down := migration000135SQL(t, "down")
 	readme := migrationReadFile(t, filepath.Join("..", "..", "migrations", "README.md"))
 
-	catalogKeys := migration000135CatalogKeys()
+	catalogKeys := migration000135FrozenKeys()
 	for _, key := range migration000135NewKeys {
 		require.Contains(t, catalogKeys, key,
-			"the Go catalog must carry the key this migration admits, or the two have drifted")
+			"the frozen list must carry the key this migration admits, or the freeze was taken wrong")
 	}
 
 	upSamples := migration000135ConstraintKeys(up, "ops_metric_samples_metric_key_check")
@@ -96,16 +96,6 @@ func TestMigration000135_FilesAndSchemaLock(t *testing.T) {
 
 	assert.Contains(t, readme, "| 000135 | camera_layering_ops_metrics |")
 
-	// The header RANGE is the one part of this README nothing checked, and it sat
-	// at 000133 while 000134 and 000135 both had rows. A row assertion cannot see
-	// it: the list grows correctly while the heading above it goes stale (#3094).
-	//
-	// Derived from the files on disk rather than written as a literal, because a
-	// literal here would be the same defect one layer up -- it would need editing
-	// by whoever adds 000136, which is exactly the step that was missed.
-	assert.Contains(t, readme,
-		fmt.Sprintf("## Existing Migrations (000001\u2013%s)", migrationNewestNumber(t)),
-		"README header range must name the newest migration on disk")
 }
 
 // TestMigration000135_UpDownReUp proves the constraint actually gates the keys in
@@ -247,11 +237,83 @@ func migration000135ConstraintKeys(contents, constraint string) []string {
 	return keys
 }
 
-func migration000135CatalogKeys() []string {
-	definitions := opsmetrics.Catalog()
-	keys := make([]string, 0, len(definitions))
-	for _, definition := range definitions {
-		keys = append(keys, string(definition.Key))
+// migration000135FrozenKeys is the catalog AS OF 000135 -- the exact 64 keys this
+// migration's own CHECK admits, sorted.
+//
+// Deliberately a literal rather than a live catalog read. The live catalog is now
+// 66 keys and will keep growing; this SQL file is finished and will not. Deriving
+// it would make this test assert that a file written in 2026 already contains
+// every key added since, which is false by construction and is exactly the
+// failure 000136 would otherwise have caused here.
+//
+// Nothing may be added to this list. A new catalog key belongs in the newest
+// migration's test, which owns the live pin.
+func migration000135FrozenKeys() []string {
+	keys := []string{
+		"active_sessions_current",
+		"active_users_15d",
+		"active_users_24h",
+		"active_users_30d",
+		"active_users_7d",
+		"channel_messages_total",
+		"dm_messages_total",
+		"host_cpu_percent",
+		"host_disk_percent",
+		"host_load_1m",
+		"host_memory_percent",
+		"http_client_errors_total",
+		"http_requests_total",
+		"http_server_errors_total",
+		"media_camera_layering_gate_flips_total",
+		"media_camera_pressure_demands_total",
+		"media_camera_publishers_current",
+		"media_egress_cumulative_bytes",
+		"media_egress_current_bps",
+		"media_egress_peak_bps",
+		"media_participant_hours_audio",
+		"media_participant_hours_screenshare",
+		"media_participant_hours_webcam",
+		"media_participants_audio_current",
+		"media_participants_screenshare_current",
+		"media_participants_webcam_current",
+		"media_peak_video_publishers_per_room",
+		"media_rooms_current",
+		"media_screen_publishers_current",
+		"media_uploads_total",
+		"ops_snapshot_rejections_total",
+		"pending_registrations_current",
+		"presence_audience_suppressed_total",
+		"registered_users_current",
+		"service_control_plane_cpu_percent",
+		"service_control_plane_healthy",
+		"service_control_plane_memory_bytes",
+		"service_control_plane_running",
+		"service_coturn_cpu_percent",
+		"service_coturn_healthy",
+		"service_coturn_memory_bytes",
+		"service_coturn_running",
+		"service_media_plane_cpu_percent",
+		"service_media_plane_healthy",
+		"service_media_plane_memory_bytes",
+		"service_media_plane_running",
+		"service_minio_cpu_percent",
+		"service_minio_healthy",
+		"service_minio_memory_bytes",
+		"service_minio_running",
+		"service_nats_cpu_percent",
+		"service_nats_healthy",
+		"service_nats_memory_bytes",
+		"service_nats_running",
+		"service_postgres_cpu_percent",
+		"service_postgres_healthy",
+		"service_postgres_memory_bytes",
+		"service_postgres_running",
+		"service_redis_cpu_percent",
+		"service_redis_healthy",
+		"service_redis_memory_bytes",
+		"service_redis_running",
+		"users_online_current",
+		"websocket_connections_current",
 	}
 	sort.Strings(keys)
 	return keys

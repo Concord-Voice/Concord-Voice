@@ -82,7 +82,7 @@ func TestAdminMetricsOpenAPICounterKeysMatchCatalog(t *testing.T) {
 		assert.Truef(t, exists, "counter metric %q missing from admin OpenAPI", definition.Key)
 	}
 	require.Len(t, documented, expectedCount)
-	assert.Contains(t, contents, "maxItems: 14\n          items:\n            $ref: '#/components/schemas/AdminCounterPoint'")
+	assert.Contains(t, contents, "maxItems: 16\n          items:\n            $ref: '#/components/schemas/AdminCounterPoint'")
 }
 
 func TestAdminMetricsOpenAPISeriesBoundsMatchHandlers(t *testing.T) {

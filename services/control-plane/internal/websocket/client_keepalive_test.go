@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/google/uuid"
 	gorillaws "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
@@ -153,4 +154,88 @@ func TestWritePumpEmitsTheKeepaliveOnlyOnAnIdleSocket(t *testing.T) {
 // and worth an assertion rather than a comment.
 func TestHeartbeatAckFrameIsReusedVerbatim(t *testing.T) {
 	assert.JSONEq(t, `{"type":"heartbeat_ack","data":{}}`, string(heartbeatAckFrame))
+}
+
+// TestAbnormalSocketCloseIsCounted drives a REAL socket death through readPump.
+//
+// "Abnormal" is the complement of a clean handshake, and the complement is the
+// part worth testing: the counter must fire for a vanished TCP connection AND
+// stay silent for a well-behaved client that sent a close frame. A test covering
+// only the first would pass against a counter that fires unconditionally, which
+// would make every ordinary sign-out look like an edge reaping connections --
+// the precise misreading #3328's originating incident already suffered once.
+func TestAbnormalSocketCloseIsCounted(t *testing.T) {
+	run := func(t *testing.T, closePeer func(peer *gorillaws.Conn)) int {
+		t.Helper()
+		hub := NewHub(nil, setupHubTestRedis(t))
+		counter := &opsCounterSpy{}
+		hub.opsCounter = counter
+		go hub.Run()
+		t.Cleanup(func() { hub.closeOnce.Do(func() { close(hub.done) }) })
+
+		pumpDone := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			up := gorillaws.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			conn, err := up.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			c := &Client{ID: uuid.New(), UserID: uuid.New(), Conn: conn, Send: make(chan []byte, 8), Hub: hub}
+			go func() { c.readPump(); close(pumpDone) }()
+		}))
+		t.Cleanup(srv.Close)
+
+		peer, _, err := gorillaws.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+		require.NoError(t, err)
+		closePeer(peer)
+
+		select {
+		case <-pumpDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("readPump did not exit after the peer went away")
+		}
+		return counter.count(opsmetrics.MetricWebSocketAbnormalClosesTotal)
+	}
+
+	t.Run("peer vanishes with no close frame", func(t *testing.T) {
+		// Dropping the TCP connection underneath the websocket is the 1006 shape
+		// the Cloudflare edge produced before the server owned its own keepalive.
+		assert.Equal(t, 1, run(t, func(peer *gorillaws.Conn) {
+			_ = peer.UnderlyingConn().Close()
+		}))
+	})
+
+	t.Run("peer closes cleanly", func(t *testing.T) {
+		assert.Zero(t, run(t, func(peer *gorillaws.Conn) {
+			_ = peer.WriteMessage(gorillaws.CloseMessage,
+				gorillaws.FormatCloseMessage(gorillaws.CloseNormalClosure, ""))
+			_ = peer.Close()
+		}), "a clean close is not abnormal; counting it would make every sign-out look like a reap")
+	})
+
+	t.Run("peer closes with an empty payload", func(t *testing.T) {
+		// An EMPTY payload, not FormatCloseMessage(CloseNoStatusReceived, "") --
+		// gorilla refuses to SEND 1005 as a code, and receiving it as one would be
+		// a protocol error rather than the case under test. The wire shape here is
+		// a Close frame carrying zero bytes, which RFC 6455 permits and which
+		// gorilla's advanceFrame turns into CloseError{Code: 1005} on our side.
+		// That is a completed handshake, so it must not reach the counter.
+		assert.Zero(t, run(t, func(peer *gorillaws.Conn) {
+			_ = peer.WriteMessage(gorillaws.CloseMessage, []byte{})
+			_ = peer.Close()
+		}), "a close frame with no status code still completed the handshake")
+	})
+
+	t.Run("peer closes with an explicit error code", func(t *testing.T) {
+		// The guard against over-correcting the case above. Excluding 1005 is one
+		// code, not "every CloseError is graceful" -- a peer that names 1008 is
+		// reporting a real failure, and widening the predicate to IsCloseError
+		// alone would silently swallow exactly the events this counter exists to
+		// witness while both cases above stayed green.
+		assert.Equal(t, 1, run(t, func(peer *gorillaws.Conn) {
+			_ = peer.WriteMessage(gorillaws.CloseMessage,
+				gorillaws.FormatCloseMessage(gorillaws.ClosePolicyViolation, "policy"))
+			_ = peer.Close()
+		}), "an explicit error code is an abnormal close and must still be counted")
+	})
 }

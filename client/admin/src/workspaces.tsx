@@ -20,6 +20,7 @@ import {
 } from "./contracts";
 import { SeriesChart } from "./Chart";
 import { formatScalar } from "./formatMetric";
+import { OPERATOR_METRIC_LABELS } from "./metricLabels";
 import type { ThresholdStatus, Thresholds } from "./preferences";
 import { statusFor } from "./preferences";
 import type { PollingState } from "./usePolling";
@@ -119,45 +120,6 @@ const COUNTER_GROUPS = [
   },
 ] as const;
 
-const METRIC_COPY: Partial<Record<MetricKey, string>> = {
-  host_cpu_percent: "Host CPU",
-  host_memory_percent: "Host memory",
-  host_disk_percent: "Host disk",
-  host_load_1m: "One-minute load",
-  http_requests_total: "HTTP requests",
-  http_client_errors_total: "HTTP client errors",
-  http_server_errors_total: "HTTP server errors",
-  websocket_connections_current: "WebSocket connections",
-  channel_messages_total: "Channel messages",
-  dm_messages_total: "Direct messages",
-  ops_snapshot_rejections_total: "Rejected operations snapshots",
-  presence_audience_suppressed_total: "Suppressed presence broadcasts",
-  media_camera_layering_gate_flips_total: "Camera layering gate flips",
-  media_camera_pressure_demands_total: "Camera pressure demands",
-  registered_users_current: "Registered users",
-  pending_registrations_current: "Pending registrations",
-  users_online_current: "Users online",
-  active_sessions_current: "Active sessions",
-  active_users_24h: "Active users over 24 hours",
-  active_users_7d: "Active users over 7 days",
-  active_users_15d: "Active users over 15 days",
-  active_users_30d: "Active users over 30 days",
-  media_uploads_total: "Media uploads",
-  media_rooms_current: "Media rooms",
-  media_participants_audio_current: "Audio participants",
-  media_participants_webcam_current: "Webcam participants",
-  media_participants_screenshare_current: "Screenshare participants",
-  media_camera_publishers_current: "Camera publishers",
-  media_screen_publishers_current: "Screen publishers",
-  media_peak_video_publishers_per_room: "Peak video publishers per room",
-  media_egress_current_bps: "Current media egress",
-  media_egress_peak_bps: "Peak media egress",
-  media_egress_cumulative_bytes: "Cumulative media egress",
-  media_participant_hours_audio: "Audio participant hours",
-  media_participant_hours_webcam: "Webcam participant hours",
-  media_participant_hours_screenshare: "Screenshare participant hours",
-};
-
 const lifetimeKeys = new Set<MetricKey>(COUNTER_METRIC_KEYS);
 
 const SERIES_PRESETS = [
@@ -206,9 +168,17 @@ function serviceMetricSuffix(field: string): string {
   return field;
 }
 
+// The service derivation runs FIRST and that ordering is load-bearing:
+// `OPERATOR_METRIC_LABELS` is total, so it carries the 28 `service_*` keys with
+// the chart's wording ("Control plane health"), while this surface renders the
+// suffix verbatim ("Control plane healthy"). Consulting the map first would
+// silently rewrite seven rendered strings.
+//
+// There is no "Unknown metric" fallback any more, and its absence is the point.
+// The map is `Record<MetricKey, string>` rather than a `Partial`, so a key added
+// to the catalog but forgotten here fails `tsc --noEmit` instead of reaching an
+// operator as placeholder text.
 export function metricLabel(key: MetricKey): string {
-  const fixed = METRIC_COPY[key];
-  if (fixed) return fixed;
   for (const service of SERVICE_NAMES) {
     const prefix = `service_${service}_`;
     if (key.startsWith(prefix)) {
@@ -216,7 +186,7 @@ export function metricLabel(key: MetricKey): string {
       return `${SERVICE_LABELS[service]} ${serviceMetricSuffix(field)}`;
     }
   }
-  return "Unknown metric";
+  return OPERATOR_METRIC_LABELS[key];
 }
 
 function metricMap(response: AdminCurrentResponse | null) {

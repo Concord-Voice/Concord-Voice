@@ -57,6 +57,8 @@ const CONTROL_METRIC_KEYS = [
   "dm_messages_total",
   "ops_snapshot_rejections_total",
   "presence_audience_suppressed_total",
+  "presence_ttl_lapsed_total",
+  "websocket_abnormal_closes_total",
 ] as const;
 
 export const ACCOUNT_ACTIVITY_METRIC_KEYS = [
@@ -130,6 +132,8 @@ export const COUNTER_METRIC_KEYS = [
   "media_uploads_total",
   "ops_snapshot_rejections_total",
   "presence_audience_suppressed_total",
+  "presence_ttl_lapsed_total",
+  "websocket_abnormal_closes_total",
   "media_egress_cumulative_bytes",
   "media_participant_hours_audio",
   "media_participant_hours_webcam",

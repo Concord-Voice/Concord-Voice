@@ -4769,3 +4769,136 @@ func TestPresenceAudienceRevokedDuringTheQueryIsUnproven(t *testing.T) {
 	assert.Empty(t, delivered,
 		"the viewer lost authorization while the query ran, so no frame may be delivered")
 }
+
+// TestHandleHeartbeatRestoresVisiblePresenceAfterTheKeyExpires is the latch
+// regression, and it is the #3328 throttling case end to end.
+//
+// A renderer Electron throttles stops sending heartbeats for longer than the TTL,
+// presence:<uuid> lapses on its own, and the next heartbeat arrives to find it
+// gone. Before this fix canRestore ALSO required recovery.pending -- which is set
+// only when a previous refresh FAILED -- so a key that expired after a SUCCESSFUL
+// refresh was indistinguishable from a user the hub had never seen. The user went
+// offline to everyone while fully connected, and because failClosedPresenceHeartbeat
+// latches hiddenPresence to offline, every later heartbeat returned early. Chromium's
+// network service answers the hub's pings without renderer JS, so that connection
+// can persist indefinitely: a connection-lifetime outage from one missed window.
+func TestHandleHeartbeatRestoresVisiblePresenceAfterTheKeyExpires(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+	ctx := context.Background()
+	key := presence.StatusRedisKey(userID)
+
+	// A healthy connection: the key exists and the heartbeat refreshes it.
+	require.NoError(t, redisClient.Set(ctx, key, statusOnline, presence.StatusTTL).Err())
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+	require.Equal(t, statusOnline, hub.presenceRecovery[userID].status,
+		"the hub must know this user's visible status")
+	require.False(t, hub.presenceRecovery[userID].pending,
+		"the refresh SUCCEEDED -- which is precisely the state the old gate latched on")
+
+	// The renderer is throttled past the TTL and the key lapses on its own.
+	require.NoError(t, redisClient.Del(ctx, key).Err())
+	clear(hub.onlineCountPending)
+
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	stored, err := redisClient.Get(ctx, key).Result()
+	require.NoError(t, err, "a lapsed key under a LIVE connection must be restored, not left absent")
+	assert.Equal(t, statusOnline, stored)
+	assert.NotContains(t, hub.hiddenPresence, userID,
+		"a live connection must not be latched offline by its own expired key")
+}
+
+// TestHandleHeartbeatNeverRestoresAnInvisibleUserAsVisible fences the latch fix.
+//
+// Dropping recovery.pending widens what the missing-key path will restore, so the
+// thing that must NOT widen is asserted directly: isVisibleStatus becomes the sole
+// gate on the restored value, and an invisible user has to stay invisible. This is
+// the privacy direction of the #2444/#2461 fence and the reason the fix drops only
+// the liveness half of the old condition.
+func TestHandleHeartbeatNeverRestoresAnInvisibleUserAsVisible(t *testing.T) {
+	redisClient := setupHubTestRedis(t)
+	hub := NewHub(nil, redisClient)
+	userID := uuid.New()
+	hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+	ctx := context.Background()
+	key := presence.StatusRedisKey(userID)
+
+	require.NoError(t, redisClient.Set(ctx, key, statusInvisible, presence.StatusTTL).Err())
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+	require.Equal(t, statusInvisible, hub.hiddenPresence[userID])
+
+	require.NoError(t, redisClient.Del(ctx, key).Err())
+	clear(hub.onlineCountPending)
+	hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+	stored, err := redisClient.Get(ctx, key).Result()
+	require.NoError(t, err)
+	assert.Equal(t, statusInvisible, stored, "invisible must never be restored as a visible status")
+	assert.Equal(t, statusInvisible, hub.hiddenPresence[userID])
+}
+
+// TestPresenceTTLLapseIsCounted asserts the OUTERMOST observable effect of a
+// lapse, not that one internal function called another.
+//
+// Both outcomes are exercised deliberately. The counter is incremented ABOVE the
+// restore-or-fail-closed decision precisely so it cannot discriminate them --
+// restorable versus fenced is the branch the #2444/#2461 fence keeps
+// indistinguishable, so a counter that split on it would be a privacy-decision
+// discriminator (observability.md principle 7). Asserting BOTH paths produce the
+// same single increment is what pins that, and a test covering only one path
+// would still pass if someone moved the call below the branch.
+func TestPresenceTTLLapseIsCounted(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("lapse the hub can restore", func(t *testing.T) {
+		redisClient := setupHubTestRedis(t)
+		hub := NewHub(nil, redisClient)
+		counter := &opsCounterSpy{}
+		hub.opsCounter = counter
+		userID := uuid.New()
+		hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+		key := presence.StatusRedisKey(userID)
+
+		require.NoError(t, redisClient.Set(ctx, key, statusOnline, presence.StatusTTL).Err())
+		hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+		require.Zero(t, counter.count(opsmetrics.MetricPresenceTTLLapsedTotal),
+			"a heartbeat that FOUND its key must not count as a lapse")
+
+		require.NoError(t, redisClient.Del(ctx, key).Err())
+		clear(hub.onlineCountPending)
+		hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+		assert.Equal(t, 1, counter.count(opsmetrics.MetricPresenceTTLLapsedTotal))
+	})
+
+	t.Run("lapse that still fails closed", func(t *testing.T) {
+		redisClient := setupHubTestRedis(t)
+		hub := NewHub(nil, redisClient)
+		counter := &opsCounterSpy{}
+		hub.opsCounter = counter
+		userID := uuid.New()
+		hub.userClients[userID] = map[uuid.UUID]bool{uuid.New(): true}
+
+		// No prior presence state, so canRestore is false and this fails closed.
+		hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: userID})
+
+		require.Equal(t, statusOffline, hub.hiddenPresence[userID],
+			"precondition: this heartbeat must have taken the fail-closed path")
+		assert.Equal(t, 1, counter.count(opsmetrics.MetricPresenceTTLLapsedTotal),
+			"the counter must not discriminate the outcome: both paths are one lapse")
+	})
+
+	t.Run("a disconnected user is not a lapse", func(t *testing.T) {
+		hub := NewHub(nil, setupHubTestRedis(t))
+		counter := &opsCounterSpy{}
+		hub.opsCounter = counter
+
+		// Not in userClients, so the handler returns before counting anything.
+		hub.handleHeartbeat(IncomingMessage{Type: "heartbeat", UserID: uuid.New()})
+
+		assert.Zero(t, counter.count(opsmetrics.MetricPresenceTTLLapsedTotal))
+	})
+}
