@@ -261,6 +261,51 @@ function currentEncodedTransformApis() {
 // single source of truth otherwise, so tests reset by clearing storage.
 let inMemoryLegacyOverride = false;
 
+// IGNIS dev/support override. `localStorage['concord.forceDecoderZone']` set to
+// 'green' | 'yellow' | 'red' substitutes that zone for the rho-derived one on
+// every usable sample, so the real emit / escalate / pause path runs instead of
+// only the badge.
+//
+// It exists because IGNIS has now shipped twice with no way to reach yellow or
+// red locally: `concord-dev.sh`'s fake-device decodes a synthetic pattern one to
+// two orders of magnitude under the ~26 ms p95 @30 fps that rho >= 0.80 needs.
+// Dev media does produce USABLE samples — they are simply always green — which is
+// why substituting the zone at classification works while faking the stats would
+// not.
+//
+// The packaged-shell vs remote-SPA parity question this follow-up was flagged
+// with has a one-line answer: localStorage is per-origin and both shells run the
+// same renderer bundle, so there is nothing to reconcile. Same mechanism as
+// `concord.forceLegacyE2EE` above, deliberately.
+//
+// Not gated to dev builds, for the same reason that override is not: support
+// needs it on a user's real machine, the blast radius is self-inflicted (a user
+// can degrade their own incoming video and nobody else's), and a build gate would
+// make it useless exactly when it is wanted. Clearing the key restores normal
+// behaviour on the next profiling tick.
+export const FORCE_DECODER_ZONE_KEY = 'concord.forceDecoderZone';
+
+/** The rho -> zone ladder, extracted so the override and the real path cannot
+ *  drift: both now go through `classifyAndHandleDecoderZone`'s single dispatch. */
+function zoneForRho(rho: number): DecoderHealthZone {
+  if (rho >= 0.925) return 'red';
+  if (rho >= 0.8) return 'yellow';
+  return 'green';
+}
+
+function readForcedDecoderZone(): DecoderHealthZone | null {
+  try {
+    const raw = globalThis.localStorage?.getItem(FORCE_DECODER_ZONE_KEY);
+    // Closed set, not a cast: a typo must fall through to real measurement
+    // rather than silently pinning the session to an unintended zone.
+    return raw === 'green' || raw === 'yellow' || raw === 'red' ? raw : null;
+  } catch {
+    // Storage can throw outright (private mode, blocked site data). An override
+    // that cannot be read is simply absent.
+    return null;
+  }
+}
+
 function readLegacyTransformOverride(): boolean {
   try {
     // Storage is the single source of truth when it works (tests reset by
@@ -2521,6 +2566,20 @@ class VoiceService {
   // Decoder budget profiling (IGNIS)
   private decoderProfilingTimer: ReturnType<typeof setInterval> | null = null;
   private decoderProfilingInFlight = false;
+
+  /** Snapshot of the dev zone override for the CURRENT profiling cycle. Read once
+   *  per pass rather than per consumer: storage access is synchronous, and a value
+   *  that changed mid-pass would classify two consumers differently in one cycle. */
+  // The forced zone is deliberately NOT an instance field (#3280).
+  //
+  // It was one, set at the top of `profileDecoders` and read after the
+  // `getStats()` await. Single-flight is supposed to make that safe, but BOTH
+  // teardown paths reset `decoderProfilingInFlight` — so a disconnect/rejoin
+  // while a pass is awaiting lets the next pass start and overwrite the field,
+  // and the original pass then classifies its remaining consumers under the new
+  // pass's override, or loses its own. The sampling rule requires one cycle to
+  // use a CONSISTENT snapshot, so the snapshot is a local threaded through the
+  // pass rather than state anything else can reach (Codex, #3280).
   private readonly decoderBudgetSampler = new DecoderBudgetSampler();
 
   // A/V sync-drift sampler (#2941). Report-only diagnostic — deliberately its OWN timer
@@ -7810,7 +7869,8 @@ class VoiceService {
     consumer: mediasoupTypes.Consumer,
     rho: number,
     p95DecodeMs: number,
-    currentFps: number
+    currentFps: number,
+    forcedZone: DecoderHealthZone | null
   ): void {
     const outcome = this.tryEmitCameraPressureLayerRequest(consumer.id, 'red');
     // A deferral is this user's step already having landed on an earlier
@@ -7826,7 +7886,13 @@ class VoiceService {
         'decode p95ms:',
         p95DecodeMs.toFixed(1),
         'fps:',
-        currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
+        currentFps,
+        // Without this the line reads as self-contradictory to the one audience the
+        // override exists for: a forced zone still prints the REAL measurement, so a
+        // developer verifying the feature sees 'IGNIS RED ... rho: 0.15' and has to
+        // infer the override from the mismatch (Gitar, #3280).
+        'forced:',
+        forcedZone !== null
       );
       this.decoderBudgetSampler.deleteConsumer(consumer.id);
       return;
@@ -7917,14 +7983,19 @@ class VoiceService {
     rho: number,
     p95DecodeMs: number,
     currentFps: number,
-    worstZone: DecoderHealthZone
+    worstZone: DecoderHealthZone,
+    forcedZone: DecoderHealthZone | null
   ): DecoderHealthZone {
-    if (rho >= 0.925) {
-      this.handleRedZone(consumer, rho, p95DecodeMs, currentFps);
+    // Substitute the forced zone BEFORE dispatch, so the override drives the real
+    // handlers — emit, escalate, pause, and the three-green recovery — rather than
+    // only the health badge, which was already reachable by writing the store.
+    const zone = forcedZone ?? zoneForRho(rho);
+    if (zone === 'red') {
+      this.handleRedZone(consumer, rho, p95DecodeMs, currentFps, forcedZone);
       return 'red';
     }
-    if (rho >= 0.8) {
-      return this.handleYellowZone(consumer, rho, p95DecodeMs, currentFps, worstZone);
+    if (zone === 'yellow') {
+      return this.handleYellowZone(consumer, rho, p95DecodeMs, currentFps, worstZone, forcedZone);
     }
     return worstZone;
   }
@@ -7934,7 +8005,8 @@ class VoiceService {
     rho: number,
     p95DecodeMs: number,
     currentFps: number,
-    worstZone: DecoderHealthZone
+    worstZone: DecoderHealthZone,
+    forcedZone: DecoderHealthZone | null
   ): DecoderHealthZone {
     if (this.tryEmitCameraPressureLayerRequest(consumer.id, 'yellow') === 'emitted') {
       console.warn(
@@ -7945,7 +8017,13 @@ class VoiceService {
         'decode p95ms:',
         p95DecodeMs.toFixed(1),
         'fps:',
-        currentFps // eslint-disable-line no-restricted-syntax -- currentFps is a number from RTCStatsReport, not an Error
+        currentFps,
+        // Without this the line reads as self-contradictory to the one audience the
+        // override exists for: a forced zone still prints the REAL measurement, so a
+        // developer verifying the feature sees 'IGNIS YELLOW ... rho: 0.15' and has to
+        // infer the override from the mismatch (Gitar, #3280).
+        'forced:',
+        forcedZone !== null
       );
       this.decoderBudgetSampler.deleteConsumer(consumer.id);
     }
@@ -7981,7 +8059,8 @@ class VoiceService {
   private observeDecoderConsumer(
     consumer: mediasoupTypes.Consumer,
     selected: SelectedDecoderStatsReport | null,
-    worstZone: DecoderHealthZone | null
+    worstZone: DecoderHealthZone | null,
+    forcedZone: DecoderHealthZone | null
   ): DecoderHealthZone | null {
     const decoded = this.decoderBudgetSampler.observe({
       consumerId: consumer.id,
@@ -7997,11 +8076,15 @@ class VoiceService {
       decoded.rho,
       decoded.p95DecodeMs,
       decoded.currentFps,
-      worstZone ?? 'green'
+      worstZone ?? 'green',
+      forcedZone
     );
   }
 
   private async profileDecoders(): Promise<void> {
+    // Read ONCE per pass and carried by value, so a pass that resumes after a
+    // teardown-and-restart still classifies under the override it began with.
+    const forcedZone = readForcedDecoderZone();
     let worstZone: DecoderHealthZone | null = null;
     // One pressure step per producing user per pass. Cleared HERE rather than
     // after the loop so an early return cannot leave a stale ledger behind.
@@ -8012,7 +8095,7 @@ class VoiceService {
 
       let selected: SelectedDecoderStatsReport | null = null;
       if (!consumer.paused) selected = await this.selectDecoderReport(consumer);
-      worstZone = this.observeDecoderConsumer(consumer, selected, worstZone);
+      worstZone = this.observeDecoderConsumer(consumer, selected, worstZone, forcedZone);
     }
 
     if (!worstZone) return;

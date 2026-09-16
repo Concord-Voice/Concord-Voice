@@ -191,7 +191,8 @@ Object.defineProperty(navigator, 'mediaDevices', {
 // ---------------------------------------------------------------------------
 // Import voiceService AFTER all mocks
 // ---------------------------------------------------------------------------
-const { voiceService } = await import('@/renderer/services/voice/voiceService');
+const { voiceService, FORCE_DECODER_ZONE_KEY } =
+  await import('@/renderer/services/voice/voiceService');
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
@@ -386,6 +387,7 @@ describe('IGNIS decoder recovery (#1540)', () => {
     svc.remoteVideoRenderStateByUser?.clear();
     svc.lastPreferredLayerKeyByConsumer?.clear();
     svc.cameraLayeringEnabled = false;
+    globalThis.localStorage?.removeItem(FORCE_DECODER_ZONE_KEY);
   });
 
   afterEach(() => {
@@ -403,6 +405,7 @@ describe('IGNIS decoder recovery (#1540)', () => {
     svc.remoteVideoRenderStateByUser?.clear();
     svc.lastPreferredLayerKeyByConsumer?.clear();
     svc.cameraLayeringEnabled = false;
+    globalThis.localStorage?.removeItem(FORCE_DECODER_ZONE_KEY);
     vi.useRealTimers();
   });
 
@@ -798,6 +801,167 @@ describe('IGNIS decoder recovery (#1540)', () => {
     // No second emit, and the pause lands on that first red tick rather than a later one.
     expect(setPreferredLayerEmits()).toHaveLength(1);
     expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(true);
+  });
+
+  // Dev/support zone override (`localStorage['concord.forceDecoderZone']`). IGNIS has
+  // shipped twice with no local repro path: concord-dev.sh's fake-device decodes a
+  // synthetic pattern one to two orders of magnitude under the ~26 ms p95 @30 fps
+  // that rho >= 0.80 needs. Dev media DOES produce usable samples — they are simply
+  // always green — which is why substituting the zone at classification works.
+  //
+  // The point of these cases is that the override drives the real ACTIONS, not just
+  // the badge: the badge was already reachable by writing the store directly.
+  it('forces the red path on a green sample, including the emit', async () => {
+    const svc = voiceService as any;
+    globalThis.localStorage.setItem(FORCE_DECODER_ZONE_KEY, 'red');
+    const cursor = makeCursor('fz-cam-report', 98);
+    const cam = makeVideoConsumer('fz-cam', () => statsMap(cursor), { negotiatedSsrc: 98 });
+    const other = makeVideoConsumer('fz-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    registerCameraPressureContext(svc, 'fz-user', cam.id, { role: 'focus' });
+
+    await svc.profileDecoders(); // baseline
+    addInterval(cursor, elapse(), 5); // rho ~= 0.15 — unmistakably GREEN
+    await svc.profileDecoders();
+
+    expect(useVoiceStore.getState().decoderHealth).toBe('red');
+    expect(
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers')
+    ).toHaveLength(1);
+  });
+
+  it('forces yellow, which steps down and never pauses', async () => {
+    const svc = voiceService as any;
+    globalThis.localStorage.setItem(FORCE_DECODER_ZONE_KEY, 'yellow');
+    const cursor = makeCursor('fy-cam-report', 100);
+    const cam = makeVideoConsumer('fy-cam', () => statsMap(cursor), { negotiatedSsrc: 100 });
+    const other = makeVideoConsumer('fy-other', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    svc.consumers.set(other.id, other);
+    registerCameraPressureContext(svc, 'fy-user', cam.id, { role: 'focus' });
+
+    await svc.profileDecoders();
+    addInterval(cursor, elapse(), 5);
+    await svc.profileDecoders();
+
+    // The badge was ALWAYS reachable by writing the store, so asserting it alone
+    // lets the override degrade into the badge-only implementation this feature
+    // exists to avoid -- the name says "steps down", so the step-down is what has
+    // to be asserted (Codex, #3280; [internal]rules/tests.md).
+    expect(useVoiceStore.getState().decoderHealth).toBe('yellow');
+    expect(svc.pauseCoordinator.hasReason(cam.id, 'ignis')).toBe(false);
+
+    const emits = mockSocket.emit.mock.calls.filter(
+      ([event]: [string]) => event === 'set-preferred-layers'
+    );
+    expect(emits).toHaveLength(1);
+    expect(emits[0][1]).toMatchObject({ pressureStepDown: true });
+    const unpressured = svc.computePreferredLayerPayloadForUser('fy-user', 0);
+    expect(emits[0][1].spatialLayer).toBeLessThan(unpressured.spatialLayer);
+  });
+
+  // The forced zone travels BY VALUE, so two classifications can disagree.
+  //
+  // It used to be an instance field set at the top of `profileDecoders` and read
+  // after the `getStats()` await. Single-flight was supposed to make that safe,
+  // but both teardown paths reset `decoderProfilingInFlight`, so a
+  // disconnect/rejoin mid-await lets the next pass overwrite the field and the
+  // original pass then classifies its remaining consumers under someone else's
+  // override (Codex, #3280).
+  //
+  // This pins the PARAMETERISATION rather than replaying the teardown race. The
+  // fixture types `getStats` as synchronous, so staging a genuinely concurrent
+  // pass needs a gated promise plus call-counting against the sampler baseline,
+  // and that test would obscure more than it pins. Two classifications on ONE
+  // instance yielding different zones is impossible if the value is read from
+  // shared state, which is the property the fix turns on.
+  // The override is read ONCE per pass, not once per consumer.
+  //
+  // The parameterisation case below cannot see this: a regression that reads
+  // storage per consumer and forwards the result through the same helper leaves
+  // every one of its assertions green (Codex, #3280). That class needs no
+  // concurrency to detect -- counting the storage reads across a multi-consumer
+  // pass is enough, and it is the half of "consistent snapshot per cycle" that
+  // is actually cheap to pin.
+  it('reads the override once per profiling pass, not once per consumer', async () => {
+    const svc = voiceService as any;
+    // A counting STUB rather than vi.spyOn: Node 26 ships a native WebStorage that
+    // shadows jsdom's, and a spy installed on it never saw the service's reads --
+    // the first version of this case asserted 1 and observed 0. Swapping the
+    // global outright is independent of whether the underlying object is
+    // spy-able, and it restores in a finally so a failure cannot leak it.
+    const real = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    let reads = 0;
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => {
+          if (key === FORCE_DECODER_ZONE_KEY) reads += 1;
+          return 'red';
+        },
+        setItem: () => {},
+        removeItem: () => {},
+      },
+    });
+
+    try {
+      const cursorA = makeCursor('once-a-report', 120);
+      const cursorB = makeCursor('once-b-report', 121);
+      const camA = makeVideoConsumer('once-a', () => statsMap(cursorA), { negotiatedSsrc: 120 });
+      const camB = makeVideoConsumer('once-b', () => statsMap(cursorB), { negotiatedSsrc: 121 });
+      svc.consumers.set(camA.id, camA);
+      svc.consumers.set(camB.id, camB);
+      registerCameraPressureContext(svc, 'once-user-a', camA.id, { role: 'focus' });
+      registerCameraPressureContext(svc, 'once-user-b', camB.id, { role: 'focus' });
+
+      await svc.profileDecoders();
+
+      // TWO video consumers, ONE read. A per-consumer read would be 2 and would
+      // pass every assertion in the parameterisation case below.
+      expect(reads).toBe(1);
+    } finally {
+      if (real) Object.defineProperty(globalThis, 'localStorage', real);
+    }
+  });
+
+  it('carries the forced zone per call, so one pass cannot retune another', () => {
+    const svc = voiceService as any;
+    const cam = makeVideoConsumer('fv-cam', () => new Map());
+    svc.consumers.set(cam.id, cam);
+    registerCameraPressureContext(svc, 'fv-user', cam.id, { role: 'focus' });
+
+    // rho 0.1 is unmistakably GREEN, so any red/yellow verdict below can only
+    // have come from the forced argument.
+    const GREEN_RHO = 0.1;
+    expect(svc.classifyAndHandleDecoderZone(cam, GREEN_RHO, 3, 30, 'green', 'red')).toBe('red');
+    expect(svc.classifyAndHandleDecoderZone(cam, GREEN_RHO, 3, 30, 'green', 'yellow')).toBe(
+      'yellow'
+    );
+    expect(svc.classifyAndHandleDecoderZone(cam, GREEN_RHO, 3, 30, 'green', null)).toBe('green');
+  });
+
+  it('ignores an unrecognised value rather than pinning the session to a wrong zone', async () => {
+    const svc = voiceService as any;
+    globalThis.localStorage.setItem(FORCE_DECODER_ZONE_KEY, 'REDD');
+    const cursor = makeCursor('fb-cam-report', 102);
+    const cam = makeVideoConsumer('fb-cam', () => statsMap(cursor), { negotiatedSsrc: 102 });
+    svc.consumers.set(cam.id, cam);
+    registerCameraPressureContext(svc, 'fb-user', cam.id, { role: 'focus' });
+
+    await svc.profileDecoders();
+    addInterval(cursor, elapse(), 5); // genuinely green
+    await svc.profileDecoders();
+
+    // A typo falls through to real measurement — it does not become 'red', and it
+    // does not throw. Asserted behaviourally rather than by reading the parsed
+    // value: the forced zone is now a per-pass local rather than an instance
+    // field (#3280), and the stronger claim is that nothing ACTED on it anyway.
+    // A forced red would have emitted a layer request here.
+    expect(useVoiceStore.getState().decoderHealth).toBe('green');
+    expect(
+      mockSocket.emit.mock.calls.filter(([event]: [string]) => event === 'set-preferred-layers')
+    ).toHaveLength(0);
   });
   // Multi-step pressure. A 1920x1080 focus tile computes to spatial layer 2, so it
   // can absorb TWO steps before a step stops being a step. The single-bit design
