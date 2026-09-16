@@ -548,12 +548,24 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // The empty list: nothing to follow, plus the bookkeeping that tells an
     // empty thread's first live message from hydration (emptyAfterLoadRef).
     const noteEmptyList = useCallback(() => {
+      // A list that empties while mounted (a purge) is a leave: whatever was
+      // seen was seen before now, so the parent flushes its pending marker
+      // before a replacement row can be committed under it; arrivals that
+      // were only shown are forgotten, since nothing remains to report.
+      const purged = prevIdsRef.current.size > 0;
+      if (purged) onLatestLeftRef.current?.();
+      unseenAtBottomRef.current = 0;
+      firstUnseenIdRef.current = null;
       prevLastMessageIdRef.current = null;
       prevIdsRef.current = new Set();
       arrivedWhileAwayRef.current = 0;
       seededRef.current = 0;
+      // Loaded empty, or purged after rows were shown: either way the thread
+      // is past hydration, so its next row is a live arrival. Without the
+      // purge case the first row after a purge would be read as hydration
+      // (prevId is null again) and never marked or counted.
       if (isLoading) emptyAfterLoadRef.current = false;
-      else if (prevLoadingRef.current) {
+      else if (prevLoadingRef.current || purged) {
         emptyAfterLoadRef.current = true;
         hydratedRef.current = true;
       }
@@ -582,9 +594,9 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // first loading cycle for this thread (hydration), and not on the very
     // first rows unless the thread had finished loading empty.
     const isArrival = useCallback(
-      (lastId: string, prevId: string | null): boolean => {
+      (prevId: string | null): boolean => {
         const hydration = (isLoading || prevLoadingRef.current) && !hydratedRef.current;
-        if (hydration || lastId === prevId) return false;
+        if (hydration) return false;
         return prevId !== null || emptyAfterLoadRef.current;
       },
       [isLoading]
@@ -615,12 +627,18 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       const lastId = lastMessage.id;
       const list = listRef.current;
       const prevId = prevLastMessageIdRef.current;
-      const arrived = isArrival(lastId, prevId);
-      const prevLast = arrived && list && prevId !== null ? findRow(list, prevId) : null;
-      // What arrived: the rows that were not here before, others' only.
+      // What arrived: the rows that were not here before, wherever they sit
+      // below the first row the list already held — a reconnect inserts
+      // missed rows BEFORE a preserved live tail, so the latest id alone does
+      // not say. Rows ABOVE that first held row are an older page prepended
+      // by pagination, history rather than arrivals; counting them would badge
+      // and report old rows as unread. With nothing held, every row is new.
       const prevIds = prevIdsRef.current;
-      const appended = arrived ? messages.filter((m) => !prevIds.has(m.id)) : [];
-      const others = appended.filter((m) => m.user_id !== currentUserId);
+      const prevFirstIdx = messages.findIndex((m) => prevIds.has(m.id));
+      const appended = messages.filter((m, i) => !prevIds.has(m.id) && i > prevFirstIdx);
+      const arrived = appended.length > 0 && isArrival(prevId);
+      const prevLast = arrived && list && prevId !== null ? findRow(list, prevId) : null;
+      const others = arrived ? appended.filter((m) => m.user_id !== currentUserId) : [];
 
       // Follow the latest row, or start following when a message lands while
       // the bottom was already in view: a restored anchor can sit inside the

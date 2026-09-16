@@ -246,10 +246,13 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     [handlePinToggleBase]
   );
 
-  // Per thread, how many read markers have been dispatched since the last
-  // open-time read was sent. An open-time failure that lands after a newer
-  // marker went out must not restore a count that marker clears; if the
-  // marker fails too, the local count stays low — the safe direction.
+  // Per thread, the read claims made — open-time attempts, and markers
+  // QUEUED at the seen event, before the debounce — so an open-time failure
+  // landing after a newer claim never restores a count that claim clears:
+  // a marker inside the debounce window or after dispatch, or a second
+  // open-time attempt posted by a quick return to the thread while the first
+  // was still in flight (this component keeps its instance across threads).
+  // If every claim fails, the local count stays low — the safe direction.
   const readGensRef = useRef(new Map<string, number>());
   // The thread whose open-time read has been posted. The fetch hook fires
   // completion after every successful fetch, and a reconnect refetch's page
@@ -264,17 +267,27 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     openReadThreadRef.current = threadId;
     const previousUnread =
       useDMStore.getState().conversations.find((c) => c.id === threadId)?.unreadCount ?? 0;
-    const gen = readGensRef.current.get(threadId) ?? 0;
+    const gens = readGensRef.current;
+    const gen = (gens.get(threadId) ?? 0) + 1; // this attempt's claim, see readGensRef
+    gens.set(threadId, gen);
     clearUnread(threadId);
-    apiFetch(`/api/v1/dm/conversations/${threadId}/read`, { method: 'POST' }).catch((error) => {
-      console.error('[DMChatArea] Failed to mark conversation as read:', errorMessage(error));
-      // A newer marker made the server current: nothing to put back.
-      if ((readGensRef.current.get(threadId) ?? 0) !== gen) return;
-      // The server still counts these; ADD them back on top of whatever has
-      // landed since (the leave-time count, if the user already left) — a
-      // set from either writer would discard the other.
-      useDMStore.getState().incrementUnread(threadId, previousUnread);
-    });
+    apiFetch(`/api/v1/dm/conversations/${threadId}/read`, { method: 'POST' })
+      .then((res) => {
+        // apiFetch resolves a non-2xx; a 429 or 500 here left the local
+        // count cleared with the server marker stale.
+        if (!res.ok) throw new Error(`open-time read rejected: HTTP ${res.status}`);
+      })
+      .catch((error) => {
+        console.error('[DMChatArea] Failed to mark conversation as read:', errorMessage(error));
+        // Let the next fetch completion for this thread try again.
+        if (openReadThreadRef.current === threadId) openReadThreadRef.current = null;
+        // A newer marker made the server current: nothing to put back.
+        if ((readGensRef.current.get(threadId) ?? 0) !== gen) return;
+        // The server still counts these; ADD them back on top of whatever has
+        // landed since (the leave-time count, if the user already left) — a
+        // set from either writer would discard the other.
+        useDMStore.getState().incrementUnread(threadId, previousUnread);
+      });
   }, [selectedThreadId, clearUnread]);
 
   // Shared fetch/decrypt/paginate logic
@@ -291,8 +304,6 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   // success.
   const { markSeen, flush: flushSeen } = useReadMarker(async () => {
     if (!selectedThreadId) return;
-    const gens = readGensRef.current;
-    gens.set(selectedThreadId, (gens.get(selectedThreadId) ?? 0) + 1); // at dispatch, see readGensRef
     const res = await apiFetch(`/api/v1/dm/conversations/${selectedThreadId}/read`, {
       method: 'POST',
     });
@@ -306,6 +317,8 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     ) {
       clearUnread(selectedThreadId);
     }
+    const gens = readGensRef.current;
+    gens.set(selectedThreadId, (gens.get(selectedThreadId) ?? 0) + 1); // queued, see readGensRef
     markSeen();
   }, [selectedThreadId, clearUnread, markSeen]);
 

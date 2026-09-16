@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { MessageSquare, Volume2, PanelBottom, PanelRight } from 'lucide-react';
 import MessageList from '../Chat/MessageList';
 import MessageInput from '../Chat/MessageInput';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { useUserStore } from '../../stores/auth/userStore';
+import { useDMStore } from '../../stores/chat/dmStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useTTSSettingsStore } from '../../stores/audio/ttsSettingsStore';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
@@ -49,25 +50,85 @@ const VoiceTextChat: React.FC = () => {
   }, [ttsEnabled]);
 
   // Shared fetch/decrypt/paginate logic
+  // The open-time read for a DM call: DMChatArea's ran when the conversation
+  // was opened, but a backlog that arrived while this drawer was closed is
+  // hydration when it reopens, and hydration is never "seen". Once per
+  // target ENTRY: the guard clears when the target changes, so coming back
+  // to a conversation after another target (a DM, or a linked channel, which
+  // never writes the guard) reads its backlog again as opening it would,
+  // while a reconnect refetch of the same target does not. The
+  // linked-channel case is ChannelList's voice-linked effect.
+  const openReadTargetRef = useRef<string | null>(null);
+  useEffect(() => {
+    openReadTargetRef.current = null;
+  }, [targetId]);
+  // Read claims per target — open-time attempts and queued live markers —
+  // DMChatArea's fence: an open-time failure landing after a newer claim
+  // must not restore a count that claim clears. Keyed by target, not one
+  // number: no mount site gives this panel a key, so one instance survives a
+  // target change, and a claim on the next target must not fence the
+  // previous target's rollback.
+  const readGensRef = useRef(new Map<string, number>());
+  const readPath = isDMCall
+    ? `/api/v1/dm/conversations/${targetId}/read`
+    : `/api/v1/channels/${targetId}/read`;
+  const handleFetchComplete = useCallback(() => {
+    if (!isDMCall || !targetId || openReadTargetRef.current === targetId) return;
+    openReadTargetRef.current = targetId;
+    const previousUnread =
+      useDMStore.getState().conversations.find((c) => c.id === targetId)?.unreadCount ?? 0;
+    // A new attempt claims the marker as a queued marker does: an older
+    // attempt still in flight (A → B → A before its read returned) must not
+    // restore a baseline this one superseded when it fails late. If every
+    // claim fails the count stays low, the safe direction.
+    const gens = readGensRef.current;
+    const gen = (gens.get(targetId) ?? 0) + 1;
+    gens.set(targetId, gen);
+    useDMStore.getState().clearUnread(targetId);
+    apiFetch(readPath, { method: 'POST' })
+      .then((res) => {
+        if (!res.ok) throw new Error(`open-time read rejected: HTTP ${res.status}`);
+      })
+      .catch((error: unknown) => {
+        console.error(
+          '[VoiceTextChat] Failed to mark conversation as read:',
+          error instanceof Error ? error.message : String(error)
+        );
+        if (openReadTargetRef.current === targetId) openReadTargetRef.current = null;
+        if ((readGensRef.current.get(targetId) ?? 0) !== gen) return; // a newer marker made the server current
+        // The server still counts these: put them back, as DMChatArea does.
+        useDMStore.getState().incrementUnread(targetId, previousUnread);
+      });
+  }, [isDMCall, targetId, readPath]);
+
   const { messages, isLoading, hasMore, error, handleLoadMore } = useMessageFetch(targetId, {
     type: fetchType,
+    onFetchComplete: handleFetchComplete,
   });
 
   const currentUserId = user?.id || '';
 
-  // Advance the read marker while the panel is open (#3289). The open-time
-  // read is ChannelList's for a linked channel and DMChatArea's for a DM
-  // call; neither covers a message read as it arrives here. Same shape as
-  // ChatView and DMChatArea: debounced, flushed when the list stops
-  // following, and a non-2xx is rejected so the hook logs it.
-  const readPath = isDMCall
-    ? `/api/v1/dm/conversations/${targetId}/read`
-    : `/api/v1/channels/${targetId}/read`;
+  // Advance the read marker while the panel is open (#3289): a message read
+  // as it arrives here. Same shape as ChatView and DMChatArea: debounced,
+  // flushed when the list stops following, and a non-2xx is rejected so the
+  // hook logs it. A DM call's local unread count is cleared before marking,
+  // as DMChatArea does — the active conversation may be another one, so the
+  // WebSocket handler keeps counting this one.
   const { markSeen, flush: flushSeen } = useReadMarker(async () => {
     if (!targetId) return;
     const res = await apiFetch(readPath, { method: 'POST' });
     if (!res.ok) throw new Error(`read marker rejected: HTTP ${res.status}`);
   }, targetId);
+  const handleLatestSeen = useCallback(() => {
+    if (isDMCall && targetId) {
+      const unread =
+        useDMStore.getState().conversations.find((c) => c.id === targetId)?.unreadCount ?? 0;
+      if (unread > 0) useDMStore.getState().clearUnread(targetId);
+      const gens = readGensRef.current;
+      gens.set(targetId, (gens.get(targetId) ?? 0) + 1); // queued, see readGensRef
+    }
+    markSeen();
+  }, [isDMCall, targetId, markSeen]);
 
   const handleSendMessage = (
     content: string,
@@ -119,6 +180,7 @@ const VoiceTextChat: React.FC = () => {
           key={targetId}
           messages={messages}
           currentUserId={currentUserId}
+          persistenceKey={targetId}
           chatContext={chatContext}
           channelName={targetName}
           isLoading={isLoading}
@@ -129,7 +191,7 @@ const VoiceTextChat: React.FC = () => {
           onReply={handleReply}
           onPinToggle={handlePinToggle}
           canPin={canPin}
-          onLatestSeen={markSeen}
+          onLatestSeen={handleLatestSeen}
           onLatestLeft={flushSeen}
         />
       </div>

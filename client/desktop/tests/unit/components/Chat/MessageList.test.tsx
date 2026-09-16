@@ -593,7 +593,10 @@ describe('MessageList', () => {
       fireEvent.scroll(list);
       expect(returnToLatest()).toBeVisible();
 
-      rerender(<MessageList messages={[]} currentUserId="user-1" persistenceKey="k" />);
+      // A refill is a refetch, so it carries the loading cycle; rows that land
+      // after a purge with no loading cycle are live arrivals instead (see the
+      // onLatestSeen purge test).
+      rerender(<MessageList messages={[]} currentUserId="user-1" persistenceKey="k" isLoading />);
       rerender(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
       expect(getList().scrollTop).toBe(1000);
       expect(returnToLatest()).not.toBeInTheDocument();
@@ -1309,6 +1312,55 @@ describe('MessageList', () => {
       expect(getList().scrollTop).toBe(1000);
       expect(onLatestLeft).toHaveBeenCalledTimes(1);
       expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('4');
+    });
+
+    it('marks rows a reconnect inserted before a preserved live tail', () => {
+      // The store replaced the page with missed rows placed BEFORE the tail
+      // that arrived live during the outage; the latest id did not change.
+      const onLatestSeen = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen };
+      const { rerender } = render(<MessageList messages={rows} {...props} />);
+      const missed = [arrival('r1'), arrival('r2')];
+      rerender(<MessageList messages={[...rows.slice(0, 9), ...missed, rows[9]]} {...props} />);
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('flushes the pending marker and forgets unseen arrivals when the list empties while mounted', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestLeft = vi.fn();
+      const onUnseenOnLeave = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestLeft, onUnseenOnLeave };
+      const { rerender, unmount } = render(<MessageList messages={rows} {...props} />);
+      rerender(<MessageList messages={[...rows, arrival('a1')]} {...props} />); // shown, unseen
+      rerender(<MessageList messages={[]} {...props} />); // a purge emptied the store
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
+      unmount();
+      expect(onUnseenOnLeave).not.toHaveBeenCalled();
+    });
+
+    it('marks the first row after a purge as an arrival, not hydration', () => {
+      const onLatestSeen = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen };
+      const { rerender } = render(<MessageList messages={rows} {...props} />);
+      rerender(<MessageList messages={[]} {...props} />); // a purge emptied the store
+      rerender(<MessageList messages={[arrival('p1')]} {...props} />); // live, not a fetch
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not count an older page prepended by pagination as arrivals', () => {
+      const onLatestSeen = vi.fn();
+      const onUnseenOnLeave = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen, onUnseenOnLeave };
+      const { rerender, unmount } = render(<MessageList messages={rows} {...props} />);
+      const list = getList();
+      list.scrollTop = 100;
+      fireEvent.scroll(list); // scrolled up, as a reader who paged back would be
+      const older = Array.from({ length: 5 }, (_, i) => ({ ...arrival(`old-${i}`) }));
+      rerender(<MessageList messages={[...older, ...rows]} {...props} />); // history, not new
+      expect(screen.getByRole('button', { name: /return to latest/i })).not.toHaveTextContent(/\d/);
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      unmount();
+      expect(onUnseenOnLeave).not.toHaveBeenCalled();
     });
 
     it('does not fire for an edit of the latest row', () => {

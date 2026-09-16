@@ -244,6 +244,13 @@ describe('VoiceTextChat', () => {
     }
   });
 
+  it('passes the target as the persistence key so the panel lands like the other owners', () => {
+    useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
+    useChannelStore.setState({ channels: [linkedTextChannel] });
+    render(<VoiceTextChat />);
+    expect(capturedMessageListProps.persistenceKey).toBe(TEXT_CHANNEL_ID);
+  });
+
   it('renders layout toggle button', () => {
     useVoiceStore.setState({
       activeChannelId: VOICE_CHANNEL_ID,
@@ -388,6 +395,188 @@ describe('VoiceTextChat — DM call', () => {
       '/api/v1/dm/conversations/dm-1/read',
       expect.objectContaining({ method: 'POST' })
     );
+  });
+
+  it('posts the DM open-time read once when the drawer fetch completes, clearing the local count', async () => {
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    useDMStore.setState({ conversations: [{ ...dmConversation, unreadCount: 3 }] } as never);
+    render(<VoiceTextChat />);
+    const calls = (useMessageFetch as ReturnType<typeof vi.fn>).mock.calls;
+    const options = calls[calls.length - 1][1] as { onFetchComplete?: () => void };
+    await act(async () => {
+      options.onFetchComplete?.();
+      options.onFetchComplete?.(); // a refetch: not a second open
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    const reads = (apiFetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([url, opts]) =>
+        String(url).endsWith('/dm/conversations/dm-1/read') && opts?.method === 'POST'
+    );
+    expect(reads).toHaveLength(1);
+  });
+
+  it('restores the local DM count when the drawer open-time read fails, unless a marker was queued since', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: false, status: 429 });
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    useDMStore.setState({ conversations: [{ ...dmConversation, unreadCount: 3 }] } as never);
+    render(<VoiceTextChat />);
+    const calls = (useMessageFetch as ReturnType<typeof vi.fn>).mock.calls;
+    const options = calls[calls.length - 1][1] as { onFetchComplete?: () => void };
+    await act(async () => {
+      options.onFetchComplete?.();
+    });
+    // The 429 rolled the cleared count back, as DMChatArea does.
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(3);
+
+    // A seen event queued before the failure lands: nothing to put back.
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve({ ok: false, status: 500 }), 10))
+    );
+    await act(async () => {
+      options.onFetchComplete?.(); // retry after the failure reset the once-guard
+      (capturedMessageListProps.onLatestSeen as () => void)();
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    consoleSpy.mockRestore();
+  });
+
+  it("rolls a previous target's failed open-time read back even after a marker was queued for the next target", async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    let finishFirstRead!: (res: { ok: boolean; status: number }) => void;
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishFirstRead = resolve;
+        })
+    );
+    const other = {
+      ...dmConversation,
+      id: 'dm-2',
+      participants: [
+        { userId: 'me', username: 'me' },
+        { userId: 'u3', username: 'carol', displayName: 'Carol' },
+      ],
+    };
+    useDMStore.setState({
+      conversations: [{ ...dmConversation, unreadCount: 3 }, other],
+    } as never);
+    render(<VoiceTextChat />);
+    const calls = (useMessageFetch as ReturnType<typeof vi.fn>).mock.calls;
+    const options = calls[calls.length - 1][1] as { onFetchComplete?: () => void };
+    await act(async () => {
+      options.onFetchComplete?.(); // dm-1's open-time read goes out and hangs
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+
+    // The call moves to another conversation: no mount site keys this panel,
+    // so the same instance carries on with the new target.
+    await act(async () => {
+      useVoiceStore.setState({ activeChannelId: 'dm-2', dmConversationId: 'dm-2' });
+    });
+    expect(screen.getByText('Carol Text Chat')).toBeInTheDocument();
+    await act(async () => {
+      (capturedMessageListProps.onLatestSeen as () => void)(); // a marker queued for dm-2
+    });
+    await act(async () => {
+      finishFirstRead({ ok: false, status: 500 }); // dm-1's read fails now
+      await Promise.resolve();
+    });
+    // dm-2's marker is not dm-1's: the cleared count comes back.
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(3);
+    consoleSpy.mockRestore();
+  });
+
+  it('posts the open-time read again when the call returns to a conversation after another target', async () => {
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    const latestOptions = () => {
+      const calls = (useMessageFetch as ReturnType<typeof vi.fn>).mock.calls;
+      return calls[calls.length - 1][1] as { onFetchComplete?: () => void };
+    };
+    const reads = () =>
+      (apiFetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([path]) => path === '/api/v1/dm/conversations/dm-1/read'
+      ).length;
+    render(<VoiceTextChat />);
+    await act(async () => {
+      latestOptions().onFetchComplete?.();
+    });
+    expect(reads()).toBe(1);
+
+    // A server voice call with no linked channel, then back to the DM call:
+    // the same instance, so nothing remounts the panel.
+    await act(async () => {
+      useVoiceStore.setState({ isDMCall: false, activeChannelId: 'ch-1', dmConversationId: null });
+    });
+    expect(screen.getByText('No text channel linked')).toBeInTheDocument();
+    await act(async () => {
+      useVoiceStore.setState({ isDMCall: true, activeChannelId: 'dm-1', dmConversationId: 'dm-1' });
+    });
+    await act(async () => {
+      latestOptions().onFetchComplete?.(); // the return's fetch completes
+    });
+    expect(reads()).toBe(2);
+  });
+
+  it("ignores an older open-time read's late failure once a newer attempt for the same target was posted", async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    let finishFirstRead!: (res: { ok: boolean; status: number }) => void;
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishFirstRead = resolve;
+        })
+    );
+    const latestOptions = () => {
+      const calls = (useMessageFetch as ReturnType<typeof vi.fn>).mock.calls;
+      return calls[calls.length - 1][1] as { onFetchComplete?: () => void };
+    };
+    useDMStore.setState({ conversations: [{ ...dmConversation, unreadCount: 3 }] } as never);
+    render(<VoiceTextChat />);
+    await act(async () => {
+      latestOptions().onFetchComplete?.(); // the first read hangs
+    });
+    // Away and back before it returns: the return posts a second read, which
+    // succeeds.
+    await act(async () => {
+      useVoiceStore.setState({ isDMCall: false, activeChannelId: 'ch-1', dmConversationId: null });
+    });
+    await act(async () => {
+      useVoiceStore.setState({ isDMCall: true, activeChannelId: 'dm-1', dmConversationId: 'dm-1' });
+    });
+    await act(async () => {
+      latestOptions().onFetchComplete?.();
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    // The first read fails late: the newer attempt made the server current,
+    // so its stale baseline of 3 must not come back.
+    await act(async () => {
+      finishFirstRead({ ok: false, status: 500 });
+      await Promise.resolve();
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    consoleSpy.mockRestore();
+  });
+
+  it('clears the local DM unread count before marking the latest seen', () => {
+    useDMStore.setState({ conversations: [{ ...dmConversation, unreadCount: 3 }] } as never);
+    render(<VoiceTextChat />);
+    act(() => {
+      (capturedMessageListProps.onLatestSeen as () => void)();
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
   });
 
   it('shows the DM empty state when the conversation id is missing', () => {

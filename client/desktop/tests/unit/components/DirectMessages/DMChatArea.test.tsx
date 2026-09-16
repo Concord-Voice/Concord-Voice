@@ -1429,6 +1429,88 @@ describe('DMChatArea', () => {
     consoleSpy.mockRestore();
   });
 
+  it('does not restore the open-time count when it fails inside the debounce window after a seen event', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let rejectOpenRead: (e: Error) => void = () => {};
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        return new Promise((_resolve, reject) => {
+          rejectOpenRead = reject;
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 5 })],
+      clearUnread: (id: string) => useDMStore.getState().updateConversation(id, { unreadCount: 0 }),
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(useDMStore.getState().conversations[0].unreadCount).toBe(0));
+    fireEvent.click(screen.getByTestId('trigger-latest-seen')); // queued, not yet dispatched
+    await act(async () => {
+      rejectOpenRead(new Error('boom'));
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    consoleSpy.mockRestore();
+  });
+
+  it('rolls the local count back when the open-time read returns a non-2xx', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 429, json: async () => ({}) });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 5 })],
+      clearUnread: (id: string) => useDMStore.getState().updateConversation(id, { unreadCount: 0 }),
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(useDMStore.getState().conversations[0].unreadCount).toBe(5));
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '[DMChatArea] Failed to mark conversation as read:',
+      'open-time read rejected: HTTP 429'
+    );
+    consoleSpy.mockRestore();
+  });
+
+  it("ignores an older open-time read's late failure once a quick return posted a newer attempt", async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    type ReadResult = { ok: boolean; status: number; json: () => Promise<unknown> };
+    const reads: Array<{ url: string; resolve: (r: ReadResult) => void }> = [];
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        return new Promise<ReadResult>((resolve) => {
+          reads.push({ url, resolve });
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 5 }), makeConversation({ id: 'conv-2' })],
+      clearUnread: (id: string) => useDMStore.getState().updateConversation(id, { unreadCount: 0 }),
+    });
+    // This component keeps its instance across threads: away and back before
+    // the first read returns posts a second attempt for the same thread.
+    const { rerender } = render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(reads.length).toBe(1));
+    rerender(<DMChatArea selectedThreadId="conv-2" />);
+    await waitFor(() => expect(reads.length).toBe(2));
+    rerender(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(reads.length).toBe(3));
+    expect(reads[2].url).toBe('/api/v1/dm/conversations/conv-1/read');
+    await act(async () => {
+      reads[2].resolve({ ok: true, status: 200, json: async () => ({}) }); // the newer attempt wins
+    });
+    await act(async () => {
+      reads[0].resolve({ ok: false, status: 500, json: async () => ({}) }); // the older fails late
+    });
+    // Its baseline of 5 is stale: the server marker is current.
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    consoleSpy.mockRestore();
+  });
+
   it('clears the local unread count when latest-seen fires with a nonzero count', () => {
     const mockClearUnread = vi.fn();
     useDMStore.setState({
