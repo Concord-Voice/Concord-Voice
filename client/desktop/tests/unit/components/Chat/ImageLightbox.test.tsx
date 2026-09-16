@@ -137,6 +137,23 @@ describe('ImageLightbox', () => {
     // Zoom-out/Reset are disabled at 1×, so the first enabled control is Zoom in.
     expect(screen.getByLabelText('Zoom in')).toHaveFocus();
   });
+
+  // ---------- paused prop (#2369 review fix, fb529eb5d) ----------
+
+  it('paused=true renders the paused chrome instead of the <img>, and keeps the close button', () => {
+    render(<ImageLightbox {...baseProps} paused={true} />);
+    expect(document.querySelector('img.image-lightbox-image')).toBeNull();
+    expect(screen.getByText('Paused — Concord is in the background')).toBeInTheDocument();
+    expect(screen.getByLabelText('Close')).toBeInTheDocument();
+  });
+
+  it('paused absent renders the <img> and no paused chrome', () => {
+    render(<ImageLightbox {...baseProps} />);
+    expect(document.querySelector('img.image-lightbox-image')).toBeInTheDocument();
+    expect(document.querySelector('.image-lightbox-paused')).toBeNull();
+    expect(screen.queryByText('Paused — Concord is in the background')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Close')).toBeInTheDocument();
+  });
 });
 
 // Source guard for the CSS-only part of the fix (jsdom can't verify layout). The

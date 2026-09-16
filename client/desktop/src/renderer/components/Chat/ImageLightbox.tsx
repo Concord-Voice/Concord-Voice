@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Download, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react';
+import { Download, Pause, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react';
 import './ImageLightbox.css';
 
 export interface ImageLightboxProps {
@@ -11,6 +11,18 @@ export interface ImageLightboxProps {
    */
   src: string;
   alt: string;
+  /**
+   * Stop the animation because the window is unfocused (#2369). The viewer is
+   * the LARGEST animated surface in the app, so it is the one where a GIF
+   * decoding for nobody costs the most.
+   *
+   * Deliberately driven by focus ALONE, never by the hover gate: opening this
+   * viewer is an explicit "show me this" action, and requiring a hover inside a
+   * full-screen image the user just opened would be hostile. Same shape as the
+   * GIF picker's divergence — the rationale for gating holds while the window
+   * is focused and stops holding when it is not.
+   */
+  paused?: boolean;
   onClose: () => void;
   /**
    * Invoked when the user picks Save. Omit to hide the control. The caller owns
@@ -37,7 +49,7 @@ const clampScale = (s: number): number => Math.min(MAX_SCALE, Math.max(MIN_SCALE
  * document.body so the fixed overlay always covers the viewport. `open` (not
  * `showModal()`) keeps it jsdom-testable; modality is enforced by the focus trap.
  */
-const ImageLightbox: React.FC<ImageLightboxProps> = ({ src, alt, onClose, onSave }) => {
+const ImageLightbox: React.FC<ImageLightboxProps> = ({ src, alt, paused, onClose, onSave }) => {
   const overlayRef = useRef<HTMLDialogElement>(null);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
   const [scale, setScale] = useState(MIN_SCALE);
@@ -197,20 +209,30 @@ const ImageLightbox: React.FC<ImageLightboxProps> = ({ src, alt, onClose, onSave
           <X size={18} />
         </button>
       </div>
-      <img
-        src={src}
-        alt={alt}
-        className="image-lightbox-image"
-        style={{
-          transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
-          cursor: scale > MIN_SCALE ? 'grab' : 'default',
-        }}
-        onDoubleClick={onDoubleClick}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        draggable={false}
-      />
+      {paused ? (
+        /* No still frame exists for an end-to-end-encrypted attachment, so
+           stopping it means unmounting the <img>. Zoom and pan live in this
+           component's state, so they survive the round trip untouched. */
+        <div className="image-lightbox-paused">
+          <Pause size={18} aria-hidden="true" />
+          <span>Paused — Concord is in the background</span>
+        </div>
+      ) : (
+        <img
+          src={src}
+          alt={alt}
+          className="image-lightbox-image"
+          style={{
+            transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+            cursor: scale > MIN_SCALE ? 'grab' : 'default',
+          }}
+          onDoubleClick={onDoubleClick}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          draggable={false}
+        />
+      )}
     </dialog>,
     document.body
   );

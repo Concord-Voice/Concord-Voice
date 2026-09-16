@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '../../../test-utils';
+import { render, screen, waitFor, act } from '../../../test-utils';
 import userEvent from '@testing-library/user-event';
 import AttachmentDisplay, {
   extFromMime,
@@ -559,6 +559,77 @@ describe('AttachmentDisplay', () => {
     fireEvent.mouseEnter(box);
     await waitFor(() => expect(container.querySelector('img')).toBeInTheDocument());
     fireEvent.mouseLeave(box);
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
+  });
+
+  // CodeRabbit review, PR #3291: the container carried tabIndex 0 alongside a
+  // native button that was already focusable (predates this PR — 50b871f69).
+  it('the container is NOT a tab stop, and focusing the button still plays', async () => {
+    mockFetchSuccess(new ArrayBuffer(100), 'image/gif');
+    installImmediateIO();
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: true },
+    }));
+    const gif: AttachmentSummary = {
+      id: 'gif-tabstop',
+      file_type: 'animated',
+      mime_type: 'image/gif',
+      file_size: 1000,
+    };
+    const { container } = render(<AttachmentDisplay attachments={[gif]} channelId="ch-1" />);
+    await waitFor(() =>
+      expect(container.querySelector('.attachment-reduced-motion-hint')).toBeInTheDocument()
+    );
+
+    const box = container.querySelector('.attachment-image-container') as HTMLElement;
+    expect(box.getAttribute('tabindex')).toBeNull();
+
+    // Removing it costs no keyboard reach: the button is mounted whenever `url`
+    // is non-null (§2.5 invariant 2) and its focusin bubbles to the container.
+    const btn = container.querySelector('.attachment-image-btn') as HTMLElement;
+    expect(btn).not.toBeNull();
+    fireEvent.focusIn(btn);
+    await waitFor(() => expect(container.querySelector('img')).toBeInTheDocument());
+  });
+
+  it('hover state does not go STALE when the gate turns off and back on', async () => {
+    mockFetchSuccess(new ArrayBuffer(100), 'image/gif');
+    installImmediateIO();
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: true },
+    }));
+    const gif: AttachmentSummary = {
+      id: 'gif-stale-gate',
+      file_type: 'animated',
+      mime_type: 'image/gif',
+      file_size: 1000,
+    };
+    const { container } = render(<AttachmentDisplay attachments={[gif]} channelId="ch-1" />);
+    await waitFor(() =>
+      expect(container.querySelector('.attachment-reduced-motion-hint')).toBeInTheDocument()
+    );
+    const box = container.querySelector('.attachment-image-container') as HTMLElement;
+
+    fireEvent.mouseEnter(box);
+    await waitFor(() => expect(container.querySelector('img')).toBeInTheDocument());
+
+    // Gate turns OFF (Reduce Animations cleared), and the pointer leaves while
+    // it is off. If the leave handler is only attached under the gate, nothing
+    // records the departure.
+    act(() => {
+      useSettingsStore.setState((s) => ({
+        appearance: { ...s.appearance, reduceAnimations: false },
+      }));
+    });
+    fireEvent.mouseLeave(box);
+
+    // Gate turns back ON. Nothing is pointing at this attachment, so it must be
+    // paused — not playing on a hover that ended two state changes ago.
+    act(() => {
+      useSettingsStore.setState((s) => ({
+        appearance: { ...s.appearance, reduceAnimations: true },
+      }));
+    });
     await waitFor(() => expect(container.querySelector('img')).toBeNull());
   });
 
@@ -1380,5 +1451,383 @@ describe('AttachmentDisplay decrypts under the epoch the file was sealed with', 
       /retry/i.test(b.getAttribute('title') ?? b.textContent ?? '')
     );
     expect(retryish).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2369 — GIF playback gating (window-focus axis)
+// ---------------------------------------------------------------------------
+
+import { __resetWindowFocusForTests } from '@/renderer/hooks/ui/useWindowFocus';
+
+describe('AttachmentDisplay GIF playback gating (#2369)', () => {
+  const originalHasFocus = document.hasFocus;
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    __resetWindowFocusForTests();
+    document.hasFocus = () => true;
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptFile.mockImplementation((data: ArrayBuffer) => Promise.resolve(data));
+    mockDecryptAttachmentBlob.mockImplementation(
+      async (bytes: Uint8Array, key: unknown, mime: string) => {
+        const plain = (await mockDecryptFile(bytes.buffer ?? bytes, key)) as ArrayBuffer;
+        const blob = new Blob([], { type: mime });
+        Object.defineProperty(blob, 'size', { value: plain.byteLength });
+        return blob;
+      }
+    );
+  });
+
+  afterEach(() => {
+    __resetWindowFocusForTests();
+    document.hasFocus = originalHasFocus;
+    (globalThis as unknown as Record<string, unknown>).IntersectionObserver = OriginalIO;
+    ioCallback = null;
+  });
+
+  function gifAttachmentOf(id: string): AttachmentSummary {
+    return { id, file_type: 'animated', mime_type: 'image/gif', file_size: 1000 };
+  }
+
+  async function renderLoadedGif(id: string) {
+    mockFetchSuccess(new ArrayBuffer(64), 'image/gif');
+    installImmediateIO();
+    const utils = render(
+      <AttachmentDisplay attachments={[gifAttachmentOf(id)]} channelId="ch-1" />
+    );
+    await waitFor(() => {
+      expect(utils.container.querySelector('img.attachment-image')).toBeInTheDocument();
+    });
+    return utils;
+  }
+
+  // Bubble-phase dispatch on window itself — matches useWindowFocus's own
+  // `addEventListener('blur'/'focus', ...)` without a capture flag (see the
+  // module's "load-bearing" comment: a capture-phase listener would see every
+  // inner focus/blur too).
+  function blurWindow() {
+    document.hasFocus = () => false;
+    fireEvent(window, new Event('blur'));
+  }
+
+  function focusWindow() {
+    document.hasFocus = () => true;
+    fireEvent(window, new Event('focus'));
+  }
+
+  it('A: plays live with Reduce Animations off, gifPlayback "always", window focused', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    const { container } = await renderLoadedGif('gif-a1');
+    expect(container.querySelector('img.attachment-image')).toBeInTheDocument();
+    expect(container.querySelector('.attachment-reduced-motion-hint')).toBeNull();
+  });
+
+  it('B: blurring the window pauses playback with the background copy; refocusing resumes it', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    const { container } = await renderLoadedGif('gif-b1');
+    expect(container.querySelector('img.attachment-image')).toBeInTheDocument();
+
+    blurWindow();
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
+    expect(container.querySelector('.attachment-image-placeholder')).toBeInTheDocument();
+    expect(container.querySelector('.attachment-reduced-motion-hint')?.textContent).toContain(
+      'Paused — Concord is in the background'
+    );
+
+    focusWindow();
+    await waitFor(() =>
+      expect(container.querySelector('img.attachment-image')).toBeInTheDocument()
+    );
+    expect(container.querySelector('.attachment-reduced-motion-hint')).toBeNull();
+  });
+
+  it('C (§2.5 invariant 2): the viewer button survives a blur/focus cycle as the SAME DOM node', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    const { container } = await renderLoadedGif('gif-c1');
+    const button = screen.getByRole('button', { name: 'Open image in viewer' });
+
+    blurWindow();
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
+    expect(screen.getByRole('button', { name: 'Open image in viewer' })).toBe(button);
+
+    focusWindow();
+    await waitFor(() =>
+      expect(container.querySelector('img.attachment-image')).toBeInTheDocument()
+    );
+    expect(screen.getByRole('button', { name: 'Open image in viewer' })).toBe(button);
+  });
+
+  it('D (§2.5 invariant 1): blur/focus never re-decrypts or revokes the live blob url', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+    const { container } = await renderLoadedGif('gif-d1');
+    const img = container.querySelector('img.attachment-image') as HTMLImageElement;
+    const url = img.getAttribute('src') ?? '';
+    const fetchCountAfterLoad = mockApiFetch.mock.calls.length;
+    const decryptCountAfterLoad = mockDecryptAttachmentBlob.mock.calls.length;
+
+    blurWindow();
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
+    focusWindow();
+    await waitFor(() =>
+      expect(container.querySelector('img.attachment-image')).toBeInTheDocument()
+    );
+
+    expect(mockApiFetch).toHaveBeenCalledTimes(fetchCountAfterLoad);
+    expect(mockDecryptAttachmentBlob).toHaveBeenCalledTimes(decryptCountAfterLoad);
+    expect(revokeSpy.mock.calls.filter((call) => call[0] === url)).toHaveLength(0);
+  });
+
+  it('E: gifPlayback "hover" gates independently of Reduce Animations', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'hover' },
+    }));
+    mockFetchSuccess(new ArrayBuffer(64), 'image/gif');
+    installImmediateIO();
+    const { container } = render(
+      <AttachmentDisplay attachments={[gifAttachmentOf('gif-e1')]} channelId="ch-1" />
+    );
+    await waitFor(() =>
+      expect(container.querySelector('.attachment-reduced-motion-hint')).toBeInTheDocument()
+    );
+    expect(container.querySelector('.attachment-reduced-motion-hint')?.textContent).toContain(
+      'Hover to play'
+    );
+    expect(container.querySelector('img')).toBeNull();
+  });
+
+  it('F: a static (non-animated) image is unaffected by a blur event', async () => {
+    mockFetchSuccess(new ArrayBuffer(64), 'image/png');
+    installImmediateIO();
+    const photo: AttachmentSummary = {
+      id: 'photo-f1',
+      file_type: 'photo',
+      mime_type: 'image/png',
+      file_size: 1000,
+    };
+    const { container } = render(<AttachmentDisplay attachments={[photo]} channelId="ch-1" />);
+    await waitFor(() =>
+      expect(container.querySelector('img.attachment-image')).toBeInTheDocument()
+    );
+
+    blurWindow();
+
+    expect(container.querySelector('img.attachment-image')).toBeInTheDocument();
+  });
+
+  // ---------------------------------------------------------------------------
+  // #2369 review fix (fb529eb5d) — the lightbox is wired
+  // `paused={isAnimated && !windowFocused}`, focus ONLY, deliberately not the
+  // hover gate.
+  // ---------------------------------------------------------------------------
+
+  it('G: an open lightbox over an animated attachment shows the paused chrome when the window blurs', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    await renderLoadedGif('gif-lb-g1');
+    fireEvent.click(screen.getByRole('button', { name: 'Open image in viewer' }));
+    expect(screen.getByRole('dialog', { name: 'Image viewer' })).toBeInTheDocument();
+    expect(document.querySelector('img.image-lightbox-image')).toBeInTheDocument();
+
+    blurWindow();
+
+    await waitFor(() => {
+      expect(document.querySelector('.image-lightbox-paused')).toBeInTheDocument();
+    });
+    expect(document.querySelector('.image-lightbox-paused')?.textContent).toContain(
+      'Paused — Concord is in the background'
+    );
+    expect(document.querySelector('img.image-lightbox-image')).toBeNull();
+  });
+
+  it('H: an open lightbox over a STATIC attachment still shows its <img> when the window blurs', async () => {
+    mockFetchSuccess(new ArrayBuffer(64), 'image/png');
+    installImmediateIO();
+    const photo: AttachmentSummary = {
+      id: 'photo-lb-h1',
+      file_type: 'photo',
+      mime_type: 'image/png',
+      file_size: 1000,
+    };
+    render(<AttachmentDisplay attachments={[photo]} channelId="ch-1" />);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Open image in viewer' })).toBeInTheDocument()
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Open image in viewer' }));
+    expect(screen.getByRole('dialog', { name: 'Image viewer' })).toBeInTheDocument();
+
+    blurWindow();
+
+    expect(document.querySelector('img.image-lightbox-image')).toBeInTheDocument();
+    expect(document.querySelector('.image-lightbox-paused')).toBeNull();
+  });
+
+  // The MIRROR of GifEmbed's case. Fixing one copy and not the other is how the
+  // wrapper tab-stop defect survived its first fix, so the twin gets its own
+  // test rather than relying on the sibling's. Codex review, PR #3291.
+  it('J: keyboard focus keeps an attachment playing when the pointer leaves', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'hover' },
+    }));
+    mockFetchSuccess(new ArrayBuffer(64), 'image/gif');
+    installImmediateIO();
+    render(
+      <AttachmentDisplay attachments={[gifAttachmentOf('gif-hover-focus')]} channelId="ch-1" />
+    );
+
+    await waitFor(() => expect(screen.getByText('Hover to play')).toBeInTheDocument());
+    const box = document.querySelector('.attachment-image-container') as HTMLElement;
+
+    fireEvent.focus(box);
+    await waitFor(() => expect(document.querySelector('img.attachment-image')).not.toBeNull());
+
+    // Pointer leaves while the keyboard still holds focus — must keep playing.
+    fireEvent.mouseLeave(box);
+    expect(document.querySelector('img.attachment-image')).not.toBeNull();
+    expect(screen.queryByText('Hover to play')).toBeNull();
+
+    // Blur with the pointer away does stop it.
+    fireEvent.blur(box);
+    await waitFor(() => expect(screen.getByText('Hover to play')).toBeInTheDocument());
+  });
+
+  it('I: gifPlayback "hover" without hovering still shows the animated <img> in an open lightbox — the hover gate never reaches the viewer', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: false, gifPlayback: 'hover' },
+    }));
+    mockFetchSuccess(new ArrayBuffer(64), 'image/gif');
+    installImmediateIO();
+    render(<AttachmentDisplay attachments={[gifAttachmentOf('gif-lb-i1')]} channelId="ch-1" />);
+    // Under the hover gate without hovering, the inline surface shows the
+    // hint, not the <img> — but the viewer button stays mounted (§2.5
+    // invariant 2), so it can still be opened.
+    await waitFor(() => expect(screen.getByText('Hover to play')).toBeInTheDocument());
+
+    const box = document.querySelector('.attachment-image-container') as HTMLElement;
+    fireEvent.click(screen.getByRole('button', { name: 'Open image in viewer' }));
+    expect(screen.getByRole('dialog', { name: 'Image viewer' })).toBeInTheDocument();
+
+    // LOAD-BEARING, and the reason an earlier version of this test was vacuous:
+    // clicking the viewer button focuses it, `focusin` BUBBLES to the
+    // container's onFocus, and that sets `hovering` true. The hover gate is
+    // then open, both `!windowFocused` and `!verdict.playing` agree, and the
+    // test passes against either — it would have survived the mutation it
+    // exists to catch. Clearing hover restores the condition under test:
+    // hover-gated and NOT hovering, window focused, viewer open.
+    fireEvent.blur(box);
+    fireEvent.mouseLeave(box);
+
+    // The inline surface is back to its paused chrome...
+    await waitFor(() => expect(screen.getByText('Hover to play')).toBeInTheDocument());
+    // ...while the viewer the user deliberately opened keeps animating.
+    expect(document.querySelector('img.image-lightbox-image')).toBeInTheDocument();
+    expect(document.querySelector('.image-lightbox-paused')).toBeNull();
+  });
+
+  // Codex review, PR #3291: `file_type` is MIME-derived and persisted at upload,
+  // so an animated WebP and an APNG sent as `image/png` are both stored as
+  // `photo` and escaped the gate entirely. The bytes decide now.
+  const u32be = (n: number): number[] => [
+    (n >>> 24) & 255,
+    (n >>> 16) & 255,
+    (n >>> 8) & 255,
+    n & 255,
+  ];
+  function riffWebp(flags: number): Uint8Array {
+    const out: number[] = [];
+    for (const ch of 'RIFF') out.push(ch.charCodeAt(0));
+    out.push(...u32be(30));
+    for (const ch of 'WEBPVP8X') out.push(ch.charCodeAt(0));
+    out.push(...u32be(10), flags, ...new Array(9).fill(0));
+    return new Uint8Array(out);
+  }
+
+  /** Renders one attachment whose DECRYPTED bytes are exactly `payload`. */
+  async function renderWithBytes(id: string, mime: string, payload: Uint8Array) {
+    // Pinned because the GATE IS PART OF THE SCENARIO: a blur only means
+    // anything under 'always'. It is no longer a leak workaround —
+    // `resetAllStores()` now resets settingsStore, and these tests pass without
+    // this block. Kept so the scenario reads off the test rather than off a
+    // default somewhere else.
+    useSettingsStore.setState((st) => ({
+      appearance: { ...st.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    mockFetchSuccess(new ArrayBuffer(64), mime);
+    mockDecryptAttachmentBlob.mockImplementation(
+      async (_bytes: Uint8Array, _key: unknown, m: string) => new Blob([payload], { type: m })
+    );
+    installImmediateIO();
+    // Stored as `photo` — which is precisely the defect: the uploader could not
+    // tell, so the gate never applied.
+    const att: AttachmentSummary = {
+      id,
+      file_type: 'photo',
+      mime_type: mime,
+      file_size: 1000,
+    };
+    const utils = render(<AttachmentDisplay attachments={[att]} channelId="ch-1" />);
+    await waitFor(() => expect(utils.container.querySelector('img')).toBeInTheDocument());
+    return utils;
+  }
+
+  it('an animated WebP stored as photo now PAUSES on blur', async () => {
+    const { container } = await renderWithBytes('webp-anim', 'image/webp', riffWebp(0x02));
+
+    blurWindow();
+
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
+    expect(container.querySelector('.attachment-image-placeholder')).toBeInTheDocument();
+  });
+
+  it('THE CONTROL: a STATIC WebP stored as photo keeps rendering on blur', async () => {
+    // Without this, making every image animated would pass the case above and
+    // the suite would be asserting nothing about the detection.
+    const { container } = await renderWithBytes('webp-still', 'image/webp', riffWebp(0x00));
+
+    blurWindow();
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.querySelector('img')).toBeInTheDocument();
+  });
+
+  it('an APNG sent under the common image/png label pauses too', async () => {
+    const magic = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    const png: number[] = [...magic];
+    png.push(...u32be(13));
+    for (const ch of 'IHDR') png.push(ch.charCodeAt(0));
+    png.push(...new Array(13).fill(0), ...u32be(0));
+    png.push(...u32be(8));
+    for (const ch of 'acTL') png.push(ch.charCodeAt(0));
+    png.push(...new Array(8).fill(0), ...u32be(0));
+
+    const { container } = await renderWithBytes('apng', 'image/png', new Uint8Array(png));
+
+    blurWindow();
+
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
+  });
+
+  it('a GIF keeps its persisted verdict, because the sniffer has no opinion on GIF', async () => {
+    // Regression guard for the fallback: the sniffer returns null here, so
+    // `file_type: 'animated'` must still drive the gate.
+    useSettingsStore.setState((st) => ({
+      appearance: { ...st.appearance, reduceAnimations: false, gifPlayback: 'always' },
+    }));
+    const { container } = await renderLoadedGif('gif-fallback');
+
+    blurWindow();
+
+    await waitFor(() => expect(container.querySelector('img')).toBeNull());
   });
 });

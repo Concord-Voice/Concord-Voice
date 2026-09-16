@@ -377,3 +377,13 @@
 .gif-picker.reduce-motion .gif-tile:hover {
   transform: none;
 }
+
+/* Same as .gif-embed-stopped: a tile whose "still" is the animated url under
+   another name cannot be paused by swapping src, so it is unmounted (#2369). */
+.gif-tile-stopped {
+  width: 100%;
+  height: 100%;
+  min-height: 80px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+}

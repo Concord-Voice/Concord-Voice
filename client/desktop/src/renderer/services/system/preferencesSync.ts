@@ -433,6 +433,13 @@ class PreferencesSyncService {
           // reduceAnimations. Active cross-device font sync is a follow-up (#1642 deferred).
           appFont: settings.appFont,
           dyslexicSupport: settings.dyslexicSupport,
+          // #2369. Rides the blob on the same terms as appFont/dyslexicSupport
+          // above: synced, but deliberately NOT applied cross-device on pull
+          // (applyRemoteAppearance is untouched). Do not describe this feature
+          // as cross-device. `v` stays 1 — preferencesSync rejects a non-1 blob
+          // WHOLESALE, so bumping it would silently disable all theme and layout
+          // sync for every not-yet-updated device in the fleet.
+          gifPlayback: settings.gifPlayback,
         },
         layout: {
           sidebarProfiles,

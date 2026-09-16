@@ -4,6 +4,8 @@ import { unwrapGifEnvelope } from '../../utils/messaging/gifEnvelope';
 import MarkdownContent from '../Markdown/MarkdownContent';
 import AttachmentDisplay from './AttachmentDisplay';
 import GifEmbed from './GifEmbed';
+import { useSettingsStore } from '../../stores/ui/settingsStore';
+import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import type { MentionLookup } from './messageUtils';
 
 export type DecryptedPin = MessageWithUser & { decrypted?: boolean; decryptFailed?: boolean };
@@ -24,6 +26,17 @@ export interface PinContentProps {
  *  chat surface: MarkdownContent for text, GifEmbed for KLIPY embeds, and
  *  AttachmentDisplay for image/video/audio/file attachments. */
 export function PinContent({ message }: PinContentProps) {
+  // Read before the early returns — rules-of-hooks. These were hardcoded
+  // `reduceMotion={false}` / `loadAutomatically={true}`, so a pinned GIF ignored
+  // BOTH the Reduce Animations setting and the Privacy "Load GIFs from KLIPY
+  // automatically" consent, the latter meaning a pinned GIF reached out to KLIPY
+  // for a user who had explicitly switched that off. Fixed here under the
+  // boy-scout rule because #2369 has to touch this call site anyway; the fix is
+  // to read the same stores the main chat surface already reads.
+  const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
+  const gifPlayback = useSettingsStore((s) => s.appearance.gifPlayback);
+  const loadGifsAutomatically = usePrivacyStore((s) => s.settings.loadGifsAutomatically);
+
   if (message.decryptFailed) {
     return <span className="pinned-message-encrypted">Unable to decrypt</span>;
   }
@@ -41,7 +54,14 @@ export function PinContent({ message }: PinContentProps) {
           mentionLookup={EMPTY_MENTION_LOOKUP}
         />
       )}
-      {gif_slug && <GifEmbed slug={gif_slug} reduceMotion={false} loadAutomatically={true} />}
+      {gif_slug && (
+        <GifEmbed
+          slug={gif_slug}
+          mode={gifPlayback}
+          reduceAnimations={reduceAnimations}
+          loadAutomatically={loadGifsAutomatically}
+        />
+      )}
       {attachments && attachments.length > 0 && (
         <AttachmentDisplay attachments={attachments} channelId={channel_id} messageBody={content} />
       )}

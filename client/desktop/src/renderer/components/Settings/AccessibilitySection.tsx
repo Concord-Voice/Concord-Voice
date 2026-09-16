@@ -9,6 +9,7 @@ import { UI_SCALE_MIN, UI_SCALE_MAX, type AppearanceSettings } from '../../store
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
+import GifPlaybackControl from './GifPlaybackControl';
 import SettingsPreviewPanel from './SettingsPreviewPanel';
 import {
   getVoices as getTTSVoices,
@@ -124,6 +125,16 @@ const DisplaySection: React.FC = () => {
           onChange={(v) => setDraftAppearanceSetting('reduceAnimations', v)}
         />
       </div>
+
+      {/* Sits directly under Reduce Animations because 'auto' FOLLOWS it: the
+          two read as one decision, and separating them would hide the follow.
+          Display now holds 7 controls — an 8th forces chunking or the deferred
+          Media section (spec §5 residual 8). */}
+      <GifPlaybackControl
+        mode={appearance.gifPlayback}
+        reduceAnimations={appearance.reduceAnimations}
+        onChange={(v) => setDraftAppearanceSetting('gifPlayback', v)}
+      />
 
       <div className="settings-row">
         <div className="settings-row-info">

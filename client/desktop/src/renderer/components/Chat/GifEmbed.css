@@ -112,3 +112,28 @@
 [data-reduce-animations='true'] .gif-embed-image {
   transition: none;
 }
+
+/* Stand-in for an animated <img> with no distinct still rendition, where the
+   only way to stop it is to take it off screen (#2369). Sized inline to the box
+   the image occupied so nothing reflows, and it SAYS why it is blank rather
+   than sitting as an unexplained grey rectangle. */
+.gif-embed-stopped {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  text-align: center;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  /* --text-primary, not --text-secondary: that pair measures 4.31:1 on
+     [data-scheme='midnightsky'], below the 4.5:1 floor. The identical pair
+     failed earlier in this same PR on .gif-playback-option — I reached for the
+     muted token twice and the contrast-pairs guard (#3285) caught it twice. */
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+}
+
+.gif-embed-stopped svg {
+  flex-shrink: 0;
+}

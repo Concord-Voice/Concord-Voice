@@ -112,6 +112,13 @@ export function resetAllStores(): void {
   resetToInitialState(useNotificationStore);
   resetToInitialState(useOsPermissionStore);
   resetToInitialState(usePermissionStore);
+  // The only settings store that was NOT reset here, while every sibling
+  // (audio, TTS, video, nav, overlay) was — so `appearance` leaked between
+  // tests: `gifPlayback`, `reduceAnimations`, fonts. A leaked 'hover' makes an
+  // attachment render NO image at all, which looks exactly like the feature
+  // under test being broken. Six test files had grown explicit workarounds.
+  // Found while adding #2369 coverage on PR #3291.
+  resetToInitialState(useSettingsStore);
   resetToInitialState(useSettingsNavStore);
   resetToInitialState(useSettingsOverlayStore);
   resetToInitialState(useTTSSettingsStore);

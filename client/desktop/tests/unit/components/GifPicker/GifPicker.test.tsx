@@ -5,6 +5,7 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useSavedGifsStore } from '@/renderer/stores/chat/savedGifsStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { usePrivacyStore } from '@/renderer/stores/ui/privacyStore';
+import { __resetWindowFocusForTests } from '@/renderer/hooks/ui/useWindowFocus';
 
 // Mock the gifProvider entirely. The picker no longer talks to a vendor SDK
 // directly — it goes through the abstract gifProvider singleton, which we
@@ -786,5 +787,139 @@ describe('GifPicker non-selection close focus restore (#2370 §2.5, WCAG 2.4.3)'
     await waitFor(() => expect(document.activeElement).toBe(trigger));
 
     cleanup();
+  });
+});
+
+// ── GifMedia window-focus playback gating (#2369 T6) ──────────────────────
+describe('GifPicker GifMedia — window-focus playback gating (#2369 T6)', () => {
+  const position = { x: 100, y: 200, anchorCenterX: 150 };
+
+  const setFocused = (focused: boolean) => {
+    Object.defineProperty(document, 'hasFocus', {
+      value: () => focused,
+      writable: true,
+      configurable: true,
+    });
+  };
+  const blur = () => {
+    setFocused(false);
+    fireEvent(window, new Event('blur'));
+  };
+  const refocus = () => {
+    setFocused(true);
+    fireEvent(window, new Event('focus'));
+  };
+
+  beforeEach(() => {
+    resetAllStores();
+    trendingMock.mockReset();
+    recentMock.mockReset();
+    categoriesMock.mockReset();
+    notifySharedMock.mockReset();
+    usePrivacyStore.setState((s) => ({
+      settings: { ...s.settings, sharePersonalizationWithGifProvider: true },
+    }));
+    recentMock.mockResolvedValue({ items: [], hasMore: false });
+    categoriesMock.mockResolvedValue([]);
+    notifySharedMock.mockResolvedValue(undefined);
+    __resetWindowFocusForTests();
+  });
+
+  afterEach(() => {
+    __resetWindowFocusForTests();
+    setFocused(true);
+  });
+
+  it('A1: image-kind tile swaps src on blur/refocus on the SAME <img> DOM node', async () => {
+    trendingMock.mockResolvedValue({ items: [sampleImageGif], hasMore: false });
+    render(<GifPicker onSelect={vi.fn()} onClose={vi.fn()} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+
+    const img = await waitFor(() => {
+      const el = document.querySelector('.gif-tile img') as HTMLImageElement;
+      expect(el).not.toBeNull();
+      return el;
+    });
+    expect(img.getAttribute('src')).toBe(sampleImageGif.animatedUrl);
+
+    blur();
+    await waitFor(() => expect(img.getAttribute('src')).toBe(sampleImageGif.stillUrl));
+    // Same DOM node throughout -- proves a src swap, not a remount.
+    expect(document.querySelector('.gif-tile img')).toBe(img);
+
+    refocus();
+    await waitFor(() => expect(img.getAttribute('src')).toBe(sampleImageGif.animatedUrl));
+    expect(document.querySelector('.gif-tile img')).toBe(img);
+  });
+
+  // A KLIPY "still" is often the ANIMATED url aliased: `toCategory` writes
+  // `stillUrl: proxied`, the same variable, so EVERY category tile lands here.
+  // Swapping src to it is a no-op and the tile keeps animating, so the only
+  // stop available is taking it off screen. Codex review, PR #3291.
+  it('A4: a tile whose still IS its animated url unmounts on blur rather than swapping to itself', async () => {
+    const aliased = {
+      ...sampleImageGif,
+      slug: 'aliased-still',
+      stillUrl: sampleImageGif.animatedUrl,
+    };
+    trendingMock.mockResolvedValue({ items: [aliased], hasMore: false });
+    render(<GifPicker onSelect={vi.fn()} onClose={vi.fn()} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+    await waitFor(() => expect(document.querySelector('.gif-tile img')).not.toBeNull());
+
+    blur();
+
+    // The <img> is gone — a src swap here would have changed nothing at all.
+    await waitFor(() => expect(document.querySelector('.gif-tile-stopped')).not.toBeNull());
+    expect(document.querySelector('.gif-tile img')).toBeNull();
+
+    refocus();
+    await waitFor(() => expect(document.querySelector('.gif-tile img')).not.toBeNull());
+    expect(document.querySelector('.gif-tile-stopped')).toBeNull();
+  });
+
+  it('A2: video-kind tile pauses on blur (stays mounted) and plays on refocus', async () => {
+    trendingMock.mockResolvedValue({ items: [sampleVideoGif], hasMore: false });
+    const pauseSpy = vi
+      .spyOn(HTMLMediaElement.prototype, 'pause')
+      .mockImplementation(() => undefined);
+    const playSpy = vi
+      .spyOn(HTMLMediaElement.prototype, 'play')
+      .mockImplementation(() => Promise.resolve());
+
+    render(<GifPicker onSelect={vi.fn()} onClose={vi.fn()} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+    await waitFor(() => expect(document.querySelector('video')).not.toBeNull());
+    // Mount focused -> play() already fired once; settle before clearing.
+    await waitFor(() => expect(playSpy).toHaveBeenCalled());
+
+    pauseSpy.mockClear();
+    playSpy.mockClear();
+
+    blur();
+    await waitFor(() => expect(pauseSpy).toHaveBeenCalled());
+    expect(document.querySelector('video')).not.toBeNull();
+
+    refocus();
+    await waitFor(() => expect(playSpy).toHaveBeenCalled());
+    expect(document.querySelector('video')).not.toBeNull();
+
+    pauseSpy.mockRestore();
+    playSpy.mockRestore();
+  });
+
+  it('A3: reduceAnimations ON + gifPlayback "hover" never reach the picker -- a focused tile still shows the animated url with no hover', async () => {
+    useSettingsStore.setState((s) => ({
+      appearance: { ...s.appearance, reduceAnimations: true, gifPlayback: 'hover' },
+    }));
+    trendingMock.mockResolvedValue({ items: [sampleImageGif], hasMore: false });
+    render(<GifPicker onSelect={vi.fn()} onClose={vi.fn()} position={position} />);
+    await waitFor(() => expect(trendingMock).toHaveBeenCalled());
+
+    await waitFor(() => {
+      const img = document.querySelector('.gif-tile img') as HTMLImageElement;
+      expect(img).not.toBeNull();
+      expect(img.getAttribute('src')).toBe(sampleImageGif.animatedUrl);
+    });
   });
 });

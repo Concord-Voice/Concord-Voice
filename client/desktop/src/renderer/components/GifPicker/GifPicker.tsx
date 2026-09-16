@@ -10,6 +10,7 @@ import { useSavedGifsStore } from '../../stores/chat/savedGifsStore';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { resolveAnchoredPlacement } from '../../utils/ui/pickerAnchor';
+import { useWindowFocus } from '../../hooks/ui/useWindowFocus';
 import './GifPicker.css';
 
 interface GifPickerProps {
@@ -38,17 +39,57 @@ const SEARCH_DEBOUNCE_MS = 300;
 
 /** Render the animated rendition (video or image) for a GIF.
  *
- *  The picker intentionally IGNORES the Reduce Animations setting — users
- *  need to see the animation to choose a GIF. Reduce Animations only affects
- *  inline chat embeds (GifEmbed), not the picker itself. See QA bug #571
- *  item #6A. */
+ *  The picker deliberately does NOT consult `resolveGifPlayback` — it reads
+ *  window focus directly, and the two GIF-playback settings never reach it:
+ *
+ *  - Reduce Animations is ignored, and hover-only with it. Users need to see
+ *    the animation to choose a GIF (QA bug #571 item #6A), and a grid that
+ *    only animates the one tile under the pointer is unusable. Both settings
+ *    govern inline chat surfaces, not the picker.
+ *  - Unfocus-pause DOES reach it, because #6A's rationale is false when the
+ *    window is unfocused: nobody is choosing a GIF from a background window.
+ *    This is the highest-motion surface in the app, so it is also where the
+ *    pause is worth the most.
+ *
+ *  The divergence is the whole reason this component takes focus as its only
+ *  input; a verdict here would silently import the hover gate with it. */
 function GifMedia({ gif }: Readonly<{ gif: GifCategoryPreview }>) {
+  const windowFocused = useWindowFocus();
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Drive the mounted <video> rather than unmounting it: `/api/v1/klipy/media`
+  // is rate-limited 300/min per user with a hard 429, and a picker grid is
+  // ~20 tiles, so a remount-per-blur would burn the budget in a handful of
+  // alt-tabs and fail as broken tiles (spec X7). Pausing re-requests nothing.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (!windowFocused) {
+      v.pause();
+      return;
+    }
+    // Both halves are load-bearing: `play()` is specified to return a Promise
+    // but jsdom returns `undefined` (so `.catch` on it throws a TypeError),
+    // and a synchronous throw is separately reachable under an autoplay-policy
+    // refusal. A refused start leaves the element paused, which degrades
+    // correctly — and nothing is logged, because logBufferService captures
+    // console.* into a buffer that reaches a public repo via feedback.
+    try {
+      const started: Promise<void> | undefined = v.play();
+      if (started) void started.catch(() => undefined);
+    } catch {
+      /* autoplay refused — element stays paused */
+    }
+  }, [windowFocused]);
+
   if (gif.animatedKind === 'video') {
     return (
       <video
+        ref={videoRef}
         src={gif.animatedUrl}
         poster={gif.stillUrl}
-        autoPlay
+        // See GifEmbed: never start a tile that mounts while unfocused.
+        autoPlay={windowFocused}
         loop
         muted
         playsInline
@@ -56,7 +97,19 @@ function GifMedia({ gif }: Readonly<{ gif: GifCategoryPreview }>) {
       />
     );
   }
-  return <img src={gif.animatedUrl} alt="" draggable={false} />;
+  // No API pauses an animated <img>, so this path swaps the source instead.
+  // But a KLIPY still is OFTEN the animated url aliased — `toCategory` writes
+  // `stillUrl: proxied`, the very same variable, so EVERY category tile lands
+  // here — and swapping a url for itself stops nothing. Where there is no
+  // distinct still, the only stop available is taking the tile off screen.
+  // Found by Codex review on PR #3291.
+  if (!windowFocused && gif.stillUrl === gif.animatedUrl) {
+    // aria-hidden rather than role="img" (SonarQube S6819): the enclosing
+    // tile button already carries the accessible name, so naming this box
+    // again would announce the same tile twice.
+    return <div className="gif-tile-stopped" aria-hidden="true" />;
+  }
+  return <img src={windowFocused ? gif.animatedUrl : gif.stillUrl} alt="" draggable={false} />;
 }
 
 /** Save / unsave button rendered on hover over each GIF tile. */

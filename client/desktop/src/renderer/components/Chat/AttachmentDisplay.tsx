@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Download, FileText, Film, Music, File, Loader2, Maximize2 } from 'lucide-react';
+import { Download, FileText, Film, Music, File, Loader2, Maximize2, Pause } from 'lucide-react';
 import { apiFetch } from '../../services/system/apiClient';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import {
@@ -18,6 +18,9 @@ import {
 import { MAX_DECRYPTABLE_ATTACHMENT_BYTES } from '../../utils/policy/entitlementLimits';
 import type { AttachmentSummary } from '../../types/chat';
 import { useSettingsStore } from '../../stores/ui/settingsStore';
+import { useWindowFocus } from '../../hooks/ui/useWindowFocus';
+import { resolveGifPlayback } from '../../utils/ui/gifPlayback';
+import { detectAnimatedImage, ANIMATION_SNIFF_BYTES } from '../../utils/ui/animatedImage';
 import OverflowMarkdownAttachment from './OverflowMarkdownAttachment';
 import ThemedMediaPlayer from './ThemedMediaPlayer';
 import ImageLightbox from './ImageLightbox';
@@ -71,6 +74,17 @@ export const BLOB_CACHE_RETAIN_MAX_BYTES = Math.floor(BLOB_CACHE_MAX_BYTES / 2);
 interface CachedBlob {
   readonly url: string;
   readonly bytes: number;
+  /** Whether the BYTES animate; `null` when they could not say. See
+   *  `utils/ui/animatedImage`. Cached with the url so a second surface
+   *  showing the same file inherits the answer rather than re-deciding. */
+  readonly animated: boolean | null;
+}
+
+/** What a completed load hands back. The animation flag cannot be derived from
+ *  `file_type`, so it travels with the url instead of being looked up later. */
+interface LoadedAttachment {
+  readonly url: string;
+  readonly animated: boolean | null;
 }
 
 const blobUrlCache = new Map<string, CachedBlob>();
@@ -157,7 +171,7 @@ export function __resetBlobCacheForTests(): void {
   cachedBytes = 0;
 }
 
-function cacheBlobUrl(fileId: string, url: string, bytes: number): void {
+function cacheBlobUrl(fileId: string, url: string, bytes: number, animated: boolean | null): void {
   // Too large to retain: show it, do not cache it. useRetainedBlobUrl revokes it
   // when the last surface unmounts -- without that this would leak, because the
   // cache is otherwise the ONLY thing that ever revokes a url.
@@ -181,12 +195,12 @@ function cacheBlobUrl(fileId: string, url: string, bytes: number): void {
   ) {
     /* eviction happens in the condition */
   }
-  blobUrlCache.set(fileId, { url, bytes });
+  blobUrlCache.set(fileId, { url, bytes, animated });
   cachedBytes += bytes;
 }
 
 /** Loads in progress, keyed by file id. */
-const inFlightLoads = new Map<string, Promise<string>>();
+const inFlightLoads = new Map<string, Promise<LoadedAttachment>>();
 
 /** Why an attachment could not be shown.
  *
@@ -228,7 +242,7 @@ async function loadAndCache(
   fileId: string,
   channelId: string,
   declaredSize: number
-): Promise<string> {
+): Promise<LoadedAttachment> {
   // Guards run BEFORE the allocating operation, not between two of them.
   // `file_size` rides on the summary, so an oversized attachment costs no
   // network at all. It is server-supplied metadata though, so it is a fast
@@ -263,22 +277,41 @@ async function loadAndCache(
   // contiguous copy of a 256 MiB file is ever built.
   const blob = await decryptAttachmentBlob(new Uint8Array(data), channelKey, mimeType);
 
+  // Decide from the BYTES whether this actually animates, because `file_type`
+  // cannot: it is MIME-derived and persisted at upload, so an animated WebP or
+  // an APNG sent as `image/png` is stored as `photo` forever. Reads a bounded
+  // prefix via `slice`, never the whole blob — holding a Blob rather than an
+  // ArrayBuffer on this path is deliberate (a 256 MiB attachment must never be
+  // materialised contiguously) and sniffing must not undo that.
+  // Images only: a prefix read of a video buys nothing.
+  let animated: boolean | null = null;
+  if (mimeType.toLowerCase().startsWith('image/')) {
+    try {
+      const head = await blob.slice(0, ANIMATION_SNIFF_BYTES).arrayBuffer();
+      animated = detectAnimatedImage(new Uint8Array(head), mimeType);
+    } catch {
+      // A failed prefix read must not fail the attachment: the image is fine,
+      // we simply have no opinion, and `null` already means exactly that.
+      animated = null;
+    }
+  }
+
   const url = URL.createObjectURL(blob);
-  cacheBlobUrl(fileId, url, blob.size);
-  return url;
+  cacheBlobUrl(fileId, url, blob.size, animated);
+  return { url, animated };
 }
 
 async function fetchAndDecrypt(
   fileId: string,
   channelId: string,
   declaredSize: number
-): Promise<string> {
+): Promise<LoadedAttachment> {
   const cached = blobUrlCache.get(fileId);
   if (cached) {
     // Move to end for LRU freshness
     blobUrlCache.delete(fileId);
     blobUrlCache.set(fileId, cached);
-    return cached.url;
+    return { url: cached.url, animated: cached.animated };
   }
 
   // Coalesce concurrent loads of one attachment onto a single fetch + decrypt.
@@ -366,12 +399,41 @@ export function extFromMime(mime: string | undefined): string {
 }
 
 function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
+  // Declared above the focus hook, which now takes it as its `enabled` gate.
+  // `file_type` is MIME-derived and PERSISTED at upload, so it is wrong for two
+  // formats it cannot distinguish: an animated WebP and an APNG sent under the
+  // common `image/png` label both land as `photo`. Both therefore escaped the
+  // hover gate and the unfocus pause entirely, and because the value is stored,
+  // no classifier fix reaches attachments already in a channel. The decrypted
+  // bytes decide instead, and fall back to the persisted value whenever they
+  // have no opinion (`null`) — which is the case for every format the sniffer
+  // does not judge, GIF included, where `file_type` is already right.
+  // Found by Codex review on PR #3291.
+  const [sniffedAnimated, setSniffedAnimated] = useState<boolean | null>(null);
+  const isAnimated = sniffedAnimated ?? attachment.file_type === 'animated';
   const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
-  // Animated GIF attachments under Reduce Animations play only on hover/focus.
-  // See QA bug #571 item #6B. Static photos ignore this flag entirely.
-  const isAnimated = attachment.file_type === 'animated';
-  const gatedByHover = isAnimated && reduceAnimations;
-  const [hovering, setHovering] = useState(false);
+  const gifPlayback = useSettingsStore((s) => s.appearance.gifPlayback);
+  // Gated on `isAnimated`: a static JPEG or PNG ignores the verdict entirely
+  // (`showLiveImage` short-circuits on `!isAnimated`), so subscribing it to the
+  // focus store only bought a re-render on every alt-tab — and message history
+  // is unvirtualized, so a photo-heavy channel paid that for every mounted
+  // image. Found by Codex review on PR #3291.
+  const windowFocused = useWindowFocus(isAnimated);
+  // Animated GIF attachments obey the shared two-axis verdict (#2369); the
+  // hover half of it originates in QA bug #571 item #6B. Static photos ignore
+  // both axes — a still JPEG has nothing to pause.
+  // Two booleans for two independent conditions — see GifEmbed. One boolean
+  // stopped playback when the pointer left an element the keyboard still held,
+  // and when focus left an element the pointer still rested on.
+  const [pointerOver, setPointerOver] = useState(false);
+  const [focusWithin, setFocusWithin] = useState(false);
+  const hovering = pointerOver || focusWithin;
+  const verdict = resolveGifPlayback({
+    mode: gifPlayback,
+    reduceAnimations,
+    hovering,
+    windowFocused,
+  });
   const [url, setUrl] = useState<string | null>(blobUrlCache.get(attachment.id)?.url ?? null);
   const [loading, setLoading] = useState(!url);
   const [error, setError] = useState<AttachmentFailure>(null);
@@ -411,8 +473,13 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
   const load = useCallback(async () => {
     try {
       setLoading(true);
-      const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
-      setUrl(blobUrl);
+      const loaded = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
+      // Set the animation verdict BEFORE the url. `showLiveImage` gates on
+      // `url !== null`, so nothing is rendered until the url lands — sequencing
+      // it this way means the first paint already knows whether to pause,
+      // rather than flashing one animated frame and then correcting itself.
+      if (loaded.animated !== null) setSniffedAnimated(loaded.animated);
+      setUrl(loaded.url);
     } catch (err) {
       // A refusal is a different failure from a broken fetch or decrypt: the
       // bytes were never requested, so say so instead of "failed to load".
@@ -456,20 +523,42 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
     containerStyle = { aspectRatio: String(naturalRatio), maxWidth: `${ATTACHMENT_MAX_W}px` };
   }
 
-  // Under Reduce Animations, animated GIF attachments show a muted overlay
-  // with "Hover to play" and only render the live <img> while hovered/focused
-  // — the browser restarts the GIF animation every mount. Static photos and
-  // non-reduced-motion sessions skip the overlay and render the image as-is.
-  const showLiveImage = url && (!gatedByHover || hovering);
-  const hoverHandlers = gatedByHover
-    ? {
-        onMouseEnter: () => setHovering(true),
-        onMouseLeave: () => setHovering(false),
-        onFocus: () => setHovering(true),
-        onBlur: () => setHovering(false),
-        tabIndex: 0,
-      }
-    : {};
+  // No browser API pauses an animated <img>, and the server only ever holds
+  // ciphertext so there is no still frame to swap in either: on THIS surface
+  // "stopped" can only mean the <img> is not mounted. Both axes therefore
+  // collapse onto `playing`, which already implies `surface === 'animated'`.
+  // That is a property of this surface, not a simplification of the model —
+  // `GifEmbed` keeps them apart because it has a still frame and a real
+  // `HTMLMediaElement.pause()`. The browser restarts the animation on every
+  // mount; §5 residual 1 records that as accepted and unfixable here.
+  const showLiveImage = url !== null && (!isAnimated || verdict.playing);
+  // The two copies are never merged: one names an action available right now,
+  // the other names a cause hovering cannot fix. Unfocus wins when both hold,
+  // because moving the pointer onto a background window does nothing.
+  const pausedByPlayback = isAnimated && url !== null && !verdict.playing;
+  const pausedCause: 'unfocused' | 'hover' = windowFocused ? 'hover' : 'unfocused';
+  const pausedReason: 'unfocused' | 'hover' | null = pausedByPlayback ? pausedCause : null;
+  // Tracked UNCONDITIONALLY, not only while the hover gate is active. Attaching
+  // them conditionally means a pointer or focus that leaves during an inactive spell
+  // never fires its matching leave handler, so the flag stays stuck true and the
+  // next time the gate turns on the attachment believes it is being hovered when
+  // it is not. React delegates all four of these at the root, so always passing
+  // them adds fiber props rather than four DOM listeners per attachment.
+  // CodeRabbit review, PR #3291.
+  //
+  // NO `tabIndex` here. §2.5 invariant 2 keeps a native <button> mounted whenever
+  // `url` is non-null, so the container stop was a SECOND stop that activates
+  // nothing — and while `url` is null (loading, failed, too large) it was a stop
+  // on nothing at all. Keyboard reach is unaffected: React's onFocus is focusin,
+  // which bubbles, so tabbing to that button still sets `focusWithin`. Predates
+  // this PR (50b871f69, QA #571); fixed here under the boy-scout rule because
+  // this PR is what put a playback gate behind that flag. CodeRabbit, PR #3291.
+  const hoverHandlers = {
+    onMouseEnter: () => setPointerOver(true),
+    onMouseLeave: () => setPointerOver(false),
+    onFocus: () => setFocusWithin(true),
+    onBlur: () => setFocusWithin(false),
+  };
 
   return (
     <div
@@ -491,7 +580,13 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
       {tooLarge !== null && (
         <AttachmentTooLargeNotice bytes={tooLarge.bytes} truncated={tooLarge.truncated} />
       )}
-      {showLiveImage && (
+      {/* §2.5 invariant 2: the button is mounted whenever `url` is non-null, and
+          the playback gate lives strictly INSIDE it. Gating the button itself —
+          the obvious one-boolean implementation — destroys keyboard focus on
+          every alt-tab, so on return focus is on <body> and the user has lost
+          their place in the message list. Its aria-label never depends on the
+          <img>'s alt, so the accessible name survives the paused state. */}
+      {url !== null && (
         <button
           type="button"
           className="attachment-image-btn"
@@ -502,30 +597,38 @@ function ImageAttachment({ attachment, channelId }: AttachmentItemProps) {
             setMenuPos({ x: e.clientX, y: e.clientY });
           }}
         >
-          <img
-            src={url}
-            alt={`Attachment ${attachment.id}`}
-            className="attachment-image"
-            loading="lazy"
-            onLoad={(e) => {
-              if (clamped) return;
-              const img = e.currentTarget;
-              if (img.naturalWidth && img.naturalHeight) {
-                setNaturalRatio(img.naturalWidth / img.naturalHeight);
-              }
-            }}
-          />
+          {!showLiveImage && <div className="attachment-image-placeholder" aria-hidden="true" />}
+          {showLiveImage && (
+            <img
+              src={url}
+              alt={`Attachment ${attachment.id}`}
+              className="attachment-image"
+              loading="lazy"
+              onLoad={(e) => {
+                if (clamped) return;
+                const img = e.currentTarget;
+                if (img.naturalWidth && img.naturalHeight) {
+                  setNaturalRatio(img.naturalWidth / img.naturalHeight);
+                }
+              }}
+            />
+          )}
         </button>
       )}
-      {gatedByHover && !hovering && !loading && !error && tooLarge === null && (
+      {pausedReason !== null && !loading && !error && tooLarge === null && (
         <div className="attachment-reduced-motion-hint" aria-hidden="true">
-          Hover to play
+          <Pause size={14} aria-hidden="true" />
+          {pausedReason === 'hover' ? 'Hover to play' : 'Paused — Concord is in the background'}
         </div>
       )}
       {lightboxOpen && url && (
         <ImageLightbox
           src={url}
           alt={`Attachment ${attachment.id}`}
+          // `!windowFocused`, NOT `!verdict.playing` — the latter folds in the
+          // hover gate, which deliberately does not reach a viewer the user
+          // opened on purpose. Static photos are never paused.
+          paused={isAnimated && !windowFocused}
           onClose={() => setLightboxOpen(false)}
           onSave={handleSaveImage}
         />
@@ -573,7 +676,11 @@ function MediaAttachment({ attachment, channelId }: AttachmentItemProps) {
     setError(null);
     setLoading(true);
     try {
-      const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
+      const { url: blobUrl } = await fetchAndDecrypt(
+        attachment.id,
+        channelId,
+        attachment.file_size
+      );
       setUrl(blobUrl);
     } catch (err) {
       if (err instanceof AttachmentTooLargeError)
@@ -665,7 +772,11 @@ function FileAttachment({ attachment, channelId }: AttachmentItemProps) {
   const handleDownload = async () => {
     setDownloading(true);
     try {
-      const blobUrl = await fetchAndDecrypt(attachment.id, channelId, attachment.file_size);
+      const { url: blobUrl } = await fetchAndDecrypt(
+        attachment.id,
+        channelId,
+        attachment.file_size
+      );
       setDownloadedUrl(blobUrl);
       const a = document.createElement('a');
       a.href = blobUrl;

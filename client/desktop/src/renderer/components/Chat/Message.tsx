@@ -515,6 +515,7 @@ const Message: React.FC<MessageProps> = ({
 }) => {
   const isDM = chatContext === 'dm';
   const reduceAnimations = useSettingsStore((s) => s.appearance.reduceAnimations);
+  const gifPlayback = useSettingsStore((s) => s.appearance.gifPlayback);
   const loadGifsAutomatically = usePrivacyStore((s) => s.settings.loadGifsAutomatically);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
@@ -665,7 +666,8 @@ const Message: React.FC<MessageProps> = ({
         {message.gif_slug && (
           <GifEmbed
             slug={message.gif_slug}
-            reduceMotion={reduceAnimations}
+            mode={gifPlayback}
+            reduceAnimations={reduceAnimations}
             loadAutomatically={loadGifsAutomatically}
           />
         )}

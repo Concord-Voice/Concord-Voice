@@ -1,0 +1,92 @@
+/* GIF playback tri-state (#2369). Co-located with its component, following the
+   FontSection pair. Mirrors .font-size-option's drawing so the two option-group
+   idioms in Settings look like one, while the markup underneath is a real
+   <fieldset> of native radios — see the component's header comment. */
+
+.gif-playback-fieldset {
+  display: flex;
+  gap: calc(6px * var(--sp, 1));
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+/* The group needs a programmatic name for assistive tech, but the visible
+   "GIF Playback" row label already carries it for sighted users, so showing
+   both would be a duplicate. Clipped rather than `display: none`, which would
+   remove it from the accessibility tree along with the pixels. */
+.gif-playback-legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.gif-playback-option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* X12 specifies this floor as a flat 36px, and it must NOT be multiplied by
+     --sp. That factor is `--sp-base * --compact-factor` and goes well below 1
+     under Small font + Compact + a reduced UI Scale, which would shrink a
+     36px minimum to roughly 19px — making the smallest pointer target in
+     Settings smallest precisely for the users who chose denser settings. A
+     floor that scales down is not a floor. Padding above still scales, which
+     is what --sp is for. Found by Codex review on PR #3291. */
+  min-height: 36px;
+  padding: 0 calc(14px * var(--sp, 1));
+  background: var(--bg-tertiary);
+  border: 2px solid var(--border-color);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  /* --text-primary, NOT the --text-secondary that .font-size-option uses. Copying
+     that precedent verbatim reproduced its contrast defect: the pair measured
+     4.31:1 against the 4.5:1 floor in [data-scheme='midnightsky'], caught by the
+     contrast-pairs guard (#3285). The allowlist is explicitly "a frozen
+     inventory, not an approval", so a new control does not earn a line in it. */
+  color: var(--text-primary);
+  font-family: 'SourceSans', sans-serif;
+  font-size: calc(14px * var(--font-scale, 1));
+  white-space: nowrap;
+}
+
+.gif-playback-option:hover {
+  border-color: var(--accent-hover);
+  color: var(--text-primary);
+}
+
+/* Raising the resting text to --text-primary for contrast cost the selected
+   state its text-colour cue, leaving border colour as the ONLY differentiator.
+   The background shift puts a second one back, so selection does not rest on a
+   single colour property. The radio itself carries the state semantically, so
+   this is for sighted users specifically. */
+.gif-playback-option.selected {
+  border-color: var(--accent-primary);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+/* The radio itself is never drawn — the segment IS the control surface. It
+   stays in the layout (not `display: none`) so it remains focusable and keeps
+   the group's native arrow-key navigation and checked semantics. */
+.gif-playback-radio {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+
+/* Focus lands on the visually-hidden input, so the ring is drawn on the <label>
+   that the user can actually see. `:focus-within` is the whole mechanism — a
+   sibling selector on the input would match nothing, because what follows it is
+   a text node rather than an element. */
+.gif-playback-option:focus-within {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}

@@ -21,6 +21,7 @@ import {
   themeBundledFontFor,
   RESOLVER_CONFIG,
 } from '../../utils/ui/effectiveFont';
+import type { GifPlaybackMode } from '../../utils/ui/gifPlayback';
 
 export interface AppearanceSettings {
   theme: 'dark' | 'light' | 'system';
@@ -63,6 +64,14 @@ export interface AppearanceSettings {
   appFont: AppFontId;
   /** Authoritative dyslexia-support overlay (the toggle UI lands in #1644). */
   dyslexicSupport: boolean;
+  /**
+   * GIF playback gate (#2369). 'auto' === no explicit pick: follow Reduce
+   * Animations. REQUIRED rather than optional, deliberately — `preferencesSync`
+   * builds its blob from an explicit field literal, so required-ness is what
+   * turns "forgot to sync the new key" into a compile error instead of a
+   * setting that silently never syncs.
+   */
+  gifPlayback: GifPlaybackMode;
 }
 
 /** Lower + upper bound for uiScale; defaults match the slider range.
@@ -121,6 +130,7 @@ interface SettingsState {
   setCustomColors: (colors: CustomColors) => void;
   setAppFont: (id: AppFontId) => void;
   setDyslexicSupport: (on: boolean) => void;
+  setGifPlayback: (mode: GifPlaybackMode) => void;
   setClientBehavior: (value: ClientBehavior) => void;
   setSubscriptionResetAcknowledged: (acknowledged: boolean) => void;
   setAllowNsfwContent: (allowed: boolean) => void;
@@ -137,6 +147,7 @@ const defaultAppearance: AppearanceSettings = {
   customColors: null,
   appFont: 'default',
   dyslexicSupport: false,
+  gifPlayback: 'auto',
 };
 
 function resolveTheme(theme: AppearanceSettings['theme']): 'dark' | 'light' {
@@ -268,6 +279,11 @@ export const useSettingsStore = wrapStore(
 
         setDyslexicSupport: (dyslexicSupport) =>
           set((state) => ({ appearance: { ...state.appearance, dyslexicSupport } })),
+
+        // Name is load-bearing: draftSettingsStore derives `set${Key}` at runtime,
+        // so a mismatch fails live-preview/revert SILENTLY. See the note above setAppFont.
+        setGifPlayback: (gifPlayback) =>
+          set((state) => ({ appearance: { ...state.appearance, gifPlayback } })),
 
         setSubscriptionResetAcknowledged: (subscriptionResetAcknowledged) =>
           set({ subscriptionResetAcknowledged }),

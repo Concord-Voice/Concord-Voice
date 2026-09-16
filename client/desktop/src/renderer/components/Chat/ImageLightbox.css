@@ -103,3 +103,28 @@
   font-variant-numeric: tabular-nums;
   color: #ffffff;
 }
+
+/* Shown in place of the image while playback is paused (#2369). Sized to the
+   same box the image would occupy so the viewer does not collapse, and the
+   copy names the CAUSE rather than offering an action, because nothing the
+   user does inside this window will resume it. */
+.image-lightbox-paused {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 240px;
+  min-height: 160px;
+  padding: 0 16px;
+  text-align: center;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.image-lightbox-paused svg {
+  flex-shrink: 0;
+}

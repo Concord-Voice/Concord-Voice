@@ -140,6 +140,23 @@ if (typeof window !== 'undefined') {
     writable: true,
     configurable: true,
   });
+
+  // jsdom reports { hasFocus: false, hidden: false, visibilityState: 'visible' }
+  // — a document that is VISIBLE but has never been focused. That is a real
+  // state (it is exactly what an unfocused-but-visible Electron window looks
+  // like, which is #2369's whole subject), but it is the WRONG DEFAULT for a
+  // test environment: the ordinary production state is focused, so without this
+  // every test that renders an animated surface silently inherits the paused
+  // rendering and asserts against it.
+  //
+  // Default to focused; a test that wants the unfocused path opts in with
+  // `vi.spyOn(document, 'hasFocus').mockReturnValue(false)` — `configurable`
+  // is what keeps that available.
+  Object.defineProperty(document, 'hasFocus', {
+    value: () => true,
+    writable: true,
+    configurable: true,
+  });
 }
 
 // Suppress React act() warnings in test output

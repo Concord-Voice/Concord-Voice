@@ -186,6 +186,35 @@ describe('preferencesSyncService', () => {
       expect(pushedBody).toEqual({ encrypted_data: 'encrypted-blob' });
     });
 
+    it('A8: the pushed PreferencesBlob carries gifPlayback and is pinned to v === 1', async () => {
+      let encryptedBlob: unknown;
+      vi.mocked(e2eeService.encryptPreferences).mockImplementationOnce(async (blob) => {
+        encryptedBlob = blob;
+        return 'encrypted-blob';
+      });
+      useSettingsStore.setState((s) => ({
+        appearance: { ...s.appearance, gifPlayback: 'hover' },
+      }));
+      server.use(
+        http.put(`${API_BASE}/api/v1/users/me/preferences`, () => HttpResponse.json({ version: 1 }))
+      );
+
+      await preferencesSyncService.pushPreferences();
+
+      expect(encryptedBlob).toMatchObject({
+        settings: { gifPlayback: 'hover' },
+      });
+      // `v` is asserted as a literal 1, not merely truthy or "a number": this
+      // locks §2.6 of the design against a future "let's version the blob
+      // properly" refactor. preferencesSync.ts:239 rejects a non-1 blob
+      // WHOLESALE (`if (blob.v !== 1) { ... return; }`), so bumping `v` on a
+      // push would silently disable ALL theme/layout sync — not just
+      // gifPlayback — for every device that has not yet updated to read the
+      // new version. A blob shape change must add fields within v: 1, never
+      // bump the version number.
+      expect((encryptedBlob as { v: number }).v).toBe(1);
+    });
+
     it('round-trips all four retained docks and the decoupling preference', async () => {
       const profiles: SidebarProfiles = {
         dm: {

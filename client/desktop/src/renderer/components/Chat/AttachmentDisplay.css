@@ -172,11 +172,55 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.45);
+  /* Spaces the Pause glyph from the copy (#2369). The font-size rule stays
+     calc()-scaled deliberately: a flat px desynchronizes the hint from UI
+     Scale and Font Size (spec X11). */
+  gap: 6px;
+  /* The container has a min-height but NO min-width, so a small GIF gets a
+     narrow box and the longer unfocused copy has to wrap inside it. Found in
+     the #2369 visual pass at 120px: without padding the text ran into both
+     edges, and text-align matters because centring the FLEX LINE does not
+     centre the second line of wrapped text within it. */
+  padding: 0 8px;
+  text-align: center;
+  /* 0.45 fails WCAG AA in the LIGHT themes and always did — measured at 3.36:1
+     against the 4.5:1 floor for 12px text, because the scrim composites over a
+     white container rather than over the image (the image is unmounted whenever
+     this overlay is up, so there is nothing to see through and nothing lost by
+     going darker). 0.6 measures 5.74:1. Found in the #2369 visual pass; the
+     shipped "Hover to play" overlay carried the same defect, which is why this
+     is fixed here rather than filed — the file is already open and this PR adds
+     a second consumer of the same rule. */
+  background: rgba(0, 0, 0, 0.6);
   color: #fff;
   font-size: calc(12px * var(--font-scale, 1));
   pointer-events: none;
   border-radius: 4px;
+}
+
+/* Same narrow case: a flex item shrinks by default, so the glyph was crushed to
+   a sliver while the text beside it wrapped. It is a fixed-size icon, never a
+   flexible one. */
+.attachment-reduced-motion-hint svg {
+  flex-shrink: 0;
+}
+
+/* Holds the button's hit area open while playback is paused, so the <button>
+   that keeps keyboard focus (§2.5 invariant 2) is not a zero-height target.
+   The min-height matches .attachment-image-container's own floor, which is what
+   a legacy history row with no known dimensions falls back to. */
+.attachment-image-placeholder {
+  width: 100%;
+  height: 100%;
+  /* Both floors exist because a legacy history row carries no dimensions and
+     learns `naturalRatio` from <img onLoad> — which never fires if the row
+     first paints while the window is unfocused, since the <img> is not mounted.
+     The container then has auto width, this percentage resolves against
+     nothing, and the absolutely-positioned overlay contributes no intrinsic
+     size, so the button collapses. 120px mirrors .attachment-loading's floor,
+     which exists for the same reason. Found by Codex review on PR #3291. */
+  min-width: 120px;
+  min-height: 60px;
 }
 
 .spinner {

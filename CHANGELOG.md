@@ -47,6 +47,37 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   microphone already on the tile: that one means they muted themselves, and this one means you
   muted them, and only you hear the difference.
 - **Opening a busy channel or DM drops you at your first unread message** ([#3289](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3289), [#3329](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3329), [#2006](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2006)) — when there's more unread than fits on screen, the conversation now opens right where you left off reading instead of scrolled all the way to the bottom, with a Return to Latest button showing how many messages are still ahead of you. And reading messages as they arrive now actually counts: previously, only opening a conversation marked it read, so a message you read the moment it appeared could still show up as unread again after restarting the app. Now it's marked read whether you opened the conversation to see it or watched it arrive.
+- **GIFs stop playing when you switch away from Concord** ([#3291](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3291), [#2369](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2369)) — a chat full of
+  animated GIFs kept animating while you were off in another app, spending battery and CPU on
+  pictures nobody was looking at. They now stop when Concord loses focus and start again when you
+  come back. Worth knowing what "start again" means, because it differs by where the GIF came
+  from: one from the GIF picker resumes where it left off, while one someone attached to a
+  message begins again from its first frame. That second case is not an oversight. An attached
+  GIF is encrypted end to end, so the server never sees it and cannot produce a frozen frame to
+  hold its place, and nothing in a browser can pause an animated image the way it can pause a
+  video — so the only way to stop one is to take it off the screen, and putting it back starts it
+  over. A paused attachment says so rather than going blank. The GIF picker pauses as well, since
+  nobody is choosing a GIF from a window they have switched away from. This covers more than
+  files that happen to end in .gif: an animated WebP, and an animated PNG that Windows or macOS
+  handed us as an ordinary .png, both stop too. Neither used to, and not because anyone decided
+  they should not — the file type was worked out from the label the operating system put on the
+  upload, and that label cannot tell an animated WebP from a still one. Concord now looks at the
+  start of the picture itself, so this works for things already sitting in your channels rather
+  than only for what you upload from here on. One thing this does not
+  cover, so it is not a surprise later: animated profile pictures and banners keep animating. They
+  are small, they are identity rather than content, and whether "GIF playback" ought to mean
+  somebody else's avatar is a separate question from the one this change answers.
+- **You can choose when GIFs play** ([#3291](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3291), [#2369](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2369)) — Settings ▸ Accessibility ▸
+  Display has a GIF Playback control offering Auto, Always, and Hover only. Until now this rode
+  entirely on Reduce Animations: turning that on made GIFs play only while you pointed at them,
+  which meant there was no way to ask for hover-only GIFs without also flattening every other
+  animation in the app, and no way to keep GIFs playing while Reduce Animations was on. Auto
+  keeps the old behaviour and follows Reduce Animations; the other two override it in either
+  direction. Nothing here ever locks — Reduce Animations is followed, not enforced — and the line
+  underneath the control describes what will actually happen rather than restating the name you
+  picked, because Auto and Always behave identically while Reduce Animations is off and the names
+  alone cannot tell you that. This setting is stored per device; it does not follow you to your
+  other computers yet.
 
 ### Changed
 
