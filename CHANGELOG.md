@@ -46,6 +46,7 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   before rather than jumping to full. It is deliberately a different symbol from the crossed-out
   microphone already on the tile: that one means they muted themselves, and this one means you
   muted them, and only you hear the difference.
+- **Opening a busy channel or DM drops you at your first unread message** ([#3289](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3289), [#2006](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2006)) — when there's more unread than fits on screen, the conversation now opens right where you left off reading instead of scrolled all the way to the bottom, with a Return to Latest button showing how many messages are still ahead of you. And reading messages as they arrive now actually counts: previously, only opening a conversation marked it read, so a message you read the moment it appeared could still show up as unread again after restarting the app. Now it's marked read whether you opened the conversation to see it or watched it arrive.
 
 ### Changed
 

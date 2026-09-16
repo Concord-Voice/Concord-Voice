@@ -7,6 +7,8 @@ import { useUserStore } from '../../stores/auth/userStore';
 import { usePrivacyStore } from '../../stores/ui/privacyStore';
 import { useTTSSettingsStore } from '../../stores/audio/ttsSettingsStore';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
+import { useReadMarker } from '../../hooks/messaging/useReadMarker';
+import { apiFetch } from '../../services/system/apiClient';
 import { useChatController } from '../../hooks/messaging/useChatController';
 import { useVoiceTextChatTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 import './VoiceTextChat.css';
@@ -52,6 +54,20 @@ const VoiceTextChat: React.FC = () => {
   });
 
   const currentUserId = user?.id || '';
+
+  // Advance the read marker while the panel is open (#3289). The open-time
+  // read is ChannelList's for a linked channel and DMChatArea's for a DM
+  // call; neither covers a message read as it arrives here. Same shape as
+  // ChatView and DMChatArea: debounced, flushed when the list stops
+  // following, and a non-2xx is rejected so the hook logs it.
+  const readPath = isDMCall
+    ? `/api/v1/dm/conversations/${targetId}/read`
+    : `/api/v1/channels/${targetId}/read`;
+  const { markSeen, flush: flushSeen } = useReadMarker(async () => {
+    if (!targetId) return;
+    const res = await apiFetch(readPath, { method: 'POST' });
+    if (!res.ok) throw new Error(`read marker rejected: HTTP ${res.status}`);
+  }, targetId);
 
   const handleSendMessage = (
     content: string,
@@ -113,6 +129,8 @@ const VoiceTextChat: React.FC = () => {
           onReply={handleReply}
           onPinToggle={handlePinToggle}
           canPin={canPin}
+          onLatestSeen={markSeen}
+          onLatestLeft={flushSeen}
         />
       </div>
 

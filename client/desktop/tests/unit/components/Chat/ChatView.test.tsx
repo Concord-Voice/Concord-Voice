@@ -472,6 +472,121 @@ describe('ChatView', () => {
     markServerUnreadSpy.mockRestore();
   });
 
+  // ── onLatestSeen (read marker while viewing, #2006) ──
+
+  it('advances the read marker via useReadMarker when onLatestSeen fires', async () => {
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+
+    const onLatestSeen = capturedMessageListProps.onLatestSeen as (() => void) | undefined;
+    expect(onLatestSeen).toBeDefined();
+
+    vi.useFakeTimers();
+    try {
+      act(() => onLatestSeen?.());
+      expect(mockApiFetch).not.toHaveBeenCalledWith(
+        expect.stringContaining('/read'),
+        expect.anything()
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/channels/channel-1/read',
+        expect.objectContaining({ method: 'POST' })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes the pending read marker for the channel that was read when the channel changes', async () => {
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    const { rerender } = render(<ChatView />);
+    vi.useFakeTimers();
+    try {
+      act(() => (capturedMessageListProps.onLatestSeen as () => void)?.());
+      act(() => {
+        useChannelStore.setState({ activeChannelId: 'channel-2' });
+      });
+      rerender(<ChatView />);
+      // The old channel's post fired at once, with the old id captured.
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/channels/channel-1/read',
+        expect.objectContaining({ method: 'POST' })
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(mockApiFetch).not.toHaveBeenCalledWith(
+        '/api/v1/channels/channel-2/read',
+        expect.anything()
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes the pending read marker at once when onLatestLeft fires', () => {
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    vi.useFakeTimers();
+    try {
+      act(() => (capturedMessageListProps.onLatestSeen as () => void)?.());
+      expect(mockApiFetch).not.toHaveBeenCalledWith(
+        expect.stringContaining('/read'),
+        expect.anything()
+      );
+      act(() => (capturedMessageListProps.onLatestLeft as () => void)?.());
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/channels/channel-1/read',
+        expect.objectContaining({ method: 'POST' })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('logs a non-2xx read marker response instead of treating it as success', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockApiFetch.mockImplementation((url: string) =>
+      url.endsWith('/read')
+        ? Promise.resolve({ ok: false, status: 429, json: async () => ({}) })
+        : Promise.resolve({ ok: true, json: async () => ({ messages: [] }) })
+    );
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    vi.useFakeTimers();
+    try {
+      act(() => (capturedMessageListProps.onLatestSeen as () => void)?.());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(consoleSpy).toHaveBeenCalledWith(
+        '[useReadMarker] Failed to post read marker:',
+        'read marker rejected: HTTP 429'
+      );
+    } finally {
+      vi.useRealTimers();
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it('clears the local unread count when latest-seen fires with a nonzero count', () => {
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    useUnreadStore.getState().setUnreadCount('channel-1', 4);
+    render(<ChatView />);
+
+    const clearUnreadSpy = vi.spyOn(useUnreadStore.getState(), 'clearUnread');
+    const onLatestSeen = capturedMessageListProps.onLatestSeen as (() => void) | undefined;
+    act(() => onLatestSeen?.());
+
+    expect(clearUnreadSpy).toHaveBeenCalledWith('channel-1');
+    clearUnreadSpy.mockRestore();
+  });
+
   // ── handlePinToggle ──
 
   it('handlePinToggle calls pinMessage and increments count', async () => {

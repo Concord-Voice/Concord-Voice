@@ -12,6 +12,7 @@ import { useDMSubscription } from '../../hooks/messaging/useDMSubscription';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useChatController } from '../../hooks/messaging/useChatController';
+import { useReadMarker } from '../../hooks/messaging/useReadMarker';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { voiceService } from '../../services/voice/voiceService';
@@ -245,21 +246,35 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     [handlePinToggleBase]
   );
 
+  // Per thread, how many read markers have been dispatched since the last
+  // open-time read was sent. An open-time failure that lands after a newer
+  // marker went out must not restore a count that marker clears; if the
+  // marker fails too, the local count stays low — the safe direction.
+  const readGensRef = useRef(new Map<string, number>());
+  // The thread whose open-time read has been posted. The fetch hook fires
+  // completion after every successful fetch, and a reconnect refetch's page
+  // is read as it is seen (the live marker), not by arriving.
+  const openReadThreadRef = useRef<string | null>(null);
+
   // Mark conversation as read after messages are fetched
   const handleFetchComplete = useCallback(() => {
     if (!selectedThreadId) return;
+    const threadId = selectedThreadId;
+    if (openReadThreadRef.current === threadId) return;
+    openReadThreadRef.current = threadId;
     const previousUnread =
-      useDMStore.getState().conversations.find((c) => c.id === selectedThreadId)?.unreadCount ?? 0;
-    clearUnread(selectedThreadId);
-    apiFetch(`/api/v1/dm/conversations/${selectedThreadId}/read`, { method: 'POST' }).catch(
-      (error) => {
-        console.error('[DMChatArea] Failed to mark conversation as read:', errorMessage(error));
-        // The server still counts these; ADD them back on top of whatever has
-        // landed since (the leave-time count, if the user already left) — a
-        // set from either writer would discard the other.
-        useDMStore.getState().incrementUnread(selectedThreadId, previousUnread);
-      }
-    );
+      useDMStore.getState().conversations.find((c) => c.id === threadId)?.unreadCount ?? 0;
+    const gen = readGensRef.current.get(threadId) ?? 0;
+    clearUnread(threadId);
+    apiFetch(`/api/v1/dm/conversations/${threadId}/read`, { method: 'POST' }).catch((error) => {
+      console.error('[DMChatArea] Failed to mark conversation as read:', errorMessage(error));
+      // A newer marker made the server current: nothing to put back.
+      if ((readGensRef.current.get(threadId) ?? 0) !== gen) return;
+      // The server still counts these; ADD them back on top of whatever has
+      // landed since (the leave-time count, if the user already left) — a
+      // set from either writer would discard the other.
+      useDMStore.getState().incrementUnread(threadId, previousUnread);
+    });
   }, [selectedThreadId, clearUnread]);
 
   // Shared fetch/decrypt/paginate logic
@@ -268,8 +283,35 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     { type: 'dm', onFetchComplete: handleFetchComplete }
   );
 
+  // Advance the read marker while the thread stays open (#2006), so a message
+  // read as it arrives doesn't come back as unread after a refresh —
+  // handleFetchComplete above only covers the open-time read. Debounced
+  // server-side; the local badge clears immediately. A non-2xx is rejected
+  // so the hook logs it: a 429 from the 30/min route limit must not read as
+  // success.
+  const { markSeen, flush: flushSeen } = useReadMarker(async () => {
+    if (!selectedThreadId) return;
+    const gens = readGensRef.current;
+    gens.set(selectedThreadId, (gens.get(selectedThreadId) ?? 0) + 1); // at dispatch, see readGensRef
+    const res = await apiFetch(`/api/v1/dm/conversations/${selectedThreadId}/read`, {
+      method: 'POST',
+    });
+    if (!res.ok) throw new Error(`read marker rejected: HTTP ${res.status}`);
+  }, selectedThreadId);
+  const handleLatestSeen = useCallback(() => {
+    if (!selectedThreadId) return;
+    if (
+      (useDMStore.getState().conversations.find((c) => c.id === selectedThreadId)?.unreadCount ??
+        0) > 0
+    ) {
+      clearUnread(selectedThreadId);
+    }
+    markSeen();
+  }, [selectedThreadId, clearUnread, markSeen]);
+
   // Unseen count on leave (DM-specific: uses dmStore, not unreadStore).
-  // `count` is how many messages arrived while the user was scrolled up; it
+  // `count` is how many messages arrived while the user was scrolled up (the
+  // badge seeded at landing is excluded — the open-time read covered it); it
   // is ADDED because the open-time clear may be rolled back above, and "+1"
   // (the old form) reported 1 for a thread left with three unseen.
   const handleUnseenOnLeave = useCallback(
@@ -456,6 +498,8 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
             onEditMessage={editMessage}
             onDeleteMessage={deleteMessage}
             onUnseenOnLeave={handleUnseenOnLeave}
+            onLatestSeen={handleLatestSeen}
+            onLatestLeft={flushSeen}
             onReply={handleReply}
             onScrollToMessage={handleScrollToMessage}
             onPinToggle={handlePinToggle}

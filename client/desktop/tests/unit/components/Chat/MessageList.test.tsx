@@ -2,9 +2,12 @@ import { act, fireEvent, render, screen } from '../../../test-utils';
 import MessageList from '@/renderer/components/Chat/MessageList';
 import { mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 import { useChannelScrollStore } from '@/renderer/stores/chat/channelScrollStore';
+import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
 import { vi } from 'vitest';
 import { StrictMode } from 'react';
 import { render as bareRender } from '@testing-library/react';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 // Mock the Message component to simplify testing
 vi.mock('@/renderer/components/Chat/Message', () => ({
@@ -279,72 +282,72 @@ describe('MessageList', () => {
 
   // ---- Scroll position preservation (WS3 #7, reworked for the lazy-media case) ----
 
+  // Ten rows from another user, so every one of them counts as unread.
+  const rows = Array.from({ length: 10 }, (_, i) => ({
+    ...mockMessage,
+    id: `msg-${i}`,
+    user_id: 'user-2',
+  }));
+
+  /**
+   * Stub the layout jsdom does not compute: the scroll container is
+   * `clientHeight` tall and every message row is `rowHeight` tall, laid out
+   * top-to-bottom. Rects are derived from the live scrollTop so a test can
+   * scroll and re-measure the way a browser would. `rowHeight` is mutable so
+   * a test can "resolve a GIF" by growing the rows after mount.
+   */
+  function installLayout(layout: { clientHeight: number; rowHeight: number }) {
+    const proto = Element.prototype;
+    const original = {
+      rect: proto.getBoundingClientRect,
+      scrollHeight: Object.getOwnPropertyDescriptor(proto, 'scrollHeight'),
+      clientHeight: Object.getOwnPropertyDescriptor(proto, 'clientHeight'),
+    };
+    const rect = (top: number, bottom: number) =>
+      ({
+        top,
+        bottom,
+        left: 0,
+        right: 0,
+        width: 0,
+        height: bottom - top,
+        x: 0,
+        y: top,
+      }) as DOMRect;
+    const isList = (el: Element) => el.classList.contains('message-list');
+    Object.defineProperty(proto, 'scrollHeight', {
+      configurable: true,
+      get(this: Element) {
+        return isList(this)
+          ? this.querySelectorAll('[data-message-id]').length * layout.rowHeight
+          : 0;
+      },
+    });
+    Object.defineProperty(proto, 'clientHeight', {
+      configurable: true,
+      get(this: Element) {
+        return isList(this) ? layout.clientHeight : 0;
+      },
+    });
+    proto.getBoundingClientRect = function (this: Element) {
+      if (!this.isConnected) return rect(0, 0);
+      if (isList(this)) return rect(0, layout.clientHeight);
+      const list = this.closest('.message-list');
+      if (!list || !this.hasAttribute('data-message-id')) return rect(0, 0);
+      const index = Array.from(list.querySelectorAll('[data-message-id]')).indexOf(this);
+      const top = index * layout.rowHeight - list.scrollTop;
+      return rect(top, top + layout.rowHeight);
+    };
+    return () => {
+      proto.getBoundingClientRect = original.rect;
+      if (original.scrollHeight)
+        Object.defineProperty(proto, 'scrollHeight', original.scrollHeight);
+      if (original.clientHeight)
+        Object.defineProperty(proto, 'clientHeight', original.clientHeight);
+    };
+  }
+
   describe('scroll position preservation', () => {
-    // Ten rows from another user, so every one of them counts as unread.
-    const rows = Array.from({ length: 10 }, (_, i) => ({
-      ...mockMessage,
-      id: `msg-${i}`,
-      user_id: 'user-2',
-    }));
-
-    /**
-     * Stub the layout jsdom does not compute: the scroll container is
-     * `clientHeight` tall and every message row is `rowHeight` tall, laid out
-     * top-to-bottom. Rects are derived from the live scrollTop so a test can
-     * scroll and re-measure the way a browser would. `rowHeight` is mutable so
-     * a test can "resolve a GIF" by growing the rows after mount.
-     */
-    function installLayout(layout: { clientHeight: number; rowHeight: number }) {
-      const proto = Element.prototype;
-      const original = {
-        rect: proto.getBoundingClientRect,
-        scrollHeight: Object.getOwnPropertyDescriptor(proto, 'scrollHeight'),
-        clientHeight: Object.getOwnPropertyDescriptor(proto, 'clientHeight'),
-      };
-      const rect = (top: number, bottom: number) =>
-        ({
-          top,
-          bottom,
-          left: 0,
-          right: 0,
-          width: 0,
-          height: bottom - top,
-          x: 0,
-          y: top,
-        }) as DOMRect;
-      const isList = (el: Element) => el.classList.contains('message-list');
-      Object.defineProperty(proto, 'scrollHeight', {
-        configurable: true,
-        get(this: Element) {
-          return isList(this)
-            ? this.querySelectorAll('[data-message-id]').length * layout.rowHeight
-            : 0;
-        },
-      });
-      Object.defineProperty(proto, 'clientHeight', {
-        configurable: true,
-        get(this: Element) {
-          return isList(this) ? layout.clientHeight : 0;
-        },
-      });
-      proto.getBoundingClientRect = function (this: Element) {
-        if (!this.isConnected) return rect(0, 0);
-        if (isList(this)) return rect(0, layout.clientHeight);
-        const list = this.closest('.message-list');
-        if (!list || !this.hasAttribute('data-message-id')) return rect(0, 0);
-        const index = Array.from(list.querySelectorAll('[data-message-id]')).indexOf(this);
-        const top = index * layout.rowHeight - list.scrollTop;
-        return rect(top, top + layout.rowHeight);
-      };
-      return () => {
-        proto.getBoundingClientRect = original.rect;
-        if (original.scrollHeight)
-          Object.defineProperty(proto, 'scrollHeight', original.scrollHeight);
-        if (original.clientHeight)
-          Object.defineProperty(proto, 'clientHeight', original.clientHeight);
-      };
-    }
-
     let restoreLayout: () => void = () => {};
     // 200px viewport over ten 100px rows: 1000px of content, bottom at 800.
     const layout = { clientHeight: 200, rowHeight: 100 };
@@ -353,6 +356,9 @@ describe('MessageList', () => {
       layout.rowHeight = 100;
       layout.clientHeight = 200;
       restoreLayout = installLayout(layout);
+      // Stores leak between tests otherwise: an unread count set by one case
+      // would turn the next case's bare mount into a first-unread landing.
+      resetAllStores();
       useChannelScrollStore.setState({ anchors: {} });
     });
     afterEach(() => restoreLayout());
@@ -629,20 +635,191 @@ describe('MessageList', () => {
       expect(screen.queryByRole('button', { name: /return to latest/i })).not.toBeInTheDocument();
     });
 
-    it('Return to Latest puts the list back in following mode so the next leave clears the anchor', () => {
-      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+    it('lands on the first unread message when the unread messages overflow the viewport', () => {
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      // Four unread of ten: the first unread is msg-6, at 600px.
+      expect(getList().scrollTop).toBe(600);
+      const button = screen.getByRole('button', { name: /return to latest/i });
+      expect(button).toBeVisible();
+      // msg-6 and msg-7 fill the viewport; the badge is what is still below.
+      expect(button).toHaveTextContent('2');
+    });
+
+    it('counts the badge down as the user reads through the unread rows, and back up above them', () => {
+      useUnreadStore.getState().setUnreadCount('k', 6);
+      render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      const list = getList();
+      expect(list.scrollTop).toBe(400); // msg-4 at the top, msg-5 below it
+      const button = () => screen.getByRole('button', { name: /return to latest/i });
+      expect(button()).toHaveTextContent('4'); // msg-6..msg-9
+      list.scrollTop = 500; // msg-5 and msg-6 in view, 300px from the bottom
+      fireEvent.scroll(list);
+      expect(button()).toHaveTextContent('3'); // msg-7..msg-9
+      list.scrollTop = 0; // eight others' rows below, but only six were unread
+      fireEvent.scroll(list);
+      expect(button()).toHaveTextContent('6');
+    });
+
+    it("skips the user's own messages when counting back to the first unread", () => {
+      // The server's count excludes own messages; msg-7 and msg-8 are mine, so
+      // three unread are msg-9, msg-6 and msg-5 — land on msg-5, not on msg-7.
+      const mixed = rows.map((m, i) => (i === 7 || i === 8 ? { ...m, user_id: 'user-1' } : m));
+      useUnreadStore.getState().setUnreadCount('k', 3);
+      render(<MessageList messages={mixed} currentUserId="user-1" persistenceKey="k" />);
+      expect(getList().scrollTop).toBe(500);
+      // Below the viewport: msg-7 and msg-8 (mine) and msg-9 — one unread.
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('1');
+    });
+
+    it('lands on the topmost row when the unread count exceeds the mounted rows', () => {
+      useUnreadStore.getState().setUnreadCount('k', 25);
+      render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      const list = getList();
+      expect(list.scrollTop).toBe(0);
+      // The badge is what lies below on the loaded page; the rest is above, unloaded.
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('8');
+      // The landing did not move the list, so no echo is armed: a real scroll
+      // down to the bottom is honoured at once.
+      list.scrollTop = 800;
+      fireEvent.scroll(list);
+      expect(screen.queryByRole('button', { name: /return to latest/i })).not.toBeInTheDocument();
+    });
+
+    it('requests the older page when the unread count exceeds the mounted rows', () => {
+      const onLoadMore = vi.fn();
+      useUnreadStore.getState().setUnreadCount('k', 25);
+      render(
+        <MessageList
+          messages={rows}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+          onLoadMore={onLoadMore}
+        />
+      );
+      expect(getList().scrollTop).toBe(0);
+      expect(onLoadMore).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not request the older page when the first unread is mounted', () => {
+      const onLoadMore = vi.fn();
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      render(
+        <MessageList
+          messages={rows}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+          onLoadMore={onLoadMore}
+        />
+      );
+      expect(getList().scrollTop).toBe(600);
+      expect(onLoadMore).not.toHaveBeenCalled();
+    });
+
+    it('reports only messages that arrived while scrolled up on leave, not the seeded badge', () => {
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      const onUnseenOnLeave = vi.fn();
+      const { rerender, unmount } = render(
+        <MessageList
+          messages={rows}
+          currentUserId="user-1"
+          persistenceKey="k"
+          onUnseenOnLeave={onUnseenOnLeave}
+        />
+      );
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('2');
+      rerender(
+        <MessageList
+          messages={[...rows, { ...mockMessage, id: 'msg-10', user_id: 'user-2' }]}
+          currentUserId="user-1"
+          persistenceKey="k"
+          onUnseenOnLeave={onUnseenOnLeave}
+        />
+      );
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('3');
+      unmount();
+      expect(onUnseenOnLeave).toHaveBeenCalledTimes(1);
+      expect(onUnseenOnLeave).toHaveBeenCalledWith(1);
+    });
+
+    it('reads DM unread from the conversation when the list is a DM thread', () => {
+      useDMStore.setState({
+        conversations: [
+          {
+            id: 'k',
+            isGroup: false,
+            isPersonal: false,
+            name: 'Someone',
+            participants: [],
+            lastMessage: null,
+            unreadCount: 4,
+            createdAt: '2025-01-01T00:00:00Z',
+          },
+        ],
+      });
+      render(
+        <MessageList messages={rows} currentUserId="user-1" persistenceKey="k" chatContext="dm" />
+      );
+      expect(getList().scrollTop).toBe(600);
+    });
+
+    it('goes to the bottom when the unread messages fit in the viewport', () => {
+      useUnreadStore.getState().setUnreadCount('k', 1);
+      render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      expect(getList().scrollTop).toBe(1000);
+      expect(screen.queryByRole('button', { name: /return to latest/i })).not.toBeInTheDocument();
+    });
+
+    it('re-counts the badge when layout moves under a still viewport', () => {
+      const ro = mockResizeObserver();
+      try {
+        useUnreadStore.getState().setUnreadCount('k', 6);
+        render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+        expect(getList().scrollTop).toBe(400);
+        const button = () => screen.getByRole('button', { name: /return to latest/i });
+        expect(button()).toHaveTextContent('4');
+        layout.clientHeight = 400; // the window grew: msg-4..msg-7 now in view
+        ro.fire();
+        expect(button()).toHaveTextContent('2');
+      } finally {
+        ro.restore();
+      }
+    });
+
+    it('prefers the saved anchor over the first unread message', () => {
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-1', offset: 0 });
+      render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      expect(getList().scrollTop).toBe(100);
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('4');
+    });
+
+    it('Return to Latest clears the unread badge and the next leave clears the anchor', () => {
+      useUnreadStore.getState().setUnreadCount('k', 4);
       const { unmount } = render(
         <MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />
       );
       const list = getList();
       stubScrollTo(list);
-      expect(list.scrollTop).toBe(330);
+      expect(list.scrollTop).toBe(600);
       fireEvent.click(screen.getByRole('button', { name: /return to latest/i }));
       expect(list.scrollTop).toBe(1000);
       expect(screen.queryByRole('button', { name: /return to latest/i })).not.toBeInTheDocument();
       unmount();
       expect(useChannelScrollStore.getState().getAnchor('k')).toBeUndefined();
     });
+    it('keeps a first-unread landing and its badge when the echo of its own scroll samples a taller viewport', () => {
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      render(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      const list = getList();
+      expect(list.scrollTop).toBe(600);
+      layout.clientHeight = 700; // transient: 1000 - 600 - 700 < threshold
+      fireEvent.scroll(list); // the echo of the landing scroll
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('2');
+    });
+
     it('keeps the restored anchor and its button when the echo of its own scroll samples a taller viewport', () => {
       // The programmatic scroll that restores an anchor fires a scroll event a
       // frame later. If a sibling below the list is mid-way through mount-time
@@ -704,6 +881,501 @@ describe('MessageList', () => {
       expect(useChannelScrollStore.getState().anchors).toEqual({
         ignored: { messageId: 'msg-3', offset: 0 },
       });
+    });
+  });
+
+  // ---- onLatestSeen (read marker while viewing, #2006) ----
+
+  describe('onLatestSeen', () => {
+    function setVisibility(state: 'visible' | 'hidden') {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+    }
+
+    // Real geometry, not jsdom's zero rects: "scrolled up" must leave the
+    // previous latest row out of the near-bottom band, or an arrival reads as
+    // seen. 200px viewport over 100px rows, as in the preservation block.
+    let restoreLayout: () => void = () => {};
+    let hasFocus: ReturnType<typeof vi.spyOn>;
+    const seenLayout = { clientHeight: 200, rowHeight: 100 };
+    const shrinkViewport = (px: number) => {
+      seenLayout.clientHeight = px;
+    };
+    beforeEach(() => {
+      seenLayout.clientHeight = 200;
+      restoreLayout = installLayout(seenLayout);
+      resetAllStores();
+      // jsdom never reports focus; "seen" requires it.
+      hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    });
+    afterEach(() => {
+      restoreLayout();
+      hasFocus.mockRestore();
+      setVisibility('visible');
+    });
+    const getList = () => document.querySelector('.message-list') as HTMLElement;
+    const arrival = (id = 'msg-arrived') => ({ ...mockMessage2, id });
+
+    it("fires when another user's message arrives while near the bottom and the document is visible", () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={[mockMessage]} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      const arrived = { ...mockMessage2, id: 'msg-arrived' };
+      rerender(
+        <MessageList
+          messages={[mockMessage, arrived]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fire when the arriving message is the user’s own', () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={[mockMessage2]} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      const ownArrival = { ...mockMessage, id: 'msg-own-arrived' };
+      rerender(
+        <MessageList
+          messages={[mockMessage2, ownArrival]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+    });
+
+    it('does not fire when the user has scrolled up', () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={rows} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      const list = getList();
+      list.scrollTop = 100;
+      fireEvent.scroll(list);
+
+      const arrived = { ...mockMessage2, id: 'msg-arrived' };
+      rerender(
+        <MessageList
+          messages={[...rows, arrived]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+    });
+
+    it('does not fire when the document is hidden', () => {
+      setVisibility('hidden');
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={[mockMessage]} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      const arrived = { ...mockMessage2, id: 'msg-arrived' };
+      rerender(
+        <MessageList
+          messages={[mockMessage, arrived]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+    });
+
+    it('fires on Return to Latest when the badge count is greater than zero', () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={rows} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      const list = getList();
+      Object.defineProperty(list, 'scrollTo', {
+        configurable: true,
+        value: vi.fn((options: ScrollToOptions) => {
+          list.scrollTop = options.top ?? list.scrollTop;
+        }),
+      });
+      list.scrollTop = 100;
+      fireEvent.scroll(list);
+
+      // A message arrives while scrolled up — counted, not yet "seen".
+      const arrived = { ...mockMessage2, id: 'msg-arrived' };
+      rerender(
+        <MessageList
+          messages={[...rows, arrived]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('1');
+
+      fireEvent.click(screen.getByRole('button', { name: /return to latest/i }));
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('fires when scrolling down reaches the bottom with unseen messages pending', () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={rows} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      const list = getList();
+      list.scrollTop = 100;
+      fireEvent.scroll(list);
+
+      const arrived = { ...mockMessage2, id: 'msg-arrived' };
+      rerender(
+        <MessageList
+          messages={[...rows, arrived]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+
+      // Scroll back down to the bottom without using the button (11 rows: 1100px).
+      list.scrollTop = 900;
+      fireEvent.scroll(list);
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fire while the window is unfocused, then fires once when focus returns', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={[mockMessage]} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      rerender(
+        <MessageList
+          messages={[mockMessage, arrival()]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+
+      hasFocus.mockReturnValue(true);
+      act(() => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+      expect(getList().scrollTop).toBe(200); // the one arrival fits: still at the bottom
+      act(() => {
+        window.dispatchEvent(new Event('focus')); // nothing new to mark
+      });
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('stands on the first of an unfocused burst as soon as it overflows, and marks nothing until the user reads down', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestSeen = vi.fn();
+      const onLatestLeft = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen, onLatestLeft };
+      const { rerender } = render(<MessageList messages={rows} {...props} />);
+      const burst = ['a1', 'a2', 'a3', 'a4', 'a5'].map((id) => arrival(id));
+      for (let n = 1; n <= burst.length; n++) {
+        rerender(<MessageList messages={[...rows, ...burst.slice(0, n)]} {...props} />);
+      }
+      const list = getList();
+      // Three rows fit the 200px viewport within the band; the fourth did not,
+      // so the list stood on a1 (row 10, at 1000px) then and stopped following.
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(list.scrollTop).toBe(1000);
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('3');
+
+      hasFocus.mockReturnValue(true);
+      act(() => {
+        window.dispatchEvent(new Event('focus')); // nothing to mark: the burst is unread, not seen
+      });
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(list.scrollTop).toBe(1000);
+
+      // Reading down to the bottom marks it, as any scroll-down does.
+      list.scrollTop = 1300;
+      fireEvent.scroll(list);
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole('button', { name: /return to latest/i })).not.toBeInTheDocument();
+    });
+
+    it('lands on the first unseen row on focus regain when the viewport shrank under a burst that had fitted', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestSeen = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen };
+      const { rerender } = render(<MessageList messages={rows} {...props} />);
+      rerender(<MessageList messages={[...rows, arrival('a1'), arrival('a2')]} {...props} />); // fits: pinned at 1200
+      expect(getList().scrollTop).toBe(1200);
+      shrinkViewport(40); // the window was resized while away: two rows no longer fit
+      hasFocus.mockReturnValue(true);
+      act(() => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(getList().scrollTop).toBe(1000); // standing on a1
+      expect(screen.getByRole('button', { name: /return to latest/i })).toBeInTheDocument();
+    });
+
+    it('counts arrivals shown while unfocused as unread if the user scrolls up before focus returns', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestSeen = vi.fn();
+      const onUnseenOnLeave = vi.fn();
+      const { rerender, unmount } = render(
+        <MessageList
+          messages={rows}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+          onUnseenOnLeave={onUnseenOnLeave}
+        />
+      );
+      rerender(
+        <MessageList
+          messages={[...rows, arrival('a1')]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+          onUnseenOnLeave={onUnseenOnLeave}
+        />
+      );
+      rerender(
+        <MessageList
+          messages={[...rows, arrival('a1'), arrival('a2')]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+          onUnseenOnLeave={onUnseenOnLeave}
+        />
+      );
+      const list = getList();
+      list.scrollTop = 100;
+      fireEvent.scroll(list); // scrolled away, still unfocused
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('2');
+      unmount();
+      expect(onUnseenOnLeave).toHaveBeenCalledWith(2);
+    });
+
+    it('stands on the first of a batch appended at once when it overflows, instead of pinning and marking', () => {
+      // A reconnect backfill commits every missed message in one store update.
+      const onLatestSeen = vi.fn();
+      const onLatestLeft = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen, onLatestLeft };
+      const { rerender } = render(<MessageList messages={rows} {...props} />);
+      const batch = ['a1', 'a2', 'a3', 'a4', 'a5'].map((id) => arrival(id));
+      rerender(<MessageList messages={[...rows, ...batch]} {...props} />);
+      const list = getList();
+      // Focused and following, but five rows do not fit: the list stands on
+      // a1 (row 10, at 1000px) with a3..a5 below, and nothing is marked.
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(list.scrollTop).toBe(1000);
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('3');
+      list.scrollTop = 1300;
+      fireEvent.scroll(list);
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('pins and marks a batch that fits, and counts a whole batch when scrolled up', () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={rows} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      rerender(
+        <MessageList
+          messages={[...rows, arrival('a1'), arrival('a2')]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(getList().scrollTop).toBe(1200);
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+
+      const list = getList();
+      list.scrollTop = 100;
+      fireEvent.scroll(list);
+      rerender(
+        <MessageList
+          messages={[
+            ...rows,
+            arrival('a1'),
+            arrival('a2'),
+            arrival('b1'),
+            arrival('b2'),
+            arrival('b3'),
+          ]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('3');
+    });
+
+    it("marks an empty thread's first live message, but not the rows a fetch delivers", () => {
+      const onLatestSeen = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen };
+      const { rerender } = render(<MessageList messages={[]} isLoading {...props} />);
+      rerender(<MessageList messages={[]} isLoading={false} {...props} />); // loaded, and empty
+      rerender(<MessageList messages={[arrival()]} isLoading={false} {...props} />);
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+
+      // Hydration: the loading cycle ends WITH rows, so they are not arrivals.
+      onLatestSeen.mockClear();
+      const { rerender: rerender2 } = render(<MessageList messages={[]} isLoading {...props} />);
+      rerender2(
+        <MessageList messages={[mockMessage, arrival('h1')]} isLoading={false} {...props} />
+      );
+      expect(onLatestSeen).not.toHaveBeenCalled();
+    });
+
+    it('treats a page that replaced an evicted tail as one appended batch, and a deleted tail as nothing', () => {
+      const onLatestSeen = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen };
+      const { rerender, unmount } = render(<MessageList messages={rows} {...props} />);
+      // A reconnect that missed more than a page: the store now holds ten rows
+      // sharing no id with what was mounted. Every one of them is new.
+      const page = Array.from({ length: 10 }, (_, i) => arrival(`p${i}`));
+      rerender(<MessageList messages={page} {...props} />);
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(getList().scrollTop).toBe(0); // standing on p0
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('8');
+      unmount();
+
+      // The latest row deleted: nothing new, nothing marked, nothing counted.
+      onLatestSeen.mockClear();
+      const { rerender: rerender2 } = render(<MessageList messages={rows} {...props} />);
+      rerender2(<MessageList messages={rows.slice(0, 9)} {...props} />);
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      expect(screen.queryByRole('button', { name: /return to latest/i })).not.toBeInTheDocument();
+    });
+
+    it('does not count the rows the first fetch appends to cached rows, but counts a later backfill', () => {
+      // A remount on cached rows with unread waiting: the landing walks the
+      // cached tail, then the fetch appends the messages received while
+      // closed. Those are hydration — the open-time read covered them.
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      const onUnseenOnLeave = vi.fn();
+      const props = { currentUserId: 'user-1', persistenceKey: 'k', onUnseenOnLeave };
+      const { rerender, unmount } = render(
+        <MessageList messages={rows} isLoading={false} {...props} />
+      );
+      expect(getList().scrollTop).toBe(600);
+      rerender(<MessageList messages={rows} isLoading {...props} />);
+      const hydrated = [...rows, arrival('h1'), arrival('h2'), arrival('h3'), arrival('h4')];
+      rerender(<MessageList messages={hydrated} isLoading={false} {...props} />);
+      // A later cycle — a reconnect backfill — is an arrival and is counted.
+      rerender(<MessageList messages={hydrated} isLoading {...props} />);
+      rerender(
+        <MessageList
+          messages={[...hydrated, arrival('r1'), arrival('r2')]}
+          isLoading={false}
+          {...props}
+        />
+      );
+      unmount();
+      expect(onUnseenOnLeave).toHaveBeenCalledTimes(1);
+      expect(onUnseenOnLeave).toHaveBeenCalledWith(2);
+    });
+
+    it('reports an arrival shown while unfocused as unread when the list unmounts before focus returns', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestSeen = vi.fn();
+      const onUnseenOnLeave = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestSeen, onUnseenOnLeave };
+      const { rerender, unmount } = render(<MessageList messages={rows} {...props} />);
+      rerender(<MessageList messages={[...rows, arrival('a1')]} {...props} />);
+      expect(onLatestSeen).not.toHaveBeenCalled();
+      unmount(); // switched thread without ever looking
+      expect(onUnseenOnLeave).toHaveBeenCalledWith(1);
+    });
+
+    it('counts every row of a batch shown while unfocused', () => {
+      hasFocus.mockReturnValue(false);
+      const onUnseenOnLeave = vi.fn();
+      const props = { currentUserId: 'user-1', onUnseenOnLeave };
+      const { rerender, unmount } = render(<MessageList messages={rows} {...props} />);
+      rerender(<MessageList messages={[...rows, arrival('a1'), arrival('a2')]} {...props} />); // one update, fits
+      expect(getList().scrollTop).toBe(1200);
+      unmount();
+      expect(onUnseenOnLeave).toHaveBeenCalledWith(2);
+    });
+
+    it('stands on the earliest unseen row, not the batch, when a later batch overflows while unfocused', () => {
+      hasFocus.mockReturnValue(false);
+      const onLatestLeft = vi.fn();
+      const props = { currentUserId: 'user-1', onLatestLeft };
+      const { rerender } = render(<MessageList messages={rows} {...props} />);
+      rerender(<MessageList messages={[...rows, arrival('a1')]} {...props} />); // a1 shown, unseen
+      const batch = ['a2', 'a3', 'a4', 'a5', 'a6'].map((id) => arrival(id));
+      rerender(<MessageList messages={[...rows, arrival('a1'), ...batch]} {...props} />);
+      // a1 is row 10, at 1000px; the batch alone would have landed at 1100.
+      expect(getList().scrollTop).toBe(1000);
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', { name: /return to latest/i })).toHaveTextContent('4');
+    });
+
+    it('does not fire for an edit of the latest row', () => {
+      const onLatestSeen = vi.fn();
+      const { rerender } = render(
+        <MessageList messages={[mockMessage]} currentUserId="user-1" onLatestSeen={onLatestSeen} />
+      );
+      rerender(
+        <MessageList
+          messages={[mockMessage, arrival()]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      rerender(
+        <MessageList
+          messages={[mockMessage, { ...arrival(), content: 'edited' }]}
+          currentUserId="user-1"
+          onLatestSeen={onLatestSeen}
+        />
+      );
+      expect(onLatestSeen).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fire on a scroll at the bottom, or on Return to Latest, with nothing pending', () => {
+      const onLatestSeen = vi.fn();
+      render(<MessageList messages={rows} currentUserId="user-1" onLatestSeen={onLatestSeen} />);
+      const list = getList();
+      Object.defineProperty(list, 'scrollTo', {
+        configurable: true,
+        value: vi.fn((options: ScrollToOptions) => {
+          list.scrollTop = options.top ?? list.scrollTop;
+        }),
+      });
+      list.scrollTop = 800;
+      fireEvent.scroll(list); // at the bottom, nothing arrived
+      list.scrollTop = 100;
+      fireEvent.scroll(list); // up: the button appears with no count
+      fireEvent.click(screen.getByRole('button', { name: /return to latest/i }));
+      expect(onLatestSeen).not.toHaveBeenCalled();
+    });
+
+    it('fires onLatestLeft when the list unmounts, so an owner that stays mounted flushes', () => {
+      const onLatestLeft = vi.fn();
+      const { unmount } = render(
+        <MessageList messages={rows} currentUserId="user-1" onLatestLeft={onLatestLeft} />
+      );
+      expect(onLatestLeft).not.toHaveBeenCalled();
+      unmount();
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
+    });
+
+    it('fires onLatestLeft once when the user scrolls up from the bottom', () => {
+      const onLatestLeft = vi.fn();
+      render(<MessageList messages={rows} currentUserId="user-1" onLatestLeft={onLatestLeft} />);
+      const list = getList();
+      list.scrollTop = 800;
+      fireEvent.scroll(list); // still following
+      expect(onLatestLeft).not.toHaveBeenCalled();
+      list.scrollTop = 300;
+      fireEvent.scroll(list); // left the latest message
+      list.scrollTop = 100;
+      fireEvent.scroll(list); // further up: already left
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
+      list.scrollTop = 800;
+      fireEvent.scroll(list); // back to the bottom is not a leave
+      expect(onLatestLeft).toHaveBeenCalledTimes(1);
     });
   });
 

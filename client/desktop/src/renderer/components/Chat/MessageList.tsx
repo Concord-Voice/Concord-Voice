@@ -12,6 +12,7 @@ import Message from './Message';
 import { CallEventMessage } from '../DirectMessages/CallEventMessage';
 import { useChannelScrollStore, type ScrollAnchor } from '../../stores/chat/channelScrollStore';
 import { useDMStore } from '../../stores/chat/dmStore';
+import { useUnreadStore } from '../../stores/chat/unreadStore';
 import './MessageList.css';
 
 export interface MessageListProps {
@@ -25,6 +26,20 @@ export interface MessageListProps {
   onEditMessage?: (messageId: string, newContent: string) => void;
   onDeleteMessage?: (messageId: string) => void;
   onUnseenOnLeave?: (count: number) => void;
+  /**
+   * Called when the user has demonstrably seen the latest message: another
+   * user's message arrives while already at the bottom with the tab visible,
+   * or the user reaches the bottom (scroll or Return to Latest) with unseen
+   * messages pending. Wire to `useReadMarker`'s `markSeen` — this prop only
+   * signals "seen", it does not itself post anything.
+   */
+  onLatestSeen?: () => void;
+  /**
+   * Fires when the list stops following the latest message (the user scrolls
+   * up from the bottom). The parent flushes its pending read marker here, so
+   * the server's stamp lands before anything arrives unseen.
+   */
+  onLatestLeft?: () => void;
   onReply?: (message: MessageWithStatus) => void;
   onPinToggle?: (message: MessageWithStatus) => void;
   canPin?: boolean;
@@ -37,7 +52,10 @@ export interface MessageListProps {
    * threshold) and restored on mount from channelScrollStore. Both callers
    * key the component by this id, so a change remounts it; a key change on a
    * surviving instance is handled the same way (the old key's anchor is
-   * saved, the new key lands fresh).
+   * saved, the new key lands fresh). It is also the key under which the
+   * thread's unread count is read — once, at mount — so on a surviving
+   * instance a new key would land with the old key's count; acceptable only
+   * because both callers remount.
    */
   persistenceKey?: string;
 }
@@ -92,6 +110,123 @@ function alignRowToTop(list: HTMLElement, row: HTMLElement, offset: number): voi
   list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top + offset;
 }
 
+/** Rule 2's probe: stand on `row` only if the rows below it overflow the
+ *  viewport. If they fit, reading from the bottom covers them, so the list
+ *  is pinned there instead. Returns whether the list now stands on the row. */
+function standOnUnread(list: HTMLElement, row: HTMLElement): boolean {
+  alignRowToTop(list, row, 0);
+  if (!isNearBottom(list)) return true;
+  list.scrollTop = list.scrollHeight;
+  return false;
+}
+
+/** How many of the last `unread` others' rows still sit below the viewport's
+ *  bottom edge. The unread rows are always a suffix of others' rows — the
+ *  last N at open, then arrivals — so no per-row flag is needed: count others'
+ *  rows up from the bottom until one is fully in view, capped at the run. */
+function unreadBelow(
+  list: HTMLElement,
+  rows: MessageWithStatus[],
+  currentUserId: string,
+  unread: number
+): number {
+  if (unread <= 0) return 0;
+  const own = new Set(rows.filter((m) => m.user_id === currentUserId).map((m) => m.id));
+  const listBottom = list.getBoundingClientRect().bottom;
+  const domRows = list.querySelectorAll<HTMLElement>('[data-message-id]');
+  let below = 0;
+  for (let i = domRows.length - 1; i >= 0 && below < unread; i--) {
+    const row = domRows[i];
+    if (row.getBoundingClientRect().bottom <= listBottom) break;
+    if (!own.has(row.dataset.messageId ?? '')) below++;
+  }
+  return below;
+}
+
+type LandingTarget = {
+  row: HTMLElement;
+  offset: number;
+  unread: boolean;
+  /** Rule 2 only: the count exceeded the mounted rows, so the true first
+   *  unread is on an older page. */
+  exhausted: boolean;
+};
+
+/** Where a fresh mount of a thread lands: the saved anchor when its row is
+ *  still mounted, else the first unread row when there are unread rows, else
+ *  nothing — applyLanding then pins to the latest row. */
+function resolveLandingTarget(
+  list: HTMLElement,
+  rows: MessageWithStatus[],
+  anchor: ScrollAnchor | undefined,
+  unreadOnOpen: number,
+  currentUserId: string
+): LandingTarget | null {
+  const anchorRow = anchor ? findRow(list, anchor.messageId) : null;
+  if (anchor && anchorRow) {
+    return { row: anchorRow, offset: anchor.offset, unread: false, exhausted: false };
+  }
+  // The server's count excludes the user's own messages, so walk back over
+  // others' rows only; a count larger than what is mounted stops at the
+  // topmost such row. Own rows above it are read by definition.
+  let firstUnread: MessageWithStatus | undefined;
+  let remaining = unreadOnOpen;
+  for (let i = rows.length - 1; i >= 0 && remaining > 0; i--) {
+    if (rows[i].user_id === currentUserId) continue;
+    firstUnread = rows[i];
+    remaining--;
+  }
+  const unreadRow = firstUnread ? findRow(list, firstUnread.id) : null;
+  return unreadRow ? { row: unreadRow, offset: 0, unread: true, exhausted: remaining > 0 } : null;
+}
+
+/** Move the list to its landing target. Rule 2 lands only when the unread
+ *  rows overflow the viewport; if they fit, reading from the bottom covers
+ *  them. That IS a geometry question, measured after the align — unlike rule
+ *  1, where the anchor itself says the user was above the threshold. With no
+ *  target (or a rule-2 target that fits) the list opens at the latest row.
+ *  Returns whether the list is now following, and the scrollTop before any
+ *  align: the echo skip must be armed against where the list STARTED, and
+ *  the rule-2 probe moves it. */
+function applyLanding(
+  list: HTMLElement,
+  target: LandingTarget | null
+): { following: boolean; before: number } {
+  const before = list.scrollTop;
+  if (target?.unread) return { following: !standOnUnread(list, target.row), before };
+  if (!target) {
+    list.scrollTop = list.scrollHeight;
+    return { following: true, before };
+  }
+  alignRowToTop(list, target.row, target.offset);
+  return { following: false, before };
+}
+
+/** Leaving a thread: save the topmost visible row as its anchor when the user
+ *  was above the Return to Latest threshold, otherwise clear the entry so the
+ *  next visit lands on the latest row. A detached node has no geometry to
+ *  decide from, so it writes nothing: neither a bogus anchor nor a clear that
+ *  would drop a real one. */
+function recordLeave(list: HTMLElement, key: string, following: boolean): void {
+  if (!list.isConnected) return;
+  const store = useChannelScrollStore.getState();
+  const anchor = following ? null : findTopAnchor(list);
+  if (anchor) store.saveAnchor(key, anchor);
+  else store.clearAnchor(key);
+}
+
+/** The thread's unread count as it stands when the list mounts. Read once, at
+ *  mount: ChannelList clears the channel count in a passive effect of the same
+ *  commit that mounts this list, and DMChatArea clears the DM count when the
+ *  fetch completes, so by the time rows are on screen the count is gone. */
+function readUnreadOnOpen(chatContext: ChatContextType, key: string | undefined): number {
+  if (!key) return 0;
+  if (chatContext === 'dm') {
+    return useDMStore.getState().conversations.find((c) => c.id === key)?.unreadCount ?? 0;
+  }
+  return useUnreadStore.getState().unreadCounts.get(key) ?? 0;
+}
+
 // eslint-disable-next-line @eslint-react/no-forward-ref -- forwardRef is intentional here; refactoring to prop-based ref would require updating all callers and is deferred
 const MessageList = forwardRef<MessageListHandle, MessageListProps>(
   (
@@ -106,6 +241,8 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       onEditMessage,
       onDeleteMessage,
       onUnseenOnLeave,
+      onLatestSeen,
+      onLatestLeft,
       onReply,
       onScrollToMessage,
       onPinToggle,
@@ -125,11 +262,103 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     const newMessageCountRef = useRef(0);
     const onUnseenOnLeaveRef = useRef(onUnseenOnLeave);
     onUnseenOnLeaveRef.current = onUnseenOnLeave;
+    const onLatestSeenRef = useRef(onLatestSeen);
+    onLatestSeenRef.current = onLatestSeen;
+    const onLatestLeftRef = useRef(onLatestLeft);
+    onLatestLeftRef.current = onLatestLeft;
+    // Read at landing time without joining the landing effect's deps, whose
+    // change would pair a leave with a fresh landing.
+    const loadMoreRef = useRef({ hasMore, onLoadMore, isLoading });
+    loadMoreRef.current = { hasMore, onLoadMore, isLoading };
+    // Others' messages that arrived while scrolled up — the part of the badge
+    // reported on leave. The badge itself is a position: the unread rows
+    // still below the viewport, capped at this plus the count seeded at
+    // landing, which the open-time read already covered server-side.
+    const arrivedWhileAwayRef = useRef(0);
+    const seededRef = useRef(0);
+    // Arrivals shown at the bottom while the window was hidden or unfocused:
+    // marked when both return (the regain effect below), folded into the
+    // away count if the user scrolls up first, reported on unmount — never
+    // dropped. Counted row by row (a batch adds all its other-user rows), and
+    // the first one's row is where a burst that no longer fits is landed on.
+    const unseenAtBottomRef = useRef(0);
+    const firstUnseenIdRef = useRef<string | null>(null);
+    // A thread whose fetch ended with no rows: its first live message is an
+    // arrival, not hydration. Set only when a loading cycle ends on an empty
+    // list, so a mount's initial `[]` (loading not yet begun) and the rows a
+    // fetch delivers never read as arrivals.
+    const emptyAfterLoadRef = useRef(false);
+    const prevLoadingRef = useRef(false);
+    // The ids the list held before this update: what arrived is what was not
+    // here. A page that replaced an evicted tail is all new; a deleted tail
+    // is not.
+    const prevIdsRef = useRef<Set<string>>(new Set());
+    // Whether the first loading cycle for this thread has ended. Rows that
+    // cycle appends — a remount shows cached rows first, then the fetch's
+    // newer ones — are hydration, never arrivals; later cycles (a reconnect
+    // backfill) are.
+    const hydratedRef = useRef(false);
     const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
     const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const landedKeyRef = useRef<string | null>(null);
     // scrollTop the landing left the list at, until its scroll event echoes.
     const landingScrollTopRef = useRef<number | null>(null);
+    const [unreadOnOpen] = useState(() => readUnreadOnOpen(chatContext, persistenceKey));
+    // Landing reads the rows once, so keep them in a ref rather than making the
+    // landing effect re-run (and re-save the anchor) on every message arrival.
+    const messagesRef = useRef(messages);
+    messagesRef.current = messages;
+
+    // Leaving the latest message: arrivals only "shown" while unfocused were
+    // never seen — they become unread, not lost — and the parent flushes its
+    // pending read marker so the server's stamp lands before anything
+    // arrives unseen.
+    const leaveLatest = useCallback(() => {
+      arrivedWhileAwayRef.current += unseenAtBottomRef.current;
+      unseenAtBottomRef.current = 0;
+      onLatestLeftRef.current?.();
+    }, []);
+    // The badge while not following: unread rows still below the viewport.
+    const refreshBadge = useCallback(
+      (list: HTMLElement) => {
+        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the badge is re-derived from geometry after a landing or a scroll; not a render loop
+        setNewMessageCount(
+          unreadBelow(
+            list,
+            messagesRef.current,
+            currentUserId,
+            seededRef.current + arrivedWhileAwayRef.current
+          )
+        );
+      },
+      [currentUserId]
+    );
+    // Others' rows appended at once that overflow the viewport (a reconnect
+    // backfill, a burst committed in one update): pinning would show only
+    // their tail and mark them all. Stand on the first instead, as unread at
+    // open, and count them. Returns whether the list stood.
+    const standOnAppended = useCallback(
+      (list: HTMLElement, others: MessageWithStatus[]): boolean => {
+        if (others.length === 0) return false;
+        // The earliest unseen row: one remembered from an unfocused arrival
+        // if there is one, else the first of this batch — a burst that
+        // started while unfocused must not be landed on past its start.
+        const firstId =
+          unseenAtBottomRef.current > 0 && firstUnseenIdRef.current
+            ? firstUnseenIdRef.current
+            : others[0].id;
+        const row = findRow(list, firstId);
+        if (!row || !standOnUnread(list, row)) return false;
+        isNearBottomRef.current = false;
+        leaveLatest();
+        arrivedWhileAwayRef.current += others.length;
+        refreshBadge(list);
+        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the button is re-derived from geometry when a batch overflows; not a render loop
+        setShowScrollButton(true);
+        return true;
+      },
+      [leaveLatest, refreshBadge]
+    );
 
     // Real group flag for DM call-event rendering (#1568): when this list is a
     // DM thread, look up the conversation by persistenceKey (its id) and read
@@ -185,35 +414,57 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       newMessageCountRef.current = newMessageCount;
     }, [newMessageCount]);
 
-    // On unmount, report unseen messages so the parent can set unread badges
+    // On unmount, report the messages that arrived while scrolled up so the
+    // parent can put them on the unread badge. The count seeded at landing is
+    // excluded: the open-time read already covered it server-side, and the
+    // DM parent ADDS this number to its live count.
     useEffect(() => {
       return () => {
-        if (newMessageCountRef.current > 0 && onUnseenOnLeaveRef.current) {
-          onUnseenOnLeaveRef.current(newMessageCountRef.current);
+        // Arrivals shown at the bottom while unfocused were never seen: they
+        // leave as unread too, as leaveLatest folds them on a scroll-up.
+        const unseen = arrivedWhileAwayRef.current + unseenAtBottomRef.current;
+        if (unseen > 0 && onUnseenOnLeaveRef.current) {
+          onUnseenOnLeaveRef.current(unseen);
         }
+        // The owner may stay mounted under the same key (a DM switching into
+        // its call view): whatever was seen was seen before now, and nothing
+        // arriving while the list is absent is.
+        onLatestLeftRef.current?.();
       };
     }, []);
 
     // Reading position across channel/DM switches (persistenceKey).
     //
-    // Landing runs once per key, the first time the list has rows: a saved
-    // anchor puts that message back where it was and marks the list as not
-    // following; otherwise the list opens at the latest row and follows it as
-    // media resolves. Leaving saves an anchor only when the user was above
-    // the Return to Latest threshold; from the bottom it clears the entry, so
-    // the next visit lands on the latest row. The cleanup pairs every landing
-    // with a leave, so a key change on a surviving instance, a StrictMode
-    // replay, and a list that empties and refills all land afresh.
-    // There is no pixel offset anywhere: GIF and image rows are skeletons
-    // until their bytes resolve, so a scrollTop measured after they settled
-    // lands short when replayed before they do, and pinning isNearBottom=false
-    // on top of that disabled the re-pin that would have corrected it — the
-    // recurring "soft-lock above the bottom".
+    // Landing runs once per key, the first time the list has rows, and takes
+    // the first rule that applies:
+    //   1. a saved anchor → put that message back where it was;
+    //   2. unread messages that overflow the viewport → open at the first
+    //      unread so the user reads forward, with Return to Latest offered
+    //      and the badge showing how many they have to go;
+    //   3. otherwise → the latest message, following it as media resolves.
+    // Rules 1 and 2 mark the list as not following; geometry decides only the
+    // button. Leaving saves an anchor only when the user was above the Return
+    // to Latest threshold; from the bottom it clears the entry, so the next
+    // visit lands on the latest message. The cleanup pairs every landing with
+    // a leave, so a key change on a surviving instance, a StrictMode replay,
+    // and a list that empties and refills all land afresh. There is no pixel
+    // offset anywhere: GIF and image rows are skeletons until their bytes
+    // resolve, so a scrollTop measured after they settled lands short when
+    // replayed before they do, and pinning isNearBottom=false on top of that
+    // disabled the re-pin that would have corrected it — the recurring
+    // "soft-lock above the bottom".
     //
-    // A first-unread landing was tried here and pulled: the server read marker
-    // advances only when a thread is opened, so anything that arrived while
-    // the user was viewing reads as unread after a refresh, and the landing
-    // reproduced the soft-lock on messages they had already seen.
+    // Rule 2 was tried and pulled once already: the server read marker only
+    // advanced when a thread was opened, so a message that arrived while the
+    // user was viewing came back unread after a refresh and the landing
+    // reproduced the soft-lock on rows the user had already read. onLatestSeen
+    // (wired to useReadMarker in the parent) now advances the marker while the
+    // thread stays open, so the count this rule reads is accurate again.
+    //
+    // Known ceiling: rule 2 indexes from the END of whatever rows are mounted,
+    // so a stale local cache missing the newest messages lands a few rows
+    // early — a gap the read-marker fix above does not touch, since it's about
+    // the client's row cache, not the server's count.
     const hasRows = messages.length > 0;
     useLayoutEffect(() => {
       if (!persistenceKey || !hasRows) return;
@@ -223,60 +474,139 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       if (landedKeyRef.current !== persistenceKey) {
         landedKeyRef.current = persistenceKey;
         const anchor = useChannelScrollStore.getState().getAnchor(persistenceKey);
-        const anchorRow = anchor ? findRow(list, anchor.messageId) : null;
-
-        if (anchor && anchorRow) {
-          const before = list.scrollTop;
-          alignRowToTop(list, anchorRow, anchor.offset);
-          // An anchor exists only because the user left from above the
-          // threshold, so a restore is never "following". The ref is set from
-          // that fact, not from geometry: at skeleton height the viewport can
-          // read near the bottom, and a ref derived from it re-pinned the list
-          // on the next media resize. Geometry decides only the button, here
-          // and again on every resize.
-          isNearBottomRef.current = false;
-          setShowScrollButton(!isNearBottom(list));
-          // The assignment above fires a scroll event a frame later. The
-          // handler must recognise that echo and not re-decide from whatever
-          // geometry the viewport has at that instant (siblings below the list
-          // are still settling their mount-time layout; StrictMode replays
-          // every one of them in dev). Armed only when the list moved, and
-          // never cleared here, so a StrictMode replay that lands on the same
-          // scrollTop keeps the first landing's pending echo armed. Not armed
-          // for a bottom landing: there the ref is true, and eating the first
-          // user scroll-up would keep it true.
-          if (list.scrollTop !== before) landingScrollTopRef.current = list.scrollTop;
-        } else {
-          // Explicit, not assumed: the ref survives a key change on a mounted
-          // instance and a StrictMode replay. Pin here rather than leaving it
-          // to the messages effect, whose deps do not change on a key change.
-          isNearBottomRef.current = true;
-          setShowScrollButton(false);
-          list.scrollTop = list.scrollHeight;
+        const target = resolveLandingTarget(
+          list,
+          messagesRef.current,
+          anchor,
+          unreadOnOpen,
+          currentUserId
+        );
+        const { following, before } = applyLanding(list, target);
+        // Neither rule 1 nor rule 2 is "following". The ref is set from that
+        // fact, not from geometry: at skeleton height the viewport can read
+        // near the bottom, and a ref derived from it re-pinned the list on
+        // the next media resize. Geometry decides only the button, here and
+        // again on every resize. Explicit for the bottom landing too: the ref
+        // survives a key change on a mounted instance and a StrictMode
+        // replay, and applyLanding pinned the list rather than leaving it to
+        // the messages effect, whose deps do not change on a key change.
+        isNearBottomRef.current = following;
+        setShowScrollButton(!following && !isNearBottom(list));
+        // For both rules the badge shows how many unread rows are still
+        // below the viewport, re-counted on every scroll: the open-time read
+        // already marked them read server-side, so they are not reported on
+        // leave and the badge does not survive a restart.
+        if (!following) {
+          seededRef.current = unreadOnOpen;
+          refreshBadge(list);
         }
+        // A count beyond the mounted rows means the true first unread is on
+        // an older page. Landing at the top of the loaded page assigns a
+        // scrollTop that is already 0, which fires no scroll event, so the
+        // load-more check in handleScroll would never run: request it here.
+        // The landing does not re-run when that page prepends; the user reads
+        // up from where the loaded history starts.
+        const { hasMore, onLoadMore, isLoading } = loadMoreRef.current;
+        if (target?.exhausted && hasMore && onLoadMore && !isLoading) onLoadMore();
+        // The align fires a scroll event a frame later. The handler must
+        // recognise that echo and not re-decide from whatever geometry the
+        // viewport has at that instant (siblings below the list are still
+        // settling their mount-time layout; StrictMode replays every one of
+        // them in dev). Armed only when the list moved, and never cleared
+        // here, so a StrictMode replay that lands on the same scrollTop keeps
+        // the first landing's pending echo armed. Not armed for a bottom
+        // landing: there the ref is true, and eating the first user scroll-up
+        // would keep it true.
+        if (!following && list.scrollTop !== before) landingScrollTopRef.current = list.scrollTop;
       }
 
       // Use the element captured at setup so cleanup measures the same node;
       // it is still attached when a deleted component's layout cleanup runs.
-      // A detached node has no geometry to decide from, so it writes nothing:
-      // neither a bogus anchor nor a clear that would drop a real one.
       return () => {
         landedKeyRef.current = null;
-        if (!list.isConnected) return;
-        const store = useChannelScrollStore.getState();
-        const anchor = isNearBottomRef.current ? null : findTopAnchor(list);
-        if (anchor) store.saveAnchor(persistenceKey, anchor);
-        else store.clearAnchor(persistenceKey);
+        recordLeave(list, persistenceKey, isNearBottomRef.current);
       };
-    }, [persistenceKey, hasRows]);
+    }, [persistenceKey, hasRows, unreadOnOpen, currentUserId, refreshBadge]);
+
+    // Others' rows arriving while following: seen if the window is visible
+    // AND actually being looked at (focused) — advance the read marker.
+    // Visible-but-unfocused (alt-tabbed, another desktop) is not "seen"; every
+    // row is remembered and marked when focus returns, or counted as unread
+    // if the user scrolls up or leaves first. Own rows are filtered out by the
+    // caller: the server excludes them.
+    const noteArrivalAtBottom = useCallback((others: MessageWithStatus[]) => {
+      if (others.length === 0) return;
+      if (document.visibilityState === 'visible' && document.hasFocus()) {
+        unseenAtBottomRef.current = 0;
+        onLatestSeenRef.current?.();
+      } else {
+        if (unseenAtBottomRef.current === 0) firstUnseenIdRef.current = others[0].id;
+        unseenAtBottomRef.current += others.length;
+      }
+    }, []);
+
+    // The empty list: nothing to follow, plus the bookkeeping that tells an
+    // empty thread's first live message from hydration (emptyAfterLoadRef).
+    const noteEmptyList = useCallback(() => {
+      prevLastMessageIdRef.current = null;
+      prevIdsRef.current = new Set();
+      arrivedWhileAwayRef.current = 0;
+      seededRef.current = 0;
+      if (isLoading) emptyAfterLoadRef.current = false;
+      else if (prevLoadingRef.current) {
+        emptyAfterLoadRef.current = true;
+        hydratedRef.current = true;
+      }
+      prevLoadingRef.current = isLoading;
+      // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets newMessageCount to 0 when messages list clears; not a render loop
+      setNewMessageCount(0);
+    }, [isLoading]);
+
+    // Follow the latest row: pin, clear the badge, and note an arrival from
+    // another user (seen if focused, remembered if not).
+    const followLatest = useCallback(
+      (list: HTMLElement | null, others: MessageWithStatus[]) => {
+        isNearBottomRef.current = true;
+        if (list) list.scrollTop = list.scrollHeight;
+        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: the badge clears when the list follows the latest row; not a render loop
+        setNewMessageCount(0);
+        arrivedWhileAwayRef.current = 0;
+        seededRef.current = 0;
+        // New rows (not the same row re-rendering, e.g. an edit).
+        noteArrivalAtBottom(others);
+      },
+      [noteArrivalAtBottom]
+    );
+
+    // Whether a change of the latest row is a live arrival: not during the
+    // first loading cycle for this thread (hydration), and not on the very
+    // first rows unless the thread had finished loading empty.
+    const isArrival = useCallback(
+      (lastId: string, prevId: string | null): boolean => {
+        const hydration = (isLoading || prevLoadingRef.current) && !hydratedRef.current;
+        if (hydration || lastId === prevId) return false;
+        return prevId !== null || emptyAfterLoadRef.current;
+      },
+      [isLoading]
+    );
+
+    // A key change on a surviving instance is a new thread, never an arrival:
+    // forget the previous thread's rows and loading history so the new one
+    // hydrates as a mount would. Declared before the messages effect so it
+    // runs first in the same commit.
+    useEffect(() => {
+      prevLastMessageIdRef.current = null;
+      prevIdsRef.current = new Set();
+      hydratedRef.current = false;
+      emptyAfterLoadRef.current = false;
+    }, [persistenceKey]);
 
     // Auto-scroll when messages change (new message arrives) if user is near bottom.
-    // Also track new messages arriving while the user is scrolled up.
+    // Also track new messages arriving while the user is scrolled up. Runs on
+    // a loading change too, so a fetch that ends on an empty list is seen.
     useEffect(() => {
       if (messages.length === 0) {
-        prevLastMessageIdRef.current = null;
-        // eslint-disable-next-line @eslint-react/set-state-in-effect -- intentional: resets newMessageCount to 0 when messages list clears; not a render loop
-        setNewMessageCount(0);
+        noteEmptyList();
         return;
       }
 
@@ -285,8 +615,12 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       const lastId = lastMessage.id;
       const list = listRef.current;
       const prevId = prevLastMessageIdRef.current;
-      const arrived = prevId !== null && lastId !== prevId;
-      const prevLast = arrived && list ? findRow(list, prevId) : null;
+      const arrived = isArrival(lastId, prevId);
+      const prevLast = arrived && list && prevId !== null ? findRow(list, prevId) : null;
+      // What arrived: the rows that were not here before, others' only.
+      const prevIds = prevIdsRef.current;
+      const appended = arrived ? messages.filter((m) => !prevIds.has(m.id)) : [];
+      const others = appended.filter((m) => m.user_id !== currentUserId);
 
       // Follow the latest row, or start following when a message lands while
       // the bottom was already in view: a restored anchor can sit inside the
@@ -296,16 +630,60 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       // arrival may promote geometry to following — on mount the geometry is
       // skeleton-height and the landing has decided.
       if (isNearBottomRef.current || (list && prevLast && rowNearBottom(list, prevLast))) {
-        isNearBottomRef.current = true;
-        if (list) list.scrollTop = list.scrollHeight;
-        setNewMessageCount(0);
-      } else if (arrived && lastMessage.user_id !== currentUserId) {
-        // Scrolled up and someone else's message arrived — count it.
-        setNewMessageCount((c) => c + 1);
+        if (!(list && standOnAppended(list, others))) followLatest(list, others);
+      } else if (others.length > 0) {
+        // Scrolled up and others' messages arrived — count them.
+        arrivedWhileAwayRef.current += others.length;
+        setNewMessageCount((c) => c + others.length);
       }
 
       prevLastMessageIdRef.current = lastId;
-    }, [messages, currentUserId]);
+      prevIdsRef.current = new Set(messages.map((m) => m.id));
+      if (!isLoading && prevLoadingRef.current) hydratedRef.current = true;
+      prevLoadingRef.current = isLoading;
+      emptyAfterLoadRef.current = false;
+    }, [
+      messages,
+      isLoading,
+      currentUserId,
+      isArrival,
+      noteEmptyList,
+      followLatest,
+      standOnAppended,
+    ]);
+
+    // Arrivals shown at the bottom while the window was hidden or unfocused
+    // are marked once it is both visible and focused again, if the list is
+    // still following — and only if they are still on screen. A burst that
+    // outgrows the viewport normally stands on its first row as it arrives
+    // (standOnAppended); this covers a viewport that shrank under a burst
+    // that had fitted: focus alone saw the tail, so the list stands on the
+    // first unseen row the way unread at open is (rule 2) and the badge
+    // counts what lies below.
+    useEffect(() => {
+      const onRegain = () => {
+        if (unseenAtBottomRef.current === 0 || !isNearBottomRef.current) return;
+        if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
+        const list = listRef.current;
+        const first =
+          list && firstUnseenIdRef.current ? findRow(list, firstUnseenIdRef.current) : null;
+        if (list && first && standOnUnread(list, first)) {
+          isNearBottomRef.current = false;
+          leaveLatest();
+          refreshBadge(list);
+          setShowScrollButton(true);
+          return;
+        }
+        unseenAtBottomRef.current = 0;
+        onLatestSeenRef.current?.();
+      };
+      document.addEventListener('visibilitychange', onRegain);
+      window.addEventListener('focus', onRegain);
+      return () => {
+        document.removeEventListener('visibilitychange', onRegain);
+        window.removeEventListener('focus', onRegain);
+      };
+    }, [leaveLatest, refreshBadge]);
 
     // Re-pin to bottom when the rendered content grows after initial paint
     // (e.g. a GIF embed resolves to its final size, or an image attachment's
@@ -330,16 +708,26 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         if (isNearBottomRef.current) {
           list.scrollTop = list.scrollHeight;
         } else {
+          // Layout moved under a still viewport: the button and the badge
+          // are both geometry, so both are re-derived.
           setShowScrollButton(!isNearBottom(list));
+          refreshBadge(list);
         }
       });
       observer.observe(content);
       observer.observe(list);
       return () => observer.disconnect();
-    }, [messages.length]);
+    }, [messages.length, refreshBadge]);
 
     const scrollToBottom = useCallback((smooth = true) => {
+      // Reaching the bottom with unseen messages pending counts as reading
+      // them, whoever they're from — the count only ever holds others' messages.
+      if (newMessageCountRef.current > 0) {
+        onLatestSeenRef.current?.();
+      }
       setNewMessageCount(0);
+      arrivedWhileAwayRef.current = 0;
+      seededRef.current = 0;
       setShowScrollButton(false);
       isNearBottomRef.current = true;
       if (listRef.current) {
@@ -373,17 +761,28 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         if (echo) return;
       }
 
+      const wasFollowing = isNearBottomRef.current;
       isNearBottomRef.current = isNearBottom(list);
 
       if (isNearBottomRef.current) {
+        // Scrolling down into unseen messages counts as reading them, same
+        // as Return to Latest — the count only ever holds others' messages.
+        if (newMessageCountRef.current > 0) {
+          onLatestSeenRef.current?.();
+        }
         setNewMessageCount(0);
+        arrivedWhileAwayRef.current = 0;
+        seededRef.current = 0;
+      } else {
+        if (wasFollowing) leaveLatest();
+        refreshBadge(list);
       }
 
       const shouldShow = !isNearBottomRef.current;
       if (shouldShow !== showScrollButton) {
         setShowScrollButton(shouldShow);
       }
-    }, [hasMore, onLoadMore, isLoading, showScrollButton]);
+    }, [hasMore, onLoadMore, isLoading, showScrollButton, leaveLatest, refreshBadge]);
 
     const shouldShowAvatar = (index: number): boolean => {
       if (index === 0) return true;

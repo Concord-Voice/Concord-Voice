@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '../../../test-utils';
+import { render, screen, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
@@ -216,6 +216,34 @@ describe('VoiceTextChat', () => {
 
   // ── Layout toggle ────────────────────────────────────────────────────────
 
+  it('advances the read marker for the linked channel when the list reports the latest seen', async () => {
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
+    useChannelStore.setState({ channels: [linkedTextChannel] });
+    useUserStore.setState({ user: { id: 'me', username: 'me' } } as never);
+    render(<VoiceTextChat />);
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        (capturedMessageListProps.onLatestSeen as () => void)();
+      });
+      expect(apiFetch).not.toHaveBeenCalledWith(
+        expect.stringContaining('/read'),
+        expect.anything()
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(apiFetch).toHaveBeenCalledWith(
+        '/api/v1/channels/text-1/read',
+        expect.objectContaining({ method: 'POST' })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('renders layout toggle button', () => {
     useVoiceStore.setState({
       activeChannelId: VOICE_CHANNEL_ID,
@@ -343,6 +371,23 @@ describe('VoiceTextChat — DM call', () => {
   it('still exposes the layout toggle in DM mode', () => {
     render(<VoiceTextChat />);
     expect(screen.getByTitle(/Switch to (side|bottom) layout/)).toBeInTheDocument();
+  });
+
+  it('flushes the DM read marker at once when the list stops following', async () => {
+    const { apiFetch } = await import('@/renderer/services/system/apiClient');
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    render(<VoiceTextChat />);
+    act(() => {
+      (capturedMessageListProps.onLatestSeen as () => void)();
+    });
+    expect(apiFetch).not.toHaveBeenCalledWith(expect.stringContaining('/read'), expect.anything());
+    act(() => {
+      (capturedMessageListProps.onLatestLeft as () => void)();
+    });
+    expect(apiFetch).toHaveBeenCalledWith(
+      '/api/v1/dm/conversations/dm-1/read',
+      expect.objectContaining({ method: 'POST' })
+    );
   });
 
   it('shows the DM empty state when the conversation id is missing', () => {

@@ -12,7 +12,9 @@ import { useChannelSubscription } from '../../hooks/messaging/useChannelSubscrip
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useMessageFetch } from '../../hooks/messaging/useMessageFetch';
 import { useChatController } from '../../hooks/messaging/useChatController';
+import { useReadMarker } from '../../hooks/messaging/useReadMarker';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
+import { apiFetch } from '../../services/system/apiClient';
 import { useServerStore } from '../../stores/chat/serverStore';
 import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { isChannelMuted } from '../../stores/ui/notificationPrefsStore';
@@ -145,6 +147,25 @@ const ChatView: React.FC = () => {
     },
     [activeChannelId]
   );
+
+  // Advance the read marker while the channel stays open (#2006), so a
+  // message read as it arrives doesn't come back as unread after a refresh —
+  // the open-time POST (ChannelList's effect on activeChannelId) only covers
+  // the "just switched in" read. Debounced server-side; the local badge
+  // clears immediately. A non-2xx is rejected so the hook logs it: a 429
+  // from the 30/min route limit must not read as success.
+  const { markSeen, flush: flushSeen } = useReadMarker(async () => {
+    if (!activeChannelId) return;
+    const res = await apiFetch(`/api/v1/channels/${activeChannelId}/read`, { method: 'POST' });
+    if (!res.ok) throw new Error(`read marker rejected: HTTP ${res.status}`);
+  }, activeChannelId);
+  const handleLatestSeen = useCallback(() => {
+    if (!activeChannelId) return;
+    if ((useUnreadStore.getState().unreadCounts.get(activeChannelId) ?? 0) > 0) {
+      useUnreadStore.getState().clearUnread(activeChannelId);
+    }
+    markSeen();
+  }, [activeChannelId, markSeen]);
 
   // Scroll handling
   const messageListRef = useRef<MessageListHandle>(null);
@@ -367,6 +388,8 @@ const ChatView: React.FC = () => {
           onEditMessage={editMessage}
           onDeleteMessage={deleteMessage}
           onUnseenOnLeave={handleUnseenOnLeave}
+          onLatestSeen={handleLatestSeen}
+          onLatestLeft={flushSeen}
           onReply={handleReply}
           onScrollToMessage={handleScrollToMessage}
           onPinToggle={handlePinToggle}

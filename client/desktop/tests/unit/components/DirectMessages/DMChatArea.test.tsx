@@ -29,6 +29,7 @@ vi.mock('@/renderer/components/Chat/MessageList', () => ({
     onEditMessage?: (id: string, content: string) => void;
     onDeleteMessage?: (id: string) => void;
     onUnseenOnLeave?: (count: number) => void;
+    onLatestSeen?: () => void;
     onReply?: (message: unknown) => void;
     onPinToggle?: (message: unknown) => void;
     canPin?: boolean;
@@ -59,6 +60,12 @@ vi.mock('@/renderer/components/Chat/MessageList', () => ({
         </button>
         <button data-testid="trigger-unseen-zero" onClick={() => props.onUnseenOnLeave?.(0)}>
           Unseen
+        </button>
+        <button data-testid="trigger-latest-seen" onClick={() => props.onLatestSeen?.()}>
+          latest seen
+        </button>
+        <button data-testid="trigger-latest-left" onClick={() => props.onLatestLeft?.()}>
+          left
         </button>
       </div>
     );
@@ -1232,6 +1239,222 @@ describe('DMChatArea', () => {
     render(<DMChatArea selectedThreadId="conv-1" />);
     fireEvent.click(screen.getByTestId('trigger-unseen-zero'));
     expect(useDMStore.getState().conversations[0].unreadCount).toBe(2);
+  });
+
+  // --- onLatestSeen (read marker while viewing, #2006) ---
+
+  it('advances the read marker via useReadMarker when onLatestSeen fires', async () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+
+    // Let the open-time read (handleFetchComplete) land first so it isn't
+    // mistaken for the debounced post under test.
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/dm/conversations/conv-1/read'),
+        expect.objectContaining({ method: 'POST' })
+      );
+    });
+    mockApiFetch.mockClear();
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+      expect(mockApiFetch).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/dm/conversations/conv-1/read',
+        expect.objectContaining({ method: 'POST' })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes the pending read marker at once when onLatestLeft fires', async () => {
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/dm/conversations/conv-1/read'),
+        expect.objectContaining({ method: 'POST' })
+      );
+    });
+    mockApiFetch.mockClear();
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+      expect(mockApiFetch).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId('trigger-latest-left'));
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/v1/dm/conversations/conv-1/read',
+        expect.objectContaining({ method: 'POST' })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('logs a non-2xx read marker response instead of treating it as success', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let readCalls = 0;
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        readCalls += 1;
+        // The open-time read succeeds; the debounced marker is rate limited.
+        return Promise.resolve({
+          ok: readCalls === 1,
+          status: readCalls === 1 ? 200 : 429,
+          json: async () => ({}),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(readCalls).toBe(1));
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(consoleSpy).toHaveBeenCalledWith(
+        '[useReadMarker] Failed to post read marker:',
+        'read marker rejected: HTTP 429'
+      );
+    } finally {
+      vi.useRealTimers();
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it('does not restore the open-time count when a later read marker already succeeded', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let rejectOpenRead: (e: Error) => void = () => {};
+    let readCalls = 0;
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        readCalls += 1;
+        // The open-time read hangs and fails late; the live marker succeeds first.
+        if (readCalls === 1) {
+          return new Promise((_resolve, reject) => {
+            rejectOpenRead = reject;
+          });
+        }
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 5 })],
+      clearUnread: (id: string) => useDMStore.getState().updateConversation(id, { unreadCount: 0 }),
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(useDMStore.getState().conversations[0].unreadCount).toBe(0));
+    await waitFor(() => expect(readCalls).toBe(1));
+
+    fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('trigger-latest-left')); // flush: the live marker posts and succeeds
+    });
+    expect(readCalls).toBe(2);
+    await act(async () => {
+      rejectOpenRead(new Error('boom')); // the open-time read fails only now
+    });
+    // The server is current as of the live marker; nothing is owed locally.
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    consoleSpy.mockRestore();
+  });
+
+  it('posts the open-time read once per thread, not again on a reconnect refetch', async () => {
+    let readCalls = 0;
+    let messageFetches = 0;
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        readCalls += 1;
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+      }
+      if (url.includes('/messages')) messageFetches += 1;
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(readCalls).toBe(1));
+    const fetchesBefore = messageFetches;
+    await act(async () => {
+      globalThis.dispatchEvent(new Event('connection-recovered'));
+    });
+    await waitFor(() => expect(messageFetches).toBeGreaterThan(fetchesBefore));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(readCalls).toBe(1);
+  });
+
+  it('does not restore the open-time count when the open-time read fails while a later marker is in flight', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pending: Array<{ resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
+    mockApiFetch.mockImplementation((url: string, opts?: { method?: string }) => {
+      if (url.endsWith('/read') && opts?.method === 'POST') {
+        return new Promise((resolve, reject) => {
+          pending.push({ resolve, reject });
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 5 })],
+      clearUnread: (id: string) => useDMStore.getState().updateConversation(id, { unreadCount: 0 }),
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    await waitFor(() => expect(useDMStore.getState().conversations[0].unreadCount).toBe(0));
+    await waitFor(() => expect(pending.length).toBe(1)); // the open-time read, hanging
+
+    fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+    fireEvent.click(screen.getByTestId('trigger-latest-left')); // the live marker goes out, also hanging
+    expect(pending.length).toBe(2);
+    await act(async () => {
+      pending[0].reject(new Error('boom')); // the open-time read fails first
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    await act(async () => {
+      pending[1].resolve({ ok: true, status: 200, json: async () => ({}) });
+    });
+    expect(useDMStore.getState().conversations[0].unreadCount).toBe(0);
+    consoleSpy.mockRestore();
+  });
+
+  it('clears the local unread count when latest-seen fires with a nonzero count', () => {
+    const mockClearUnread = vi.fn();
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 3 })],
+      clearUnread: mockClearUnread,
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    mockClearUnread.mockClear();
+
+    fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+
+    expect(mockClearUnread).toHaveBeenCalledWith('conv-1');
+  });
+
+  it('does not call clearUnread again when latest-seen fires with a zero count', () => {
+    const mockClearUnread = vi.fn();
+    useDMStore.setState({
+      conversations: [makeConversation({ unreadCount: 0 })],
+      clearUnread: mockClearUnread,
+    });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    mockClearUnread.mockClear();
+
+    fireEvent.click(screen.getByTestId('trigger-latest-seen'));
+
+    expect(mockClearUnread).not.toHaveBeenCalled();
   });
 
   // --- handleTyping ---
