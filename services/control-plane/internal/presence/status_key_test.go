@@ -3,8 +3,10 @@ package presence
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,4 +57,17 @@ func (d alwaysPermitPresence) RichPresenceEmissionState(
 	// Test double: always DETERMINED, so it exercises the
 	// suppression path rather than the indeterminate one.
 	return d.RichPresenceEmissionPermitted(ctx, senderID), nil
+}
+
+// TestStatusTTLValueIsPinned pins the constant's VALUE, and nothing more.
+//
+// Be honest about its reach: it CANNOT catch a re-introduced local
+// 120*time.Second in a presence writer, which is the regression the shared
+// constant exists to prevent -- the two would simply agree. The "obeyed" half of
+// that pair is TestSweeperRenewsAnOfflineMarkerToExactlyTheSharedTTL in
+// internal/websocket, which asserts the sweeper's argument against this constant
+// rather than against a literal. A source-scanning guard over the writers would
+// close what remains; until one exists, do not read this test as covering it.
+func TestStatusTTLValueIsPinned(t *testing.T) {
+	assert.Equal(t, 120*time.Second, StatusTTL)
 }

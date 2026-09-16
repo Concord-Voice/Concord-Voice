@@ -131,6 +131,26 @@ const (
 	// watchPresenceAuthzLevel for why a watchdog that RESET the count would be
 	// strictly worse than none.
 	presenceAuthzWatchdogInterval = 30 * time.Second
+
+	// presenceSweepInterval (S) is how often the hub renews presence for users it
+	// believes are alive.
+	presenceSweepInterval = 30 * time.Second
+
+	// presenceLivenessWindow (W) is how long after a user's last inbound
+	// application frame the hub keeps renewing their presence.
+	//
+	// Effective grace is NOT W. The binding refresh is the last sweep still inside
+	// W, so expiry falls in lastInbound + [W-S+T, W+T] -- at W=T=120s, S=30s that
+	// is 210-240s, against the old deterministic 120s. That widening IS the
+	// mechanism by which this buys headroom against renderer timer throttling; it
+	// is deliberate and named, not emergent.
+	//
+	// What the extra grace costs: an unclean client disconnect is already bounded
+	// by pongWait (60s) -> readPump error -> unregister -> explicit offline write,
+	// so this does not govern that path. It governs the hub-crash / replica-loss
+	// backstop -- users appear online for up to ~4 minutes rather than ~2 after a
+	// control-plane replica dies. That is the trade being bought.
+	presenceLivenessWindow        = 120 * time.Second
 	presenceAuthzWatchdogEpisodes = 4
 )
 
@@ -225,6 +245,17 @@ type Hub struct {
 
 	// User ID to client IDs mapping (for multi-device support)
 	userClients map[uuid.UUID]map[uuid.UUID]bool
+
+	// lastInboundAt is the wall time of each user's most recent inbound
+	// APPLICATION frame, and is the presence sweeper's evidence that a renderer
+	// is alive and producing work.
+	//
+	// Deliberately NOT socket liveness. A protocol pong is emitted by Chromium's
+	// network service without any renderer JavaScript, so a wedged renderer pongs
+	// indefinitely; keying presence on that would report a dead client as online
+	// forever. Written under h.mu by noteInboundApplicationFrame (from the Run
+	// goroutine's dispatch) and read under h.mu.RLock by the sweeper.
+	lastInboundAt map[uuid.UUID]time.Time
 
 	// Hub-local fail-closed presence for connected users. Values are the status
 	// visible to the user themselves (invisible or offline); every other viewer
@@ -480,6 +511,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		redis:                    redisClient,
 		clients:                  make(map[uuid.UUID]*Client),
 		userClients:              make(map[uuid.UUID]map[uuid.UUID]bool),
+		lastInboundAt:            make(map[uuid.UUID]time.Time),
 		hiddenPresence:           make(map[uuid.UUID]string),
 		presenceRecovery:         make(map[uuid.UUID]presenceRecoveryState),
 		channelSubscriptions:     make(map[uuid.UUID]map[uuid.UUID]bool),
@@ -861,6 +893,7 @@ func (h *Hub) Run() {
 	// Log-only, exits on h.done. Started here rather than in NewHub so a
 	// struct-literal test hub never spawns one (#2992).
 	go h.watchPresenceAuthzLevel()
+	go h.runPresenceLivenessSweeper()
 	for {
 		// nil channel is never selected; active only when a debounce timer is pending
 		var onlineCountC <-chan time.Time
@@ -1045,7 +1078,7 @@ func (h *Hub) handleRegister(client *Client) {
 	if isFirstConnection {
 		ctx := context.Background()
 		recovery := presenceRecoveryState{status: statusOnline}
-		if err := h.redis.Set(ctx, presence.StatusRedisKey(client.UserID), statusOnline, 120*time.Second).Err(); err != nil {
+		if err := h.redis.Set(ctx, presence.StatusRedisKey(client.UserID), statusOnline, presence.StatusTTL).Err(); err != nil {
 			log.Printf("[hub] failed to persist initial presence for user %s: %v", sanitizeLogValue(client.UserID.String()), err)
 			recovery.pending = true
 			h.setPresenceRecovery(client.UserID, recovery)
@@ -1338,7 +1371,7 @@ func (h *Hub) transitionUserOffline(ctx context.Context, userID uuid.UUID, allow
 	offlinePersisted := false
 	if h.redis == nil {
 		log.Printf("[hub] presence Redis client unavailable while taking user %s offline", sanitizeLogValue(userID.String()))
-	} else if err := h.redis.Set(ctx, presence.StatusRedisKey(userID), statusOffline, 120*time.Second).Err(); err != nil {
+	} else if err := h.redis.Set(ctx, presence.StatusRedisKey(userID), statusOffline, presence.StatusTTL).Err(); err != nil {
 		log.Printf("[hub] failed to persist offline presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 	} else {
 		offlinePersisted = true
@@ -1411,9 +1444,52 @@ func (h *Hub) removeUserClient(client *Client) bool {
 	if len(userClients) == 0 {
 		delete(h.userClients, client.UserID)
 		delete(h.usernames, client.UserID)
+		// Liveness dies with the user's LAST connection, or the map accumulates
+		// one entry per user ever seen for the life of the process. Inline because
+		// this runs under h.mu.Lock(): a helper taking the same non-reentrant mutex
+		// would deadlock every disconnect, which is why no such helper exists.
+		delete(h.lastInboundAt, client.UserID)
 		return true
 	}
 	return false
+}
+
+// noteInboundApplicationFrame records that a REGISTERED user produced a
+// JSON-parseable application frame.
+//
+// Called from handleIncoming -- i.e. AFTER json.Unmarshal has succeeded in
+// readPump, which `continue`s past malformed frames before they ever reach the
+// hub. That placement is the point: a client spamming unparseable frames must not
+// sustain its own presence. Scope the claim precisely, though: an unknown
+// msg.Type and a frame the per-handler rate limiter later refuses both still
+// count, because both prove a renderer serialized and sent well-formed JSON.
+//
+// The registration gate is load-bearing, not defensive. h.incoming is buffered
+// (256) while h.unregister is not, and both are arms of one select in Run, so
+// frames can still be queued when the unregister arm wins; forced disconnects
+// (handleDisconnectUser / handleDisconnectSession) likewise call handleUnregister
+// directly while readPump is still enqueueing. An ungated record would re-add the
+// entry AFTER removeUserClient's inline delete, and readPump's own later
+// unregister returns early at handleUnregister's !exists -- so nothing would
+// remove it a second time and the map would grow for the life of the process.
+//
+// That is not merely a leak. While an orphaned entry survives, the sweeper
+// EXPIREs the key of a user with ZERO connections. Against an offline marker
+// that is the documented no-op -- but transitionUserOffline logs and continues
+// when its SET fails, leaving a VISIBLE status in Redis, and the sweeper would
+// then extend that status's life from a deterministic <=StatusTTL to ~240s.
+// resolveVisibleStatus consults Redis alone and never connectivity, so that is
+// user-visible: a departed user reads online for four minutes instead of two.
+func (h *Hub) noteInboundApplicationFrame(userID uuid.UUID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, registered := h.userClients[userID]; !registered {
+		return
+	}
+	if h.lastInboundAt == nil {
+		h.lastInboundAt = make(map[uuid.UUID]time.Time)
+	}
+	h.lastInboundAt[userID] = time.Now()
 }
 
 func (h *Hub) removeClientSubscriptions(client *Client) {
@@ -1441,6 +1517,12 @@ func (h *Hub) removeFromSubscriptionMap(m map[uuid.UUID]map[uuid.UUID]bool, key,
 
 // handleIncoming processes incoming messages from clients
 func (h *Hub) handleIncoming(msg IncomingMessage) {
+	// Recorded before the switch so it counts every application frame, not only a
+	// heartbeat -- a client actively chatting is self-evidently alive. msg.UserID
+	// is server-assigned in readPump from the authenticated connection, so a
+	// client cannot address another user's record.
+	h.noteInboundApplicationFrame(msg.UserID)
+
 	switch msg.Type {
 	case "subscribe":
 		h.handleSubscribe(msg)
@@ -3260,7 +3342,7 @@ func (h *Hub) handleVisiblePresenceHeartbeat(ctx context.Context, key string, us
 	}
 	if selfStatus == statusInvisible {
 		h.clearPresenceRecovery(userID)
-		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
+		if err := h.redis.Set(ctx, key, statusInvisible, presence.StatusTTL).Err(); err != nil {
 			log.Printf("[hub] failed to repair invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		}
 		return
@@ -3295,7 +3377,7 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 	}
 	if hidden && selfStatus == statusInvisible {
 		h.clearPresenceRecovery(userID)
-		if err := h.redis.Set(ctx, key, statusInvisible, 120*time.Second).Err(); err != nil {
+		if err := h.redis.Set(ctx, key, statusInvisible, presence.StatusTTL).Err(); err != nil {
 			log.Printf("[hub] failed to restore invisible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		}
 		return
@@ -3303,7 +3385,7 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 	if !canRestore {
 		return
 	}
-	if err := h.redis.Set(ctx, key, recovery.status, 120*time.Second).Err(); err != nil {
+	if err := h.redis.Set(ctx, key, recovery.status, presence.StatusTTL).Err(); err != nil {
 		log.Printf("[hub] failed to restore visible presence for user %s: %v", sanitizeLogValue(userID.String()), err)
 		if !hidden {
 			h.failClosedPresenceHeartbeat(userID)
@@ -3321,7 +3403,7 @@ func (h *Hub) handleMissingPresenceHeartbeat(ctx context.Context, key string, us
 }
 
 func (h *Hub) refreshPresenceTTL(ctx context.Context, key string, userID uuid.UUID) bool {
-	refreshed, err := h.redis.Expire(ctx, key, 120*time.Second).Result()
+	refreshed, err := h.redis.Expire(ctx, key, presence.StatusTTL).Result()
 	if err != nil {
 		log.Printf("[hub] failed to refresh presence TTL for user %s: %v", sanitizeLogValue(userID.String()), err)
 		return false
@@ -3382,7 +3464,7 @@ func (h *Hub) handleSetStatus(msg IncomingMessage) {
 	if status == statusInvisible {
 		_, wasHidden = h.hiddenPresence[msg.UserID]
 	}
-	if err := h.redis.Set(ctx, key, status, 120*time.Second).Err(); err != nil {
+	if err := h.redis.Set(ctx, key, status, presence.StatusTTL).Err(); err != nil {
 		h.handleSetStatusWriteFailure(msg, status, err)
 		return
 	}
@@ -5011,6 +5093,112 @@ func (h *Hub) watchPresenceAuthzLevel() {
 					presenceAuthzWatchdogInterval*(presenceAuthzWatchdogEpisodes-1),
 					"presence_authz_fence_held")
 			}
+		}
+	}
+}
+
+// sweepPresenceLiveness renews base presence for every user whose renderer has
+// produced a valid application frame within presenceLivenessWindow.
+//
+// EXPIRE-ONLY, PERMANENTLY. It may never SET. Two independent reasons, and the
+// second is the one that is easy to miss:
+//
+//   - EXPIRE cannot create a key, cannot change a status and cannot resurrect a
+//     lapsed presence. That is what makes the snapshot-vs-unregister race benign:
+//     a user who disconnects between the snapshot and the pipeline gets an EXPIRE
+//     against a key their unregister already rewrote or deleted, which is a no-op
+//     or a harmless same-value renewal. Relax this to SET and that race becomes a
+//     presence-RESURRECTION bug -- the hub would announce a departed user online.
+//   - cleanupStalePresence (cmd/server/main.go) reaps any presence:* key whose
+//     PTTL is -1. EXPIRE always installs a TTL, so a key this sweeper touches is
+//     never a reap candidate. A SET-based sweeper would be one bug away from
+//     feeding the reaper instead.
+//
+// Renewing to presence.StatusTTL is NOT an exact no-op for a key another path
+// just wrote -- EXPIRE restarts the countdown from now. It is safe because EXPIRE
+// cannot change the stored VALUE, and because the registration gate in
+// noteInboundApplicationFrame bounds this sweeper's reach into a departing user's
+// key to a single snapshot-to-pipeline round trip. Do not give the sweeper its
+// own TTL: a larger one would have neither bound.
+//
+// The snapshot copies a map and does nothing else: h.mu is shared with the
+// off-Run activity-bootstrap readers, so any work held under it lands on their
+// critical path every S.
+func (h *Hub) sweepPresenceLiveness(ctx context.Context) {
+	cutoff := time.Now().Add(-presenceLivenessWindow)
+
+	h.mu.RLock()
+	live := make([]uuid.UUID, 0, len(h.lastInboundAt))
+	for userID, at := range h.lastInboundAt {
+		if at.After(cutoff) {
+			live = append(live, userID)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(live) == 0 {
+		return
+	}
+	if h.redis == nil {
+		// Same guard every other presence path carries (transitionUserOffline,
+		// activity_bootstrap, richpresence). This runs on its own goroutine with
+		// no recover, so a nil deref here takes the whole control plane down.
+		log.Printf("[hub] presence Redis client unavailable; skipping liveness sweep for %d user(s)", len(live))
+		return
+	}
+
+	pipe := h.redis.Pipeline()
+	for _, userID := range live {
+		// presence.StatusRedisKey, never a local fmt.Sprintf: isBasePresenceKey in
+		// cmd/server is an allowlist pinned to this exact spelling, and a second
+		// speller would silently diverge from the reaper.
+		pipe.Expire(ctx, presence.StatusRedisKey(userID), presence.StatusTTL)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		// No user identifier: this is a fleet-wide condition, and naming a
+		// participant in a presence log line is a privacy leak on a privacy path.
+		// The count is what an operator can act on.
+		//
+		// len(live) is the TRUE failure count here, not an upper bound. A pipeline
+		// can report a partial failure in general, but not this one: h.redis is a
+		// single-node *redis.Client (never a cluster, so no per-key MOVED), and
+		// EXPIRE has no per-key error path — it carries no denyoom flag, and a
+		// missing key is `false`, not an error. So these EXPIREs fail at the
+		// connection level or not at all. Raised and rejected in review on #3328;
+		// do not re-raise without a reachable partial-failure case.
+		log.Printf("[hub] presence liveness sweep failed for %d user(s): %v", len(live), err)
+	}
+}
+
+// runPresenceLivenessSweeper owns the sweep cadence. Patterned on
+// watchPresenceAuthzLevel: one ticker, stopped on defer, exits on h.done.
+// presenceSweepTickInterval is presenceSweepInterval, indirected so a test can
+// drive the loop without waiting 30 s for a tick. Reassigned ONLY from _test.go.
+// The sweep's own deadline is derived from it too, so the invariant a test
+// exercises is the same one production runs: a sweep never outlives its cadence.
+var presenceSweepTickInterval = presenceSweepInterval
+
+func (h *Hub) runPresenceLivenessSweeper() {
+	ticker := time.NewTicker(presenceSweepTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-ticker.C:
+			// Bound the sweep to its own cadence. database.NewRedisClient sets
+			// ContextTimeoutEnabled, so the context IS the socket deadline here —
+			// context.Background() opts out of the mechanism this codebase
+			// deliberately turned on and falls back to ParseURL's default
+			// read_timeout, which REDIS_URL can widen from outside the binary.
+			// A sweep that outlives its interval holds back every presence renewal
+			// on this replica, and the grace budget absorbs one missed sweep, not two.
+			//
+			// cancel() per iteration, never deferred: a defer in this infinite loop
+			// would not fire until the hub shuts down.
+			ctx, cancel := context.WithTimeout(context.Background(), presenceSweepTickInterval)
+			h.sweepPresenceLiveness(ctx)
+			cancel()
 		}
 	}
 }

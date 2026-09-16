@@ -57,15 +57,22 @@ WebSocket connections use **ticket-based authentication**:
 4. **Confirmation** - Server sends `connected` message with client/user IDs
 5. **Subscribe** - Client subscribes to channels
 6. **Messaging** - Bidirectional message exchange
-7. **Heartbeat** - Two layers, both required:
+7. **Heartbeat** - Three layers:
    - WS protocol ping/pong every 54 seconds (dead-connection detection via the
      60s read deadline).
-   - Application-level `heartbeat` (client, every 30s) answered with a
-     `heartbeat_ack` DATA frame (server). The ack exists because the
-     Cloudflare edge in front of `api.concordvoice.chat` does not reliably
-     count protocol control frames against its ~100s idle tracking — without
-     origin→client *data* traffic, quiet connections were abruptly closed
-     (client-observed close code 1006) every few minutes.
+   - **Unsolicited `heartbeat_ack` DATA frame (server)**, emitted on that same
+     54s tick whenever nothing else has been written to the socket since the
+     previous tick. This is what keeps the Cloudflare edge in front of
+     `api.concordvoice.chat` from closing a quiet connection: it does not
+     reliably count protocol control frames against its ~100s idle tracking —
+     without origin→client *data* traffic, quiet connections were abruptly
+     closed (client-observed close code 1006) every few minutes. Server-owned
+     since #3328, because the client timer that used to carry this deadline is a
+     renderer `setInterval` that Electron throttles when the window is hidden.
+   - Application-level `heartbeat` (client, every 30s), still answered with a
+     `heartbeat_ack`. On a healthy socket that echo is now redundant with the
+     unsolicited tick, and it is deliberately RETAINED — see Heartbeat Mechanism
+     for why it may not be deleted.
 8. **Disconnect** - Client closes connection or timeout
 9. **Unregister** - Client removed from Hub and all subscriptions
 
@@ -121,7 +128,12 @@ under [Protocol Version 2 — Connection-Ready Barrier](#protocol-version-2--con
 }
 ```
 
-#### Heartbeat (presence TTL refresh + keepalive)
+#### Heartbeat (inbound liveness signal)
+
+Sent by the client every 30s. Since #3328 it does NOT itself refresh the Redis
+presence TTL — the server owns that. It counts as one inbound APPLICATION frame,
+which is the evidence `Hub.sweepPresenceLiveness` uses to renew an EXISTING
+`presence:<uuid>` key. See Heartbeat Mechanism.
 ```json
 {
   "type": "heartbeat",
@@ -209,17 +221,21 @@ connection this user holds. The client sends no fields.
 
 ### Server -> Client (Outgoing)
 
-#### Heartbeat Ack (keepalive echo)
+#### Heartbeat Ack (keepalive)
 ```json
 {
   "type": "heartbeat_ack",
   "data": {}
 }
 ```
-Constant frame (`heartbeatAckFrame` in `messages.go`) echoed for every client
-`heartbeat` so proxies see origin→client application traffic at the 30s
-heartbeat cadence — see Connection Lifecycle step 7. Keep in sync with
-`HeartbeatAckSchema` in `client/desktop/src/renderer/types/ws-events.ts`.
+Constant frame (`heartbeatAckFrame` in `messages.go`), sent TWO ways: unsolicited
+on `writePump`'s 54s tick whenever the socket has been idle since the previous
+tick, and as an echo answering each client `heartbeat`. The unsolicited form is
+the one that actually guarantees origin→client application traffic, because the
+echo depends on a throttleable renderer timer — see Connection Lifecycle step 7.
+Envelope-only and deliberately consumer-less. Keep in sync with
+`HeartbeatAckSchema` in `client/desktop/src/renderer/types/ws-events.ts`, which
+records that the frame MUST NOT be used as a liveness or RTT signal.
 
 #### Connection Confirmation
 ```json
@@ -315,7 +331,7 @@ No server-side version negotiation required.
 
 ## Heartbeat Mechanism
 
-Two independent layers (see Connection Lifecycle step 7):
+Three layers (see Connection Lifecycle step 7):
 
 **1. WS protocol ping/pong** — dead-connection detection.
 
@@ -326,16 +342,48 @@ Two independent layers (see Connection Lifecycle step 7):
 
 If a client fails to respond to a ping within 60 seconds, the hub closes the connection.
 
-**2. Application-level `heartbeat` / `heartbeat_ack`** — proxy keepalive.
+**2. Unsolicited `heartbeat_ack`** — proxy keepalive, server-owned.
 
-The client sends a `heartbeat` DATA frame every 30 seconds (it also refreshes
-Redis presence TTL); the hub answers each one with a constant `heartbeat_ack`
-DATA frame (`heartbeatAckFrame`). This layer exists because the Cloudflare edge
-in front of `api.concordvoice.chat` does not reliably count WS protocol control
-frames against its ~100s idle tracking — without origin→client *data* traffic,
-quiet connections were abruptly closed (client-observed close code 1006) every
-few minutes. The `heartbeat_ack` guarantees origin→client application traffic at
-the 30s heartbeat cadence, well under the idle threshold.
+`writePump` emits the constant `heartbeat_ack` DATA frame (`heartbeatAckFrame`)
+on its existing 54s ticker whenever the socket has been idle since the previous
+tick. A socket already carrying traffic gets nothing, so a busy connection costs
+zero extra frames. This layer exists because the Cloudflare edge in front of
+`api.concordvoice.chat` does not reliably count WS protocol control frames
+against its ~100s idle tracking — without origin→client *data* traffic, quiet
+connections were abruptly closed (client-observed close code 1006) every few
+minutes.
+
+Before #3328 the only origin→client application traffic on an idle socket was the
+ECHO of a client heartbeat, and that heartbeat rides a renderer `setInterval`
+Electron is free to throttle to ≥60s or suspend outright. The deadline is the
+server's, so the server now carries it.
+
+**⚠️ The solicited echo (`hub.handlePresenceIncoming`) is an ADDITION's
+counterpart, not its predecessor, and may NOT be deleted as redundant** until the
+hypothesis that the edge's idle timer is directional is actually refuted. It looks
+like dead weight on a healthy socket and is not.
+
+This frame MUST NOT be used as a liveness or RTT signal by any client. It is
+origin→client and proves nothing about whether a renderer is alive: Chromium's
+network service answers the hub's pings without renderer JS, so a wedged client
+would read as healthy indefinitely. Wiring it to presence would be
+socket-open-as-presence, which this design explicitly rejected.
+
+**3. Presence lifetime** — `Hub.sweepPresenceLiveness`, every 30s.
+
+`presence:<uuid>` is renewed by the hub, not the client. The hub records the wall
+time of each user's last inbound APPLICATION frame (recorded at `handleIncoming`,
+so a client spamming unparseable frames cannot sustain itself, and only for a
+REGISTERED user) and every 30s pipelines `EXPIRE presence:<uuid> StatusTTL` for
+users whose last frame is within 120s. It is **`EXPIRE`-only, permanently** — it
+may never `SET`, because that is what keeps the snapshot-vs-unregister race from
+becoming presence resurrection, and what keeps swept keys out of
+`cleanupStalePresence`, which reaps any `presence:*` with `PTTL == -1`.
+
+Consequence worth knowing: presence expiry moves from a deterministic 120s to a
+210–240s band (`lastInbound + [W−S+T, W+T]`). That widening IS the headroom bought
+against throttling. It does not govern ordinary disconnects — `pongWait` already
+bounds those at 60s — it governs the replica-loss backstop.
 
 ## Configuration
 

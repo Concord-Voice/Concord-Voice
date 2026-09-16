@@ -534,7 +534,13 @@ export class WebSocketService {
   }
 
   /**
-   * Send heartbeat to refresh Redis presence TTL
+   * Send a heartbeat frame.
+   *
+   * This does NOT refresh the Redis presence TTL directly — the server has
+   * owned that since #3328. It is one inbound APPLICATION frame, which is what
+   * the hub's presence sweeper counts as liveness before renewing an EXISTING
+   * `presence:<uuid>` key. The sweeper can never create or resurrect one, so a
+   * heartbeat arriving after the key has lapsed does not bring the user back.
    */
   sendHeartbeat(): void {
     this.send({
@@ -1068,7 +1074,14 @@ export class WebSocketService {
   private startPingInterval(): void {
     this.clearPingInterval();
 
-    // Send heartbeat every 30 seconds to refresh Redis presence TTL (120s)
+    // Send a heartbeat every 30 seconds.
+    //
+    // The SERVER owns the presence TTL since the hub's presence-liveness sweeper
+    // landed -- it renews from each user's last inbound APPLICATION frame, so
+    // this timer being throttled by Electron no longer takes presence down with
+    // it. This frame still matters: it is what proves to the hub that this
+    // renderer is alive and producing valid work, which a protocol pong -- which
+    // Chromium's network service answers without any renderer JS -- does not.
     this.pingInterval = setInterval(() => {
       if (this.state === ConnectionState.CONNECTED && this.ws) {
         this.sendHeartbeat();

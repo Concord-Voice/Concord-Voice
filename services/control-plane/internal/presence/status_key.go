@@ -2,6 +2,7 @@ package presence
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -22,6 +23,27 @@ const (
 	StatusInvisible = "invisible"
 	StatusOffline   = "offline"
 )
+
+// StatusTTL is the lifetime of a base-presence key.
+//
+// It lives beside StatusRedisKey for the same reason the key format does: every
+// writer of presence:<uuid> must agree on it. That agreement is load-bearing for
+// the hub's presence sweeper (internal/websocket, sweepPresenceLiveness), which
+// may only EXPIRE an existing key, and can therefore touch a key another path has
+// just rewritten -- including the offline marker transitionUserOffline writes.
+//
+// Be precise about WHY, because the obvious phrasing is false: EXPIRE restarts
+// the countdown from NOW, so renewing a key to its own TTL is an exact no-op only
+// if issued at the instant of the write -- which it is not. Two things make it
+// safe instead. EXPIRE cannot change the stored VALUE, so an offline marker stays
+// offline and reads identically to an absent key. And the registration gate in
+// noteInboundApplicationFrame bounds the sweeper's reach into a departing user's
+// key to one snapshot-to-pipeline round trip, so the shift is sub-second rather
+// than a fresh full lifetime from an arbitrary later moment. A sweeper carrying
+// its OWN, larger TTL would have neither bound.
+//
+// Do not reintroduce a local 120*time.Second, and do not give the sweeper its own.
+const StatusTTL = 120 * time.Second
 
 // StatusRedisKey returns the Redis key holding one user's base presence status.
 func StatusRedisKey(userID uuid.UUID) string {

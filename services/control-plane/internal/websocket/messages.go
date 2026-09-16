@@ -37,6 +37,13 @@ type OutgoingMessage struct {
 // 30s heartbeat as data guarantees origin→client application traffic on every
 // hop at well under the idle threshold. Keep the shape in sync with
 // HeartbeatAckSchema in client/desktop/src/renderer/types/ws-events.ts.
+//
+// It is ALSO sent UNSOLICITED: writePump emits it on its existing 54s ticker
+// whenever the socket has been idle since the previous tick. The echo above put
+// the CF deadline on a renderer timer, and Electron throttles a hidden
+// renderer's timers, so a backgrounded client could lose its socket to the very
+// 1006 this frame exists to prevent. The server now owns that deadline outright
+// and the echo is unchanged -- an addition, never a replacement.
 var heartbeatAckFrame = []byte(`{"type":"heartbeat_ack","data":{}}`)
 
 // BroadcastMessage represents a message to be broadcast to channel subscribers

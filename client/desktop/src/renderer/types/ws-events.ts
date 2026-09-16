@@ -1600,8 +1600,16 @@ export const ConnectionReadySchema = z.object({
  * cadence. Without it the CF leg starved during quiet periods and abruptly
  * closed production sockets with 1006 every few minutes.
  *
+ * ALSO UNSOLICITED: since the server took ownership of the transport deadline,
+ * the hub emits this frame on its own 54s ticker whenever the socket has been
+ * idle -- not only in reply to a client heartbeat. It therefore MUST NOT be used
+ * as a liveness, RTT or round-trip-correlation signal: an arriving frame does
+ * not imply this client asked for one.
+ *
  * No consumer: wsService.handleMessage validates it and drops it (no switch
- * case, no subscribers). Its entire job is to exist on the wire.
+ * case, no subscribers). Its entire job is to exist on the wire. That is a
+ * CONTRACT, not an accident of the current tree -- adding a consumer keyed on
+ * this frame would silently receive unsolicited traffic at the server cadence.
  * Server emitter: `heartbeatAckFrame` in
  * `services/control-plane/internal/websocket/messages.go` — keep in sync.
  */

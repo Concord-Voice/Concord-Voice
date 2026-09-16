@@ -1214,9 +1214,12 @@ func reapUnexpiringPresence(
 //
 // Every writer of presence:<uuid> sets a 120s TTL (internal/websocket/hub.go
 // registration, offline transition, set_status, and the heartbeat repair paths;
-// refreshPresenceTTL renews it with EXPIRE). A base key that still exists with
-// no expiry therefore cannot have come from any of them, and is the only thing
-// this job may delete.
+// refreshPresenceTTL renews it with EXPIRE), as does Hub.sweepPresenceLiveness,
+// which renews with EXPIRE off the Run goroutine every 30s for users whose last
+// inbound application frame is recent. That sweeper is EXPIRE-only by
+// construction, so it can never produce the un-expiring key this job looks for.
+// A base key that still exists with no expiry therefore cannot have come from
+// any of them, and is the only thing this job may delete.
 //
 // It deliberately does NOT consult the hub's connected-user set. That check
 // could only ever reap an orphan Redis expiry removes within 120s anyway, which

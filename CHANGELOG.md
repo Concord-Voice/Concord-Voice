@@ -80,6 +80,17 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **You no longer drop offline, or lose your connection, while Concord sits in the background** ([#3328](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3328)) — leaving
+  Concord open but minimised for a while could make you appear offline to everyone else even
+  though you were still connected, and could quietly drop the connection itself every few
+  minutes. Both came from the same cause: the desktop app sent a keep-alive every thirty
+  seconds, and the operating system is free to slow that timer down once a window is hidden.
+  The server now keeps both of those alive on its own schedule instead of waiting to be asked,
+  so neither depends on a timer the system may pause. Worth knowing: appearing offline was the
+  worse of the two, because it did not fix itself — once it happened you stayed offline to
+  other people for the rest of that connection, even while you were reading and sending
+  messages normally.
+
 - **Screen-share audio loading no longer accepts a substituted JavaScript module as its native helper** ([#3300](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3300)) — the
   desktop now loads the packaged audio-capture helper through the native-addon boundary directly,
   so a directory or JavaScript symlink at that path fails instead of being executed.

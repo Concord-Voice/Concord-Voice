@@ -483,8 +483,17 @@ func (c *Client) readPump() {
 }
 
 // writePump pumps messages from the hub to the WebSocket connection
+// writePumpTickInterval is pingPeriod, indirected so a test can drive the ticker
+// arm without waiting 54 s for a tick. Reassigned ONLY from _test.go.
+var writePumpTickInterval = pingPeriod
+
 func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(writePumpTickInterval)
+	// Idle gate for the unsolicited keepalive in the ticker arm below. A plain
+	// bool owned by this goroutine -- writePump is the sole writer on this conn,
+	// so no lock and no allocation. A healthy, chatty client therefore produces
+	// ZERO extra frames; only a silent socket is kept alive.
+	wroteSinceLastTick := false
 	defer func() {
 		ticker.Stop()
 		_ = c.Conn.Close()
@@ -509,12 +518,39 @@ func (c *Client) writePump() {
 			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
+			wroteSinceLastTick = true
 
 		case <-ticker.C:
 			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
+
+			// Unsolicited transport keepalive.
+			//
+			// The protocol PING above keeps the ORIGIN leg alive; it does not keep
+			// the Cloudflare EDGE leg alive, because CF does not reliably count
+			// control frames against its ~100s idle tracking (see heartbeatAckFrame
+			// in messages.go for the incident). Before this, the only origin->client
+			// application traffic on an idle socket was the ECHO of a client
+			// heartbeat -- which rides a renderer timer Electron is free to throttle
+			// or suspend. The server now owns the transport deadline outright.
+			//
+			// This MUST NOT refresh the presence TTL. It is origin->client and
+			// proves nothing about whether the renderer is alive; wiring it to
+			// presence would be socket-open-as-presence, which this design rejected
+			// because Chromium's network service answers pings without renderer JS,
+			// so a wedged client would read as online indefinitely.
+			//
+			// The solicited echo (hub.handlePresenceIncoming) is UNCHANGED and must
+			// stay: this is an addition, never a replacement.
+			if !wroteSinceLastTick {
+				_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := c.Conn.WriteMessage(websocket.TextMessage, heartbeatAckFrame); err != nil {
+					return
+				}
+			}
+			wroteSinceLastTick = false
 		}
 	}
 }
