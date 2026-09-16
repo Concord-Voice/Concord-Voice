@@ -605,6 +605,62 @@
   color: var(--success);
 }
 
+/* #2360 - a fixed slot so one `gap` produces the uniform rhythm the report asked
+   for. 16px, not 12px: the server-enforced variant overlays a Lock at
+   `right: -3px` which is absolutely positioned and therefore bleeds past the
+   glyph box into whatever sits to its right. */
+.voice-channel-participant__status {
+  width: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* #2360 - participant avatar. 18px is a plain literal, matching the donor
+   .member-avatar (MemberList.css:291), which is a bare 28px and scales only its
+   margin. Deliberately NOT var(--rail-avatar): that is declared only on
+   .dock-shell__surface[data-presentation='compact'], and the compact detail
+   flyout is portalled to document.body, where it would resolve to nothing. */
+.voice-channel-participant__avatar {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  /* Without this the avatar squashes instead of the name truncating - the name
+     carries min-width: 0 / text-overflow: ellipsis in
+     .voice-channel-participant-name below. Named, not line-numbered: this rule's
+     own insertion is what moved that block, and the pointer went stale in the
+     same commit that wrote it. */
+  flex-shrink: 0;
+}
+
+.voice-channel-participant__avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.voice-channel-participant__avatar-initial {
+  font-size: calc(10px * var(--font-scale, 1));
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1;
+}
+
+/* #2360 - box-shadow, not border: a border changes the box size, so the row
+   reflows on every speaking transition (visible jitter at high VAD churn).
+   Reuses --success, the same token the row's text colour already uses, which
+   gets all 32 theme blocks for free. */
+.voice-channel-participant.speaking .voice-channel-participant__avatar {
+  box-shadow: 0 0 0 2px var(--success);
+}
+
 .voice-channel-participant-name {
   /* Button-reset: the interactive variant renders as a native <button> (a11y
      S6819/S6845/S6848); these neutralize default button chrome so it matches the

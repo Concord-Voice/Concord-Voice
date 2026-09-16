@@ -11,12 +11,21 @@ import {
   MessageSquare,
   PenLine,
 } from 'lucide-react';
+import { resolveMediaUrl } from '../../utils/ui/resolveMediaUrl';
 import type { Channel } from '../../types/chat';
 
 export interface VoiceMemberInfo {
   userId: string;
   displayName?: string;
   username: string;
+  /** Raw server-relative path (e.g. /api/v1/media/avatars/<id>.png), ABSENT OR EMPTY
+   *  when the user has none - the two producers differ and neither emits null. The
+   *  join handler writes a bare gin.H key, so an unset avatar arrives as "" (voice
+   *  handlers.go:333); the participants list is a struct tagged
+   *  `json:"avatar_url,omitempty"`, so there it is omitted and arrives as undefined
+   *  (voice handlers.go:98). Both are falsy, and resolveMediaUrl's falsy path
+   *  handles both - but do not write code that relies on "" specifically. */
+  avatarUrl?: string;
   isMuted: boolean;
   isSpeaking?: boolean;
   serverMuted: boolean;
@@ -112,6 +121,39 @@ function VoiceStatusIcon({ p }: Readonly<{ p: VoiceMemberInfo }>) {
   return <Mic size={12} />;
 }
 
+/** #2360. Sibling of the name, never a child of it - an avatar inside the
+ *  interactive <button> would join its accessible name (D1).
+ *
+ *  resolveMediaUrl is called twice, inline, on purpose: the #1586 ESLint guard
+ *  matches `src={avatarUrl}` as a DIRECT child of the expression container, so
+ *  hoisting the result into a variable would pass lint by renaming rather than
+ *  by correctness, and this call site would stop being guarded. It is pure.
+ *
+ *  The fallback is untinted (D5): the per-user gradient comes from
+ *  resolveUserAccentColors(color_scheme), and color_scheme is carried by neither
+ *  the voice store nor the Go voice handler. Both donors already render untinted
+ *  when the accent lookup returns nothing. */
+function VoiceParticipantAvatar({ p }: Readonly<{ p: VoiceMemberInfo }>) {
+  return (
+    <span className="voice-channel-participant__avatar">
+      {resolveMediaUrl(p.avatarUrl) ? (
+        <img
+          src={resolveMediaUrl(p.avatarUrl)}
+          alt=""
+          className="voice-channel-participant__avatar-img"
+        />
+      ) : (
+        <span className="voice-channel-participant__avatar-initial">
+          {/* Spread, not charAt(0): charAt splits a surrogate pair, so a display
+              name starting with an emoji or any astral character would render a
+              lone half as a replacement glyph. */}
+          {[...(p.displayName || p.username)][0]?.toUpperCase()}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function VoiceSubItems({
   channel,
   isGrouped,
@@ -163,7 +205,10 @@ function VoiceSubItems({
               key={p.userId}
               className={`voice-channel-participant ${p.isSpeaking ? 'speaking' : ''}`}
             >
-              <VoiceStatusIcon p={p} />
+              <span className="voice-channel-participant__status">
+                <VoiceStatusIcon p={p} />
+              </span>
+              <VoiceParticipantAvatar p={p} />
               {interactive ? (
                 // Native <button> for the interactive participant name — gives
                 // keyboard activation (Enter/Space), focusability, and button

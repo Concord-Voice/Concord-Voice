@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from '../../../test-utils';
 import ChannelItem, { type VoiceMemberInfo } from '@/renderer/components/Channels/ChannelItem';
 import type { Channel } from '@/renderer/types/chat';
+import { API_BASE } from '@/renderer/config';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { vi } from 'vitest';
 
@@ -640,5 +641,183 @@ describe('ChannelItem', () => {
     const itemRef = vi.fn();
     render(<ChannelItem {...defaultProps} itemRef={itemRef} />);
     expect(itemRef).toHaveBeenCalledWith('channel-1', expect.anything());
+  });
+
+  // -- #2360 voice-participant avatars --
+
+  it('renders the participant avatar through resolveMediaUrl', () => {
+    const voiceMembers: VoiceMemberInfo[] = [
+      {
+        userId: 'u1',
+        username: 'alice',
+        avatarUrl: '/api/v1/media/avatars/u1.png',
+        isMuted: false,
+      },
+    ];
+    const { container } = render(
+      <ChannelItem {...defaultProps} channel={mockVoiceChannel} voiceMembers={voiceMembers} />
+    );
+    const img = container.querySelector<HTMLImageElement>('.voice-channel-participant__avatar-img');
+    expect(img).toBeInTheDocument();
+    // EXACT match against the API base, never toContain. mediaUrl returns
+    // `${API_BASE}${path}`, so the resolved value CONTAINS the raw one - a
+    // `toContain` here stayed green against `src={p.avatarUrl}`, i.e. against the
+    // very #1586 defect the double-call comment in the component exists to
+    // prevent. Verified by mutation: toContain survived it, toBe kills it.
+    // getAttribute, not img.src: jsdom absolutizes the property against the
+    // document base and would mask the difference either way.
+    expect(img?.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/u1.png`);
+  });
+
+  it('refuses a non-allowlisted scheme and falls back to the initial', () => {
+    // The one behaviour resolveMediaUrl uniquely provides: anything that is not
+    // `/`-prefixed, data:, blob: or http(s): resolves to undefined, so it can
+    // never reach an <img src>. This is the security-relevant half of the helper
+    // and the half a future refactor is most likely to drop.
+    const voiceMembers: VoiceMemberInfo[] = [
+      {
+        userId: 'u1',
+        username: 'alice',
+        avatarUrl: 'javascript:alert(1)',
+        isMuted: false,
+      },
+    ];
+    const { container } = render(
+      <ChannelItem {...defaultProps} channel={mockVoiceChannel} voiceMembers={voiceMembers} />
+    );
+    expect(container.querySelector('.voice-channel-participant__avatar-img')).toBeNull();
+    expect(container.querySelector('.voice-channel-participant__avatar-initial')?.textContent).toBe(
+      'A'
+    );
+  });
+
+  it('falls back to the displayName initial, preferring it over username', () => {
+    // "No avatar" arrives in two shapes and this pins the "" one: the join
+    // handler emits a bare gin.H key (voice handlers.go:333, pinned by
+    // handlers_test.go:207,228) while the participants list is `omitempty` and
+    // omits the key entirely (voice handlers.go:98). Both are falsy.
+    //
+    // The two fields deliberately start with DIFFERENT characters: with
+    // displayName 'Alice' beside username 'alice' both yield 'A', so swapping
+    // the `p.displayName || p.username` operands survived. This kills that.
+    // The astral first character additionally pins the spread over charAt(0),
+    // which would split the surrogate pair and render a replacement glyph.
+    const voiceMembers: VoiceMemberInfo[] = [
+      { userId: 'u1', username: 'alice', displayName: '🎧Zara', avatarUrl: '', isMuted: false },
+    ];
+    const { container } = render(
+      <ChannelItem {...defaultProps} channel={mockVoiceChannel} voiceMembers={voiceMembers} />
+    );
+    expect(container.querySelector('.voice-channel-participant__avatar-img')).toBeNull();
+    expect(container.querySelector('.voice-channel-participant__avatar-initial')?.textContent).toBe(
+      '🎧'
+    );
+  });
+
+  it('keeps the avatar out of the button, so the initial never joins its name', () => {
+    // D1. Deliberately the FALLBACK branch, not the image branch: the <img>
+    // carries alt="", so nesting it inside the button would contribute nothing
+    // to the accessible name and the image branch cannot witness the defect D1
+    // exists to prevent. The fallback renders a bare text node, so nesting THAT
+    // yields the accessible name "A alice". This asserts both the structure and
+    // the name it is supposed to protect, plus the sibling ORDER (the avatar
+    // precedes the button) - without the order check, moving the avatar after
+    // the button survives.
+    const voiceMembers: VoiceMemberInfo[] = [
+      {
+        userId: 'u1',
+        username: 'alice',
+        avatarUrl: '',
+        isMuted: false,
+      },
+    ];
+    const { container } = render(
+      <ChannelItem
+        {...defaultProps}
+        channel={mockVoiceChannel}
+        voiceMembers={voiceMembers}
+        onParticipantClick={vi.fn()}
+      />
+    );
+    const button = container.querySelector('button.voice-channel-participant-name');
+    expect(button).toBeInTheDocument();
+    expect(button?.querySelector('.voice-channel-participant__avatar')).toBeNull();
+    const avatar = container.querySelector('.voice-channel-participant__avatar');
+    expect(avatar).toBeInTheDocument();
+    // The initial IS rendered, so the accessible name below is a real result and
+    // not vacuously true because nothing was there to leak.
+    expect(avatar?.textContent).toBe('A');
+    // The name D1 protects: "alice", never "A alice".
+    expect(screen.getByRole('button', { name: 'alice' })).toBe(button);
+    // Order: avatar precedes the button it sits beside.
+    expect(avatar?.nextElementSibling).toBe(button);
+  });
+
+  it('marks only the speaking row with the speaking class', () => {
+    // What this actually proves, stated honestly: a NON-speaking row does not
+    // carry the class, which the single-row test above cannot show. It does NOT
+    // falsify an over-broad CSS rule - jsdom applies no stylesheet, so nothing
+    // here can distinguish `.voice-channel-participant.speaking .…__avatar` from
+    // `.voice-channel-participant .…__avatar`. An earlier version of this comment
+    // claimed it did; the ring's actual scoping is confirmed only by the visual
+    // capture.
+    const voiceMembers: VoiceMemberInfo[] = [
+      { userId: 'u1', username: 'alice', isMuted: false, isSpeaking: true },
+      { userId: 'u2', username: 'bob', isMuted: false, isSpeaking: false },
+    ];
+    const { container } = render(
+      <ChannelItem {...defaultProps} channel={mockVoiceChannel} voiceMembers={voiceMembers} />
+    );
+    const rows = container.querySelectorAll('.voice-channel-participant');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].classList.contains('speaking')).toBe(true);
+    expect(rows[1].classList.contains('speaking')).toBe(false);
+    // The CSS selector is the COMPOUND
+    // `.voice-channel-participant.speaking .voice-channel-participant__avatar`,
+    // so the avatar must be a DESCENDANT of the row that carries the class.
+    // Both rows are asserted because the structural requirement is the same for
+    // each; this pair does not distinguish scoping (see the note above).
+    expect(rows[0].querySelector('.voice-channel-participant__avatar')).toBeInTheDocument();
+    expect(rows[1].querySelector('.voice-channel-participant__avatar')).toBeInTheDocument();
+  });
+
+  it('wraps the status icon in exactly one slot element in both variants', () => {
+    // D3. This pins the structural HOOK the CSS depends on, not the width -
+    // jsdom applies no stylesheet, so `width: 16px` is unobservable here and is
+    // confirmed by the visual capture instead. Both branches matter: the
+    // server-enforced variant ALREADY has its own wrapper span, so a careless
+    // change double-wraps one and not the other.
+    const voiceMembers: VoiceMemberInfo[] = [
+      {
+        userId: 'u1',
+        username: 'alice',
+        isMuted: true,
+        serverMuted: false,
+        serverDeafened: false,
+        isDeafened: false,
+      },
+      {
+        userId: 'u2',
+        username: 'bob',
+        isMuted: false,
+        serverMuted: false,
+        serverDeafened: true,
+        isDeafened: false,
+      },
+    ];
+    const { container } = render(
+      <ChannelItem {...defaultProps} channel={mockVoiceChannel} voiceMembers={voiceMembers} />
+    );
+    // THIS is the assertion that catches a double-wrap: querySelectorAll finds a
+    // nested duplicate too, so a second slot span inside either row makes the
+    // count 3. (The comment previously sat on the line below, which counts icons
+    // rather than wrappers and cannot see a double-wrap at all.)
+    const slots = container.querySelectorAll('.voice-channel-participant__status');
+    expect(slots).toHaveLength(2);
+    // The server-enforced row still renders its own single icon wrapper inside
+    // the slot - the slot wraps it, it does not replace it.
+    expect(
+      slots[1].querySelectorAll('.voice-channel-participant__icon--server-enforced')
+    ).toHaveLength(1);
   });
 });

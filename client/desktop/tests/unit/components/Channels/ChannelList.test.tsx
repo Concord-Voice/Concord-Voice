@@ -6,6 +6,7 @@ import ChannelList, {
   resolveTargetGroupId,
   buildOldGroupUpdates,
 } from '@/renderer/components/Channels/ChannelList';
+import { API_BASE } from '@/renderer/config';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
@@ -569,6 +570,72 @@ describe('ChannelList', () => {
     });
     renderChannelList();
     expect(screen.getByText('Other User')).toBeInTheDocument();
+  });
+
+  // -- #2360: the two lines in getVoiceMembers that ARE the fix --
+  //
+  // Every avatar test in ChannelItem.test.tsx renders ChannelItem DIRECTLY with a
+  // hand-built voiceMembers array, so none of them touches getVoiceMembers. That
+  // was measured, not assumed: deleting both `avatarUrl:` lines from
+  // getVoiceMembers left the whole Channels suite green at 393/393. The pair
+  // below is what notices. getVoiceMembers has two branches and each owns one of
+  // the deleted lines, so one test cannot cover both.
+
+  it('forwards avatarUrl from the cached roster (disconnected branch)', () => {
+    useServerStore.setState({ activeServerId: 'server-1' });
+    useChannelStore.setState({
+      channels: [mockVoiceChannel],
+      isLoading: false,
+      error: null,
+    });
+    useVoiceStore.setState({
+      activeChannelId: null,
+      connectionState: 'idle',
+      channelVoiceMembers: {
+        'voice-1': [
+          {
+            userId: 'user-2',
+            username: 'otheruser',
+            displayName: 'Other User',
+            avatarUrl: '/api/v1/media/avatars/user-2.png',
+            isMuted: false,
+          },
+        ],
+      },
+    });
+    const { container } = renderChannelList();
+    const img = container.querySelector('.voice-channel-participant__avatar-img');
+    expect(img).toBeInTheDocument();
+    expect(img?.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/user-2.png`);
+  });
+
+  it('forwards avatarUrl from live participants (connected branch)', () => {
+    useServerStore.setState({ activeServerId: 'server-1' });
+    useChannelStore.setState({
+      channels: [mockVoiceChannel],
+      isLoading: false,
+      error: null,
+    });
+    useVoiceStore.setState({
+      activeChannelId: 'voice-1',
+      connectionState: 'connected',
+      participants: {
+        'user-1': {
+          peerId: 'peer-1',
+          userId: 'user-1',
+          username: 'testuser',
+          displayName: 'Test User',
+          avatarUrl: '/api/v1/media/avatars/user-1.png',
+          isMuted: false,
+          isDeafened: false,
+          isSpeaking: false,
+        },
+      },
+    });
+    const { container } = renderChannelList();
+    const img = container.querySelector('.voice-channel-participant__avatar-img');
+    expect(img).toBeInTheDocument();
+    expect(img?.getAttribute('src')).toBe(`${API_BASE}/api/v1/media/avatars/user-1.png`);
   });
 
   it('uses the existing cached roster for compact voice count and detail', () => {

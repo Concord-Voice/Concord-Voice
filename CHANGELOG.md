@@ -78,6 +78,17 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   picked, because Auto and Always behave identically while Reduce Animations is off and the names
   alone cannot tell you that. This setting is stored per device; it does not follow you to your
   other computers yet.
+- **Voice participants show their profile photo in the channel sidebar** ([#2360](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2360)) — the
+  list of who is in a voice channel showed a microphone icon and a name and nothing else, so
+  telling people apart meant reading rather than glancing. Each row now carries the person's
+  photo between the two, and while someone is speaking their photo picks up the same green
+  their name already does. Anyone without a photo gets their initial, the way the member list
+  has always shown them. The rows also line up evenly now, which they did not before: the
+  plain microphone glyph and the locked-by-a-moderator version of it were different widths,
+  so the column shifted depending on who was muted and how.
+  This took very little to build, for a reason worth stating. The photo was already being sent
+  to the app and was being thrown away one step before anything could draw it. Nothing new is
+  fetched — it is the same picture the member list and the voice tiles were already showing.
 
 ### Changed
 
