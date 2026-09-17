@@ -41,7 +41,6 @@ const props = () => ({
   lockedDescription: 'Only moderators can change this timer.',
   onRefresh: vi.fn(async () => ({ kind: 'fresh' as const, policy })),
   onApplyPolicy,
-  onMarkSeen: vi.fn(),
   onClose: vi.fn(),
 });
 
@@ -121,10 +120,58 @@ describe('MessageExpirationEditor', () => {
     ).not.toBeInTheDocument();
   });
 
+  // Cancel and Discard are DIFFERENT acts, and the component's own comment says so:
+  // Discard abandons a staged choice, Cancel dismisses a dialog. They were the same
+  // function until review caught it, so cancelling silently threw away a staged window
+  // the user had not decided to abandon -- recoverable only by re-picking it, with no
+  // indication anything had been dropped.
+  it('keeps the staged choice when the confirmation is CANCELLED', async () => {
+    const user = userEvent.setup();
+    render(<MessageExpirationEditor {...props()} />);
+
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    await screen.findByRole('dialog', { name: 'Change message expiration' });
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Change message expiration' })
+      ).not.toBeInTheDocument()
+    );
+
+    // The staging row survives, and nothing was sent.
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard' })).toBeInTheDocument();
+    expect(onApplyPolicy).not.toHaveBeenCalled();
+    // aria-pressed still reports what is IN FORCE, never the staged choice.
+    expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  // The control for the test above: Discard is what abandons a draft, so the staging row
+  // must disappear. Without this, "Apply is present" could pass against a component that
+  // never clears a draft at all.
+  it('drops the staged choice when DISCARD is pressed', async () => {
+    const user = userEvent.setup();
+    render(<MessageExpirationEditor {...props()} />);
+
+    await user.click(screen.getByRole('button', { name: '1 hour' }));
+    expect(screen.getByRole('button', { name: 'Discard' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Discard' }));
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Discard' })).not.toBeInTheDocument()
+    );
+    expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+    expect(onApplyPolicy).not.toHaveBeenCalled();
+  });
+
   it('requires a radio and acknowledgement before applying a selected timer', async () => {
     const user = userEvent.setup();
     render(<MessageExpirationEditor {...props()} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const dialog = await screen.findByRole('dialog', { name: 'Change message expiration' });
     expect(dialog).toBeInTheDocument();
     const apply = screen.getByRole('button', { name: 'Apply timer' });
@@ -153,6 +200,8 @@ describe('MessageExpirationEditor', () => {
     render(<MessageExpirationEditor {...props()} policy={{ ...policy, windowSeconds: null }} />);
 
     await user.click(screen.getByRole('button', { name: label }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const dialog = await screen.findByRole('dialog', { name: 'Change message expiration' });
 
     expect(within(dialog).getByText(new RegExp(`after ${label}`))).toBeInTheDocument();
@@ -162,6 +211,8 @@ describe('MessageExpirationEditor', () => {
     const user = userEvent.setup();
     render(<MessageExpirationEditor {...props()} />);
     await user.click(screen.getByRole('button', { name: 'Off' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await screen.findByRole('dialog', { name: 'Turn off message expiration' });
     expect(screen.getByRole('radio', { name: 'Cancel scheduled deletions' })).not.toBeChecked();
     expect(screen.getByRole('radio', { name: 'Keep scheduled deletions' })).not.toBeChecked();
@@ -224,6 +275,8 @@ describe('MessageExpirationEditor', () => {
         )
       );
       await user.click(screen.getByRole('button', { name: 'Off' }));
+      // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+      await user.click(screen.getByRole('button', { name: 'Apply' }));
       await user.click(screen.getByRole('radio', { name: choiceLabel }));
       await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
       expect(screen.getByText(/already deleted cannot be recovered/i)).toBeInTheDocument();
@@ -247,6 +300,8 @@ describe('MessageExpirationEditor', () => {
       <MessageExpirationEditor {...props()} onRefresh={refresh} onApplyPolicy={apply} />
     );
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     const submit = user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -282,6 +337,8 @@ describe('MessageExpirationEditor', () => {
       />
     );
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -307,6 +364,8 @@ describe('MessageExpirationEditor', () => {
     const apply = vi.fn(async () => ({ kind: 'ok' as const, policy }));
     const view = render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     const changed: ExpirationPolicy = { ...policy, revision: 5, windowSeconds: 604800 };
@@ -325,6 +384,8 @@ describe('MessageExpirationEditor', () => {
     }));
     render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -389,14 +450,12 @@ describe('MessageExpirationEditor', () => {
       kind: 'partial' as const,
       candidate: pendingPolicy,
     }));
-    const onMarkSeen = vi.fn();
     render(
       <MessageExpirationEditor
         {...props()}
         policy={pendingPolicy}
         onRefresh={refresh}
         onApplyPolicy={apply}
-        onMarkSeen={onMarkSeen}
       />
     );
     await user.click(screen.getByRole('button', { name: 'Resume processing' }));
@@ -408,7 +467,6 @@ describe('MessageExpirationEditor', () => {
 
     expect(refresh).toHaveBeenCalledTimes(2);
     expect(apply).toHaveBeenCalledWith({ mode: 'resume', revision: policy.revision });
-    expect(onMarkSeen).toHaveBeenCalledWith(completed.revision);
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: 'Refresh policy' })).toBeNull();
   });
@@ -461,16 +519,10 @@ describe('MessageExpirationEditor', () => {
       kind: 'partial' as const,
       candidate: { ...completed, backfillPending: true },
     }));
-    const onMarkSeen = vi.fn();
-    render(
-      <MessageExpirationEditor
-        {...props()}
-        onRefresh={refresh}
-        onApplyPolicy={apply}
-        onMarkSeen={onMarkSeen}
-      />
-    );
+    render(<MessageExpirationEditor {...props()} onRefresh={refresh} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await act(async () => {
@@ -497,6 +549,8 @@ describe('MessageExpirationEditor', () => {
     const onRefresh = vi.fn(async () => ({ kind: 'fresh' as const, policy: offPolicy }));
     render(<MessageExpirationEditor {...props()} policy={offPolicy} onRefresh={onRefresh} />);
     await user.click(screen.getByRole('button', { name: label }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await screen.findByRole('dialog', { name: 'Change message expiration' });
     expect(screen.getByRole('radio', { name: 'Only new messages' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: /cannot be recovered/i })).not.toBeChecked();
@@ -511,6 +565,8 @@ describe('MessageExpirationEditor', () => {
     const fresh = vi.fn(async () => ({ kind: 'fresh' as const, policy }));
     render(<MessageExpirationEditor {...props()} onRefresh={fresh} />);
     await user.click(screen.getByRole('button', { name: '30 days' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('radio', { name: 'Apply to existing messages' }));
@@ -589,6 +645,8 @@ describe('MessageExpirationEditor', () => {
         />
       );
       await user.click(screen.getByRole('button', { name: '1 hour' }));
+      // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+      await user.click(screen.getByRole('button', { name: 'Apply' }));
       await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
       await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
       await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -624,6 +682,8 @@ describe('MessageExpirationEditor', () => {
     const user = userEvent.setup();
     render(<MessageExpirationEditor {...props()} />);
     await user.click(screen.getByRole('button', { name: '7 days' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     expect(screen.getByText(/text, images, GIFs, attachments, and emoji/i)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onApplyPolicy).not.toHaveBeenCalled();
@@ -701,6 +761,8 @@ describe('MessageExpirationEditor', () => {
         )
       );
       await user.click(screen.getByRole('button', { name: '1 hour' }));
+      // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+      await user.click(screen.getByRole('button', { name: 'Apply' }));
       await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
       await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
       await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -853,6 +915,8 @@ describe('MessageExpirationEditor', () => {
         )
       );
       await user.click(screen.getByRole('button', { name: '1 hour' }));
+      // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+      await user.click(screen.getByRole('button', { name: 'Apply' }));
       await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
       await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
       await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -897,6 +961,8 @@ describe('MessageExpirationEditor', () => {
     const refresh = vi.fn(async () => ({ kind: 'fresh' as const, policy }));
     render(<MessageExpirationEditor {...props()} onRefresh={refresh} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -920,6 +986,8 @@ describe('MessageExpirationEditor', () => {
       )
     );
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -931,6 +999,8 @@ describe('MessageExpirationEditor', () => {
     const apply = vi.fn(async () => ({ kind: 'rejected' as const, reason: 'forbidden' as const }));
     render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -947,6 +1017,8 @@ describe('MessageExpirationEditor', () => {
     const apply = vi.fn(async () => ({ kind: 'rejected' as const, reason: 'forbidden' as const }));
     const view = render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -980,6 +1052,8 @@ describe('MessageExpirationEditor', () => {
       />
     );
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1000,6 +1074,8 @@ describe('MessageExpirationEditor', () => {
     }));
     render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1018,6 +1094,8 @@ describe('MessageExpirationEditor', () => {
     const apply = vi.fn(async () => result);
     render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1032,6 +1110,8 @@ describe('MessageExpirationEditor', () => {
     }));
     render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1052,6 +1132,8 @@ describe('MessageExpirationEditor', () => {
       <MessageExpirationEditor {...props()} onRefresh={refresh} onApplyPolicy={apply} />
     );
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     const submit = user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1126,6 +1208,8 @@ describe('MessageExpirationEditor', () => {
           )
         );
         await user.click(screen.getByRole('button', { name: '1 hour' }));
+        // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+        await user.click(screen.getByRole('button', { name: 'Apply' }));
         await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
         await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
         await user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1154,6 +1238,8 @@ describe('MessageExpirationEditor', () => {
           )
         );
         await user.click(screen.getByRole('button', { name: '1 hour' }));
+        // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+        await user.click(screen.getByRole('button', { name: 'Apply' }));
         await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
         await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
         expect(screen.getByRole('button', { name: 'Apply timer' })).toBeEnabled();
@@ -1209,6 +1295,8 @@ describe('MessageExpirationEditor', () => {
       <MessageExpirationEditor {...props()} onApplyPolicy={apply} onClose={onClose} />
     );
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     const submit = user.click(screen.getByRole('button', { name: 'Apply timer' }));
@@ -1224,6 +1312,8 @@ describe('MessageExpirationEditor', () => {
     const apply = vi.fn(async () => ({ kind: 'ok' as const, policy }));
     const view = render(<MessageExpirationEditor {...props()} onApplyPolicy={apply} />);
     await user.click(screen.getByRole('button', { name: '1 hour' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     view.rerender(<MessageExpirationEditor {...props()} canEdit={false} onApplyPolicy={apply} />);
@@ -1277,6 +1367,8 @@ describe('MessageExpirationEditor', () => {
       )
     );
     await user.click(screen.getByRole('button', { name: '30 days' }));
+    // Selecting a stop stages it; Apply is what opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     await user.click(screen.getByRole('radio', { name: 'Only new messages' }));
     await user.click(screen.getByRole('checkbox', { name: /cannot be recovered/i }));
     await user.click(screen.getByRole('button', { name: 'Apply timer' }));

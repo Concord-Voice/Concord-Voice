@@ -283,7 +283,7 @@ describe('useExpirationPolicy', () => {
     await waitFor(() => expect(result.current.policy?.revision).toBe(5));
   });
 
-  it('does not acknowledge a conflict as a successful setter', async () => {
+  it('adopts a conflict policy without reporting a successful set', async () => {
     useChannelStore.setState({ currentServerId: 'server-1' });
     usePermissionStore.setState({
       channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
@@ -314,15 +314,13 @@ describe('useExpirationPolicy', () => {
         retroactive: 'apply',
       });
     });
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]).toEqual({
-      'channel-1': 4,
-    });
+    expect(useChannelStore.getState().channels[0]?.expirationPolicy?.revision).toBe(5);
+    expect(result.current.policy?.windowSeconds).toBe(2592000);
   });
 
-  it('rejects a session-expired mutation without changing policy or seen marker', async () => {
+  it('rejects a session-expired mutation without changing the policy', async () => {
     useChannelStore.setState({
       currentServerId: 'server-1',
-      seenExpirationRevisionsByAccount: { [mockUser.id]: { 'channel-1': 3 } },
     });
     usePermissionStore.setState({
       channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
@@ -363,9 +361,6 @@ describe('useExpirationPolicy', () => {
       expect(patchCount).toBe(2);
       expect(refreshToken).toHaveBeenCalledOnce();
       expect(result.current.policy?.windowSeconds).toBe(86400);
-      expect(
-        useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]?.['channel-1']
-      ).toBe(3);
     } finally {
       unmount();
       globalThis.electron = originalElectron;
@@ -428,12 +423,6 @@ describe('useExpirationPolicy', () => {
       await waitFor(() =>
         expect(useChannelStore.getState().channels[0]?.expirationPolicy?.revision).toBe(7)
       );
-      expect(
-        useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]
-      ).toBeUndefined();
-      expect(useChannelStore.getState().seenExpirationRevisionsByAccount['user-2']).toEqual({
-        'channel-1': 7,
-      });
     } finally {
       pending.resolve(HttpResponse.json({ channels: [] }));
       unmount();
@@ -498,26 +487,19 @@ describe('useExpirationPolicy', () => {
     const retained = {
       refresh: result.current.onRefresh,
       apply: result.current.onApplyPolicy,
-      markSeen: result.current.onMarkSeen,
     };
     act(() => useAuthStore.getState().beginAuthLifecycle('successor-token', 'session-2'));
     await waitFor(() => expect(result.current.policy?.revision).toBe(5));
     const readsAfterSuccessor = reads;
-    const markerBeforeRetainedCallbacks =
-      useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]?.['channel-1'];
     await expect(retained.refresh()).resolves.toEqual({ kind: 'superseded' });
     await expect(
       retained.apply({ mode: 'set', window_seconds: 3600, retroactive: 'new_only' })
     ).resolves.toEqual({ kind: 'rejected', reason: 'unavailable' });
-    retained.markSeen(5);
     expect(reads).toBe(readsAfterSuccessor);
     expect(patches).toBe(0);
-    expect(
-      useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]?.['channel-1']
-    ).toBe(markerBeforeRetainedCallbacks);
   });
 
-  it('keeps a newer mutation and seen marker when an older channel read completes late', async () => {
+  it('keeps a newer mutation when an older channel read completes late', async () => {
     useChannelStore.setState({ currentServerId: 'server-1' });
     usePermissionStore.setState({
       channelPermissions: { 'channel-1': Permissions.MANAGE_CHANNELS },
@@ -560,9 +542,6 @@ describe('useExpirationPolicy', () => {
       expect(patches).toBe(1);
       await waitFor(() => expect(result.current.policy?.revision).toBe(5));
       expect(result.current.policyState).toBe('ready');
-      expect(useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]).toEqual({
-        'channel-1': 5,
-      });
       readResponse.resolve(HttpResponse.json({ channels: [channelRow] }));
       await expect(oldRead).resolves.toEqual({
         kind: 'fresh',
@@ -571,9 +550,6 @@ describe('useExpirationPolicy', () => {
       expect(result.current.policy?.revision).toBe(5);
       expect(result.current.policyState).toBe('ready');
       expect(result.current.policy?.windowSeconds).toBe(2592000);
-      expect(useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]).toEqual({
-        'channel-1': 5,
-      });
     } finally {
       readResponse.resolve(HttpResponse.json({ channels: [channelRow] }));
       unmount();
@@ -630,10 +606,6 @@ describe('useExpirationPolicy', () => {
     await expect(
       personal.result.current.onApplyPolicy({ mode: 'resume', revision: 4 })
     ).resolves.toMatchObject({ kind: 'rejected', reason: 'unavailable' });
-    personal.result.current.onMarkSeen(4);
-    nontext.result.current.onMarkSeen(4);
-    closed.result.current.onMarkSeen(4);
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({});
     personal.unmount();
     nontext.unmount();
     closed.unmount();
@@ -769,83 +741,5 @@ describe('useExpirationPolicy', () => {
     } finally {
       setItem.mockRestore();
     }
-  });
-
-  it('dismisses and persists a changed-revision notice per account', async () => {
-    useChannelStore.setState({ currentServerId: 'server-1' });
-    let row = channelRow;
-    server.use(
-      http.get(`${API}/api/v1/servers/server-1/channels`, () =>
-        HttpResponse.json({ channels: [row] })
-      )
-    );
-    const { result } = renderHook(() =>
-      useExpirationPolicy({ kind: 'channel', id: 'channel-1' }, 'server-1')
-    );
-    await waitFor(() => expect(result.current.policy?.revision).toBe(4));
-    expect(result.current.showChangedNotice).toBe(false);
-    row = { ...channelRow, expiration_revision: 5, expiration_updated_at: '2026-09-08T06:00:00Z' };
-    await act(async () => {
-      await result.current.onRefresh();
-    });
-    await waitFor(() => expect(result.current.policy?.revision).toBe(5));
-    expect(result.current.showChangedNotice).toBe(true);
-    act(() => result.current.onDismissNotice());
-    expect(result.current.showChangedNotice).toBe(false);
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({
-      [mockUser.id]: { 'channel-1': 5 },
-    });
-  });
-
-  it('rehydrates the same-account marker for notice state and isolates another account', async () => {
-    localStorage.setItem(
-      'concord-channels',
-      JSON.stringify({
-        state: {
-          seenExpirationRevisionsByAccount: { [mockUser.id]: { 'channel-1': 4 } },
-        },
-        version: 0,
-      })
-    );
-    await useChannelStore.persist.rehydrate();
-    useChannelStore.setState({ currentServerId: 'server-1' });
-    const row = { ...channelRow, expiration_revision: 5 };
-    server.use(
-      http.get(`${API}/api/v1/servers/server-1/channels`, () =>
-        HttpResponse.json({ channels: [row] })
-      )
-    );
-    const view = renderHook(() =>
-      useExpirationPolicy({ kind: 'channel', id: 'channel-1' }, 'server-1')
-    );
-    try {
-      await waitFor(() => expect(view.result.current.policy?.revision).toBe(5));
-      expect(view.result.current.showChangedNotice).toBe(true);
-      act(() => view.result.current.onDismissNotice());
-      expect(view.result.current.showChangedNotice).toBe(false);
-      act(() =>
-        useUserStore.getState().setUser({ id: 'different-account', username: mockUser.username })
-      );
-      await waitFor(() => expect(view.result.current.policyState).toBe('ready'));
-      await waitFor(() =>
-        expect(
-          useChannelStore.getState().seenExpirationRevisionsByAccount['different-account']?.[
-            'channel-1'
-          ]
-        ).toBe(5)
-      );
-    } finally {
-      view.unmount();
-    }
-
-    localStorage.setItem(
-      'concord-channels',
-      JSON.stringify({
-        state: { seenExpirationRevisionsByAccount: { bad: { 'channel-1': 'five' } } },
-        version: 0,
-      })
-    );
-    await useChannelStore.persist.rehydrate();
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({});
   });
 });

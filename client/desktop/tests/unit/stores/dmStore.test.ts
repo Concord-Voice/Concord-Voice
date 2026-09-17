@@ -2942,18 +2942,6 @@ describe('dmStore expiration policy contract', () => {
     expect(conversation?.expirationPolicy?.revision).toBe(5);
   });
 
-  it('keeps seen markers account-scoped and monotonic, then clears them', () => {
-    useDMStore.getState().markExpirationSeen('account-a', 'conv-1', 7);
-    useDMStore.getState().markExpirationSeen('account-a', 'conv-1', 6);
-    useDMStore.getState().markExpirationSeen('account-b', 'conv-1', 2);
-    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({
-      'account-a': { 'conv-1': 7 },
-      'account-b': { 'conv-1': 2 },
-    });
-    useDMStore.getState().clearDMs();
-    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({});
-  });
-
   it('does not throw or lose a definitive policy when persistence repeatedly fails', () => {
     useDMStore.getState().addConversation(mockConversation);
     const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
@@ -2975,36 +2963,13 @@ describe('dmStore expiration policy contract', () => {
     }
   });
 
-  it('rehydrates valid markers and preserves active navigation, but discards corrupt maps', async () => {
+  it('rehydrates persisted navigation', async () => {
     localStorage.setItem(
       'concord:dm-store',
-      JSON.stringify({
-        state: {
-          activeConversationId: 'conv-1',
-          seenExpirationRevisionsByAccount: { 'account-a': { 'conv-1': 4 } },
-        },
-        version: 0,
-      })
+      JSON.stringify({ state: { activeConversationId: 'conv-1' }, version: 0 })
     );
     await useDMStore.persist.rehydrate();
     expect(useDMStore.getState().activeConversationId).toBe('conv-1');
-    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({
-      'account-a': { 'conv-1': 4 },
-    });
-
-    localStorage.setItem(
-      'concord:dm-store',
-      JSON.stringify({
-        state: {
-          activeConversationId: 'conv-2',
-          seenExpirationRevisionsByAccount: { bad: { conv: 'four' } },
-        },
-        version: 0,
-      })
-    );
-    await useDMStore.persist.rehydrate();
-    expect(useDMStore.getState().activeConversationId).toBe('conv-2');
-    expect(useDMStore.getState().seenExpirationRevisionsByAccount).toEqual({});
   });
 
   it.each([

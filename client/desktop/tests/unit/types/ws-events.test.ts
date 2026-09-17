@@ -920,6 +920,88 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(false);
   });
 
+  // ──────────── Expiration events (#1351) (6) ──────────────────────────
+  //
+  // These were missing entirely: the PR that added both schemas only bumped the
+  // member count, so nothing parsed either one. The handler suite's fixture used
+  // placeholder ids that this boundary REJECTS, and passed regardless because it
+  // invokes the handler directly — so no test proved a real payload ever arrived.
+
+  const expirationData = {
+    id: UUID_A,
+    channel_id: UUID_B,
+    actor_user_id: UUID_A,
+    actor_username: 'alice',
+    actor_display_name: 'Alice',
+    kind: 'set' as const,
+    window_seconds: 86400,
+    created_at: '2026-09-16T12:00:00.000Z',
+    revision: 5,
+    updated_at: '2026-09-16T12:00:00.000Z',
+    backfill_pending: false,
+  };
+
+  it('ExpirationEventSchema accepts a canonical expiration_event envelope', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'expiration_event',
+      data: expirationData,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('DMExpirationEventSchema accepts a canonical dm_expiration_event envelope', () => {
+    const { channel_id: _drop, ...rest } = expirationData;
+    const result = WebSocketEventSchema.safeParse({
+      type: 'dm_expiration_event',
+      data: { ...rest, conversation_id: UUID_B, kind: 'cleared', window_seconds: null },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('ExpirationEventSchema rejects a non-UUID id', () => {
+    // The exact shape the handler fixture used before this was caught.
+    const result = WebSocketEventSchema.safeParse({
+      type: 'expiration_event',
+      data: { ...expirationData, id: 'evt-1' },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('ExpirationEventSchema rejects a window outside the closed set', () => {
+    // 3600 / 86400 / 604800 / 2592000 are the only admissible windows; anything
+    // else would render "expire after undefined".
+    const result = WebSocketEventSchema.safeParse({
+      type: 'expiration_event',
+      data: { ...expirationData, window_seconds: 999 },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('ExpirationEventSchema rejects an unknown kind', () => {
+    const result = WebSocketEventSchema.safeParse({
+      type: 'expiration_event',
+      data: { ...expirationData, kind: 'deleted' },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('ExpirationEventSchema accepts a null updated_at but not a null backfill_pending', () => {
+    // updated_at is nullable by contract; backfill_pending is not, and a null there
+    // would read as falsy and silently under-report a pending backfill.
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'expiration_event',
+        data: { ...expirationData, updated_at: null },
+      }).success
+    ).toBe(true);
+    expect(
+      WebSocketEventSchema.safeParse({
+        type: 'expiration_event',
+        data: { ...expirationData, backfill_pending: null },
+      }).success
+    ).toBe(false);
+  });
+
   // ──────────── Message purge (#1352) (3) ──────────────────────────────
 
   it('ChannelPurgedSchema accepts a canonical channel_purged envelope', () => {
@@ -2205,9 +2287,9 @@ describe('Server role events (#2359)', () => {
     }
   });
 
-  it('WebSocketEventSchema has exactly 75 members', () => {
+  it('WebSocketEventSchema has exactly 78 members', () => {
     // Pins the count quoted in [internal]rules/frontend.md and in the ws-events.ts
     // header, so a future addition cannot silently drift the docs.
-    expect(WebSocketEventSchema.options).toHaveLength(76);
+    expect(WebSocketEventSchema.options).toHaveLength(78);
   });
 });

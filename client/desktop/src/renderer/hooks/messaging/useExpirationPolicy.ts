@@ -25,9 +25,6 @@ export interface ExpirationPolicyControls {
   lockedDescription: string;
   onRefresh: () => Promise<ExpirationPolicyReadResult>;
   onApplyPolicy: (request: ExpirationRequest) => Promise<ExpirationMutationResult>;
-  onMarkSeen: (revision: number) => void;
-  showChangedNotice: boolean;
-  onDismissNotice: () => void;
 }
 
 type View = {
@@ -46,12 +43,6 @@ const keyFor = (
   authGeneration: number
 ) =>
   `${authGeneration}:${accountId ?? ''}:${scope?.kind ?? ''}:${scope?.id ?? ''}:${serverId ?? ''}`;
-
-function currentPolicy(scope: ExpirationScope): ExpirationPolicy | undefined {
-  return scope.kind === 'channel'
-    ? useChannelStore.getState().channels.find((item) => item.id === scope.id)?.expirationPolicy
-    : useDMStore.getState().conversations.find((item) => item.id === scope.id)?.expirationPolicy;
-}
 
 function eligible(scope: ExpirationScope, serverId: string | undefined): boolean {
   if (scope.kind === 'channel') {
@@ -128,16 +119,6 @@ export function useExpirationPolicy(
   );
   const conversation = useDMStore((state) =>
     scope?.kind === 'dm' ? state.conversations.find((item) => item.id === scope.id) : undefined
-  );
-  const channelSeen = useChannelStore((state) =>
-    scope?.kind === 'channel' && accountId
-      ? state.seenExpirationRevisionsByAccount[accountId]?.[scope.id]
-      : undefined
-  );
-  const dmSeen = useDMStore((state) =>
-    scope?.kind === 'dm' && accountId
-      ? state.seenExpirationRevisionsByAccount[accountId]?.[scope.id]
-      : undefined
   );
   const channelPolicyInvalid = useChannelStore((state) =>
     scope?.kind === 'channel' ? state.invalidExpirationPolicyIds[scope.id] : undefined
@@ -267,49 +248,6 @@ export function useExpirationPolicy(
     return () => globalThis.removeEventListener('connection-recovered', refreshOnRecovery);
   }, [inactive, onRefresh]);
 
-  const onMarkSeen = useCallback(
-    (revision: number) => {
-      const captured: View = {
-        scope: scopeKind && scopeId ? { kind: scopeKind, id: scopeId } : null,
-        serverId,
-        accountId,
-        authGeneration,
-        mounted: true,
-      };
-      if (
-        !captured.scope ||
-        !captured.accountId ||
-        !Number.isSafeInteger(revision) ||
-        revision < 0 ||
-        !isCurrent(captured) ||
-        !eligible(captured.scope, captured.serverId) ||
-        currentPolicy(captured.scope)?.revision !== revision
-      )
-        return;
-      if (captured.scope.kind === 'channel')
-        useChannelStore
-          .getState()
-          .markExpirationSeen(captured.accountId, captured.scope.id, revision);
-      else
-        useDMStore.getState().markExpirationSeen(captured.accountId, captured.scope.id, revision);
-    },
-    [accountId, authGeneration, isCurrent, scopeId, scopeKind, serverId]
-  );
-
-  const seenRevision = scope?.kind === 'channel' ? channelSeen : dmSeen;
-  useEffect(() => {
-    if (policyState === 'ready' && policy && seenRevision === undefined)
-      onMarkSeen(policy.revision);
-  }, [onMarkSeen, policy, policyState, seenRevision]);
-  const showChangedNotice =
-    policyState === 'ready' &&
-    policy !== null &&
-    seenRevision !== undefined &&
-    seenRevision < policy.revision;
-  const onDismissNotice = useCallback(() => {
-    if (policyState === 'ready' && policy) onMarkSeen(policy.revision);
-  }, [onMarkSeen, policy, policyState]);
-
   const onApplyPolicy = useCallback(
     async (request: ExpirationRequest): Promise<ExpirationMutationResult> => {
       const captured: View = {
@@ -342,18 +280,12 @@ export function useExpirationPolicy(
           captured.accountId,
           captured.authGeneration
         );
-        if (
-          result.kind === 'ok' &&
-          isCurrent(captured, lifecycle) &&
-          currentPolicy(captured.scope)?.revision === next.revision
-        )
-          onMarkSeen(next.revision);
         if (result.kind === 'ok' && isCurrent(captured, lifecycle))
           setRead({ key: capturedKey, state: 'ready' });
       }
       return result;
     },
-    [accountId, authGeneration, isCurrent, onMarkSeen, scopeId, scopeKind, serverId]
+    [accountId, authGeneration, isCurrent, scopeId, scopeKind, serverId]
   );
 
   return {
@@ -363,8 +295,5 @@ export function useExpirationPolicy(
     lockedDescription,
     onRefresh,
     onApplyPolicy,
-    onMarkSeen,
-    showChangedNotice,
-    onDismissNotice,
   };
 }

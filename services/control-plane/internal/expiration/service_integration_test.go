@@ -55,10 +55,10 @@ func startChannelDB(t *testing.T, db *sql.DB, channelID string, request Request)
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	policy, err := NewService(db).StartChannel(context.Background(), tx, channelID, request)
+	transition, err := NewService(db).StartChannelTransition(context.Background(), tx, channelID, request)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	return policy
+	return transition.Current
 }
 
 func timezoneDB(t *testing.T) *sql.DB {
@@ -84,10 +84,10 @@ func startConversation(t *testing.T, f expirationFixture, request Request) Polic
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	policy, err := NewService(f.db).StartConversation(context.Background(), tx, f.conversation.String(), request)
+	transition, err := NewService(f.db).StartConversationTransition(context.Background(), tx, f.conversation.String(), request)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	return policy
+	return transition.Current
 }
 
 func insertChannelMessage(t *testing.T, f expirationFixture, created time.Time) string {
@@ -197,7 +197,7 @@ func TestService_StartRollbackLeavesCallerTransactionUnchanged(t *testing.T) {
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	_, err = NewService(f.db).StartChannel(context.Background(), tx, f.channel.String(), Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only"})
+	_, err = NewService(f.db).StartChannelTransition(context.Background(), tx, f.channel.String(), Request{Mode: "set", WindowSeconds: &window, Retroactive: "new_only"})
 	require.NoError(t, err)
 	require.NoError(t, tx.Rollback())
 
@@ -401,7 +401,7 @@ func TestService_StartChoicesAndPendingGuards(t *testing.T) {
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	_, err = NewService(f.db).StartChannel(context.Background(), tx, f.channel.String(), Request{Mode: "clear", Retroactive: "clear_pending"})
+	_, err = NewService(f.db).StartChannelTransition(context.Background(), tx, f.channel.String(), Request{Mode: "clear", Retroactive: "clear_pending"})
 	assert.ErrorIs(t, err, ErrBackfillPending)
 	require.NoError(t, tx.Rollback())
 
@@ -422,12 +422,12 @@ func TestService_StartResumeMatchingPendingRevisionLeavesPolicyUnchanged(t *test
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	resumed, err := NewService(f.db).StartChannel(context.Background(), tx, f.channel.String(), Request{Mode: "resume", Revision: &original.Revision})
+	resumed, err := NewService(f.db).StartChannelTransition(context.Background(), tx, f.channel.String(), Request{Mode: "resume", Revision: &original.Revision})
 	require.NoError(t, err)
-	assert.Equal(t, original.Revision, resumed.Revision)
-	assert.Equal(t, original.WindowSeconds, resumed.WindowSeconds)
-	assert.Equal(t, original.UpdatedAt, resumed.UpdatedAt)
-	assert.True(t, resumed.BackfillPending)
+	assert.Equal(t, original.Revision, resumed.Current.Revision)
+	assert.Equal(t, original.WindowSeconds, resumed.Current.WindowSeconds)
+	assert.Equal(t, original.UpdatedAt, resumed.Current.UpdatedAt)
+	assert.True(t, resumed.Current.BackfillPending)
 	require.NoError(t, tx.Commit())
 	after, err := readPolicy(context.Background(), f.db, channelScope, f.channel.String())
 	require.NoError(t, err)
@@ -458,7 +458,7 @@ func TestService_StartResumeRejectsWrongOrCompletedRevisionWithoutMutation(t *te
 					t.Errorf("rollback transaction: %v", rollbackErr)
 				}
 			}()
-			_, err = NewService(f.db).StartChannel(context.Background(), tx, f.channel.String(), Request{Mode: "resume", Revision: &tc.revision})
+			_, err = NewService(f.db).StartChannelTransition(context.Background(), tx, f.channel.String(), Request{Mode: "resume", Revision: &tc.revision})
 			assert.ErrorIs(t, err, tc.wantErr)
 			require.NoError(t, tx.Commit())
 			after, readErr := readPolicy(context.Background(), f.db, channelScope, f.channel.String())
@@ -483,10 +483,10 @@ func TestService_StartResumeConversationLeavesPolicyUnchanged(t *testing.T) {
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	resumed, err := NewService(f.db).StartConversation(context.Background(), tx, f.conversation.String(), Request{Mode: "resume", Revision: &original.Revision})
+	resumed, err := NewService(f.db).StartConversationTransition(context.Background(), tx, f.conversation.String(), Request{Mode: "resume", Revision: &original.Revision})
 	require.NoError(t, err)
-	assert.Equal(t, original.Revision, resumed.Revision)
-	assert.Equal(t, original.UpdatedAt, resumed.UpdatedAt)
+	assert.Equal(t, original.Revision, resumed.Current.Revision)
+	assert.Equal(t, original.UpdatedAt, resumed.Current.UpdatedAt)
 	require.NoError(t, tx.Commit())
 	after, err := readPolicy(context.Background(), f.db, conversationScope, f.conversation.String())
 	require.NoError(t, err)
@@ -502,11 +502,11 @@ func TestService_StartResumeMissingScopes(t *testing.T) {
 		start func(*sql.Tx) error
 	}{
 		{name: "channel", start: func(tx *sql.Tx) error {
-			_, err := NewService(f.db).StartChannel(context.Background(), tx, uuid.NewString(), Request{Mode: "resume", Revision: ptr(int64(1))})
+			_, err := NewService(f.db).StartChannelTransition(context.Background(), tx, uuid.NewString(), Request{Mode: "resume", Revision: ptr(int64(1))})
 			return err
 		}},
 		{name: "conversation", start: func(tx *sql.Tx) error {
-			_, err := NewService(f.db).StartConversation(context.Background(), tx, uuid.NewString(), Request{Mode: "resume", Revision: ptr(int64(1))})
+			_, err := NewService(f.db).StartConversationTransition(context.Background(), tx, uuid.NewString(), Request{Mode: "resume", Revision: ptr(int64(1))})
 			return err
 		}},
 	} {
@@ -604,7 +604,7 @@ func TestService_NotFoundAndUnreadySentinels(t *testing.T) {
 			t.Errorf("rollback transaction: %v", rollbackErr)
 		}
 	}()
-	_, err = NewService(f.db).StartChannel(context.Background(), tx, uuid.NewString(), Request{Mode: "clear", Retroactive: "leave_pending"})
+	_, err = NewService(f.db).StartChannelTransition(context.Background(), tx, uuid.NewString(), Request{Mode: "clear", Retroactive: "leave_pending"})
 	assert.ErrorIs(t, err, ErrScopeNotFound)
 	require.NoError(t, tx.Rollback())
 	_, err = (*Service)(nil).ResumeChannel(context.Background(), f.channel.String(), 0)

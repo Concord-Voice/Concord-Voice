@@ -1,7 +1,10 @@
 // Package models contains data models for the Concord platform.
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Server represents a Concord server (Discord-like community)
 type Server struct {
@@ -92,8 +95,23 @@ type Message struct {
 	PinnedBy         *string    `json:"pinned_by,omitempty" db:"pinned_by"`
 	EditedAt         *time.Time `json:"edited_at,omitempty" db:"edited_at"`
 	ExpiresAt        *time.Time `json:"expires_at" db:"expires_at"`
-	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
+	// Type discriminates an ordinary message ('user') from a server-authored
+	// system row ('expiration_event'). Added by migration 000137; dm_messages
+	// has carried the equivalent since 000026.
+	//
+	// omitempty does NOT omit this field in practice, and the comment here used to
+	// claim it did: the column defaults to 'user', omitempty drops only the empty
+	// string, so `"type":"user"` now ships on every channel message. Verified
+	// harmless — every consumer compares against a specific literal rather than
+	// testing truthiness — but a future `if (message.type)` would be true for every
+	// row, so do not read the tag as a guarantee that ordinary messages are unchanged.
+	Type string `json:"type,omitempty" db:"type"`
+	// ExpirationEventPayload is the plaintext envelope for type='expiration_event'
+	// rows — server-authored metadata the client never decrypts, mirroring
+	// dm_messages.call_event_payload. Nil for every ordinary message.
+	ExpirationEventPayload json.RawMessage `json:"expiration_event_payload,omitempty" db:"expiration_event_payload"`
+	CreatedAt              time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time       `json:"updated_at" db:"updated_at"`
 }
 
 // MessageWithUser combines message with user details

@@ -28,25 +28,8 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
 		return
 	}
-	var request expiration.Request
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxExpirationRequestBytes)
-	if err := c.ShouldBindBodyWithJSON(&request); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": errMsgExpirationBodyTooLarge})
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
-		return
-	}
-	body, ok := c.Get(gin.BodyBytesKey)
-	bodyBytes, bodyIsBytes := body.([]byte)
-	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
-		return
-	}
-	if err := request.Validate(); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	request, ok := h.bindExpirationRequest(c)
+	if !ok {
 		return
 	}
 
@@ -68,58 +51,149 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		return
 	}
 
-	var isGroup bool
-	if err := tx.QueryRowContext(mutationCtx,
-		`SELECT is_group FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, conversationID,
-	).Scan(&isGroup); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
-			return
-		}
-		h.log.Error("Failed to lock DM expiration scope", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
-		return
-	}
-	var role string
-	if err := tx.QueryRowContext(mutationCtx,
-		`SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
-	).Scan(&role); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
-			return
-		}
-		h.log.Error("Failed to lock DM expiration participant", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
-		return
-	}
-	if isGroup && role != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotAdmin})
+	if !h.authorizeDMExpirationTx(mutationCtx, c, tx, conversationID, userID) {
 		return
 	}
 
 	service := expiration.NewService(h.db)
-	policy, err := service.StartConversation(mutationCtx, tx, conversationID, request)
+	transition, err := service.StartConversationTransition(mutationCtx, tx, conversationID, request)
 	if err != nil {
 		h.writeExpirationStartError(c, err)
 		return
 	}
+	policy := transition.Current
+
+	staged, ok := h.stageDMExpirationEvent(mutationCtx, c, tx, conversationID, userID, request, transition)
+	if !ok {
+		return
+	}
+
 	if err := tx.Commit(); err != nil {
 		h.log.Error("DM expiration commit outcome is ambiguous", "error", err)
 		c.JSON(http.StatusServiceUnavailable, policy)
 		return
 	}
+	if staged.Present {
+		h.broadcastDMExpirationEvent(conversationID, staged.MessageID, userID, staged.Payload, policy)
+	}
 	if !policy.BackfillPending {
 		c.JSON(http.StatusOK, policy)
 		return
 	}
+	h.respondDMExpirationBackfill(c, service, conversationID, policy)
+}
 
+// bindExpirationRequest applies the byte cap and the strict full-document read
+// this repo requires of every JSON handler: MaxBytesReader alone is not enough,
+// because the decoder may stop after the first valid value without reading the
+// oversized remainder, so the cached body is re-checked with json.Valid. Error
+// ordering is part of the wire contract — 413 before 400.
+func (h *Handler) bindExpirationRequest(c *gin.Context) (expiration.Request, bool) {
+	var request expiration.Request
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxExpirationRequestBytes)
+	if err := c.ShouldBindBodyWithJSON(&request); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": errMsgExpirationBodyTooLarge})
+			return expiration.Request{}, false
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return expiration.Request{}, false
+	}
+	body, ok := c.Get(gin.BodyBytesKey)
+	bodyBytes, bodyIsBytes := body.([]byte)
+	if !ok || !bodyIsBytes || !json.Valid(bodyBytes) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidRequestBody})
+		return expiration.Request{}, false
+	}
+	if err := request.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return expiration.Request{}, false
+	}
+	return request, true
+}
+
+// authorizeDMExpirationTx locks the conversation and the actor's participant
+// row, then applies the group-admin rule. It writes its own response and
+// returns false when the caller must stop.
+//
+// A non-participant and a missing conversation deliberately return the same
+// 404: distinguishing them would tell a stranger that a conversation exists.
+func (h *Handler) authorizeDMExpirationTx(
+	ctx context.Context,
+	c *gin.Context,
+	tx *sql.Tx,
+	conversationID, userID string,
+) bool {
+	var isGroup bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT is_group FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, conversationID,
+	).Scan(&isGroup); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
+			return false
+		}
+		h.log.Error("Failed to lock DM expiration scope", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
+		return false
+	}
+	var role string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
+	).Scan(&role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
+			return false
+		}
+		h.log.Error("Failed to lock DM expiration participant", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
+		return false
+	}
+	if isGroup && role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotAdmin})
+		return false
+	}
+	return true
+}
+
+// stageDMExpirationEvent writes the durable system row on the SAME transaction
+// as the policy update — see insertDMExpirationEvent's doc comment for the
+// transactional-correctness argument. The second return is "keep going", not
+// "wrote a row".
+func (h *Handler) stageDMExpirationEvent(
+	ctx context.Context,
+	c *gin.Context,
+	tx *sql.Tx,
+	conversationID, userID string,
+	request expiration.Request,
+	transition expiration.Transition,
+) (expiration.StagedEvent, bool) {
+	payload, ok := expiration.EventFor(request, transition, userID)
+	if !ok {
+		return expiration.StagedEvent{}, true
+	}
+	messageID, err := insertDMExpirationEvent(ctx, tx, conversationID, userID, payload)
+	if err != nil {
+		h.log.Error("Failed to insert DM expiration_event row", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
+		return expiration.StagedEvent{}, false
+	}
+	return expiration.StagedEvent{MessageID: messageID, Payload: payload, Present: true}, true
+}
+
+// respondDMExpirationBackfill runs the post-commit resume batch and writes the
+// response. It deliberately uses the REQUEST context, not the mutation context:
+// that 3-second budget bounds the write transaction, and the batch runs after
+// the commit.
+func (h *Handler) respondDMExpirationBackfill(
+	c *gin.Context,
+	service *expiration.Service,
+	conversationID string,
+	policy expiration.Policy,
+) {
 	resumed, resumeErr := service.ResumeConversation(c.Request.Context(), conversationID, policy.Revision)
 	resumed, status := expiration.NormalizeResume(policy, resumed, resumeErr)
-	if status != http.StatusServiceUnavailable {
-		c.JSON(status, resumed)
-		return
-	}
-	if !errors.Is(resumeErr, expiration.ErrBackfillPending) {
+	if status == http.StatusServiceUnavailable && !errors.Is(resumeErr, expiration.ErrBackfillPending) {
 		h.log.Error("Failed to resume DM expiration backfill", "error", resumeErr)
 	}
 	c.JSON(status, resumed)

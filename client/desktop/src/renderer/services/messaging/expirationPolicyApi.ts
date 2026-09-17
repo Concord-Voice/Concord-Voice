@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { createJSONStorage, type PersistStorage } from 'zustand/middleware';
 import { apiFetch } from '../system/apiClient';
 
 const expirationWindowSchema = z.union([
@@ -10,6 +9,29 @@ const expirationWindowSchema = z.union([
 ]);
 
 export type ExpirationWindowSeconds = z.infer<typeof expirationWindowSchema>;
+
+/** The one label per window. Previously duplicated three ways — the zod literals here,
+ *  a `labels` record in the (now-deleted) policy summary, and an options array in the
+ *  editor — which meant the system-message row would have been a fourth copy. Keyed by
+ *  the same literals the schema validates, so a new window cannot be added to one and
+ *  forgotten in the other: `Record<ExpirationWindowSeconds, string>` fails to compile
+ *  until this map covers it. */
+export const EXPIRATION_WINDOW_LABELS: Record<ExpirationWindowSeconds, string> = {
+  3600: '1 hour',
+  86400: '24 hours',
+  604800: '7 days',
+  2592000: '30 days',
+};
+
+/** Ordered for pickers. Derived from the label map rather than restated, so order is the
+ *  only thing this adds. */
+export const EXPIRATION_WINDOW_OPTIONS: ReadonlyArray<{
+  label: string;
+  value: ExpirationWindowSeconds;
+}> = [3600, 86400, 604800, 2592000].map((value) => ({
+  label: EXPIRATION_WINDOW_LABELS[value as ExpirationWindowSeconds],
+  value: value as ExpirationWindowSeconds,
+}));
 
 export interface ExpirationPolicy {
   windowSeconds: ExpirationWindowSeconds | null;
@@ -59,47 +81,6 @@ export type ExpirationPolicyReadResult =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-export function parseSeenExpirationRevisions(
-  value: unknown
-): Record<string, Record<string, number>> {
-  if (!isRecord(value)) return {};
-  const accounts: Record<string, Record<string, number>> = {};
-  for (const [accountId, revisions] of Object.entries(value)) {
-    if (!accountId || !isRecord(revisions)) continue;
-    const validRevisions: Record<string, number> = {};
-    for (const [targetId, revision] of Object.entries(revisions)) {
-      if (
-        targetId &&
-        typeof revision === 'number' &&
-        Number.isSafeInteger(revision) &&
-        revision >= 0
-      ) {
-        validRevisions[targetId] = revision;
-      }
-    }
-    if (Object.keys(validRevisions).length > 0) accounts[accountId] = validRevisions;
-  }
-  return accounts;
-}
-
-/** Keeps a definitive in-memory policy result truthful when browser storage is unavailable. */
-export function createExpirationPolicyStorage<T>(): PersistStorage<T> | undefined {
-  return createJSONStorage<T>(() => {
-    const storage = localStorage;
-    return {
-      getItem: storage.getItem.bind(storage),
-      setItem: (name, value) => {
-        try {
-          storage.setItem(name, value);
-        } catch {
-          console.warn('Unable to persist expiration policy acknowledgement.');
-        }
-      },
-      removeItem: storage.removeItem.bind(storage),
-    };
-  });
 }
 
 const policyResponseSchema = z.object({

@@ -1,5 +1,8 @@
-.message-expiration-editor,
-.message-expiration-summary {
+/* Editor-only. The summary/notice/header-action rules that used to live here went with
+   MessageExpirationPolicySummary: the policy display moved to the composer status strip
+   (MessageInput.css) and the header entry point to .chat-header-expiration-button
+   (ChatView.css), which both headers consume. */
+.message-expiration-editor {
   font: inherit;
   color: var(--text-primary);
 }
@@ -9,6 +12,11 @@
   white-space: normal;
   overflow: visible;
   text-overflow: clip;
+  /* A transparent border reserved at rest, so neither .applied nor .pending below can
+     resize the pill when it paints its own. */
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
 }
 .message-expiration-stops .settings-tier-label.message-expiration-stop:focus-visible {
   color: var(--text-primary);
@@ -18,39 +26,6 @@
   color: var(--text-secondary);
   cursor: default;
 }
-.chat-header .chat-header-search-button.message-expiration-header-action {
-  font: inherit;
-  color: var(--text-primary);
-}
-.chat-header .chat-header-search-button.message-expiration-header-action:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: 2px;
-}
-.message-expiration-notice {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  color: var(--text-secondary);
-}
-.message-expiration-notice button,
-.message-expiration-summary button {
-  font: inherit;
-  color: var(--text-primary);
-}
-.message-expiration-summary .message-expiration-notice-action {
-  appearance: none;
-  background: transparent;
-  border: 1px solid var(--text-muted);
-  border-radius: 4px;
-  color: var(--text-primary);
-  cursor: pointer;
-  padding: 3px 6px;
-  white-space: normal;
-}
-.message-expiration-summary .message-expiration-notice-action:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: 2px;
-}
 .message-expiration-options {
   display: grid;
   gap: 8px;
@@ -59,7 +34,73 @@
   color: var(--danger);
 }
 
-.message-expiration-summary:focus-visible {
-  outline: 2px solid var(--accent-primary);
-  outline-offset: 2px;
+/* Applied vs pending, as two visually distinct states.
+   Bold-weight alone (the shared `.settings-tier-label.active` rule) was too soft to read
+   as "this is your current retention policy" — found by looking at the running app. These
+   rules are scoped to `.message-expiration-stop` on purpose: `.settings-tier-label` is
+   shared with the audio-quality slider and DMPrivacyControls, and widening the shared rule
+   would restyle both for a problem neither has. */
+
+/* The window currently in force. A filled pill, so it reads at a glance. */
+.message-expiration-stops .settings-tier-label.message-expiration-stop.applied {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+
+/* A staged, not-yet-applied choice. Deliberately an ACCENT OUTLINE rather than a second
+   fill: the two states must not read as equally settled, and an outline says "chosen"
+   where a fill says "in force". Placed after `.applied` so a stop that is both — i.e.
+   the user re-picked the current window — is not possible, because selectWindow clears
+   the draft in that case. */
+.message-expiration-stops .settings-tier-label.message-expiration-stop.pending {
+  background: transparent;
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+/* While a change is staged, dim the applied pill so the eye lands on the pending one. */
+.message-expiration-stops:has(.message-expiration-stop.pending)
+  .settings-tier-label.message-expiration-stop.applied {
+  opacity: 0.65;
+}
+
+.message-expiration-apply {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+/* Accent-OUTLINED, not accent-filled. `--on-accent` (#ffffff) on `--accent-primary`
+   (#fa709a) measures 2.68:1 — well under the 4.5:1 floor for button text. The codebase
+   already carries that exact pair allowlisted twice (`.role-reorder-apply-btn` 2.19,
+   `.settings-pending-blob-apply` 2.68); adding a third entry would grow a ratchet that
+   exists to shrink. A 2px accent border carries the primary-action weight against Cancel
+   while the label keeps a pair that actually passes. */
+.message-expiration-apply-button {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 2px solid var(--accent-primary);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.message-expiration-apply-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.message-expiration-cancel-button {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font: inherit;
+  cursor: pointer;
 }

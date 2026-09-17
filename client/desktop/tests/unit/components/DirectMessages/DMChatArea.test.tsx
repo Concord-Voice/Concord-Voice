@@ -89,6 +89,9 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
     onTyping?: (isTyping: boolean) => void;
     replyingTo?: unknown;
     onCancelReply?: () => void;
+    // The composer renders this slot, so a mock that drops it makes the
+    // indicator invisible to every assertion with no error to explain why.
+    expirationClause?: string | null;
   }) => {
     capturedMIProps = props;
     return (
@@ -98,6 +101,7 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
         data-disabled={props.disabled}
         data-encrypted={props.isChannelEncrypted}
       >
+        <span>{`Messages are Encrypted End-to-End${props.expirationClause ?? ''}`}</span>
         <button data-testid="trigger-send" onClick={() => props.onSendMessage?.('Hello world')}>
           Send
         </button>
@@ -347,7 +351,6 @@ describe('DMChatArea', () => {
     });
     useDMStore.setState({
       conversations: [group],
-      seenExpirationRevisionsByAccount: { 'user-1': { 'group-1': 3 } },
     });
     mockApiFetch.mockImplementation(async (input: RequestInfo | URL) => {
       if (String(input).includes('/dm/conversations')) {
@@ -381,12 +384,15 @@ describe('DMChatArea', () => {
     const user = userEvent.setup();
     render(<DMChatArea selectedThreadId="group-1" />);
 
-    const summary = await screen.findByLabelText('Message expiration');
-    expect(screen.getByText('Messages expire after 24 hours')).toBeInTheDocument();
-    await user.click(await screen.findByRole('button', { name: 'Review policy' }));
-
+    // Awareness is universal, capability is permission-gated: a non-admin group
+    // member reads the live window off the composer indicator and is offered no
+    // entry point at all. The old read-only "Review policy" surface is gone, so
+    // the absence of the header control IS the read-only guarantee.
+    expect(
+      await screen.findByText('Messages are Encrypted End-to-End and expire after 24 hours')
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Message expiration:/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('dialog', { name: 'Message expiration' })).not.toBeInTheDocument();
-    expect(summary).toHaveFocus();
   });
 
   it('keeps a successor DM editor isolated from a held timer save', async () => {
@@ -471,12 +477,13 @@ describe('DMChatArea', () => {
     });
     useDMStore.setState({
       conversations: [conversationA, conversationB],
-      seenExpirationRevisionsByAccount: { 'user-1': { 'conv-a': 4, 'conv-b': 4 } },
     });
     const user = userEvent.setup();
     const { rerender } = render(<DMChatArea selectedThreadId="conv-a" />);
     await waitFor(() =>
-      expect(screen.getByText('Messages expire after 24 hours')).toBeInTheDocument()
+      expect(
+        screen.getByText('Messages are Encrypted End-to-End and expire after 24 hours')
+      ).toBeInTheDocument()
     );
     act(() =>
       useDMStore.getState().applyExpirationPolicy('conv-a', {
@@ -485,7 +492,7 @@ describe('DMChatArea', () => {
         revision: 5,
       })
     );
-    await user.click(await screen.findByRole('button', { name: 'Review policy' }));
+    await user.click(await screen.findByRole('button', { name: /^Message expiration:/ }));
     await waitFor(() =>
       expect(screen.getByRole('button', { name: '7 days' })).toHaveAttribute(
         'aria-disabled',
@@ -493,6 +500,8 @@ describe('DMChatArea', () => {
       )
     );
     await user.click(screen.getByRole('button', { name: '30 days' }));
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const dialogA = await screen.findByRole('dialog', { name: 'Change message expiration' });
     await user.click(within(dialogA).getByRole('radio', { name: 'Only new messages' }));
     await user.click(within(dialogA).getByRole('checkbox', { name: /cannot be recovered/i }));
@@ -507,7 +516,7 @@ describe('DMChatArea', () => {
         screen.queryByRole('dialog', { name: 'Change message expiration' })
       ).not.toBeInTheDocument()
     );
-    await user.click(await screen.findByRole('button', { name: 'Review policy' }));
+    await user.click(await screen.findByRole('button', { name: /^Message expiration:/ }));
     await waitFor(() =>
       expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute(
         'aria-disabled',
@@ -515,6 +524,8 @@ describe('DMChatArea', () => {
       )
     );
     await user.click(screen.getByRole('button', { name: '30 days' }));
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const dialogB = await screen.findByRole('dialog', { name: 'Change message expiration' });
     await user.click(within(dialogB).getByRole('radio', { name: 'Only new messages' }));
     await user.click(within(dialogB).getByRole('checkbox', { name: /cannot be recovered/i }));
@@ -1001,7 +1012,7 @@ describe('DMChatArea', () => {
 
   // --- Toggle button aria attributes ---
 
-  it('group info toggle button has correct aria-label and title', () => {
+  it('group info toggle button is labelled by aria-label alone, with no duplicate title', () => {
     useDMStore.setState({
       conversations: [
         makeConversation({
@@ -1018,7 +1029,12 @@ describe('DMChatArea', () => {
 
     const btn = screen.getByLabelText('Toggle group info');
     expect(btn).toHaveAttribute('aria-label', 'Toggle group info');
-    expect(btn).toHaveAttribute('title', 'Group Info');
+    // Inverted deliberately: this asserted title="Group Info" until the header became a
+    // pill row. Every direct button child of .chat-header-actions grows a
+    // `content: attr(aria-label)` pill on hover, so a native title showed the same control
+    // a second time ~1s later — and with DIFFERENT wording, since the two strings had
+    // drifted. The ABSENCE is the invariant now.
+    expect(btn).not.toHaveAttribute('title');
     expect(btn.tagName).toBe('BUTTON');
     expect(btn).toHaveAttribute('type', 'button');
   });
@@ -1820,7 +1836,7 @@ describe('DMChatArea', () => {
     useDMStore.setState({ conversations: [group] });
     const user = userEvent.setup();
     render(<DMChatArea selectedThreadId="group-1" />);
-    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    await user.click(await screen.findByRole('button', { name: /^Purge messages in this/ }));
     const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
     await user.click(screen.getByLabelText('Last hour'));
 
@@ -1847,7 +1863,7 @@ describe('DMChatArea', () => {
     useDMStore.setState({ conversations: [group] });
     const user = userEvent.setup();
     render(<DMChatArea selectedThreadId="group-1" />);
-    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    await user.click(await screen.findByRole('button', { name: /^Purge messages in this/ }));
     expect(await screen.findByRole('dialog', { name: 'Purge Messages' })).toBeInTheDocument();
 
     act(() =>

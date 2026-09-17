@@ -357,7 +357,6 @@ const EditChannelModal: React.FC<EditChannelModalProps> = ({
             lockedDescription={expiration.lockedDescription}
             onRefresh={expiration.onRefresh}
             onApplyPolicy={expiration.onApplyPolicy}
-            onMarkSeen={expiration.onMarkSeen}
             onClose={closeExpirationEditor}
           />
         </>

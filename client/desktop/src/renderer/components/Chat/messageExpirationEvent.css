@@ -1,0 +1,58 @@
+/* Geometry mirrors .call-event-message so the two system-row types read as one family.
+   Colour deliberately does not, for two separate reasons.
+
+   The first is semantic — see MessageExpirationEventMessage for why a policy change must
+   not borrow call-event green.
+
+   The second is contrast. This row renders a sentence, so WCAG 2.1 SC 1.4.3 wants 4.5:1,
+   and --text-secondary on --bg-tertiary measures 4.31:1 in Midnight Sky. Its sibling
+   .call-event-message carries exactly that pair and is allowlisted at 4.31; copying the
+   pair here would have meant adding a SECOND entry to a ratchet that exists to shrink.
+   --text-primary clears the floor in all 34 theme blocks, and the row still reads as a
+   system row through the tinted pill, the icon, and the shared geometry — none of which
+   depend on the text being dimmer than a real message. */
+.expiration-event-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 4px 0;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--text-primary);
+}
+
+.expiration-event-message__icon {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+/* The retention fact and its attribution are separate elements on purpose, and this is a
+   security boundary rather than a typographic one. The row used to be one text node opening
+   with the actor's display name — attacker-controlled, capped only at 100 characters — which
+   let a DM peer prepend their own sentence to a trusted-looking system notice. The fact now
+   leads and carries the row's weight; the attribution is secondary and visibly so, which is
+   also what stops a long name from crowding the fact out of view.
+
+   Do not merge these back into one node, and do not let the actor span outrank the fact. */
+.expiration-event-message__fact {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.expiration-event-message__actor {
+  /* --text-primary, NOT --text-muted or --text-secondary. This is body text, and #3341
+     retired --text-muted as a text colour repo-wide; its blanket successor
+     --text-secondary does not work HERE either, because this row sits on --bg-tertiary
+     where that pair measures 4.31:1 in Midnight Sky — the same measurement recorded at
+     the top of this file. The hierarchy between the fact and its attribution is carried
+     by font-weight instead, which costs no contrast. */
+  color: var(--text-primary);
+  /* A hostile name is clamped at 40 characters in the component; this is the visual
+     backstop for a merely long one, so the fact beside it never scrolls away. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

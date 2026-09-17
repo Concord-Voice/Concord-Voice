@@ -202,6 +202,14 @@ export interface MessageInputProps {
   onCancelReply?: () => void;
   /** Whether the user has permission to attach files */
   canAttachFiles?: boolean;
+  /** Passive message-expiration status, rendered under the E2EE line in the composer's
+   *  status strip. Passed in rather than read from a store here: `useExpirationPolicy` is
+   *  already owned by ChatView / DMChatArea, and a second subscription at composer level
+   *  would duplicate that hook's scope and auth-lifecycle fencing. Undefined when no policy
+   *  is active — the caller owns that decision. */
+  /** Trailing retention clause, already prefixed with ' and '. `null`/absent says
+   *  nothing about retention — see `expirationClause`. */
+  expirationClause?: string | null;
 }
 
 const MessageInput: React.FC<MessageInputProps> = ({
@@ -217,6 +225,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   replyingTo,
   onCancelReply,
   canAttachFiles = true,
+  expirationClause,
 }) => {
   const sidebarContext: SidebarContext = conversationId ? 'dm' : 'server';
   const leftPinned = useLayoutStore(
@@ -931,10 +940,18 @@ const MessageInput: React.FC<MessageInputProps> = ({
 
   return (
     <div className="message-input-container">
-      {/* Always-visible E2EE status indicator */}
-      <div className="e2ee-status-bar encrypted">
-        <Lock size={14} />
-        <span>Messages are Encrypted End-to-End</span>
+      {/* Peace-of-mind status about what happens to what you are about to send: how it is
+          protected in transit, and how long it survives. Grouped in one bordered region so
+          the two read as one fact rather than two unrelated notices. Expiration is absent
+          whenever no policy is active, which is the default and the majority case. */}
+      <div className="composer-status-strip">
+        <div className="composer-status-row e2ee-status-bar encrypted">
+          <Lock size={14} />
+          {/* ONE template literal, not `{'…'}{clause}`. Two JSX expressions would split
+              this across sibling text nodes even though it renders identically, and the
+              sentence is what a consumer reading textContent expects to find whole. */}
+          <span>{`Messages are Encrypted End-to-End${expirationClause ?? ''}`}</span>
+        </div>
       </div>
 
       <section

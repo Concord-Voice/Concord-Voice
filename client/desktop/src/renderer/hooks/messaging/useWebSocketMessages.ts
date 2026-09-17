@@ -22,7 +22,13 @@ import {
   handleCallTimedOut,
 } from '../../services/voice/voiceService/callStateMachine';
 import { voiceService } from '../../services/voice/voiceService';
-import type { PresenceSnapshotPayload, WebSocketEvent } from '../../types/ws-events';
+import type {
+  DMExpirationEventPayload,
+  ExpirationEventPayload,
+  PresenceSnapshotPayload,
+  WebSocketEvent,
+} from '../../types/ws-events';
+import type { ExpirationPolicy } from '../../services/messaging/expirationPolicyApi';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { isPendingKeyError } from '../../services/e2ee/e2eeErrors';
 import { preferencesSyncService } from '../../services/system/preferencesSync';
@@ -1171,6 +1177,68 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       useDMStore.getState().bumpConversation(scopeId, null);
     };
     globalThis.addEventListener('messages-purged', handleMessagesPurged);
+
+    // Message-expiration system rows (#1351). The server writes the durable row on
+    // the SAME transaction as the policy update, so by the time this event arrives
+    // the row already exists server-side; this inserts the client's copy so it
+    // renders without a refetch. addMessage dedupes by id, so the actor receiving
+    // their own broadcast — the server excludes nobody — cannot double the row.
+    //
+    // No decrypt pass: content is '' by construction and was never encrypted. The
+    // synthesized row carries type + expiration_event_payload, which is exactly what
+    // MessageList's dispatch branch requires; a row missing either one falls through
+    // to the ordinary renderer and would attempt to decrypt that empty content.
+    const addExpirationEventRow = (
+      scopeId: string,
+      data: ExpirationEventPayload | DMExpirationEventPayload,
+      applyPolicy: (policy: ExpirationPolicy) => void
+    ) => {
+      addMessage(scopeId, {
+        id: data.id,
+        channel_id: scopeId,
+        user_id: data.actor_user_id,
+        // The row's own author fields feed MessageList's actorName; an empty pair
+        // (the server's lookup-failure degradation) renders "Someone", which is a
+        // true-but-vague record rather than a dropped one.
+        //
+        // The empty string is stored verbatim here because `username` is typed `string`,
+        // and it is UNUSABLE as a name — `MessageList` composes `display_name || username`
+        // and hands the result to MessageExpirationEventMessage, whose `sanitizeActorName`
+        // maps '' to undefined so the "someone" fallback fires. That single seam owns the
+        // decision; a `?? 'Someone'` in the component alone did NOT, because `??` does not
+        // catch '', which is how this rendered with a blank actor.
+        username: data.actor_username,
+        display_name: data.actor_display_name || undefined,
+        content: '',
+        type: 'expiration_event',
+        expiration_event_payload: {
+          kind: data.kind,
+          actor_user_id: data.actor_user_id,
+          window_seconds: data.window_seconds,
+          changed_at: data.created_at,
+        },
+        created_at: data.created_at,
+        updated_at: data.created_at,
+      });
+      applyPolicy({
+        windowSeconds: data.window_seconds,
+        updatedAt: data.updated_at,
+        revision: data.revision,
+        backfillPending: data.backfill_pending,
+      });
+    };
+
+    const unsubExpirationEvent = wsService.on('expiration_event', (msg) => {
+      addExpirationEventRow(msg.data.channel_id, msg.data, (policy) =>
+        useChannelStore.getState().applyExpirationPolicy(msg.data.channel_id, policy)
+      );
+    });
+
+    const unsubDMExpirationEvent = wsService.on('dm_expiration_event', (msg) => {
+      addExpirationEventRow(msg.data.conversation_id, msg.data, (policy) =>
+        useDMStore.getState().applyExpirationPolicy(msg.data.conversation_id, policy)
+      );
+    });
 
     const purgeScope = (scopeId: string) => {
       globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId } }));
@@ -2495,6 +2563,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
       unsubRichPresenceClear();
       unsubSubscribed();
       unsubError();
+      unsubExpirationEvent();
+      unsubDMExpirationEvent();
       unsubSessionRevoked();
     };
   }, [

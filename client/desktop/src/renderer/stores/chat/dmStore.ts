@@ -10,15 +10,14 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { useChatStore } from './chatStore';
 import type { CallEventPayload } from '../../types/chat';
 import {
-  createExpirationPolicyStorage,
   hasMalformedExpirationPolicyListRow,
   mergeExpirationPolicy,
   parseExpirationPolicyFromListRow,
-  parseSeenExpirationRevisions,
   type ExpirationPolicy,
   type ExpirationPolicyReadRequest,
   type ExpirationPolicyReadResult,
 } from '../../services/messaging/expirationPolicyApi';
+import { createQuotaSafeStorage } from '../../utils/runtime/quotaSafeStorage';
 import {
   captureAuthLifecycle,
   isSameAuthLifecycle,
@@ -452,7 +451,6 @@ interface DMState {
   activeConversationId: string | null;
   isLoading: boolean;
   error: string | null;
-  seenExpirationRevisionsByAccount: Record<string, Record<string, number>>;
   invalidExpirationPolicyIds: Record<string, true>;
 
   // Removed in #1209: dmCallActive / dmCallConversationId / setDMCallActive
@@ -464,7 +462,6 @@ interface DMState {
     read?: ExpirationPolicyReadRequest
   ) => Promise<ExpirationPolicyReadResult | undefined>;
   applyExpirationPolicy: (targetId: string, policy: ExpirationPolicy) => void;
-  markExpirationSeen: (accountId: string, targetId: string, revision: number) => void;
   openDM: (userId: string) => Promise<DMConversation>;
   createGroupDM: (userIds: string[], name?: string) => Promise<DMConversation>;
   openPersonalThread: () => Promise<DMConversation>;
@@ -737,7 +734,6 @@ export const useDMStore = wrapStore(
           activeConversationId: null,
           isLoading: false,
           error: null,
-          seenExpirationRevisionsByAccount: {},
           invalidExpirationPolicyIds: {},
 
           fetchConversations: async (read?: ExpirationPolicyReadRequest) => {
@@ -792,32 +788,25 @@ export const useDMStore = wrapStore(
           },
 
           applyExpirationPolicy: (targetId: string, policy: ExpirationPolicy) => {
-            set((state) => ({
-              conversations: state.conversations.map((conversation) => {
+            set((state) => {
+              const conversations = state.conversations.map((conversation) => {
                 if (conversation.id !== targetId) return conversation;
                 const expirationPolicy = mergeExpirationPolicy(
                   conversation.expirationPolicy,
                   policy
                 );
                 return expirationPolicy ? { ...conversation, expirationPolicy } : conversation;
-              }),
-            }));
-          },
-
-          markExpirationSeen: (accountId: string, targetId: string, revision: number) => {
-            if (!accountId || !targetId || !Number.isSafeInteger(revision) || revision < 0) return;
-            set((state) => ({
-              seenExpirationRevisionsByAccount: {
-                ...state.seenExpirationRevisionsByAccount,
-                [accountId]: {
-                  ...state.seenExpirationRevisionsByAccount[accountId],
-                  [targetId]: Math.max(
-                    state.seenExpirationRevisionsByAccount[accountId]?.[targetId] ?? 0,
-                    revision
-                  ),
-                },
-              },
-            }));
+              });
+              // Clearing the invalid marker is part of accepting the policy, not a separate
+              // concern. A list response that failed to parse a scope's policy sets the marker,
+              // and useExpirationPolicy reports `unavailable` while it is set — so without this
+              // a validated event would update the policy and the composer would still say
+              // nothing about retention until the next successful refetch.
+              if (!state.invalidExpirationPolicyIds[targetId]) return { conversations };
+              const invalidExpirationPolicyIds = { ...state.invalidExpirationPolicyIds };
+              delete invalidExpirationPolicyIds[targetId];
+              return { conversations, invalidExpirationPolicyIds };
+            });
           },
 
           openDM: async (userId: string) => {
@@ -1016,7 +1005,6 @@ export const useDMStore = wrapStore(
               conversations: [],
               activeConversationId: null,
               isLoading: false,
-              seenExpirationRevisionsByAccount: {},
               invalidExpirationPolicyIds: {},
             });
           },
@@ -1118,19 +1106,8 @@ export const useDMStore = wrapStore(
           name: 'concord:dm-store',
           partialize: (state) => ({
             activeConversationId: state.activeConversationId,
-            seenExpirationRevisionsByAccount: state.seenExpirationRevisionsByAccount,
           }),
-          merge: (persistedState, currentState) => {
-            const persisted = isRecord(persistedState) ? persistedState : {};
-            return {
-              ...currentState,
-              ...persisted,
-              seenExpirationRevisionsByAccount: parseSeenExpirationRevisions(
-                persisted.seenExpirationRevisionsByAccount
-              ),
-            };
-          },
-          storage: createExpirationPolicyStorage<Partial<DMState>>(),
+          storage: createQuotaSafeStorage<Partial<DMState>>(),
         }
       ),
       { name: 'DMStore' }

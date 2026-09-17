@@ -158,8 +158,12 @@ async function decryptMessages(
   // leaking ciphertext. Mark as pendingKeys so the UI shows the correct placeholder.
   if (!e2eeService.isInitialized) {
     return rawMsgs.map((m) => {
-      // Call-event rows have no ciphertext; never mark them pendingKeys (#1219).
-      if (m.type === 'call_event') {
+      // Server-authored system rows have no ciphertext; never mark them pendingKeys
+      // (#1219). Tested on the DISCRIMINATOR, not on one literal: this guard read
+      // `=== 'call_event'` while four comments added alongside `expiration_event`
+      // promised any non-'user' type was skipped, so every fetched expiration row ran a
+      // doomed decrypt. A literal test silently excludes whatever type is added next.
+      if (m.type && m.type !== 'user') {
         return m;
       }
       const rt = m.replied_to;
@@ -203,12 +207,17 @@ async function decryptMessages(
 
   const decryptedMessages = await Promise.all(
     rawMsgs.map(async (m) => {
-      // Call-event rows carry plaintext server metadata in call_event_payload
-      // and empty content; bypass the E2EE decrypt pass (#1219) — decryptContent
-      // on '' would set decryptFailed. Return the row untouched. This covers
-      // both the initial and pagination fetch sites, which both go through
-      // decryptMessages.
-      if (m.type === 'call_event') {
+      // System rows carry plaintext server metadata in their own payload column and
+      // empty content; bypass the E2EE decrypt pass (#1219) — decryptContent on ''
+      // would set decryptFailed. Return the row untouched. This covers both the initial
+      // and pagination fetch sites, which both go through decryptMessages.
+      //
+      // The test is on the DISCRIMINATOR rather than a literal. It read
+      // `=== 'call_event'` when `expiration_event` landed, so those rows took the
+      // decrypt path and came back stamped decryptFailed; nothing showed it because
+      // MessageList dispatches on `type` before reading content, which put the
+      // correctness in the RENDERER instead of the read path.
+      if (m.type && m.type !== 'user') {
         return m;
       }
 

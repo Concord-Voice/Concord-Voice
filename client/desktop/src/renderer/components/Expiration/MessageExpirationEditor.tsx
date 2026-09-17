@@ -1,12 +1,13 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import ConfirmActionModal from '../ui/ConfirmActionModal';
-import type {
-  ExpirationMutationResult,
-  ExpirationPolicy,
-  ExpirationPolicyReadResult,
-  ExpirationRequest,
-  ExpirationScope,
-  ExpirationWindowSeconds,
+import {
+  EXPIRATION_WINDOW_OPTIONS,
+  type ExpirationMutationResult,
+  type ExpirationPolicy,
+  type ExpirationPolicyReadResult,
+  type ExpirationRequest,
+  type ExpirationScope,
+  type ExpirationWindowSeconds,
 } from '../../services/messaging/expirationPolicyApi';
 import {
   captureAuthLifecycle,
@@ -24,7 +25,6 @@ export interface MessageExpirationEditorProps {
   lockedDescription: string;
   onRefresh: () => Promise<ExpirationPolicyReadResult>;
   onApplyPolicy: (request: ExpirationRequest) => Promise<ExpirationMutationResult>;
-  onMarkSeen: (revision: number) => void;
   onClose: () => void;
 }
 
@@ -37,12 +37,11 @@ type Baseline = {
   backfillPending: boolean;
 };
 
+// 'Off' is the editor's own zero stop; the windows come from the canonical map so a new one
+// cannot be added to the schema and forgotten here.
 const stops: Array<{ label: string; value: ExpirationWindowSeconds | null }> = [
   { label: 'Off', value: null },
-  { label: '1 hour', value: 3600 },
-  { label: '24 hours', value: 86400 },
-  { label: '7 days', value: 604800 },
-  { label: '30 days', value: 2592000 },
+  ...EXPIRATION_WINDOW_OPTIONS,
 ];
 
 function semanticError(result: ExpirationMutationResult): string | null {
@@ -196,7 +195,6 @@ export default function MessageExpirationEditor({
   lockedDescription,
   onRefresh,
   onApplyPolicy,
-  onMarkSeen,
   onClose,
 }: Readonly<MessageExpirationEditorProps>) {
   const authGeneration = useAuthStore((state) => state.authGeneration);
@@ -284,29 +282,79 @@ export default function MessageExpirationEditor({
       ? 'Cancel scheduled deletions stops applicable upcoming schedules and does not restore messages already deleted. Keep scheduled deletions leaves already scheduled messages to delete while future messages get no timer. Text, images, GIFs, attachments, and emojis already deleted cannot be recovered.'
       : `Applying to existing messages means eligible existing and future text, images, GIFs, attachments, and emojis are permanently deleted after ${selectedDuration} and cannot be recovered. New-only leaves already scheduled messages unchanged.`;
 
-  const closeConfirmation = () => {
-    if (
-      !mountedRef.current ||
-      authGenerationRef.current !== authGeneration ||
-      confirmationIdentityRef.current !== confirmationIdentity ||
-      `${scopeRef.current.kind}:${scopeRef.current.id}` !== `${scope.kind}:${scope.id}`
-    )
-      return;
+  /** Is the dialog we are about to tear down still the one this render owns?
+   *
+   *  Guards an unmount, an auth-generation change, a different confirmation identity, and a
+   *  scope switch — any of which means the close belongs to a dialog that is already gone. */
+  const confirmationStillOurs = () =>
+    mountedRef.current &&
+    authGenerationRef.current === authGeneration &&
+    confirmationIdentityRef.current === confirmationIdentity &&
+    `${scopeRef.current.kind}:${scopeRef.current.id}` === `${scope.kind}:${scope.id}`;
+
+  /** Dismiss the dialog and LEAVE the staged choice alone.
+   *
+   *  This is what the dialog's own Cancel does. The two acts are deliberately different —
+   *  the comment on the Discard button says so in as many words — and they were collapsed
+   *  into one function until review caught it: cancelling the confirmation silently did what
+   *  Discard does, throwing away a staged window the user had not decided to abandon. The
+   *  only way back was to re-pick it, with no indication anything had been dropped. */
+  const dismissConfirmation = () => {
+    if (!confirmationStillOurs()) return;
     setConfirmationOpen(false);
     setResumeOpen(false);
     setChoice(undefined);
     setAcknowledged(false);
-    setDraftWindow(undefined);
     setBaseline(null);
   };
+
+  /** Dismiss the dialog AND drop the staged choice.
+   *
+   *  For the terminal paths only — a mutation that landed, or one that failed in a way that
+   *  makes the staged window meaningless (a refused window, a scope that moved). A failure
+   *  the user can retry keeps the dialog open instead and never reaches here, which is what
+   *  lets `aria-pressed` keep reporting the window actually in force. */
+  const closeConfirmation = () => {
+    if (!confirmationStillOurs()) return;
+    dismissConfirmation();
+    setDraftWindow(undefined);
+  };
+  // Three distinct facts, deliberately not collapsed into one:
+  //   appliedWindow  - what the server currently enforces (undefined while unknown)
+  //   draftWindow    - what the user has staged, undefined when nothing is staged
+  //   selectedWindow - what the row should highlight right now
+  // `null` is a real value here (Off), so every comparison uses `undefined` for
+  // "unknown"/"unstaged" and never a falsy test, which would fold Off into both.
+  const appliedWindow = policyState === 'ready' ? (policy?.windowSeconds ?? null) : undefined;
+  const selectedWindow = draftWindow === undefined ? appliedWindow : draftWindow;
+  const hasPendingChange = draftWindow !== undefined && draftWindow !== appliedWindow;
+
+  // Selecting a stop STAGES it; it does not mutate. The user must then press Apply,
+  // which opens the confirmation. Before this split a single click on a label went
+  // straight to a destructive-sounding modal, and the only cue for which window was
+  // already in force was a font-weight change — too soft to read as "this is your
+  // current retention policy" (found by looking at it, not by a test).
   const selectWindow = (windowSeconds: ExpirationWindowSeconds | null) => {
-    if (!editable || windowSeconds === policy?.windowSeconds) return;
+    if (!editable) return;
     operationRef.current += 1;
-    setDraftWindow(windowSeconds);
+    // Re-picking the window already in force clears the pending change rather than
+    // staging a no-op, so the row always shows exactly one highlight.
+    setDraftWindow(windowSeconds === appliedWindow ? undefined : windowSeconds);
     setChoice(undefined);
     setAcknowledged(false);
     setError(null);
     setNeedsRefresh(false);
+  };
+
+  // The baseline is captured HERE rather than at selection time. It fences the mutation
+  // against a policy that moved underneath us, and a staged choice may sit unapplied for
+  // any length of time — capturing it at selection would age the fence by exactly that
+  // gap and make `confirmDisabled`'s revision comparison reject legitimate applies.
+  const openConfirmation = () => {
+    if (!editable || !hasPendingChange) return;
+    operationRef.current += 1;
+    setChoice(undefined);
+    setAcknowledged(false);
     setBaseline(policyBaseline(scope, policy));
     setConfirmationOpen(true);
   };
@@ -422,9 +470,7 @@ export default function MessageExpirationEditor({
         )
       )
         return;
-      if (reread.kind === 'fresh' && matchesPartialPolicy(reread, result.candidate)) {
-        onMarkSeen(reread.policy.revision);
-      } else {
+      if (!(reread.kind === 'fresh' && matchesPartialPolicy(reread, result.candidate))) {
         setMutationBlocked(true);
         setNeedsRefresh(true);
         setError('Refresh the policy before continuing.');
@@ -495,9 +541,7 @@ export default function MessageExpirationEditor({
         reread.kind === 'superseded'
       )
         return;
-      if (reread.kind === 'fresh' && matchesPartialPolicy(reread, result.candidate)) {
-        onMarkSeen(reread.policy.revision);
-      } else {
+      if (!(reread.kind === 'fresh' && matchesPartialPolicy(reread, result.candidate))) {
         setMutationBlocked(true);
         setNeedsRefresh(true);
         setError('Refresh the policy before continuing.');
@@ -626,13 +670,29 @@ export default function MessageExpirationEditor({
           Refresh policy
         </button>
       )}
+      {/* `aria-pressed` means IN FORCE, not staged. Tracking the staged choice instead was
+          tried and reverted: a mutation that FAILS leaves the draft staged (the throwing path
+          keeps the dialog open rather than calling `closeConfirmation`, which is what clears
+          it), so the row would report a window the server had just refused as the pressed one
+          — the editor asserting a change that did not happen. An sr-only "(current)" marker
+          was also tried and removed, because it mutates the accessible NAME that every
+          consumer queries by. The staged choice needs no separate announcement: the user
+          just activated the stop, so focus is on it when Apply appears. */}
       <div className="settings-tier-labels message-expiration-stops">
         {stops.map((stop) => (
           <button
             key={stop.label}
             type="button"
-            className={`settings-tier-label message-expiration-stop ${policyState === 'ready' && policy?.windowSeconds === stop.value ? 'active' : ''}`}
-            aria-pressed={policyState === 'ready' && policy?.windowSeconds === stop.value}
+            className={[
+              'settings-tier-label',
+              'message-expiration-stop',
+              selectedWindow === stop.value ? 'active' : '',
+              hasPendingChange && draftWindow === stop.value ? 'pending' : '',
+              appliedWindow === stop.value ? 'applied' : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+            aria-pressed={appliedWindow === stop.value}
             aria-disabled={!editable}
             aria-describedby={editable ? undefined : stopDescriptionId}
             onClick={() => selectWindow(stop.value)}
@@ -641,6 +701,29 @@ export default function MessageExpirationEditor({
           </button>
         ))}
       </div>
+      {hasPendingChange && (
+        <div className="message-expiration-apply">
+          <button
+            type="button"
+            className="message-expiration-apply-button"
+            onClick={openConfirmation}
+            disabled={!canEdit || forbidden || mutationBlocked || needsRefresh}
+          >
+            Apply
+          </button>
+          {/* "Discard", not "Cancel". The confirmation dialog this Apply opens has its own
+              Cancel, and two buttons with the same accessible name in one view is ambiguous
+              to a screen reader — and to anyone reading the row. This one abandons a staged
+              choice; that one dismisses a dialog. Different acts, different words. */}
+          <button
+            type="button"
+            className="message-expiration-cancel-button"
+            onClick={() => setDraftWindow(undefined)}
+          >
+            Discard
+          </button>
+        </div>
+      )}
       <ConfirmActionModal
         key={`policy:${confirmationIdentity}`}
         isOpen={confirmationOpen}
@@ -664,7 +747,7 @@ export default function MessageExpirationEditor({
           baseline.backfillPending !== policy?.backfillPending
         }
         onConfirm={confirmPolicyChange}
-        onClose={closeConfirmation}
+        onClose={dismissConfirmation}
       />
       <ConfirmActionModal
         key={`resume:${confirmationIdentity}`}
@@ -696,7 +779,7 @@ export default function MessageExpirationEditor({
           !policy?.backfillPending
         }
         onConfirm={confirmResume}
-        onClose={closeConfirmation}
+        onClose={dismissConfirmation}
       />
     </section>
   );

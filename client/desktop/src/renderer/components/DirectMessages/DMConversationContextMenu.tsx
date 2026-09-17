@@ -1,5 +1,5 @@
 import React, { useCallback } from 'react';
-import { Eraser } from 'lucide-react';
+import { Eraser, Timer } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
 import { useRotateKey } from '../../hooks/voice/useRotateKey';
@@ -66,6 +66,16 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
   // Personal DM (self-DM) is NOT 1:1 for the purpose of block/unfriend — you
   // can't block yourself.
   const isOneOnOne = !conversation.isGroup && !conversation.isPersonal;
+
+  // Mirrors canEditScope in hooks/messaging/useExpirationPolicy.ts — a group DM's policy is
+  // admin-only, a 1:1's is open to either participant, and a personal thread has no policy at
+  // all. Deliberately NOT loosened to "any group member": the editor enforces the same rule
+  // server-side, so a wider menu gate would render an entry that opens a modal and is refused.
+  const canEditExpiration =
+    !conversation.isPersonal &&
+    (conversation.isGroup
+      ? conversation.participants.find((p) => p.userId === currentUserId)?.role === 'admin'
+      : conversation.participants.some((p) => p.userId === currentUserId));
   const peer = isOneOnOne
     ? (conversation.participants.find((p) => p.userId !== currentUserId) ?? null)
     : null;
@@ -308,9 +318,9 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
         />
       )}
 
-      {isOneOnOne && onMessageExpiration && (
+      {canEditExpiration && onMessageExpiration && (
         <ContextMenu.Item
-          icon={<span aria-hidden="true">⏱</span>}
+          icon={<Timer size={16} />}
           label="Message expiration"
           onClick={() => {
             onMessageExpiration(conversation);

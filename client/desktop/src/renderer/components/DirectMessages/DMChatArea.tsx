@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { MessageSquare, Users, Phone } from 'lucide-react';
+import { MessageSquare, Users, Phone, Timer, Eraser } from 'lucide-react';
 import MessageList, { type MessageListHandle } from '../Chat/MessageList';
 import DMPinnedMessagesPanel from './DMPinnedMessagesPanel';
 import { getPins } from '../../services/messaging/pinService';
@@ -25,7 +25,8 @@ import Modal from '../ui/Modal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
 import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
-import MessageExpirationPolicySummary from '../Expiration/MessageExpirationPolicySummary';
+import { expirationClause, expirationControlLabel } from '../Chat/MessageExpirationIndicator';
+import { useHoverIntent } from '../../hooks/ui/useHoverIntent';
 import type { ChatContext } from '../../types/chat';
 import './DirectMessages.css';
 
@@ -42,8 +43,16 @@ interface DMPurgeTarget {
   role: 'admin' | 'member';
 }
 
-function voiceJoinButtonTitle(availability: VoiceJoinAvailability): string {
-  if (availability === 'busy') return 'Another voice call is already in progress';
+/** The button's accessible name, including WHY it is disabled.
+ *
+ *  This was a `title` until the header became a pill row: every direct button child of
+ *  .chat-header-actions grows a `content: attr(aria-label)` pill on hover, so a `title`
+ *  alongside it showed the same words a second time ~1s later. Removing the title alone
+ *  would have dropped the "busy" reason entirely, because it lived ONLY there — the
+ *  aria-label said "Join voice call" whether or not the control was usable, so a screen
+ *  reader user was never told why it was disabled. Folding it in fixes both. */
+function voiceJoinButtonLabel(availability: VoiceJoinAvailability): string {
+  if (availability === 'busy') return 'Join voice call — another call is already in progress';
   if (availability === 'joining') return 'Joining voice call';
   return 'Join voice call';
 }
@@ -57,7 +66,6 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const [purgeTarget, setPurgeTarget] = useState<DMPurgeTarget | null>(null);
   const pinGenerationRef = useRef(0);
   const messageListRef = useRef<MessageListHandle>(null);
-  const expirationSummaryRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     return () => {
@@ -140,6 +148,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   const activeConv = conversations.find((c) => c.id === selectedThreadId);
   const currentUserId = user?.id || '';
   const threadName = getThreadName(activeConv, currentUserId);
+  const headerHover = useHoverIntent();
   const expirationScope =
     activeConv && !activeConv.isPersonal ? { kind: 'dm' as const, id: activeConv.id } : null;
   const expiration = useExpirationPolicy(expirationScope);
@@ -162,14 +171,15 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
     }
   }, [canPurge, purgeRole, purgeTarget, selectedThreadId]);
 
-  const reviewExpiration = () => {
-    if (expiration.canEdit) {
-      setShowExpirationEditor(true);
-      void expiration.onRefresh();
-      return;
-    }
-    expirationSummaryRef.current?.focus();
+  const openExpirationEditor = () => {
+    if (!expirationScope || !expiration.canEdit) return;
+    setShowExpirationEditor(true);
+    void expiration.onRefresh();
   };
+
+  /** State-bearing accessible name — the lit glyph confirms it, never carries it alone.
+   *  Shared with ChatView and the composer clause so the three cannot disagree. */
+  const expirationControl = expirationControlLabel(expiration.policy, expiration.policyState);
 
   // Hydrate the active-DM-call roster on conversation open (#1219 R4 / G4).
   // Live `dm_voice_state_update` deltas only populate the roster for events
@@ -408,92 +418,93 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
               })()}
             </div>
           </div>
-          {/* Join voice call (#1219 R5). Shown when this is a group DM with an
+          <div className="chat-header-actions" {...headerHover.groupProps}>
+            {expirationScope && expiration.canEdit && (
+              <button
+                type="button"
+                className="chat-header-expiration-button"
+                data-policy-active={expirationControl.lit ? 'true' : 'false'}
+                onClick={openExpirationEditor}
+                aria-label={expirationControl.label}
+              >
+                <Timer size={18} aria-hidden="true" />
+              </button>
+            )}
+            {/* Join voice call (#1219 R5). Shown when this is a group DM with an
               active voice call the local user is NOT already in — a member who
               was offline/declined at ring, or who closed and reopened the
               conversation, can jump in. Routes through voiceService.joinChannel
               with the 'dm' join type, mirroring acceptIncomingCall. */}
-          {activeConv?.isGroup && activeCall && !isInThisCall && (
+            {activeConv?.isGroup && activeCall && !isInThisCall && (
+              <button
+                type="button"
+                className="dm-chat-header-join-call-btn"
+                disabled={voiceJoinAvailability !== 'available'}
+                onClick={() => {
+                  if (!activeConv) return;
+                  void voiceService.joinChannel(activeConv.id, 'dm').catch((err: unknown) => {
+                    // .catch prevents an unhandled rejection at the click
+                    // boundary; joinChannel surfaces its own user-facing error.
+                    console.error(
+                      'Join voice call:',
+                      err instanceof Error ? err.message : 'non-Error thrown'
+                    );
+                  });
+                }}
+                aria-label={voiceJoinButtonLabel(voiceJoinAvailability)}
+              >
+                <Phone size={16} />
+                <span>{voiceJoinAvailability === 'joining' ? 'Joining…' : 'Join voice call'}</span>
+              </button>
+            )}
             <button
               type="button"
-              className="dm-chat-header-join-call-btn"
-              disabled={voiceJoinAvailability !== 'available'}
-              onClick={() => {
-                if (!activeConv) return;
-                void voiceService.joinChannel(activeConv.id, 'dm').catch((err: unknown) => {
-                  // .catch prevents an unhandled rejection at the click
-                  // boundary; joinChannel surfaces its own user-facing error.
-                  console.error(
-                    'Join voice call:',
-                    err instanceof Error ? err.message : 'non-Error thrown'
-                  );
-                });
-              }}
-              aria-label={
-                voiceJoinAvailability === 'joining' ? 'Joining voice call' : 'Join voice call'
-              }
-              title={voiceJoinButtonTitle(voiceJoinAvailability)}
+              className="chat-header-pin-button"
+              onClick={() => setShowPinnedPanel((v) => !v)}
+              aria-label="Pinned messages"
+              aria-expanded={showPinnedPanel}
             >
-              <Phone size={16} />
-              <span>{voiceJoinAvailability === 'joining' ? 'Joining…' : 'Join voice call'}</span>
+              <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+                <path
+                  d="M9 2L5 8h3v6l4-6H9V2z"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              {pinnedCount > 0 && <span className="pin-count-badge">{pinnedCount}</span>}
             </button>
-          )}
-          <button
-            type="button"
-            className="chat-header-pin-button"
-            onClick={() => setShowPinnedPanel((v) => !v)}
-            title="Pinned messages"
-            aria-label="Pinned messages"
-            aria-expanded={showPinnedPanel}
-          >
-            <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
-              <path
-                d="M9 2L5 8h3v6l4-6H9V2z"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-            {pinnedCount > 0 && <span className="pin-count-badge">{pinnedCount}</span>}
-          </button>
-          {activeConv?.isGroup && (
-            <button
-              type="button"
-              className="dm-chat-header-group-info-btn"
-              onClick={() => setShowGroupInfo((v) => !v)}
-              aria-label="Toggle group info"
-              title="Group Info"
-            >
-              <Users size={18} />
-            </button>
-          )}
+            {activeConv?.isGroup && (
+              <button
+                type="button"
+                className="dm-chat-header-group-info-btn"
+                onClick={() => setShowGroupInfo((v) => !v)}
+                aria-label="Toggle group info"
+              >
+                <Users size={18} />
+              </button>
+            )}
+            {canPurge && activeConv && (
+              <button
+                type="button"
+                className="chat-header-purge-button"
+                onClick={() =>
+                  setPurgeTarget({
+                    id: activeConv.id,
+                    name: threadName,
+                    context: activeConv.isGroup ? 'group' : 'dm',
+                    role: purgeRole,
+                  })
+                }
+                aria-label="Purge messages in this conversation"
+              >
+                <Eraser size={18} aria-hidden="true" />
+                <span className="chat-header-purge-label">Purge</span>
+              </button>
+            )}
+          </div>
         </div>
-
-        {expirationScope && (
-          <MessageExpirationPolicySummary
-            ref={expirationSummaryRef}
-            policy={expiration.policy}
-            policyState={expiration.policyState}
-            showChangedNotice={expiration.showChangedNotice}
-            onReview={reviewExpiration}
-            onDismissNotice={expiration.onDismissNotice}
-            onManageMessages={
-              canPurge && activeConv
-                ? () =>
-                    setPurgeTarget({
-                      id: activeConv.id,
-                      name: threadName,
-                      context: activeConv.isGroup ? 'group' : 'dm',
-                      role: purgeRole,
-                    })
-                : undefined
-            }
-            manageMessagesUnavailableDescription={
-              canPurge ? undefined : 'You must be a member of this conversation to manage messages.'
-            }
-          />
-        )}
 
         {error && <div className="chat-error">{error}</div>}
 
@@ -537,6 +548,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
               conversationId={selectedThreadId}
               replyingTo={replyingTo}
               onCancelReply={cancelReply}
+              expirationClause={expirationClause(expiration.policy, expiration.policyState)}
             />
           </div>
         )}
@@ -569,7 +581,6 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
             lockedDescription={expiration.lockedDescription}
             onRefresh={expiration.onRefresh}
             onApplyPolicy={expiration.onApplyPolicy}
-            onMarkSeen={expiration.onMarkSeen}
             onClose={() => setShowExpirationEditor(false)}
           />
         </Modal>

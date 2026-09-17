@@ -144,7 +144,7 @@ func TestPolicyUpdate_MapsOnlyRetroactiveOperationsToMarkers(t *testing.T) {
 
 func TestService_StartRejectsMissingCallerTransaction(t *testing.T) {
 	service := NewService(nil)
-	_, err := service.StartChannel(context.Background(), nil, "channel", Request{Mode: "clear", Retroactive: "leave_pending"})
+	_, err := service.StartChannelTransition(context.Background(), nil, "channel", Request{Mode: "clear", Retroactive: "leave_pending"})
 	assert.ErrorIs(t, err, ErrServiceUnready)
 }
 

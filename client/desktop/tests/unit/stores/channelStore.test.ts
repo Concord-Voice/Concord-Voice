@@ -702,17 +702,7 @@ describe('channelStore expiration policy contract', () => {
     });
   });
 
-  it('acknowledges seen revisions monotonically and clears markers with channels', () => {
-    useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 4);
-    useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 3);
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({
-      'account-a': { 'channel-1': 4 },
-    });
-    useChannelStore.getState().clearChannels();
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({});
-  });
-
-  it('persists only markers/navigation and survives a storage quota failure in memory', () => {
+  it('persists only navigation and survives a storage quota failure in memory', () => {
     useChannelStore.setState({ currentServerId: 'server-1', activeChannelId: 'channel-1' });
     useChannelStore.getState().addChannel({
       ...mockChannel,
@@ -723,26 +713,22 @@ describe('channelStore expiration policy contract', () => {
         backfillPending: false,
       },
     });
-    useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 4);
     const stored = JSON.parse(localStorage.getItem('concord-channels') ?? '{}');
     expect(stored.state).toMatchObject({
       activeChannelId: 'channel-1',
       currentServerId: 'server-1',
-      seenExpirationRevisionsByAccount: { 'account-a': { 'channel-1': 4 } },
     });
     expect(stored.state).not.toHaveProperty('channels');
 
+    // A refused write degrades to in-memory state: the store's own value is
+    // already correct, and only its survival across a restart is lost.
     const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
       throw new DOMException('quota', 'QuotaExceededError');
     });
     try {
-      expect(() =>
-        useChannelStore.getState().markExpirationSeen('account-a', 'channel-1', 5)
-      ).not.toThrow();
+      expect(() => useChannelStore.getState().setActiveChannel('channel-2')).not.toThrow();
       expect(setItem).toHaveBeenCalled();
-      expect(
-        useChannelStore.getState().seenExpirationRevisionsByAccount['account-a']['channel-1']
-      ).toBe(5);
+      expect(useChannelStore.getState().activeChannelId).toBe('channel-2');
     } finally {
       setItem.mockRestore();
     }
@@ -769,38 +755,17 @@ describe('channelStore expiration policy contract', () => {
     }
   });
 
-  it('rehydrates valid markers and preserves navigation, but discards corrupt marker maps', async () => {
+  it('rehydrates persisted navigation', async () => {
     localStorage.setItem(
       'concord-channels',
       JSON.stringify({
-        state: {
-          activeChannelId: 'channel-1',
-          currentServerId: 'server-1',
-          seenExpirationRevisionsByAccount: { 'account-a': { 'channel-1': 4 } },
-        },
+        state: { activeChannelId: 'channel-1', currentServerId: 'server-1' },
         version: 0,
       })
     );
     await useChannelStore.persist.rehydrate();
     expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({
-      'account-a': { 'channel-1': 4 },
-    });
-
-    localStorage.setItem(
-      'concord-channels',
-      JSON.stringify({
-        state: {
-          activeChannelId: 'channel-2',
-          currentServerId: 'server-1',
-          seenExpirationRevisionsByAccount: { bad: { channel: 'four' } },
-        },
-        version: 0,
-      })
-    );
-    await useChannelStore.persist.rehydrate();
-    expect(useChannelStore.getState().activeChannelId).toBe('channel-2');
-    expect(useChannelStore.getState().seenExpirationRevisionsByAccount).toEqual({});
+    expect(useChannelStore.getState().currentServerId).toBe('server-1');
   });
 
   it.each([

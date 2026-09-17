@@ -154,7 +154,6 @@ const EditGroupModal: React.FC<EditGroupModalProps> = ({
           lockedDescription={expiration.lockedDescription}
           onRefresh={expiration.onRefresh}
           onApplyPolicy={expiration.onApplyPolicy}
-          onMarkSeen={expiration.onMarkSeen}
           onClose={closeExpirationEditor}
         />
       </>

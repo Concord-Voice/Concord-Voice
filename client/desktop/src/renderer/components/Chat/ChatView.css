@@ -34,8 +34,23 @@
   white-space: nowrap;
 }
 
-.chat-header-search-button {
+/* Owns the right-hand edge for the whole trailing group.
+   `margin-left: auto` used to live on .chat-header-search-button, which the expiration
+   button also wore — and two auto margins in a flex row do not stack, they split the free
+   space between them. That is why the expiration button rendered floating at the header
+   midpoint instead of grouped with the icons. One auto margin, on the wrapper. */
+.chat-header-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  /* Containing block for the hover pills below, which are absolutely positioned so the
+     icon row never reflows. */
+  position: relative;
+}
+
+.chat-header-search-button {
   background: none;
   border: none;
   color: var(--text-secondary);
@@ -69,6 +84,93 @@
   color: var(--text-primary);
 }
 
+/* Shared by the channel and DM headers — DMChatArea already consumes .chat-header-pin-button
+   from this file, so the shared-header vocabulary stays here rather than being duplicated
+   into DirectMessages.css. */
+.chat-header-expiration-button,
+.chat-header-purge-button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font: inherit;
+}
+
+.chat-header-expiration-button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chat-header-expiration-button:focus-visible,
+.chat-header-purge-button:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+/* Lit when a policy is set. Colour is CONFIRMATION, never the signal — the accessible name
+   carries the state ("Message expiration: 24 hours" vs ": off"), so removing colour loses
+   nothing and SC 1.4.1 holds. */
+.chat-header-expiration-button[data-policy-active='true'] svg {
+  color: var(--accent-primary);
+}
+
+/* Destructive, and separated two ways at rest: this margin, and the danger-coloured glyph.
+   A resting BORDER used to be the third and is deliberately gone — once all four controls
+   became equal-weight icons, an outline on one of them read as a stray artefact rather than
+   as emphasis, which is the complaint that unified the row in the first place. The danger
+   edge is a HOVER state now, so it arrives with the pointer that could act on it.
+
+   Margin rather than a divider node because a standalone divider orphans itself when the
+   viewer lacks purge permission and the button does not render. */
+.chat-header-purge-button {
+  /* Separation is margin ONLY. `padding-left: 12px` used to push the label away from the
+     old divider edge; with the glyph alone it just pushed it off-centre inside its own
+     box, and made this control 4px wider than its three neighbours. */
+  margin-left: 6px;
+  /* --danger fails WCAG AA (4.5:1) as label text in 10 of 33 theme blocks, including the
+     default Concord Light at 3.91:1 — measured, not assumed. It passes the 3:1 threshold
+     governing icons and UI components in all 33. So the word carries --text-primary and the
+     glyph carries --danger; the word "Purge" is the non-colour signal either way. */
+  color: var(--text-primary);
+}
+
+.chat-header-purge-button svg {
+  color: var(--danger);
+}
+
+/* Hover intensifies the same shape rather than introducing one: the border picks up the
+   danger hue the glyph already carries, and the fill stays the light tint so the
+   --text-primary label keeps the contrast the measurement above bought. */
+.chat-header-purge-button:hover {
+  background-color: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border-color));
+}
+
+/* Purge is icon-only at rest, like its three neighbours. The word now arrives in the
+   hover/focus pill instead of sitting permanently in the header, which is what lets all
+   four controls read as one row of equal-weight icons.
+
+   SC 1.4.1 still holds without the always-visible word: the eraser glyph is a distinct
+   SHAPE, not a recolouring of a neighbour, and the accessible name is unchanged — so
+   colour is not the only visual means of conveying what this control is. */
+.chat-header-purge-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .pin-count-badge {
   font-size: 11px;
   font-weight: 700;
@@ -96,4 +198,194 @@
   font-size: calc(13px * var(--font-scale, 1));
   text-align: center;
   flex-shrink: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Header actions: icon at rest, label floats out on hover.
+
+   The pill is ABSOLUTELY POSITIONED, so the icon row never reflows. That is not a
+   shortcut around "expand rightward" — the group is flush with the header's right
+   edge, so a pill in the flow would have to displace a sibling or slide the whole
+   group, and the row moving under the pointer is what makes fast icon-to-icon
+   travel feel unstable. Out of flow, nothing moves at all.
+
+   The label text comes from `attr(aria-label)`, which every one of these buttons
+   already carries. That keeps one source of truth: there is no second copy of the
+   wording to drift, and because an `aria-label` takes precedence over descendant
+   and generated content when computing the accessible name, the pill CANNOT cause
+   a screen reader to announce the name twice.
+   --------------------------------------------------------------------------- */
+/* All four header controls share one box so the row reads as a set: same padding, same
+   1px border, same centring. The border is transparent at rest on every one of them —
+   including purge, whose visible edge is now a HOVER state — and reserving it here is what
+   stops the row shifting by a pixel when that edge paints.
+
+   `position: relative` is what each button's own pill anchors to. */
+.chat-header-actions > button {
+  position: relative;
+  box-sizing: border-box;
+  border: 1px solid transparent;
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* Pinned rather than left to content. Purge's glyph was 16px where its neighbours are
+     18px, which made its box 2px smaller in both axes — invisible in isolation, obvious
+     as a ragged row. A floor here means a future glyph-size change cannot reintroduce it. */
+  min-width: 36px;
+  min-height: 28px;
+}
+
+.chat-header-actions > button::after {
+  content: attr(aria-label);
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) scale(0.96);
+  transform-origin: top center;
+  z-index: 20;
+  white-space: nowrap;
+  pointer-events: none;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 500;
+  opacity: 0;
+  visibility: hidden;
+
+  /* Asymmetric on purpose. Opening waits out a mild intent gate so a pointer merely
+     crossing the row does not flash four pills; closing has NO delay, so leaving is
+     immediate and the row never feels sticky. */
+  transition:
+    opacity 90ms ease,
+    transform 90ms ease,
+    visibility 0s linear 90ms;
+}
+
+/* The visible state only. Every `transition` for it is set by the three delay rules at the
+   end of this section — cold, warm, and keyboard — so declaring one here too would be
+   overridden by all three and would read as the effective timing to anyone who stopped at
+   the first match. */
+.chat-header-actions > button:hover::after,
+.chat-header-actions > button:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) scale(1);
+}
+
+/* A button that already shows its label needs no pill — it would repeat the words that are
+   sitting right beside it, which is the same duplicate-label defect the native `title` was
+   removed for. The DM Join-voice-call control is the only one: it renders a Phone glyph AND
+   a visible "Join voice call" span, where its four neighbours are icon-only.
+
+   Keyed on the class rather than on "has text" because CSS cannot ask that. A future
+   labelled control in this row needs adding here too. */
+.chat-header-actions > .dm-chat-header-join-call-btn::after {
+  content: none;
+}
+
+/* The rightmost controls would overflow the window if centred, so they anchor to
+   their own right edge instead and grow leftward under the header. */
+.chat-header-actions > button:last-child::after,
+.chat-header-actions > button:nth-last-child(2)::after {
+  left: auto;
+  right: 0;
+  transform: translateX(0) scale(0.96);
+  transform-origin: top right;
+}
+
+.chat-header-actions > button:last-child:hover::after,
+.chat-header-actions > button:last-child:focus-visible::after,
+.chat-header-actions > button:nth-last-child(2):hover::after,
+.chat-header-actions > button:nth-last-child(2):focus-visible::after {
+  transform: translateX(0) scale(1);
+}
+
+/* Purge is destructive, so its pill says so. The FILL stays a light tint rather than
+   a solid --danger: white-on-danger is the 2.68:1-class pairing this file already
+   measured and rejected, and --text-primary on a tinted surface keeps the label
+   above the 4.5:1 floor. */
+.chat-header-actions > button.chat-header-purge-button::after {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border-color));
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-tertiary));
+}
+
+/* Hover gate: one fixed delay, opening only.
+
+   This is the COLD delay. The warm one is the rule below it, and both are live — read them
+   together rather than stopping here.
+
+   What was removed is narrower than an earlier version of this comment claimed: an
+   `@property --warm` scheme that tried to schedule the warm flip in pure CSS. It did not
+   work — a custom property transitioned with a 0s duration did not flip back reliably when
+   the pointer left, so the group latched warm and the gate collapsed to 0s permanently,
+   measured rather than assumed. The BEHAVIOUR it was reaching for was kept and is now owned
+   by `useHoverIntent`; only the CSS-only mechanism went.
+
+   400ms is the conventional hover-tooltip delay. Opening waits it out; closing has no
+   delay at all, so leaving never feels sticky. */
+.chat-header-actions > button:hover::after {
+  transition:
+    opacity 90ms ease 400ms,
+    transform 90ms ease 400ms,
+    visibility 0s linear 400ms;
+}
+
+/* Warm group. `data-warm` is owned by `useHoverIntent`, which flips it once the pointer has
+   dwelt in this row rather than passed through it. It changes ONLY the delay — never which
+   pill shows, which stays pure `:hover` — so the attribute cannot disagree with what the
+   pointer is actually over.
+
+   The point is the asymmetry your eye expects: crossing the header triggers nothing, but
+   once you have clearly stopped to read one icon, reading the next should not make you wait
+   again. */
+.chat-header-actions[data-warm='true'] > button:hover::after {
+  transition:
+    opacity 90ms ease 60ms,
+    transform 90ms ease 60ms,
+    visibility 0s linear 60ms;
+}
+
+/* Keyboard focus never waits — a Tab press carries no ambiguity of intent. */
+.chat-header-actions > button:focus-visible::after {
+  transition:
+    opacity 90ms ease,
+    transform 90ms ease,
+    visibility 0s linear;
+}
+
+/* LAST in this section on purpose. A media query carries no specificity of its own, so this
+   block ties with the three `transition` shorthands above and wins only on source order.
+   It sat before them until now, which measured as: the scale was suppressed correctly but
+   `transition-duration` still read 0.09s on all three states — reduced motion half-applied,
+   and silently. Anything added below this point must keep that in mind. */
+@media (prefers-reduced-motion: reduce) {
+  /* The DELAY is deliberately left intact throughout this block: an intent gate is not
+     motion, and dropping it would reintroduce the pill-flash the gate exists to prevent.
+     Only duration and scale are suppressed. */
+  .chat-header-actions > button::after,
+  .chat-header-actions > button:hover::after,
+  .chat-header-actions > button:focus-visible::after {
+    transition-duration: 0s;
+    transform: translateX(-50%) scale(1);
+  }
+
+  /* The warm arm needs its own rule, and it must set DURATION ONLY. `[data-warm]` scores in
+     the class column, making this selector (0,3,1) — a step above the three above and above
+     the right-anchored arm below. Source order alone does not reach it, so leaving it out
+     measured as 0.09s while its neighbours read 0s; but folding it into the group above
+     measured worse, because its transform then outranked the right-anchor and shoved the two
+     rightmost pills back to translateX(-50%), half a label off their edge. */
+  .chat-header-actions[data-warm='true'] > button:hover::after {
+    transition-duration: 0s;
+  }
+
+  /* Right-anchored, so it must stay reachable by everything above. */
+  .chat-header-actions > button:last-child::after,
+  .chat-header-actions > button:nth-last-child(2)::after {
+    transform: translateX(0) scale(1);
+  }
 }

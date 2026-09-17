@@ -192,21 +192,26 @@ func (h *Handler) HasActivePlanRail() bool { return h != nil && h.activePlans !=
 
 // dmMessageResponse represents a DM message in API responses.
 type dmMessageResponse struct {
-	ID               string                     `json:"id"`
-	ConversationID   string                     `json:"conversation_id"`
-	UserID           string                     `json:"user_id"`
-	Content          string                     `json:"content"`
-	Type             string                     `json:"type"`
-	CallEventPayload json.RawMessage            `json:"call_event_payload,omitempty"`
-	KeyVersion       int                        `json:"key_version"`
-	EditedAt         *string                    `json:"edited_at,omitempty"`
-	ExpiresAt        *string                    `json:"expires_at"`
-	CreatedAt        string                     `json:"created_at"`
-	Username         string                     `json:"username"`
-	DisplayName      *string                    `json:"display_name,omitempty"`
-	AvatarURL        *string                    `json:"avatar_url,omitempty"`
-	Attachments      []models.AttachmentSummary `json:"attachments,omitempty"`
-	Reactions        []models.ReactionSummary   `json:"reactions,omitempty"`
+	ID               string          `json:"id"`
+	ConversationID   string          `json:"conversation_id"`
+	UserID           string          `json:"user_id"`
+	Content          string          `json:"content"`
+	Type             string          `json:"type"`
+	CallEventPayload json.RawMessage `json:"call_event_payload,omitempty"`
+	// Plaintext server-authored envelope for type='expiration_event' rows
+	// (migration 000137). omitempty keeps every ordinary message's wire shape
+	// byte-identical to before, exactly as call_event_payload does — this field is
+	// nil on an ordinary message, so it genuinely is omitted.
+	ExpirationEventPayload json.RawMessage            `json:"expiration_event_payload,omitempty"`
+	KeyVersion             int                        `json:"key_version"`
+	EditedAt               *string                    `json:"edited_at,omitempty"`
+	ExpiresAt              *string                    `json:"expires_at"`
+	CreatedAt              string                     `json:"created_at"`
+	Username               string                     `json:"username"`
+	DisplayName            *string                    `json:"display_name,omitempty"`
+	AvatarURL              *string                    `json:"avatar_url,omitempty"`
+	Attachments            []models.AttachmentSummary `json:"attachments,omitempty"`
+	Reactions              []models.ReactionSummary   `json:"reactions,omitempty"`
 }
 
 func (h *Handler) enrichDMReactions(messages []dmMessageResponse, userID string) {
@@ -1749,7 +1754,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
-			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, COALESCE(m.key_version, 1),
+			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, m.expiration_event_payload, COALESCE(m.key_version, 1),
 			       m.edited_at, m.expires_at, m.created_at,
 			       u.username, u.display_name, u.avatar_url
 			FROM dm_messages m
@@ -1764,7 +1769,7 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		//nolint:gosec // G202: concatenated fragment is a compile-time constant; all values parameterized
 		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 		rows, err = h.db.Query(`
-			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, COALESCE(m.key_version, 1),
+			SELECT m.id, m.conversation_id, m.user_id, m.content, m.type, m.call_event_payload, m.expiration_event_payload, COALESCE(m.key_version, 1),
 			       m.edited_at, m.expires_at, m.created_at,
 			       u.username, u.display_name, u.avatar_url
 			FROM dm_messages m
@@ -1788,8 +1793,9 @@ func (h *Handler) GetMessages(c *gin.Context) {
 	for rows.Next() {
 		var m messageResponse
 		var callEventRaw []byte
+		var expirationEventRaw []byte
 		if err := rows.Scan(
-			&m.ID, &m.ConversationID, &m.UserID, &m.Content, &m.Type, &callEventRaw, &m.KeyVersion,
+			&m.ID, &m.ConversationID, &m.UserID, &m.Content, &m.Type, &callEventRaw, &expirationEventRaw, &m.KeyVersion,
 			&m.EditedAt, &m.ExpiresAt, &m.CreatedAt,
 			&m.Username, &m.DisplayName, &m.AvatarURL,
 		); err != nil {
@@ -1798,6 +1804,9 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		}
 		if len(callEventRaw) > 0 {
 			m.CallEventPayload = json.RawMessage(callEventRaw)
+		}
+		if len(expirationEventRaw) > 0 {
+			m.ExpirationEventPayload = json.RawMessage(expirationEventRaw)
 		}
 		messages = append(messages, m)
 	}

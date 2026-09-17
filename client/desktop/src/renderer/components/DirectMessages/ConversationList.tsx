@@ -464,9 +464,19 @@ const ConversationItem: React.FC<ConversationItemProps> = ({
   const onSelect = () => onSelectThread(conv.id);
   const onContextMenu = (event: React.MouseEvent) => {
     event.preventDefault();
+    // Chromium dispatches `contextmenu` for Shift+F10 and the ContextMenu key on a focused
+    // element, but with no pointer there are no meaningful client coordinates — they arrive as
+    // 0, which would pin the menu to the top-left corner of the window instead of to the row
+    // the user is on. Fall back to the row's own box so the keyboard path lands where the mouse
+    // path would. `> 0` rather than a null check: 0 is the value actually observed, and a
+    // genuine click at the viewport origin cannot land on a conversation row.
+    const rect = event.currentTarget.getBoundingClientRect();
     onOpenContextMenu({
       conversation: conv,
-      position: { x: event.clientX, y: event.clientY },
+      position: {
+        x: event.clientX > 0 ? event.clientX : rect.left + 8,
+        y: event.clientY > 0 ? event.clientY : rect.bottom,
+      },
     });
   };
   const sharedProps: ConversationItemViewProps = {
@@ -915,7 +925,6 @@ const ConversationList: React.FC<ConversationListProps> = ({
             lockedDescription={expiration.lockedDescription}
             onRefresh={expiration.onRefresh}
             onApplyPolicy={expiration.onApplyPolicy}
-            onMarkSeen={expiration.onMarkSeen}
             onClose={() => setExpirationTarget(null)}
           />
         </Modal>

@@ -12,7 +12,7 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 76 schemas total: 73 subscriber events (handled via wsService.on) + 3
+ * 78 schemas total: 75 subscriber events (handled via wsService.on) + 3
  * envelope-only events (connected, connection_ready, heartbeat_ack) consumed
  * internally by wsService.handleMessage — all must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts
@@ -1727,10 +1727,83 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (76 schemas: 73 subscriber + 3 envelope)
+// 4. The discriminated union (78 schemas: 75 subscriber + 3 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
+/** Message-expiration policy change (#1351).
+ *
+ *  Emitted after the control-plane commits a set / change / clear, so participants see the
+ *  durable system row land without waiting for a refetch. Two events rather than one because
+ *  the channel and DM rails carry different scope ids and broadcast through different
+ *  authorized-fan-out helpers.
+ *
+ *  `window_seconds` is null iff `kind === 'cleared'`. It is NOT modelled as a discriminated
+ *  union on `kind`: the server owns that invariant, and a client-side schema that rejected a
+ *  mismatch would drop a legitimate policy change on a server/client version skew rather than
+ *  render it. The renderer reads `window_seconds` and treats null as "off".
+ *
+ *  `id` is the system message row's own id — carried as `data-message-id` so the row anchors
+ *  scroll restoration exactly like every other message. */
+const ExpirationEventWindow = z
+  .union([z.literal(3600), z.literal(86400), z.literal(604800), z.literal(2592000)])
+  .nullable();
+
+const ExpirationEventKind = z.enum(['set', 'changed', 'cleared']);
+
+export const ExpirationEventSchema = z.object({
+  type: z.literal('expiration_event'),
+  data: z.object({
+    id: UUID,
+    channel_id: UUID,
+    actor_user_id: UUID,
+    // Resolved server-side for the live row; the fetched row gets the same names
+    // from its users JOIN. Empty when the lookup failed, which the renderer shows
+    // as "Someone" — a degraded name, never a dropped row.
+    actor_username: z.string(),
+    actor_display_name: z.string(),
+    kind: ExpirationEventKind,
+    window_seconds: ExpirationEventWindow,
+    created_at: ISOTimestamp,
+    // The policy's own revision travels with the event so the composer indicator
+    // advances in the same tick the system row renders — otherwise the row would
+    // announce a new window beside a bar still showing the old one until the next
+    // fetch. mergeExpirationPolicy fences on revision, so a replayed or
+    // out-of-order event is ignored rather than regressing the indicator.
+    revision: z.number().int().nonnegative(),
+    updated_at: ISOTimestamp.nullable(),
+    backfill_pending: z.boolean(),
+  }),
+});
+
+export const DMExpirationEventSchema = z.object({
+  type: z.literal('dm_expiration_event'),
+  data: z.object({
+    id: UUID,
+    conversation_id: UUID,
+    actor_user_id: UUID,
+    // Resolved server-side for the live row; the fetched row gets the same names
+    // from its users JOIN. Empty when the lookup failed, which the renderer shows
+    // as "Someone" — a degraded name, never a dropped row.
+    actor_username: z.string(),
+    actor_display_name: z.string(),
+    kind: ExpirationEventKind,
+    window_seconds: ExpirationEventWindow,
+    created_at: ISOTimestamp,
+    // The policy's own revision travels with the event so the composer indicator
+    // advances in the same tick the system row renders — otherwise the row would
+    // announce a new window beside a bar still showing the old one until the next
+    // fetch. mergeExpirationPolicy fences on revision, so a replayed or
+    // out-of-order event is ignored rather than regressing the indicator.
+    revision: z.number().int().nonnegative(),
+    updated_at: ISOTimestamp.nullable(),
+    backfill_pending: z.boolean(),
+  }),
+});
+
 export const WebSocketEventSchema = z.discriminatedUnion('type', [
+  // Message expiration (2)
+  ExpirationEventSchema,
+  DMExpirationEventSchema,
   // Chat messages (9)
   MessageSchema,
   MessageUpdateSchema,
@@ -1833,7 +1906,7 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ConnectionReadySchema,
   HeartbeatAckSchema,
 ]);
-// TOTAL: 76 schemas (73 subscriber + 3 envelope-only;
+// TOTAL: 78 schemas (75 subscriber + 3 envelope-only;
 // +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive;
 // +6 server-role events #2359).
 // The count is asserted in tests/unit/types/ws-events.test.ts so an addition
@@ -1983,3 +2056,6 @@ export type HeartbeatAckPayload = z.infer<typeof HeartbeatAckSchema>['data'];
 export function scrubZodIssues(issues: readonly z.core.$ZodIssue[]): string[] {
   return [...new Set(issues.map(({ code }) => code))];
 }
+
+export type ExpirationEventPayload = z.infer<typeof ExpirationEventSchema>['data'];
+export type DMExpirationEventPayload = z.infer<typeof DMExpirationEventSchema>['data'];

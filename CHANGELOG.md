@@ -10,6 +10,12 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Added
 
+- **Changing the message timer now leaves a note in the conversation** ([#1351](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1351)) — when
+  someone sets, changes or turns off how long messages last, a line appears in the conversation
+  saying who did it and what they chose, the same way a call leaves a record. It arrives straight
+  away for everyone in the chat and stays in the history afterwards, so the answer to "when did
+  this change, and who changed it?" is in the conversation rather than in someone's memory. This
+  replaces a notice that each person had to dismiss separately and that vanished once dismissed.
 - **Rich Presence activity now appears in member rows and profiles, and your own panel shows its eligible audience** ([#2235](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2235)) — member rows show the highest-priority delivered activity with a `+N` count for additional entries, profile cards show the ordered `Now` list, and your own panel shows the confirmed audience policy for active voice or call activity. Server-delivered detail stays omitted when the server withholds it.
 - **You can now pick what to share from two tabs instead of one long list** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145), [#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the
   share window listed every screen and every open window in two flat piles, which on a busy
@@ -96,6 +102,49 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Changed
 
+- **Message expiration and purging are no longer the same button** ([#1351](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1351)) — a box
+  labelled "Manage messages" sat across the top of every conversation, and behind it were two
+  things that have nothing to do with each other: the timer that expires messages for everyone,
+  and the tool that deletes them. Sharing one control meant it could not be right for either. It
+  is gone, and the two live where each belongs.
+
+  How long messages last is now a quiet line above the message box, next to the one telling you
+  messages are encrypted — the same kind of reassurance, in the same place you already look for
+  it. Everyone in the conversation sees it, whether or not they are allowed to change it, because
+  knowing when your messages disappear is not a permission. It is not a button and does not want
+  a click.
+
+  Changing the timer moved to a small clock in the conversation's header, which appears only if
+  you are allowed to change it, and to the right-click menu on the conversation in your list.
+  Purging has its own clearly marked button in that same header, where a destructive action
+  should be: labelled, not hidden behind a word like "manage".
+
+  One deliberate restraint on the purge button — the word "Purge" is in ordinary text with a red
+  icon beside it, rather than being red itself. Red text on those header colours was genuinely
+  hard to read in nine of the thirty theme and light/dark combinations Concord ships, and a
+  warning you have to squint at is not a warning.
+
+  Encryption and expiry ended up as one sentence rather than two stacked lines: "Messages are
+  Encrypted End-to-End and expire after 24 hours", or "and never expire" when no timer is set.
+  Two short notices on two full-width rows spent space to say less, and they read as two
+  unrelated announcements when they are one fact about what happens to what you are about to
+  send. If Concord cannot read the timer setting at that moment it says nothing about expiry
+  rather than guessing — "never expire" is a promise, and a failed lookup is not grounds to
+  make one.
+
+  The four controls in a conversation's header are now icons of equal size, each of which
+  expands to show what it does when you hover or tab to it. The label floats above the header
+  rather than pushing its neighbours aside, so nothing shifts under your pointer, and it waits
+  a beat before appearing so that sweeping the mouse across the row does not set off four
+  labels in turn. Once you have clearly stopped on one, moving to the next is immediate. If you
+  have reduced motion turned on in your system settings, the label still waits that beat and
+  then simply appears, with no fade or grow — the pause is there to read your intent, not to
+  animate anything, so it is kept.
+
+  Setting a timer also takes one more step than it did. Picking a duration now highlights it as
+  a pending choice and waits for you to press Apply; before, a single click went straight to a
+  confirmation dialog, and the only sign of which duration was already in force was slightly
+  bolder text.
 - **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. This does not promise instant deletion or secure erasure for clients that were offline.
 - **The buttons during a call are grouped by what they do** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the row along the
   bottom of a call had grown to eleven buttons of equal weight in a single line, with nothing to

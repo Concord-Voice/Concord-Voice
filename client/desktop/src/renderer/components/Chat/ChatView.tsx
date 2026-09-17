@@ -1,5 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Eraser, Timer } from 'lucide-react';
 import MessageList, { type MessageListHandle } from './MessageList';
+import { expirationClause, expirationControlLabel } from './MessageExpirationIndicator';
+import { useHoverIntent } from '../../hooks/ui/useHoverIntent';
 import MessageInput from './MessageInput';
 import TypingIndicator from './TypingIndicator';
 import PinnedMessagesPanel from './PinnedMessagesPanel';
@@ -20,7 +23,6 @@ import { usePermissionStore } from '../../stores/chat/permissionStore';
 import { isChannelMuted } from '../../stores/ui/notificationPrefsStore';
 import { useExpirationPolicy } from '../../hooks/messaging/useExpirationPolicy';
 import MessageExpirationEditor from '../Expiration/MessageExpirationEditor';
-import MessageExpirationPolicySummary from '../Expiration/MessageExpirationPolicySummary';
 import Modal from '../ui/Modal';
 import PurgeMessagesModal from '../Purge/PurgeMessagesModal';
 import {
@@ -45,7 +47,6 @@ const ChatView: React.FC = () => {
   const authGeneration = useAuthStore((s) => s.authGeneration);
   const [showExpirationEditor, setShowExpirationEditor] = useState(false);
   const [purgeTarget, setPurgeTarget] = useState<ChannelPurgeTarget | null>(null);
-  const expirationSummaryRef = useRef<HTMLElement>(null);
 
   // Subscribe to active channel for full message delivery
   useChannelSubscription(activeChannelId);
@@ -58,6 +59,7 @@ const ChatView: React.FC = () => {
   // Active channel info
   const activeChannel = channels.find((c) => c.id === activeChannelId);
   const currentUserId = user?.id || '';
+  const headerHover = useHoverIntent();
   const expirationScope =
     activeChannelId && activeChannel?.type === 'text'
       ? { kind: 'channel' as const, id: activeChannelId }
@@ -100,13 +102,11 @@ const ChatView: React.FC = () => {
     void expiration.onRefresh();
   };
 
-  const reviewExpiration = () => {
-    if (expiration.canEdit) {
-      openExpirationEditor();
-      return;
-    }
-    expirationSummaryRef.current?.focus();
-  };
+  /** State-bearing accessible name. This is what keeps the lit glyph from being a
+   *  colour-only signal — the state is in the text, and the colour merely confirms it.
+   *  Derived by the shared helper rather than computed here, because the same question
+   *  computed in two headers drifted from the composer's answer once already. */
+  const expirationControl = expirationControlLabel(expiration.policy, expiration.policyState);
 
   // Chat controller — unified send/edit/delete/reply/pin/typing
   const ctx: ChatContext = useMemo(
@@ -299,79 +299,74 @@ const ChatView: React.FC = () => {
           </svg>
         )}
         <span className="chat-header-name">{activeChannel?.name || 'Channel'}</span>
-        {expirationScope && expiration.canEdit && (
+        <div className="chat-header-actions" {...headerHover.groupProps}>
+          {expirationScope && expiration.canEdit && (
+            <button
+              type="button"
+              className="chat-header-expiration-button"
+              data-policy-active={expirationControl.lit ? 'true' : 'false'}
+              onClick={openExpirationEditor}
+              aria-label={expirationControl.label}
+            >
+              <Timer size={18} aria-hidden="true" />
+            </button>
+          )}
           <button
-            type="button"
-            className="chat-header-search-button message-expiration-header-action"
-            onClick={openExpirationEditor}
+            className="chat-header-search-button"
+            onClick={() => setShowSearchPanel(!showSearchPanel)}
+            aria-label="Search messages"
+            aria-expanded={showSearchPanel}
           >
-            Message expiration
-          </button>
-        )}
-        <button
-          className="chat-header-search-button"
-          onClick={() => setShowSearchPanel(!showSearchPanel)}
-          title="Search messages"
-          aria-label="Search messages"
-          aria-expanded={showSearchPanel}
-        >
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-        </button>
-        <button
-          className="chat-header-pin-button"
-          onClick={() => setShowPinnedPanel(!showPinnedPanel)}
-          title="Pinned messages"
-          aria-label="Pinned messages"
-          aria-expanded={showPinnedPanel}
-        >
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
-            <path
-              d="M9 2L5 8h3v6l4-6H9V2z"
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
               stroke="currentColor"
-              strokeWidth="1.5"
+              strokeWidth="2"
               strokeLinecap="round"
               strokeLinejoin="round"
-            />
-          </svg>
-          {pinnedCount > 0 && <span className="pin-count-badge">{pinnedCount}</span>}
-        </button>
+            >
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+          </button>
+          <button
+            className="chat-header-pin-button"
+            onClick={() => setShowPinnedPanel(!showPinnedPanel)}
+            aria-label="Pinned messages"
+            aria-expanded={showPinnedPanel}
+          >
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+              <path
+                d="M9 2L5 8h3v6l4-6H9V2z"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            {pinnedCount > 0 && <span className="pin-count-badge">{pinnedCount}</span>}
+          </button>
+          {canPurge && activeChannel && (
+            <button
+              type="button"
+              className="chat-header-purge-button"
+              onClick={() =>
+                setPurgeTarget({
+                  id: activeChannel.id,
+                  name: activeChannel.name,
+                  selfScopeOnly: purgeSelfScopeOnly,
+                })
+              }
+              aria-label="Purge messages in this channel"
+            >
+              <Eraser size={18} aria-hidden="true" />
+              <span className="chat-header-purge-label">Purge</span>
+            </button>
+          )}
+        </div>
       </div>
-
-      {expirationScope && (
-        <MessageExpirationPolicySummary
-          ref={expirationSummaryRef}
-          policy={expiration.policy}
-          policyState={expiration.policyState}
-          showChangedNotice={expiration.showChangedNotice}
-          onReview={reviewExpiration}
-          onDismissNotice={expiration.onDismissNotice}
-          onManageMessages={
-            canPurge && activeChannel
-              ? () =>
-                  setPurgeTarget({
-                    id: activeChannel.id,
-                    name: activeChannel.name,
-                    selfScopeOnly: purgeSelfScopeOnly,
-                  })
-              : undefined
-          }
-          manageMessagesUnavailableDescription={
-            canPurge ? undefined : 'You do not have permission to manage messages in this channel.'
-          }
-        />
-      )}
 
       {error && <div className="chat-error">{error}</div>}
 
@@ -410,6 +405,7 @@ const ChatView: React.FC = () => {
           channelId={activeChannelId || undefined}
           replyingTo={replyingTo}
           onCancelReply={cancelReply}
+          expirationClause={expirationClause(expiration.policy, expiration.policyState)}
         />
       </div>
 
@@ -446,7 +442,6 @@ const ChatView: React.FC = () => {
             lockedDescription={expiration.lockedDescription}
             onRefresh={expiration.onRefresh}
             onApplyPolicy={expiration.onApplyPolicy}
-            onMarkSeen={expiration.onMarkSeen}
             onClose={() => setShowExpirationEditor(false)}
           />
         </Modal>

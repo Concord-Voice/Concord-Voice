@@ -112,6 +112,8 @@ describe('message expiration host entry points', () => {
     const readyStop = await screen.findByRole('button', { name: '7 days' });
     await waitFor(() => expect(readyStop).toHaveAttribute('aria-disabled', 'false'));
     await user.click(readyStop);
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     expect(
       await screen.findByRole('dialog', { name: 'Change message expiration' })
     ).toBeInTheDocument();
@@ -193,6 +195,8 @@ describe('message expiration host entry points', () => {
     const readyStop = await screen.findByRole('button', { name: '7 days' });
     await waitFor(() => expect(readyStop).toHaveAttribute('aria-disabled', 'false'));
     await user.click(readyStop);
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     expect(
       await screen.findByRole('dialog', { name: 'Change message expiration' })
     ).toBeInTheDocument();
@@ -495,7 +499,6 @@ describe('message expiration host entry points', () => {
     let patchB: unknown;
     useDMStore.setState({
       conversations: [targetA, targetB],
-      seenExpirationRevisionsByAccount: { [mockUser.id]: { 'dm-a': 4, 'dm-b': 4 } },
     });
     server.use(
       http.get(`${API}/api/v1/dm/conversations`, () =>
@@ -564,7 +567,12 @@ describe('message expiration host entry points', () => {
         'false'
       )
     );
-    await user.click(screen.getByRole('button', { name: '7 days' }));
+    const stop7days = screen.getByRole('button', { name: '7 days' });
+    await user.click(stop7days);
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review). Two
+    // editors are mounted here, so scope Apply to the one owning this stop.
+    const editor7days = stop7days.closest('.message-expiration-editor');
+    await user.click(within(editor7days as HTMLElement).getByRole('button', { name: 'Apply' }));
     const dialogA = await screen.findByRole('dialog', { name: 'Change message expiration' });
     await user.click(within(dialogA).getByRole('radio', { name: 'Only new messages' }));
     await user.click(within(dialogA).getByRole('checkbox', { name: /cannot be recovered/i }));
@@ -589,7 +597,12 @@ describe('message expiration host entry points', () => {
         'false'
       )
     );
-    await user.click(screen.getByRole('button', { name: '30 days' }));
+    const stop30days = screen.getByRole('button', { name: '30 days' });
+    await user.click(stop30days);
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review). Two
+    // editors are mounted here, so scope Apply to the one owning this stop.
+    const editor30days = stop30days.closest('.message-expiration-editor');
+    await user.click(within(editor30days as HTMLElement).getByRole('button', { name: 'Apply' }));
     const dialogB = await screen.findByRole('dialog', { name: 'Change message expiration' });
     await user.click(within(dialogB).getByRole('radio', { name: 'Only new messages' }));
     await user.click(within(dialogB).getByRole('checkbox', { name: /cannot be recovered/i }));

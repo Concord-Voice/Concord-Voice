@@ -10,6 +10,8 @@ import React, {
 import { MessageWithStatus, type ChatContextType } from '../../types/chat';
 import Message from './Message';
 import { CallEventMessage } from '../DirectMessages/CallEventMessage';
+import MessageExpirationEventMessage from './MessageExpirationEventMessage';
+import type { ExpirationWindowSeconds } from '../../services/messaging/expirationPolicyApi';
 import { useChannelScrollStore, type ScrollAnchor } from '../../stores/chat/channelScrollStore';
 import { useDMStore } from '../../stores/chat/dmStore';
 import { useUnreadStore } from '../../stores/chat/unreadStore';
@@ -890,6 +892,17 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
 
             {messages.map((message, index) => {
               const dateDividerLabel = shouldShowDateDivider(index);
+              // Built once and rendered by EVERY branch below. The two system-row branches
+              // return early, and both used to return before this was rendered — so a call
+              // event or an expiration event that happened to be the first row on a date
+              // swallowed that date's divider, for itself and for every message after it.
+              const dateDivider = dateDividerLabel ? (
+                <div className="date-divider">
+                  <span className="date-divider-line"></span>
+                  <span className="date-divider-text">{dateDividerLabel}</span>
+                  <span className="date-divider-line"></span>
+                </div>
+              ) : null;
               // Call-event system rows (#1219 R7): render the dedicated
               // CallEventMessage instead of <Message>. The backend serializer
               // returns `type` + `call_event_payload`; useMessageFetch skips
@@ -897,28 +910,51 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
               // conversation `isGroup` (dmIsGroup, resolved from persistenceKey),
               // falling back to a participant-count heuristic only when the DM
               // conversation isn't loaded (#1568 Gitar accuracy fix).
+              // Expiration policy-change system row (#1351). Sits beside the call-event
+              // branch rather than inside <Message>: both are server-authored plaintext rows
+              // that useMessageFetch deliberately skips the E2EE decrypt pass for, so routing
+              // either through the ordinary message renderer would attempt to decrypt content
+              // that was never encrypted. data-message-id anchors scroll restoration exactly
+              // like every other row.
+              if (message.type === 'expiration_event' && message.expiration_event_payload) {
+                const payload = message.expiration_event_payload;
+                return (
+                  <React.Fragment key={message.id}>
+                    {dateDivider}
+                    <div data-message-id={message.id}>
+                      <MessageExpirationEventMessage
+                        kind={payload.kind}
+                        windowSeconds={
+                          payload.window_seconds === null
+                            ? null
+                            : (payload.window_seconds as ExpirationWindowSeconds)
+                        }
+                        actorName={message.display_name || message.username}
+                        isSelf={payload.actor_user_id === currentUserId}
+                      />
+                    </div>
+                  </React.Fragment>
+                );
+              }
               if (message.type === 'call_event' && message.call_event_payload) {
                 const isGroupConversation =
                   dmIsGroup ?? (message.call_event_payload.participant_user_ids?.length ?? 0) > 2;
                 return (
-                  <div key={message.id} data-message-id={message.id}>
-                    <CallEventMessage
-                      payload={message.call_event_payload}
-                      isGroup={isGroupConversation}
-                      currentUserId={currentUserId}
-                    />
-                  </div>
+                  <React.Fragment key={message.id}>
+                    {dateDivider}
+                    <div data-message-id={message.id}>
+                      <CallEventMessage
+                        payload={message.call_event_payload}
+                        isGroup={isGroupConversation}
+                        currentUserId={currentUserId}
+                      />
+                    </div>
+                  </React.Fragment>
                 );
               }
               return (
                 <React.Fragment key={message.id}>
-                  {dateDividerLabel && (
-                    <div className="date-divider">
-                      <span className="date-divider-line"></span>
-                      <span className="date-divider-text">{dateDividerLabel}</span>
-                      <span className="date-divider-line"></span>
-                    </div>
-                  )}
+                  {dateDivider}
                   <div
                     data-message-id={message.id}
                     className={

@@ -71,6 +71,7 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
     serverId,
     channelId,
     onSendMessage,
+    expirationClause,
   }: {
     channelName?: string;
     disabled: boolean;
@@ -78,6 +79,9 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
     serverId?: string;
     channelId?: string;
     onSendMessage?: (...args: unknown[]) => void;
+    // The composer renders this slot, so a mock that drops it makes the
+    // indicator invisible to every assertion with no error to explain why.
+    expirationClause?: string | null;
   }) => (
     <div
       data-testid="message-input"
@@ -87,6 +91,7 @@ vi.mock('@/renderer/components/Chat/MessageInput', () => ({
       data-server-id={serverId}
       data-channel-id={channelId}
     >
+      <span>{`Messages are Encrypted End-to-End${expirationClause ?? ''}`}</span>
       <button
         data-testid="mock-send-btn"
         onClick={() => onSendMessage?.('hello', undefined, undefined, ['att-1'], [{ id: 'att-1' }])}
@@ -778,7 +783,7 @@ describe('ChatView', () => {
     expect(searchBtn).toHaveAttribute('aria-expanded', 'true');
   });
 
-  it('opens the header editor for a channel manager while preserving the first-observation baseline', async () => {
+  it('opens the header editor for a channel manager and survives a held reopen read', async () => {
     const channel = {
       ...mockChannel,
       expirationPolicy: {
@@ -819,15 +824,13 @@ describe('ChatView', () => {
     });
     render(<ChatView />);
     const user = userEvent.setup();
-    await screen.findByText('Messages expire after 24 hours');
-    expect(screen.queryByRole('button', { name: 'Review policy' })).not.toBeInTheDocument();
-    expect(
-      useChannelStore.getState().seenExpirationRevisionsByAccount[mockUser.id]?.[channel.id]
-    ).toBe(4);
+    await screen.findByText('Messages are Encrypted End-to-End and expire after 24 hours');
     const baselineReads = channelReads;
-    await user.click(await screen.findByRole('button', { name: 'Message expiration' }));
+    await user.click(await screen.findByRole('button', { name: /^Message expiration:/ }));
     await waitFor(() => expect(channelReads).toBeGreaterThan(baselineReads));
     await user.click(screen.getByRole('button', { name: '7 days' }));
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const childDialog = await screen.findByRole('dialog', { name: 'Change message expiration' });
     expect(childDialog).toBeInTheDocument();
     await user.click(within(childDialog).getByRole('button', { name: 'Close' }));
@@ -841,10 +844,9 @@ describe('ChatView', () => {
     await waitFor(() =>
       expect(screen.queryByRole('dialog', { name: 'Message expiration' })).not.toBeInTheDocument()
     );
-    expect(screen.queryByRole('button', { name: 'Review policy' })).not.toBeInTheDocument();
 
     holdReopenedRead = true;
-    await user.click(screen.getByRole('button', { name: 'Message expiration' }));
+    await user.click(screen.getByRole('button', { name: /^Message expiration:/ }));
     await waitFor(() => expect(channelReads).toBeGreaterThan(baselineReads + 1));
     expect(screen.getByRole('button', { name: '1 hour' })).toHaveAttribute('aria-disabled', 'true');
     try {
@@ -870,6 +872,8 @@ describe('ChatView', () => {
       await reopenedRead.promise;
     }
     await user.click(screen.getByRole('button', { name: '7 days' }));
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     expect(
       await screen.findByRole('dialog', { name: 'Change message expiration' })
     ).toBeInTheDocument();
@@ -938,8 +942,10 @@ describe('ChatView', () => {
     });
     const user = userEvent.setup();
     render(<ChatView />);
-    await user.click(await screen.findByRole('button', { name: 'Message expiration' }));
+    await user.click(await screen.findByRole('button', { name: /^Message expiration:/ }));
     await user.click(await screen.findByRole('button', { name: '7 days' }));
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const dialogA = await screen.findByRole('dialog', { name: 'Change message expiration' });
     await user.click(within(dialogA).getByRole('radio', { name: 'Only new messages' }));
     await user.click(within(dialogA).getByRole('checkbox', { name: /cannot be recovered/i }));
@@ -954,7 +960,7 @@ describe('ChatView', () => {
         screen.queryByRole('dialog', { name: 'Change message expiration' })
       ).not.toBeInTheDocument()
     );
-    await user.click(await screen.findByRole('button', { name: 'Message expiration' }));
+    await user.click(await screen.findByRole('button', { name: /^Message expiration:/ }));
     await waitFor(() =>
       expect(screen.getByRole('button', { name: '24 hours' })).toHaveAttribute(
         'aria-pressed',
@@ -962,6 +968,8 @@ describe('ChatView', () => {
       )
     );
     await user.click(await screen.findByRole('button', { name: '30 days' }));
+    // Selecting a stop stages it; Apply opens the confirmation (#1351 review).
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
     const dialogB = await screen.findByRole('dialog', { name: 'Change message expiration' });
     expect(within(dialogB).getByRole('button', { name: 'Apply timer' })).toBeInTheDocument();
     await user.click(within(dialogB).getByRole('radio', { name: 'Only new messages' }));
@@ -1016,7 +1024,7 @@ describe('ChatView', () => {
       serverPermissions: { 'server-1': 0n },
     });
     render(<ChatView />);
-    const manage = await screen.findByRole('button', { name: 'Manage messages' });
+    const manage = await screen.findByRole('button', { name: /^Purge messages in this/ });
     const user = userEvent.setup();
     await user.click(manage);
     const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
@@ -1037,7 +1045,7 @@ describe('ChatView', () => {
     });
     render(<ChatView />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    await user.click(await screen.findByRole('button', { name: /^Purge messages in this/ }));
     const dialog = await screen.findByRole('dialog', { name: 'Purge Messages' });
     await user.click(screen.getByLabelText('Last hour'));
 
@@ -1064,7 +1072,7 @@ describe('ChatView', () => {
     });
     render(<ChatView />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'Manage messages' }));
+    await user.click(await screen.findByRole('button', { name: /^Purge messages in this/ }));
     expect(await screen.findByRole('dialog', { name: 'Purge Messages' })).toBeInTheDocument();
 
     act(() =>

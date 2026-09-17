@@ -6,15 +6,14 @@ import { apiFetch } from '../../services/system/apiClient';
 import { e2eeService } from '../../services/e2ee/e2eeService';
 import { removeScope } from '../../services/messaging/searchService';
 import {
-  createExpirationPolicyStorage,
   hasMalformedExpirationPolicyListRow,
   mergeExpirationPolicy,
   parseExpirationPolicyFromListRow,
-  parseSeenExpirationRevisions,
   type ExpirationPolicy,
   type ExpirationPolicyReadRequest,
   type ExpirationPolicyReadResult,
 } from '../../services/messaging/expirationPolicyApi';
+import { createQuotaSafeStorage } from '../../utils/runtime/quotaSafeStorage';
 import { isSameAuthLifecycle } from '../../services/system/postLoginHydrationLifecycle';
 import { useChatStore } from './chatStore';
 import { useUnreadStore } from './unreadStore';
@@ -69,7 +68,6 @@ interface ChannelState {
   channelIdsByServer: Record<string, string[]>;
   isLoading: boolean;
   error: string | null;
-  seenExpirationRevisionsByAccount: Record<string, Record<string, number>>;
   invalidExpirationPolicyIds: Record<string, true>;
 
   fetchChannels: (
@@ -77,7 +75,6 @@ interface ChannelState {
     read?: ExpirationPolicyReadRequest
   ) => Promise<ExpirationPolicyReadResult | undefined>;
   applyExpirationPolicy: (targetId: string, policy: ExpirationPolicy) => void;
-  markExpirationSeen: (accountId: string, targetId: string, revision: number) => void;
   addChannel: (channel: Channel) => void;
   updateChannel: (channelId: string, updates: Partial<Channel>) => void;
   removeChannel: (channelId: string) => void;
@@ -330,7 +327,6 @@ export const useChannelStore = wrapStore(
           channelIdsByServer: {},
           isLoading: false,
           error: null,
-          seenExpirationRevisionsByAccount: {},
           invalidExpirationPolicyIds: {},
 
           fetchChannels: async (serverId: string, read?: ExpirationPolicyReadRequest) => {
@@ -394,29 +390,22 @@ export const useChannelStore = wrapStore(
           },
 
           applyExpirationPolicy: (targetId: string, policy: ExpirationPolicy) => {
-            set((state) => ({
-              channels: state.channels.map((channel) => {
+            set((state) => {
+              const channels = state.channels.map((channel) => {
                 if (channel.id !== targetId) return channel;
                 const expirationPolicy = mergeExpirationPolicy(channel.expirationPolicy, policy);
                 return expirationPolicy ? { ...channel, expirationPolicy } : channel;
-              }),
-            }));
-          },
-
-          markExpirationSeen: (accountId: string, targetId: string, revision: number) => {
-            if (!accountId || !targetId || !Number.isSafeInteger(revision) || revision < 0) return;
-            set((state) => ({
-              seenExpirationRevisionsByAccount: {
-                ...state.seenExpirationRevisionsByAccount,
-                [accountId]: {
-                  ...state.seenExpirationRevisionsByAccount[accountId],
-                  [targetId]: Math.max(
-                    state.seenExpirationRevisionsByAccount[accountId]?.[targetId] ?? 0,
-                    revision
-                  ),
-                },
-              },
-            }));
+              });
+              // Clearing the invalid marker is part of accepting the policy, not a separate
+              // concern. A list response that failed to parse a scope's policy sets the marker,
+              // and useExpirationPolicy reports `unavailable` while it is set — so without this
+              // a validated event would update the policy and the composer would still say
+              // nothing about retention until the next successful refetch.
+              if (!state.invalidExpirationPolicyIds[targetId]) return { channels };
+              const invalidExpirationPolicyIds = { ...state.invalidExpirationPolicyIds };
+              delete invalidExpirationPolicyIds[targetId];
+              return { channels, invalidExpirationPolicyIds };
+            });
           },
 
           addChannel: (channel: Channel) => {
@@ -544,7 +533,6 @@ export const useChannelStore = wrapStore(
               currentServerId: null,
               isLoading: false,
               error: null,
-              seenExpirationRevisionsByAccount: {},
               invalidExpirationPolicyIds: {},
             });
           },
@@ -618,19 +606,8 @@ export const useChannelStore = wrapStore(
             currentServerId: state.currentServerId,
             lastChannelByServer: state.lastChannelByServer,
             collapsedGroups: state.collapsedGroups,
-            seenExpirationRevisionsByAccount: state.seenExpirationRevisionsByAccount,
           }),
-          merge: (persistedState, currentState) => {
-            const persisted = isRecord(persistedState) ? persistedState : {};
-            return {
-              ...currentState,
-              ...persisted,
-              seenExpirationRevisionsByAccount: parseSeenExpirationRevisions(
-                persisted.seenExpirationRevisionsByAccount
-              ),
-            };
-          },
-          storage: createExpirationPolicyStorage<Partial<ChannelState>>(),
+          storage: createQuotaSafeStorage<Partial<ChannelState>>(),
         }
       ),
       { name: 'ChannelStore' }

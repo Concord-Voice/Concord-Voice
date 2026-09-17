@@ -25,6 +25,17 @@ export type CallEventStatus = 'completed' | 'missed' | 'declined' | 'canceled' |
 /** Shape of dm_messages.call_event_payload for rows where type === 'call_event'.
  *  Centralized here (#1219) so the Message type, the CallEventMessage component,
  *  and the message-fetch path share one definition. */
+/** Shape of {messages,dm_messages}.expiration_event_payload for rows where
+ *  type === 'expiration_event' (migration 000137). Server-authored plaintext. */
+export interface ExpirationEventMessagePayload {
+  kind: 'set' | 'changed' | 'cleared';
+  actor_user_id: string;
+  /** Null for kind === 'cleared'. */
+  window_seconds: number | null;
+  previous_window_seconds?: number | null;
+  changed_at: string;
+}
+
 export interface CallEventPayload {
   ring_id?: string;
   caller_user_id?: string;
@@ -61,9 +72,14 @@ export interface Message {
   pinned_at?: string;
   pinned_by?: string;
   attachments?: AttachmentSummary[];
-  /** Present only for system rows where type === 'call_event' (#1219). */
+  /** Present only for system rows — type === 'call_event' (#1219) or
+   *  type === 'expiration_event' (#1351). Ordinary messages omit it. */
   type?: string;
   call_event_payload?: CallEventPayload;
+  /** Plaintext server-authored envelope for type === 'expiration_event' rows. Like
+   *  call_event_payload it is never decrypted client-side — useMessageFetch skips the
+   *  E2EE pass for any non-'user' type. */
+  expiration_event_payload?: ExpirationEventMessagePayload;
   created_at: string;
   updated_at: string;
 }

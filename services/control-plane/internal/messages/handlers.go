@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -367,6 +368,7 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 	query := `
 		SELECT m.id, m.channel_id, m.user_id, m.content, COALESCE(m.key_version, 1),
 			   m.embeds_suppressed, m.reply_to_id, m.pinned_at, m.pinned_by, m.edited_at, m.expires_at, m.created_at, m.updated_at,
+			   m.type, m.expiration_event_payload,
 		       u.username, u.display_name, u.avatar_url
 		FROM messages m
 		INNER JOIN users u ON m.user_id = u.id
@@ -401,6 +403,9 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 	messages := []models.MessageWithUser{}
 	for rows.Next() {
 		var msg models.MessageWithUser
+		// Scanned via []byte, not json.RawMessage, so a SQL NULL (every ordinary
+		// message) lands as nil rather than erroring on the conversion.
+		var expirationEventRaw []byte
 		scanErr := rows.Scan(
 			&msg.ID,
 			&msg.ChannelID,
@@ -415,6 +420,8 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 			&msg.ExpiresAt,
 			&msg.CreatedAt,
 			&msg.UpdatedAt,
+			&msg.Type,
+			&expirationEventRaw,
 			&msg.Username,
 			&msg.DisplayName,
 			&msg.AvatarURL,
@@ -422,6 +429,9 @@ func (h *Handler) queryMessagesBounded(channelID, before string, limit int, cuto
 		if scanErr != nil {
 			h.log.Error("Failed to scan message row", "error", scanErr)
 			continue
+		}
+		if len(expirationEventRaw) > 0 {
+			msg.ExpirationEventPayload = json.RawMessage(expirationEventRaw)
 		}
 		messages = append(messages, msg)
 	}

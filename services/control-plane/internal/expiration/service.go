@@ -141,16 +141,34 @@ func NewService(db *sql.DB) *Service {
 	return &Service{db: db}
 }
 
-// StartChannel validates and records a channel policy in the caller's
-// transaction. A resume request only locks and verifies the existing marker;
-// it does not change the row, so the caller can commit its authorization work
-// before ResumeChannel starts independently committed batches.
-func (s *Service) StartChannel(ctx context.Context, tx *sql.Tx, channelID string, request Request) (Policy, error) {
+// Transition captures a policy mutation's pre- and post-state, both read
+// under the SAME lock (start's lockPolicy call). A caller that needs to tell
+// an initial "set" apart from a "changed" — e.g. to emit the durable
+// expiration-event system-message row — MUST read Previous from here rather
+// than issuing its own separate, unlocked read: a second read could observe
+// a different row version than the one this mutation actually overwrote,
+// were a concurrent policy change to land between the two reads. Resume (no
+// mutation) reports its single locked state as both Previous and Current.
+type Transition struct {
+	Previous Policy
+	Current  Policy
+}
+
+// StartChannelTransition validates and records a channel policy in the caller's
+// transaction, returning the pre- and post-mutation snapshots captured under the
+// same lock. A resume request only locks and verifies the existing marker; it does
+// not change the row, so the caller can commit its authorization work before
+// ResumeChannel starts independently committed batches.
+//
+// This is the only entry point. Narrower Policy-returning wrappers existed until the
+// durable event row needed Transition.Previous and every production caller moved here,
+// leaving them reachable from tests alone.
+func (s *Service) StartChannelTransition(ctx context.Context, tx *sql.Tx, channelID string, request Request) (Transition, error) {
 	return s.start(ctx, tx, channelScope, channelID, request)
 }
 
-// StartConversation is StartChannel for a DM conversation.
-func (s *Service) StartConversation(ctx context.Context, tx *sql.Tx, conversationID string, request Request) (Policy, error) {
+// StartConversationTransition is StartChannelTransition for a DM conversation.
+func (s *Service) StartConversationTransition(ctx context.Context, tx *sql.Tx, conversationID string, request Request) (Transition, error) {
 	return s.start(ctx, tx, conversationScope, conversationID, request)
 }
 
@@ -322,37 +340,37 @@ type policyState struct {
 	cutoff sql.NullTime
 }
 
-func (s *Service) start(ctx context.Context, tx *sql.Tx, scope scope, id string, request Request) (Policy, error) {
+func (s *Service) start(ctx context.Context, tx *sql.Tx, scope scope, id string, request Request) (Transition, error) {
 	if tx == nil {
-		return Policy{}, ErrServiceUnready
+		return Transition{}, ErrServiceUnready
 	}
 	if err := request.Validate(); err != nil {
-		return Policy{}, err
+		return Transition{}, err
 	}
 
 	current, err := lockPolicy(ctx, tx, scope, id)
 	if err != nil {
-		return Policy{}, err
+		return Transition{}, err
 	}
 	if request.Mode == "resume" {
 		if current.policy.Revision != *request.Revision {
-			return current.policy, ErrRevisionMismatch
+			return Transition{Previous: current.policy, Current: current.policy}, ErrRevisionMismatch
 		}
 		if !current.policy.BackfillPending || !current.cutoff.Valid {
-			return current.policy, ErrBackfillNotFound
+			return Transition{Previous: current.policy, Current: current.policy}, ErrBackfillNotFound
 		}
-		return current.policy, nil
+		return Transition{Previous: current.policy, Current: current.policy}, nil
 	}
 	if current.policy.BackfillPending {
-		return current.policy, ErrBackfillPending
+		return Transition{Previous: current.policy, Current: current.policy}, ErrBackfillPending
 	}
 
 	window, mode := policyUpdate(request)
 	updated, err := updatePolicy(ctx, tx, scope, id, window, mode)
 	if err != nil {
-		return current.policy, err
+		return Transition{Previous: current.policy, Current: current.policy}, err
 	}
-	return updated.policy, nil
+	return Transition{Previous: current.policy, Current: updated.policy}, nil
 }
 
 func policyUpdate(request Request) (any, any) {
