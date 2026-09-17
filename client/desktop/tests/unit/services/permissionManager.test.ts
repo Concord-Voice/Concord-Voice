@@ -60,6 +60,25 @@ const getRemoteSpaBaseUrl = () => null;
 describe('permissionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Drain the *Once queues: vi.clearAllMocks() does not, so an unconsumed
+    // queued value is served to the next test. See [internal]rules/tests.md
+    // § The *Once queue outlives the test that queued it.
+    // Proving a branch does NOT consult the OS is exactly a test that queues a
+    // value it never consumes. mockIsSupported/mockIsEncryptionAvailable carry no
+    // *Once but are set with PERSISTENT mockReturnValue, which leaks the same way.
+    // mockReset() also clears the implementation, so each default is restored.
+    mockGetMediaAccessStatus.mockReset();
+    mockGetMediaAccessStatus.mockReturnValue('granted');
+    mockAskForMediaAccess.mockReset();
+    mockAskForMediaAccess.mockResolvedValue(true);
+    mockGetNotificationSettings.mockReset();
+    mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'authorized' });
+    mockIsPackaged.mockReset();
+    mockIsPackaged.mockReturnValue(true);
+    mockIsSupported.mockReset();
+    mockIsSupported.mockReturnValue(true);
+    mockIsEncryptionAvailable.mockReset();
+    mockIsEncryptionAvailable.mockReturnValue(true);
   });
 
   describe('checkPermission', () => {
@@ -196,11 +215,19 @@ describe('permissionManager', () => {
       mockIsSupported.mockReturnValue(true);
       mockGetNotificationSettings.mockReturnValue({ authorizationStatus: 'authorized' });
       const result = checkAllPermissions();
-      expect(result).toHaveProperty('microphone');
-      expect(result).toHaveProperty('camera');
-      expect(result).toHaveProperty('screen');
-      expect(result).toHaveProperty('secureStorage');
-      expect(result).toHaveProperty('notifications');
+      // Assert the VALUES, not just the keys. Presence-only assertions passed
+      // whatever this fixture said: before the *Once drain landed, `notifications`
+      // read 'denied' off a value leaked from the dev-mode case two tests above,
+      // and the 'authorized' set up here was never consulted. Five toHaveProperty
+      // calls cannot tell those apart -- they hold even if every checker is
+      // replaced by a hardcoded 'unavailable'.
+      expect(result).toEqual({
+        microphone: 'granted',
+        camera: 'granted',
+        screen: 'granted',
+        secureStorage: 'granted',
+        notifications: 'granted',
+      });
     });
   });
 

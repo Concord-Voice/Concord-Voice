@@ -74,6 +74,20 @@ function guardExpiringAfterInternalBatch(
 describe('useMessageFetch — extended coverage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Drain the *Once queues: vi.clearAllMocks() does not, so an unconsumed
+    // queued value is served to the next test. See [internal]rules/tests.md
+    // § The *Once queue outlives the test that queued it.
+    // mockReset() also clears a PERSISTENT implementation, which is the same
+    // cross-test-fixture defect by a different mechanism — several cases here
+    // set one with mockRejectedValue. It restores an impl given to vi.fn(impl),
+    // so mockCreateChannelOperationGuard keeps its own.
+    mockApiFetch.mockReset();
+    mockSafeJson.mockReset();
+    mockDecryptWithKey.mockReset();
+    mockDecryptForChannel.mockReset();
+    mockDecryptForChannelWithVersion.mockReset();
+    mockGetChannelKey.mockReset();
+    mockCreateChannelOperationGuard.mockReset();
     mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
     resetAllStores();
     mockIsInitialized = true;

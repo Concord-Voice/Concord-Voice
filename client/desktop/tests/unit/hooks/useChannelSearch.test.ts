@@ -68,6 +68,25 @@ import {
   DEBOUNCE_MS,
 } from '@/renderer/hooks/messaging/useChannelSearch';
 
+// Drain the *Once queues: vi.clearAllMocks() does not, so an unconsumed queued value
+// is served to the next test. See [internal]rules/tests.md § The *Once queue outlives
+// the test that queued it. mockReset() also clears the implementation, so every
+// default set at declaration is re-established here.
+function drainOnceQueues(): void {
+  mockApiFetch.mockReset();
+  mockSafeJson.mockReset();
+  mockDecryptForChannel.mockReset();
+  mockDecryptForChannelWithVersion.mockReset();
+  mockSearchMessages.mockReset();
+  mockSearchMessages.mockReturnValue([]);
+  mockSearchMessagesMultiScope.mockReset();
+  mockSearchMessagesMultiScope.mockReturnValue([]);
+  mockIsIndexed.mockReset();
+  mockIsIndexed.mockReturnValue(false);
+  mockCanIndexBackfillMessage.mockReset();
+  mockCanIndexBackfillMessage.mockReturnValue(true);
+}
+
 // Helper: mock a successful bulk fetch response
 function mockBulkResponse(messages: MessageWithUser[], ok = true) {
   mockApiFetch.mockResolvedValueOnce({ ok, status: ok ? 200 : 500 });
@@ -94,6 +113,7 @@ function makeMsg(overrides: Partial<MessageWithUser> = {}): MessageWithUser {
 describe('useChannelSearch helpers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    drainOnceQueues();
     mockE2eeInitialized = true;
     capturedScopeInvalidation = undefined;
   });
@@ -331,6 +351,7 @@ describe('useChannelSearch helpers', () => {
 describe('useChannelSearch hook', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    drainOnceQueues();
     mockE2eeInitialized = true;
     capturedScopeInvalidation = undefined;
     useChatStore.setState({

@@ -61,7 +61,14 @@ export default defineConfig(() => {
       // a working in-memory Storage. Vitest's populateGlobal skips keys already on
       // globalThis, so both shadow jsdom's real Storage. Node 24 (CI) defines neither.
       execArgv: ['--no-experimental-webstorage'],
-      setupFiles: ['./tests/setup.ts'],
+      // onceQueueLeak runs always; ONCE_LEAK_GUARD_OFF=1 disables it. See that file.
+      // ORDER IS LOAD-BEARING, do not swap: sequence.hooks defaults to 'stack',
+      // so afterEach runs in REVERSE registration order. Registering the guard
+      // FIRST is what makes its afterEach run LAST -- after setup.ts's cleanup()
+      // and useRealTimers(). Listing it second would invert that, and a guard
+      // that throws would then preempt cleanup and turn one real finding into a
+      // cascade of unrelated failures for the rest of the file.
+      setupFiles: ['./tests/onceQueueLeak.setup.ts', './tests/setup.ts'],
       include: [
         'tests/**/*.test.{ts,tsx}',
         'src/**/*.test.{ts,tsx}',

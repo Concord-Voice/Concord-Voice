@@ -71,6 +71,12 @@ function deferred<T>() {
 describe('useMessageFetch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Drain the *Once queues: vi.clearAllMocks() does not, so an unconsumed
+    // queued value is served to the next test. See [internal]rules/tests.md
+    // § The *Once queue outlives the test that queued it.
+    // Neither mock carries a default to restore.
+    mockApiFetch.mockReset();
+    mockSafeJson.mockReset();
     mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
     useChatStore.setState({
       messagesByChannel: new Map(),
@@ -481,7 +487,21 @@ describe('useMessageFetch', () => {
         );
       });
 
-      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+      // Assert the WHOLE page, not just that a request was issued: a hook that
+      // fires the refetch and drops the response passes a call-count check, and
+      // a first-ID check still passes if a purged row survives alongside the new
+      // one -- which is the thing a purge is supposed to prevent. This case could
+      // not assert the payload at all before the *Once drain: it was being served
+      // a response queued by an earlier test.
+      await waitFor(() =>
+        expect(
+          useChatStore
+            .getState()
+            .messagesByChannel.get('channel-1')
+            ?.map((m) => m.id)
+        ).toEqual([mockMessage2.id])
+      );
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
     });
 
     it('ignores messages-purged for a scope that is not mounted', async () => {
@@ -511,7 +531,16 @@ describe('useMessageFetch', () => {
         globalThis.dispatchEvent(new CustomEvent('messages-purged', { detail: { scopeId: null } }));
       });
 
-      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+      // As above: the null-scope refetch must replace the page, not merely fire.
+      await waitFor(() =>
+        expect(
+          useChatStore
+            .getState()
+            .messagesByChannel.get('channel-1')
+            ?.map((m) => m.id)
+        ).toEqual([mockMessage2.id])
+      );
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
     });
 
     // #1741 content invariant: `aborted` alone cannot close this window. It
@@ -519,11 +548,6 @@ describe('useMessageFetch', () => {
     // setFetchTrigger bump the purge queues — a response resolving in between
     // reaches indexDecryptedMessages + setMessages with purged plaintext.
     it('does not publish a response that resolves inside the purge window', async () => {
-      // vi.clearAllMocks() keeps queued once-implementations, so drain them:
-      // this case depends on THIS test's request being the deferred one.
-      mockApiFetch.mockReset();
-      mockSafeJson.mockReset();
-
       const response = { ok: true, status: 200 };
       const purgedPage = deferred<{ messages: MessageWithStatus[] }>();
       mockApiFetch.mockResolvedValueOnce(response);
@@ -574,9 +598,6 @@ describe('useMessageFetch', () => {
     // removed and asserts the content DOES land, which is what makes the
     // difference attributable to the fence.
     it('publishes that same response when no purge intervenes', async () => {
-      mockApiFetch.mockReset();
-      mockSafeJson.mockReset();
-
       const response = { ok: true, status: 200 };
       const page = deferred<{ messages: MessageWithStatus[] }>();
       mockApiFetch.mockResolvedValueOnce(response);

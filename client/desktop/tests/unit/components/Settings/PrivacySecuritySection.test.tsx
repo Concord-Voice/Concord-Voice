@@ -291,9 +291,25 @@ describe('resolveSSOToggleError', () => {
   });
 });
 
+// Drain the *Once queues: vi.clearAllMocks() does not, so an unconsumed queued value
+// is served to the next test. See [internal]rules/tests.md § The *Once queue outlives
+// the test that queued it. This file's own beforeEach queues three responses per
+// test, so any case rendering fewer than three fetches leaves the remainder behind
+// and shifts the next test's whole sequence by one — across a describe boundary too,
+// which is why every top-level describe calls this rather than just the first.
+// mockReset() restores an implementation given to vi.fn(impl); a default attached
+// afterwards with .mockResolvedValue() is wiped and re-established here.
+function drainOnceQueues(): void {
+  mockApiFetch.mockReset();
+  mockSecurityGetFetch.mockReset();
+  mockUpdatePrivacy.mockReset();
+  mockUpdatePrivacy.mockResolvedValue(undefined);
+}
+
 describe('PrivacySecuritySection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    drainOnceQueues();
     mockApiFetch
       .mockResolvedValueOnce({
         ok: true,
@@ -3251,6 +3267,7 @@ describe('PrivacySecuritySection — superseded tier mutations (#1241)', () => {
   // `loaded: true` the friend-request control renders disabled, its clicks are
   // no-ops, and the cross-control test below passes for the wrong reason.
   beforeEach(() => {
+    drainOnceQueues();
     vi.mocked(usePrivacyStore).mockImplementation((s: (st: unknown) => unknown) =>
       s({
         settings: {
@@ -3344,6 +3361,7 @@ describe('PrivacySecuritySection — cross-control supersession (#1241)', () => 
   // `loaded: true` the friend-request control renders disabled, its clicks are
   // no-ops, and the cross-control test below passes for the wrong reason.
   beforeEach(() => {
+    drainOnceQueues();
     vi.mocked(usePrivacyStore).mockImplementation((s: (st: unknown) => unknown) =>
       s({
         settings: {
@@ -3454,6 +3472,7 @@ function friendRequestGroup() {
 
 describe('PrivacySecuritySection — friend-request write path (#1241)', () => {
   beforeEach(() => {
+    drainOnceQueues();
     vi.clearAllMocks();
     mockUpdatePrivacy.mockReset();
     mockUpdatePrivacy.mockResolvedValue(undefined);
@@ -3512,6 +3531,7 @@ describe('PrivacySecuritySection — friend-request write path (#1241)', () => {
 // misrepresentation AC-19 exists to prevent.
 describe('PrivacySecuritySection — rejected tier PATCH reverts the control (#1241, AC-19)', () => {
   beforeEach(() => {
+    drainOnceQueues();
     vi.clearAllMocks();
     mockUpdatePrivacy.mockReset();
     installPrivacyStoreMock(true);
@@ -3600,6 +3620,7 @@ describe('PrivacySecuritySection — rejected tier PATCH reverts the control (#1
 // left the suite green, so nothing proved the section forwards the store flag.
 describe('PrivacySecuritySection — friend-request control awaits `loaded` (#1241)', () => {
   beforeEach(() => {
+    drainOnceQueues();
     vi.clearAllMocks();
     mockUpdatePrivacy.mockReset();
     mockUpdatePrivacy.mockResolvedValue(undefined);
@@ -3639,6 +3660,7 @@ describe('PrivacySecuritySection — screen-capture protection (#2468)', () => {
     };
 
   beforeEach(() => {
+    drainOnceQueues();
     vi.clearAllMocks();
     electron().getContentProtection = vi.fn().mockResolvedValue(false);
     useDraftSettingsStore.getState().teardown();
