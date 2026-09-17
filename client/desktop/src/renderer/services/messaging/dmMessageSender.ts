@@ -104,7 +104,10 @@ export function sendDMMessage(
     createdAt: optimisticMessage.created_at,
     ...(gifSlug ? { gifSlug } : {}),
     ...(opts?.attachments?.length
-      ? { attachmentType: opts.attachments[0].file_type as string }
+      ? {
+          attachmentType: opts.attachments[0].file_type as string,
+          attachmentMime: opts.attachments[0].mime_type,
+        }
       : {}),
   });
 

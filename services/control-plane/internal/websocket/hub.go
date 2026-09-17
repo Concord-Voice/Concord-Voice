@@ -3953,6 +3953,13 @@ type dmUnreadLastMessage struct {
 	userID    string
 	username  string
 	createdAt time.Time
+	// Attachment metadata for the sidebar preview (#2364). Populated from
+	// attachments[0] — linkAttachmentsToTable re-sorts by position ascending and
+	// returns only successfully-linked rows, so [0] is "lowest position, live
+	// row", the same semantic the REST LATERAL's ORDER BY ma.position LIMIT 1
+	// reproduces. Display-only; mime is sender-asserted.
+	attachmentType string
+	attachmentMime string
 }
 
 func (h *Hub) validateDMMessage(msg IncomingMessage) (*Client, uuid.UUID, *dmMessageInput) {
@@ -4301,12 +4308,17 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 		client: client, input: input, createdAt: createdAt, updatedAt: updatedAt, expiresAt: expiresAt,
 		attachments: attachments, convPersonal: convPersonal,
 	})
-	h.sendDMUnreadNotify(convUUID, msg.UserID, dmUnreadLastMessage{
+	lastMsg := dmUnreadLastMessage{
 		content:   input.content,
 		userID:    msg.UserID.String(),
 		username:  client.Username,
 		createdAt: createdAt,
-	})
+	}
+	if len(attachments) > 0 {
+		lastMsg.attachmentType = attachments[0].FileType
+		lastMsg.attachmentMime = attachments[0].MimeType
+	}
+	h.sendDMUnreadNotify(convUUID, msg.UserID, lastMsg)
 
 	if input.mentionAddendum != nil {
 		h.routeDMMentionNotifications(convUUID, msg.UserID, input.mentionAddendum)
@@ -4322,16 +4334,26 @@ func (h *Hub) sendDMUnreadNotify(conversationID, senderUserID uuid.UUID, lastMsg
 		return
 	}
 
+	lastMessage := map[string]interface{}{
+		keyContent:   lastMsg.content,
+		keyUserID:    lastMsg.userID,
+		keyUsername:  lastMsg.username,
+		keyCreatedAt: lastMsg.createdAt,
+	}
+	// Conditional, mirroring the REST side's omitempty: an absent key and an
+	// empty string must not mean the same thing to the client.
+	if lastMsg.attachmentType != "" {
+		lastMessage["attachment_type"] = lastMsg.attachmentType
+	}
+	if lastMsg.attachmentMime != "" {
+		lastMessage["attachment_mime"] = lastMsg.attachmentMime
+	}
+
 	notifyMsg := OutgoingMessage{
 		Type: "dm_unread_notify",
 		Data: map[string]interface{}{
 			keyConversationID: conversationID.String(),
-			"last_message": map[string]interface{}{
-				keyContent:   lastMsg.content,
-				keyUserID:    lastMsg.userID,
-				keyUsername:  lastMsg.username,
-				keyCreatedAt: lastMsg.createdAt,
-			},
+			"last_message":    lastMessage,
 		},
 	}
 	data, marshalErr := json.Marshal(notifyMsg)

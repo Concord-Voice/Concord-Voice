@@ -702,6 +702,21 @@ export const DMUnreadNotifySchema = z.object({
         user_id: UUID.optional(),
         username: z.string().optional(),
         created_at: ISOTimestamp.optional(),
+        // #2364. `.optional()` and never `.nullable()`: Go `omitempty` on a
+        // non-pointer string emits the key or omits it and can never emit null,
+        // so `.nullable()` would be dead shape. Display-only; attachment_mime is
+        // sender-asserted and is never rendered.
+        //
+        // `z.string()` rather than the closed enum used by
+        // MessageAttachmentSchema.file_type twenty lines up, and the asymmetry
+        // is deliberate. There, narrowing buys a discriminated union the
+        // renderer switches on. Here the value only selects a display label, and
+        // this schema also carries the unread count: a sixth server-side
+        // file_type would make the enum reject the WHOLE dm_unread_notify frame,
+        // losing the count over a label. Fail open on the label, never on the
+        // frame.
+        attachment_type: z.string().optional(),
+        attachment_mime: z.string().optional(),
       })
       .optional(),
   }),

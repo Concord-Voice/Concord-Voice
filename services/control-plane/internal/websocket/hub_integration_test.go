@@ -2999,6 +2999,103 @@ func TestSendDMUnreadNotifySkipsSubscribedParticipants(t *testing.T) {
 	}
 }
 
+// TestSendDMUnreadNotify_CarriesAttachmentMetadata pins that the two
+// attachment fields reach the wire when populated (#2364 Task 2).
+func TestSendDMUnreadNotify_CarriesAttachmentMetadata(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	convUUID, _ := uuid.Parse(setup.convID)
+
+	client2ID := uuid.New()
+	client2 := &Client{
+		ID:       client2ID,
+		UserID:   setup.user2,
+		Username: "hubuser2",
+		Send:     make(chan []byte, 10),
+		Hub:      setup.hub,
+		Channels: make(map[uuid.UUID]bool),
+	}
+	setup.hub.clients[client2ID] = client2
+	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
+
+	lastMsg := testLastMessage()
+	lastMsg.attachmentType = "photo"
+	lastMsg.attachmentMime = "image/jpeg"
+	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, lastMsg)
+
+	msg := readClientMsg(t, client2)
+	assert.Equal(t, "dm_unread_notify", msg["type"])
+	msgData, ok := msg["data"].(map[string]interface{})
+	require.True(t, ok)
+	lm, ok := msgData["last_message"].(map[string]interface{})
+	require.True(t, ok, "last_message must be present in dm_unread_notify")
+	assert.Equal(t, "photo", lm["attachment_type"])
+	assert.Equal(t, "image/jpeg", lm["attachment_mime"])
+}
+
+// TestSendDMUnreadNotify_OmitsAttachmentKeysWhenAbsent pins that an absent
+// attachment omits both keys entirely rather than emitting empty strings —
+// parity with the REST side's omitempty (#2364 Task 2).
+func TestSendDMUnreadNotify_OmitsAttachmentKeysWhenAbsent(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	convUUID, _ := uuid.Parse(setup.convID)
+
+	client2ID := uuid.New()
+	client2 := &Client{
+		ID:       client2ID,
+		UserID:   setup.user2,
+		Username: "hubuser2",
+		Send:     make(chan []byte, 10),
+		Hub:      setup.hub,
+		Channels: make(map[uuid.UUID]bool),
+	}
+	setup.hub.clients[client2ID] = client2
+	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
+
+	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage())
+
+	msg := readClientMsg(t, client2)
+	msgData, ok := msg["data"].(map[string]interface{})
+	require.True(t, ok)
+	lm, ok := msgData["last_message"].(map[string]interface{})
+	require.True(t, ok, "last_message must be present in dm_unread_notify")
+	// Absent, not empty string — this asserts the conditional-key branch fires.
+	_, hasType := lm["attachment_type"]
+	_, hasMime := lm["attachment_mime"]
+	assert.False(t, hasType, "attachment_type must be absent, not empty")
+	assert.False(t, hasMime, "attachment_mime must be absent, not empty")
+}
+
+// TestSendDMMentionNotify_CarriesNoLastMessage pins the fifth-emitter trap
+// (spec §3.4): sendDMMentionNotify emits a second dm_unread_notify for the
+// same message, after the preview-bearing one, with no last_message key at
+// all. A client handler reading attachment_type outside the existing !muted
+// guard would null a preview that arrived one frame earlier (#2364 Task 2).
+func TestSendDMMentionNotify_CarriesNoLastMessage(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	convUUID, _ := uuid.Parse(setup.convID)
+
+	client2ID := uuid.New()
+	client2 := &Client{
+		ID:       client2ID,
+		UserID:   setup.user2,
+		Username: "hubuser2",
+		Send:     make(chan []byte, 10),
+		Hub:      setup.hub,
+		Channels: make(map[uuid.UUID]bool),
+	}
+	setup.hub.clients[client2ID] = client2
+	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
+
+	setup.hub.sendDMMentionNotify(convUUID, map[uuid.UUID]bool{setup.user2: true}, false)
+
+	msg := readClientMsg(t, client2)
+	assert.Equal(t, "dm_unread_notify", msg["type"])
+	msgData, ok := msg["data"].(map[string]interface{})
+	require.True(t, ok)
+	_, hasLastMessage := msgData["last_message"]
+	assert.False(t, hasLastMessage, "mention frame must not carry last_message")
+}
+
 // --- DisconnectUser / DisconnectSession thread-safe wrappers ---
 
 func TestDisconnectUserQueuesOnChannel(t *testing.T) {

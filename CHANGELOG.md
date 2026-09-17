@@ -160,6 +160,31 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   unchanged and is still fainter than it should be. That colour is shared with every timestamp
   in the app, so it is being corrected separately rather than in this one place.
 
+- **A direct message containing a photo or a file now says so in your DM list, instead of reading "Encrypted message"** ([#2364](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2364)) — when
+  someone sent you an image, a video or a document with no words attached, the conversation list
+  showed "Encrypted message" rather than telling you what had arrived. It now reads
+  "Alexandra sent a Photo", and a file sent *with* a caption shows the caption followed by the
+  kind — "check this out · Photo" — so the words you were actually sent keep the space they
+  deserve. The six kinds are Photo, GIF, Video, Audio file, Doc and File.
+
+  Worth knowing why this looked fine to anyone testing it: it already worked in the conversation
+  you had open on screen. It was wrong everywhere you were *not* looking — every thread you had
+  not opened, and every thread after restarting the app — which is where a message list is most
+  useful. The name shown is the sender's display name, shortened if it is very long so the kind
+  of file never gets cut off, and it reads "You" for your own messages. That name is drawn a
+  little stronger than the words around it, so it is always clear where somebody else's chosen
+  name ends and Concord's own wording begins.
+
+  A message the app genuinely cannot decrypt still reads "Encrypted message", and it will not
+  guess at a file type it has not actually confirmed. Nor will it take the sender's word for it
+  where it can tell: a file uploaded as a "photo" whose actual type says otherwise is now shown
+  as a plain file rather than labelled a photo on the sender's say-so. Screen-reader users now hear the preview
+  line along with the conversation name, which previously was not announced at all.
+
+  Two words changed outside your DM list as well, so the same thing is called the same name
+  everywhere: a notification about an attachment in a server channel now says "Photo" where it
+  used to say "Image", and "File" where it used to say "Attachment".
+
 - **If you do drop offline, you come back on your own instead of staying offline until you reconnect** ([#3332](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3332)) — the previous release stopped the drop happening in the first place; this one fixes what happened when it did. The server could tell "your presence expired" apart from "I have never heard of you" only when its own last write had failed, so an ordinary expiry was treated as the second case and you stayed marked offline for the rest of that connection. Reopening the app looked like the cure, because reconnecting was the only thing that cleared it. Now a heartbeat from a connection the server can still see restores your status, while a genuinely unknown client and anyone who chose Invisible are unaffected.
 
 - **You no longer drop offline, or lose your connection, while Concord sits in the background** ([#3328](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3328)) — leaving

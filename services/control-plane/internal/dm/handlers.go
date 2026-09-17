@@ -286,6 +286,12 @@ type lastMessageResponse struct {
 	CreatedAt        string          `json:"created_at"`
 	Type             string          `json:"type,omitempty"`
 	CallEventPayload json.RawMessage `json:"call_event_payload,omitempty"`
+	// Attachment metadata for the conversation-list preview (#2364). Both are
+	// display-only: mime_type is sender-asserted (spec §3.3) and must never gate
+	// rendering, download, or any authorization decision. Two scalars only — no
+	// filename, size, or count (C2).
+	AttachmentType string `json:"attachment_type,omitempty"`
+	AttachmentMime string `json:"attachment_mime,omitempty"`
 }
 
 // ListConversations returns the caller's DM conversations with last message preview.
@@ -319,6 +325,7 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by,
 		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL, dc.created_at,
 		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload,
+		       att.file_type, att.mime_type,
 		       (SELECT COUNT(*) FROM dm_messages m
 		        WHERE m.conversation_id = dc.id
 		          AND m.created_at > COALESCE(drs.last_read_at, '1970-01-01')
@@ -329,10 +336,18 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $1
 		LEFT JOIN dm_read_states drs ON drs.conversation_id = dc.id AND drs.user_id = $1
 		LEFT JOIN LATERAL (
-		    SELECT m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
+		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
 		    WHERE m.conversation_id = dc.id ` + hiddenRangeFilter(1) + `
 		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT mf.file_type, mf.mime_type
+		    FROM dm_message_attachments ma
+		    INNER JOIN media_files mf ON mf.id = ma.file_id
+		    WHERE ma.message_id = dm.id AND mf.deleted_at IS NULL
+		    ORDER BY ma.position
+		    LIMIT 1
+		) att ON TRUE
 		ORDER BY COALESCE(dm.created_at, dc.created_at) DESC
 	`
 
@@ -361,26 +376,17 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 
 func (h *Handler) scanConversationRow(rows *sql.Rows) (conversationResponse, error) {
 	var conv conversationResponse
-	var lmContent, lmExpiresAt, lmCreatedAt, lmUserID, lmType sql.NullString
-	var lmCallEventPayload []byte
+	var lm lastMessageRow
 	if err := rows.Scan(
 		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy,
 		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.CreatedAt,
-		&lmContent, &lmExpiresAt, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
+		&lm.content, &lm.expiresAt, &lm.createdAt, &lm.userID, &lm.msgType, &lm.callEventPayload,
+		&lm.attachmentType, &lm.attachmentMime,
 		&conv.UnreadCount,
 	); err != nil {
 		return conv, err
 	}
-	if lmContent.Valid {
-		conv.LastMessage = &lastMessageResponse{
-			Content:          lmContent.String,
-			ExpiresAt:        nullStringPointer(lmExpiresAt),
-			UserID:           lmUserID.String,
-			CreatedAt:        lmCreatedAt.String,
-			Type:             lmType.String,
-			CallEventPayload: json.RawMessage(lmCallEventPayload),
-		}
-	}
+	conv.LastMessage = newLastMessageResponse(lm)
 	return conv, nil
 }
 
@@ -389,6 +395,47 @@ func nullStringPointer(value sql.NullString) *string {
 		return nil
 	}
 	return &value.String
+}
+
+// lastMessageRow is the scan target both DM conversation reads share. It exists
+// so each site declares one value rather than seven loose locals whose order
+// must silently match the SELECT list, and so the constructor below takes one
+// parameter instead of eight.
+//
+// Field order matches the SELECT list at both sites deliberately: a reader
+// copying this declaration into a new Scan gets the right order. It would fail
+// loudly rather than silently ([]byte against sql.NullString), but a struct
+// whose whole purpose is to stop order drift should not itself model it wrong.
+type lastMessageRow struct {
+	content          sql.NullString
+	expiresAt        sql.NullString
+	createdAt        sql.NullString
+	userID           sql.NullString
+	msgType          sql.NullString
+	callEventPayload []byte
+	attachmentType   sql.NullString
+	attachmentMime   sql.NullString
+}
+
+// newLastMessageResponse builds the shared last-message payload for both DM
+// conversation reads. The SQL at the two sites genuinely differs (one is a list
+// with an unread count, one is a single row), but the response mapping does not
+// — extracting it makes that half structurally undivergeable (C6, R8).
+// Returns nil when there is no visible last message.
+func newLastMessageResponse(row lastMessageRow) *lastMessageResponse {
+	if !row.content.Valid {
+		return nil
+	}
+	return &lastMessageResponse{
+		Content:          row.content.String,
+		ExpiresAt:        nullStringPointer(row.expiresAt),
+		UserID:           row.userID.String,
+		CreatedAt:        row.createdAt.String,
+		Type:             row.msgType.String,
+		CallEventPayload: json.RawMessage(row.callEventPayload),
+		AttachmentType:   row.attachmentType.String,
+		AttachmentMime:   row.attachmentMime.String,
+	}
 }
 
 func (h *Handler) attachParticipants(conversations []conversationResponse, convIDs []string) {
@@ -2271,37 +2318,37 @@ func (h *Handler) isParticipant(convID, userID string) bool {
 // nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 func (h *Handler) fetchConversationResponse(convID, viewerID string) *conversationResponse {
 	var conv conversationResponse
-	var lmContent, lmExpiresAt, lmCreatedAt, lmUserID, lmType sql.NullString
-	var lmCallEventPayload []byte
+	var lm lastMessageRow
 	err := h.db.QueryRow(`
 		SELECT dc.id, dc.is_group, dc.is_personal, dc.name, dc.icon_url, dc.created_by,
 		       dc.expiration_window_seconds, dc.expiration_updated_at, dc.expiration_revision, dc.expiration_backfill_mode IS NOT NULL, dc.created_at,
-		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload
+		       dm.content, dm.expires_at, dm.created_at, dm.user_id, dm.type, dm.call_event_payload,
+		       att.file_type, att.mime_type
 		FROM dm_conversations dc
 		LEFT JOIN LATERAL (
-		    SELECT m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
+		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
 		    WHERE m.conversation_id = dc.id `+hiddenRangeFilter(2)+`
 		    ORDER BY m.created_at DESC LIMIT 1
 		) dm ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT mf.file_type, mf.mime_type
+		    FROM dm_message_attachments ma
+		    INNER JOIN media_files mf ON mf.id = ma.file_id
+		    WHERE ma.message_id = dm.id AND mf.deleted_at IS NULL
+		    ORDER BY ma.position
+		    LIMIT 1
+		) att ON TRUE
 		WHERE dc.id = $1
 	`, convID, viewerID).Scan(
 		&conv.ID, &conv.IsGroup, &conv.IsPersonal, &conv.Name, &conv.IconURL, &conv.CreatedBy,
 		&conv.ExpirationWindowSeconds, &conv.ExpirationUpdatedAt, &conv.ExpirationRevision, &conv.ExpirationBackfillPending, &conv.CreatedAt,
-		&lmContent, &lmExpiresAt, &lmCreatedAt, &lmUserID, &lmType, &lmCallEventPayload,
+		&lm.content, &lm.expiresAt, &lm.createdAt, &lm.userID, &lm.msgType, &lm.callEventPayload,
+		&lm.attachmentType, &lm.attachmentMime,
 	)
 	if err != nil {
 		return nil
 	}
-	if lmContent.Valid {
-		conv.LastMessage = &lastMessageResponse{
-			Content:          lmContent.String,
-			ExpiresAt:        nullStringPointer(lmExpiresAt),
-			UserID:           lmUserID.String,
-			CreatedAt:        lmCreatedAt.String,
-			Type:             lmType.String,
-			CallEventPayload: json.RawMessage(lmCallEventPayload),
-		}
-	}
+	conv.LastMessage = newLastMessageResponse(lm)
 
 	// Fetch participants
 	pRows, err := h.db.Query(`

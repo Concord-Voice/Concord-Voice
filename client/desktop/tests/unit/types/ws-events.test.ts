@@ -294,6 +294,49 @@ describe('ws-events schemas — happy path (one per event)', () => {
     expect(result.success).toBe(true);
   });
 
+  describe('DMUnreadNotifySchema attachment fields', () => {
+    it('accepts and preserves both attachment fields', () => {
+      const parsed = WebSocketEventSchema.safeParse({
+        type: 'dm_unread_notify',
+        data: {
+          conversation_id: UUID_A,
+          last_message: {
+            content: 'ciphertext',
+            user_id: UUID_B,
+            username: 'alice',
+            created_at: ISO_NOW,
+            attachment_type: 'photo',
+            attachment_mime: 'image/jpeg',
+          },
+        },
+      });
+      expect(parsed.success).toBe(true);
+      if (!parsed.success) return;
+      // Asserts on the PARSED VALUE, not just `success` — DMUnreadNotifySchema
+      // is not `.strict()`, so an envelope with unknown keys STRIPPED would
+      // still validate. This is what proves the two fields actually made it
+      // into the schema rather than being silently dropped (C5).
+      const data = parsed.data.data as { last_message?: Record<string, unknown> };
+      expect(data.last_message?.attachment_type).toBe('photo');
+      expect(data.last_message?.attachment_mime).toBe('image/jpeg');
+    });
+
+    it('accepts a frame with both fields absent', () => {
+      const parsed = WebSocketEventSchema.safeParse({
+        type: 'dm_unread_notify',
+        data: {
+          conversation_id: UUID_A,
+          last_message: {
+            content: 'ciphertext',
+            user_id: UUID_B,
+            created_at: ISO_NOW,
+          },
+        },
+      });
+      expect(parsed.success).toBe(true);
+    });
+  });
+
   it('DMConversationCreatedSchema accepts a canonical conversation-created envelope', () => {
     const result = DMConversationCreatedSchema.safeParse({
       type: 'dm_conversation_created',

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { sendDMMessage } from '@/renderer/services/messaging/dmMessageSender';
+import { describeMessagePreview } from '@/renderer/utils/messaging/messagePreview';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
@@ -122,5 +123,42 @@ describe('dmMessageSender.sendDMMessage', () => {
         plaintextPreview: 'Latest self-sent DM',
       })
     );
+  });
+
+  it('carries the attachment MIME into the optimistic preview so a PDF reads as a Doc', () => {
+    mockGetState.mockReturnValue(ConnectionState.DISCONNECTED);
+    useDMStore.setState({
+      conversations: [
+        {
+          id: 'dm-conv-1',
+          isGroup: false,
+          isPersonal: false,
+          name: null,
+          participants: [],
+          lastMessage: null,
+          unreadCount: 0,
+          createdAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+    } as Partial<ReturnType<typeof useDMStore.getState>>);
+
+    sendDMMessage('dm-conv-1', '', 'me', {
+      attachments: [
+        { id: 'file-1', file_type: 'file', mime_type: 'application/pdf', file_size: 1024 },
+      ],
+    });
+
+    const last = useDMStore.getState().conversations.find((c) => c.id === 'dm-conv-1')?.lastMessage;
+
+    // The consumer, not the handshake. `file_type: 'file'` alone classifies as
+    // File; only the MIME promotes it to Doc. Asserting the field in isolation
+    // would still pass on a writer that carried a MIME nothing could use.
+    expect(
+      describeMessagePreview({
+        content: '',
+        attachmentType: last?.attachmentType,
+        attachmentMime: last?.attachmentMime,
+      }).phrase
+    ).toBe('a Doc');
   });
 });

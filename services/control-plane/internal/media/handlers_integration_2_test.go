@@ -827,6 +827,75 @@ func TestIsValidFileType(t *testing.T) {
 }
 
 // =====================================================================
+// reconcileFileType — file_type is sender-asserted, and so is mime_type
+// =====================================================================
+
+func TestReconcileFileTypeRejectsIncoherentPairs(t *testing.T) {
+	// The exploit this closes: both fields come from the same multipart form,
+	// so a declared `photo` cost an attacker nothing. The sidebar then reads
+	// "Mallory sent a Photo" for an executable.
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypePhoto, "application/x-msdownload"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypeAnimated, "application/zip"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypeVideo, "audio/mpeg"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypeAudio, "video/mp4"))
+}
+
+func TestReconcileFileTypeKeepsWhatAnHonestClientSends(t *testing.T) {
+	// classifyFileType (attachmentCrypto.ts) derives file_type FROM mime_type
+	// using sets that each sit inside their matching top-level type, so every
+	// honest pair must survive. A rule that rejected one of these would be
+	// rejecting uploads rather than lies.
+	for _, tc := range []struct {
+		fileType FileType
+		mimeType string
+	}{
+		{FileTypePhoto, "image/png"},
+		{FileTypePhoto, "image/heic"},
+		{FileTypeAnimated, "image/gif"},
+		{FileTypeAnimated, "image/apng"},
+		{FileTypeVideo, "video/quicktime"},
+		{FileTypeAudio, "audio/x-m4a"},
+		// `file` is the catch-all and is never demoted, whatever the MIME.
+		{FileTypeFile, "application/pdf"},
+		{FileTypeFile, "image/png"},
+		{FileTypeFile, ""},
+	} {
+		assert.Equal(t, tc.fileType, reconcileFileType(tc.fileType, tc.mimeType),
+			"honest pair %s/%s must survive", tc.fileType, tc.mimeType)
+	}
+}
+
+func TestReconcileFileTypeNormalizesBeforeComparing(t *testing.T) {
+	// A parameterised or oddly-cased MIME is still coherent; only the
+	// top-level type is consulted.
+	assert.Equal(t, FileTypePhoto, reconcileFileType(FileTypePhoto, "image/png; charset=binary"))
+	assert.Equal(t, FileTypePhoto, reconcileFileType(FileTypePhoto, "  IMAGE/PNG  "))
+	// An absent MIME normalizes to application/octet-stream upstream, which is
+	// incoherent with every specific type — the fail-closed direction.
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypePhoto, mimeOctetStream))
+}
+
+func TestReconcileFileTypeRequiresBothMimeHalves(t *testing.T) {
+	// strings.Cut("image", "/") yields topLevel == "image" with found == false,
+	// so a check reading only the top level accepted a string that is not a
+	// MIME type at all as evidence that the attachment is a photo.
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypePhoto, "image"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypePhoto, "image/"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypeVideo, "video"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypePhoto, "/png"))
+	assert.Equal(t, FileTypeFile, reconcileFileType(FileTypeAudio, ""))
+	// A well-formed pair is still untouched.
+	assert.Equal(t, FileTypePhoto, reconcileFileType(FileTypePhoto, "image/png"))
+}
+
+func TestNormalizeFileTypeAppliesBothGates(t *testing.T) {
+	// Out-of-enum still degrades, and a coherent enum value still reconciles.
+	assert.Equal(t, FileTypeFile, normalizeFileType("unknown", "image/png"))
+	assert.Equal(t, FileTypePhoto, normalizeFileType("photo", "image/png"))
+	assert.Equal(t, FileTypeFile, normalizeFileType("photo", "application/x-msdownload"))
+}
+
+// =====================================================================
 // Delete: Successful deletion
 // =====================================================================
 

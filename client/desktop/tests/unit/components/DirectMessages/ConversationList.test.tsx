@@ -26,9 +26,24 @@ vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
 }));
 
 import ConversationList from '@/renderer/components/DirectMessages/ConversationList';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
 import { DockOverlayProvider, DockShell } from '@/renderer/components/Layout/DockShell';
 import ContextMenuProvider from '@/renderer/components/ui/ContextMenuProvider';
 import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+
+/**
+ * The preview renders the sender name in its own element, so the untrusted half
+ * is bounded in the DOM (a display name of exactly `You sent a Photo` otherwise
+ * composes into a complete forged attribution). RTL's default text matcher sees
+ * only an element's DIRECT text nodes, so `getByText('Alice sent a Photo')`
+ * cannot match across that boundary. Assert the composed text on the preview
+ * element instead — scoped by class so it can never match an ancestor.
+ */
+const findPreview = (text: string) =>
+  screen.findByText(
+    (_content, element) =>
+      element?.classList.contains('conversation-preview') === true && element.textContent === text
+  );
 
 const makeConversation = (overrides: Partial<DMConversation> = {}): DMConversation => ({
   id: 'conv-1',
@@ -66,6 +81,14 @@ describe('ConversationList', () => {
     (e2eeService.createChannelOperationGuard as ReturnType<typeof vi.fn>).mockImplementation(
       () => ({ assertCurrent: vi.fn() })
     );
+    // vi.clearAllMocks() clears call history but NOT the mockResolvedValueOnce
+    // queue, and a test whose queued value is never consumed (an optimistic
+    // send skips the decrypt entirely) hands it to the NEXT test's first
+    // decrypt. mockReset drains the queue; the other three mocks already get
+    // the equivalent treatment from their mockImplementation calls.
+    const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+    decryptMock.mockReset();
+    decryptMock.mockResolvedValue(null);
     (e2eeService.invalidateChannelKey as ReturnType<typeof vi.fn>).mockImplementation(
       () => undefined
     );
@@ -383,7 +406,10 @@ describe('ConversationList', () => {
 
     render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
 
-    await waitFor(() => expect(screen.getByText('GIF')).toBeInTheDocument());
+    // A GIF-only message carries no text, so the descriptor's kind is 'gif' and
+    // §4.1 rung 5 + §4.2 give every no-text rung sender attribution. The bare
+    // 'GIF' label is superseded by 'Alice sent a GIF' — spec, not regression.
+    expect(await findPreview('Alice sent a GIF')).toBeInTheDocument();
     expect(screen.queryByText(/gif_slug/)).not.toBeInTheDocument();
     (e2eeService as any).isInitialized = false;
   });
@@ -472,6 +498,459 @@ describe('ConversationList', () => {
     await waitFor(() => expect(screen.getByText('Second sent message')).toBeInTheDocument());
     expect(screen.queryByText('First sent message')).not.toBeInTheDocument();
     (e2eeService as any).isInitialized = false;
+  });
+
+  describe('preview decrypt tri-state (#2364)', () => {
+    const encryptedPhotoConversation = () =>
+      makeConversation({
+        lastMessage: {
+          content: 'encrypted-photo-ciphertext',
+          userId: 'user-2',
+          username: 'alice',
+          createdAt: '2025-01-01T12:00:00Z',
+          attachmentType: 'photo',
+        },
+      });
+
+    // Settling the decrypt inside act() is what makes the "was anything
+    // committed?" assertions non-vacuous: without it, decryptingRef may still
+    // hold the conversation and a skipped re-decrypt would read as a cache hit.
+    const deferred = <T,>() => {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: Error) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+
+    beforeEach(() => {
+      (e2eeService as any).isInitialized = true;
+    });
+
+    it('renders the attributed type when decryption proves the text is empty', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [encryptedPhotoConversation()],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      expect(await findPreview('Alice sent a Photo')).toBeInTheDocument();
+    });
+
+    it('renders the caption with a suffix when decryption yields text', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        'check this out'
+      );
+      useDMStore.setState({
+        conversations: [encryptedPhotoConversation()],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      expect(await screen.findByText('check this out · Photo')).toBeInTheDocument();
+    });
+
+    it('renders the placeholder when decryption genuinely fails, never a type', async () => {
+      const attempt = deferred<string>();
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock.mockReturnValueOnce(attempt.promise);
+      useDMStore.setState({
+        conversations: [encryptedPhotoConversation()],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        attempt.reject(new Error('no key'));
+        await attempt.promise.catch(() => undefined);
+      });
+
+      expect(screen.getByText('Encrypted message')).toBeInTheDocument();
+      expect(screen.queryByText(/sent a Photo/)).not.toBeInTheDocument();
+
+      // A GENUINE failure is committed and is terminal for this ciphertext: a
+      // fresh pass over the same conversation must not re-attempt the decrypt.
+      // This is the positive witness the superseded case below must NOT show.
+      await act(async () => {
+        useDMStore.setState({ conversations: [encryptedPhotoConversation()] });
+      });
+      expect(decryptMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('commits nothing when the operation is superseded, so a later pass recovers (R9)', async () => {
+      // assertCurrent() throws from OUTSIDE the decrypt try. A naive tri-state
+      // catches that throw and records a terminal 'failed' for a conversation
+      // whose key material has since rotated — re-arming exactly the preview
+      // resurrection class the guard exists to prevent. Nothing may be
+      // committed, and "nothing" is only distinguishable from "failed" by the
+      // re-decrypt that a terminal entry with a matching cipher would suppress.
+      let superseded = true;
+      (e2eeService.createChannelOperationGuard as ReturnType<typeof vi.fn>).mockImplementation(
+        () => ({
+          assertCurrent: () => {
+            if (superseded) throw new Error('stale preview generation');
+          },
+        })
+      );
+      const attempt = deferred<string>();
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock.mockReturnValueOnce(attempt.promise).mockResolvedValueOnce('recovered plaintext');
+      useDMStore.setState({
+        conversations: [encryptedPhotoConversation()],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        attempt.resolve('superseded plaintext');
+        await attempt.promise;
+      });
+
+      expect(screen.getByText('Encrypted message')).toBeInTheDocument();
+      expect(screen.queryByText(/superseded plaintext/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/sent a Photo/)).not.toBeInTheDocument();
+
+      // Key material settles. A fresh pass over the SAME ciphertext must
+      // re-decrypt, which only holds if the superseded pass committed nothing.
+      superseded = false;
+      await act(async () => {
+        useDMStore.setState({ conversations: [encryptedPhotoConversation()] });
+      });
+
+      // The conversation carries a photo, so a captioned decrypt renders with
+      // the '· Photo' suffix — the same shape the caption case above asserts.
+      expect(await screen.findByText('recovered plaintext · Photo')).toBeInTheDocument();
+    });
+  });
+
+  describe('accessible description carries the preview (#2364 a11y)', () => {
+    // aria-label sets the accessible NAME, and NVDA/JAWS re-announce a
+    // focused element whenever its name changes. aria-describedby instead
+    // points at an accessible DESCRIPTION, which is read once on focus and
+    // is NOT monitored for mutation — that is why the preview (which
+    // changes on every incoming message) belongs in the description and
+    // must never move into the name. See the comment on
+    // StandardConversationItem in ConversationList.tsx for the same note.
+    beforeEach(() => {
+      (e2eeService as any).isInitialized = true;
+    });
+
+    it('carries the preview for a plain text message', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        'Hey there!'
+      );
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: 'user-2',
+              username: 'alice',
+              createdAt: '2025-01-01T12:00:00Z',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      await screen.findByText('Hey there!');
+      expect(screen.getByLabelText('Alice')).toHaveAccessibleDescription('Hey there!');
+    });
+
+    it('carries the preview for an attachment message', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            lastMessage: {
+              content: 'encrypted-photo-ciphertext',
+              userId: 'user-2',
+              username: 'alice',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'photo',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      await findPreview('Alice sent a Photo');
+      expect(screen.getByLabelText('Alice')).toHaveAccessibleDescription('Alice sent a Photo');
+    });
+
+    it('carries the preview for a captioned attachment', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        'check this out'
+      );
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            lastMessage: {
+              content: 'encrypted-photo-ciphertext',
+              userId: 'user-2',
+              username: 'alice',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'photo',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      await screen.findByText('check this out · Photo');
+      expect(screen.getByLabelText('Alice')).toHaveAccessibleDescription('check this out · Photo');
+    });
+
+    it('exposes only the placeholder for an undecryptable message — no ciphertext, no attachment type', async () => {
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock.mockRejectedValueOnce(new Error('no key'));
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            lastMessage: {
+              content: 'encrypted-photo-ciphertext',
+              userId: 'user-2',
+              username: 'alice',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'photo',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      await screen.findByText('Encrypted message');
+      const item = screen.getByLabelText('Alice');
+      expect(item).toHaveAccessibleDescription('Encrypted message');
+      expect(item).not.toHaveAccessibleDescription(/encrypted-photo-ciphertext/);
+      expect(item).not.toHaveAccessibleDescription(/Photo/);
+    });
+
+    it('leaves the accessible name unchanged while an incoming message updates the description', async () => {
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock.mockResolvedValueOnce('first message');
+      const conversation = makeConversation({
+        lastMessage: {
+          content: 'encrypted-ciphertext-1',
+          userId: 'user-2',
+          username: 'alice',
+          createdAt: '2025-01-01T12:00:00Z',
+        },
+      });
+      useDMStore.setState({
+        conversations: [conversation],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      await screen.findByText('first message');
+      expect(screen.getByLabelText('Alice')).toHaveAccessibleDescription('first message');
+
+      decryptMock.mockResolvedValueOnce('second message');
+      act(() => {
+        useDMStore.setState({
+          conversations: [
+            {
+              ...conversation,
+              lastMessage: {
+                content: 'encrypted-ciphertext-2',
+                userId: 'user-2',
+                username: 'alice',
+                createdAt: '2025-01-01T12:05:00Z',
+              },
+            },
+          ],
+        });
+      });
+
+      await waitFor(() =>
+        expect(screen.getByLabelText('Alice')).toHaveAccessibleDescription('second message')
+      );
+      // The NAME is unchanged by the incoming message — only the description
+      // moved. This is the assertion that pins the design decision: moving
+      // the preview into aria-label would both fail this assertion AND break
+      // the getByLabelText('Alice') query above it.
+      expect(screen.getByLabelText('Alice')).toHaveAttribute('aria-label', 'Alice');
+    });
+
+    it('gets no aria-describedby at all when there is no last message', () => {
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: null })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      const item = screen.getByLabelText('Alice');
+      expect(item).not.toHaveAttribute('aria-describedby');
+    });
+  });
+
+  describe('preview sender attribution — the name ladder is total', () => {
+    beforeEach(() => {
+      (e2eeService as any).isInitialized = true;
+    });
+
+    it('uses You for the current user', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: 'user-1',
+              username: 'me',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'photo',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      expect(await findPreview('You sent a Photo')).toBeInTheDocument();
+    });
+
+    it('bounds a hostile display name that reads exactly like the app clause', async () => {
+      // 16 graphemes, so truncateSenderName returns it verbatim, and the flat
+      // string it used to compose into was "You sent a Photo sent a Photo" --
+      // which .conversation-preview's text-overflow clips back to a complete,
+      // well-formed attribution of Mallory's attachment to the reader.
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            participants: [
+              { userId: 'user-1', username: 'me', displayName: 'Me' },
+              { userId: 'user-2', username: 'mallory', displayName: 'You sent a Photo' },
+            ],
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: 'user-2',
+              username: 'mallory',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'photo',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+
+      const preview = await findPreview('You sent a Photo sent a Photo');
+      // The defect was the ABSENCE of any boundary: one text run in which the
+      // reader cannot tell the attacker's characters from the app's. The name
+      // must occupy its own element, so weight, colour and bidi isolation can
+      // mark where the untrusted half ends.
+      expect(preview.childElementCount).toBe(1);
+      const sender = preview.querySelector('.conversation-preview-sender');
+      expect(sender).not.toBeNull();
+      expect(sender?.textContent).toBe('You sent a Photo');
+      // And the app's own words are NOT inside that element.
+      expect(sender?.textContent).not.toContain('sent a Photo sent');
+    });
+
+    it('prefers displayName over username', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            participants: [
+              { userId: 'user-1', username: 'me', displayName: 'Me' },
+              { userId: 'user-2', username: 'alice99', displayName: 'Alice' },
+            ],
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: 'user-2',
+              username: 'alice99',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'video',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      expect(await findPreview('Alice sent a Video')).toBeInTheDocument();
+    });
+
+    it('falls back to the message username when the sender left the group', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            participants: [{ userId: 'user-1', username: 'me', displayName: 'Me' }],
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: 'gone',
+              username: 'bob',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'file',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      expect(await findPreview('bob sent a File')).toBeInTheDocument();
+    });
+
+    it('renders Someone — never undefined, never a UUID — when nothing resolves', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            participants: [{ userId: 'user-1', username: 'me', displayName: 'Me' }],
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: '33333333-3333-4333-8333-333333333333',
+              username: undefined,
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'audio',
+            } as DMLastMessage,
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      expect(await findPreview('Someone sent an Audio file')).toBeInTheDocument();
+      expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/33333333/)).not.toBeInTheDocument();
+    });
+
+    it('truncates a long sender name so the type word survives', async () => {
+      (e2eeService.decryptForChannel as ReturnType<typeof vi.fn>).mockResolvedValueOnce('');
+      useDMStore.setState({
+        conversations: [
+          makeConversation({
+            participants: [
+              { userId: 'user-1', username: 'me', displayName: 'Me' },
+              { userId: 'user-2', username: 'x', displayName: 'Alexandra Bartholomew' },
+            ],
+            lastMessage: {
+              content: 'encrypted-ciphertext',
+              userId: 'user-2',
+              username: 'x',
+              createdAt: '2025-01-01T12:00:00Z',
+              attachmentType: 'photo',
+            },
+          }),
+        ],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      expect(await findPreview('Alexandra Bartho… sent a Photo')).toBeInTheDocument();
+    });
   });
 
   it('calls onSelectThread on conversation click', () => {
@@ -1567,6 +2046,156 @@ describe('ConversationList', () => {
       );
 
       expect(screen.getByRole('button', { name: 'Friend 18' })).toBeVisible();
+    });
+  });
+
+  describe('preview cache freshness and retry (#2364 review)', () => {
+    const lastMessage = (content: string) => ({
+      content,
+      userId: 'user-2',
+      username: 'alice',
+      createdAt: '2025-01-01T12:00:00Z',
+    });
+
+    it('does not render a cached preview belonging to the previous message', async () => {
+      (e2eeService as any).isInitialized = true;
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      // First ciphertext decrypts; the second never settles, so the only entry
+      // in the cache is the one describing the message that is no longer last.
+      decryptMock
+        .mockResolvedValueOnce('first plaintext')
+        .mockReturnValueOnce(new Promise(() => {}));
+
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: lastMessage('cipher-1') })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(screen.getByText('first plaintext')).toBeInTheDocument());
+
+      act(() =>
+        useDMStore.setState({
+          conversations: [makeConversation({ lastMessage: lastMessage('cipher-2') })],
+        })
+      );
+
+      // The stale entry is not data about this message. Rendering it produced
+      // the previous message's text under the new message's sender and type.
+      await waitFor(() => expect(screen.getByText('Encrypted message')).toBeInTheDocument());
+      expect(screen.queryByText('first plaintext')).not.toBeInTheDocument();
+      (e2eeService as any).isInitialized = false;
+    });
+
+    it('retries after a key that has not arrived yet, instead of latching the placeholder', async () => {
+      (e2eeService as any).isInitialized = true;
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock
+        .mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true))
+        .mockResolvedValueOnce('arrived late');
+
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: lastMessage('cipher-pending') })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+      expect(screen.getByText('Encrypted message')).toBeInTheDocument();
+
+      // Caching 'failed' for a pending key satisfied the effect's re-decrypt
+      // predicate, so the placeholder stuck for the rest of the connection.
+      act(() =>
+        useDMStore.setState({
+          conversations: [
+            makeConversation({ lastMessage: lastMessage('cipher-pending'), unreadCount: 1 }),
+          ],
+        })
+      );
+
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByText('arrived late')).toBeInTheDocument());
+      (e2eeService as any).isInitialized = false;
+    });
+
+    it('re-attempts the preview when the missing key is delivered', async () => {
+      (e2eeService as any).isInitialized = true;
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock
+        .mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true))
+        .mockResolvedValueOnce('decrypted once the key landed');
+
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: lastMessage('cipher-await-key') })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+      expect(screen.getByText('Encrypted message')).toBeInTheDocument();
+
+      // Nothing else changes: the arriving key touches neither `conversations`
+      // nor `decryptedPreviews`, so without a listener the attempt is never
+      // re-armed and the row stays on the placeholder indefinitely.
+      act(() => {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-delivered', { detail: { channelId: 'conv-1' } })
+        );
+      });
+
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(screen.getByText('decrypted once the key landed')).toBeInTheDocument()
+      );
+      (e2eeService as any).isInitialized = false;
+    });
+
+    it('ignores a key delivered for a different conversation', async () => {
+      (e2eeService as any).isInitialized = true;
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock.mockRejectedValueOnce(new E2EEKeyUnavailableError('NO_KEY_YET', true));
+
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: lastMessage('cipher-other') })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+
+      act(() => {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-delivered', { detail: { channelId: 'some-other-conv' } })
+        );
+      });
+
+      await Promise.resolve();
+      expect(decryptMock).toHaveBeenCalledTimes(1);
+      (e2eeService as any).isInitialized = false;
+    });
+
+    it('decrypts a message that arrives while the previous decrypt is still in flight', async () => {
+      (e2eeService as any).isInitialized = true;
+      const decryptMock = e2eeService.decryptForChannel as ReturnType<typeof vi.fn>;
+      decryptMock
+        .mockReturnValueOnce(new Promise(() => {}))
+        .mockResolvedValueOnce('second plaintext');
+
+      useDMStore.setState({
+        conversations: [makeConversation({ lastMessage: lastMessage('cipher-1') })],
+        fetchConversations: vi.fn().mockResolvedValue(undefined),
+      });
+      render(<ConversationList selectedThreadId={null} onSelectThread={mockOnSelectThread} />);
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(1));
+
+      // Keyed by conversation alone, this second ciphertext was refused by the
+      // in-flight guard and then never re-armed.
+      act(() =>
+        useDMStore.setState({
+          conversations: [makeConversation({ lastMessage: lastMessage('cipher-2') })],
+        })
+      );
+
+      await waitFor(() => expect(decryptMock).toHaveBeenCalledTimes(2));
+      expect(decryptMock).toHaveBeenLastCalledWith('conv-1', 'cipher-2');
+      await waitFor(() => expect(screen.getByText('second plaintext')).toBeInTheDocument());
+      (e2eeService as any).isInitialized = false;
     });
   });
 });

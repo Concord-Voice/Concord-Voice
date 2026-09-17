@@ -81,7 +81,13 @@ export interface DMParticipant {
 export interface DMLastMessage {
   content: string;
   userId: string;
-  username: string;
+  /**
+   * Present on the WS paths, absent on the REST path — the conversation-list
+   * endpoint has never returned it (#2364 §4.9). Optional so the type stops
+   * claiming a string that is `undefined` at runtime; resolve display names from
+   * `participants` by `userId` instead.
+   */
+  username?: string;
   createdAt: string;
   /** Server-authored metadata for plaintext voice-call history rows. */
   type?: string;
@@ -90,8 +96,10 @@ export interface DMLastMessage {
   plaintextPreview?: string;
   /** E2EE GIF slug metadata for local optimistic previews and server-enriched summaries. */
   gifSlug?: string;
-  /** Media type label when message has no text content (e.g. 'photo', 'video', 'file'). */
+  /** Coarse media class of the first live attachment ('photo' | 'animated' | 'video' | 'audio' | 'file'). */
   attachmentType?: string;
+  /** MIME of that same attachment. Sender-asserted — classify by allowlist, never render. */
+  attachmentMime?: string;
 }
 
 export interface DMConversation {
@@ -1159,10 +1167,12 @@ function mapConversation(c: Record<string, unknown>): DMConversation {
       ? {
           content: lastMsg.content as string,
           userId: lastMsg.user_id as string,
-          username: lastMsg.username as string,
+          username: lastMsg.username as string | undefined,
           createdAt: lastMsg.created_at as string,
           type: lastMsg.type as string | undefined,
           callEventPayload: lastMsg.call_event_payload as CallEventPayload | undefined,
+          attachmentType: lastMsg.attachment_type as string | undefined,
+          attachmentMime: lastMsg.attachment_mime as string | undefined,
         }
       : null,
     unreadCount: (c.unread_count as number) || 0,

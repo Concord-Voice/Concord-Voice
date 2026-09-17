@@ -73,7 +73,14 @@ import {
 const CIPHERTEXT = 'encrypted-dm-wire-content-that-must-never-be-shown';
 const PLAINTEXT = 'Hey, are we still on for lunch?';
 
-function dmEvent(content: string, keyVersion?: number) {
+interface DMEventAttachment {
+  id: string;
+  file_type: string;
+  mime_type: string;
+  file_size: number;
+}
+
+function dmEvent(content: string, keyVersion?: number, attachments?: DMEventAttachment[]) {
   return {
     type: 'dm_message',
     data: {
@@ -86,20 +93,21 @@ function dmEvent(content: string, keyVersion?: number) {
       // key_version > 1 selects the versioned decrypt path (CSK rotation); omitted
       // (undefined) selects the plain decryptForChannel path.
       ...(keyVersion !== undefined ? { key_version: keyVersion } : {}),
+      ...(attachments !== undefined ? { attachments } : {}),
       created_at: '2025-01-01T00:00:00Z',
     },
   };
 }
 
 /** Renders the hook, dispatches one dm_message, and flushes the async decrypt. */
-async function receiveDM(keyVersion?: number): Promise<void> {
+async function receiveDM(keyVersion?: number, attachments?: DMEventAttachment[]): Promise<void> {
   const ws = createMockWsService();
   renderHook(() => useWebSocketMessages(ws as never));
   const handler = ws.handlers.get('dm_message');
   expect(handler).toBeDefined();
   // dm_message decrypts asynchronously — async act flushes the promise microtasks.
   await act(async () => {
-    handler!(dmEvent(CIPHERTEXT, keyVersion));
+    handler!(dmEvent(CIPHERTEXT, keyVersion, attachments));
   });
 }
 
@@ -214,5 +222,42 @@ describe('useWebSocketMessages — DM notification decryption (regression #1715)
     const failBody = (notifySpy.mock.calls[1][0] as { body: string }).body;
     expect(failBody).toBe('');
     expect(failBody).not.toContain(CIPHERTEXT);
+  });
+});
+
+/**
+ * notificationPreviewBody (A12 / R10) — pins §4.7's renamed nouns as a decision
+ * rather than a side effect. `notificationPreviewBody` feeds this DM path AND
+ * channel notifications (`notifyChannelMessagePreview`), so the rename must
+ * reach it, but the DM-attribution ladder (`{Sender} sent a Photo`,
+ * `caption · Photo`) added elsewhere in this PR must NOT — notifications
+ * already name the sender in their title, which is exactly why
+ * `describeMessagePreview` was split from `formatMessagePreview`.
+ */
+describe('notificationPreviewBody — renamed nouns, no attribution (A12 / R10)', () => {
+  const PHOTO_ATTACHMENT = [
+    { id: 'attachment-1', file_type: 'photo', mime_type: 'image/jpeg', file_size: 1024 },
+  ];
+
+  it('uses the renamed nouns', async () => {
+    mockDecryptForChannel.mockResolvedValue('');
+
+    await receiveDM(undefined, PHOTO_ATTACHMENT);
+
+    expect(notifySpy).toHaveBeenCalledTimes(1);
+    const opts = notifySpy.mock.calls[0][0] as { body: string };
+    expect(opts.body).toBe('Photo');
+  });
+
+  it('carries no sender prefix and no · suffix', async () => {
+    mockDecryptForChannel.mockResolvedValue('hello');
+
+    await receiveDM(undefined, PHOTO_ATTACHMENT);
+
+    expect(notifySpy).toHaveBeenCalledTimes(1);
+    const opts = notifySpy.mock.calls[0][0] as { body: string };
+    expect(opts.body).toBe('hello');
+    expect(opts.body).not.toMatch(/ sent /);
+    expect(opts.body).not.toContain('·');
   });
 });

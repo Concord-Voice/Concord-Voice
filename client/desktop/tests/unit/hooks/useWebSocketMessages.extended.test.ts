@@ -481,6 +481,46 @@ describe('useWebSocketMessages — extended handlers', () => {
       expect(notificationSoundService.play).not.toHaveBeenCalled();
       expect(conversation?.lastMessage?.content).not.toBe('Message while muted');
     });
+
+    // C8: the same mute suppression, for an attachment-bearing last_message.
+    // Muting is enforced entirely inside this handler's `if (!muted &&
+    // data.last_message)` guard — nothing in ConversationList's preview
+    // renderer knows about mute state — so an attachment payload must be
+    // proven not to slip past that guard on its own attachment_type/
+    // attachment_mime fields. The count still accumulates; only the preview
+    // advance and the sound are suppressed (#84).
+    it('does not advance lastMessage for a muted conversation receiving an attachment-bearing notify (C8)', () => {
+      const ws = createMockWsService();
+      addDMConversation('conv-1');
+      useNotificationPrefsStore.getState().setMute('dm', 'conv-1', true, null);
+      renderHook(() => useWebSocketMessages(ws as never));
+
+      const handler = ws.handlers.get('dm_unread_notify')!;
+      act(() => {
+        handler({
+          type: 'dm_unread_notify',
+          data: {
+            conversation_id: 'conv-1',
+            last_message: {
+              content: '',
+              user_id: 'user-2',
+              username: 'alice',
+              created_at: '2025-01-01T02:00:00Z',
+              attachment_type: 'photo',
+              attachment_mime: 'image/jpeg',
+            },
+          },
+        });
+      });
+
+      const conversation = useDMStore.getState().conversations.find((c) => c.id === 'conv-1');
+      // Count still accumulates while muted...
+      expect(conversation?.unreadCount).toBe(1);
+      // ...but the preview is never written, so it stays at its initial null —
+      // never advancing to an attachment-attributed preview behind the mute.
+      expect(conversation?.lastMessage).toBeNull();
+      expect(notificationSoundService.play).not.toHaveBeenCalled();
+    });
   });
 
   describe('dm_conversation_created handler', () => {

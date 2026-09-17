@@ -185,6 +185,15 @@
   flex: 1;
 }
 
+.conversation-preview-sender {
+  font-weight: 600;
+  color: var(--text-primary);
+  /* The name is another user's display_name. `isolate` confines its
+     bidirectional resolution to this box, so a strongly-RTL or post-strip
+     residual directional run cannot reorder the app's own words beside it. */
+  unicode-bidi: isolate;
+}
+
 .conversation-item.unread .conversation-preview {
   color: var(--text-primary);
 }

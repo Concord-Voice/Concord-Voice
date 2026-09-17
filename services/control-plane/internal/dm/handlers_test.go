@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -5450,4 +5451,228 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_TierFromAuthenticatedUser(t *testi
 	me := testhelpers.JSONField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
 	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
+}
+
+// ============================================================================
+// DM Attachment Metadata On Last-Message Preview Tests (#2364)
+// ============================================================================
+
+// newDMConversation creates a 1:1 DM conversation between two friended users
+// and returns it along with the first participant's id and access token — the
+// participant these tests use to author and read back the last message.
+func newDMConversation(t *testing.T, ts *testhelpers.TestServer) (convID, token, userID string) {
+	t.Helper()
+	user1 := ts.CreateTestUser(t, "dmlmp1")
+	user2 := ts.CreateTestUser(t, "dmlmp2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID = ts.CreateDMConversation(t, user1.ID, user2.ID)
+	return convID, user1.AccessToken, user1.ID
+}
+
+// insertDMAttachment creates a media_files row and links it to a DM message at
+// the given position, returning the file id. Thin wrapper composing the
+// package's existing insertDMMediaFile / insertDMMessageAttachment helpers
+// (see TestGetMessagesWithAttachments above) rather than a third, divergent
+// SQL path — insertDMMediaFile already satisfies the live media_files
+// NOT NULL/CHECK columns (media_tier=2, key_version, exactly one of
+// channel_id/conversation_id).
+func insertDMAttachment(t *testing.T, ts *testhelpers.TestServer, convID, messageID, uploaderID string, position int, fileType, mimeType string) string {
+	t.Helper()
+	fileID := insertDMMediaFile(t, ts, uploaderID, convID, fileType, mimeType, 1024)
+	insertDMMessageAttachment(t, ts, messageID, fileID, position)
+	return fileID
+}
+
+// hideDMMessageForViewer records a receiver-hide range (#1352) that covers
+// exactly one message's created_at, so the last-message preview and unread
+// count skip it for that viewer only. No such helper exists elsewhere in this
+// package — hidden_ranges_integration_test.go seeds ranges from wall-clock
+// literals, not an existing message's timestamp — so this reads the target
+// message's real created_at and brackets it with a 1-microsecond-wide window.
+func hideDMMessageForViewer(t *testing.T, ts *testhelpers.TestServer, convID, userID, messageID string) {
+	t.Helper()
+	var createdAt time.Time
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT created_at FROM dm_messages WHERE id = $1`, messageID,
+	).Scan(&createdAt))
+	_, err := ts.DB.Exec(
+		`INSERT INTO dm_message_hidden_ranges (user_id, conversation_id, hidden_from, hidden_to)
+		 VALUES ($1, $2, $3::timestamptz, $3::timestamptz + interval '1 microsecond')`,
+		userID, convID, createdAt,
+	)
+	require.NoError(t, err)
+}
+
+// dmLastMessageJSON fetches the conversation's last_message object from BOTH
+// endpoints that build one. The pairing is the R8 lock: a change applied to
+// queryConversations but not fetchConversationResponse (or vice versa) fails
+// here.
+func dmLastMessageJSON(t *testing.T, ts *testhelpers.TestServer, token, convID, endpoint string) map[string]interface{} {
+	t.Helper()
+	var path string
+	switch endpoint {
+	case "list":
+		path = pathDMConversations
+	case "single":
+		path = pathDMConversationsPrefix + convID
+	default:
+		t.Fatalf("unknown endpoint %q", endpoint)
+	}
+
+	w := ts.DoRequest("GET", path, nil, testhelpers.AuthHeaders(token))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+
+	if endpoint == "single" {
+		conv := testhelpers.JSONField[map[string]interface{}](t, body, "conversation")
+		lm, _ := conv["last_message"].(map[string]interface{})
+		return lm
+	}
+
+	conversations := testhelpers.JSONField[[]interface{}](t, body, "conversations")
+	for _, raw := range conversations {
+		conv, ok := raw.(map[string]interface{})
+		if !ok || conv["id"] != convID {
+			continue
+		}
+		lm, _ := conv["last_message"].(map[string]interface{})
+		return lm
+	}
+	t.Fatalf("conversation %s not in list response", convID)
+	return nil
+}
+
+func TestDMLastMessage_AttachmentMetadata(t *testing.T) {
+	for _, endpoint := range []string{"list", "single"} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Run("attachment only", func(t *testing.T) {
+				ts := setupTS(t)
+				convID, token, userID := newDMConversation(t, ts)
+				msgID := insertDMMessage(t, ts, convID, userID, "")
+				insertDMAttachment(t, ts, convID, msgID, userID, 0, "photo", "image/jpeg")
+
+				lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+				require.Equal(t, "photo", lm["attachment_type"])
+				require.Equal(t, "image/jpeg", lm["attachment_mime"])
+			})
+
+			t.Run("no attachments omits both keys", func(t *testing.T) {
+				ts := setupTS(t)
+				convID, token, userID := newDMConversation(t, ts)
+				insertDMMessage(t, ts, convID, userID, "ciphertext")
+
+				lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+				// Absent, not empty string — this asserts omitempty fires.
+				_, hasType := lm["attachment_type"]
+				_, hasMime := lm["attachment_mime"]
+				require.False(t, hasType, "attachment_type must be absent, not empty")
+				require.False(t, hasMime, "attachment_mime must be absent, not empty")
+			})
+
+			t.Run("soft-deleted media row omits both keys", func(t *testing.T) {
+				ts := setupTS(t)
+				convID, token, userID := newDMConversation(t, ts)
+				msgID := insertDMMessage(t, ts, convID, userID, "")
+				fileID := insertDMAttachment(t, ts, convID, msgID, userID, 0, "photo", "image/jpeg")
+				_, err := ts.DB.Exec(`UPDATE media_files SET deleted_at = NOW() WHERE id = $1`, fileID)
+				require.NoError(t, err)
+
+				lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+				_, hasType := lm["attachment_type"]
+				require.False(t, hasType)
+			})
+
+			t.Run("lowest position wins", func(t *testing.T) {
+				ts := setupTS(t)
+				convID, token, userID := newDMConversation(t, ts)
+				msgID := insertDMMessage(t, ts, convID, userID, "")
+				insertDMAttachment(t, ts, convID, msgID, userID, 0, "video", "video/mp4")
+				insertDMAttachment(t, ts, convID, msgID, userID, 1, "photo", "image/jpeg")
+
+				lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+				// Parity with client writers 1-2, which read attachments[0].
+				require.Equal(t, "video", lm["attachment_type"])
+			})
+		})
+	}
+}
+
+// TestDMLastMessage_KeySetIsExactlySixFields is the C2 lock: catches a
+// filename, size, or count being added later. The message is inserted with an
+// explicit empty `type` (rather than insertDMMessage's hardcoded 'text') so
+// `type` and `call_event_payload` are correctly absent via omitempty — this
+// is NOT an assertion that a call-event row omits them.
+func TestDMLastMessage_KeySetIsExactlySixFields(t *testing.T) {
+	for _, endpoint := range []string{"list", "single"} {
+		t.Run(endpoint, func(t *testing.T) {
+			ts := setupTS(t)
+			convID, token, userID := newDMConversation(t, ts)
+			msgID := uuid.New().String()
+			_, err := ts.DB.Exec(
+				`INSERT INTO dm_messages (id, conversation_id, user_id, content, type) VALUES ($1, $2, $3, $4, '')`,
+				msgID, convID, userID, "ciphertext",
+			)
+			require.NoError(t, err)
+			insertDMAttachment(t, ts, convID, msgID, userID, 0, "photo", "image/jpeg")
+
+			lm := dmLastMessageJSON(t, ts, token, convID, endpoint)
+			keys := make([]string, 0, len(lm))
+			for k := range lm {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			require.Equal(t, []string{
+				"attachment_mime", "attachment_type", "content",
+				"created_at", "expires_at", "user_id",
+			}, keys)
+		})
+	}
+}
+
+func TestDMLastMessage_HiddenMessageAttachmentNeverSurfaces(t *testing.T) {
+	// R5/A8: the receiver hides a PEER's attachment message; the preview
+	// falls back to the earlier text message. The hidden message's type must
+	// appear NOWHERE in the serialized body — asserted on the raw body, so a
+	// refactor surfacing it under a different key still fails.
+	//
+	// The hidden message must be authored by the peer, not the viewer:
+	// hiddenRangeFilter's anti-join carries `m.user_id <> $viewer` by design
+	// (#1352 — a participant can only hard-delete their own messages, so the
+	// receiver-hide range exists for messages they CANNOT delete-for-both).
+	// A viewer "hiding" their own message would leave the filter's NOT EXISTS
+	// satisfied and the message still visible, so same-author setup here
+	// would not exercise the hide path at all.
+	for _, endpoint := range []string{"list", "single"} {
+		t.Run(endpoint, func(t *testing.T) {
+			ts := setupTS(t)
+			viewer := ts.CreateTestUser(t, "dmhide1")
+			peer := ts.CreateTestUser(t, "dmhide2")
+			ts.CreateFriendship(t, viewer.ID, peer.ID, statusAccepted)
+			convID := ts.CreateDMConversation(t, viewer.ID, peer.ID)
+
+			insertDMMessage(t, ts, convID, peer.ID, "earlier-text")
+			hiddenID := insertDMMessage(t, ts, convID, peer.ID, "")
+			insertDMAttachment(t, ts, convID, hiddenID, peer.ID, 0, "video", "video/mp4")
+			hideDMMessageForViewer(t, ts, convID, viewer.ID, hiddenID)
+
+			var path string
+			if endpoint == "list" {
+				path = pathDMConversations
+			} else {
+				path = pathDMConversationsPrefix + convID
+			}
+			w := ts.DoRequest("GET", path, nil, testhelpers.AuthHeaders(viewer.AccessToken))
+			require.Equal(t, http.StatusOK, w.Code)
+			body := w.Body.String()
+			require.NotContains(t, body, "video/mp4")
+			require.NotContains(t, body, `"video"`)
+
+			lm := dmLastMessageJSON(t, ts, viewer.AccessToken, convID, endpoint)
+			require.Equal(t, "earlier-text", lm["content"])
+			_, hasType := lm["attachment_type"]
+			require.False(t, hasType)
+		})
+	}
 }

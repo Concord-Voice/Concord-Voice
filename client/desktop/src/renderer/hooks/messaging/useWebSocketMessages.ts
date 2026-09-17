@@ -1824,7 +1824,12 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
         userId: data.user_id,
         username: data.username || 'Unknown',
         createdAt: data.created_at || new Date().toISOString(),
-        ...(data.attachments?.length ? { attachmentType: data.attachments[0].file_type } : {}),
+        ...(data.attachments?.length
+          ? {
+              attachmentType: data.attachments[0].file_type,
+              attachmentMime: data.attachments[0].mime_type,
+            }
+          : {}),
       };
 
       const selfId = useUserStore.getState().user?.id;
@@ -1965,6 +1970,8 @@ export function useWebSocketMessages(wsService: ReturnType<typeof getWebSocketSe
           userId: data.last_message.user_id || data.user_id || '',
           username: data.last_message.username || '',
           createdAt: data.last_message.created_at || new Date().toISOString(),
+          attachmentType: data.last_message.attachment_type,
+          attachmentMime: data.last_message.attachment_mime,
         });
       }
 

@@ -16795,6 +16795,22 @@ components:
                   enum: [completed, missed, declined, canceled, failed]
                 duration_seconds:
                   type: integer
+            attachment_type:
+              type: string
+              enum: [photo, animated, video, audio, file]
+              description: >-
+                Coarse media class of the last message's first attachment
+                (lowest `position`, live row). Absent when the message has no
+                live attachment. Display-only.
+            attachment_mime:
+              type: string
+              description: >-
+                MIME type of that same attachment. **Sender-asserted and
+                non-authoritative** — `validateAttachmentRequest` takes it
+                verbatim from the upload form and cross-checks it against
+                `attachment_type` nowhere. Clients classify by exact-match
+                allowlist and must never render this string, nor use it to gate
+                rendering, download, or any authorization decision.
         unread_count:
           type: integer
         created_at:

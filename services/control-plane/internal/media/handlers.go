@@ -1546,15 +1546,11 @@ const errMsgKeyVersionRequired = "key_version is required and must be a positive
 const errMsgKeyVersionUnknown = "key_version names an epoch that does not exist for this context"
 
 func validateAttachmentRequest(c *gin.Context) (fileType FileType, mimeType string, keyVersion int, ok bool) {
-	fileType = FileType(c.PostForm("file_type"))
-	if !isValidFileType(fileType) {
-		fileType = FileTypeFile
-	}
-
-	mimeType = c.PostForm("mime_type")
-	if mimeType == "" {
-		mimeType = mimeOctetStream
-	}
+	// Both paths share these two helpers, so the single-shot and chunked uploads
+	// cannot disagree about what a declared file_type means. The MIME is
+	// resolved FIRST because normalizeFileType reconciles against it.
+	mimeType = normalizeMimeType(c.PostForm("mime_type"))
+	fileType = normalizeFileType(c.PostForm("file_type"), mimeType)
 
 	// #2843: a tier-2 attachment's epoch is CLIENT-ATTESTED, never invented here.
 	// This previously seeded `keyVersion = 1` and validated only when the field

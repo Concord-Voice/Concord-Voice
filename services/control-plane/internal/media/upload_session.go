@@ -639,7 +639,8 @@ func (h *Handler) InitUploadSession(c *gin.Context) {
 	sess := &uploadSession{
 		id: sessionID, userID: userID, fileID: fileID, storageKey: storageKey,
 		uploadID: uploadID, channelID: req.ChannelID, conversationID: req.ConversationID,
-		fileType: normalizeFileType(req.FileType), mimeType: normalizeMimeType(req.MimeType),
+		fileType:   normalizeFileType(req.FileType, normalizeMimeType(req.MimeType)),
+		mimeType:   normalizeMimeType(req.MimeType),
 		keyVersion: req.KeyVersion, envelopeVersion: envelopeVersion,
 		totalChunks:    req.TotalChunks,
 		plaintextBytes: plaintextBytes, ciphertextBytes: req.DeclaredCiphertextBytes,
@@ -740,12 +741,66 @@ func validateInitArithmetic(
 	return envelopeVersion, plaintextBytes, true
 }
 
-func normalizeFileType(raw string) FileType {
+// reconcileFileType stops a sender's two declarations from contradicting each
+// other. `file_type` and `mime_type` arrive from the SAME multipart form and
+// neither can be checked against the bytes: a tier-2 attachment reaches the
+// server as ciphertext it never reads, so content sniffing is not available at
+// this layer and never will be. What IS checkable without decrypting anything
+// is coherence — a declared `photo` whose MIME is `application/x-msdownload`
+// is a lie visible on its face.
+//
+// The test is the MIME's TOP-LEVEL type, deliberately not an enumerated set.
+// The client derives file_type FROM mime_type (`classifyFileType`,
+// `attachmentCrypto.ts`) using sets that each sit entirely inside their
+// matching prefix, so this rule is implied by that mapping and strictly weaker
+// than it: it cannot reject anything an honest client sends, and it cannot
+// drift from the client's taxonomy the way a duplicated Go copy of those sets
+// would.
+//
+// An incoherent pair degrades to FileTypeFile rather than 400 — the
+// least-specific label, matching how an out-of-enum file_type is already
+// handled, and refusing the upload would punish a client whose MIME detection
+// merely disagrees with ours.
+//
+// RESIDUAL, stated because it is irreducible here: a sender who lies
+// CONSISTENTLY — declaring both `photo` and `image/png` for an executable — is
+// not detected and cannot be at this layer. Only the receiving client holds
+// plaintext; `animatedImage.ts` already sniffs decrypted bytes for the
+// animation gate, and that is the pattern any stronger check must follow.
+func reconcileFileType(fileType FileType, mimeType string) FileType {
+	// Both halves are required. strings.Cut returns found=false for a bare
+	// "image", leaving topLevel == "image" — so reading topLevel alone accepted
+	// a string that is not a MIME type at all as evidence that one is a photo.
+	topLevel, subtype, found := strings.Cut(strings.ToLower(strings.TrimSpace(mimeType)), "/")
+	if !found || topLevel == "" || subtype == "" {
+		return FileTypeFile
+	}
+	switch fileType {
+	case FileTypePhoto, FileTypeAnimated:
+		if topLevel != "image" {
+			return FileTypeFile
+		}
+	case FileTypeVideo:
+		if topLevel != "video" {
+			return FileTypeFile
+		}
+	case FileTypeAudio:
+		if topLevel != "audio" {
+			return FileTypeFile
+		}
+	}
+	return fileType
+}
+
+// normalizeFileType takes the MIME deliberately: the coherence check above is
+// not optional, and a signature that cannot be called without it is what keeps
+// a future upload path from reintroducing the free-form field.
+func normalizeFileType(raw, mimeType string) FileType {
 	ft := FileType(raw)
 	if !isValidFileType(ft) {
 		return FileTypeFile
 	}
-	return ft
+	return reconcileFileType(ft, mimeType)
 }
 
 func normalizeMimeType(raw string) string {

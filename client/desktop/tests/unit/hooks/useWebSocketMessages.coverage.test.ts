@@ -97,6 +97,7 @@ import { useWebSocketMessages } from '@/renderer/hooks/messaging/useWebSocketMes
 import { speak as ttsSpeak } from '@/renderer/services/system/ttsService';
 import { createMockWsService, requireHandler } from '../../helpers/wsServiceMock';
 import { deferred } from '../../helpers/deferred';
+import { describeMessagePreview } from '@/renderer/utils/messaging/messagePreview';
 
 const mockTtsSpeak = vi.mocked(ttsSpeak);
 
@@ -2681,6 +2682,53 @@ describe('useWebSocketMessages — coverage boost', () => {
         'conv-1',
         expect.objectContaining({ attachmentType: 'image/png' })
       );
+    });
+
+    it('carries the attachment MIME so a PDF in an open thread reads as a Doc', () => {
+      const { handler } = setupHandler('dm_message');
+      useDMStore.getState().addConversation({
+        id: 'conv-doc',
+        isGroup: false,
+        isPersonal: false,
+        name: null,
+        participants: [],
+        lastMessage: null,
+        unreadCount: 0,
+        createdAt: '2025-01-01T00:00:00Z',
+      });
+      const updateSpy = vi.spyOn(useDMStore.getState(), 'bumpConversation');
+
+      act(() => {
+        handler({
+          type: 'dm_message',
+          data: {
+            id: 'dm-attach-doc',
+            conversation_id: 'conv-doc',
+            user_id: 'user-2',
+            username: 'alice',
+            content: 'ciphertext',
+            attachments: [
+              { id: 'file-1', file_type: 'file', mime_type: 'application/pdf', file_size: 2048 },
+            ],
+            created_at: '2025-01-01T00:00:00Z',
+          },
+        });
+      });
+
+      // Read the MIME back out of what this writer actually committed, then ask
+      // the classifier. Pinning the field alone would not show that the value
+      // reaches the only decision it exists to change: File versus Doc.
+      const preview = updateSpy.mock.calls.at(-1)?.[1] as {
+        attachmentType?: string;
+        attachmentMime?: string;
+      };
+      expect(
+        describeMessagePreview({
+          content: '',
+          attachmentType: preview?.attachmentType,
+          attachmentMime: preview?.attachmentMime,
+        }).phrase
+      ).toBe('a Doc');
     });
   });
 
