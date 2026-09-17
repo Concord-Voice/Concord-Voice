@@ -122,6 +122,16 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **The record of a voice call in a direct message is readable in every theme** ([#3334](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3334)) — the
+  "Voice call — 4:37" line that appears in a conversation after a call was drawn in a dimmed
+  grey on its own tinted panel. In Midnight Sky the two were close enough in tone that the
+  sentence fell below the contrast the accessibility guidelines ask for on body text, and it
+  read as washed out rather than deliberately quiet. It now uses the same colour as an ordinary
+  message; the tinted panel, the phone icon and the layout still mark it as a record of a call
+  rather than something somebody typed. Worth knowing: the time on the right of that row is
+  unchanged and is still fainter than it should be. That colour is shared with every timestamp
+  in the app, so it is being corrected separately rather than in this one place.
+
 - **If you do drop offline, you come back on your own instead of staying offline until you reconnect** ([#3332](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3332)) — the previous release stopped the drop happening in the first place; this one fixes what happened when it did. The server could tell "your presence expired" apart from "I have never heard of you" only when its own last write had failed, so an ordinary expiry was treated as the second case and you stayed marked offline for the rest of that connection. Reopening the app looked like the cure, because reconnecting was the only thing that cleared it. Now a heartbeat from a connection the server can still see restores your status, while a genuinely unknown client and anyone who chose Invisible are unaffected.
 
 - **You no longer drop offline, or lose your connection, while Concord sits in the background** ([#3328](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3328)) — leaving

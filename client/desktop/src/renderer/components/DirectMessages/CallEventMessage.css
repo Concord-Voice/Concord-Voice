@@ -9,7 +9,13 @@
   background: var(--bg-tertiary);
   border-radius: 6px;
   font-size: 13px;
-  color: var(--text-secondary, #aab);
+  /* The row renders a sentence, so SC 1.4.3 wants 4.5:1. --text-secondary on
+     --bg-tertiary measures 4.31:1 in Midnight Sky; --text-primary is the only
+     text token that clears the floor on this surface in all 34 theme blocks
+     (worst 8.76:1, Fox Den). No literal fallback — the token is declared in
+     every block, and a fallback on a declared token is what hides the next
+     mismatch from the contrast guard. */
+  color: var(--text-primary);
 }
 
 .call-event-message__icon {
@@ -22,6 +28,13 @@
 
 .call-event-message__time {
   font-size: 11px;
-  color: var(--text-muted, #888);
+  /* Muted on purpose, and still short of the floor. A timestamp is text, so
+     4.5:1 applies and the 3:1 non-text floor (SC 1.4.11) does not — but
+     --text-muted misses BOTH: 2.00:1 here in Midnight Sky, under 4.5:1 in
+     30/34 blocks and under 3:1 in 10. Every other timestamp in the app carries
+     the same token, so the fix belongs to the token, not to this rule. The
+     contrast guard cannot see this pair — the background is inherited, not
+     declared, which is one of the 287 pairs it documents as unmeasurable. */
+  color: var(--text-muted);
   margin-left: auto;
 }

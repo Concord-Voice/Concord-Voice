@@ -58,7 +58,6 @@ src/renderer/components/Chat/ThemedMediaPlayer.css	.media-controls-btn:hover	2.1
 src/renderer/components/common/audioQualitySlider.css	.settings-tier-description	4.31
 src/renderer/components/common/audioQualitySlider.css	.settings-tier-kbps-label	2.19
 src/renderer/components/common/PremiumChip.css	.premium-chip	1.20
-src/renderer/components/DirectMessages/CallEventMessage.css	.call-event-message	4.31
 src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-delete-confirm-btn	3.83
 src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-delete-confirm-btn:hover	4.04
 src/renderer/components/DirectMessages/CategoryManagerPanel.css	.category-manager .create-role-btn	4.31
