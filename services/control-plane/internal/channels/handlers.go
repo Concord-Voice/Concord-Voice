@@ -2058,49 +2058,66 @@ func insertWrappedChannelKeyTx(ctx context.Context, tx *sql.Tx, channelID, membe
 // revoked epochs get a typed 409, credential-epoch rejections get the generic
 // 401, and unexpected transaction or statement failures get a 500.
 func (h *Handler) respondKeyDistributionError(c *gin.Context, distErr error, contextID string) {
-	if errors.Is(distErr, errDMKeyDistributorNotParticipant) {
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied})
-		return
-	}
-	if errors.Is(distErr, errChannelKeyDistributorAccess) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You must have the channel key to distribute keys"})
-		return
-	}
-	if errors.Is(distErr, errNoChannelKeyRecipients) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No eligible recipients supplied for channel-key distribution"})
-		return
-	}
-	if errors.Is(distErr, errInitialKeyDistributionCreator) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgInitialKeyDistributionOnly})
-		return
-	}
-	if errors.Is(distErr, errInitialKeyDistributionBusy) {
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgInitialKeyDistributionBusy})
-		return
-	}
-	if errors.Is(distErr, errUnissuedChannelKeyVersion) {
-		c.JSON(http.StatusConflict, gin.H{"error": "Key rotation has not been initiated"})
-		return
-	}
-	if errors.Is(distErr, errRotationDistributor) {
-		c.JSON(http.StatusConflict, gin.H{"error": "Key rotation requires its established key fingerprint"})
-		return
-	}
-	var pqErr *pq.Error
-	if errors.As(distErr, &pqErr) && pqErr.Code == pgRevokedChannelKeyEpoch {
-		c.JSON(http.StatusConflict, e2eekeys.ErrorResponse{
-			Error: "Key epoch has been revoked; rekey required",
-			Code:  e2eekeys.CodeRevokedEpoch,
-			Kind:  e2eekeys.KindChannel,
-		})
-		return
-	}
-	if errors.Is(distErr, credepoch.ErrEpochMismatch) || errors.Is(distErr, credepoch.ErrBlocked) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired})
+	if status, body, known := keyDistributionErrorResponse(distErr); known {
+		c.JSON(status, body)
 		return
 	}
 	h.log.Error("Key distribution failed", "error", distErr, "context_id", sanitizeID(contextID))
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDistributeKeys})
+}
+
+// keyDistributionErrorResponse maps a distribution or rotation error to its
+// status and body. known=false means the caller logs and answers 500 with its
+// own message — the unified route and RotateDMKey differ only there.
+func keyDistributionErrorResponse(distErr error) (int, interface{}, bool) {
+	if errors.Is(distErr, errDMKeyDistributorNotParticipant) {
+		return http.StatusNotFound, gin.H{"error": errMsgContextNotFoundOrDenied}, true
+	}
+	if errors.Is(distErr, errChannelKeyDistributorAccess) {
+		return http.StatusForbidden, gin.H{"error": "You must have the channel key to distribute keys"}, true
+	}
+	if errors.Is(distErr, errNoChannelKeyRecipients) {
+		return http.StatusBadRequest, gin.H{"error": "No eligible recipients supplied for channel-key distribution"}, true
+	}
+	if errors.Is(distErr, errInitialKeyDistributionCreator) {
+		return http.StatusForbidden, gin.H{"error": errMsgInitialKeyDistributionOnly}, true
+	}
+	if errors.Is(distErr, errInitialKeyDistributionBusy) {
+		return http.StatusConflict, gin.H{"error": errMsgInitialKeyDistributionBusy}, true
+	}
+	if errors.Is(distErr, errUnissuedChannelKeyVersion) {
+		return http.StatusConflict, gin.H{"error": "Key rotation has not been initiated"}, true
+	}
+	if errors.Is(distErr, errRotationDistributor) {
+		return http.StatusConflict, gin.H{"error": "Key rotation requires its established key fingerprint"}, true
+	}
+	var stale *dmEpochClaimStaleError
+	if errors.As(distErr, &stale) {
+		return http.StatusConflict, gin.H{"error": errMsgRotationNextEpoch, "current_version": stale.current}, true
+	}
+	if errors.Is(distErr, errDMEpochClaimNotHolder) {
+		return http.StatusForbidden, gin.H{"error": errMsgRotationNotHolder}, true
+	}
+	var incomplete *dmEpochClaimIncompleteError
+	if errors.As(distErr, &incomplete) {
+		return http.StatusBadRequest, gin.H{"error": errMsgRotationIncomplete, "missing": incomplete.missing}, true
+	}
+	var staleRecipient *dmEpochClaimStaleRecipientError
+	if errors.As(distErr, &staleRecipient) {
+		return http.StatusConflict, gin.H{"error": errMsgRotationRecipientChanged, "stale_recipients": staleRecipient.stale}, true
+	}
+	var pqErr *pq.Error
+	if errors.As(distErr, &pqErr) && pqErr.Code == pgRevokedChannelKeyEpoch {
+		return http.StatusConflict, e2eekeys.ErrorResponse{
+			Error: "Key epoch has been revoked; rekey required",
+			Code:  e2eekeys.CodeRevokedEpoch,
+			Kind:  e2eekeys.KindChannel,
+		}, true
+	}
+	if errors.Is(distErr, credepoch.ErrEpochMismatch) || errors.Is(distErr, credepoch.ErrBlocked) {
+		return http.StatusUnauthorized, gin.H{"error": errMsgAuthRequired}, true
+	}
+	return 0, nil, false
 }
 
 type channelKeyDistributionRequest struct {
@@ -2563,11 +2580,19 @@ func (h *Handler) filterVisiblePendingRequests(ctx context.Context, callerID str
 // requests. DM membership is scoped by the dm_channel_keys join, so no extra
 // VIEW gate applies here.
 func (h *Handler) appendDMPendingRequests(userID string, requests []pendingKeyRequest) []pendingKeyRequest {
+	// Only a holder of the conversation's CURRENT epoch may fulfil. The
+	// fulfiller wraps the key it has and the server stamps the row at the
+	// current version, so a holder of an older epoch would deliver the wrong
+	// key under the right version — undetectable until the recipient decrypts
+	// garbage. Mirrors the channel query's active-epoch join above.
 	dmQuery := `
 		SELECT dpkr.id, dpkr.conversation_id, dpkr.user_id, dpkr.created_at
 		FROM dm_pending_key_requests dpkr
 		INNER JOIN dm_channel_keys dck ON dpkr.conversation_id = dck.conversation_id AND dck.user_id = $1
 		WHERE dpkr.user_id != $1
+		  AND dck.key_version = (
+			SELECT MAX(key_version) FROM dm_channel_keys WHERE conversation_id = dpkr.conversation_id
+		  )
 		ORDER BY dpkr.created_at ASC
 	`
 	dmRows, dmErr := h.db.Query(dmQuery, userID)
@@ -3054,6 +3079,13 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 				"kind", "enroll_pending_dm",
 				"context_id", contextID,
 				"user_id", userID)
+			// The row is served only when a holder runs its pending queue, and
+			// a DM peer online the whole time had nothing to run it: key_needed
+			// was pushed for server channels only, so the requester waited on
+			// the holder's next reconnect. Pushed on the first enrollment only —
+			// the insert is ON CONFLICT DO NOTHING, so a re-fetch cannot re-page
+			// every holder.
+			h.notifyDMKeyNeeded(contextID, userID)
 		}
 
 		h.log.Info("e2ee key fetch: no DM key row",
@@ -3082,17 +3114,33 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 		return
 	}
 
-	// Epoch revocation check — if the caller's current key_version appears
-	// in dm_key_revocations as revoked_epoch, return REVOKED_EPOCH so the
-	// client triggers a rekey flow instead of trying to use stale wrap bytes.
-	// Per [internal]rules/e2ee.md: epoch numbers do NOT appear in the response.
-	var revokedExists bool
-	err = h.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM dm_key_revocations
+	// Epoch revocation check — if the caller's CURRENT key_version appears in
+	// dm_key_revocations as revoked_epoch, return REVOKED_EPOCH so the client
+	// triggers a rekey flow instead of trying to use stale wrap bytes. Per
+	// [internal]rules/e2ee.md: epoch numbers do NOT appear in the response.
+	//
+	// The current-key fetch only. A fetch that names a version is a history
+	// read: the row is the caller's own wrap, and reading old ciphertext under
+	// a superseded epoch is exactly what the ledger exists to permit once the
+	// successor is established. The channel path never applied the check to a
+	// versioned fetch; this one did, so a rotated DM lost its history on every
+	// device that had to refetch.
+	revokedExists := false
+	successorEpoch := 0
+	if c.Query("version") == "" {
+		revErr := h.db.QueryRow(`
+			SELECT successor_epoch FROM dm_key_revocations
 			WHERE conversation_id = $1 AND revoked_epoch = $2
-		)
-	`, contextID, key.KeyVersion).Scan(&revokedExists)
+		`, contextID, key.KeyVersion).Scan(&successorEpoch)
+		switch {
+		case revErr == nil:
+			revokedExists = true
+		case errors.Is(revErr, sql.ErrNoRows):
+			// Not revoked.
+		default:
+			err = revErr
+		}
+	}
 	if err != nil {
 		h.log.Error("e2ee key fetch: dm revocation check failed",
 			"kind", "dm_revocation_check_db_error",
@@ -3112,9 +3160,10 @@ func (h *Handler) getDMKeyResponse(c *gin.Context, contextID, userID string) {
 			"context_id", contextID,
 			"user_id", userID)
 		c.JSON(http.StatusNotFound, e2eekeys.ErrorResponse{
-			Error: "Key epoch has been revoked; rekey required",
-			Code:  e2eekeys.CodeRevokedEpoch,
-			Kind:  e2eekeys.KindDM,
+			Error:          "Key epoch has been revoked; rekey required",
+			Code:           e2eekeys.CodeRevokedEpoch,
+			Kind:           e2eekeys.KindDM,
+			SuccessorEpoch: successorEpoch,
 		})
 		return
 	}
@@ -3352,10 +3401,12 @@ func enqueueDMKeyRequest(ctx context.Context, tx *sql.Tx, conversationID, userID
 // distributeOneDMKey processes one DM distribution target inside the caller's
 // epoch-guarded transaction: the current-participant and #2420 recipient-
 // freshness guards (fail-open when the distributor supplied no version), then
-// the idempotent insert. A stale or removed recipient is skipped (inserted=false);
-// a stale recipient additionally gets a self-heal enqueue. Any statement error
-// fails the batch (25P02). Its sole caller holds the participant-set lock.
-func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberUserID, wrappedKey string, wrappedKeyVersions map[string]int, keyVersion int) (inserted bool, err error) {
+// the idempotent insert. A removed recipient is skipped; a stale recipient is
+// skipped and gets a self-heal enqueue — the caller decides whether a stale
+// skip is acceptable (a rewrap) or fails the batch (a successor claim). Any
+// statement error fails the batch (25P02). Its sole caller holds the
+// participant-set lock.
+func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberUserID, wrappedKey string, wrappedKeyVersions map[string]int, keyVersion int) (dmRecipientOutcome, error) {
 	var current bool
 	if err := tx.QueryRowContext(ctx, `
 		SELECT EXISTS(
@@ -3363,24 +3414,31 @@ func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberU
 			WHERE conversation_id = $1 AND user_id = $2
 		)
 	`, conversationID, memberUserID).Scan(&current); err != nil {
-		return false, fmt.Errorf("read dm key distribution recipient: %w", err)
+		return dmRecipientSkippedNotParticipant, fmt.Errorf("read dm key distribution recipient: %w", err)
 	}
 	if !current {
-		return false, nil
+		return dmRecipientSkippedNotParticipant, nil
 	}
 	if wrappedVersion, ok := wrappedKeyVersions[memberUserID]; ok {
 		fresh, fErr := recipientKeyFresh(ctx, tx, memberUserID, wrappedVersion)
 		if fErr != nil {
-			return false, fErr
+			return dmRecipientSkippedStaleKey, fErr
 		}
 		if !fresh {
 			if eErr := enqueueDMKeyRequest(ctx, tx, conversationID, memberUserID); eErr != nil {
-				return false, fmt.Errorf("enqueue dm self-heal: %w", eErr)
+				return dmRecipientSkippedStaleKey, fmt.Errorf("enqueue dm self-heal: %w", eErr)
 			}
-			return false, nil
+			return dmRecipientSkippedStaleKey, nil
 		}
 	}
-	return insertWrappedDMKeyTx(ctx, tx, conversationID, memberUserID, wrappedKey, keyVersion)
+	inserted, err := insertWrappedDMKeyTx(ctx, tx, conversationID, memberUserID, wrappedKey, keyVersion)
+	if err != nil {
+		return dmRecipientAlreadyHeld, err
+	}
+	if !inserted {
+		return dmRecipientAlreadyHeld, nil
+	}
+	return dmRecipientInserted, nil
 }
 
 // lockDMKeyDistributionUsers takes every user-row lock this request can need
@@ -3452,11 +3510,6 @@ func lockDMKeyDistributionUsers(ctx context.Context, tx *sql.Tx, actorID, tokenE
 }
 
 func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, conversationID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, explicitVersion *int) (int, error) {
-	conversationUUID, err := uuid.Parse(conversationID)
-	if err != nil {
-		return 0, fmt.Errorf("parse dm conversation ID: %w", err)
-	}
-
 	// #2201 review: request context, same rationale as distributeChannelKeysToMembers.
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -3467,23 +3520,97 @@ func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, con
 			h.log.Error("Failed to rollback dm distribution tx", "error", rbErr)
 		}
 	}()
+	outcome, err := distributeDMKeysTx(ctx, tx, dmDistributionBatch{
+		actorID:            actorID,
+		tokenEpoch:         tokenEpoch,
+		conversationID:     conversationID,
+		wrappedKeys:        wrappedKeys,
+		wrappedKeyVersions: wrappedKeyVersions,
+		explicitVersion:    explicitVersion,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit dm distribution tx: %w", err)
+	}
+	h.notifyDMKeyDistribution(conversationID, outcome.delivered)
+	return len(outcome.delivered), nil
+}
+
+// dmDistributionOutcome is what one DM distribution transaction body wrote:
+// the epoch the batch landed at, the conversation's highest epoch BEFORE it
+// (0 for a conversation that had no key), and the recipients it reached.
+type dmDistributionOutcome struct {
+	keyVersion      int
+	previousVersion int
+	delivered       []string
+}
+
+// dmDistributionBatch is one caller's distribution request: who is posting
+// (and under which credential epoch), for which conversation, the wraps, the
+// recipient identity-key versions they were made against (#2420), and the
+// epoch the caller claims — nil resolves to the conversation's current one.
+type dmDistributionBatch struct {
+	actorID            string
+	tokenEpoch         string
+	conversationID     string
+	wrappedKeys        map[string]string
+	wrappedKeyVersions map[string]int
+	explicitVersion    *int
+	// reason is recorded in dm_key_revocations when this batch establishes a
+	// successor epoch; empty means dmSuccessorClaimReason.
+	reason string
+}
+
+// dmSuccessorClaimReason is the ledger reason for a successor epoch that a
+// participant established through the unified route — the rotation
+// coordinator answering a member change or a revoked-epoch cue.
+const dmSuccessorClaimReason = "successor_claim"
+
+// dmRecipientOutcome is what distributeOneDMKey did for one batch entry.
+type dmRecipientOutcome int
+
+const (
+	dmRecipientSkippedNotParticipant dmRecipientOutcome = iota
+	dmRecipientSkippedStaleKey
+	dmRecipientAlreadyHeld
+	dmRecipientInserted
+)
+
+// distributeDMKeysTx is the transaction body shared by the unified distribute
+// route and RotateDMKey. The caller owns the transaction and its commit.
+//
+// The conversation row is taken FOR UPDATE rather than FOR KEY SHARE: a batch
+// that establishes a new epoch must serialise against every other distribution
+// for the conversation, or two claimants can each write part of one epoch and
+// the participants end up holding two different keys under one version. That
+// lock strength is also what makes the successor fences below sound — the
+// "previous" epoch they reason about cannot move underneath them.
+func distributeDMKeysTx(ctx context.Context, tx *sql.Tx, batch dmDistributionBatch) (dmDistributionOutcome, error) {
+	actorID, tokenEpoch, conversationID := batch.actorID, batch.tokenEpoch, batch.conversationID
+	wrappedKeys, explicitVersion := batch.wrappedKeys, batch.explicitVersion
+	conversationUUID, err := uuid.Parse(conversationID)
+	if err != nil {
+		return dmDistributionOutcome{}, fmt.Errorf("parse dm conversation ID: %w", err)
+	}
 	if lockErr := lockDMKeyDistributionUsers(ctx, tx, actorID, tokenEpoch, wrappedKeys); lockErr != nil {
-		return 0, lockErr
+		return dmDistributionOutcome{}, lockErr
 	}
 	if err := dm.LockDMVoiceParticipantSetTx(ctx, tx, conversationUUID); err != nil {
-		return 0, err
+		return dmDistributionOutcome{}, err
 	}
 	var parentID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT id FROM dm_conversations
 		WHERE id = $1
-		FOR KEY SHARE
+		FOR UPDATE
 	`, conversationID).Scan(&parentID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, errDMKeyDistributorNotParticipant
+		return dmDistributionOutcome{}, errDMKeyDistributorNotParticipant
 	}
 	if err != nil {
-		return 0, fmt.Errorf("recheck dm key distributor conversation: %w", err)
+		return dmDistributionOutcome{}, fmt.Errorf("recheck dm key distributor conversation: %w", err)
 	}
 	var memberID string
 	err = tx.QueryRowContext(ctx, `
@@ -3492,37 +3619,242 @@ func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, con
 		FOR KEY SHARE
 	`, conversationID, actorID).Scan(&memberID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, errDMKeyDistributorNotParticipant
+		return dmDistributionOutcome{}, errDMKeyDistributorNotParticipant
 	}
 	if err != nil {
-		return 0, fmt.Errorf("recheck dm key distributor membership: %w", err)
+		return dmDistributionOutcome{}, fmt.Errorf("recheck dm key distributor membership: %w", err)
+	}
+	var previousVersion int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`,
+		conversationID,
+	).Scan(&previousVersion); err != nil {
+		return dmDistributionOutcome{}, fmt.Errorf("read dm current epoch: %w", err)
 	}
 	keyVersion, err := resolveTargetKeyVersionDM(ctx, tx, conversationID, explicitVersion)
 	if err != nil {
-		return 0, err
+		return dmDistributionOutcome{}, err
+	}
+	successorClaim := keyVersion > previousVersion
+	switch {
+	case successorClaim:
+		if err := admitDMSuccessorClaimTx(ctx, tx, conversationID, actorID, previousVersion, keyVersion, wrappedKeys); err != nil {
+			return dmDistributionOutcome{}, err
+		}
+	case previousVersion > 0:
+		if err := admitDMCurrentEpochWriteTx(ctx, tx, conversationID, actorID, previousVersion, keyVersion); err != nil {
+			return dmDistributionOutcome{}, err
+		}
 	}
 
-	distributed := 0
-	var delivered []string
-	for memberUserID, wrappedKey := range wrappedKeys {
+	outcome := dmDistributionOutcome{keyVersion: keyVersion, previousVersion: previousVersion}
+	delivered, stale, err := applyDMKeyBatchTx(ctx, tx, batch, keyVersion)
+	if err != nil {
+		return dmDistributionOutcome{}, err
+	}
+	outcome.delivered = delivered
+	if err := recordDMSuccessorRevocationTx(ctx, tx, batch, previousVersion, keyVersion, stale); err != nil {
+		return dmDistributionOutcome{}, err
+	}
+	return outcome, nil
+}
+
+// applyDMKeyBatchTx writes each wrap in the batch and reports which recipients
+// received a new row and how many were skipped for holding a since-rotated
+// identity key (#2420). It performs no fencing; the caller has already admitted
+// the batch against the conversation's current epoch.
+func applyDMKeyBatchTx(ctx context.Context, tx *sql.Tx, batch dmDistributionBatch, keyVersion int) (delivered []string, stale int, err error) {
+	for memberUserID, wrappedKey := range batch.wrappedKeys {
 		if _, parseErr := uuid.Parse(memberUserID); parseErr != nil {
 			continue
 		}
-		inserted, insErr := distributeOneDMKey(ctx, tx, conversationID, memberUserID, wrappedKey, wrappedKeyVersions, keyVersion)
+		result, insErr := distributeOneDMKey(ctx, tx, batch.conversationID, memberUserID, wrappedKey, batch.wrappedKeyVersions, keyVersion)
 		if insErr != nil {
-			return 0, insErr
+			return nil, 0, insErr
 		}
-		if !inserted {
-			continue
+		switch result {
+		case dmRecipientInserted:
+			delivered = append(delivered, memberUserID)
+		case dmRecipientSkippedStaleKey:
+			stale++
 		}
-		delivered = append(delivered, memberUserID)
-		distributed++
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit dm distribution tx: %w", err)
+	return delivered, stale, nil
+}
+
+// recordDMSuccessorRevocationTx writes the dm_key_revocations row for a
+// rotation — an established epoch's successor claim — in the same transaction
+// as the wraps. It is a no-op for an initial epoch or a current-epoch rewrap
+// (previousVersion == 0, or keyVersion not above it).
+//
+// A rotation must not commit with a participant left behind. A stale wrap is
+// skipped rather than stored (#2420), which on a rewrap is a transient the
+// pending queue heals — but here the epoch it would have joined is about to be
+// revoked, and a participant holding only the revoked one cannot claim its way
+// out (they are not a holder). A stale recipient therefore refuses the whole
+// claim; the client refetches public keys and posts again. The ledger row
+// commits WITH the successor wraps, never ahead of them: membership changes
+// only cue a rotation (key_revocation), and the epoch is revoked here once its
+// successor exists for every participant.
+func recordDMSuccessorRevocationTx(ctx context.Context, tx *sql.Tx, batch dmDistributionBatch, previousVersion, keyVersion, stale int) error {
+	if previousVersion == 0 || keyVersion <= previousVersion {
+		return nil
 	}
-	h.notifyDMKeyDistribution(conversationID, delivered)
-	return distributed, nil
+	if stale > 0 {
+		return &dmEpochClaimStaleRecipientError{stale: stale}
+	}
+	reason := batch.reason
+	if reason == "" {
+		reason = dmSuccessorClaimReason
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
+	`, batch.conversationID, previousVersion, keyVersion, reason, batch.actorID); err != nil {
+		return fmt.Errorf("record dm key revocation: %w", err)
+	}
+	return nil
+}
+
+// admitDMCurrentEpochWriteTx fences a batch at or below the current epoch of a
+// conversation that has one. Below is refused outright — no message will ever
+// reference an epoch older than the current one for a NEW wrap, and the
+// refusal names the current epoch so a client that guessed low can resync. At
+// the current epoch the batch is a rewrap for participants still missing a
+// row, which only a holder of that epoch may perform: otherwise a participant
+// stranded without the key could write an invented one under the live
+// version for themselves and for anyone else still missing a row —
+// undetectable until decrypt fails, and it consumes the pending request that
+// would have healed them.
+func admitDMCurrentEpochWriteTx(ctx context.Context, tx *sql.Tx, conversationID, actorID string, previousVersion, claimedVersion int) error {
+	if claimedVersion < previousVersion {
+		return &dmEpochClaimStaleError{current: previousVersion}
+	}
+	holder, err := dmActorHoldsEpochTx(ctx, tx, conversationID, actorID, previousVersion)
+	if err != nil {
+		return err
+	}
+	if !holder {
+		return errDMEpochClaimNotHolder
+	}
+	return nil
+}
+
+// dmActorHoldsEpochTx reports whether actorID has a wrapped key at version.
+func dmActorHoldsEpochTx(ctx context.Context, tx *sql.Tx, conversationID, actorID string, version int) (bool, error) {
+	var holder bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM dm_channel_keys
+			WHERE conversation_id = $1 AND user_id = $2 AND key_version = $3
+		)
+	`, conversationID, actorID, version).Scan(&holder); err != nil {
+		return false, fmt.Errorf("read dm epoch claimant key: %w", err)
+	}
+	return holder, nil
+}
+
+// admitDMSuccessorClaimTx fences a batch that would establish a new DM epoch.
+// Three things can go wrong with a claim, and each has locked a conversation
+// or can: an epoch that is not the next one leaves a gap, or means another
+// claimant already won and this batch would fill in behind it with a
+// different key; a claimant who never held the current key would re-key the
+// conversation onto material the established members never agreed to; and a
+// batch that omits a participant strands them at an epoch about to be
+// revoked. A recipient whose public key has since changed is not visible here
+// — distributeOneDMKey discovers that per row — and distributeDMKeysTx refuses
+// the claim after the loop when it happens, for the same stranding reason.
+func admitDMSuccessorClaimTx(ctx context.Context, tx *sql.Tx, conversationID, actorID string, previousVersion, claimedVersion int, wrappedKeys map[string]string) error {
+	if claimedVersion != previousVersion+1 {
+		return &dmEpochClaimStaleError{current: previousVersion}
+	}
+	// The holder and completeness requirements below bind a ROTATION only. The
+	// initial epoch of a fresh conversation (previousVersion == 0) has no holder
+	// yet, so it takes a narrower fence — admitInitialDMEpochCompleteTx — that
+	// refuses only a SELF-SERVING claim (the B1 lockout) while leaving the #1023
+	// peer-fulfillment bootstrap, where the distributor wraps for the peer and
+	// omits its own row, untouched.
+	if previousVersion == 0 {
+		return admitInitialDMEpochCompleteTx(ctx, tx, conversationID, actorID, wrappedKeys)
+	}
+	holder, err := dmActorHoldsEpochTx(ctx, tx, conversationID, actorID, previousVersion)
+	if err != nil {
+		return err
+	}
+	if !holder {
+		return errDMEpochClaimNotHolder
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1`, conversationID)
+	if err != nil {
+		return fmt.Errorf("read dm epoch claim participants: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	missing := 0
+	for rows.Next() {
+		var participantID string
+		if err := rows.Scan(&participantID); err != nil {
+			return fmt.Errorf("scan dm epoch claim participant: %w", err)
+		}
+		if _, wrapped := wrappedKeys[participantID]; !wrapped {
+			missing++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate dm epoch claim participants: %w", err)
+	}
+	if missing > 0 {
+		return &dmEpochClaimIncompleteError{missing: missing}
+	}
+	return nil
+}
+
+// admitInitialDMEpochCompleteTx fences the FIRST epoch of a conversation that
+// has no holder yet. Only a SELF-SERVING claim is refused: the #1023
+// peer-fulfillment bootstrap posts a batch that wraps for the PEER and
+// legitimately omits the distributor (whose own row is peer-fulfilled later),
+// so requiring completeness on every initial POST would refuse the normal DM
+// bootstrap. The lockout (B1, red-team on PR #3343) needs the actor to make
+// ITSELF an initial holder while keyed peers get nothing — once epoch 1 exists
+// the holder fence makes every omitted keyed participant a permanent
+// non-holder — so the completeness requirement binds only a batch that
+// includes the actor's own wrap. Residual (inherent, not closable here): a
+// founder can still strand a peer by wrapping GARBAGE bytes for them, the same
+// limit that lets any holder rotate garbage since the server never sees
+// plaintext. This closes the trivial self-only primitive, not that tail.
+func admitInitialDMEpochCompleteTx(ctx context.Context, tx *sql.Tx, conversationID, actorID string, wrappedKeys map[string]string) error {
+	if _, actorWrapped := wrappedKeys[actorID]; !actorWrapped {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT dp.user_id
+		FROM dm_participants dp
+		WHERE dp.conversation_id = $1
+		  AND dp.user_id <> $2
+		  AND EXISTS (SELECT 1 FROM public_keys pk WHERE pk.user_id = dp.user_id)
+	`, conversationID, actorID)
+	if err != nil {
+		return fmt.Errorf("read dm initial epoch participants: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	missing := 0
+	for rows.Next() {
+		var participantID string
+		if err := rows.Scan(&participantID); err != nil {
+			return fmt.Errorf("scan dm initial epoch participant: %w", err)
+		}
+		if _, wrapped := wrappedKeys[participantID]; !wrapped {
+			missing++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate dm initial epoch participants: %w", err)
+	}
+	if missing > 0 {
+		return &dmEpochClaimIncompleteError{missing: missing}
+	}
+	return nil
 }
 
 // notifyDMKeyDistribution is the DM counterpart to notifyChannelKeyDistribution:

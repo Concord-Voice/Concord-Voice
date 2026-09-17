@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback } from 'react';
 import { Eraser } from 'lucide-react';
 import ContextMenu from '../ui/ContextMenu';
 import MuteContextMenuItem from '../Notifications/MuteContextMenuItem';
@@ -6,6 +6,7 @@ import { useRotateKey } from '../../hooks/voice/useRotateKey';
 import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
 import { useFriendStore } from '../../stores/chat/friendStore';
 import { apiFetch } from '../../services/system/apiClient';
+import { e2eeService } from '../../services/e2ee/e2eeService';
 import { initiateDMCall } from '../../services/voice/voiceService/callStateMachine';
 
 interface DMConversationContextMenuProps {
@@ -39,9 +40,20 @@ const DMConversationContextMenu: React.FC<DMConversationContextMenuProps> = ({
 }) => {
   const canRotateKey = !conversation.isGroup || conversation.createdBy === currentUserId;
 
+  // A DM rotation carries the successor wraps for every participant so the
+  // server commits them with the revocation, or refuses (e2eeService.rotateDMKey).
+  const rotateDMKey = useCallback(
+    () =>
+      e2eeService.rotateDMKey(
+        conversation.id,
+        conversation.participants.map((p) => p.userId)
+      ),
+    [conversation.id, conversation.participants]
+  );
   const { rotateStatus, rotateMessage, handleRotate } = useRotateKey(
     `/api/v1/dm/conversations/${conversation.id}/rotate-key`,
-    () => setTimeout(() => onClose(), 800)
+    () => setTimeout(() => onClose(), 800),
+    rotateDMKey
   );
 
   const getRotateLabel = (): string => {

@@ -1377,26 +1377,32 @@ export const RoleUnassignedSchema = z.object({
 // ──────────── E2EE (3 events) — Task A9 (security-verified) ───────────
 
 /**
- * `key_needed` — server requests E2EE key rewrap for new channel members.
- * Server emitter: `services/control-plane/internal/invites/handlers.go:252`.
- * Triggers `e2eeService.processPendingKeyRequests()` if E2EE is initialized.
- * Carries routing-only metadata (no key material).
+ * `key_needed` — server asks a holder to run its pending rewrap queue.
+ * Server emitters: `internal/invites/handlers.go` and
+ * `internal/channels/handlers.go` (`notifyKeyNeeded`, server channels —
+ * `server_id` present) and `internal/channels/handlers.go`
+ * (`notifyDMKeyNeeded`, a DM peer just enrolled a request — no server, so
+ * `server_id` absent). Triggers `e2eeService.processPendingKeyRequests()` if
+ * E2EE is initialized. Carries routing-only metadata (no key material).
  */
 export const KeyNeededSchema = z.object({
   type: z.literal('key_needed'),
   data: z.object({
-    server_id: UUID,
+    server_id: UUID.optional(),
     user_id: UUID,
     channel_ids: z.array(UUID),
   }),
 });
 
 /**
- * `key_revocation` — TWO emit shapes (members/handlers.go server-channel rotation;
- * friends/handlers.go DM friend-block). All fields .optional() to accommodate both;
- * handler early-returns on missing channel_id (friend-block branch is no-op).
- * Server emitter: `services/control-plane/internal/members/handlers.go:855`
- * (channel-rotation variant; friend-block variant at `internal/friends/handlers.go:550`).
+ * `key_revocation` — emitted in several shapes, so every field is .optional():
+ * server-channel rotation (`internal/members/handlers.go`), DM friend-block
+ * (`internal/friends/handlers.go`, no channel_id — the handler's early return
+ * makes that branch a no-op), group-DM membership changes
+ * (`internal/dm/handlers.go` `dmKeyRevocationEvent`, reasons member_added /
+ * member_removed / member_left — a CUE: no ledger row exists yet, the
+ * successor claim the coordinator makes writes it), and the DM manual rotation
+ * (`internal/channels/dm_rotation.go`, reason manual_rotation, after commit).
  */
 export const KeyRevocationSchema = z.object({
   type: z.literal('key_revocation'),

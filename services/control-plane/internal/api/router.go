@@ -2625,12 +2625,14 @@ func NewRouter(
 					dmHandler.DMHardUndeafen,
 				)
 
-				// Manual seal & rotate DM encryption key.
-				// 10 per 24h per conversation, enforced in the handler;
-				// 5 requests/min per user, enforced here.
+				// Manual seal & rotate DM encryption key — atomic: the successor
+				// wraps for every participant and the revocation commit together
+				// (channels.RotateDMKey, which shares the unified distribution
+				// transaction). 10 per 24h per conversation, enforced in the
+				// handler; 5 requests/min per user, enforced here.
 				dmRoutes.POST("/:id/rotate-key",
 					middleware.RateLimitByUser(redis, 5, 1*time.Minute),
-					dmHandler.RotateKey,
+					channelsHandler.RotateDMKey,
 				)
 			}
 

@@ -18,9 +18,16 @@ export type E2EEKeyErrorCode =
   | 'MALFORMED_PAYLOAD';
 
 export class E2EEKeyUnavailableError extends Error {
+  /**
+   * @param successorEpoch — on a DM `REVOKED_EPOCH` refusal, the epoch the
+   * server's ledger names as the replacement for the one this device holds.
+   * The rotation coordinator claims exactly this; without it a device that
+   * has never seen the epoch number could only guess.
+   */
   constructor(
     public readonly code: E2EEKeyErrorCode,
-    public readonly pending: boolean = false
+    public readonly pending: boolean = false,
+    public readonly successorEpoch?: number
   ) {
     super(`E2EE key unavailable: ${code}`);
     this.name = 'E2EEKeyUnavailableError';
@@ -149,5 +156,28 @@ export function classifyError(err: unknown): ErrorClassification {
       // back to terminal + generic UX rather than returning undefined (which
       // would cause a TypeError at consumer sites dereferencing .retryable etc.).
       return { retryable: false, triggerRekey: false, uxMessage: 'Unable to send message' };
+  }
+}
+
+/**
+ * A manual DM rotation stopped before it reached the server, for a reason
+ * the user can act on. useRotateKey shows the message verbatim.
+ */
+export class DMRotationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DMRotationError';
+  }
+}
+
+/**
+ * The server refused a successor-epoch claim because the conversation is at
+ * another epoch; `currentVersion` is the one it is at, so the claimant can
+ * claim its successor instead of guessing again.
+ */
+export class E2EEEpochClaimStaleError extends Error {
+  constructor(public readonly currentVersion: number) {
+    super('key epoch claim is not the next epoch');
+    this.name = 'E2EEEpochClaimStaleError';
   }
 }

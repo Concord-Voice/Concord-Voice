@@ -289,14 +289,18 @@ func TestRemoveMemberDeliveryFailureStillEnforcesAndBroadcasts(t *testing.T) {
 			Data map[string]interface{} `json:"data"`
 		}
 		require.NoError(t, json.Unmarshal(payload, &event))
-		if event.Type == "dm_participant_removed" || event.Type == "dm_role_changed" || event.Type == "key_rotation" {
+		if event.Type == "dm_participant_removed" || event.Type == "dm_role_changed" || event.Type == "key_revocation" {
 			seen[event.Type] = event.Data
 		}
 	}
 	require.Equal(t, target.String(), seen["dm_participant_removed"]["user_id"])
 	require.Equal(t, successor.String(), seen["dm_role_changed"]["user_id"])
 	require.Equal(t, "admin", seen["dm_role_changed"]["role"])
-	require.Equal(t, float64(2), seen["key_rotation"]["new_key_version"])
+	require.Equal(t, float64(1), seen["key_revocation"]["revoked_epoch"])
+	require.Equal(t, float64(2), seen["key_revocation"]["new_epoch"])
+	// The creator removes THEMSELF here (target == creator), which the handler
+	// reports as a departure, not a removal.
+	require.Equal(t, "member_left", seen["key_revocation"]["reason"])
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, target))
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
@@ -304,7 +308,9 @@ func TestRemoveMemberDeliveryFailureStillEnforcesAndBroadcasts(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT created_by FROM dm_conversations WHERE id = $1`, convID).Scan(&newCreator))
 	require.Equal(t, successor, newCreator)
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM presence_active_pending_plans WHERE user_id = $1 AND category = $2 AND resolution = 'conservative'`, target, string(presence.CategoryPrivateCall)))
-	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1 AND reason = 'member_removed'`, convID))
+	// The removal cues a rotation; the ledger row is written by the successor
+	// claim, never ahead of the successor wraps.
+	require.Equal(t, 0, countRows(t, db, `SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID))
 }
 
 func TestRemoveMemberLocksUserBeforeConversation(t *testing.T) {

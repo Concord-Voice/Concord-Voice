@@ -14,11 +14,15 @@
 
 import { useEffect, useCallback, useRef } from 'react';
 import { useAuthStore } from '../../stores/auth/authStore';
+import { useE2EEStore } from '../../stores/auth/e2eeStore';
 import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';
 import { useChatStore } from '../../stores/chat/chatStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
+import { useDMStore, type DMConversation } from '../../stores/chat/dmStore';
+import { fetchParticipantPublicKeys } from '../../services/e2ee/participantPublicKeys';
 import { getWebSocketService, ConnectionState } from '../../services/messaging/websocketService';
 import { e2eeService, type E2EEChannelOperationGuard } from '../../services/e2ee/e2eeService';
+import { E2EEEpochClaimStaleError } from '../../services/e2ee/e2eeErrors';
 import { apiFetch, safeJson } from '../../services/system/apiClient';
 import {
   captureRuntimeServerSelection,
@@ -206,6 +210,74 @@ export function useWebSocket() {
     }
   }, []);
 
+  // Establish the successor epoch of a DM conversation. A DM has no server to
+  // resolve members through, so the channel branch below returned before it
+  // posted anything and a DM revocation never got its successor — every
+  // participant then held only the revoked epoch (prod, 2026-09-17). The
+  // successor batch must wrap for EVERY participant, so a participant whose
+  // public key cannot be fetched ends the attempt: the server refuses a
+  // partial batch, and a partial claim that succeeded would strand the rest.
+  const performDMKeyRotation = useCallback(
+    async (
+      conversation: DMConversation,
+      newEpoch: number,
+      operationGuard: E2EEChannelOperationGuard
+    ) => {
+      const { keys, versions, missing } = await fetchParticipantPublicKeys(
+        conversation.participants.map((p) => p.userId)
+      );
+      operationGuard.assertCurrent();
+      if (missing.length > 0 || keys.size === 0) {
+        console.debug('[E2EE] DM key rotation skipped: participant key unavailable', {
+          conversationId: conversation.id,
+          missing: missing.length,
+        });
+        return;
+      }
+      if (versions.size !== keys.size) {
+        // Mirror rotateDMKey's guard: this is an established-epoch successor
+        // claim, so every wrap must carry its recipient's identity-key version
+        // to arm the server's #2420 freshness check. A versionless recipient
+        // would be posted unchecked; skip this cycle (the next cue retries).
+        console.debug('[E2EE] DM key rotation skipped: participant key version unavailable', {
+          conversationId: conversation.id,
+        });
+        return;
+      }
+      const wrappedKeyVersions = Object.fromEntries(versions);
+      try {
+        await e2eeService.rotateChannelKey(
+          conversation.id,
+          newEpoch,
+          keys,
+          wrappedKeyVersions,
+          operationGuard
+        );
+      } catch (err) {
+        // The claimed epoch was not the conversation's next one. The refusal
+        // names the real current epoch, so claim ITS successor — once. A
+        // second refusal means the epoch is moving under us; the next
+        // revocation or key miss cues another attempt with fresh numbers.
+        if (!(err instanceof E2EEEpochClaimStaleError)) throw err;
+        // The conversation is already at or past the epoch this cue asked
+        // for: the goal is met, another claimant won. Re-keying on top would
+        // rotate everyone a second time for nothing.
+        if (err.currentVersion >= newEpoch) return;
+        const successor = err.currentVersion + 1;
+        operationGuard.assertCurrent();
+        await e2eeService.rotateChannelKey(
+          conversation.id,
+          successor,
+          keys,
+          wrappedKeyVersions,
+          operationGuard
+        );
+      }
+      console.debug('[E2EE] DM key rotation completed for', conversation.id);
+    },
+    []
+  );
+
   // Perform key rotation for a single channel — extracted to reduce nesting depth
   const performKeyRotation = useCallback(
     async (channelId: string, newEpoch: number, operationGuard: E2EEChannelOperationGuard) => {
@@ -221,6 +293,14 @@ export function useWebSocket() {
           e2eeService.invalidateChannelKey(channelId);
           return;
         }
+      }
+
+      const dmConversation = useDMStore
+        .getState()
+        .conversations.find((conversation) => conversation.id === channelId);
+      if (dmConversation) {
+        await performDMKeyRotation(dmConversation, newEpoch, operationGuard);
+        return;
       }
 
       const channelState = useChannelStore.getState();
@@ -250,7 +330,7 @@ export function useWebSocket() {
       );
       console.debug('[E2EE] Key rotation completed for', channelId, 'epoch', newEpoch);
     },
-    [getMemberPublicKeys]
+    [getMemberPublicKeys, performDMKeyRotation]
   );
 
   // Rotation coordinator — listens for key rotation events and distributes new keys
@@ -354,6 +434,22 @@ export function useWebSocket() {
 
   // Connection recovery handler
   const handleRecovery = useConnectionRecovery(wsService, validateEpochsOnReconnect);
+
+  // Run the pending rewrap queue once this device is a reachable holder. A
+  // peer who opened a conversation while this device was away enrolled a
+  // request that only a holder can serve, and nothing ran the queue at login:
+  // it ran on a key_needed push (server channels; DMs since this change) or
+  // on a reconnect after an outage. Keyed on both flags because login
+  // publishes the token — and connects the socket — BEFORE the keys unwrap,
+  // so neither transition alone can see the other.
+  const e2eeReady = useE2EEStore((s) => s.ready);
+  const wsConnected = useChatStore((s) => s.isConnected);
+  useEffect(() => {
+    if (!e2eeReady || !wsConnected) return;
+    e2eeService.processPendingKeyRequests().catch((err) => {
+      console.debug('[WebSocket] processPendingKeyRequests failed:', err);
+    });
+  }, [e2eeReady, wsConnected]);
 
   // Connection state listener
   useEffect(() => {

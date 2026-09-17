@@ -10,6 +10,9 @@ import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { useConnectionStore } from '@/renderer/stores/ui/connectionStore';
+import { useDMStore, type DMConversation } from '@/renderer/stores/chat/dmStore';
+import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
+import { E2EEEpochClaimStaleError } from '@/renderer/services/e2ee/e2eeErrors';
 import {
   resetRuntimeServerBase,
   setRuntimeServerBase,
@@ -214,6 +217,10 @@ beforeEach(async () => {
   mockWsService.getState.mockReturnValue('disconnected');
   mockGetCurrentKeyVersion.mockReset();
   mockGetCurrentKeyVersion.mockReturnValue(0);
+  // clearAllMocks drains neither a mockRejectedValueOnce queue nor an
+  // implementation; the DM rotation tests below queue both.
+  mockRotateChannelKey.mockReset();
+  mockRotateChannelKey.mockResolvedValue(undefined);
   mockApiFetch.mockReset();
   mockApiFetch.mockResolvedValue(defaultApiResponse());
   const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
@@ -1055,5 +1062,235 @@ describe('useWebSocket — extended', () => {
 
       expect(removeListenerSpy).toHaveBeenCalledWith('e2ee-key-rotation', expect.any(Function));
     });
+  });
+});
+
+// ─── DM rotation coordinator ──────────────────────────────────────────────
+//
+// A DM has no server to resolve members through, so the channel branch of
+// performKeyRotation returned before posting anything and a DM revocation
+// never got its successor epoch — every participant then held only the
+// revoked one (prod, 2026-09-17). The DM branch wraps for every participant
+// from their individual public keys.
+describe('useWebSocket — DM rotation coordinator', () => {
+  const dmConversation = (overrides: Partial<DMConversation> = {}): DMConversation => ({
+    id: 'conv-dm-1',
+    isGroup: false,
+    isPersonal: false,
+    name: null,
+    participants: [
+      { userId: 'user-1', username: 'alice' },
+      { userId: 'user-2', username: 'bob' },
+    ],
+    lastMessage: null,
+    unreadCount: 0,
+    createdAt: '2026-01-01T00:00:00Z',
+    ...overrides,
+  });
+
+  const publicKeyRoutes = (
+    keys: Record<string, { public_key: string; key_version?: number } | null>
+  ) =>
+    mockApiFetch.mockImplementation((path: string) => {
+      if (path.startsWith('/api/v1/e2ee/keys/')) {
+        return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
+      }
+      const match = /^\/api\/v1\/users\/([^/]+)\/public-key$/.exec(path);
+      if (match) {
+        const key = keys[match[1]];
+        return Promise.resolve(
+          key ? { ok: true, json: () => Promise.resolve(key) } : { ok: false, status: 404 }
+        );
+      }
+      return Promise.resolve(defaultApiResponse());
+    });
+
+  async function armRotation() {
+    useAuthStore.getState().setAccessToken('test-token');
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    (e2eeService as unknown as { isInitialized: boolean }).isInitialized = true;
+    const hook = renderHook(() => useWebSocket());
+    return {
+      dispatch: async (newEpoch: number) => {
+        globalThis.dispatchEvent(
+          new CustomEvent('e2ee-key-rotation', {
+            detail: { channelId: 'conv-dm-1', newEpoch },
+          })
+        );
+        await vi.advanceTimersByTimeAsync(1);
+      },
+      done: () => {
+        random.mockRestore();
+        hook.unmount();
+        vi.useRealTimers();
+      },
+    };
+  }
+
+  it('wraps the successor for every participant from their own public keys', async () => {
+    useDMStore.getState().addConversation(dmConversation());
+    publicKeyRoutes({
+      'user-1': { public_key: 'pk-1', key_version: 3 },
+      'user-2': { public_key: 'pk-2', key_version: 1 },
+    });
+    const rotation = await armRotation();
+    try {
+      await rotation.dispatch(2);
+
+      expect(mockRotateChannelKey).toHaveBeenCalledTimes(1);
+      const [channelId, epoch, keys, versions] = mockRotateChannelKey.mock.calls[0];
+      expect(channelId).toBe('conv-dm-1');
+      expect(epoch).toBe(2);
+      expect(keys).toEqual(
+        new Map([
+          ['user-1', 'pk-1'],
+          ['user-2', 'pk-2'],
+        ])
+      );
+      expect(versions).toEqual({ 'user-1': 3, 'user-2': 1 });
+      expect(
+        mockApiFetch.mock.calls.some(([path]) => String(path).includes('member-public-keys'))
+      ).toBe(false);
+    } finally {
+      rotation.done();
+    }
+  });
+
+  it('skips the rotation when a participant public key carries no version', async () => {
+    useDMStore.getState().addConversation(dmConversation());
+    publicKeyRoutes({
+      'user-1': { public_key: 'pk-1', key_version: 3 },
+      // user-2 has a key but no version: a versionless wrap on a successor
+      // claim would bypass the server's #2420 freshness guard, so the
+      // coordinator skips this cycle (the next cue retries) rather than post it.
+      'user-2': { public_key: 'pk-2' },
+    });
+    const rotation = await armRotation();
+    try {
+      await rotation.dispatch(2);
+      expect(mockRotateChannelKey).not.toHaveBeenCalled();
+    } finally {
+      rotation.done();
+    }
+  });
+
+  // A cue that ran ahead of the conversation (this device's highest-seen
+  // epoch was stale) is refused with the real epoch; claim ITS successor.
+  it('retries a stale claim once at the successor of the epoch the server names', async () => {
+    useDMStore.getState().addConversation(dmConversation());
+    publicKeyRoutes({
+      'user-1': { public_key: 'pk-1', key_version: 1 },
+      'user-2': { public_key: 'pk-2', key_version: 1 },
+    });
+    mockRotateChannelKey
+      .mockRejectedValueOnce(new E2EEEpochClaimStaleError(2))
+      .mockResolvedValueOnce(undefined);
+    const rotation = await armRotation();
+    try {
+      await rotation.dispatch(5);
+
+      expect(mockRotateChannelKey).toHaveBeenCalledTimes(2);
+      expect(mockRotateChannelKey.mock.calls[0][1]).toBe(5);
+      expect(mockRotateChannelKey.mock.calls[1][1]).toBe(3);
+    } finally {
+      rotation.done();
+    }
+  });
+
+  it('stops after a second stale refusal', async () => {
+    useDMStore.getState().addConversation(dmConversation());
+    publicKeyRoutes({
+      'user-1': { public_key: 'pk-1', key_version: 1 },
+      'user-2': { public_key: 'pk-2', key_version: 1 },
+    });
+    mockRotateChannelKey
+      .mockRejectedValueOnce(new E2EEEpochClaimStaleError(2))
+      .mockRejectedValueOnce(new E2EEEpochClaimStaleError(3));
+    const rotation = await armRotation();
+    try {
+      await rotation.dispatch(5);
+
+      expect(mockRotateChannelKey).toHaveBeenCalledTimes(2);
+    } finally {
+      rotation.done();
+    }
+  });
+
+  // The refusal names an epoch at or past the one this cue asked for: another
+  // claimant already established it. Re-keying on top would rotate everyone
+  // a second time for nothing.
+  it('does not re-key a conversation the server says is already past the cue', async () => {
+    useDMStore.getState().addConversation(dmConversation());
+    publicKeyRoutes({
+      'user-1': { public_key: 'pk-1', key_version: 1 },
+      'user-2': { public_key: 'pk-2', key_version: 1 },
+    });
+    mockRotateChannelKey.mockRejectedValueOnce(new E2EEEpochClaimStaleError(3));
+    const rotation = await armRotation();
+    try {
+      await rotation.dispatch(2);
+
+      expect(mockRotateChannelKey).toHaveBeenCalledTimes(1);
+    } finally {
+      rotation.done();
+    }
+  });
+
+  it('does not claim a successor when a participant key is unavailable', async () => {
+    useDMStore.getState().addConversation(dmConversation());
+    publicKeyRoutes({
+      'user-1': { public_key: 'pk-1', key_version: 1 },
+      'user-2': null,
+    });
+    const rotation = await armRotation();
+    try {
+      await rotation.dispatch(2);
+
+      expect(mockRotateChannelKey).not.toHaveBeenCalled();
+    } finally {
+      rotation.done();
+    }
+  });
+});
+
+// ─── Pending rewrap queue at login ────────────────────────────────────────
+//
+// Login publishes the token (and connects the socket) BEFORE the keys
+// unwrap, so neither transition alone can run the holder's queue; the effect
+// waits for both.
+describe('useWebSocket — pending rewrap queue on ready + connected', () => {
+  it('runs the queue once E2EE is ready and the socket is connected', async () => {
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    useAuthStore.getState().setAccessToken('test-token');
+    renderHook(() => useWebSocket());
+
+    act(() => {
+      fireConnectionChange('connected');
+    });
+    expect(e2eeService.processPendingKeyRequests).not.toHaveBeenCalled();
+
+    act(() => {
+      useE2EEStore.getState().setReady(true);
+    });
+
+    await waitFor(() => expect(e2eeService.processPendingKeyRequests).toHaveBeenCalledTimes(1));
+  });
+
+  it('runs the queue when the socket connects after the keys are ready', async () => {
+    const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+    useAuthStore.getState().setAccessToken('test-token');
+    act(() => {
+      useE2EEStore.getState().setReady(true);
+    });
+    renderHook(() => useWebSocket());
+    expect(e2eeService.processPendingKeyRequests).not.toHaveBeenCalled();
+
+    act(() => {
+      fireConnectionChange('connected');
+    });
+
+    await waitFor(() => expect(e2eeService.processPendingKeyRequests).toHaveBeenCalledTimes(1));
   });
 });

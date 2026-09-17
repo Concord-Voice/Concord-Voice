@@ -37,7 +37,6 @@ const mimeImagePNG = "image/png"
 const (
 	pathDMConversationsPrefix = "/api/v1/dm/conversations/"
 	pathDMConversations       = "/api/v1/dm/conversations"
-	pathRotateKey             = "/rotate-key"
 	statusAccepted            = "accepted"
 	statusPending             = "pending"
 
@@ -174,133 +173,6 @@ func TestUpdateMessage_AcceptsWithinCap(t *testing.T) {
 		map[string]interface{}{"content": content, "key_version": 1},
 		testhelpers.AuthHeaders(u1.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-// ============================================================================
-// RotateKey Tests (Security-Critical: E2EE forward secrecy)
-// ============================================================================
-
-func TestRotateKey_Success(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "rotator1")
-	user2 := ts.CreateTestUser(t, "rotator2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	ts.SeedDMKey(t, convID, user1.ID, 1)
-	ts.SeedDMKey(t, convID, user2.ID, 1)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(2), body["new_key_version"])
-}
-
-func TestRotateKey_RecordsRevocation(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "rotator3")
-	user2 := ts.CreateTestUser(t, "rotator4")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	ts.SeedDMKey(t, convID, user1.ID, 1)
-	ts.SeedDMKey(t, convID, user2.ID, 1)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code)
-
-	// Verify revocation record
-	var reason, revokedBy string
-	var revokedEpoch, successorEpoch int
-	err := ts.DB.QueryRow(
-		`SELECT revoked_epoch, successor_epoch, reason, revoked_by FROM dm_key_revocations WHERE conversation_id = $1`,
-		convID,
-	).Scan(&revokedEpoch, &successorEpoch, &reason, &revokedBy)
-	require.NoError(t, err)
-	assert.Equal(t, 1, revokedEpoch)
-	assert.Equal(t, 2, successorEpoch)
-	assert.Equal(t, "manual_rotation", reason)
-	assert.Equal(t, user1.ID, revokedBy)
-}
-
-func TestRotateKey_NoExistingKeys(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "rotator5")
-	user2 := ts.CreateTestUser(t, "rotator6")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	// No keys seeded — maxVersion = 0
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(1), body["new_key_version"])
-
-	// No revocation should be recorded (guard: if maxVersion > 0)
-	var count int
-	err := ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 0, count, "no revocation should be recorded when maxVersion=0")
-}
-
-func TestRotateKey_NotParticipant(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "rotator7")
-	user2 := ts.CreateTestUser(t, "rotator8")
-	outsider := ts.CreateTestUser(t, "outsider1")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, testhelpers.AuthHeaders(outsider.AccessToken))
-	assert.Equal(t, http.StatusForbidden, w.Code)
-}
-
-func TestRotateKey_InvalidConversationID(t *testing.T) {
-	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "rotator9")
-
-	w := ts.DoRequest("POST", "/api/v1/dm/conversations/not-a-uuid/rotate-key", nil, testhelpers.AuthHeaders(user.AccessToken))
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestRotateKey_MultipleRotations(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "multirot1")
-	user2 := ts.CreateTestUser(t, "multirot2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	ts.SeedDMKey(t, convID, user1.ID, 1)
-
-	// First rotation
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusOK, w.Code)
-
-	// Seed the new key version so second rotation has something to revoke
-	ts.SeedDMKey(t, convID, user1.ID, 2)
-
-	// Second rotation
-	w = ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, testhelpers.AuthHeaders(user1.AccessToken))
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, float64(3), body["new_key_version"])
-
-	// Should have 2 revocation records
-	var count int
-	err := ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 2, count)
-}
-
-func TestRotateKey_Unauthorized(t *testing.T) {
-	ts := setupTS(t)
-	convID := uuid.New().String()
-
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil, nil)
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 // ============================================================================
@@ -2868,11 +2740,14 @@ func TestAddMemberTriggersKeyRevocation(t *testing.T) {
 	}, testhelpers.AuthHeaders(admin.AccessToken))
 	require.Equal(t, http.StatusOK, w.Code)
 
-	// Verify a revocation record was created
+	// No ledger row: adding a member CUES a rotation (key_revocation) and the
+	// successor claim that answers it records the revocation together with
+	// the successor wraps. Writing the row here revoked the only epoch anyone
+	// held before a successor existed (the 2026-09-17 lockout shape).
 	var count int
-	err := ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1 AND reason = 'member_added'`, convID).Scan(&count)
+	err := ts.DB.QueryRow(`SELECT COUNT(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&count)
 	require.NoError(t, err)
-	assert.Equal(t, 1, count, "should have one key revocation for member_added")
+	assert.Equal(t, 0, count, "membership changes must not revoke an epoch ahead of its successor")
 }
 
 func TestRemoveMemberAdminRemovesOther(t *testing.T) {
@@ -4080,94 +3955,6 @@ func TestAuthorizeVoiceJoinEnforcement(t *testing.T) {
 }
 
 // --- Rate Limit Tests ---
-
-const fmtRateLimitDMKey = "ratelimit:dm_rotate:%s"
-const fmtUserRLKeyDMRotate = "ratelimit:user:%s:POST:/api/v1/dm/conversations/:id/rotate-key"
-
-func TestDMRotateKeyRateLimitBlocks11th(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "dmrl-user1")
-	user2 := ts.CreateTestUser(t, "dmrl-user2")
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-
-	headers := testhelpers.AuthHeaders(user1.AccessToken)
-	endpoint := pathDMConversationsPrefix + convID + pathRotateKey
-
-	// Clear any pre-existing rate limit counter for this conversation
-	ts.Redis.Del(context.Background(), fmt.Sprintf(fmtRateLimitDMKey, convID))
-
-	// First 10 calls should succeed.
-	for i := 1; i <= 10; i++ {
-		// Clear per-user middleware key every 4 requests (middleware allows 5/min)
-		if i%4 == 0 {
-			userRLKey := fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID)
-			ts.Redis.Del(context.Background(), userRLKey)
-		}
-		w := ts.DoRequest("POST", endpoint, nil, headers)
-		assert.Equal(t, http.StatusOK, w.Code, "request %d should succeed", i)
-	}
-
-	// Clear per-user middleware key before 11th request
-	userRLKey := fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID)
-	ts.Redis.Del(context.Background(), userRLKey)
-
-	// 11th should be rate limited by per-conversation limit
-	w := ts.DoRequest("POST", endpoint, nil, headers)
-	assert.Equal(t, http.StatusTooManyRequests, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, "Rate limit exceeded", body["error"])
-	assert.Contains(t, body["message"], "Try again in")
-	assert.NotNil(t, body["retry_after"])
-}
-
-func TestDMRotateKeyRateLimitIndependentConversations(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "dmrl-indep1")
-	user2 := ts.CreateTestUser(t, "dmrl-indep2")
-	user3 := ts.CreateTestUser(t, "dmrl-indep3")
-
-	convA := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	convB := ts.CreateDMConversation(t, user1.ID, user3.ID)
-
-	headers := testhelpers.AuthHeaders(user1.AccessToken)
-
-	// Clear any pre-existing rate limit counters
-	ts.Redis.Del(context.Background(), fmt.Sprintf(fmtRateLimitDMKey, convA))
-	ts.Redis.Del(context.Background(), fmt.Sprintf(fmtRateLimitDMKey, convB))
-
-	// Exhaust conv A's limit
-	for i := 1; i <= 10; i++ {
-		if i%4 == 0 {
-			userRLKey := fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID)
-			ts.Redis.Del(context.Background(), userRLKey)
-		}
-		w := ts.DoRequest("POST", pathDMConversationsPrefix+convA+pathRotateKey, nil, headers)
-		assert.Equal(t, http.StatusOK, w.Code, "conv A request %d should succeed", i)
-	}
-
-	// Clear per-user middleware key
-	userRLKey := fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID)
-	ts.Redis.Del(context.Background(), userRLKey)
-
-	// Conv A should now be rate limited
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convA+pathRotateKey, nil, headers)
-	assert.Equal(t, http.StatusTooManyRequests, w.Code)
-
-	var body map[string]interface{}
-	testhelpers.ParseJSON(t, w, &body)
-	assert.Equal(t, "Rate limit exceeded", body["error"])
-	assert.Contains(t, body["message"], "Try again in")
-	assert.NotNil(t, body["retry_after"])
-
-	// Clear per-user middleware key again
-	ts.Redis.Del(context.Background(), userRLKey)
-
-	// Conv B should still work
-	w = ts.DoRequest("POST", pathDMConversationsPrefix+convB+pathRotateKey, nil, headers)
-	assert.Equal(t, http.StatusOK, w.Code, "conv B should still work")
-}
 
 // ─── RingDMCall tests (#1209, plan Task B3) ──────────────────────────────
 
@@ -5663,59 +5450,4 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_TierFromAuthenticatedUser(t *testi
 	me := testhelpers.JSONField[map[string]interface{}](t, body, "media_entitlements")
 	assert.Equal(t, "free", me["tier"], "tier must come from the JWT user, not the request body")
 	assert.EqualValues(t, 5000000, me["max_manual_bitrate_bps"], "body cannot raise the bitrate cap")
-}
-
-// The per-conversation rotation limiter (10/24h) was keyed on the raw path
-// parameter, so re-spelling the conversation UUID minted a fresh counter with a
-// full budget (#1218 red-team, same class as the DM key-distribution limiter).
-// uuid.Parse accepts upper-case, hyphen-less and braced forms and PostgreSQL's
-// uuid_in accepts the same set, so every gate still passed against the same row.
-// The per-user limit is 5/min, so the bypass turned 10 rotations per day into
-// thousands. The handler now canonicalizes at its existing parse.
-func TestRotateKey_LimitSurvivesUUIDRespelling(t *testing.T) {
-	ts := setupTS(t)
-	user1 := ts.CreateTestUser(t, "rotrespell1")
-	user2 := ts.CreateTestUser(t, "rotrespell2")
-	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
-	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
-	ts.SeedDMKey(t, convID, user1.ID, 1)
-	ts.SeedDMKey(t, convID, user2.ID, 1)
-	ctx := context.Background()
-
-	// Spend the whole per-conversation rotation budget.
-	for i := 0; i < 10; i++ {
-		w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil,
-			testhelpers.AuthHeaders(user1.AccessToken))
-		require.Equal(t, http.StatusOK, w.Code, "rotation %d of 10 should be within budget", i+1)
-		// The route also caps 5/min per user; clear it so only the per-conversation
-		// limiter can answer, or this test proves the wrong limiter.
-		ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID))
-	}
-	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathRotateKey, nil,
-		testhelpers.AuthHeaders(user1.AccessToken))
-	require.Equal(t, http.StatusTooManyRequests, w.Code, "the 11th rotation must be blocked")
-
-	upper := strings.ToUpper(convID)
-	require.NotEqual(t, convID, upper, "fixture UUID must contain hex letters to re-spell")
-
-	for name, spelling := range map[string]string{
-		"upper-case":  upper,
-		"hyphen-less": strings.ReplaceAll(convID, "-", ""),
-		"braced":      "{" + convID + "}",
-	} {
-		t.Run(name, func(t *testing.T) {
-			ts.Redis.Del(ctx, fmt.Sprintf(fmtUserRLKeyDMRotate, user1.ID))
-			got := ts.DoRequest("POST", pathDMConversationsPrefix+spelling+pathRotateKey, nil,
-				testhelpers.AuthHeaders(user1.AccessToken))
-			assert.Equal(t, http.StatusTooManyRequests, got.Code,
-				"re-spelling the conversation id must not mint a second rotation budget")
-			// The Del above is a hand-written mirror of c.FullPath(); a route
-			// rename makes it a silent no-op and this test would then prove the
-			// per-user limiter instead. The header is the discriminator that
-			// turns that procedural guard into a mechanical one — 10 is the
-			// per-conversation budget, 5 the per-user one.
-			assert.Equal(t, "10", got.Header().Get("X-RateLimit-Limit"),
-				"the 429 must come from the per-conversation limiter")
-		})
-	}
 }

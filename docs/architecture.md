@@ -1130,6 +1130,9 @@ sequenceDiagram
     Note over S: New messages use epoch N+1<br/>removed member cannot derive CSK'
 ```
 
+> The DM stack raises the same `key_needed` when a peer's first key fetch enrolls a `dm_pending_key_requests` row (`notifyDMKeyNeeded`); a DM has no server, so that push carries no `server_id` and the client schema marks the field optional.
+
+
 Server channels (`channel_keys` / `key_revocations`) and DMs (`dm_channel_keys` / `dm_key_revocations`) use parallel epoch ledgers. `channel_initial_key_distributions` holds the creator-only distribution fence until every current eligible viewer has a durable key at its tracked epoch. A key reset deletes its creator-owned marker, so another eligible holder can drain the resulting pending-key queue.
 
 Mandatory rotations advance that epoch and broadcast the successor immediately. If the sole creator was removed, compromised, or erased, the incomplete channel is deleted fail-closed, rather than leaving the revoked epoch usable. Channel-key distribution admission locks the stable channel row before it checks the revocation ledger. A concurrent revocation therefore serializes with admission, and the server rejects any already-revoked epoch. Every desktop pending-key and rotation batch includes the recipient public-key versions used for its wraps, so the server can reject stale wraps after a reset.
@@ -1326,6 +1329,9 @@ sequenceDiagram
     S-->>B: WS message {content: ciphertext}
     B->>B: AES-256-GCM decrypt(CSK, ciphertext) → plaintext
 ```
+
+> The DM stack raises the same `key_needed` when a peer's first key fetch enrolls a `dm_pending_key_requests` row (`notifyDMKeyNeeded`); a DM has no server, so that push carries no `server_id` and the client schema marks the field optional.
+
 
 - RSA-OAEP 4096-bit key wrapping, AES-256-GCM message encryption, and Argon2id key derivation. The password-derived wrapping key is an AES-GCM 256 key. AES-GCM wraps the private key, not RFC 3394 AES-KW. `POST /api/v1/auth/register` uploads the registration-time key material (`public_key`, `wrapped_private_key`). `GET`/`PUT /api/v1/users/me/keys` cover re-wrap on password change and key recovery.
 - PostgreSQL stores the public keys. The client wraps private keys locally, and they never leave the client unwrapped.

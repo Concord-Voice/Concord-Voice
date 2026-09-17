@@ -51,6 +51,14 @@ type ErrorResponse struct {
 	Code    Code   `json:"code"`
 	Kind    Kind   `json:"kind"`
 	Pending bool   `json:"pending,omitempty"`
+	// SuccessorEpoch accompanies a DM REVOKED_EPOCH refusal: the epoch the
+	// ledger says supersedes the one the caller holds. The caller holds the
+	// revoked epoch already and every participant received the same number in
+	// the key_revocation push, so naming it discloses nothing new — and it is
+	// what lets a device that has never seen the epoch number claim the right
+	// successor instead of guessing (a wrong guess at or below the current
+	// epoch is a no-op rewrap that loops).
+	SuccessorEpoch int `json:"successor_epoch,omitempty"`
 }
 
 // KeyPayload carries the wrapped key material on a 200 response.

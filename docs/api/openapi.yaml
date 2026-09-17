@@ -3718,11 +3718,13 @@ paths:
 
         The target''s DM privacy settings are enforced before adding. If the conversation
 
-        has existing E2EE key material, the current key epoch is revoked
+        has existing E2EE key material, a `key_revocation` WebSocket event (reason
 
-        (reason `member_added`) and a `key_rotation` WebSocket event is broadcast so
+        `member_added`) is broadcast as a cue: the rotation coordinator on a current-epoch
 
-        existing participants re-wrap keys at the successor epoch. Existing participants
+        holder claims the successor epoch for every participant, and that claim records the
+
+        revocation of the current epoch together with the successor wraps. Existing participants
 
         receive `dm_participant_added`; the new member receives `dm_conversation_created`.
 
@@ -4218,10 +4220,24 @@ paths:
       - DM
       - E2EE
       summary: Rotate DM encryption key
-      description: 'Initiate key rotation for a DM conversation (all DMs are encrypted under the E2EE-everywhere
-        posture, #201).
+      description: 'Rotate a DM conversation key in one atomic step (all DMs are encrypted under the
+        E2EE-everywhere posture, #201). The caller wraps the successor key for EVERY participant
+        client-side and posts the batch; the server commits the wraps and the revocation of the
+        current epoch in one transaction, or refuses and writes nothing. A DM has no server-side
+        rotation coordinator, so a request without the batch cannot be honoured — it used to
+        revoke the only epoch anyone held.
 
-        Rate limit: 10 requests per 24 hours (per conversation, Redis INCR+EXPIRE).
+        The claimed key_version must be exactly the current epoch plus one. For a rotation — a
+        conversation that already has an epoch — the caller must also hold the current epoch,
+        wrapped_keys must cover every participant, and every wrapped_key_versions entry must still
+        match that participant''s identity key (a mismatch refuses the whole batch rather than
+        committing a successor that strands them). The first distribution (key_version 1 on a
+        conversation with no key) carries neither requirement and revokes nothing. On a group
+        conversation only the creator or an admin-role participant may rotate. key_fingerprint is
+        accepted and ignored for DM contexts.
+
+        Rate limit: 10 committed rotations per 24 hours per conversation (a refused request does
+        not spend the budget) and 5 requests per minute per user.
 
         '
       operationId: rotateDMKey
@@ -4234,9 +4250,36 @@ paths:
         schema:
           type: string
           format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - wrapped_keys
+              - key_version
+              properties:
+                wrapped_keys:
+                  type: object
+                  description: Successor key wrapped for every participant, keyed by user id (RSA-OAEP, base64).
+                  additionalProperties:
+                    type: string
+                key_version:
+                  type: integer
+                  minimum: 1
+                  description: The epoch being claimed; must equal the current epoch plus one.
+                key_fingerprint:
+                  type: string
+                  description: base64 SHA-256 of the raw successor key.
+                wrapped_key_versions:
+                  type: object
+                  description: Each recipient's identity-key version the wrap was made against (#2420 freshness guard).
+                  additionalProperties:
+                    type: integer
       responses:
         '200':
-          description: Key rotation initiated
+          description: Key rotated; every participant holds the new epoch
           content:
             application/json:
               schema:
@@ -4244,21 +4287,40 @@ paths:
                 properties:
                   message:
                     type: string
-                    example: Key rotation initiated
+                    example: Key rotated
                   new_key_version:
                     type: integer
         '400':
-          description: Invalid conversation ID
+          description: Invalid conversation ID, invalid or missing body, or a batch that does not cover every participant (`missing` counts them)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Not a participant
+          description: The caller does not hold the current epoch, or is a group member without creator or admin authority
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          description: Conversation not found, or the caller is not a participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The claimed key_version is not the next epoch (`current_version` names the epoch the conversation is at), or a recipient's identity key changed since the batch was wrapped (`stale_recipients` counts them; fetch keys again)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  current_version:
+                    type: integer
+                  stale_recipients:
+                    type: integer
         '429':
           $ref: '#/components/responses/RateLimited'
   /dm/conversations/{id}/voice/authorize:
@@ -5164,7 +5226,7 @@ paths:
                         type: string
                         format: date-time
         '404':
-          description: No key found for this context
+          description: No key found for this context (`code` NO_KEY_YET, with `pending` true once the caller is enrolled for a rewrap), or the caller's current DM epoch is revoked (`code` REVOKED_EPOCH, with `successor_epoch` naming the ledger's replacement so the client can claim it)
           content:
             application/json:
               schema:
@@ -14719,7 +14781,7 @@ paths:
 
         | `key_delivered` | `channel_id`, `user_id` | E2EE key now available |
 
-        | `key_needed` | `server_id`, `user_id`, `channel_ids[]` | Key distribution needed |
+        | `key_needed` | `server_id` (absent for a DM), `user_id`, `channel_ids[]` | Key distribution needed — a server channel''s new member, or a DM peer whose first key fetch enrolled a pending request |
 
         | `friend_request_received` | `id`, `from_user_id`, `from_username`, `from_display_name`, `from_avatar_url`,
         `to_user_id`, `to_username`, `to_display_name`, `to_avatar_url`, `created_at` | Incoming friend

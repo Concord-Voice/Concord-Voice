@@ -221,7 +221,16 @@ function handleReconnected(
       (m) => m.clearCrashFlag(),
       'clearCrashFlag'
     );
-    if (e2eeService.isInitialized) validateEpochsOnReconnect().catch(() => {});
+    if (e2eeService.isInitialized) {
+      validateEpochsOnReconnect().catch((err) => {
+        console.debug('[WebSocket] validate_epochs failed:', err);
+      });
+      // A holder's pending rewrap queue ran only on the grace-period path
+      // below; a sustained outage is at least as likely to have queued one.
+      e2eeService.processPendingKeyRequests().catch((err) => {
+        console.debug('[E2EE] processPendingKeyRequests failed:', err);
+      });
+    }
     // Voice was torn down when the grace period expired (preflight entry), so
     // rejoin the channel the user was in. Blips shorter than the grace period
     // never reach preflight and keep their live media session — this fires

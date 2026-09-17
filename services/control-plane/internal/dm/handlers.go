@@ -1001,7 +1001,7 @@ func (h *Handler) AddMember(c *gin.Context) {
 	}
 
 	// Begin transaction: insert participant + record key revocation
-	maxVersion, err := h.addMemberTx(convID, req.UserID, userID)
+	maxVersion, err := h.addMemberTx(convID, req.UserID)
 	if err != nil {
 		h.log.Error("Failed to add member", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAddMember})
@@ -1017,7 +1017,7 @@ func (h *Handler) AddMember(c *gin.Context) {
 
 // addMemberTx inserts a new participant and records key revocation in a transaction.
 // Returns the max key version before revocation.
-func (h *Handler) addMemberTx(convID, targetUserID, callerUserID string) (int, error) {
+func (h *Handler) addMemberTx(convID, targetUserID string) (int, error) {
 	tx, err := h.db.Begin()
 	if err != nil {
 		return 0, err
@@ -1039,19 +1039,15 @@ func (h *Handler) addMemberTx(convID, targetUserID, callerUserID string) (int, e
 		return 0, err
 	}
 
+	// The current epoch is read for the key_revocation CUE broadcast after
+	// commit; the ledger row itself is written by the successor claim that
+	// cue produces (channels.distributeDMKeysTx), in the same transaction as
+	// the successor wraps. Writing it here — as this path did until the
+	// 2026-09-17 lockout — revoked the only epoch anyone held before any
+	// successor existed, and left the conversation unreadable until one did.
 	var maxVersion int
 	if err := tx.QueryRow(`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&maxVersion); err != nil {
 		return 0, err
-	}
-
-	if maxVersion > 0 {
-		if _, err := tx.Exec(`
-			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
-			VALUES ($1, $2, $3, 'member_added', $4)
-			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
-		`, convID, maxVersion, maxVersion+1, callerUserID); err != nil {
-			return 0, err
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1089,16 +1085,33 @@ func (h *Handler) broadcastMemberAdded(convID, targetUserID, callerUserID string
 		}
 	}
 
-	// Notify all participants of key rotation
+	// Tell every participant the epoch was revoked and which one succeeds it.
+	// key_revocation is the event the client's rotation coordinator consumes
+	// (invalidate the cached key, then a holder distributes the successor);
+	// the key_rotation this path used to emit had no client handler at all,
+	// so a membership change revoked the only epoch anyone held and nothing
+	// ever established the next one.
 	if maxVersion > 0 {
-		h.broadcastToDMParticipants(convID, "", websocket.OutgoingMessage{
-			Type: "key_rotation",
-			Data: map[string]interface{}{
-				"channel_id":      convID,
-				"triggered_by":    callerUserID,
-				"new_key_version": maxVersion + 1,
-			},
-		})
+		h.broadcastToDMParticipants(convID, "", dmKeyRevocationEvent(convID, maxVersion, "member_added"))
+	}
+}
+
+// dmKeyRevocationEvent is the DM shape of the server-channel rotator's
+// key_revocation broadcast: the conversation id rides in channel_id, which is
+// the field the client's handler reads for either kind. It is a CUE, not a
+// ledger fact: at the time it is sent no dm_key_revocations row exists for
+// revoked_epoch. The rotation coordinator it wakes claims new_epoch through the
+// unified route, and that claim writes the row together with the successor
+// wraps — so the epoch is never revoked ahead of its replacement.
+func dmKeyRevocationEvent(convID string, revokedEpoch int, reason string) websocket.OutgoingMessage {
+	return websocket.OutgoingMessage{
+		Type: "key_revocation",
+		Data: map[string]interface{}{
+			"channel_id":    convID,
+			"revoked_epoch": revokedEpoch,
+			"new_epoch":     revokedEpoch + 1,
+			"reason":        reason,
+		},
 	}
 }
 
@@ -1412,7 +1425,7 @@ func (h *Handler) removeMemberRowsTx(
 	if err != nil {
 		return "", 0, nil, err
 	}
-	maxVersion, err := removeMemberRowsAndRecordRevocation(ctx, tx, convID, targetID, callerUserID)
+	maxVersion, err := removeMemberRows(ctx, tx, convID, targetID)
 	if err != nil {
 		return "", 0, nil, err
 	}
@@ -1474,12 +1487,14 @@ func (h *Handler) transferMemberRemovalCreator(
 	return newCreatorID, nil
 }
 
-func removeMemberRowsAndRecordRevocation(
+// removeMemberRows deletes the member's participant and voice rows and returns
+// the conversation's current epoch for the key_revocation cue. It records no
+// ledger row: see addMemberTx for why the successor claim writes it.
+func removeMemberRows(
 	ctx context.Context,
 	tx *sql.Tx,
 	convID string,
 	targetID uuid.UUID,
-	callerUserID string,
 ) (int, error) {
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, targetID.String()); err != nil {
@@ -1503,15 +1518,6 @@ func removeMemberRowsAndRecordRevocation(
 		`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID,
 	).Scan(&maxVersion); err != nil {
 		return 0, fmt.Errorf("read max key version: %w", err)
-	}
-	if maxVersion > 0 {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
-			VALUES ($1, $2, $3, 'member_removed', $4)
-			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
-		`, convID, maxVersion, maxVersion+1, callerUserID); err != nil {
-			return 0, fmt.Errorf("record member removal revocation: %w", err)
-		}
 	}
 	return maxVersion, nil
 }
@@ -1639,16 +1645,13 @@ func (h *Handler) broadcastMemberRemoved(convID, targetUserID, callerUserID stri
 		})
 	}
 
-	// Notify all participants of key rotation
+	// See dmKeyRevocationEvent: the coordinator-consumed event, not key_rotation.
 	if maxVersion > 0 {
-		h.broadcastToDMParticipants(convID, "", websocket.OutgoingMessage{
-			Type: "key_rotation",
-			Data: map[string]interface{}{
-				"channel_id":      convID,
-				"triggered_by":    callerUserID,
-				"new_key_version": maxVersion + 1,
-			},
-		})
+		reason := "member_removed"
+		if isSelfLeave {
+			reason = "member_left"
+		}
+		h.broadcastToDMParticipants(convID, "", dmKeyRevocationEvent(convID, maxVersion, reason))
 	}
 }
 
@@ -1863,75 +1866,6 @@ func (h *Handler) respondGuardTxError(c *gin.Context, guardErr error, genericMsg
 	}
 	h.log.Error("credential-epoch guard read failed", "error", guardErr)
 	c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
-}
-
-// RotateKey handles manual seal & rotate for DM forward secrecy.
-// POST /dm/conversations/:id/rotate-key
-func (h *Handler) RotateKey(c *gin.Context) {
-	userID := c.GetString("user_id")
-	convID := c.Param("id")
-
-	parsedConvID, parseErr := uuid.Parse(convID)
-	if parseErr != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
-		return
-	}
-	// Canonicalize before the per-resource limiter key is built — see
-	// channels.DistributeUnifiedKeys for why (#1218 red-team).
-	convID = parsedConvID.String()
-
-	if !h.isParticipant(convID, userID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
-		return
-	}
-
-	// Per-resource rate limit: 10 rotations per 24h per conversation.
-	rateLimitKey := fmt.Sprintf("ratelimit:dm_rotate:%s", convID)
-	if blocked, retryAfter := middleware.IsRateLimited(c.Request.Context(), h.redis, rateLimitKey, 10, 24*time.Hour); blocked {
-		middleware.RespondRateLimited(c, retryAfter, 10)
-		return
-	}
-
-	// Get current max key version
-	var maxVersion int
-	err := h.db.QueryRow(`SELECT COALESCE(MAX(key_version), 0) FROM dm_channel_keys WHERE conversation_id = $1`, convID).Scan(&maxVersion)
-	if err != nil {
-		h.log.Error("Failed to get max key version", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rotate key"})
-		return
-	}
-
-	h.log.Info("DM key rotation requested", "conversation_id", convID, "user_id", userID, "current_version", maxVersion)
-
-	// Record the revocation of the current epoch
-	if maxVersion > 0 {
-		if _, err := h.db.Exec(`
-			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
-			VALUES ($1, $2, $3, 'manual_rotation', $4)
-			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
-		`, convID, maxVersion, maxVersion+1, userID); err != nil {
-			h.log.Error("Failed to record DM key revocation", "error", err, "conversation_id", convID)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rotate key"})
-			return
-		}
-	}
-
-	// Notify all participants to rotate
-	if h.hub != nil {
-		h.broadcastToDMParticipants(convID, userID, websocket.OutgoingMessage{
-			Type: "key_rotation",
-			Data: map[string]interface{}{
-				"channel_id":      convID,
-				"triggered_by":    userID,
-				"new_key_version": maxVersion + 1,
-			},
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":         "Key rotation initiated",
-		"new_key_version": maxVersion + 1,
-	})
 }
 
 // --- Voice Endpoints ---

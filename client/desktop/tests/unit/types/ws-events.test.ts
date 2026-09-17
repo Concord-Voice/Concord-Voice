@@ -1338,6 +1338,18 @@ describe('ws-events schemas — rejection cases', () => {
     expect(result.success).toBe(false);
   });
 
+  // A DM enrollment pages holders with the same event and no server to name.
+  it('KeyNeededSchema accepts the DM shape with no server_id', () => {
+    const result = KeyNeededSchema.safeParse({
+      type: 'key_needed',
+      data: {
+        user_id: UUID_B,
+        channel_ids: [UUID_C],
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
   it('KeyNeededSchema rejects when channel_ids contains a non-UUID', () => {
     const result = KeyNeededSchema.safeParse({
       type: 'key_needed',

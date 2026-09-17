@@ -2153,8 +2153,11 @@ func TestDistributeUnifiedKeysDM_DuplicateKeyVersionSkipped(t *testing.T) {
 	ts.CreateFriendship(t, user1.ID, user2.ID, "accepted")
 	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
 
+	// The initial batch covers the distributor too: a second post at the
+	// CURRENT epoch is a rewrap, which only a holder of that epoch may make.
 	w := ts.DoRequest("POST", pathE2EEKeys+convID, map[string]interface{}{
 		keyWrappedKeys: map[string]string{
+			user1.ID: testhelpers.ValidCiphertext(),
 			user2.ID: testhelpers.ValidCiphertext(),
 		},
 		"key_version": 1,

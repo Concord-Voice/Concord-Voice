@@ -192,5 +192,24 @@ describe('useConnectionRecovery', () => {
       await vi.waitFor(() => expect(recoveryReset).toHaveBeenCalledTimes(1));
       expect(gracefulReset).not.toHaveBeenCalled();
     });
+
+    // A sustained outage is at least as likely as a blip to have queued a
+    // rewrap request for this holder; only the grace-period branch ran the
+    // queue until now.
+    it('runs the pending rewrap queue after a sustained outage', async () => {
+      const { e2eeService } = await import('@/renderer/services/e2ee/e2eeService');
+      useConnectionStore.getState().startGracePeriod();
+      useConnectionStore.getState().enterPreflight();
+      const { result } = renderHook(() =>
+        useConnectionRecovery(mockWsService as never, validateEpochs)
+      );
+
+      result.current('CONNECTED' as never);
+
+      await vi.waitFor(() =>
+        expect(e2eeService.processPendingKeyRequests).toHaveBeenCalledTimes(1)
+      );
+      expect(validateEpochs).toHaveBeenCalledTimes(1);
+    });
   });
 });

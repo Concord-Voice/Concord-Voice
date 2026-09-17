@@ -122,6 +122,7 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **Rotating a direct message's encryption key no longer locks everyone out of the conversation** ([#3343](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3343)) — choosing Rotate Encryption Key on a DM revoked the current key without creating its replacement, so every message in the conversation showed "Unable to decrypt this message" for both people until the row was removed by hand. The rotation now creates the new key for every participant in the same step, a conversation left in that state repairs itself the next time a participant who still holds the current key opens it, and the app stops re-requesting a key the server has already said it cannot serve (it was asking a dozen times a minute for each such conversation).
 - **The quieter text throughout the app is now readable** ([#3341](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3341)) — timestamps,
   hints, subtitles, secondary labels and the small notices the app adds to a conversation were
   drawn in a colour that sat well below the contrast the accessibility guidelines ask for on

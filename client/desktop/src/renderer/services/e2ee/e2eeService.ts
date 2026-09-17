@@ -32,15 +32,22 @@ import {
 } from '../../utils/crypto/crypto';
 import { apiFetch, safeJson } from '../system/apiClient';
 import {
+  DMRotationError,
+  E2EEEpochClaimStaleError,
   E2EEInitTeardownError,
   E2EEKeyUnavailableError,
   type E2EEKeyErrorCode,
 } from './e2eeErrors';
 import { useE2EEStore } from '../../stores/auth/e2eeStore';
+import { fetchParticipantPublicKeys } from './participantPublicKeys';
 
 // Session lifetime — keys cached until explicit invalidation (rotation) or logout/close.
 // Lazy fetch + hold: each channel's key is fetched on first visit and held for the session.
 const CHANNEL_KEY_CACHE_TTL = Number.MAX_SAFE_INTEGER;
+// How long a key the server just refused (no wrap yet, or a revoked epoch) is
+// not fetched again. Cleared early by invalidateChannelKey, which every
+// key-arrival path calls, so the window only ever delays a repeat refusal.
+const MISSING_KEY_BACKOFF_MS = 30_000;
 const PENDING_KEY_RETRY_DELAY_MS = 60_000;
 
 interface CachedWrappedKey {
@@ -69,6 +76,7 @@ interface ErrorResponseShape {
   code?: E2EEKeyErrorCode;
   kind?: 'channel' | 'dm' | 'unknown';
   pending?: boolean;
+  successor_epoch?: number;
 }
 
 interface KeyResponseShape {
@@ -481,6 +489,12 @@ class E2EEService {
   /**
    * Check if the service is initialized (user has logged in with E2EE)
    */
+  // Missing-key backoff — see getChannelKeyMaterial and noteKeyMiss.
+  private readonly keyMissBackoff = new Map<
+    string,
+    { until: number; code: E2EEKeyErrorCode; pending: boolean; successorEpoch?: number }
+  >();
+
   get isInitialized(): boolean {
     return this.wrappingKey !== null;
   }
@@ -601,7 +615,11 @@ class E2EEService {
       });
     }
 
-    throw new E2EEKeyUnavailableError(code, pending);
+    const successorEpoch =
+      typeof body.successor_epoch === 'number' && body.successor_epoch > 0
+        ? body.successor_epoch
+        : undefined;
+    throw new E2EEKeyUnavailableError(code, pending, successorEpoch);
   }
 
   /**
@@ -739,6 +757,16 @@ class E2EEService {
       return { channelKey, keyVersion };
     }
 
+    // A key the server just said it cannot serve is not asked for again for
+    // a short window. The DM sidebar's preview decrypt re-runs on every store
+    // change and each pass fetched the same refusal — a dozen a minute per
+    // keyless conversation in prod. The refusal is replayed as-is so callers
+    // see exactly what the server said.
+    const miss = this.keyMissBackoff.get(channelId);
+    if (miss && Date.now() < miss.until) {
+      throw new E2EEKeyUnavailableError(miss.code, miss.pending, miss.successorEpoch);
+    }
+
     // If we're rate-limited, don't fire another request
     if (Date.now() < this.rateLimitedUntil) {
       throw new E2EEKeyUnavailableError('NO_KEY_YET', false);
@@ -759,11 +787,63 @@ class E2EEService {
 
     try {
       return await fetchPromise;
+    } catch (err) {
+      this.noteKeyMiss(channelId, err, sessionGeneration, channelGeneration);
+      throw err;
     } finally {
       if (this.pendingKeyFetches.get(channelId) === fetchPromise) {
         this.pendingKeyFetches.delete(channelId);
       }
     }
+  }
+
+  /**
+   * Remember a key the server refused so the next caller inside
+   * MISSING_KEY_BACKOFF_MS gets the same answer without a request. A revoked
+   * epoch additionally cues the rotation coordinator: only the DM key route
+   * answers a current-key fetch with REVOKED_EPOCH, and it means the epoch
+   * this device holds was revoked with no successor reaching it. That is the
+   * same cue key_revocation carries for a connected client, and it is how a
+   * conversation whose rotation never established its successor heals — the
+   * first current-epoch holder to open it claims the next epoch for everyone.
+   * The claim is the successor the refusal names (the ledger's
+   * successor_epoch); a device that has seen an epoch falls back to that plus
+   * one, and a device that knows neither does not cue at all — a claim at or
+   * below the current epoch is a no-op rewrap the server answers 200, which
+   * would clear this backoff and repeat every window.
+   */
+  private noteKeyMiss(
+    channelId: string,
+    err: unknown,
+    sessionGeneration: number,
+    channelGeneration: number
+  ): void {
+    if (!(err instanceof E2EEKeyUnavailableError)) return;
+    if (err.code !== 'NO_KEY_YET' && err.code !== 'REVOKED_EPOCH') return;
+    // A fetch that invalidation superseded rejects with the same code a
+    // refusal does. Recording it would block the replacement fetch that the
+    // invalidation started — and clear the very backoff it just cleared.
+    if (
+      sessionGeneration !== this.keySessionGeneration ||
+      channelGeneration !== this.getChannelKeyGeneration(channelId)
+    ) {
+      return;
+    }
+    this.keyMissBackoff.set(channelId, {
+      until: Date.now() + MISSING_KEY_BACKOFF_MS,
+      code: err.code,
+      pending: err.pending,
+      successorEpoch: err.successorEpoch,
+    });
+    if (err.code !== 'REVOKED_EPOCH' || typeof globalThis.dispatchEvent !== 'function') return;
+    const highestSeen = this.getHighestSeenKeyVersion(channelId);
+    const newEpoch = err.successorEpoch ?? (highestSeen > 0 ? highestSeen + 1 : 0);
+    if (newEpoch <= 0) return;
+    globalThis.dispatchEvent(
+      new CustomEvent('e2ee-key-rotation', {
+        detail: { channelId, newEpoch, reason: 'revoked_epoch' },
+      })
+    );
   }
 
   /**
@@ -1512,29 +1592,11 @@ class E2EEService {
     operationGuard: E2EEChannelOperationGuard = this.createChannelOperationGuard(channelId)
   ): Promise<void> {
     operationGuard.assertCurrent();
-    const channelKey = await generateChannelKey();
-    operationGuard.assertCurrent();
-    const exportedChannelKey = await exportChannelKey(channelKey);
-    operationGuard.assertCurrent();
-    const keyFingerprint = arrayBufferToBase64(
-      await crypto.subtle.digest('SHA-256', exportedChannelKey)
+    const { wrappedKeys, keyFingerprint } = await this.wrapFreshKeyForMembers(
+      memberPublicKeys,
+      operationGuard
     );
-    operationGuard.assertCurrent();
-    const wrappedMembers: Array<[string, string]> = [];
-    for (const [userId, publicKeyBase64] of memberPublicKeys) {
-      operationGuard.assertCurrent();
-      try {
-        const publicKey = await importPublicKey(publicKeyBase64);
-        operationGuard.assertCurrent();
-        wrappedMembers.push([userId, await wrapChannelKey(channelKey, publicKey)]);
-      } catch (err) {
-        console.warn('[E2EE] Skipping member with invalid public key during rotation', {
-          userId,
-          error: (err as Error).message,
-        });
-      }
-      operationGuard.assertCurrent();
-    }
+    const wrappedMembers = Object.entries(wrappedKeys);
     if (wrappedMembers.length === 0) {
       throw new Error('channel key rotation has no valid recipients');
     }
@@ -1543,41 +1605,187 @@ class E2EEService {
       wrappedBatches.push(Object.fromEntries(wrappedMembers.slice(start, start + 500)));
     }
 
-    for (const wrappedKeys of wrappedBatches) {
-      const batchKeyVersions: Record<string, number> = {};
-      for (const userId of Object.keys(wrappedKeys)) {
-        const keyVersion = wrappedKeyVersions?.[userId];
-        if (keyVersion !== undefined) batchKeyVersions[userId] = keyVersion;
-      }
-      const body: {
-        wrapped_keys: Record<string, string>;
-        key_version: number;
-        key_fingerprint: string;
-        wrapped_key_versions?: Record<string, number>;
-      } = {
-        wrapped_keys: wrappedKeys,
-        key_version: newKeyVersion,
-        key_fingerprint: keyFingerprint,
-      };
-      if (Object.keys(batchKeyVersions).length > 0) body.wrapped_key_versions = batchKeyVersions;
-      operationGuard.assertCurrent();
-      const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      operationGuard.assertCurrent();
-      if (!res.ok) {
-        const data = await safeJson(res).catch(() => ({}));
-        operationGuard.assertCurrent();
-        console.debug('[E2EE] Key rotation distribution failed:', res.status, data);
-        throw new Error('channel key rotation distribution failed');
-      }
+    for (const batch of wrappedBatches) {
+      await this.postRotationBatch(
+        channelId,
+        batch,
+        newKeyVersion,
+        keyFingerprint,
+        wrappedKeyVersions,
+        operationGuard
+      );
     }
 
     // Invalidate current cache so next encrypt/decrypt fetches the new key
     operationGuard.assertCurrent();
     this.invalidateChannelKey(channelId);
+  }
+
+  /**
+   * Post one rotation batch to the unified distribute route. A refusal ends
+   * the rotation; a DM successor claim at the wrong epoch is answered with the
+   * real one so the claimant can claim its successor (useWebSocket retries
+   * exactly once).
+   */
+  private async postRotationBatch(
+    channelId: string,
+    batch: Record<string, string>,
+    newKeyVersion: number,
+    keyFingerprint: string,
+    wrappedKeyVersions: Record<string, number> | undefined,
+    operationGuard: E2EEChannelOperationGuard
+  ): Promise<void> {
+    const batchKeyVersions: Record<string, number> = {};
+    for (const userId of Object.keys(batch)) {
+      const keyVersion = wrappedKeyVersions?.[userId];
+      if (keyVersion !== undefined) batchKeyVersions[userId] = keyVersion;
+    }
+    const body: {
+      wrapped_keys: Record<string, string>;
+      key_version: number;
+      key_fingerprint: string;
+      wrapped_key_versions?: Record<string, number>;
+    } = {
+      wrapped_keys: batch,
+      key_version: newKeyVersion,
+      key_fingerprint: keyFingerprint,
+    };
+    if (Object.keys(batchKeyVersions).length > 0) body.wrapped_key_versions = batchKeyVersions;
+    operationGuard.assertCurrent();
+    const res = await apiFetch(`/api/v1/e2ee/keys/${channelId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    operationGuard.assertCurrent();
+    if (res.ok) return;
+    const data: { current_version?: unknown } = await safeJson<{
+      current_version?: unknown;
+    }>(res).catch(() => ({}));
+    operationGuard.assertCurrent();
+    console.debug('[E2EE] Key rotation distribution failed:', res.status, data);
+    if (res.status === 409 && typeof data.current_version === 'number') {
+      throw new E2EEEpochClaimStaleError(data.current_version);
+    }
+    throw new Error('channel key rotation distribution failed');
+  }
+
+  /**
+   * Manual seal-and-rotate for a DM conversation. Generates the successor key,
+   * wraps it for EVERY participant, and posts the batch to the DM rotate route,
+   * which commits the wraps and the revocation of the current epoch in one
+   * transaction — or refuses. The server-channel path records the revocation
+   * first and lets any member's rotation coordinator establish the successor;
+   * for a DM that coordinator used to resolve members through a server the
+   * conversation does not have and returned silently, so a rotation posted
+   * without its wraps revoked the only epoch anyone held (prod, 2026-09-17).
+   *
+   * Resolves to the server's Response so the caller keeps useRotateKey's
+   * status mapping (429 retry-after, the server's error text); throws
+   * DMRotationError for a precondition the user can act on.
+   */
+  async rotateDMKey(
+    conversationId: string,
+    participantIds: string[],
+    operationGuard: E2EEChannelOperationGuard = this.createChannelOperationGuard(conversationId)
+  ): Promise<Response> {
+    operationGuard.assertCurrent();
+    let currentVersion: number;
+    try {
+      ({ keyVersion: currentVersion } = await this.getChannelKeyMaterial(conversationId));
+    } catch (err) {
+      const code = err instanceof E2EEKeyUnavailableError ? err.code : undefined;
+      // A revoked epoch with no successor is being re-keyed by the rotation
+      // coordinator noteKeyMiss just cued; a manual rotation on top would race it.
+      if (code === 'REVOKED_EPOCH')
+        throw new DMRotationError('This conversation is being re-keyed; try again shortly');
+      // NO_KEY_YET is the genuine precondition: this device holds no current key.
+      if (code === 'NO_KEY_YET') throw new DMRotationError('You need the current key to rotate it');
+      // Anything else — a network blip, a 500, a decrypt error — is transient,
+      // not a precondition the user can satisfy by acquiring a key. Record the
+      // message (never the raw error, which can carry key material) so a
+      // recurring fault is diagnosable, and ask for a retry.
+      console.debug('[E2EE] rotateDMKey could not read the current key:', (err as Error)?.message);
+      throw new DMRotationError("Couldn't read the current key; try again");
+    }
+    operationGuard.assertCurrent();
+
+    const {
+      keys: memberPublicKeys,
+      versions,
+      missing,
+    } = await fetchParticipantPublicKeys([...new Set(participantIds)]);
+    operationGuard.assertCurrent();
+    if (missing.length > 0) throw new DMRotationError('A participant has no encryption key yet');
+    // This path is always an established-epoch rotation, so every wrap must
+    // carry its recipient's identity-key version — that is what activates the
+    // server's #2420 recipient-freshness guard. A key fetched without a
+    // positive version (versions omits it) would post a wrap the server stores
+    // unchecked against a since-rotated identity key; refuse instead. The
+    // initial-distribution path (dmStore, previous epoch 0) keeps the shared
+    // helper's version-optional behaviour, where that guard is correctly absent.
+    if (versions.size !== memberPublicKeys.size)
+      throw new DMRotationError("A participant's encryption key is not ready");
+    const wrappedKeyVersions = Object.fromEntries(versions);
+
+    const { wrappedKeys, keyFingerprint } = await this.wrapFreshKeyForMembers(
+      memberPublicKeys,
+      operationGuard
+    );
+    if (Object.keys(wrappedKeys).length !== memberPublicKeys.size) {
+      // The server refuses an incomplete batch; say why before it does.
+      throw new DMRotationError("A participant's encryption key could not be used");
+    }
+
+    const res = await apiFetch(`/api/v1/dm/conversations/${conversationId}/rotate-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wrapped_keys: wrappedKeys,
+        key_version: currentVersion + 1,
+        key_fingerprint: keyFingerprint,
+        wrapped_key_versions: wrappedKeyVersions,
+      }),
+    });
+    operationGuard.assertCurrent();
+    if (res.ok) this.invalidateChannelKey(conversationId);
+    return res;
+  }
+
+  /**
+   * Generate a fresh channel key and wrap it for each member. A member whose
+   * public key does not import is skipped with a warning — the callers decide
+   * whether a partial set is acceptable (a channel batch is; a DM successor
+   * batch is not, and the server refuses it).
+   */
+  private async wrapFreshKeyForMembers(
+    memberPublicKeys: Map<string, string>,
+    operationGuard: E2EEChannelOperationGuard
+  ): Promise<{ wrappedKeys: Record<string, string>; keyFingerprint: string }> {
+    const channelKey = await generateChannelKey();
+    operationGuard.assertCurrent();
+    const exportedChannelKey = await exportChannelKey(channelKey);
+    operationGuard.assertCurrent();
+    const keyFingerprint = arrayBufferToBase64(
+      await crypto.subtle.digest('SHA-256', exportedChannelKey)
+    );
+    operationGuard.assertCurrent();
+    const wrappedKeys: Record<string, string> = {};
+    for (const [userId, publicKeyBase64] of memberPublicKeys) {
+      operationGuard.assertCurrent();
+      try {
+        const publicKey = await importPublicKey(publicKeyBase64);
+        operationGuard.assertCurrent();
+        wrappedKeys[userId] = await wrapChannelKey(channelKey, publicKey);
+      } catch (err) {
+        console.warn('[E2EE] Skipping member with invalid public key during rotation', {
+          userId,
+          error: (err as Error).message,
+        });
+      }
+      operationGuard.assertCurrent();
+    }
+    return { wrappedKeys, keyFingerprint };
   }
 
   /**
@@ -1638,6 +1846,7 @@ class E2EEService {
     this.sessionKeys = null;
     this.sessionKeysInitAttempt = null;
     this.channelKeyCache.clear();
+    this.keyMissBackoff.clear();
     this.versionedKeyCache.clear();
     this.channelKeyGenerations.clear();
     this.channelAccessRevocationGenerations.clear();
@@ -1661,6 +1870,7 @@ class E2EEService {
     this.channelKeyCache.delete(channelId);
     this.versionedKeyCache.delete(channelId);
     this.pendingKeyFetches.delete(channelId);
+    this.keyMissBackoff.delete(channelId);
     const versionedPrefix = `${channelId}:v`;
     for (const dedupKey of this.pendingVersionedKeyFetches.keys()) {
       if (dedupKey.startsWith(versionedPrefix)) {

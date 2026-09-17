@@ -5,10 +5,23 @@ import type { DMConversation } from '@/renderer/stores/chat/dmStore';
 vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: vi.fn(),
 }));
+vi.mock('@/renderer/services/e2ee/e2eeService', () => ({
+  e2eeService: {
+    rotateDMKey: vi.fn(),
+    // dmStore reaches these from the menu's other actions (close conversation).
+    revokeChannelAccess: vi.fn(),
+    getChannelKey: vi.fn(),
+    createChannelKeys: vi.fn(),
+    isInitialized: true,
+  },
+}));
 
 import { apiFetch } from '@/renderer/services/system/apiClient';
+import { e2eeService } from '@/renderer/services/e2ee/e2eeService';
+import { DMRotationError } from '@/renderer/services/e2ee/e2eeErrors';
 
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
+const mockRotateDMKey = vi.mocked(e2eeService.rotateDMKey);
 
 const CURRENT_USER_ID = 'user-1';
 
@@ -86,18 +99,23 @@ describe('DMConversationContextMenu', () => {
     expect(screen.getByText('Mute Conversation')).toBeInTheDocument();
   });
 
-  it('calls correct API endpoint and shows success', async () => {
-    mockApiFetch.mockResolvedValue({ ok: true, status: 200 });
+  // The rotation goes through e2eeService.rotateDMKey, which wraps the
+  // successor for every participant before it posts. A bare POST to the
+  // route revoked the only epoch anyone held (prod, 2026-09-17).
+  it('rotates through e2eeService with every participant and shows success', async () => {
+    mockRotateDMKey.mockResolvedValue({ ok: true, status: 200 } as Response);
     const conv = makeConversation({ id: 'conv-42' });
     renderMenu(conv);
 
     fireEvent.click(screen.getByText('Rotate Encryption Key'));
 
     await waitFor(() => {
-      expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/dm/conversations/conv-42/rotate-key', {
-        method: 'POST',
-      });
+      expect(mockRotateDMKey).toHaveBeenCalledWith('conv-42', ['user-1', 'user-2']);
     });
+    expect(mockApiFetch).not.toHaveBeenCalledWith(
+      '/api/v1/dm/conversations/conv-42/rotate-key',
+      expect.anything()
+    );
 
     await waitFor(() => {
       expect(screen.getByText('Key Rotated!')).toBeInTheDocument();
@@ -105,11 +123,11 @@ describe('DMConversationContextMenu', () => {
   });
 
   it('shows rate limit message on 429', async () => {
-    mockApiFetch.mockResolvedValue({
+    mockRotateDMKey.mockResolvedValue({
       ok: false,
       status: 429,
       json: async () => ({ retry_after: 7200 }),
-    });
+    } as unknown as Response);
     renderMenu(makeConversation());
 
     fireEvent.click(screen.getByText('Rotate Encryption Key'));
@@ -120,11 +138,11 @@ describe('DMConversationContextMenu', () => {
   });
 
   it('shows error message on non-429 failure', async () => {
-    mockApiFetch.mockResolvedValue({
+    mockRotateDMKey.mockResolvedValue({
       ok: false,
       status: 403,
       json: async () => ({ error: 'Forbidden' }),
-    });
+    } as unknown as Response);
     renderMenu(makeConversation());
 
     fireEvent.click(screen.getByText('Rotate Encryption Key'));
@@ -134,8 +152,21 @@ describe('DMConversationContextMenu', () => {
     });
   });
 
+  it('shows the precondition a DMRotationError names', async () => {
+    mockRotateDMKey.mockRejectedValue(
+      new DMRotationError('A participant has no encryption key yet')
+    );
+    renderMenu(makeConversation());
+
+    fireEvent.click(screen.getByText('Rotate Encryption Key'));
+
+    await waitFor(() => {
+      expect(screen.getByText('A participant has no encryption key yet')).toBeInTheDocument();
+    });
+  });
+
   it('shows fallback error message on network failure', async () => {
-    mockApiFetch.mockRejectedValue(new Error('Network error'));
+    mockRotateDMKey.mockRejectedValue(new Error('Network error'));
     renderMenu(makeConversation());
 
     fireEvent.click(screen.getByText('Rotate Encryption Key'));
