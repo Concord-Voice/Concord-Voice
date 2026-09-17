@@ -114,7 +114,7 @@ export function renderManifestYaml(manifest: Manifest): string {
 /* istanbul ignore next -- CLI usage helper, only invoked from the entry shim below */
 function usage(): never {
   process.stderr.write(
-    'Usage: generate-update-manifest.mts <version> <output-yaml> <file> [<file> ...]\n',
+    'Usage: generate-update-manifest.mts <version> <output-yaml> <file> [<file> ...]\n'
   );
   process.exit(2);
 }
@@ -129,7 +129,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     const manifest = buildManifest({ version, files });
     const yaml = renderManifestYaml(manifest);
     writeFileSync(output, yaml);
-    process.stdout.write(`Wrote ${output} (${manifest.files.length} file${manifest.files.length === 1 ? '' : 's'})\n`);
+    process.stdout.write(
+      `Wrote ${output} (${manifest.files.length} file${manifest.files.length === 1 ? '' : 's'})\n`
+    );
   } catch (err) {
     if (err instanceof ManifestSchemaError) {
       process.stderr.write(`::error::${err.message}\n`);

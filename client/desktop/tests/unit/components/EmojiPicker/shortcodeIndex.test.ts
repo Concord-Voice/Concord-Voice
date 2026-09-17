@@ -31,9 +31,7 @@ describe('shortcodeIndex', () => {
 
   it('first category wins on duplicate shortcodes across categories', () => {
     indexCategory('smileys', smileys);
-    indexCategory('symbols', [
-      { e: '❤️', n: 'red heart', s: false, c: ['smile'] },
-    ]);
+    indexCategory('symbols', [{ e: '❤️', n: 'red heart', s: false, c: ['smile'] }]);
     expect(lookupShortcode('smile')).toBe('😄');
   });
 

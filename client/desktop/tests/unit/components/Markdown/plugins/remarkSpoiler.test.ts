@@ -17,7 +17,9 @@ function collectSpoilers(tree: Root): string[] {
     const n = node as { type?: string; value?: unknown; children?: unknown[] };
     if (n.type === 'spoiler') {
       const texts = (n.children ?? [])
-        .filter((c) => typeof c === 'object' && c !== null && (c as { type?: string }).type === 'text')
+        .filter(
+          (c) => typeof c === 'object' && c !== null && (c as { type?: string }).type === 'text'
+        )
         .map((c) => (c as { value: string }).value);
       out.push(texts.join(''));
       return;

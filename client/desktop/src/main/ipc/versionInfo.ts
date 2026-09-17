@@ -29,13 +29,10 @@ export function getCurrentSpaDisplayHash(url: string | null): string | null {
 }
 
 export function registerVersionInfoIpc(getWindow: () => BrowserWindow | null): void {
-  ipcMain.handle(
-    'window:getVersionString',
-    (): VersionString => ({
-      appVersion: app.getVersion(),
-      spaHash: getCurrentSpaDisplayHash(getRemoteSpaUrl()),
-    })
-  );
+  ipcMain.handle('window:getVersionString', (): VersionString => ({
+    appVersion: app.getVersion(),
+    spaHash: getCurrentSpaDisplayHash(getRemoteSpaUrl()),
+  }));
 
   onSpaStateChange((url) => {
     const win = getWindow();

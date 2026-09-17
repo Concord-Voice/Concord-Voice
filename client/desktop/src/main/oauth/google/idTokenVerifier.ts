@@ -41,7 +41,9 @@ export async function verifyGoogleIDToken(opts: {
     }
     throw new GoogleFlowError('google_id_token_invalid', 'verify');
   }
-  if (payload.nonce !== opts.expectedNonce) throw new GoogleFlowError('google_id_token_invalid', 'verify-nonce');
+  if (payload.nonce !== opts.expectedNonce) {
+    throw new GoogleFlowError('google_id_token_invalid', 'verify-nonce');
+  }
   if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
     throw new GoogleFlowError('google_id_token_invalid', 'verify-sub');
   }

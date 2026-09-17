@@ -5,7 +5,7 @@
 // orchestration: claim assembly, just-in-time key_version fetch, error_code
 // mapping, and — the privacy crux — that the raw birthdate never reaches a
 // persistence sink or the request body.
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // vi.hoisted: these are referenced by the hoisted vi.mock factories below, so they
 // must be hoisted alongside (a plain const initializes too late — ReferenceError).
@@ -31,6 +31,29 @@ const USER_ID = '11111111-1111-4111-8111-111111111111';
 const BIRTH_YEAR = 2008;
 const adultSignal = { kind: 'birthdate' as const, year: BIRTH_YEAR, month: 1, day: 1 };
 
+// The clock AND the nonce are pinned. Both are LOAD-BEARING, not tidiness.
+//
+// The privacy assertion below scans the whole stringified body for the 4-digit
+// BIRTH_YEAR, so ANY field that can contain those digits is a false-positive
+// carrier. There are exactly two, and fixing only the loud one leaves the
+// suite flaky:
+//
+//   timestamp — epoch SECONDS from a live clock. 1789620088
+//     (2026-09-17T04:41:28Z) reads as 17896<2008>8 and failed CI on a
+//     ten-second window. ~1 run in 2,545.
+//   nonce — 64 hex chars from crypto.getRandomValues. Bytes 0x20,0x08 render
+//     as exactly "2008", so it collides on its own. Measured over 20M draws:
+//     0.094%, ~1 run in 1,065 — MORE likely than the timestamp, and it
+//     survived the first fix because that fix only addressed the clock.
+//
+// Both are pinned at the source rather than excluded from the scan, so the
+// assertion keeps its full breadth. setSystemTime pins Date.now() AND
+// new Date(), which evaluateAge reads — spying on Date.now alone left those
+// two clocks 244 days apart. 1768478400 contains no "2008" and 0xab yields a
+// nonce with no digits at all; re-check both if BIRTH_YEAR ever moves.
+const FIXED_NOW_MS = Date.UTC(2026, 0, 15, 12, 0, 0); // 2026-01-15T12:00:00Z -> epoch 1768478400
+const FIXED_NONCE_BYTE = 0xab; // -> "abab…", no decimal digits
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -55,6 +78,13 @@ function putCallBody(): Record<string, unknown> {
 describe('submitSignedAgeClaim', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.setSystemTime(FIXED_NOW_MS);
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(
+      <T extends ArrayBufferView | null>(buf: T): T => {
+        if (buf) new Uint8Array(buf.buffer).fill(FIXED_NONCE_BYTE);
+        return buf;
+      }
+    );
     mockUser.user = { id: USER_ID };
     mockE2EE.isInitialized = true;
     mockE2EE.signAgeClaim.mockResolvedValue('c2lnbmF0dXJlLWJhc2U2NA==');
@@ -62,6 +92,14 @@ describe('submitSignedAgeClaim', () => {
       getVersion: vi.fn().mockResolvedValue('0.1.65'),
     };
     defaultApi();
+  });
+
+  // The spies above are not self-restoring: vite.config.ts sets clearMocks: false
+  // and no restoreMocks, and tests/setup.ts only calls useRealTimers(). Cross-file
+  // safety currently rests on vitest's `isolate: true` DEFAULT, which this repo
+  // never sets explicitly — so turning isolation off for speed would leak these.
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('submits a well-formed claim and returns ok on 200', async () => {

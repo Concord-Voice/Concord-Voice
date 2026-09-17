@@ -3,10 +3,14 @@ import { resolveClientSecret, formatClientSecretJson } from './generate-google-c
 
 describe('resolveClientSecret', () => {
   it('prefers env var, trimmed', () => {
-    expect(resolveClientSecret({ GOOGLE_OAUTH_CLIENT_SECRET_DESKTOP: '  sek  ' }, null)).toBe('sek');
+    expect(resolveClientSecret({ GOOGLE_OAUTH_CLIENT_SECRET_DESKTOP: '  sek  ' }, null)).toBe(
+      'sek'
+    );
   });
   it('falls back to .env content', () => {
-    expect(resolveClientSecret({}, 'X=1\nGOOGLE_OAUTH_CLIENT_SECRET_DESKTOP=fromfile\n')).toBe('fromfile');
+    expect(resolveClientSecret({}, 'X=1\nGOOGLE_OAUTH_CLIENT_SECRET_DESKTOP=fromfile\n')).toBe(
+      'fromfile'
+    );
   });
   it('returns empty string when unset', () => {
     expect(resolveClientSecret({}, null)).toBe('');

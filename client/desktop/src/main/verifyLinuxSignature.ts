@@ -35,8 +35,7 @@ export type SigFetch = (url: string, options?: { cache?: 'no-store' }) => Promis
  *                     so distinguishing the message does not weaken the gate.
  */
 export type LinuxVerifyResult =
-  | { verified: true }
-  | { verified: false; reason: string; kind: 'tampered' | 'unavailable' };
+  { verified: true } | { verified: false; reason: string; kind: 'tampered' | 'unavailable' };
 
 /**
  * Verify a downloaded Linux update artifact against its detached Ed25519
