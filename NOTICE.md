@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-09-08
+**Generated:** 2026-09-16
 **MinIO distribution addendum updated:** 2026-07-12
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -168,7 +168,7 @@ current tree rather than a guarantee.
 | github.com/go-webauthn/x | v0.3.0 | BSD-3-Clause |
 | github.com/goccy/go-yaml | v1.19.2 | MIT |
 | github.com/golang-jwt/jwt/v5 | v5.3.1 | MIT |
-| github.com/golang-migrate/migrate/v4 | v4.19.1 | MIT |
+| github.com/golang-migrate/migrate/v4 | v4.20.1 | MIT |
 | github.com/google/go-tpm | v0.9.8 | Apache-2.0 |
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause |
 | github.com/gorilla/websocket | v1.5.3 | BSD-2-Clause |
@@ -201,13 +201,13 @@ current tree rather than a guarantee.
 | go.mongodb.org/mongo-driver/v2 | v2.9.0 | Apache-2.0 |
 | go.uber.org/atomic | v1.11.0 | MIT |
 | go.yaml.in/yaml/v3 | v3.0.5 | MIT |
-| golang.org/x/crypto | v0.56.0 | BSD-3-Clause |
-| golang.org/x/image | v0.45.0 | BSD-3-Clause |
+| golang.org/x/crypto | v0.57.0 | BSD-3-Clause |
+| golang.org/x/image | v0.46.0 | BSD-3-Clause |
 | golang.org/x/net | v0.58.0 | BSD-3-Clause |
 | golang.org/x/oauth2 | v0.36.0 | BSD-3-Clause |
-| golang.org/x/sync | v0.22.0 | BSD-3-Clause |
-| golang.org/x/sys | v0.47.0 | BSD-3-Clause |
-| golang.org/x/text | v0.41.0 | BSD-3-Clause |
+| golang.org/x/sync | v0.23.0 | BSD-3-Clause |
+| golang.org/x/sys | v0.48.0 | BSD-3-Clause |
+| golang.org/x/text | v0.42.0 | BSD-3-Clause |
 | google.golang.org/protobuf | v1.36.12 | BSD-3-Clause |
 | gopkg.in/ini.v1 | v1.67.3 | Apache-2.0 |
 
@@ -223,7 +223,7 @@ bundle (client/desktop):
 | @lukeed/csprng | 1.1.0 | MIT | https://github.com/lukeed/csprng |
 | @lukeed/uuid | 2.0.1 | MIT | https://github.com/lukeed/uuid |
 | @msgpack/msgpack | 3.1.3 | ISC | https://github.com/msgpack/msgpack-javascript |
-| @noble/hashes | 2.3.0 | MIT | https://github.com/paulmillr/noble-hashes |
+| @noble/hashes | 2.4.0 | MIT | https://github.com/paulmillr/noble-hashes |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/debug | 4.1.13 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/estree-jsx | 1.0.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
@@ -291,8 +291,8 @@ bundle (client/desktop):
 | is-fullwidth-code-point | 3.0.0 | MIT | https://github.com/sindresorhus/is-fullwidth-code-point |
 | is-hexadecimal | 2.0.1 | MIT | https://github.com/wooorm/is-hexadecimal |
 | is-plain-obj | 4.1.0 | MIT | https://github.com/sindresorhus/is-plain-obj |
-| jose | 6.2.10 | MIT | https://github.com/panva/jose |
-| js-yaml | 4.3.1 | MIT | https://github.com/nodeca/js-yaml |
+| jose | 6.2.12 | MIT | https://github.com/panva/jose |
+| js-yaml | 4.3.2 | MIT | https://github.com/nodeca/js-yaml |
 | jsonfile | 6.2.0 | MIT | https://github.com/jprichardson/node-jsonfile |
 | lazy-val | 1.0.5 | MIT | https://github.com/develar/lazy-val |
 | locate-path | 5.0.0 | MIT | https://github.com/sindresorhus/locate-path |
@@ -300,7 +300,7 @@ bundle (client/desktop):
 | lodash.isequal | 4.5.0 | MIT | https://github.com/lodash/lodash |
 | longest-streak | 3.1.0 | MIT | https://github.com/wooorm/longest-streak |
 | lowlight | 3.3.0 | MIT | https://github.com/wooorm/lowlight |
-| lucide-react | 1.38.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.43.0 | ISC | https://github.com/lucide-icons/lucide |
 | markdown-table | 3.0.4 | MIT | https://github.com/wooorm/markdown-table |
 | mdast-util-find-and-replace | 3.0.2 | MIT | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | mdast-util-from-markdown | 2.0.3 | MIT | https://github.com/syntax-tree/mdast-util-from-markdown |
@@ -428,7 +428,7 @@ bundle (services/media-plane):
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/node | 26.4.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/node | 26.5.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/triple-beam | 1.3.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |
@@ -555,7 +555,7 @@ bundle (services/media-plane):
 | triple-beam | 1.4.1 | MIT | https://github.com/winstonjs/triple-beam |
 | tweetnacl | 1.0.3 | Unlicense | https://github.com/dchest/tweetnacl-js |
 | type-is | 2.1.0 | MIT | https://github.com/jshttp/type-is |
-| undici-types | 8.3.0 | MIT | https://github.com/nodejs/undici |
+| undici-types | 8.9.0 | MIT | https://github.com/nodejs/undici |
 | unpipe | 1.0.0 | MIT | https://github.com/stream-utils/unpipe |
 | util-deprecate | 1.0.2 | MIT | https://github.com/TooTallNate/util-deprecate |
 | vary | 1.1.2 | MIT | https://github.com/jshttp/vary |
@@ -584,7 +584,7 @@ guarantee — do not read either table as covering the other.
 
 | Package | Version | License | Repository |
 |---|---|---|---|
-| lucide-react | 1.38.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.43.0 | ISC | https://github.com/lucide-icons/lucide |
 | react-dom | 19.2.8 | MIT | https://github.com/react/react |
 | react | 19.2.8 | MIT | https://github.com/react/react |
 | scheduler | 0.27.0 | MIT | https://github.com/facebook/react |
