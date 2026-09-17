@@ -157,7 +157,7 @@
   gap: 5px;
   margin-top: 16px;
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   text-decoration: none;
   transition: color 0.2s ease;
 }

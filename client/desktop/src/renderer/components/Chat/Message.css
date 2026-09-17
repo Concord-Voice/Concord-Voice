@@ -49,7 +49,7 @@
 .message-gutter-timestamp {
   display: none;
   font-size: calc(10px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   white-space: nowrap;
 }
 
@@ -121,18 +121,18 @@
 
 .message-timestamp {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .message-edited {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-style: italic;
 }
 
 .message-edited-inline {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-style: italic;
   margin-left: 4px;
 }
@@ -190,7 +190,7 @@
   border-radius: var(--radius-base);
   border: 1px solid color-mix(in srgb, var(--accent-primary) 15%, transparent);
   background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-style: normal;
 }
 

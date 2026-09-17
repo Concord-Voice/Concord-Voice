@@ -197,7 +197,7 @@
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.03em;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .subscription-feature-row.is-granted .subscription-feature-status {

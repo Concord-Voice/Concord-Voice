@@ -52,7 +52,7 @@
 }
 
 .mfa-tier-desc {
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-size: 13px;
   margin: 4px 0 8px;
   line-height: 1.4;
@@ -112,7 +112,7 @@
 
 .mfa-tier-lock-overlay {
   font-size: 12px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-style: italic;
 }
 
@@ -154,7 +154,7 @@
 }
 
 .mfa-recovery-only-hint {
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.4;
 }
@@ -167,7 +167,7 @@
 
 .mfa-recovery-only-preview {
   font-size: 12px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-style: italic;
   margin: 4px 0 0;
 }
@@ -208,7 +208,7 @@
 
 .mfa-credential-meta {
   font-size: 11px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
 }
 
 .mfa-action-hint {
@@ -238,7 +238,7 @@
 .mfa-backup-email-hint {
   display: block;
   font-size: 12px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   margin-bottom: 8px;
   line-height: 1.4;
 }
@@ -439,7 +439,7 @@
 
 .mfa-manual-entry {
   font-size: 13px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   cursor: pointer;
 }
 
@@ -488,7 +488,7 @@
 }
 
 .backup-code-number {
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-size: 12px;
   min-width: 16px;
 }
@@ -557,7 +557,7 @@
 
 .mfa-modal-alt {
   font-size: 12px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   margin: 0;
 }
 
@@ -628,7 +628,7 @@
 }
 
 .mfa-status-muted {
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-style: italic;
   font-weight: 400;
 }
@@ -642,7 +642,7 @@
 
 .btn-reset-danger {
   background: transparent;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   border: 1px solid var(--border-color, #444);
   padding: 3px 10px;
   font-size: 11px;
@@ -715,7 +715,7 @@
 
 .sso-toggle-warning {
   font-size: 12px;
-  color: var(--text-muted, #888);
+  color: var(--text-secondary);
   margin: 0 0 0 56px;
   line-height: 1.4;
 }

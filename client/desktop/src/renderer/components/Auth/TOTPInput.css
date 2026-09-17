@@ -48,7 +48,7 @@
 .totp-backup-link {
   background: none;
   border: none;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-size: 13px;
   cursor: pointer;
   text-decoration: underline;
@@ -133,13 +133,13 @@
 
 .mfa-method-picker-desc {
   font-size: 11px;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
 }
 
 .mfa-choose-another {
   background: none;
   border: none;
-  color: var(--text-tertiary, #999);
+  color: var(--text-secondary);
   font-size: 13px;
   cursor: pointer;
   text-decoration: underline;

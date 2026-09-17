@@ -16,7 +16,7 @@
 }
 
 .voice-stage__empty-text {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(14px * var(--font-scale, 1));
 }
 
@@ -277,7 +277,7 @@
 
 .voice-stage__paused-hint {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted, #888);
+  color: var(--text-secondary);
   line-height: 1.4;
   max-width: 340px;
 }

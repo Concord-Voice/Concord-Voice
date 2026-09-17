@@ -7,6 +7,8 @@ import {
   contrastColor,
   isValidHex,
   deriveThemeVariables,
+  liftToContrast,
+  contrastRatio,
   applyCustomThemeVariables,
   clearCustomThemeVariables,
   type CustomColors,
@@ -301,6 +303,52 @@ describe('deriveThemeVariables', () => {
       const darkAccentL = hexToHsl(darkVars['--accent-primary']).l;
       const lightAccentL = hexToHsl(vars['--accent-primary']).l;
       expect(lightAccentL).toBeLessThan(darkAccentL);
+    });
+  });
+
+  describe('liftToContrast — direction and fallback', () => {
+    const SURFACES_DARK = ['#0d0821', '#150d35', '#1d124a', '#1a1042', '#201452'];
+    const worstAgainst = (c: string, surfaces: string[]) =>
+      Math.min(...surfaces.map((s) => contrastRatio(c, s)));
+
+    it('clears the floor searching the preferred direction on a clustered dark ladder', () => {
+      const got = liftToContrast('#5a4a9a', SURFACES_DARK, 4.6, true);
+      expect(worstAgainst(got, SURFACES_DARK)).toBeGreaterThanOrEqual(4.6);
+    });
+
+    it('retries the opposite direction when the preferred one cannot reach the floor', () => {
+      // A light background under dark mode: every surface is near-white, so towardsLight
+      // is unsatisfiable. Returning '#ffffff' anyway was a 1:1 fail-open (white on white).
+      const surfaces = ['#ffffff', '#ffffff', '#ffffff', '#ffffff', '#ffffff'];
+      const got = liftToContrast('#ffffff', surfaces, 4.6, true);
+      expect(got).not.toBe('#ffffff');
+      const w = worstAgainst(got, surfaces);
+      expect(w).toBeGreaterThanOrEqual(4.6);
+      // Bounded ABOVE deliberately. Without this the test is vacuous: deleting the reverse
+      // search still leaves the unsatisfiable-fallback, which returns '#000000' at 21:1 and
+      // satisfies every other assertion here. The reverse SEARCH stops at the first candidate
+      // that clears the floor, so it lands just above it — 21:1 means the search never ran.
+      expect(w).toBeLessThan(8);
+      expect(got).not.toBe('#000000');
+    });
+
+    it('returns the best candidate SEEN when the floor is unreachable, not a fixed extreme', () => {
+      // Surfaces straddling the full luminance range: both extremes score 1:1 while an
+      // interior grey scores ~4.5. An extremes-only fallback returns the WORST value here,
+      // so the optimum is not always at an extreme — it is only so while surfaces cluster.
+      const surfaces = ['#000000', '#ffffff'];
+      const got = liftToContrast('#808080', surfaces, 4.6, true);
+      const extremesOnly = Math.max(
+        worstAgainst('#ffffff', surfaces),
+        worstAgainst('#000000', surfaces)
+      );
+      expect(extremesOnly).toBeCloseTo(1, 1);
+      expect(worstAgainst(got, surfaces)).toBeGreaterThan(4);
+    });
+
+    it('returns the seed untouched when it already clears the floor', () => {
+      const seed = '#ffffff';
+      expect(liftToContrast(seed, SURFACES_DARK, 4.6, true)).toBe(seed);
     });
   });
 });

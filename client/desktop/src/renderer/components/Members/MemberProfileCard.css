@@ -144,7 +144,7 @@
 
 .member-profile-username {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-top: 2px;
 }
 
@@ -173,7 +173,7 @@
 .member-profile-detail-label {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -193,7 +193,7 @@
 
 .member-profile-detail-value.status-offline,
 .member-profile-detail-value.status-invisible {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .member-profile-now {
@@ -362,7 +362,7 @@
 .send-friend-request-btn--inert {
   background: var(--bg-tertiary);
   border-color: var(--border-color);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: default;
 }
 

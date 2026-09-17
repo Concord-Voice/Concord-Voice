@@ -293,7 +293,7 @@
   align-items: center;
   gap: calc(6px * var(--sp, 1));
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .server-bar-tooltip-dot {
@@ -305,7 +305,7 @@
 }
 
 .server-bar-tooltip-voice {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .server-bar-tooltip-voice--active {
@@ -331,7 +331,7 @@
   justify-content: center;
   cursor: pointer;
   transition: all 0.2s ease;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   flex-shrink: 0;
   padding: 0;
 }

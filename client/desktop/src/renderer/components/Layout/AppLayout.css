@@ -350,7 +350,7 @@
   padding: 4px;
   border: 0;
   background: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   border-radius: 4px;
   transition:
@@ -395,7 +395,7 @@
   overflow: hidden;
   background-color: var(--bg-tertiary);
   border: 1px solid var(--border-color);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   transition:
     width var(--motion-duration-fast) var(--motion-curve-base),

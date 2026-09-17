@@ -122,6 +122,23 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **The quieter text throughout the app is now readable** ([#3341](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3341)) — timestamps,
+  hints, subtitles, secondary labels and the small notices the app adds to a conversation were
+  drawn in a colour that sat well below the contrast the accessibility guidelines ask for on
+  body text — in some themes far enough below that it was closer to the panel behind it than to
+  anything you could read. All of that text now uses the same quieter-but-legible colour the app
+  already used elsewhere, so it stays visibly secondary to what people actually typed without
+  disappearing into the background. Worth knowing what did NOT change: icons, chevrons, spinners
+  and status glyphs keep the dimmer colour, because the guidelines ask less of a symbol than of
+  a sentence and those were never the hard-to-read part. Custom themes are covered too — the
+  colours they derive from your chosen background are now calculated to clear the same bar
+  instead of being a fixed step away from it, which for most backgrounds was not far enough.
+  That calculation also handles a pairing it used to get badly wrong: a light background chosen
+  while the app is set to dark. The colour picker and the light/dark switch are independent, so
+  it is an easy combination to land on, and the quieter text came out white on a white panel —
+  present, but completely unreadable. It now looks for a readable colour in whichever direction
+  actually has room, rather than only the one the dark setting implies.
+
 - **Midnight Sky's quieter text is no longer too faint to read on raised panels** ([#3335](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3335)) — Midnight
   Sky uses a second, softer text colour for the things that should not shout: hints, subtitles,
   secondary button labels, and the small notices the app adds to a conversation. On the darker

@@ -90,7 +90,7 @@
 .user-popover-email {
   padding: 2px 12px 6px;
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -112,7 +112,7 @@
 .user-popover-status-label {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   padding: 4px 12px 6px;

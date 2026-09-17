@@ -55,7 +55,7 @@
   border: none;
   border-radius: 6px;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   transition:
     background-color 120ms ease,

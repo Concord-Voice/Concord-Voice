@@ -50,7 +50,7 @@
   justify-content: center;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 4px;
   border-radius: 4px;
@@ -248,7 +248,7 @@
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
   line-height: 1;
   cursor: pointer;
@@ -276,7 +276,7 @@
 }
 
 .category-manager .channel-form-hint {
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
   line-height: 1.4;
 }
@@ -335,7 +335,7 @@
 }
 
 .category-manager-empty {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   padding: 40px;
   text-align: center;
 }
@@ -369,7 +369,7 @@
 .category-delete-confirm p {
   margin: 0 0 16px;
   font-size: 13px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .category-delete-confirm-actions {

@@ -273,7 +273,7 @@ const ServerSettingsPage: React.FC<ServerSettingsPageProps> = ({ serverId }) => 
       <div className="view-container settings-fullpage">
         <div className="settings-page-content">
           <div className="settings-page-inner">
-            <p style={{ color: 'var(--text-muted)', textAlign: 'center', padding: '40px' }}>
+            <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '40px' }}>
               Server not found.
             </p>
           </div>

@@ -250,7 +250,7 @@
   border: 1.5px dashed var(--border-color);
   background: transparent;
   cursor: pointer;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   transition: all 0.15s ease;
   flex-shrink: 0;
 }

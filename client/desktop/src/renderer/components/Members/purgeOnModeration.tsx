@@ -90,7 +90,7 @@ export function PurgeMessagesOptIn({
       {checked && (
         <p
           style={{
-            color: 'var(--text-muted)',
+            color: 'var(--text-secondary)',
             fontSize: 'calc(12px * var(--font-scale, 1))',
             margin: '6px 0 0',
           }}

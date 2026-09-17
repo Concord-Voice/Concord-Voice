@@ -134,7 +134,7 @@
 
 .presence-history__item-header time,
 .presence-history__item-end {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .presence-history__payload,

@@ -62,7 +62,7 @@
 
 .send-to-friend-modal__status {
   font-size: 0.75rem;
-  color: var(--text-muted, #949ba4);
+  color: var(--text-secondary);
 }
 
 .send-to-friend-modal__error {
@@ -74,5 +74,5 @@
 .send-to-friend-modal__empty {
   margin: 8px 0;
   font-size: 0.875rem;
-  color: var(--text-muted, #949ba4);
+  color: var(--text-secondary);
 }

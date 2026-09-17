@@ -161,7 +161,7 @@
 }
 
 .member-list-search-input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .member-list-search-input:focus {
@@ -205,7 +205,7 @@
 .member-group-header span {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-family: var(--font-display-stack); /* category header (#1034) */
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -426,7 +426,7 @@
 
 .member-custom-status-text {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -477,7 +477,7 @@
 .member-list-error p,
 .member-list-empty p {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-bottom: calc(8px * var(--sp, 1));
 }
 

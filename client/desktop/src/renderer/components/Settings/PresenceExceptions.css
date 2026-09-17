@@ -30,7 +30,7 @@
 .presence-exception-unavailable,
 .presence-exceptions__live {
   margin: 0;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
   line-height: 1.5;
 }
@@ -76,7 +76,7 @@
 .presence-exceptions__list small,
 .presence-exception-option small {
   overflow: hidden;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -195,7 +195,7 @@
 
 .presence-exception-dialog__header p {
   margin: 5px 0 0;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
 }
 
@@ -302,7 +302,7 @@
   gap: 16px;
   padding: 14px 20px;
   border-top: 1px solid var(--border-color);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
 }
 

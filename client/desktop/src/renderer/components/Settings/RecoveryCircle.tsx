@@ -234,7 +234,7 @@ const RecoveryCircle: React.FC<RecoveryCircleProps> = ({ onComplete, onCancel })
             style={{ width: '100%' }}
             disabled={selectedContacts.length < 2}
           />
-          <p style={{ color: 'var(--text-tertiary, #718096)', fontSize: 12, margin: '4px 0 0' }}>
+          <p style={{ color: 'var(--text-secondary)', fontSize: 12, margin: '4px 0 0' }}>
             Select at least 2 contacts (max 7). Threshold must be at least 2.
           </p>
         </div>
@@ -249,7 +249,7 @@ const RecoveryCircle: React.FC<RecoveryCircleProps> = ({ onComplete, onCancel })
           }}
         >
           {friends.length === 0 ? (
-            <p style={{ color: 'var(--text-tertiary)', textAlign: 'center', padding: 16 }}>
+            <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: 16 }}>
               No friends found. Add friends to set up a recovery circle.
             </p>
           ) : (
@@ -276,7 +276,7 @@ const RecoveryCircle: React.FC<RecoveryCircleProps> = ({ onComplete, onCancel })
                 <span style={{ color: 'var(--text-primary)' }}>
                   {friend.displayName || friend.username}
                 </span>
-                <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>
+                <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
                   @{friend.username}
                 </span>
               </label>

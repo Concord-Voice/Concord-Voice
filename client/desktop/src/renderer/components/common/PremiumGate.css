@@ -21,9 +21,11 @@
    Scope the receding treatment to the first child (NOT the chip) via a child
    combinator so it applies whether the control was cloned or wrapped. */
 .premium-gate > :first-child {
-  /* Receded treatment via a SOLID muted token at FULL opacity (P1) — the locked
-     text never drops below the 4.5:1 contrast floor that `opacity:0.5` would. */
-  color: var(--text-muted);
+  /* Receded treatment via a SOLID dimmer token at FULL opacity (P1) — the locked
+     text never drops below the 4.5:1 contrast floor that `opacity:0.5` would.
+     --text-secondary, not a graphical token: this paints a sentence, so SC 1.4.3
+     applies and only the secondary tier clears 4.5:1 on every surface. */
+  color: var(--text-secondary);
 }
 
 /* Per-mode receding. All three keep full opacity + full pointer reachability;

@@ -608,7 +608,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 <p style={{ color: 'var(--text-secondary)', marginTop: 12 }}>
                   Waiting for approval from your trusted device...
                 </p>
-                <p style={{ color: 'var(--text-tertiary, #718096)', fontSize: 13 }}>
+                <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
                   Open Concord on your trusted device and approve the recovery request.
                 </p>
               </div>
@@ -641,7 +641,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
                 <p style={{ color: 'var(--text-primary)', fontSize: 18, fontWeight: 600 }}>
                   {socialSharesReceived} / {socialThreshold} shares received
                 </p>
-                <p style={{ color: 'var(--text-tertiary, #718096)', fontSize: 13 }}>
+                <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
                   Your contacts need to open Concord and approve your recovery request. This may
                   take up to 24 hours.
                 </p>

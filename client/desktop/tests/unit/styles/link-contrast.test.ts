@@ -80,10 +80,15 @@ const CONTRAST_PAIRS: readonly ContrastPair[] = [
     standard: 'WCAG AA text',
   },
   {
+    // --text-muted stopped being a TEXT colour: every rule that painted text with it
+    // now uses --text-secondary, and it survives only on icons, chevrons, spinners and
+    // status glyphs. Those are non-text contrast targets, so SC 1.4.11's 3:1 is the
+    // correct floor here — asserting 4.5 would demand a legibility standard that does
+    // not apply and that this palette provably cannot seat (see the migration commit).
     foreground: '--text-muted',
     background: '--bg-primary',
-    threshold: WCAG_AA_THRESHOLD,
-    standard: 'WCAG AA text',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
   },
   {
     foreground: '--link-color',
@@ -180,35 +185,6 @@ type KnownNoncompliantContrast = {
  * lists keep that debt explicit without repeating one object per failure.
  */
 const KNOWN_NONCOMPLIANT_BLOCKS: readonly KnownNoncompliantContrast[] = [
-  {
-    foreground: '--text-muted',
-    background: '--bg-primary',
-    issue: '#1183',
-    blocks: [
-      "[data-theme='light']",
-      "[data-scheme='concord'][data-theme='light']",
-      "[data-scheme='morky']",
-      "[data-scheme='morky'][data-theme='light']",
-      "[data-scheme='bardic']",
-      "[data-scheme='bardic'][data-theme='light']",
-      "[data-scheme='foxden']",
-      "[data-scheme='foxden'][data-theme='light']",
-      "[data-scheme='hacker']",
-      "[data-scheme='spooky']",
-      "[data-scheme='spooky'][data-theme='light']",
-      "[data-scheme='leviathan']",
-      "[data-scheme='leviathan'][data-theme='light']",
-      "[data-scheme='grassynill']",
-      "[data-scheme='grassynill'][data-theme='light']",
-      "[data-scheme='driftwood']",
-      "[data-scheme='driftwood'][data-theme='light']",
-      "[data-scheme='eclipse']",
-      "[data-scheme='midnightsky']",
-      "[data-scheme='midnightsky'][data-theme='light']",
-      "[data-scheme='agency']",
-      "[data-scheme='pride'][data-theme='light']",
-    ],
-  },
   {
     foreground: '--link-color',
     background: '--bg-secondary',

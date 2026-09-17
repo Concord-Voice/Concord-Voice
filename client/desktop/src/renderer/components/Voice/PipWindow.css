@@ -46,7 +46,7 @@
   border: none;
   border-radius: 4px;
   background: transparent;
-  color: var(--text-muted, #949ba4);
+  color: var(--text-secondary);
   cursor: pointer;
   -webkit-app-region: no-drag;
   transition:
@@ -87,7 +87,7 @@
 }
 
 .pip-empty {
-  color: var(--text-muted, #949ba4);
+  color: var(--text-secondary);
   font-size: 12px;
   text-align: center;
 }
@@ -153,7 +153,7 @@
 .pip-controls-status {
   text-align: center;
   font-size: 10px;
-  color: var(--text-muted, #949ba4);
+  color: var(--text-secondary);
   padding: 0 8px 6px;
   flex-shrink: 0;
 }
@@ -177,7 +177,7 @@
 }
 
 .pip-screen-placeholder__sub {
-  color: var(--text-muted, #949ba4);
+  color: var(--text-secondary);
   font-size: 11px;
 }
 

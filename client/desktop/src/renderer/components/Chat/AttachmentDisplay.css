@@ -47,7 +47,7 @@
   justify-content: center;
   min-width: 120px;
   min-height: 80px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 .attachment-error {
@@ -108,7 +108,7 @@
 
 .attachment-load-meta {
   font-size: 11px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -147,7 +147,7 @@
 
 .attachment-file-size {
   font-size: 11px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 .attachment-download-btn {

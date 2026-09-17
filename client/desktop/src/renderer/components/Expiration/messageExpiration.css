@@ -15,7 +15,7 @@
   outline-color: currentColor;
 }
 .message-expiration-stops .settings-tier-label.message-expiration-stop[aria-disabled='true'] {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: default;
 }
 .chat-header .chat-header-search-button.message-expiration-header-action {

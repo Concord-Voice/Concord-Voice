@@ -51,7 +51,7 @@
 .syntax-help-modal header button {
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   font-size: 1.25rem;
   line-height: 1;
@@ -103,5 +103,5 @@
 .syntax-help-modal footer {
   margin-top: 14px;
   font-size: 0.85rem;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }

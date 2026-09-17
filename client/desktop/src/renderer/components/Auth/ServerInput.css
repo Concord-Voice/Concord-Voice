@@ -97,7 +97,7 @@
 }
 
 .server-url-input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* Reserve one line so the region does not grow from zero when the first message

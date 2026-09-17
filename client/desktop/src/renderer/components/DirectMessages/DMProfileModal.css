@@ -137,7 +137,7 @@
 
 .dm-profile-modal-username {
   font-size: 14px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-top: 2px;
 }
 
@@ -153,7 +153,7 @@
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.5px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-bottom: 8px;
 }
 
@@ -165,7 +165,7 @@
 }
 
 .dm-profile-modal-detail-label {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .dm-profile-modal-detail-value {

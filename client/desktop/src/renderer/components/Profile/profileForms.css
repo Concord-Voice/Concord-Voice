@@ -74,12 +74,12 @@
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .profile-avatar-placeholder-text {
   font-size: calc(10px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .profile-avatar-actions {
@@ -144,7 +144,7 @@
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
 }
 
@@ -187,7 +187,7 @@
   border-radius: 6px;
   background: none;
   border: 1px solid var(--border-color);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -206,7 +206,7 @@
   background: none;
   border: 1px dashed var(--border-color);
   border-radius: 8px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
   font-family: 'SourceSans', sans-serif;
   cursor: pointer;
@@ -316,7 +316,7 @@
 /* Member since */
 .profile-member-since {
   font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-top: 16px;
   padding-top: 16px;
   border-top: 1px solid var(--border-color);
@@ -352,7 +352,7 @@
 /* L8: the username-cadence premium upsell appended to the existing form hint.
    Full-opacity legible text — the word "Premium" carries the signal (P2). */
 .username-cadence-upsell {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-weight: 600;
 }
 

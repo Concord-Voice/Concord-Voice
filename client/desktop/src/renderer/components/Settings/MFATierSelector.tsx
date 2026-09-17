@@ -733,7 +733,7 @@ const MFATierSelector: React.FC<MFATierSelectorProps> = ({
                   <span style={{ color: 'var(--text-primary)', fontSize: 14 }}>
                     {device.device_name}
                   </span>
-                  <span style={{ color: 'var(--text-tertiary, #718096)', fontSize: 12 }}>
+                  <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
                     {new Date(device.designated_at).toLocaleDateString()}
                   </span>
                 </div>

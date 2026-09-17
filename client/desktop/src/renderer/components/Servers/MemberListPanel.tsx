@@ -342,7 +342,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
                 {assignableRoles.length === 0 && (
                   <span
                     style={{
-                      color: 'var(--text-muted)',
+                      color: 'var(--text-secondary)',
                       fontSize: 'calc(12px * var(--font-scale, 1))',
                     }}
                   >
@@ -354,7 +354,7 @@ const MemberListPanel: React.FC<MemberListPanelProps> = ({
           );
         })}
         {members.length === 0 && (
-          <li style={{ color: 'var(--text-muted)', padding: '40px', textAlign: 'center' }}>
+          <li style={{ color: 'var(--text-secondary)', padding: '40px', textAlign: 'center' }}>
             No members found.
           </li>
         )}

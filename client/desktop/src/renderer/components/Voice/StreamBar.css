@@ -136,6 +136,6 @@
 
 .stream-thumbnail__paused-text {
   font-size: calc(10px * var(--font-scale, 1));
-  color: var(--text-muted, #888);
+  color: var(--text-secondary);
   font-weight: 500;
 }

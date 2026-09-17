@@ -62,13 +62,13 @@
 
 .bug-report-input::placeholder,
 .bug-report-textarea::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .bug-report-counter {
   align-self: flex-end;
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
 
@@ -100,7 +100,7 @@
   margin: 0;
   font-size: calc(12px * var(--font-scale, 1));
   line-height: 1.5;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   border-radius: 6px;

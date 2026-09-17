@@ -35,7 +35,7 @@
 .settings-preview-label {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
@@ -52,7 +52,7 @@
   display: flex;
   gap: 6px;
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-bottom: 4px;
   /* Discord-style left border to indicate a quoted parent. */
   border-left: 2px solid var(--accent-primary);

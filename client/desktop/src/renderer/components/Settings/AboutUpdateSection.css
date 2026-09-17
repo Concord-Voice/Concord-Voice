@@ -114,7 +114,7 @@
 
 .about-third-party-item {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   line-height: 1.5;
 }
 
@@ -164,7 +164,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 400;
@@ -209,7 +209,7 @@
 
 .about-setting-description {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   line-height: 1.4;
 }
 
@@ -248,7 +248,7 @@
 
 .about-update-last-checked {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 /* ─── Update status panel ──────────────────────────────────────────── */
@@ -351,5 +351,5 @@
 
 .about-update-progress-detail {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }

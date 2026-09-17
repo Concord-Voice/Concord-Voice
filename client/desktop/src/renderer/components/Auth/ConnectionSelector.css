@@ -232,7 +232,7 @@
 .footer-link {
   all: unset;
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   transition: color 0.15s ease;
 }
@@ -253,5 +253,5 @@
 }
 
 .footer-separator {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }

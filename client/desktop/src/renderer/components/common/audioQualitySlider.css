@@ -33,7 +33,7 @@
 .settings-tier-label {
   flex: 1;
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 2px 0;
   transition: all 0.15s ease;
@@ -219,7 +219,7 @@
 /* L1: a premium audio-tier label. Receded via a solid muted colour (full
    opacity), with a trailing lock glyph. Stays clickable to explain the lock. */
 .settings-tier-label-locked {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .settings-tier-lock-glyph {

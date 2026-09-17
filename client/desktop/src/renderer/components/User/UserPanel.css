@@ -224,7 +224,7 @@
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 500;
   line-height: 1.3;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .user-panel-status.online {
@@ -237,7 +237,7 @@
 
 .user-panel-status.invisible,
 .user-panel-status.offline {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Settings Button ─────────────────────────────────────────────────────── */
@@ -251,7 +251,7 @@
   border-radius: 6px;
   border: none;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   flex-shrink: 0;
   transition: all 0.15s ease;

@@ -62,7 +62,7 @@
   border: 1px dashed var(--border-color, rgba(255, 255, 255, 0.1));
   background: transparent;
   cursor: pointer;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   opacity: 0;
   transition:
     opacity 0.15s ease,

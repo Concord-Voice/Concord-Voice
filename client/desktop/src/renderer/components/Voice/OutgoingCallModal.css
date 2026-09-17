@@ -65,7 +65,7 @@
 }
 
 .outgoing-call-modal__declinee {
-  color: var(--text-muted, #777);
+  color: var(--text-secondary);
   text-decoration: line-through;
 }
 

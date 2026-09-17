@@ -31,7 +31,7 @@
 
 .feature-request-optional {
   font-weight: 400;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .feature-request-input,
@@ -75,13 +75,13 @@
 
 .feature-request-input::placeholder,
 .feature-request-textarea::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .feature-request-counter {
   align-self: flex-end;
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
 

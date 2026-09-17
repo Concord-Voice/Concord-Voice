@@ -10,7 +10,7 @@
 
 .typing-indicator-text {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-weight: 500;
   display: flex;
   align-items: center;

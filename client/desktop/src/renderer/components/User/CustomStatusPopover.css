@@ -86,7 +86,7 @@
 .custom-status-emoji-remove {
   border: none;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
   cursor: pointer;
   padding: 0;
@@ -100,7 +100,7 @@
 .custom-status-counter {
   margin-left: auto;
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
 
@@ -133,7 +133,7 @@
 .custom-status-clear-btn {
   border: 1px solid var(--border-color);
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .custom-status-clear-btn:hover:not(:disabled) {

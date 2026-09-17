@@ -74,7 +74,7 @@
 .change-email-form .buttons button[type='button'] {
   background: none;
   border: none;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-size: 13px;
   cursor: pointer;
   padding: 4px 8px;

@@ -65,7 +65,7 @@
 }
 
 .feedback-panel-placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
   font-style: italic;
 }
@@ -111,7 +111,7 @@
 }
 
 .feedback-submit-status {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
 }
 

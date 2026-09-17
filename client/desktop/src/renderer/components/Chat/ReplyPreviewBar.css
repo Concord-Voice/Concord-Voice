@@ -47,7 +47,7 @@
 .reply-preview-cancel {
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 2px;
   margin-left: auto;
@@ -82,7 +82,7 @@
 /* Deleted message styling */
 .reply-deleted .reply-preview-snippet {
   font-style: italic;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .reply-deleted .reply-preview-indicator {

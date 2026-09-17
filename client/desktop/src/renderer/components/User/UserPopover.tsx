@@ -27,14 +27,18 @@ const statusOptions: Array<{
 }> = [
   { value: 'online', label: 'Online', color: 'var(--status-connected)' },
   { value: 'dnd', label: 'Do Not Disturb', color: 'var(--status-disconnected)' },
+  // Painted as backgroundColor on .user-popover-status-dot — a graphical object, so the
+  // dim token is correct here (SC 1.4.11, 3:1). Not text; do not migrate.
   { value: 'invisible', label: 'Invisible', color: 'var(--text-muted)' },
 ];
 
+// Painted as `color` on .user-popover-status — the visible status label, so SC 1.4.3's
+// 4.5:1 applies and the dim tokens may not appear here.
 const statusColorMap: Record<PresenceStatus, string> = {
   online: 'var(--status-connected)',
   dnd: 'var(--status-disconnected)',
-  invisible: 'var(--text-muted)',
-  offline: 'var(--text-muted)',
+  invisible: 'var(--text-secondary)',
+  offline: 'var(--text-secondary)',
 };
 
 const statusLabelMap: Record<PresenceStatus, string> = {

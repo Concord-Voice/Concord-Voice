@@ -68,7 +68,7 @@
 
 .update-banner__btn.dismiss {
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   padding: 4px;
   display: flex;
   align-items: center;

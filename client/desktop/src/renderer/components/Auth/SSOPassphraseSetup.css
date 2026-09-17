@@ -78,7 +78,7 @@
 
 .sso-passphrase-setup__hint {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .sso-passphrase-setup__success {

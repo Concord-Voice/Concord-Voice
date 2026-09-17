@@ -63,7 +63,7 @@ function calculateStrength(password: string): StrengthResult {
     return {
       score: 0,
       label: 'No password',
-      color: 'var(--text-muted)',
+      color: 'var(--text-secondary)',
       feedback: ['Enter a password'],
     };
   }

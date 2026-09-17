@@ -122,7 +122,7 @@
 .attachment-preview-size {
   display: block;
   font-size: 10px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 /* MEASURED, not assumed. --text-tertiary on --bg-secondary ranges 1.70:1

@@ -23,7 +23,7 @@
   padding: calc(8px * var(--sp, 1)) 0 calc(6px * var(--sp, 1));
   background: transparent;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 500;
   cursor: pointer;
@@ -211,6 +211,6 @@
 
 .invite-popup-hint {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-align: center;
 }

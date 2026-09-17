@@ -189,6 +189,110 @@ export function isValidHex(hex: string): boolean {
   return /^#[0-9a-fA-F]{6}$/.test(hex);
 }
 
+/** WCAG 2.1 contrast ratio between two hex colours. */
+export function contrastRatio(a: string, b: string): number {
+  const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/**
+ * Move `seed` away from `surfaces` until it clears `floor` against every one of them.
+ *
+ * A FIXED lightness offset cannot guarantee a contrast RATIO: the offset a colour needs
+ * depends on the base it is derived from, so `lighten(bg, 55)` lands anywhere between
+ * compliant and badly short depending on the user's background. Measured over 567 sampled
+ * dark backgrounds, the old constants left --text-secondary below 4.5:1 on 60% of them and
+ * --text-tertiary below 3:1 on ALL of them, and no fixed replacement constant existed —
+ * the sweep for one returned nothing at any value up to 100.
+ *
+ * Hue and saturation are preserved while lightness alone moves. If lightness alone cannot
+ * reach the floor (a saturated hue can cap out before it does), saturation is released as
+ * a second pass, because a greyscale fallback is always reachable: pure white and pure
+ * black bound every possible surface.
+ */
+export function liftToContrast(
+  seed: string,
+  surfaces: readonly string[],
+  floor: number,
+  towardsLight: boolean
+): string {
+  const worst = (c: string) => Math.min(...surfaces.map((s) => contrastRatio(c, s)));
+  if (worst(seed) >= floor) return seed;
+  const hsl = hexToHsl(seed);
+
+  // `towardsLight` is a PREFERENCE derived from the theme mode, never a fact about the
+  // surfaces. A custom theme sets its background and its light/dark toggle independently
+  // (settingsStore passes the user's own customColors with isDark from resolveTheme), so a
+  // light background under dark mode is reachable — and then every surface is near-white
+  // and no lighter colour can clear the floor. Searching one direction and returning
+  // '#ffffff' anyway is a fail-open that reads as 1:1: white text on a white surface.
+  // So try the preferred direction first, then the opposite one. --text-primary has always
+  // done the equivalent through contrastColor(), which picks by luminance rather than mode.
+  const forward = searchDirection(hsl, floor, towardsLight, worst);
+  if (forward.hit) return forward.hit;
+  const reverse = searchDirection(hsl, floor, !towardsLight, worst);
+  if (reverse.hit) return reverse.hit;
+
+  // Nothing clears the floor. Return the best-scoring candidate SEEN, including the two
+  // extremes — never a fixed extreme. An earlier revision returned
+  // `worst('#ffffff') >= worst('#000000') ? '#ffffff' : '#000000'` and justified it by
+  // claiming the optimum is always at an extreme. That is true only while the surfaces are
+  // CLUSTERED, which the two production callers are (bg .. lighten(bg, 12)). When they
+  // straddle a wide luminance range the shape inverts: against ['#000000', '#ffffff'] both
+  // extremes score 1.00 while an interior grey scores ~4.5, so the extremes-only comparison
+  // returns the WORST available value rather than the best.
+  // Seeded with `forward` rather than left to reduce's implicit first element: S6959 asks for
+  // an initial value, and naming this one keeps the fold order and the strict `>` intact, so a
+  // score tie still resolves to the earliest candidate exactly as before.
+  return [reverse, probe('#ffffff', worst), probe('#000000', worst)].reduce(
+    (a, b) => (b.score > a.score ? b : a),
+    forward
+  ).best;
+}
+
+interface DirectionProbe {
+  /** A candidate that cleared the floor, or null when the direction ran out. */
+  hit: string | null;
+  /** The highest-scoring candidate seen, used only when nothing cleared the floor. */
+  best: string;
+  score: number;
+}
+
+function probe(hex: string, worst: (c: string) => number): DirectionProbe {
+  return { hit: null, best: hex, score: worst(hex) };
+}
+
+/**
+ * Walk lightness away from `hsl` in one direction until the whole surface set clears
+ * `floor`, or the direction runs out. Returns null rather than a best effort, so the
+ * caller can try the other direction instead of shipping a value that misses the floor.
+ */
+function searchDirection(
+  hsl: HSL,
+  floor: number,
+  towards: boolean,
+  worst: (c: string) => number
+): DirectionProbe {
+  // Preserve the seed's saturation first, then retry desaturated: a grey reaches contrast
+  // a saturated hue cannot at the same lightness. `i` starts at 0 for both passes — for the
+  // saturated one that reproduces the seed, which the caller has already ruled out.
+  let best = towards ? '#ffffff' : '#000000';
+  let score = -1;
+  for (const s of [hsl.s, 0]) {
+    for (let i = 0; i <= 100; i++) {
+      const l = towards ? Math.min(100, hsl.l + i) : Math.max(0, hsl.l - i);
+      const cand = hslToHex({ h: hsl.h, s, l });
+      const w = worst(cand);
+      if (w >= floor) return { hit: cand, best: cand, score: w };
+      if (w > score) {
+        best = cand;
+        score = w;
+      }
+    }
+  }
+  return { hit: null, best, score };
+}
+
 // ─── Theme Derivation ────────────────────────────────────────────────────────
 
 export function deriveThemeVariables(colors: CustomColors, isDark: boolean): DerivedThemeVariables {
@@ -202,6 +306,7 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
   const bg = colors.background;
   const a1 = colors.accentPrimary;
   const a2 = colors.accentSecondary;
+  const darkSurfaces = [bg, lighten(bg, 5), lighten(bg, 10), lighten(bg, 8), lighten(bg, 12)];
 
   return {
     '--bg-primary': bg,
@@ -210,9 +315,11 @@ function deriveDark(colors: CustomColors): DerivedThemeVariables {
     '--bg-hover': lighten(bg, 8),
     '--bg-active': lighten(bg, 12),
     '--text-primary': contrastColor(bg),
-    '--text-secondary': lighten(bg, 55),
-    '--text-muted': lighten(bg, 35),
-    '--text-tertiary': lighten(bg, 25),
+    // 4.6 for the text tier (SC 1.4.3 + headroom); 3.2 for the two graphical tiers,
+    // which no longer paint text and are judged by SC 1.4.11's 3:1 instead.
+    '--text-secondary': liftToContrast(lighten(bg, 55), darkSurfaces, 4.6, true),
+    '--text-muted': liftToContrast(lighten(bg, 35), darkSurfaces, 3.2, true),
+    '--text-tertiary': liftToContrast(lighten(bg, 25), darkSurfaces, 3.2, true),
     '--accent-primary': a1,
     '--accent-secondary': a2,
     '--accent-hover': lighten(a1, 15),
@@ -252,6 +359,13 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
   // Slightly darker accents for contrast on light bg
   const lightA1 = darken(a1, 8);
   const lightA2 = darken(a2, 8);
+  const lightSurfaces = [
+    bgLight,
+    lighten(bgLight, 2),
+    darken(bgLight, 5),
+    darken(bgLight, 8),
+    darken(bgLight, 10),
+  ];
 
   return {
     '--bg-primary': bgLight,
@@ -260,9 +374,9 @@ function deriveLight(colors: CustomColors): DerivedThemeVariables {
     '--bg-hover': darken(bgLight, 8),
     '--bg-active': darken(bgLight, 10),
     '--text-primary': textDark,
-    '--text-secondary': lighten(textDark, 20),
-    '--text-muted': lighten(textDark, 38),
-    '--text-tertiary': lighten(textDark, 30),
+    '--text-secondary': liftToContrast(lighten(textDark, 20), lightSurfaces, 4.6, false),
+    '--text-muted': liftToContrast(lighten(textDark, 38), lightSurfaces, 3.2, false),
+    '--text-tertiary': liftToContrast(lighten(textDark, 30), lightSurfaces, 3.2, false),
     '--accent-primary': lightA1,
     '--accent-secondary': lightA2,
     '--accent-hover': lighten(lightA1, 10),

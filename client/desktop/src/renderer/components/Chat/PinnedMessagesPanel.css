@@ -45,7 +45,7 @@
 .pinned-panel-close {
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 4px;
   border-radius: 4px;
@@ -69,7 +69,7 @@
   align-items: center;
   justify-content: center;
   padding: 32px 16px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-align: center;
 }
 
@@ -126,7 +126,7 @@
 
 .pinned-message-encrypted {
   font-style: italic;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .pinned-message-actions {

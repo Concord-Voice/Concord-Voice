@@ -64,7 +64,7 @@
 
 .overflow-md-attachment__message {
   font-size: 12px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 /* Spin animation — similar to (but distinct from) the `spin` animation in AttachmentDisplay.css */

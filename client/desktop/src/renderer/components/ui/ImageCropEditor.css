@@ -78,7 +78,7 @@
 
 .image-crop-hint {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-top: 8px;
   text-align: center;
   font-family: 'SourceSans', sans-serif;
@@ -105,7 +105,7 @@
   align-items: center;
   justify-content: center;
   height: 300px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(14px * var(--font-scale, 1));
   font-family: 'SourceSans', sans-serif;
 }

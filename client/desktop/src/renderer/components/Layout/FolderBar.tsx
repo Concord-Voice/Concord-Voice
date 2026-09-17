@@ -433,7 +433,7 @@ const FolderBar: React.FC = () => {
                 <div
                   style={{
                     padding: '8px 12px',
-                    color: 'var(--text-muted)',
+                    color: 'var(--text-secondary)',
                     fontSize: 'calc(12px * var(--font-scale, 1))',
                   }}
                 >

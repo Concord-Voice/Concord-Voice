@@ -181,7 +181,7 @@
 
 .user-profile-modal-username {
   font-size: calc(14px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-top: 2px;
 }
 
@@ -223,7 +223,7 @@
 .user-profile-modal-section-title {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin-bottom: calc(10px * var(--sp, 1));
@@ -246,7 +246,7 @@
 .user-profile-modal-detail-label {
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .user-profile-modal-detail-value {
@@ -264,7 +264,7 @@
 
 .user-profile-modal-detail-value.status-offline,
 .user-profile-modal-detail-value.status-invisible {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Bio ───────────────────────────────────────────────────────────────── */
@@ -328,7 +328,7 @@
   display: flex;
   align-items: center;
   gap: calc(8px * var(--sp, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
   padding: calc(4px * var(--sp, 1)) 0;
 }

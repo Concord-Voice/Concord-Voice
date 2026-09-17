@@ -148,7 +148,7 @@
 }
 
 .gif-picker-search input::placeholder {
-  color: var(--text-muted, #777);
+  color: var(--text-secondary);
 }
 
 .gif-picker-search-icon {
@@ -217,7 +217,7 @@
      switch and initial open, since loading shared this rule. */
   height: 100%;
   padding: 0 16px;
-  color: var(--text-muted, #777);
+  color: var(--text-secondary);
   font-size: 14px;
   text-align: center;
 }
@@ -354,7 +354,7 @@
 
 .gif-picker-attribution {
   font-size: 10px;
-  color: var(--text-muted, #888);
+  color: var(--text-secondary);
   letter-spacing: 0.3px;
   font-weight: 600;
 }
@@ -362,7 +362,7 @@
 .gif-picker-disclaimer {
   flex: 1 1 100%;
   font-size: 9px;
-  color: var(--text-muted, #666);
+  color: var(--text-secondary);
   line-height: 1.3;
 }
 

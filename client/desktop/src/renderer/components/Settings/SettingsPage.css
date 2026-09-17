@@ -127,7 +127,7 @@
   padding: 2px 6px;
   border-radius: 4px;
   background: var(--bg-tertiary);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-weight: 600;
 }
 
@@ -336,7 +336,7 @@
 
 .settings-section-description {
   font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-bottom: 20px;
   line-height: 1.5;
 }
@@ -389,7 +389,7 @@
 
 .settings-row-hint {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .settings-radio-fieldset {
@@ -502,7 +502,7 @@
   justify-content: center;
   border: 2px dashed var(--border-color);
   background: var(--bg-tertiary);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   transition: all 0.2s ease;
 }
 
@@ -846,7 +846,7 @@
 
 .session-card-details {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-top: 4px;
   display: flex;
   gap: 12px;
@@ -1112,7 +1112,7 @@
   align-items: center;
   justify-content: center;
   padding: 40px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* Error state */
@@ -1189,12 +1189,12 @@
 
 .os-perm-badge--pending {
   background: color-mix(in srgb, var(--text-tertiary, #888) 15%, transparent);
-  color: var(--text-tertiary, #888);
+  color: var(--text-secondary);
 }
 
 .os-perm-badge--unavailable {
   background: color-mix(in srgb, var(--text-tertiary, #888) 10%, transparent);
-  color: var(--text-tertiary, #888);
+  color: var(--text-secondary);
   font-style: italic;
 }
 
@@ -1361,7 +1361,7 @@
 
 .settings-codec-meta dd em {
   font-style: normal;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 /* ─── Audio Settings Controls ──────────────────────────────────────── */
@@ -1467,7 +1467,7 @@
   border-radius: 6px;
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   transition: all 0.15s ease;
   user-select: none;
@@ -1494,7 +1494,7 @@
   border-radius: 4px;
   background: var(--bg-tertiary);
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-family: monospace;
   vertical-align: middle;
 }
@@ -1528,7 +1528,7 @@
   letter-spacing: 0.05em;
   padding-bottom: 6px;
   border-bottom: 1px solid var(--border-color);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: default;
 }
 
@@ -1577,7 +1577,7 @@
 
 .settings-codec-name.strikethrough {
   text-decoration: line-through;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .settings-codec-status {
@@ -1591,19 +1591,19 @@
 }
 
 .settings-codec-status.unavailable {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .settings-codec-empty {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-style: italic;
 }
 
 .settings-codec-active-unknown {
   display: block;
   margin: -4px 0 10px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
 }
 
@@ -1880,7 +1880,7 @@
   justify-content: space-between;
   padding-top: 4px;
   font-size: calc(10px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1928,7 +1928,7 @@
   padding: 6px 8px 6px 20px;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
   font-family: 'SourceSans', sans-serif;
   cursor: pointer;
@@ -2005,11 +2005,11 @@
 .settings-back-btn--blocked {
   cursor: not-allowed;
   opacity: 0.4;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .settings-back-btn--blocked:hover {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Pending changes blob ───────────────────────────────────────────────── */
@@ -2147,7 +2147,7 @@
 
 .settings-mode-notice {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin: 6px 0 0;
   padding: 8px 12px;
   background: rgba(var(--accent-primary-rgb, 250, 112, 154), 0.06);
@@ -2227,7 +2227,7 @@
    information is conveyed by the word "Premium" (in the sibling chip) + this
    note, never colour alone. */
 .settings-native-exceeds-note {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
 }
 

@@ -29,7 +29,7 @@
 
 .shortcut-empty {
   text-align: center;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   padding: 24px;
 }
 
@@ -38,7 +38,7 @@
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin: 0 0 8px 0;
 }
 

@@ -137,14 +137,14 @@
 
 /* Disabled variant */
 .ctx-menu-item-disabled {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: not-allowed;
   opacity: 0.5;
 }
 
 .ctx-menu-item-disabled:hover {
   background: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .ctx-menu-item-disabled:active {

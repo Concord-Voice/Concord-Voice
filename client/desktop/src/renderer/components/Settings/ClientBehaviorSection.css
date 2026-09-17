@@ -109,7 +109,7 @@
   margin: 0;
   font-size: calc(13px * var(--font-scale, 1));
   line-height: 1.6;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .client-behavior-explanation strong {

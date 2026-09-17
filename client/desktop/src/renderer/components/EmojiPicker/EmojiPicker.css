@@ -132,7 +132,7 @@
 }
 
 .emoji-picker-search-input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Category Bar ────────────────────────────────────────────────── */
@@ -155,7 +155,7 @@
   cursor: pointer;
   border-radius: 4px 4px 0 0;
   transition: all 0.15s ease;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -364,6 +364,6 @@
   align-items: center;
   justify-content: center;
   height: var(--emoji-grid-height);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
 }

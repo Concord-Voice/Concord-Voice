@@ -54,7 +54,7 @@
 
 .override-target-type {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -76,7 +76,7 @@
 .override-delete-btn {
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 4px;
   border-radius: 4px;
@@ -139,13 +139,13 @@
   font-family: var(--font-display-stack);
   font-size: calc(12px * var(--font-scale, 1));
   letter-spacing: 1px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-bottom: 8px;
 }
 
 .no-overrides {
   padding: 20px;
   text-align: center;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
 }

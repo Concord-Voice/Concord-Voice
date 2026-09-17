@@ -89,7 +89,7 @@
   padding: 10px 14px;
   border-radius: 8px;
   background: var(--bg-secondary, #1e1e22);
-  color: var(--text-muted, #777);
+  color: var(--text-secondary);
   font-size: 13px;
 }
 

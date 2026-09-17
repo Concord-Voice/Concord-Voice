@@ -24,7 +24,7 @@
 
 .sync-label-hint {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .sync-toggle {
@@ -64,7 +64,7 @@
   background: var(--bg-tertiary);
   border-radius: 6px;
   border-left: 3px solid var(--accent-primary);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
   font-style: italic;
 }

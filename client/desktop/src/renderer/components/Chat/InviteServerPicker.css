@@ -5,6 +5,6 @@
 }
 .invite-server-picker__empty {
   padding: 8px 10px;
-  color: var(--text-muted, #aab);
+  color: var(--text-secondary);
   font-size: 13px;
 }

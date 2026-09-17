@@ -35,6 +35,6 @@
      the same token, so the fix belongs to the token, not to this rule. The
      contrast guard cannot see this pair — the background is inherited, not
      declared, which is one of the 287 pairs it documents as unmeasurable. */
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-left: auto;
 }

@@ -75,7 +75,7 @@
 }
 
 .server-e2ee-indicator.unencrypted:hover {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* E2EE tooltip — rendered with position:fixed via JS to escape overflow:hidden containers */
@@ -113,7 +113,7 @@
 }
 
 .e2ee-tooltip.unencrypted .e2ee-tooltip-header {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .e2ee-tooltip-body {
@@ -124,7 +124,7 @@
 
 .e2ee-tooltip-hint {
   font-size: calc(10px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-style: italic;
   line-height: 1.4;
 }
@@ -150,7 +150,7 @@
 }
 
 .role-text.role-member {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Resize Handle ─────────────────────────────────────────────────────── */

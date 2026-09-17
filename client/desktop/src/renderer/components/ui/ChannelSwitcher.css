@@ -39,7 +39,7 @@
 
 .channel-switcher-empty {
   text-align: center;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   padding: 24px;
   font-size: 13px;
 }
@@ -79,7 +79,7 @@
 
 .channel-switcher-context {
   font-size: 12px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   flex-shrink: 0;
 }
 
@@ -95,7 +95,7 @@
 
 .channel-switcher-type-badge.channel {
   background: var(--bg-secondary);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .channel-switcher-type-badge.dm {

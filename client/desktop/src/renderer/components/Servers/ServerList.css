@@ -138,7 +138,7 @@
 }
 
 .server-tooltip-role.role-member {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* Separator */
@@ -161,7 +161,7 @@
   justify-content: center;
   cursor: pointer;
   transition: all 0.2s ease;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .add-server-btn:hover {

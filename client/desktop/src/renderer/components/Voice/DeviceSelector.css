@@ -10,7 +10,7 @@
   gap: 6px;
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 500;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .device-selector__select {

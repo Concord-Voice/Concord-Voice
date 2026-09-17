@@ -26,5 +26,5 @@
 }
 
 .server-ctx-role.role-member {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }

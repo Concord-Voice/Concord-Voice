@@ -148,7 +148,7 @@ const SocialRecoveryApproval: React.FC<SocialRecoveryApprovalProps> = ({
           requesting account recovery from their Recovery Circle. You hold one of the shares needed
           to recover their account.
         </p>
-        <p style={{ color: 'var(--text-tertiary, #718096)', fontSize: 13, marginBottom: 16 }}>
+        <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 16 }}>
           Approving will securely transfer your share via an encrypted channel. You cannot see or
           use the share contents.
         </p>

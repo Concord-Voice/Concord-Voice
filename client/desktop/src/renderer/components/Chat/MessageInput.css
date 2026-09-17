@@ -85,7 +85,7 @@
 }
 
 .message-input-textarea::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .message-input-textarea:disabled {
@@ -128,7 +128,7 @@
 
 .char-counter {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
   min-width: 40px;
   text-align: right;
@@ -174,7 +174,7 @@
   align-items: center;
   margin-top: calc(8px * var(--sp, 1));
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   gap: calc(16px * var(--sp, 1));
   flex-wrap: wrap;
 }
@@ -217,7 +217,7 @@ kbd {
 .media-btn {
   background: transparent;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 3px;
   border-radius: 4px;

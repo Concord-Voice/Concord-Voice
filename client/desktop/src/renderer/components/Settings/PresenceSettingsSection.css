@@ -25,7 +25,7 @@
 .presence-tier-option {
   border: none;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   padding: calc(6px * var(--sp, 1)) calc(14px * var(--sp, 1));
   font-size: calc(12px * var(--font-scale, 1));
   font-weight: 600;
@@ -68,7 +68,7 @@
   padding: 10px 12px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
 }
 
@@ -98,7 +98,7 @@
 
 .presence-activity-card-header p {
   margin: 0 0 16px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
   line-height: 1.45;
 }
@@ -139,7 +139,7 @@
 }
 
 .presence-preview-label {
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -183,7 +183,7 @@
 
 .settings-status {
   margin: 10px 0;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(12px * var(--font-scale, 1));
 }
 

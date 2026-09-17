@@ -47,7 +47,7 @@
 }
 
 .conversation-search input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .conversation-search input:focus {
@@ -165,7 +165,7 @@
 
 .conversation-time {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   flex-shrink: 0;
 }
 
@@ -199,7 +199,7 @@
 .conversation-draft-indicator {
   display: flex;
   align-items: center;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   opacity: 0.7;
   margin-right: 4px;
   flex-shrink: 0;
@@ -233,7 +233,7 @@
   align-items: center;
   flex-shrink: 0;
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .conversation-in-call-badge.group {
@@ -253,7 +253,7 @@
   justify-content: center;
   padding: calc(40px * var(--sp, 1)) calc(20px * var(--sp, 1));
   text-align: center;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .conversation-list-empty p {
@@ -270,7 +270,7 @@
   justify-content: center;
   flex: 1;
   min-height: 0;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   gap: calc(12px * var(--sp, 1));
   padding: calc(24px * var(--sp, 1));
   text-align: center;
@@ -290,7 +290,7 @@
 
 .dm-chat-empty p {
   font-size: calc(14px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   max-width: 320px;
 }
 
@@ -313,7 +313,7 @@
 
 .dm-chat-header-status {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* DM chat placeholder body */
@@ -329,7 +329,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(14px * var(--font-scale, 1));
 }
 
@@ -350,7 +350,7 @@
 }
 
 .dm-chat-placeholder-input input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Friends List (right panel) ─────────────────────────────────────── */
@@ -428,14 +428,14 @@
 .friend-category-header span {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .friend-category-count {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-left: auto;
 }
 
@@ -544,7 +544,7 @@
 }
 
 .friends-list-search-input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .friends-list-search-input:focus {
@@ -563,7 +563,7 @@
 .friends-list-search-empty {
   margin: calc(6px * var(--sp, 1)) 0 0;
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .friends-search-trigger {
@@ -837,7 +837,7 @@
   padding: 2px;
   border-radius: 50%;
   background: var(--bg-secondary);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── Add Friend Modal ──────────────────────────────────────────────── */
@@ -886,7 +886,7 @@
 }
 
 .add-friend-input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .add-friend-input:focus {
@@ -915,7 +915,7 @@
 
 .add-friend-empty {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   padding: calc(4px * var(--sp, 1)) 0;
 }
 
@@ -943,7 +943,7 @@
 
 .search-result-username {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   margin-left: calc(6px * var(--sp, 1));
   font-weight: 400;
 }
@@ -989,7 +989,7 @@
 .add-friend-option-group label {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -1080,7 +1080,7 @@
 .add-friend-active-codes h5 {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin: 0;
@@ -1102,7 +1102,7 @@
 .add-friend-code-meta {
   flex: 1;
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .add-friend-revoke-btn {
@@ -1112,7 +1112,7 @@
   padding: 4px;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   border-radius: 4px;
   transition:
@@ -1138,7 +1138,7 @@
 
 .dm-privacy-blocked p {
   font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-align: center;
   max-width: 500px;
   line-height: 1.5;
@@ -1173,7 +1173,7 @@
 
 .friends-list-empty p {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ─── DM Disabled Notice ──────────────────────────────────────────── */
@@ -1183,7 +1183,7 @@
   margin: 0 12px 12px;
   text-align: center;
   font-size: calc(13px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   background: var(--bg-tertiary);
   border-radius: 8px;
   border: 1px solid var(--border-color);
@@ -1214,7 +1214,7 @@
 
 .friend-request-meta {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .friend-request-actions {
@@ -1274,7 +1274,7 @@
   align-items: center;
   gap: calc(4px * var(--sp, 1));
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-weight: 500;
 }
 
@@ -1362,7 +1362,7 @@
   padding: 4px;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   border-radius: 4px;
   transition:
@@ -1403,7 +1403,7 @@
 }
 
 .create-group-name-input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .create-group-name-input:focus {
@@ -1433,7 +1433,7 @@
   align-items: center;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 0;
   border-radius: 50%;
@@ -1475,12 +1475,12 @@
 }
 
 .create-group-search input::placeholder {
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .create-group-limit {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-align: center;
   padding: calc(4px * var(--sp, 1)) 0;
 }
@@ -1510,7 +1510,7 @@
 .create-group-no-results {
   text-align: center;
   padding: calc(16px * var(--sp, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
 }
 
@@ -1545,7 +1545,7 @@
 
 .create-group-user-username {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .create-group-add-btn {
@@ -1744,7 +1744,7 @@
   padding: 4px;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   border-radius: 4px;
   transition:
@@ -1804,7 +1804,7 @@
   padding: 4px;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   border-radius: 4px;
   flex-shrink: 0;
@@ -1817,7 +1817,7 @@
 
 .group-info-member-count {
   font-size: calc(12px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .group-info-error {
@@ -1840,7 +1840,7 @@
 .group-info-members-title {
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin: 0 0 calc(6px * var(--sp, 1)) 0;
@@ -1879,13 +1879,13 @@
 
 .group-member-you {
   font-weight: 400;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
 }
 
 .group-member-username {
   font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .group-member-role-badge {
@@ -1915,7 +1915,7 @@
   height: 24px;
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   cursor: pointer;
   border-radius: 4px;
   transition:

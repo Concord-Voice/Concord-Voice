@@ -41,7 +41,7 @@
 }
 
 .email-verification-attempts {
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-size: 13px;
   margin: 0;
 }
@@ -63,7 +63,7 @@
 }
 
 .email-verification-resend:disabled {
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   cursor: default;
 }
 
@@ -107,7 +107,7 @@
 .email-verification-back {
   background: none;
   border: none;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   cursor: pointer;
   font-size: 13px;
   padding: 4px 8px;

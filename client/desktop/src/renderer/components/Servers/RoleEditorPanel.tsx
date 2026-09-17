@@ -276,7 +276,7 @@ const RoleEditorPanel: React.FC<RoleEditorPanelProps> = ({
             </div>
           </>
         ) : (
-          <div style={{ color: 'var(--text-muted)', padding: '40px', textAlign: 'center' }}>
+          <div style={{ color: 'var(--text-secondary)', padding: '40px', textAlign: 'center' }}>
             Select a role to edit, or create a new one.
           </div>
         )}
