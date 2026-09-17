@@ -122,6 +122,16 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **Midnight Sky's quieter text is no longer too faint to read on raised panels** ([#3335](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3335)) — Midnight
+  Sky uses a second, softer text colour for the things that should not shout: hints, subtitles,
+  secondary button labels, and the small notices the app adds to a conversation. On the darker
+  raised panels that colour sat just under the contrast the accessibility guidelines ask for on
+  body text, so those lines strained against the surface behind them. The colour has been
+  lifted a little. It is still clearly quieter than ordinary message text — the intent was
+  never to make it shout — it simply no longer sits so close in tone to the panel it is printed
+  on. Midnight Sky was the only one of the fifteen schemes where this happened; the other
+  fourteen already had room to spare.
+
 - **The record of a voice call in a direct message is readable in every theme** ([#3334](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3334)) — the
   "Voice call — 4:37" line that appears in a conversation after a call was drawn in a dimmed
   grey on its own tinted panel. In Midnight Sky the two were close enough in tone that the
