@@ -575,6 +575,45 @@ describe('audiocap host reaping a child that has not spawned yet (#3245)', () =>
   });
 });
 
+/**
+ * THE FAULT-STAGE MAPPING, which had no test at all before #3198.
+ *
+ * `reasonForFaultStage` is a closed mapping from what the child says failed to
+ * the mechanism a user is shown, and every arm was unasserted -- so the arm this
+ * task adds is pinned together with the five it joins, rather than leaving a
+ * table where only the newest entry is checked.
+ *
+ * Driven through the real fault path (a `fault` message on a live session), not
+ * by exporting the mapping: what matters is the reason the host RETIRES with.
+ */
+describe('audiocap fault stage → degrade mechanism (#3198)', () => {
+  it.each([
+    ['guard', 'load-fault'],
+    ['load', 'load-fault'],
+    ['capability', 'capability-fault'],
+    ['start', 'no-backend'],
+    ['target', 'target-unresolved'],
+    ['protocol', 'protocol-fault'],
+  ])('maps stage %s to %s', async (stage, reason) => {
+    const { startAudiocapHost } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const pending = startAudiocapHost(1);
+    child.handlers.message({ kind: 'fault', stage, message: 'why' });
+
+    await expect(pending).resolves.toEqual({ ok: false, reason });
+  });
+
+  // A prior version of this suite carried a same-named case that asserted only
+  // two `SCREEN_AUDIO_DEGRADE_REASONS` memberships -- it could not fail unless
+  // the exhaustiveness test below (`has exactly the ten members...`) had
+  // already failed, and the actual "target does not collapse into start"
+  // behaviour is what the `it.each` table above already pins (`'target'` ->
+  // `'target-unresolved'`, distinct from `'start'` -> `'no-backend'`). Removed
+  // rather than kept as dead coverage (#3327 review).
+});
+
 describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
   // ASSERTED AT RUNTIME, AGAINST A SET DECLARED IN src/, and that is the whole
   // point. tsconfig.json includes only src/** — zero files under tests/ are in
@@ -582,7 +621,7 @@ describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
   // be type-checked and could never fail. The Readonly<Record<Union, true>> in
   // audiocapHost.ts is what makes a missing member a compile error; this asserts
   // the set that error protects.
-  it('has exactly the nine members, including capture-starved', () => {
+  it('has exactly the ten members, including capture-starved and target-unresolved', () => {
     expect(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS).sort()).toEqual(
       [
         'capability-fault',
@@ -593,6 +632,7 @@ describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
         'no-backend',
         'produce-rejected',
         'protocol-fault',
+        'target-unresolved',
         'unsupported-os',
       ].sort()
     );

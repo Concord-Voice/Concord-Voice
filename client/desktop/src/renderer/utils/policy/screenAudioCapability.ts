@@ -25,12 +25,16 @@ export type ScreenAudioVerdict = 'none' | 'system-loopback' | 'per-process';
  * `screen:` prefix and so offered an enabled, default-on Stream Audio control on Linux,
  * where this capture path has no loopback at all and silently falls back to video.
  *
- * Two independent reasons a target cannot carry audio:
+ * Two independent reasons a target cannot carry audio BY DEFAULT — the third rung
+ * below is the exception, not a third reason:
  *
- *   1. It is a window or application. Electron's desktop audio capture is a
- *      whole-system loopback that ignores `chromeMediaSourceId`, so a window share
- *      asking for audio sends every application's sound to the channel (#2161).
- *      Per-application audio needs a native addon — see ADR-0043.
+ *   1. It is a window or application, and this machine has not granted per-process
+ *      capture for it. Electron's desktop audio capture is a whole-system loopback
+ *      that ignores `chromeMediaSourceId`, so a window/app share asking for audio
+ *      would send every application's sound to the channel (#2161) unless the
+ *      third rung below grants a narrower capture instead. Per-application audio
+ *      uses the native addon (ADR-0043) on macOS 14.4+, where the machine snapshot
+ *      allows it.
  *   2. The platform has no loopback. Linux is the known case.
  *
  * An UNKNOWN platform resolves to allowed rather than refused, and that is not a
@@ -110,15 +114,25 @@ export function canCarryScreenAudio(
  * can carry audio, which is silent-feature-death rather than a privacy breach, and is the
  * failure class ADR-0043's epic exists to close.
  *
- * `'per-process'` IS FALSE HERE, AND THAT IS THE FAIL-CLOSED CHOICE FOR PR 1 OF 2.
+ * `'per-process'` IS FALSE HERE, AND THAT IS THE FAIL-CLOSED CHOICE THROUGH PR 2 OF 3.
  * The rung is unreachable in this PR (no production call site passes the third argument
  * to `canCarryScreenAudio`), so no user meets either answer. `false` is nonetheless the
- * one to ship: `voiceService.setScreenAudioEnabled` REFUSES `'per-process'` until PR 2
- * wires `start({ targetPids })`, so `true` here would mean an enabled control that errors
- * on every click — which is precisely the outcome this PR's own description argues against
- * making reachable. PR 2 flips this to `true` in the same change that lands the capture
- * wiring, and the agreement test in `voiceService.captureSeam.test.ts` fails if it does
- * not.
+ * one to ship: `voiceService.setScreenAudioEnabled` REFUSES `'per-process'` until the
+ * capture seam posts `start({ targetPids })`, so `true` here would mean an enabled
+ * control that errors on every click — precisely the outcome this epic argues against
+ * making reachable.
+ *
+ * **PR 3 flips this to `true`, not PR 2.** An earlier version of this comment said PR 2,
+ * written before the 2026-09-16 scope split moved the capture-seam wiring out of it; PR 2
+ * ships the resolver and the widened protocol with no reachable caller. Leaving the old
+ * claim standing would have instructed the next author to make the rung reachable one PR
+ * early — the same stale instruction the plan document carried, one layer down.
+ *
+ * The agreement between this answer and the capture seam is pinned by
+ * `tests/unit/renderer/utils/screenAudioVerdictAgreement.test.ts`, NOT by
+ * `voiceService.captureSeam.test.ts` — that file exists but asserts nothing about
+ * `'per-process'` or `verdictOffersAudio`, so the citation sent a reader to a file that
+ * does not enforce what it was credited with.
  */
 export function verdictOffersAudio(verdict: ScreenAudioVerdict): boolean {
   switch (verdict) {

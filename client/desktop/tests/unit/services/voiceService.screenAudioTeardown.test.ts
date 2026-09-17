@@ -272,6 +272,26 @@ describe('voiceService screen-audio teardown choke point (#3195 section 6c)', ()
     expect(svc.producers.has('screen-audio')).toBe(false);
   });
 
+  // #3198 Task 13b: the degrade reason must reach the user, not just the store.
+  // Asserted at the OUTERMOST OBSERVABLE SEAM -- the rendered slot error text --
+  // not at screenAudioDegradeMessage's return value, per tests.md "Test the
+  // consumer, not the handshake": a mapping function can be correct while nothing
+  // ever calls it with the live reason.
+  it('surfaces the degrade reason as a user-visible slot error', async () => {
+    delete svc.produceScreenAudioFromStream;
+    svc.produceEncrypted = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('Only one active screen-audio producer allowed per participant')
+      );
+
+    await svc.produceScreenAudioFromStream(svc.localScreenStream);
+
+    expect(useVoiceStore.getState().videoSlotError).toBe(
+      'This call can’t carry another audio track, so your screen is being shared without sound.'
+    );
+  });
+
   it('does NOT write a degraded verdict for a share that already ended', async () => {
     const captured = svc.localScreenStream;
     delete svc.produceScreenAudioFromStream;

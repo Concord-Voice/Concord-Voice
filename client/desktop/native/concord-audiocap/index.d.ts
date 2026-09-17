@@ -2,7 +2,8 @@
  * concord-audiocap — per-process screen-share audio capture.
  * See [internal]0043-per-process-screen-share-audio-capture.md.
  *
- * SURFACE: five functions — `capability`, `start`, `drain`, `stop`, `status`.
+ * SURFACE: six functions — `capability`, `start`, `drain`, `stop`, `status`,
+ * `resolveWindowOwner`.
  *
  * `AudioCapStartFailure` is a CLOSED union that ships whole in PR 1, including
  * members only a PR-2 real backend can produce (see the member-by-member notes
@@ -321,3 +322,16 @@ export interface AudioCapStatus {
  * that crosses a dispatcher inherits the dispatcher's lateness (#2992).
  */
 export function status(): AudioCapStatus;
+
+/**
+ * The PID owning `handle` (an `HWND` on Windows, a `CGWindowID` on macOS), or
+ * `null` for every refusal — handle 0, out of u32 range, no live window, a
+ * platform with no implementation, or an OS call that failed.
+ *
+ * A PULL with no data path, like `status()`. It is called ONCE PER SHARE in the
+ * capture child, never in main (ADR-0043 D5) and never from `rt/`.
+ *
+ * `null`, never 0: a numeric refusal invites `if (pid)`, and a falsy-check is
+ * exactly how a refusal becomes a widened capture (#2161).
+ */
+export function resolveWindowOwner(handle: number): number | null;

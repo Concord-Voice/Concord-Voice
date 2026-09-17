@@ -78,6 +78,10 @@ describe('audiocap child credit floor (#3195 C5)', () => {
       },
       // Never empty: the ring is not what stops this drain, the credit bound is.
       drain: (_into: ArrayBuffer) => ({ ok: true }),
+      // #3198: the child resolves the handle before it asks the addon to
+      // capture, so a fake with no resolver refuses every start at stage
+      // 'target' and never reaches the behaviour these cases pin.
+      resolveWindowOwner: () => 4242,
       stop: vi.fn(),
     });
 
@@ -101,6 +105,9 @@ describe('audiocap child credit floor (#3195 C5)', () => {
         frameCount: 480,
         creditBound: 8,
         ringSlots: 8,
+        // #3198. A handle the fake resolver accepts; the child resolves it to a
+        // PID before `addon.start`, and that PID never leaves this process.
+        windowHandle: 4242,
       },
       ports: [childEnd],
     });

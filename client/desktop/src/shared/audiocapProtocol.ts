@@ -130,15 +130,51 @@ const OFFSET = {
  * that this channel does not become a general RPC surface; a comment is not
  * enforcement (design section 4a).
  */
-export type AudiocapFaultStage = 'guard' | 'load' | 'capability' | 'start' | 'protocol';
+export type AudiocapFaultStage =
+  | 'guard'
+  | 'load'
+  | 'capability'
+  | 'start'
+  // The child could not resolve the handle main sent to an owning PID: no live
+  // window, or the OS refused. A SEPARATE stage from 'start' because it is the
+  // one failure that happens BEFORE the addon is asked to capture anything, and
+  // collapsing it into 'start' would make "nothing was ever tapped" and "a tap
+  // failed" report the same degrade reason -- `reasonForFaultStage` maps 'start'
+  // to `no-backend`, which would tell the user this machine cannot do
+  // per-process audio when the truth is that we could not find the process
+  // behind that window (#3198 spec §4.3).
+  | 'target'
+  | 'protocol';
 
-const AUDIOCAP_FAULT_STAGES: ReadonlySet<string> = new Set([
-  'guard',
-  'load',
-  'capability',
-  'start',
-  'protocol',
-]);
+/**
+ * THE EXHAUSTIVENESS ANCHOR for `AudiocapFaultStage`, and the reason it is a
+ * `Record` rather than the `Set` literal it used to be.
+ *
+ * `isAudiocapFault` narrows on the SET, so a member added to the union without a
+ * matching set entry type-checks everywhere and is then refused at runtime by
+ * the one predicate that guards this channel — a child reporting the new stage
+ * would be killed as a protocol fault. Keyed by the union, a missing entry is a
+ * COMPILE error instead. Same mechanism, and the same reasoning, as
+ * `SCREEN_AUDIO_DEGRADE_REASONS` in `src/main/audiocapHost.ts`.
+ */
+const AUDIOCAP_FAULT_STAGE_ANCHOR: Readonly<Record<AudiocapFaultStage, true>> = {
+  guard: true,
+  load: true,
+  capability: true,
+  start: true,
+  target: true,
+  protocol: true,
+};
+
+/**
+ * Exported for the runtime membership pin only. `tsconfig.json` includes no file
+ * under `tests/`, so a stage list enumerated in a test is never type-checked;
+ * asserting against the set the predicate actually consults is what makes that
+ * pin mean something.
+ */
+export const AUDIOCAP_FAULT_STAGES: ReadonlySet<string> = new Set(
+  Object.keys(AUDIOCAP_FAULT_STAGE_ANCHOR)
+);
 
 export interface AudiocapCapability {
   platform: string;
@@ -169,6 +205,15 @@ export interface AudiocapStart {
   frameCount: typeof FRAME_COUNT;
   creditBound: typeof CREDIT_BOUND;
   ringSlots: typeof RING_SLOTS;
+  /**
+   * The `HWND` / `CGWindowID` main parsed and confirmed live. A HANDLE, NOT A
+   * PID: main never resolves one (ADR-0043 D5, invariant I-PID). The child
+   * resolves it with `resolveWindowOwner` and never sends the result back.
+   *
+   * Not a literal type -- unlike the geometry above, this is a REQUEST rather
+   * than a mirror of a compiled constant.
+   */
+  windowHandle: number;
 }
 
 export interface AudiocapStop {

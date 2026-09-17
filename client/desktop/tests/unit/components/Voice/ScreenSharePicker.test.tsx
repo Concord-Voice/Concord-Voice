@@ -180,20 +180,87 @@ describe('ScreenSharePicker', () => {
     await waitFor(() => {
       expect(screen.getByText('Entire Screen')).toBeInTheDocument();
     });
-    const audio = () => screen.getByRole('button', { name: 'Stream Audio' });
+    const audio = () => screen.getByRole('button', { name: /^Stream Audio\b/ });
+    // aria-disabled, NEVER the native `disabled` attribute (#3198 PR 2, §6 a11y floor) --
+    // a native `disabled` button drops out of the tab order, which would make the
+    // persistent hint below keyboard/AT-unreachable.
+    const hint = () => screen.getByText((_, el) => el?.id === 'screen-audio-hint');
 
     // Nothing selected yet -- inert, and it says why.
-    expect(audio()).toBeDisabled();
+    expect(audio()).toHaveAttribute('aria-disabled', 'true');
+    expect(audio()).not.toBeDisabled();
 
     fireEvent.click(screen.getByText('Entire Screen'));
-    expect(audio()).toBeEnabled();
+    expect(audio()).toHaveAttribute('aria-disabled', 'false');
     expect(audio()).toHaveAttribute('aria-pressed', 'true');
 
     openTab('Windows');
     fireEvent.click(screen.getByText('VS Code'));
-    expect(audio()).toBeDisabled();
-    // The disabled reason is user-visible, not just implied by the greyed control.
-    expect(audio()).toHaveAttribute('title', expect.stringContaining('not available'));
+    expect(audio()).toHaveAttribute('aria-disabled', 'true');
+    // The disabled reason is user-visible PERSISTENTLY, not just implied by the greyed
+    // control and not only in a `title=` a mouse-only user would have to hover.
+    expect(hint()).toHaveTextContent(/isn.t available on this computer/);
+    expect(audio()).toHaveAttribute('aria-describedby', 'screen-audio-hint');
+
+    // The activation guard refuses the click while locked (#3198 PR 2).
+    fireEvent.click(audio());
+    expect(audio()).toHaveAttribute('aria-pressed', 'false');
+
+    // Prove the guard actually blocked the flip rather than merely hiding it:
+    // `aria-pressed` reads false here regardless of streamAudio's real value,
+    // because `audioCapable` alone gates the attribute while locked. Return to
+    // a capable target and read the pill text, which is the only place the
+    // underlying streamAudio value becomes visible again. If the guard were
+    // removed, the click above would have flipped streamAudio true -> false
+    // while locked, and this would read 'Off' instead of 'Desktop'.
+    openTab('Screens');
+    fireEvent.click(screen.getByText('Entire Screen'));
+    expect(audio()).toHaveTextContent('Desktop');
+  });
+
+  // The pill is the ONLY place the UI states WHAT is being sent, rather than merely
+  // whether anything is -- and it is therefore the one label here that can OVERCLAIM.
+  // It had no test at all until this case: the 42 others assert aria state, the hint text
+  // and the emitted options, so the label could have said anything and stayed green.
+  it('names what is actually being sent, and never claims app audio this PR cannot deliver', async () => {
+    render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+    await waitFor(() => {
+      expect(screen.getByText('Entire Screen')).toBeInTheDocument();
+    });
+    const pill = () => screen.getByRole('button', { name: /^Stream Audio\b/ });
+
+    // 'Desktop', never 'On': a screen share carries the WHOLE-SYSTEM mix, including the
+    // other monitor and every other app (#2161). The label has to say which.
+    fireEvent.click(screen.getByText('Entire Screen'));
+    expect(pill()).toHaveTextContent('Desktop');
+    // ACCESSIBLE NAME, not just text content -- the m1 pin. `aria-labelledby`
+    // OVERRIDES element contents, so while it named only the "Stream Audio" span
+    // this pill's own text was announced by NOTHING: a sighted-only signal on the
+    // one control this PR made AT-reachable. `toHaveTextContent` passed throughout
+    // that defect, which is exactly why the assertion has to be on the computed name.
+    expect(pill()).toHaveAccessibleName('Stream Audio Desktop');
+
+    // streamAudio is still ON here, so this 'Off' can ONLY come from the capability
+    // verdict. Toggling first would let the switch produce it and the case would pass
+    // whatever the verdict said -- the two causes have to be separated to pin either.
+    openTab('Windows');
+    fireEvent.click(screen.getByText('VS Code'));
+    expect(pill()).toHaveTextContent('Off');
+    expect(pill()).toHaveAccessibleName('Stream Audio Off');
+    // 'per-process' is unreachable until PR 3 wires the seam (no production call
+    // site passes canCarryScreenAudio's third argument), so this component can
+    // never compute a verdict of 'per-process' and this assertion could not fail
+    // regardless of what the pill renders -- `verdictOffersAudio('per-process')`
+    // is false, which is what actually keeps 'App' from appearing here. See
+    // `screenAudioVerdictAgreement.test.ts` for the test that pins that.
+
+    // ...and on a capable target the switch alone still reaches Off, so the label tracks
+    // BOTH inputs rather than collapsing to whichever one this test happened to move.
+    openTab('Screens');
+    fireEvent.click(screen.getByText('Entire Screen'));
+    expect(pill()).toHaveTextContent('Desktop');
+    fireEvent.click(pill());
+    expect(pill()).toHaveTextContent('Off');
   });
 
   it('passes the toggled-off audio choice through for a screen target', async () => {
@@ -202,7 +269,7 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByText('Entire Screen')).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText('Entire Screen'));
-    fireEvent.click(screen.getByRole('button', { name: 'Stream Audio' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Stream Audio\b/ }));
     fireEvent.click(screen.getByText('Share'));
     expect(mockOnSelect).toHaveBeenCalledWith(
       'screen:0',
@@ -238,12 +305,14 @@ describe('ScreenSharePicker', () => {
     });
     fireEvent.click(screen.getByText('Entire Screen'));
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Stream Audio' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: /^Stream Audio\b/ })).toHaveAttribute(
+        'aria-disabled',
+        'true'
+      );
     });
-    expect(screen.getByRole('button', { name: 'Stream Audio' })).toHaveAttribute(
-      'title',
-      expect.stringContaining('Linux')
-    );
+    // OQ1 ruling: the Linux arm is untouched -- still its own string, never the
+    // collapsed three-cause 'none' text.
+    expect(screen.getByText((_, el) => el?.id === 'screen-audio-hint')).toHaveTextContent('Linux');
   });
 
   // Mid-share the picker is a SWITCH dialog. Seeding from the persisted preference
@@ -261,7 +330,7 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByText('Entire Screen')).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText('Entire Screen'));
-    expect(screen.getByRole('button', { name: 'Stream Audio' })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: /^Stream Audio\b/ })).toHaveAttribute(
       'aria-pressed',
       'false'
     );
@@ -283,7 +352,7 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByText('Entire Screen')).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText('Entire Screen'));
-    expect(screen.getByRole('button', { name: 'Stream Audio' })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: /^Stream Audio\b/ })).toHaveAttribute(
       'aria-pressed',
       'true'
     );
@@ -297,7 +366,7 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByText('Entire Screen')).toBeInTheDocument();
     });
     fireEvent.click(screen.getByText('Entire Screen'));
-    fireEvent.click(screen.getByRole('button', { name: 'Stream Audio' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Stream Audio\b/ }));
     fireEvent.click(screen.getByText('Share'));
     expect(useVideoSettingsStore.getState().screenStreamAudio).toBe(false);
   });

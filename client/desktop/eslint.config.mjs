@@ -97,6 +97,18 @@ export default [
             // never a system mix, so leaving it unlinted would be the wrong trade.
             'native/concord-audiocap/index.js',
             'native/concord-audiocap/index.d.ts',
+            // #3198 PR 2: the window-owner resolver's CI probe. Same category and
+            // the same trade as the loader above — it is the ONLY coverage the
+            // native OS call has (client/desktop/native/** is outside
+            // sonar.sources, so the >=80% new-code gate cannot bind one line of
+            // it), which makes leaving it unlinted the wrong way round.
+            //
+            // It needs an entry where scripts/audiocap-target-probe/main.js does
+            // not, and the asymmetry is not arbitrary: scripts/ has its own
+            // project (scripts/tsconfig.json, allowJs) precisely so plain-JS
+            // Electron probes parse. native/ has none, because it is a node-gyp
+            // toolchain whose output the TS bundle never compiles.
+            'native/concord-audiocap/test/resolve_window_owner_probe.js',
           ],
           // `scripts/` HAS ITS OWN PROJECT: scripts/tsconfig.json. It carries no
           // comments of its own — check-json rejects JSONC and no other tsconfig

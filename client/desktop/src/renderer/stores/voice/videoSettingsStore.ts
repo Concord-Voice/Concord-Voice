@@ -72,11 +72,22 @@ export interface ScreenShareOptions {
    *
    * Honoured ONLY for `screen:` targets: Electron's desktop audio capture is a
    * whole-system loopback that ignores chromeMediaSourceId, so a `window:` target
-   * requesting audio would leak every application's sound to the channel (#2161).
-   * TWO independent gates, and both are real: the picker refuses to ask (canCarryScreenAudio,
-   * which also covers Linux), and captureScreenElectron requires `wantAudio && screen:`
-   * before requesting loopback — so a renderer that sent `true` for a window target would
-   * still get video only. Per-application audio needs a native addon -- see ADR-0043.
+   * requesting audio would leak every application's sound to the channel (#2161) --
+   * unless and until the machine has granted per-process capture for that exact
+   * target -- which NOTHING IN THIS BUILD CAN REACH. Two gates are wired and real:
+   * the picker refuses to ask (canCarryScreenAudio, which also covers Linux), and
+   * captureScreenElectron requires `wantAudio && screen:` before requesting the
+   * whole-desktop loopback. So a renderer that sends `true` for a `window:` target
+   * gets video only, full stop.
+   *
+   * THE THIRD GATE IS DEFERRED TO #3198 PR 3, and an earlier version of this comment
+   * described it as live ("all three are real"). It is not: every production call site
+   * of `canCarryScreenAudio` passes TWO arguments, so the `'per-process'` verdict never
+   * returns, and nothing in the repository posts the `{kind:'start'}` control message
+   * that would aim a capture at a PID. PR 3 must wire that seam before `streamAudio:
+   * true` can capture a `window:` target's sound; until it does, the native addon
+   * (ADR-0043) resolves a PID and no caller consumes it. Do not read the macOS 14.4+
+   * floor as a live capability -- it is the floor the rung WILL check, not one it does.
    */
   streamAudio: boolean;
 }

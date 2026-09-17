@@ -22,15 +22,19 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   wrong in a way worth knowing about: a Terminal window is titled with its size, so every
   terminal that happened to be the same size was filed together under a heading reading
   "183x62", regardless of which project it was in.
-- **Screen sharing has a sound switch** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — sharing a screen now carries your computer's
+- **Screen sharing has a sound switch** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145), [#3198](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3198)) — sharing a screen now carries your computer's
   sound by default, and a Stream Audio control lets you turn that off if you would rather show
   video only. Worth knowing what "your computer's sound" means: it is everything playing, not
   only the screen you picked, so on a two-monitor setup the people watching hear the other
-  monitor too. You can flip it mid-share without interrupting what people are watching. When you share
-  a single window or application the control is switched off and says why: sharing sound from one
-  app, and only that app, is not something the desktop app can do yet, and it will not quietly
-  send every other sound on your computer instead. The same applies on Linux, where sharing
-  computer sound is not supported yet at all.
+  monitor too. You can flip it mid-share without interrupting what people are watching. When you
+  share a single window the control is switched off, and the reason sits underneath it in plain
+  sight rather than in a tooltip: sending the sound of one app, and only that app, is not
+  something the desktop app can do yet, and it will not quietly send every other sound on your
+  computer instead. The switch stays reachable by keyboard and screen reader while it is off, so
+  that explanation can be read without a mouse, and a small label beside it names what is
+  actually being sent — Desktop or Off. The same applies on Linux, where sharing computer
+  sound is not supported yet at all. If the call is already carrying someone else's screen
+  sound, the message says so rather than leaving your share quietly silent.
 - **You can change what you are sharing without stopping first** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — switching from your
   screen to a document used to mean stopping the share and starting a new one, which dropped
   everyone watching and made them click back in. A Switch button now swaps the source in place.

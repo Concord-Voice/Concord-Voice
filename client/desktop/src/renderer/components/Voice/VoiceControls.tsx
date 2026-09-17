@@ -26,6 +26,7 @@ import {
   type ActiveScreenShare,
   MAX_TUNED_SCREEN_SHARES,
 } from '../../stores/voice/voiceStore';
+import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useChannelStore } from '../../stores/chat/channelStore';
 import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
@@ -58,17 +59,34 @@ function muteTitle(serverMuted: boolean, selfMuted: boolean): string {
   return 'Mute';
 }
 
-/** Compute deafen button tooltip based on enforcement state. */
-function screenAudioTitle(capable: boolean, on: boolean): string {
-  if (!capable) {
-    return 'This share cannot carry computer sound \u2014 share a whole screen, on Windows or macOS';
+/**
+ * Toolbar tooltip for the live Stream Audio toggle. Tooltip-only disclosure is correct
+ * HERE (persistent chrome, not a decision surface) -- contrast the picker's persistent
+ * `<p>` hint, which exists because the picker IS the decision surface (#3198 PR 2, §6).
+ *
+ * Takes the VERDICT, not a boolean `capable` (#3198 PR 2): a boolean cannot express the
+ * Desktop/App distinction, and "app", never "window", throughout.
+ */
+export function screenAudioTitle(verdict: ScreenAudioVerdict, on: boolean): string {
+  switch (verdict) {
+    case 'none':
+      // The platform claim ("on Windows or macOS") is DELETED, not patched -- it becomes
+      // false the moment per-process exists on some machines and not others.
+      return 'This share can\u2019t carry sound';
+    case 'system-loopback':
+      // "this screen's audio" is a claim the loopback cannot keep — it ignores the selected
+      // source, so a multi-monitor user broadcasts the other screen's applications too. Same
+      // correction as the picker hint; this separate live-control tooltip had been missed.
+      return on
+        ? 'Stop sharing desktop sound'
+        : 'Share every sound on this computer, not only this screen';
+    case 'per-process':
+      return on ? 'Stop sharing app sound' : 'Share only this app\u2019s sound';
+    default: {
+      const unhandled: never = verdict;
+      return unhandled;
+    }
   }
-  // "this screen's audio" is a claim the loopback cannot keep — it ignores the selected
-  // source, so a multi-monitor user broadcasts the other screen's applications too. Same
-  // correction as the picker hint; this separate live-control tooltip had been missed.
-  return on
-    ? 'Stop sharing your computer\u2019s sound'
-    : 'Share your computer\u2019s sound \u2014 everything playing, not only this screen';
 }
 
 function deafenTitle(serverDeafened: boolean, selfDeafened: boolean): string {
@@ -359,6 +377,20 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   // Published by voiceService, which is the only place that knows both the live source
   // id and the platform. Read, never derived here.
   const isScreenAudioCapable = useVoiceStore((s) => s.isScreenAudioCapable);
+  // TWO-VALUE MAPPING, DELIBERATELY (#3198 PR 2 of 3, scope split). The live-share verdict
+  // that would distinguish 'system-loopback' from 'per-process' is not threaded to this
+  // component: PR 3 wires the capture seam that makes 'per-process' reachable, and until
+  // then `isScreenAudioCapable` can only ever mean the whole-desktop loopback (or Linux/
+  // below-floor, on the dev/web path). `screenAudioTitle` and `activeLabel` are written
+  // exhaustive against `ScreenAudioVerdict` so PR 3 only has to change this one mapping.
+  //
+  // Cast, not a type annotation: TS narrows a ternary-initialized const to the literal
+  // union of its two arms for later comparisons even under a widening annotation, which
+  // would make the (currently dead, PR-3-reachable) `=== 'per-process'` comparison below a
+  // compile error rather than the exhaustive check it is written to be.
+  const screenAudioVerdict = (
+    isScreenAudioCapable ? 'system-loopback' : 'none'
+  ) as ScreenAudioVerdict;
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
   const toggleVoiceTextChat = useVoiceStore((s) => s.toggleVoiceTextChat);
   const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
@@ -581,10 +613,10 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
                 isActive={isScreenAudioOn}
                 onClick={handleToggleScreenAudio}
                 locked={!isScreenAudioCapable}
-                title={screenAudioTitle(isScreenAudioCapable, isScreenAudioOn)}
+                title={screenAudioTitle(screenAudioVerdict, isScreenAudioOn)}
                 activeIcon={<Volume2 size={18} />}
                 inactiveIcon={<VolumeX size={18} />}
-                activeLabel="Sound shared"
+                activeLabel={screenAudioVerdict === 'per-process' ? 'App sound' : 'Desktop sound'}
                 inactiveLabel="Share sound"
               />
             )}

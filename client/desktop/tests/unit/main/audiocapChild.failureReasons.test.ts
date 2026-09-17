@@ -42,6 +42,10 @@ vi.mock('node:module', () => {
     }),
     start: () => ({ ok: true }),
     drain: () => ({ ok: true }),
+    // #3198: the child resolves the handle before it asks the addon to capture,
+    // so a fake with no resolver refuses every start at stage 'target' and never
+    // reaches the behaviour these cases pin.
+    resolveWindowOwner: () => 4242,
     stop: () => undefined,
     status: () => ({
       running: false,

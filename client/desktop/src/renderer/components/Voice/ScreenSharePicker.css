@@ -170,10 +170,56 @@
   gap: 8px;
 }
 
+/* WCAG 1.4.4. These THREE rules -- the row label, the audio hint and the select --
+   were the only bare-`px` font sizes left in this file; the other seven already scaled.
+   They move TOGETHER and must keep doing so: they share a 12px base, so scaling one
+   alone inverts the hierarchy (a caption larger than the label above it). The quality
+   row's `flex-wrap` and the hint's `flex-basis: 100%` already absorb the extra width
+   this buys at large scales.
+
+   They share a COLOUR for the same reason. #3341 retired `--text-muted` as a text
+   colour outright -- the palette cannot seat four AA-compliant text tiers, so 297
+   rules moved to `--text-secondary` and the dim tokens were left to paint icons,
+   where SC 1.4.11's 3:1 applies instead of 1.4.3's 4.5:1. That landed on main while
+   this branch was open and moved the label below; the hint has to follow it or the
+   caption and the label directly above it disagree on a token, which is the
+   hierarchy inversion this comment already exists to prevent, arriving by colour
+   rather than by size. `.settings-row-hint` -- the idiom this hint is modelled on --
+   moved in the same commit. */
 .screen-picker__quality-label {
-  font-size: 12px;
+  font-size: calc(12px * var(--font-scale, 1));
   color: var(--text-secondary);
   white-space: nowrap;
+}
+
+/* Persistent, not conditional (#3198 PR 2 §6 accessibility floor) -- rendered for every
+   verdict so its presence is never itself the signal. FLAT treatment across all four arms
+   is equally deliberate: an `aria-describedby` description announces IDENTICALLY whatever
+   its colour or weight, so emphasising the privacy arm would be a sighted-only signal on
+   the one element this PR made AT-reachable -- and it would make appearance the signal,
+   which is what the render-for-every-verdict rule exists to prevent. The arm's WORD ORDER
+   carries that emphasis instead ("all computer sound" in words 2-3), and WCAG 1.4.1 wants
+   the distinction in text regardless. In-repo idiom: `.settings-row-hint`
+   (SettingsPage.css:390) -- NOT ShareTunePill.css's `__cap-note`, which is visually hidden
+   (`clip: rect(0,0,0,0)`) and AT-only, and would reinstate the defect this PR removes. */
+.screen-picker__audio-hint {
+  /* `.screen-picker__quality` is a WRAPPING FLEX ROW, so this <p> is a flex ITEM
+     beside the Stream Audio pill -- not a block beneath it. Without a full-width
+     basis it shares that line, reads as a floating tooltip rather than the caption
+     `aria-describedby` says it is, and pushes Resolution/Frame Rate/Content onto
+     their own line anyway. The 100% basis takes the line deliberately instead, so
+     the hint sits directly under the control it explains, which is what the JSX
+     comment at ScreenSharePicker.tsx:670 and the CHANGELOG entry both describe. */
+  flex-basis: 100%;
+  /* Negative, against the container's 10px row-gap: 6px binds the caption to the
+     row above it instead of reading as a fifth independent control row. */
+  margin: -4px 0 0;
+  font-size: calc(12px * var(--font-scale, 1));
+  /* The modal is `width: 90%; max-width: 720px`, so the longest arm wraps to two lines
+     at narrow widths. Without an explicit value the caption inherits body leading and
+     the wrap reads as two ROWS, fighting the -4px binding above. */
+  line-height: 1.3;
+  color: var(--text-secondary);
 }
 
 .screen-picker__quality-select {
@@ -182,7 +228,7 @@
   border: 1px solid var(--border-color);
   background: var(--bg-tertiary);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: calc(12px * var(--font-scale, 1));
   font-family: 'SourceSans', sans-serif;
   cursor: pointer;
 }
@@ -306,10 +352,18 @@
   color: var(--text-primary);
 }
 
-.screen-picker__audio-toggle:disabled {
+/* ATTRIBUTE SELECTOR, NOT `:disabled`. The toggle is never natively `disabled` --
+   it carries `aria-disabled` plus a JS activation guard so it stays in the tab
+   order and a screen reader can still reach the reason (ScreenSharePicker.tsx).
+   `:disabled` matches only the native IDL attribute, so the rule that used to
+   live here was DEAD the moment that swap landed, and a locked toggle rendered
+   at full opacity with a pointer cursor -- indistinguishable from a live one.
+   Same shape as the sibling pill at ShareTunePill.css:30, which pairs the same
+   `aria-disabled` + click-guard pattern with exactly these two declarations. */
+.screen-picker__audio-toggle[aria-disabled='true'] {
   opacity: 0.5;
-  /* not-allowed rather than default: the title explains WHY it is off, and the cursor
-     is what prompts a user to hover long enough to read it. */
+  /* not-allowed rather than default: the hint beneath explains WHY it is off, and
+     the cursor is what tells a pointer user the control will not respond. */
   cursor: not-allowed;
 }
 

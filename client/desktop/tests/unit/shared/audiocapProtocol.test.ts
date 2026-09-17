@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
 // Relative import (not @/ alias) so Istanbul coverage instrumentation tracks the file correctly.
 import {
+  AUDIOCAP_FAULT_STAGES,
   QUANTUM_BYTES,
   HEADER_BYTES,
   decodeQuantumHeader,
   encodeQuantumHeader,
+  isAudiocapFault,
   isAudiocapHello,
   sanitizeDiagnostic,
 } from '../../../src/shared/audiocapProtocol';
@@ -252,5 +254,45 @@ describe('sanitizeDiagnostic', () => {
     const out = sanitizeDiagnostic(e.message, 200);
     expect(out).toBe('outer');
     expect(out).not.toContain('secret');
+  });
+});
+
+/**
+ * THE FAULT-STAGE EXHAUSTIVENESS PIN (#3198 spec section 8 test 8).
+ *
+ * There was no membership assertion for this set before -- `SCREEN_AUDIO_DEGRADE_REASONS`
+ * had one in `audiocapHost.test.ts` and this one had none anywhere -- so "move
+ * the pin, do not duplicate it" had nothing to move for `AUDIOCAP_FAULT_STAGES`
+ * and it is created here, beside the predicate that consults it.
+ *
+ * ASSERTED AT RUNTIME, AGAINST THE SET `isAudiocapFault` ACTUALLY READS.
+ * `tsconfig.json` includes no file under `tests/`, so a stage list enumerated
+ * here is never type-checked and could not fail on its own; the
+ * `Readonly<Record<AudiocapFaultStage, true>>` anchor in `audiocapProtocol.ts`
+ * is what makes a missing member a compile error, and this pins the set that
+ * error protects.
+ */
+describe('AUDIOCAP_FAULT_STAGES — the #3198 addition', () => {
+  it('has exactly the six stages, including target', () => {
+    expect([...AUDIOCAP_FAULT_STAGES].sort()).toEqual(
+      ['capability', 'guard', 'load', 'protocol', 'start', 'target'].sort()
+    );
+    expect(AUDIOCAP_FAULT_STAGES.size).toBe(6);
+  });
+
+  it('does not carry run', () => {
+    // Not an omission. A mid-share silence latch routed through `retire()`,
+    // which reaps the child, so a `'run'` fault would kill a live, correct
+    // share -- #3197's advisory-only ruling inverted into a teardown. It needs
+    // a non-terminal `notice` kind, which is its own issue.
+    expect(AUDIOCAP_FAULT_STAGES.has('run')).toBe(false);
+  });
+
+  it('admits a target fault and refuses an out-of-set stage', () => {
+    // The type and the runtime guard have to agree: a union member without its
+    // set entry type-checks everywhere and is then refused HERE, which main
+    // reads as a protocol fault and answers by killing the child.
+    expect(isAudiocapFault({ kind: 'fault', stage: 'target', message: 'x' })).toBe(true);
+    expect(isAudiocapFault({ kind: 'fault', stage: 'run', message: 'x' })).toBe(false);
   });
 });

@@ -122,6 +122,7 @@ import {
   canCarryScreenAudio,
   type ScreenAudioVerdict,
 } from '../../utils/policy/screenAudioCapability';
+import { screenAudioDegradeMessage } from '../../utils/policy/screenAudioDegradeCopy';
 import type { CallState } from './voiceService/callStateMachine';
 
 /** Ceiling for the saturating production-observation witness. Any non-zero value proves the
@@ -409,14 +410,48 @@ function stopStreamTracks(stream: MediaStream | null | undefined): void {
  * unknown was told to "share a whole screen" when it already was one. That is the same
  * defect as the Linux-gets-the-window-message bug one revision earlier: a boolean
  * standing in for a three-way question always mislabels the case it forgot.
+ *
+ * A FOURTH arm, `startRefused` (#3198 PR 2 of 3), is WRITTEN but UNREACHABLE in this
+ * PR: it is for a per-process capture START refused at the seam, and nothing in this
+ * repo can attempt that start yet — Tasks 10/12/12a moved to PR 3. Checked FIRST and
+ * independent of `sourceId`'s shape, because a refused start is not an id-shape
+ * problem the other three arms are about.
+ *
+ * Exported for test — the only user-visible consumer of this string, and the plan's
+ * vocabulary rule ("app", never "window") is proven against it directly.
  */
-function screenAudioRefusalMessage(sourceId: string | null | undefined): string {
+export function screenAudioRefusalMessage(
+  sourceId: string | null | undefined,
+  startRefused = false,
+  platform: string | null = null
+): string {
+  if (startRefused) {
+    return 'Couldn’t start app sound for this share — share a whole screen to include sound.';
+  }
   if (!sourceId) {
-    return 'Concord cannot tell what this share is showing, so it cannot add sound — stop the share and start it again to include audio.';
+    return 'Concord cannot tell what this share is showing, so it cannot add sound — stop the share and start it again to include sound.';
+  }
+  // LINUX BEFORE THE ID SHAPE. Linux has no loopback for ANY target, so its answer
+  // does not depend on what was picked — and until this parameter existed the
+  // function could not ask. A Linux user sharing a WINDOW fell through to the arm
+  // below and was told to "share a whole screen to include sound", which on Linux
+  // produces silence too: the remedy is false, and following it costs them the
+  // share they had.
+  //
+  // This is the MIRROR of the bug the docblock above already records as fixed.
+  // That revision corrected Linux + whole-screen; the same function still got
+  // Linux + window wrong, because both were being inferred from `sourceId` alone
+  // and one input cannot answer a two-input question. Hardening one copy left the
+  // twin weaker (#3198 PR 2 review).
+  if (platform === 'linux') {
+    return 'Sharing computer sound is not supported on Linux yet, so your screen is being shared without it.';
   }
   if (!sourceId.startsWith('screen:')) {
-    return 'Sharing audio from a single window is not supported yet — share a whole screen to include sound.';
+    return 'Sharing this app’s sound isn’t supported on this computer — share a whole screen to include sound.';
   }
+  // A `screen:` target refused on a platform that is not known to be Linux. The
+  // inference this arm has always made — whole-screen plus refusal implies Linux —
+  // still holds, and it is what a null `platform` (the probe has not settled) gets.
   return 'Sharing computer sound is not supported on Linux yet, so your screen is being shared without it.';
 }
 
@@ -4152,9 +4187,9 @@ class VoiceService {
           return { stream: await videoOnly(), sourceId: chosenId };
         }
       case 'per-process':
-        // PR 1 OF 2 (#3198): UNREACHABLE. No production call site passes the
-        // machine-capability argument yet, so the verdict function cannot return this.
-        // The arm exists so the union compiles and so PR 2's change is a one-line swap
+        // UNREACHABLE THROUGH PR 2 OF 3 (#3198). No production call site passes the
+        // machine-capability argument, so the verdict function cannot return this.
+        // The arm exists so the union compiles and so PR 3's change is a one-line swap
         // of this body for start({ targetPids }) rather than a new arm nobody reviewed.
         // Video-only is the correct behaviour if it IS somehow reached: it never widens.
         return { stream: await videoOnly(), sourceId: chosenId };
@@ -4258,9 +4293,12 @@ class VoiceService {
         this.localScreenStream === stream &&
         !!this.producers.get('screen');
       if (shareStillLive) {
-        useVoiceStore
-          .getState()
-          .setScreenAudioState({ mode: 'degraded', reason: 'produce-rejected', overrun: 0 });
+        const store = useVoiceStore.getState();
+        store.setScreenAudioState({ mode: 'degraded', reason: 'produce-rejected', overrun: 0 });
+        // #3198 Task 13b: tell the user why, not just that. Asserted at the
+        // outermost observable seam (the rendered slot error), not at the mapping
+        // function's return value (tests.md § "Test the consumer, not the handshake").
+        store.setVideoSlotError(screenAudioDegradeMessage('produce-rejected'));
       }
     }
   }
@@ -4828,8 +4866,8 @@ class VoiceService {
       case 'system-loopback':
         break;
       case 'per-process':
-        // PR 1 OF 2 (#3198): unreachable, as at the capture seam. PR 2 replaces this
-        // with the per-process re-capture; refusing is the safe answer meanwhile.
+        // UNREACHABLE THROUGH PR 2 OF 3 (#3198), as at the capture seam. PR 3 replaces
+        // this with the per-process re-capture; refusing is the safe answer meanwhile.
         //
         // ITS OWN MESSAGE, not `screenAudioRefusalMessage`. That helper keys on the id,
         // so a window target returns "share a whole screen to include sound" — which in
@@ -4837,11 +4875,17 @@ class VoiceService {
         // per-process audio to do the one thing the feature exists to make unnecessary
         // (#3198 Phase-8 review). The `console.debug` matches the `'none'` sibling; its
         // absence here was an inconsistency, not a decision.
+        //
+        // SAYS "app", NEVER "window" — the §6 vocabulary rule the two copy suites
+        // enforce. They assert it only against the three exported helpers, so this
+        // inline string sat outside every test that would have caught it and shipped
+        // saying "this window" until the #3198 PR 2 review. A rule enforced over the
+        // exports is not enforced over the module.
         console.debug('setScreenAudioEnabled: per-process rung not wired yet');
         useVoiceStore
           .getState()
           .setVideoSlotError(
-            'Per-app audio for this window is not available yet — share a whole screen to include sound for now.'
+            'Per-app sound isn’t available yet — share a whole screen to include sound for now.'
           );
         return;
       case 'none': {
@@ -4849,9 +4893,13 @@ class VoiceService {
         // Telling the causes apart matters: on Linux a WHOLE-SCREEN share is refused by
         // the platform, so the window text would send that user to a remedy that cannot
         // work — and a share with no known source is neither of those.
-        useVoiceStore
-          .getState()
-          .setVideoSlotError(screenAudioRefusalMessage(this.currentScreenSourceId));
+        useVoiceStore.getState().setVideoSlotError(
+          // PASSES `cachedPlatform`. Without it `platform` defaulted to null and the
+          // Linux arm above was dead in production -- the parameter existed, the branch
+          // existed, its tests passed, and no caller ever reached it. The value is read
+          // 34 lines up for `canCarryScreenAudio`; it was in hand the whole time.
+          screenAudioRefusalMessage(this.currentScreenSourceId, false, this.cachedPlatform)
+        );
         return;
       }
       default: {
@@ -5088,13 +5136,19 @@ class VoiceService {
         return true;
       case 'per-process':
         // FALSE, and it was `true` until the #3198 Phase-8 review. `setScreenAudioEnabled`
-        // REFUSES this verdict until PR 2 wires `start({ targetPids })`, so `true` here
-        // meant the toolbar reporting "audio available" and the click producing a refusal
-        // toast — the exact outcome this PR's description argues against making reachable,
+        // REFUSES this verdict until the capture seam posts `start({ targetPids })`, so
+        // `true` here meant the toolbar reporting "audio available" and the click producing
+        // a refusal toast — the exact outcome this epic argues against making reachable,
         // already encoded in the arm the toolbar reads. Unreachable today (no call site
         // passes the third argument), so the two answers cost nothing to align now and are
-        // expensive to discover misaligned later. PR 2 flips BOTH in one change;
-        // `voiceService.captureSeam.test.ts` fails if it flips only one.
+        // expensive to discover misaligned later.
+        //
+        // PR 3 FLIPS BOTH IN ONE CHANGE, not PR 2 — the 2026-09-16 scope split moved the
+        // capture-seam wiring out of PR 2, and the claim here outlived it. The pin is
+        // `tests/unit/renderer/utils/screenAudioVerdictAgreement.test.ts`, NOT
+        // `voiceService.captureSeam.test.ts`: that file exists but contains no
+        // `'per-process'` or `verdictOffersAudio` assertion, so it could not have failed
+        // on a one-sided flip and never could have.
         return false;
       case 'none':
         // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a

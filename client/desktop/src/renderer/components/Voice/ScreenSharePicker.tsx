@@ -11,7 +11,11 @@ import { errorMessage } from '../../utils/runtime/redactError';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { effectiveStreamAxis, clampScreenCapture } from '../../utils/policy/videoLimits';
 import { resolveScreenDims } from '../../utils/ui/screenResolution';
-import { canCarryScreenAudio, verdictOffersAudio } from '../../utils/policy/screenAudioCapability';
+import {
+  canCarryScreenAudio,
+  verdictOffersAudio,
+  type ScreenAudioVerdict,
+} from '../../utils/policy/screenAudioCapability';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { groupDesktopSources, type GroupedSources } from '../../utils/ui/groupDesktopSources';
 import './ScreenSharePicker.css';
@@ -37,24 +41,98 @@ const TABS: { id: TabId; label: string }[] = [
 const SCREEN_FPS_OPTIONS = [5, 15, 30, 60] as const;
 
 /**
+ * What the pill beside the Stream Audio toggle says is actually being sent.
+ *
+ * An exhaustive Record, not a ternary, and the reason is the same one that produced
+ * this epic. The shape it replaced was `verdict === 'per-process' ? 'App' : 'Desktop'`,
+ * whose else-arm answers for EVERY audio-capable verdict -- so a fourth rung added later
+ * would silently be labelled `Desktop`, the whole-system mix, which is the most
+ * permissive thing the product can do. A default that widens on an unknown input is the
+ * #2161 shape exactly. Here a new rung is a compile error instead.
+ *
+ * `'none'` maps to `Off` so the caller needs no separate not-capable arm:
+ * `verdictOffersAudio('none')` is false, so the two agree by construction rather than by
+ * a reader checking that they do.
+ */
+// EXPORTED so `screenAudioVerdictAgreement.test.ts` can pin the real map rather
+// than a copy of it. It was private, and the copy-leg test mirrored the value as
+// a local literal -- which SonarCloud correctly flagged as an assertion that
+// always succeeds (typescript:S5914). Mirroring is right for a constant whose
+// source genuinely cannot be imported; this module was already imported by that
+// test for `audioToggleHint`, so the mirror bought nothing and asserted nothing.
+export const AUDIO_PILL_LABEL: Readonly<Record<ScreenAudioVerdict, string>> = {
+  none: 'Off',
+  'system-loopback': 'Desktop',
+  // Written and exhaustive, but UNREACHABLE in this PR -- every `canCarryScreenAudio`
+  // call site passes two arguments, so `'per-process'` never returns. Declared, not
+  // incidental (#3198 PR 2 body, [internal]); PR 3 wires the seam that reaches it.
+  'per-process': 'App',
+};
+
+/**
  * Why the Stream Audio control is in the state it is in. This string is the ONLY
  * explanation a user gets for why an application share is silent, so it is a named
- * function rather than a ternary buried in a JSX attribute (#2161, ADR-0043).
+ * function rather than a ternary buried in a JSX attribute (#2161, ADR-0043) -- and it
+ * is now rendered PERSISTENTLY (never just a `title=`), so a keyboard/AT user can read
+ * it too (#3198 PR 2, §6 accessibility floor).
+ *
+ * Takes the VERDICT, not a boolean (#3198 PR 2): a boolean cannot say whether an
+ * "on" share is the whole-desktop mix or one app's sound, and "app", never "window",
+ * throughout -- capture is PID-scoped and a process may own several windows.
+ *
+ * COUPLED TO `verdictOffersAudio`, and unlike the pill NOT guarded by it at the call
+ * site. The pill renders `audioCapable && streamAudio ? LABEL[verdict] : 'Off'`, so a
+ * verdict the capability layer refuses can never reach the label; this hint is rendered
+ * unconditionally and persistently. So the `'per-process'` arm below promises app audio
+ * to anyone who can see it, and the only thing keeping that honest is that
+ * `verdictOffersAudio('per-process')` is false and the rung is unreachable. PR 3 must
+ * flip BOTH together -- `screenAudioVerdictAgreement.test.ts` pins that pairing.
  */
-function audioToggleHint(
+export function audioToggleHint(
   selected: string | null,
-  audioCapable: boolean,
-  platform: string | null
+  verdict: ScreenAudioVerdict,
+  platform: string | null,
+  // TAKES THE TOGGLE STATE, and must. The two capable arms are PRESENT-INDICATIVE
+  // claims about what the share is carrying, so with the switch off they asserted
+  // that a share was sending system audio at the exact moment the user turned it
+  // off -- on the one element this PR made AT-reachable and persistent. The mood
+  // was indicative before the #3192 copy rewrite too; the rewrite tightened the
+  // wording and inherited the defect rather than introducing it. The reconciled
+  // copy template says the hint describes "what the Stream Audio control WILL
+  // send", which is the conditional this restores for the off state.
+  //
+  // The `none` and no-selection arms are state-INDEPENDENT by construction: a
+  // locked control has no on state to describe.
+  on: boolean
 ): string {
-  if (selected === null) return 'Choose what to share first';
-  // "on this screen" would be a PRIVACY claim we cannot keep. Electron's desktop audio
-  // capture is a whole-system loopback that ignores the chosen source, so on a
-  // multi-monitor machine a user picking the second monitor still broadcasts sound from
-  // apps on the first. Say what is actually sent.
-  if (audioCapable)
-    return 'Share your computer\u2019s sound \u2014 everything playing, not only this screen';
-  if (platform === 'linux') return 'Sharing computer sound is not supported on Linux yet';
-  return 'Application audio is not available yet \u2014 sharing a whole screen carries your whole computer\u2019s sound';
+  if (selected === null) return 'Choose what to share to include sound.';
+  switch (verdict) {
+    case 'system-loopback':
+      // "on this screen" would be a PRIVACY claim we cannot keep. Electron's desktop
+      // audio capture is a whole-system loopback that ignores the chosen source, so on
+      // a multi-monitor machine a user picking the second monitor still broadcasts
+      // sound from apps on the first. Say what is actually sent.
+      return on
+        ? 'Sharing all computer sound, not just this screen.'
+        : 'Turning this on shares all computer sound, not just this screen.';
+    case 'per-process':
+      return on
+        ? 'Sharing only this app\u2019s sound.'
+        : 'Turning this on shares only this app\u2019s sound.';
+    case 'none':
+      // The three per-process causes (below floor, snapshot not yet arrived,
+      // unresolvable PID) COLLAPSE to one string -- both a UX ruling and an
+      // observability.md principle-7 obligation (nothing may log or count which
+      // cause produced a `none`). Linux is its OWN arm, untouched, per the OQ1
+      // ruling: it is getting dedicated screen-audio support later, and the "share a
+      // whole screen" remedy below is false on Linux, which has no loopback either.
+      if (platform === 'linux') return 'Computer sound isn\u2019t supported on Linux yet.';
+      return 'App sound isn\u2019t available on this computer. Share a whole screen instead.';
+    default: {
+      const unhandled: never = verdict;
+      return unhandled;
+    }
+  }
 }
 
 /**
@@ -322,7 +400,18 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   // produced zero compile errors here while the other three consumers were converted to
   // exhaustive switches (#3198 Phase-8 review). The helper is exhaustive, so the next rung
   // is a compile error rather than a silent default.
-  const audioCapable = verdictOffersAudio(canCarryScreenAudio(selected, platform));
+  //
+  // TWO ARGUMENTS, DELIBERATELY (PR 2 of 3, #3198). The capture seam (`voiceService.ts`)
+  // still computes 'none' for every window/app target -- Tasks 10/12/12a (the invoke, the
+  // capture wiring, and the missing main-side `start` + port handoff) move to a PR 3, so
+  // nothing yet turns a `'per-process'` verdict into an actual capture. Passing the third
+  // `machineScreenAudioCapable` argument here would let this picker alone reach
+  // `'per-process'`, offering an ENABLED app-audio toggle the capture path still refuses --
+  // the #2161 overclaim reproduced in the very copy written to fix it. `canCarryScreenAudio`
+  // stays the single authority; `'per-process'` stays unreachable here until PR 3 wires the
+  // seam that makes the two agree.
+  const verdict = canCarryScreenAudio(selected, platform);
+  const audioCapable = verdictOffersAudio(verdict);
 
   // ── #2163: tier the per-share picker to the stream entitlement ──────────
   // The produce boundary clamps screen capture to the entitlement's tiered
@@ -565,31 +654,52 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
               Stream Audio
             </span>
             {/*
-              Disabled for window/application targets, and the title says WHY. This is the
-              one place a user learns that application audio is a platform limitation
-              rather than a missing checkbox -- Electron's desktop audio capture is a
-              whole-system loopback that ignores the chosen source (#2161), so scoping it
-              to one app needs a native addon (ADR-0043). Silence with no explanation is
-              what made this confusing in the first place.
+              A window/application target is disabled UNLESS this machine has granted
+              per-process capture for it (#3198 PR 2) -- and the persistent hint below says
+              WHY, for every verdict, not just this one. Electron's desktop audio capture is
+              a whole-system loopback that ignores the chosen source (#2161); per-application
+              audio uses the native addon (ADR-0043) on macOS 14.4+, where the machine
+              snapshot allows it. `aria-disabled` + a JS activation guard, NOT the native
+              `disabled` attribute -- a `disabled` button drops out of the tab order, which
+              would make the hint keyboard/AT-unreachable (in-repo precedent: MediaButton,
+              FontSection).
             */}
             <button
               type="button"
               className={`screen-picker__audio-toggle ${
                 audioCapable && streamAudio ? 'screen-picker__audio-toggle--on' : ''
               }`}
-              aria-labelledby="screen-audio-label"
+              // BOTH ids. `aria-labelledby` OVERRIDES element contents, so naming only
+              // the "Stream Audio" label left the pill's own text -- Desktop / App / Off,
+              // the one fact the pill exists to carry -- announced by nothing. `aria-pressed`
+              // conveys on/off but never Desktop-vs-App, which is the distinction that
+              // matters once PR 3 makes `'per-process'` reachable. Same defect class the
+              // CSS docblock rejects emphasis over: a sighted-only signal on the control
+              // this PR made AT-reachable.
+              aria-labelledby="screen-audio-label screen-audio-state"
               aria-pressed={audioCapable && streamAudio}
-              disabled={!audioCapable}
-              title={audioToggleHint(selected, audioCapable, platform)}
+              aria-disabled={!audioCapable}
+              aria-describedby="screen-audio-hint"
               onClick={() => {
+                if (!audioCapable) return; // activation guard -- never toggle while locked
                 setStreamAudio((on) => !on);
                 setDirty(true);
               }}
             >
               {audioCapable && streamAudio ? <Volume2 size={16} /> : <VolumeX size={16} />}
-              <span>{audioCapable && streamAudio ? 'On' : 'Off'}</span>
+              <span id="screen-audio-state">
+                {audioCapable && streamAudio ? AUDIO_PILL_LABEL[verdict] : 'Off'}
+              </span>
             </button>
           </div>
+          {/*
+            PERSISTENT, not conditional: rendered for EVERY verdict, so a keyboard/AT user
+            can always find the explanation via aria-describedby rather than its absence
+            being the only signal something is wrong (#3198 PR 2, §6 accessibility floor).
+          */}
+          <p id="screen-audio-hint" className="screen-picker__audio-hint">
+            {audioToggleHint(selected, verdict, platform, audioCapable && streamAudio)}
+          </p>
           <div className="screen-picker__quality-row">
             <label htmlFor="screen-resolution" className="screen-picker__quality-label">
               Resolution

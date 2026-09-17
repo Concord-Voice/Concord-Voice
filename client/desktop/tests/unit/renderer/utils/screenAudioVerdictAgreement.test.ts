@@ -4,6 +4,7 @@ import {
   verdictOffersAudio,
   type ScreenAudioVerdict,
 } from '@/renderer/utils/policy/screenAudioCapability';
+import { AUDIO_PILL_LABEL, audioToggleHint } from '@/renderer/components/Voice/ScreenSharePicker';
 
 /**
  * THE FOUR CONSUMERS MUST AGREE (#3198 Phase-8 review).
@@ -58,6 +59,25 @@ describe('screen-audio verdict: affordance and enforcement agree', () => {
     const offered = ALL_VERDICTS.filter(verdictOffersAudio);
     const accepted = ALL_VERDICTS.filter((v) => ENFORCEMENT_ACCEPTS[v]);
     expect(offered).toEqual(accepted);
+  });
+
+  // THE COPY LEG. The two cases above pin affordance<->enforcement; nothing
+  // pinned copy<->affordance. `AUDIO_PILL_LABEL['per-process']` (imported from
+  // ScreenSharePicker.tsx -- NOT mirrored as a local literal, which is what the
+  // first version did and which asserts a constant against itself) resolves to
+  // 'App', and
+  // `audioToggleHint(...,'per-process',...)` resolves to "Shares only this
+  // app's sound" -- both answer AFFIRMATIVELY for a verdict `verdictOffersAudio`
+  // says is FALSE. The hint is rendered PERSISTENTLY and is not guarded by
+  // `audioCapable` at its call site, so it is the one that would actually reach
+  // a user if PR 3 flips only enforcement and not copy. If a future change
+  // flips any one of the three without the others, this goes red.
+  it('copy and affordance move together for per-process', () => {
+    expect(AUDIO_PILL_LABEL['per-process']).toBe('App');
+    expect(audioToggleHint('window:12:0', 'per-process', 'darwin', true)).toBe(
+      'Sharing only this app’s sound.'
+    );
+    expect(verdictOffersAudio('per-process')).toBe(false);
   });
 
   // POSITIVE CONTROL. Without it the two cases above pass against a `verdictOffersAudio`

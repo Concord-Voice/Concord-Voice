@@ -110,10 +110,34 @@ describe('voiceService.setScreenAudioEnabled (R5)', () => {
   // Three causes, three messages. A boolean here mislabels whichever case it forgot:
   // the first version said "share a whole screen" to a Linux user already sharing one,
   // and the second said it to a share whose source id was unknown.
+  //
+  // The window:7 discriminator was /single window/i until #3198 PR 2. It is now
+  // /this app/i because the copy deliberately stopped saying "window": capture is
+  // PID-scoped and one process owns several windows, so "window" understates what is
+  // sent — the #2161 overclaim reproduced in the copy written to fix it
+  // (design §6, "app, never window"). The regex binds to the SEMANTIC (this message is
+  // about the app you picked) rather than the sentence, so an ordinary copy edit does
+  // not break it while a message that stops naming the app still does.
+  //
+  // THE FULL CROSS-PRODUCT, and it has to be (#3198 PR 2 Phase-8 review). This table
+  // held three of these six rows, and the missing `['window:7', 'linux']` row is
+  // precisely the case the `platform` parameter was ADDED to serve -- so the parameter
+  // shipped, its branch shipped, its helper-level tests passed, and the sole production
+  // call site never passed it. Nothing went red, because no row varied the input whose
+  // absence was the defect. A caller-level test only proves a branch is REACHED if it
+  // varies the input that reaches it.
   it.each([
-    ['window:7', 'darwin', /single window/i],
+    ['window:7', 'darwin', /this app/i],
+    ['window:7', 'linux', /Linux/i],
+    // No `['screen:0', 'darwin']` row, and its absence is the point rather than an
+    // omission: that pair resolves to `'system-loopback'`, so audio is ACCEPTED and no
+    // refusal message is produced. The cross-product of this table is the five cells
+    // that reach the `'none'` arm, not all six combinations -- adding the sixth reds
+    // with "toMatch expects a string, got object", which is `videoSlotError` still null
+    // because nothing refused.
     ['screen:0', 'linux', /Linux/i],
     [null, 'darwin', /cannot tell what this share is showing/i],
+    [null, 'linux', /cannot tell what this share is showing/i],
   ])('names the real reason audio is refused (%s on %s)', async (sourceId, platform, expected) => {
     svc.localScreenStream = streamOf([track('v', 'video')]);
     svc.currentScreenSourceId = sourceId;

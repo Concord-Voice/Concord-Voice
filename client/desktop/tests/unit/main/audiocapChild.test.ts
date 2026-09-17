@@ -106,6 +106,10 @@ function installWorkingAddon(): FakeAddonHandle {
     // Always reports success -- the credit gate, not ring emptiness, is what
     // these tests pin. Ring-empty behaviour is Task 2's concern (native rt/).
     drain: (_into: ArrayBuffer) => ({ ok: true }),
+    // #3198: the child resolves the handle before it asks the addon to capture,
+    // so a fake with no resolver refuses every start at stage 'target' and never
+    // reaches the behaviour these cases pin.
+    resolveWindowOwner: () => 4242,
     stop: vi.fn(),
   });
   return handle;
@@ -173,6 +177,10 @@ async function runChildWith(opts: {
       },
       start: vi.fn(() => ({ ok: true })),
       drain: vi.fn(() => ({ ok: true })),
+      // #3198: the child resolves the handle before it asks the addon to
+      // capture, so a fake with no resolver refuses every start at stage
+      // 'target' and never reaches the behaviour these cases pin.
+      resolveWindowOwner: () => 4242,
       stop: vi.fn(),
     };
   };
@@ -277,6 +285,9 @@ async function startChildHarness(): Promise<CreditGateHarness> {
       frameCount: 480,
       creditBound: 8,
       ringSlots: 8,
+      // #3198. A handle the fake resolver accepts; the child resolves it to a
+      // PID before `addon.start`, and that PID never leaves this process.
+      windowHandle: 4242,
     },
     ports: [childEnd],
   });
@@ -436,6 +447,10 @@ describe('audiocap child start-failure unwind', () => {
       }),
       start,
       drain: () => ({ ok: false }),
+      // #3198: the child resolves the handle before it asks the addon to
+      // capture, so a fake with no resolver refuses every start at stage
+      // 'target' and never reaches the behaviour these cases pin.
+      resolveWindowOwner: () => 4242,
       stop,
       status: () => ({
         running: false,
@@ -474,6 +489,9 @@ describe('audiocap child start-failure unwind', () => {
         frameCount: 480,
         creditBound: 8,
         ringSlots: 8,
+        // #3198. A handle the fake resolver accepts; the child resolves it to a
+        // PID before `addon.start`, and that PID never leaves this process.
+        windowHandle: 4242,
       },
       ports: [childEnd],
     });
@@ -531,5 +549,198 @@ describe('audiocap child start-failure unwind', () => {
     expect(c.stop).toHaveBeenCalledTimes(1);
     c.sendStop();
     expect(c.stop).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * TARGET RESOLUTION (#3198 Task 11; spec section 4.3, section 8 test 6).
+ *
+ * WHAT THIS HALF CAN AND CANNOT PROVE. These cases drive a FAKE resolver, so
+ * they pin the wiring -- resolve before `addon.start`, refuse at stage
+ * `'target'`, hand the PID to the addon and to nothing else -- and say nothing
+ * about whether the OS can resolve a handle from inside a utilityProcess. That
+ * question needs a real window server and is answered by
+ * `scripts/audiocap-target-probe`, which is NOT a CI job and cannot be one (see
+ * its header). Read the two together; neither is sufficient alone.
+ */
+interface TargetHarness {
+  /** Every message the child posted on parentPort. */
+  posted: unknown[];
+  /** Fault messages among `posted`. */
+  readonly faults: { kind: string; stage: string; message: string }[];
+  start: ReturnType<typeof vi.fn>;
+  resolveWindowOwner: ReturnType<typeof vi.fn>;
+  /**
+   * NO DEFAULT ARGUMENT, deliberately: `sendStart(undefined)` would take it
+   * and send a perfectly valid handle, so the omitted-field case would
+   * silently test the happy path. Every caller states the handle.
+   */
+  sendStart: (windowHandle: unknown) => void;
+}
+
+async function startTargetHarness(resolved: unknown): Promise<TargetHarness> {
+  setProcessType('utility');
+  const start = vi.fn(() => ({ ok: true }));
+  const resolveWindowOwner = vi.fn(() => resolved);
+  addonRequireImpl = () => ({
+    capability: () => ({
+      platform: 'darwin',
+      osVersion: '14.4',
+      perProcessAudio: true,
+      reason: '',
+    }),
+    start,
+    drain: () => ({ ok: true }),
+    stop: vi.fn(),
+    status: () => ({}),
+    resolveWindowOwner,
+  });
+  const { posted, handlers } = installParentPort();
+
+  vi.resetModules();
+  await import('../../../src/main/audiocapChild');
+  expect(typeof handlers.message).toBe('function');
+
+  const { port1: childEnd } = new MessageChannel();
+  return {
+    posted,
+    get faults() {
+      return posted.filter(
+        (m) => (m as { kind?: string }).kind === 'fault'
+      ) as TargetHarness['faults'];
+    },
+    start,
+    resolveWindowOwner,
+    sendStart: (windowHandle: unknown) =>
+      handlers.message({
+        data: {
+          kind: 'start',
+          quantumMs: 10,
+          sampleRate: 48000,
+          channels: 2,
+          frameCount: 480,
+          creditBound: 8,
+          ringSlots: 8,
+          windowHandle,
+        },
+        ports: [childEnd],
+      }),
+  };
+}
+
+describe('audiocap child target resolution (#3198)', () => {
+  it('refuses an unresolvable handle at stage target and NEVER calls addon.start (test 6)', async () => {
+    const c = await startTargetHarness(null);
+
+    c.sendStart(0xff_ff_ff_fe);
+
+    expect(c.faults).toEqual([{ kind: 'fault', stage: 'target', message: expect.any(String) }]);
+    // THE NON-VACUITY CLAUSE, and the reason this case is worth writing.
+    // Without it the test passes when the child falls straight through to the
+    // addon, because a real backend handed no target refuses with `NoTarget`
+    // and `unwindFailedStart` posts a fault too -- at stage `'start'`, which
+    // main maps to `no-backend` and shows the user as "this machine cannot do
+    // per-process audio". The stage assertion alone cannot tell the two apart
+    // on a fake whose `start` returns ok; this one can.
+    expect(c.start).not.toHaveBeenCalled();
+  });
+
+  it('does not hand a non-numeric handle to the native call', async () => {
+    const c = await startTargetHarness(1234);
+
+    c.sendStart(undefined);
+
+    expect(c.faults.map((f) => f.stage)).toEqual(['target']);
+    // Narrowed in TS, so the native seam is never asked to interpret an
+    // arbitrary value off the wire. The refusal is the same one a live-but-
+    // unknown handle gets: `'target'` names every way a target failed to
+    // resolve, collapsed deliberately (A7).
+    expect(c.resolveWindowOwner).not.toHaveBeenCalled();
+    expect(c.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 12.5],
+  ])('refuses a %s native answer rather than passing it as a target', async (_label, answer) => {
+    const c = await startTargetHarness(answer);
+
+    c.sendStart(4242);
+
+    // The .d.ts is a claim ABOUT a native binary, not a guarantee FROM one. A
+    // numeric 0 in particular invites `if (pid)`, and a falsy-check is exactly
+    // how a refusal becomes a widened capture (#2161).
+    expect(c.faults.map((f) => f.stage)).toEqual(['target']);
+    expect(c.start).not.toHaveBeenCalled();
+  });
+
+  it('resolves before starting and passes the PID as the only target', async () => {
+    const c = await startTargetHarness(4242);
+
+    c.sendStart(99);
+
+    // The positive control. Without it every assertion above is satisfied by a
+    // child that refuses everything.
+    expect(c.faults).toEqual([]);
+    expect(c.resolveWindowOwner).toHaveBeenCalledWith(99);
+    expect(c.start).toHaveBeenCalledTimes(1);
+    const options = c.start.mock.calls[0][0] as Record<string, unknown>;
+    expect(options.targetPids).toEqual([4242]);
+    // Not set, and not set to `false` either: `allowDescendants` is
+    // platform-asymmetric (macOS wants a caller-expanded list, Windows honours
+    // INCLUDE_TARGET_PROCESS_TREE on one PID) and choosing a policy is its own
+    // decision. Absent is the only form that does not claim one.
+    expect('allowDescendants' in options).toBe(false);
+  });
+
+  it('never lets the resolved PID cross back to main (I-PID)', async () => {
+    const c = await startTargetHarness(4242);
+
+    c.sendStart(99);
+
+    // I-PID is structural, not a logging convention: nothing the child posts on
+    // the control channel may carry a PID. This is the adversarial half of the
+    // case above -- the resolve succeeded, so there IS a PID in this process to
+    // leak, which is the only state in which the assertion means anything.
+    expect(JSON.stringify(c.posted)).not.toContain('4242');
+  });
+
+  it('reports fault{stage:target} rather than dying when resolveWindowOwner throws', async () => {
+    // Sibling to the throw coverage `addon.start` already has
+    // (`audiocapChild.unwindFault.test.ts:92`-ish, the try/catch around
+    // addon.start()). `resolveTargetPid` now wraps its own native call too --
+    // this pins that the child stays alive and reports 'target' rather than
+    // letting a native throw escape as an uncaught exception.
+    const c = await startTargetHarness(4242);
+    c.resolveWindowOwner.mockImplementation(() => {
+      throw new Error('native resolve blew up');
+    });
+
+    expect(() => c.sendStart(99)).not.toThrow();
+    expect(c.faults).toEqual([{ kind: 'fault', stage: 'target', message: expect.any(String) }]);
+    expect(c.start).not.toHaveBeenCalled();
+    // I-PID: the caught error text is discarded, never forwarded.
+    expect(JSON.stringify(c.posted)).not.toContain('native resolve blew up');
+  });
+
+  it('recovers on a second start with a resolvable handle after a refused target', async () => {
+    // Pins the ordering claim in handleStart's own comment: the target resolves
+    // BEFORE `pcmPort` is assigned and before `capturing = true`, so a refused
+    // target needs no unwind. If the resolve instead ran AFTER those
+    // assignments, a refused first start would leave `capturing` stuck true and
+    // this second, otherwise-valid start would be refused too (stage 'start',
+    // "a capture is already running in this child") instead of succeeding.
+    const c = await startTargetHarness(null);
+
+    c.sendStart(0xff_ff_ff_fe);
+    expect(c.faults.map((f) => f.stage)).toEqual(['target']);
+    expect(c.start).not.toHaveBeenCalled();
+
+    c.resolveWindowOwner.mockReturnValue(4242);
+    c.sendStart(99);
+
+    expect(c.faults.map((f) => f.stage)).toEqual(['target']);
+    expect(c.start).toHaveBeenCalledTimes(1);
   });
 });

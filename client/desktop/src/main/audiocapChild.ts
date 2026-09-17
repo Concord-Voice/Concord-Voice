@@ -172,6 +172,17 @@ interface AudiocapAddon {
    * that lands as wiring rather than as a new native surface.
    */
   status: () => unknown;
+  /**
+   * The sixth export (#3198). THE ONLY PROCESS THAT EVER LEARNS A PID IS THIS
+   * ONE (ADR-0043 D5, invariant I-PID): main holds the handle, the child
+   * resolves it, and the result is never posted, logged or counted.
+   *
+   * Takes `number` rather than `unknown` even though the message field is
+   * untrusted — narrowing belongs at the call site, where a non-number is one of
+   * the refusals `'target'` already names, not in a signature that would then
+   * misdescribe the native contract.
+   */
+  resolveWindowOwner: (handle: number) => unknown;
 }
 
 /**
@@ -186,6 +197,18 @@ interface AddonStartOptions {
   channels: typeof CHANNELS;
   frameCount: typeof FRAME_COUNT;
   ringSlots: typeof RING_SLOTS;
+  /**
+   * REQUIRED HERE, though `index.d.ts` declares it optional — this child never
+   * starts a capture without a target, so "forgot the target" is a compile error
+   * rather than a start the addon refuses with `NoTarget` (or, on a future
+   * backend, one that captures more than it was asked to).
+   *
+   * `allowDescendants` is deliberately ABSENT rather than `false`. It is
+   * platform-asymmetric (macOS documents the list as already expanded by the
+   * caller; Windows honours `INCLUDE_TARGET_PROCESS_TREE`), and choosing a
+   * descendant-expansion policy is its own decision with its own review.
+   */
+  targetPids: number[];
 }
 
 /**
@@ -299,6 +322,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
+}
+
+/**
+ * I-PID. `errorMessage` forwards a native `.message` verbatim, and
+ * `sanitizeDiagnostic`'s charset (`[^A-Za-z0-9. _-]`) PRESERVES DIGITS — so a
+ * backend that names the process it failed on ("CATapDescription failed for pid
+ * 4242") sends that PID across the process boundary and into main's
+ * `console.warn`. That is the one value ADR-0043 says must never leave this child.
+ *
+ * Proven as a mechanism by a red-team PoC, with the precondition stated: no
+ * first-party binary produces such a string today, because `startFailureMessage`
+ * maps a closed reason union to fixed phrases and the `NAPI_CALL` path carries
+ * fixed N-API text. It arms the moment a backend author writes a conventional
+ * diagnostic — which is exactly what Core Audio and WASAPI error paths do, and
+ * #3197's macOS tap backend is the code most likely to do it.
+ *
+ * Digits are stripped rather than the message dropped: the text is the only
+ * diagnostic a packaging or device fault leaves behind, and a PID is the only
+ * part of it that is forbidden.
+ *
+ * TWO CALL SITES, AND THEY ARE A PAIR. Both are on the `start` stage, which runs
+ * after `resolveTargetPid` succeeded: the `addon.start` catch, and the teardown
+ * exception inside `unwindFailedStart`. The first shipped sanitised and the second
+ * did not, which left the invariant broken through the other door — the two halves
+ * are concatenated into ONE `postFault('start', ...)`, so a PID in either reaches
+ * the same log line. If a third forwarding site is ever added on this stage, it
+ * belongs here too; grep `errorMessage(` before assuming there are only two.
+ *
+ * The `load` and `capability` stages run BEFORE any PID exists and deliberately
+ * keep their text intact — sanitising them would cost diagnostics for no gain.
+ */
+function pidFreeErrorMessage(err: unknown, fallback: string): string {
+  return errorMessage(err, fallback).replace(/\d/g, '');
 }
 
 /** A capability string, capped and charset-stripped to what a `hello` may carry. */
@@ -517,6 +573,50 @@ export function startFailureMessage(reason: unknown): string {
 }
 
 /**
+ * The handle from the `start` message to the PID that owns it, or `null` for
+ * every refusal — a non-numeric field, a handle the OS does not recognise, a
+ * window that closed between pick and start, a platform with no implementation,
+ * or a native return this build will not believe.
+ *
+ * `null`, NEVER 0, and the return is re-narrowed rather than trusted: the `.d.ts`
+ * is a claim ABOUT a native binary, not a guarantee FROM one, and a numeric 0
+ * invites `if (pid)` — the falsy-check shape that turns a refusal into a widened
+ * capture (#2161). The addon validates the list again on its own side; the
+ * redundancy is correct, there is no TOCTOU fix here, only a refusal at each edge.
+ */
+function resolveTargetPid(addon: AudiocapAddon, windowHandle: unknown): number | null {
+  if (typeof windowHandle !== 'number') return null;
+
+  // GUARDED, like every other native call in this file. It was not, and a red-team
+  // PoC proved what that cost: a throw escaped resolveTargetPid -> handleStart ->
+  // handleControlMessage -> the parentPort listener, and the child died as an
+  // uncaught exception having posted NOTHING. That breaks unwindFailedStart's own
+  // stated invariant ("exactly one fault is posted on every path") and lands main
+  // on `child-crash`, which audiocapHost.ts documents as a PACKAGING DEFECT — so
+  // the user reads "App sound stopped unexpectedly" for a window that simply could
+  // not be resolved.
+  //
+  // The trigger is not exotic: a `concord_audiocap.node` built before #3198 has no
+  // `resolveWindowOwner` export, so the call is a TypeError and EVERY share start
+  // kills the capture child with no diagnostic anywhere. A stale dev tree or a
+  // half-updated install reaches it.
+  //
+  // The caught value is DISCARDED, not reported. A throw is one more way the handle
+  // did not resolve, and `'target'` already says that; forwarding `err.message`
+  // would put native text on the wire from the one function that has a PID in
+  // scope (see the digit strip at the `start` unwind below).
+  let resolved: unknown;
+  try {
+    resolved = addon.resolveWindowOwner(windowHandle);
+  } catch {
+    return null;
+  }
+
+  if (typeof resolved !== 'number' || !Number.isInteger(resolved) || resolved <= 0) return null;
+  return resolved;
+}
+
+/**
  * Handle a `start` control message: validate it, then hand the PCM port to the addon.
  *
  * All four validation rejections call `postFault` and return; nothing propagates out
@@ -549,6 +649,21 @@ function handleStart(
     postFault('start', 'a capture is already running in this child');
     return;
   }
+
+  // RESOLVE HERE, IN THIS PROCESS, AND NOWHERE ELSE (ADR-0043 D5, invariant
+  // I-PID). Main holds the handle; this is the only process that ever learns a
+  // PID, and the PID is never sent back, logged or counted.
+  //
+  // BEFORE the addon is asked to capture and before this child takes ownership
+  // of anything — no port listener, no `pcmPort`, no `capturing` — so
+  // `fault{stage:'target'}` means NOTHING WAS EVER TAPPED and the refusal needs
+  // no unwind. That is precisely why it is not stage 'start'.
+  const pid = resolveTargetPid(addon, message.windowHandle);
+  if (pid === null) {
+    postFault('target', 'window handle did not resolve to a live owner');
+    return;
+  }
+
   if (
     !listenOnPort(port, (data) => {
       handlePcmMessage(addon, data);
@@ -590,6 +705,7 @@ function handleStart(
         channels: CHANNELS,
         frameCount: FRAME_COUNT,
         ringSlots: RING_SLOTS,
+        targetPids: [pid],
       },
       () => {
         drainAvailable(addon);
@@ -602,7 +718,9 @@ function handleStart(
     // `addon.stop()`, where it previously closed the port and left the addon
     // running. Guarded, because the seam has already failed once: see
     // unwindFailedStart.
-    unwindFailedStart(addon, errorMessage(err, 'capture did not start'));
+    // pidFreeErrorMessage, NOT errorMessage: `pid` is in scope here and the native
+    // text is unvalidated. See that function for the I-PID reasoning.
+    unwindFailedStart(addon, pidFreeErrorMessage(err, 'capture did not start'));
     return;
   }
 
@@ -720,9 +838,16 @@ function unwindFailedStart(addon: AudiocapAddon, message: string): void {
     // that is cut. The separator avoids `(` `)` and `:` because DIAGNOSTIC_STRIP
     // deletes them silently -- composing punctuation the sink is known to remove
     // is how a message ends up reading as though words were missing.
+    // BOTH HALVES ARE PID-FREE, not just the caller's. `message` already came
+    // through `pidFreeErrorMessage` at the call site, and this half must match:
+    // it is the SAME `postFault('start', ...)`, on a path that only runs after
+    // target resolution, and a native `stop()` diagnostic is target-scoped, so a
+    // backend naming the process it failed to release lands the PID here instead.
+    // Sanitising the first half and not the second leaves the invariant exactly
+    // as broken as before, through the other door (#3198 PR 2 review, CWE-209).
     postFault(
       'start',
-      `${message} - teardown also failed - ${errorMessage(unwindErr, 'stop threw')}`
+      `${message} - teardown also failed - ${pidFreeErrorMessage(unwindErr, 'stop threw')}`
     );
     return;
   }

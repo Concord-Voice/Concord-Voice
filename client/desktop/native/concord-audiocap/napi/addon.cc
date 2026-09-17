@@ -24,6 +24,8 @@
 #include <cstdio>   // std::snprintf
 #include <cstring>
 
+#include "napi/window_owner.h"
+
 #include "../rt/capture_backend.h"
 #include "../rt/quantum_header.h"
 #include "../rt/quantum_pump.h"
@@ -1185,17 +1187,29 @@ napi_value Start_JS(napi_env env, napi_callback_info info) {
   g_capture.running.store(true, std::memory_order_release);
   g_capture.backend = backend;
 
-  // THE TARGET IS PARSED, NOT SUPPLIED, IN PR 1. #3198 owns picker->PID
-  // resolution and is the first caller that will pass `targetPids`; until then
-  // every real backend sees CaptureScope::kProcessList with pidCount == 0 and
-  // fails closed with NoTarget, which IS the feature being dark.
+  // THE TARGET WAS PARSED, NOT SUPPLIED, THROUGH PR 1. #3198 PR 2's capture
+  // child now resolves a picked window handle to its owning PID
+  // (`resolveWindowOwner`, napi/window_owner.cc) and passes it here as
+  // `targetPids: [pid]` -- see audiocapChild.ts's `resolveTargetPid` /
+  // `handleStart`. That caller is itself UNREACHABLE in production through PR 2:
+  // nothing in this repository yet posts the `{kind:'start'}` control message
+  // that would invoke it (main constructs no `MessageChannelMain` for a capture
+  // share), so every real backend still sees CaptureScope::kProcessList with
+  // pidCount == 0 and fails closed with NoTarget in practice. #3198 PR 3 wires
+  // the main-side `audiocap:start` invoke and the port handoff that make this
+  // path reachable from a share.
   //
-  // NOTHING HERE CAN ASK FOR A SYSTEM MIX. `scope` is only ever kProcessList on
-  // this path -- parseTarget value-initialises the struct and buildTarget sets
-  // the same arm -- so ADR-0043 D6's whole-system row is unreachable from JS in
-  // this build rather than one omitted option away. When #3198 resolves a monitor
-  // target it adds an explicit option here and sets kSystemMix; a window target
-  // whose PID lookup failed must still arrive as an empty kProcessList list. The synthetic backend ignores the target entirely
+  // NOTHING HERE CAN ASK FOR A SYSTEM MIX, AND THAT PREDICTION WAS SUPERSEDED.
+  // `scope` is only ever kProcessList on this path -- parseTarget
+  // value-initialises the struct and buildTarget sets the same arm -- so
+  // ADR-0043 D6's whole-system row is unreachable from JS in this build rather
+  // than one omitted option away. An earlier version of this comment predicted
+  // "#3198 resolves a monitor target [and] adds an explicit option here and
+  // sets kSystemMix" -- superseded by ADR-0043 D6's ruling: #3198 resolves a
+  // per-WINDOW target only, the monitor row was never in this addon's scope,
+  // and it stays on the Electron whole-desktop loopback path permanently. A
+  // window target whose PID lookup failed must still arrive as an empty
+  // kProcessList list. The synthetic backend ignores the target entirely
   // -- it is a generator, not a tap, so there is no process to point it at.
   //
   // Copied BY VALUE into the backend (rt/capture_backend.h): a backend that
@@ -1293,6 +1307,46 @@ napi_value Stop_JS(napi_env env, napi_callback_info /*info*/) {
   return undefinedValue;
 }
 
+// ---------------------------------------------------------------------------
+// resolveWindowOwner(handle: number): number | null — the sixth export.
+//
+// A PULL with no data path, like status(). RANGE-CHECKED IN JS SPACE before the
+// OS is asked, so a double that is not a u32 never reaches a reinterpret_cast.
+// `null` rather than 0 at the JS boundary: a numeric 0 invites `if (pid)` and a
+// falsy-check is how a refusal becomes a capture (#2161's shape).
+// ---------------------------------------------------------------------------
+
+napi_value ResolveWindowOwner_JS(napi_env env, napi_callback_info info) {
+  // Taken once and reused by every refusal arm below, so there is exactly one
+  // spelling of "refused" in this function.
+  napi_value nullValue = nullptr;
+  NAPI_CALL(env, napi_get_null(env, &nullValue));
+
+  size_t     argc    = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
+    return nullValue;
+  }
+
+  double raw = 0.0;
+  if (napi_get_value_double(env, argv[0], &raw) != napi_ok) { return nullValue; }
+
+  // Integral, in u32 range, non-zero. Anything else is a refusal, not a clamp.
+  // NaN fails the first comparison, which is why it is written as a positive
+  // range test and not as a pair of negations.
+  if (!(raw >= 1.0 && raw <= 4294967295.0) ||
+      raw != static_cast<double>(static_cast<std::uint32_t>(raw))) {
+    return nullValue;
+  }
+
+  const std::uint32_t pid = concord::ResolveWindowOwner(static_cast<std::uint32_t>(raw));
+  if (pid == 0) { return nullValue; }
+
+  napi_value out = nullptr;
+  NAPI_CALL(env, napi_create_uint32(env, pid, &out));
+  return out;
+}
+
 }  // namespace
 
 NAPI_MODULE_INIT() {
@@ -1301,5 +1355,8 @@ NAPI_MODULE_INIT() {
   if (!exportFunction(env, exports, "drain", Drain_JS)) { return nullptr; }
   if (!exportFunction(env, exports, "stop", Stop_JS)) { return nullptr; }
   if (!exportFunction(env, exports, "status", Status_JS)) { return nullptr; }
+  if (!exportFunction(env, exports, "resolveWindowOwner", ResolveWindowOwner_JS)) {
+    return nullptr;
+  }
   return exports;
 }

@@ -20,7 +20,7 @@
   # Shared by both targets, so the release and CI/test binaries cannot drift in
   # anything except the one define that separates them.
   'target_defaults': {
-    'sources': [ 'napi/addon.cc' ],
+    'sources': [ 'napi/addon.cc', 'napi/window_owner.cc' ],
     'include_dirs': [ '.' ],
 
     # NAPI_VERSION pins the ABI surface. 8 is available in every Node and Electron
@@ -65,7 +65,10 @@
         'link_settings': {
           'libraries': [
             '$(SDKROOT)/System/Library/Frameworks/CoreAudio.framework',
-            '$(SDKROOT)/System/Library/Frameworks/Foundation.framework'
+            '$(SDKROOT)/System/Library/Frameworks/Foundation.framework',
+            # CGWindowListCopyWindowInfo, for napi/window_owner.cc. Not a
+            # real-time dependency: one call per share, in the capture child.
+            '$(SDKROOT)/System/Library/Frameworks/CoreGraphics.framework'
           ]
         }
       } ],
@@ -75,6 +78,17 @@
             'ExceptionHandling': 0,
             'AdditionalOptions': [ '/std:c++17' ]
           }
+        },
+        'link_settings': {
+          # GetWindowThreadProcessId. (IsWindow was dropped in the #3198 PR 2
+          # review -- it refused nothing the call above does not, and the gap
+          # between the two was a live HWND-recycling window.) R12 flagged the
+          # `-luser32.lib` spelling as an assumption; it is now MEASURED -- the
+          # windows-latest x64 row of native-audiocap.yml links green on this head,
+          # so node-gyp accepts this form under MSVC. Left as-is rather than
+          # "corrected" to a bare `user32.lib` on style grounds: a green link is
+          # evidence, a spelling preference is not.
+          'libraries': [ '-luser32.lib' ]
         }
       } ]
     ]

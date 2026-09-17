@@ -111,12 +111,32 @@ export type ScreenAudioDegradeReason =
   // declarations: nothing produces it. The route the design names is
   // `status().faulted` -> `fault{stage:'run'}` -> here, and neither leg exists
   // yet -- `QuantumPump::fault()` has no production caller and
-  // `AudiocapFaultStage` has no `'run'` member. #3198 owns both, alongside the
-  // watchdog that reads the counters this reason would be derived from. A
-  // reader who assumed a live path would go looking for a producer that is not
-  // there.
+  // `AudiocapFaultStage` has no `'run'` member. #3198 PR 2 (this PR) DECLINES
+  // this work, deliberately: every fault currently routes to `retire()`, which
+  // reaps the capturing child, so a mid-share silence latch would kill a live,
+  // correct share rather than merely quiet one channel of it. Filed as its own
+  // follow-up issue at Phase 9 of the #3198 lifecycle rather than left implicit
+  // here. A reader who assumed a live path would go looking for a producer
+  // that is not there.
   | 'capture-starved'
-  | 'unsupported-os';
+  | 'unsupported-os'
+  // Main could not turn the renderer's source id into a live window handle, or
+  // the child could not turn that handle into an owning PID. ONE member for both
+  // legs, and for all of: a malformed id, a `screen:` id, a window that closed
+  // between pick and start, and an OS call that refused.
+  //
+  // COLLAPSED DELIBERATELY (#3198 A7, observability.md principle 7). Splitting it
+  // by cause would be a privacy-decision discriminator -- the same ruling that
+  // forbids a reason dimension on `presence_audience_suppressed_total`.
+  //
+  // The CHILD-side leg is live: `audiocapChild.ts` resolves the handle before it
+  // asks the addon for anything, and a refusal arrives here as
+  // `fault{stage:'target'}`. The MAIN-side legs -- a malformed id, a `screen:`
+  // id, a window absent from a live enumeration -- arrive with the
+  // `audiocap:start` handler in `src/main/ipc/audiocap.ts` (#3198 PR 3, after the
+  // 2026-09-16 scope split moved Tasks 10/12/12a out of this PR); that file does
+  // not exist yet.
+  | 'target-unresolved';
 
 /**
  * THE EXHAUSTIVENESS ANCHOR for `ScreenAudioDegradeReason`, and it exists
@@ -129,10 +149,10 @@ export type ScreenAudioDegradeReason =
  * test something real to assert against at runtime. Same reasoning, and the
  * same shape, as `START_FAILURE_REASONS` in audiocapChild.ts.
  *
- * A MEMBERSHIP SET, NOT A PHRASE MAP. #3197 PR 2 ships no user-facing copy for
- * these — the renderer has no consumer for the union yet, and adding one would
- * be new UI in a PR that ships dark. #3198 owns the copy alongside the ladder
- * rung that makes these states reachable.
+ * A MEMBERSHIP SET, NOT A PHRASE MAP. #3197 PR 2 shipped no user-facing copy for
+ * these — the renderer had no consumer for the union, and adding one would have
+ * been new UI in a PR that shipped dark. #3198 Task 13b owns the copy: see
+ * `renderer/utils/policy/screenAudioDegradeCopy.ts` for the phrase map.
  */
 export const SCREEN_AUDIO_DEGRADE_REASONS: Readonly<Record<ScreenAudioDegradeReason, true>> = {
   'no-backend': true,
@@ -144,6 +164,7 @@ export const SCREEN_AUDIO_DEGRADE_REASONS: Readonly<Record<ScreenAudioDegradeRea
   'produce-rejected': true,
   'capture-starved': true,
   'unsupported-os': true,
+  'target-unresolved': true,
 };
 
 export type AudiocapStartResult =
@@ -229,9 +250,13 @@ export const ENV_ALLOWLIST: readonly string[] = [
  * probe below, which main kills on the same turn the handshake settles. A timer
  * guarding nothing is the same "shipped code with no caller" defect the probe
  * exists to close, wearing a different costume — and §6c is explicit that an
- * unwired watchdog is UNFINISHED, not defence. #3198 reintroduces
- * `armWatchdog` / `noteAudiocapCreditAck` / `setAudiocapShareLive` alongside the
- * capturing child that gives them meaning. Do not re-add it before then.
+ * unwired watchdog is UNFINISHED, not defence. #3198 PR 2 (this PR) wires the
+ * capture child's own PID resolution (see `audiocapChild.ts`) but STILL forks
+ * no capturing child in production — nothing yet posts the `{kind:'start'}`
+ * control message that would start one (#3198 PR 3, tracked as Task 12a in the
+ * implementation plan). `armWatchdog` / `noteAudiocapCreditAck` /
+ * `setAudiocapShareLive` are reintroduced alongside that capturing child, not
+ * before. Do not re-add them here.
  */
 
 let session: HostSession | null = null;
@@ -282,6 +307,11 @@ function reasonForFaultStage(stage: AudiocapFaultStage): ScreenAudioDegradeReaso
       return 'capability-fault';
     case 'start':
       return 'no-backend';
+    // NOT 'no-backend'. The child refused before the addon was asked to capture,
+    // so nothing was ever tapped and the machine's backend is not in question
+    // (#3198 spec §4.3).
+    case 'target':
+      return 'target-unresolved';
     case 'protocol':
       return 'protocol-fault';
   }
@@ -469,6 +499,13 @@ function handleChildMessage(live: HostSession, message: unknown): void {
  *
  * The fork happens in the executor's synchronous run, before any microtask, so
  * a caller may `void` this and still rely on the child existing.
+ *
+ * NO `windowHandle` PARAMETER, deliberately. One was carried here and stored on
+ * the session, and nothing ever read it -- no main-side leg posts a `start`
+ * control message through PR 2, so the value could not reach the child that would
+ * consume it. #3195 set the precedent when it DELETED an unwired watchdog rather
+ * than shipping it inert, and this follows it: PR 3 reintroduces the parameter
+ * alongside the capture seam that gives it meaning (#3198 PR 2 review, m2).
  */
 export function startAudiocapHost(generation: number): Promise<AudiocapStartResult> {
   // I3. Supersede first, synchronously, with nothing awaited in between.

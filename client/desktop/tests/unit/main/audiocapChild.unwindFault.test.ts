@@ -63,7 +63,13 @@ interface Harness {
  * Bring the child up with an addon whose `stop()` ALWAYS throws, and whose
  * `start()` fails in the requested shape.
  */
-async function childWithFailingStartAndStop(mode: 'throw' | 'refuse'): Promise<Harness> {
+async function childWithFailingStartAndStop(
+  mode: 'throw' | 'refuse',
+  // The teardown exception's text. Parameterised so a case can carry a PID:
+  // the default has no digits, so it cannot tell a sanitised fault from an
+  // unsanitised one (#3198 PR 2 review).
+  stopMessage = 'native stop exploded'
+): Promise<Harness> {
   Object.defineProperty(process, 'type', { value: 'utility', configurable: true });
 
   const posted: unknown[] = [];
@@ -92,10 +98,14 @@ async function childWithFailingStartAndStop(mode: 'throw' | 'refuse'): Promise<H
       return { ok: false, reason: 'Poisoned' };
     },
     drain: () => ({ ok: false }),
+    // #3198: the child resolves the handle before it asks the addon to capture,
+    // so a fake with no resolver refuses every start at stage 'target' and never
+    // reaches the behaviour these cases pin.
+    resolveWindowOwner: () => 4242,
     // The second failure. A native module broken enough to fail `start` is
     // broken enough to fail `stop`, which is the whole premise.
     stop: () => {
-      throw new Error('native stop exploded');
+      throw new Error(stopMessage);
     },
   });
 
@@ -117,6 +127,9 @@ async function childWithFailingStartAndStop(mode: 'throw' | 'refuse'): Promise<H
           frameCount: 480,
           creditBound: 8,
           ringSlots: 8,
+          // #3198. A handle the fake resolver accepts; the child resolves it to a
+          // PID before `addon.start`, and that PID never leaves this process.
+          windowHandle: 4242,
         },
         ports: [childEnd],
       }),
@@ -161,4 +174,34 @@ describe('audiocap child failed-start unwind (#3197)', () => {
       expect(message).toContain('native stop exploded');
     }
   );
+
+  // I-PID, THE TEARDOWN HALF. `unwindFailedStart` concatenates the caller's
+  // message with the teardown exception into ONE postFault('start', ...), and
+  // only the caller's half was routed through `pidFreeErrorMessage` when that
+  // helper first shipped. Both halves run after `resolveTargetPid` succeeded,
+  // and a native stop() diagnostic is target-scoped, so a backend naming the
+  // process it could not release put that PID on the wire through the second
+  // door. The cases above cannot see it: 'native stop exploded' has no digits,
+  // so they pass identically sanitised or not.
+  it('does not let a PID in the TEARDOWN message cross back to main (I-PID)', async () => {
+    const c = await childWithFailingStartAndStop(
+      'throw',
+      'CATapDescription release failed for pid 4242'
+    );
+
+    expect(() => c.sendStart()).not.toThrow();
+
+    const faults = c.posted.filter((m) => (m as { kind?: string }).kind === 'fault');
+    expect(faults).toHaveLength(1);
+    const message = (faults[0] as { message: string }).message;
+
+    // The diagnostic still arrives -- digits are stripped, the text is not dropped.
+    expect(message).toContain('teardown also failed');
+    expect(message).toContain('CATapDescription release failed for pid');
+
+    // 4242 is the PID this harness's resolveWindowOwner returns, so a leak here
+    // is the real invariant breaking, not an arbitrary number.
+    expect(message).not.toContain('4242');
+    expect(JSON.stringify(c.posted)).not.toContain('4242');
+  });
 });

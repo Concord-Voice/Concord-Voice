@@ -1179,7 +1179,7 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: false });
     render(<VoiceControls />);
 
-    const btn = screen.getByTitle(/cannot carry computer sound/i);
+    const btn = screen.getByTitle(/can.t carry sound/i);
     expect(btn).toHaveAttribute('aria-disabled', 'true');
     expect(btn).not.toBeDisabled();
 
@@ -1192,7 +1192,7 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     render(<VoiceControls />);
 
     await act(async () => {
-      fireEvent.click(screen.getByTitle(/Stop sharing your computer/));
+      fireEvent.click(screen.getByTitle(/Stop sharing desktop sound/));
     });
 
     expect(mockSetScreenAudioEnabled).toHaveBeenCalledWith(false);
@@ -1203,7 +1203,7 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     // that distinguishes them: an OFFERED control that happens to be switched off.
     setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: true });
     render(<VoiceControls />);
-    expect(screen.getByTitle(/^Share your computer/)).toBeInTheDocument();
+    expect(screen.getByTitle(/^Share every sound on this computer/)).toBeInTheDocument();
   });
 
   // -- Bar clustering: Self / Share / Utility / Danger --------------------
@@ -1224,7 +1224,7 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     const stop = screen.getByTitle('Stop Sharing');
     // By LABEL, not title: screenAudioTitle() returns different copy per state,
     // so a title regex silently depends on which flags this test happens to set.
-    const shareAudio = screen.getByText('Sound shared').closest('button');
+    const shareAudio = screen.getByText('Desktop sound').closest('button');
     const mute = screen.getByText('Mute').closest('button');
 
     // Leave is the only irreversible action in the bar, so it never shares a

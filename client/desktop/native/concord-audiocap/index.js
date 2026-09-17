@@ -215,4 +215,21 @@ function status() {
 // `concord_audiocap_synthetic.node`, which nothing here can reach. A synthetic
 // binary sitting beside the release one in a dev tree is therefore unreachable
 // through this module, not merely absent from the packaged payload.
-module.exports = { capability, start, drain, stop, status };
+/**
+ * The PID owning `handle` (an `HWND` on Windows, a `CGWindowID` on macOS), or
+ * `null` for every refusal. See index.d.ts for the full refusal set.
+ *
+ * Called ONCE PER SHARE in the capture child, never in main (ADR-0043 D5) and
+ * never from rt/. It is a PULL with no data path, like status().
+ *
+ * `null`, never 0: a numeric refusal invites `if (pid)`, and a falsy-check is
+ * exactly how a refusal becomes a widened capture (#2161).
+ *
+ * @param {number} handle
+ * @returns {number | null}
+ */
+function resolveWindowOwner(handle) {
+  return binding.resolveWindowOwner(handle);
+}
+
+module.exports = { capability, start, drain, stop, status, resolveWindowOwner };
