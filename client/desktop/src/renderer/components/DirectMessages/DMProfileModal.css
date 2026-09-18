@@ -7,6 +7,15 @@
    The dialog IS the modal container; the ::backdrop pseudo-element draws
    the dimmed background. */
 .dm-profile-modal-container {
+  /* A modal <dialog> is centred by the UA sheet's `dialog { margin: auto }`,
+     and styles/index.css opens with a global `* { margin: 0 }` that outranks
+     it -- so both axes collapsed to the start edge and this sat at viewport
+     0,0. Restating it here is the fix, and it is load-bearing rather than
+     cosmetic: at top:0 the close button's 28px circle occupied y 12-40, and
+     the app's custom titlebar is 32px of `-webkit-app-region: drag`, which
+     swallows pointer input whatever the paint order. Only the bottom arc was
+     clickable. Do not delete this as redundant with the UA default. */
+  margin: auto;
   background: var(--bg-primary);
   color: var(--text-primary);
   width: 100%;

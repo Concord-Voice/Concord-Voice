@@ -175,6 +175,37 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **The volume controls in a voice call actually change the volume now** ([#3351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3351)) — the slider on someone's
+  video did nothing at all: dragging it to 0% left them exactly as loud, and so did 200%. The
+  same fault quietly took three more things with it. The master output volume in Settings did
+  nothing. Quiet-user boost did nothing. And picking a specific speaker or headset did nothing —
+  call audio stayed on whatever your computer treats as the default, so anyone whose default is
+  their speakers has been hearing calls out loud while wearing headphones. One cause underneath
+  all four: the app was reading the audio out of the hidden player it uses for each person, and
+  on the current version of the browser engine that read comes back silent. Everything downstream
+  of it — every volume, every boost, every device choice — was adjusting nothing while the player
+  carried on at full volume. The Mute button was unaffected throughout, because it stops the sound
+  before it ever reaches that point, which is why muting worked while the slider beside it did not.
+- **The chat button is back in DM calls** ([#3351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3351)) — a direct message always has a conversation attached to
+  it, so you should be able to talk and type at the same time, but the button never appeared. The
+  call was looking for a text channel linked to a voice channel, which is how servers work and
+  is not how a DM works: the conversation is the thread. The panel itself had handled DMs
+  correctly since it was built; there was simply no way to open it.
+- **Right-clicking someone in a DM call opens their menu again** ([#3351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3351)) — neither right-click nor the "..."
+  button did anything for anyone in a direct-message call. The menu was waiting to be told which
+  server the call belonged to, and a DM call does not belong to one. It now offers what makes
+  sense without a server: their volume, their profile, a direct message and a friend request.
+- **The profile window from a DM opens in the middle of the screen** ([#3351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3351)) — opening someone's profile
+  from a DM put the window hard against the top-left corner, with its close button tucked under
+  the title bar so that only the bottom sliver of it could be clicked. A site-wide styling rule
+  was cancelling the one thing that centres this kind of window.
+- **"Eligible audience" no longer sits under your name permanently** ([#3351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3351)) — the line explaining who can
+  see your current activity took up a row of the panel at all times to answer a question you ask
+  occasionally. It now appears when you point at your user area. Screen readers still announce it
+  exactly as before.
+- **The screen-share volume slider no longer sits on top of the video** ([#3351](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3351)) — when someone shared a
+  screen with sound, the slider was painted across the bottom of the picture for the whole call.
+  It now appears when you point at the video and fades away when you move off.
 - **Screen sharing respects your quality setting again** ([#3348](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3348)) — when a screen
   share sends several quality levels at once, your chosen limit is meant to cap the largest one
   while the smaller levels get proportionally less. Instead every level was being given the full

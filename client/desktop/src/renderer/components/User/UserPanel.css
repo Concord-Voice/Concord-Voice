@@ -165,6 +165,7 @@
 }
 
 .user-panel-activity {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -187,15 +188,70 @@
   white-space: normal;
 }
 
-.user-panel-activity-policy {
-  display: block;
-  font-size: calc(11px * var(--font-scale, 1));
-  color: var(--text-secondary);
-}
-
 .user-panel-activity-note {
   margin-left: calc(4px * var(--sp, 1));
   color: var(--text-secondary);
+}
+
+/* "Eligible audience" is an on-demand disclosure, not a standing line. It
+   answers a question asked occasionally -- who can see this? -- while
+   permanently occupying a row of a cramped panel, which is why it read as
+   noise rather than information.
+
+   Kept in the DOM and hidden VISUALLY, never with display:none or
+   visibility:hidden: the status-menu button's aria-describedby points into
+   this subtree (UserPanel.tsx), and those two properties would drop the node
+   from the accessibility tree and silently break that association. opacity
+   leaves it readable to assistive tech at all times, which is the correct
+   behaviour here -- the disclosure is a sighted-user space optimisation, not
+   a decision to withhold the information.
+
+   Out of flow, so revealing it never reflows the panel or displaces the
+   pointer onto a neighbouring control. */
+.user-panel-activity-policy {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 5;
+  max-width: 260px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 30%);
+  font-size: calc(11px * var(--font-scale, 1));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+/* The trigger is the BUTTON, not the disclosure itself (a zero-opacity,
+   out-of-flow element cannot be hovered to reveal itself) and not the
+   `.user-panel-info` span it used to be.
+
+   `:focus-within` on that span matched NOTHING reachable. It is a `<span>`
+   containing only `<span>`s (UserPanel.tsx -- UserPanelStatus renders spans all
+   the way down), so it has no focusable descendant, and keyboard focus lands on
+   the ANCESTOR `.user-panel-menu-btn`. `:focus-within` matches an element that
+   is focused or CONTAINS focus, never one contained BY it -- so a keyboard user
+   heard the line announced via aria-describedby and could never see it, which is
+   the entire case the arm was added for.
+
+   Anchoring both arms on the button also fixes the mouse half: the avatar and
+   the username are one control, and hovering the avatar revealed nothing.
+
+   `:focus-visible` rather than `:focus` so a mouse click on the button does not
+   leave the disclosure latched open behind the popover it just opened. */
+.user-panel-menu-btn:hover .user-panel-activity-policy,
+.user-panel-menu-btn:focus-visible .user-panel-activity-policy {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .user-panel-activity-policy {
+    transition: none;
+  }
 }
 
 .user-panel-custom-status {

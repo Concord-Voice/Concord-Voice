@@ -281,3 +281,62 @@
   line-height: 1.4;
   max-width: 340px;
 }
+
+/* Screen-share audio controls are an on-demand control, not a permanent HUD.
+   They sat on the video at all times because the overlay bars they live in are
+   ungated gradient strips, so a remote share carrying audio painted a slider
+   across the bottom of the picture for the whole call.
+
+   Revealed on hover or focus of the stage instead. The sharer's NAME stays
+   visible -- that is context, not a control.
+
+   NOT moved off the frame entirely, which the report also asked for, because
+   this is the only screen-share volume control that exists: the tile context
+   menu deliberately carries the voice axis (perParticipantVolume) and never
+   perScreenShareVolume, per ParticipantTile.tsx. Giving it a permanent home
+   elsewhere is a layout decision with no obvious slot, so it is left open
+   rather than guessed at.
+
+   Descendant selectors, not a bare .screenshare-audio-controls: that class
+   sets pointer-events in its own stylesheet, and CSS import order between two
+   sibling components is not something to depend on. Higher specificity wins
+   whichever way the bundler orders them.
+
+   opacity rather than display/visibility so the slider stays focusable, which
+   is what lets :focus-within reveal it for keyboard users at all. */
+.voice-stage__cell-overlay .screenshare-audio-controls,
+.voice-stage__overlay .screenshare-audio-controls {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+/* Each arm is scoped to the overlay it actually serves, because the two
+   layouts nest differently and an unscoped pair let one swallow the other.
+
+   `.voice-stage--equal` also carries `.voice-stage` and the cells live inside
+   it, so a bare `.voice-stage:hover` matched every cell overlay on the stage:
+   hovering the layout toggle, the gap between tiles, or somebody else's tile
+   revealed EVERY tuned-in share's slider at once, and the cell-scoped arm
+   beside it could never be the one that fired.
+
+   Deleting the stage arms is not the fix -- it looks like it, and it would
+   leave the spotlight layout with no trigger at all. `.voice-stage__overlay`
+   (VoiceStage.tsx, the spotlight) hangs directly off `.voice-stage` and has no
+   `.voice-stage__cell` ancestor; only `.voice-stage__cell-overlay` (the equal
+   grid) has one. Stage-wide hover is already per-share in the spotlight, which
+   shows one share at a time -- the leak only ever existed in the grid. */
+.voice-stage__cell:hover .voice-stage__cell-overlay .screenshare-audio-controls,
+.voice-stage__cell:focus-within .voice-stage__cell-overlay .screenshare-audio-controls,
+.voice-stage:hover .voice-stage__overlay .screenshare-audio-controls,
+.voice-stage:focus-within .voice-stage__overlay .screenshare-audio-controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-stage__cell-overlay .screenshare-audio-controls,
+  .voice-stage__overlay .screenshare-audio-controls {
+    transition: none;
+  }
+}

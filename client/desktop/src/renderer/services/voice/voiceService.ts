@@ -320,7 +320,24 @@ function readLegacyTransformOverride(): boolean {
   }
 }
 
-/** The active transform path. Dynamic — the legacy fallback can engage mid-session. */
+/**
+ * The active transform path. Dynamic — the legacy fallback can engage
+ * mid-session, and this re-reads both storage overrides on every call.
+ *
+ * DELIBERATELY NOT EXPORTED. It was, briefly, so the receive audio graph in
+ * `ParticipantGrid` could decide which capture is safe over a consumer track.
+ * That shared one copy of the composition but not one copy of the ANSWER: the
+ * renderer read it at component-mount time, while #295's real precondition is
+ * whether `encodedInsertableStreams` was set on the transport the track arrives
+ * on — a decision made once, here, when the transport was built. Clearing
+ * `concord.forceLegacyE2EE` mid-call leaves the transports untouched, so the
+ * next `AudioOutput` to mount read `script-transform`, muted its element and
+ * built an inert stream source over an insertable-streams peer connection:
+ * silent, with nothing thrown.
+ *
+ * Renderers ask `voiceService.recvTransportUsesInsertableStreams(kind)` instead,
+ * which reports the fact rather than re-deriving it from an input that can move.
+ */
 function currentTransformPath(): EncodedTransformPath {
   return resolveEncodedTransformSupport(currentEncodedTransformApis(), {
     forceLegacy: readLegacyTransformOverride(),
@@ -631,6 +648,33 @@ class VoiceService {
   // Send transport stays single (server allows only 1, and send path has no demux).
   private recvTransportAudio: mediasoupTypes.Transport | null = null;
   private recvTransportVideo: mediasoupTypes.Transport | null = null;
+
+  /**
+   * What each recv transport was ACTUALLY built with — not what the resolver
+   * would say now. `currentTransformPath()` re-reads two storage overrides on
+   * every call, while `encodedInsertableStreams` is fixed at construction, so
+   * the two diverge the moment an override changes without a transport rebuild.
+   * Clearing `concord.forceLegacyE2EE` mid-call does exactly that.
+   *
+   * Undefined means no transport of that kind has been built in this session.
+   */
+  private recvInsertableStreams: Partial<Record<'audio' | 'video', boolean>> = {};
+
+  /**
+   * Whether the live recv transport for `kind` carries `encodedInsertableStreams`
+   * — the actual precondition for Chromium #295, and therefore for whether a
+   * `MediaStreamAudioSourceNode` over a consumer track can be trusted to carry
+   * audio. `ParticipantGrid`'s receive graph forks on this.
+   *
+   * Falls back to the resolver when no transport of that kind exists yet, which
+   * is the pre-existing behaviour and is not reachable from a mounted
+   * `AudioOutput`: that mounts on a consumer, and a consumer requires the
+   * transport. The fallback exists so the answer is never undefined, not
+   * because anything depends on it.
+   */
+  recvTransportUsesInsertableStreams(kind: 'audio' | 'video'): boolean {
+    return this.recvInsertableStreams[kind] ?? currentTransformPath() === 'encoded-streams';
+  }
 
   /**
    * Server-minted ICE servers for the CURRENT media session (#3104). Set at the
@@ -3580,6 +3624,9 @@ class VoiceService {
     this.sendTransport = null;
     this.recvTransportAudio = null;
     this.recvTransportVideo = null;
+    // Cleared with the transports it describes: a stale claim would tell the
+    // next session's receive graph what the PREVIOUS session was built with.
+    this.recvInsertableStreams = {};
     // Credentials must not outlive the transports they were minted for (#3104).
     this.iceServers = null;
     this.cameraSpatialCapForSession = null;
@@ -6692,13 +6739,17 @@ class VoiceService {
       direction: 'recv',
     });
 
+    // Resolve ONCE, here, and both build the transport with it and record it.
+    // Two calls would be two answers the moment an override moved between them.
+    const usesInsertableStreams = currentTransformPath() === 'encoded-streams';
+
     const transport = this.device.createRecvTransport({
       id: options.id,
       iceParameters: options.iceParameters,
       iceCandidates: options.iceCandidates,
       dtlsParameters: options.dtlsParameters,
       // E2EE (legacy path only) — see send transport comment (#295)
-      ...(currentTransformPath() === 'encoded-streams' && {
+      ...(usesInsertableStreams && {
         additionalSettings: {
           encodedInsertableStreams: true,
         } as unknown as Partial<RTCConfiguration>,
@@ -6706,6 +6757,12 @@ class VoiceService {
       // Server-minted STUN/TURN (#3104). Empty when unavailable — see iceConfigForTransport.
       ...this.iceConfigForTransport(),
     });
+
+    // Record what this transport was built with, AFTER it exists — a throw
+    // above must not leave a claim about a transport that was never created.
+    // The receive audio graph reads this rather than re-deriving the path at
+    // its own mount time; see `recvTransportUsesInsertableStreams`.
+    this.recvInsertableStreams[mediaKind] = usesInsertableStreams;
 
     if (mediaKind === 'audio') {
       this.recvTransportAudio = transport;
@@ -9652,6 +9709,9 @@ class VoiceService {
     this.sendTransport = null;
     this.recvTransportAudio = null;
     this.recvTransportVideo = null;
+    // Cleared with the transports it describes: a stale claim would tell the
+    // next session's receive graph what the PREVIOUS session was built with.
+    this.recvInsertableStreams = {};
     // Duplicated deliberately: cleanup() does not call cleanupMediaAndTransports() (#3104).
     this.iceServers = null;
     this.cameraSpatialCapForSession = null;

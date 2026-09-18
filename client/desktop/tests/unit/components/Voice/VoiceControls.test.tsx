@@ -282,6 +282,29 @@ describe('VoiceControls', () => {
     expect(screen.getByText('Chat')).toBeInTheDocument();
   });
 
+  it('shows chat toggle in a DM call, whose thread is persistent and unlinked', () => {
+    setVoiceState();
+    // A DM can never have a linked channel: getLinkedTextChannel matches on
+    // linked_voice_channel_id, which no channel row carries for a conversation.
+    // The empty list is the point — the button has to come from the DM branch.
+    useChannelStore.setState({ channels: [] });
+    useVoiceStore.setState({ isDMCall: true, dmConversationId: 'dm-1' });
+    render(<VoiceControls />);
+    expect(screen.getByText('Chat')).toBeInTheDocument();
+  });
+
+  it('hides chat toggle in a DM call with no conversation resolved', () => {
+    // Guard against over-correcting to a bare `isDMCall ||`: the panel resolves
+    // its target from dmConversationId, so a button shown without one opens an
+    // empty thread. This is what keeps the test above from passing for the
+    // wrong reason.
+    setVoiceState();
+    useChannelStore.setState({ channels: [] });
+    useVoiceStore.setState({ isDMCall: true, dmConversationId: null });
+    render(<VoiceControls />);
+    expect(screen.queryByText('Chat')).not.toBeInTheDocument();
+  });
+
   // ── Keep active while unfocused ──────────────────────────────────────────
 
   it('does not show keep-active button when not screen sharing', () => {

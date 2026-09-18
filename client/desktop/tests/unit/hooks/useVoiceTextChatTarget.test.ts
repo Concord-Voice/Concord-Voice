@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { renderHook } from '@testing-library/react';
+import { renderHook, act } from '@testing-library/react';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
@@ -16,7 +16,10 @@ vi.mock('@/renderer/hooks/messaging/useDMSubscription', () => ({
   useDMSubscription: (id: string | null) => mockDMSub(id),
 }));
 
-import { useVoiceTextChatTarget } from '@/renderer/hooks/voice/useVoiceTextChatTarget';
+import {
+  useVoiceTextChatTarget,
+  useHasVoiceTextTarget,
+} from '@/renderer/hooks/voice/useVoiceTextChatTarget';
 
 const linkedTextChannel = {
   id: 'text-1',
@@ -83,5 +86,42 @@ describe('useVoiceTextChatTarget (#1873)', () => {
     const { result } = renderHook(() => useVoiceTextChatTarget());
     expect(result.current.targetId).toBeNull();
     expect(result.current.targetName).toBe('Conversation'); // getThreadName(undefined)
+  });
+});
+
+describe('useHasVoiceTextTarget — reactivity', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+  });
+
+  it('turns true when the link arrives AFTER the first render', () => {
+    // The defect this pins: the hook subscribed to `getLinkedTextChannel`, a
+    // stable closure over `get().channels`, so a change to `channels` alone
+    // never notified. A `channel_updated` linking a text channel mid-call, or a
+    // reconnect refetch landing after the control mounted, left this false and
+    // the Chat button silently never appeared.
+    useVoiceStore.setState({ activeChannelId: 'voice-1', isDMCall: false, dmConversationId: null });
+    useChannelStore.setState({ channels: [] });
+
+    const { result } = renderHook(() => useHasVoiceTextTarget());
+    expect(result.current).toBe(false); // precondition, not the assertion
+
+    // NO explicit rerender(). That is the whole point: a manual rerender forces
+    // a fresh read regardless of whether the store notified, so it passes just
+    // as happily against a subscription that never fires. The store update has
+    // to drive the re-render by itself, or nothing here is being tested.
+    act(() => {
+      useChannelStore.setState({ channels: [linkedTextChannel] });
+    });
+
+    expect(result.current).toBe(true);
+  });
+
+  it('stays true for a DM call regardless of the channel list', () => {
+    useVoiceStore.setState({ activeChannelId: 'dm-1', isDMCall: true, dmConversationId: 'dm-1' });
+    useChannelStore.setState({ channels: [] });
+    const { result } = renderHook(() => useHasVoiceTextTarget());
+    expect(result.current).toBe(true);
   });
 });

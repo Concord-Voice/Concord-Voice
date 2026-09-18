@@ -37,13 +37,20 @@ export function useVoiceTextChatTarget(): VoiceTextChatTarget {
   const activeChannelId = useVoiceStore((s) => s.activeChannelId);
   const isDMCall = useVoiceStore((s) => s.isDMCall);
   const dmConversationId = useVoiceStore((s) => s.dmConversationId);
-  const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
   const conversations = useDMStore((s) => s.conversations);
   const user = useUserStore((s) => s.user);
   const activeServerId = useServerStore((s) => s.activeServerId);
 
-  const linkedChannel =
-    !isDMCall && activeChannelId ? getLinkedTextChannel(activeChannelId) : undefined;
+  // Select the CHANNEL, not `getLinkedTextChannel`. That action is a stable
+  // closure over `get().channels`, so subscribing to it never notifies — a
+  // change to `channels` alone did not re-render the consumer. `find` returns a
+  // reference into the existing array, so this stays referentially stable while
+  // `channels` does and cannot loop.
+  const linkedChannel = useChannelStore((s) =>
+    !isDMCall && activeChannelId
+      ? s.channels.find((c) => c.linked_voice_channel_id === activeChannelId)
+      : undefined
+  );
   const dmConversation =
     isDMCall && dmConversationId ? conversations.find((c) => c.id === dmConversationId) : undefined;
 
@@ -67,4 +74,45 @@ export function useVoiceTextChatTarget(): VoiceTextChatTarget {
   );
 
   return { isDMCall, targetId, targetName, fetchType: isDMCall ? 'dm' : 'channel', ctx };
+}
+
+/**
+ * Whether the active voice session has ANY text target: the DM conversation in
+ * a DM call, else the linked text channel of `channelId` (defaulting to the
+ * connected channel).
+ *
+ * Separate from `useVoiceTextChatTarget` on purpose — that hook also opens the
+ * real-time subscription for whatever it resolves, so calling it from every
+ * control surface just to read a boolean would open one subscription per
+ * surface. Shared so the render gates cannot drift, which they already had:
+ * VoiceView was DM-aware while VoiceControls and PersistentVoiceBar were not,
+ * so the DM chat button never rendered and VoiceView's own correct branch was
+ * unreachable (#1873 updated the panel and not its entry points).
+ *
+ * `channelId` is a parameter rather than a store read because VoiceView renders
+ * for a SPECIFIC channel, which is not necessarily the connected one.
+ */
+export function useHasVoiceTextTarget(channelId?: string | null): boolean {
+  const activeChannelId = useVoiceStore((s) => s.activeChannelId);
+  const isDMCall = useVoiceStore((s) => s.isDMCall);
+  const dmConversationId = useVoiceStore((s) => s.dmConversationId);
+  const id = channelId ?? activeChannelId;
+
+  // Subscribe to the DERIVED boolean rather than to `getLinkedTextChannel`,
+  // which is a stable closure over `get().channels` and therefore never
+  // notifies. The link arriving after this first rendered — a reconnect
+  // refetch, or a `channel_updated` linking a text channel to the live voice
+  // channel mid-call — left this `false` until some unrelated `voiceStore`
+  // write forced a render, and the Chat button silently never appeared. The
+  // three old call sites carried the same bug; being the one definition of
+  // this gate is exactly why it is fixed here.
+  const hasLinkedText = useChannelStore(
+    (s) => !!id && s.channels.some((c) => c.linked_voice_channel_id === id)
+  );
+
+  // A DM's thread is the conversation itself and is always present, but the
+  // panel resolves its target from dmConversationId — so gate on that rather
+  // than on isDMCall alone, or the button opens an empty thread.
+  if (isDMCall) return !!dmConversationId;
+  return hasLinkedText;
 }

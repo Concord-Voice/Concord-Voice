@@ -49,10 +49,25 @@ vi.mock('@/renderer/components/Voice/ParticipantGrid.css', () => ({}));
 // which lazily imports voiceService. Mock it so the report is observable and the real
 // singleton is never pulled into this render tree. Only StreamGridTile (Tile view) uses
 // it, so this is inert for the AudioOutputs / avatar-grid tests.
-const setRemoteVideoRenderState = vi.fn();
-const removeRemoteVideoTile = vi.fn();
+// vi.hoisted, not bare consts: ParticipantGrid now imports voiceService at
+// module scope (for currentTransformPath), so this factory runs BEFORE plain
+// top-level declarations initialise and a bare const throws a TDZ ReferenceError.
+const { setRemoteVideoRenderState, removeRemoteVideoTile } = vi.hoisted(() => ({
+  setRemoteVideoRenderState: vi.fn(),
+  removeRemoteVideoTile: vi.fn(),
+}));
 vi.mock('@/renderer/services/voice/voiceService', () => ({
-  voiceService: { setRemoteVideoRenderState, removeRemoteVideoTile },
+  voiceService: {
+    setRemoteVideoRenderState,
+    removeRemoteVideoTile,
+    // The receive graph forks on what the recv transport was BUILT with,
+    // not on what the resolver would answer now. `false` selects the
+    // graph-driven path these suites assert against.
+    recvTransportUsesInsertableStreams: () => false,
+  },
+  // Mocking the module replaces ALL of its exports, so the transform-path
+  // reader has to be supplied here too or the graph fork reads undefined.
+  currentTransformPath: () => 'script-transform',
 }));
 
 // ── AudioContext mock objects ─────────────────────────────────────────────────
@@ -85,7 +100,12 @@ const mockAudioContext = {
   sampleRate: 48000,
   createAnalyser: vi.fn(() => mockAnalyserNode),
   createGain: vi.fn(() => ({ ...mockGainNode })),
+  // The graph is fed from the STREAM, not the element: createMediaElementSource
+  // on a srcObject-backed element captures silence on Chromium 152. Both are
+  // mocked so a regression to the dead API fails on the ASSERTION below rather
+  // than on a missing mock, which reads like a real failure and is not.
   createMediaElementSource: vi.fn(() => mockSourceNode),
+  createMediaStreamSource: vi.fn(() => mockSourceNode),
   resume: mockResume,
   close: mockClose,
   setSinkId: vi.fn().mockResolvedValue(undefined),
@@ -189,7 +209,7 @@ describe('AudioOutputs', () => {
       },
     });
     render(<AudioOutputs />);
-    expect(mockAudioContext.createMediaElementSource).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalledTimes(1);
   });
 
   it('instantiates an AudioOutput for a remote participant with screenAudioStream', () => {
@@ -208,7 +228,7 @@ describe('AudioOutputs', () => {
       },
     });
     render(<AudioOutputs />);
-    expect(mockAudioContext.createMediaElementSource).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalledTimes(1);
   });
 
   it('instantiates separate AudioOutputs for audioStream and screenAudioStream', () => {
@@ -228,7 +248,7 @@ describe('AudioOutputs', () => {
       },
     });
     render(<AudioOutputs />);
-    expect(mockAudioContext.createMediaElementSource).toHaveBeenCalledTimes(2);
+    expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalledTimes(2);
   });
 
   it('instantiates AudioOutputs for multiple remote participants', () => {
@@ -257,7 +277,7 @@ describe('AudioOutputs', () => {
       },
     });
     render(<AudioOutputs />);
-    expect(mockAudioContext.createMediaElementSource).toHaveBeenCalledTimes(2);
+    expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalledTimes(2);
   });
 
   it('excludes local user from audio outputs even if they have a stream', () => {
@@ -287,7 +307,7 @@ describe('AudioOutputs', () => {
     });
     render(<AudioOutputs />);
     // Only remote-1 gets an AudioOutput, not the local user.
-    expect(mockAudioContext.createMediaElementSource).toHaveBeenCalledTimes(1);
+    expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -320,7 +340,7 @@ describe('AudioOutput', () => {
     render(<AudioOutput stream={stream} />);
     expect(mockAudioContext.createAnalyser).toHaveBeenCalled();
     expect(mockAudioContext.createGain).toHaveBeenCalled();
-    expect(mockAudioContext.createMediaElementSource).toHaveBeenCalled();
+    expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalled();
   });
 
   it('cleans up AudioContext on unmount', () => {
@@ -461,9 +481,13 @@ describe('AudioOutput', () => {
     });
   });
 
-  it('logs redacted warning when AudioContext.resume() rejects on suspended state', async () => {
+  it('hands audio back to the element when AudioContext.resume() rejects', async () => {
+    // This used to assert only that a warning was logged, and a warning was all
+    // it did: the element is muted by the time resume() is attempted, so a
+    // context that never reaches `running` meant TOTAL SILENCE for that
+    // participant with one console line and no UI signal. The contract is one
+    // audible path, so a dead context has to give the audio back.
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    // Flip mock ctx to suspended so the resume() branch executes
     const origState = mockAudioContext.state;
     mockAudioContext.state = 'suspended';
     mockAudioContext.resume = vi.fn().mockRejectedValueOnce(new Error('boom'));
@@ -472,8 +496,11 @@ describe('AudioOutput', () => {
     render(<AudioOutput stream={stream} />);
 
     await vi.waitFor(() => {
-      expect(warnSpy).toHaveBeenCalledWith('AudioContext resume failed:', 'boom');
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('context suspended'), 'boom');
     });
+    // The property, not the message: the graph is torn down rather than left
+    // in place muted-and-silent.
+    await vi.waitFor(() => expect(mockClose).toHaveBeenCalled());
 
     mockAudioContext.state = origState;
   });

@@ -13,6 +13,11 @@ import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification'
 import { useGridLayout } from '../../hooks/ui/useGridLayout';
 import { useScreenTileVideo } from '../../hooks/voice/useScreenTileVideo';
 import { errorMessage } from '../../utils/runtime/redactError';
+// Static, not the dynamic import() the sibling voice components use: the fork
+// below must be decided SYNCHRONOUSLY inside the setup effect, before the
+// element is muted and played. An awaited import would build the element
+// first and settle the path afterwards.
+import { voiceService } from '../../services/voice/voiceService';
 import './ParticipantGrid.css';
 
 /** Base vertical px reserved below each grid slot for the Tune In/Out pill row. */
@@ -80,12 +85,21 @@ async function setSinkThenPlay(el: SinkAudioElement, sinkId: string): Promise<Si
  * internal <audio> element is created in the effect and never attached to
  * the DOM (see the effect body for why).
  *
- * Chain: <audio>.srcObject → createMediaElementSource → analyser → volumeGain
- *        → boostGain → ctx.destination
+ * Two chains, selected by the active encoded-transform path (see the effect for
+ * the measurement and the #295 reasoning):
  *
- * `volumeGain` applies the combined master × per-participant volume. When
- * `userId` is provided the per-participant override (default 100) is mixed in;
- * otherwise only the master `outputVolume` applies.
+ *   graph-driven (script-transform / unavailable — the normal case)
+ *     stream → createMediaStreamSource → analyser → volumeGain → boostGain
+ *            → ctx.destination,  with the <audio> element MUTED but playing so
+ *            the remote track keeps rendering.
+ *
+ *   element-driven (encoded-streams / legacy)
+ *     <audio>.srcObject plays audibly and carries volume and sink itself. No
+ *     graph is built, so quiet boost is unavailable rather than silently inert.
+ *
+ * The combined master × per-participant volume lands on whichever of those is
+ * audible. When `userId` is provided the per-participant override (default 100)
+ * is mixed in; otherwise only the master `outputVolume` applies.
  */
 export const AudioOutput: React.FC<{
   stream: MediaStream;
@@ -119,11 +133,36 @@ export const AudioOutput: React.FC<{
     return map[userId] ?? 100;
   });
 
+  // Which side of the #295 fork this output is on. Written when the graph is
+  // built; read by the volume, boost and output-device effects so all four
+  // agree on where the audio actually is.
+  const graphDrivenRef = useRef(true);
+
+  /** Master x per-participant as a 0..1 multiplier — one definition, both paths. */
+  const combinedVolume = useCallback(() => {
+    const state = useAudioSettingsStore.getState();
+    const master = state.outputVolume / 100;
+    const map = volumeKind === 'screen' ? state.perScreenShareVolume : state.perParticipantVolume;
+    const perParticipant = userId ? (map[userId] ?? 100) / 100 : 1;
+    return master * perParticipant;
+  }, [userId, volumeKind]);
+
+  /**
+   * Element-driven volume. HTMLMediaElement.volume is clamped to 0..1 by spec,
+   * so this path can attenuate but cannot amplify — which is precisely why
+   * quiet boost is unavailable on it rather than silently ineffective.
+   */
+  const applyElementVolume = useCallback(
+    (el: HTMLAudioElement) => {
+      el.volume = Math.min(1, Math.max(0, combinedVolume()));
+    },
+    [combinedVolume]
+  );
+
   const retargetOutputDevice = useCallback((selectedOutputDeviceId?: string) => {
     const ctx = ctxRef.current;
     const boostGain = boostGainRef.current;
     const el = audioElRef.current;
-    if (!ctx || !boostGain || ctx.state === 'closed') return;
     if (!selectedOutputDeviceId && !appliedOutputDeviceRef.current) return;
 
     const sinkId = selectedOutputDeviceId ?? '';
@@ -135,6 +174,35 @@ export const AudioOutput: React.FC<{
       appliedOutputDeviceRef.current = false;
       appliedSinkIdRef.current = null;
     };
+
+    // Element-driven (#295 legacy path): the primary element IS the audible
+    // output, so the sink belongs on it. Nothing used to set a sink here at
+    // all — every route below is downstream of a capture that carries no
+    // audio — so call audio stayed on the system default whatever was picked.
+    if (!graphDrivenRef.current) {
+      if (!el || !('setSinkId' in el)) {
+        resetAppliedSinkOnFailure();
+        return;
+      }
+      void setSinkThenPlay(el as SinkAudioElement, sinkId).then((result) => {
+        if (!result.ok) {
+          console.warn('Failed to set audio output device:', errorMessage(result.err));
+          resetAppliedSinkOnFailure();
+        }
+      });
+      return;
+    }
+
+    // Graph-driven: every route below hangs off ctx.destination, so it needs
+    // both the context and the graph. This guard sits BELOW the element branch
+    // deliberately. Above it, an element-driven output -- which builds no
+    // AudioContext at all -- returned here and never reached its own sink call,
+    // so device selection would stay broken on the legacy path for exactly the
+    // reason this function was extended to fix.
+    if (!ctx || ctx.state === 'closed' || !boostGain) {
+      resetAppliedSinkOnFailure();
+      return;
+    }
 
     const retargetViaAudioElement = () => {
       if (!el || !('setSinkId' in el)) return false;
@@ -177,13 +245,41 @@ export const AudioOutput: React.FC<{
 
   // Set up the Web Audio processing chain.
   //
-  // Chromium 135+ broke createMediaStreamSource for WebRTC consumer tracks
-  // with encodedInsertableStreams — the source node produces silence even though
-  // the track is live. Raw <audio>.srcObject playback still works (#295).
+  // #295: createMediaStreamSource produces silence for a WebRTC consumer track
+  // when the peer connection sets `encodedInsertableStreams`. That flag is set
+  // ONLY on the legacy `encoded-streams` transform path, so on the modern
+  // RTCRtpScriptTransform path the precondition does not exist and a stream
+  // source is the correct way to feed the graph.
   //
-  // Fix: let the <audio> element play the stream, then capture its output via
-  // createMediaElementSource. This routes the element's decoded audio through
-  // the Web Audio chain (volume, boost, analysis) → ctx.destination.
+  // We ask the transport what it was BUILT with, not what the resolver would
+  // say now. `currentTransformPath()` re-reads two storage overrides on every
+  // call while the flag is fixed at transport construction, so clearing
+  // `concord.forceLegacyE2EE` mid-call leaves the transports insertable-streams
+  // while the resolver starts answering `script-transform`. An AudioOutput
+  // mounting after that (a participant joining is enough) would mute its
+  // element AND build an inert stream source over an insertable-streams peer
+  // connection — silent, nothing thrown, which is this file's own bug one layer
+  // up. The reverse direction self-corrects: `engageLegacyFallback` rebuilds
+  // the transports.
+  //
+  // The previous workaround — capture the element with createMediaElementSource
+  // — was MEASURED INERT on Electron 44 / Chromium 152: on an element whose
+  // source is a MediaStream via srcObject it captures nothing, throws nothing,
+  // and warns nothing, while the element keeps playing at full volume. Every
+  // node downstream therefore governed nothing: per-participant volume, master
+  // volume, quiet boost, the analyser feeding boost, and output-device
+  // selection (whose sink was set on the fallback element and the context, both
+  // fed by the dead capture, while this element was never muted or re-sinked).
+  //
+  // So the path forks on the same condition the transport uses:
+  //   script-transform / unavailable → graph-driven: stream source, element
+  //                                    muted. A muted element still PULLS the
+  //                                    remote track (measured), which is what
+  //                                    keeps the pipeline rendering.
+  //   encoded-streams                → element-driven: #295 applies, so the
+  //                                    element stays audible and carries volume
+  //                                    and sink itself. Boost is unavailable
+  //                                    there; there is no graph to apply it to.
   //
   // Important: we create the <audio> element INSIDE the effect rather than
   // reusing a ref'd JSX element. `createMediaElementSource` can only be called
@@ -192,55 +288,129 @@ export const AudioOutput: React.FC<{
   // double-mount (mount → cleanup → remount) would otherwise throw on the
   // second invocation. Creating a fresh element per mount avoids this.
   useEffect(() => {
+    const graphDriven = !voiceService.recvTransportUsesInsertableStreams('audio');
+    graphDrivenRef.current = graphDriven;
+
     const el = document.createElement('audio');
     audioElRef.current = el;
 
-    // Play the consumer stream through the <audio> element first
+    // The element always plays: a remote WebRTC track does not render until a
+    // media element pulls it, and that holds even while it is muted. When the
+    // graph owns the audio the element must be muted, or it is a second,
+    // unattenuated route to the speakers that no volume control touches.
     el.srcObject = stream;
+    el.muted = graphDriven;
+    if (!graphDriven) applyElementVolume(el);
     el.play().catch((err) => {
       console.warn('Audio element play() rejected:', errorMessage(err));
     });
 
-    const ctx = new AudioContext({ sampleRate: 48000 });
-    ctxRef.current = ctx;
+    /**
+     * Hand the audio back to the element when the graph cannot carry it.
+     *
+     * The invariant this file exists to hold is EXACTLY ONE audible path. A
+     * graph that fails to build or fails to run leaves the element muted with
+     * nothing downstream of it, which is ZERO — strictly worse than the
+     * ungoverned single path we started from, and it arrives as silence with a
+     * console line rather than as anything a user can act on.
+     *
+     * Disconnects before unmuting, so this can never produce TWO instead.
+     *
+     * FENCED ON ELEMENT IDENTITY, because `ctx.resume()` rejects
+     * ASYNCHRONOUSLY. This closure captures `el` from its own setup run but
+     * mutates the SHARED refs, so a rejection arriving after a `stream` swap
+     * would disconnect the successor's `boostGain`, close the successor's
+     * context, and unmute this run's already-detached element — leaving the
+     * live element muted with no graph behind it. Silence, produced by the
+     * guard that exists to prevent silence.
+     *
+     * `audioElRef.current` is the successor's element after a re-run and null
+     * after an unmount, so the one comparison covers both.
+     */
+    const degradeToElementDriven = (reason: string, err: unknown) => {
+      if (audioElRef.current !== el) return;
+      console.warn(`Audio graph unavailable (${reason}); element takes over:`, errorMessage(err));
+      try {
+        boostGainRef.current?.disconnect();
+      } catch {
+        /* already torn down — nothing downstream either way */
+      }
+      analyserRef.current = null;
+      boostGainRef.current = null;
+      volumeGainRef.current = null;
+      const dying = ctxRef.current;
+      if (dying && dying.state !== 'closed') void dying.close().catch(() => {});
+      ctxRef.current = null;
 
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch((err) => {
-        console.warn('AudioContext resume failed:', errorMessage(err));
-      });
+      graphDrivenRef.current = false;
+      el.muted = false;
+      applyElementVolume(el);
+      // The sink was applied against ctx.destination, which is gone. Clear the
+      // applied-sink memo or the retarget below short-circuits on it.
+      appliedOutputDeviceRef.current = false;
+      appliedSinkIdRef.current = null;
+      retargetOutputDevice(latestOutputDeviceIdRef.current);
+    };
+
+    // Build the graph — and the CONTEXT — only when it can actually carry
+    // audio. On the legacy path the refs stay null, which is what makes the
+    // boost effect's `!analyser || !boostGain` guard short-circuit instead of
+    // writing gain to a node nothing is connected to: the failure mode this
+    // change exists to remove, reintroduced one layer down.
+    //
+    // The context is inside the branch because on the legacy path it held no
+    // nodes at all. Chromium caps concurrent AudioContexts per document and
+    // this component mints one per remote participant plus one per screen-audio
+    // stream, so an unused one is real pressure against that cap for nothing.
+    if (graphDriven) {
+      try {
+        const ctx = new AudioContext({ sampleRate: 48000 });
+        ctxRef.current = ctx;
+
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.3;
+        const boostGain = ctx.createGain();
+        boostGain.gain.value = 1;
+        const volumeGain = ctx.createGain();
+        volumeGain.gain.value = combinedVolume();
+
+        source.connect(analyser);
+        analyser.connect(volumeGain);
+        volumeGain.connect(boostGain);
+        boostGain.connect(ctx.destination);
+
+        analyserRef.current = analyser;
+        boostGainRef.current = boostGain;
+        volumeGainRef.current = volumeGain;
+
+        if (ctx.state === 'suspended') {
+          // A context that never reaches `running` carries nothing, and the
+          // element is muted by now — so a rejection here is total silence
+          // unless we hand it back. Should not fire in the packaged shell
+          // (`autoplay-policy=no-user-gesture-required`, src/main/main.ts).
+          ctx.resume().catch((err) => degradeToElementDriven('context suspended', err));
+        }
+      } catch (err) {
+        // createMediaStreamSource throws InvalidStateError for a stream with no
+        // audio track, and the AudioContext constructor throws once the
+        // per-document cap is reached. Neither is reachable from a production
+        // path today; both would otherwise escape the effect body to an error
+        // boundary with the element already muted.
+        degradeToElementDriven('construction failed', err);
+      }
+    } else {
+      analyserRef.current = null;
+      boostGainRef.current = null;
+      volumeGainRef.current = null;
     }
 
-    // Capture the audio element's output into the Web Audio graph.
-    // createMediaElementSource redirects playback through the graph —
-    // the element itself goes silent, audio comes out of ctx.destination.
-    const source = ctx.createMediaElementSource(el);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.3;
-    const boostGain = ctx.createGain();
-    boostGain.gain.value = 1;
-    const volumeGain = ctx.createGain();
-    {
-      const state = useAudioSettingsStore.getState();
-      const master = state.outputVolume / 100;
-      const volumeMap =
-        volumeKind === 'screen' ? state.perScreenShareVolume : state.perParticipantVolume;
-      const perParticipant = userId ? (volumeMap[userId] ?? 100) / 100 : 1;
-      volumeGain.gain.value = master * perParticipant;
-    }
-
-    source.connect(analyser);
-    analyser.connect(volumeGain);
-    volumeGain.connect(boostGain);
-    boostGain.connect(ctx.destination);
-
-    analyserRef.current = analyser;
-    boostGainRef.current = boostGain;
-    volumeGainRef.current = volumeGain;
     retargetOutputDevice(latestOutputDeviceIdRef.current);
 
     console.debug('[AudioOutput] setup', {
-      ctxState: ctx.state,
+      graphDriven: graphDrivenRef.current,
+      ctxState: ctxRef.current?.state ?? 'none',
       streamActive: stream.active,
       trackCount: stream.getAudioTracks().length,
       trackState: stream.getAudioTracks()[0]?.readyState,
@@ -265,7 +435,11 @@ export const AudioOutput: React.FC<{
       fallbackDestRef.current = null;
       appliedOutputDeviceRef.current = false;
       appliedSinkIdRef.current = null;
-      if (ctx.state !== 'closed') ctx.close().catch(() => {});
+      // Read the ref, not a captured local: the context is built inside the
+      // graph branch and `degradeToElementDriven` may already have closed and
+      // nulled it, and the element path never builds one at all.
+      const ctx = ctxRef.current;
+      if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {});
       ctxRef.current = null;
       volumeGainRef.current = null;
       boostGainRef.current = null;
@@ -273,20 +447,38 @@ export const AudioOutput: React.FC<{
     };
     // `userId` is stable for a given AudioOutput instance (the parent keys by
     // userId), but ESLint needs it listed since we read it during setup.
-  }, [stream, userId, volumeKind, retargetOutputDevice]);
+    // The two volume helpers are memoized on [userId, volumeKind], both already
+    // listed, so naming them here satisfies the rule without widening when this
+    // effect re-runs — it must not rebuild the graph on a volume change.
+  }, [stream, userId, volumeKind, retargetOutputDevice, combinedVolume, applyElementVolume]);
 
   // Retarget the active output device without rebuilding the audio graph.
   useEffect(() => {
     retargetOutputDevice(outputDeviceId);
   }, [outputDeviceId, retargetOutputDevice]);
 
-  // Update output volume in real-time. Applies master × per-participant.
+  // Update output volume in real-time. Applies master × per-participant to
+  // whichever path is actually audible — the graph's gain node when the graph
+  // owns the audio, the element itself when #295 keeps it element-driven.
+  // Writing only to the gain node is what made this control inert.
   useEffect(() => {
-    if (volumeGainRef.current && ctxRef.current && ctxRef.current.state !== 'closed') {
-      const combined = (outputVolume / 100) * (participantVolume / 100);
-      volumeGainRef.current.gain.setTargetAtTime(combined, ctxRef.current.currentTime, 0.01);
+    if (graphDrivenRef.current) {
+      if (volumeGainRef.current && ctxRef.current && ctxRef.current.state !== 'closed') {
+        // `combinedVolume()` rather than recomputing the product inline: the
+        // docblock on it says "one definition, both paths", and an inline copy
+        // here made that false the moment either factor gained a third term.
+        // It reads the store directly, so it does not need the subscribed
+        // values — those stay in the dep array as the re-run trigger.
+        volumeGainRef.current.gain.setTargetAtTime(
+          combinedVolume(),
+          ctxRef.current.currentTime,
+          0.01
+        );
+      }
+      return;
     }
-  }, [outputVolume, participantVolume]);
+    if (audioElRef.current) applyElementVolume(audioElRef.current);
+  }, [outputVolume, participantVolume, combinedVolume, applyElementVolume]);
 
   // Quiet user boost: dynamic gain based on audio level
   useEffect(() => {
@@ -355,7 +547,18 @@ export const AudioOutput: React.FC<{
         boostTimerRef.current = null;
       }
     };
-  }, [quietBoost, quietBoostThreshold]);
+    // `stream` is not read here, and it is load-bearing anyway: the SETUP
+    // effect's cleanup clears this timer, and that effect is keyed on `stream`
+    // while this one is not. A stream-only change (a reconnect, a codec
+    // re-produce, any `fastReproduce*`) therefore killed the 50 Hz poll and
+    // nothing ever restarted it — quiet boost died for the rest of the call,
+    // with `boostGain` frozen wherever the last tick left it, possibly at a
+    // multiplier that never released. One of the four features this file is
+    // meant to repair, silently still broken after the first re-consume.
+    //
+    // Listing it re-runs this effect on the same commit as the rebuild, after
+    // the setup effect has repopulated the refs it reads.
+  }, [quietBoost, quietBoostThreshold, stream]);
 
   // The <audio> element is created inside the effect — nothing to render here.
   return null;

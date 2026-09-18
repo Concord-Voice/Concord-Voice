@@ -525,3 +525,40 @@ describe('ParticipantTile', () => {
     });
   });
 });
+
+describe('ParticipantTile — DM call (no server scope)', () => {
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    // A DM call sets server_id '' ("DM rooms aren't server-scoped"), and
+    // voiceStore stores it with `??`, which does not catch ''. The suite above
+    // seeds 'server-1' precisely "so the menu opens", so every existing menu
+    // test runs in the one state where this cannot fail.
+    useVoiceStore.setState({ activeServerId: '', activeChannelId: 'dm-1', isDMCall: true });
+  });
+
+  it('opens the participant menu on right-click', () => {
+    const { container } = render(
+      <ParticipantTile participant={makeParticipant()} isLocal={false} />
+    );
+    fireEvent.contextMenu(container.querySelector('.participant-tile') as HTMLElement);
+    expect(screen.getByLabelText('Participant volume')).toBeInTheDocument();
+  });
+
+  it('offers volume and profile, and no server moderation it cannot authorize', () => {
+    // The degradation contract. Every server-scoped item is gated on
+    // hasServerPermission(serverId, ...), which is false for '' because the
+    // permission map has no such key — asserted here rather than assumed,
+    // since "it should hide" is exactly the claim that needs checking.
+    const { container } = render(
+      <ParticipantTile participant={makeParticipant()} isLocal={false} />
+    );
+    fireEvent.contextMenu(container.querySelector('.participant-tile') as HTMLElement);
+
+    expect(screen.getByLabelText('Participant volume')).toBeInTheDocument();
+    expect(screen.getByText('View Profile')).toBeInTheDocument();
+    for (const serverOnly of ['Kick', 'Ban', 'Move to', 'Disconnect']) {
+      expect(screen.queryByText(serverOnly)).not.toBeInTheDocument();
+    }
+  });
+});

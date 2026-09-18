@@ -19,6 +19,30 @@ vi.mock('@/renderer/components/Voice/useVoiceMagnification', () => ({
 
 vi.mock('@/renderer/components/Voice/ParticipantGrid.css', () => ({}));
 
+// Pin the transform path, as ParticipantGrid.test.tsx already does. Without
+// this the audio-graph fork is decided by REAL feature detection against
+// whatever jsdom happens to expose: every `createMediaStreamSource` assertion
+// below passes only because `RTCRtpSender.prototype.createEncodedStreams` is
+// absent there. The day jsdom or a polyfill grows it, the fork flips to the
+// element path and this file fails for a reason unrelated to its subject.
+// `vi.hoisted` because the factory runs before plain top-level consts
+// initialise, and ParticipantGrid imports voiceService at module scope.
+const { setRemoteVideoRenderState, removeRemoteVideoTile } = vi.hoisted(() => ({
+  setRemoteVideoRenderState: vi.fn(),
+  removeRemoteVideoTile: vi.fn(),
+}));
+vi.mock('@/renderer/services/voice/voiceService', () => ({
+  voiceService: {
+    setRemoteVideoRenderState,
+    removeRemoteVideoTile,
+    // The receive graph forks on what the recv transport was BUILT with,
+    // not on what the resolver would answer now. `false` selects the
+    // graph-driven path these suites assert against.
+    recvTransportUsesInsertableStreams: () => false,
+  },
+  currentTransformPath: () => 'script-transform',
+}));
+
 // AudioContext mock
 const mockClose = vi.fn().mockResolvedValue(undefined);
 const mockResume = vi.fn().mockResolvedValue(undefined);
@@ -45,7 +69,12 @@ const mockAudioContext = {
   sampleRate: 48000,
   createAnalyser: vi.fn(() => mockAnalyserNode),
   createGain: vi.fn(() => ({ ...mockGainNode })),
+  // The graph is fed from the STREAM, not the element: createMediaElementSource
+  // on a srcObject-backed element captures silence on Chromium 152. Both are
+  // mocked so a regression to the dead API fails on the ASSERTION below rather
+  // than on a missing mock, which reads like a real failure and is not.
   createMediaElementSource: vi.fn(() => mockSourceNode),
+  createMediaStreamSource: vi.fn(() => mockSourceNode),
   resume: mockResume,
   close: mockClose,
   setSinkId: vi.fn().mockResolvedValue(undefined),
@@ -165,7 +194,7 @@ describe('ParticipantGrid — extended coverage', () => {
       const { container } = render(<ParticipantGrid />);
       // <audio> lives in the effect closure (DOM-less AudioOutput), so verify
       // the audio graph via the mock and the visual layer via the DOM.
-      expect(mockAudioContext.createMediaElementSource).toHaveBeenCalled();
+      expect(mockAudioContext.createMediaStreamSource).toHaveBeenCalled();
       expect(container.querySelector('.user-frame-grid')).toBeInTheDocument();
     });
   });
@@ -238,13 +267,13 @@ describe('ParticipantGrid — extended coverage', () => {
       expect(audioContextCtor).toHaveBeenCalledTimes(1);
 
       mockAudioContext.setSinkId.mockClear();
-      mockAudioContext.createMediaElementSource.mockClear();
+      mockAudioContext.createMediaStreamSource.mockClear();
 
       rerender(<AudioOutput stream={stream} outputDeviceId="speaker-b" />);
 
       expect(mockAudioContext.setSinkId).toHaveBeenCalledWith('speaker-b');
       expect(audioContextCtor).toHaveBeenCalledTimes(1);
-      expect(mockAudioContext.createMediaElementSource).not.toHaveBeenCalled();
+      expect(mockAudioContext.createMediaStreamSource).not.toHaveBeenCalled();
     });
 
     it('reapplies outputDeviceId when the stream is replaced', () => {

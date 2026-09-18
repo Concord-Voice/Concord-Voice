@@ -28,7 +28,7 @@ import {
 } from '../../stores/voice/voiceStore';
 import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
 import { useUserStore } from '../../stores/auth/userStore';
-import { useChannelStore } from '../../stores/chat/channelStore';
+import { useHasVoiceTextTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import ScreenSharePicker from './ScreenSharePicker';
@@ -367,7 +367,6 @@ interface VoiceControlsProps {
 }
 
 const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', onPopOut }) => {
-  const activeChannelId = useVoiceStore((s) => s.activeChannelId);
   const connectionState = useVoiceStore((s) => s.connectionState);
   const isMuted = useVoiceStore((s) => s.isMuted);
   const isDeafened = useVoiceStore((s) => s.isDeafened);
@@ -409,8 +408,7 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   const isServerMuted = localParticipant?.serverMuted || false;
   const isServerDeafened = localParticipant?.serverDeafened || false;
 
-  const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
-  const hasLinkedText = !!(activeChannelId && getLinkedTextChannel(activeChannelId));
+  const hasLinkedText = useHasVoiceTextTarget();
 
   const [showScreenPicker, setShowScreenPicker] = useState(false);
   // Resolved when the picker OPENS rather than read during render: voiceService is a

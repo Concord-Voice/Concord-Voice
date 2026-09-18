@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useCallback, useMemo } from 'react';
 import { Lock, Users, ChevronUp, ChevronDown } from 'lucide-react';
 import { createResizeKeyHandler } from '../../utils/ui/resizeKeyboard';
 import { useVoiceStore, MAX_TUNED_SCREEN_SHARES } from '../../stores/voice/voiceStore';
-import { useChannelStore } from '../../stores/chat/channelStore';
+import { useHasVoiceTextTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import { UserFrameGrid } from './ParticipantGrid';
 import UserFrameBar from './UserFrameBar';
@@ -222,7 +222,6 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   const effectiveQualityTier = useVoiceStore((s) => s.effectiveQualityTier);
   const decoderHealth = useVoiceStore((s) => s.decoderHealth);
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
-  const isDMCall = useVoiceStore((s) => s.isDMCall);
   const voiceTextChatHeight = useVoiceStore((s) => s.voiceTextChatHeight);
   const setVoiceTextChatHeight = useVoiceStore((s) => s.setVoiceTextChatHeight);
   const voiceTextChatLayout = useVoiceStore((s) => s.voiceTextChatLayout);
@@ -242,10 +241,9 @@ const VoiceView: React.FC<VoiceViewProps> = ({ channelId, channelName }) => {
   const isScreenSharing = useVoiceStore((s) => s.isScreenSharing);
   const keepActiveWhileUnfocused = useVoiceStore((s) => s.keepActiveWhileUnfocused);
 
-  const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
   // DM calls always have a conversation to show in the text panel; server
   // voice still requires an explicitly linked text channel (#1873).
-  const hasLinkedText = isDMCall || !!getLinkedTextChannel(channelId);
+  const hasLinkedText = useHasVoiceTextTarget(channelId);
 
   const hasJoinedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);

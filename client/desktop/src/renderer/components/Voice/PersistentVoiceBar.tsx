@@ -1,7 +1,7 @@
 import React, { useRef, useCallback, useEffect, useMemo } from 'react';
 import { useVoiceStore } from '../../stores/voice/voiceStore';
 import { createResizeKeyHandler } from '../../utils/ui/resizeKeyboard';
-import { useChannelStore } from '../../stores/chat/channelStore';
+import { useHasVoiceTextTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 import VoiceControls from './VoiceControls';
 import VoiceTextChat from './VoiceTextChat';
 import './PersistentVoiceBar.css';
@@ -20,7 +20,6 @@ const MAX_CHAT_RATIO = 0.7;
  * as a side column instead of inside this bar.
  */
 const PersistentVoiceBar: React.FC = () => {
-  const activeChannelId = useVoiceStore((s) => s.activeChannelId);
   const voiceControlsPinned = useVoiceStore((s) => s.voiceControlsPinned);
   const voiceControlsPoppedOut = useVoiceStore((s) => s.voiceControlsPoppedOut);
   const setVoiceControlsPoppedOut = useVoiceStore((s) => s.setVoiceControlsPoppedOut);
@@ -29,8 +28,7 @@ const PersistentVoiceBar: React.FC = () => {
   const persistentTextChatHeight = useVoiceStore((s) => s.persistentTextChatHeight);
   const setPersistentTextChatHeight = useVoiceStore((s) => s.setPersistentTextChatHeight);
 
-  const getLinkedTextChannel = useChannelStore((s) => s.getLinkedTextChannel);
-  const hasLinkedText = !!(activeChannelId && getLinkedTextChannel(activeChannelId));
+  const hasLinkedText = useHasVoiceTextTarget();
   const isVertical = voiceTextChatLayout === 'vertical';
   // In vertical mode, the text chat is rendered as a side panel by MainView
   const showChat = showVoiceTextChat && hasLinkedText && !isVertical;

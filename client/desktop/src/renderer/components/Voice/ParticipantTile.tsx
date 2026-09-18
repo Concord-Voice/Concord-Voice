@@ -434,10 +434,18 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
           <MoreVertical size={14} aria-hidden="true" />
         </button>
       )}
-      {ctxMenu && activeServerId && activeChannelId && (
+      {/* A DM call has no server, so requiring activeServerId here made the menu
+          unreachable for every DM participant: voiceService sets server_id ''
+          and voiceStore keeps it with `??`, which does not catch ''. The channel
+          is what the menu actually needs. Passing '' is safe rather than merely
+          tolerated -- every server-scoped item inside is gated on
+          hasServerPermission(serverId, ...), and the permission map has no ''
+          key, so the menu collapses to the volume row, View Profile, Send DM and
+          the friend request. ParticipantTile.test.tsx asserts that collapse. */}
+      {ctxMenu && activeChannelId && (
         <VoiceParticipantContextMenu
           participant={participant}
-          serverId={activeServerId}
+          serverId={activeServerId ?? ''}
           channelId={activeChannelId}
           position={ctxMenu}
           showVolumeControl
