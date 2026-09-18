@@ -10515,7 +10515,15 @@ paths:
       tags:
       - Servers
       summary: Get unread status across all servers
-      description: 'Returns a list of server IDs that have unread messages.
+      description: 'Returns a list of server IDs that have unread messages, plus a
+        per-channel unread count for each readable channel that has unread. `server_ids`
+        is derived from the same rows as `channels`, so the two cannot disagree.
+
+        A channel is counted only when the caller holds BOTH the type-appropriate view
+        permission AND `read_message_history` in it — an unread count is message-content
+        disclosure. A channel the caller can see but not read is absent from `channels`
+        and does not raise its server in `server_ids`; it still appears in the server''s
+        channel list.
 
         Rate limit: 30 requests per minute.
 
@@ -10524,7 +10532,7 @@ paths:
       - BearerAuth: []
       responses:
         '200':
-          description: Server IDs with unread messages
+          description: Server IDs with unread messages, and per-channel unread counts
           content:
             application/json:
               schema:
@@ -10535,6 +10543,23 @@ paths:
                     items:
                       type: string
                       format: uuid
+                  channels:
+                    type: array
+                    description: Per-channel unread counts across every server the caller
+                      can view. Additive; a client that ignores it behaves exactly as
+                      before. Channels with no unread are absent rather than zero.
+                    items:
+                      type: object
+                      properties:
+                        channel_id:
+                          type: string
+                          format: uuid
+                        server_id:
+                          type: string
+                          format: uuid
+                        unread_count:
+                          type: integer
+                          example: 3
   /servers/{id}/messages:
     delete:
       tags:
@@ -12284,7 +12309,11 @@ paths:
       tags:
       - Channels
       summary: Get unread counts per channel
-      description: 'Get unread message counts for all channels in a server.
+      description: 'Get unread message counts for the channels of a server that the
+        caller may read: a count is returned only where the caller holds BOTH the
+        type-appropriate view permission AND `read_message_history`. Channels the caller
+        can see but not read are absent from `unreads` while remaining in the channel
+        list.
 
         Rate limit: 30 requests per minute.
 

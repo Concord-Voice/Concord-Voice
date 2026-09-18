@@ -213,7 +213,6 @@ function notifyChannelMessagePreview(
     serverId: data.server_id,
     senderId: data.user_id,
   });
-  desktopNotificationService.incrementBadge();
 }
 
 function notifyDMMessagePreview(
@@ -233,7 +232,6 @@ function notifyDMMessagePreview(
     targetId: conversationId,
     senderId: data.user_id,
   });
-  desktopNotificationService.incrementBadge();
 }
 
 // ── Extracted handlers to reduce cognitive complexity ─────────────────────
@@ -286,6 +284,64 @@ function markServerUnreadWithMention(
   if (isMentioned) unreadStore.markServerMention(serverId);
 }
 
+/**
+ * Route an unread notify for a server that is NOT the currently active one.
+ *
+ * Extracted from handleUnreadNotify so that function stays under the cognitive
+ * complexity ceiling (typescript:S3776). The branch carries its own meaning —
+ * "this server is in the background" — which the flat form hid.
+ */
+function applyBackgroundServerUnread(
+  serverId: string,
+  channelId: string | undefined,
+  isMentioned: boolean
+): void {
+  // Precise only when a concrete channel gated the mark in the caller (that
+  // `isChannelMuted` guard runs solely for a present `channelId`). A
+  // `channel_id`-less notify has had no mute resolution, so keep it
+  // approximate and let ServerBar's server-level `!isMuted` gate suppress
+  // muted servers.
+  //
+  // channelWins: when that concrete channel carries its own mute override, the
+  // not-muted verdict came from the channel-wins branch (not the server
+  // fallback), so this precise mark must outlive a later server mute; the
+  // background demote sweep leaves channel-wins servers alone.
+  const channelWins = channelId ? hasChannelMuteOverride(channelId) : false;
+  // This path never reaches incrementUnread — which is exactly why
+  // unreadCounts is active-server-only. The cross-server map has to be
+  // maintained here or a background server's unread never counts (#2403).
+  if (channelId) useUnreadStore.getState().bumpChannelUnread(channelId, serverId);
+  markServerUnreadWithMention(serverId, isMentioned, Boolean(channelId), channelWins);
+}
+
+/**
+ * Route an unread notify for a channel on the ACTIVE server. Extracted from
+ * handleUnreadNotify alongside applyBackgroundServerUnread, and for the same
+ * reason.
+ */
+function applyActiveChannelUnread(
+  channelId: string,
+  serverId: string | undefined,
+  isMentioned: boolean
+): void {
+  const activeChannelId = useChannelStore.getState().activeChannelId;
+  if (channelId === activeChannelId) return;
+
+  useUnreadStore.getState().incrementUnread(channelId);
+  if (serverId) useUnreadStore.getState().bumpChannelUnread(channelId, serverId);
+  if (isMentioned) useUnreadStore.getState().incrementMention(channelId);
+  // `channelId` is guaranteed present here (the caller returns without it), so
+  // the mute resolution ran — this mark is precise.
+  if (serverId) markServerUnreadWithMention(serverId, isMentioned, true);
+
+  // Notification sound for unfocused-channel messages
+  if (isMentioned) {
+    notificationSoundService.play('mention');
+  } else {
+    notificationSoundService.play('message');
+  }
+}
+
 /** Handle unread notification from server subscription. */
 function handleUnreadNotify(msg: Extract<WebSocketEvent, { type: 'unread_notify' }>): void {
   const { data } = msg;
@@ -313,36 +369,12 @@ function handleUnreadNotify(msg: Extract<WebSocketEvent, { type: 'unread_notify'
   const activeServerId = useServerStore.getState().activeServerId;
 
   if (serverId && serverId !== activeServerId) {
-    // Precise only when a concrete channel gated the mark above (the mute guard
-    // at line ~227 runs solely for a present `channelId`). A `channel_id`-less
-    // notify has had no mute resolution, so keep it approximate and let
-    // ServerBar's server-level `!isMuted` gate suppress muted servers.
-    //
-    // channelWins: when that concrete channel carries its own mute override, the
-    // not-muted verdict came from the channel-wins branch (not the server
-    // fallback), so this precise mark must outlive a later server mute; the
-    // background demote sweep leaves channel-wins servers alone.
-    const channelWins = channelId ? hasChannelMuteOverride(channelId) : false;
-    markServerUnreadWithMention(serverId, isMentioned, Boolean(channelId), channelWins);
+    applyBackgroundServerUnread(serverId, channelId, isMentioned);
     return;
   }
 
   if (!channelId) return;
-  const activeChannelId = useChannelStore.getState().activeChannelId;
-  if (channelId === activeChannelId) return;
-
-  useUnreadStore.getState().incrementUnread(channelId);
-  if (isMentioned) useUnreadStore.getState().incrementMention(channelId);
-  // `channelId` is guaranteed present here (guarded above), so the mute
-  // resolution ran — this mark is precise.
-  if (serverId) markServerUnreadWithMention(serverId, isMentioned, true);
-
-  // Notification sound for unfocused-channel messages
-  if (isMentioned) {
-    notificationSoundService.play('mention');
-  } else {
-    notificationSoundService.play('message');
-  }
+  applyActiveChannelUnread(channelId, serverId, isMentioned);
 }
 
 /** Context bag for voice membership change handling — reduces parameter count. */

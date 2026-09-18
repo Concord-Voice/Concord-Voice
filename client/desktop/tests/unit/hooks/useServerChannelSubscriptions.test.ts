@@ -434,4 +434,193 @@ describe('useServerChannelSubscriptions', () => {
     expect(clearServerUnread).toHaveBeenCalledWith('server-1');
     expect(markServerUnread).not.toHaveBeenCalled();
   });
+  // --- The bulk seed's commit fence (#2403, CodeRabbit follow-up) ---------
+
+  it('does not commit a bulk seed whose connection ended while it was in flight', async () => {
+    const setInitialChannelUnreads = vi.fn();
+    useUnreadStore.setState({ setInitialChannelUnreads });
+    useChatStore.setState({ isConnected: true });
+    useServerStore.setState({ servers: [mockServer], activeServerId: null });
+
+    let resolveBulk!: (value: unknown) => void;
+    mockApiFetch.mockImplementationOnce(() => new Promise((r) => (resolveBulk = r)));
+
+    const { rerender } = renderHook(() => useServerChannelSubscriptions());
+
+    // The connection drops while the request is still open. That invalidates the
+    // seed: its response describes a session that has ended.
+    act(() => {
+      useChatStore.setState({ isConnected: false });
+    });
+    rerender();
+
+    await act(async () => {
+      resolveBulk({
+        ok: true,
+        json: async () => ({
+          server_ids: ['server-1'],
+          channels: [{ channel_id: 'channel-1', server_id: 'server-1', unread_count: 4 }],
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(setInitialChannelUnreads).not.toHaveBeenCalled();
+  });
+
+  // The fence is checked TWICE, after each await, and the two cover different
+  // windows. The case above drops the connection while `apiFetch` is open, where
+  // either check catches it — so it proves the seed is fenced, but not which
+  // check did it. This one drops the connection while `res.json()` is open,
+  // which ONLY the second check can see.
+  it('does not commit when the connection ends while the body is still parsing', async () => {
+    const setInitialChannelUnreads = vi.fn();
+    useUnreadStore.setState({ setInitialChannelUnreads });
+    useChatStore.setState({ isConnected: true });
+    useServerStore.setState({ servers: [mockServer], activeServerId: null });
+
+    let resolveJson!: (value: unknown) => void;
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      // Resolves the response but holds the BODY open, so the continuation is
+      // parked between the two fences.
+      json: () => new Promise((r) => (resolveJson = r)),
+    });
+
+    const { rerender } = renderHook(() => useServerChannelSubscriptions());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    act(() => {
+      useChatStore.setState({ isConnected: false });
+    });
+    rerender();
+
+    await act(async () => {
+      resolveJson({
+        server_ids: ['server-1'],
+        channels: [{ channel_id: 'channel-1', server_id: 'server-1', unread_count: 4 }],
+      });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(setInitialChannelUnreads).not.toHaveBeenCalled();
+  });
+
+  // Fence 1's UNIQUE branch. Fence 2 sits after `res.json()`, which the non-ok
+  // arm never reaches, so the only thing standing between a stale FAILURE and a
+  // current request's latch is the check right after `apiFetch`.
+  //
+  // Note what is NOT the defect: a separate, pre-existing effect deliberately
+  // clears `unreadsFetchedRef` on disconnect so the seed refetches on reconnect.
+  // The second request below is therefore correct. The defect is the THIRD — a
+  // stale failure releasing the latch that the live second request is holding.
+  it('does not let a stale failure release the live request’s latch', async () => {
+    useChatStore.setState({ isConnected: true });
+    useServerStore.setState({ servers: [mockServer], activeServerId: null });
+
+    let failStale!: (value: unknown) => void;
+    mockApiFetch
+      .mockImplementationOnce(() => new Promise((r) => (failStale = r))) // #1
+      .mockImplementationOnce(() => new Promise(() => {})); // #2 — stays open
+
+    const { rerender } = renderHook(() => useServerChannelSubscriptions());
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+    // Disconnect clears the latch (by design) and invalidates seed #1.
+    act(() => {
+      useChatStore.setState({ isConnected: false });
+    });
+    rerender();
+    // Reconnect starts seed #2, which is now the live one and holds the latch.
+    act(() => {
+      useChatStore.setState({ isConnected: true });
+    });
+    rerender();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+
+    // Seed #1 finally fails. Its 503 says nothing about seed #2.
+    await act(async () => {
+      failStale({ ok: false, status: 503 });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // Any later effect run — here a membership change — would start seed #3 if
+    // that stale failure had released the latch, putting three requests in
+    // flight and widening the overlap the fence exists to close.
+    act(() => {
+      useServerStore.setState({ servers: [mockServer, mockServer2] });
+    });
+    rerender();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses the whole seed when any channel row is malformed', async () => {
+    const setInitialChannelUnreads = vi.fn();
+    useUnreadStore.setState({ setInitialChannelUnreads });
+    useChatStore.setState({ isConnected: true });
+    useServerStore.setState({ servers: [mockServer], activeServerId: null });
+
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        server_ids: ['server-1'],
+        channels: [
+          { channel_id: 'channel-1', server_id: 'server-1', unread_count: 4 },
+          // unread_count is not a number — a contract break, not a transient.
+          { channel_id: 'channel-2', server_id: 'server-1', unread_count: null },
+        ],
+      }),
+    });
+
+    renderHook(() => useServerChannelSubscriptions());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // Not "commits channel-1 and drops channel-2" — setInitialChannelUnreads
+    // REPLACES the map, so a partial commit would delete whatever count
+    // channel-2 already had. Nothing is committed at all.
+    expect(setInitialChannelUnreads).not.toHaveBeenCalled();
+  });
+
+  it('drops seed rows for a server the user is no longer in', async () => {
+    const setInitialChannelUnreads = vi.fn();
+    useUnreadStore.setState({ setInitialChannelUnreads });
+    useChatStore.setState({ isConnected: true });
+    // Member of server-1 only; the response also names server-2, which the user
+    // left while the request was in flight.
+    useServerStore.setState({ servers: [mockServer], activeServerId: null });
+
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        server_ids: ['server-1', 'server-2'],
+        channels: [
+          { channel_id: 'channel-1', server_id: 'server-1', unread_count: 4 },
+          { channel_id: 'channel-9', server_id: 'server-2', unread_count: 7 },
+        ],
+      }),
+    });
+
+    renderHook(() => useServerChannelSubscriptions());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // A departed server is an ordinary race, NOT malformed — so the payload is
+    // committed, minus that server's rows. Restoring them would put back counts
+    // removeServer already dropped, with nothing able to clear them again.
+    expect(setInitialChannelUnreads).toHaveBeenCalledTimes(1);
+    const [rows] = setInitialChannelUnreads.mock.calls[0];
+    expect(rows).toEqual([{ channelId: 'channel-1', serverId: 'server-1', count: 4 }]);
+  });
 });

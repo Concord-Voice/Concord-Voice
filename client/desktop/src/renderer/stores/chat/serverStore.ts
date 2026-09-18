@@ -72,6 +72,10 @@ function purgeMissingServerState(
     if (fetchedServerIds.has(server.id)) continue;
     useChannelStore.getState().removeServerChannels(server.id);
     useUnreadStore.getState().clearServerUnread(server.id);
+    // Must follow removeServerChannels: once the channels are gone no read
+    // recorder can reach them, so their cross-server counts would sit on the
+    // desktop badge permanently (#2403).
+    useUnreadStore.getState().clearServerChannelUnreads(server.id);
   }
 }
 
@@ -257,6 +261,9 @@ const serverStore = create<ServerState>()(
 
           // Clear server-level unread
           useUnreadStore.getState().clearServerUnread(serverId);
+          // And the per-channel cross-server counts, which nothing else can
+          // reach once removeServerChannels has dropped the channels (#2403).
+          useUnreadStore.getState().clearServerChannelUnreads(serverId);
 
           set((state) => ({
             servers: state.servers.filter((s) => s.id !== serverId),

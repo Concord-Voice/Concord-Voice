@@ -55,6 +55,14 @@ const { desktopNotificationService } =
 
 describe('DesktopNotificationService', () => {
   beforeEach(() => {
+    // #2403: the service tracks whether a dock flash is outstanding, and that
+    // flag is module-singleton state that outlives a test. A test that flashes
+    // without regaining focus would leave it set, and the NEXT test's flash
+    // would be silently skipped — passing for the wrong reason
+    // (`[internal]rules/tests.md` § Vacuity). Dispatching focus clears it through
+    // the real listener, before `clearAllMocks` wipes the resulting call.
+    globalThis.dispatchEvent(new Event('focus'));
+
     vi.clearAllMocks();
     MockNotification.clear();
     mockOnClick.handler = null;
@@ -72,9 +80,6 @@ describe('DesktopNotificationService', () => {
       quietHoursEnd: '08:00',
     });
 
-    // Reset badge count
-    desktopNotificationService.clearBadge();
-    vi.clearAllMocks(); // Clear the setBadgeCount call from clearBadge
     vi.useRealTimers();
   });
 
@@ -362,7 +367,19 @@ describe('DesktopNotificationService', () => {
       expect(MockNotification.instances[0].silent).toBe(true);
     });
 
+    // Vitest's jsdom environment reports the document FOCUSED, so every case
+    // that expects a dock flash must say so explicitly — the #2403 guard
+    // suppresses the flash while focused, which makes this fixture load-bearing
+    // rather than incidental. (A bare jsdom instance reports unfocused; the
+    // difference is the environment, not the library.)
+    const unfocusWindow = () => {
+      const hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+      return () => hasFocus.mockRestore();
+    };
+
     it('calls flashFrame to attract attention', () => {
+      const refocus = unfocusWindow();
+
       desktopNotificationService.notify({
         title: 'Alice',
         senderDisplayName: 'Alice',
@@ -373,6 +390,67 @@ describe('DesktopNotificationService', () => {
       });
 
       expect(mockFlashFrame).toHaveBeenCalledWith(true);
+      refocus();
+    });
+
+    // ── Dock/taskbar flash lifecycle (#2403) ──────────────────────────────
+    //
+    // `flashFrame(true)` is NOT self-clearing. Electron 31 changed macOS to
+    // match Windows/Linux — "flash continuously until `flashFrame(false)` is
+    // called" — and this app is on Electron 44. Nothing ever called it with
+    // `false`, so every notification started a permanent dock bounce.
+
+    const notifyOnce = (targetId = 'dm-123') =>
+      desktopNotificationService.notify({
+        title: 'Alice',
+        senderDisplayName: 'Alice',
+        body: 'Hello',
+        targetType: 'dm',
+        targetId,
+        senderId: 'user-1',
+      });
+
+    it('stops the flash when the window regains focus', () => {
+      const refocus = unfocusWindow();
+
+      notifyOnce();
+      expect(mockFlashFrame).toHaveBeenCalledWith(true);
+      expect(mockFlashFrame).not.toHaveBeenCalledWith(false);
+
+      refocus();
+      globalThis.dispatchEvent(new Event('focus'));
+
+      expect(mockFlashFrame).toHaveBeenCalledWith(false);
+    });
+
+    it('does not flash while the window is already focused', () => {
+      // `shouldNotify` suppresses only when focused AND on the active channel,
+      // so a notification legitimately fires while focused. Flashing then is
+      // unclearable by construction — the `focus` event that would stop it has
+      // already happened and will not repeat. No spy needed: the environment
+      // already reports focused, which is the state under test.
+      expect(document.hasFocus()).toBe(true);
+
+      notifyOnce();
+
+      expect(MockNotification.instances).toHaveLength(1); // the notification still fires
+      expect(mockFlashFrame).not.toHaveBeenCalled(); // only the flash is suppressed
+    });
+
+    it('a burst registers one flash, and one focus clears it', () => {
+      const refocus = unfocusWindow();
+
+      notifyOnce('dm-1');
+      notifyOnce('dm-2');
+      notifyOnce('dm-3');
+
+      expect(MockNotification.instances).toHaveLength(3);
+      expect(mockFlashFrame.mock.calls.filter(([f]) => f === true)).toHaveLength(1);
+
+      refocus();
+      globalThis.dispatchEvent(new Event('focus'));
+
+      expect(mockFlashFrame.mock.calls.filter(([f]) => f === false)).toHaveLength(1);
     });
 
     it('onclick calls focusWindow and sets pending navigation', async () => {
@@ -405,25 +483,22 @@ describe('DesktopNotificationService', () => {
 
   // ── badge ─────────────────────────────────────────────────────────
 
-  describe('incrementBadge and clearBadge', () => {
-    it('increments badge count and calls setBadgeCount', () => {
-      desktopNotificationService.incrementBadge();
-      expect(desktopNotificationService.getBadgeCount()).toBe(1);
-      expect(mockSetBadgeCount).toHaveBeenCalledWith(1);
+  it('does not touch the OS badge — badgeSync owns it (#2403)', () => {
+    const service = desktopNotificationService as unknown as Record<string, unknown>;
+    expect(service.incrementBadge).toBeUndefined();
+    expect(service.clearBadge).toBeUndefined();
+    expect(service.getBadgeCount).toBeUndefined();
 
-      desktopNotificationService.incrementBadge();
-      expect(desktopNotificationService.getBadgeCount()).toBe(2);
-      expect(mockSetBadgeCount).toHaveBeenCalledWith(2);
+    desktopNotificationService.notify({
+      title: 'Someone',
+      senderDisplayName: 'Someone',
+      body: 'hello',
+      targetType: 'channel',
+      targetId: 'c1',
+      senderId: 'user-1',
     });
 
-    it('clears badge count and calls setBadgeCount with 0', () => {
-      desktopNotificationService.incrementBadge();
-      desktopNotificationService.incrementBadge();
-      desktopNotificationService.clearBadge();
-
-      expect(desktopNotificationService.getBadgeCount()).toBe(0);
-      expect(mockSetBadgeCount).toHaveBeenCalledWith(0);
-    });
+    expect(mockSetBadgeCount).not.toHaveBeenCalled();
   });
 
   // ── isInQuietHours ────────────────────────────────────────────────

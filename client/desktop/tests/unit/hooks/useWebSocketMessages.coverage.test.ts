@@ -82,14 +82,24 @@ vi.mock('@/renderer/services/messaging/searchService', () => ({
   removeScope: vi.fn(),
 }));
 
+// Removed in #2403: this suite mocked `incrementBadge` and asserted it fired
+// alongside each notification. The badge is no longer an accumulator the notify
+// path increments — it is derived from unread state by `badgeSync`, so this hook
+// touches it not at all. Coverage is in `badgeSync.test.ts`.
+//
+// The NEGATIVE assertions went with them, and that is the more important half:
+// with nothing able to call the mock, `expect(mockIncrementBadge).not
+// .toHaveBeenCalled()` passes unconditionally. It would have read as coverage
+// while pinning nothing — the vacuity `[internal]rules/tests.md` § Vacuity names.
+// Every one of the nine sat directly beneath an `expect(mockNotify)` assertion
+// making the same claim about the notification itself, so none of them was the
+// only thing asserting its case.
 const mockShouldNotify = vi.fn().mockReturnValue(false);
 const mockNotify = vi.fn();
-const mockIncrementBadge = vi.fn();
 vi.mock('@/renderer/services/system/desktopNotificationService', () => ({
   desktopNotificationService: {
     shouldNotify: (...args: unknown[]) => mockShouldNotify(...args),
     notify: (...args: unknown[]) => mockNotify(...args),
-    incrementBadge: (...args: unknown[]) => mockIncrementBadge(...args),
   },
 }));
 
@@ -847,7 +857,6 @@ describe('useWebSocketMessages — coverage boost', () => {
         .soft(mockIndexMessage)
         .not.toHaveBeenCalledWith('msg-add-edit-race', 'Original channel plaintext', 'channel-1');
       expect.soft(mockNotify).not.toHaveBeenCalled();
-      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
     });
 
     it('preserves a DM edit that decrypts before its pending message add', async () => {
@@ -923,7 +932,6 @@ describe('useWebSocketMessages — coverage boost', () => {
           'conv-add-edit-race'
         );
       expect.soft(mockNotify).not.toHaveBeenCalled();
-      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
     });
 
     it.each(['success', 'failure'] as const)(
@@ -1144,7 +1152,6 @@ describe('useWebSocketMessages — coverage boost', () => {
         addSpy.mockClear();
         mockIndexMessage.mockClear();
         mockNotify.mockClear();
-        mockIncrementBadge.mockClear();
         mockTtsSpeak.mockClear();
         await act(async () => {
           if (settlement === 'success') {
@@ -1160,7 +1167,6 @@ describe('useWebSocketMessages — coverage boost', () => {
         expect.soft(addSpy).not.toHaveBeenCalled();
         expect.soft(mockIndexMessage).not.toHaveBeenCalled();
         expect.soft(mockNotify).not.toHaveBeenCalled();
-        expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
         expect.soft(mockTtsSpeak).not.toHaveBeenCalled();
       }
     );
@@ -1204,7 +1210,6 @@ describe('useWebSocketMessages — coverage boost', () => {
         addSpy.mockClear();
         mockIndexMessage.mockClear();
         mockNotify.mockClear();
-        mockIncrementBadge.mockClear();
         await act(async () => {
           if (settlement === 'success') {
             pendingDecrypt.resolve('Late ordinary DM plaintext');
@@ -1221,7 +1226,6 @@ describe('useWebSocketMessages — coverage boost', () => {
         expect.soft(addSpy).not.toHaveBeenCalled();
         expect.soft(mockIndexMessage).not.toHaveBeenCalled();
         expect.soft(mockNotify).not.toHaveBeenCalled();
-        expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
       }
     );
 
@@ -1280,7 +1284,6 @@ describe('useWebSocketMessages — coverage boost', () => {
       updateSpy.mockClear();
       mockIndexMessage.mockClear();
       mockNotify.mockClear();
-      mockIncrementBadge.mockClear();
       mockTtsSpeak.mockClear();
       await act(async () => {
         contentDecrypt.resolve('Late content plaintext');
@@ -1293,7 +1296,6 @@ describe('useWebSocketMessages — coverage boost', () => {
       expect.soft(updateSpy).not.toHaveBeenCalled();
       expect.soft(mockIndexMessage).not.toHaveBeenCalled();
       expect.soft(mockNotify).not.toHaveBeenCalled();
-      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
       expect.soft(mockTtsSpeak).not.toHaveBeenCalled();
     });
 
@@ -1327,7 +1329,6 @@ describe('useWebSocketMessages — coverage boost', () => {
       addSpy.mockClear();
       mockIndexMessage.mockClear();
       mockNotify.mockClear();
-      mockIncrementBadge.mockClear();
       await act(async () => {
         pendingDecrypt.resolve('Late unmounted DM plaintext');
         await pendingDecrypt.promise;
@@ -1339,7 +1340,6 @@ describe('useWebSocketMessages — coverage boost', () => {
       expect.soft(addSpy).not.toHaveBeenCalled();
       expect.soft(mockIndexMessage).not.toHaveBeenCalled();
       expect.soft(mockNotify).not.toHaveBeenCalled();
-      expect.soft(mockIncrementBadge).not.toHaveBeenCalled();
     });
 
     it('suppresses a pending DM decrypt after the conversation is deleted', async () => {
@@ -2799,7 +2799,6 @@ describe('useWebSocketMessages — coverage boost', () => {
           body: 'hey there!',
         })
       );
-      expect(mockIncrementBadge).toHaveBeenCalled();
 
       mockShouldNotify.mockReturnValue(false);
     });
@@ -2825,7 +2824,6 @@ describe('useWebSocketMessages — coverage boost', () => {
       });
 
       expect(mockNotify).not.toHaveBeenCalled();
-      expect(mockIncrementBadge).not.toHaveBeenCalled();
     });
 
     it('passes mention type when data.mentioned is true', async () => {
@@ -2948,7 +2946,6 @@ describe('useWebSocketMessages — coverage boost', () => {
           title: 'DM from Alice',
         })
       );
-      expect(mockIncrementBadge).toHaveBeenCalled();
 
       mockShouldNotify.mockReturnValue(false);
     });

@@ -52,7 +52,7 @@ import { useServerStore } from './stores/chat/serverStore';
 import { useChannelStore } from './stores/chat/channelStore';
 import { useDMStore } from './stores/chat/dmStore';
 import { useVoiceStore } from './stores/voice/voiceStore';
-import { desktopNotificationService } from './services/system/desktopNotificationService';
+import { startBadgeSync } from './services/system/badgeSync';
 import { usePendingRegistrationStore } from './stores/auth/pendingRegistrationStore';
 // resetService is eagerly registered by main.tsx; local dynamic imports resolve
 // from that loaded module while avoiding direct feature-module cycles.
@@ -243,7 +243,6 @@ function AuthenticatedLayout() {
         navigate('/app/dms');
       }
 
-      desktopNotificationService.clearBadge();
       useNotificationNavigationStore.getState().clearPendingNavigation();
     });
 
@@ -449,6 +448,16 @@ function App() {
   useEffect(() => {
     if (isPipWindow || !accessToken) return;
     void useDMStore.getState().fetchConversations();
+  }, [isPipWindow, accessToken]);
+
+  // #2403: the badge is DERIVED from unread state, so it is subscribed for the
+  // session's lifetime rather than pushed at notification time. Starting it here
+  // is also what re-asserts the value after a renderer reload: main keeps
+  // whatever it was last told, and a reload alone never tells it anything — which
+  // is why the stale count survived a reload and died only on a restart.
+  useEffect(() => {
+    if (isPipWindow || !accessToken) return;
+    return startBadgeSync();
   }, [isPipWindow, accessToken]);
 
   useEffect(() => {

@@ -82,12 +82,13 @@ vi.mock('@/renderer/services/voice/mediaCapabilities', () => ({
   prewarmWebRTC: vi.fn(),
 }));
 
-const mockClearBadge = vi.fn();
-vi.mock('@/renderer/services/system/desktopNotificationService', () => ({
-  desktopNotificationService: {
-    clearBadge: (...args: unknown[]) => mockClearBadge(...args),
-  },
-}));
+// #2403: App no longer imports desktopNotificationService. The badge used to be
+// an accumulator this subscriber cleared, which meant it cleared ONLY when the
+// user clicked the OS notification popup. It is now derived from unread state by
+// badgeSync, so clicking clears it the same way opening the channel any other way
+// does — through clearUnread. Badge behaviour is covered in badgeSync.test.ts;
+// what these tests still own is that the click NAVIGATES and clears the pending
+// navigation.
 
 const mockMarkRendererCrashed = vi.fn().mockResolvedValue(undefined);
 const mockSoftRestart = vi.fn().mockResolvedValue(undefined);
@@ -469,7 +470,6 @@ describe('App', () => {
     });
 
     expect(useChannelStore.getState().activeChannelId).toBe('channel-1');
-    expect(mockClearBadge).toHaveBeenCalled();
     expect(useNotificationNavigationStore.getState().pendingNavigation).toBeNull();
   });
 
@@ -485,7 +485,6 @@ describe('App', () => {
     });
 
     expect(useDMStore.getState().activeConversationId).toBe('dm-conv-1');
-    expect(mockClearBadge).toHaveBeenCalled();
     expect(useNotificationNavigationStore.getState().pendingNavigation).toBeNull();
   });
 

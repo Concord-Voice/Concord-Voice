@@ -226,4 +226,76 @@ describe('unreadStore', () => {
       expect(useUnreadStore.getState().serverUnreadChannelWinsSet.size).toBe(0);
     });
   });
+
+  describe('allUnreadCounts (cross-server, #2403)', () => {
+    beforeEach(() => {
+      useUnreadStore.getState().clearAll();
+    });
+
+    it('seeds cross-server counts and keeps them addressable by channel', () => {
+      useUnreadStore.getState().setInitialChannelUnreads([
+        { channelId: 'c1', serverId: 's1', count: 3 },
+        { channelId: 'c2', serverId: 's2', count: 5 },
+      ]);
+
+      const all = useUnreadStore.getState().allUnreadCounts;
+      expect(all.get('c1')).toEqual({ serverId: 's1', count: 3 });
+      expect(all.get('c2')).toEqual({ serverId: 's2', count: 5 });
+    });
+
+    it('bumps a BACKGROUND server channel — the case unreadCounts cannot represent', () => {
+      useUnreadStore.getState().bumpChannelUnread('c9', 's9');
+      useUnreadStore.getState().bumpChannelUnread('c9', 's9');
+
+      expect(useUnreadStore.getState().allUnreadCounts.get('c9')).toEqual({
+        serverId: 's9',
+        count: 2,
+      });
+      // unreadCounts is active-server-only and must NOT have been touched.
+      expect(useUnreadStore.getState().unreadCounts.has('c9')).toBe(false);
+    });
+
+    it('clearUnread removes the channel from the cross-server map too', () => {
+      useUnreadStore
+        .getState()
+        .setInitialChannelUnreads([{ channelId: 'c1', serverId: 's1', count: 3 }]);
+      useUnreadStore.getState().clearUnread('c1');
+
+      expect(useUnreadStore.getState().allUnreadCounts.has('c1')).toBe(false);
+    });
+
+    it('clearServerChannelUnreads drops only the departed server, leaving others intact', () => {
+      useUnreadStore.getState().setInitialChannelUnreads([
+        { channelId: 'c1', serverId: 's1', count: 3 },
+        { channelId: 'c2', serverId: 's1', count: 1 },
+        { channelId: 'c3', serverId: 's2', count: 5 },
+      ]);
+
+      useUnreadStore.getState().clearServerChannelUnreads('s1');
+
+      const all = useUnreadStore.getState().allUnreadCounts;
+      expect(all.has('c1')).toBe(false);
+      expect(all.has('c2')).toBe(false);
+      // A different server's counts are untouched.
+      expect(all.get('c3')).toEqual({ serverId: 's2', count: 5 });
+    });
+
+    it('clearServerChannelUnreads does NOT fire on the muted-only path', () => {
+      // clearServerUnread has nine call sites and seven of them mean "every
+      // unread channel here is muted, dim the dot" rather than "the server is
+      // gone". Folding the channel-count purge into it would delete real unread
+      // data on a mute — and require it to reappear when the mute expired. The
+      // two must stay separate; this pins that.
+      useUnreadStore
+        .getState()
+        .setInitialChannelUnreads([{ channelId: 'c1', serverId: 's1', count: 3 }]);
+
+      useUnreadStore.getState().clearServerUnread('s1');
+
+      expect(useUnreadStore.getState().allUnreadCounts.get('c1')).toEqual({
+        serverId: 's1',
+        count: 3,
+      });
+    });
+  });
 });

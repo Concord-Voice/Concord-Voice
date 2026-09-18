@@ -457,6 +457,39 @@ const batchChannelOverrideQuery = `
 // replicating the RBAC+SBAC resolution logic (base | role_allow &^ role_deny
 // | user_allow &^ user_deny) in SQL rather than looping per-channel.
 func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID string) ([]string, error) {
+	return r.visibleChannelIDs(ctx, serverID, userID, 0)
+}
+
+// GetReadableChannelIDs returns the channel IDs in one server that the user can
+// both SEE and read message history in: the type-appropriate view bit AND
+// PermReadMessageHistory.
+//
+// The two bits are separately deniable and answer different questions. The view
+// bit answers "does this channel exist for you" — the channel list — and a
+// history denial must never take a channel out of it. PermReadMessageHistory
+// answers "may you read what was said in it", and it is what every path that
+// returns message content already enforces (messages.checkChannelAccess, message
+// reactions, attachment delivery).
+//
+// Anything DERIVED from message content must resolve its channels through this
+// method rather than GetVisibleChannelIDs. An unread count is such a derivation:
+// polled, it is a live measure of message volume and timing, so serving one for a
+// view-only channel hands a member a side channel on a channel they are forbidden
+// to read (CWE-863).
+func (r *Resolver) GetReadableChannelIDs(ctx context.Context, serverID, userID string) ([]string, error) {
+	return r.visibleChannelIDs(ctx, serverID, userID, PermReadMessageHistory)
+}
+
+// visibleChannelIDs is the shared implementation of GetVisibleChannelIDs and
+// GetReadableChannelIDs. alsoRequired is a bitfield of permissions a channel must
+// grant IN ADDITION to the type-appropriate view bit; 0 means plain visibility.
+//
+// alsoRequired is folded into the per-type required mask in Go rather than added
+// as a second SQL predicate, so the query keeps one shape for every caller: a
+// channel qualifies when its effective permissions contain EVERY bit of the
+// required mask. With alsoRequired == 0 the mask is a single view bit and the test
+// is equivalent to the "view bit is set" test it generalizes.
+func (r *Resolver) visibleChannelIDs(ctx context.Context, serverID, userID string, alsoRequired Permission) ([]string, error) {
 	// Membership gate: non-members see nothing, even if stale overrides exist
 	var isMember bool
 	if err := r.db.QueryRowContext(ctx,
@@ -468,7 +501,13 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 		return []string{}, nil
 	}
 
-	// Fast path: server owner sees everything
+	// Fast path: server owner sees everything.
+	//
+	// The owner bypasses alsoRequired too, and must: resolveServerPermissions
+	// short-circuits an owner to OwnerPermissions before SBAC is consulted, so the
+	// per-request check an extra bit stands in for (HasPermission) grants it
+	// regardless of any override. Withholding it here would only make this
+	// resolver disagree with the endpoints it feeds.
 	var ownerID string
 	if err := r.db.QueryRowContext(ctx, `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&ownerID); err != nil {
 		return nil, fmt.Errorf("failed to fetch server owner: %w", err)
@@ -489,7 +528,10 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 		return nil, fmt.Errorf("failed to compute role permissions: %w", err)
 	}
 
-	// Fast path: administrators see everything (SBAC cannot restrict them)
+	// Fast path: administrators see everything (SBAC cannot restrict them), and
+	// for the same reason they bypass alsoRequired — applyChannelOverrides returns
+	// early for an administrator and Permission.Has reports true for every bit once
+	// PermAdministrator is set.
 	if Permission(basePerms).Has(PermAdministrator) {
 		return r.getAllChannelIDs(ctx, serverID)
 	}
@@ -500,9 +542,10 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 	// The SBAC resolution mirrors applyChannelOverrides exactly:
 	//   effective = ((base | role_allow) & ~role_deny | user_allow) & ~user_deny
 	//
-	// Channel type mapping:
-	//   text, bulletin → PermViewTextChannels ($4)
-	//   voice          → PermViewVoiceChannels ($5)
+	// Required-mask mapping ($4/$5 are the type-appropriate view bit OR'd with
+	// alsoRequired, combined in Go so the SQL carries one predicate shape):
+	//   text, bulletin → PermViewTextChannels | alsoRequired ($4)
+	//   voice          → PermViewVoiceChannels | alsoRequired ($5)
 	query := `
 		WITH user_roles AS (
 			SELECT mr.role_id
@@ -532,14 +575,18 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 		        | COALESCE(co.user_allow, 0)
 		      ) & ~COALESCE(co.user_deny, 0)
 		    ) &
-		    -- Check the appropriate view permission bit based on channel type
+		    -- Keep only the bits this channel type requires...
 		    CASE WHEN c.type = 'voice' THEN $5::bigint ELSE $4::bigint END
-		    != 0
+		    -- ...and require ALL of them, not merely one: the mask carries the
+		    -- type-appropriate view bit plus any caller-supplied extra bits, so a
+		    -- channel granting the view bit but not the extra one is excluded.
+		    = CASE WHEN c.type = 'voice' THEN $5::bigint ELSE $4::bigint END
 		  )
 	`
 
 	return r.queryChannelIDs(ctx, "failed to query visible channels", query,
-		serverID, userID, basePerms, int64(PermViewTextChannels), int64(PermViewVoiceChannels))
+		serverID, userID, basePerms,
+		int64(PermViewTextChannels|alsoRequired), int64(PermViewVoiceChannels|alsoRequired))
 }
 
 // GetAllVisibleChannelIDs returns every channel ID the user can view across all
@@ -558,6 +605,23 @@ func (r *Resolver) GetVisibleChannelIDs(ctx context.Context, serverID, userID st
 // it, or the effective permissions include the type-appropriate view bit
 // (PermViewTextChannels for text/bulletin, PermViewVoiceChannels for voice).
 func (r *Resolver) GetAllVisibleChannelIDs(ctx context.Context, userID string) ([]string, error) {
+	return r.allVisibleChannelIDs(ctx, userID, 0)
+}
+
+// GetAllReadableChannelIDs is the cross-server counterpart to
+// GetReadableChannelIDs: every channel the user can both see AND read message
+// history in, across all their servers, in one round-trip. See
+// GetReadableChannelIDs for why the two permissions must not be conflated.
+func (r *Resolver) GetAllReadableChannelIDs(ctx context.Context, userID string) ([]string, error) {
+	return r.allVisibleChannelIDs(ctx, userID, PermReadMessageHistory)
+}
+
+// allVisibleChannelIDs is the shared implementation of GetAllVisibleChannelIDs
+// and GetAllReadableChannelIDs. alsoRequired carries the same meaning as in
+// visibleChannelIDs — extra bits a channel must grant on top of the
+// type-appropriate view bit — and is folded into the per-type required mask in
+// Go, so the two resolvers stay predicate-for-predicate identical.
+func (r *Resolver) allVisibleChannelIDs(ctx context.Context, userID string, alsoRequired Permission) ([]string, error) {
 	// One statement across every server the user is a member of:
 	//   - memberships: gates results to the user's servers (non-members see nothing)
 	//   - base_perms:  BIT_OR of the user's role permissions per server (owner/admin fast paths)
@@ -611,11 +675,16 @@ func (r *Resolver) GetAllVisibleChannelIDs(ctx context.Context, userID string) (
 		LEFT JOIN base_perms bp ON bp.server_id = c.server_id
 		LEFT JOIN channel_overrides co ON co.channel_id = c.id
 		WHERE
-			-- Owner fast path: owner sees every channel
+			-- Owner fast path: owner sees every channel. As in visibleChannelIDs this
+			-- bypasses alsoRequired, because resolveServerPermissions grants an owner
+			-- OwnerPermissions before SBAC is consulted.
 			s.owner_id = $1
-			-- Administrator fast path: SBAC cannot restrict administrators
+			-- Administrator fast path: SBAC cannot restrict administrators, and
+			-- Permission.Has reports true for every bit once PermAdministrator is set.
 			OR (COALESCE(bp.perms, 0) & $2::bigint) != 0
-			-- Otherwise: per-channel SBAC bitfield math against the view bit
+			-- Otherwise: per-channel SBAC bitfield math against the required mask,
+			-- which must be satisfied in FULL ($3/$4 carry the type-appropriate view
+			-- bit OR'd with alsoRequired).
 			OR (
 				(
 					(
@@ -624,12 +693,13 @@ func (r *Resolver) GetAllVisibleChannelIDs(ctx context.Context, userID string) (
 					) & ~COALESCE(co.user_deny, 0)
 				) &
 				CASE WHEN c.type = 'voice' THEN $4::bigint ELSE $3::bigint END
-				!= 0
+				= CASE WHEN c.type = 'voice' THEN $4::bigint ELSE $3::bigint END
 			)
 	`
 
 	return r.queryChannelIDs(ctx, "failed to query all visible channels", query,
-		userID, int64(PermAdministrator), int64(PermViewTextChannels), int64(PermViewVoiceChannels))
+		userID, int64(PermAdministrator),
+		int64(PermViewTextChannels|alsoRequired), int64(PermViewVoiceChannels|alsoRequired))
 }
 
 // getAllChannelIDs returns all channel IDs for a server (used for owner/admin fast path)

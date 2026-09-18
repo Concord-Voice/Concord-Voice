@@ -1253,9 +1253,13 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 		return
 	}
 
-	// CV-CAN-002: restrict unread counts to channels the caller can view — server
-	// membership alone must not enumerate hidden channel IDs or their activity.
-	visibleIDs, visErr := h.resolver.GetVisibleChannelIDs(c.Request.Context(), serverID, userID)
+	// CV-CAN-002: restrict unread counts to channels the caller can READ — server
+	// membership alone must not enumerate hidden channel IDs or their activity, and
+	// an unread count is message-content disclosure, so it needs
+	// PermReadMessageHistory on top of the view bit (the same permission every
+	// message-fetch path enforces). Channels the caller can see but not read stay in
+	// the channel list and simply carry no count.
+	readableIDs, visErr := h.resolver.GetReadableChannelIDs(c.Request.Context(), serverID, userID)
 	if visErr != nil {
 		h.log.Error(errMsgFailedResolveVisible, "error", visErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchUnreadCounts})
@@ -1267,19 +1271,20 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 		UnreadCount int    `json:"unread_count"`
 	}
 	unreads := []unreadEntry{}
-	if len(visibleIDs) == 0 {
+	if len(readableIDs) == 0 {
 		c.JSON(http.StatusOK, gin.H{"unreads": unreads})
 		return
 	}
 
-	// For each VISIBLE channel in the server, count messages newer than
+	// For each READABLE channel in the server, count messages newer than
 	// last_read_at. If no read state exists, fall back to the user's join date so
 	// pre-existing messages are not counted as unread for first-time members.
 	// Uses JOINs instead of correlated subqueries for better query planning.
 	//
-	// CV-CAN-002: the ANY($3) predicate scopes aggregation to visible channels in
-	// SQL, so a view-denied member cannot force the aggregate over hidden
-	// channels' message history (the rows are never scanned, not just dropped).
+	// CV-CAN-002: the ANY($3) predicate scopes aggregation to readable channels in
+	// SQL, so a view- or history-denied member cannot force the aggregate over
+	// those channels' message history (the rows are never scanned, not just
+	// dropped).
 	query := `
 		SELECT ch.id,
 			COUNT(m.id)::int AS unread_count
@@ -1298,7 +1303,7 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 		GROUP BY ch.id
 	`
 
-	rows, err := h.db.Query(query, serverID, userID, pq.Array(visibleIDs))
+	rows, err := h.db.Query(query, serverID, userID, pq.Array(readableIDs))
 	if err != nil {
 		h.log.Error("Failed to query unread counts", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchUnreadCounts})
@@ -1323,29 +1328,49 @@ func (h *Handler) GetUnreadCounts(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"unreads": unreads})
 }
 
-// GetServerUnreadStatus returns a list of server IDs where the user has unread messages.
-// Used to show unread dots on server icons without fetching per-channel counts for every server.
+// channelUnread is one row of GetServerUnreadStatus's additive `channels` field.
+type channelUnread struct {
+	ChannelID   string `json:"channel_id"`
+	ServerID    string `json:"server_id"`
+	UnreadCount int    `json:"unread_count"`
+}
+
+// GetServerUnreadStatus returns per-channel unread counts across every server the
+// user belongs to, plus the list of server IDs that have any unread. `server_ids`
+// is DERIVED from the same rows as `channels`, so the two cannot disagree.
+// Used to show unread dots on server icons, and (since #2403) to seed the desktop
+// badge, without fetching per-channel counts for every server separately.
 func (h *Handler) GetServerUnreadStatus(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	// CV-CAN-002: only count unread in channels the caller can view, so a hidden
-	// channel's activity does not raise a server's unread flag. Resolved in a
-	// single query across all of the user's servers to avoid a per-server N+1.
-	visibleIDs, visErr := h.resolver.GetAllVisibleChannelIDs(c.Request.Context(), userID)
+	// CV-CAN-002: only count unread in channels the caller can READ — view alone is
+	// not enough, because a count is a live measure of message volume and timing in
+	// a channel the caller may be forbidden to read (see GetReadableChannelIDs). A
+	// channel excluded here neither reports a count nor raises its server's unread
+	// flag. Resolved in a single query across all of the user's servers to avoid a
+	// per-server N+1.
+	readableIDs, visErr := h.resolver.GetAllReadableChannelIDs(c.Request.Context(), userID)
 	if visErr != nil {
 		h.log.Error(errMsgFailedResolveVisible, "error", visErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchServerUnread})
 		return
 	}
-	if len(visibleIDs) == 0 {
-		c.JSON(http.StatusOK, gin.H{"server_ids": []string{}})
+	if len(readableIDs) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"server_ids": []string{},
+			"channels":   []channelUnread{},
+		})
 		return
 	}
 
+	// Grouped per channel so the client can apply its own mute resolution:
+	// mute is a client-side concern (no query in this package filters it), and
+	// per-server totals would put muted servers on the desktop badge (#2403).
+	//
 	// Uses a LEFT JOIN to channel_read_states instead of a correlated subquery
 	// so the planner can use a hash/merge join instead of nested-loop per row.
 	query := `
-		SELECT DISTINCT ch.server_id
+		SELECT ch.id, ch.server_id, COUNT(*) AS unread_count
 		FROM channels ch
 		INNER JOIN server_members sm
 			ON ch.server_id = sm.server_id AND sm.user_id = $1
@@ -1356,9 +1381,10 @@ func (h *Handler) GetServerUnreadStatus(c *gin.Context) {
 			AND m.user_id != $1
 			AND m.created_at > COALESCE(crs.last_read_at, sm.joined_at)
 		WHERE ch.id = ANY($2::uuid[])
+		GROUP BY ch.id, ch.server_id
 	`
 
-	rows, err := h.db.Query(query, userID, pq.Array(visibleIDs))
+	rows, err := h.db.Query(query, userID, pq.Array(readableIDs))
 	if err != nil {
 		h.log.Error("Failed to query server unread status", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchServerUnread})
@@ -1366,14 +1392,20 @@ func (h *Handler) GetServerUnreadStatus(c *gin.Context) {
 	}
 	defer func() { _ = rows.Close() }()
 
+	channels := []channelUnread{}
+	seenServers := map[string]struct{}{}
 	serverIDs := []string{}
 	for rows.Next() {
-		var serverID string
-		if err := rows.Scan(&serverID); err != nil {
-			h.log.Error("Failed to scan server ID", "error", err)
+		var row channelUnread
+		if err := rows.Scan(&row.ChannelID, &row.ServerID, &row.UnreadCount); err != nil {
+			h.log.Error("Failed to scan channel unread row", "error", err)
 			continue
 		}
-		serverIDs = append(serverIDs, serverID)
+		channels = append(channels, row)
+		if _, ok := seenServers[row.ServerID]; !ok {
+			seenServers[row.ServerID] = struct{}{}
+			serverIDs = append(serverIDs, row.ServerID)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		h.log.Error("Error iterating server unread status", "error", err)
@@ -1381,7 +1413,7 @@ func (h *Handler) GetServerUnreadStatus(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"server_ids": serverIDs})
+	c.JSON(http.StatusOK, gin.H{"server_ids": serverIDs, "channels": channels})
 }
 
 // MarkChannelRead updates the user's last_read_at for a channel (upsert).
@@ -1477,6 +1509,15 @@ func (h *Handler) MarkServerRead(c *gin.Context) {
 
 	// CV-CAN-002: only write read state for channels the caller can view — do not
 	// upsert read state for hidden channels the member is denied visibility on.
+	//
+	// Deliberately still VISIBILITY, not readability, while GetUnreadCounts and
+	// GetServerUnreadStatus moved to GetReadableChannelIDs. Those two DISCLOSE a
+	// measure of message volume, which is what the history bit governs; this one
+	// writes the caller's own channel_read_states row and answers with a constant
+	// string however many rows it touched, so it is neither an oracle nor a
+	// disclosure. Stamping last_read_at on a history-denied channel is also the
+	// better behaviour: a later re-grant then surfaces no backlog, and a backlog's
+	// SIZE is exactly the activity measure the denial was meant to withhold.
 	visibleIDs, visErr := h.resolver.GetVisibleChannelIDs(c.Request.Context(), serverID, userID)
 	if visErr != nil {
 		h.log.Error(errMsgFailedResolveVisible, "error", visErr)

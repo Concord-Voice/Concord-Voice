@@ -200,6 +200,25 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   effect. And the error message no longer blames your camera for a failure that happens well after
   the camera has already started and is working — it now says the camera started but could not be
   shared with the call.
+- **The unread count on the app icon now clears when you read the messages** ([#2403](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2403)) — the number on
+  the Dock or taskbar icon went up when messages arrived while you were away, and then stayed
+  there. It cleared only if you clicked the notification popup itself; coming back to the app,
+  clicking the icon, or opening the channel in the sidebar all left it stuck, and reloading did
+  not help — only quitting and reopening did. The count is now worked out from what you have
+  actually read, so any way of reading a message clears it, and it is correct again the moment
+  the app reloads. It also counts messages from every server rather than only the one you are
+  looking at, and leaves out anything you have muted.
+- **The app icon no longer bounces forever after a notification** ([#2403](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2403)) — found while
+  fixing the count above. Every notification asked the Dock or taskbar icon to flash for
+  attention, and nothing ever asked it to stop, so it kept going until you quit. It now stops as
+  soon as you come back to the app, and does not start at all if you were already looking at it.
+- **Unread counts no longer leak from channels you cannot read** ([#2403](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2403)) — found while
+  fixing the count above. A server can let you see that a channel exists while withholding
+  permission to read what was said in it. The unread totals the app fetches were worked out from
+  the first permission only, so such a channel still reported a running count of how many
+  messages had arrived and when — a live measure of a conversation you are not allowed to read.
+  Those totals now require both permissions. The channel list is unaffected: a channel you can
+  see stays visible.
 - **Rotating a direct message's encryption key no longer locks everyone out of the conversation** ([#3343](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3343)) — choosing Rotate Encryption Key on a DM revoked the current key without creating its replacement, so every message in the conversation showed "Unable to decrypt this message" for both people until the row was removed by hand. The rotation now creates the new key for every participant in the same step, a conversation left in that state repairs itself the next time a participant who still holds the current key opens it, and the app stops re-requesting a key the server has already said it cannot serve (it was asking a dozen times a minute for each such conversation).
 - **The quieter text throughout the app is now readable** ([#3341](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3341)) — timestamps,
   hints, subtitles, secondary labels and the small notices the app adds to a conversation were

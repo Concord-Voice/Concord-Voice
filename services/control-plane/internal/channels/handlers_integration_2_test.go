@@ -98,7 +98,7 @@ func TestListChannelsEdgeCases(t *testing.T) {
 		testhelpers.ParseJSON(t, w, &body)
 		assert.NotNil(t, body["channels"])
 		assert.NotNil(t, body["channel_groups"])
-		groups := body["channel_groups"].([]interface{})
+		groups := testhelpers.JSONField[[]interface{}](t, body, "channel_groups")
 		assert.GreaterOrEqual(t, len(groups), 1)
 	})
 }
@@ -269,11 +269,11 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, "voice", channel["type"])
 
 		assert.NotNil(t, body["linked_text_channel"])
-		ltc := body["linked_text_channel"].(map[string]interface{})
+		ltc := testhelpers.JSONField[map[string]interface{}](t, body, "linked_text_channel")
 		assert.Equal(t, "text", ltc["type"])
 		assert.Equal(t, "voice-room", ltc["name"])
 	})
@@ -286,7 +286,7 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 		require.Equal(t, http.StatusCreated, w.Code)
 		var groupBody map[string]interface{}
 		testhelpers.ParseJSON(t, w, &groupBody)
-		groupID := groupBody["channel_group"].(map[string]interface{})["id"].(string)
+		groupID := testhelpers.JSONField[string](t, testhelpers.JSONField[map[string]interface{}](t, groupBody, "channel_group"), "id")
 
 		w = ts.DoRequest("POST", pathChannels, map[string]interface{}{
 			keyServerID: serverID,
@@ -301,7 +301,7 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, groupID, channel["group_id"])
 	})
 
@@ -318,7 +318,7 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, "bulletin", channel["type"])
 	})
 
@@ -336,7 +336,7 @@ func TestCreateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, "rocket", channel["emoji"])
 	})
 }
@@ -461,7 +461,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 		require.Equal(t, http.StatusCreated, w.Code)
 		var createBody map[string]interface{}
 		testhelpers.ParseJSON(t, w, &createBody)
-		voiceChID := createBody[keyChannel].(map[string]interface{})["id"].(string)
+		voiceChID := testhelpers.JSONField[string](t, testhelpers.JSONField[map[string]interface{}](t, createBody, keyChannel), "id")
 
 		// "standard" is the ceiling on a Groundspeed server (#179); "hifi" is
 		// above the ceiling and now correctly rejected. Use "standard" here.
@@ -474,7 +474,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, "standard", channel["audio_quality_tier"])
 	})
 
@@ -486,7 +486,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 		require.Equal(t, http.StatusCreated, w.Code)
 		var groupBody map[string]interface{}
 		testhelpers.ParseJSON(t, w, &groupBody)
-		groupID := groupBody["channel_group"].(map[string]interface{})["id"].(string)
+		groupID := testhelpers.JSONField[string](t, testhelpers.JSONField[map[string]interface{}](t, groupBody, "channel_group"), "id")
 
 		w = ts.DoRequest("PATCH", pathChannelsPrefix+channelID, map[string]interface{}{
 			"name":     "movable-chan",
@@ -497,7 +497,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, groupID, channel["group_id"])
 	})
 
@@ -511,7 +511,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Nil(t, channel["group_id"])
 	})
 
@@ -525,7 +525,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, "fire", channel["emoji"])
 	})
 
@@ -539,7 +539,7 @@ func TestUpdateChannelEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, "voice", channel["type"])
 	})
 }
@@ -676,9 +676,9 @@ func TestGetUnreadCountsEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		unreads := body["unreads"].([]interface{})
+		unreads := testhelpers.JSONField[[]interface{}](t, body, "unreads")
 		for _, u := range unreads {
-			entry := u.(map[string]interface{})
+			entry := testhelpers.JSONAs[map[string]interface{}](t, u, "unread entry")
 			if entry["channel_id"] == channelID {
 				assert.Equal(t, float64(0), entry["unread_count"])
 			}
@@ -705,9 +705,49 @@ func TestGetServerUnreadStatusEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		serverIDs := body["server_ids"].([]interface{})
+		serverIDs := testhelpers.JSONField[[]interface{}](t, body, "server_ids")
 		assert.Empty(t, serverIDs)
 	})
+}
+
+// TestGetServerUnreadStatusReturnsPerChannelCounts pins the additive `channels`
+// field: per-channel unread counts, with `server_ids` derived from those same
+// rows so the two can never disagree (#2403).
+func TestGetServerUnreadStatusReturnsPerChannelCounts(t *testing.T) {
+	ts := setupTS(t)
+
+	owner := ts.CreateTestUser(t, "cntowner")
+	other := ts.CreateTestUser(t, "cntother")
+	serverID := ts.CreateTestServer(t, owner.ID, "Counts Server")
+	channelID := ts.CreateTestChannel(t, serverID, "general")
+	ts.AddMemberToServer(t, serverID, other.ID, roleMember)
+
+	// Three messages from someone else; `other` has never read the channel.
+	for i := 0; i < 3; i++ {
+		ts.CreateTestMessage(t, channelID, owner, "hello")
+	}
+
+	w := ts.DoRequest("GET", "/api/v1/servers/unread-status", nil,
+		testhelpers.AuthHeaders(other.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		ServerIDs []string `json:"server_ids"`
+		Channels  []struct {
+			ChannelID   string `json:"channel_id"`
+			ServerID    string `json:"server_id"`
+			UnreadCount int    `json:"unread_count"`
+		} `json:"channels"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+
+	require.Len(t, body.Channels, 1)
+	assert.Equal(t, channelID, body.Channels[0].ChannelID)
+	assert.Equal(t, serverID, body.Channels[0].ServerID)
+	assert.Equal(t, 3, body.Channels[0].UnreadCount)
+
+	// server_ids must be derivable from the same rows — the two cannot disagree.
+	assert.Equal(t, []string{serverID}, body.ServerIDs)
 }
 
 // ===========================================================================
@@ -857,7 +897,7 @@ func TestGetChannelKeysEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		key := body["key"].(map[string]interface{})
+		key := testhelpers.JSONField[map[string]interface{}](t, body, "key")
 		assert.Equal(t, float64(1), key["key_version"])
 	})
 
@@ -981,7 +1021,7 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		revocations := body["revocations"].([]interface{})
+		revocations := testhelpers.JSONField[[]interface{}](t, body, "revocations")
 		assert.Empty(t, revocations, "no revocations should exist for a fresh channel")
 	})
 
@@ -1005,9 +1045,9 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		revocations := body["revocations"].([]interface{})
+		revocations := testhelpers.JSONField[[]interface{}](t, body, "revocations")
 		require.Len(t, revocations, 1)
-		revocation := revocations[0].(map[string]interface{})
+		revocation := testhelpers.JSONElem[map[string]interface{}](t, revocations, 0)
 		assert.Equal(t, float64(1), revocation["revoked_epoch"])
 		assert.Equal(t, float64(3), revocation["successor_epoch"])
 	})
@@ -1034,7 +1074,7 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		revocations := body["revocations"].([]interface{})
+		revocations := testhelpers.JSONField[[]interface{}](t, body, "revocations")
 		assert.Empty(t, revocations)
 	})
 
@@ -1048,7 +1088,7 @@ func TestValidateEpochsAllPaths(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		revocations := body["revocations"].([]interface{})
+		revocations := testhelpers.JSONField[[]interface{}](t, body, "revocations")
 		assert.Empty(t, revocations)
 		assert.Equal(t, []interface{}{channelID}, body["access_lost"])
 	})
@@ -1167,7 +1207,7 @@ func TestGetUnifiedKeysAllPaths(t *testing.T) {
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
 		assert.Equal(t, "channel", body["kind"])
-		key := body["key"].(map[string]interface{})
+		key := testhelpers.JSONField[map[string]interface{}](t, body, "key")
 		assert.Equal(t, float64(1), key["key_version"])
 	})
 
@@ -2420,7 +2460,7 @@ func TestGetPendingKeyRequestsEdgeCases(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		requests := body["pending_requests"].([]interface{})
+		requests := testhelpers.JSONField[[]interface{}](t, body, "pending_requests")
 		assert.Empty(t, requests)
 	})
 }
@@ -2448,7 +2488,7 @@ func TestEncryptedChannelFullFlow(t *testing.T) {
 	require.Equal(t, http.StatusCreated, w.Code)
 	var createBody map[string]interface{}
 	testhelpers.ParseJSON(t, w, &createBody)
-	channelID := createBody[keyChannel].(map[string]interface{})["id"].(string)
+	channelID := testhelpers.JSONField[string](t, testhelpers.JSONField[map[string]interface{}](t, createBody, keyChannel), "id")
 
 	// 2. Owner fetches their key
 	w = ts.DoRequest("GET", pathChannelsPrefix+channelID+pathKeys, nil, testhelpers.AuthHeaders(owner.AccessToken))
@@ -2510,12 +2550,12 @@ func TestCreateEncryptedVoiceChannelWithLinkedText(t *testing.T) {
 	var body map[string]interface{}
 	testhelpers.ParseJSON(t, w, &body)
 
-	channel := body[keyChannel].(map[string]interface{})
+	channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 	assert.Equal(t, "voice", channel["type"])
 
 	// Linked text channel exists
 	assert.NotNil(t, body["linked_text_channel"])
-	ltc := body["linked_text_channel"].(map[string]interface{})
+	ltc := testhelpers.JSONField[map[string]interface{}](t, body, "linked_text_channel")
 	assert.Equal(t, "text", ltc["type"])
 }
 
@@ -2545,10 +2585,10 @@ func TestReorderChannelsAdditional(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channels := body["channels"].([]interface{})
+		channels := testhelpers.JSONField[[]interface{}](t, body, "channels")
 		assert.GreaterOrEqual(t, len(channels), 3)
 
-		first := channels[0].(map[string]interface{})
+		first := testhelpers.JSONElem[map[string]interface{}](t, channels, 0)
 		assert.Equal(t, ch3, first["id"])
 	})
 
@@ -2565,7 +2605,7 @@ func TestReorderChannelsAdditional(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Equal(t, groupID, channel["group_id"])
 	})
 
@@ -2612,7 +2652,7 @@ func TestChannelGroupsAdditional(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		groups := body["channel_groups"].([]interface{})
+		groups := testhelpers.JSONField[[]interface{}](t, body, "channel_groups")
 		assert.GreaterOrEqual(t, len(groups), 1)
 	})
 
@@ -2632,7 +2672,7 @@ func TestChannelGroupsAdditional(t *testing.T) {
 		require.Equal(t, http.StatusCreated, w.Code)
 		var createBody map[string]interface{}
 		testhelpers.ParseJSON(t, w, &createBody)
-		channelID := createBody[keyChannel].(map[string]interface{})["id"].(string)
+		channelID := testhelpers.JSONField[string](t, testhelpers.JSONField[map[string]interface{}](t, createBody, keyChannel), "id")
 
 		// Delete the group
 		w = ts.DoRequest("DELETE", groupPath(serverID, groupID), nil, testhelpers.AuthHeaders(owner.AccessToken))
@@ -2644,7 +2684,7 @@ func TestChannelGroupsAdditional(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channel := body[keyChannel].(map[string]interface{})
+		channel := testhelpers.JSONField[map[string]interface{}](t, body, keyChannel)
 		assert.Nil(t, channel["group_id"], "channel's group_id should be null after group deletion")
 	})
 }
@@ -2678,7 +2718,7 @@ func TestMultipleChannelOperations(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channels := body["channels"].([]interface{})
+		channels := testhelpers.JSONField[[]interface{}](t, body, "channels")
 		assert.Equal(t, len(channelNames), len(channels))
 	})
 
@@ -2701,7 +2741,7 @@ func TestMultipleChannelOperations(t *testing.T) {
 
 		var body map[string]interface{}
 		testhelpers.ParseJSON(t, w, &body)
-		channels := body["channels"].([]interface{})
+		channels := testhelpers.JSONField[[]interface{}](t, body, "channels")
 		assert.Empty(t, channels)
 	})
 }
