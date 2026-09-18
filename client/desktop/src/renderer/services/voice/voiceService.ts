@@ -1767,10 +1767,16 @@ class VoiceService {
       const params = producer.rtpSender.getParameters();
       if (!params.encodings?.length) return;
       const effectivePriority = priority === 'off' ? 'low' : priority;
-      for (const enc of params.encodings) {
-        enc.priority = effectivePriority;
-        (enc as Record<string, unknown>).networkPriority = effectivePriority;
-      }
+      // encodings[0] ONLY. `priority` / `networkPriority` are PER-SENDER in libwebrtc, and
+      // `RtpSenderBase::SetParametersInternal` rejects the WHOLE setParameters call -- with
+      // "Attempted to set an unimplemented parameter of RtpParameters." -- when a non-default
+      // value appears on any encoding after index 0. Looping therefore made a LAYERED sender
+      // silently drop every priority change, index 0 included, because the call never landed.
+      // Deliberately UNLIKE `liveUpdateScreenBitrate` below, which must write every rung:
+      // `maxBitrate` is genuinely per-encoding and the ladder graduates it.
+      const senderEncoding = params.encodings[0];
+      senderEncoding.priority = effectivePriority;
+      (senderEncoding as Record<string, unknown>).networkPriority = effectivePriority;
       producer.rtpSender.setParameters(params).catch((err: unknown) => {
         console.warn('[video-settings] Video priority update failed:', errorMessage(err));
       });
@@ -1800,13 +1806,23 @@ class VoiceService {
       // and, on a LOWERED setting, push q and h above what produce-time gives them.
       // One setParameters transaction; order, rid, scaling and activity flags untouched.
       const ladder = simulcastLadderBitrates(effectiveBitrate);
-      for (const enc of params.encodings) {
-        // Key on rid, never index: only a simulcast plan carries rids, and a
-        // single-encoding sender (SVC, or the layering gate off) has none — it is the
-        // f-equivalent and takes the ceiling verbatim, exactly as before.
-        const rid = enc.rid as 'q' | 'h' | 'f' | undefined;
-        enc.maxBitrate = rid && rid in ladder ? ladder[rid] : effectiveBitrate;
-      }
+      // Key by INDEX, never by rid — the reverse of what this block said until #3348, and
+      // the rid form made the whole #2208 fix inert. Our 'q'/'h'/'f' never reaches the
+      // sender: `Transport.produce()` rebuilds each encoding through an allow-list that
+      // omits `rid` entirely (it copies active, dtx, scalabilityMode, scaleResolutionDownBy,
+      // maxBitrate, maxFramerate, adaptivePtime, priority, networkPriority), and the send
+      // handler then assigns `r${idx}`. So a live sender's rid is ALWAYS 'r0'/'r1'/'r2',
+      // `rid in ladder` was always false, and every layer took the flat ceiling — exactly
+      // the aggregate-ceiling defect #2208 exists to close. MEASURED on Chromium 152.
+      // Index is sound because the handler's forEach preserves encoding order, so position
+      // IS the layer; that is the same property the per-sender encodings[0] write relies on.
+      const byIndex = [ladder.q, ladder.h, ladder.f];
+      const layered = params.encodings.length === byIndex.length;
+      params.encodings.forEach((enc, i) => {
+        // A single-encoding sender (SVC, or the layering gate off) is the f-equivalent and
+        // takes the ceiling verbatim, exactly as before.
+        enc.maxBitrate = layered ? byIndex[i] : effectiveBitrate;
+      });
       producer.rtpSender.setParameters(params).catch((err: unknown) => {
         // Never swallow this. A rejection (stale transactionId after an intervening
         // renegotiation, or a per-encoding validation failure) leaves the slider moved
@@ -3861,8 +3877,23 @@ class VoiceService {
     return null;
   }
 
-  /** Map a camera capture error to a user-friendly message. */
-  private static mapCameraError(err: unknown): string {
+  /**
+   * Map a camera CAPTURE or PUBLISH failure to a user-friendly message.
+   * `captureSucceeded` is true once getUserMedia has resolved, which is what separates a
+   * device/permission fault from a publish fault. It is REQUIRED, not defaulting: the value a
+   * forgetful caller would inherit is exactly the misattribution this distinction exists to fix.
+   */
+  private static mapCameraError(err: unknown, captureSucceeded: boolean): string {
+    // A failure AFTER getUserMedia resolved is not a camera fault: the device opened, and the
+    // throw came from publishing (encoding parameters, transport, the E2EE transform). Telling
+    // that user to try another camera or video preset is advice neither can act on -- which is
+    // how a rejected RTP encoding parameter came to be reported as a hardware problem.
+    if (captureSucceeded) {
+      // Video is already OFF here: setVideoOn(true) is reached only from commitCameraProducer
+      // after a successful commit, and this path threw before that. Telling the user to turn it
+      // off first names a state they are not in.
+      return 'Camera started, but sharing it with the call failed. Try turning video on again.';
+    }
     if (err instanceof DOMException && err.name === 'NotAllowedError') {
       return 'Camera access denied. Check your browser or system permissions.';
     }
@@ -3961,7 +3992,9 @@ class VoiceService {
       if (this.localCameraStream === acquiredStream) {
         this.localCameraStream = null;
       }
-      useVoiceStore.getState().setVideoSlotError(VoiceService.mapCameraError(err));
+      useVoiceStore
+        .getState()
+        .setVideoSlotError(VoiceService.mapCameraError(err, acquiredStream !== null));
     }
   }
 

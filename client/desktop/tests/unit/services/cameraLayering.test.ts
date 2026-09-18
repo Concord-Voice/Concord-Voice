@@ -75,10 +75,15 @@ describe('buildCameraEncodingPlan', () => {
       eligibility: ALL_ELIGIBLE,
     });
     expect(plan.kind).toBe('simulcast');
+    // This case asserts the LADDER SHAPE -- rid names, scaleResolutionDownBy, bitrate ratios.
+    // `...priority` was only ever spread in to satisfy toEqual, and spreading it across all
+    // three rungs pinned the defect that stopped camera video publishing entirely: libwebrtc
+    // rejects those per-sender fields on any encoding after index 0. See the `per-sender RTP
+    // encoding parameters (libwebrtc contract)` suite below, which owns that rule.
     expect(plan.encodings).toEqual([
       { rid: 'q', scaleResolutionDownBy: 4, maxBitrate: 250_000, ...priority },
-      { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 800_000, ...priority },
-      { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 2_500_000, ...priority },
+      { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 800_000 },
+      { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 2_500_000 },
     ]);
   });
 
@@ -247,5 +252,131 @@ describe('gated simulcast-screen plan (#1924)', () => {
       expect(p.kind).toBe('svc');
       expect(p.encodings).toHaveLength(1);
     }
+  });
+});
+
+// libwebrtc treats `priority` (bitrate_priority) and `networkPriority` (network_priority) as
+// PER-SENDER fields, not per-encoding — pc/rtp_sender.cc's UnimplementedRtpParameterHasValue
+// rejects a non-default value on any encoding at index >= 1, and addTransceiver() throws
+// OperationError. buildCameraEncodingPlan's simulcast branch spread `base` (carrying both
+// fields) into all three rungs, which reproduced that production crash for any non-'low'
+// priority selection -- and the app default is 'medium'.
+//
+// MEASURED on Chromium 152 (2026-09-17), the major Electron 44 ships: both fields on all
+// three rungs -> OperationError with the exact production message; both fields on rung 0
+// only -> accepted; either field ALONE on rungs 1-2 -> throws; priority/networkPriority
+// 'low' on all three -> accepted, confirming 'low' is the one value matching both libwebrtc
+// defaults; a single encoding carrying both -> accepted, since that encoding IS index 0.
+describe('per-sender RTP encoding parameters (libwebrtc contract)', () => {
+  function expectPerSenderFieldsOnlyOnFirstEncoding(
+    encodings: mediasoupTypes.RtpEncodingParameters[],
+    expectedFirst: CameraLayeringPriority
+  ) {
+    // encoding[0] is where libwebrtc actually reads these fields — a "fix" that strips them
+    // everywhere would silently delete the DSCP priority feature rather than fix the bug.
+    expect(encodings[0].priority).toBe(expectedFirst.priority);
+    expect(encodings[0].networkPriority).toBe(expectedFirst.networkPriority);
+
+    encodings.forEach((enc, i) => {
+      if (i === 0) return;
+      expect(
+        enc.priority,
+        `encoding[${i}] carries per-sender field "priority" — libwebrtc rejects ` +
+          `priority/networkPriority on any encoding after index 0 (addTransceiver throws ` +
+          `OperationError)`
+      ).toBeUndefined();
+      expect(
+        enc.networkPriority,
+        `encoding[${i}] carries per-sender field "networkPriority" — libwebrtc rejects ` +
+          `priority/networkPriority on any encoding after index 0 (addTransceiver throws ` +
+          `OperationError)`
+      ).toBeUndefined();
+    });
+  }
+
+  it('H264 3-rung simulcast: only encoding[0] carries priority/networkPriority', () => {
+    const plan = buildCameraEncodingPlan({
+      codec: codec('video/H264'),
+      maxBitrate: 2_500_000,
+      scalabilityMode: 'auto',
+      priority,
+      eligibility: ALL_ELIGIBLE,
+    });
+
+    // Vacuity guard: must actually be the 3-rung ladder, or there is nothing to check — an
+    // eligibility collapse to 'single' would make this pass trivially.
+    expect(plan.kind).toBe('simulcast');
+    expect(plan.encodings).toHaveLength(3);
+
+    expectPerSenderFieldsOnlyOnFirstEncoding(plan.encodings, priority);
+  });
+
+  it('VP8 3-rung simulcast: only encoding[0] carries priority/networkPriority', () => {
+    const plan = buildCameraEncodingPlan({
+      codec: codec('video/VP8'),
+      maxBitrate: 900_000,
+      scalabilityMode: 'auto',
+      priority,
+      eligibility: ALL_ELIGIBLE,
+    });
+
+    expect(plan.kind).toBe('simulcast');
+    expect(plan.encodings).toHaveLength(3);
+
+    expectPerSenderFieldsOnlyOnFirstEncoding(plan.encodings, priority);
+  });
+
+  // CONTROL — expected to pass both BEFORE and AFTER the production fix. This exercises the
+  // app's `priority: 'off'` state, which produces an empty `base` ({}). Spreading an empty
+  // object into every rung yields no per-sender fields anywhere, index 0 included, so this
+  // case cannot distinguish the buggy code from the fixed code. Do NOT "fix" this case later —
+  // it pins the no-op behavior of an empty priority selection, not the libwebrtc bug.
+  it('CONTROL: empty priority ({}) yields a well-formed ladder with no per-sender fields anywhere', () => {
+    const emptyPriority: CameraLayeringPriority = {};
+    const plan = buildCameraEncodingPlan({
+      codec: codec('video/H264'),
+      maxBitrate: 2_500_000,
+      scalabilityMode: 'auto',
+      priority: emptyPriority,
+      eligibility: ALL_ELIGIBLE,
+    });
+
+    expect(plan.kind).toBe('simulcast');
+    expect(plan.encodings).toHaveLength(3);
+
+    plan.encodings.forEach((enc) => {
+      expect(enc.priority).toBeUndefined();
+      expect(enc.networkPriority).toBeUndefined();
+    });
+  });
+
+  it('SVC (AV1) single encoding: index 0 legally carries both per-sender fields', () => {
+    const plan = buildCameraEncodingPlan({
+      codec: codec('video/AV1'),
+      maxBitrate: 2_500_000,
+      scalabilityMode: 'auto',
+      priority,
+      eligibility: ALL_ELIGIBLE,
+    });
+
+    expect(plan.kind).toBe('svc');
+    expect(plan.encodings).toHaveLength(1);
+    expect(plan.encodings[0].priority).toBe(priority.priority);
+    expect(plan.encodings[0].networkPriority).toBe(priority.networkPriority);
+  });
+
+  it('single-layer fallback: index 0 legally carries both per-sender fields', () => {
+    const plan = buildCameraEncodingPlan({
+      codec: codec('video/unknown'),
+      maxBitrate: 1_500_000,
+      scalabilityMode: 'auto',
+      priority,
+      eligibility: ALL_ELIGIBLE,
+    });
+
+    expect(plan.kind).toBe('single');
+    expect(plan.encodings).toHaveLength(1);
+    expect(plan.encodings[0].priority).toBe(priority.priority);
+    expect(plan.encodings[0].networkPriority).toBe(priority.networkPriority);
   });
 });

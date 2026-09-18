@@ -175,6 +175,31 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 
 ### Fixed
 
+- **Screen sharing respects your quality setting again** ([#3348](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3348)) — when a screen
+  share sends several quality levels at once, your chosen limit is meant to cap the largest one
+  while the smaller levels get proportionally less. Instead every level was being given the full
+  limit, so a share could use roughly two and a half times the bandwidth you had asked it to, and
+  lowering the setting mid-share raised the smaller levels rather than lowering them. This was
+  supposed to have been fixed once already; the earlier fix looked up each level by a name the
+  video engine quietly replaces, so it matched nothing and changed nothing, and its test used the
+  original names rather than the replacements and so never noticed.
+- **Turning your camera on in a call works again** ([#3348](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3348)) — switching a webcam on failed with "Could not
+  start camera. Try a different camera or video preset in Settings.", and neither a different
+  camera nor a different preset made any difference, because the camera was never the problem. To
+  keep video watchable on slower connections the app sends your camera at three quality levels at
+  once, and it was attaching a network-priority setting to all three. That setting describes the
+  whole stream rather than an individual level, so the video engine refused the request outright
+  and nothing was sent at all. It now rides the first level only. This is also why the failure
+  looked so strange: sharing your camera alone worked, it broke the moment a second person turned
+  theirs on — a second camera is what makes the app start sending three levels — and from then on
+  it stayed broken even after the other person stopped, because a call keeps sending three levels
+  for the rest of its life. Screen sharing carried exactly the same flaw and never showed it: it
+  only sends multiple levels once at least two people are watching, which a two-person call cannot
+  reach. Two related repairs come with it. Changing the video priority setting mid-call was
+  silently doing nothing on any call sending multiple levels, for the same reason, and now takes
+  effect. And the error message no longer blames your camera for a failure that happens well after
+  the camera has already started and is working — it now says the camera started but could not be
+  shared with the call.
 - **Rotating a direct message's encryption key no longer locks everyone out of the conversation** ([#3343](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3343)) — choosing Rotate Encryption Key on a DM revoked the current key without creating its replacement, so every message in the conversation showed "Unable to decrypt this message" for both people until the row was removed by hand. The rotation now creates the new key for every participant in the same step, a conversation left in that state repairs itself the next time a participant who still holds the current key opens it, and the app stops re-requesting a key the server has already said it cannot serve (it was asking a dozen times a minute for each such conversation).
 - **The quieter text throughout the app is now readable** ([#3341](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3341)) — timestamps,
   hints, subtitles, secondary labels and the small notices the app adds to a conversation were

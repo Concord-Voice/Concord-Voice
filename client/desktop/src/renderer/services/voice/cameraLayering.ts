@@ -116,10 +116,20 @@ export function buildCameraEncodingPlan(input: BuildCameraEncodingPlanInput): Ca
       kind: 'simulcast',
       encodings: (() => {
         const ladder = simulcastLadderBitrates(input.maxBitrate);
+        // `priority` / `networkPriority` are PER-SENDER in libwebrtc, not per-encoding, so
+        // they ride encoding[0] alone. `UnimplementedRtpParameterHasValue` rejects a
+        // non-default value on any encoding after index 0, and BOTH publish paths run that
+        // check -- `PeerConnection::AddTransceiver` (pc/peer_connection.cc) and
+        // `RtpSenderBase::SetParametersInternal` (pc/rtp_sender.cc). Spreading `base` across
+        // the ladder therefore fails the whole publish with "Attempted to set an
+        // unimplemented parameter of RtpParameters.", which is what broke camera video once
+        // the room layering gate turned this plan into three rungs. Only 'low' maps to both
+        // libwebrtc defaults, so every other setting throws -- and the app default is
+        // 'medium'. Do NOT "restore symmetry" by spreading `base` again.
         return [
           { ...base, rid: 'q', scaleResolutionDownBy: 4, maxBitrate: ladder.q },
-          { ...base, rid: 'h', scaleResolutionDownBy: 2, maxBitrate: ladder.h },
-          { ...base, rid: 'f', scaleResolutionDownBy: 1, maxBitrate: ladder.f },
+          { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: ladder.h },
+          { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: ladder.f },
         ];
       })(),
     };

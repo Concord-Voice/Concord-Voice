@@ -932,7 +932,14 @@ describe('VoiceService Extended', () => {
   // ===== liveUpdateVideoPriority =====
 
   describe('liveUpdateVideoPriority', () => {
-    it('applies priority to all encodings', async () => {
+    it('writes per-sender priority to encoding 0 only, never to a later rung', async () => {
+      // Renamed from 'applies priority to all encodings', which asserted a call that could
+      // never land: libwebrtc rejects the WHOLE setParameters call when priority or
+      // networkPriority carries a non-default value on any encoding after index 0
+      // (RtpSenderBase::SetParametersInternal -> UnimplementedRtpParameterHasValue). On a
+      // layered sender the old loop therefore dropped every priority change, index 0 included.
+      // Contrast liveUpdateScreenBitrate, which must write every rung -- maxBitrate is
+      // genuinely per-encoding.
       await joinVoiceChannel();
       const svc = voiceService as any;
       const producer = createMockProducer('cam-1', 'camera');
@@ -942,7 +949,9 @@ describe('VoiceService Extended', () => {
       svc.liveUpdateVideoPriority(producer, 'high');
       const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
       expect(params.encodings[0].priority).toBe('high');
-      expect(params.encodings[1].priority).toBe('high');
+      expect(params.encodings[0].networkPriority).toBe('high');
+      expect(params.encodings[1].priority).toBeUndefined();
+      expect(params.encodings[1].networkPriority).toBeUndefined();
     });
 
     it('resets to low when priority is off', async () => {
@@ -1012,9 +1021,15 @@ describe('VoiceService Extended', () => {
         // `active: false` on q is load-bearing: with every layer already active the
         // "leaves untouched" assertion below cannot distinguish "left alone" from
         // "written true", and a loop that forced enc.active = true survived the suite.
-        { rid: 'q', maxBitrate: 300_000, scaleResolutionDownBy: 4, active: false },
-        { rid: 'h', maxBitrate: 900_000, scaleResolutionDownBy: 2, active: true },
-        { rid: 'f', maxBitrate: 2_500_000, scaleResolutionDownBy: 1, active: true },
+        // rid is 'r0'/'r1'/'r2', NOT 'q'/'h'/'f'. This fixture said q/h/f until #3348 and
+        // that is what hid the defect: mediasoup drops our rid in Transport.produce()'s
+        // encoding allow-list and the send handler reassigns `r${idx}`, so no live sender
+        // ever carries the plan's names. Asserting against the shape the code WANTED rather
+        // than the one the platform DELIVERS let a rid-keyed lookup that matched nothing
+        // pass as a fix. Keep these production values.
+        { rid: 'r0', maxBitrate: 300_000, scaleResolutionDownBy: 4, active: false },
+        { rid: 'r1', maxBitrate: 900_000, scaleResolutionDownBy: 2, active: true },
+        { rid: 'r2', maxBitrate: 2_500_000, scaleResolutionDownBy: 1, active: true },
       ];
     }
 
@@ -1097,7 +1112,7 @@ describe('VoiceService Extended', () => {
       });
       svc.liveUpdateScreenBitrate(producer, 5_000_000);
       const params = producer.rtpSender.setParameters.mock.calls[0]?.[0];
-      expect(params.encodings.map((e: { rid: string }) => e.rid)).toEqual(['q', 'h', 'f']);
+      expect(params.encodings.map((e: { rid: string }) => e.rid)).toEqual(['r0', 'r1', 'r2']);
       // q is INACTIVE in the fixture — a loop that wrote enc.active would fail here.
       expect(params.encodings[0]).toMatchObject({ scaleResolutionDownBy: 4, active: false });
       expect(params.encodings[1]).toMatchObject({ scaleResolutionDownBy: 2, active: true });

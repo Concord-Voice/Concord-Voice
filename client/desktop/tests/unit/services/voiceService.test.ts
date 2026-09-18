@@ -1714,6 +1714,13 @@ describe('VoiceService', () => {
       await voiceService.produceVideo();
 
       expect(consoleSpy).toHaveBeenCalledWith('Failed to start camera:', 'camera produce failed');
+      // getUserMedia RESOLVED and produce() rejected, so this is the publish-stage branch.
+      // Without this assertion the test's own name over-claims -- it said "sets videoSlotError"
+      // while asserting only the console line, so a regression to the camera/preset wording
+      // (the exact misattribution this branch fixes) would go undetected.
+      expect(useVoiceStore.getState().videoSlotError).toBe(
+        'Camera started, but sharing it with the call failed. Try turning video on again.'
+      );
       consoleSpy.mockRestore();
     });
   });
