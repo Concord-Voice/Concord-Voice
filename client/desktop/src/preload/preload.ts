@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+// TYPE-ONLY, and that is load-bearing rather than stylistic: the comment below
+// records that `audiocapRelay` is the file's ONLY runtime local import, a property
+// `tests/integration/preload-sandbox-contract.test.ts` pins. `import type` is erased
+// by esbuild, so this adds no `require`. Same shape as the `ipcContract` import above.
+import type { AudiocapStartResult } from '../main/audiocapHost';
 import type { CredentialOwner, SelfHostedProbeResult } from '../main/ipcContract';
 import type { AppleSignInResult } from '../shared/appleSso';
 import type {
@@ -557,8 +562,12 @@ contextBridge.exposeInMainWorld('electron', {
      * in `src/main/`, so the `chromeMediaSource: 'desktop'` loopback is NOT main-enforced.
      * For the #2161 path the renderer-side verdict switches are the WHOLE enforcement,
      * exactly as `screenAudioD6.test.ts` says. The claim applies to what main itself
-     * decides — #3198 PR 2's `audiocap:start` invoke — never to the Electron loopback.
-     * (#3198 Phase-8 review.)
+     * decides — #3198 PR 3's `audiocap:start` invoke, which is the `start` method
+     * immediately below — never to the Electron loopback. (#3198 Phase-8 review.)
+     *
+     * This sentence named "PR 2" until PR 3 landed the handler. PR 2 was split on
+     * 2026-09-16 and the invoke moved with it, so the marker outlived its own subject
+     * for one PR — exactly the drift the docs-ship-with-the-code rule exists to stop.
      */
     onCapability: (callback: (data: { perProcessAudio: boolean }) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: { perProcessAudio: boolean }) =>
@@ -568,6 +577,36 @@ contextBridge.exposeInMainWorld('electron', {
         ipcRenderer.removeListener('audiocap:capability', handler);
       };
     },
+
+    /**
+     * Ask main to start a per-process capture for a picked window (#3198 PR 3).
+     *
+     * Named `start`, not `startAudiocap`: inside the namespace the latter reads
+     * `audiocap.startAudiocap`.
+     *
+     * ADDITIVE WITHIN CONTRACT 28 — `IPC_CONTRACT_VERSION` does not move and
+     * `SPA_MIN_CONTRACT` stays 19. The renderer feature-detects
+     * `typeof window.electron?.audiocap?.start !== 'function'`, so a shell without
+     * this channel loses per-process audio and falls back to video-only, never to a
+     * system mix (C9). Capability, not demand (#2967).
+     *
+     * A PASS-THROUGH THAT AUTHORISES NOTHING. Everything this call carries is
+     * re-validated in main: the sender frame, the payload shape, the `window:`
+     * prefix, and the id's presence in a live enumeration. The renderer cannot widen
+     * a capture by lying here — the worst it can do is name a window it may already
+     * name through the picker.
+     */
+    start: (sourceId: string): Promise<AudiocapStartResult> =>
+      ipcRenderer.invoke('audiocap:start', { sourceId }),
+
+    /**
+     * End the live per-process capture (#3198 PR 3).
+     *
+     * Zero-argument: the renderer triggers, main decides what to reap. Additive within
+     * contract 28 like `start`, so feature-detect rather than demand -- a shell without
+     * it falls back to the quit hooks, which is the pre-PR-3 behaviour.
+     */
+    stop: (): Promise<void> => ipcRenderer.invoke('audiocap:stop'),
   },
 });
 
@@ -854,6 +893,13 @@ export interface ElectronAPI {
   audiocap: {
     getPortMessageTag: () => string;
     onCapability: (callback: (data: { perProcessAudio: boolean }) => void) => () => void;
+    /**
+     * #3198 PR 3. Additive within contract 28; feature-detect its presence rather
+     * than demanding a contract bump (`SPA_MIN_CONTRACT` stays 19).
+     */
+    start: (sourceId: string) => Promise<AudiocapStartResult>;
+    /** #3198 PR 3. Zero-argument; additive within contract 28. */
+    stop: () => Promise<void>;
   };
 }
 

@@ -75,6 +75,147 @@ const NS_PER_US = 1000n;
  */
 let currentGeneration = 0;
 
+/**
+ * THE HANDOFF CAN LAND BEFORE ITS BRIDGE EXISTS, so the listener cannot live on the
+ * bridge (#3198 PR 3).
+ *
+ * Until PR 3 nothing started a capture, so no handoff was ever posted and the listener
+ * `createScreenAudioBridge` installed for itself was sufficient by vacuity. With the
+ * capture leg live the ordering is decided in the MAIN process and loses: main posts the
+ * port to preload inside the same turn that settles the `audiocap:start` promise, and the
+ * renderer can only construct a bridge after that promise crosses IPC and resolves. The
+ * relay hands the main world its end with ONE `postMessage` and never repeats it — see
+ * `audiocapRelay.ts`, "Hand the main world its end exactly once" — so a handoff with no
+ * listener is not delayed, it is destroyed.
+ *
+ * This is the `windowLoaded` trap from `[internal]rules/electron.md` § "IPC contract v27",
+ * one layer up: *"Deferring construction until the IPC message with the port arrives
+ * races app startup … the symptom is an intermittent, silent 'screen share has no audio'
+ * with nothing in any log."* That note is written about preload; the identical shape is
+ * reachable here, and the remedy it prescribes is the one taken below — register at
+ * MODULE SCOPE, before anything can arrive.
+ *
+ * A second property falls out for free, and it retires a real bug rather than a
+ * hypothetical one. The handoff is a `window` message, so a per-bridge listener made it a
+ * BROADCAST every live bridge saw — which is what let a not-yet-stopped bridge destroy its
+ * successor's port (PR #3245 red-team, VULN-2, recorded at `adoptPort` below). Dispatching
+ * by generation means a bridge is only ever offered its own port, so that collision is
+ * unrepresentable instead of guarded against.
+ */
+const awaitingPort = new Map<number, (port: MessagePort) => void>();
+
+/**
+ * Ports that arrived before their bridge registered, keyed by generation.
+ *
+ * BOUNDED, because this map is fed by a message the renderer does not initiate. One share
+ * is live at a time and a superseded generation's port is closed the moment a newer bridge
+ * registers, so the steady state is 0 or 1; the cap only bounds a pathological producer.
+ */
+const unclaimedPorts = new Map<number, MessagePort>();
+const UNCLAIMED_PORT_LIMIT = 4;
+
+function dropUnclaimed(generation: number): void {
+  const stale = unclaimedPorts.get(generation);
+  if (stale === undefined) return;
+  unclaimedPorts.delete(generation);
+  stale.close();
+}
+
+/**
+ * Route a verified handoff to its bridge, or hold it until that bridge registers.
+ *
+ * Holding is the whole point: a port with no claimant is the one case the old per-bridge
+ * listener could not represent, because a listener that does not exist cannot buffer.
+ */
+function deliverHandoff(generation: number, port: MessagePort): void {
+  const claim = awaitingPort.get(generation);
+  if (claim !== undefined) {
+    claim(port);
+    return;
+  }
+
+  // A duplicate for a generation already waiting unclaimed. Close the older one rather
+  // than leak it — two ports feeding one track is the failure `adoptPort` already refuses.
+  dropUnclaimed(generation);
+
+  if (unclaimedPorts.size >= UNCLAIMED_PORT_LIMIT) {
+    // Drop the OLDEST. `Map` preserves insertion order, so the first key is the stalest
+    // claim, and a stale claim is the one least likely to still have a bridge coming.
+    const oldest = unclaimedPorts.keys().next();
+    if (!oldest.done) dropUnclaimed(oldest.value);
+  }
+  unclaimedPorts.set(generation, port);
+}
+
+/**
+ * The tag, resolved per message rather than captured once.
+ *
+ * `createScreenAudioBridge` THROWS when the bridge is missing, because there the absence
+ * is a capability answer the caller must act on. Here it is not: this listener runs from
+ * module evaluation, which can precede anything, and a throw would escape into an
+ * unrelated `message` dispatch. Returning `null` simply declines the message.
+ */
+function portMessageTag(): string | null {
+  const getPortMessageTag = globalThis.electron?.audiocap?.getPortMessageTag;
+  if (typeof getPortMessageTag !== 'function') return null;
+  const tag = getPortMessageTag();
+  return typeof tag === 'string' && tag.length > 0 ? tag : null;
+}
+
+/**
+ * The ONE handoff listener, installed at module evaluation.
+ *
+ * Its security checks are unchanged from the per-bridge listener this replaces, and both
+ * are still required — see the long note that used to sit here, preserved verbatim:
+ *
+ * 1. ORIGIN. `event.origin` is the SENDER's origin, and preload posts from this same
+ *    document, so it must equal ours. This is the check SonarQube S2819 names, and it
+ *    carries weight on the REMOTE SPA where the origin is a real `https://` value another
+ *    document could not forge.
+ * 2. SOURCE IDENTITY. Strict `=== window`, and `null` is NOT accepted — that is what a
+ *    hand-constructed `MessageEvent` dispatched by page script carries.
+ *
+ * Neither subsumes the other. On the bundled origins `app://concord` and
+ * `spa-cache://concord` the ORIGIN check degenerates: they are non-special schemes whose
+ * origin serializes to the literal string "null", which every opaque origin satisfies, so
+ * there the source check does all the work. Conversely a same-document attacker can
+ * dispatch an event carrying our own origin string, and only the source check refuses it.
+ *
+ * WHAT THIS DOES NOT CLAIM. It does not defend against a compromised MAIN WORLD in this
+ * document: that code can forge a handoff, and it already holds `voiceService` outright.
+ * The discriminator is a public constant by construction (`contextBridge` hands it to any
+ * caller), so no secret can help. This narrows the sender set to one window; it is not
+ * authentication.
+ */
+globalThis.addEventListener('message', (event: MessageEvent<unknown>): void => {
+  if (event.origin !== globalThis.location.origin) return;
+  // `window`, not `globalThis`: the latter does not typecheck against
+  // `MessageEventSource` (TS2367 — lib.dom merges `Window` into the `window` declaration,
+  // not into `typeof globalThis`), and blinding the compiler with a double cast on the one
+  // check that refuses a same-document attacker is not worth the consistency.
+  if (event.source !== window) return;
+
+  const data: unknown = event.data;
+  if (typeof data !== 'object' || data === null) return;
+
+  const tag = portMessageTag();
+  if (tag === null) return;
+  if ((data as Record<string, unknown>)[tag] !== true) return;
+
+  const port: MessagePort | undefined = event.ports[0];
+  if (port === undefined) return;
+
+  const generation = (data as Record<string, unknown>).generation;
+  // The generation is chosen by main and mirrored back by preload; a handoff that does not
+  // carry a real one cannot be routed to any bridge, so it is declined rather than guessed.
+  if (typeof generation !== 'number' || !Number.isInteger(generation) || generation < 0) {
+    port.close();
+    return;
+  }
+
+  deliverHandoff(generation, port);
+});
+
 export interface ScreenAudioBridgeStats {
   /**
    * The highest `overrunTotal` the child has reported — observer 2 of §4f.
@@ -279,9 +420,16 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
     // A handoff stamped with ANOTHER generation is addressed to a DIFFERENT
     // bridge, and is not this one's to destroy. Leave it entirely alone.
     //
+    // DEFENCE IN DEPTH SINCE #3198 PR 3, not the live fence it used to be. Dispatch
+    // is now keyed by generation in `deliverHandoff`, so a bridge is only ever
+    // offered its own port and this branch is unreachable from the module listener.
+    // It stays because the check is one comparison and its absence was once a real
+    // defect — the history below is why.
+    //
     // This used to fall into the `candidate.close()` below, which was a real bug
-    // with no attacker in it (PR #3245 red-team, VULN-2). The handoff is a
-    // `window` message BROADCAST, so every live bridge sees every handoff; a
+    // with no attacker in it (PR #3245 red-team, VULN-2). The handoff was a
+    // `window` message BROADCAST and every bridge installed its own listener, so
+    // every live bridge saw every handoff; a
     // bridge that has not been `stop()`ped when the host mints generation N+1
     // therefore destroyed the successor's port before the successor's own
     // listener ran -- listener registration order guarantees the older bridge
@@ -304,72 +452,65 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
     candidate.start();
   }
 
-  const onWindowMessage = (event: MessageEvent<unknown>): void => {
-    // VERIFY THE SENDER BEFORE READING THE PAYLOAD (SonarQube S2819, CWE-345).
-    //
-    // The handoff is posted by THIS document's preload onto THIS window, so the
-    // only legitimate sender is the window itself. A `message` event whose
-    // `source` is anything else came from another browsing context -- an iframe,
-    // an opener, a popup -- and has no business handing this bridge a port that
-    // terminates at the process which loaded native code.
-    //
-    // `source` rather than `origin` is the load-bearing half, and the reason is
-    // the same WHATWG rule that shaped the relay's `handoverTargetOrigin`: the
-    // bundled origins `app://concord` and `spa-cache://concord` are non-special
-    // schemes whose origin serializes to the literal string "null". Comparing
-    // origins there compares "null" to "null", which every opaque origin
-    // satisfies -- so an origin test alone would admit exactly the cross-context
-    // sender it is meant to exclude, while ALSO risking a false reject on the
-    // remote SPA. Identity of the window object has no such degenerate case.
-    //
-    // WHAT THIS DOES NOT CLAIM. It does not defend against a compromised MAIN
-    // WORLD in this same document: that code can forge a handoff, and it already
-    // holds `voiceService` outright, so there is nothing left to protect. The
-    // discriminator `tag` is a public constant by construction (`contextBridge`
-    // hands it to any caller), so no secret can help here. This narrows the
-    // sender set to one window; it is not authentication.
-    // TWO CHECKS, AND THEY DO DIFFERENT WORK. Both must hold.
-    //
-    // 1. ORIGIN. `event.origin` is the SENDER's origin, and preload posts from
-    //    this same document, so it must equal ours. This is the check S2819
-    //    names, and it is the one that carries weight on the REMOTE SPA, where
-    //    the origin is a real `https://` value a different document could not
-    //    forge.
-    // 2. SOURCE IDENTITY. Strict `=== window`, and `null` is NOT accepted (that
-    //    is what a hand-constructed `MessageEvent` dispatched by page script
-    //    carries).
-    //
-    // Neither subsumes the other, which is why both are here rather than one.
-    // On the bundled origins the ORIGIN check degenerates: `app://concord` and
-    // `spa-cache://concord` are non-special schemes whose origin serializes to
-    // the literal string "null", so the comparison is "null" === "null", which
-    // ANY opaque origin satisfies. There the source check is doing all the work.
-    // Conversely a same-document attacker can dispatch an event carrying our own
-    // origin string, and only the source check refuses that.
-    if (event.origin !== globalThis.location.origin) return;
-    // `window` here, unlike the origin check above, because `globalThis` does not
-    // typecheck against `MessageEventSource` (TS2367 — lib.dom merges `Window` into
-    // the `window` declaration, not into `typeof globalThis`). The only way to the
-    // globalThis spelling is a double cast, and blinding the compiler on the one
-    // check that refuses a same-document attacker is not worth the consistency.
-    if (event.source !== window) return;
-    const data: unknown = event.data;
-    if (typeof data !== 'object' || data === null) return;
-    if ((data as Record<string, unknown>)[tag] !== true) return;
-    const candidate: MessagePort | undefined = event.ports[0];
-    adoptPort(candidate, (data as Record<string, unknown>).generation);
-  };
+  // REGISTER, then DRAIN. Both halves are required and the order is the design: the
+  // handoff for this generation may already be sitting unclaimed (main posts it inside the
+  // turn that settles `audiocap:start`, which is strictly before this constructor can run),
+  // or it may still be in flight. Registering first means an in-flight one is routed the
+  // moment it lands; draining second means an already-arrived one is picked up now.
+  //
+  // Registering AFTER the drain would reopen the race in miniature -- a handoff landing
+  // between the two statements would find no claimant and be buffered, with nothing left to
+  // drain it until the next bridge for the same generation, which never comes.
+  awaitingPort.set(generation, (handed: MessagePort): void => {
+    adoptPort(handed, generation);
+  });
 
-  // Registered before returning, so a handoff that lands in the same task as
-  // construction is not missed.
-  globalThis.addEventListener('message', onWindowMessage);
+  // Anything older than this bridge is superseded and will never be claimed: the host has
+  // already killed the child it belonged to. Closing it here is what keeps `unclaimedPorts`
+  // at 0 or 1 in steady state rather than relying on the cap.
+  //
+  // Iterating the live key set rather than a copy is safe HERE and only here:
+  // `dropUnclaimed` deletes exactly the key it is handed, and a Map iterator
+  // that has already yielded an entry is unaffected by that entry's removal.
+  // Widening the loop body to delete some OTHER generation would break that.
+  for (const pending of unclaimedPorts.keys()) {
+    if (pending < generation) dropUnclaimed(pending);
+  }
+
+  const buffered = unclaimedPorts.get(generation);
+  if (buffered !== undefined) {
+    unclaimedPorts.delete(generation);
+    adoptPort(buffered, generation);
+  }
 
   return {
     track: generator,
     stop(): void {
       if (stopped) return;
       stopped = true;
-      globalThis.removeEventListener('message', onWindowMessage);
+      // A TOMBSTONE CLAIM, NOT A DELETION — and the difference is the whole fix (Gitar
+      // review, PR #3349). The listener is module-scoped and outlives every bridge, so a
+      // handoff for this generation can still land after `stop()` returns; teardown
+      // racing the handoff is exactly the case. Deleting the claim sent that port to
+      // `deliverHandoff`'s no-claimant branch, which BUFFERS it — held open until some
+      // later bridge's supersession sweep or until `UNCLAIMED_PORT_LIMIT` evicts it.
+      //
+      // Gitar proposed `dropUnclaimed(generation)` here instead. MEASURED: that is inert
+      // for its own scenario, because `stop()` runs BEFORE the late port arrives and the
+      // buffer is empty at this moment. A claim that closes on arrival is what actually
+      // closes it, and it removes the dependence on a later bridge ever existing.
+      //
+      // It removes itself, so the map holds at most one dead entry per stopped
+      // generation and nothing at all once the late port lands. A generation is unique
+      // per share, so this can never shadow a live claim.
+      awaitingPort.set(generation, (late: MessagePort): void => {
+        awaitingPort.delete(generation);
+        late.close();
+      });
+      // The other ordering: a port already buffered for this generation when `stop()`
+      // runs. Reachable only via a duplicate handoff — `deliverHandoff` buffers the
+      // second of two for one generation — but it costs one call to cover.
+      dropUnclaimed(generation);
       closePort();
       writer.releaseLock();
       generator.stop();

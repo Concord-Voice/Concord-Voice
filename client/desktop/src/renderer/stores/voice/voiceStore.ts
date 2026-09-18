@@ -5,6 +5,7 @@ import type { CallState } from '../../services/voice/voiceService/callStateMachi
 // The degrade reasons are AUTHORED in the host because the host is what produces them;
 // re-declaring them here would let the two lists drift silently.
 import type { ScreenAudioDegradeReason } from '../../../main/audiocapHost';
+import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
 
 // ---------------------------------------------------------------------------
 // Persisted device settings (per-machine via localStorage)
@@ -338,18 +339,27 @@ interface VoiceState {
    */
   isScreenAudioOn: boolean;
   /**
-   * Whether the LIVE share's target can carry audio at all (whole screen, and not
-   * Linux). Distinct from `isScreenAudioOn`, which is whether audio is actually being
-   * sent: a capable target with audio switched off is `true`/`false`, an incapable one
-   * is `false`/`false`. The toolbar needs the first to decide whether to OFFER the
-   * control and the second to decide what it says.
+   * WHICH RUNG the LIVE share's target sits on, not merely whether it is capable.
+   * Distinct from `isScreenAudioOn`, which is whether audio is actually being sent.
+   *
+   * A VERDICT, NOT A BOOLEAN, and that is the whole point (#3198 PR 3). This was
+   * `isScreenAudioCapable: boolean`, and `VoiceControls` recovered a verdict from it
+   * with `isScreenAudioCapable ? 'system-loopback' : 'none'` — a two-value mapping that
+   * structurally could not name `'per-process'`. So the live toolbar told a per-process
+   * sharer "Share every sound on this computer, not only this screen", the exact claim
+   * #3198 exists to delete, while `screenAudioTitle`'s `'per-process'` arm sat in the
+   * binary reachable only from its own unit test. A boolean cannot carry a three-rung
+   * ladder; widening the channel is the fix, not another mapping at the far end.
+   *
+   * Consumers that only need "does this offer audio" call `verdictOffersAudio`, so the
+   * policy keeps exactly one encoding (#3198 AC: no second inline copy of the ladder).
    */
-  isScreenAudioCapable: boolean;
+  screenAudioVerdict: ScreenAudioVerdict;
   /**
    * The MACHINE's per-process-audio claim (#3198), pushed by main over contract 28.
    * `null` = not yet known, which the ladder reads as the pre-addon rungs (I-FC).
    *
-   * Distinct from `isScreenAudioCapable`, which is about THIS SHARE's live track.
+   * Distinct from `screenAudioVerdict`, which is about THIS SHARE's live track.
    * NOT PERSISTED: a machine fact that would survive an OS upgrade or a driver change
    * and become a stale grant.
    */
@@ -483,7 +493,7 @@ interface VoiceState {
   setVideoOn: (on: boolean) => void;
   setScreenSharing: (sharing: boolean) => void;
   setScreenAudioOn: (on: boolean) => void;
-  setScreenAudioCapable: (capable: boolean) => void;
+  setScreenAudioVerdict: (verdict: ScreenAudioVerdict) => void;
   setMachineScreenAudioCapable: (capable: boolean | null) => void;
   /**
    * Replace the whole screen-audio state. A REPLACE, not a merge: a merge would let a
@@ -633,7 +643,7 @@ const initialState = {
   isVideoOn: false,
   isScreenSharing: false,
   isScreenAudioOn: false,
-  isScreenAudioCapable: false,
+  screenAudioVerdict: 'none' as ScreenAudioVerdict,
   machineScreenAudioCapable: null as boolean | null,
   screenAudio: { mode: 'off', overrun: 0 } as ScreenAudioState,
   localIsTesting: false,
@@ -771,7 +781,7 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
   setVideoOn: (isVideoOn) => set({ isVideoOn }),
   setScreenSharing: (isScreenSharing) => set({ isScreenSharing }),
   setScreenAudioOn: (isScreenAudioOn) => set({ isScreenAudioOn }),
-  setScreenAudioCapable: (isScreenAudioCapable) => set({ isScreenAudioCapable }),
+  setScreenAudioVerdict: (screenAudioVerdict) => set({ screenAudioVerdict }),
   setMachineScreenAudioCapable: (machineScreenAudioCapable) => set({ machineScreenAudioCapable }),
   setScreenAudioState: (screenAudio) => set({ screenAudio }),
   setLocalIsTesting: (localIsTesting) => set({ localIsTesting }),

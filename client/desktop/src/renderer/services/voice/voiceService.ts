@@ -120,9 +120,11 @@ import {
 import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/ui/screenResolution';
 import {
   canCarryScreenAudio,
+  verdictOffersAudio,
   type ScreenAudioVerdict,
 } from '../../utils/policy/screenAudioCapability';
 import { screenAudioDegradeMessage } from '../../utils/policy/screenAudioDegradeCopy';
+import { createScreenAudioBridge, type ScreenAudioBridge } from './screenAudioBridge';
 import type { CallState } from './voiceService/callStateMachine';
 
 /** Ceiling for the saturating production-observation witness. Any non-zero value proves the
@@ -151,6 +153,33 @@ interface RtpSenderWithEncodedStreams extends RTCRtpSender {
 
 /** Decoder health zone classification for IGNIS profiling. */
 type DecoderHealthZone = 'green' | 'yellow' | 'red';
+
+/**
+ * What a screen capture produced, plus WHO OWNS the screen-audio outcome it left behind.
+ *
+ * `ownsScreenAudioOutcome` exists because `switchScreenSourceQueued` tears down the
+ * PREVIOUS share's audio AFTER the new capture has already run, and the per-process arm
+ * writes the authoritative new state during that capture. Without this field the teardown
+ * destroyed what the capture had just established — twice over, in opposite ways:
+ *
+ *   SUCCESS — it stopped the bridge the arm had just installed and reaped the child
+ *   `startAudiocapHost` had just started, so `produceScreenAudioFromStream` then read a
+ *   stream whose audio track had already ended. Per-process audio never survived a switch.
+ *
+ *   REFUSAL — it overwrote the arm's `mode: 'degraded'` and its reason with `mode: 'off'`,
+ *   so a user whose app could not be captured was told nothing at all rather than why.
+ *
+ * It is OWNERSHIP OF THE OUTCOME, not "installed a host", and the difference is the whole
+ * point: a refusal installs nothing yet has still superseded the inherited host and
+ * written the state that must stand. A field named for the host would be false exactly
+ * where the second defect lives. Both are pinned by
+ * `voiceService.switchScreenSource.test.ts` (#3349).
+ */
+type ScreenCaptureResult = {
+  stream: MediaStream;
+  sourceId: string | null;
+  ownsScreenAudioOutcome: boolean;
+};
 
 interface RemoteVideoTileRenderState {
   visible: boolean;
@@ -747,6 +776,19 @@ class VoiceService {
   // OS-mediated, so a live audio track IS the capability -- without this the toolbar
   // locked the audio button on a share that was actively sending sound.
   private currentScreenAudioCapable = false;
+
+  /**
+   * The live per-process audio bridge, or null when the share carries no app audio
+   * (#3198 PR 3).
+   *
+   * HELD BY THE SERVICE RATHER THAN THE STREAM, because its lifetime is not the track's.
+   * `bridge.track` is owned by the capture stream and stopped with it, but the bridge
+   * also holds an adopted `MessagePort` terminating at the process that loaded native
+   * code — and stopping a track does not close a port. Every path that ends a share must
+   * reach `stop()` here, which is why this field exists rather than the bridge being a
+   * local in `captureScreenElectron`.
+   */
+  private screenAudioBridge: ScreenAudioBridge | null = null;
 
   // Cached because it cannot change while the app runs, and because the audio-capability
   // check runs on a user click where an await would be an avoidable round trip.
@@ -3590,7 +3632,7 @@ class VoiceService {
     this.currentScreenAudioCapable = false;
     const vs = useVoiceStore.getState();
     vs.setScreenAudioOn(false);
-    vs.setScreenAudioCapable(false);
+    vs.setScreenAudioVerdict('none');
 
     for (const [, producer] of this.producers) {
       try {
@@ -4162,7 +4204,7 @@ class VoiceService {
     screenRes: { w: number; h: number },
     screenFps: number,
     wantAudio: boolean
-  ): Promise<{ stream: MediaStream; sourceId: string | null }> {
+  ): Promise<ScreenCaptureResult> {
     if (typeof globalThis.electron?.getDesktopSources === 'function') {
       return this.captureScreenElectron(sourceId, screenRes, screenFps, wantAudio);
     }
@@ -4184,7 +4226,10 @@ class VoiceService {
     });
     // The OS picker chose the surface; we never learn an Electron source id here, so
     // report null rather than inventing one the re-capture path would act on.
-    return { stream, sourceId: null };
+    //
+    // `ownsScreenAudioOutcome: false` — this path never reaches the per-process arm, so
+    // the caller's generic teardown is still the right owner of the audio state.
+    return { stream, sourceId: null, ownsScreenAudioOutcome: false };
   }
 
   /** Electron desktopCapturer path — tries video+audio, falls back to video-only. */
@@ -4193,7 +4238,7 @@ class VoiceService {
     screenRes: { w: number; h: number },
     screenFps: number,
     wantAudio: boolean
-  ): Promise<{ stream: MediaStream; sourceId: string }> {
+  ): Promise<ScreenCaptureResult & { sourceId: string }> {
     const electron = globalThis.electron;
     if (!electron) throw new Error('captureScreenElectron called without Electron bridge');
 
@@ -4241,15 +4286,26 @@ class VoiceService {
     // future mechanism straight into the whole-desktop request below. The opt-out folds
     // in as 'none' so the switch is the single decision this seam makes.
     const audioVerdict: ScreenAudioVerdict = wantAudio
-      ? canCarryScreenAudio(chosenId, this.cachedPlatform)
+      ? // THIRD ARGUMENT SINCE PR 3 (#3198) — one of four sites that must carry it or
+        // `'per-process'` is unreturnable. The argument is OPTIONAL, so a site that forgets
+        // it compiles cleanly and silently answers with the pre-addon rungs; the compiler
+        // names nobody. Grep `canCarryScreenAudio(` before assuming this list is complete.
+        canCarryScreenAudio(
+          chosenId,
+          this.cachedPlatform,
+          useVoiceStore.getState().machineScreenAudioCapable
+        )
       : 'none';
 
     // The `chromeMediaSource: 'desktop'` request lives INSIDE the 'system-loopback' arm
     // and nowhere else, so a rung added to `ScreenAudioVerdict` without its own capture
     // shape is a compile error at the `never` below, not a silently widened capture.
+    // `ownsScreenAudioOutcome: false` on every arm but 'per-process'. Only that arm
+    // supersedes the inherited audio host and writes the state that must stand; the
+    // others leave the caller's generic teardown as the owner, exactly as before.
     switch (audioVerdict) {
       case 'none':
-        return { stream: await videoOnly(), sourceId: chosenId };
+        return { stream: await videoOnly(), sourceId: chosenId, ownsScreenAudioOutcome: false };
       case 'system-loopback':
         try {
           const stream = await navigator.mediaDevices.getUserMedia({
@@ -4258,31 +4314,147 @@ class VoiceService {
             } as unknown as MediaTrackConstraints,
             video: videoConstraints,
           });
-          return { stream, sourceId: chosenId };
+          return { stream, sourceId: chosenId, ownsScreenAudioOutcome: false };
         } catch (audioErr) {
           console.debug(
             'produceScreen: audio capture unavailable, falling back to video-only',
             errorMessage(audioErr)
           );
-          return { stream: await videoOnly(), sourceId: chosenId };
+          return { stream: await videoOnly(), sourceId: chosenId, ownsScreenAudioOutcome: false };
         }
       case 'per-process':
-        // UNREACHABLE THROUGH PR 2 OF 3 (#3198). No production call site passes the
-        // machine-capability argument, so the verdict function cannot return this.
-        // The arm exists so the union compiles and so PR 3's change is a one-line swap
-        // of this body for start({ targetPids }) rather than a new arm nobody reviewed.
-        // Video-only is the correct behaviour if it IS somehow reached: it never widens.
-        return { stream: await videoOnly(), sourceId: chosenId };
+        // The arm lives in its own method; see it for why each refusal keeps its own
+        // degrade reason rather than collapsing into a shared one.
+        return this.capturePerProcessScreenAudio(chosenId, videoOnly);
       default: {
         // Unreachable while every reachable verdict has its own arm above; C9 keeps
         // the degraded answer video-only rather than a system mix.
         const unhandled: never = audioVerdict;
         console.debug('captureScreenElectron: unhandled screen-audio verdict', unhandled);
-        return { stream: await videoOnly(), sourceId: chosenId };
+        return { stream: await videoOnly(), sourceId: chosenId, ownsScreenAudioOutcome: false };
       }
     }
   }
 
+  /**
+   * The `'per-process'` rung of the capture seam — extracted from
+   * `captureScreenElectron` for S3776 (cognitive complexity 16 > 15).
+   *
+   * EXTRACTED, NOT GOLFED. The arm is a self-contained sequence with four refusal
+   * points, each of which sets its own degrade reason; collapsing those into fewer
+   * branches would have cost the thing this epic keeps paying for — a mechanism
+   * string that names the mechanism that actually failed. A named method costs one
+   * call and leaves every refusal intact.
+   *
+   * `videoOnly` is passed as a thunk rather than a resolved stream because three of
+   * the four refusals return before any audio work, and one returns after — so the
+   * caller must not pay for a capture the first refusal would discard.
+   */
+  private async capturePerProcessScreenAudio(
+    chosenId: string,
+    videoOnly: () => Promise<MediaStream>
+  ): Promise<ScreenCaptureResult & { sourceId: string }> {
+    // REACHABLE FROM #3198 PR 3, and this is the rung the whole epic exists for: the
+    // share carries THIS APP'S audio and nothing else. No `chromeMediaSource:
+    // 'desktop'` request appears anywhere in this arm, which is what makes the #2161
+    // widening structurally impossible here rather than merely avoided.
+    //
+    // The video half is the SAME `videoOnly()` the other arms use. Per-process audio
+    // does not come from `getUserMedia` at all — it arrives over a `MessagePort` from
+    // the capture child and is attached as a track built by the bridge.
+    const start = globalThis.electron?.audiocap?.start;
+    if (typeof start !== 'function') {
+      // CAPABILITY, NOT DEMAND (#2967). A shell below contract 28's additive channel
+      // has no `start`, so it loses app audio and keeps its video — never a fall back
+      // to the system mix (C9). `SPA_MIN_CONTRACT` stays 19 precisely so this path
+      // exists rather than the whole remote SPA refusing to load.
+      //
+      // `ownsScreenAudioOutcome: false` and that is deliberate: nothing below this line
+      // ran, so no inherited host was superseded and no state was written. The caller's
+      // generic teardown is still the only thing that can reap a previous share's audio.
+      return { stream: await videoOnly(), sourceId: chosenId, ownsScreenAudioOutcome: false };
+    }
+
+    // SUPERSEDE THE INHERITED HOST ONCE, HERE, BEFORE ANY REFUSAL CAN SHORT-CIRCUIT.
+    // From this line on this method owns the screen-audio outcome and says so with
+    // `ownsScreenAudioOutcome: true`, so `switchScreenSourceQueued`'s generic teardown
+    // stands down instead of overwriting what the arms below write.
+    //
+    // THE FULL TEARDOWN, NOT JUST THE BRIDGE. Stopping the bridge closes the renderer's
+    // port; it does not reap the capture child, and the child is what holds the OS tap.
+    // `startAudiocapHost` reaps the previous child synchronously (I3) — but only for an
+    // invoke that REACHES main, and all four `audiocap:start` fences return before it.
+    // A fence refusal would otherwise leave the old app's tap running underneath a share
+    // the UI has already relabelled (Gitar review, PR #3349).
+    //
+    // It writes `mode: 'off'`, which every arm below immediately replaces. That ordering
+    // is what keeps a degrade reason intact without a separate reap-only helper.
+    this.stopScreenAudioHost();
+
+    const stream = await videoOnly();
+    const store = useVoiceStore.getState();
+
+    let started: Awaited<ReturnType<typeof start>>;
+    try {
+      started = await start(chosenId);
+    } catch {
+      // The invoke itself rejected — main threw rather than returning an outcome.
+      // Nothing is logged: the rejection can carry an `Error.cause` from across the
+      // IPC boundary, and `observability.md` principle 3 keeps that out of any sink.
+      store.setScreenAudioState({ mode: 'degraded', reason: 'protocol-fault', overrun: 0 });
+      return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
+    }
+
+    if (!started.ok) {
+      // Main's own fences, surfaced as the reason they produced. Task 13b's phrase map
+      // already has a live consumer, so this reaches the user as words rather than
+      // silence — which is the difference between this arm and the placeholder it
+      // replaces.
+      store.setScreenAudioState({ mode: 'degraded', reason: started.reason, overrun: 0 });
+      return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
+    }
+
+    try {
+      // ORDER-INDEPENDENT SINCE THE MODULE-SCOPE LISTENER LANDED. The port for this
+      // generation may already have arrived — main posts it in the same turn that
+      // settles the invoke above — in which case it is sitting buffered and this
+      // constructor adopts it synchronously. Before that fix this line was a race the
+      // renderer lost, and the symptom was a silent audio-free share.
+      const bridge = createScreenAudioBridge(started.generation);
+      // No supersede here any more: `stopScreenAudioHost()` above already stopped the
+      // inherited bridge AND reaped its child, which stopping the bridge alone never did.
+      this.screenAudioBridge = bridge;
+      stream.addTrack(bridge.track);
+
+      // THE PROMISE THE SIBLING ARM MADE ON THIS PR'S BEHALF. `produceScreen` sets
+      // `mode: 'system'` on its own success and says outright: "#3198 adds the
+      // per-process rung; it sets the mode where it creates the track, not here."
+      // This is that place, and the first revision of this arm did not keep it
+      // (Gitar review, PR #3349).
+      //
+      // NOT MERELY UNSET -- STALE, WHICH IS WORSE. `setScreenAudioState` is a REPLACE
+      // and nothing clears the mode between shares except `stopScreenAudioHost`, whose
+      // `mode === 'off' && overrun === 0` early return skips the write when the value
+      // is already off. So a per-process share started after a whole-desktop one left
+      // the state reading `'system'`: the app claiming a system mix while an
+      // app-scoped tap runs, which is a false statement about what audio leaves this
+      // machine and precisely the class #3198 exists to delete.
+      //
+      // `overrun: 0` for the same reason the sibling gives -- the counter belongs to
+      // the share, not the session, so a previous share's drops must not carry over.
+      store.setScreenAudioState({ mode: 'per-process', overrun: 0 });
+    } catch {
+      // `createScreenAudioBridge` throws a TypeError when the shell cannot support
+      // per-process audio at all — a preload predating the relay, or an engine without
+      // `MediaStreamTrackGenerator`. `no-backend` is the mechanism: the machine said it
+      // could and this renderer cannot. Video-only, never a system mix.
+      store.setScreenAudioState({ mode: 'degraded', reason: 'no-backend', overrun: 0 });
+    }
+
+    // The success arm and the `no-backend` catch share this return: both ran past the
+    // supersede above, so both own the outcome they wrote.
+    return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
+  }
   /** Produce screen audio from the capture stream if audio tracks are available. */
   private async produceScreenAudioFromStream(stream: MediaStream): Promise<void> {
     const audioTracks = stream.getAudioTracks();
@@ -4394,7 +4566,7 @@ class VoiceService {
      * user sharing nothing, which is precisely what the acquire-first ordering exists
      * to prevent. Mirrors `produceAudio`'s `preAcquiredStream` parameter.
      */
-    preAcquired?: { stream: MediaStream; sourceId: string | null } | null
+    preAcquired?: ScreenCaptureResult | null
   ): Promise<void> {
     if (!this.sendTransport || !this.device) {
       console.warn('produceScreen: no sendTransport or device — cannot share screen');
@@ -4941,33 +5113,38 @@ class VoiceService {
     // A window/application target cannot carry audio at all (#2161, ADR-0043), so
     // re-capturing would replace the track, glitch every viewer, and still produce
     // nothing. Tell the user why instead of churning the share on every click.
-    const liveVerdict = canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform);
+    const liveVerdict = canCarryScreenAudio(
+      this.currentScreenSourceId,
+      this.cachedPlatform,
+      useVoiceStore.getState().machineScreenAudioCapable
+    );
     switch (liveVerdict) {
       case 'system-loopback':
         break;
       case 'per-process':
-        // UNREACHABLE THROUGH PR 2 OF 3 (#3198), as at the capture seam. PR 3 replaces
-        // this with the per-process re-capture; refusing is the safe answer meanwhile.
+        // SAME `break` AS LOOPBACK, and that is the whole change (#3198 PR 3). The
+        // re-capture below routes through `switchScreenSourceQueued` ->
+        // `captureScreenElectron`, whose `'per-process'` arm now starts the capture and
+        // attaches the bridge's track. Re-implementing any of that here would be a
+        // second copy of the capture seam, which is the drift `canCarryScreenAudio`
+        // itself exists to prevent.
         //
-        // ITS OWN MESSAGE, not `screenAudioRefusalMessage`. That helper keys on the id,
-        // so a window target returns "share a whole screen to include sound" — which in
-        // the era that makes this arm reachable tells a user whose machine CAN do
-        // per-process audio to do the one thing the feature exists to make unnecessary
-        // (#3198 Phase-8 review). The `console.debug` matches the `'none'` sibling; its
-        // absence here was an inconsistency, not a decision.
+        // WHAT THIS REPLACES: a refusal plus its own hand-written message. Both are gone
+        // because the thing they apologised for now works. The message is not merely
+        // relocated — `screenAudioRefusalMessage` is still not used on this path and
+        // still must not be, for the reason the deleted comment recorded: it keys on the
+        // id, so a window target returns "share a whole screen to include sound", which
+        // would tell a user whose machine CAN do per-process audio to do the one thing
+        // the feature exists to make unnecessary.
         //
-        // SAYS "app", NEVER "window" — the §6 vocabulary rule the two copy suites
-        // enforce. They assert it only against the three exported helpers, so this
-        // inline string sat outside every test that would have caught it and shipped
-        // saying "this window" until the #3198 PR 2 review. A rule enforced over the
-        // exports is not enforced over the module.
-        console.debug('setScreenAudioEnabled: per-process rung not wired yet');
-        useVoiceStore
-          .getState()
-          .setVideoSlotError(
-            'Per-app sound isn’t available yet — share a whole screen to include sound for now.'
-          );
-        return;
+        // THE COST, NAMED: re-capturing replaces the VIDEO track for a change that only
+        // touches audio, because per-process audio arrives over a port rather than from
+        // `getUserMedia` and does not strictly need a new video capture. Viewers are not
+        // interrupted — `switchScreenSource` keeps the video producer id — so the cost is
+        // a capture restart, not a visible glitch. Taking the shared path beats a
+        // bespoke audio-only branch that would then be the only path not exercised by
+        // the capture seam's own tests.
+        break;
       case 'none': {
         console.debug('setScreenAudioEnabled: target cannot carry audio');
         // Telling the causes apart matters: on Linux a WHOLE-SCREEN share is refused by
@@ -5075,10 +5252,10 @@ class VoiceService {
     sourceId: string,
     label: string,
     options?: ScreenShareOptions
-  ): Promise<{ stream: MediaStream; sourceId: string | null } | null> {
+  ): Promise<ScreenCaptureResult | null> {
     const { dims, fps, contentType, streamAudio } = await this.resolveScreenCaptureParams(options);
 
-    let captured: { stream: MediaStream; sourceId: string | null };
+    let captured: ScreenCaptureResult;
     try {
       captured = await this.captureScreen(sourceId, dims, fps, streamAudio);
     } catch (captureErr) {
@@ -5165,13 +5342,48 @@ class VoiceService {
    * reaches `cleanupScreenState`, and the media-plane's `producer-closed` self-echo for
    * the same share lands moments later on rail 2.
    *
-   * IT RELEASES NO HOST LEASE, and there is none to release. #3195 forks exactly one
-   * child -- main's app-start capability probe, which main kills itself -- so there is
-   * no capturing child for a renderer path to reap. The watchdog rail that would have
-   * been driven from here was DELETED rather than shipped inert (spec section 6c: an
-   * unwired watchdog is unfinished, not defence). #3198 brings back both together.
+   * IT NOW RELEASES THE BRIDGE, which is half of what #3195 promised here. That note
+   * read "IT RELEASES NO HOST LEASE, and there is none to release" -- true while main
+   * forked only its app-start capability probe, which it kills itself. #3198 PR 3 gives
+   * this function something to reap, exactly as that note anticipated ("#3198 brings back
+   * both together"), and this is the choke point it was built for: seven local paths
+   * already route here behind the local-user fence, so nothing new had to be found.
+   *
+   * THE SECOND HALF IS NOT WIRED YET. Releasing the bridge closes the renderer's end of
+   * the port; it does not reap the CAPTURE CHILD, which holds the OS tap. Every
+   * `killAudiocapHost` caller is a quit or crash hook and `audiocapChild.ts`'s
+   * `handleStop` "deliberately does NOT exit", so until an `audiocap:stop` invoke exists
+   * a share the user ended leaves that child capturing until the app quits or the next
+   * share supersedes it. `'per-process'` is therefore still unreachable by construction
+   * (no call site passes `canCarryScreenAudio`'s third argument), and it must STAY
+   * unreachable until that channel lands -- making the verdict reachable first is what
+   * would turn this gap into a live tap outliving its share.
    */
   private stopScreenAudioHost(): void {
+    // BEFORE the early return below, and idempotent, so a repeated teardown still
+    // releases the port. The bridge holds an adopted `MessagePort` terminating at the
+    // process that loaded native code, and stopping a TRACK does not close a PORT --
+    // which is why the bridge is held on the service rather than left to the stream.
+    this.screenAudioBridge?.stop();
+    this.screenAudioBridge = null;
+
+    // REAP THE CHILD, which is the half releasing the bridge cannot do. Closing the
+    // renderer's port leaves the capture child holding its OS tap: every
+    // `killAudiocapHost` caller is a quit or crash hook, and `audiocapChild.ts`'s
+    // `handleStop` "deliberately does NOT exit". Without this line a share the user ended
+    // keeps a live tap until the app quits or the next share supersedes it.
+    //
+    // FEATURE-DETECTED, not demanded (#2967). `SPA_MIN_CONTRACT` stays 19, so a renderer
+    // can meet a shell without this channel; there it degrades to the pre-PR-3 behaviour
+    // — the quit hooks — rather than refusing to load.
+    //
+    // FIRE AND FORGET, and the `catch` is required rather than tidy: this runs on teardown
+    // paths that are themselves synchronous, an unhandled rejection here would surface as a
+    // renderer error during an ordinary share stop, and there is nothing to recover — the
+    // quit hooks remain the backstop. Nothing is logged: a rejection crossing IPC can carry
+    // an `Error.cause`, which `observability.md` principle 3 keeps out of every sink.
+    void globalThis.electron?.audiocap?.stop?.().catch(() => {});
+
     const { screenAudio, setScreenAudioState } = useVoiceStore.getState();
     if (screenAudio.mode === 'off' && screenAudio.overrun === 0) return;
     setScreenAudioState({ mode: 'off', overrun: 0 });
@@ -5208,43 +5420,49 @@ class VoiceService {
    * Async because the platform is resolved over IPC; `ensurePlatform` is cached and
    * idempotent, so repeated calls cost nothing after the first.
    */
-  async canShareScreenAudio(): Promise<boolean> {
+  /**
+   * WHICH RUNG the live share sits on — the single producer of `voiceStore.screenAudioVerdict`.
+   *
+   * This is the only place that can answer it: the ladder needs the live source id and the
+   * platform, and `VoiceControls` holds neither. It used to publish a BOOLEAN, and the
+   * toolbar reconstructed a verdict from it with a two-value ternary that could never say
+   * `'per-process'` — so the live control kept promising whole-computer sound during an
+   * app-scoped share. Publishing the verdict is what retires that mapping.
+   */
+  async currentScreenAudioVerdict(): Promise<ScreenAudioVerdict> {
     await this.ensurePlatform();
-    const verdict = canCarryScreenAudio(this.currentScreenSourceId, this.cachedPlatform);
-    switch (verdict) {
-      case 'system-loopback':
-        return true;
-      case 'per-process':
-        // FALSE, and it was `true` until the #3198 Phase-8 review. `setScreenAudioEnabled`
-        // REFUSES this verdict until the capture seam posts `start({ targetPids })`, so
-        // `true` here meant the toolbar reporting "audio available" and the click producing
-        // a refusal toast — the exact outcome this epic argues against making reachable,
-        // already encoded in the arm the toolbar reads. Unreachable today (no call site
-        // passes the third argument), so the two answers cost nothing to align now and are
-        // expensive to discover misaligned later.
-        //
-        // PR 3 FLIPS BOTH IN ONE CHANGE, not PR 2 — the 2026-09-16 scope split moved the
-        // capture-seam wiring out of PR 2, and the claim here outlived it. The pin is
-        // `tests/unit/renderer/utils/screenAudioVerdictAgreement.test.ts`, NOT
-        // `voiceService.captureSeam.test.ts`: that file exists but contains no
-        // `'per-process'` or `verdictOffersAudio` assertion, so it could not have failed
-        // on a one-sided flip and never could have.
-        return false;
-      case 'none':
-        // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a
-        // share that may be sending audio right now. A live audio track on the capture is
-        // proof of capability that the id cannot express; without this the toolbar locked the
-        // button and the only way to stop sending sound was to end the whole share.
-        //
-        // THIS FALL-THROUGH IS LOAD-BEARING. A `default: return false` conversion silently
-        // locks the toolbar on every non-Electron share (#3198 spec R8).
-        return this.currentScreenAudioCapable;
-      default: {
-        const unhandled: never = verdict;
-        console.debug('canShareScreenAudio: unhandled verdict', unhandled);
-        return false;
-      }
+    const verdict = canCarryScreenAudio(
+      this.currentScreenSourceId,
+      this.cachedPlatform,
+      useVoiceStore.getState().machineScreenAudioCapable
+    );
+
+    // `'none'` IS THE ONE VERDICT ANSWERED DIFFERENTLY, and the difference is load-bearing.
+    // `getDisplayMedia` records no source id, so the id-based test says "incapable" for a
+    // share that may be sending audio right now; a live audio track is proof of capability
+    // the id cannot express. Without this the toolbar locked the button and the only way to
+    // stop sending sound was to end the whole share (#3198 spec R8).
+    //
+    // It resolves to `'system-loopback'` rather than to some fourth member because that is
+    // exactly what the browser path sends — the display surface's whole audio, not one
+    // app's — and it is also the string this case has always rendered, back when the
+    // boolean `true` mapped to `'system-loopback'`. So R8's copy is unchanged by the
+    // widening; only the previously-unreachable `'per-process'` arm becomes reachable.
+    if (verdict === 'none') {
+      return this.currentScreenAudioCapable ? 'system-loopback' : 'none';
     }
+    return verdict;
+  }
+
+  async canShareScreenAudio(): Promise<boolean> {
+    // DELEGATES ENTIRELY — no second encoding of the ladder, and no second copy of the R8
+    // divergence above. This used to be its own `switch` returning hand-written booleans
+    // for `'system-loopback'` and `'per-process'`; the two disagreed for real during PR 3,
+    // and the whole suite stayed green because `screenAudioVerdictAgreement.test.ts` never
+    // calls this function. The pin on `verdictOffersAudio` now covers the toolbar because
+    // the toolbar IS that function — the "hardening one copy leaves the mirror weaker"
+    // shape closed by removing the copy rather than adding a third assertion.
+    return verdictOffersAudio(await this.currentScreenAudioVerdict());
   }
 
   /**
@@ -5257,7 +5475,7 @@ class VoiceService {
    * other click in the same commit.
    */
   private async publishScreenAudioCapability(): Promise<void> {
-    useVoiceStore.getState().setScreenAudioCapable(await this.canShareScreenAudio());
+    useVoiceStore.getState().setScreenAudioVerdict(await this.currentScreenAudioVerdict());
   }
 
   async switchScreenSource(sourceId: string, options?: ScreenShareOptions): Promise<void> {
@@ -5361,7 +5579,14 @@ class VoiceService {
           contentType: options?.contentType ?? useVideoSettingsStore.getState().screenContentType,
           streamAudio: wantAudio,
         },
-        { stream, sourceId: captured.sourceId }
+        // Forward the capture's own ownership verdict rather than a literal: this hands
+        // over the stream ALREADY acquired above, so whatever that capture decided about
+        // the audio host is still the truth on the other side of the re-entry.
+        {
+          stream,
+          sourceId: captured.sourceId,
+          ownsScreenAudioOutcome: captured.ownsScreenAudioOutcome,
+        }
       );
       return;
     }
@@ -5406,7 +5631,17 @@ class VoiceService {
     // reproduce already owns the screen-audio state, and stopping from here would
     // clobber the successor's. The old share's audio is gone either way -- the retire
     // above closed its producer.
-    this.stopScreenAudioHost();
+    //
+    // AND ONLY WHEN THE CAPTURE DID NOT ALREADY OWN THE OUTCOME. The per-process arm
+    // supersedes the inherited host itself and then writes the state that must stand;
+    // running this teardown afterwards destroyed that state in two different directions
+    // -- stopping the bridge it had just installed, and replacing its degrade reason
+    // with a bare 'off'. Both are pinned by `voiceService.switchScreenSource.test.ts`.
+    //
+    // Every other capture -- a screen target, an opt-out, a shell with no `audiocap`
+    // channel, or the getDisplayMedia fallback -- reports false and still reaches here,
+    // so the previous share's bridge and child are reaped exactly as before.
+    if (!captured.ownsScreenAudioOutcome) this.stopScreenAudioHost();
 
     const localUserId = useUserStore.getState().user?.id;
     if (localUserId) {
@@ -6597,7 +6832,7 @@ class VoiceService {
     this.currentScreenSourceId = null;
     this.currentScreenOptions = null;
     this.currentScreenAudioCapable = false;
-    useVoiceStore.getState().setScreenAudioCapable(false);
+    useVoiceStore.getState().setScreenAudioVerdict('none');
     const store = useVoiceStore.getState();
     store.setScreenSharing(false);
     store.setScreenAudioOn(false);

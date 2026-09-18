@@ -68,7 +68,11 @@ async function childWithFailingStartAndStop(
   // The teardown exception's text. Parameterised so a case can carry a PID:
   // the default has no digits, so it cannot tell a sanitised fault from an
   // unsanitised one (#3198 PR 2 review).
-  stopMessage = 'native stop exploded'
+  stopMessage = 'native stop exploded',
+  // WHICH refusal the addon answers with. Parameterised for the #3198 PR 3 stage
+  // split: `NoTarget` must report stage 'target', every other reason stays on
+  // 'start'. The default keeps the pre-existing cases byte-identical.
+  refuseReason = 'Poisoned'
 ): Promise<Harness> {
   Object.defineProperty(process, 'type', { value: 'utility', configurable: true });
 
@@ -95,7 +99,7 @@ async function childWithFailingStartAndStop(
     }),
     start: () => {
       if (mode === 'throw') throw new Error('device open refused');
-      return { ok: false, reason: 'Poisoned' };
+      return { ok: false, reason: refuseReason };
     },
     drain: () => ({ ok: false }),
     // #3198: the child resolves the handle before it asks the addon to capture,
@@ -183,6 +187,41 @@ describe('audiocap child failed-start unwind (#3197)', () => {
   // process it could not release put that PID on the wire through the second
   // door. The cases above cannot see it: 'native stop exploded' has no digits,
   // so they pass identically sanitised or not.
+  // -- NoTarget is a TARGET outcome, not a backend one (#3198 PR 3) ----------
+  //
+  // MEASURED 2026-09-18 against a live build: sharing a SILENT app (a Finder
+  // window) makes the macOS tap answer `NoTarget`, because a process that has
+  // never produced audio has no audio object to attach to. Reported on stage
+  // 'start' that maps to `'no-backend'` and renders "App sound isn't available on
+  // this computer." -- which was false, since the same build captured a browser
+  // window seconds later. #3198 is the issue about the app not lying, and this was
+  // the lie arriving through the degrade path rather than through the copy.
+
+  it('reports NoTarget on the target stage, so the copy cannot blame the machine', async () => {
+    const c = await childWithFailingStartAndStop('refuse', 'native stop exploded', 'NoTarget');
+
+    expect(() => c.sendStart()).not.toThrow();
+
+    const faults = c.posted.filter((m) => (m as { kind?: string }).kind === 'fault');
+    expect(faults).toHaveLength(1);
+    expect(faults[0]).toMatchObject({ kind: 'fault', stage: 'target' });
+    // The addon's own reason still survives the unwind, exactly as it does on 'start'.
+    expect((faults[0] as { message: string }).message).toContain('no capture target was supplied');
+  });
+
+  it('leaves every OTHER refusal on the start stage', async () => {
+    // The converse, and what makes the case above mean anything: a fix that moved
+    // EVERY refusal to 'target' would satisfy that assertion and still be wrong,
+    // because a genuinely absent backend must keep reading as one.
+    const c = await childWithFailingStartAndStop('refuse', 'native stop exploded', 'NoBackend');
+
+    expect(() => c.sendStart()).not.toThrow();
+
+    const faults = c.posted.filter((m) => (m as { kind?: string }).kind === 'fault');
+    expect(faults).toHaveLength(1);
+    expect(faults[0]).toMatchObject({ kind: 'fault', stage: 'start' });
+  });
+
   it('does not let a PID in the TEARDOWN message cross back to main (I-PID)', async () => {
     const c = await childWithFailingStartAndStop(
       'throw',

@@ -728,7 +728,30 @@ function handleStart(
     // Read BEFORE the unwind, so the reported reason is the addon's own and
     // cannot be affected by anything teardown does.
     const reason = isRecord(result) ? result.reason : undefined;
-    unwindFailedStart(addon, startFailureMessage(reason));
+
+    // `NoTarget` IS A TARGET OUTCOME, NOT A BACKEND ONE, and reporting it as
+    // `'start'` made the app lie about the machine. MEASURED 2026-09-18: sharing a
+    // SILENT app (a Finder window) reaches here with `NoTarget`, because a process
+    // that has never produced audio has no audio object for the macOS tap to attach
+    // to. `'start'` maps to `'no-backend'`, whose copy reads "App sound isn't
+    // available on this computer." — and it demonstrably IS available: the same
+    // build captured a browser window seconds later. That is exactly the false claim
+    // #3198 exists to delete, arriving through the degrade path instead of the copy.
+    //
+    // `'target'` maps to `'target-unresolved'` — "We couldn't capture that app's
+    // sound." — which is true of every cause collapsed into that member, this one
+    // included. The collapse is A7's, and it holds here for the same reason: the
+    // distinction between "that app makes no sound" and "the OS refused" is not one
+    // the user can act on differently, and splitting it would re-open the
+    // discriminator the member exists to close.
+    //
+    // The UNWIND IS UNCHANGED. `capturing` is already true at this point, so the
+    // teardown still runs exactly as before; only the stage reported to main moves.
+    // That is why this passes a stage rather than returning early to `postFault`:
+    // skipping the unwind here would leave a possibly-armed addon behind, which is
+    // the defect the unwind exists to prevent.
+    const stage: AudiocapFaultStage = reason === 'NoTarget' ? 'target' : 'start';
+    unwindFailedStart(addon, startFailureMessage(reason), stage);
   }
 }
 
@@ -829,7 +852,11 @@ function reportLiveness(addon: AudiocapAddon): void {
  * both causes in one fault and return; main kills us, which is the documented
  * teardown. Exactly one fault is posted on every path.
  */
-function unwindFailedStart(addon: AudiocapAddon, message: string): void {
+function unwindFailedStart(
+  addon: AudiocapAddon,
+  message: string,
+  stage: AudiocapFaultStage = 'start'
+): void {
   try {
     handleStop(addon);
   } catch (unwindErr) {
@@ -846,12 +873,12 @@ function unwindFailedStart(addon: AudiocapAddon, message: string): void {
     // Sanitising the first half and not the second leaves the invariant exactly
     // as broken as before, through the other door (#3198 PR 2 review, CWE-209).
     postFault(
-      'start',
+      stage,
       `${message} - teardown also failed - ${pidFreeErrorMessage(unwindErr, 'stop threw')}`
     );
     return;
   }
-  postFault('start', message);
+  postFault(stage, message);
 }
 
 function handleControlMessage(

@@ -20,6 +20,16 @@ import { voiceService } from '@/renderer/services/voice/voiceService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
+// The bridge builds a `MediaStreamTrackGenerator`, which jsdom does not implement. The
+// cases below are about which state survives a switch, not about the bridge itself --
+// `screenAudioBridge.test.ts` owns that.
+vi.mock('@/renderer/services/voice/screenAudioBridge', () => ({
+  createScreenAudioBridge: () => ({
+    track: { id: 'bridge-track', kind: 'audio', readyState: 'live', muted: false, stop: vi.fn() },
+    stop: vi.fn(),
+  }),
+}));
+
 const liveTrack = (id: string, kind: 'video' | 'audio' = 'video') => ({
   id,
   kind,
@@ -244,5 +254,163 @@ describe('voiceService.switchScreenSource (R6)', () => {
     await svc.switchScreenSource('screen:1');
 
     expect(svc.captureScreen).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Who owns the screen-audio outcome when a switch re-captures (#3349).
+ *
+ * `switchScreenSourceQueued` tears down the PREVIOUS share's audio AFTER the new
+ * capture has already run. The per-process arm writes the authoritative new state
+ * DURING that capture, so an unconditional teardown destroyed what the capture had
+ * just established -- in two opposite directions, neither of which any existing test
+ * could see:
+ *
+ *   SUCCESS -- it stopped the bridge the arm had just installed and reaped the child
+ *   `startAudiocapHost` had just started, leaving `produceScreenAudioFromStream` to
+ *   read a stream whose audio track had already ended. Per-process audio never
+ *   survived a switch at all.
+ *
+ *   REFUSAL -- it replaced the arm's `mode: 'degraded'` and its reason with a bare
+ *   `mode: 'off'`, so a user whose app could not be captured was told nothing rather
+ *   than why. The mechanism string was computed and then discarded, which is the
+ *   failure class this epic exists to close.
+ *
+ * Both were found by following a Gitar review finding one layer deeper; its own
+ * analysis named neither. The CONTROL case is first on purpose: without it, a failure
+ * in either regression case is indistinguishable from a fixture that never reached the
+ * per-process rung.
+ */
+describe('per-process audio ownership across a switch (#3349)', () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any -- the capture seam and its state
+     are private; these cases drive the real singleton, which is the only way the
+     interaction between the capture and the teardown is under test at all. */
+  let svc: any;
+  let audiocapStop: ReturnType<typeof vi.fn>;
+
+  // `window:<handle>:<n>`, not `window:7` -- `canCarryScreenAudio` requires
+  // `parseWindowSourceId` to resolve, and a bare `window:7` never reaches the rung.
+  const WINDOW_ID = 'window:9:0';
+
+  const captureStream = () => ({
+    getTracks: () => [],
+    getVideoTracks: () => [liveTrack('new-video')],
+    getAudioTracks: () => [],
+    removeTrack: vi.fn(),
+    // The arm attaches the bridge track to the video-only stream. Without this the
+    // call throws into the arm's catch and reports 'no-backend' -- a harness gap that
+    // reads exactly like a real degrade.
+    addTrack: vi.fn(),
+  });
+
+  const arm = (startResult: unknown) => {
+    resetAllStores();
+    svc = voiceService as any;
+
+    // A SIBLING describe, so the suite above's `beforeEach` does not run here and this
+    // has to stand up the live share itself. Getting that wrong is not a loud failure:
+    // `switchScreenSourceQueued` returns at its "no active screen share" guard, the
+    // capture never runs, and every assertion below reads untouched state -- which is
+    // exactly how this first shipped. The CONTROL case did not catch it, because it
+    // drives `captureScreenElectron` directly and needs none of this.
+    svc.producers.clear();
+    svc.producers.set('screen', {
+      id: 'producer-STABLE',
+      closed: false,
+      paused: false,
+      close: vi.fn(),
+      pause: vi.fn(),
+      resume: vi.fn(),
+      replaceTrack: vi.fn().mockResolvedValue(undefined),
+      on: vi.fn(),
+    });
+    svc.socket = { emit: vi.fn() };
+    svc.sendTransport = { id: 'transport-1' };
+    svc.localScreenStream = streamOf([liveTrack('old-video')]);
+    svc.videoReproduceSessionActive = true;
+    svc.drainSendTransportQueue = vi.fn().mockResolvedValue(undefined);
+    svc.produceScreenAudioFromStream = vi.fn().mockResolvedValue(undefined);
+    svc.resolveCaptureDims = vi.fn().mockResolvedValue({ w: 1920, h: 1080 });
+    svc.clampScreenToEntitlement = vi.fn().mockReturnValue({ width: 1920, height: 1080, fps: 30 });
+
+    svc.cachedPlatform = 'darwin';
+    svc.ensurePlatform = vi.fn().mockResolvedValue(undefined);
+    svc.publishScreenAudioCapability = vi.fn().mockResolvedValue(undefined);
+    svc.screenAudioBridge = null;
+    useVoiceStore.setState({ machineScreenAudioCapable: true } as any);
+
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(captureStream()), getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    audiocapStop = vi.fn().mockResolvedValue(undefined);
+    globalThis.electron = {
+      ...globalThis.electron,
+      getDesktopSources: vi.fn().mockResolvedValue([{ id: WINDOW_ID, name: 'W' }]),
+      audiocap: { start: vi.fn().mockResolvedValue(startResult), stop: audiocapStop },
+    } as unknown as typeof globalThis.electron;
+
+    // Delegate to the REAL capture rather than stubbing a result: the defect lives in
+    // the interaction between what the capture writes and what the switch tears down,
+    // so a stubbed capture cannot express it.
+    svc.acquireScreenCapture = vi.fn(async () =>
+      svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true)
+    );
+  };
+
+  it('CONTROL: a bare per-process capture reaches the rung and installs a bridge', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(useVoiceStore.getState().screenAudio.mode).toBe('per-process');
+    expect(svc.screenAudioBridge).not.toBeNull();
+  });
+
+  // The SECOND control, and the one the first could not stand in for: it proves the
+  // switch reaches the capture at all. Without it a missing piece of share state makes
+  // `switchScreenSourceQueued` return at its guard, and the three cases below read
+  // untouched state and fail as though the fix were absent.
+  it('CONTROL: the switch reaches the capture', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+
+    await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+
+    expect(svc.acquireScreenCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('a SUCCESSFUL per-process re-capture survives the switch', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+
+    await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+
+    // The store, not a spy on our own setter: a spy passes the moment any arm calls it.
+    expect(useVoiceStore.getState().screenAudio.mode).toBe('per-process');
+    expect(svc.screenAudioBridge).not.toBeNull();
+  });
+
+  it('a REFUSED per-process re-capture keeps its degrade reason across the switch', async () => {
+    arm({ ok: false, reason: 'target-unresolved' });
+
+    await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+
+    expect(useVoiceStore.getState().screenAudio).toMatchObject({
+      mode: 'degraded',
+      reason: 'target-unresolved',
+    });
+  });
+
+  // Gitar's own finding, stated as the property rather than as its suggested patch: a
+  // refusal must not leave the inherited host running. `audiocap:stop` is the half that
+  // reaps the CHILD -- stopping the bridge alone closes only the renderer's port, and
+  // `startAudiocapHost`'s kill-first ordering does not help when a fence refused before
+  // main was ever reached.
+  it('a REFUSED per-process re-capture still reaps the inherited capture child', async () => {
+    arm({ ok: false, reason: 'target-unresolved' });
+
+    await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+
+    expect(audiocapStop).toHaveBeenCalled();
   });
 });

@@ -7,6 +7,7 @@ import { registerSSOIPC } from './ipc/sso';
 import { cancelActiveAppleFlow } from './oauth/apple/appleFlow';
 import { cancelActiveGoogleFlow } from './oauth/google/googleFlow';
 import { registerAttestationIpc } from './ipc/attestation';
+import { registerAudiocapIpc } from './ipc/audiocap';
 import { registerWindowControlsIpc, getCachedClientBehavior } from './ipc/windowControls';
 import { initTray, destroyTray, isTrayActive } from './tray';
 import {
@@ -14,6 +15,7 @@ import {
   killAudiocapHost,
   probeAudiocapCapability,
   setAudiocapCapabilityListener,
+  setAudiocapPortSink,
 } from './audiocapHost';
 import { registerVersionInfoIpc } from './ipc/versionInfo';
 import { buildBrowserWindowConfig } from './browserWindowConfig';
@@ -1581,6 +1583,11 @@ app.whenReady().then(async () => {
   registerSaveImageHandler(() => mainWindow, getRemoteSpaBaseUrl);
   registerSSOIPC(getRemoteSpaBaseUrl);
   registerAttestationIpc(getRemoteSpaBaseUrl);
+  // #3198 PR 3 — the `audiocap:start` invoke. This is the ONE audiocap handler the
+  // sender-frame criterion binds; `audiocap:capability` is a push and has no sender
+  // to validate. Same DI shape as its four siblings above, so the origin getter is
+  // stubbable in tests rather than reached through a module import.
+  registerAudiocapIpc(getRemoteSpaBaseUrl);
   // Permission request handler: explicitly allow app-required permissions, deny risky ones.
   // Notifications are allowed (JIT-managed by permissionManager #197).
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
@@ -1802,6 +1809,27 @@ app.whenReady().then(async () => {
   setAudiocapCapabilityListener((perProcessAudio) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send('audiocap:capability', { perProcessAudio });
+  });
+
+  // Hand the renderer end of a capture channel to the preload relay (#3198 PR 3).
+  //
+  // `postMessage`, NOT `send`: this carries a `MessagePortMain` in a transfer list, and
+  // `webContents.send` has no transfer list. The channel name is spelled here rather
+  // than imported because `AUDIOCAP_PORT_CHANNEL` lives in `src/preload/audiocapRelay.ts`,
+  // which imports `ipcRenderer` — pulling a preload module into main to borrow a string
+  // constant is a worse trade than the literal. Same choice the two
+  // `'audiocap:capability'` sites above already make.
+  //
+  // THIS SINK THROWS RATHER THAN RETURNING, and that is the contract `audiocapHost`
+  // expects: a port that cannot reach the renderer means the child is capturing into
+  // nothing, so the host retires the session instead of reporting a started share. That
+  // is the opposite of the capability push above, which swallows because its value is
+  // monotone and re-pushed on the next `did-finish-load`. A port is neither.
+  setAudiocapPortSink((generation, port) => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      throw new Error('audiocap port sink: no live window');
+    }
+    mainWindow.webContents.postMessage('audiocap:port', { generation }, [port]);
   });
 
   // ─── concord-audiocap capability probe (#3195, ADR-0043) ──────────

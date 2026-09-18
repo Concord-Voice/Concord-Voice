@@ -122,24 +122,32 @@ export function canCarryScreenAudio(
  * control that errors on every click — precisely the outcome this epic argues against
  * making reachable.
  *
- * **PR 3 flips this to `true`, not PR 2.** An earlier version of this comment said PR 2,
- * written before the 2026-09-16 scope split moved the capture-seam wiring out of it; PR 2
- * ships the resolver and the widened protocol with no reachable caller. Leaving the old
- * claim standing would have instructed the next author to make the rung reachable one PR
- * early — the same stale instruction the plan document carried, one layer down.
+ * **FLIPPED TO `true` BY PR 3**, which is what the previous revision of this comment
+ * instructed. The capture seam now starts a real capture and attaches the bridge's track,
+ * so an enabled control no longer errors on every click.
  *
- * The agreement between this answer and the capture seam is pinned by
- * `tests/unit/renderer/utils/screenAudioVerdictAgreement.test.ts`, NOT by
- * `voiceService.captureSeam.test.ts` — that file exists but asserts nothing about
- * `'per-process'` or `verdictOffersAudio`, so the citation sent a reader to a file that
- * does not enforce what it was credited with.
+ * THIS ANSWER HAS THREE MIRRORS AND THEY MOVE TOGETHER. `verdictOffersAudio` drives the
+ * PICKER's toggle; `voiceService.canShareScreenAudio` drives the TOOLBAR's; and
+ * `setScreenAudioEnabled`'s own `'per-process'` arm is what a click actually reaches.
+ * Flipping any one alone is the #2161 overclaim reproduced in the copy written to fix it —
+ * a control that offers audio and a click that refuses it.
+ *
+ * WHAT THE PIN ACTUALLY COVERS, stated precisely because the previous revision overstated
+ * it. `screenAudioVerdictAgreement.test.ts` asserts on THIS function and on the copy
+ * helpers; it does not call `canShareScreenAudio` at all. So it pins the picker half and
+ * the copy half, and a one-sided flip of the TOOLBAR half passes it — which is exactly
+ * what happened while PR 3 was being written, and is why this paragraph now names the
+ * mirrors rather than delegating the whole guarantee to one file.
  */
 export function verdictOffersAudio(verdict: ScreenAudioVerdict): boolean {
   switch (verdict) {
     case 'system-loopback':
       return true;
     case 'per-process':
-      return false;
+      // TRUE since #3198 PR 3, flipped together with `voiceService.canShareScreenAudio`
+      // and the `setScreenAudioEnabled` arm that a click reaches. See the docblock: the
+      // rule is that these answers AGREE, not that any one of them holds a fixed value.
+      return true;
     case 'none':
       return false;
     default: {

@@ -226,6 +226,11 @@ vi.mock('../../../src/main/audiocapHost', () => ({
   // reaches for it from failing somewhere unrelated.
   setAudiocapCapabilityListener: vi.fn(),
   audiocapMachineCapability: vi.fn(() => null),
+  // #3198 PR 3. REQUIRED, by the same test the comment above applies: `main.ts` calls
+  // it unconditionally in the `whenReady()` body this suite drives. Omitting it did not
+  // fail the suite — the rejection surfaced as an "unhandled error" after the run while
+  // all 1557 tests still reported green, which is why the count is not the thing to read.
+  setAudiocapPortSink: vi.fn(),
 }));
 
 // ── Per-platform re-import harness ─────────────────────────────────────────

@@ -323,7 +323,7 @@ describe('ScreenSharePicker', () => {
     useVoiceStore.setState({
       isScreenSharing: true,
       isScreenAudioOn: false,
-      isScreenAudioCapable: true,
+      screenAudioVerdict: 'system-loopback',
     });
     render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
     await waitFor(() => {
@@ -345,7 +345,7 @@ describe('ScreenSharePicker', () => {
     useVoiceStore.setState({
       isScreenSharing: true,
       isScreenAudioOn: false,
-      isScreenAudioCapable: false,
+      screenAudioVerdict: 'none',
     });
     render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
     await waitFor(() => {

@@ -1199,7 +1199,7 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
   });
 
   it('disables the audio toggle when the live target cannot carry sound', () => {
-    setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: false });
+    setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, screenAudioVerdict: 'none' });
     render(<VoiceControls />);
 
     const btn = screen.getByTitle(/can.t carry sound/i);
@@ -1211,7 +1211,11 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
   });
 
   it('toggles screen audio to the opposite of the live state', async () => {
-    setVoiceState({ isScreenSharing: true, isScreenAudioOn: true, isScreenAudioCapable: true });
+    setVoiceState({
+      isScreenSharing: true,
+      isScreenAudioOn: true,
+      screenAudioVerdict: 'system-loopback',
+    });
     render(<VoiceControls />);
 
     await act(async () => {
@@ -1221,10 +1225,54 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
     expect(mockSetScreenAudioEnabled).toHaveBeenCalledWith(false);
   });
 
+  // -- The 'per-process' rung reaches the LIVE toolbar ---------------------
+  //
+  // THE GAP THESE CLOSE, recorded because a green suite is what let it ship. PR 2 left
+  // `VoiceControls` recovering a verdict from a boolean with
+  // `isScreenAudioCapable ? 'system-loopback' : 'none'` and named PR 3 as its owner. PR 3
+  // made `'per-process'` reachable and did not change it, so a per-process sharer was told
+  // "Share every sound on this computer, not only this screen" — the exact claim #3198
+  // exists to delete — while `screenAudioTitle`'s `'per-process'` arm was reachable only
+  // from its own unit test. `screenAudioTitle` was tested directly and passed; nothing
+  // asserted the RENDERED toolbar could ever be handed that verdict. These two do.
+
+  it('renders the app-scoped tooltip when the live share is per-process', () => {
+    setVoiceState({
+      isScreenSharing: true,
+      isScreenAudioOn: false,
+      screenAudioVerdict: 'per-process',
+    });
+    render(<VoiceControls />);
+
+    expect(screen.getByTitle(/^Share only this app.s sound$/)).toBeInTheDocument();
+    // The whole-computer claim must be ABSENT, not merely outranked: asserting only the
+    // presence of the new string would still pass if both rendered somewhere.
+    expect(screen.queryByTitle(/every sound on this computer/i)).toBeNull();
+  });
+
+  it('offers the control on a per-process share rather than locking it', () => {
+    // `locked` derives from `verdictOffersAudio`, so a rung that offers audio must not
+    // render the disabled affordance. Guards the other half of the two-value mapping:
+    // a fix that named the rung but left it locked would still be wrong.
+    setVoiceState({
+      isScreenSharing: true,
+      isScreenAudioOn: true,
+      screenAudioVerdict: 'per-process',
+    });
+    render(<VoiceControls />);
+
+    const btn = screen.getByTitle(/^Stop sharing app sound$/);
+    expect(btn).not.toHaveAttribute('aria-disabled', 'true');
+  });
+
   it('reflects a silent share as Audio Off, so the button never lies', () => {
     // Capable but currently off -- the two flags are independent, and this is the case
     // that distinguishes them: an OFFERED control that happens to be switched off.
-    setVoiceState({ isScreenSharing: true, isScreenAudioOn: false, isScreenAudioCapable: true });
+    setVoiceState({
+      isScreenSharing: true,
+      isScreenAudioOn: false,
+      screenAudioVerdict: 'system-loopback',
+    });
     render(<VoiceControls />);
     expect(screen.getByTitle(/^Share every sound on this computer/)).toBeInTheDocument();
   });
@@ -1232,7 +1280,11 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
   // -- Bar clustering: Self / Share / Utility / Danger --------------------
 
   it('clusters the bar so share controls sit together and Leave sits alone', () => {
-    setVoiceState({ isScreenSharing: true, isScreenAudioOn: true, isScreenAudioCapable: true });
+    setVoiceState({
+      isScreenSharing: true,
+      isScreenAudioOn: true,
+      screenAudioVerdict: 'system-loopback',
+    });
     // `persistent` + onPopOut is what puts a button in the UTILITY cluster. Without
     // it Utility renders empty here -- StreamControls returns null outside
     // voiceView, and this fixture has no linked text channel and no Electron PiP --

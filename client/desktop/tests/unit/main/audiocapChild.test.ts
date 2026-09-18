@@ -510,11 +510,23 @@ describe('audiocap child start-failure unwind', () => {
     // Value passed, value obeyed: the addon refused, and this child tore the
     // capture down rather than merely closing its port.
     expect(c.stop).toHaveBeenCalledTimes(1);
+
+    // STAGE INVERTED DELIBERATELY BY #3198 PR 3, and this is the one existing
+    // assertion that change touches. It read `stage: 'start'`, which maps to
+    // `'no-backend'` -> "App sound isn't available on this computer." Measured
+    // 2026-09-18: a SILENT app (a Finder window) reaches here with `NoTarget`,
+    // because a process that has never produced audio has no audio object to tap
+    // -- and the same build captured a browser window seconds later, so the
+    // machine claim was simply false. `'target'` maps to `'target-unresolved'`
+    // ("We couldn't capture that app's sound."), which is true of every cause
+    // that member collapses. The TEARDOWN is unchanged and still asserted above;
+    // only the stage moved. See audiocapChild.unwindFault.test.ts for the pair
+    // that pins both directions.
     expect(c.posted).toEqual([
       expect.objectContaining({ kind: 'hello' }),
       {
         kind: 'fault',
-        stage: 'start',
+        stage: 'target',
         message: 'capture did not start - no capture target was supplied',
       },
     ]);

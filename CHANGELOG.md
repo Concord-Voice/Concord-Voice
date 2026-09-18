@@ -33,14 +33,26 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   video only. Worth knowing what "your computer's sound" means: it is everything playing, not
   only the screen you picked, so on a two-monitor setup the people watching hear the other
   monitor too. You can flip it mid-share without interrupting what people are watching. When you
-  share a single window the control is switched off, and the reason sits underneath it in plain
-  sight rather than in a tooltip: sending the sound of one app, and only that app, is not
-  something the desktop app can do yet, and it will not quietly send every other sound on your
-  computer instead. The switch stays reachable by keyboard and screen reader while it is off, so
+  share a single window, what happens depends on your computer — see the next entry. Where
+  single-app sound is not available the control is switched off, and the reason sits underneath
+  it in plain sight rather than in a tooltip, because the one thing it will never do is quietly
+  send every other sound on your computer instead. The switch stays reachable by keyboard and screen reader while it is off, so
   that explanation can be read without a mouse, and a small label beside it names what is
   actually being sent — Desktop or Off. The same applies on Linux, where sharing computer
   sound is not supported yet at all. If the call is already carrying someone else's screen
   sound, the message says so rather than leaving your share quietly silent.
+- **Sharing one window can now send just that app's sound** ([#3198](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3198)) — until now, sharing a
+  single window meant sharing it silently. The only sound the desktop app could send was your
+  whole computer's, which is the wrong answer for a window share: nobody demonstrating one
+  application wants the call to hear their email arriving. On a computer that supports it,
+  sharing a window now carries the sound of that app and nothing else, and the label beside the
+  switch says **App** rather than Desktop so you can tell which of the two you are sending at a
+  glance. Two things are worth knowing. It is per-application, not per-window — if the app has
+  three windows open, you are sending the sound of all three, because that is the unit your
+  operating system actually offers. And it depends on the computer, not on Concord: where the
+  support is missing the switch stays off with the reason underneath it, exactly as before, and
+  it still never falls back to sending everything instead. Minimising the window you are sharing
+  stops the sound as well, because the app can no longer tell which window you meant.
 - **You can change what you are sharing without stopping first** ([#3145](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3145)) — switching from your
   screen to a document used to mean stopping the share and starting a new one, which dropped
   everyone watching and made them click back in. A Switch button now swaps the source in place.

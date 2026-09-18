@@ -43,7 +43,10 @@ const ALL_VERDICTS: ScreenAudioVerdict[] = ['none', 'system-loopback', 'per-proc
 const ENFORCEMENT_ACCEPTS: Record<ScreenAudioVerdict, boolean> = {
   none: false,
   'system-loopback': true,
-  'per-process': false,
+  // TRUE since #3198 PR 3. `setScreenAudioEnabled`'s `'per-process'` arm no longer refuses
+  // with a message — it `break`s into the shared re-capture, which routes through
+  // `captureScreenElectron`'s arm and starts a real capture.
+  'per-process': true,
 };
 
 describe('screen-audio verdict: affordance and enforcement agree', () => {
@@ -77,7 +80,10 @@ describe('screen-audio verdict: affordance and enforcement agree', () => {
     expect(audioToggleHint('window:12:0', 'per-process', 'darwin', true)).toBe(
       'Sharing only this app’s sound.'
     );
-    expect(verdictOffersAudio('per-process')).toBe(false);
+    // TRUE since #3198 PR 3. The three legs — pill, hint, affordance — now all answer
+    // affirmatively, which is the agreement this case exists to pin. It pinned them
+    // agreeing at FALSE before; the property is the agreement, not the value.
+    expect(verdictOffersAudio('per-process')).toBe(true);
   });
 
   // POSITIVE CONTROL. Without it the two cases above pass against a `verdictOffersAudio`
@@ -86,10 +92,20 @@ describe('screen-audio verdict: affordance and enforcement agree', () => {
     expect(verdictOffersAudio(canCarryScreenAudio('screen:0:0', 'darwin'))).toBe(true);
   });
 
-  // The picker's seam, end to end: a window target on a capable machine must not light the
-  // control up while PR 2's capture wiring is absent.
-  it('does not offer audio for a window target even on a capable machine', () => {
-    expect(verdictOffersAudio(canCarryScreenAudio('window:12:0', 'darwin', true))).toBe(false);
+  // The picker's seam, end to end, INVERTED BY #3198 PR 3. It asserted `false` while the
+  // capture wiring was absent; PR 3 landed that wiring, so a window target on a capable
+  // machine is now exactly the case the feature exists to serve.
+  it('offers audio for a window target on a capable machine', () => {
+    expect(verdictOffersAudio(canCarryScreenAudio('window:12:0', 'darwin', true))).toBe(true);
+  });
+
+  // THE NEGATIVE THAT MUST SURVIVE THE FLIP. The case above stops discriminating the
+  // moment `verdictOffersAudio` returns true for everything, so the machine-capability
+  // half needs its own case: the SAME window target on a machine that reported NO
+  // per-process backend must still be refused. Without this, PR 3's flip and a blanket
+  // `return true` are indistinguishable.
+  it('does not offer audio for a window target on an INCAPABLE machine', () => {
+    expect(verdictOffersAudio(canCarryScreenAudio('window:12:0', 'darwin', false))).toBe(false);
   });
 
   // EXHAUSTIVENESS. `verdictOffersAudio` must answer every member of the union; a fourth

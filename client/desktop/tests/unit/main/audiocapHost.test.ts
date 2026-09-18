@@ -40,9 +40,13 @@ vi.mock('electron', () => ({
   // Minimal Option-B' stand-in (design §5 Q6). Task 3 does not exercise the port
   // handoff itself -- that is Task 5/6/7's territory -- but the host module
   // imports the constructor, so the mock must exist for the module to load.
+  // Option-B' stand-in (design §5 Q6). #3198 PR 3 gave the ports a real `close`,
+  // because `beginCapture`'s failure arm closes BOTH — against `{}` that arm threw a
+  // TypeError out of its own catch block and the failure under test was replaced by an
+  // unrelated one. A mock that omits a method the code calls is not neutral.
   MessageChannelMain: class {
-    port1 = {};
-    port2 = {};
+    port1 = { close: vi.fn() };
+    port2 = { close: vi.fn() };
   },
   app: {
     on: vi.fn(),
@@ -149,7 +153,7 @@ describe('audiocap host env allowlist (#3195, C7 obeyed at the outermost fork() 
     const { startAudiocapHost, ENV_ALLOWLIST } = await loadHost();
     fork.mockReturnValue(makeChild());
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
 
     // Outermost observable: what utilityProcess.fork was actually handed, not
     // that a value moved between our own functions (tests.md § "Test the
@@ -168,7 +172,7 @@ describe('audiocap host crash policy — zero respawn (spec §5 Q3, ADR-0043 D4b
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
 
     // Precondition, not incidental: if the host never wires an 'exit' listener at
     // all, firing the crash below is a no-op and the count assertion after it
@@ -190,8 +194,8 @@ describe('audiocap host crash policy — zero respawn (spec §5 Q3, ADR-0043 D4b
     const { startAudiocapHost } = await loadHost();
     fork.mockReturnValue(makeChild());
 
-    void startAudiocapHost(1);
-    void startAudiocapHost(2);
+    void startAudiocapHost(1, null);
+    void startAudiocapHost(2, null);
 
     expect(fork).toHaveBeenCalledTimes(2);
   });
@@ -203,7 +207,7 @@ describe('audiocap host kill — #1383 no-await window', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
     killAudiocapHost();
 
     // Called before any microtask drains: utilityProcess.kill() is synchronous
@@ -217,7 +221,7 @@ describe('audiocap host kill — #1383 no-await window', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
     killAudiocapHost();
     killAudiocapHost();
     killAudiocapHost();
@@ -232,7 +236,7 @@ describe('audiocap host handshake validation — trust boundary (spec §7)', () 
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(1);
+    const pending = startAudiocapHost(1, null);
 
     // Same vacuity guard as the crash-policy case above: firing a 'message' the
     // host never listens for would leave `pending` hanging forever rather than
@@ -260,7 +264,7 @@ describe('audiocap host handshake timeout (spec §6b, HANDSHAKE_TIMEOUT_MS)', ()
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(1);
+    const pending = startAudiocapHost(1, null);
     await vi.advanceTimersByTimeAsync(HANDSHAKE_TIMEOUT_MS);
 
     await expect(pending).resolves.toEqual({ ok: false, reason: 'handshake-timeout' });
@@ -287,7 +291,7 @@ describe('audiocap host unsupported platform (migrated, #3194)', () => {
     const { startAudiocapHost } = await loadHost();
     fork.mockReturnValue(makeChild());
 
-    await expect(startAudiocapHost(1)).resolves.toEqual({
+    await expect(startAudiocapHost(1, null)).resolves.toEqual({
       ok: false,
       reason: 'unsupported-os',
     });
@@ -307,7 +311,7 @@ describe('audiocap host child environment (migrated, #3194 CWE-497 / CWE-178)', 
     const { startAudiocapHost, ENV_ALLOWLIST } = await loadHost();
     fork.mockReturnValue(makeChild());
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
 
     const env = (fork.mock.calls[0][2] as { env: NodeJS.ProcessEnv }).env;
     // The whole point of the allowlist: a variable nobody named cannot reach the
@@ -328,7 +332,7 @@ describe('audiocap host child environment (migrated, #3194 CWE-497 / CWE-178)', 
     const { startAudiocapHost } = await loadHost();
     fork.mockReturnValue(makeChild());
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
 
     const env = (fork.mock.calls[0][2] as { env: NodeJS.ProcessEnv }).env;
     const leaked = Object.keys(env).filter((k) => k.toUpperCase() === NATIVE_ADDON_ENV);
@@ -346,7 +350,7 @@ describe('audiocap host child environment (migrated, #3194 CWE-497 / CWE-178)', 
     const { startAudiocapHost } = await loadHost();
     fork.mockReturnValue(makeChild());
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
 
     const env = (fork.mock.calls[0][2] as { env: NodeJS.ProcessEnv }).env;
     expect(env[NATIVE_ADDON_ENV]).toBe('/App/Resources/concord_audiocap.node');
@@ -359,7 +363,7 @@ describe('audiocap host outcomes (migrated, #3194)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(7);
+    const pending = startAudiocapHost(7, null);
     child.handlers.message(validHello());
 
     // `perProcessAudio` is the child's CLAIM relayed outward (I5) -- the value the
@@ -380,7 +384,7 @@ describe('audiocap host outcomes (migrated, #3194)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(1);
+    const pending = startAudiocapHost(1, null);
     child.handlers.exit(1);
 
     // A child that threw -- the D5 guard, or the loader refusing -- must read as a
@@ -410,7 +414,7 @@ describe('audiocap host outcomes (migrated, #3194)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(1);
+    const pending = startAudiocapHost(1, null);
     child.handlers.message(validHello());
     child.handlers.exit(0);
 
@@ -428,7 +432,7 @@ describe('audiocap host trust boundary — a rung, once decided, is not re-opene
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(3);
+    const pending = startAudiocapHost(3, null);
     child.handlers.message(validHello());
     await expect(pending).resolves.toEqual({ ok: true, generation: 3, perProcessAudio: true });
     expect(child.kill).not.toHaveBeenCalled();
@@ -547,7 +551,7 @@ describe('audiocap host reaping a child that has not spawned yet (#3245)', () =>
     const child = makeChild({ killReturns: false });
     fork.mockReturnValue(child);
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
     killAudiocapHost();
 
     // The kill was attempted and reported failure...
@@ -565,7 +569,7 @@ describe('audiocap host reaping a child that has not spawned yet (#3245)', () =>
     const child = makeChild({ killReturns: true });
     fork.mockReturnValue(child);
 
-    void startAudiocapHost(1);
+    void startAudiocapHost(1, null);
     killAudiocapHost();
 
     // The control. A child that really was reaped must not carry a listener that
@@ -599,7 +603,7 @@ describe('audiocap fault stage → degrade mechanism (#3198)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const pending = startAudiocapHost(1);
+    const pending = startAudiocapHost(1, null);
     child.handlers.message({ kind: 'fault', stage, message: 'why' });
 
     await expect(pending).resolves.toEqual({ ok: false, reason });
@@ -667,7 +671,7 @@ describe('machine-capability snapshot (#3198)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(validHello());
     await started;
 
@@ -679,7 +683,7 @@ describe('machine-capability snapshot (#3198)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(helloWithCapability(false));
     await started;
 
@@ -691,7 +695,7 @@ describe('machine-capability snapshot (#3198)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.exit(1);
     await started;
 
@@ -705,7 +709,7 @@ describe('machine-capability snapshot (#3198)', () => {
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(validHello());
     await started;
 
@@ -733,7 +737,7 @@ describe('machine-capability snapshot (#3198)', () => {
     const probe = probeAudiocapCapability();
     expect(audiocapMachineCapability()).toBeNull();
 
-    const share = startAudiocapHost(2);
+    const share = startAudiocapHost(2, null);
     expect(probeChild.kill).toHaveBeenCalled();
     probeChild.handlers.exit(0);
 
@@ -770,7 +774,7 @@ describe('capability listener cannot abort the handshake (#3198 red-team, area 4
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(validHello());
 
     await expect(started).resolves.toMatchObject({ ok: true, perProcessAudio: true });
@@ -787,7 +791,7 @@ describe('capability listener cannot abort the handshake (#3198 red-team, area 4
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(validHello());
     await started;
 
@@ -818,7 +822,7 @@ describe('capability listener cannot abort the handshake (#3198 red-team, area 4
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(validHello());
 
     await expect(started).resolves.toMatchObject({ ok: true, perProcessAudio: true });
@@ -837,7 +841,7 @@ describe('capability listener cannot abort the handshake (#3198 red-team, area 4
     const child = makeChild();
     fork.mockReturnValue(child);
 
-    const started = startAudiocapHost(1);
+    const started = startAudiocapHost(1, null);
     child.handlers.message(validHello());
     await started;
 
@@ -845,5 +849,227 @@ describe('capability listener cannot abort the handshake (#3198 red-team, area 4
     const logged = warn.mock.calls.flat().map(String).join(' ');
     expect(logged).not.toContain('SECRET-CAUSE-SHOULD-NOT-BE-LOGGED');
     warn.mockRestore();
+  });
+});
+
+// ─── The capture leg (#3198 PR 3, plan Task 12a) ───────────────────────────────
+//
+// The leg this epic never had: #3195 built the host and the handshake, #3197 the
+// backends, #3198 PR 1 the ladder and PR 2 the resolver, and nothing anywhere posted
+// `{kind:'start'}` — so `AudiocapStart` had no constructor and the child's
+// `handleStart` was unreachable in production.
+//
+// EVERY CASE HERE ASSERTS WHAT REACHED THE CHILD OR THE SINK, never that an internal
+// value was passed along (tests.md § "Test the consumer, not the handshake"). The
+// handle is VARIED across two cases for the reason § "a branch that is OBEYED must be
+// proven REACHED" gives: one handle proves the argument exists, two prove it is
+// carried rather than constant-folded.
+describe('capture leg — start + port handoff (#3198 PR 3)', () => {
+  it.each([
+    ['a low handle', 42],
+    ['a different handle', 1337],
+  ])('posts start carrying %s and hands the renderer its port', async (_label, handle) => {
+    const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    const sink = vi.fn();
+    setAudiocapPortSink(sink);
+
+    const started = startAudiocapHost(5, handle);
+    child.handlers.message(validHello());
+    await expect(started).resolves.toEqual({
+      ok: true,
+      generation: 5,
+      perProcessAudio: true,
+    });
+
+    expect(child.postMessage).toHaveBeenCalledTimes(1);
+    const [message, transfer] = child.postMessage.mock.calls[0] as [
+      { kind: string; windowHandle: number },
+      unknown[],
+    ];
+    expect(message).toMatchObject({ kind: 'start', windowHandle: handle });
+    // The port must TRANSFER, not ride as a field: a structured clone of a port is not
+    // a port, and the child would hold nothing.
+    expect(transfer).toHaveLength(1);
+
+    // The renderer gets the OTHER end, under this share's generation. Asserting the two
+    // ends DIFFER is the load-bearing half — handing the same end to both would satisfy
+    // every count-based check while nothing could ever flow.
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(sink.mock.calls[0][0]).toBe(5);
+    expect(sink.mock.calls[0][1]).toBeDefined();
+    expect(sink.mock.calls[0][1]).not.toBe(transfer[0]);
+  });
+
+  it('tells the child FIRST and the renderer second', async () => {
+    const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    const order: string[] = [];
+    child.postMessage.mockImplementation(() => {
+      order.push('child');
+    });
+    setAudiocapPortSink(() => {
+      order.push('renderer');
+    });
+
+    const started = startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    await started;
+
+    // A renderer holding a port whose peer never reached a child waits forever with no
+    // signal; the reverse merely queues quanta the port buffers. One failure mode is
+    // permanent and silent, the other self-corrects in a tick.
+    expect(order).toEqual(['child', 'renderer']);
+  });
+
+  it('THE PROBE TAKES NONE OF IT: a null handle posts no start and calls no sink', async () => {
+    const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    const sink = vi.fn();
+    setAudiocapPortSink(sink);
+
+    const started = startAudiocapHost(1, null);
+    child.handlers.message(validHello());
+    await expect(started).resolves.toMatchObject({ ok: true });
+
+    // The byte-identical-to-before property that keeps P3 (short-lived probe child) and
+    // P4 (it runs once) intact.
+    expect(child.postMessage).not.toHaveBeenCalled();
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the child claims no per-process backend', async () => {
+    const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    const sink = vi.fn();
+    setAudiocapPortSink(sink);
+
+    const started = startAudiocapHost(1, 42);
+    child.handlers.message(helloWithCapability(false));
+
+    // Reachable despite the renderer's ladder, and that is the point: a renderer that
+    // lies to itself must not obtain a capture (I5).
+    await expect(started).resolves.toEqual({ ok: false, reason: 'no-backend' });
+    expect(child.postMessage).not.toHaveBeenCalled();
+    expect(sink).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('reaps the child when the port cannot reach the renderer', async () => {
+    const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    setAudiocapPortSink(() => {
+      throw new Error('no live window');
+    });
+
+    const started = startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+
+    // A child told to start whose audio reaches nobody holds an OS tap for no one.
+    // Reaping it is the only thing that destroys that tap.
+    await expect(started).resolves.toEqual({ ok: false, reason: 'protocol-fault' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('fails closed when no sink was ever registered', async () => {
+    const { startAudiocapHost } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const started = startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+
+    // A missing sink is a wiring defect, not a machine fact.
+    await expect(started).resolves.toEqual({ ok: false, reason: 'protocol-fault' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+});
+
+describe('graceful stop (#3198 PR 3)', () => {
+  it('posts stop and reaps only after the quiesce window', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink, stopAudiocapHost } = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+
+      const started = startAudiocapHost(1, 42);
+      child.handlers.message(validHello());
+      await started;
+      child.postMessage.mockClear();
+      child.kill.mockClear();
+
+      stopAudiocapHost();
+
+      // The child's `handleStop` is the ONLY caller of the addon's `status()`, so this
+      // message is the only path on which the R9 silence detector, `quiesceProved` and
+      // `destroyFailures` are read by anything at all.
+      expect(child.postMessage).toHaveBeenCalledWith({ kind: 'stop' });
+      expect(child.kill).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(200);
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the reap when the child exits on its own', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink, stopAudiocapHost } = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+
+      const started = startAudiocapHost(1, 42);
+      child.handlers.message(validHello());
+      await started;
+      child.kill.mockClear();
+
+      stopAudiocapHost();
+      child.onceHandlers.exit?.(0);
+
+      vi.advanceTimersByTime(200);
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a supersede drains a still-quiescing child rather than letting two taps overlap', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink, stopAudiocapHost } = await loadHost();
+      const first = makeChild();
+      fork.mockReturnValue(first);
+      setAudiocapPortSink(vi.fn());
+
+      const started = startAudiocapHost(1, 42);
+      first.handlers.message(validHello());
+      await started;
+      first.kill.mockClear();
+
+      stopAudiocapHost();
+      expect(first.kill).not.toHaveBeenCalled();
+
+      // A new share forks through `killAudiocapHost`, which must drain the pending child
+      // SYNCHRONOUSLY. Without the drain the old child holds a live OS tap while the new
+      // one opens its own — two taps where the design says one, on the exact privacy
+      // surface this epic exists to narrow.
+      const second = makeChild();
+      fork.mockReturnValue(second);
+      void startAudiocapHost(2, 99);
+
+      expect(first.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

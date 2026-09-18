@@ -262,8 +262,11 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   // `isScreenAudioOn` is false because the platform forces it, not because the user
   // chose it, and reading that as an opt-out left the toggle off after switching to a
   // whole screen -- then persisted the false, quietly clearing a default-on preference.
-  const isScreenAudioCapable = useVoiceStore((s) => s.isScreenAudioCapable);
-  const seedStreamAudio = isSharing && isScreenAudioCapable ? isScreenAudioOn : savedStreamAudio;
+  // Reads the same published verdict the toolbar does, through the same single
+  // authority — `verdictOffersAudio`. Never a second boolean beside it (#3198 AC).
+  const liveShareVerdict = useVoiceStore((s) => s.screenAudioVerdict);
+  const seedStreamAudio =
+    isSharing && verdictOffersAudio(liveShareVerdict) ? isScreenAudioOn : savedStreamAudio;
   const [streamAudio, setStreamAudio] = useState<boolean>(seedStreamAudio);
 
   // Local transient state — initialized from saved defaults, not persisted on change
@@ -401,16 +404,26 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
   // exhaustive switches (#3198 Phase-8 review). The helper is exhaustive, so the next rung
   // is a compile error rather than a silent default.
   //
-  // TWO ARGUMENTS, DELIBERATELY (PR 2 of 3, #3198). The capture seam (`voiceService.ts`)
-  // still computes 'none' for every window/app target -- Tasks 10/12/12a (the invoke, the
-  // capture wiring, and the missing main-side `start` + port handoff) move to a PR 3, so
-  // nothing yet turns a `'per-process'` verdict into an actual capture. Passing the third
-  // `machineScreenAudioCapable` argument here would let this picker alone reach
-  // `'per-process'`, offering an ENABLED app-audio toggle the capture path still refuses --
-  // the #2161 overclaim reproduced in the very copy written to fix it. `canCarryScreenAudio`
-  // stays the single authority; `'per-process'` stays unreachable here until PR 3 wires the
-  // seam that makes the two agree.
-  const verdict = canCarryScreenAudio(selected, platform);
+  // THREE ARGUMENTS SINCE PR 3 OF 3 (#3198), and this is the line that makes the
+  // `'per-process'` rung reachable at all. The previous revision passed two DELIBERATELY,
+  // because the capture seam still refused every window target: Tasks 10/12/12a (the
+  // invoke, the capture wiring, and the missing main-side `start` + port handoff) had moved
+  // to PR 3, so passing the third argument HERE would have let this picker alone reach
+  // `'per-process'` and offer an enabled app-audio toggle the capture path refused — the
+  // #2161 overclaim reproduced in the very copy written to fix it.
+  //
+  // PR 3 landed that seam, so the two now agree and the argument goes in. It must go in at
+  // EVERY call site in the same change: `canCarryScreenAudio` is the single authority, but
+  // the argument is OPTIONAL, so the compiler names none of the sites that forgot it. The
+  // other three are in `voiceService.ts` — the capture seam, `setScreenAudioEnabled`, and
+  // `canShareScreenAudio`.
+  // SUBSCRIBED, not `getState()`. The snapshot is PUSHED from main on the capability
+  // handshake and again on every `did-finish-load`, so it can land after this component
+  // first renders — a one-shot read would freeze the picker on the pre-push `null` (the
+  // fail-closed pre-addon rungs) with no re-render to correct it, and the toggle would
+  // stay hidden on a machine that supports app audio.
+  const machineCapable = useVoiceStore((s) => s.machineScreenAudioCapable);
+  const verdict = canCarryScreenAudio(selected, platform, machineCapable);
   const audioCapable = verdictOffersAudio(verdict);
 
   // ── #2163: tier the per-share picker to the stream entitlement ──────────

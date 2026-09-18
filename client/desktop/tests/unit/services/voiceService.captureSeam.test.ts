@@ -16,6 +16,16 @@ import { voiceService } from '@/renderer/services/voice/voiceService';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { resetAllStores } from '../../helpers/store-helpers';
 
+// The bridge builds a `MediaStreamTrackGenerator`, which jsdom does not implement.
+// Stubbed because these cases are about what the capture SEAM records in the store,
+// not about the bridge — `screenAudioBridge.test.ts` owns that.
+vi.mock('@/renderer/services/voice/screenAudioBridge', () => ({
+  createScreenAudioBridge: () => ({
+    track: { kind: 'audio', readyState: 'live', muted: false, stop: vi.fn() },
+    stop: vi.fn(),
+  }),
+}));
+
 const track = (kind: 'video' | 'audio', over: Record<string, unknown> = {}) => ({
   kind,
   readyState: 'live',
@@ -30,6 +40,10 @@ const streamOf = (tracks: ReturnType<typeof track>[]) => ({
   getVideoTracks: () => tracks.filter((t) => t.kind === 'video'),
   getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'),
   removeTrack: vi.fn(),
+  // The per-process arm attaches the bridge track to the video-only stream. Without
+  // this the call throws and lands in the arm's catch, which reports 'no-backend' —
+  // a harness gap that reads exactly like a real degrade.
+  addTrack: vi.fn(),
 });
 
 describe('screen capture honours the audio opt-out (capture seam)', () => {
@@ -76,6 +90,58 @@ describe('screen capture honours the audio opt-out (capture seam)', () => {
   it('requests NO audio for a window target even when audio is explicitly asked for', async () => {
     await svc.captureScreenElectron('window:7', { w: 1280, h: 720 }, 30, true);
     expect(audioConstraintOf(getUserMedia.mock.calls[0])).toBe(false);
+  });
+
+  // -- The live share RECORDS itself (Gitar review, PR #3349) ----------------
+  //
+  // This file's own header says why these exist: every earlier test asserted the
+  // picker EMITTED a value and the service FORWARDED it, and none asserted capture
+  // OBEYED. Same shape here one layer on — the per-process arm attached the track
+  // and never wrote `screenAudio.mode`, so a live app-scoped share was
+  // indistinguishable from an idle one, while `produceScreen`'s sibling comment
+  // promised on this arm's behalf that it "sets the mode where it creates the track".
+
+  const perProcessHarness = () => {
+    useVoiceStore.getState().setMachineScreenAudioCapable(true);
+    globalThis.electron = {
+      ...globalThis.electron,
+      getDesktopSources: vi.fn().mockResolvedValue([{ id: 'window:42:0', name: 'W' }]),
+      audiocap: {
+        start: vi.fn().mockResolvedValue({ ok: true, generation: 1, perProcessAudio: true }),
+        stop: vi.fn().mockResolvedValue(undefined),
+        getPortMessageTag: vi.fn().mockReturnValue('tag'),
+        onCapability: vi.fn(),
+      },
+    } as unknown as typeof globalThis.electron;
+  };
+
+  it('records a successful per-process capture as mode per-process', async () => {
+    perProcessHarness();
+    await svc.captureScreenElectron('window:42:0', { w: 1280, h: 720 }, 30, true);
+
+    const { screenAudio } = useVoiceStore.getState();
+    // Asserted on the STORE, never on a call to our own setter: the defect was a
+    // missing write, and a spy on the setter would pass the moment any arm called it.
+    expect(screenAudio).toEqual({ mode: 'per-process', overrun: 0 });
+  });
+
+  it('does not leave a previous system-mix share claiming the new one', async () => {
+    // THE CASE WITH TEETH. `setScreenAudioState` is a REPLACE and
+    // `stopScreenAudioHost` early-returns when the mode is already off, so an unset
+    // mode is not merely absent — it is whatever the last share left. A per-process
+    // share started after a whole-desktop one read `'system'`: the app claiming a
+    // system mix while an app-scoped tap runs, which is a false statement about what
+    // audio leaves this machine.
+    useVoiceStore.getState().setScreenAudioState({ mode: 'system', overrun: 4 });
+    perProcessHarness();
+    await svc.captureScreenElectron('window:42:0', { w: 1280, h: 720 }, 30, true);
+
+    const { screenAudio } = useVoiceStore.getState();
+    expect(screenAudio.mode).not.toBe('system');
+    expect(screenAudio.mode).toBe('per-process');
+    // The counter belongs to the share, not the session — a previous share's drops
+    // must not be attributed to this one.
+    expect(screenAudio.overrun).toBe(0);
   });
 
   it('returns the RESOLVED source id so callers need not re-derive it', async () => {
@@ -209,7 +275,7 @@ describe('a dead audio track is never published (spec §7.3)', () => {
   // an explicit opt-out.
   it('clears the live screen-audio state during reconnect teardown', () => {
     useVoiceStore.getState().setScreenAudioOn(true);
-    useVoiceStore.getState().setScreenAudioCapable(true);
+    useVoiceStore.getState().setScreenAudioVerdict('system-loopback');
     svc.currentScreenSourceId = 'screen:0';
     svc.currentScreenAudioCapable = true;
     svc.producers.set('screen-audio', { id: 'a1', close: vi.fn() });
@@ -217,7 +283,7 @@ describe('a dead audio track is never published (spec §7.3)', () => {
     svc.cleanupMediaAndTransports();
 
     expect(useVoiceStore.getState().isScreenAudioOn).toBe(false);
-    expect(useVoiceStore.getState().isScreenAudioCapable).toBe(false);
+    expect(useVoiceStore.getState().screenAudioVerdict).toBe('none');
     expect(svc.currentScreenSourceId).toBeNull();
     expect(svc.currentScreenAudioCapable).toBe(false);
   });

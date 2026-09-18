@@ -26,7 +26,10 @@ import {
   type ActiveScreenShare,
   MAX_TUNED_SCREEN_SHARES,
 } from '../../stores/voice/voiceStore';
-import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
+import {
+  verdictOffersAudio,
+  type ScreenAudioVerdict,
+} from '../../utils/policy/screenAudioCapability';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useHasVoiceTextTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
@@ -373,23 +376,16 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   const isVideoOn = useVoiceStore((s) => s.isVideoOn);
   const isScreenSharing = useVoiceStore((s) => s.isScreenSharing);
   const isScreenAudioOn = useVoiceStore((s) => s.isScreenAudioOn);
-  // Published by voiceService, which is the only place that knows both the live source
-  // id and the platform. Read, never derived here.
-  const isScreenAudioCapable = useVoiceStore((s) => s.isScreenAudioCapable);
-  // TWO-VALUE MAPPING, DELIBERATELY (#3198 PR 2 of 3, scope split). The live-share verdict
-  // that would distinguish 'system-loopback' from 'per-process' is not threaded to this
-  // component: PR 3 wires the capture seam that makes 'per-process' reachable, and until
-  // then `isScreenAudioCapable` can only ever mean the whole-desktop loopback (or Linux/
-  // below-floor, on the dev/web path). `screenAudioTitle` and `activeLabel` are written
-  // exhaustive against `ScreenAudioVerdict` so PR 3 only has to change this one mapping.
+  // THE VERDICT ITSELF, published by voiceService — the only place that knows both the
+  // live source id and the platform. Read, never derived here.
   //
-  // Cast, not a type annotation: TS narrows a ternary-initialized const to the literal
-  // union of its two arms for later comparisons even under a widening annotation, which
-  // would make the (currently dead, PR-3-reachable) `=== 'per-process'` comparison below a
-  // compile error rather than the exhaustive check it is written to be.
-  const screenAudioVerdict = (
-    isScreenAudioCapable ? 'system-loopback' : 'none'
-  ) as ScreenAudioVerdict;
+  // PR 2 left a two-value ternary here (`isScreenAudioCapable ? 'system-loopback' : 'none'`)
+  // and named PR 3 as its owner, because until the capture seam existed `'per-process'` was
+  // unreachable. PR 3 made it reachable, so the ternary became a live defect rather than a
+  // placeholder: it could not name the rung, and the toolbar promised whole-computer sound
+  // during an app-scoped share while `screenAudioTitle`'s `'per-process'` arm stayed dead.
+  // The store carries the verdict now; there is nothing left to map.
+  const screenAudioVerdict = useVoiceStore((s) => s.screenAudioVerdict);
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
   const toggleVoiceTextChat = useVoiceStore((s) => s.toggleVoiceTextChat);
   const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
@@ -610,7 +606,7 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
               <MediaButton
                 isActive={isScreenAudioOn}
                 onClick={handleToggleScreenAudio}
-                locked={!isScreenAudioCapable}
+                locked={!verdictOffersAudio(screenAudioVerdict)}
                 title={screenAudioTitle(screenAudioVerdict, isScreenAudioOn)}
                 activeIcon={<Volume2 size={18} />}
                 inactiveIcon={<VolumeX size={18} />}

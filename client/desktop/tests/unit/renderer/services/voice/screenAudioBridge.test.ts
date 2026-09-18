@@ -70,7 +70,7 @@
 // was wrong, and the bridge must NOT be "corrected" to match the false premise.
 // A rewind here would un-fence a stale bridge the instant its successor stopped
 // — the ABA shape this fence exists to prevent.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createScreenAudioBridge } from '../../../../../src/renderer/services/voice/screenAudioBridge';
 import { AUDIOCAP_PORT_TAG } from '../../../../../src/preload/audiocapRelay';
@@ -284,13 +284,7 @@ async function bridgeHarness(options: BridgeHarnessOptions = {}) {
     window.postMessage = originalPostMessage;
   });
 
-  // Precondition, asserted rather than optional-chained: a bridge that never
-  // registers its `message` listener must fail HERE, not silently pass every
-  // case below because `deliver()` never reaches a real handler.
-  const addSpy = vi.spyOn(window, 'addEventListener');
   const bridge = createScreenAudioBridge(generation);
-  expect(addSpy).toHaveBeenCalledWith('message', expect.any(Function));
-  addSpy.mockRestore();
   cleanups.push(() => bridge.stop());
 
   const port = makeFakePort(ackOrder);
@@ -302,6 +296,18 @@ async function bridgeHarness(options: BridgeHarnessOptions = {}) {
   window.postMessage({ [AUDIOCAP_PORT_TAG]: true, generation }, window.location.origin, [
     port,
   ] as unknown as Transferable[]);
+
+  // PRECONDITION, asserted rather than optional-chained: a handoff that never reached
+  // this bridge must fail HERE, not silently pass every case below because `deliver()`
+  // delivers to nothing.
+  //
+  // This replaces an assertion that `createScreenAudioBridge` called
+  // `window.addEventListener('message', …)`, which #3198 PR 3 made false: the listener
+  // is installed once at MODULE SCOPE, because main posts the port inside the turn that
+  // settles `audiocap:start` and a per-bridge listener does not exist yet to hear it.
+  // `port.start()` is the stronger property anyway — registration is a step toward
+  // adoption, adoption is the thing every case below depends on.
+  expect(port.start).toHaveBeenCalled();
 
   return {
     bridge,
@@ -589,5 +595,145 @@ describe('screenAudioBridge — a stopped bridge cannot fault (#3245, Gitar)', (
     await new Promise((r) => setTimeout(r, 0));
 
     expect(b.stats().faulted).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The handoff can arrive BEFORE its bridge (#3198 PR 3)
+// ---------------------------------------------------------------------------
+//
+// THE ORDERING IS DECIDED IN THE MAIN PROCESS AND THE RENDERER LOSES. Main posts the
+// port to preload inside the same turn that settles the `audiocap:start` promise, and
+// a bridge can only be constructed after that promise crosses IPC and resolves. The
+// relay hands the main world its end with ONE `postMessage` and never repeats it, so a
+// handoff with no listener is not delayed — it is destroyed, and the share is silently
+// audio-free with nothing in any log.
+//
+// Nothing above can catch this: every case in this file creates the bridge first, which
+// is the order the defect does not occur in. These cases invert it.
+//
+// Dispatched by hand rather than through the harness's `window.postMessage` shim,
+// because the shim is installed *inside* `bridgeHarness` — which creates the bridge,
+// which is exactly what these cases must do last.
+function postHandoff(generation: unknown, port: unknown): void {
+  const event = new MessageEvent('message', {
+    data: { [AUDIOCAP_PORT_TAG]: true, generation },
+    source: window,
+    origin: window.location.origin,
+  });
+  Object.defineProperty(event, 'ports', { value: [port], configurable: true });
+  window.dispatchEvent(event);
+}
+
+describe('screenAudioBridge — handoff before construction (#3198 PR 3)', () => {
+  // The module listener resolves the discriminator per message via
+  // `window.electron.audiocap.getPortMessageTag` — the same C4 feature detection the
+  // bridge does, and for the same reason. `bridgeHarness` installs this stub for the
+  // cases above; these run without the harness, so they install it themselves.
+  let previousElectron: unknown;
+  let previousGenerator: unknown;
+
+  // A MINIMAL generator, deliberately not the harness's `FakeMediaStreamTrackGenerator`:
+  // that one closes over per-harness recording state these cases have no use for. Nothing
+  // here delivers a quantum — the property under test is whether the PORT is adopted, and
+  // the bridge must merely construct for that to be observable.
+  class MinimalGenerator {
+    writable = {
+      getWriter: () => ({ write: (): void => {}, releaseLock: (): void => {} }),
+    };
+    stop(): void {}
+  }
+
+  beforeEach(() => {
+    const w = globalThis as unknown as {
+      electron?: Record<string, unknown>;
+      MediaStreamTrackGenerator?: unknown;
+    };
+    previousElectron = w.electron;
+    previousGenerator = w.MediaStreamTrackGenerator;
+    w.electron = {
+      ...(previousElectron as Record<string, unknown> | undefined),
+      audiocap: { getPortMessageTag: () => AUDIOCAP_PORT_TAG },
+    };
+    w.MediaStreamTrackGenerator = MinimalGenerator;
+  });
+
+  afterEach(() => {
+    const w = globalThis as unknown as {
+      electron?: unknown;
+      MediaStreamTrackGenerator?: unknown;
+    };
+    w.electron = previousElectron;
+    w.MediaStreamTrackGenerator = previousGenerator;
+  });
+
+  it('adopts a port that arrived BEFORE the bridge was created', () => {
+    const port = makeFakePort([]);
+    postHandoff(201, port);
+
+    // Held, not adopted and not destroyed: nothing has claimed generation 201 yet.
+    expect(port.start).not.toHaveBeenCalled();
+    expect(port.close).not.toHaveBeenCalled();
+
+    const bridge = createScreenAudioBridge(201);
+    try {
+      // The whole point of Fix A. Before the module-scope listener this port was
+      // unreachable — the listener that would have caught it did not exist when it
+      // was posted, and the relay never posts a second time.
+      expect(port.start).toHaveBeenCalled();
+      expect(typeof port.onmessage).toBe('function');
+    } finally {
+      bridge.stop();
+    }
+  });
+
+  it('closes a superseded unclaimed port when a newer bridge registers', () => {
+    const stale = makeFakePort([]);
+    postHandoff(202, stale);
+    expect(stale.close).not.toHaveBeenCalled();
+
+    // The host killed the child generation 202 belonged to when it minted 203, so no
+    // bridge for 202 is ever coming. Holding it forever would leak a port terminating
+    // at the process that loaded native code.
+    const bridge = createScreenAudioBridge(203);
+    try {
+      expect(stale.close).toHaveBeenCalled();
+    } finally {
+      bridge.stop();
+    }
+  });
+
+  // Teardown racing the handoff: main posts the port, the share ends before it lands.
+  // `stop()` used to DELETE its claim, so the late port fell through to the no-claimant
+  // branch and was BUFFERED -- held open until a later bridge's supersession sweep or
+  // until `UNCLAIMED_PORT_LIMIT` evicted it, both of which depend on another share
+  // happening at all.
+  //
+  // Gitar (PR #3349) proposed `dropUnclaimed(generation)` inside `stop()`. That is inert
+  // for this exact case and this test is why: `stop()` runs BEFORE the port arrives, so
+  // the buffer is empty at that moment and there is nothing to drop. A tombstone CLAIM
+  // is what closes it -- verified by mutation, which is the only thing that separates the
+  // two, since both leave the suite green everywhere else.
+  it('closes a port that arrives AFTER its bridge stopped, rather than buffering it', () => {
+    const bridge = createScreenAudioBridge(9001);
+    bridge.stop();
+
+    const late = makeFakePort([]);
+    postHandoff(9001, late);
+
+    expect(late.close).toHaveBeenCalled();
+    // Not adopted either -- a stopped bridge has released its writer, so a port it
+    // started reading would write into nothing.
+    expect(late.start).not.toHaveBeenCalled();
+  });
+
+  it('declines a handoff carrying no usable generation rather than guessing one', () => {
+    const port = makeFakePort([]);
+    postHandoff('not-a-generation', port);
+
+    // It cannot be routed to any bridge, so holding it would leak it and adopting it
+    // would mean inventing an identity main never assigned.
+    expect(port.close).toHaveBeenCalled();
+    expect(port.start).not.toHaveBeenCalled();
   });
 });
