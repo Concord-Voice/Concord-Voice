@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.47] — 2026-09-18
+
 Concord Voice now gives you clearer control over screen sharing, voice calls, and Rich Presence. Activity details show what is shared and who may receive it.
 
 ### Added
