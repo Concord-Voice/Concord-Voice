@@ -6,12 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The invite button in a direct message lists every server you can invite to** ([#2372](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2372)) — opening
+  a direct message and pressing the invite button showed only the server you had open before you
+  navigated away, and often nothing at all, so inviting a friend to any other server was simply
+  not possible from there. The list is now built from the servers you are actually allowed to
+  invite people to, wherever you are in the app, instead of depending on which server you
+  happened to visit last. If creating the invite does fail anyway — the list is a snapshot, so a
+  permission removed while you had the chat open is not reflected until it refreshes — the reason
+  now appears above the message box instead of the button quietly doing nothing.
+
 ## [0.2.47] — 2026-09-18
 
 Concord Voice now gives you clearer control over screen sharing, voice calls, and Rich Presence. Activity details show what is shared and who may receive it.
 
 ### Added
-
 - **Changing the message timer now leaves a note in the conversation** ([#1351](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/1351)) — when
   someone sets, changes or turns off how long messages last, a line appears in the conversation
   saying who did it and what they chose, the same way a call leaves a record. It arrives straight

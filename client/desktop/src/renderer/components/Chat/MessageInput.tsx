@@ -258,6 +258,15 @@ const MessageInput: React.FC<MessageInputProps> = ({
   } = useDraftMessage(draftTargetId);
   const [dragOver, setDragOver] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // Invite-creation failures get their OWN alert rather than reusing
+  // `uploadError`, whose comment scopes it to post-queue transport/encrypt
+  // failures. Separate because the two can be true at once and because a
+  // failure here is routinely EXPECTED: `servers[].permissions` is a snapshot
+  // taken at fetchServers with no invalidation path, so a revoked PermInvite
+  // leaves an un-invitable server in the picker until the next fetch. The
+  // server re-resolves and returns 403 — this is what stops that 403 being an
+  // click that does nothing at all.
+  const [inviteError, setInviteError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const isSendingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -527,8 +536,18 @@ const MessageInput: React.FC<MessageInputProps> = ({
   const handlePickInviteServer = useCallback(
     async (serverId: string) => {
       setInvitePickerOpen(false);
+      setInviteError(null);
       const invite = await createInvite(serverId);
-      if (!invite) return; // createInvite records its own error in the store
+      if (!invite) {
+        // `createInvite` records the reason on the store, and NOTHING rendered
+        // it — the store's `error` has no subscriber anywhere in components/Chat.
+        // "Recorded" is not "shown": before this, a refused invite produced a
+        // click that did nothing, with no feedback on any surface.
+        setInviteError(
+          useInviteStore.getState().error ?? 'Could not create an invite for that server.'
+        );
+        return;
+      }
       const url = buildInviteUrl(invite.code);
       setContent((prev) => (prev.trim() ? `${prev.trimEnd()} ${url}` : url));
     },
@@ -1029,6 +1048,11 @@ const MessageInput: React.FC<MessageInputProps> = ({
             </div>
           )}
           {uploadStatus && !uploadError && <div className="upload-status">{uploadStatus}</div>}
+          {inviteError && (
+            <div className="upload-error" role="alert">
+              {inviteError}
+            </div>
+          )}
           <AttachmentNotice
             rejections={rejections}
             acceptedCount={acceptedCount}

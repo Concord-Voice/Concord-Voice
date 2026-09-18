@@ -16294,9 +16294,17 @@ components:
         icon_url:
           type: string
           nullable: true
+        banner_url:
+          type: string
+          nullable: true
         owner_id:
           type: string
           format: uuid
+        allow_embedded_content:
+          type: boolean
+          description: >-
+            Whether link previews and embedded media may render in this
+            server's channels.
         server_tier:
           $ref: '#/components/schemas/ServerTier'
         created_at:
@@ -16320,6 +16328,14 @@ components:
             type: integer
           online_count:
             type: integer
+          permissions:
+            type: string
+            description: >-
+              The caller's effective server-scope permission bitfield, decimal
+              encoded. A string rather than an integer because the bitfield
+              reaches bit 62 and JSON numbers lose precision above 2^53.
+              Absent on a control plane predating this field.
+            example: '484687360'
     Channel:
       type: object
       properties:

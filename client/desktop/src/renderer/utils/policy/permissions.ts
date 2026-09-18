@@ -152,6 +152,22 @@ export function removePermission(bitfield: bigint, perm: bigint): bigint {
 /** Parse a permissions string (from API) into a BigInt */
 export function parsePermissions(permsStr: string | number | undefined): bigint {
   if (permsStr === undefined || permsStr === null) return 0n;
+  // Strict decimal, because `BigInt()` alone does NOT fail closed and this
+  // function's whole contract is that it does. `BigInt` accepts `0x40`, `0o100`,
+  // `0b1000000`, `+64`, and surrounding whitespace — none of which the wire
+  // format permits — and, worse, it accepts `-1` without throwing. A negative
+  // sign-extends under BigInt's two's-complement `&`, which SETS bit 62, and
+  // `hasPermission` short-circuits on that bit and returns true for every
+  // permission. So the one input shape that most needs to be refused was the
+  // one that granted everything.
+  //
+  // No writer can currently emit a negative — `strconv.FormatInt` on a
+  // COALESCE'd BIT_OR only produces plain non-negative decimal — so this is
+  // hardening, not a live defect. It is worth the regex anyway: the failure
+  // direction is OPEN, and this decode is the only thing standing between a
+  // wire value and a permission check (red-team, PR #3350).
+  if (typeof permsStr === 'string' && !/^\d+$/.test(permsStr)) return 0n;
+  if (typeof permsStr === 'number' && (!Number.isInteger(permsStr) || permsStr < 0)) return 0n;
   try {
     return BigInt(permsStr);
   } catch {

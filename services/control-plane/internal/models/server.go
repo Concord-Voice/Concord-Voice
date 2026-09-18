@@ -38,6 +38,23 @@ type ServerWithRole struct {
 	Role        string `json:"role" db:"role"`
 	MemberCount int    `json:"member_count" db:"member_count"`
 	OnlineCount int    `json:"online_count" db:"online_count"`
+	// Permissions is the caller's effective SERVER-level permission bitfield,
+	// decimal-encoded as a string. A string rather than a number because the
+	// bitfield reaches bit 62 (PermAdministrator) and JSON numbers lose
+	// precision above 2^53 — GET /servers/{id}/permissions emits an int64 and
+	// carries that hazard; this field does not inherit it.
+	//
+	// `omitempty` is load-bearing, not style. ListServers is today the only
+	// producer, and it always computes a value — a member with no roles yields
+	// "0", which is non-empty and correctly denies. But the zero VALUE of this
+	// field is the empty string, so a future handler that returns this type
+	// without computing it would put `"permissions": ""` on the wire. The
+	// renderer treats a field that is present as authoritative, and `BigInt("")`
+	// is 0n rather than a throw — so such a row would be silently hidden instead
+	// of falling back to permissionStore. omitempty keeps "not computed"
+	// indistinguishable from absent, which is the state the client is written
+	// for and what the TS optional type and the OpenAPI description both claim.
+	Permissions string `json:"permissions,omitempty" db:"permissions"`
 }
 
 // ChannelGroup represents a user-defined category for organizing channels

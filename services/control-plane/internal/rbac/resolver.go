@@ -318,6 +318,13 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 }
 
 // computeRolePermissions computes base permissions by OR'ing all user's role permissions
+// NOTE: this server-scope derivation is MIRRORED in raw SQL by
+// servers.ListServers (internal/servers/handlers.go), which inlines the same
+// owner short-circuit and BIT_OR to avoid N round-trips on a login-path query.
+// The two are byte-equivalent today and nothing enforces that. If you add a
+// term here — a member-timeout gate, a server-level SBAC tier, an epoch fence —
+// add it there too, or the API will report permissions the enforcer does not
+// grant. That copy fails in the PERMISSIVE direction for the UI.
 func (r *Resolver) computeRolePermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, error) {
 	query := `
 		SELECT COALESCE(BIT_OR(r.permissions), 0) AS total_permissions

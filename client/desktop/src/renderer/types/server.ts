@@ -14,7 +14,19 @@ export interface ServerWithRole extends Server {
   role: 'owner' | 'admin' | 'member'; // Legacy — kept for backwards compat during transition
   member_count: number;
   online_count: number;
-  permissions?: string; // Stringified bigint of computed server permissions
+  /**
+   * The caller's effective SERVER-scope permission bitfield, decimal-encoded.
+   *
+   * `GET /api/v1/servers` computes it for every row (#2372). It stayed optional
+   * because two real states leave it absent: a control plane predating that
+   * change (Concord is self-hostable), and a row written by `joinServer`, whose
+   * `JoinServerResponse` carries only `{ server, role }`.
+   *
+   * A string rather than a number because the bitfield reaches bit 62 and JSON
+   * numbers lose precision above 2^53. Read it through `parsePermissions`, which
+   * fails closed to `0n` on anything unparseable.
+   */
+  permissions?: string;
 }
 
 export interface Role {

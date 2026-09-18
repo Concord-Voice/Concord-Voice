@@ -216,12 +216,16 @@ const serverStore = create<ServerState>()(
             // an ABSENT key is already preserved by the spread, so the `??`
             // below only guards a caller that passes an EXPLICIT
             // `permissions: undefined` — which the optional field permits and
-            // no current caller does. Kept as a boundary guard, not because a
-            // live path needs it: today nothing in the renderer reads
-            // `servers[].permissions` (permission checks come from
-            // permissionStore), so clobbering it would not downgrade anything
-            // yet. `fetchServers` does populate the field, so a future reader
-            // could start depending on it (#2363).
+            // no current caller does (#2363).
+            //
+            // It is now load-bearing rather than future-facing:
+            // `InviteServerPicker` reads `servers[].permissions` as its primary
+            // source, and `ListServers` populates it for every row (#2372).
+            // An earlier version of this comment said `fetchServers` already
+            // populated the field — it did not. `models.ServerWithRole` carried
+            // no `Permissions` at all until #2372, so the TS field was declared
+            // with no writer anywhere and no reader anywhere. Do not restore
+            // that claim; verify against `internal/servers/handlers.go`.
             const servers = [...state.servers];
             servers[index] = {
               ...servers[index],

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -107,17 +108,39 @@ func (h *Handler) ListServers(c *gin.Context) {
 		connectedIDs = append(connectedIDs, uid.String())
 	}
 
+	// The permissions column mirrors rbac.resolveServerPermissions for the
+	// SERVER scope exactly: owner short-circuits to OwnerPermissions, everyone
+	// else gets BIT_OR over their roles. It is inlined rather than resolved
+	// per row because this is a login-path query — one resolver call per server
+	// would be N round trips, and GET /servers/{id}/permissions is capped at
+	// 30/min/user, so a client fanning out instead would exhaust that budget on
+	// any account with more than 30 servers.
+	//
+	// Deliberately NOT read through the RBAC Redis cache: this is strictly
+	// fresher than a cached value, never staler, and adding a cache write here
+	// would publish a value computed outside the resolver's own invalidation.
+	//
+	// Channel-scope SBAC overrides are absent by construction — that layer only
+	// exists per channel, and this is the server bitfield.
 	query := `
 		SELECT s.id, s.name, s.icon_url, s.banner_url, s.owner_id, s.allow_embedded_content, s.created_at, s.updated_at, sm.role,
 			(SELECT COUNT(*) FROM server_members WHERE server_id = s.id) AS member_count,
-			(SELECT COUNT(*) FROM server_members WHERE server_id = s.id AND user_id = ANY($2::uuid[])) AS online_count
+			(SELECT COUNT(*) FROM server_members WHERE server_id = s.id AND user_id = ANY($2::uuid[])) AS online_count,
+			CASE WHEN s.owner_id = $1 THEN $3::bigint
+				ELSE COALESCE((
+					SELECT BIT_OR(r.permissions)
+					FROM member_roles mr
+					INNER JOIN roles r ON mr.role_id = r.id
+					WHERE mr.server_id = s.id AND mr.user_id = $1
+				), 0)
+			END AS permissions
 		FROM servers s
 		INNER JOIN server_members sm ON s.id = sm.server_id
 		WHERE sm.user_id = $1
 		ORDER BY s.created_at DESC
 	`
 
-	rows, err := h.db.Query(query, userID, pq.Array(connectedIDs))
+	rows, err := h.db.Query(query, userID, pq.Array(connectedIDs), int64(rbac.OwnerPermissions))
 	if err != nil {
 		h.log.Error("Failed to query servers", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
@@ -128,6 +151,14 @@ func (h *Handler) ListServers(c *gin.Context) {
 	servers := []models.ServerWithRole{}
 	for rows.Next() {
 		var server models.ServerWithRole
+		// sql.NullInt64 rather than int64, because the COST of being wrong here is
+		// not a wrong bitfield. BIT_OR over zero rows returns NULL; scanning NULL
+		// into int64 errors; the loop below then `continue`s — and fetchServers
+		// commits a whole-array replace, so purgeMissingServerState tears down that
+		// server's channel state. A derived display column would silently remove a
+		// server from the sidebar behind an HTTP 200. COALESCE makes NULL
+		// unreachable today; this keeps the failure proportionate if it ever is not.
+		var permissions sql.NullInt64
 		err := rows.Scan(
 			&server.ID,
 			&server.Name,
@@ -140,11 +171,14 @@ func (h *Handler) ListServers(c *gin.Context) {
 			&server.Role,
 			&server.MemberCount,
 			&server.OnlineCount,
+			&permissions,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan server", "error", err)
 			continue
 		}
+		// Fail closed on the permission, never on the server's visibility.
+		server.Permissions = strconv.FormatInt(permissions.Int64, 10)
 		server.ServerTier = h.serverTiers.GetServerTier(c.Request.Context(), server.ID)
 		servers = append(servers, server)
 	}
