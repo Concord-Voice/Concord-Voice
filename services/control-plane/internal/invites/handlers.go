@@ -729,7 +729,20 @@ func (h *Handler) GetInviteInfo(c *gin.Context) {
 		(expiresAt == nil || expiresAt.After(time.Now().UTC())) &&
 		(maxUses == nil || *maxUses == 0 || useCount < *maxUses)
 
+	// server_id lets the client recognise an invite to a server the user is
+	// already in and offer "Joined" instead of a Join button that can only 409
+	// (#2372). It is deliberately NOT a membership boolean: the renderer already
+	// holds live membership in `serverStore`, which `joinServer` updates the
+	// instant a join commits, whereas this response is cached for five minutes
+	// by `useInvitePreview` and a cached `is_member: false` would show a Join
+	// button on a server the user had just joined.
+	//
+	// This route is authenticated. The anonymous edge preview
+	// (GetPublicInvitePreview) must NOT gain this field — it is privacy-trimmed
+	// by design and an opaque server identifier there is a correlation handle
+	// for an unauthenticated caller holding only a code.
 	c.JSON(http.StatusOK, gin.H{
+		"server_id":     serverID,
 		"server_name":   serverName,
 		"server_icon":   serverIcon,
 		"server_banner": serverBanner,

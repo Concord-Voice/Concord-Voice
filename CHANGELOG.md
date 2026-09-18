@@ -16,6 +16,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   happened to visit last. If creating the invite does fail anyway — the list is a snapshot, so a
   permission removed while you had the chat open is not reflected until it refreshes — the reason
   now appears above the message box instead of the button quietly doing nothing.
+- **An invite to a server you are already in now says "Joined"** ([#2372](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2372)) — an invite
+  card in a chat always offered a Join button, so the only way to find out you were already a
+  member was to press it and read the refusal. The card now recognises the server and shows
+  "Joined", with no button to press. The same applies to an invite you open from a link outside
+  the app: the join window names the server and tells you that you are already in it, instead of
+  letting you try. And when a join genuinely does fail, the reason now comes from the server —
+  so "you are already a member of this server" no longer arrives dressed up as "this invite may
+  have expired", which used to send people hunting for a fresh invite to a server they were
+  already in. One more thing the join window could get wrong: if you typed a code, changed your
+  mind and typed a different one, a slow lookup of the first code could land afterwards and put
+  the first server's name and icon on screen while the box held the second code — which also
+  meant the "already a member" check was answering about the wrong server. It now ignores an
+  answer to a code you have already replaced, so the card always describes the code in front of
+  you.
 
 ## [0.2.47] — 2026-09-18
 

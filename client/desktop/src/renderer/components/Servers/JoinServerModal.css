@@ -156,3 +156,15 @@
     transform: translateY(0);
   }
 }
+
+/* Already-a-member notice (#2372).
+   Deliberately sets NO background: a rule setting both a foreground and a
+   background enters contrast-pairs.test.ts, and --text-secondary on
+   --bg-tertiary measures 4.31:1 in Midnight Sky — under the 4.5:1 floor.
+   --text-primary inheriting the modal's own surface needs no allowlist entry. */
+.join-preview-note {
+  padding: 10px 12px;
+  color: var(--text-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  text-align: center;
+}

@@ -17,6 +17,28 @@ import { useServerStore } from './serverStore';
 
 export type { InviteInfoResponse };
 
+/**
+ * The outcome of ONE `joinServer` call, carried back to that caller.
+ *
+ * `error` on this store is a single shared field owned by the newest join (see
+ * `joinSequence` below), which makes it the wrong place for a caller to read a
+ * reason from: `InviteEmbed` renders one card per invite link and a chat can
+ * hold several, so two joins racing means the older call's component reads a
+ * value that is not its own. Both failure shapes are reachable — it reads the
+ * NEWER join's message, or it reads the `null` that join's own start wrote and
+ * falls back to a generic guess. Returning the reason per call removes the
+ * shared read entirely rather than trying to time it (Gitar, PR #3353).
+ *
+ * `abandoned` is a third state and not a failure: a different account owns the
+ * session now, the join did happen for the ORIGINAL user, and there is nothing
+ * to tell whoever is sitting here. Folding it into `failed` would surface one
+ * account's error to the next.
+ */
+export type JoinServerOutcome =
+  | { status: 'joined'; response: JoinServerResponse }
+  | { status: 'failed'; reason: string }
+  | { status: 'abandoned' };
+
 interface InviteState {
   invites: Record<string, ServerInviteWithCreator[]>; // keyed by serverId
   isLoading: boolean;
@@ -28,7 +50,7 @@ interface InviteState {
     opts?: CreateInviteRequest
   ) => Promise<ServerInviteWithCreator | null>;
   revokeInvite: (serverId: string, inviteId: string) => Promise<boolean>;
-  joinServer: (code: string) => Promise<JoinServerResponse | null>;
+  joinServer: (code: string) => Promise<JoinServerOutcome>;
   getInviteInfo: (code: string) => Promise<InviteInfoResponse | null>;
   clearInvites: () => void;
 }
@@ -176,6 +198,14 @@ export const useInviteStore = wrapStore(
           // started a join of their own, A still owns the sequence and would have
           // written its failure into B's store.
           const mayWriteJoinState = () => mySeq === joinSequence && isSameAuthLifecycle(lifecycle);
+          // A failure that lands AFTER the account changed is `abandoned`, not
+          // `failed` — the same rule the success path applies further down, and
+          // the reason it has to be applied here too is that a stale failure
+          // otherwise hands a reason to a caller belonging to a session that no
+          // longer exists. Symmetry is the point: the two halves disagreeing is
+          // how one account's error reaches the next one's screen.
+          const failure = (reason: string): JoinServerOutcome =>
+            isSameAuthLifecycle(lifecycle) ? { status: 'failed', reason } : { status: 'abandoned' };
           set({ isLoading: true, error: null });
           try {
             const res = await apiFetch('/api/v1/invites/join', {
@@ -183,9 +213,28 @@ export const useInviteStore = wrapStore(
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ code }),
             });
-            const data = await res.json();
+            // Parse DEFENSIVELY and never let a parse failure become user-facing
+            // text. `res.json()` on a non-JSON body — a Cloudflare 502, a WAF
+            // interstitial, an edge 429 — throws a SyntaxError whose message
+            // embeds a fragment of that body ("Unexpected token '<', \"<html>…").
+            // `InviteEmbed` renders the reason verbatim, so that fragment would
+            // reach the screen. Note `apiClient.safeJson` does NOT solve this:
+            // it embeds a 120-char body preview of its own.
+            //
+            // Only a string the SERVER authored is ever surfaced; anything else
+            // collapses to a fixed message (security review, PR #3353).
+            let data: unknown = null;
+            try {
+              data = await res.json();
+            } catch {
+              data = null;
+            }
+            const serverError =
+              typeof (data as { error?: unknown } | null)?.error === 'string'
+                ? (data as { error: string }).error
+                : null;
             if (!res.ok) {
-              throw new Error(data.error || 'Failed to join server');
+              throw new Error(serverError || 'Failed to join server');
             }
             const joined = data as JoinServerResponse;
             // `res.ok` says the request succeeded, not that the body is what we
@@ -196,7 +245,7 @@ export const useInviteStore = wrapStore(
             // failed join rather than repaired: there is no server to show.
             if (!isJoinedServerUsable(joined)) {
               if (mayWriteJoinState()) set({ error: 'Failed to join server', isLoading: false });
-              return null;
+              return failure('Failed to join server');
             }
             // DELIBERATELY `isSameAuthLifecycle` here and `mayWriteJoinState()`
             // above, and the two are NOT interchangeable — collapsing them into
@@ -216,9 +265,13 @@ export const useInviteStore = wrapStore(
               // happen server-side for the ORIGINAL user, so this is not an error
               // to surface to whoever is sitting here — drop the continuation and
               // let the new session's own fetchServers describe its membership.
-              // Touch nothing at all: a stale lifecycle can never write, so the
-              // successor session's own state is left exactly as it found it.
-              return null;
+              // Touch nothing ACCOUNT-scoped: a stale lifecycle can never write, so
+              // the successor session's own state is left as it found it. The
+              // shared spinner is a different question — it is operation-scoped,
+              // and leaving it pinned true would strand it for the rest of the
+              // session, so it is cleared under the sequence fence alone.
+              if (mySeq === joinSequence) set({ isLoading: false });
+              return { status: 'abandoned' };
             }
             // Reconciliation lives here, not in the callers: there are two call
             // sites (JoinServerModal and InviteEmbed) and one of them forgot,
@@ -236,21 +289,26 @@ export const useInviteStore = wrapStore(
               online_count: 0,
             });
             if (mayWriteJoinState()) set({ isLoading: false });
-            return joined;
+            return { status: 'joined', response: joined };
           } catch (error) {
-            if (mayWriteJoinState()) {
-              set({
-                error: error instanceof Error ? error.message : 'Failed to join server',
-                isLoading: false,
-              });
-            }
-            return null;
+            const reason = error instanceof Error ? error.message : 'Failed to join server';
+            // The shared field is still written, unchanged. Stating its status
+            // honestly rather than implying a consumer: after this PR it has NO
+            // production reader anywhere — `InviteEmbed` and `JoinServerModal`
+            // were the last two, and every other importer of this store
+            // subscribes only to actions. It is kept deliberately, as the store
+            // contract every other action here follows, and because dropping it
+            // would also retire `joinSequence`, whose only job is deciding who
+            // may write it. Retiring both is a separate, larger change than a
+            // review fix (code review, PR #3353).
+            if (mayWriteJoinState()) set({ error: reason, isLoading: false });
+            return failure(reason);
           }
         },
 
         getInviteInfo: async (code: string) => {
           try {
-            const res = await apiFetch(`/api/v1/invites/${code}`);
+            const res = await apiFetch(`/api/v1/invites/${encodeURIComponent(code)}`);
             if (!res.ok) {
               const data = await res.json();
               throw new Error(data.error || 'Invalid invite code');

@@ -206,6 +206,18 @@ export interface JoinServerResponse {
 }
 
 export interface InviteInfoResponse {
+  /**
+   * The invited server's id, for recognising an invite to a server the user is
+   * already in (#2372).
+   *
+   * Optional because a control plane predating that change omits it. Absent
+   * means "cannot tell", never "not a member" — the caller must fall through to
+   * offering Join and let the server's 409 be the authority.
+   *
+   * Present only on the AUTHENTICATED `GET /api/v1/invites/{code}`. The
+   * anonymous edge preview does not carry it and must not start.
+   */
+  server_id?: string;
   server_name: string;
   server_icon: string | null;
   server_banner: string | null;

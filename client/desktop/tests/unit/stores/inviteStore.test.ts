@@ -159,17 +159,20 @@ describe('inviteStore', () => {
         })
       );
       const result = await useInviteStore.getState().joinServer('CODE');
-      expect(result).not.toBeNull();
+      expect(result.status).toBe('joined');
       expect(useInviteStore.getState().isLoading).toBe(false);
     });
 
-    it('returns null on invalid code', async () => {
+    it('reports the server reason on an invalid code', async () => {
       server.use(
         http.post(`${API_BASE}/api/v1/invites/join`, () => {
           return HttpResponse.json({ error: 'Invalid or expired invite' }, { status: 404 });
         })
       );
-      expect(await useInviteStore.getState().joinServer('BAD')).toBeNull();
+      const outcome = await useInviteStore.getState().joinServer('BAD');
+      expect(outcome).toEqual({ status: 'failed', reason: 'Invalid or expired invite' });
+      // Still written to the shared field, unchanged — what changed is that the
+      // CALLER no longer has to read it back off shared state after its await.
       expect(useInviteStore.getState().error).toBe('Invalid or expired invite');
     });
   });
@@ -200,7 +203,7 @@ describe('inviteStore', () => {
 
       const result = await useInviteStore.getState().joinServer('CODE2363A');
 
-      expect(result).not.toBeNull();
+      expect(result.status).toBe('joined');
       const ids = useServerStore.getState().servers.map((s) => s.id);
       expect(
         ids,
@@ -283,7 +286,9 @@ describe('inviteStore', () => {
       releaseJoin();
       const result = await pending;
 
-      expect(result, 'a superseded join must not report success to the new session').toBeNull();
+      expect(result.status, 'a superseded join must not report success to the new session').toBe(
+        'abandoned'
+      );
       expect(
         useServerStore.getState().servers,
         "user A's join must not appear in user B's sidebar"
@@ -322,7 +327,7 @@ describe('inviteStore', () => {
       releaseJoin();
       const result = await pending;
 
-      expect(result, 'an ordinary rotation must not fail the join').not.toBeNull();
+      expect(result.status, 'an ordinary rotation must not fail the join').toBe('joined');
       expect(useServerStore.getState().servers.map((s) => s.id)).toContain(joinedServer.id);
     });
 
@@ -341,7 +346,7 @@ describe('inviteStore', () => {
 
       const result = await useInviteStore.getState().joinServer('CODE2363SHAPE');
 
-      expect(result, 'a malformed 200 must not read as a successful join').toBeNull();
+      expect(result.status, 'a malformed 200 must not read as a successful join').toBe('failed');
       expect(
         useServerStore.getState().servers,
         'no row may be written for a server that was never described'
@@ -363,7 +368,9 @@ describe('inviteStore', () => {
 
       const result = await useInviteStore.getState().joinServer('CODE2363NONAME');
 
-      expect(result, 'a row the renderer cannot render is not a successful join').toBeNull();
+      expect(result.status, 'a row the renderer cannot render is not a successful join').toBe(
+        'failed'
+      );
       expect(useServerStore.getState().servers).toEqual([]);
     });
 
@@ -378,7 +385,7 @@ describe('inviteStore', () => {
 
       const result = await useInviteStore.getState().joinServer('CODE2363ROLE');
 
-      expect(result).toBeNull();
+      expect(result.status).toBe('failed');
       expect(useServerStore.getState().servers).toEqual([]);
     });
 
@@ -426,6 +433,49 @@ describe('inviteStore', () => {
       expect(useInviteStore.getState().isLoading).toBe(false);
     });
 
+    // THE REGRESSION TEST for the cross-instance error race (Gitar, PR #3353).
+    //
+    // A chat can hold several invite cards, so two joins racing is ordinary, not
+    // exotic. `error` is ONE field owned by the newest join, so before the
+    // outcome type the older card read either the newer join's message or the
+    // `null` that join's own start wrote — and fell back to a generic expiry
+    // guess, which is exactly what reading the reason per call was meant to fix.
+    //
+    // Both codes fail, with DIFFERENT reasons, and the older one resolves LAST.
+    // Asserting each caller gets its own reason is the whole property; asserting
+    // only that A is non-null would pass against the shared read.
+    it('T3k: concurrent joins each get their OWN failure reason', async () => {
+      useAuthStore.getState().beginAuthLifecycle('token-a', 'session-a');
+      let releaseA: () => void = () => {};
+      const aInFlight = new Promise<void>((resolve) => {
+        releaseA = resolve;
+      });
+      server.use(
+        http.post(`${API_BASE}/api/v1/invites/join`, async ({ request }) => {
+          const body = (await request.json()) as { code: string };
+          if (body.code === 'CODE2363RA') {
+            await aInFlight;
+            return HttpResponse.json({ error: 'A expired' }, { status: 410 });
+          }
+          return HttpResponse.json({ error: 'B already a member' }, { status: 409 });
+        })
+      );
+
+      const aPending = useInviteStore.getState().joinServer('CODE2363RA');
+      const bPending = useInviteStore.getState().joinServer('CODE2363RB');
+
+      // B owns the sequence and settles first, writing the shared field.
+      const b = await bPending;
+      releaseA();
+      const a = await aPending;
+
+      expect(b).toEqual({ status: 'failed', reason: 'B already a member' });
+      expect(
+        a,
+        "the older card must report ITS OWN reason — reading the shared field here yields B's message, or the null B's start wrote"
+      ).toEqual({ status: 'failed', reason: 'A expired' });
+    });
+
     // joinSequence alone does not fence a stale ACCOUNT: with no successor join,
     // A still owns the sequence, so its failure would be written into B's store.
     // Both questions are asked on every write (CodeRabbit, round 9).
@@ -447,7 +497,10 @@ describe('inviteStore', () => {
       useAuthStore.getState().beginAuthLifecycle('token-b', 'session-b');
       releaseA();
 
-      expect(await pending).toBeNull();
+      expect(
+        (await pending).status,
+        "A's failure must be ABANDONED rather than failed: returning a reason to a caller whose session is gone is how one account's error reaches the next"
+      ).toBe('abandoned');
       expect(
         useInviteStore.getState().error,
         "A's failure must not surface to B, who never asked for anything"
@@ -464,7 +517,7 @@ describe('inviteStore', () => {
 
       const result = await useInviteStore.getState().joinServer('BADCODE2363');
 
-      expect(result).toBeNull();
+      expect(result.status).toBe('failed');
       expect(
         useServerStore.getState().servers,
         'serverStore.servers must remain empty after a failed join'

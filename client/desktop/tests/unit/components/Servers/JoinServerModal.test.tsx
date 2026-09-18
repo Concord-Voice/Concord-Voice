@@ -51,7 +51,7 @@ describe('JoinServerModal', () => {
       isLoading: false,
       error: null,
       getInviteInfo: vi.fn().mockResolvedValue(null),
-      joinServer: vi.fn().mockResolvedValue(null),
+      joinServer: vi.fn().mockResolvedValue({ status: 'failed', reason: 'Failed to join server' }),
     });
   });
 
@@ -201,7 +201,9 @@ describe('JoinServerModal', () => {
   });
 
   it('joins a previewed server and reports success', async () => {
-    const joinServer = vi.fn().mockResolvedValue({ server: joinedServer, role: 'member' });
+    const joinServer = vi
+      .fn()
+      .mockResolvedValue({ status: 'joined', response: { server: joinedServer, role: 'member' } });
     useInviteStore.setState({
       getInviteInfo: vi.fn().mockResolvedValue(validPreview),
       joinServer,
@@ -245,12 +247,16 @@ describe('JoinServerModal', () => {
     expect(mockOnClose).toHaveBeenCalled();
   });
 
-  it('shows the invite-store error when join fails', async () => {
+  // The reason now travels back on the OUTCOME. The shared `error` field is
+  // deliberately set to something DIFFERENT here: if the modal ever goes back to
+  // reading the store after its await, this test fails instead of passing on a
+  // value that happens to match (Gitar, PR #3353).
+  it('shows the reason the join returned, not the shared store field', async () => {
     useInviteStore.setState({
       getInviteInfo: vi.fn().mockResolvedValue(validPreview),
       joinServer: vi.fn().mockImplementation(async () => {
-        useInviteStore.setState({ error: 'Invite already used' });
-        return null;
+        useInviteStore.setState({ error: 'a DIFFERENT invite failed' });
+        return { status: 'failed', reason: 'Invite already used' };
       }),
     });
 
@@ -268,5 +274,143 @@ describe('JoinServerModal', () => {
     expect(screen.getByText('Invite already used')).toBeInTheDocument();
     expect(screen.getByText('Join Server')).toBeEnabled();
     expect(mockOnSuccess).not.toHaveBeenCalled();
+  });
+  // --- #2372 defect 3: already a member ---
+  //
+  // This modal is where `concord://invite/<code>` deep links land (App.tsx feeds
+  // them in as `initialCode`), so these cases cover the reporter's "shouldn't be
+  // allowed to join a server they're already a member of ... via the app:// link"
+  // half as well as manual entry.
+
+  const memberPreview = { ...validPreview, server_id: 'server-1' };
+
+  async function openWithPreview(preview: unknown, props = {}) {
+    useInviteStore.setState({ getInviteInfo: vi.fn().mockResolvedValue(preview) });
+    render(
+      <JoinServerModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} {...props} />
+    );
+    fireEvent.change(screen.getByPlaceholderText('AbCd1234'), { target: { value: 'ABCDEFGH' } });
+    await advancePreviewTimer();
+  }
+
+  it('refuses a code for a server the user is already in', async () => {
+    useServerStore.setState({ servers: [joinedServer] } as never);
+    await openWithPreview(memberPreview);
+
+    expect(screen.getByText(/already a member of Concord Test/i)).toBeInTheDocument();
+    expect(screen.getByText('Join Server')).toBeDisabled();
+  });
+
+  // The deep-link path, which is the half the reporter described. Same guard,
+  // reached by `initialCode` instead of typing.
+  it('refuses a deep-linked invite for a server the user is already in', async () => {
+    useServerStore.setState({ servers: [joinedServer] } as never);
+    useInviteStore.setState({ getInviteInfo: vi.fn().mockResolvedValue(memberPreview) });
+
+    render(
+      <JoinServerModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        initialCode="ABCDEFGH"
+      />
+    );
+    await advancePreviewTimer();
+
+    expect(screen.getByText(/already a member of Concord Test/i)).toBeInTheDocument();
+    expect(screen.getByText('Join Server')).toBeDisabled();
+  });
+
+  // The discriminator: identical fixture, membership list empty. Without it the
+  // pair above would pass against a component that disabled Join whenever a
+  // `server_id` was present at all.
+  it('still offers Join for a server the user is not in', async () => {
+    useServerStore.getState().clearServers();
+    await openWithPreview(memberPreview);
+
+    expect(screen.queryByText(/already a member/i)).not.toBeInTheDocument();
+    expect(screen.getByText('Join Server')).toBeEnabled();
+  });
+
+  // "Cannot tell" (a control plane predating #2372) must not read as "member" —
+  // that would disable Join on every invite against an older self-hosted server.
+  // The membership list is deliberately seeded so the case cannot pass merely
+  // because there was nothing to match against.
+  it('offers Join when the preview carries no server_id', async () => {
+    useServerStore.setState({ servers: [joinedServer] } as never);
+    await openWithPreview(validPreview);
+
+    expect(screen.queryByText(/already a member/i)).not.toBeInTheDocument();
+    expect(screen.getByText('Join Server')).toBeEnabled();
+  });
+  // A superseded lookup must write NOTHING. `getInviteInfo` is a plain await with
+  // no cancellation, so clearing the debounce timer only stops a request that has
+  // not started yet — the generation fence is the only thing standing between a
+  // slow first lookup and the preview the user is actually looking at. This PR
+  // raised the stakes: `alreadyMember` is derived from `preview.server_id`, so a
+  // stale row aims the membership guard at the wrong server (CodeRabbit, #3353).
+  it('ignores a preview for a code the user has already replaced', async () => {
+    const resolvers: Array<(info: unknown) => void> = [];
+    const getInviteInfo = vi
+      .fn()
+      .mockImplementation(() => new Promise((resolve) => resolvers.push(resolve)));
+    useInviteStore.setState({ getInviteInfo });
+
+    render(<JoinServerModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+    const input = screen.getByPlaceholderText('AbCd1234');
+
+    fireEvent.change(input, { target: { value: 'AAAAAAAA' } });
+    await advancePreviewTimer();
+    expect(getInviteInfo).toHaveBeenCalledWith('AAAAAAAA');
+
+    // Edited away, then a different complete code typed.
+    fireEvent.change(input, { target: { value: 'AAAAAAA' } });
+    fireEvent.change(input, { target: { value: 'BBBBBBBB' } });
+    await advancePreviewTimer();
+    expect(getInviteInfo).toHaveBeenCalledWith('BBBBBBBB');
+
+    // The SECOND request answers first; the abandoned first one lands after it.
+    await act(async () => {
+      resolvers[1]({ ...validPreview, server_name: 'Second Server' });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      resolvers[0]({ ...validPreview, server_name: 'First Server' });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.getByText('Second Server')).toBeInTheDocument();
+    expect(screen.queryByText('First Server')).not.toBeInTheDocument();
+  });
+
+  // The fence removes the only thing that used to stop the spinner on this path —
+  // the superseded request's own continuation, which cleared it on its way past.
+  // Without the accompanying else-branch clear the modal sits on "Looking up
+  // invite..." forever after a single backspace.
+  it('stops the lookup spinner when the code is edited back below full length', async () => {
+    let resolveLookup: ((info: unknown) => void) | undefined;
+    const getInviteInfo = vi
+      .fn()
+      .mockImplementation(() => new Promise((resolve) => (resolveLookup = resolve)));
+    useInviteStore.setState({ getInviteInfo });
+
+    render(<JoinServerModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />);
+    const input = screen.getByPlaceholderText('AbCd1234');
+
+    fireEvent.change(input, { target: { value: 'ABCDEFGH' } });
+    await advancePreviewTimer();
+    expect(screen.getByText('Looking up invite...')).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'ABCDEFG' } });
+    expect(screen.queryByText('Looking up invite...')).not.toBeInTheDocument();
+
+    // The abandoned request landing afterwards must revive neither the spinner
+    // nor the preview it was fetching.
+    await act(async () => {
+      resolveLookup?.(validPreview);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.queryByText('Looking up invite...')).not.toBeInTheDocument();
+    expect(screen.queryByText('Concord Test')).not.toBeInTheDocument();
   });
 });

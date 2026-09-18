@@ -6495,6 +6495,16 @@ paths:
               schema:
                 type: object
                 properties:
+                  server_id:
+                    type: string
+                    format: uuid
+                    description: >-
+                      The invited server's id, so an authenticated client can
+                      recognise an invite to a server it is already in and offer
+                      "Joined" rather than a Join that can only 409. Absent on a
+                      control plane predating this field; absent means "cannot
+                      tell", never "not a member". Deliberately NOT present on
+                      the anonymous /invites/{code}/preview response.
                   server_name:
                     type: string
                   server_icon:
