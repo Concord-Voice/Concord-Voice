@@ -466,6 +466,11 @@ func (c *mixedChannelPermissionChecker) HasChannelPermissionsUncached(context.Co
 	return true, nil
 }
 
+// TestChannelDeliverySecurityEventSetterIsRaceSafe pins two independent properties.
+// -race proves the setter is safe against concurrent probe completion; the emission
+// counter proves a transition still reaches the installed emitter. Neither subsumes
+// the other: a mutant that swaps the captured emitter for Discard survives -race and
+// fails the counter, while a mutex-less setter fails only under -race.
 func TestChannelDeliverySecurityEventSetterIsRaceSafe(t *testing.T) {
 	hub := NewHub(nil, nil)
 	emitter := &concurrentSecurityEventEmitter{}
@@ -494,6 +499,11 @@ func TestChannelDeliverySecurityEventSetterIsRaceSafe(t *testing.T) {
 	}()
 	close(start)
 	group.Wait()
+	// Emission is asynchronous: a transition hands the reserved first emission
+	// to a drain goroutine, so group.Wait only joins the probe drivers. Without
+	// this the counter races the drain and reads 0 (~0.5% locally, far more on
+	// a loaded CI shard).
+	requireSecurityEventDrain(t, hub)
 	require.Positive(t, emitter.emitted.Load())
 }
 
