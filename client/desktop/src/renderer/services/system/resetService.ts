@@ -49,6 +49,7 @@ import { savedGifsSyncService } from './savedGifsSync';
 import { friendOrgSyncService } from './friendOrgSync';
 import { presenceOverrideSyncService } from './presenceOverrideSync';
 import { clearFriendEligibilityCache } from './friendEligibility';
+import { clearMutualServersCache } from './mutualServers';
 import { stopExpirySweep } from './notificationPrefsService';
 import { useFriendOrgStore } from '../../stores/chat/friendOrgStore';
 import { useSavedGifsStore } from '../../stores/chat/savedGifsStore';
@@ -132,6 +133,12 @@ export function gracefulReset(opts?: { keepDeepLinks?: boolean }): void {
   // #1241: module-scope eligibility cache. Surviving logout would serve the
   // previous account's verdicts to the next user on a shared device.
   clearFriendEligibilityCache();
+  // #2372: same reasoning one module over. The mutual-servers probe caches
+  // which servers the viewer shares with each user, so surviving logout would
+  // grey the next account's invite picker against the previous account's
+  // memberships — and tell them, by omission, which servers the previous user
+  // was in.
+  clearMutualServersCache();
   useMemberStore.getState().clearMembers();
   useUnreadStore.getState().clearAll();
   useVoiceStore.getState().reset();

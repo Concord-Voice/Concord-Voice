@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Inviting someone to a server they are already in is greyed out** ([#2372](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2372)) — the
+  invite list offered every server you could invite to, including the ones the person you were
+  messaging had already joined, so the only way to find out was to send an invite they could not
+  use. Those now appear greyed and marked "already a member". In a group message a server is
+  greyed only when _everyone_ in the conversation is already there, since a server one person has
+  joined is still worth inviting the rest to. If the list cannot be checked — an older self-hosted
+  server, or a brief network problem — nothing is greyed and the invite works exactly as before.
 - **The invite button in a direct message lists every server you can invite to** ([#2372](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2372)) — opening
   a direct message and pressing the invite button showed only the server you had open before you
   navigated away, and often nothing at all, so inviting a friend to any other server was simply
@@ -183,6 +190,7 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   a pending choice and waits for you to press Apply; before, a single click went straight to a
   confirmation dialog, and the only sign of which duration was already in force was slightly
   bolder text.
+
 - **Expired messages now leave chats and pinned-message views together** ([#2196](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2196)) — Concord Voice removes eligible channel, direct-message, and group-DM messages in bounded five-minute sweeps, refreshes desktop pinned-message views when a purge arrives, and clears eligible expired messages during the startup restore preflight. This does not promise instant deletion or secure erasure for clients that were offline.
 - **The buttons during a call are grouped by what they do** ([#3204](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3204)) — the row along the
   bottom of a call had grown to eleven buttons of equal weight in a single line, with nothing to
@@ -329,12 +337,12 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
 - **A direct message containing a photo or a file now says so in your DM list, instead of reading "Encrypted message"** ([#2364](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2364)) — when
   someone sent you an image, a video or a document with no words attached, the conversation list
   showed "Encrypted message" rather than telling you what had arrived. It now reads
-  "Alexandra sent a Photo", and a file sent *with* a caption shows the caption followed by the
+  "Alexandra sent a Photo", and a file sent _with_ a caption shows the caption followed by the
   kind — "check this out · Photo" — so the words you were actually sent keep the space they
   deserve. The six kinds are Photo, GIF, Video, Audio file, Doc and File.
 
   Worth knowing why this looked fine to anyone testing it: it already worked in the conversation
-  you had open on screen. It was wrong everywhere you were *not* looking — every thread you had
+  you had open on screen. It was wrong everywhere you were _not_ looking — every thread you had
   not opened, and every thread after restarting the app — which is where a message list is most
   useful. The name shown is the sender's display name, shortened if it is very long so the kind
   of file never gets cut off, and it reads "You" for your own messages. That name is drawn a
@@ -444,6 +452,7 @@ Concord Voice now gives you clearer control over screen sharing, voice calls, an
   Concord's own pink accent carrying white text, which measures 2.68, is left alone deliberately:
   that is the brand's colour and changing it is a decision about how the app looks, not a defect
   to fix in passing.
+
 - **Server-enforced mutes look enforced again, and some hover highlights came back** ([#3270](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3270)) — when a
   moderator mutes or deafens someone, the marker on that person is meant to be amber, so you can
   tell at a glance that the server did it rather than they did. In the channel list, and in the
@@ -634,6 +643,7 @@ Voice now connects on networks that block UDP: Concord's servers were already of
 - **Picture-in-Picture voice windows now prove who they are** ([#3104](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3104)) — the private channel a PiP window uses to talk to the main window accepted instructions from any page loaded in the app and echoed every answer back to all of them. The desktop app now issues each PiP window its own one-time credential and gives it a private line, so nothing else in the app can listen in, ask for connection details, or hang up your call on your behalf.
 
 - **Calls no longer spend part of their setup on a route that cannot work** ([#3105](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3105)) — the media server told every client about a second, TCP-based way to reach it, and then held an open network connection point for that route on each call. No Concord server has ever accepted it: the door was never opened in the firewall, so the attempts were discarded in silence. Every call on every network paid for those attempts before settling on a route that works. Both the offer and the listener are now switched off unless an operator deliberately enables them. Nothing changes for people on networks that block the usual voice traffic — they keep connecting through the relay servers, which was already the route that worked.
+
 ### Fixed
 
 - **Server updates no longer cut your connection short** ([#3106](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3106)) — Concord's servers are updated many times a month, and each update restarted the part of the service that holds your connection. It was being given ten seconds to finish, while the work of closing everyone's connections tidily takes considerably longer, so it was cut off partway through every single time. Your app saw the connection vanish rather than close, showed "Reconnecting…", and if the gap ran long enough it tore down your voice call as collateral even though the voice server never restarted. The service is now given enough time to finish, and it stops accepting new connections a moment before it stops serving the ones it already has.
@@ -740,7 +750,7 @@ A large release. Attachments can finally be as big as your plan has been adverti
 ### Added
 
 - **Attachments can now actually be as large as your plan says** ([#2157](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2157)) — the size shown for your plan has been right for a while, but sending anything near it failed. Files were encrypted in one piece, and the layer in front of Concord refuses a single upload over 100 MB. Large files are now encrypted and sent in pieces, so the advertised size — up to 256 MiB — is reachable. An upload abandoned partway is now cleaned up rather than leaving the space consumed.
-- **You can choose who may send you a friend request** ([#2888](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2888), [#2911](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2911)) — Settings ▸ Privacy now offers *everyone*, *people I share a server with*, or *nobody*, and where you have chosen not to receive them the Send Friend Request button is not offered. Someone who tries anyway is told the same thing, in the same time, as they would be if you had blocked them or if you did not exist — so your setting cannot be worked out by testing against it.
+- **You can choose who may send you a friend request** ([#2888](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2888), [#2911](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2911)) — Settings ▸ Privacy now offers _everyone_, _people I share a server with_, or _nobody_, and where you have chosen not to receive them the Send Friend Request button is not offered. Someone who tries anyway is told the same thing, in the same time, as they would be if you had blocked them or if you did not exist — so your setting cannot be worked out by testing against it.
 - **Server roles can be reordered** ([#2359](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2359)) — Server Settings ▸ Roles can now be reordered by dragging, by keyboard, or from the toolbar, and the new order is committed with an explicit **Apply Order** rather than saving as you move. It works for anyone allowed to manage roles rather than only the server owner, and you can only move roles below your own highest one.
 
 ### Changed
@@ -992,15 +1002,18 @@ Activity History arrives: an opt-in, self-only record of your own voice and call
 Screen sharing was rebuilt around what viewers can actually see. Every participant can share at once, each stream carries its own volume and mute, and the server sends each viewer only the resolution their window needs. Video codec selection now learns from the live call whether hardware encoding is really being used.
 
 ### Added
+
 - **Everyone can share their screen at once** ([#2160](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2160), [#2185](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2185)) — concurrent screenshare limits were raised substantially, and a shared screen is sent at several qualities so each viewer receives the one that fits their window instead of everyone paying for the largest.
 - **Per-stream screenshare audio** ([#2169](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2169)) — each shared screen has its own volume slider and mute. Muting one stops the server sending you that audio at all, rather than silencing it locally.
 - **A voice tile view** ([#2177](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2177)) — participants fill the available space, and the view switch moved somewhere you can find it.
 - **Custom Status recipient exceptions** ([#2191](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2191)) — you can hide your Custom Status from specific people. The exception list is encrypted with your password-derived key, so the server enforces it without being able to read it.
 
 ### Changed
+
 - **Subscriptions expire on schedule** ([#2168](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2168)) — when a plan reaches the end of its period, entitlements return to the free tier automatically instead of waiting for the next sign-in.
 
 ### Fixed
+
 - **Hardware video encoding is detected from the live call** ([#2184](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2184), [#2189](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2189)) — the app probes what your machine can encode and then confirms it against the running call, so a codec that claims hardware support but silently falls back is demoted for the session.
 - **Voice survives a brief server blip on join** ([#2181](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2181)) — joining a call during a short interruption now retries instead of failing outright.
 - **Picture-in-picture windows close promptly when a call ends** ([#2215](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2215)) — leaving voice now releases each floating window's media immediately instead of leaving an always-on-top window visible while cleanup requests time out.
@@ -1012,6 +1025,7 @@ Screen sharing was rebuilt around what viewers can actually see. Every participa
 - **Follow-up fixes from the desktop notification work** ([#2167](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2167)) — remaining issues found while auditing the notification changes.
 
 ### Security
+
 - **Voice publishing is checked by the media server** ([#2140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2140)) — permission to speak or share is enforced where the media is actually accepted, not only in the interface.
 - **An empty server-supplied voice identity fails closed** ([#2152](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2152)) — following the change in 0.2.25, a blank authoritative name is used as-is rather than falling back to the name the client supplied.
 - **Channel video limits follow the server's plan, not the owner's** ([#2175](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/2175)) — per-room camera and screenshare limits are resolved from the server's own subscription, so a premium member or owner on a free server cannot raise the limits for that room.

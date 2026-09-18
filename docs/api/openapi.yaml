@@ -14536,6 +14536,76 @@ paths:
                         avatar_url:
                           type: string
                           nullable: true
+  /users/{user_id}/mutual-servers:
+    get:
+      tags:
+      - Users
+      summary: Servers the caller and this user are both in
+      description: >-
+        Returns the INTERSECTION of the caller's server memberships and the
+        target's, and nothing else. Every id in the response names a server the
+        caller is already a member of, and can therefore already read the member
+        list of — that scope is the privacy argument, not an implementation
+        detail. This is not a general "which servers is this user in" lookup and
+        must not become one.
+
+
+        An unknown user is answered with an empty list, NOT a 404. That is a
+        deliberate divergence from
+        `/users/{user_id}/friend-request-eligibility`, which does 404 there:
+        that endpoint has to resolve the user to answer at all, whereas this one
+        computes its answer from a join and needs no existence check, so adding
+        one would hand out a user-existence oracle for nothing. A caller cannot
+        distinguish "no such user" from "we share no servers".
+
+
+        Presentation only — the invite picker greys a server the person it is
+        about to invite is already in. `POST /invites/join` remains
+        authoritative and answers 409 for an existing member regardless.
+
+
+        Rate limit: 30 requests per minute. One picker open fans out over the
+        conversation's recipients and a group DM holds up to ten participants,
+        so a single open can legitimately cost nine requests.
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Shared server ids, possibly empty
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  server_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+        '400':
+          description: Malformed user id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: >-
+            Rate limit exceeded. Reachable in ordinary use, not only under
+            abuse: the 30/min budget above is consumed nine at a time by one
+            group-DM picker open, so roughly three cold opens a minute reach
+            it. Clients degrade open — grey nothing and retry on the next open
+            — rather than treating it as "no shared servers".
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /users/{user_id}/friend-request-eligibility:
     get:
       tags:

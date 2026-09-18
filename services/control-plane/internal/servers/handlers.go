@@ -1127,3 +1127,78 @@ func (h *Handler) disconnectServerAudience(ctx context.Context, members []uuid.U
 	}
 	h.log.Info("Server delete presence reconciled", "member_count", len(members))
 }
+
+// GetMutualServers returns the servers the caller and the named user are BOTH
+// members of (#2372).
+//
+// The invite picker reads it to grey a server the person it is about to invite
+// is already in. The intersection scope is the privacy argument and not an
+// implementation convenience: every id returned names a server the CALLER is
+// in, so the response discloses nothing they could not already read from that
+// server's own member list. This is not a general "which servers is X in"
+// lookup and must never become one — widening it past the caller's own
+// membership turns it into one.
+//
+// An unknown user yields an EMPTY list rather than a 404. The adjacent
+// /users/{id}/friend-request-eligibility route does answer 404 there, and this
+// divergence is deliberate rather than drift: that route has to look the user
+// up anyway, whereas this one computes its answer without an existence check,
+// so adding one would buy a user-existence oracle for nothing. Same
+// uniform-shape posture as the public invite preview.
+func (h *Handler) GetMutualServers(c *gin.Context) {
+	callerID := c.GetString("user_id")
+	targetID := c.Param("user_id")
+
+	// Validated before it reaches the driver: an unparseable id otherwise
+	// surfaces as a pq 22P02 whose message echoes the caller's string into the
+	// log (CWE-117, the shape observability.md principle 5 governs).
+	//
+	// The parsed value is USED rather than discarded, and that is what closes
+	// the gap: uuid.Parse is a parser, not a canonicality check. It also accepts
+	// `urn:uuid:<id>`, `{<id>}`, unhyphenated, and any case. Measured against
+	// this project's own Postgres 16: braces and the unhyphenated form are
+	// accepted by the uuid type and canonicalized, but `urn:uuid:` is REJECTED
+	// with 22P02 — so that one form passed this guard and produced exactly the
+	// driver error the guard exists to prevent. Re-serializing through
+	// parsed.String() means only the canonical form ever reaches the query.
+	parsedTarget, err := uuid.Parse(targetID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+	targetID = parsedTarget.String()
+
+	rows, err := h.db.QueryContext(c.Request.Context(), `
+		SELECT target.server_id
+		FROM server_members target
+		INNER JOIN server_members caller
+			ON caller.server_id = target.server_id AND caller.user_id = $1
+		WHERE target.user_id = $2
+	`, callerID, targetID)
+	if err != nil {
+		h.log.Error("Failed to query mutual servers", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
+		return
+	}
+	defer func() { _ = rows.Close() }()
+
+	// Non-nil so an empty result serializes as `[]` rather than `null` — the
+	// client iterates this field, where null is a runtime error and not an
+	// empty loop.
+	serverIDs := []string{}
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			h.log.Error("Failed to scan mutual server", "error", scanErr)
+			continue
+		}
+		serverIDs = append(serverIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		h.log.Error("Error iterating mutual servers", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetch})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"server_ids": serverIDs})
+}

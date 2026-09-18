@@ -1,5 +1,9 @@
+import { useMemo } from 'react';
 import { useServerStore } from '@/renderer/stores/chat/serverStore';
 import { usePermissionStore } from '@/renderer/stores/chat/permissionStore';
+import { useDMStore } from '@/renderer/stores/chat/dmStore';
+import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useMutualServersForAll } from '@/renderer/hooks/messaging/useMutualServers';
 import { INVITE, hasPermission, parsePermissions } from '@/renderer/utils/policy/permissions';
 import type { ServerWithRole } from '@/renderer/types/server';
 import ContextMenu from '@/renderer/components/ui/ContextMenu';
@@ -7,6 +11,8 @@ import './InviteServerPicker.css';
 
 interface InviteServerPickerProps {
   position?: { x: number; y: number };
+  /** The DM this invite is being composed in, used to resolve its recipients. */
+  conversationId?: string;
   onPick: (serverId: string) => void;
   onClose: () => void;
 }
@@ -55,11 +61,26 @@ function canInviteTo(
 
 export function InviteServerPicker({
   position = { x: 0, y: 0 },
+  conversationId,
   onPick,
   onClose,
 }: Readonly<InviteServerPickerProps>) {
   const servers = useServerStore((s) => s.servers);
   const hasServerPermission = usePermissionStore((s) => s.hasServerPermission);
+  const conversation = useDMStore((s) => s.conversations.find((c) => c.id === conversationId));
+  const myUserId = useUserStore((s) => s.user?.id);
+
+  // Everyone in the conversation except the sender. A group DM holds up to ten
+  // participants, so this is bounded at nine by the product, not by a guess.
+  const recipientIds = useMemo(
+    () =>
+      (conversation?.participants ?? [])
+        .map((participant) => participant.userId)
+        .filter((id) => id !== myUserId),
+    [conversation, myUserId]
+  );
+  const alreadyIn = useMutualServersForAll(recipientIds);
+
   const invitable = servers.filter((sv) => canInviteTo(sv, hasServerPermission));
 
   return (
@@ -68,9 +89,22 @@ export function InviteServerPicker({
         {invitable.length === 0 ? (
           <div className="invite-server-picker__empty">No servers you can invite to.</div>
         ) : (
-          invitable.map((sv) => (
-            <ContextMenu.Item key={sv.id} label={sv.name} onClick={() => onPick(sv.id)} />
-          ))
+          invitable.map((sv) => {
+            // Greyed, never removed. The server is still one the user can invite
+            // to; what has changed is that this particular recipient is already
+            // there. Hiding it would make the list silently differ per
+            // conversation with nothing to explain why, which is the confusion
+            // the whole picker defect was about.
+            const joined = alreadyIn.has(sv.id);
+            return (
+              <ContextMenu.Item
+                key={sv.id}
+                label={joined ? `${sv.name} — already a member` : sv.name}
+                ariaDisabled={joined}
+                onClick={() => onPick(sv.id)}
+              />
+            );
+          })
         )}
         <ContextMenu.Separator />
         <ContextMenu.Item label="Close" onClick={onClose} />

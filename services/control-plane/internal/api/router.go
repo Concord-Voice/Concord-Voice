@@ -1764,6 +1764,20 @@ func NewRouter(
 					friendsHandler.GetFriendRequestEligibility,
 				)
 
+				// Servers the caller and this user are BOTH in, for the invite
+				// picker's already-a-member greying (#2372).
+				//
+				// 30/min rather than the 10/min above because one picker open
+				// fans out over the conversation's recipients, and a group DM
+				// holds up to 10 participants — so a single open can legitimately
+				// cost 9 requests, which 10/min would exhaust immediately. The
+				// client caches per user for 5 minutes and dedupes in flight, so
+				// repeat opens cost nothing.
+				userRoutes.GET("/:user_id/mutual-servers",
+					middleware.RateLimitByUser(redis, 30, 1*time.Minute),
+					serversHandler.GetMutualServers,
+				)
+
 				// Encrypted user preferences (cross-device sync)
 				userRoutes.GET("/me/preferences",
 					middleware.RateLimitByUser(redis, 30, 1*time.Minute),

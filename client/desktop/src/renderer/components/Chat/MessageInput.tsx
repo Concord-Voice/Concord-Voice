@@ -1178,6 +1178,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 {invitePickerOpen && (
                   <InviteServerPicker
                     position={invitePickerPos}
+                    conversationId={conversationId}
                     onPick={handlePickInviteServer}
                     onClose={() => setInvitePickerOpen(false)}
                   />

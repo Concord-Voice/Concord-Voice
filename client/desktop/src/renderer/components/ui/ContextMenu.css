@@ -106,7 +106,7 @@
   color: var(--text-primary);
 }
 
-.ctx-menu-item:active:not(:disabled) {
+.ctx-menu-item:active:not(:disabled):not([aria-disabled='true']) {
   transform: scale(0.97);
 }
 

@@ -97,16 +97,44 @@ interface ItemProps {
   label: string;
   danger?: boolean;
   disabled?: boolean;
+  /**
+   * Inert, but still FOCUSABLE — `aria-disabled` rather than the native
+   * attribute, with the same greyed styling and the same activation guard.
+   *
+   * Use this, not `disabled`, when the item's LABEL is the only place a fact is
+   * stated ("Alpha — already a member"): a natively disabled button leaves the
+   * focus order and takes its label with it, so the explanation never reaches a
+   * keyboard or screen-reader user — which defeats greying an item rather than
+   * omitting it. Same swap, same reason, as the ScreenSharePicker toggle
+   * (#3198 PR 2).
+   *
+   * Keep `disabled` for a TRANSIENT busy state ("Updating…"), where there is no
+   * label to read and letting someone tab onto a control that does nothing is
+   * worse than removing it from the order.
+   */
+  ariaDisabled?: boolean;
   onClick: () => void;
   /** Show a chevron indicating a submenu */
   hasSubMenu?: boolean;
 }
 
-const Item: React.FC<ItemProps> = ({ icon, label, danger, disabled, onClick, hasSubMenu }) => (
+const Item: React.FC<ItemProps> = ({
+  icon,
+  label,
+  danger,
+  disabled,
+  ariaDisabled,
+  onClick,
+  hasSubMenu,
+}) => (
   <button
-    className={`ctx-menu-item ${danger ? 'ctx-menu-item-danger' : ''} ${disabled ? 'ctx-menu-item-disabled' : ''}`}
-    onClick={disabled ? undefined : onClick}
+    className={`ctx-menu-item ${danger ? 'ctx-menu-item-danger' : ''} ${disabled || ariaDisabled ? 'ctx-menu-item-disabled' : ''}`}
+    // Both forms block activation here, which is what covers pointer AND
+    // keyboard for the aria form: Enter and Space on a focused button dispatch
+    // a click, so the one guard is the whole story.
+    onClick={disabled || ariaDisabled ? undefined : onClick}
     disabled={disabled}
+    aria-disabled={ariaDisabled || undefined}
   >
     {icon != null && <span className="ctx-menu-item-icon">{icon}</span>}
     <span style={{ flex: 1 }}>{label}</span>
