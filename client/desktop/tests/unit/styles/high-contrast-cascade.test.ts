@@ -49,6 +49,27 @@ import { describe, expect, it } from 'vitest';
 const CSS_PATH = resolve(__dirname, '../../../src/renderer/styles/index.css');
 const css = readFileSync(CSS_PATH, 'utf-8');
 
+/**
+ * `css` with every comment removed, for the positional assertions below.
+ *
+ * Those tests ask where the last per-scheme BLOCK is, and answered it with
+ * `lastIndexOf("[data-scheme='")` over raw source — which cannot tell a selector from
+ * prose describing one. Any comment mentioning `[data-scheme='X']` anywhere below the
+ * HCM blocks reads as a scheme block declared after them and fails the test, and
+ * index.css already contained one such comment that passed only because it happened to
+ * sit ABOVE the HCM blocks. #2366 added a second one below them and turned that latent
+ * fragility into a red build, which is what surfaced this.
+ *
+ * Stripping comments shifts every index by the same amount, and all three assertions
+ * compare positions within this one string, so the relative ordering they actually care
+ * about is preserved exactly.
+ *
+ * Literal regex (not constructed from variables) — Semgrep's CWE-1333 ReDoS taint
+ * applies to dynamic RegExp construction, and the lazy quantifier is bounded by the
+ * closing delimiter.
+ */
+const cssCode = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
 const HCM_DARK_SELECTOR = "[data-high-contrast='true']";
 const HCM_LIGHT_SELECTOR = "[data-high-contrast='true'][data-theme='light']";
 
@@ -236,8 +257,8 @@ describe('High Contrast Mode cascade (#489)', () => {
     // by source order, silently defeating the toggle. This was the exact
     // failure mode during #489 development.
     it('dark HCM block source position is after the last [data-scheme=...] declaration', () => {
-      const hcmDarkPos = css.indexOf(`${HCM_DARK_SELECTOR} {`);
-      const lastSchemePos = css.lastIndexOf("[data-scheme='");
+      const hcmDarkPos = cssCode.indexOf(`${HCM_DARK_SELECTOR} {`);
+      const lastSchemePos = cssCode.lastIndexOf("[data-scheme='");
       expect(hcmDarkPos).toBeGreaterThan(-1);
       expect(lastSchemePos).toBeGreaterThan(-1);
       expect(
@@ -247,8 +268,8 @@ describe('High Contrast Mode cascade (#489)', () => {
     });
 
     it('light HCM compound block source position is after the last [data-scheme=...] declaration', () => {
-      const hcmLightPos = css.indexOf(`${HCM_LIGHT_SELECTOR} {`);
-      const lastSchemePos = css.lastIndexOf("[data-scheme='");
+      const hcmLightPos = cssCode.indexOf(`${HCM_LIGHT_SELECTOR} {`);
+      const lastSchemePos = cssCode.lastIndexOf("[data-scheme='");
       expect(hcmLightPos).toBeGreaterThan(-1);
       expect(lastSchemePos).toBeGreaterThan(-1);
       expect(
@@ -262,8 +283,8 @@ describe('High Contrast Mode cascade (#489)', () => {
       // specificity (0,2,0) than the base `[data-high-contrast='true']`
       // (0,1,0), but both blocks share token assignments. Source-order
       // discipline still matters for ergonomic editing — dark goes first.
-      const darkPos = css.indexOf(`${HCM_DARK_SELECTOR} {`);
-      const lightPos = css.indexOf(`${HCM_LIGHT_SELECTOR} {`);
+      const darkPos = cssCode.indexOf(`${HCM_DARK_SELECTOR} {`);
+      const lightPos = cssCode.indexOf(`${HCM_LIGHT_SELECTOR} {`);
       expect(darkPos).toBeGreaterThan(-1);
       expect(lightPos).toBeGreaterThan(-1);
       expect(lightPos).toBeGreaterThan(darkPos);

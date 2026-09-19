@@ -147,9 +147,15 @@ describe('design-token schema symmetry', () => {
     // declared) while leaving the new block unchecked. This assertion makes
     // that drift loud.
     //
+    // `:root` must be followed by `{` here, so this counts the BASE theme block and not
+    // #2366's `:root[data-appfont='opendyslexic']` rule, which is a single-property
+    // token override rather than a theme block. Counting it reported 33 blocks against
+    // a taxonomy that is 32 by construction — failing this guard while nothing had
+    // actually drifted. The sink's own coverage is asserted in the describe below.
+    //
     // Literal regex (not constructed from variables) — Semgrep CWE-1333
     // ReDoS taint applies only to dynamic RegExp construction.
-    const matches = css.match(/^(?::root|\[data-(?:scheme|theme)=)/gm);
+    const matches = css.match(/^(?::root\s*\{|\[data-(?:scheme|theme)=)/gm);
     expect(matches?.length).toBe(ALL_32_BLOCKS.length);
   });
 
@@ -170,5 +176,87 @@ describe('design-token schema symmetry', () => {
       const declared = body.includes(`${token}:`) || body.includes(`${token} :`);
       expect(declared).toBe(true);
     });
+  });
+});
+
+/**
+ * #2366 — the application-font sink must cover every font the picker offers.
+ *
+ * The defect this guards is the one #2366 fixed: a font id can exist in the picker, be
+ * typed, be selectable, write `appFont`, reach the DOM as `data-appfont` — and resolve
+ * to no CSS at all, so choosing it does nothing. Every layer above the CSS passes its
+ * own tests while the feature is dead.
+ *
+ * Both sides are read as TEXT rather than imported: `FONT_OPTIONS` is a module-local
+ * const in a .tsx that imports React and CSS, and pulling that in would buy a jsdom
+ * dependency to learn seven strings. Reading both sources also means drift in EITHER
+ * direction fails — a font added to the picker with no rule, and a rule left behind for
+ * a font the picker dropped.
+ *
+ * Note the two shapes, which are not an inconsistency. The body font is INHERITED, so
+ * `[data-appfont='<id>'] body` reaches every surface that inherits, and the controls
+ * that cannot inherit (`<input>`, `<select>`, `<textarea>`, `<button>`) say
+ * `font-family: inherit` — no token needed. The display font is NOT inherited; it is a
+ * token each surface opts into by name, so redirecting it means redefining the token at
+ * :root. Only OpenDyslexic does that.
+ *
+ * This is a source-parse check, not a rendering one. jsdom cannot resolve custom
+ * properties at all, so whether the :root override WINS its cascade is unanswerable
+ * here and is asserted in real Chromium by tests/e2e/design-tokens.spec.ts. Green here
+ * means the rules are present, never that they apply.
+ */
+describe('application-font sink (#2366)', () => {
+  const cssPath = resolve(__dirname, '../../../src/renderer/styles/index.css');
+  const css = readFileSync(cssPath, 'utf-8');
+  const pickerPath = resolve(
+    __dirname,
+    '../../../src/renderer/components/Settings/FontSection.tsx'
+  );
+  const picker = readFileSync(pickerPath, 'utf-8');
+
+  // Start at the `= [` rather than at the declaration, and end at a `];` that begins a
+  // line. The obvious `indexOf('];')` lands INSIDE the type annotation — which reads
+  // `{ id: AppearanceSettings['appFont']; … }` and so contains `];` before the array
+  // ever opens — leaving an empty slice, zero parsed ids, and every assertion below
+  // running against nothing. The guard below caught exactly that.
+  const optionsStart = picker.indexOf('const FONT_OPTIONS');
+  const arrayStart = picker.indexOf('= [', optionsStart);
+  const optionsEnd = picker.indexOf('\n];', arrayStart);
+  const pickerIds = [...picker.slice(arrayStart, optionsEnd).matchAll(/id: '([a-z]+)'/g)].map(
+    (m) => m[1]
+  );
+
+  it('the picker literal was located and parsed (guards a vacuous pass)', () => {
+    // Without this, a rename of FONT_OPTIONS would leave `pickerIds` empty and the
+    // assertions below would pass by iterating nothing.
+    expect(optionsStart).toBeGreaterThan(-1);
+    expect(pickerIds.length).toBeGreaterThan(1);
+    expect(pickerIds).toContain('default');
+  });
+
+  it('every non-default picker font has a body rule', () => {
+    const missing = pickerIds
+      .filter((id) => id !== 'default')
+      .filter((id) => !css.includes(`[data-appfont='${id}'] body`));
+    expect(missing).toEqual([]);
+  });
+
+  it("'default' deliberately has NO rule — the base body stack stands", () => {
+    expect(css).not.toContain("[data-appfont='default']");
+  });
+
+  it('Dyslexic Support is the one id that also claims the display stack', () => {
+    // The accommodation reaches headings, nav and brand surfaces; a mere preference
+    // does not. Asserting the NEGATIVE for the sibling ids is what makes this
+    // meaningful — without it the test passes on a sink that overrode the display
+    // stack for everything, which is a different feature (#2366's layered-font half).
+    //
+    // Reads each block's BODY rather than pattern-matching the declaration onto the
+    // opening brace, so declaration order cannot answer for declaration presence.
+    const displayOverrides = pickerIds.filter((id) => {
+      const body = extractBlockBody(css, `:root[data-appfont='${id}']`);
+      return body !== null && body.includes('--font-display-stack:');
+    });
+    expect(displayOverrides).toEqual(['opendyslexic']);
   });
 });

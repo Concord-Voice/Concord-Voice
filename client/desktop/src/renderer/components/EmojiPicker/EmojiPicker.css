@@ -35,12 +35,7 @@
      floor) yields today's 280px exactly; the full +15% (322px) arrives at
      any window >= 642px tall — monotonic, never worse than today. */
   --emoji-grid-height: min(322px, calc(100vh - 320px));
-  font-family:
-    'SourceSans',
-    -apple-system,
-    BlinkMacSystemFont,
-    'Segoe UI',
-    sans-serif;
+  font-family: inherit;
 }
 
 /* Popover mode: fixed position, portal-rendered */

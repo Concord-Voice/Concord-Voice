@@ -229,7 +229,7 @@
   background: var(--bg-tertiary);
   color: var(--text-primary);
   font-size: calc(12px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   cursor: pointer;
 }
 

@@ -52,14 +52,14 @@
 }
 
 .permission-label {
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .permission-description {
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(12px * var(--font-scale, 1));
   color: var(--text-secondary);
   line-height: 1.4;

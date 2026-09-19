@@ -120,7 +120,7 @@
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 600;
   color: var(--text-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
 }
 
 .server-tooltip-role {

@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Dyslexic Support now changes every piece of text, not just some of it** ([#2366](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2366)) — turning on
+  Dyslexic Support said it applied "across the app", but headings, the server and channel list
+  down the side, and the window title all kept the old lettering. Only ordinary body text
+  changed. Now every one of those follows it too, including on themes that bring their own
+  heading font.
+- **Choosing an app font now changes text boxes, buttons and menus as well** ([#2366](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2366)) — picking a
+  font under Appearance left a great deal of the app behind: anything you type into, every
+  button, the right-click menus, and most of Settings stayed in the original font. It was easy
+  to miss, because the font they were stuck on was the default one — so nothing looked wrong
+  until you picked something else. They all follow your choice now.
+
 - **Inviting someone to a server they are already in is greyed out** ([#2372](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2372)) — the
   invite list offered every server you could invite to, including the ones the person you were
   messaging had already joined, so the only way to find out was to send an invite they could not

@@ -121,7 +121,7 @@
   background: transparent;
   border: none;
   color: var(--text-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.25;
   padding: calc(8px * var(--sp, 1)) 0;

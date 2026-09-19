@@ -11,6 +11,10 @@
   border-radius: 4px;
   background: #fff;
   color: #3c4043;
+  /* DELIBERATELY NOT `var(--font-body-stack)` — do not "fix" this to match #2366's
+     sweep. Google's Sign-In branding guidelines mandate Roboto on the button, so this
+     face is a third-party brand requirement rather than an app-font oversight. It is
+     the one hardcoded family the #2366 token migration left in place. */
   font-family:
     'Roboto',
     system-ui,

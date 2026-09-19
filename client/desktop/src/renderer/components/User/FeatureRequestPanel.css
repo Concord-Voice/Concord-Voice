@@ -42,7 +42,7 @@
   border: 1px solid var(--border-color);
   border-radius: 6px;
   color: var(--text-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(14px * var(--font-scale, 1));
   padding: 8px 10px;
   box-sizing: border-box;
@@ -96,7 +96,7 @@
   background: var(--accent-fill);
   border: 1px solid var(--accent-primary);
   color: var(--on-accent);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(13px * var(--font-scale, 1));
   font-weight: 600;
   padding: 8px 18px;

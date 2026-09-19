@@ -238,7 +238,7 @@
   border: 1px solid var(--border-color);
   border-radius: 4px;
   color: var(--text-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(15px * var(--font-scale, 1));
   padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
   resize: vertical;
@@ -392,7 +392,7 @@
   border: none;
   color: var(--text-primary);
   font-size: calc(14px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   cursor: pointer;
   transition: background-color 0.15s ease;
   text-align: left;

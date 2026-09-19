@@ -35,7 +35,10 @@
   display: inline-block;
   padding: 1px 5px;
   font-size: calc(11px * var(--font-scale, 1));
-  font-family: 'SourceSans', monospace;
+  /* #2366: the `monospace` fallback was unreachable — SourceSans is the body face and
+     always loads, so this <kbd> has always rendered in body text. Tracks the app font
+     now; if it ever wants a real key look, that needs a mono face, not a fallback. */
+  font-family: inherit;
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   border-radius: 4px;

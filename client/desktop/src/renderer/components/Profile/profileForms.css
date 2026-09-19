@@ -101,7 +101,7 @@
   cursor: pointer;
   padding: 0;
   text-align: left;
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   transition: opacity 0.15s ease;
 }
 
@@ -160,7 +160,7 @@
   resize: vertical;
   min-height: 80px;
   max-height: 200px;
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   line-height: 1.5;
 }
 
@@ -208,7 +208,7 @@
   border-radius: 8px;
   color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   cursor: pointer;
   padding: 8px 12px;
   transition: all 0.15s ease;

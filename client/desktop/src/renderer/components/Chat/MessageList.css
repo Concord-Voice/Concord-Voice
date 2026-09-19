@@ -146,7 +146,7 @@
   padding: calc(10px * var(--sp, 1)) calc(20px * var(--sp, 1));
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   cursor: pointer;
   display: flex;
   align-items: center;

@@ -45,7 +45,7 @@
   padding: 2px 8px;
   background: transparent;
   color: var(--accent-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(11px * var(--font-scale, 1));
   font-weight: 600;
   cursor: pointer;
@@ -231,7 +231,7 @@
   background: var(--accent-fill);
   color: var(--on-accent);
   font-size: calc(13px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-weight: 500;
   cursor: pointer;
   transition: opacity 0.15s ease;
@@ -312,7 +312,7 @@
   background: transparent;
   color: var(--accent-primary);
   font-size: calc(12px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s ease;

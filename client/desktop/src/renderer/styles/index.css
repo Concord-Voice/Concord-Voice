@@ -1673,7 +1673,12 @@
   --font-display-stack: 'Atkinson Hyperlegible Next', 'Lato', system-ui, sans-serif;
   /* #1643: body font is applied via the data-appfont sink (SCHEME_FONTS → atkinson),
      not this token. Kept at the canonical default for design-token schema symmetry
-     (design-tokens.test.ts); --font-body-stack remains globally unconsumed. */
+     (design-tokens.test.ts). --font-body-stack has exactly ONE consumer
+     (CategoryManagerPanel.css); this line used to claim "globally unconsumed", which
+     was already off by one. #2366 deliberately did not wire it up either: overriding
+     `body` reaches every inheriting surface already, and routing the body font through
+     a :root-level token would put it in a source-order specificity tie with the theme
+     blocks for no gain. */
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
   --font-display-tracking: 0;
   --font-display-tracking-tight: -0.02em;
@@ -1735,7 +1740,12 @@
   --font-display-stack: 'Atkinson Hyperlegible Next', 'Lato', system-ui, sans-serif;
   /* #1643: body font is applied via the data-appfont sink (SCHEME_FONTS → atkinson),
      not this token. Kept at the canonical default for design-token schema symmetry
-     (design-tokens.test.ts); --font-body-stack remains globally unconsumed. */
+     (design-tokens.test.ts). --font-body-stack has exactly ONE consumer
+     (CategoryManagerPanel.css); this line used to claim "globally unconsumed", which
+     was already off by one. #2366 deliberately did not wire it up either: overriding
+     `body` reaches every inheriting surface already, and routing the body font through
+     a :root-level token would put it in a source-order specificity tie with the theme
+     blocks for no gain. */
   --font-body-stack: 'SourceSans', system-ui, sans-serif;
   --font-display-tracking: 0;
   --font-display-tracking-tight: -0.02em;
@@ -2407,10 +2417,17 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
 }
 
 /* Application-font override (Settings ▸ Appearance ▸ Fonts).
-   The body font is hardcoded (not token-driven — `--font-body-stack` is currently
-   an unconsumed token owned by the theme-font work in #1643), so override the body
-   font-family directly. `[data-appfont='…'] body` outranks the bare `body` rule by
-   specificity. Body/UI text only — brand/heading surfaces keep var(--font-display-stack).
+   The body font is set directly rather than through a token: `[data-appfont='…'] body`
+   is an attribute+type selector, so it outranks the bare `body` rule outright — no tie,
+   no source-order dependency. (`--font-body-stack` exists and has exactly one consumer,
+   CategoryManagerPanel.css; #2366 evaluated routing the body font through it and
+   declined, because a :root-level token override only buys a source-order tie with the
+   theme blocks. The two Agency-block comments above say the same thing — do not let
+   these three drift apart again, which is how this comment came to contradict them.)
+   Body text only — brand/heading surfaces keep var(--font-display-stack), with ONE
+   exception: #2366 gives OpenDyslexic the display stack as well, in the block at the
+   very end of this file. Everything that inherits follows body automatically; the
+   controls that cannot inherit say `font-family: inherit` in their own CSS.
    `data-appfont` reflects the RESOLVED font (utils/ui/effectiveFont.ts); 'default' has no
    rule, so the base body stack stands. Self-hosted faces only (no CDN). See
    [internal]specs/2026-06-18-1642-appearance-fonts-foundation-design.md §3.5. */
@@ -2440,4 +2457,47 @@ a[target='_blank']:not(.update-security-banner__cta):hover {
 }
 [data-appfont='atkinson'] body {
   font-family: 'Atkinson Hyperlegible Next', 'SourceSans', sans-serif;
+}
+
+/* #2366(b) — Dyslexic Support is the one font id that also claims the DISPLAY stack.
+
+   An accommodation is not a brand preference. `resolveEffectiveFont` already says so:
+   Dyslexic Support is its top layer and overrides both an explicit pick and a
+   theme-bundled font. That authority stopped at the CSS boundary, where all seven ids
+   collapsed into the body-only rules above — so headings, the server/channel nav and
+   the titlebar, which read `--font-display-stack`, kept rendering in the brand face.
+   Those are the surfaces the reporter named.
+
+   Why this one rule is token-shaped while the rules above target `body`: the body font
+   is inherited, so overriding `body` reaches everything that inherits and the handful
+   of controls that cannot (`<input>`, `<select>`, `<textarea>`, `<button>` do not
+   inherit font-family by UA default) say `font-family: inherit`. The display font is
+   NOT inherited from anywhere — it is a token each surface opts into by name — so the
+   only way to redirect it is to redefine the token.
+
+   SPECIFICITY, MEASURED. That makes this the one place a tie is unavoidable:
+   `:root[data-appfont='opendyslexic']` is (0,2,0), which merely TIES with the strongest
+   theme block `[data-scheme='…'][data-theme='light']` and wins on source order, so this
+   rule MUST stay at the end of the file. Demoting it to a bare `[data-appfont='…']`
+   (0,1,0) fails agency-light and concord-light in Chromium while BOTH dark cases still
+   PASS — the dark blocks are single-attribute and only tie. The weaker selector does
+   not break the feature, it breaks 16 of 32 theme/mode combinations and every survivor
+   is dark, so a screenshot of the default theme would show a perfect fix.
+   `tests/e2e/design-tokens.spec.ts` asserts all four in real Chromium; jsdom returns ''
+   for every custom property, so Vitest structurally cannot make that assertion.
+
+   Keyed on the RESOLVED id rather than on `dyslexicSupport`, so choosing OpenDyslexic
+   from the Appearance picker goes global too. The sink carries the resolved font and
+   not its provenance, and separating them would need a second DOM write for fonts,
+   which `[internal]rules/frontend.md` forbids. It is also the better behaviour — nobody
+   picks OpenDyslexic and wants Droidiga headings.
+
+   This DOES replace Agency's bundled `Atkinson Hyperlegible Next` display face, the one
+   scheme whose value diverges (30 blocks are 'Droidiga', Agency's 2 are not). Correct,
+   not collateral: accessibility outranks branding, mirroring the resolver's own order.
+
+   Layered assignment for the OTHER ids — a pick driving headings and body
+   independently — is the feature half of #2366 and ships separately. */
+:root[data-appfont='opendyslexic'] {
+  --font-display-stack: 'OpenDyslexic', 'SourceSans', sans-serif;
 }

@@ -91,7 +91,7 @@
   background: none;
   color: var(--text-secondary);
   font-size: calc(13px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   cursor: pointer;
   border-radius: 4px;
   transition:

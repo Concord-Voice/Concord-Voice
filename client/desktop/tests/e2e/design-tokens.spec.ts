@@ -219,3 +219,116 @@ test(
     expect(parseFloat(sizes.lg), `lg resolved to ${sizes.lg}`).toBeCloseTo(28.2, 1); // 24 × 1.175
   }
 );
+
+// ---------------------------------------------------------------------------
+// Dyslexic Support reaches the display stack — cascade verification (#2366)
+// ---------------------------------------------------------------------------
+
+/**
+ * The assertion Vitest structurally cannot make.
+ *
+ * `tests/unit/styles/design-tokens.test.ts` proves the sink's rules are PRESENT in
+ * source; jsdom returns '' for every custom property regardless of what is declared, so
+ * it can never prove one WINS. That distinction is the whole risk in this one rule.
+ *
+ * #2366 leaves the five other font ids on their original `[data-appfont='<id>'] body`
+ * rules, which are attribute+type selectors that outrank the bare `body` rule outright
+ * — no tie, nothing to verify at runtime. OpenDyslexic additionally redefines
+ * `--font-display-stack`, and that is the one rule that MUST live at :root, because the
+ * display font is a token each surface opts into by name rather than something
+ * inherited. At :root it is (0,2,0), which merely TIES with
+ * `[data-scheme='…'][data-theme='light']` and wins on source order alone.
+ *
+ * `agency-light` is the deliberate worst case on both axes: a two-attribute block, and
+ * the ONLY scheme whose `--font-display-stack` diverges from the other 30 (Atkinson
+ * Hyperlegible Next rather than Droidiga), so a sink that failed to win resolves to a
+ * real, plausible, wrong font rather than to an empty string.
+ */
+const FONT_CASCADE_CASES = [
+  { scheme: 'agency', theme: 'light', label: 'agency-light' },
+  { scheme: 'agency', theme: null as string | null, label: 'agency-dark' },
+  { scheme: 'concord', theme: 'light', label: 'concord-light' },
+  { scheme: 'concord', theme: null as string | null, label: 'concord-dark' },
+] as const;
+
+async function applyFontContext(
+  page: import('@playwright/test').Page,
+  scheme: string,
+  theme: string | null,
+  appfont: string | null
+): Promise<void> {
+  await page.evaluate(
+    ({ s, t, f }) => {
+      const root = document.documentElement;
+      root.setAttribute('data-scheme', s);
+      if (t === null) root.removeAttribute('data-theme');
+      else root.setAttribute('data-theme', t);
+      if (f === null) delete root.dataset.appfont;
+      else root.dataset.appfont = f;
+    },
+    { s: scheme, t: theme, f: appfont }
+  );
+}
+
+const readDisplayStack = (page: import('@playwright/test').Page) =>
+  page.evaluate(() =>
+    getComputedStyle(document.documentElement).getPropertyValue('--font-display-stack').trim()
+  );
+
+/** The rendered body font — the inherited half, asserted as an OUTCOME not a token. */
+const readBodyFont = (page: import('@playwright/test').Page) =>
+  page.evaluate(() => getComputedStyle(document.body).fontFamily);
+
+for (const combo of FONT_CASCADE_CASES) {
+  test(
+    `Dyslexic Support reaches the display stack in ${combo.label} (#2366)`,
+    { tag: '@renderer-only' },
+    async ({ page }) => {
+      await page.goto('/');
+      await applyFontContext(page, combo.scheme, combo.theme, 'opendyslexic');
+
+      // The half that was already working: `[data-appfont] body` sets the body font,
+      // and everything that inherits follows it.
+      expect(await readBodyFont(page), `body font in ${combo.label}`).toContain('OpenDyslexic');
+
+      // The half #2366 adds: headings, the server/channel nav and the titlebar read the
+      // DISPLAY stack, so an accommodation that stopped at body left them in the brand
+      // face. This is the assertion that fails if the :root rule loses its cascade tie.
+      expect(await readDisplayStack(page), `display stack in ${combo.label}`).toContain(
+        'OpenDyslexic'
+      );
+    }
+  );
+}
+
+test(
+  'an ordinary font pick moves BODY only, leaving the display face alone (#2366)',
+  { tag: '@renderer-only' },
+  async ({ page }) => {
+    // The distinguishing control. Without it the tests above pass just as well on a
+    // sink that overrode the display stack for EVERY font id — a different feature
+    // (#2366's layered-assignment half). This is what makes "Dyslexic Support is the
+    // one id that goes global" tellable apart from "all fonts go global".
+    await page.goto('/');
+    await applyFontContext(page, 'concord', 'light', 'inter');
+
+    expect(await readBodyFont(page)).toContain('Inter');
+
+    const display = await readDisplayStack(page);
+    expect(display).toContain('Droidiga');
+    expect(display).not.toContain('Inter');
+  }
+);
+
+test(
+  "'default' leaves the theme's own display face standing (#2366)",
+  { tag: '@renderer-only' },
+  async ({ page }) => {
+    // 'default' is the "no explicit pick" sentinel and deliberately has no rule, so
+    // Agency keeps its bundled display face rather than falling back to Droidiga.
+    await page.goto('/');
+    await applyFontContext(page, 'agency', 'light', null);
+
+    expect(await readDisplayStack(page)).toContain('Atkinson');
+  }
+);

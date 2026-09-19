@@ -96,7 +96,7 @@
   border-radius: 6px;
   color: var(--text-primary);
   font-size: calc(13px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   padding: 8px 10px;
   cursor: pointer;
   transition: border-color 0.15s ease;

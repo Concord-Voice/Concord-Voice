@@ -50,7 +50,7 @@
      contrast-pairs guard (#3285). The allowlist is explicitly "a frozen
      inventory, not an approval", so a new control does not earn a line in it. */
   color: var(--text-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   font-size: calc(14px * var(--font-scale, 1));
   white-space: nowrap;
 }

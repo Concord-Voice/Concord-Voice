@@ -4,7 +4,7 @@
   font-size: calc(14px * var(--font-scale, 1));
   font-weight: 600;
   color: var(--text-primary);
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

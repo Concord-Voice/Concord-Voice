@@ -34,7 +34,7 @@
   border-radius: 8px;
   color: var(--text-primary);
   font-size: calc(15px * var(--font-scale, 1));
-  font-family: 'SourceSans', sans-serif;
+  font-family: inherit;
   transition: all 0.2s ease;
 }
 
