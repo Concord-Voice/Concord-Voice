@@ -91,17 +91,43 @@ const (
 	ReasonInvalidCredentials ReasonCode = "invalid_credentials"
 	ReasonAccountLocked      ReasonCode = "account_locked"
 	ReasonAccountDisabled    ReasonCode = "account_disabled"
-	ReasonChallengeRequired  ReasonCode = "challenge_required"
-	ReasonChallengeVerified  ReasonCode = "challenge_verified"
-	ReasonChallengeInvalid   ReasonCode = "challenge_invalid"
-	ReasonChallengeExpired   ReasonCode = "challenge_expired"
-	ReasonChallengeLocked    ReasonCode = "challenge_locked"
-	ReasonFactorEnabled      ReasonCode = "factor_enabled"
-	ReasonFactorDisabled     ReasonCode = "factor_disabled"
-	ReasonRecoveryVerified   ReasonCode = "recovery_verified"
-	ReasonRecoveryReset      ReasonCode = "recovery_reset"
-	ReasonRefreshRotated     ReasonCode = "refresh_rotated"
-	ReasonRefreshReplay      ReasonCode = "refresh_replay"
+	// ReasonIdentityClaimMalformed: an HMAC-VALID token carried a `user_id`
+	// claim that is not a parseable uuid (#3362). It is separated from
+	// ReasonInvalidCredentials because the two have incomparable causes: a bad
+	// password is routine and arrives thousands of times an hour, whereas this
+	// condition cannot be produced by any client — every mint path copies the id
+	// from a `uuid` column or uuid.New(), and the token must already carry a
+	// valid signature. Its only causes are a compromised signing secret or a
+	// regressed mint path, both incidents. Folded into the generic bucket it was
+	// unobservable; before #3362 it at least surfaced (wrongly) as a HIGH
+	// dependency event when PostgreSQL rejected the cast.
+	//
+	// Carries no dimension and never reaches the wire — the response body stays
+	// the generic authError. It is zero-leak by construction: every field of a
+	// Nightwatch verdict is selected from this closed constant set, never copied
+	// from the request.
+	ReasonIdentityClaimMalformed ReasonCode = "identity_claim_malformed"
+	// ReasonIdentityClaimNonCanonical: the `user_id` claim parsed but was not
+	// already in canonical spelling, so AuthRequired normalized it (#3362). The
+	// request is ADMITTED — this is not a denial.
+	//
+	// It exists because normalize-rather-than-reject has a cost the decision
+	// itself hides: a mint path that starts emitting a non-canonical spelling
+	// works correctly forever and reports nothing, so the defect class #3362
+	// closes would become undetectable rather than merely harmless. This is the
+	// witness that the provenance property still holds.
+	ReasonIdentityClaimNonCanonical ReasonCode = "identity_claim_non_canonical"
+	ReasonChallengeRequired         ReasonCode = "challenge_required"
+	ReasonChallengeVerified         ReasonCode = "challenge_verified"
+	ReasonChallengeInvalid          ReasonCode = "challenge_invalid"
+	ReasonChallengeExpired          ReasonCode = "challenge_expired"
+	ReasonChallengeLocked           ReasonCode = "challenge_locked"
+	ReasonFactorEnabled             ReasonCode = "factor_enabled"
+	ReasonFactorDisabled            ReasonCode = "factor_disabled"
+	ReasonRecoveryVerified          ReasonCode = "recovery_verified"
+	ReasonRecoveryReset             ReasonCode = "recovery_reset"
+	ReasonRefreshRotated            ReasonCode = "refresh_rotated"
+	ReasonRefreshReplay             ReasonCode = "refresh_replay"
 	// #nosec G101 -- public schema enum, not a credential.
 	ReasonTokenTheftSuspected                ReasonCode = "token_theft_suspected"
 	ReasonSessionRevoked                     ReasonCode = "session_revoked"
@@ -747,7 +773,7 @@ var outcomes = set(OutcomeSuccess, OutcomeFailure, OutcomeDenied, OutcomeDegrade
 var severities = set(SeverityInformational, SeverityLow, SeverityMedium, SeverityHigh, SeverityCritical)
 var authMethods = set(AuthPassword, AuthWebAuthn, AuthTOTP, AuthBackupCode, AuthSSO, AuthRecovery, AuthSession)
 var routes = set(RouteAuthLogin, RouteAuthRefresh, RouteAuthLogout, RouteAuthMFAVerify, RouteRecoveryVerifyCode, RouteRecoveryResetPassword, RouteRecoveryResetAccount, RouteSessionDelete, RouteSessionsRevokeAll, RouteSessionsRevocationMode, RouteServerMemberPatch, RouteServerMemberDelete, RouteServerBanCreate, RouteServerBanDelete, RouteServerRoleCreate, RouteServerRolePatch, RouteServerRoleDelete, RouteServerMemberRoleCreate, RouteServerMemberRoleDelete, RouteServerTransferOwnership, RouteServerTransferOwnershipOK, RouteSocketJoin, RouteSocketProduce, RouteSocketConsume, RouteSocketPermissionsUpdate, RouteSocketForceDisconnect)
-var reasons = set(ReasonAuthenticationSucceeded, ReasonInvalidCredentials, ReasonAccountLocked, ReasonAccountDisabled, ReasonChallengeRequired, ReasonChallengeVerified, ReasonChallengeInvalid, ReasonChallengeExpired, ReasonChallengeLocked, ReasonFactorEnabled, ReasonFactorDisabled, ReasonRecoveryVerified, ReasonRecoveryReset, ReasonRefreshRotated, ReasonRefreshReplay, ReasonTokenTheftSuspected, ReasonSessionRevoked, ReasonSessionsRevoked, ReasonRevocationModeChanged, ReasonCredentialEpochMismatch, ReasonCredentialEpochOperationInProgress, ReasonCredentialEpochBackendUnavailable, ReasonRateLimitExceeded, ReasonRateLimitBackendUnavailable, ReasonSourceBanned, ReasonSourceBanCreated, ReasonCloudflareAccessDenied, ReasonAttestationRejected, ReasonAttestationIssued, ReasonAttestationCacheDegraded, ReasonAuditCommitted, ReasonAuditWriteFailed, ReasonPrivilegedRouteDenied, ReasonOriginRejected, ReasonAdmissionRejected, ReasonAdmissionGateInactive, ReasonSocketRateLimited, ReasonSocketHandlerFailed, ReasonRoomClaimConflict, ReasonAuthorizationDenied, ReasonAuthorizationRevoked, ReasonIdentityAuthorityMismatch, ReasonIdentityAuthorityMissing, ReasonCryptoVersionInvalid, ReasonPermissionDenied, ReasonRevocationEnforced, ReasonStructuralLimitExceeded, ReasonMediaSchemaRejected, ReasonDependencyUnavailable, ReasonDependencyRecovered, ReasonSignedTelemetryRejected, ReasonDiskWatermark, ReasonWriterValidationDrop, ReasonWriterBudgetDrop, ReasonWriterWriteFailed, ReasonWriterRecovered, ReasonWriterSizeRefused)
+var reasons = set(ReasonAuthenticationSucceeded, ReasonInvalidCredentials, ReasonAccountLocked, ReasonAccountDisabled, ReasonIdentityClaimMalformed, ReasonIdentityClaimNonCanonical, ReasonChallengeRequired, ReasonChallengeVerified, ReasonChallengeInvalid, ReasonChallengeExpired, ReasonChallengeLocked, ReasonFactorEnabled, ReasonFactorDisabled, ReasonRecoveryVerified, ReasonRecoveryReset, ReasonRefreshRotated, ReasonRefreshReplay, ReasonTokenTheftSuspected, ReasonSessionRevoked, ReasonSessionsRevoked, ReasonRevocationModeChanged, ReasonCredentialEpochMismatch, ReasonCredentialEpochOperationInProgress, ReasonCredentialEpochBackendUnavailable, ReasonRateLimitExceeded, ReasonRateLimitBackendUnavailable, ReasonSourceBanned, ReasonSourceBanCreated, ReasonCloudflareAccessDenied, ReasonAttestationRejected, ReasonAttestationIssued, ReasonAttestationCacheDegraded, ReasonAuditCommitted, ReasonAuditWriteFailed, ReasonPrivilegedRouteDenied, ReasonOriginRejected, ReasonAdmissionRejected, ReasonAdmissionGateInactive, ReasonSocketRateLimited, ReasonSocketHandlerFailed, ReasonRoomClaimConflict, ReasonAuthorizationDenied, ReasonAuthorizationRevoked, ReasonIdentityAuthorityMismatch, ReasonIdentityAuthorityMissing, ReasonCryptoVersionInvalid, ReasonPermissionDenied, ReasonRevocationEnforced, ReasonStructuralLimitExceeded, ReasonMediaSchemaRejected, ReasonDependencyUnavailable, ReasonDependencyRecovered, ReasonSignedTelemetryRejected, ReasonDiskWatermark, ReasonWriterValidationDrop, ReasonWriterBudgetDrop, ReasonWriterWriteFailed, ReasonWriterRecovered, ReasonWriterSizeRefused)
 var writerOwnedReasonSet = set(ReasonWriterValidationDrop, ReasonWriterBudgetDrop, ReasonWriterWriteFailed, ReasonWriterRecovered, ReasonWriterSizeRefused)
 
 func set[T comparable](values ...T) map[T]struct{} {

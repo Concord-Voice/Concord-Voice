@@ -1645,7 +1645,12 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 
 	// Credential-epoch fence (#2201): publish the blocked marker before the
 	// rotating transaction. Fail closed if the fence is unwired.
-	fenceOp, fenceOK := h.beginCredentialFence(c, uid, errMsgFailedChangePassword)
+	// parsedUID.String(), never the raw `uid` (#3362): uuid.Parse above is a
+	// PARSER, not a canonicality check — it accepts braced / UPPERCASE /
+	// dash-less / urn spellings — and this value is concatenated into the
+	// fence's Redis key. AuthRequired now canonicalizes, so the two agree; using
+	// the parsed value keeps them agreeing without depending on that.
+	fenceOp, fenceOK := h.beginCredentialFence(c, parsedUID.String(), errMsgFailedChangePassword)
 	if !fenceOK {
 		return
 	}
@@ -1685,7 +1690,11 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	if req.SyncDomains != nil {
 		resp["sync_domain_versions"] = outcome.domainVersions
 	}
-	h.appendContinuationPair(c, resp, uid, fenceOp.NewEpochValue())
+	// parsedUID.String() (#3362): this MINTS a new token pair, so the raw `uid`
+	// would re-mint a non-canonical spelling as another one rather than
+	// normalizing it away — the one live self-propagation path. The sibling call
+	// site in ReplaceKeys already passes senderID.String().
+	h.appendContinuationPair(c, resp, parsedUID.String(), fenceOp.NewEpochValue())
 
 	h.log.Info("Password changed with key re-wrap", "user_id", userID)
 	c.JSON(http.StatusOK, resp)

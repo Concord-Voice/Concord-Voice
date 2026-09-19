@@ -3,6 +3,7 @@ import { createHash, createHmac } from 'node:crypto';
 import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
 import { logger } from '../lib/logger.js';
+import { isCanonicalEnforcementUUID } from '../lib/enforcementCommand.js';
 import type { SecurityEventInput } from '../lib/securityEvent.js';
 import type { TokenBucket } from '../lib/rateLimit.js';
 
@@ -120,6 +121,47 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
           socketId: socket.id,
         });
         return next(new Error('Invalid token: missing user_id'));
+      }
+
+      // A participant is keyed in the room by this exact string
+      // (`roomManager.participants.set(userId, …)`), while the mid-session
+      // enforcement rail refuses to act on anything `isCanonicalEnforcementUUID`
+      // rejects (`enforcePermissions.ts`). Admitting a spelling that predicate
+      // refuses therefore seats a participant NOTHING the control plane can
+      // emit is able to address — no kick, no mute, no permission revocation —
+      // which is an enforcement bypass rather than a cosmetic mismatch.
+      //
+      // This is the media plane's half of #3362. The control plane canonicalizes
+      // at its admission choke point, but it is not this service's choke point:
+      // the media plane verifies the SAME token itself and never passes through
+      // AuthRequired, so the invariant has to be re-established here.
+      //
+      // REFUSE rather than normalize, which is the opposite of the control
+      // plane's choice and deliberate: normalizing needs a UUID parser this
+      // service does not depend on, and hand-rolling one in an auth path to
+      // re-derive what PostgreSQL and google/uuid already agree on is how a
+      // subtle acceptance difference gets introduced. Reusing the enforcement
+      // rail's own predicate makes the invariant provable instead — if you are
+      // in the participants map, enforcement can reach you — and it is the same
+      // function on both ends, so the two cannot drift.
+      //
+      // Accepted asymmetry: a token the control plane would admit by
+      // normalizing is refused here. No mint path emits such a token (every one
+      // copies from a `uuid` column or uuid.New()), so producing one requires
+      // the signing secret, and a holder of that has better options than a
+      // voice socket.
+      if (!isCanonicalEnforcementUUID(decoded.user_id)) {
+        deny();
+        logger.warn('Socket connection rejected: non-canonical user_id in token', {
+          socketId: socket.id,
+        });
+        // Its OWN message, not the missing-claim one above. Sharing that string
+        // would make `rejects token missing user_id claim` pass off THIS branch
+        // if the presence check were ever deleted — the shadowed-assertion
+        // vacuity in `[internal]rules/tests.md`. The claim is chosen by whoever
+        // signed the token, never by a victim, so there is no indistinguishability
+        // requirement here of the kind the control plane's 401 body protects.
+        return next(new Error('Invalid token: non-canonical user_id'));
       }
 
       // Attach authenticated user data to socket

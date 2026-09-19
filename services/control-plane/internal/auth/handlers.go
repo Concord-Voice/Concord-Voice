@@ -3216,7 +3216,13 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 			[]interface{}{claims.UserID, recKey, recSalt, recPrefsKey, recPrefsSalt}, "Failed to upsert recovery key"}
 	}
 
-	fenceOp, ok := h.beginRecoveryFence(c, claims.UserID, recoveryUsedKey, errFailedResetPwd)
+	// senderID.String(), never the raw claim (#3362). credepoch.Begin builds
+	// Key(userID) INTERNALLY, so this is a key-builder call site that no grep for
+	// `credepoch.Key(` reveals — and the recovery routes are UNAUTHENTICATED, so
+	// AuthRequired's canonicalization structurally cannot reach them. This rail
+	// states the invariant itself. senderID is the already-parsed uuid from
+	// parseRecoverySenderID above.
+	fenceOp, ok := h.beginRecoveryFence(c, senderID.String(), recoveryUsedKey, errFailedResetPwd)
 	if !ok {
 		return
 	}
@@ -3299,7 +3305,10 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 		return
 	}
 
-	fenceOp, fok := h.beginRecoveryFence(c, claims.UserID, recoveryUsedKey, errFailedResetAccount)
+	// senderID.String(), never the raw claim (#3362) — see the sibling call in
+	// the password-reset flow above for why this rail cannot inherit the
+	// invariant from AuthRequired.
+	fenceOp, fok := h.beginRecoveryFence(c, senderID.String(), recoveryUsedKey, errFailedResetAccount)
 	if !fok {
 		return
 	}

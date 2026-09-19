@@ -784,16 +784,8 @@ func (h *Handler) hydrateJoinerPresence(ctx context.Context, viewerID string) {
 // UpdateMember updates a member's role
 func (h *Handler) UpdateMember(c *gin.Context) {
 	userID := c.GetString("user_id")
-	serverID := c.Param("id")
-	targetUserID := c.Param("user_id")
-
-	// Validate IDs
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return
-	}
-	if _, err := uuid.Parse(targetUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+	serverID, targetUserID, idsOK := moderationTarget(c)
+	if !idsOK {
 		return
 	}
 
@@ -930,15 +922,8 @@ func (h *Handler) broadcastTimeout(serverID, targetUserID string, timedOutUntil 
 // TimeoutMember temporarily bars a member from sending messages and joining voice.
 func (h *Handler) TimeoutMember(c *gin.Context) {
 	userID := c.GetString("user_id")
-	serverID := c.Param("id")
-	targetUserID := c.Param("user_id")
-
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return
-	}
-	if _, err := uuid.Parse(targetUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+	serverID, targetUserID, idsOK := moderationTarget(c)
+	if !idsOK {
 		return
 	}
 
@@ -998,15 +983,8 @@ func (h *Handler) TimeoutMember(c *gin.Context) {
 // RemoveTimeout clears a member timeout restriction.
 func (h *Handler) RemoveTimeout(c *gin.Context) {
 	userID := c.GetString("user_id")
-	serverID := c.Param("id")
-	targetUserID := c.Param("user_id")
-
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return
-	}
-	if _, err := uuid.Parse(targetUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+	serverID, targetUserID, idsOK := moderationTarget(c)
+	if !idsOK {
 		return
 	}
 
@@ -1191,6 +1169,37 @@ type RemoveMemberRequest struct {
 // Discarding the bind error would let a truncated body like `{"purge_messages":true,` set the
 // flag before ShouldBindJSON errors and trigger an irreversible purge from an invalid request.
 // Returns true to proceed; on false the caller must return (the 400 is already written).
+// moderationTarget reads the `:id` / `:user_id` path pair every member-moderation
+// handler takes, rejects a non-UUID in either with that handler's usual 400, and
+// returns the target id in its CANONICAL spelling.
+//
+// The canonical form is the point, not a side effect (#3362). `targetUserID` is
+// compared BYTE-WISE against DB-sourced ids further down — owner immunity and the
+// self-action guards — while PostgreSQL resolves braced, UPPERCASE and dash-less
+// spellings to the SAME row. `uuid.Parse` is a parser, not a canonicality check, so
+// parsing and then carrying the raw param validated nothing: an admin could defeat
+// the owner guard by uppercasing the owner's id and still have the ban SQL resolve
+// to the owner's row.
+//
+// It is ONE function rather than six copies for the same reason #3362 canonicalizes
+// at a single choke point instead of at each Redis key builder: a boundary expressed
+// six times is six places to forget it. The first draft did write it six times, and
+// SonarCloud failed the PR on 10.2% duplication of new code — the rule catching the
+// exact shape the change exists to argue against.
+func moderationTarget(c *gin.Context) (serverID, targetUserID string, ok bool) {
+	serverID = c.Param("id")
+	if _, err := uuid.Parse(serverID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
+		return "", "", false
+	}
+	parsed, err := uuid.Parse(c.Param("user_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+		return "", "", false
+	}
+	return serverID, parsed.String(), true
+}
+
 func bindOptionalBody(c *gin.Context, req any) bool {
 	if err := c.ShouldBindJSON(req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
@@ -1202,19 +1211,13 @@ func bindOptionalBody(c *gin.Context, req any) bool {
 // RemoveMember removes a member from a server (kick or leave)
 func (h *Handler) RemoveMember(c *gin.Context) {
 	userID := c.GetString("user_id")
-	serverID := c.Param("id")
-	targetUserID := c.Param("user_id")
+	serverID, targetUserID, idsOK := moderationTarget(c)
+	if !idsOK {
+		return
+	}
+
 	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
 	defer purgeCancel()
-
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return
-	}
-	if _, err := uuid.Parse(targetUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
-		return
-	}
 
 	var req RemoveMemberRequest
 	if !bindOptionalBody(c, &req) { // #1353 optional body; empty OK, malformed rejected
@@ -1514,19 +1517,13 @@ func (h *Handler) execBanTx(
 // BanMember bans a member from a server (removes + prevents rejoin)
 func (h *Handler) BanMember(c *gin.Context) {
 	userID := c.GetString("user_id")
-	serverID := c.Param("id")
-	targetUserID := c.Param("user_id")
+	serverID, targetUserID, idsOK := moderationTarget(c)
+	if !idsOK {
+		return
+	}
+
 	purgeCtx, purgeCancel := context.WithTimeout(c.Request.Context(), purgeOnModerationTimeout)
 	defer purgeCancel()
-
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return
-	}
-	if _, err := uuid.Parse(targetUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
-		return
-	}
 
 	hasPerm, err := h.resolver.HasPermission(c.Request.Context(), serverID, userID, "", rbac.PermBan)
 	if err != nil {
@@ -1651,15 +1648,8 @@ func (h *Handler) BanMember(c *gin.Context) {
 // UnbanMember removes a ban from a server
 func (h *Handler) UnbanMember(c *gin.Context) {
 	userID := c.GetString("user_id")
-	serverID := c.Param("id")
-	targetUserID := c.Param("user_id")
-
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidServerID})
-		return
-	}
-	if _, err := uuid.Parse(targetUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidUserID})
+	serverID, targetUserID, idsOK := moderationTarget(c)
+	if !idsOK {
 		return
 	}
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
@@ -61,10 +62,24 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 			return
 		}
 
-		userID, ok := claims["user_id"].(string)
-		if !ok || userID == "" {
-			abortUnauthorized(c)
+		userID, identityReason, ok := canonicalUserID(claims)
+		if !ok {
+			// NOT abortUnauthorized: that reports ReasonInvalidCredentials at
+			// medium severity, which is the routine bad-password bucket. A
+			// malformed identity claim on an HMAC-VALID token cannot be produced
+			// by a client — its only causes are a compromised signing secret or a
+			// regressed mint path. Same 401, same generic body, distinguishable
+			// event (#3362).
+			abortMalformedIdentityClaim(c)
 			return
+		}
+		if identityReason != "" {
+			MarkNightwatchVerdict(c, NightwatchVerdict{
+				EventType: securityevent.EventAuthentication,
+				Outcome:   securityevent.OutcomeSuccess,
+				Severity:  securityevent.SeverityMedium,
+				Reason:    identityReason,
+			})
 		}
 
 		blacklisted, err := isTokenBlacklisted(c.Request.Context(), redisClient, claims)
@@ -157,6 +172,17 @@ func abortUnauthorized(c *gin.Context) {
 	c.Abort()
 }
 
+// abortMalformedIdentityClaim refuses a token whose `user_id` claim is not a
+// parseable uuid (#3362). Verdict and body are IDENTICAL to abortUnauthorized —
+// 401, generic authError — so nothing an attacker can observe changes; only the
+// security event differs, and it is HIGH because this condition requires either
+// the signing secret or a broken mint path.
+func abortMalformedIdentityClaim(c *gin.Context) {
+	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityHigh, Reason: securityevent.ReasonIdentityClaimMalformed})
+	c.JSON(http.StatusUnauthorized, gin.H{"error": authError})
+	c.Abort()
+}
+
 func abortAccountDisabled(c *gin.Context) {
 	MarkNightwatchVerdict(c, NightwatchVerdict{EventType: securityevent.EventAuthentication, Outcome: securityevent.OutcomeDenied, Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonAccountDisabled})
 	c.JSON(http.StatusForbidden, gin.H{"error_code": "account_disabled"})
@@ -174,6 +200,79 @@ func abortAuthDependency(c *gin.Context) {
 // middleware (the reader) call it, so the writer and reader can never drift apart and
 // silently break the denylist.
 func UserDisabledKey(userID string) string { return "user_disabled:" + userID }
+
+// canonicalUserID reads the `user_id` claim and pins it to PostgreSQL's canonical
+// uuid spelling before anything downstream keys on it. It is the reason
+// `c.Get("user_id")` may be relied on as a canonical UUID BY CONSTRUCTION.
+//
+// WHY IT IS HERE AND NOT AT EACH GATE (#3362). The request identity crosses two
+// stores with different equality rules. Every SQL predicate compares it as a
+// `uuid`, and PostgreSQL resolves `{braced}`, UPPERCASE and dash-less spellings
+// to ONE value — so all three reach the same users row. The two identity-keyed
+// Redis gates instead CONCATENATE the raw string into a key: UserDisabledKey
+// above, and credepoch.Key for the #2201 fence. Measured, all three spellings
+// were admitted 200 where the canonical form was refused: the denylist has no
+// database fallback at all, so a disabled account was simply not seen; and a
+// `blocked:` epoch marker was missed while the read-through returned the
+// still-current DB epoch and admitted. Canonicalizing HERE fixes both for every
+// AUTHENTICATED caller and keeps the invariant in one place — the two key
+// builders deliberately do NOT re-canonicalize, because a boundary expressed
+// twice drifts (see [internal]rules/backend.md § Token-class binding).
+//
+// THAT ARGUMENT HAS ONE EXCEPTION, and it is not reachable from here.
+// credepoch.Begin builds Key(userID) INTERNALLY, so a caller of the FENCE is a
+// key-builder call site that no grep for `credepoch.Key(` will show — the first
+// draft of this comment claimed "every one of their callers" on exactly that
+// incomplete enumeration, and was wrong. The recovery reset routes
+// (internal/auth/handlers.go) are UNAUTHENTICATED: AuthRequired never runs on
+// them, so they take the id from a recovery JWT claim and must state this
+// invariant themselves, which they now do. Any future unauthenticated rail that
+// fences a destructive credential operation owes the same.
+//
+// The WebSocket door already does this: websocket/handler.go's
+// parseUserIDFromClaims parses, and its gates key on `userID.String()`.
+//
+// NORMALIZE RATHER THAN REJECT. uuid.Parse is a parser, not a canonicality
+// check, so normalizing covers any future mint path that keys a token on an
+// identifier it did not read back from the users table, where a
+// reject-on-non-canonical rule would instead 401 a legitimate user with no
+// diagnosis. It is also LOOSER than it looks — its 38-byte arm slices s[1:] and
+// never validates the delimiters, so `!<canonical>?` parses — and its accepted
+// set is NOT a superset of PostgreSQL's: PG takes a hyphen after any group of
+// four digits, which uuid.Parse refuses. Those PG-only spellings were live
+// variants of this same bypass and are closed here by REFUSAL rather than by
+// normalization. None of that is a soundness problem: every accepted input maps
+// to one canonical output, so no two distinct identities can collide.
+//
+// Two consequences, both deliberate: a `urn:uuid:` claim (which PostgreSQL
+// rejects, so it used to surface as a 503) is now normalized and gated like any
+// other spelling; and non-uuid input is refused here with a 401 instead of
+// reaching PostgreSQL and surfacing a malformed request as a dependency fault
+// the dependency never had.
+//
+// The third return value is the OBSERVABILITY seam. Normalizing silently would
+// make a regressed mint path work forever while reporting nothing — the defect
+// class this function closes would become undetectable rather than harmless —
+// and folding a malformed claim into the generic invalid-credentials bucket
+// hides an event no client can produce. `(string, bool)` cannot carry either,
+// so the caller gets the reason.
+func canonicalUserID(claims jwt.MapClaims) (string, securityevent.ReasonCode, bool) {
+	raw, ok := claims["user_id"].(string)
+	if !ok || raw == "" {
+		return "", securityevent.ReasonIdentityClaimMalformed, false
+	}
+	parsed, err := uuid.Parse(raw)
+	if err != nil {
+		return "", securityevent.ReasonIdentityClaimMalformed, false
+	}
+	canonical := parsed.String()
+	if canonical != raw {
+		// Admitted, not denied — but a mint path emitting a non-canonical
+		// spelling is a defect, and this is the only place it is visible.
+		return canonical, securityevent.ReasonIdentityClaimNonCanonical, true
+	}
+	return canonical, "", true
+}
 
 var errAccountDisabled = errors.New("account disabled")
 

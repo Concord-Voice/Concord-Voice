@@ -49,6 +49,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   answer to a code you have already replaced, so the card always describes the code in front of
   you.
 
+### Security
+
+- **Account safety checks now agree on one spelling of your account's identifier** ([#3362](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3362)) — every
+  account has an internal identifier, and the same identifier can be written in several ways
+  that all mean the same account. Concord's database treats those spellings as one account, but
+  two of the checks that run on every request compared them letter by letter instead — the check
+  that refuses a disabled account, and the check that freezes an account while its password or
+  keys are being changed. A differently-written form of the same identifier went unrecognised by
+  both, so a request that should have been refused was allowed through and served as that
+  account. The same mismatch reached two more places. Server moderation compared the identifier
+  of the person being acted on letter by letter, so the protection that stops an owner being
+  kicked, banned or timed out could be stepped around by writing their identifier differently —
+  the database still resolved it to the owner. And the voice server, which checks your sign-in
+  pass itself, would have seated someone under a spelling its own moderation commands could not
+  address: for the rest of that call they could not be muted, removed, or have permissions taken
+  away. Nothing in Concord has ever issued an identifier written any other way, so none of this
+  was a way in — the checks were relying on that habit rather than enforcing it, and nothing
+  would have failed if it ever stopped holding. Requests and moderation now settle on a single
+  spelling before any check runs, and the voice server turns away a spelling it does not
+  recognise instead of guessing. No identifier Concord issues is affected, so signing in,
+  messaging and calling are unchanged.
+
 ## [0.2.47] — 2026-09-18
 
 Concord Voice now gives you clearer control over screen sharing, voice calls, and Rich Presence. Activity details show what is shared and who may receive it.

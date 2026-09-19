@@ -207,11 +207,16 @@ func (h *Handler) authenticateViaTicket(c *gin.Context, ticket string) (uuid.UUI
 	// credential-epoch gates as HTTP bearer auth (#2201). Pre-#2201 the ticket
 	// path checked neither, so a ticket minted just before a disable or a
 	// destructive credential reset could still open a socket after it.
-	if err := h.checkUserDisabled(c, userIDStr); err != nil {
+	// userID.String(), not the raw userIDStr (#3362): both gates CONCATENATE this
+	// into a Redis key, and a non-canonical spelling misses the key while every
+	// SQL predicate still resolves to the same row. The JWT rail below already
+	// keys on userID.String(); this makes the ticket rail state that invariant
+	// itself rather than inherit it from whatever IssueTicket happened to store.
+	if err := h.checkUserDisabled(c, userID.String()); err != nil {
 		return uuid.Nil, "", err
 	}
 	if h.fence != nil {
-		if err := h.fence.Check(c.Request.Context(), userIDStr, ticketEpoch); err != nil {
+		if err := h.fence.Check(c.Request.Context(), userID.String(), ticketEpoch); err != nil {
 			return uuid.Nil, "", fmt.Errorf("credential epoch check failed: %w", err)
 		}
 	}

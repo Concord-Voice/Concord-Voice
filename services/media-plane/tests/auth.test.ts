@@ -13,6 +13,14 @@ vi.mock('@/config/index.js', () => ({
 
 const TEST_SIGNING_KEY = ['vitest', 'mock', 'jwt'].join('-'); // NOSONAR — test-only mock
 
+// Every token this file signs carries a CANONICAL uuid, because that is what
+// the control plane mints — `user_id` is copied from a Postgres `uuid` column
+// or `uuid.New()` on every path. The middleware refuses any other spelling
+// (#3362), so a `'u-1'`-shaped fixture tested a token no issuer can produce.
+// The bare `'u-1'` strings that remain below are `validateChannelAccess`
+// ARGUMENTS, which never cross that gate.
+const TEST_USER_ID = 'd8fe119d-a28c-4573-be19-7847469aa59e';
+
 import {
   createAuthMiddleware,
   releaseDMVoiceAuthorization,
@@ -93,7 +101,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('rejects when no username is provided', () => {
-    const token = signToken({ user_id: 'u-1' });
+    const token = signToken({ user_id: TEST_USER_ID });
     const socket = createMockSocket({ token });
     const next = vi.fn();
 
@@ -103,7 +111,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('rejects when username is not a string', () => {
-    const token = signToken({ user_id: 'u-1' });
+    const token = signToken({ user_id: TEST_USER_ID });
     const socket = createMockSocket({ token, username: 42 });
     const next = vi.fn();
 
@@ -113,7 +121,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('populates socket.data on valid JWT', () => {
-    const token = signToken({ user_id: 'u-1' });
+    const token = signToken({ user_id: TEST_USER_ID });
     const socket = createMockSocket({
       token,
       username: 'alice',
@@ -125,14 +133,14 @@ describe('createAuthMiddleware', () => {
     middleware(socket as any, next);
 
     expect(next).toHaveBeenCalledWith(); // no error
-    expect(socket.data.userId).toBe('u-1');
+    expect(socket.data.userId).toBe(TEST_USER_ID);
     expect(socket.data.username).toBe('alice');
     expect(socket.data.displayName).toBe('Alice A.');
     expect(socket.data.avatarUrl).toBe('https://example.com/avatar.png');
   });
 
   it('populates socket.data.tier from the JWT tier claim', () => {
-    const token = signToken({ user_id: 'u-1', tier: 'premium' });
+    const token = signToken({ user_id: TEST_USER_ID, tier: 'premium' });
     const socket = createMockSocket({ token, username: 'alice' });
     const next = vi.fn();
 
@@ -143,7 +151,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('defaults socket.data.tier to free when the tier claim is absent', () => {
-    const token = signToken({ user_id: 'u-1' });
+    const token = signToken({ user_id: TEST_USER_ID });
     const socket = createMockSocket({ token, username: 'alice' });
     const next = vi.fn();
 
@@ -154,7 +162,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('defaults socket.data.tier to free when the tier claim is blank', () => {
-    const token = signToken({ user_id: 'u-1', tier: '' });
+    const token = signToken({ user_id: TEST_USER_ID, tier: '' });
     const socket = createMockSocket({ token, username: 'alice' });
     const next = vi.fn();
 
@@ -165,7 +173,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('ignores non-string displayName and avatarUrl', () => {
-    const token = signToken({ user_id: 'u-1' });
+    const token = signToken({ user_id: TEST_USER_ID });
     const socket = createMockSocket({
       token,
       username: 'alice',
@@ -182,7 +190,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('rejects expired tokens', () => {
-    const token = signToken({ user_id: 'u-1' }, { expiresIn: '-1s' });
+    const token = signToken({ user_id: TEST_USER_ID }, { expiresIn: '-1s' });
     const socket = createMockSocket({ token, username: 'alice' });
     const next = vi.fn();
 
@@ -192,7 +200,7 @@ describe('createAuthMiddleware', () => {
   });
 
   it('rejects tokens with invalid signature', () => {
-    const token = jwt.sign({ user_id: 'u-1' }, ['wrong', 'key'].join('-'), {
+    const token = jwt.sign({ user_id: TEST_USER_ID }, ['wrong', 'key'].join('-'), {
       algorithm: 'HS256',
       issuer: 'concordvoice-control-plane',
     });

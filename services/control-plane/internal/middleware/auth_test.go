@@ -20,7 +20,12 @@ const testSecret = testhelpers.TestJWTSecret
 const (
 	pathUsersMe  = "/api/v1/users/me"
 	bearerPrefix = "Bearer "
-	testUserID1  = "user-1"
+	// A canonical UUID, not a placeholder string (#3362). AuthRequired's
+	// canonicalUserID runs BEFORE isTokenBlacklisted, so the former "user-1"
+	// aborted at the identity gate and TestAuthRequired_BlacklistedJTI below
+	// never reached the blacklist lookup it exists to exercise — it still
+	// asserted 401 and still passed, for an entirely different reason.
+	testUserID1 = "00000000-0000-4000-8000-000000000001"
 )
 
 // makeToken creates a JWT token with the given claims for testing.
