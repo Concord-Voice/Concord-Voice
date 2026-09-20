@@ -134,6 +134,13 @@ function deliverHandoff(generation: number, port: MessagePort): void {
     return;
   }
 
+  // A generation without a claimant is already adopted or stopped. Only a
+  // bridge that may still be created can own a buffered handoff.
+  if (generation <= currentGeneration) {
+    port.close();
+    return;
+  }
+
   // A duplicate for a generation already waiting unclaimed. Close the older one rather
   // than leak it — two ports feeding one track is the failure `adoptPort` already refuses.
   dropUnclaimed(generation);
@@ -302,6 +309,7 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
   const writer = generator.writable.getWriter();
 
   let port: MessagePort | null = null;
+  let portAdopted = false;
   let stopped = false;
   let faulted = false;
   let overrun = 0;
@@ -445,6 +453,8 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
       candidate.close();
       return;
     }
+    awaitingPort.delete(generation);
+    portAdopted = true;
     port = candidate;
     candidate.onmessage = (event: MessageEvent<unknown>): void => {
       handleQuantum(candidate, event.data);
@@ -488,25 +498,17 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
     stop(): void {
       if (stopped) return;
       stopped = true;
-      // A TOMBSTONE CLAIM, NOT A DELETION — and the difference is the whole fix (Gitar
-      // review, PR #3349). The listener is module-scoped and outlives every bridge, so a
-      // handoff for this generation can still land after `stop()` returns; teardown
-      // racing the handoff is exactly the case. Deleting the claim sent that port to
-      // `deliverHandoff`'s no-claimant branch, which BUFFERS it — held open until some
-      // later bridge's supersession sweep or until `UNCLAIMED_PORT_LIMIT` evicts it.
-      //
-      // Gitar proposed `dropUnclaimed(generation)` here instead. MEASURED: that is inert
-      // for its own scenario, because `stop()` runs BEFORE the late port arrives and the
-      // buffer is empty at this moment. A claim that closes on arrival is what actually
-      // closes it, and it removes the dependence on a later bridge ever existing.
-      //
-      // It removes itself, so the map holds at most one dead entry per stopped
-      // generation and nothing at all once the late port lands. A generation is unique
-      // per share, so this can never shadow a live claim.
-      awaitingPort.set(generation, (late: MessagePort): void => {
-        awaitingPort.delete(generation);
-        late.close();
-      });
+      // A normal adoption already removed this generation's claim, and late handoffs
+      // for adopted generations close in `deliverHandoff` because they are <= the
+      // current generation. Only stop-before-handoff needs a tombstone: deleting that
+      // claim would otherwise buffer the late port indefinitely. The tombstone removes
+      // itself when it closes that one late handoff.
+      if (!portAdopted) {
+        awaitingPort.set(generation, (late: MessagePort): void => {
+          awaitingPort.delete(generation);
+          late.close();
+        });
+      }
       // The other ordering: a port already buffered for this generation when `stop()`
       // runs. Reachable only via a duplicate handoff — `deliverHandoff` buffers the
       // second of two for one generation — but it costs one call to cover.

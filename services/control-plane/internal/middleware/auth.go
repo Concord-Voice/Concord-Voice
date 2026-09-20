@@ -74,7 +74,7 @@ func AuthRequired(jwtSecret string, redisClient *redis.Client, fence *credepoch.
 			return
 		}
 		if identityReason != "" {
-			MarkNightwatchVerdict(c, NightwatchVerdict{
+			MarkNightwatchObservation(c, NightwatchObservation{
 				EventType: securityevent.EventAuthentication,
 				Outcome:   securityevent.OutcomeSuccess,
 				Severity:  securityevent.SeverityMedium,

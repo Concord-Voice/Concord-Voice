@@ -19,15 +19,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { voiceService } from '@/renderer/services/voice/voiceService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { createScreenAudioBridge } from '@/renderer/services/voice/screenAudioBridge';
+import { deferred } from '../../helpers/deferred';
 
 // The bridge builds a `MediaStreamTrackGenerator`, which jsdom does not implement. The
 // cases below are about which state survives a switch, not about the bridge itself --
 // `screenAudioBridge.test.ts` owns that.
 vi.mock('@/renderer/services/voice/screenAudioBridge', () => ({
-  createScreenAudioBridge: () => ({
+  createScreenAudioBridge: vi.fn(() => ({
     track: { id: 'bridge-track', kind: 'audio', readyState: 'live', muted: false, stop: vi.fn() },
     stop: vi.fn(),
-  }),
+  })),
 }));
 
 const liveTrack = (id: string, kind: 'video' | 'audio' = 'video') => ({
@@ -46,6 +48,38 @@ const streamOf = (tracks: ReturnType<typeof liveTrack>[]) => ({
   getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'),
   removeTrack: vi.fn(),
 });
+
+const stubScreenPublication = (svc: any) => {
+  const originals = {
+    device: svc.device,
+    cachedPlatform: svc.cachedPlatform,
+    ensurePlatform: svc.ensurePlatform,
+    pickScreenCodec: svc.pickScreenCodec,
+    requireSelectedVideoCodec: svc.requireSelectedVideoCodec,
+    applyDegradationPreference: svc.applyDegradationPreference,
+    startPacketLossMonitor: svc.startPacketLossMonitor,
+    getProducerCodecMimeType: svc.getProducerCodecMimeType,
+    produceScreenAudioFromStream: svc.produceScreenAudioFromStream,
+    produceEncrypted: svc.produceEncrypted,
+  };
+  svc.device = {};
+  svc.cachedPlatform = 'darwin';
+  svc.ensurePlatform = vi.fn().mockResolvedValue(undefined);
+  svc.pickScreenCodec = vi.fn().mockReturnValue({
+    codec: { mimeType: 'video/VP8' },
+    encodings: [],
+    effectiveBitrate: 1_000_000,
+  });
+  svc.requireSelectedVideoCodec = vi.fn().mockReturnValue({ mimeType: 'video/VP8' });
+  svc.applyDegradationPreference = vi.fn();
+  svc.startPacketLossMonitor = vi.fn();
+  svc.getProducerCodecMimeType = vi.fn().mockReturnValue('video/VP8');
+  svc.produceScreenAudioFromStream = vi.fn().mockResolvedValue(undefined);
+
+  return () => {
+    Object.assign(svc, originals);
+  };
+};
 
 describe('voiceService.switchScreenSource (R6)', () => {
   let svc: any;
@@ -138,7 +172,10 @@ describe('voiceService.switchScreenSource (R6)', () => {
       streamAudio: true,
     });
 
-    expect(svc.closeProducer).toHaveBeenCalledWith('screen');
+    expect(svc.closeProducer).toHaveBeenCalledWith(
+      'screen',
+      expect.objectContaining({ preserveVideoReproduceToken: true })
+    );
     // The stream we ALREADY hold is handed over, not thrown away and re-acquired.
     // Re-acquiring is fallible, and failing after the old producer is closed leaves
     // the user sharing nothing -- the outcome acquire-first exists to prevent.
@@ -150,6 +187,219 @@ describe('voiceService.switchScreenSource (R6)', () => {
     expect(newStream.getTracks()[0].stop).not.toHaveBeenCalled();
     // Viewers lose their tune-in on a new producer id, so the user is told.
     expect(useVoiceStore.getState().videoSlotError).toMatch(/tune back in/i);
+  });
+
+  it('discards a fallback producer that resolves after an explicit stop', async () => {
+    const newVideo = liveTrack('replacement-video');
+    const newStream = streamOf([newVideo]);
+    const lateProducer = { id: 'late-screen', close: vi.fn(), on: vi.fn() };
+    const publication = deferred<typeof lateProducer>();
+    svc.captureScreen = vi.fn().mockResolvedValue({
+      stream: newStream,
+      sourceId: 'screen:0',
+    });
+    producer.replaceTrack = vi.fn().mockRejectedValue(new Error('codec cannot accept track'));
+    const restorePublication = stubScreenPublication(svc);
+    svc.produceEncrypted = vi.fn().mockImplementation(() => publication.promise);
+    svc.produceScreen = vi.fn(Object.getPrototypeOf(svc).produceScreen.bind(svc));
+    const realCloseProducer = Object.getPrototypeOf(svc).closeProducer.bind(svc);
+    svc.closeProducer = Object.getPrototypeOf(svc).closeProducer.bind(svc);
+
+    try {
+      const switching = svc.switchScreenSource('screen:1', { streamAudio: false });
+      await vi.waitFor(() => expect(svc.produceEncrypted).toHaveBeenCalledOnce());
+      expect(svc.produceScreen).toHaveBeenCalledWith(
+        'screen:1',
+        expect.objectContaining({ streamAudio: false }),
+        expect.objectContaining({ stream: newStream, sourceId: 'screen:0' })
+      );
+
+      await svc.closeProducer('screen');
+      publication.resolve(lateProducer);
+      await switching;
+    } finally {
+      svc.closeProducer = realCloseProducer;
+      restorePublication();
+    }
+
+    expect(lateProducer.close).toHaveBeenCalledOnce();
+    expect(svc.producers.has('screen')).toBe(false);
+    expect(svc.localScreenStream).toBeNull();
+    expect(newVideo.stop).toHaveBeenCalledOnce();
+    expect(useVoiceStore.getState().isScreenSharing).toBe(false);
+  });
+
+  it('stops an older capture when its overlapping producer resolves after the newer share', async () => {
+    const oldCaptureVideo = liveTrack('overlap-old-video');
+    const oldCapture = streamOf([oldCaptureVideo]);
+    const newCapture = streamOf([liveTrack('overlap-new-video')]);
+    const oldProducer = { id: 'overlap-old-producer', close: vi.fn(), on: vi.fn() };
+    const newProducer = { id: 'overlap-new-producer', close: vi.fn(), on: vi.fn() };
+    const oldPublication = deferred<typeof oldProducer>();
+    const newPublication = deferred<typeof newProducer>();
+    const realCaptureScreen = svc.captureScreen;
+    const restorePublication = stubScreenPublication(svc);
+
+    svc.producers.delete('screen');
+    useVoiceStore.getState().setScreenSharing(false);
+    svc.captureScreen = vi
+      .fn()
+      .mockResolvedValueOnce({ stream: oldCapture, sourceId: 'screen:old' })
+      .mockResolvedValueOnce({ stream: newCapture, sourceId: 'screen:new' });
+    svc.produceEncrypted = vi
+      .fn()
+      .mockReturnValueOnce(oldPublication.promise)
+      .mockReturnValueOnce(newPublication.promise);
+
+    try {
+      const oldStart = svc.produceScreen('screen:old', { streamAudio: false });
+      await vi.waitFor(() => expect(svc.produceEncrypted).toHaveBeenCalledOnce());
+
+      const newStart = svc.produceScreen('screen:new', { streamAudio: false });
+      await vi.waitFor(() => expect(svc.produceEncrypted).toHaveBeenCalledTimes(2));
+
+      newPublication.resolve(newProducer);
+      await newStart;
+      expect(svc.localScreenStream).toBe(newCapture);
+
+      oldPublication.resolve(oldProducer);
+      await oldStart;
+    } finally {
+      svc.captureScreen = realCaptureScreen;
+      restorePublication();
+    }
+
+    expect(oldProducer.close).toHaveBeenCalledOnce();
+    expect(oldCaptureVideo.stop).toHaveBeenCalledOnce();
+    expect(svc.producers.get('screen')).toBe(newProducer);
+    expect(svc.localScreenStream).toBe(newCapture);
+  });
+
+  it('lets the newer share win when the older capture resolves last', async () => {
+    const oldCaptureVideo = liveTrack('capture-race-old-video');
+    const oldCapture = streamOf([oldCaptureVideo]);
+    const newCapture = streamOf([liveTrack('capture-race-new-video')]);
+    const newProducer = { id: 'capture-race-new-producer', close: vi.fn(), on: vi.fn() };
+    const oldCaptureResult = deferred<{ stream: ReturnType<typeof streamOf>; sourceId: string }>();
+    const realCaptureScreen = svc.captureScreen;
+    const restorePublication = stubScreenPublication(svc);
+    const produceEncrypted = vi.fn().mockResolvedValue(newProducer);
+
+    svc.producers.delete('screen');
+    useVoiceStore.getState().setScreenSharing(false);
+    svc.captureScreen = vi
+      .fn()
+      .mockReturnValueOnce(oldCaptureResult.promise)
+      .mockResolvedValueOnce({ stream: newCapture, sourceId: 'screen:new' });
+    svc.produceEncrypted = produceEncrypted;
+
+    try {
+      const oldStart = svc.produceScreen('screen:old', {
+        streamAudio: false,
+        contentType: 'detail',
+      });
+      await vi.waitFor(() => expect(svc.captureScreen).toHaveBeenCalledOnce());
+
+      const newStart = svc.produceScreen('screen:new', {
+        streamAudio: false,
+        contentType: 'motion',
+      });
+      await newStart;
+      expect(svc.localScreenStream).toBe(newCapture);
+      expect(svc.producers.get('screen')).toBe(newProducer);
+
+      oldCaptureResult.resolve({ stream: oldCapture, sourceId: 'screen:old' });
+      await oldStart;
+      expect(produceEncrypted).toHaveBeenCalledOnce();
+      expect(newProducer.close).not.toHaveBeenCalled();
+    } finally {
+      svc.captureScreen = realCaptureScreen;
+      restorePublication();
+    }
+
+    expect(oldCaptureVideo.stop).toHaveBeenCalledOnce();
+    expect(svc.localScreenStream).toBe(newCapture);
+    expect(svc.producers.get('screen')).toBe(newProducer);
+    expect(svc.currentScreenSourceId).toBe('screen:new');
+    expect(svc.currentScreenOptions.contentType).toBe('motion');
+  });
+
+  it('does not publish when cancellation lands after capture planning but before publication', async () => {
+    const candidateVideo = liveTrack('handoff-race-video');
+    const candidateStream = streamOf([candidateVideo]);
+    const captureResult = deferred<{ stream: ReturnType<typeof streamOf>; sourceId: string }>();
+    const restorePublication = stubScreenPublication(svc);
+    const realCaptureScreen = svc.captureScreen;
+    const realCapturePlan = svc.captureScreenForProduction.bind(svc);
+    const staleProducer = { id: 'stale-handoff-producer', close: vi.fn(), on: vi.fn() };
+    const produceEncrypted = vi.fn().mockResolvedValue(staleProducer);
+
+    svc.producers.delete('screen');
+    svc.captureScreen = vi.fn().mockReturnValue(captureResult.promise);
+    svc.produceEncrypted = produceEncrypted;
+    svc.captureScreenForProduction = async (...args: any[]) => {
+      const plan = await realCapturePlan(...args);
+      queueMicrotask(() => svc.cancelVideoReproduce('screen'));
+      return plan;
+    };
+
+    try {
+      const start = svc.produceScreen('screen:handoff-race', { streamAudio: false });
+      await vi.waitFor(() => expect(svc.captureScreen).toHaveBeenCalledOnce());
+
+      captureResult.resolve({ stream: candidateStream, sourceId: 'screen:handoff-race' });
+      await start;
+    } finally {
+      svc.captureScreen = realCaptureScreen;
+      delete svc.captureScreenForProduction;
+      restorePublication();
+    }
+
+    expect(produceEncrypted).not.toHaveBeenCalled();
+    expect(candidateVideo.stop).toHaveBeenCalledOnce();
+  });
+
+  it('runs a queued newer switch after fallback re-publication finishes', async () => {
+    const firstCapture = streamOf([liveTrack('fallback-first-video')]);
+    const secondCapture = streamOf([liveTrack('fallback-second-video')]);
+    const fallbackProducer = {
+      id: 'fallback-screen',
+      closed: false,
+      close: vi.fn(),
+      pause: vi.fn(),
+      resume: vi.fn(),
+      replaceTrack: vi.fn().mockResolvedValue(undefined),
+      on: vi.fn(),
+    };
+    const replaceFailure = deferred<never>();
+    const restorePublication = stubScreenPublication(svc);
+    const realCaptureScreen = svc.captureScreen;
+    svc.screenAudioBridge = null;
+    const captureScreen = vi
+      .fn()
+      .mockResolvedValueOnce({ stream: firstCapture, sourceId: 'screen:first' })
+      .mockResolvedValueOnce({ stream: secondCapture, sourceId: 'screen:second' });
+    svc.captureScreen = captureScreen;
+    svc.produceEncrypted = vi.fn().mockResolvedValue(fallbackProducer);
+    producer.replaceTrack = vi.fn().mockReturnValueOnce(replaceFailure.promise);
+
+    try {
+      const firstSwitch = svc.switchScreenSource('screen:first', { streamAudio: false });
+      await vi.waitFor(() => expect(producer.replaceTrack).toHaveBeenCalledOnce());
+
+      const secondSwitch = svc.switchScreenSource('screen:second', { streamAudio: false });
+      replaceFailure.reject(new Error('codec cannot accept track'));
+      await Promise.all([firstSwitch, secondSwitch]);
+    } finally {
+      svc.captureScreen = realCaptureScreen;
+      restorePublication();
+    }
+
+    expect(captureScreen).toHaveBeenCalledTimes(2);
+    expect(fallbackProducer.replaceTrack).toHaveBeenCalledWith({
+      track: secondCapture.getVideoTracks()[0],
+    });
+    expect(svc.localScreenStream).toBe(secondCapture);
   });
 
   // `replaceTrack` can reject BECAUSE the producer was closed under us. The fallback
@@ -351,12 +601,18 @@ describe('per-process audio ownership across a switch (#3349)', () => {
       audiocap: { start: vi.fn().mockResolvedValue(startResult), stop: audiocapStop },
     } as unknown as typeof globalThis.electron;
 
-    // Delegate to the REAL capture rather than stubbing a result: the defect lives in
-    // the interaction between what the capture writes and what the switch tears down,
-    // so a stubbed capture cannot express it.
-    svc.acquireScreenCapture = vi.fn(async () =>
-      svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true)
-    );
+    // Restore the real seams that the sibling describe may have stubbed. The capture
+    // must traverse acquireScreenCapture -> captureScreen -> captureScreenElectron so
+    // dropping either currentness handoff makes these tests fail.
+    const prototype = Object.getPrototypeOf(svc);
+    for (const method of [
+      'acquireScreenCapture',
+      'captureScreen',
+      'closeProducer',
+      'produceScreen',
+    ]) {
+      svc[method] = prototype[method].bind(svc);
+    }
   };
 
   it('CONTROL: a bare per-process capture reaches the rung and installs a bridge', async () => {
@@ -377,16 +633,162 @@ describe('per-process audio ownership across a switch (#3349)', () => {
 
     await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
 
-    expect(svc.acquireScreenCapture).toHaveBeenCalledTimes(1);
+    expect(globalThis.electron.audiocap?.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates a pending per-process start when a newer direct share wins', async () => {
+    const pendingStart = deferred<{ ok: true; generation: number; perProcessAudio: true }>();
+    arm(pendingStart.promise);
+    const restorePublication = stubScreenPublication(svc);
+    const oldVideo = liveTrack('pending-per-process-video');
+    const newVideo = liveTrack('newer-video-only');
+    const oldStream = streamOf([oldVideo]);
+    const newStream = streamOf([newVideo]);
+    const newProducer = { id: 'newer-screen', close: vi.fn(), on: vi.fn() };
+    const getUserMedia = vi.fn().mockResolvedValueOnce(oldStream).mockResolvedValueOnce(newStream);
+    const produceEncrypted = vi.fn().mockResolvedValue(newProducer);
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia, getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+    svc.producers.delete('screen');
+    svc.produceEncrypted = produceEncrypted;
+
+    try {
+      const oldStart = svc.produceScreen(WINDOW_ID, {
+        streamAudio: true,
+        contentType: 'detail',
+      });
+      await vi.waitFor(() => expect(globalThis.electron.audiocap?.start).toHaveBeenCalledOnce());
+
+      const newStart = svc.produceScreen(WINDOW_ID, {
+        streamAudio: false,
+        contentType: 'motion',
+      });
+      await newStart;
+      expect(svc.localScreenStream).toBe(newStream);
+      expect(svc.producers.get('screen')).toBe(newProducer);
+
+      expect(audiocapStop).toHaveBeenCalledTimes(2);
+      pendingStart.resolve({ ok: true, generation: 7, perProcessAudio: true });
+      await oldStart;
+    } finally {
+      restorePublication();
+    }
+
+    expect(oldVideo.stop).toHaveBeenCalledOnce();
+    expect(svc.screenAudioBridge).toBeNull();
+    expect(useVoiceStore.getState().screenAudio.mode).not.toBe('per-process');
+    expect(svc.localScreenStream).toBe(newStream);
+    expect(svc.producers.get('screen')).toBe(newProducer);
+    expect(svc.currentScreenOptions.contentType).toBe('motion');
+    expect(produceEncrypted).toHaveBeenCalledOnce();
+  });
+
+  it('retires an installed per-process bridge when a newer video share wins', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    const restorePublication = stubScreenPublication(svc);
+    const oldVideo = liveTrack('installed-per-process-video');
+    const newVideo = liveTrack('newer-video-only');
+    const oldStream = { ...streamOf([oldVideo]), addTrack: vi.fn() };
+    const newStream = { ...streamOf([newVideo]), addTrack: vi.fn() };
+    const oldProducer = { id: 'stale-screen', close: vi.fn(), on: vi.fn() };
+    const newProducer = { id: 'authoritative-screen', close: vi.fn(), on: vi.fn() };
+    const oldPublication = deferred<typeof oldProducer>();
+    const bridge = {
+      track: { id: 'installed-per-process-track', kind: 'audio', readyState: 'live' },
+      stop: vi.fn(),
+    };
+    const getUserMedia = vi.fn().mockResolvedValueOnce(oldStream).mockResolvedValueOnce(newStream);
+    const produceEncrypted = vi
+      .fn()
+      .mockReturnValueOnce(oldPublication.promise)
+      .mockResolvedValueOnce(newProducer);
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia, getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => bridge as any);
+    svc.producers.delete('screen');
+    svc.produceEncrypted = produceEncrypted;
+
+    try {
+      const oldStart = svc.produceScreen(WINDOW_ID, {
+        streamAudio: true,
+        contentType: 'detail',
+      });
+      await vi.waitFor(() => expect(produceEncrypted).toHaveBeenCalledOnce());
+      expect(svc.screenAudioBridge).toBe(bridge);
+      expect(useVoiceStore.getState().screenAudio.mode).toBe('per-process');
+
+      const newStart = svc.produceScreen(WINDOW_ID, {
+        streamAudio: false,
+        contentType: 'motion',
+      });
+      await newStart;
+      expect(svc.localScreenStream).toBe(newStream);
+      expect(svc.producers.get('screen')).toBe(newProducer);
+
+      expect(bridge.stop).toHaveBeenCalledOnce();
+      expect(audiocapStop).toHaveBeenCalledTimes(2);
+      oldPublication.resolve(oldProducer);
+      await oldStart;
+    } finally {
+      restorePublication();
+    }
+
+    expect(oldProducer.close).toHaveBeenCalledOnce();
+    expect(oldVideo.stop).toHaveBeenCalledOnce();
+    expect(svc.screenAudioBridge).toBeNull();
+    expect(useVoiceStore.getState().screenAudio.mode).not.toBe('per-process');
+    expect(svc.localScreenStream).toBe(newStream);
+    expect(svc.producers.get('screen')).toBe(newProducer);
+    expect(svc.currentScreenOptions.contentType).toBe('motion');
+  });
+
+  it('reaps the per-process host and bridge when video publication fails before commit', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    const restorePublication = stubScreenPublication(svc);
+    const bridge = {
+      track: { id: 'failed-publication-track', kind: 'audio', readyState: 'live' },
+      stop: vi.fn(),
+    };
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => bridge as any);
+    svc.producers.delete('screen');
+    svc.produceEncrypted = vi.fn().mockRejectedValue(new Error('video publication failed'));
+
+    try {
+      await expect(svc.produceScreen(WINDOW_ID, { streamAudio: true })).rejects.toThrow(
+        'video publication failed'
+      );
+    } finally {
+      restorePublication();
+    }
+
+    expect(bridge.stop).toHaveBeenCalledOnce();
+    expect(audiocapStop).toHaveBeenCalledTimes(2);
+    expect(svc.screenAudioBridge).toBeNull();
+    expect(useVoiceStore.getState().screenAudio.mode).toBe('off');
   });
 
   it('a SUCCESSFUL per-process re-capture survives the switch', async () => {
     arm({ ok: true, generation: 7, perProcessAudio: true });
+    const oldBridge = { stop: vi.fn(), track: { kind: 'audio' } };
+    const newBridge = {
+      stop: vi.fn(),
+      track: { id: 'new-audiocap-track', kind: 'audio', readyState: 'live', muted: false },
+    };
+    svc.screenAudioBridge = oldBridge;
+    useVoiceStore.getState().setScreenAudioState({ mode: 'per-process', overrun: 1 });
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => newBridge as any);
 
     await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
 
     // The store, not a spy on our own setter: a spy passes the moment any arm calls it.
     expect(useVoiceStore.getState().screenAudio.mode).toBe('per-process');
+    expect(oldBridge.stop).toHaveBeenCalledTimes(1);
+    expect(audiocapStop).toHaveBeenCalledTimes(1);
+    expect(newBridge.stop).not.toHaveBeenCalled();
     expect(svc.screenAudioBridge).not.toBeNull();
   });
 
@@ -412,5 +814,347 @@ describe('per-process audio ownership across a switch (#3349)', () => {
     await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
 
     expect(audiocapStop).toHaveBeenCalled();
+  });
+
+  it('keeps the existing video, audio host, and state when replacement video capture rejects', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    const existingBridge = { stop: vi.fn(), track: { kind: 'audio' } };
+    svc.screenAudioBridge = existingBridge;
+    useVoiceStore.getState().setScreenAudioState({ mode: 'per-process', overrun: 3 });
+    const replacementCapture = vi.fn().mockRejectedValue(new Error('video capture denied'));
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: replacementCapture, getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    await expect(
+      svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true)
+    ).rejects.toThrow('video capture denied');
+
+    expect(existingBridge.stop).not.toHaveBeenCalled();
+    expect(audiocapStop).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'per-process', overrun: 3 });
+  });
+
+  it('preserves the newly acquired per-process host and publishes live audio after replaceTrack rejects', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+
+    const capturedVideo = liveTrack('new-video') as ReturnType<typeof liveTrack> & {
+      getSettings: () => { width: number; height: number };
+    };
+    capturedVideo.getSettings = () => ({ width: 1280, height: 720 });
+    const tracks = [capturedVideo];
+    const captured = {
+      getTracks: () => tracks,
+      getVideoTracks: () => tracks.filter((track) => track.kind === 'video'),
+      getAudioTracks: () => tracks.filter((track) => track.kind === 'audio'),
+      removeTrack: vi.fn((track: (typeof tracks)[number]) => {
+        const index = tracks.indexOf(track);
+        if (index >= 0) tracks.splice(index, 1);
+      }),
+      addTrack: vi.fn((track: (typeof tracks)[number]) => tracks.push(track)),
+    };
+    const getUserMedia = vi.fn().mockResolvedValue(captured);
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia, getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    const newBridge = {
+      track: {
+        id: 'new-audiocap-track',
+        kind: 'audio',
+        readyState: 'live',
+        muted: false,
+        stop: vi.fn(),
+      },
+      stop: vi.fn(),
+    };
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => newBridge as any);
+
+    const oldProducer = svc.producers.get('screen');
+    oldProducer.replaceTrack = vi.fn().mockRejectedValue(new Error('codec cannot accept track'));
+    svc.device = {};
+    svc.produceEncrypted = vi.fn().mockImplementation(async (_transport: unknown, params: any) => ({
+      id: params.appData.source === 'screen' ? 'new-screen' : 'new-screen-audio',
+      closed: false,
+      close: vi.fn(),
+      on: vi.fn(),
+    }));
+    svc.pickScreenCodec = vi.fn().mockReturnValue({
+      codec: { mimeType: 'video/VP8' },
+      encodings: [],
+      effectiveBitrate: 1_000_000,
+    });
+    svc.requireSelectedVideoCodec = vi.fn().mockReturnValue({ mimeType: 'video/VP8' });
+    svc.startPacketLossMonitor = vi.fn();
+    svc.applyDegradationPreference = vi.fn();
+    svc.getProducerCodecMimeType = vi.fn().mockReturnValue('video/VP8');
+    svc.produceScreenAudioFromStream =
+      Object.getPrototypeOf(svc).produceScreenAudioFromStream.bind(svc);
+
+    await svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+
+    expect(newBridge.stop, 'preservation of the newly acquired host/bridge').not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().screenAudio.mode).toBe('per-process');
+    // One stop is expected: it supersedes the inherited host before the new host starts.
+    // A second stop means fallback cleanup reaped the newly acquired host.
+    expect(audiocapStop, 'fallback must not stop the newly acquired host').toHaveBeenCalledTimes(1);
+    expect(svc.screenAudioBridge, 'preservation of the newly acquired host/bridge').toBe(newBridge);
+    expect(
+      getUserMedia,
+      'fallback must publish the already acquired capture'
+    ).toHaveBeenCalledOnce();
+    expect(svc.producers.get('screen-audio')?.id, 'publish a live audio track').toBe(
+      'new-screen-audio'
+    );
+    expect(svc.produceEncrypted).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ track: newBridge.track, appData: { source: 'screen-audio' } })
+    );
+  });
+
+  it('does not re-produce after an explicit stop wins during fallback cleanup', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: false });
+    const capturedVideo = liveTrack('replacement-video');
+    const captured = streamOf([capturedVideo]);
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(captured), getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    const oldProducer = svc.producers.get('screen');
+    oldProducer.replaceTrack = vi.fn().mockRejectedValue(new Error('codec cannot accept track'));
+    svc.produceScreen = vi.fn().mockResolvedValue(undefined);
+
+    let releaseDrain!: () => void;
+    const pendingDrain = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+    const drainStarted = vi.fn();
+    svc.drainSendTransportQueue = vi.fn(() => {
+      drainStarted();
+      return pendingDrain;
+    });
+
+    const switching = svc.switchScreenSource(WINDOW_ID, { streamAudio: false });
+    await vi.waitFor(() => expect(drainStarted).toHaveBeenCalledOnce());
+
+    // The user explicitly stops sharing while the fallback close is waiting for the
+    // transport queue. Both closes share the same deferred drain so the old fallback
+    // continuation resumes before the stop's own cleanup completes.
+    const stopping = svc.closeProducer('screen');
+    expect(drainStarted).toHaveBeenCalledTimes(2);
+    releaseDrain();
+    await Promise.all([switching, stopping]);
+
+    expect(svc.produceScreen).not.toHaveBeenCalled();
+    expect(capturedVideo.stop).toHaveBeenCalled();
+  });
+
+  it('reaps a stale per-process fallback during emergency cleanup', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    const capturedVideo = liveTrack('replacement-video') as ReturnType<typeof liveTrack> & {
+      getSettings: () => { width: number; height: number };
+    };
+    capturedVideo.getSettings = () => ({ width: 1280, height: 720 });
+    const tracks = [capturedVideo];
+    const captured = {
+      getTracks: () => tracks,
+      getVideoTracks: () => tracks.filter((track) => track.kind === 'video'),
+      getAudioTracks: () => tracks.filter((track) => track.kind === 'audio'),
+      removeTrack: vi.fn((track: (typeof tracks)[number]) => {
+        const index = tracks.indexOf(track);
+        if (index >= 0) tracks.splice(index, 1);
+      }),
+      addTrack: vi.fn((track: (typeof tracks)[number]) => tracks.push(track)),
+    };
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(captured), getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    const capturedBridge = {
+      stop: vi.fn(),
+      track: {
+        id: 'captured-audio',
+        kind: 'audio',
+        readyState: 'live',
+        muted: false,
+        stop: vi.fn(),
+      },
+    };
+    svc.screenAudioBridge = { stop: vi.fn(), track: { kind: 'audio' } };
+    useVoiceStore.getState().setScreenAudioState({ mode: 'per-process', overrun: 1 });
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => capturedBridge as any);
+
+    const oldProducer = svc.producers.get('screen');
+    oldProducer.replaceTrack = vi.fn().mockRejectedValue(new Error('codec cannot accept track'));
+    svc.produceScreen = vi.fn().mockResolvedValue(undefined);
+
+    let releaseDrain!: () => void;
+    const drainStarted = vi.fn();
+    svc.drainSendTransportQueue = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          drainStarted();
+          releaseDrain = resolve;
+        })
+    );
+
+    const switching = svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+    await vi.waitFor(() => expect(drainStarted).toHaveBeenCalledOnce());
+    const inheritedStopCount = audiocapStop.mock.calls.length;
+    expect(svc.screenAudioBridge).toBe(capturedBridge);
+    expect(capturedBridge.stop).not.toHaveBeenCalled();
+
+    svc.emergencyCleanup();
+    expect(capturedBridge.stop).toHaveBeenCalled();
+    expect(audiocapStop.mock.calls.length).toBeGreaterThan(inheritedStopCount);
+    expect(svc.screenAudioBridge).toBeNull();
+    releaseDrain();
+    await switching;
+
+    expect(svc.produceScreen).not.toHaveBeenCalled();
+    expect(capturedVideo.stop).toHaveBeenCalled();
+  });
+
+  it('stops the full existing host when bridge construction fails after audiocap start', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    const existingBridge = { stop: vi.fn(), track: { kind: 'audio' } };
+    svc.screenAudioBridge = existingBridge;
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => {
+      throw new Error('bridge unsupported');
+    });
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(audiocapStop).toHaveBeenCalledTimes(2);
+    expect(useVoiceStore.getState().screenAudio).toMatchObject({
+      mode: 'degraded',
+      reason: 'no-backend',
+    });
+  });
+
+  it('stops the new bridge and full host when stream track attachment fails after audiocap start', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    const existingBridge = { stop: vi.fn(), track: { kind: 'audio' } };
+    const bridge = {
+      stop: vi.fn(),
+      track: {
+        id: 'named-bridge-track',
+        kind: 'audio',
+        readyState: 'live',
+        muted: false,
+        stop: vi.fn(),
+      },
+    };
+    svc.screenAudioBridge = existingBridge;
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => bridge);
+    const stream = captureStream();
+    stream.addTrack = vi.fn(() => {
+      throw new Error('track attachment failed');
+    });
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(stream), getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(bridge.stop).toHaveBeenCalled();
+    expect(audiocapStop).toHaveBeenCalledTimes(2);
+    expect(useVoiceStore.getState().screenAudio).toMatchObject({
+      mode: 'degraded',
+      reason: 'no-backend',
+    });
+  });
+
+  it('does not attach a late audiocap completion after explicit share stop wins', async () => {
+    let resolveStart!: (result: unknown) => void;
+    const pendingStart = new Promise((resolve) => {
+      resolveStart = resolve;
+    });
+    arm(pendingStart);
+    const stream = captureStream();
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(stream), getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    const capture = svc.switchScreenSource(WINDOW_ID, { streamAudio: true });
+    await vi.waitFor(() => expect(globalThis.electron.audiocap?.start).toHaveBeenCalled());
+
+    svc.invalidateVideoReproduces();
+    svc.stopScreenAudioHost();
+    resolveStart({ ok: true, generation: 7, perProcessAudio: true });
+    await capture;
+
+    expect(stream.addTrack).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'off', overrun: 0 });
+  });
+
+  it('leaves a successor host untouched when invalidated during video-only capture', async () => {
+    let resolveVideo!: (stream: unknown) => void;
+    const pendingVideo = new Promise((resolve) => {
+      resolveVideo = resolve;
+    });
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockReturnValue(pendingVideo), getDisplayMedia: vi.fn() },
+      configurable: true,
+    });
+
+    let current = true;
+    const capture = svc.captureScreenElectron(
+      WINDOW_ID,
+      { w: 1280, h: 720 },
+      30,
+      true,
+      () => current
+    );
+    await vi.waitFor(() =>
+      expect(globalThis.navigator.mediaDevices.getUserMedia).toHaveBeenCalled()
+    );
+
+    const successor = { stop: vi.fn(), track: { kind: 'audio' } };
+    svc.screenAudioBridge = successor;
+    useVoiceStore.getState().setScreenAudioState({ mode: 'per-process', overrun: 4 });
+    current = false;
+    resolveVideo(captureStream());
+    await capture;
+
+    expect(successor.stop).not.toHaveBeenCalled();
+    expect(audiocapStop).not.toHaveBeenCalled();
+    expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'per-process', overrun: 4 });
+  });
+
+  it('leaves a successor host untouched when a stale audiocap start rejects', async () => {
+    let rejectStart!: (error: Error) => void;
+    const pendingStart = new Promise((_, reject) => {
+      rejectStart = reject;
+    });
+    arm(pendingStart);
+
+    let current = true;
+    const capture = svc.captureScreenElectron(
+      WINDOW_ID,
+      { w: 1280, h: 720 },
+      30,
+      true,
+      () => current
+    );
+    await vi.waitFor(() => expect(globalThis.electron.audiocap?.start).toHaveBeenCalled());
+
+    const successor = { stop: vi.fn(), track: { kind: 'audio' } };
+    svc.screenAudioBridge = successor;
+    useVoiceStore.getState().setScreenAudioState({ mode: 'per-process', overrun: 5 });
+    current = false;
+    rejectStart(new Error('stale start rejected'));
+    await capture;
+
+    expect(successor.stop).not.toHaveBeenCalled();
+    expect(audiocapStop).toHaveBeenCalledTimes(1);
+    expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'per-process', overrun: 5 });
   });
 });

@@ -179,7 +179,7 @@ The desktop client is the only shipping client. Source: `client/desktop/`.
   - Socket.IO → Media Plane (signaling)
   - WebRTC (DTLS-SRTP carrying E2EE frames) → Media Plane (audio/video)
 
-#### Per-process screen-share audio: a third process (ADR-0043, #3195, #3197)
+#### Per-process screen-share audio: a third process (ADR-0043, #3195, #3197, #3198)
 
 The desktop topology is main / renderer plus a third, narrowly-scoped process: an Electron
 **`utilityProcess`** that hosts the first-party `concord-audiocap` native addon
@@ -187,20 +187,17 @@ The desktop topology is main / renderer plus a third, narrowly-scoped process: a
 cannot own the main process, which holds SSO tokens and the update path (ADR-0043 D5); the
 renderer is not a candidate host either, since `nodeIntegration` stays off there.
 
-**The mechanism still ships dark, but it is no longer empty.** `canCarryScreenAudio` now returns
-`'none' | 'system-loopback' | 'per-process'` — #3198 PR 1 widened it — but no per-process audio
-track is reachable by a user, because **no production call site passes the third
-(`machineCapability`) argument**, so the new rung cannot be selected. Dark here means unreachable
-by construction rather than absent from the type; the PID resolution that would feed it is #3198
-PR 2. What changed with #3197 PR 2 is what sits behind it:
-**macOS 14.4+ now has a real Core Audio process-tap backend** compiled into release builds
-(`rt/platform/macos/`), so `start()` there reaches target validation and refuses with `NoTarget`
-rather than `NoBackend`. Windows still has no producer at all (#3196), and below the macOS 14.4
-product floor `platformBackend()` returns `nullptr`, so `NoBackend` remains correct on both.
+**The per-process path is live on supported macOS machines.** `canCarryScreenAudio` returns
+`'none' | 'system-loopback' | 'per-process'`, and its production callers pass the machine
+capability that can select the third rung. Main revalidates the trusted sender, window-shaped
+source ID, and live window before starting the native host. A monotonic operation epoch prevents
+an awaited source lookup from starting a host after a trusted stop or newer start has superseded
+it. Renderer reproduce-token checks and the shared screen-audio teardown keep stale switches and
+emergency cleanup from publishing or retaining a bridge, track, child, or OS tap.
 
-The distinction matters for reading the code: "dark" now means *no caller supplies a target*, not
-*no backend exists*. A grep that concludes the macOS path is unimplemented is reading the #3195
-state.
+**macOS 14.4+ has the Core Audio process-tap backend** compiled into release builds
+(`rt/platform/macos/`). Windows still has no producer (#3196), and below the macOS 14.4 product
+floor `platformBackend()` returns `nullptr`, so `NoBackend` remains correct on both.
 
 Two independent `MessagePort` pairs carry the two things that cross this boundary:
 
@@ -208,7 +205,8 @@ Two independent `MessagePort` pairs carry the two things that cross this boundar
   closed `hello` / `fault` / `start` / `stop` message set; anything else kills the child
   (`src/main/audiocapHost.ts`, `src/main/audiocapChild.ts`).
 - **Child → preload → main world, PCM only** — the child hands its PCM port to **preload**
-  (`audiocap:port`, `IPC_CONTRACT_VERSION = 27`), which validates every 3872-byte quantum and
+  (`audiocap:port`; the current shell version is authoritative in
+  `client/desktop/src/main/ipcContract.ts`), which validates every 3872-byte quantum and
   relays it over a **second, preload-created `MessageChannel`** to the main world, delivered
   exactly once (`src/preload/audiocapRelay.ts`). The main world builds the `AudioData` and
   `MediaStreamTrackGenerator` (`src/renderer/services/voice/screenAudioBridge.ts`); it never holds

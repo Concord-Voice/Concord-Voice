@@ -2853,6 +2853,9 @@ func nightwatchSecurityObserver(events securityevent.Emitter) gin.HandlerFunc {
 		c.Next()
 
 		route, allowed := nightwatchRouteTemplate(c.Request.Method, c.FullPath())
+		if observation, ok := middleware.NightwatchObservationFromContext(c); ok {
+			events.Emit(c.Request.Context(), nightwatchVerdictEvent(middleware.NightwatchVerdict(observation), route))
+		}
 		if verdict, ok := middleware.NightwatchVerdictFromContext(c); ok {
 			events.Emit(c.Request.Context(), nightwatchVerdictEvent(verdict, route))
 			// The verdict is the closed middleware/control outcome. It is not a

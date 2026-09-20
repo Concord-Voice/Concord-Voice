@@ -181,6 +181,12 @@ type ScreenCaptureResult = {
   ownsScreenAudioOutcome: boolean;
 };
 
+/** The resolved capture and the exact options it is being published with. */
+type ScreenProductionPlan = {
+  captured: ScreenCaptureResult;
+  options: ScreenShareOptions;
+};
+
 interface RemoteVideoTileRenderState {
   visible: boolean;
   cssWidth: number;
@@ -3633,6 +3639,7 @@ class VoiceService {
     const vs = useVoiceStore.getState();
     vs.setScreenAudioOn(false);
     vs.setScreenAudioVerdict('none');
+    this.stopScreenAudioHost();
 
     for (const [, producer] of this.producers) {
       try {
@@ -4203,10 +4210,19 @@ class VoiceService {
     sourceId: string | undefined,
     screenRes: { w: number; h: number },
     screenFps: number,
-    wantAudio: boolean
+    wantAudio: boolean,
+    isCurrent?: () => boolean,
+    screenAudioHostStopped = false
   ): Promise<ScreenCaptureResult> {
     if (typeof globalThis.electron?.getDesktopSources === 'function') {
-      return this.captureScreenElectron(sourceId, screenRes, screenFps, wantAudio);
+      return this.captureScreenElectron(
+        sourceId,
+        screenRes,
+        screenFps,
+        wantAudio,
+        isCurrent,
+        screenAudioHostStopped
+      );
     }
     console.debug('produceScreen: using getDisplayMedia fallback');
     // Non-Electron path only (dev/web) — packaged builds always take the
@@ -4237,7 +4253,9 @@ class VoiceService {
     sourceId: string | undefined,
     screenRes: { w: number; h: number },
     screenFps: number,
-    wantAudio: boolean
+    wantAudio: boolean,
+    isCurrent?: () => boolean,
+    screenAudioHostStopped = false
   ): Promise<ScreenCaptureResult & { sourceId: string }> {
     const electron = globalThis.electron;
     if (!electron) throw new Error('captureScreenElectron called without Electron bridge');
@@ -4325,7 +4343,12 @@ class VoiceService {
       case 'per-process':
         // The arm lives in its own method; see it for why each refusal keeps its own
         // degrade reason rather than collapsing into a shared one.
-        return this.capturePerProcessScreenAudio(chosenId, videoOnly);
+        return this.capturePerProcessScreenAudio(
+          chosenId,
+          videoOnly,
+          isCurrent,
+          screenAudioHostStopped
+        );
       default: {
         // Unreachable while every reachable verdict has its own arm above; C9 keeps
         // the degraded answer video-only rather than a system mix.
@@ -4346,13 +4369,15 @@ class VoiceService {
    * string that names the mechanism that actually failed. A named method costs one
    * call and leaves every refusal intact.
    *
-   * `videoOnly` is passed as a thunk rather than a resolved stream because three of
-   * the four refusals return before any audio work, and one returns after — so the
-   * caller must not pay for a capture the first refusal would discard.
+   * `videoOnly` is passed as a thunk so unsupported shells can return video-only without
+   * touching the audio host. On the supported path it is acquired before the inherited
+   * host is stopped, so a stale or rejected replacement leaves that host untouched.
    */
   private async capturePerProcessScreenAudio(
     chosenId: string,
-    videoOnly: () => Promise<MediaStream>
+    videoOnly: () => Promise<MediaStream>,
+    isCurrent?: () => boolean,
+    screenAudioHostStopped = false
   ): Promise<ScreenCaptureResult & { sourceId: string }> {
     // REACHABLE FROM #3198 PR 3, and this is the rung the whole epic exists for: the
     // share carries THIS APP'S audio and nothing else. No `chromeMediaSource:
@@ -4375,10 +4400,16 @@ class VoiceService {
       return { stream: await videoOnly(), sourceId: chosenId, ownsScreenAudioOutcome: false };
     }
 
-    // SUPERSEDE THE INHERITED HOST ONCE, HERE, BEFORE ANY REFUSAL CAN SHORT-CIRCUIT.
-    // From this line on this method owns the screen-audio outcome and says so with
-    // `ownsScreenAudioOutcome: true`, so `switchScreenSourceQueued`'s generic teardown
-    // stands down instead of overwriting what the arms below write.
+    const stream = await videoOnly();
+    if (isCurrent !== undefined && !isCurrent()) {
+      return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
+    }
+
+    // SUPERSEDE THE INHERITED HOST only after replacement video is acquired and this
+    // continuation is current. From this line on this method owns the screen-audio
+    // outcome and says so with `ownsScreenAudioOutcome: true`, so
+    // `switchScreenSourceQueued`'s generic teardown stands down. A stale continuation
+    // returns before state or bridge work and leaves the winner-owned state untouched.
     //
     // THE FULL TEARDOWN, NOT JUST THE BRIDGE. Stopping the bridge closes the renderer's
     // port; it does not reap the capture child, and the child is what holds the OS tap.
@@ -4387,21 +4418,26 @@ class VoiceService {
     // A fence refusal would otherwise leave the old app's tap running underneath a share
     // the UI has already relabelled (Gitar review, PR #3349).
     //
-    // It writes `mode: 'off'`, which every arm below immediately replaces. That ordering
-    // is what keeps a degrade reason intact without a separate reap-only helper.
-    this.stopScreenAudioHost();
+    // It writes `mode: 'off'`; the current continuation replaces that with its result,
+    // while a stale continuation never overwrites the winner's state.
+    if (!screenAudioHostStopped) this.stopScreenAudioHost();
 
-    const stream = await videoOnly();
     const store = useVoiceStore.getState();
-
     let started: Awaited<ReturnType<typeof start>>;
     try {
       started = await start(chosenId);
     } catch {
+      if (isCurrent !== undefined && !isCurrent()) {
+        return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
+      }
       // The invoke itself rejected — main threw rather than returning an outcome.
       // Nothing is logged: the rejection can carry an `Error.cause` from across the
       // IPC boundary, and `observability.md` principle 3 keeps that out of any sink.
       store.setScreenAudioState({ mode: 'degraded', reason: 'protocol-fault', overrun: 0 });
+      return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
+    }
+
+    if (isCurrent !== undefined && !isCurrent()) {
       return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
     }
 
@@ -4444,6 +4480,7 @@ class VoiceService {
       // the share, not the session, so a previous share's drops must not carry over.
       store.setScreenAudioState({ mode: 'per-process', overrun: 0 });
     } catch {
+      this.stopScreenAudioHost();
       // `createScreenAudioBridge` throws a TypeError when the shell cannot support
       // per-process audio at all — a preload predating the relay, or an engine without
       // `MediaStreamTrackGenerator`. `no-backend` is the mechanism: the machine said it
@@ -4511,12 +4548,11 @@ class VoiceService {
 
       this.producers.set('screen-audio', audioProducer);
       useVoiceStore.getState().setScreenAudioOn(true);
-      // The only capture path that exists today is the whole-desktop mix
-      // (`chromeMediaSource: 'desktop'`), so this is `system` and not `per-process`.
-      // #3198 adds the per-process rung; it sets the mode where it creates the track,
-      // not here. Overrun starts at zero for every new producer -- the counter belongs
-      // to the share, not to the session.
-      useVoiceStore.getState().setScreenAudioState({ mode: 'system', overrun: 0 });
+      // Bridge tracks are per-process; desktop-capture tracks are the system mix.
+      useVoiceStore.getState().setScreenAudioState({
+        mode: this.screenAudioBridge?.track === audioTrack ? 'per-process' : 'system',
+        overrun: 0,
+      });
 
       audioProducer.on('transportclose', () => {
         this.producers.delete('screen-audio');
@@ -4568,11 +4604,34 @@ class VoiceService {
      */
     preAcquired?: ScreenCaptureResult | null
   ): Promise<void> {
-    if (!this.sendTransport || !this.device) {
-      console.warn('produceScreen: no sendTransport or device — cannot share screen');
+    if (this.producers.has('screen')) {
+      if (preAcquired?.stream !== this.localScreenStream) stopStreamTracks(preAcquired?.stream);
       return;
     }
+    const transport = this.sendTransport;
+    if (!transport || !this.device) {
+      console.warn('produceScreen: no sendTransport or device — cannot share screen');
+      stopStreamTracks(preAcquired?.stream);
+      return;
+    }
+    const socket = this.socket;
+    if (!preAcquired) this.cancelVideoReproduce('screen');
+    const token = this.captureVideoReproduceToken('screen');
+    const isCurrent = () => this.isCurrentVideoReproduce(token, transport);
+    if (!preAcquired) this.stopScreenAudioHost();
 
+    const plan = await this.captureScreenForProduction(sourceId, options, preAcquired, isCurrent);
+    if (!plan) return;
+    await this.publishScreenCapture(plan, token, transport, socket, isCurrent);
+  }
+
+  /** Capture with the same operation fence used by publication, retaining the exact live options. */
+  private async captureScreenForProduction(
+    sourceId: string | undefined,
+    options: ScreenShareOptions | undefined,
+    preAcquired: ScreenCaptureResult | null | undefined,
+    isCurrent: () => boolean
+  ): Promise<ScreenProductionPlan | null> {
     const screenSettings = useVideoSettingsStore.getState();
     const resolution = options?.resolution ?? screenSettings.screenResolution;
     const frameRate = options?.frameRate ?? screenSettings.screenFrameRate;
@@ -4583,57 +4642,84 @@ class VoiceService {
     // sub-1080p Native share keeps its correct fps tier. Premium/native + pre-hydrate
     // are structural no-ops.
     const rawRes = await this.resolveCaptureDims(resolution);
+    if (!isCurrent()) {
+      stopStreamTracks(preAcquired?.stream);
+      return null;
+    }
     const clampedCap = this.clampScreenToEntitlement(rawRes.w, rawRes.h, screenFps);
     const screenRes = { w: clampedCap.width, h: clampedCap.height };
     // The user's opt-out is honoured HERE, at the only place that can honour it. It was
     // previously read off ScreenShareOptions by nobody, so turning Stream Audio off
     // still published the desktop mix.
     await this.ensurePlatform();
+    if (!isCurrent()) {
+      stopStreamTracks(preAcquired?.stream);
+      return null;
+    }
     const wantAudio =
       (options?.streamAudio ?? screenSettings.screenStreamAudio) &&
       // sourceId may be undefined here (auto-pick); capability is re-checked against the
       // RESOLVED id inside captureScreenElectron, so this is the platform gate only.
       this.cachedPlatform !== 'linux';
 
-    let stream: MediaStream;
+    let captured: ScreenCaptureResult;
     try {
-      const captured =
-        preAcquired ?? (await this.captureScreen(sourceId, screenRes, clampedCap.fps, wantAudio));
-      stream = captured.stream;
-      this.currentScreenSourceId = captured.sourceId;
-      // The options the share is ACTUALLY running with, so an audio-only re-capture later
-      // reproduces this share rather than the persisted defaults.
-      this.currentScreenOptions = {
-        resolution,
-        frameRate,
-        contentType,
-        streamAudio: wantAudio,
-      };
-      this.currentScreenAudioCapable = stream.getAudioTracks().length > 0;
-      void this.publishScreenAudioCapability();
+      captured =
+        preAcquired ??
+        (await this.captureScreen(
+          sourceId,
+          screenRes,
+          clampedCap.fps,
+          wantAudio,
+          isCurrent,
+          !preAcquired
+        ));
+      if (!isCurrent()) {
+        stopStreamTracks(captured.stream);
+        return null;
+      }
     } catch (captureErr) {
-      if (handleScreenCaptureNotAllowed(captureErr)) return;
+      if (!isCurrent()) return null;
+      if (handleScreenCaptureNotAllowed(captureErr)) return null;
       throw captureErr;
     }
 
+    return {
+      captured,
+      options: { resolution, frameRate, contentType, streamAudio: wantAudio },
+    };
+  }
+
+  /** Publish a current capture and clean it up according to whether publication committed. */
+  private async publishScreenCapture(
+    plan: ScreenProductionPlan,
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    socket: Socket | null,
+    isCurrent: () => boolean
+  ): Promise<void> {
+    const { captured, options } = plan;
+    const stream = captured.stream;
+    if (!isCurrent() || this.producers.has('screen')) {
+      stopStreamTracks(stream);
+      return;
+    }
     const videoTracks = stream.getVideoTracks();
     if (videoTracks.length === 0) {
-      for (const t of stream.getTracks()) t.stop();
+      stopStreamTracks(stream);
       throw new Error('Screen capture returned no video tracks');
     }
 
     const track = videoTracks[0];
-    if (contentType === 'motion') track.contentHint = 'motion';
-    else if (contentType === 'detail') track.contentHint = 'detail';
+    VoiceService.applyContentHint(track, options.contentType);
 
-    this.localScreenStream = stream;
-
+    let committed = false;
     try {
       const selection = this.pickScreenCodec();
       const codec = this.requireSelectedVideoCodec(selection.codec, 'screen');
       const { encodings, effectiveBitrate: screenBitrate } = selection;
 
-      const producer = await this.produceEncrypted(this.sendTransport, {
+      const producer = await this.produceEncrypted(transport, {
         track,
         encodings,
         codec,
@@ -4644,8 +4730,21 @@ class VoiceService {
         appData: { source: 'screen' },
       });
 
-      this.applyDegradationPreference(producer);
+      if (!isCurrent() || this.producers.has('screen')) {
+        this.discardProducedProducer(producer, socket);
+        stopStreamTracks(stream);
+        return;
+      }
+
+      this.localScreenStream = stream;
+      this.currentScreenSourceId = captured.sourceId;
+      // The options the share is ACTUALLY running with, so an audio-only re-capture later
+      // reproduces this share rather than the persisted defaults.
+      this.currentScreenOptions = options;
+      this.currentScreenAudioCapable = stream.getAudioTracks().length > 0;
       this.producers.set('screen', producer);
+      committed = true;
+      this.applyDegradationPreference(producer);
 
       // #2187 item 1: idempotent — learns the B-signal in screen-only (no-mic) sessions.
       this.startPacketLossMonitor();
@@ -4656,9 +4755,17 @@ class VoiceService {
           this.getProducerCodecMimeType('screen') ?? this.codecKeyFromParameters(codec)
         );
 
-      updateStoreForScreenShare(producer.id, this.localScreenStream);
+      updateStoreForScreenShare(producer.id, stream);
+      void this.publishScreenAudioCapability(token, transport, stream);
 
       await this.produceScreenAudioFromStream(stream);
+      if (
+        !isCurrent() ||
+        this.localScreenStream !== stream ||
+        this.producers.get('screen') !== producer
+      ) {
+        return;
+      }
 
       track.onended = () => {
         this.closeProducer('screen');
@@ -4684,6 +4791,15 @@ class VoiceService {
         if (uid) s.updateParticipant(uid, { screenStream: undefined, isScreenSharing: false });
       });
     } catch (err) {
+      if (!isCurrent() || (committed && this.localScreenStream !== stream)) {
+        stopStreamTracks(stream);
+        return;
+      }
+      if (!committed) {
+        this.stopScreenAudioHost();
+        stopStreamTracks(stream);
+        throw err;
+      }
       await this.cleanupScreenState();
       throw err;
     }
@@ -5251,13 +5367,17 @@ class VoiceService {
   private async acquireScreenCapture(
     sourceId: string,
     label: string,
-    options?: ScreenShareOptions
+    options?: ScreenShareOptions,
+    isCurrent?: () => boolean
   ): Promise<ScreenCaptureResult | null> {
     const { dims, fps, contentType, streamAudio } = await this.resolveScreenCaptureParams(options);
 
     let captured: ScreenCaptureResult;
     try {
-      captured = await this.captureScreen(sourceId, dims, fps, streamAudio);
+      captured =
+        isCurrent === undefined
+          ? await this.captureScreen(sourceId, dims, fps, streamAudio)
+          : await this.captureScreen(sourceId, dims, fps, streamAudio, isCurrent);
     } catch (captureErr) {
       if (!handleScreenCaptureNotAllowed(captureErr)) {
         console.warn(
@@ -5474,8 +5594,16 @@ class VoiceService {
    * effect resolving it through the dynamic `voiceService` import would race every
    * other click in the same commit.
    */
-  private async publishScreenAudioCapability(): Promise<void> {
-    useVoiceStore.getState().setScreenAudioVerdict(await this.currentScreenAudioVerdict());
+  private async publishScreenAudioCapability(
+    token: VideoReproduceToken,
+    transport: mediasoupTypes.Transport,
+    stream: MediaStream
+  ): Promise<void> {
+    const verdict = await this.currentScreenAudioVerdict();
+    if (!this.isCurrentVideoReproduce(token, transport) || this.localScreenStream !== stream) {
+      return;
+    }
+    useVoiceStore.getState().setScreenAudioVerdict(verdict);
   }
 
   async switchScreenSource(sourceId: string, options?: ScreenShareOptions): Promise<void> {
@@ -5507,12 +5635,18 @@ class VoiceService {
     // an action with no relationship to audio -- and because the swap preserves
     // producer.id, viewers got no new-share event telling them sound had returned.
     const wantAudio = options?.streamAudio ?? useVoiceStore.getState().isScreenAudioOn;
-    const captured = await this.acquireScreenCapture(sourceId, 'switchScreenSource', {
+    const isCurrent = () =>
+      this.isCurrentVideoReproduce(token, transport) && this.producers.get('screen') === producer;
+    const captureOptions = {
       resolution: options?.resolution ?? useVideoSettingsStore.getState().screenResolution,
       frameRate: options?.frameRate ?? useVideoSettingsStore.getState().screenFrameRate,
       contentType: options?.contentType ?? useVideoSettingsStore.getState().screenContentType,
       streamAudio: wantAudio,
-    });
+    };
+    const captured =
+      wantAudio === true
+        ? await this.acquireScreenCapture(sourceId, 'switchScreenSource', captureOptions, isCurrent)
+        : await this.acquireScreenCapture(sourceId, 'switchScreenSource', captureOptions);
     if (!captured) return;
     // The capture above awaited; a concurrent re-produce may have replaced the producer
     // we captured at entry. Bail rather than mutate a producer that is no longer current.
@@ -5570,7 +5704,14 @@ class VoiceService {
       // fallible, and a failure there would leave the user sharing nothing after we
       // had already closed the old producer: the exact outcome the acquire-first
       // ordering exists to prevent, reintroduced by the fallback meant to help.
-      await this.closeProducer('screen');
+      await this.closeProducer('screen', {
+        preserveScreenAudioOutcome: captured.ownsScreenAudioOutcome,
+        preserveVideoReproduceToken: true,
+      });
+      if (!this.isCurrentVideoReproduce(token, transport)) {
+        stopStreamTracks(stream);
+        return;
+      }
       await this.produceScreen(
         sourceId,
         {
@@ -5606,7 +5747,7 @@ class VoiceService {
       streamAudio: wantAudio,
     };
     this.currentScreenAudioCapable = stream.getAudioTracks().length > 0;
-    void this.publishScreenAudioCapability();
+    void this.publishScreenAudioCapability(token, transport, stream);
     if (oldStream !== stream) stopStreamTracks(oldStream);
 
     // BEFORE the retire await, not after. That await drains the transport queue, and a
@@ -6725,8 +6866,11 @@ class VoiceService {
   }
 
   /** Close a specific producer by source */
-  async closeProducer(source: string): Promise<void> {
-    if (source === 'camera' || source === 'screen') {
+  async closeProducer(
+    source: string,
+    options?: { preserveScreenAudioOutcome?: boolean; preserveVideoReproduceToken?: boolean }
+  ): Promise<void> {
+    if ((source === 'camera' || source === 'screen') && !options?.preserveVideoReproduceToken) {
       this.cancelVideoReproduce(source);
     }
     const producer = this.producers.get(source);
@@ -6741,7 +6885,8 @@ class VoiceService {
     // Always clean up local tracks and reset state, even if no producer exists.
     if (source === 'mic') this.cleanupMicState();
     else if (source === 'camera') this.cleanupCameraState();
-    else if (source === 'screen') await this.cleanupScreenState();
+    else if (source === 'screen')
+      await this.cleanupScreenState(undefined, options?.preserveScreenAudioOutcome);
     else if (source === 'screen-audio') this.cleanupScreenAudioState();
   }
 
@@ -6794,11 +6939,14 @@ class VoiceService {
     }
   }
 
-  private async cleanupScreenState(guard?: {
-    token: VideoReproduceToken;
-    transport: mediasoupTypes.Transport;
-    stream: MediaStream;
-  }): Promise<void> {
+  private async cleanupScreenState(
+    guard?: {
+      token: VideoReproduceToken;
+      transport: mediasoupTypes.Transport;
+      stream: MediaStream;
+    },
+    preserveScreenAudioOutcome = false
+  ): Promise<void> {
     if (
       guard &&
       (!this.isCurrentVideoReproduce(guard.token, guard.transport) ||
@@ -6836,7 +6984,7 @@ class VoiceService {
     const store = useVoiceStore.getState();
     store.setScreenSharing(false);
     store.setScreenAudioOn(false);
-    this.stopScreenAudioHost();
+    if (!preserveScreenAudioOutcome) this.stopScreenAudioHost();
     store.setActiveScreenCodec(null);
     // #2088: deterministic local-share cleanup (spec §3.1 removal point) —
     // don't rely solely on the media-plane's producer-closed self-echo.

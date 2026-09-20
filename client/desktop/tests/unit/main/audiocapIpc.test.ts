@@ -207,6 +207,51 @@ describe('registerAudiocapIpc', () => {
 });
 
 describe('audiocap:stop', () => {
+  it('cancels a pending start before it can invoke the native host', async () => {
+    let releaseSources!: (sources: Array<{ id: string; name: string }>) => void;
+    const sourcesReady = new Promise<Array<{ id: string; name: string }>>((resolve) => {
+      releaseSources = resolve;
+    });
+    getSources.mockImplementationOnce(() => sourcesReady);
+
+    const { handleAudiocapStart, handleAudiocapStop } = await loadIpc();
+    const pendingStart = handleAudiocapStart(
+      trustedEvent,
+      { sourceId: 'window:42:0' },
+      getRemoteSpaOrigin
+    );
+    expect(getSources).toHaveBeenCalledTimes(1);
+
+    handleAudiocapStop(trustedEvent, getRemoteSpaOrigin);
+    releaseSources([{ id: 'window:42:0', name: 'Some App' }]);
+    await pendingStart;
+
+    expect(
+      startAudiocapHost,
+      'a trusted audiocap:stop must cancel a pending start before it invokes startAudiocapHost'
+    ).not.toHaveBeenCalled();
+  });
+
+  it('allows an uncancelled pending start to invoke the native host', async () => {
+    let releaseSources!: (sources: Array<{ id: string; name: string }>) => void;
+    const sourcesReady = new Promise<Array<{ id: string; name: string }>>((resolve) => {
+      releaseSources = resolve;
+    });
+    getSources.mockImplementationOnce(() => sourcesReady);
+
+    const { handleAudiocapStart } = await loadIpc();
+    const pendingStart = handleAudiocapStart(
+      trustedEvent,
+      { sourceId: 'window:42:0' },
+      getRemoteSpaOrigin
+    );
+    expect(startAudiocapHost).not.toHaveBeenCalled();
+
+    releaseSources([{ id: 'window:42:0', name: 'Some App' }]);
+    await pendingStart;
+    expect(startAudiocapHost).toHaveBeenCalledWith(1, 42);
+  });
+
   it('reaps the child on a trusted sender', async () => {
     const { handleAudiocapStop } = await loadIpc();
     handleAudiocapStop(trustedEvent, getRemoteSpaOrigin);

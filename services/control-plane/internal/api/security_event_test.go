@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"math"
@@ -20,6 +21,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -115,6 +117,58 @@ func TestNightwatchObserverCountsOneControlDecisionOrFallback(t *testing.T) {
 	require.Equal(t, securityevent.ReasonRateLimitExceeded, recorder.events[1].ReasonCode)
 	require.Equal(t, securityevent.RouteAuthMFAVerify, recorder.events[1].RouteTemplate)
 	requireSerializedEventPrivacy(t, recorder.events)
+}
+
+func TestNightwatchObserverDoesNotTreatNonCanonicalIdentityObservationAsTerminal(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+
+	const canonical = "0f1e2d3c-4b5a-4968-8776-655443322110"
+	testJWTSecret := rand.Text()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     middleware.AccessTokenIssuer,
+		"user_id": "{" + canonical + "}",
+		"exp":     time.Now().Add(15 * time.Minute).Unix(),
+	})
+	encoded, err := token.SignedString([]byte(testJWTSecret))
+	require.NoError(t, err)
+
+	recorder := &eventRecorder{}
+	router := gin.New()
+	router.Use(nightwatchSecurityObserver(recorder))
+	router.POST("/api/v1/servers/:id/bans/:user_id", middleware.AuthRequired(testJWTSecret, redisClient, nil), func(c *gin.Context) {
+		if c.Query("terminal") == "1" {
+			middleware.MarkNightwatchVerdict(c, middleware.NightwatchVerdict{
+				EventType: securityevent.EventPrivilegedAction, Outcome: securityevent.OutcomeDenied,
+				Severity: securityevent.SeverityMedium, Reason: securityevent.ReasonAuthorizationDenied,
+			})
+		}
+		c.Status(http.StatusForbidden)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/servers/server-1/bans/user-1", nil)
+	req.Header.Set("Authorization", "Bearer "+encoded)
+	router.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.Len(t, recorder.events, 2,
+		"a noncanonical identity observation must be emitted before the downstream privileged fallback")
+	require.Equal(t, securityevent.EventAuthentication, recorder.events[0].EventType)
+	require.Equal(t, securityevent.ReasonIdentityClaimNonCanonical, recorder.events[0].ReasonCode)
+	require.Equal(t, securityevent.EventPrivilegedAction, recorder.events[1].EventType)
+	require.Equal(t, securityevent.ReasonPrivilegedRouteDenied, recorder.events[1].ReasonCode,
+		"identity normalization must not suppress the allowlisted privileged-route fallback")
+
+	terminalReq := httptest.NewRequest(http.MethodPost, "/api/v1/servers/server-1/bans/user-1?terminal=1", nil)
+	terminalReq.Header.Set("Authorization", "Bearer "+encoded)
+	router.ServeHTTP(httptest.NewRecorder(), terminalReq)
+
+	require.Len(t, recorder.events, 4,
+		"a downstream terminal verdict must follow the identity observation without a coarse fallback duplicate")
+	require.Equal(t, securityevent.EventAuthentication, recorder.events[2].EventType)
+	require.Equal(t, securityevent.ReasonIdentityClaimNonCanonical, recorder.events[2].ReasonCode)
+	require.Equal(t, securityevent.EventPrivilegedAction, recorder.events[3].EventType)
+	require.Equal(t, securityevent.ReasonAuthorizationDenied, recorder.events[3].ReasonCode)
 }
 
 func TestNightwatchServerMutationFallbacksArePrivilegedActionDenials(t *testing.T) {

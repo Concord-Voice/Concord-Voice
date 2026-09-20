@@ -37,6 +37,7 @@ type RemoteSpaOriginProvider = () => string | null;
  * result for THIS share from a result for a superseded one.
  */
 let shareGeneration = 0;
+let shareOperationEpoch = 0;
 function nextShareGeneration(): number {
   shareGeneration += 1;
   return shareGeneration;
@@ -91,6 +92,12 @@ export async function handleAudiocapStart(
     return { ok: false, reason: 'target-unresolved' };
   }
 
+  // A trusted stop or a newer valid start wins while source enumeration is pending.
+  // There is no await between the epoch check below and startAudiocapHost, so a stop
+  // cannot land after the check but before the native host is registered.
+  shareOperationEpoch += 1;
+  const operationEpoch = shareOperationEpoch;
+
   // FENCE 4. A well-formed id for a window that has since closed is STALE, and
   // "a stale id must never silently widen a capture" (D4a). Thumbnail-free, so
   // this is a cheap enumeration rather than a screenshot of every window.
@@ -99,6 +106,9 @@ export async function handleAudiocapStart(
     thumbnailSize: { width: 0, height: 0 },
     fetchWindowIcons: false,
   });
+  if (operationEpoch !== shareOperationEpoch) {
+    return { ok: false, reason: 'target-unresolved' };
+  }
   if (!live.some((s) => s.id === sourceId)) {
     return { ok: false, reason: 'target-unresolved' };
   }
@@ -135,6 +145,7 @@ export function handleAudiocapStop(
   // FENCE 1, first statement, as on the start handler. This reaches a process kill, so a
   // frame that is not ours must not be able to end another window's share.
   if (!requireTrustedSender(event, getRemoteSpaOrigin())) return;
+  shareOperationEpoch += 1;
   stopAudiocapHost();
 }
 

@@ -6,8 +6,9 @@ import (
 )
 
 const (
-	nightwatchVerdictKey = "nightwatch_verdict"
-	nightwatchHandledKey = "nightwatch_handled"
+	nightwatchVerdictKey     = "nightwatch_verdict"
+	nightwatchObservationKey = "nightwatch_observation"
+	nightwatchHandledKey     = "nightwatch_handled"
 )
 
 // NightwatchVerdict is a closed middleware/control outcome for the observer.
@@ -19,6 +20,9 @@ type NightwatchVerdict struct {
 	AuthMethod securityevent.AuthMethod
 }
 
+// NightwatchObservation is a closed but nonterminal middleware observation.
+type NightwatchObservation NightwatchVerdict
+
 // MarkNightwatchVerdict stores one closed middleware/control outcome.
 func MarkNightwatchVerdict(c *gin.Context, verdict NightwatchVerdict) {
 	c.Set(nightwatchVerdictKey, verdict)
@@ -28,6 +32,18 @@ func MarkNightwatchVerdict(c *gin.Context, verdict NightwatchVerdict) {
 func NightwatchVerdictFromContext(c *gin.Context) (NightwatchVerdict, bool) {
 	verdict, ok := c.Get(nightwatchVerdictKey)
 	value, typed := verdict.(NightwatchVerdict)
+	return value, ok && typed
+}
+
+// MarkNightwatchObservation stores a nonterminal middleware observation.
+func MarkNightwatchObservation(c *gin.Context, observation NightwatchObservation) {
+	c.Set(nightwatchObservationKey, observation)
+}
+
+// NightwatchObservationFromContext returns the current nonterminal observation.
+func NightwatchObservationFromContext(c *gin.Context) (NightwatchObservation, bool) {
+	observation, ok := c.Get(nightwatchObservationKey)
+	value, typed := observation.(NightwatchObservation)
 	return value, ok && typed
 }
 

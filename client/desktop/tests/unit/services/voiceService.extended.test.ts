@@ -1553,7 +1553,14 @@ describe('VoiceService Extended', () => {
       // Downstream (codec pick / produce) may throw on the minimal mock — the
       // captureScreen call has already been recorded with the clamped dims.
       await svc.produceScreen('screen:1').catch(() => {});
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
+      expect(captureSpy).toHaveBeenCalledWith(
+        'screen:1',
+        { w: 1920, h: 1080 },
+        30,
+        true,
+        expect.any(Function),
+        true
+      );
       // Restore the spy on the singleton — vi.clearAllMocks() (beforeEach) clears
       // call history but not the mocked implementation, so it would otherwise leak.
       captureSpy.mockRestore();
@@ -1593,7 +1600,14 @@ describe('VoiceService Extended', () => {
       });
       await svc.produceScreen('screen:1').catch(() => {});
       // 720p is within the stream height ceiling and admits 60fps — no degradation.
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1280, h: 720 }, 60, true);
+      expect(captureSpy).toHaveBeenCalledWith(
+        'screen:1',
+        { w: 1280, h: 720 },
+        60,
+        true,
+        expect.any(Function),
+        true
+      );
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });
@@ -1628,7 +1642,14 @@ describe('VoiceService Extended', () => {
       });
       await svc.produceScreen('screen:1').catch(() => {});
       // 4K fallback clamped to the free 1080p tier → 30fps.
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
+      expect(captureSpy).toHaveBeenCalledWith(
+        'screen:1',
+        { w: 1920, h: 1080 },
+        30,
+        true,
+        expect.any(Function),
+        true
+      );
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });
@@ -1664,7 +1685,14 @@ describe('VoiceService Extended', () => {
         sourceId: 'screen:0',
       });
       await svc.produceScreen('screen:1').catch(() => {});
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
+      expect(captureSpy).toHaveBeenCalledWith(
+        'screen:1',
+        { w: 1920, h: 1080 },
+        30,
+        true,
+        expect.any(Function),
+        true
+      );
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });
@@ -1702,7 +1730,14 @@ describe('VoiceService Extended', () => {
         sourceId: 'screen:0',
       });
       await svc.produceScreen('screen:1').catch(() => {});
-      expect(captureSpy).toHaveBeenCalledWith('screen:1', { w: 1920, h: 1080 }, 30, true);
+      expect(captureSpy).toHaveBeenCalledWith(
+        'screen:1',
+        { w: 1920, h: 1080 },
+        30,
+        true,
+        expect.any(Function),
+        true
+      );
       captureSpy.mockRestore();
       (globalThis as any).electron = prevElectron;
     });

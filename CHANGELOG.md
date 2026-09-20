@@ -6,8 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Concord Voice now keeps screen sharing steady when a capture changes, cleans up
+cancelled audio work before it can surface later, and records security outcomes
+without losing the observation that triggered them.
+
 ### Fixed
 
+- **Switching screen-share sources no longer drops or leaks per-app audio** ([#3369](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3369)) — a failed
+  source switch now keeps the current share running, while cancelled or partially started captures
+  release their audio process instead of publishing it later or leaving it behind.
 - **Dyslexic Support now changes every piece of text, not just some of it** ([#2366](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2366)) — turning on
   Dyslexic Support said it applied "across the app", but headings, the server and channel list
   down the side, and the window title all kept the old lettering. Only ordinary body text
@@ -51,7 +58,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
-- **The desktop runtime now carries the current Chromium, V8, and PDFium security backports** ([#3132](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3132)) — Electron was updated from 44.3.0 to 44.4.3, which includes upstream fixes for the five browser-engine vulnerabilities tracked by #3132 without changing app settings or saved data.
+- **Identity-anomaly audit records no longer hide the request's final authorization result** ([#3369](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3369)) — Concord
+  now records the unusual identifier spelling as an observation, then still records whether the
+  request was allowed or denied.
+- **The desktop runtime now carries the current Chromium, V8, and PDFium security backports** ([#3132](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3132)) — Electron was updated
+  from 44.3.0 to 44.4.3, which includes upstream fixes for the five browser-engine
+  vulnerabilities tracked by #3132 without changing app settings or saved data.
 - **Account safety checks now agree on one spelling of your account's identifier** ([#3362](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3362)) — every
   account has an internal identifier, and the same identifier can be written in several ways
   that all mean the same account. Concord's database treats those spellings as one account, but
