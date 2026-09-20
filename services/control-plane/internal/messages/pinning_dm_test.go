@@ -1,11 +1,16 @@
 package messages_test
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,6 +30,88 @@ func insertDMMessageDirect(t *testing.T, ts *testhelpers.TestServer, convID, use
 	)
 	require.NoError(t, err, "failed to insert DM message")
 	return msgID
+}
+
+func TestPinMessageLocksActorBeforeTargetMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		setup      func(*testing.T, *testhelpers.TestServer, testhelpers.TestUser) string
+		messageSQL string
+		table      string
+	}{
+		{
+			name: "server message",
+			setup: func(t *testing.T, ts *testhelpers.TestServer, actor testhelpers.TestUser) string {
+				serverID := ts.CreateTestServer(t, actor.ID, "Pin lock server")
+				channelID := ts.CreateTestChannel(t, serverID, "general")
+				return ts.CreateTestMessage(t, channelID, actor, "pin lock target")
+			},
+			messageSQL: `SELECT id FROM messages WHERE id = $1 FOR UPDATE NOWAIT`,
+			table:      "messages",
+		},
+		{
+			name: "DM message",
+			setup: func(t *testing.T, ts *testhelpers.TestServer, actor testhelpers.TestUser) string {
+				peer := ts.CreateTestUser(t, "pin_lock_peer")
+				convID := ts.CreateDMConversation(t, actor.ID, peer.ID)
+				return insertDMMessageDirect(t, ts, convID, actor.ID, "pin lock target")
+			},
+			messageSQL: `SELECT id FROM dm_messages WHERE id = $1 FOR UPDATE NOWAIT`,
+			table:      "dm_messages",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := setupTS(t)
+			actor := ts.CreateTestUser(t, "pin_lock_actor")
+			messageID := tc.setup(t, ts, actor)
+
+			probe, err := sql.Open("postgres", testdb.DatabaseURL())
+			require.NoError(t, err)
+			probe.SetMaxOpenConns(4)
+			require.NoError(t, probe.Ping())
+			t.Cleanup(func() { require.NoError(t, probe.Close()) })
+			barrier, err := probe.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				if rollbackErr := barrier.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+					t.Errorf("failed to roll back pin lock barrier: %v", rollbackErr)
+				}
+			})
+			var barrierTxID int64
+			require.NoError(t, barrier.QueryRow(`SELECT txid_current()`).Scan(&barrierTxID))
+			var lockedActorID string
+			require.NoError(t, barrier.QueryRow(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, actor.ID).Scan(&lockedActorID))
+
+			requestCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			response := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				req := httptest.NewRequestWithContext(requestCtx, http.MethodPost, pinAPIMsg+messageID+pinPath, nil)
+				req.Header = testhelpers.AuthHeaders(actor.AccessToken)
+				recorder := httptest.NewRecorder()
+				ts.Router.ServeHTTP(recorder, req)
+				response <- recorder
+			}()
+
+			testdb.WaitForRowLockWaiter(t, probe, barrierTxID)
+			var lockedMessageID string
+			require.NoError(t, barrier.QueryRow(tc.messageSQL, messageID).Scan(&lockedMessageID))
+			assert.Equal(t, actor.ID, lockedActorID)
+			assert.Equal(t, messageID, lockedMessageID)
+			require.NoError(t, barrier.Commit())
+
+			select {
+			case recorder := <-response:
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			case <-requestCtx.Done():
+				require.FailNow(t, "pin request did not finish after releasing actor lock: %v", requestCtx.Err())
+			}
+
+			var pinnedBy string
+			require.NoError(t, ts.DB.QueryRow(`SELECT pinned_by FROM `+tc.table+` WHERE id = $1`, messageID).Scan(&pinnedBy))
+			assert.Equal(t, actor.ID, pinnedBy)
+		})
+	}
 }
 
 // --- Pin DM Message Tests ---

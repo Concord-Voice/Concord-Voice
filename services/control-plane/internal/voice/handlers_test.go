@@ -5,14 +5,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
+	concordws "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,6 +55,50 @@ const (
 func setupTS(t *testing.T) *testhelpers.TestServer {
 	t.Helper()
 	return testhelpers.SetupTestServer(t)
+}
+
+func TestServerMuteFiltersVoiceStateUpdateByChannelView(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "voice-mute-filter-owner")
+	target := ts.CreateTestUser(t, "voice-mute-filter-target")
+	allowed := ts.CreateTestUser(t, "voice-mute-filter-allowed")
+	denied := ts.CreateTestUser(t, "voice-mute-filter-denied")
+	serverID := ts.CreateTestServer(t, owner.ID, "Voice Mute Filter")
+	for _, user := range []testhelpers.TestUser{target, allowed, denied} {
+		ts.AddMemberToServer(t, serverID, user.ID, roleMember)
+	}
+	channelID := ts.CreateVoiceChannel(t, serverID, "voice-mute-filter-channel")
+	ts.CreateChannelOverride(t, channelID, "user", allowed.ID, int64(rbac.PermViewVoiceChannels), 0)
+	ts.CreateChannelOverride(t, channelID, "user", denied.ID, 0, int64(rbac.PermViewVoiceChannels))
+	_, err := ts.DB.Exec(`INSERT INTO voice_participants (channel_id, user_id) VALUES ($1, $2)`, channelID, target.ID)
+	require.NoError(t, err)
+
+	allowedConn := connectVoiceWireClient(t, ts, allowed)
+	deniedConn := connectVoiceWireClient(t, ts, denied)
+	for _, conn := range []*gorillaWS.Conn{allowedConn, deniedConn} {
+		require.NoError(t, conn.WriteJSON(map[string]interface{}{"type": "subscribe_server", "data": map[string]interface{}{"server_id": serverID}}))
+		synchronizeVoiceWireClient(t, conn)
+	}
+
+	w := ts.DoRequest("POST", voiceEnforcePath(serverID, target.ID, pathMute), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code)
+	for {
+		envelope := waitForVoiceWireType(t, allowedConn, "voice_state_update")
+		if envelope.Data["action"] == "server_muted" {
+			break
+		}
+	}
+
+	ts.Hub.BroadcastToServer(uuid.MustParse(serverID), concordws.OutgoingMessage{Type: "voice_handler_test_sentinel", Data: map[string]interface{}{}})
+	require.NoError(t, deniedConn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	for {
+		var envelope voiceWireEnvelope
+		require.NoError(t, deniedConn.ReadJSON(&envelope))
+		assert.NotEqual(t, "voice_state_update", envelope.Type, "viewer denied voice-channel access must not receive enforcement state")
+		if envelope.Type == "voice_handler_test_sentinel" {
+			break
+		}
+	}
 }
 
 // --- GetParticipants Tests ---

@@ -1,6 +1,10 @@
 package websocket
 
-import "github.com/google/uuid"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // IncomingMessage represents a message received from a client
 type IncomingMessage struct {
@@ -89,6 +93,12 @@ type ServerBroadcastMessage struct {
 	// Target server ID
 	ServerID uuid.UUID
 
+	// ChannelID and RequireVoiceViewAuth request per-recipient voice-channel-view
+	// filtering for server subscribers. handleServerBroadcast resolves the channel
+	// before delivery; callers cannot supply the permission bit.
+	ChannelID            uuid.UUID
+	RequireVoiceViewAuth bool
+
 	// Message to send
 	Data OutgoingMessage
 
@@ -108,10 +118,55 @@ type PresenceUpdate struct {
 	Timestamp int64     `json:"timestamp"` // Unix timestamp
 }
 
-// DMBroadcastMessage represents a message to be sent to all clients subscribed to a DM conversation
+type dmVisibilityDeliveryMode uint8
+
+const (
+	dmVisibilityDeliverySubscribers dmVisibilityDeliveryMode = iota + 1
+	dmVisibilityDeliveryAllConnected
+	dmVisibilityDeliveryUnreadUnsubscribed
+	dmVisibilityDeliveryMentionTargets
+	dmVisibilityDeliveryOriginClient
+)
+
+// DMMessageVisibilitySource identifies the immutable source of a
+// message-derived delivery. Deleted messages retain their author and persisted
+// creation time so the shared visibility predicate still applies after delete.
+type DMMessageVisibilitySource struct {
+	messageID        uuid.UUID
+	deletedAuthorID  uuid.UUID
+	deletedCreatedAt time.Time
+}
+
+// NewDMMessageVisibilitySource constructs a source for a persisted message.
+func NewDMMessageVisibilitySource(messageID uuid.UUID) DMMessageVisibilitySource {
+	return DMMessageVisibilitySource{messageID: messageID}
+}
+
+// NewDeletedDMMessageVisibilitySource constructs a source captured in the
+// delete transaction before its message row is removed.
+func NewDeletedDMMessageVisibilitySource(authorID uuid.UUID, createdAt time.Time) DMMessageVisibilitySource {
+	return DMMessageVisibilitySource{deletedAuthorID: authorID, deletedCreatedAt: createdAt}
+}
+
+func (s DMMessageVisibilitySource) isPersisted() bool {
+	return s.messageID != uuid.Nil
+}
+
+func (s DMMessageVisibilitySource) isDeleted() bool {
+	return s.messageID == uuid.Nil && s.deletedAuthorID != uuid.Nil && !s.deletedCreatedAt.IsZero()
+}
+
+// DMBroadcastMessage represents a message to be sent to DM clients.
 type DMBroadcastMessage struct {
 	// Target DM conversation ID
 	ConversationID uuid.UUID
+
+	// VisibilitySource and VisibilityMode are present only for message-derived
+	// events. Nil retains ordinary delivery for live control events such as typing.
+	VisibilitySource *DMMessageVisibilitySource
+	VisibilityMode   dmVisibilityDeliveryMode
+	MentionTargets   map[uuid.UUID]bool
+	OriginClientID   *uuid.UUID
 
 	// Message to send
 	Data OutgoingMessage

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,7 +25,7 @@ import (
 // the `require.Len` below is the backstop that turns that miss into a failure
 // instead of a false green.
 var migration000136MetricLiteral = regexp.MustCompile(
-	`'(?:host|service|http|websocket|channel|dm|ops|media|registered|pending|users|active|presence)_[a-z0-9_]+'`)
+	`'(?:host|service|http|websocket|channel|dm|ops|media|registered|pending|users|active|presence|server)_[a-z0-9_]+'`)
 
 // The two keys this migration admits. #3328 separated two failure modes that had
 // been riding one client timer; these make the separation countable rather than
@@ -38,11 +37,8 @@ var migration000136NewKeys = []string{
 
 // TestMigration000136_FilesAndSchemaLock pins the SQL against the Go catalog.
 //
-// 000136 is now the newest catalog migration, so it OWNS the live-catalog
-// assertion that 000135 used to carry; 000135's own list is frozen to its 64
-// keys. This is the 000086 -> 000091 -> 000113 -> 000135 handover protocol, one
-// step on. When a later migration admits another key, freeze this list and move
-// the live pin there -- do not add the new key here.
+// 000136 owns the historical 66-key constraint. Migration 000142 owns the
+// current live catalog; this test freezes the 000136 handover point.
 func TestMigration000136_FilesAndSchemaLock(t *testing.T) {
 	up := migration000136SQL(t, "up")
 	down := migration000136SQL(t, "down")
@@ -115,10 +111,13 @@ func TestMigration000136_FilesAndSchemaLock(t *testing.T) {
 func TestMigration000136_UpDownReUp(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	ctx := context.Background()
+	tx, err := ts.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, tx.Rollback()) }()
 	const nodeID = "cvn_bbbbbbbbbbbbbbbb"
 
 	insert := func(key, ts2 string, value int) error {
-		_, err := ts.DB.ExecContext(ctx, `
+		_, err := tx.ExecContext(ctx, `
 			INSERT INTO ops_metric_samples (node_id, metric_key, ts, value)
 			VALUES ($1, $2, $3::timestamptz, $4)
 		`, nodeID, key, ts2, value)
@@ -138,25 +137,11 @@ func TestMigration000136_UpDownReUp(t *testing.T) {
 	// regressed, and whether this test sees 62, 64 or 66 keys depends on test ORDER
 	// within the package. The up migration is a DROP CONSTRAINT followed by an ADD,
 	// so re-applying it is idempotent and cheap.
-	_, err := ts.DB.ExecContext(ctx, upSQL)
+	_, err = tx.ExecContext(ctx, upSQL)
 	require.NoError(t, err, "failed to establish the up state")
 
-	// Self-clean before AND after. ops_metric_samples is not covered by the
-	// package's table truncation, and the primary key is (node_id, metric_key, ts)
-	// -- all three fixed here -- so a row left behind by an earlier failed run makes
-	// every later run fail on a duplicate key rather than on the constraint this
-	// test is about. Diagnosing that costs more than preventing it.
-	clearRows := func() {
-		for _, key := range migration000136NewKeys {
-			_, err := ts.DB.ExecContext(ctx,
-				`DELETE FROM ops_metric_samples WHERE node_id = $1 AND metric_key = $2`,
-				nodeID, key)
-			require.NoError(t, err)
-		}
-	}
-	clearRows()
-	t.Cleanup(clearRows)
-
+	// Keep the catalog roundtrip inside one transaction so rollback restores the
+	// live schema after the historical constraint is exercised.
 	// BOTH keys, not just the first. One key proves the constraint moved; it does
 	// not prove it moved far enough, and a generator that emitted only one of a
 	// two-key pair is precisely the drift this file exists to catch.
@@ -165,30 +150,27 @@ func TestMigration000136_UpDownReUp(t *testing.T) {
 			"the applied 66-key constraint must accept %s", key)
 	}
 
-	reapplied := false
-	t.Cleanup(func() {
-		if !reapplied {
-			_, err := ts.DB.ExecContext(ctx, upSQL)
-			require.NoError(t, err, "failed to restore the schema for subsequent tests")
-		}
-	})
-
-	_, err = ts.DB.ExecContext(ctx, downSQL)
+	_, err = tx.ExecContext(ctx, downSQL)
 	require.NoError(t, err, "the down migration must not fail on the rows inserted above")
 
 	for _, key := range migration000136NewKeys {
 		var remaining int
-		require.NoError(t, ts.DB.QueryRowContext(ctx,
+		require.NoError(t, tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM ops_metric_samples WHERE metric_key = $1`, key).Scan(&remaining))
 		assert.Zero(t, remaining, "rollback must clear rows carrying the retired key %s", key)
 
+		_, err = tx.ExecContext(ctx, `SAVEPOINT migration000136_rejection`)
+		require.NoError(t, err)
 		require.Error(t, insert(key, "2026-09-16 13:00:00+00", 2),
 			"the restored 64-key constraint must reject %s", key)
+		_, err = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT migration000136_rejection`)
+		require.NoError(t, err)
+		_, err = tx.ExecContext(ctx, `RELEASE SAVEPOINT migration000136_rejection`)
+		require.NoError(t, err)
 	}
 
-	_, err = ts.DB.ExecContext(ctx, upSQL)
+	_, err = tx.ExecContext(ctx, upSQL)
 	require.NoError(t, err)
-	reapplied = true
 	for _, key := range migration000136NewKeys {
 		require.NoError(t, insert(key, "2026-09-16 14:00:00+00", 3),
 			"the reapplied 66-key constraint must accept %s again", key)
@@ -226,11 +208,8 @@ func migration000136ConstraintKeys(contents, constraint string) []string {
 }
 
 func migration000136CatalogKeys() []string {
-	definitions := opsmetrics.Catalog()
-	keys := make([]string, 0, len(definitions))
-	for _, definition := range definitions {
-		keys = append(keys, string(definition.Key))
-	}
+	keys := append([]string{}, migration000135FrozenKeys()...)
+	keys = append(keys, migration000136NewKeys...)
 	sort.Strings(keys)
 	return keys
 }

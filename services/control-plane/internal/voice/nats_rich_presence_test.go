@@ -34,6 +34,34 @@ type voiceWireEnvelope struct {
 	Data map[string]interface{} `json:"data"`
 }
 
+type replicaChannelPermissionChecker struct {
+	resolver *rbac.Resolver
+}
+
+func (c replicaChannelPermissionChecker) HasChannelPermission(
+	ctx context.Context, serverID, userID, channelID string, permBit int64,
+) (bool, error) {
+	return c.resolver.HasPermission(ctx, serverID, userID, channelID, rbac.Permission(permBit))
+}
+
+func (c replicaChannelPermissionChecker) HasChannelPermissionsUncached(
+	ctx context.Context, serverID, userID, channelID string, permBits ...int64,
+) (bool, error) {
+	permissions, err := c.resolver.ResolveEffectivePermissionsUncached(ctx, serverID, userID, channelID)
+	if errors.Is(err, rbac.ErrNotMember) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, permBit := range permBits {
+		if !permissions.Has(rbac.Permission(permBit)) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func connectVoiceWireClient(
 	t *testing.T,
 	ts *testhelpers.TestServer,
@@ -79,6 +107,7 @@ func newVoiceReplicaHub(
 	resolver := rbac.NewResolver(
 		ts.DB, rbac.NewPermissionCache(ts.Redis), logger.New("test-replica"),
 	)
+	hub.SetChannelPermissionChecker(replicaChannelPermissionChecker{resolver: resolver})
 	activityStore := presence.NewActivityStore(ts.Redis)
 	activityBuilder := presence.NewActivityBuilder(
 		ts.DB, testCallLeaseVerifier{redis: ts.Redis}, activityStore,

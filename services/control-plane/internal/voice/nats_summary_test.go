@@ -5,10 +5,37 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRecordServerVoiceTerminalOutboxOutcomesMapsEachCounter(t *testing.T) {
+	counters := opsmetrics.NewCounters()
+	subscriber := NATSSubscriber{opsCounters: counters}
+	subscriber.recordServerVoiceTerminalOutboxOutcomes(serverVoiceTerminalOutcomes{
+		captured:            1,
+		delivered:           2,
+		successorSuppressed: 3,
+		channelSuppressed:   4,
+		lockRetained:        5,
+		queueRescheduled:    6,
+	})
+
+	want := map[opsmetrics.MetricKey]float64{
+		opsmetrics.MetricServerVoiceTerminalOutboxCapturedTotal:            1,
+		opsmetrics.MetricServerVoiceTerminalOutboxDeliveredTotal:           2,
+		opsmetrics.MetricServerVoiceTerminalOutboxSuccessorSuppressedTotal: 3,
+		opsmetrics.MetricServerVoiceTerminalOutboxChannelSuppressedTotal:   4,
+		opsmetrics.MetricServerVoiceTerminalOutboxLockRetainedTotal:        5,
+		opsmetrics.MetricServerVoiceTerminalOutboxQueueRescheduledTotal:    6,
+	}
+	snapshot := counters.Snapshot()
+	for key, value := range want {
+		assert.Equal(t, value, snapshot[key], "counter mapping for %q", key)
+	}
+}
 
 func TestCompletedCallSummaryFromRoomEmpty(t *testing.T) {
 	callID := uuid.New()

@@ -59,6 +59,12 @@ const CONTROL_METRIC_KEYS = [
   "presence_audience_suppressed_total",
   "presence_ttl_lapsed_total",
   "websocket_abnormal_closes_total",
+  "server_voice_terminal_outbox_captured_total",
+  "server_voice_terminal_outbox_delivered_total",
+  "server_voice_terminal_outbox_successor_suppressed_total",
+  "server_voice_terminal_outbox_channel_suppressed_total",
+  "server_voice_terminal_outbox_lock_retained_total",
+  "server_voice_terminal_outbox_queue_rescheduled_total",
 ] as const;
 
 export const ACCOUNT_ACTIVITY_METRIC_KEYS = [
@@ -134,6 +140,12 @@ export const COUNTER_METRIC_KEYS = [
   "presence_audience_suppressed_total",
   "presence_ttl_lapsed_total",
   "websocket_abnormal_closes_total",
+  "server_voice_terminal_outbox_captured_total",
+  "server_voice_terminal_outbox_delivered_total",
+  "server_voice_terminal_outbox_successor_suppressed_total",
+  "server_voice_terminal_outbox_channel_suppressed_total",
+  "server_voice_terminal_outbox_lock_retained_total",
+  "server_voice_terminal_outbox_queue_rescheduled_total",
   "media_egress_cumulative_bytes",
   "media_participant_hours_audio",
   "media_participant_hours_webcam",

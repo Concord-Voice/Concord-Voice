@@ -103,3 +103,73 @@ func TestCallEventWriters_RollBackWhenCallerOrConversationIsMissing(t *testing.T
 		CallID: validID, CallerUserID: callerID, ParticipantUserIDs: []uuid.UUID{callerID}, StartedAt: now, EndedAt: now.Add(time.Second),
 	}))
 }
+
+func TestCallEventWriter_RespawnsParticipantsAfterPersistedMessage(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	convID, caller, _ := seedHiddenConv(t, db)
+	hiddenAt := time.Now().UTC().Add(-time.Minute)
+	_, err := db.Exec(`UPDATE dm_participants SET hidden_at = $1 WHERE conversation_id = $2`, hiddenAt, convID)
+	require.NoError(t, err)
+
+	h := &Handler{db: db}
+	now := time.Now().UTC()
+	require.NoError(t, h.insertCallEvent(context.Background(), uuid.MustParse(convID), CallEventPayload{
+		RingID: uuid.New(), CallerUserID: uuid.MustParse(caller), ParticipantUserIDs: []uuid.UUID{uuid.MustParse(caller)},
+		StartedAt: now.Add(-time.Minute), EndedAt: now, Status: CallEventCanceled,
+	}))
+
+	var remaining int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, convID).Scan(&remaining))
+	assert.Zero(t, remaining, "a persisted call event respawns hidden participants")
+}
+
+func TestCompletedCallEvent_NoOpDoesNotRespawn(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	convID, caller, _ := seedHiddenConv(t, db)
+	convUUID := uuid.MustParse(convID)
+	callerUUID := uuid.MustParse(caller)
+	hiddenAt := time.Now().UTC().Add(-time.Minute)
+	_, err := db.Exec(`UPDATE dm_participants SET hidden_at = $1 WHERE conversation_id = $2`, hiddenAt, convID)
+	require.NoError(t, err)
+
+	payload := CallEventPayload{
+		RingID: uuid.New(), CallerUserID: callerUUID, ParticipantUserIDs: []uuid.UUID{callerUUID},
+		StartedAt: hiddenAt, EndedAt: hiddenAt.Add(time.Second), Status: CallEventCompleted,
+	}
+	callID := uuid.New()
+	require.NoError(t, insertCompletedCallEvent(context.Background(), db, convUUID, callID, payload, false))
+	_, err = db.Exec(`UPDATE dm_participants SET hidden_at = $1 WHERE conversation_id = $2`, hiddenAt, convID)
+	require.NoError(t, err)
+	require.NoError(t, insertCompletedCallEvent(context.Background(), db, convUUID, callID, payload, false))
+
+	var remaining int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, convID).Scan(&remaining))
+	assert.Equal(t, 2, remaining, "DO NOTHING conflict must not respawn hidden participants")
+}
+
+func TestCompletedCallEvent_EndedAtBeforeHideKeepsParticipantsHidden(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	convID, caller, _ := seedHiddenConv(t, db)
+	convUUID := uuid.MustParse(convID)
+	callerUUID := uuid.MustParse(caller)
+	now := time.Now().UTC()
+	endedAt := now.Add(-2 * time.Second)
+	hiddenAt := now.Add(-time.Second)
+	_, err := db.Exec(`UPDATE dm_participants SET hidden_at = $1 WHERE conversation_id = $2`, hiddenAt, convID)
+	require.NoError(t, err)
+
+	first := CallEventPayload{
+		RingID: uuid.New(), CallerUserID: callerUUID, ParticipantUserIDs: []uuid.UUID{callerUUID},
+		StartedAt: endedAt.Add(-time.Minute), EndedAt: endedAt, Status: CallEventCompleted,
+	}
+	require.NoError(t, insertCompletedCallEvent(context.Background(), db, convUUID, uuid.New(), first, false))
+	var remaining int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, convID).Scan(&remaining))
+	assert.Equal(t, 2, remaining, "an event timestamped before the hide must not reveal participants")
+
+	later := first
+	later.EndedAt = now.Add(time.Second)
+	require.NoError(t, insertCompletedCallEvent(context.Background(), db, convUUID, uuid.New(), later, false))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, convID).Scan(&remaining))
+	assert.Zero(t, remaining, "a truly later event may reveal participants")
+}

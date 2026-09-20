@@ -658,7 +658,7 @@ describe("ServicesWorkspace", () => {
 });
 
 describe("CountersWorkspace", () => {
-  it("renders all 25 homes in four groups and labels fifteen monotonic values", () => {
+  it("renders all 31 homes in four groups and labels twenty-one monotonic values", () => {
     const { container } = render(
       <CountersWorkspace
         counters={resource(fullCounters())}
@@ -670,7 +670,7 @@ describe("CountersWorkspace", () => {
 
     expect(
       container.querySelectorAll("[data-primary-home='counters']"),
-    ).toHaveLength(25);
+    ).toHaveLength(31);
     for (const group of [
       "Control plane",
       "Media activity",
@@ -679,7 +679,19 @@ describe("CountersWorkspace", () => {
     ]) {
       expect(screen.getByRole("heading", { name: group })).toBeVisible();
     }
-    expect(screen.getAllByText("Process lifetime")).toHaveLength(15);
+    expect(screen.getAllByText("Process lifetime")).toHaveLength(21);
+    for (const key of [
+      "server_voice_terminal_outbox_captured_total",
+      "server_voice_terminal_outbox_delivered_total",
+      "server_voice_terminal_outbox_successor_suppressed_total",
+      "server_voice_terminal_outbox_channel_suppressed_total",
+      "server_voice_terminal_outbox_lock_retained_total",
+      "server_voice_terminal_outbox_queue_rescheduled_total",
+    ]) {
+      const row = container.querySelector(`[data-metric-key='${key}']`);
+      expect(row).not.toBeNull();
+      expect(row).toHaveTextContent("Process lifetime");
+    }
     expect(screen.queryByText(/total participants/i)).not.toBeInTheDocument();
     expect(screen.getByText("HTTP client-error share")).toBeVisible();
     expect(screen.getByText("HTTP server-error share")).toBeVisible();
@@ -714,7 +726,7 @@ describe("CountersWorkspace", () => {
     expect(screen.getByText(new RegExp(copy, "i"))).toBeVisible();
   });
 
-  it("renders a valid empty sample as 25 fixed metric homes", () => {
+  it("renders a valid empty sample as 31 fixed metric homes", () => {
     const { container } = render(
       <CountersWorkspace
         counters={resource({ node_id: NODE_ID, counters: [] })}
@@ -726,7 +738,7 @@ describe("CountersWorkspace", () => {
 
     expect(
       container.querySelectorAll("[data-primary-home='counters']"),
-    ).toHaveLength(25);
+    ).toHaveLength(31);
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
   });
 });
@@ -745,7 +757,7 @@ describe("TimeSeriesWorkspace", () => {
       />,
     );
 
-    expect(screen.getAllByRole("option")).toHaveLength(66);
+    expect(screen.getAllByRole("option")).toHaveLength(72);
     for (const preset of [
       "Host pressure",
       "HTTP traffic",
@@ -876,7 +888,7 @@ describe("ChangesWorkspace", () => {
 });
 
 describe("primary workspace map", () => {
-  it("keeps the approved 4/28/25/9 split totaling 66 keys", () => {
+  it("keeps the approved 4/28/31/9 split totaling 72 keys", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
     expect([
@@ -884,8 +896,8 @@ describe("primary workspace map", () => {
       ...PRIMARY_METRIC_MAP.mediaActivity,
       ...PRIMARY_METRIC_MAP.mediaEgress,
       ...PRIMARY_METRIC_MAP.participantHours,
-    ]).toHaveLength(25);
+    ]).toHaveLength(31);
     expect(PRIMARY_METRIC_MAP.usersActivity).toHaveLength(9);
-    expect(METRIC_KEYS).toHaveLength(66);
+    expect(METRIC_KEYS).toHaveLength(72);
   });
 });

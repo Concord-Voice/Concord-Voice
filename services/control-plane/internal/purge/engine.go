@@ -50,6 +50,10 @@ type DeleteSpec struct {
 	ScopeID          string  // the channel_id / conversation_id value
 	AttachmentsTable string  // "message_attachments" | "dm_message_attachments"
 	Author           *string // nil = all authors; set = only this user_id
+	// BeforeDeleteTx is an optional single-delete authorization hook. It runs
+	// after the transaction opens and before the victim row is locked; bulk
+	// purge paths never invoke it.
+	BeforeDeleteTx func(context.Context, *sql.Tx) error
 }
 
 // Plan is built by a handler AFTER authorization. RangeFrom nil = All Time.
@@ -598,6 +602,11 @@ func (e *Engine) DeleteOne(ctx context.Context, messageID string, spec DeleteSpe
 			e.log.Warn("purge: failed to rollback single delete transaction", "error", rollbackErr)
 		}
 	}()
+	if spec.BeforeDeleteTx != nil {
+		if err := spec.BeforeDeleteTx(ctx, tx); err != nil {
+			return contextError(ctx, fmt.Errorf("purge: authorize single delete: %w", err))
+		}
+	}
 
 	var lockedID string
 	if err := tx.QueryRowContext(ctx, queries.selectOne, messageID, spec.ScopeID).Scan(&lockedID); err != nil {

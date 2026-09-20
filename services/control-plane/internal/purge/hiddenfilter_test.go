@@ -16,6 +16,7 @@ func TestHiddenRangeFilter_BindsAliasAndParamPosition(t *testing.T) {
 	assert.Contains(t, frag, "hr.user_id = $4", "viewer id bound at the requested position")
 	assert.Contains(t, frag, "m.conversation_id", "correlates on the caller's alias")
 	assert.Contains(t, frag, "m.user_id <> $4", "never hides the requester's own messages")
+	assert.Contains(t, frag, "hr.includes_own OR m.user_id <> $4", "clear ranges also hide the requester's own messages")
 	assert.True(t, strings.HasPrefix(frag, " AND NOT EXISTS"), "appends to an existing WHERE")
 }
 
@@ -25,7 +26,17 @@ func TestHiddenRangeFilter_HonoursCallerAlias(t *testing.T) {
 
 	assert.Contains(t, frag, "dm.conversation_id")
 	assert.Contains(t, frag, "dm.user_id <> $2")
+	assert.Contains(t, frag, "hr.includes_own OR dm.user_id <> $2")
 	assert.NotContains(t, frag, "m.conversation_id = ", "must not hardcode the default alias")
+}
+
+func TestHiddenRangeFilterForViewerExpr_UsesTrustedViewerExpression(t *testing.T) {
+	frag := HiddenRangeFilterForViewerExpr("m", "dp.user_id")
+
+	assert.Contains(t, frag, "hr.user_id = dp.user_id")
+	assert.Contains(t, frag, "hr.includes_own OR m.user_id <> dp.user_id")
+	assert.Contains(t, frag, "m.created_at >= hr.hidden_from")
+	assert.Contains(t, frag, "m.created_at < hr.hidden_to")
 }
 
 // The window is half-open [from, to): a message exactly at hidden_to is NOT hidden,

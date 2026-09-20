@@ -50,6 +50,32 @@ func TestMergeRanges_EmptyAndSingle(t *testing.T) {
 	assert.Equal(t, one, mergeRanges(one))
 }
 
+func TestMergeRanges_MergesSameProvenanceAcrossInterleavedRange(t *testing.T) {
+	base := tm(1)
+	got := mergeRanges([]Range{
+		{From: base, To: base.Add(100 * time.Minute)},
+		{From: base.Add(10 * time.Minute), To: base.Add(20 * time.Minute), IncludesOwn: true},
+		{From: base.Add(30 * time.Minute), To: base.Add(40 * time.Minute)},
+	})
+	require.Len(t, got, 2)
+	assert.False(t, got[0].IncludesOwn)
+	assert.Equal(t, base, got[0].From)
+	assert.Equal(t, base.Add(100*time.Minute), got[0].To)
+	assert.True(t, got[1].IncludesOwn)
+}
+
+func TestMergeRanges_RepeatedClearRangesCoalesce(t *testing.T) {
+	got := mergeRanges([]Range{
+		{To: tm(3), IncludesOwn: true, infiniteFrom: true},
+		{From: tm(1), To: tm(5), IncludesOwn: true},
+		{From: tm(4), To: tm(6), IncludesOwn: true},
+	})
+	require.Len(t, got, 1)
+	assert.True(t, got[0].IncludesOwn)
+	assert.True(t, got[0].infiniteFrom)
+	assert.Equal(t, tm(6), got[0].To)
+}
+
 func TestHiddenRangeFilter_ReferencesParamTwice(t *testing.T) {
 	frag := hiddenRangeFilter(4)
 	assert.Contains(t, frag, "$4")

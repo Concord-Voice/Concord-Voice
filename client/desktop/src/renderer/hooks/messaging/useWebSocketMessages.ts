@@ -382,7 +382,6 @@ interface VoiceMembershipContext {
   channelId: string;
   action: string;
   userId: string | undefined;
-  serverId: string | undefined;
   username: string;
   displayName: string | undefined;
   localUserId: string | undefined;
@@ -403,8 +402,7 @@ function playVoicePresenceSound(
 
 /** Handle joined/left/room_empty — sidebar member list + sounds + debounced refetch. */
 function handleVoiceMembershipChange(ctx: VoiceMembershipContext): void {
-  const { action, channelId, userId, serverId, voiceStore, isLocalUserInChannel, localUserId } =
-    ctx;
+  const { action, channelId, userId, voiceStore, isLocalUserInChannel, localUserId } = ctx;
 
   if (action === 'joined' && userId) {
     voiceStore.addChannelVoiceMember(channelId, {
@@ -416,12 +414,15 @@ function handleVoiceMembershipChange(ctx: VoiceMembershipContext): void {
       serverMuted: false,
       serverDeafened: false,
     });
-    if (serverId) voiceStore.incrementServerVoiceCount(serverId);
     playVoicePresenceSound(action, userId, localUserId, isLocalUserInChannel);
   } else if (action === 'left' && userId) {
+    const wasMember = voiceStore.channelVoiceMembers[channelId]?.some(
+      (member) => member.userId === userId
+    );
     voiceStore.removeChannelVoiceMember(channelId, userId);
-    if (serverId) voiceStore.decrementServerVoiceCount(serverId);
-    playVoicePresenceSound(action, userId, localUserId, isLocalUserInChannel);
+    if (wasMember) {
+      playVoicePresenceSound(action, userId, localUserId, isLocalUserInChannel);
+    }
   } else if (action === 'room_empty') {
     voiceStore.setChannelVoiceMembers(channelId, []);
   }
@@ -495,7 +496,6 @@ function handleVoiceStateUpdate(
   const action = data.action;
 
   const userId = data.user_id;
-  const serverId = data.server_id;
   const voiceStore = useVoiceStore.getState();
   const localUserId = useUserStore.getState().user?.id;
 
@@ -504,7 +504,6 @@ function handleVoiceStateUpdate(
     action,
     channelId,
     userId,
-    serverId,
     // Use `||` (not `??`) so empty strings also fall back to 'Unknown' —
     // `VoiceStateUpdateSchema` permits `username: z.string().optional()` with
     // no `.min(1)`, so a server-emitted empty string is schema-valid and would

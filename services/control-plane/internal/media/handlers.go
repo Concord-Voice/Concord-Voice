@@ -28,6 +28,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	invitecodes "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -93,6 +94,28 @@ const profileTier1SlotKeyQuery = `
 		SELECT 1 FROM tier1_erasure_delete_obligations
 		WHERE storage_key = media_files.storage_key
 	  )`
+
+//nolint:gosec // G202: HiddenRangeFilterForViewerExpr has hardcoded alias and placeholder; values remain parameterized.
+var dmAttachmentDownloadAccessQuery = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM dm_participants dp
+		WHERE dp.conversation_id = $3 AND dp.user_id = $2
+		AND (
+			EXISTS (
+				SELECT 1
+				FROM dm_message_attachments dma
+				INNER JOIN dm_messages dm ON dm.id = dma.message_id
+				WHERE dma.file_id = $1 AND dm.conversation_id = $3
+				` + dmvisibility.HiddenRangeFilterForViewerExpr("dm", "$2") + `
+			) OR (
+				$2 = $4
+				AND NOT EXISTS (SELECT 1 FROM dm_message_attachments WHERE file_id = $1)
+				AND NOT EXISTS (SELECT 1 FROM message_attachments WHERE file_id = $1)
+			)
+		)
+	)
+`
 
 // ObjectStore defines the storage operations required by the media handler.
 // This interface is satisfied by *storage.Client and can be mocked for testing.
@@ -422,7 +445,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	}
 
 	// Fetch file metadata and verify access
-	var storageKey, mimeType string
+	var storageKey, mimeType, uploaderID string
 	var fileSize int64
 	var channelID, conversationID *string
 	// NULLable: rows predating the client-attested epoch (#2832) carry none, and
@@ -433,11 +456,11 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	// closed — it is the value every pre-cutover object carries forever.
 	var storageBackend *string
 
-	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version, storage_backend
+	query := `SELECT storage_key, mime_type, file_size, channel_id, conversation_id, key_version, storage_backend, uploader_id
 	          FROM media_files
 	          WHERE id = $1 AND deleted_at IS NULL AND media_tier = 2`
 	err := h.db.QueryRow(query, fileID).
-		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion, &storageBackend)
+		Scan(&storageKey, &mimeType, &fileSize, &channelID, &conversationID, &keyVersion, &storageBackend, &uploaderID)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
 		return
@@ -447,7 +470,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 
-	if !h.userCanDownloadAttachment(c, userID, channelID, conversationID) {
+	if !h.userCanDownloadAttachment(c, userID, uploaderID, fileID, channelID, conversationID) {
 		return
 	}
 
@@ -498,7 +521,7 @@ func (h *Handler) DownloadAttachment(c *gin.Context) {
 	}
 }
 
-func (h *Handler) userCanDownloadAttachment(c *gin.Context, userID string, channelID, conversationID *string) bool {
+func (h *Handler) userCanDownloadAttachment(c *gin.Context, userID, uploaderID, fileID string, channelID, conversationID *string) bool {
 	switch {
 	case channelID != nil:
 		// CV-CAN-003: downloading a channel attachment requires both the
@@ -508,7 +531,17 @@ func (h *Handler) userCanDownloadAttachment(c *gin.Context, userID string, chann
 		return h.userHasChannelAccess(c, userID, *channelID) &&
 			h.checkReadHistoryPermission(c, userID, *channelID)
 	case conversationID != nil:
-		return h.userHasDMAccess(c, userID, *conversationID)
+		var hasAccess bool
+		if err := h.db.QueryRow(dmAttachmentDownloadAccessQuery, fileID, userID, *conversationID, uploaderID).Scan(&hasAccess); err != nil {
+			h.log.Error("Failed to verify DM attachment access", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedVerifyAccess})
+			return false
+		}
+		if !hasAccess {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
+			return false
+		}
+		return true
 	default:
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgAccessDenied})
 		return false

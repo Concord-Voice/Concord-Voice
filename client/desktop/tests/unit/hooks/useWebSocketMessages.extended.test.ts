@@ -818,6 +818,79 @@ describe('useWebSocketMessages — extended handlers', () => {
       expect(handler).toBeDefined();
     });
 
+    it('removes a known member once, preserves the authoritative count, and refetches', async () => {
+      vi.useFakeTimers();
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
+      useVoiceStore.setState({ activeChannelId: 'ch-1' });
+      useVoiceStore.getState().setServerVoiceCounts({ 'server-1': 4 });
+      useVoiceStore.getState().addChannelVoiceMember('ch-1', {
+        userId: 'user-2',
+        username: 'alice',
+        isMuted: false,
+      });
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const handler = ws.handlers.get('voice_state_update')!;
+
+      act(() => {
+        handler({
+          type: 'voice_state_update',
+          data: { channel_id: 'ch-1', action: 'left', user_id: 'user-2', server_id: 'server-1' },
+        });
+        handler({
+          type: 'voice_state_update',
+          data: { channel_id: 'ch-1', action: 'left', user_id: 'user-2', server_id: 'server-1' },
+        });
+      });
+      await act(async () => vi.advanceTimersByTime(2100));
+
+      expect(useVoiceStore.getState().channelVoiceMembers['ch-1']).toEqual([]);
+      expect(useVoiceStore.getState().serverVoiceCounts['server-1']).toBe(4);
+      expect(notificationSoundService.play).toHaveBeenCalledTimes(1);
+      expect(notificationSoundService.play).toHaveBeenCalledWith('user-leave');
+      expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/channels/ch-1/voice/participants');
+      vi.useRealTimers();
+    });
+
+    it('refetches an unhydrated leave without sound or inferred count change', async () => {
+      vi.useFakeTimers();
+      const { apiFetch: mockApiFetch } = await import('@/renderer/services/system/apiClient');
+      useVoiceStore.setState({ activeChannelId: 'ch-1' });
+      useVoiceStore.getState().setServerVoiceCounts({ 'server-1': 2 });
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const handler = ws.handlers.get('voice_state_update')!;
+
+      act(() => {
+        handler({
+          type: 'voice_state_update',
+          data: { channel_id: 'ch-1', action: 'left', user_id: 'unknown', server_id: 'server-1' },
+        });
+      });
+      await act(async () => vi.advanceTimersByTime(2100));
+
+      expect(notificationSoundService.play).not.toHaveBeenCalledWith('user-leave');
+      expect(useVoiceStore.getState().serverVoiceCounts['server-1']).toBe(2);
+      expect(mockApiFetch).toHaveBeenCalledWith('/api/v1/channels/ch-1/voice/participants');
+      vi.useRealTimers();
+    });
+
+    it('keeps a server count received before a left frame', () => {
+      useVoiceStore.getState().setServerVoiceCounts({ 'server-1': 7 });
+      const ws = createMockWsService();
+      renderHook(() => useWebSocketMessages(ws as never));
+      const counts = ws.handlers.get('server_voice_counts')!;
+      const voice = ws.handlers.get('voice_state_update')!;
+      act(() => {
+        counts({ type: 'server_voice_counts', data: { counts: { 'server-1': 6 } } });
+        voice({
+          type: 'voice_state_update',
+          data: { channel_id: 'ch-1', action: 'left', user_id: 'user-2', server_id: 'server-1' },
+        });
+      });
+      expect(useVoiceStore.getState().serverVoiceCounts['server-1']).toBe(6);
+    });
+
     it('handles room_empty event', () => {
       const ws = createMockWsService();
       renderHook(() => useWebSocketMessages(ws as never));

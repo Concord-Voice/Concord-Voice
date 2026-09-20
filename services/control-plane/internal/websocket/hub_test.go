@@ -2,9 +2,11 @@ package websocket
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -473,6 +475,7 @@ func newMinimalHub() *Hub {
 		globalBroadcast:        make(chan OutgoingMessage, 256),
 		userBroadcast:          make(chan UserBroadcastMessage, 256),
 		serverBroadcast:        make(chan ServerBroadcastMessage, 256),
+		serverVoiceBroadcast:   make(chan ServerBroadcastMessage, 256),
 		evictBroadcast:         make(chan ServerBroadcastMessage, 16),
 		dmBroadcast:            make(chan DMBroadcastMessage, 256),
 		channelDeliveryResults: make(chan channelDeliveryResult, 256),
@@ -522,6 +525,44 @@ type blockingChannelPermissionChecker struct {
 	once    sync.Once
 }
 
+type cancellationAwareBlockingChannelPermissionChecker struct {
+	allowed    bool
+	entered    chan struct{}
+	canceled   chan struct{}
+	release    chan struct{}
+	enterOnce  sync.Once
+	cancelOnce sync.Once
+}
+
+func newCancellationAwareBlockingChannelPermissionChecker(allowed bool) *cancellationAwareBlockingChannelPermissionChecker {
+	return &cancellationAwareBlockingChannelPermissionChecker{
+		allowed:  allowed,
+		entered:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+}
+
+func (c *cancellationAwareBlockingChannelPermissionChecker) wait(ctx context.Context) (bool, error) {
+	c.enterOnce.Do(func() { close(c.entered) })
+	select {
+	case <-ctx.Done():
+		c.cancelOnce.Do(func() { close(c.canceled) })
+		<-c.release
+		return false, ctx.Err()
+	case <-c.release:
+		return c.allowed, nil
+	}
+}
+
+func (c *cancellationAwareBlockingChannelPermissionChecker) HasChannelPermission(ctx context.Context, _ string, _ string, _ string, _ int64) (bool, error) {
+	return c.wait(ctx)
+}
+
+func (c *cancellationAwareBlockingChannelPermissionChecker) HasChannelPermissionsUncached(ctx context.Context, _ string, _ string, _ string, _ ...int64) (bool, error) {
+	return c.wait(ctx)
+}
+
 func newBlockingChannelPermissionChecker(allowed bool) *blockingChannelPermissionChecker {
 	return &blockingChannelPermissionChecker{
 		allowed: allowed,
@@ -546,6 +587,90 @@ func (c *blockingChannelPermissionChecker) HasChannelPermissionsUncached(context
 	return c.allowed, nil
 }
 
+type firstCheckBlockingChannelPermissionChecker struct {
+	entered           chan struct{}
+	release           chan struct{}
+	secondEntered     chan struct{}
+	secondRelease     chan struct{}
+	releaseOnce       sync.Once
+	secondReleaseOnce sync.Once
+	calls             int
+	mu                sync.Mutex
+}
+
+type deadlineExhaustingChannelPermissionChecker struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *deadlineExhaustingChannelPermissionChecker) HasChannelPermission(ctx context.Context, _ string, _ string, _ string, _ int64) (bool, error) {
+	c.mu.Lock()
+	c.calls++
+	first := c.calls == 1
+	c.mu.Unlock()
+	if first {
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *deadlineExhaustingChannelPermissionChecker) HasChannelPermissionsUncached(ctx context.Context, serverID, userID, channelID string, permBits ...int64) (bool, error) {
+	for _, permBit := range permBits {
+		allowed, err := c.HasChannelPermission(ctx, serverID, userID, channelID, permBit)
+		if err != nil || !allowed {
+			return allowed, err
+		}
+	}
+	return true, nil
+}
+
+func (c *firstCheckBlockingChannelPermissionChecker) HasChannelPermission(context.Context, string, string, string, int64) (bool, error) {
+	c.mu.Lock()
+	c.calls++
+	first := c.calls == 1
+	c.mu.Unlock()
+	if first {
+		close(c.entered)
+		<-c.release
+	}
+	if c.callCount() == 2 && c.secondEntered != nil {
+		close(c.secondEntered)
+		<-c.secondRelease
+	}
+	return true, nil
+}
+
+func (c *firstCheckBlockingChannelPermissionChecker) HasChannelPermissionsUncached(ctx context.Context, serverID, userID, channelID string, permBits ...int64) (bool, error) {
+	for _, permBit := range permBits {
+		allowed, err := c.HasChannelPermission(ctx, serverID, userID, channelID, permBit)
+		if err != nil || !allowed {
+			return allowed, err
+		}
+	}
+	return true, nil
+}
+
+func (c *firstCheckBlockingChannelPermissionChecker) unblock() {
+	c.releaseOnce.Do(func() { close(c.release) })
+	if c.secondRelease != nil {
+		c.secondReleaseOnce.Do(func() { close(c.secondRelease) })
+	}
+}
+
+func (c *firstCheckBlockingChannelPermissionChecker) unblockFirst() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
+func (c *firstCheckBlockingChannelPermissionChecker) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
 func requirePermissionCheckOffRunGoroutine(t *testing.T, done <-chan struct{}, checker *blockingChannelPermissionChecker) {
 	t.Helper()
 	select {
@@ -568,7 +693,7 @@ func applyAsyncChannelDelivery(t *testing.T, hub *Hub) {
 	select {
 	case result := <-hub.channelDeliveryResults:
 		hub.handleChannelDeliveryResult(result)
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(time.Second):
 		t.Fatal("expected async channel delivery result")
 	}
 }
@@ -1189,6 +1314,543 @@ func TestHandleBroadcastChecksPermissionOffRunGoroutine(t *testing.T) {
 	applyAsyncChannelDelivery(t, hub)
 
 	assert.Len(t, client.Send, 1, "authorized subscriber should receive async-filtered message")
+}
+
+func TestAuthorizedServerVoiceChannelLookupDoesNotBlockRun(t *testing.T) {
+	db, query := openBlockingChannelContextDB(t)
+	hub := NewHub(db, nil)
+	serverID := uuid.New()
+	voiceChannelID := uuid.New()
+	voiceClient := newTestClient(hub, uuid.New())
+	unrelated := newTestClient(hub, uuid.New())
+	hub.clients[voiceClient.ID] = voiceClient
+	hub.clients[unrelated.ID] = unrelated
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{voiceClient.ID: true}
+	hub.SetChannelPermissionChecker(staticChannelPermissionChecker{allowed: true})
+	go hub.Run()
+	t.Cleanup(hub.Shutdown)
+	t.Cleanup(func() { close(query.release) })
+
+	hub.serverVoiceBroadcast <- ServerBroadcastMessage{
+		ServerID:             serverID,
+		ChannelID:            voiceChannelID,
+		RequireVoiceViewAuth: true,
+		Data:                 OutgoingMessage{Type: "voice_state_update"},
+	}
+	select {
+	case <-query.entered:
+	case <-time.After(time.Second):
+		t.Fatal("expected Server Voice channel lookup")
+	}
+	select {
+	case hasDeadline := <-query.hasDeadline:
+		require.True(t, hasDeadline, "Server Voice channel lookup must be bounded")
+	case <-time.After(time.Second):
+		t.Fatal("expected Server Voice channel lookup deadline")
+	}
+
+	hub.globalBroadcast <- OutgoingMessage{Type: "unrelated"}
+	select {
+	case data := <-unrelated.Send:
+		var delivered OutgoingMessage
+		require.NoError(t, json.Unmarshal(data, &delivered))
+		require.Equal(t, "unrelated", delivered.Type)
+	case <-time.After(time.Second):
+		t.Fatal("channel lookup blocked the Hub Run loop")
+	}
+}
+
+func TestServerVoiceDeliveryWorkersJoinAndRejectAfterShutdown(t *testing.T) {
+	t.Run("shutdown joins an in-flight permission worker", func(t *testing.T) {
+		hub := NewHub(nil, nil)
+		checker := newCancellationAwareBlockingChannelPermissionChecker(true)
+		hub.SetChannelPermissionChecker(checker)
+		client := newTestClient(hub, uuid.New())
+		hub.clients[client.ID] = client
+		hub.serverSubscriptions[uuid.New()] = map[uuid.UUID]bool{client.ID: true}
+		go hub.Run()
+
+		released := false
+		defer func() {
+			if !released {
+				close(checker.release)
+			}
+		}()
+		req := channelDeliveryRequest{
+			kind:       channelDeliveryServerBroadcast,
+			serverID:   uuid.New(),
+			channelID:  uuid.New(),
+			viewPerm:   permViewVoiceChannels,
+			recipients: []channelDeliveryRecipient{{clientID: client.ID, userID: client.UserID}},
+			data:       []byte(`{"type":"voice_state_update"}`),
+		}
+		require.True(t, hub.dispatchChannelDelivery(req))
+		select {
+		case <-checker.entered:
+		case <-time.After(time.Second):
+			t.Fatal("expected the Server Voice worker to enter permission checking")
+		}
+
+		shutdownDone := make(chan struct{})
+		go func() {
+			hub.Shutdown()
+			close(shutdownDone)
+		}()
+		select {
+		case <-checker.canceled:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown did not cancel the in-flight Server Voice permission check")
+		}
+		select {
+		case <-shutdownDone:
+			t.Fatal("shutdown returned before the canceled Server Voice worker joined")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		close(checker.release)
+		released = true
+		select {
+		case <-shutdownDone:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown did not complete after the permission worker was released")
+		}
+	})
+
+	t.Run("new Server Voice work is rejected after shutdown", func(t *testing.T) {
+		hub := NewHub(nil, nil)
+		checker := newBlockingChannelPermissionChecker(true)
+		hub.SetChannelPermissionChecker(checker)
+		go hub.Run()
+		hub.Shutdown()
+
+		accepted := hub.dispatchChannelDelivery(channelDeliveryRequest{
+			kind:       channelDeliveryServerBroadcast,
+			serverID:   uuid.New(),
+			channelID:  uuid.New(),
+			viewPerm:   permViewVoiceChannels,
+			recipients: []channelDeliveryRecipient{{clientID: uuid.New(), userID: uuid.New()}},
+			data:       []byte(`{"type":"voice_state_update"}`),
+		})
+		assert.False(t, accepted)
+		select {
+		case <-checker.entered:
+			t.Fatal("a Server Voice permission worker started after shutdown")
+		default:
+		}
+	})
+}
+
+func TestServerVoiceDeliveryDirectStopCancelsAcknowledgementWaitAndRejectsLateAdmission(t *testing.T) {
+	newRequest := func(clientID, userID, serverID, channelID uuid.UUID) channelDeliveryRequest {
+		return channelDeliveryRequest{
+			kind:       channelDeliveryServerBroadcast,
+			serverID:   serverID,
+			channelID:  channelID,
+			viewPerm:   permViewVoiceChannels,
+			recipients: []channelDeliveryRecipient{{clientID: clientID, userID: userID}},
+			data:       []byte(`{"type":"voice_state_update"}`),
+		}
+	}
+
+	t.Run("delivery acknowledgement", func(t *testing.T) {
+		hub := newMinimalHub()
+		results := make(chan channelDeliveryResult, 1)
+		hub.channelDeliveryResults = results
+		client := newTestClient(hub, uuid.New())
+		hub.clients[client.ID] = client
+		serverID, channelID := uuid.New(), uuid.New()
+		hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+		hub.SetChannelPermissionChecker(staticChannelPermissionChecker{allowed: true})
+		require.True(t, hub.dispatchChannelDelivery(newRequest(client.ID, client.UserID, serverID, channelID)))
+		var result channelDeliveryResult
+		select {
+		case result = <-results:
+		case <-time.After(time.Second):
+			t.Fatal("Server Voice worker did not publish its delivery result")
+		}
+		require.NotNil(t, result.deliveryDone)
+
+		stopped := make(chan struct{})
+		go func() {
+			hub.stopServerVoiceDeliveryWorkers()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("direct stop did not cancel and join a worker awaiting delivery acknowledgement")
+		}
+	})
+
+	t.Run("late admission", func(t *testing.T) {
+		hub := newMinimalHub()
+		hub.channelDeliveryResults = make(chan channelDeliveryResult, 1)
+		hub.SetChannelPermissionChecker(staticChannelPermissionChecker{allowed: true})
+		hub.stopServerVoiceDeliveryWorkers()
+		assert.False(t, hub.dispatchChannelDelivery(newRequest(uuid.New(), uuid.New(), uuid.New(), uuid.New())))
+	})
+}
+
+func TestChannelDeliveryPermissionsGiveEachRecipientIndependentDeadline(t *testing.T) {
+	hub := newMinimalHub()
+	checker := &deadlineExhaustingChannelPermissionChecker{}
+	first := uuid.New()
+	second := uuid.New()
+	result := hub.checkChannelDeliveryPermissions(channelDeliveryRequest{
+		serverID:  uuid.New(),
+		channelID: uuid.New(),
+		viewPerm:  permViewTextChannels,
+		recipients: []channelDeliveryRecipient{
+			{clientID: uuid.New(), userID: first},
+			{clientID: uuid.New(), userID: second},
+		},
+	}, checker, hub.beginSecurityEventProbe(securityEventSourcePermissionAuthority))
+
+	require.Len(t, result.decisions, 2)
+	assert.False(t, result.decisions[0].allowed, "the timed-out recipient must fail closed")
+	assert.True(t, result.decisions[1].allowed, "a later recipient gets its own authorization deadline")
+}
+
+func TestChannelDeliveryServerBroadcastUsesUncachedPermissions(t *testing.T) {
+	hub := newMinimalHub()
+	result := hub.checkChannelDeliveryPermissions(channelDeliveryRequest{
+		kind:      channelDeliveryServerBroadcast,
+		serverID:  uuid.New(),
+		channelID: uuid.New(),
+		viewPerm:  permViewVoiceChannels,
+		recipients: []channelDeliveryRecipient{{
+			clientID: uuid.New(),
+			userID:   uuid.New(),
+		}},
+	}, staleChannelPermissionChecker{}, hub.beginSecurityEventProbe(securityEventSourcePermissionAuthority))
+
+	require.Len(t, result.decisions, 1)
+	assert.False(t, result.decisions[0].allowed, "Server Voice delivery must not reuse stale permission results")
+}
+
+func TestChannelDeliveryServerBroadcastScopesAuthorizationInvalidation(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		invalidateID uuid.UUID
+		wantDelivery bool
+	}{
+		{name: "same channel", wantDelivery: false},
+		{name: "unrelated channel", invalidateID: uuid.New(), wantDelivery: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hub := newMinimalHub()
+			serverID := uuid.New()
+			channelID := uuid.New()
+			client := newTestClient(hub, uuid.New())
+			hub.clients[client.ID] = client
+			hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+			checker := newBlockingChannelPermissionChecker(true)
+			hub.SetChannelPermissionChecker(checker)
+
+			hub.dispatchChannelDelivery(channelDeliveryRequest{
+				kind:       channelDeliveryServerBroadcast,
+				serverID:   serverID,
+				channelID:  channelID,
+				viewPerm:   permViewVoiceChannels,
+				data:       []byte(`{"type":"voice_state_update"}`),
+				recipients: []channelDeliveryRecipient{{clientID: client.ID, userID: client.UserID}},
+			})
+			select {
+			case <-checker.entered:
+			case <-time.After(time.Second):
+				t.Fatal("expected Server Voice permission check")
+			}
+
+			invalidateServerID := serverID
+			invalidateChannelID := channelID
+			if test.invalidateID != uuid.Nil {
+				invalidateServerID = test.invalidateID
+				invalidateChannelID = test.invalidateID
+			}
+			hub.RevalidateChannelSubscriptions(invalidateServerID, invalidateChannelID)
+			close(checker.release)
+			applyAsyncChannelDelivery(t, hub)
+			assert.Equal(t, test.wantDelivery, len(client.Send) == 1)
+		})
+	}
+}
+
+func TestServerVoiceDeliveryResultHoldsEpochThroughEnqueue(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	key := serverVoiceDeliveryKey{serverID: serverID, channelID: channelID}
+	client := newTestClient(hub, uuid.New())
+	hub.clients[client.ID] = client
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+	hub.serverVoiceDeliveryQueues = map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue{key: {}}
+	hub.serverVoiceAuthzEpochs = map[serverVoiceDeliveryKey]uint64{key: 0}
+
+	client.sendMu.Lock()
+	released := false
+	result := channelDeliveryResult{
+		serverID:  serverID,
+		channelID: channelID,
+		data:      []byte(`{"type":"voice_state_update"}`),
+		decisions: []channelDeliveryDecision{{clientID: client.ID, allowed: true}},
+	}
+	applied := make(chan struct{})
+	defer func() {
+		if !released {
+			client.sendMu.Unlock()
+		}
+		select {
+		case <-applied:
+		case <-time.After(time.Second):
+			t.Error("Server Voice result application did not join during cleanup")
+		}
+	}()
+	go func() {
+		defer close(applied)
+		hub.applyServerBroadcastDeliveryResult(result)
+	}()
+
+	require.Eventually(t, func() bool {
+		if hub.serverVoiceDeliveryMu.TryLock() {
+			hub.serverVoiceDeliveryMu.Unlock()
+			return false
+		}
+		return true
+	}, time.Second, time.Millisecond, "result application should hold the epoch while enqueueing")
+
+	revalidated := make(chan struct{})
+	go func() {
+		defer close(revalidated)
+		hub.RevalidateChannelSubscriptions(serverID, channelID)
+	}()
+	select {
+	case <-revalidated:
+		t.Fatal("permission invalidation returned before the admitted frame was enqueued")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	client.sendMu.Unlock()
+	released = true
+	select {
+	case <-applied:
+	case <-time.After(time.Second):
+		t.Fatal("Server Voice result application did not finish")
+	}
+	select {
+	case <-revalidated:
+	case <-time.After(time.Second):
+		t.Fatal("permission invalidation did not finish")
+	}
+	assert.Len(t, client.Send, 1)
+	hub.applyServerBroadcastDeliveryResult(result)
+	assert.Len(t, client.Send, 1, "reapplying the old-epoch result must not enqueue another frame")
+}
+
+func TestChannelDeliveryServerBroadcastRefreshesQueuedAuthorizationEpoch(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	client := newTestClient(hub, uuid.New())
+	hub.clients[client.ID] = client
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+	checker := &firstCheckBlockingChannelPermissionChecker{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	hub.SetChannelPermissionChecker(checker)
+	t.Cleanup(checker.unblock)
+
+	joined := channelDeliveryRequest{
+		kind:       channelDeliveryServerBroadcast,
+		serverID:   serverID,
+		channelID:  channelID,
+		viewPerm:   permViewVoiceChannels,
+		data:       []byte(`{"type":"voice_state_update","data":{"state":"joined"}}`),
+		recipients: []channelDeliveryRecipient{{clientID: client.ID, userID: client.UserID}},
+	}
+	left := joined
+	left.data = []byte(`{"type":"voice_state_update","data":{"state":"left"}}`)
+
+	hub.dispatchChannelDelivery(joined)
+	select {
+	case <-checker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("expected the first Server Voice permission check to block")
+	}
+	hub.dispatchChannelDelivery(left)
+	hub.RevalidateChannelSubscriptions(serverID, channelID)
+
+	checker.unblockFirst()
+	first := <-hub.channelDeliveryResults
+	hub.handleChannelDeliveryResult(first)
+	applyAsyncChannelDelivery(t, hub)
+
+	require.Len(t, client.Send, 1)
+	var delivered OutgoingMessage
+	require.NoError(t, json.Unmarshal(<-client.Send, &delivered))
+	assert.Equal(t, "left", delivered.Data["state"])
+}
+
+func TestChannelDeliveryServerBroadcastPreservesAuthorizedOrder(t *testing.T) {
+	hub := newMinimalHub()
+	serverID := uuid.New()
+	channelID := uuid.New()
+	client := newTestClient(hub, uuid.New())
+	hub.clients[client.ID] = client
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+	checker := &firstCheckBlockingChannelPermissionChecker{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	hub.SetChannelPermissionChecker(checker)
+	t.Cleanup(checker.unblock)
+
+	joined := channelDeliveryRequest{
+		kind:       channelDeliveryServerBroadcast,
+		serverID:   serverID,
+		channelID:  channelID,
+		viewPerm:   permViewVoiceChannels,
+		data:       []byte(`{"type":"voice_state_update","data":{"state":"joined"}}`),
+		recipients: []channelDeliveryRecipient{{clientID: client.ID, userID: client.UserID}},
+	}
+	left := joined
+	left.data = []byte(`{"type":"voice_state_update","data":{"state":"left"}}`)
+
+	hub.dispatchChannelDelivery(joined)
+	select {
+	case <-checker.entered:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected the first permission check to block")
+	}
+	hub.dispatchChannelDelivery(left)
+
+	select {
+	case result := <-hub.channelDeliveryResults:
+		hub.handleChannelDeliveryResult(result)
+		t.Fatal("later Server Voice delivery bypassed the blocked earlier authorization")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	checker.unblock()
+	first := <-hub.channelDeliveryResults
+	assert.Equal(t, 1, checker.callCount(), "the next permission check waits for Run to apply the earlier result")
+	hub.handleChannelDeliveryResult(first)
+	applyAsyncChannelDelivery(t, hub)
+
+	states := make([]string, 0, 2)
+	for range 2 {
+		var message OutgoingMessage
+		require.NoError(t, json.Unmarshal(<-client.Send, &message))
+		states = append(states, message.Data["state"].(string))
+	}
+	assert.Equal(t, []string{"joined", "left"}, states)
+}
+
+func TestChannelDeliveryServerBroadcastBoundsSameKeyBacklog(t *testing.T) {
+	serverID := uuid.New()
+	channelID := uuid.New()
+	db := openScriptedRowsDB(t,
+		[]string{"allow_embedded_content", "server_id", "type"},
+		[][]driver.Value{{false, serverID.String(), "voice"}},
+		nil,
+	)
+	hub := NewHub(db, nil)
+	client := newTestClient(hub, uuid.New())
+	client.Send = make(chan []byte, serverVoiceDeliveryQueueCapacity+serverVoiceDeferredQueueCapacity+serverVoiceDeliveryQueueCapacity+4)
+	hub.clients[client.ID] = client
+	hub.serverSubscriptions[serverID] = map[uuid.UUID]bool{client.ID: true}
+	unrelated := newTestClient(hub, uuid.New())
+	hub.clients[unrelated.ID] = unrelated
+	unrelatedServerID := uuid.New()
+	hub.serverSubscriptions[unrelatedServerID] = map[uuid.UUID]bool{unrelated.ID: true}
+	checker := &firstCheckBlockingChannelPermissionChecker{
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+		secondEntered: make(chan struct{}),
+		secondRelease: make(chan struct{}),
+	}
+	hub.SetChannelPermissionChecker(checker)
+	t.Cleanup(checker.unblock)
+	go hub.Run()
+	t.Cleanup(hub.Shutdown)
+
+	message := func(sequence int) ServerBroadcastMessage {
+		return ServerBroadcastMessage{
+			ServerID:             serverID,
+			ChannelID:            channelID,
+			RequireVoiceViewAuth: true,
+			Data: OutgoingMessage{
+				Type: "voice_state_update",
+				Data: map[string]interface{}{"sequence": fmt.Sprintf("%03d", sequence)},
+			},
+		}
+	}
+
+	hub.serverVoiceBroadcast <- message(0)
+	select {
+	case <-checker.entered:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected the first permission check to block")
+	}
+	queued := make(chan struct{})
+	go func() {
+		for sequence := 1; sequence <= serverVoiceDeliveryQueueCapacity+serverVoiceDeferredQueueCapacity+1; sequence++ {
+			hub.serverVoiceBroadcast <- message(sequence)
+		}
+		close(queued)
+	}()
+	select {
+	case <-queued:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected Run to fill the bounded same-key backlog")
+	}
+	require.Eventually(t, func() bool {
+		return len(hub.serverVoiceBroadcast) == 0
+	}, time.Second, time.Millisecond*5, "Run should defer the saturated Server Voice backlog by key")
+
+	hub.serverBroadcast <- ServerBroadcastMessage{
+		ServerID: unrelatedServerID,
+		Data:     OutgoingMessage{Type: "server_updated"},
+	}
+	select {
+	case data := <-unrelated.Send:
+		var delivered OutgoingMessage
+		require.NoError(t, json.Unmarshal(data, &delivered))
+		require.Equal(t, "server_updated", delivered.Type)
+	case <-time.After(time.Second):
+		t.Fatal("Run stopped processing unrelated server broadcasts while Server Voice was deferred")
+	}
+
+	checker.unblockFirst()
+	select {
+	case <-checker.secondEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not apply the first result and advance the ordered worker")
+	}
+	readVoice := func() OutgoingMessage {
+		t.Helper()
+		for {
+			select {
+			case data := <-client.Send:
+				var delivered OutgoingMessage
+				require.NoError(t, json.Unmarshal(data, &delivered))
+				if delivered.Type == "voice_state_update" {
+					return delivered
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("expected Server Voice lifecycle event")
+			}
+		}
+	}
+	first := readVoice()
+	require.Equal(t, "000", first.Data["sequence"])
+
+	checker.unblock()
+	for sequence := 1; sequence <= serverVoiceDeliveryQueueCapacity+serverVoiceDeferredQueueCapacity+1; sequence++ {
+		delivered := readVoice()
+		require.Equal(t, fmt.Sprintf("%03d", sequence), delivered.Data["sequence"])
+	}
+	require.Eventually(t, func() bool { return len(hub.serverVoiceBroadcast) == 0 }, time.Second, time.Millisecond*5)
 }
 
 func TestHandleBroadcastNoSubscribers(_ *testing.T) {
@@ -2739,14 +3401,6 @@ func TestIsVisibleStatus(t *testing.T) {
 	}
 }
 
-// --- buildPlaceholders tests ---
-
-func TestBuildPlaceholders(t *testing.T) {
-	assert.Equal(t, "$1", buildPlaceholders(1))
-	assert.Equal(t, "$1,$2,$3", buildPlaceholders(3))
-	assert.Equal(t, "", buildPlaceholders(0))
-}
-
 // --- computeServerCounts tests ---
 
 func TestComputeServerCounts(t *testing.T) {
@@ -2835,89 +3489,6 @@ func TestUserHasDMSubscriptionNilDMClients(t *testing.T) {
 	userClientIDs := map[uuid.UUID]bool{clientID: true}
 
 	assert.False(t, hub.userHasDMSubscription(userClientIDs, nil))
-}
-
-// --- notifyUnsubscribedUser tests ---
-
-func TestNotifyUnsubscribedUserSendsWhenNotSubscribed(t *testing.T) {
-	hub := newMinimalHub()
-	userID := uuid.New()
-	client := newTestClient(hub, userID)
-	hub.clients[client.ID] = client
-	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
-
-	data := []byte(`{"type":"dm_unread_notify"}`)
-	hub.notifyUnsubscribedUser(userID, nil, data)
-
-	select {
-	case msg := <-client.Send:
-		assert.Equal(t, data, msg)
-	default:
-		t.Fatal("expected message to be sent")
-	}
-}
-
-func TestNotifyUnsubscribedUserSkipsWhenSubscribed(t *testing.T) {
-	hub := newMinimalHub()
-	userID := uuid.New()
-	client := newTestClient(hub, userID)
-	hub.clients[client.ID] = client
-	hub.userClients[userID] = map[uuid.UUID]bool{client.ID: true}
-
-	dmClients := map[uuid.UUID]bool{client.ID: true}
-	data := []byte(`{"type":"dm_unread_notify"}`)
-	hub.notifyUnsubscribedUser(userID, dmClients, data)
-
-	select {
-	case <-client.Send:
-		t.Fatal("should not send to subscribed user")
-	default:
-		// expected
-	}
-}
-
-func TestNotifyUnsubscribedUserUserNotConnected(_ *testing.T) {
-	hub := newMinimalHub()
-	data := []byte(`{"type":"dm_unread_notify"}`)
-	// Should not panic
-	hub.notifyUnsubscribedUser(uuid.New(), nil, data)
-}
-
-// --- sendToUserClients tests ---
-
-func TestSendToUserClientsMultipleClients(t *testing.T) {
-	hub := newMinimalHub()
-	userID := uuid.New()
-	c1 := newTestClient(hub, userID)
-	c2 := newTestClient(hub, userID)
-	hub.clients[c1.ID] = c1
-	hub.clients[c2.ID] = c2
-
-	clientIDs := map[uuid.UUID]bool{c1.ID: true, c2.ID: true}
-	data := []byte(`{"test":"msg"}`)
-	hub.sendToUserClients(clientIDs, data)
-
-	select {
-	case msg := <-c1.Send:
-		assert.Equal(t, data, msg)
-	default:
-		t.Fatal("c1 should receive message")
-	}
-	select {
-	case msg := <-c2.Send:
-		assert.Equal(t, data, msg)
-	default:
-		t.Fatal("c2 should receive message")
-	}
-}
-
-func TestSendToUserClientsSkipsMissingClient(_ *testing.T) {
-	hub := newMinimalHub()
-	missingID := uuid.New()
-	clientIDs := map[uuid.UUID]bool{missingID: true}
-	data := []byte(`{"test":"msg"}`)
-	// Should not panic
-	hub.sendToUserClients(clientIDs, data)
 }
 
 // --- parseDMMentionMeta tests ---

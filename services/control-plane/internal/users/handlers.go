@@ -2328,6 +2328,21 @@ func (h *Handler) allowPurgeFenceStepUpAttempt(ctx context.Context, userID strin
 		purgeFenceStepUpKey(userID), purgeFenceStepUpLimit, purgeFenceStepUpWindow)
 }
 
+// allowPurgeFenceStepUp consumes the fail-closed attempt budget before the
+// transaction begins. It writes the existing 429 response and returns false
+// when the budget cannot admit the request.
+func (h *Handler) allowPurgeFenceStepUp(ctx context.Context, c *gin.Context, userID string) bool {
+	allowed, err := h.allowPurgeFenceStepUpAttempt(ctx, userID)
+	if err != nil {
+		h.log.Error("Purge-fence step-up budget unavailable", "error", err)
+	}
+	if err != nil || !allowed {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many verification attempts"})
+		return false
+	}
+	return true
+}
+
 // purgeFenceStepUpKey is the one place the budget's Redis key is spelled, so
 // the consume and the clear below cannot drift apart.
 func purgeFenceStepUpKey(userID string) string {
@@ -2523,18 +2538,8 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	// REQUESTED value, never a computed transition — a prior-value read is
 	// ambiguous on a lazily-created row and would be a fail-open surface.
 	disablingPurgeFence := req.RequireAuthBeforePurge != nil && !*req.RequireAuthBeforePurge
-	if disablingPurgeFence {
-		// The only error worth diagnosing is the limiter being unreachable; an
-		// exhausted budget is an ordinary outcome and says nothing but the
-		// actor's own id, which the response already tells them.
-		allowed, rlErr := h.allowPurgeFenceStepUpAttempt(ctx, userID)
-		if rlErr != nil {
-			h.log.Error("Purge-fence step-up budget unavailable", "error", rlErr)
-		}
-		if rlErr != nil || !allowed {
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many verification attempts"})
-			return
-		}
+	if disablingPurgeFence && !h.allowPurgeFenceStepUp(ctx, c, userID) {
+		return
 	}
 
 	// The gate must be held from BEFORE BeginTx, but whether a capture happens is
@@ -2543,10 +2548,10 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	// never mentions dm_friends_of_friends takes no gate and opens its
 	// transaction exactly as it did before PR 2.
 	//
-	// A supplied-but-unchanged value still TAKES the gate but writes NO marker
-	// and takes NO row lock, because the capture below stays conditional on an
-	// actual transition. §3.8 refuses to make the MARKER unconditional; a gate
-	// is a far cheaper thing.
+	// A supplied-but-unchanged value still takes the gate and, when capture is
+	// wired, the actor users-row lock, but writes NO marker because the capture
+	// below stays conditional on an actual transition. §3.8 refuses to make the
+	// MARKER unconditional; a gate is a far cheaper thing.
 	//
 	// "Takes", not "requests": internal/api/router.go calls SetTopologyRail on
 	// the one reconciler it builds, so graphpresence.WithGatedTx no longer falls
@@ -2576,6 +2581,15 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 	}
 
 	txErr := presencehook.WithGatedTx(ctx, gatedCapture, h.db, h.log, spec, func(tx *sql.Tx) error {
+		if gatedCapture != nil {
+			var lockedUserID string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID,
+			).Scan(&lockedUserID); err != nil {
+				return fmt.Errorf("lock privacy settings actor: %w", err)
+			}
+		}
+
 		// #2765: disabling require_auth_before_purge requires the same step-up
 		// the purge requires. Gate on the REQUESTED value, not a computed
 		// transition — a prior-value read is ambiguous on a lazily-created row
@@ -2621,18 +2635,8 @@ func (h *Handler) UpdatePrivacySettings(c *gin.Context) {
 		// transaction. Reading it afterwards computes the BEFORE audience
 		// against the NEW value and the delta comes out silently empty.
 		//
-		// SITE-SCOPED LOCK-ORDER INVARIANT (#2446 §3.8): readPriorFoF is the
-		// ONLY place in internal/ that takes `privacy_settings … FOR UPDATE`,
-		// and it runs BEFORE the capture — inverse to every other chain in the
-		// family, which runs capture-first over users -> user_presence_settings
-		// -> pending markers. It is safe because both sides are the same user's
-		// own row and no second writer takes both locks, which makes it safe by
-		// COINCIDENCE rather than by construction: a future writer that takes
-		// the capture's locks and then this row would close the cycle. Do NOT
-		// "fix" it by moving this read after the capture — the capture is
-		// conditional on an actual transition, and making it unconditional
-		// would write a durable marker and take three row locks on every
-		// privacy PATCH.
+		// FoF updates lock users -> privacy_settings -> presence. The actor lock
+		// is taken at closure entry, and this locked read must precede Capture.
 		oldFoF, err := readPriorFoF(ctx, tx, userID)
 		if err != nil {
 			return err

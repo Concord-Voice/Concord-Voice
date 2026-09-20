@@ -122,17 +122,20 @@ func TestMigration000091_FilesAndSchemaLock(t *testing.T) {
 func TestMigration000091_UpDownReUp(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	ctx := context.Background()
+	tx, err := ts.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, tx.Rollback()) }()
 	const (
 		nodeID    = "cvn_aaaaaaaaaaaaaaaa"
 		metricKey = "registered_users_current"
 	)
 
-	_, err := ts.DB.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ops_metric_samples (node_id, metric_key, ts, value)
 		VALUES ($1, $2, TIMESTAMPTZ '2026-07-16 12:00:00+00', 10)
 	`, nodeID, metricKey)
 	require.NoError(t, err)
-	_, err = ts.DB.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ops_metric_rollups (
 			node_id, metric_key, bucket_start, min_value, max_value,
 			avg_value, last_value, sample_count
@@ -143,57 +146,42 @@ func TestMigration000091_UpDownReUp(t *testing.T) {
 	require.NoError(t, err)
 
 	upSQL := migration000091SQL(t, "up")
-	_, err = ts.DB.ExecContext(ctx, migration000091SQL(t, "down"))
+	_, err = tx.ExecContext(ctx, migration000091SQL(t, "down"))
 	require.NoError(t, err)
-	reapplied := false
-	t.Cleanup(func() {
-		if reapplied {
-			return
-		}
-		_, cleanupErr := ts.DB.ExecContext(context.Background(), upSQL)
-		assert.NoError(t, cleanupErr)
-	})
 
 	var sampleCount, rollupCount int
-	require.NoError(t, ts.DB.QueryRowContext(ctx, `
+	require.NoError(t, tx.QueryRowContext(ctx, `
 		SELECT
 			(SELECT COUNT(*) FROM ops_metric_samples WHERE metric_key = $1),
 			(SELECT COUNT(*) FROM ops_metric_rollups WHERE metric_key = $1)
 	`, metricKey).Scan(&sampleCount, &rollupCount))
 	assert.Zero(t, sampleCount)
 	assert.Zero(t, rollupCount)
-	assert.False(t, migration000091ColumnExists(t, ts, "ops_last_active_at"))
+	var columnExists bool
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'ops_last_active_at')`).Scan(&columnExists))
+	assert.False(t, columnExists)
 
-	_, err = ts.DB.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `SAVEPOINT migration000091_rejection`)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ops_metric_samples (node_id, metric_key, ts, value)
 		VALUES ($1, $2, TIMESTAMPTZ '2026-07-16 13:00:00+00', 11)
 	`, nodeID, metricKey)
 	require.Error(t, err, "the restored 52-key constraint must reject migration 91 keys")
-
-	_, err = ts.DB.ExecContext(ctx, upSQL)
+	_, err = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT migration000091_rejection`)
 	require.NoError(t, err)
-	reapplied = true
-	assert.True(t, migration000091ColumnExists(t, ts, "ops_last_active_at"))
-	_, err = ts.DB.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `RELEASE SAVEPOINT migration000091_rejection`)
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(ctx, upSQL)
+	require.NoError(t, err)
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'ops_last_active_at')`).Scan(&columnExists))
+	assert.True(t, columnExists)
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ops_metric_samples (node_id, metric_key, ts, value)
 		VALUES ($1, $2, TIMESTAMPTZ '2026-07-16 14:00:00+00', 12)
 	`, nodeID, metricKey)
 	require.NoError(t, err, "the reapplied 61-key constraint must accept migration 91 keys")
-}
-
-func migration000091ColumnExists(t *testing.T, ts *testhelpers.TestServer, column string) bool {
-	t.Helper()
-	var exists bool
-	require.NoError(t, ts.DB.QueryRow(`
-		SELECT EXISTS (
-			SELECT 1
-			FROM information_schema.columns
-			WHERE table_schema = 'public'
-			  AND table_name = 'users'
-			  AND column_name = $1
-		)
-	`, column).Scan(&exists))
-	return exists
 }
 
 func migration000091SQL(t *testing.T, direction string) string {

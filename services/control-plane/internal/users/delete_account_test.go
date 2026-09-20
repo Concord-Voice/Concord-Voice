@@ -7,6 +7,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/users"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +36,35 @@ func TestDeleteAccount_HappyPath(t *testing.T) {
 		`SELECT COUNT(*) FROM account_deletions WHERE user_id IS NULL AND deleted_at >= NOW() - INTERVAL '1 minute'`,
 	).Scan(&auditRows))
 	assert.GreaterOrEqual(t, auditRows, 1, "audit row must be inserted with NULL user_id")
+}
+
+// TestDeleteAccount_RemovesPendingServerVoiceTerminalOutbox verifies that
+// account erasure cannot leave a durable voice-terminal obligation that would
+// later broadcast the erased user's identifier.
+func TestDeleteAccount_RemovesPendingServerVoiceTerminalOutbox(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	user := ts.CreateTestUser(t, "deleteacct-outbox")
+	_, err := ts.DB.Exec(`
+		INSERT INTO server_voice_terminal_outbox
+			(channel_id, user_id, server_id, operation_id)
+		VALUES ($1, $2, $3, $4)`, uuid.New(), user.ID, uuid.New(), uuid.New())
+	require.NoError(t, err)
+
+	var pendingBefore int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE user_id = $1`, user.ID,
+	).Scan(&pendingBefore))
+	require.Equal(t, 1, pendingBefore, "positive control: pending outbox obligation must be present")
+
+	svc := users.NewAccountService(ts.DB, logger.New("test"))
+	require.NoError(t, svc.DeleteAccount(context.Background(), user.ID))
+
+	var pendingAfter int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE user_id = $1`, user.ID,
+	).Scan(&pendingAfter))
+	assert.Zero(t, pendingAfter,
+		"account erasure must delete pending server voice terminal obligations before a later drain can broadcast the erased user ID")
 }
 
 // TestDeleteAccount_MissingUser verifies the sentinel-error contract:

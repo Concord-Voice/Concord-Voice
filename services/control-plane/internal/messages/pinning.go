@@ -2,6 +2,7 @@ package messages
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"time"
 
@@ -20,6 +21,29 @@ const (
 	errMsgPinLimitReached = "Maximum of 50 pinned messages per channel"
 	maxPinsPerChannel     = 50
 )
+
+// beginPinTransaction locks the pinned_by FK parent before a pin locks its
+// message row; account erasure locks users first.
+func (h *Handler) beginPinTransaction(c *gin.Context, userID string) (*sql.Tx, bool) {
+	tx, err := h.db.BeginTx(c.Request.Context(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		h.log.Error(errMsgPinFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return nil, false
+	}
+
+	var actorID string
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, userID).Scan(&actorID); err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back pin transaction", "error", rollbackErr)
+		}
+		h.log.Error(errMsgPinFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return nil, false
+	}
+
+	return tx, true
+}
 
 // PinMessage pins a message in its channel or DM conversation.
 // For server channels, requires PermPinMessages. For DM conversations,
@@ -57,11 +81,21 @@ func (h *Handler) PinMessage(c *gin.Context) {
 
 	// Pin with 50-message limit check via UPDATE subquery.
 	// NOTE: Under high concurrency, two simultaneous requests could both see
-	// COUNT(*) < 50 and succeed. For production at scale, consider wrapping in
-	// a transaction with an advisory lock keyed by channel_id.
+	// COUNT(*) < 50 and succeed. An advisory lock keyed by channel_id would
+	// serialize that count at production scale.
+	tx, ok := h.beginPinTransaction(c, userID)
+	if !ok {
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back pin transaction", "error", rollbackErr)
+		}
+	}()
+
 	var pinnedAt time.Time
 	var pinnedBy string
-	err := h.db.QueryRow(`
+	err := tx.QueryRowContext(c.Request.Context(), `
 		UPDATE messages
 		SET pinned_at = NOW(), pinned_by = $1, updated_at = NOW()
 		WHERE id = $2 AND pinned_at IS NULL
@@ -73,20 +107,16 @@ func (h *Handler) PinMessage(c *gin.Context) {
 		// Disambiguate: already pinned vs limit reached
 		var existingPinnedAt *time.Time
 		var existingPinnedBy *string
-		checkErr := h.db.QueryRow(`SELECT pinned_at, pinned_by FROM messages WHERE id = $1`, messageID).Scan(&existingPinnedAt, &existingPinnedBy)
-		if checkErr != nil {
-			h.log.Error(errMsgPinFailed, "error", checkErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
-			return
-		}
-		if existingPinnedAt != nil {
-			c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": existingPinnedAt, "pinned_by": existingPinnedBy, "already_pinned": true})
-			return
-		}
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgPinLimitReached})
+		checkErr := tx.QueryRowContext(c.Request.Context(), `SELECT pinned_at, pinned_by FROM messages WHERE id = $1`, messageID).Scan(&existingPinnedAt, &existingPinnedBy)
+		h.respondPinFallback(c, messageID, checkErr, existingPinnedAt, existingPinnedBy)
 		return
 	}
 	if err != nil {
+		h.log.Error(errMsgPinFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		h.log.Error(errMsgPinFailed, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
 		return
@@ -101,30 +131,57 @@ func (h *Handler) PinMessage(c *gin.Context) {
 // pinDMMessage handles the DM branch of PinMessage. The caller has already
 // verified conversation participation via lookupMessageContext.
 func (h *Handler) pinDMMessage(c *gin.Context, messageID, userID, conversationID string) {
+	tx, ok := h.beginPinTransaction(c, userID)
+	if !ok {
+		return
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back DM pin transaction", "error", rollbackErr)
+		}
+	}()
+
 	var pinnedAt time.Time
 	var pinnedBy string
-	err := h.db.QueryRow(`
-		UPDATE dm_messages
+	// The actor's pin limit counts only messages still visible to that actor.
+	// The same predicate on the target closes a Clear race after the initial
+	// context lookup.
+	//nolint:gosec // G202: HiddenRangeFilter is a compile-time SQL fragment; values are parameterized.
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
+	err := tx.QueryRowContext(c.Request.Context(), `
+		UPDATE dm_messages dm
 		SET pinned_at = NOW(), pinned_by = $1, updated_at = NOW()
-		WHERE id = $2 AND pinned_at IS NULL
-		  AND (SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $3 AND pinned_at IS NOT NULL) < $4
+		WHERE dm.id = $2 AND dm.conversation_id = $3 AND dm.pinned_at IS NULL
+		  AND EXISTS (
+			  SELECT 1 FROM dm_participants dp
+			  WHERE dp.conversation_id = dm.conversation_id AND dp.user_id = $1
+		  )
+		`+purge.HiddenRangeFilter("dm", 1)+`
+		  AND (SELECT COUNT(*) FROM dm_messages pin_count
+		       WHERE pin_count.conversation_id = $3 AND pin_count.pinned_at IS NOT NULL
+		       `+purge.HiddenRangeFilter("pin_count", 1)+`) < $4
 		RETURNING pinned_at, pinned_by
 	`, userID, messageID, conversationID, maxPinsPerChannel).Scan(&pinnedAt, &pinnedBy)
 
 	if err == sql.ErrNoRows {
 		var existingPinnedAt *time.Time
 		var existingPinnedBy *string
-		checkErr := h.db.QueryRow(`SELECT pinned_at, pinned_by FROM dm_messages WHERE id = $1`, messageID).Scan(&existingPinnedAt, &existingPinnedBy)
-		if checkErr != nil {
-			h.log.Error(errMsgPinFailed, "error", checkErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		//nolint:gosec // G202: HiddenRangeFilter is a compile-time SQL fragment; values are parameterized.
+		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
+		checkErr := tx.QueryRowContext(c.Request.Context(), `
+			SELECT dm.pinned_at, dm.pinned_by
+			FROM dm_messages dm
+			WHERE dm.id = $1 AND dm.conversation_id = $3
+			  AND EXISTS (
+				  SELECT 1 FROM dm_participants dp
+				  WHERE dp.conversation_id = dm.conversation_id AND dp.user_id = $2
+			  )
+			`+purge.HiddenRangeFilter("dm", 2), messageID, userID, conversationID).Scan(&existingPinnedAt, &existingPinnedBy)
+		if checkErr == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 			return
 		}
-		if existingPinnedAt != nil {
-			c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": existingPinnedAt, "pinned_by": existingPinnedBy, "already_pinned": true})
-			return
-		}
-		c.JSON(http.StatusConflict, gin.H{"error": errMsgPinLimitReached})
+		h.respondPinFallback(c, messageID, checkErr, existingPinnedAt, existingPinnedBy)
 		return
 	}
 	if err != nil {
@@ -132,15 +189,40 @@ func (h *Handler) pinDMMessage(c *gin.Context, messageID, userID, conversationID
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error(errMsgPinFailed, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return
+	}
 
-	// Best-effort DM broadcast: reuse the channel broadcast keyed by the
-	// conversation id (the WS hub treats DM conversations as "channels" on
-	// the wire for purposes of pin events). DM conversations have no server
-	// view permission, so use the plain allow-all path (authorized=false) to
-	// mirror unpinDMMessage; the authorized path would drop the event.
-	broadcastPin(h.hub, conversationID, messageID, pinnedAt, pinnedBy, false)
+	if convUUID, convErr := uuid.Parse(conversationID); convErr == nil {
+		if messageUUID, messageErr := uuid.Parse(messageID); messageErr == nil {
+			h.hub.BroadcastToDMMessageRecipients(convUUID, messageUUID, websocket.OutgoingMessage{
+				Type: "message_pinned",
+				Data: map[string]interface{}{
+					"message_id": messageID,
+					"channel_id": conversationID,
+					"pinned_at":  pinnedAt,
+					"pinned_by":  pinnedBy,
+				},
+			})
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": pinnedAt, "pinned_by": pinnedBy, "conversation_id": conversationID})
+}
+
+func (h *Handler) respondPinFallback(c *gin.Context, messageID string, checkErr error, existingPinnedAt *time.Time, existingPinnedBy *string) {
+	if checkErr != nil {
+		h.log.Error(errMsgPinFailed, "error", checkErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPinFailed})
+		return
+	}
+	if existingPinnedAt != nil {
+		c.JSON(http.StatusOK, gin.H{"message_id": messageID, "pinned_at": existingPinnedAt, "pinned_by": existingPinnedBy, "already_pinned": true})
+		return
+	}
+	c.JSON(http.StatusConflict, gin.H{"error": errMsgPinLimitReached})
 }
 
 // UnpinMessage unpins a message. Requires PermPinMessages.
@@ -159,7 +241,7 @@ func (h *Handler) UnpinMessage(c *gin.Context) {
 	}
 
 	if mctx.isDM {
-		h.unpinDMMessage(c, messageID, mctx.conversationID)
+		h.unpinDMMessage(c, messageID, userID, mctx.conversationID)
 		return
 	}
 
@@ -214,11 +296,17 @@ func (h *Handler) UnpinMessage(c *gin.Context) {
 
 // unpinDMMessage handles the DM branch of UnpinMessage. The caller has already
 // verified conversation participation via lookupMessageContext.
-func (h *Handler) unpinDMMessage(c *gin.Context, messageID, conversationID string) {
+func (h *Handler) unpinDMMessage(c *gin.Context, messageID, userID, conversationID string) {
+	//nolint:gosec // G202: HiddenRangeFilter is a compile-time SQL fragment; values are parameterized.
+	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
 	result, err := h.db.Exec(`
-		UPDATE dm_messages SET pinned_at = NULL, pinned_by = NULL, updated_at = NOW()
-		WHERE id = $1 AND pinned_at IS NOT NULL
-	`, messageID)
+		UPDATE dm_messages dm SET pinned_at = NULL, pinned_by = NULL, updated_at = NOW()
+		WHERE dm.id = $1 AND dm.conversation_id = $3 AND dm.pinned_at IS NOT NULL
+		  AND EXISTS (
+			  SELECT 1 FROM dm_participants dp
+			  WHERE dp.conversation_id = dm.conversation_id AND dp.user_id = $2
+		  )
+		`+purge.HiddenRangeFilter("dm", 2), messageID, userID, conversationID)
 	if err != nil {
 		h.log.Error(errMsgUnpinFailed, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgUnpinFailed})
@@ -231,18 +319,41 @@ func (h *Handler) unpinDMMessage(c *gin.Context, messageID, conversationID strin
 		return
 	}
 	if rowsAffected == 0 {
+		var pinnedAt *time.Time
+		//nolint:gosec // G202: HiddenRangeFilter is a compile-time SQL fragment; values are parameterized.
+		// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf
+		checkErr := h.db.QueryRow(`
+			SELECT dm.pinned_at
+			FROM dm_messages dm
+			WHERE dm.id = $1 AND dm.conversation_id = $3
+			  AND EXISTS (
+				  SELECT 1 FROM dm_participants dp
+				  WHERE dp.conversation_id = dm.conversation_id AND dp.user_id = $2
+			  )
+			`+purge.HiddenRangeFilter("dm", 2), messageID, userID, conversationID).Scan(&pinnedAt)
+		if checkErr == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+			return
+		}
+		if checkErr != nil {
+			h.log.Error(errMsgUnpinFailed, "error", checkErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgUnpinFailed})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"message_id": messageID, "already_unpinned": true})
 		return
 	}
 
-	if convUUID, parseErr := uuid.Parse(conversationID); parseErr == nil {
-		h.hub.BroadcastToChannel(convUUID, websocket.OutgoingMessage{
-			Type: "message_unpinned",
-			Data: map[string]interface{}{
-				"message_id":      messageID,
-				"conversation_id": conversationID,
-			},
-		})
+	if convUUID, convErr := uuid.Parse(conversationID); convErr == nil {
+		if messageUUID, messageErr := uuid.Parse(messageID); messageErr == nil {
+			h.hub.BroadcastToDMMessageRecipients(convUUID, messageUUID, websocket.OutgoingMessage{
+				Type: "message_unpinned",
+				Data: map[string]interface{}{
+					"message_id":      messageID,
+					"conversation_id": conversationID,
+				},
+			})
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message_id": messageID, "conversation_id": conversationID})

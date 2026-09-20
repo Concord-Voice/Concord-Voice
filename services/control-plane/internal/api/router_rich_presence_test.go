@@ -69,6 +69,7 @@ func TestNewRouterWiresOneAuthoritativeRichPresenceBridgeIntoVoiceNATS(t *testin
 		"hub.SetRichPresenceHiddenSuppressor(",
 		"usersHandler.SetActivitySettingsSuppressor(activityService)",
 		"voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)",
+		"voiceSub.SetOpsCounters(opsCounters)",
 	}
 	prior := -1
 	for _, needle := range needles {

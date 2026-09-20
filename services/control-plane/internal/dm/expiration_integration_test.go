@@ -274,7 +274,7 @@ func TestCompletedCallEventUsesEndedAtAndPreservesExpiryOnConflict(t *testing.T)
 			assert.WithinDuration(t, endedAt, created, time.Microsecond)
 			if tc.want {
 				require.True(t, expires.Valid)
-				assert.WithinDuration(t, endedAt.Add(time.Hour), expires.Time, time.Microsecond)
+				assert.WithinDuration(t, created.Add(time.Hour), expires.Time, time.Microsecond)
 			} else {
 				assert.False(t, expires.Valid)
 			}
@@ -288,10 +288,20 @@ func TestCompletedCallEventUsesEndedAtAndPreservesExpiryOnConflict(t *testing.T)
 	first.CallID = conflictID
 	first.EndedAt = endedAt
 	require.NoError(t, dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, first))
+	var firstCreated, firstExpires time.Time
+	require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, conflictID).Scan(&firstCreated, &firstExpires))
 	second := first
 	second.EndedAt = endedAt.Add(24 * time.Hour)
 	require.NoError(t, dm.InsertCompletedCallEvent(context.Background(), ts.DB, convUUID, second))
-	var expires time.Time
-	require.NoError(t, ts.DB.QueryRow(`SELECT expires_at FROM dm_messages WHERE id = $1`, conflictID).Scan(&expires))
-	assert.WithinDuration(t, endedAt.Add(time.Hour), expires, time.Microsecond)
+	var created, expires time.Time
+	require.NoError(t, ts.DB.QueryRow(`SELECT created_at, expires_at FROM dm_messages WHERE id = $1`, conflictID).Scan(&created, &expires))
+	assert.Equal(t, firstCreated, created, "upsert preserves persisted message creation time")
+	assert.Equal(t, firstExpires, expires, "upsert preserves the original expiry window")
+	var payloadJSON []byte
+	require.NoError(t, ts.DB.QueryRow(`SELECT call_event_payload FROM dm_messages WHERE id = $1`, conflictID).Scan(&payloadJSON))
+	var payload struct {
+		EndedAt time.Time `json:"ended_at"`
+	}
+	require.NoError(t, json.Unmarshal(payloadJSON, &payload))
+	assert.WithinDuration(t, second.EndedAt, payload.EndedAt, time.Microsecond)
 }

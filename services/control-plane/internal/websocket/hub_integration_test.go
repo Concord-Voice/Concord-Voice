@@ -793,6 +793,31 @@ func TestBroadcastToChannelAuthorized_DropsWhenChannelGone(t *testing.T) {
 		"gone-channel resolution must clear the client's channel membership")
 }
 
+func TestBroadcastToServerChannelAuthorized_DropsNonVoiceChannel(t *testing.T) {
+	setup := setupMessageTest(t)
+	channelID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+
+	setup.hub.handleServerBroadcast(ServerBroadcastMessage{
+		ServerID:             setup.user2,
+		ChannelID:            channelID,
+		RequireVoiceViewAuth: true,
+		Data:                 OutgoingMessage{Type: "voice_state_update"},
+	})
+
+	select {
+	case result := <-setup.hub.channelDeliveryResults:
+		for _, decision := range result.decisions {
+			assert.False(t, decision.allowed, "a non-voice channel must drop the voice-authorized broadcast")
+		}
+		setup.hub.handleChannelDeliveryResult(result)
+	case <-time.After(time.Second):
+		t.Fatal("expected the async voice-channel authorization result")
+	}
+
+	assert.Empty(t, setup.client.Send)
+}
+
 // --- handleSubscribe integration tests ---
 
 func TestHandleSubscribeSuccess(t *testing.T) {
@@ -2906,8 +2931,16 @@ func TestShutdownFansOutOfflineSynchronously(t *testing.T) {
 // testLastMessage returns a deterministic dmUnreadLastMessage fixture for tests.
 var testLastMessageTime = time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
 
-func testLastMessage() dmUnreadLastMessage {
+func testLastMessage(t *testing.T, setup *hubTestSetup) dmUnreadLastMessage {
+	t.Helper()
+	messageID := uuid.New()
+	_, err := setup.db.Exec(`
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at)
+		VALUES ($1, $2, $3, 'hello from test', 'user', $4)`,
+		messageID, setup.convID, setup.user1, testLastMessageTime)
+	require.NoError(t, err)
 	return dmUnreadLastMessage{
+		messageID: messageID,
 		content:   "hello from test",
 		userID:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 		username:  "testuser",
@@ -2932,8 +2965,9 @@ func TestSendDMUnreadNotifySendsToUnsubscribedParticipants(t *testing.T) {
 	setup.hub.clients[client2ID] = client2
 	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
 
-	lastMsg := testLastMessage()
+	lastMsg := testLastMessage(t, setup)
 	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, lastMsg)
+	completePendingDMDeliveries(t, setup.hub)
 
 	select {
 	case data := <-client2.Send:
@@ -2961,7 +2995,8 @@ func TestSendDMUnreadNotifySkipsSender(t *testing.T) {
 
 	// The sender (user1) should NOT receive unread notify
 	// user1's client is already registered
-	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage())
+	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage(t, setup))
+	completePendingDMDeliveries(t, setup.hub)
 
 	select {
 	case <-setup.client.Send:
@@ -2989,7 +3024,8 @@ func TestSendDMUnreadNotifySkipsSubscribedParticipants(t *testing.T) {
 	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
 	setup.hub.dmSubscriptions[convUUID][client2ID] = true
 
-	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage())
+	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage(t, setup))
+	completePendingDMDeliveries(t, setup.hub)
 
 	select {
 	case <-client2.Send:
@@ -3017,10 +3053,11 @@ func TestSendDMUnreadNotify_CarriesAttachmentMetadata(t *testing.T) {
 	setup.hub.clients[client2ID] = client2
 	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
 
-	lastMsg := testLastMessage()
+	lastMsg := testLastMessage(t, setup)
 	lastMsg.attachmentType = "photo"
 	lastMsg.attachmentMime = "image/jpeg"
 	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, lastMsg)
+	completePendingDMDeliveries(t, setup.hub)
 
 	msg := readClientMsg(t, client2)
 	assert.Equal(t, "dm_unread_notify", msg["type"])
@@ -3051,7 +3088,8 @@ func TestSendDMUnreadNotify_OmitsAttachmentKeysWhenAbsent(t *testing.T) {
 	setup.hub.clients[client2ID] = client2
 	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
 
-	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage())
+	setup.hub.sendDMUnreadNotify(convUUID, setup.user1, testLastMessage(t, setup))
+	completePendingDMDeliveries(t, setup.hub)
 
 	msg := readClientMsg(t, client2)
 	msgData, ok := msg["data"].(map[string]interface{})
@@ -3086,7 +3124,12 @@ func TestSendDMMentionNotify_CarriesNoLastMessage(t *testing.T) {
 	setup.hub.clients[client2ID] = client2
 	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{client2ID: true}
 
-	setup.hub.sendDMMentionNotify(convUUID, map[uuid.UUID]bool{setup.user2: true}, false)
+	messageID := uuid.New()
+	_, err := setup.db.Exec(`
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type)
+		VALUES ($1, $2, $3, 'mention source', 'user')`, messageID, convUUID, setup.user1)
+	require.NoError(t, err)
+	setup.hub.sendDMMentionNotify(convUUID, NewDMMessageVisibilitySource(messageID), map[uuid.UUID]bool{setup.user2: true}, false)
 
 	msg := readClientMsg(t, client2)
 	assert.Equal(t, "dm_unread_notify", msg["type"])

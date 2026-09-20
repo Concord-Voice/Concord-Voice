@@ -213,6 +213,109 @@ func TestUpdatePrivacySettingsCapturesOnlyOnActualFoFChange(t *testing.T) {
 	assert.Empty(t, capture.abandoned, "no failure path ran")
 }
 
+func TestFoFPrivacyPatchLocksUserBeforePrivacySettings(t *testing.T) {
+	db, cleanup := testdb.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	userID := testdb.CreateUser(t, db)
+	_, err := db.Exec(`INSERT INTO privacy_settings (user_id) VALUES ($1)`, userID)
+	require.NoError(t, err)
+
+	capture := &stubCapture{db: db}
+	h := &Handler{db: db, log: logger.New("test")}
+	h.SetGraphPresenceCapture(capture)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set("user_id", userID.String())
+		c.Next()
+	})
+	engine.PATCH("/users/me/privacy", h.UpdatePrivacySettings)
+
+	clearTx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if rollbackErr := clearTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback Clear lock transaction: %v", rollbackErr)
+		}
+	})
+	var clearPID int
+	require.NoError(t, clearTx.QueryRow(`SELECT pg_backend_pid()`).Scan(&clearPID))
+	var lockedUserID string
+	require.NoError(t, clearTx.QueryRow(`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&lockedUserID))
+
+	status := make(chan int, 1)
+	released := false
+	joined := false
+	t.Cleanup(func() {
+		if !released {
+			if rollbackErr := clearTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback Clear lock transaction after failed assertion: %v", rollbackErr)
+			}
+		}
+		if !joined {
+			select {
+			case <-status:
+			case <-time.After(5 * time.Second):
+				t.Error("FoF PATCH request did not join during cleanup")
+			}
+		}
+	})
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	t.Cleanup(cancelRequest)
+	go func() {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPatch, "/users/me/privacy", strings.NewReader(`{"dm_friends_of_friends":true}`))
+		req = req.WithContext(requestCtx)
+		req.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(w, req)
+		status <- w.Code
+	}()
+	require.Eventually(t, func() bool {
+		var waiting int
+		queryErr := db.QueryRow(`
+			SELECT COUNT(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+			  AND $1 = ANY(pg_blocking_pids(pid))
+			  AND query LIKE '%SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE%'
+		`, clearPID).Scan(&waiting)
+		return queryErr == nil && waiting == 1
+	}, 5*time.Second, 10*time.Millisecond, "FoF PATCH should wait on Clear's users lock before locking privacy settings")
+
+	privacyTx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if rollbackErr := privacyTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback privacy probe transaction: %v", rollbackErr)
+		}
+	})
+	probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var requireAuth bool
+	require.NoError(t, privacyTx.QueryRowContext(probeCtx,
+		`SELECT require_auth_before_purge FROM privacy_settings WHERE user_id = $1 FOR UPDATE`, userID,
+	).Scan(&requireAuth), "a FoF PATCH waiting on Clear must not retain the privacy-settings lock")
+	require.NoError(t, privacyTx.Rollback())
+	require.NoError(t, clearTx.Commit())
+	released = true
+
+	select {
+	case code := <-status:
+		joined = true
+		assert.Equal(t, http.StatusOK, code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("FoF PATCH did not complete after Clear released the user lock")
+	}
+	require.Len(t, capture.subjects, 1,
+		"the actual FoF transition must reach capture after the actor lock is released")
+	assert.Equal(t, presencecapture.FamilyFriendsOfFriendsToggle, capture.subjects[0].Family)
+	var final bool
+	require.NoError(t, db.QueryRow(
+		`SELECT dm_friends_of_friends FROM privacy_settings WHERE user_id = $1`, userID,
+	).Scan(&final))
+	assert.True(t, final, "the requested FoF value must persist after capture")
+}
+
 // The FIRST-write half of the uncaptured-narrowing race (PR #2770 review,
 // CodeRabbit). readPriorFoF locks with FOR UPDATE, which locks NOTHING when no
 // row exists — so with the read ordered first, two concurrent first writes both

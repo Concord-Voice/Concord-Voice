@@ -16,10 +16,10 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	messagehandlers "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/messages"
-	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/mfa"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/stepup"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
@@ -117,9 +117,9 @@ type Handler struct {
 	nats        *natsclient.Client
 	redis       *redis.Client
 	entCache    *entitlements.Cache
-	purgeEngine *purge.Engine  // bulk message purge (#1352)
-	mfaVerifier mfa.Verifier   // step-up auth for DM/group purge (#1352)
-	activePlans ActivePlanRail // durable active-category reconciliation (#2448)
+	purgeEngine *purge.Engine      // bulk message purge (#1352)
+	mfaVerifier stepup.MFAVerifier // step-up auth for DM/group purge and history clear
+	activePlans ActivePlanRail     // durable active-category reconciliation (#2448)
 
 	// Test seams for deleteGroupData's ordering, nil in production. The two
 	// windows they open — between the candidate read and the conversation lock,
@@ -129,6 +129,11 @@ type Handler struct {
 	// of #2448's restructure. A grep cannot verify a conditional acquisition.
 	afterCandidateReadHook func()
 	afterUsersLockHook     func(tx *sql.Tx)
+
+	// afterDMVisibilityCommitHook is a test seam for the commit-to-publication
+	// ordering gate. It is nil in production.
+	afterDMVisibilityCommitHook func()
+	clearCommitForTest          func(*sql.Tx) error
 }
 
 type epochQueryRower interface {
@@ -153,7 +158,7 @@ type HandlerDeps struct {
 	// PurgeEngine + MFAVerifier back the DM/group bulk purge and its step-up
 	// gate (#1352). Both may be nil in tests that do not exercise purge.
 	PurgeEngine *purge.Engine
-	MFAVerifier mfa.Verifier
+	MFAVerifier stepup.MFAVerifier
 	// ActivePlans is the durable active-category rail (#2448). Nil in tests and
 	// on a replica whose wiring line was deleted, in which case group deletion
 	// keeps its pre-#2448 behaviour and degrades to the presence TTL.
@@ -338,7 +343,7 @@ func (h *Handler) queryConversations(userID string) ([]conversationResponse, []s
 		        ` + hiddenRangeFilter(1) + `
 		       ) AS unread_count
 		FROM dm_conversations dc
-		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $1
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $1 AND dp.hidden_at IS NULL
 		LEFT JOIN dm_read_states drs ON drs.conversation_id = dc.id AND drs.user_id = $1
 		LEFT JOIN LATERAL (
 		    SELECT m.id, m.content, m.expires_at, m.created_at, m.user_id, m.type, m.call_event_payload FROM dm_messages m
@@ -1760,7 +1765,8 @@ func (h *Handler) GetMessages(c *gin.Context) {
 			FROM dm_messages m
 			INNER JOIN users u ON u.id = m.user_id
 			WHERE m.conversation_id = $1
-			  AND m.created_at < (SELECT created_at FROM dm_messages WHERE id = $2)
+			  AND m.created_at < (SELECT cursor_m.created_at FROM dm_messages cursor_m WHERE cursor_m.id = $2 AND cursor_m.conversation_id = $1
+			  `+purge.HiddenRangeFilter("cursor_m", 4)+`)
 			`+hiddenRangeFilter(4)+`
 			ORDER BY m.created_at DESC
 			LIMIT $3
@@ -2433,7 +2439,9 @@ type updateDMMessageResult struct {
 // conversation and belongs to the caller. On failure it writes the response.
 func (h *Handler) authorizeDMMessageUpdate(c *gin.Context, convID, messageID, userID string) bool {
 	var authorID string
-	if err := h.db.QueryRow(`SELECT user_id FROM dm_messages WHERE id = $1 AND conversation_id = $2`, messageID, convID).Scan(&authorID); err == sql.ErrNoRows {
+	//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+	if err := h.db.QueryRow(`SELECT m.user_id FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+
+		hiddenRangeFilter(3), messageID, convID, userID).Scan(&authorID); err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return false
 	} else if err != nil {
@@ -2493,18 +2501,25 @@ func (h *Handler) updateDMMessageCiphertext(
 		return updateDMMessageResult{}, false
 	}
 
-	// Update ciphertext and its matching epoch atomically. The server never decrypts content.
+	// Update ciphertext and its matching epoch atomically. Recheck membership
+	// and authorship under the conversation lock so a completed member removal
+	// cannot leave an autocommit preflight authorized. The server never decrypts content.
 	var result updateDMMessageResult
 	err = tx.QueryRowContext(c.Request.Context(), `
-		UPDATE dm_messages
+		UPDATE dm_messages AS m
 		SET content = $1, key_version = $2, edited_at = NOW(), updated_at = NOW()
-		WHERE id = $3 AND conversation_id = $4
+		WHERE m.id = $3 AND m.conversation_id = $4
+		  AND m.user_id = $5
+		  AND EXISTS (
+		      SELECT 1 FROM dm_participants
+		      WHERE conversation_id = $4 AND user_id = $5
+		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM dm_key_revocations
 		      WHERE conversation_id = $4 AND revoked_epoch = $2
-		  )
+		  )`+hiddenRangeFilter(5)+`
 		RETURNING COALESCE(key_version, 1), edited_at, expires_at, created_at
-	`, req.Content, req.KeyVersion, messageID, convID).Scan(&result.KeyVersion, &result.EditedAt, &result.ExpiresAt, &result.CreatedAt)
+	`, req.Content, req.KeyVersion, messageID, convID, c.GetString("user_id")).Scan(&result.KeyVersion, &result.EditedAt, &result.ExpiresAt, &result.CreatedAt)
 	if err == sql.ErrNoRows {
 		if !h.enforceDMMessageEpoch(c, tx, convID, req.KeyVersion) {
 			return updateDMMessageResult{}, false
@@ -2557,6 +2572,11 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 	if !ok {
 		return
 	}
+	conversationUUID, messageUUID, actorUUID, err := parseDMMessageDeliveryIDs(convID, messageID, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateMessage})
+		return
+	}
 
 	var req updateDMMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2579,8 +2599,7 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 		return
 	}
 
-	// Broadcast to other participants
-	h.broadcastToDMParticipants(convID, userID, websocket.OutgoingMessage{
+	msg := websocket.OutgoingMessage{
 		Type: "dm_message_update",
 		Data: map[string]interface{}{
 			"id":              messageID,
@@ -2590,7 +2609,15 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 			"edited_at":       result.EditedAt,
 			"expires_at":      result.ExpiresAt,
 		},
-	})
+	}
+	if h.hub != nil {
+		h.hub.BroadcastToDMMessageAllParticipants(
+			conversationUUID,
+			websocket.NewDMMessageVisibilitySource(messageUUID),
+			actorUUID,
+			msg,
+		)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": result})
 }
@@ -2601,10 +2628,17 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	if !ok {
 		return
 	}
+	conversationUUID, _, actorUUID, err := parseDMMessageDeliveryIDs(convID, messageID, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
+		return
+	}
 
 	// Check message exists and user is the author
 	var authorID string
-	if err := h.db.QueryRow(`SELECT user_id FROM dm_messages WHERE id = $1 AND conversation_id = $2`, messageID, convID).Scan(&authorID); err == sql.ErrNoRows {
+	//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+	if err := h.db.QueryRow(`SELECT m.user_id FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+
+		hiddenRangeFilter(3), messageID, convID, userID).Scan(&authorID); err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return
 	} else if err != nil {
@@ -2617,20 +2651,54 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own messages"})
 		return
 	}
-
 	if h.purgeEngine == nil {
 		h.log.Error("Failed to delete DM message", "error", "purge engine unavailable")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedDeleteMessage})
 		return
 	}
 
+	var deletedAuthorID uuid.UUID
+	var deletedCreatedAt time.Time
 	if err := h.purgeEngine.DeleteOne(c.Request.Context(), messageID, purge.DeleteSpec{
 		MessagesTable:    "dm_messages",
 		ScopeColumn:      "conversation_id",
 		ScopeID:          convID,
 		AttachmentsTable: "dm_message_attachments",
+		BeforeDeleteTx: func(ctx context.Context, tx *sql.Tx) error {
+			if err := credepoch.GuardTx(ctx, tx, userID, middleware.TokenCredentialEpoch(c)); err != nil {
+				return err
+			}
+			var lockedConversation string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convID,
+			).Scan(&lockedConversation); err != nil {
+				return err
+			}
+			var participant string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT user_id FROM dm_participants WHERE user_id = $1 AND conversation_id = $2 FOR UPDATE`, userID, convID,
+			).Scan(&participant); err != nil {
+				return err
+			}
+			var lockedAuthor uuid.UUID
+			//nolint:gosec // G202: the filter is a compile-time constant; all values are parameterized.
+			if err := tx.QueryRowContext(ctx,
+				`SELECT m.user_id, m.created_at FROM dm_messages m WHERE m.id = $1 AND m.conversation_id = $2`+hiddenRangeFilter(3),
+				messageID, convID, userID,
+			).Scan(&lockedAuthor, &deletedCreatedAt); err != nil {
+				return err
+			}
+			if lockedAuthor != actorUUID {
+				return sql.ErrNoRows
+			}
+			deletedAuthorID = lockedAuthor
+			return nil
+		},
 	}); errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
+		return
+	} else if errors.Is(err, credepoch.ErrEpochMismatch) || errors.Is(err, credepoch.ErrBlocked) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
 		return
 	} else if err != nil {
 		h.log.Error("Failed to delete DM message", "error", err)
@@ -2638,16 +2706,39 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 		return
 	}
 
-	// Broadcast to other participants
-	h.broadcastToDMParticipants(convID, userID, websocket.OutgoingMessage{
+	msg := websocket.OutgoingMessage{
 		Type: "dm_message_delete",
 		Data: map[string]interface{}{
 			"id":              messageID,
 			"conversation_id": convID,
 		},
-	})
+	}
+	if h.hub != nil {
+		h.hub.BroadcastToDMMessageAllParticipants(
+			conversationUUID,
+			websocket.NewDeletedDMMessageVisibilitySource(deletedAuthorID, deletedCreatedAt),
+			actorUUID,
+			msg,
+		)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func parseDMMessageDeliveryIDs(convID, messageID, actorID string) (uuid.UUID, uuid.UUID, uuid.UUID, error) {
+	conversationUUID, err := uuid.Parse(convID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("parse delivery conversation ID: %w", err)
+	}
+	messageUUID, err := uuid.Parse(messageID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("parse delivery message ID: %w", err)
+	}
+	actorUUID, err := uuid.Parse(actorID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("parse delivery actor ID: %w", err)
+	}
+	return conversationUUID, messageUUID, actorUUID, nil
 }
 
 // broadcastToDMParticipants sends a WebSocket message to all participants of a DM except the sender.

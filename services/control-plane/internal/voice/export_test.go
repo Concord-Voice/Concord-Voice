@@ -150,6 +150,18 @@ func (s *NATSSubscriber) CompleteServerVoiceCleanupGraceForTest() time.Time {
 	return readyAt
 }
 
+// DrainServerVoiceTerminalOutboxCandidateForTest drains one exact candidate so
+// external-package tests can verify operation-token fencing without exposing
+// the production scheduler.
+func (s *NATSSubscriber) DrainServerVoiceTerminalOutboxCandidateForTest(
+	ctx context.Context, channelID, userID, operationID uuid.UUID,
+) error {
+	_, err := s.drainServerVoiceTerminalOutboxCandidate(ctx, serverVoiceTerminalOutboxCandidate{
+		channelID: channelID, userID: userID, operationID: operationID,
+	}, &serverVoiceTerminalOutcomes{})
+	return err
+}
+
 // RunVoiceLifecycleMutationForTest exercises the same claim-then-mutate
 // ordering as production. It intentionally mirrors the pre-fence behavior
 // until withVoiceLifecycleClaim replaces this body during the TDD cycle.

@@ -1,26 +1,33 @@
 package purge
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
+)
 
 // HiddenRangeFilter returns the anti-join SQL fragment that excludes, from a
-// dm_messages read, messages the requesting user has hidden via the receiver-hide
-// (#1352): messages authored by OTHERS whose created_at falls inside one of the
-// user's dm_message_hidden_ranges for that conversation.
+// dm_messages read, messages the requesting user has hidden. Legacy purge
+// ranges hide peer messages; Clear ranges may also hide the actor's messages.
 //
 // alias is the dm_messages table alias used by the consuming query (e.g. "m" or
 // "dm"); userParamPos is the positional parameter carrying the requesting user's
 // id (referenced twice). This fragment MUST be applied to EVERY dm_messages read
 // that returns content, last-message metadata, or counts to a requesting user —
-// scroll fetches, conversation-list previews, pins, unread counts — or the
-// receiver-hide is silently defeated (spec §7 / review finding M3).
+// scroll fetches, conversation-list previews, pins, unread counts — or private
+// removal is silently defeated.
 //
-// It lives in the purge package (not dm) because internal/messages also serves
-// dm_messages content (DM pins) and dm imports messages — importing dm from
-// messages would cycle.
+// The pure predicate lives in internal/dmvisibility so WebSocket delivery can
+// reuse it without pulling the purge engine's dependency graph. This wrapper
+// preserves the established purge package API for its existing readers.
 func HiddenRangeFilter(alias string, userParamPos int) string {
-	return fmt.Sprintf(` AND NOT EXISTS (
-  SELECT 1 FROM dm_message_hidden_ranges hr
-  WHERE hr.user_id = $%[2]d AND hr.conversation_id = %[1]s.conversation_id
-    AND %[1]s.created_at >= hr.hidden_from AND %[1]s.created_at < hr.hidden_to
-    AND %[1]s.user_id <> $%[2]d)`, alias, userParamPos)
+	return HiddenRangeFilterForViewerExpr(alias, fmt.Sprintf("$%d", userParamPos))
+}
+
+// HiddenRangeFilterForViewerExpr returns HiddenRangeFilter's provenance-aware
+// predicate for a fixed SQL expression that identifies the viewer. Callers may
+// supply only compile-time SQL identifiers/expressions (for example
+// dm_participants.user_id); request data remains a query parameter.
+func HiddenRangeFilterForViewerExpr(alias, viewerExpr string) string {
+	return dmvisibility.HiddenRangeFilterForViewerExpr(alias, viewerExpr)
 }

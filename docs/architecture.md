@@ -264,6 +264,7 @@ Packaged clients fetch binary update manifests and signed installers from the pu
 | `clientconfig`  | Serves dynamic runtime config (SPA URL, media-plane URL, TURN, feature flags, minVersion)    |
 | `database`      | PostgreSQL connection + migration runner                                                     |
 | `dm`            | DM conversation CRUD, DM messages, DM voice calls (ring/decline/cancel), DM key distribution |
+| `dmvisibility`  | Shared DM hidden-range visibility predicate and ordered participant-lock helper for writers and WebSocket delivery |
 | `email`         | Email sending (verification codes, notifications) via SMTP/Resend                            |
 | `expiration`    | Shared channel/DM message-expiration policy and bounded resumable backfill; coordinates audited expiry purge through the purge engine, startup preflight, and five-minute live sweeps |
 | `friends`       | Friend requests, acceptance/decline, blocking, friend codes                                  |
@@ -325,7 +326,7 @@ On the WebSocket path, the hub validates the envelope (`validateEnvelope` — `k
 
 **Outbound SSRF egress guard:** the Klipy media proxy (`internal/klipy/handlers.go`) is the reference SSRF-hardened outbound surface. A cloned transport installs `net.Dialer.Control` running `isDeniedEgressIP` (post-DNS, pre-connect). It defends redirect-SSRF and DNS-rebinding with no TOCTOU window, and denies loopback / private / ULA / link-local / multicast / CGNAT / deprecated site-local, after `Unmap()`), and `http.Client.CheckRedirect` re-validates scheme + host against `allowedMediaHosts` on every hop.
 
-**WebSocket hub** (`internal/websocket/hub.go`): a single `Run()` goroutine owns the subscription maps (`clients`, `userClients`, `channelSubscriptions`, `serverSubscriptions`, `dmSubscriptions`) and drains buffered broadcast channels. `handleIncoming` dispatches inbound frames by `type` (subscribe, message, typing, presence, DM variants, …). Outbound fan-out is `BroadcastToChannel` / `BroadcastToServer` / `BroadcastToUser` / `BroadcastToDM` / `BroadcastToAll`.
+**WebSocket hub** (`internal/websocket/hub.go`): a single `Run()` goroutine owns the subscription maps (`clients`, `userClients`, `channelSubscriptions`, `serverSubscriptions`, `dmSubscriptions`) and drains buffered broadcast channels. `handleIncoming` dispatches inbound frames by `type` (subscribe, message, typing, presence, DM variants, …). Outbound fan-out is `BroadcastToChannel` / `BroadcastToServer` / `BroadcastToUser` / `BroadcastToDM` / `BroadcastToAll`; channel delivery applies channel authorization, including Server Voice visibility, while DM delivery queues visibility-gated frames in order.
 
 #### Database Schema
 
@@ -420,10 +421,12 @@ erDiagram
     messages ||--o{ message_attachments : "carries"
     messages |o--o| messages : "reply_to"
     users ||--o{ friendships : "requests"
+    users ||--o{ dm_message_hidden_ranges : "owns"
     users ||--o{ dm_conversations : "creates"
     dm_conversations ||--o{ dm_participants : "has"
     dm_conversations ||--o{ dm_messages : "contains"
     dm_conversations ||--o{ dm_read_states : "tracks"
+    dm_conversations ||--o{ dm_message_hidden_ranges : "filters privately"
     dm_messages ||--o{ dm_message_attachments : "carries"
     dm_messages ||--o{ dm_message_reactions : "has"
     media_files ||--o{ message_attachments : "stored as"
@@ -455,6 +458,7 @@ erDiagram
         UUID conversation_id PK, FK
         UUID user_id PK, FK
         VARCHAR role "admin or member"
+        TIMESTAMPTZ hidden_at "nullable; private list hide"
     }
     dm_messages {
         UUID id PK
@@ -465,6 +469,15 @@ erDiagram
         UUID pinned_by FK
         JSONB call_event_payload
         TIMESTAMPTZ expires_at "nullable; server-stamped"
+    }
+    dm_message_hidden_ranges {
+        UUID id PK
+        UUID user_id FK
+        UUID conversation_id FK
+        TIMESTAMPTZ hidden_from
+        TIMESTAMPTZ hidden_to
+        TIMESTAMPTZ created_at
+        BOOLEAN includes_own "Clear provenance"
     }
     message_reactions {
         UUID message_id FK
@@ -591,7 +604,7 @@ erDiagram
 | MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045)                                                        |
 | Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087); `activity_settings_pending_cleanups` (000098, durable Rich Presence policy-cleanup evidence) |
 | Activity history    | `presence_history` (000087, category-neutral self-owned interval ledger)                                                                                                                                                                                                                                     |
-| Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133. |
+| Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133; 000140 adds `server_voice_terminal_outbox` for retrying stale-leave notifications through local Hub admission, 000141 adds its account-erasure index, and 000142 admits six aggregate operations counters. |
 | Media                | `media_files` (000042)                                                                                                                                                                                                                                                                                        |
 | Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047)                                                                                                                                                                                                                            |
 | Compliance           | `audit_log` (000035); `account_deletions` (000059); `tier1_erasure_delete_obligations` (000117, 000118); immutable profile generations, slots, and pre-PUT intents (000119–000126)                                                                                                                                                  |
@@ -611,6 +624,24 @@ erDiagram
 > - migrations 000127–000129 added shared channel/DM expiration policy state, nullable message expiry timestamps, and dedicated partial indexes for expiry lookups
 > - migrations 000130–000131 add and validate the audited `expiry` purge reason used by the startup preflight and five-minute sweeper
 > - migrations 000132–000133 added the database-observed Server Voice participant lease used by the bounded active-presence reconciliation pass
+> - migration 000134 repairs far-future DM voice lifecycle stamps; migrations 000135–000136 add the camera-layering and presence-liveness operations metrics, migration 000137 adds durable expiration-policy system-message rows, and migrations 000138–000139 add per-participant DM list hides, Clear-history provenance, and the concurrent partial index supporting hidden-participant lookups
+> - migrations 000140–000142 add the guarded Server Voice terminal outbox, its account-erasure index, retry delivery through local Hub admission, and six aggregate operations counters; account erasure or channel deletion cancels a retained user-owned obligation
+
+DM participant visibility is private to the requesting account. `dm_participants.hidden_at`
+removes one participant's conversation from list reads without changing read state;
+`dm_message_hidden_ranges.includes_own` distinguishes Clear-history ranges, which hide
+the actor's own pre-cutoff messages as well as peers' messages. The shared predicate is
+owned by `internal/dmvisibility` and consumed by purge and WebSocket delivery. Rollout
+replaces and drains the singleton control-plane reader before Clear traffic is admitted;
+the guarded 000138 downgrade refuses live visibility data rather than deleting it. See
+the [participant visibility design](superpowers/specs/2026-09-13-2820-dm-participant-visibility-design.md).
+
+The DM expiration writer locks conversation participants before inserting its
+server-authored `expiration_event` row, returns the persisted `created_at`, and
+applies the same strict respawn rule as ordinary message and call-event
+writes. Its participant-visible delivery uses the shared visibility-gated
+message path, including the actor; the separate striped publication gate is
+reserved for actor-only Hide/Unhide/Clear invalidation events.
 
 #### Admin auth surface (#1688)
 

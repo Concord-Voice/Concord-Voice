@@ -1,6 +1,7 @@
 package messages
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/purge"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
@@ -24,12 +26,13 @@ const (
 
 var errDMReactionNotParticipant = errors.New("dm reaction user is not a current participant")
 
-const (
+var (
 	messageReactionInsertSQL = `
 		INSERT INTO message_reactions (id, message_id, user_id, emoji)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
 	`
+	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionInsertSQL = `
 		INSERT INTO dm_message_reactions (id, message_id, user_id, emoji)
 		SELECT $1, $2, $3, $4
@@ -38,13 +41,14 @@ const (
 			FROM dm_messages dm
 			INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $3
 			WHERE dm.id = $2
-		)
+		` + purge.HiddenRangeFilter("dm", 3) + `)
 		ON CONFLICT (message_id, user_id, emoji) DO NOTHING
 	`
 	messageReactionDeleteSQL = `
 		DELETE FROM message_reactions
 		WHERE message_id = $1 AND user_id = $2 AND emoji = $3
 	`
+	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionDeleteSQL = `
 		DELETE FROM dm_message_reactions mr
 		USING dm_messages dm, dm_participants dp
@@ -52,6 +56,7 @@ const (
 			AND dm.id = mr.message_id
 			AND dp.conversation_id = dm.conversation_id
 			AND dp.user_id = $2
+			` + purge.HiddenRangeFilter("dm", 2) + `
 	`
 	messageReactionSummarySQL = `
 		SELECT mr.user_id, u.username, u.display_name
@@ -60,7 +65,24 @@ const (
 		WHERE mr.message_id = $1 AND mr.emoji = $2
 		ORDER BY mr.created_at ASC
 	`
+	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionSummarySQL = `
+		SELECT mr.user_id, u.username, u.display_name
+		FROM dm_message_reactions mr
+		INNER JOIN users u ON mr.user_id = u.id
+		INNER JOIN dm_messages dm ON dm.id = mr.message_id
+		WHERE mr.message_id = $1 AND mr.emoji = $2
+		` + purge.HiddenRangeFilter("dm", 3) + `
+		ORDER BY mr.created_at ASC
+	`
+	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
+	dmMessageReactionVisibleSQL = `
+		SELECT dm.id
+		FROM dm_messages dm
+		WHERE dm.id = $1 AND dm.conversation_id = $2
+		` + purge.HiddenRangeFilter("dm", 3) + `
+	`
+	dmMessageReactionBroadcastSummarySQL = `
 		SELECT mr.user_id, u.username, u.display_name
 		FROM dm_message_reactions mr
 		INNER JOIN users u ON mr.user_id = u.id
@@ -74,11 +96,14 @@ const (
 		WHERE mr.message_id = $1
 		ORDER BY mr.emoji, mr.created_at ASC
 	`
+	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionsByMessageSQL = `
 		SELECT mr.emoji, mr.user_id, u.username, u.display_name
 		FROM dm_message_reactions mr
 		INNER JOIN users u ON mr.user_id = u.id
+		INNER JOIN dm_messages dm ON dm.id = mr.message_id
 		WHERE mr.message_id = $1
+		` + purge.HiddenRangeFilter("dm", 2) + `
 		ORDER BY mr.emoji, mr.created_at ASC
 	`
 	messageReactionsForMessagesSQL = `
@@ -88,11 +113,14 @@ const (
 		WHERE mr.message_id = ANY($1::uuid[])
 		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
 	`
+	//nolint:gosec // G202: HiddenRangeFilter has hardcoded alias and placeholder; values remain parameterized.
 	dmMessageReactionsForMessagesSQL = `
 		SELECT mr.message_id, mr.emoji, mr.user_id, u.username, u.display_name
 		FROM dm_message_reactions mr
 		INNER JOIN users u ON mr.user_id = u.id
+		INNER JOIN dm_messages dm ON dm.id = mr.message_id
 		WHERE mr.message_id = ANY($1::uuid[])
+		` + purge.HiddenRangeFilter("dm", 2) + `
 		ORDER BY mr.message_id, mr.emoji, mr.created_at ASC
 	`
 )
@@ -172,10 +200,16 @@ func (h *Handler) lookupMessageContext(c *gin.Context, messageID, userID string)
 		return messageContext{}, false
 	}
 
-	// Fall back to DM messages.
+	// Fall back to a DM message visible to this participant. This check is
+	// repeated by each DM mutation query so a Clear that commits between the
+	// context lookup and the write cannot expose the message.
 	dmErr := h.db.QueryRow(`
-		SELECT conversation_id FROM dm_messages WHERE id = $1
-	`, messageID).Scan(&ctx.conversationID)
+		SELECT dm.conversation_id
+		FROM dm_messages dm
+		INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $2
+		WHERE dm.id = $1
+		`+purge.HiddenRangeFilter("dm", 2)+`
+	`, messageID, userID).Scan(&ctx.conversationID)
 	if dmErr == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
 		return messageContext{}, false
@@ -186,23 +220,6 @@ func (h *Handler) lookupMessageContext(c *gin.Context, messageID, userID string)
 		return messageContext{}, false
 	}
 	ctx.isDM = true
-
-	// Check DM participation.
-	var isParticipant bool
-	partErr := h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2)
-	`, ctx.conversationID, userID).Scan(&isParticipant)
-	if partErr != nil {
-		h.log.Error("Failed to check DM participation", "error", partErr, "conversation_id", ctx.conversationID, "user_id", userID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgReactionFailed})
-		return messageContext{}, false
-	}
-	if !isParticipant {
-		// Return 404 rather than 403 to avoid leaking that the conversation/message exists.
-		c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
-		return messageContext{}, false
-	}
-
 	return ctx, true
 }
 
@@ -286,7 +303,7 @@ func (h *Handler) ToggleReaction(c *gin.Context) {
 }
 
 func (h *Handler) toggleDMReaction(c *gin.Context, messageID, userID, emoji, conversationID string) {
-	action, err := h.toggleDMReactionRow(messageID, userID, emoji)
+	action, broadcastSummary, err := h.toggleDMReactionInConversation(c.Request.Context(), messageID, userID, emoji, conversationID)
 	if err != nil {
 		if errors.Is(err, errDMReactionNotParticipant) {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgMessageNotFound})
@@ -297,58 +314,91 @@ func (h *Handler) toggleDMReaction(c *gin.Context, messageID, userID, emoji, con
 		return
 	}
 
-	summary := h.buildDMReactionSummary(messageID, emoji, userID)
-	h.broadcastDMReaction(conversationID, messageID, emoji, userID, action, summary)
-	writeToggleReactionResponse(c, action, summary)
+	h.broadcastDMReaction(conversationID, messageID, emoji, userID, action, broadcastSummary)
+	writeToggleReactionResponse(c, action, h.buildDMReactionSummary(messageID, emoji, userID))
 }
 
-func (h *Handler) toggleDMReactionRow(messageID, userID, emoji string) (string, error) {
-	reactionID := uuid.New().String()
-	result, err := h.db.Exec(dmMessageReactionInsertSQL, reactionID, messageID, userID, emoji)
+func (h *Handler) toggleDMReactionInConversation(ctx context.Context, messageID, userID, emoji, conversationID string) (string, *models.ReactionSummary, error) {
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return "", err
+		return "", nil, err
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back DM reaction transaction", "error", rollbackErr)
+		}
+	}()
+
+	if err := lockVisibleDMReaction(ctx, tx, messageID, userID, conversationID); err != nil {
+		return "", nil, err
+	}
+
+	reactionID := uuid.New().String()
+	result, err := tx.ExecContext(ctx, dmMessageReactionInsertSQL, reactionID, messageID, userID, emoji)
+	if err != nil {
+		return "", nil, err
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if rowsAffected > 0 {
-		return "added", nil
-	}
-
-	result, err = h.db.Exec(dmMessageReactionDeleteSQL, messageID, userID, emoji)
-	if err != nil {
-		return "", err
-	}
-	rowsAffected, err = result.RowsAffected()
-	if err != nil {
-		return "", err
-	}
-	if rowsAffected > 0 {
-		return "removed", nil
+	action := "added"
+	if rowsAffected == 0 {
+		if _, err := tx.ExecContext(ctx, dmMessageReactionDeleteSQL, messageID, userID, emoji); err != nil {
+			return "", nil, err
+		}
+		action = "removed"
 	}
 
-	isParticipant, err := h.isDMMessageParticipant(messageID, userID)
+	rows, err := tx.QueryContext(ctx, dmMessageReactionBroadcastSummarySQL, messageID, emoji)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if !isParticipant {
-		return "", errDMReactionNotParticipant
+	summary, err := scanSingleReactionSummary(rows, emoji, "")
+	if err != nil {
+		return "", nil, err
 	}
-	return "removed", nil
+	if err := tx.Commit(); err != nil {
+		return "", nil, err
+	}
+	return action, summary, nil
 }
 
-func (h *Handler) isDMMessageParticipant(messageID, userID string) (bool, error) {
-	var isParticipant bool
-	err := h.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1
-			FROM dm_messages dm
-			INNER JOIN dm_participants dp ON dp.conversation_id = dm.conversation_id AND dp.user_id = $2
-			WHERE dm.id = $1
-		)
-	`, messageID, userID).Scan(&isParticipant)
-	return isParticipant, err
+func lockVisibleDMReaction(ctx context.Context, tx *sql.Tx, messageID, userID, conversationID string) error {
+	var id string
+	// The reaction's user FK requires the actor parent lock before the
+	// conversation lock; account erasure acquires those parents in that order.
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, userID,
+	).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errDMReactionNotParticipant
+		}
+		return err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, conversationID,
+	).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errDMReactionNotParticipant
+		}
+		return err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
+	).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errDMReactionNotParticipant
+		}
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, dmMessageReactionVisibleSQL, messageID, conversationID, userID).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errDMReactionNotParticipant
+		}
+		return err
+	}
+	return nil
 }
 
 func (h *Handler) toggleReactionRow(insertSQL, deleteSQL, messageID, userID, emoji string) (string, error) {
@@ -385,7 +435,17 @@ func (h *Handler) buildReactionSummary(messageID, emoji, currentUserID string) *
 }
 
 func (h *Handler) buildDMReactionSummary(messageID, emoji, currentUserID string) *models.ReactionSummary {
-	return h.buildReactionSummaryWithQuery(dmMessageReactionSummarySQL, messageID, emoji, currentUserID)
+	rows, err := h.db.Query(dmMessageReactionSummarySQL, messageID, emoji, currentUserID)
+	if err != nil {
+		h.log.Error("Failed to query DM reaction summary", "error", err)
+		return nil
+	}
+	summary, err := scanSingleReactionSummary(rows, emoji, currentUserID)
+	if err != nil {
+		h.log.Error("Error iterating DM reaction summary rows", "error", err)
+		return nil
+	}
+	return summary
 }
 
 func (h *Handler) buildReactionSummaryWithQuery(query, messageID, emoji, currentUserID string) *models.ReactionSummary {
@@ -495,10 +555,14 @@ func (h *Handler) broadcastDMReaction(conversationID, messageID, emoji, userID, 
 	if err != nil {
 		return
 	}
+	messageUUID, err := uuid.Parse(messageID)
+	if err != nil {
+		return
+	}
 	eventType, eventData := reactionEvent(messageID, emoji, userID, action, summary)
 	eventData["conversation_id"] = conversationID
 	eventData["channel_id"] = conversationID // Back-compat: renderer stores DMs by conversation id.
-	h.hub.BroadcastToDM(conversationUUID, websocket.OutgoingMessage{Type: eventType, Data: eventData})
+	h.hub.BroadcastToDMMessageRecipients(conversationUUID, messageUUID, websocket.OutgoingMessage{Type: eventType, Data: eventData})
 }
 
 func reactionEvent(messageID, emoji, userID, action string, summary *models.ReactionSummary) (string, map[string]interface{}) {
@@ -550,19 +614,46 @@ func (h *Handler) GetReactions(c *gin.Context) {
 }
 
 func (h *Handler) getDMReactions(c *gin.Context, messageID, userID string) {
-	h.writeReactionsResponse(c, dmMessageReactionsByMessageSQL, messageID, userID)
+	rows, err := h.db.Query(dmMessageReactionsByMessageSQL, messageID, userID)
+	h.writeReactionRowsResponse(
+		c,
+		rows,
+		err,
+		userID,
+		"Failed to query DM reactions",
+		"Error iterating DM reaction rows",
+	)
 }
 
-func (h *Handler) writeReactionsResponse(c *gin.Context, query, messageID, userID string) {
+func (h *Handler) writeReactionsResponse(
+	c *gin.Context,
+	query, messageID, userID string,
+) {
 	rows, err := h.db.Query(query, messageID)
+	h.writeReactionRowsResponse(
+		c,
+		rows,
+		err,
+		userID,
+		"Failed to query reactions",
+		"Error iterating reaction rows",
+	)
+}
+
+func (h *Handler) writeReactionRowsResponse(
+	c *gin.Context,
+	rows *sql.Rows,
+	err error,
+	userID, queryError, iterationError string,
+) {
 	if err != nil {
-		h.log.Error("Failed to query reactions", "error", err)
+		h.log.Error(queryError, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchReactions})
 		return
 	}
 	reactions, err := scanReactionSummaries(rows, userID)
 	if err != nil {
-		h.log.Error("Error iterating reaction rows", "error", err)
+		h.log.Error(iterationError, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFetchReactions})
 		return
 	}
@@ -577,7 +668,14 @@ func loadReactionsForMessages(db *sql.DB, messageIDs []string, currentUserID str
 
 // LoadDMReactionsForMessages batch-loads reaction summaries for DM messages.
 func LoadDMReactionsForMessages(db *sql.DB, messageIDs []string, currentUserID string) (map[string][]models.ReactionSummary, error) {
-	return loadReactionsForMessagesWithQuery(db, dmMessageReactionsForMessagesSQL, messageIDs, currentUserID)
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := db.Query(dmMessageReactionsForMessagesSQL, pq.Array(messageIDs), currentUserID)
+	if err != nil {
+		return nil, err
+	}
+	return scanReactionsForMessages(rows, currentUserID)
 }
 
 func loadReactionsForMessagesWithQuery(db *sql.DB, query string, messageIDs []string, currentUserID string) (map[string][]models.ReactionSummary, error) {

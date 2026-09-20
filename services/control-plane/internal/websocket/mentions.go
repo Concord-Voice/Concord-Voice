@@ -438,11 +438,11 @@ func (h *Hub) sendMentionNotify(
 	})
 }
 
-// routeDMMentionNotifications sends mention-enhanced dm_unread_notify to mentioned
-// DM participants. DMs have no RBAC — all participants can mention each other.
-// (#3) Validates mentioned users are actual conversation participants.
-func (h *Hub) routeDMMentionNotifications(
-	conversationID, senderUserID uuid.UUID,
+// routeDMMentionNotificationsForMessage prevents a late mention notification
+// from disclosing a source message that Clear made invisible before delivery.
+// DMs have no RBAC; it validates targets against current participants.
+func (h *Hub) routeDMMentionNotificationsForMessage(
+	conversationID, messageID, senderUserID uuid.UUID,
 	addendum *MentionAddendum,
 ) {
 	if addendum == nil || addendum.IsEmpty() {
@@ -458,8 +458,8 @@ func (h *Hub) routeDMMentionNotifications(
 	if len(mentionedUserIDs) == 0 {
 		return
 	}
-
-	h.sendDMMentionNotify(conversationID, mentionedUserIDs, addendum.Here)
+	visibilitySource := NewDMMessageVisibilitySource(messageID)
+	h.sendDMMentionNotify(conversationID, visibilitySource, mentionedUserIDs, addendum.Here)
 }
 
 // resolveDMParticipants fetches all participants for a DM conversation.
@@ -544,26 +544,25 @@ func (h *Hub) resolveDMMentionTargets(
 // who are not subscribed to the conversation.
 func (h *Hub) sendDMMentionNotify(
 	conversationID uuid.UUID,
+	visibilitySource DMMessageVisibilitySource,
 	mentionedUsers map[uuid.UUID]bool,
 	isHere bool,
 ) {
-	notifyMsg, err := marshalOutgoing(OutgoingMessage{
+	notifyMsg := OutgoingMessage{
 		Type: "dm_unread_notify",
 		Data: map[string]interface{}{
 			"conversation_id": conversationID.String(),
 			"mentioned":       true,
 			"mention_here":    isHere,
 		},
+	}
+	h.deliverDMMessageDerived(DMBroadcastMessage{
+		ConversationID:   conversationID,
+		VisibilitySource: &visibilitySource,
+		VisibilityMode:   dmVisibilityDeliveryMentionTargets,
+		MentionTargets:   mentionedUsers,
+		Data:             notifyMsg,
 	})
-	if err != nil {
-		return
-	}
-
-	dmClients := h.dmSubscriptions[conversationID]
-
-	for userID := range mentionedUsers {
-		h.sendToUnsubscribedClients(userID, dmClients, notifyMsg)
-	}
 }
 
 // sendToUnsubscribedClients sends a message to all clients of a user that are NOT

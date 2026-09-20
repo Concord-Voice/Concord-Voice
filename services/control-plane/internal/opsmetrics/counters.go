@@ -9,16 +9,22 @@ const maxTrackedRoutes = 256
 
 // Counters holds the fixed aggregate counters emitted by the control plane.
 type Counters struct {
-	httpRequests       atomic.Uint64
-	httpClientErrors   atomic.Uint64
-	httpServerErrors   atomic.Uint64
-	channelMessages    atomic.Uint64
-	dmMessages         atomic.Uint64
-	snapshotRejections atomic.Uint64
-	presenceSuppressed atomic.Uint64
-	presenceTTLLapsed  atomic.Uint64
-	wsAbnormalCloses   atomic.Uint64
-	mediaUploads       atomic.Uint64
+	httpRequests                                 atomic.Uint64
+	httpClientErrors                             atomic.Uint64
+	httpServerErrors                             atomic.Uint64
+	channelMessages                              atomic.Uint64
+	dmMessages                                   atomic.Uint64
+	snapshotRejections                           atomic.Uint64
+	presenceSuppressed                           atomic.Uint64
+	presenceTTLLapsed                            atomic.Uint64
+	wsAbnormalCloses                             atomic.Uint64
+	mediaUploads                                 atomic.Uint64
+	serverVoiceTerminalOutboxCaptured            atomic.Uint64
+	serverVoiceTerminalOutboxDelivered           atomic.Uint64
+	serverVoiceTerminalOutboxSuccessorSuppressed atomic.Uint64
+	serverVoiceTerminalOutboxChannelSuppressed   atomic.Uint64
+	serverVoiceTerminalOutboxLockRetained        atomic.Uint64
+	serverVoiceTerminalOutboxQueueRescheduled    atomic.Uint64
 
 	routesMu sync.RWMutex
 	routes   map[string]uint64
@@ -56,6 +62,18 @@ func (c *Counters) Increment(key MetricKey) {
 		c.wsAbnormalCloses.Add(1)
 	case MetricMediaUploadsTotal:
 		c.mediaUploads.Add(1)
+	case MetricServerVoiceTerminalOutboxCapturedTotal:
+		c.serverVoiceTerminalOutboxCaptured.Add(1)
+	case MetricServerVoiceTerminalOutboxDeliveredTotal:
+		c.serverVoiceTerminalOutboxDelivered.Add(1)
+	case MetricServerVoiceTerminalOutboxSuccessorSuppressedTotal:
+		c.serverVoiceTerminalOutboxSuccessorSuppressed.Add(1)
+	case MetricServerVoiceTerminalOutboxChannelSuppressedTotal:
+		c.serverVoiceTerminalOutboxChannelSuppressed.Add(1)
+	case MetricServerVoiceTerminalOutboxLockRetainedTotal:
+		c.serverVoiceTerminalOutboxLockRetained.Add(1)
+	case MetricServerVoiceTerminalOutboxQueueRescheduledTotal:
+		c.serverVoiceTerminalOutboxQueueRescheduled.Add(1)
 	}
 }
 
@@ -65,16 +83,22 @@ func (c *Counters) Snapshot() map[MetricKey]float64 {
 		return nil
 	}
 	return map[MetricKey]float64{
-		MetricHTTPRequestsTotal:               float64(c.httpRequests.Load()),
-		MetricHTTPClientErrorsTotal:           float64(c.httpClientErrors.Load()),
-		MetricHTTPServerErrorsTotal:           float64(c.httpServerErrors.Load()),
-		MetricChannelMessagesTotal:            float64(c.channelMessages.Load()),
-		MetricDMMessagesTotal:                 float64(c.dmMessages.Load()),
-		MetricSnapshotRejectionsTotal:         float64(c.snapshotRejections.Load()),
-		MetricPresenceAudienceSuppressedTotal: float64(c.presenceSuppressed.Load()),
-		MetricPresenceTTLLapsedTotal:          float64(c.presenceTTLLapsed.Load()),
-		MetricWebSocketAbnormalClosesTotal:    float64(c.wsAbnormalCloses.Load()),
-		MetricMediaUploadsTotal:               float64(c.mediaUploads.Load()),
+		MetricHTTPRequestsTotal:                                 float64(c.httpRequests.Load()),
+		MetricHTTPClientErrorsTotal:                             float64(c.httpClientErrors.Load()),
+		MetricHTTPServerErrorsTotal:                             float64(c.httpServerErrors.Load()),
+		MetricChannelMessagesTotal:                              float64(c.channelMessages.Load()),
+		MetricDMMessagesTotal:                                   float64(c.dmMessages.Load()),
+		MetricSnapshotRejectionsTotal:                           float64(c.snapshotRejections.Load()),
+		MetricPresenceAudienceSuppressedTotal:                   float64(c.presenceSuppressed.Load()),
+		MetricPresenceTTLLapsedTotal:                            float64(c.presenceTTLLapsed.Load()),
+		MetricWebSocketAbnormalClosesTotal:                      float64(c.wsAbnormalCloses.Load()),
+		MetricMediaUploadsTotal:                                 float64(c.mediaUploads.Load()),
+		MetricServerVoiceTerminalOutboxCapturedTotal:            float64(c.serverVoiceTerminalOutboxCaptured.Load()),
+		MetricServerVoiceTerminalOutboxDeliveredTotal:           float64(c.serverVoiceTerminalOutboxDelivered.Load()),
+		MetricServerVoiceTerminalOutboxSuccessorSuppressedTotal: float64(c.serverVoiceTerminalOutboxSuccessorSuppressed.Load()),
+		MetricServerVoiceTerminalOutboxChannelSuppressedTotal:   float64(c.serverVoiceTerminalOutboxChannelSuppressed.Load()),
+		MetricServerVoiceTerminalOutboxLockRetainedTotal:        float64(c.serverVoiceTerminalOutboxLockRetained.Load()),
+		MetricServerVoiceTerminalOutboxQueueRescheduledTotal:    float64(c.serverVoiceTerminalOutboxQueueRescheduled.Load()),
 	}
 }
 

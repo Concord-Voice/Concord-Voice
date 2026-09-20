@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/google/uuid"
 )
 
@@ -87,36 +88,61 @@ func (h *Handler) insertCallEvent(ctx context.Context, convID uuid.UUID, payload
 		return fmt.Errorf("marshal call event payload: %w", err)
 	}
 
-	tx, err := h.db.BeginTx(ctx, nil)
+	return withCallEventTransaction(ctx, h.db, "dm call event transaction", func(tx *sql.Tx) error {
+		windowSeconds, err := prepareCallEventInsert(ctx, tx, convID, payload.CallerUserID)
+		if err != nil {
+			return err
+		}
+		// dm_messages.content is NOT NULL; call-event renderers use call_event_payload instead.
+		var createdAt time.Time
+		if err := tx.QueryRowContext(ctx, `
+			WITH timestamps AS (SELECT clock_timestamp() AS created_at)
+			INSERT INTO dm_messages
+			  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
+			SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
+			       CASE WHEN $6::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $6) END
+			FROM timestamps
+			RETURNING created_at
+		`, uuid.New(), convID, payload.CallerUserID, dmMessagesCallEventType, payloadJSON, windowSeconds).Scan(&createdAt); err != nil {
+			return fmt.Errorf("insert dm_messages call_event row: %w", err)
+		}
+		return respawnDMParticipantVisibility(ctx, tx, convID, createdAt)
+	})
+}
+
+func withCallEventTransaction(
+	ctx context.Context,
+	db *sql.DB,
+	transactionName string,
+	write func(*sql.Tx) error,
+) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin dm call event transaction: %w", err)
+		return fmt.Errorf("begin %s: %w", transactionName, err)
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			err = errors.Join(err, fmt.Errorf("rollback dm call event transaction: %w", rollbackErr))
+			err = errors.Join(err, fmt.Errorf("rollback %s: %w", transactionName, rollbackErr))
 		}
 	}()
-	windowSeconds, err := lockDMCallEventPolicy(ctx, tx, convID, payload.CallerUserID)
-	if err != nil {
+	if err := write(tx); err != nil {
 		return err
 	}
-	// dm_messages.content is NOT NULL — store an empty string for call events
-	// (the meaningful data lives in call_event_payload). Renderer dispatches
-	// on type='call_event' and ignores content for these rows.
-	if _, err := tx.ExecContext(ctx, `
-		WITH timestamps AS (SELECT clock_timestamp() AS created_at)
-		INSERT INTO dm_messages
-		  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
-		SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
-		       CASE WHEN $6::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $6) END
-		FROM timestamps
-	`, uuid.New(), convID, payload.CallerUserID, dmMessagesCallEventType, payloadJSON, windowSeconds); err != nil {
-		return fmt.Errorf("insert dm_messages call_event row: %w", err)
-	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit dm call event transaction: %w", err)
+		return fmt.Errorf("commit %s: %w", transactionName, err)
 	}
 	return nil
+}
+
+func prepareCallEventInsert(ctx context.Context, tx *sql.Tx, convID, callerID uuid.UUID) (sql.NullInt64, error) {
+	windowSeconds, err := lockDMCallEventPolicy(ctx, tx, convID, callerID)
+	if err != nil {
+		return sql.NullInt64{}, err
+	}
+	if err := dmvisibility.LockParticipantsForWrite(ctx, tx, convID); err != nil {
+		return sql.NullInt64{}, err
+	}
+	return windowSeconds, nil
 }
 
 // lockDMCallEventPolicy keeps background call-event writes in the same
@@ -134,6 +160,15 @@ func lockDMCallEventPolicy(ctx context.Context, tx *sql.Tx, convID, callerID uui
 		return sql.NullInt64{}, fmt.Errorf("lock call-event conversation: %w", err)
 	}
 	return windowSeconds, nil
+}
+
+func respawnDMParticipantVisibility(ctx context.Context, tx *sql.Tx, convID uuid.UUID, createdAt time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE dm_participants SET hidden_at = NULL
+		WHERE conversation_id = $1 AND hidden_at < $2`, convID, createdAt); err != nil {
+		return fmt.Errorf("respawn call-event participant visibility: %w", err)
+	}
+	return nil
 }
 
 // callEventMissed constructs a CallEventPayload for the ring-timeout
@@ -222,54 +257,53 @@ func insertCompletedCallEvent(
 		return fmt.Errorf("marshal completed call event payload: %w", err)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin completed dm call event transaction: %w", err)
-	}
-	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			err = errors.Join(err, fmt.Errorf("rollback completed dm call event transaction: %w", rollbackErr))
+	return withCallEventTransaction(ctx, db, "completed dm call event transaction", func(tx *sql.Tx) error {
+		windowSeconds, err := prepareCallEventInsert(ctx, tx, convID, payload.CallerUserID)
+		if err != nil {
+			return err
 		}
-	}()
-	windowSeconds, err := lockDMCallEventPolicy(ctx, tx, convID, payload.CallerUserID)
-	if err != nil {
-		return err
-	}
-	query := `
-		INSERT INTO dm_messages
-		  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
-		VALUES ($1, $2, $3, '', $4, $5, $6::timestamptz,
-		        CASE WHEN $7::integer IS NULL THEN NULL ELSE $6::timestamptz + make_interval(secs => $7) END)
-		ON CONFLICT (id) DO NOTHING
-	`
-	if replaceExisting {
-		// An exact heartbeat fallback can arrive before the media plane's richer
-		// room-empty snapshot. The authoritative snapshot upgrades that same call
-		// row; a later fallback uses DO NOTHING and cannot downgrade it.
-		query = `
+		query := `
+			WITH timestamps AS (SELECT $6::timestamptz AS created_at)
 			INSERT INTO dm_messages
 			  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
-			VALUES ($1, $2, $3, '', $4, $5, $6::timestamptz,
-			        CASE WHEN $7::integer IS NULL THEN NULL ELSE $6::timestamptz + make_interval(secs => $7) END)
-			ON CONFLICT (id) DO UPDATE SET
-			  user_id = EXCLUDED.user_id,
-			  call_event_payload = EXCLUDED.call_event_payload,
-			  created_at = EXCLUDED.created_at
-			WHERE dm_messages.conversation_id = EXCLUDED.conversation_id
-			  AND dm_messages.type = 'call_event'
+			SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
+			       CASE WHEN $7::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $7) END
+			FROM timestamps
+			ON CONFLICT (id) DO NOTHING
+			RETURNING created_at
 		`
-	}
-	_, err = tx.ExecContext(
-		ctx, query, messageID, convID, payload.CallerUserID,
-		dmMessagesCallEventType, payloadJSON, payload.EndedAt, windowSeconds,
-	)
-	if err != nil {
-		return fmt.Errorf("insert completed call event row: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit completed dm call event transaction: %w", err)
-	}
-	return nil
+		if replaceExisting {
+			// An exact heartbeat fallback can arrive before the media plane's richer
+			// room-empty snapshot. The authoritative snapshot upgrades that same call
+			// row; a later fallback uses DO NOTHING and cannot downgrade it.
+			query = `
+				WITH timestamps AS (SELECT $6::timestamptz AS created_at)
+				INSERT INTO dm_messages
+				  (id, conversation_id, user_id, content, type, call_event_payload, created_at, expires_at)
+				SELECT $1, $2, $3, '', $4, $5, timestamps.created_at,
+				       CASE WHEN $7::integer IS NULL THEN NULL ELSE timestamps.created_at + make_interval(secs => $7) END
+				FROM timestamps
+				ON CONFLICT (id) DO UPDATE SET
+				  user_id = EXCLUDED.user_id,
+				  call_event_payload = EXCLUDED.call_event_payload
+				WHERE dm_messages.conversation_id = EXCLUDED.conversation_id
+				  AND dm_messages.type = 'call_event'
+				RETURNING created_at
+			`
+		}
+		var createdAt time.Time
+		err = tx.QueryRowContext(
+			ctx, query, messageID, convID, payload.CallerUserID,
+			dmMessagesCallEventType, payloadJSON, payload.EndedAt, windowSeconds,
+		).Scan(&createdAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("insert completed call event row: %w", err)
+		}
+		return respawnDMParticipantVisibility(ctx, tx, convID, createdAt)
+	})
 }
 
 // InsertCompletedCallEvent persists one idempotent completed-call row from the

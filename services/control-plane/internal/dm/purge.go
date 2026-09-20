@@ -2,6 +2,8 @@ package dm
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -136,9 +138,26 @@ func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, 
 	if err != nil {
 		return 0, fmt.Errorf("begin hide tx: %w", err)
 	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back DM purge hide transaction", "error", rollbackErr)
+		}
+	}()
+
+	// Take the FK parents before the participant row. Account erasure locks users
+	// before its conversations, and group deletion locks the conversation before
+	// removing participants.
+	var lockedUserID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, userID).Scan(&lockedUserID); err != nil {
+		return 0, fmt.Errorf("lock hide user: %w", err)
+	}
+	var lockedConversationID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM dm_conversations WHERE id = $1 FOR KEY SHARE`, convID).Scan(&lockedConversationID); err != nil {
+		return 0, fmt.Errorf("lock hide conversation: %w", err)
+	}
+
 	hidden, err := InsertHiddenRange(ctx, tx, userID, convID, from, time.Now().UTC())
 	if err != nil {
-		_ = tx.Rollback()
 		return 0, fmt.Errorf("insert hidden range: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

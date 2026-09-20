@@ -325,6 +325,76 @@ func f() {
 	require.Empty(t, findings)
 }
 
+func TestMissingChannelTerminalOutboxPublishesCountsBeforeCommit(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "nats.go")) // #nosec G304 -- runtime.Caller plus fixed repository path
+	require.NoError(t, err)
+	files := token.NewFileSet()
+	parsed, err := parser.ParseFile(files, "nats.go", source, 0)
+	require.NoError(t, err)
+
+	var targetFunction *ast.FuncDecl
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == "drainServerVoiceTerminalOutboxCandidate" {
+			targetFunction = function
+			break
+		}
+	}
+	require.NotNil(t, targetFunction)
+
+	var branch, deleteBlock *ast.IfStmt
+	ast.Inspect(targetFunction.Body, func(node ast.Node) bool {
+		if branch != nil {
+			return false
+		}
+		candidate, ok := node.(*ast.IfStmt)
+		if !ok || candidate.Cond == nil {
+			return true
+		}
+		unary, ok := candidate.Cond.(*ast.UnaryExpr)
+		if !ok || unary.Op != token.NOT {
+			return true
+		}
+		identifier, identifierOK := unary.X.(*ast.Ident)
+		if identifierOK && identifier.Name == "channelExists" {
+			branch = candidate
+			ast.Inspect(branch.Body, func(child ast.Node) bool {
+				if deleteBlock != nil {
+					return false
+				}
+				statement, ok := child.(*ast.IfStmt)
+				if !ok {
+					return true
+				}
+				condition, ok := statement.Cond.(*ast.BinaryExpr)
+				if !ok {
+					return true
+				}
+				left, leftOK := condition.X.(*ast.Ident)
+				right, rightOK := condition.Y.(*ast.BasicLit)
+				if condition.Op == token.EQL && leftOK && left.Name == "rowsAffected" && rightOK && right.Value == "1" {
+					deleteBlock = statement
+					return false
+				}
+				return true
+			})
+			return false
+		}
+		return true
+	})
+	require.NotNil(t, branch, "missing-channel terminal outbox branch must remain explicit")
+	require.NotNil(t, deleteBlock, "missing-channel branch must gate publication on one deleted row")
+	deleteStart := files.Position(deleteBlock.Pos()).Offset
+	deleteEnd := files.Position(deleteBlock.End()).Offset
+	deleteSource := string(source[deleteStart:deleteEnd])
+	require.Contains(t, deleteSource, "s.hub.BroadcastServerVoiceCounts()")
+	branchEnd := files.Position(branch.End()).Offset
+	commitAfterDelete := string(source[deleteEnd:branchEnd])
+	require.Contains(t, commitAfterDelete, "tx.Commit()", "missing-channel count publication must precede transaction commit")
+}
+
 func TestVoiceRoomResolutionUsesLifecycleContext(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	require.True(t, ok)

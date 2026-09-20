@@ -223,9 +223,9 @@ func indexOf(xs []string, want string) int {
 // incident.
 //
 // One deadline means one pot. A stage that wedges consumes the entire remaining
-// budget, so every stage after it is abandoned on arrival -- a wedged
-// background-worker wait takes the presence drain down with it, and that drain
-// writes Server Voice state nothing else recomputes.
+// budget, so every stage after it arrives with no shared waiting budget -- a
+// wedged background-worker wait can leave the presence drain starved, while
+// later stages may still complete their work after the caller moves on.
 //
 // Accepted deliberately rather than solved with per-stage floors: the
 // alternative is a knob per stage whose correct value nobody can derive, and
@@ -239,17 +239,31 @@ func indexOf(xs []string, want string) int {
 func TestAnEarlyWedgeStarvesTheStagesAfterIt(t *testing.T) {
 	order, abandoned := stagesFor(t, 20*time.Millisecond, "activity")
 
-	// The wedged stage HAD the budget and used it; the two after it never ran.
-	// Conflating those sends an operator after two innocent stages.
-	for _, want := range []string{"background_workers", "presence_workers(starved)", "hub(starved)"} {
-		if !contains(abandoned, want) {
-			t.Fatalf("a wedge in the first stage should abandon %q; abandoned=%v. "+
-				"A starved stage reported as an overrun is a cascade that reads as "+
-				"three independent slow stages.", want, abandoned)
+	// The wedged stage HAD the budget and used it. The stages after it are
+	// launched regardless; each may either finish its tiny test callback or be
+	// reported as starved, depending on which select arm wins.
+	if !contains(abandoned, "background_workers") || contains(abandoned, "background_workers(starved)") {
+		t.Fatalf("the wedged first stage must be reported as an overrun; abandoned=%v", abandoned)
+	}
+	for _, tc := range []struct {
+		orderName, reportName, overrunName string
+	}{
+		{"presence", "presence_workers(starved)", "presence_workers"},
+		{"hub", "hub(starved)", "hub"},
+	} {
+		if contains(abandoned, tc.overrunName) {
+			t.Fatalf("stage %q must not be reported as an independent overrun; abandoned=%v",
+				tc.orderName, abandoned)
+		}
+		if !contains(order, tc.orderName) && !contains(abandoned, tc.reportName) {
+			t.Fatalf("stage %q must either complete or be reported starved; order=%v abandoned=%v",
+				tc.orderName, order, abandoned)
 		}
 	}
-	if !contains(order, "nats") {
-		t.Fatalf("the NATS drain must still run even when every drain stage is starved; order=%v", order)
+	for _, want := range []string{"metrics", "reader", "nats"} {
+		if !contains(order, want) {
+			t.Fatalf("the %s stage must still run after the shared-budget cascade; order=%v", want, order)
+		}
 	}
 }
 
@@ -264,7 +278,7 @@ func TestAnEarlyWedgeStarvesTheStagesAfterIt(t *testing.T) {
 // 19995/20000 and settles nothing on its own.
 //
 // The resolution is that those stages are not overrunning, they are STARVED:
-// an earlier stage drained the shared pot and they never got any budget. That
+// an earlier stage drained the shared pot and they got no waiting budget. That
 // is a true statement about them, and a different one from "this stage is slow",
 // which is the diagnosis an operator would otherwise reach about two innocent
 // stages.
@@ -302,8 +316,8 @@ func TestTheAbandonSignalDoesNotLieAboutStagesThatRan(t *testing.T) {
 			<-ran // the stage's work DID finish, just not before we stopped waiting
 		}
 		if overran != 0 {
-			t.Fatalf("%d/%d starved stages were labelled overran. They had zero budget and "+
-				"never ran; calling them slow points the operator at the wrong stage.", overran, n)
+			t.Fatalf("%d/%d starved stages were labelled overran. They had no waiting budget; "+
+				"calling them slow points the operator at the wrong stage.", overran, n)
 		}
 		if starved == 0 {
 			t.Fatal("no stage was reported at all on an exhausted budget, so the cascade " +

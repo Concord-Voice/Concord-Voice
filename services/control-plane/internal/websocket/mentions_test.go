@@ -781,21 +781,24 @@ func TestSendMentionNotify_ChecksPermissionOffRunGoroutine(t *testing.T) {
 // --- sendDMMentionNotify tests ---
 
 func TestSendDMMentionNotify_SendsToMentionedUsers(t *testing.T) {
-	hub := newTestHubWithChecker(nil)
-
-	convID := uuid.New()
-	mentionedUserID := uuid.New()
-	clientID := uuid.New()
-	client := &Client{ID: clientID, UserID: mentionedUserID, Send: make(chan []byte, 10)}
-
-	hub.clients[clientID] = client
-	hub.userClients[mentionedUserID] = map[uuid.UUID]bool{clientID: true}
+	setup := setupEpochTest(t, false, false)
+	hub := setup.hub
+	convID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+	mentionedUserID := setup.user2
+	client := &Client{ID: uuid.New(), UserID: mentionedUserID, Send: make(chan []byte, 10), Hub: hub}
+	hub.clients[client.ID] = client
+	hub.userClients[mentionedUserID] = map[uuid.UUID]bool{client.ID: true}
 	// Not subscribed to the DM conversation
 	hub.dmSubscriptions[convID] = map[uuid.UUID]bool{}
 
 	mentionedUsers := map[uuid.UUID]bool{mentionedUserID: true}
+	messageID := uuid.New()
+	_, err = setup.db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type) VALUES ($1, $2, $3, 'mention source', 'user')`, messageID, convID, setup.user1)
+	require.NoError(t, err)
 
-	hub.sendDMMentionNotify(convID, mentionedUsers, true)
+	hub.sendDMMentionNotify(convID, NewDMMessageVisibilitySource(messageID), mentionedUsers, true)
+	completePendingDMDeliveries(t, hub)
 
 	require.Len(t, client.Send, 1)
 	data := <-client.Send
@@ -827,12 +830,12 @@ func TestRouteMentionNotifications_EmptyAddendum(_ *testing.T) {
 func TestRouteDMMentionNotifications_NilAddendum(_ *testing.T) {
 	hub := newTestHubWithChecker(nil)
 	// Should not panic
-	hub.routeDMMentionNotifications(uuid.New(), uuid.New(), nil)
+	hub.routeDMMentionNotificationsForMessage(uuid.New(), uuid.New(), uuid.New(), nil)
 }
 
 func TestRouteDMMentionNotifications_EmptyAddendum(_ *testing.T) {
 	hub := newTestHubWithChecker(nil)
 	addendum := &MentionAddendum{}
 	// Should not panic
-	hub.routeDMMentionNotifications(uuid.New(), uuid.New(), addendum)
+	hub.routeDMMentionNotificationsForMessage(uuid.New(), uuid.New(), uuid.New(), addendum)
 }

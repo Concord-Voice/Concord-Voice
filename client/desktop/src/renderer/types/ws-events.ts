@@ -12,7 +12,7 @@
  * arrives from the server), while `chat.ts` defines APPLICATION models (what
  * stores hold). Handlers in useWebSocketMessages.ts transform wire → app.
  *
- * 78 schemas total: 75 subscriber events (handled via wsService.on) + 3
+ * 80 schemas total: 77 subscriber events (handled via wsService.on) + 3
  * envelope-only events (connected, connection_ready, heartbeat_ack) consumed
  * internally by wsService.handleMessage — all must be in the union so that
  * the post-safeParse code accesses message.data fields without `as` casts
@@ -592,7 +592,7 @@ export const MessageAckSchema = z.object({
   }),
 });
 
-// ──────────── Direct messages (12 events) — Task A4 ───────────────────
+// ──────────── Direct messages (14 events) — Task A4 ───────────────────
 
 /**
  * `dm_message` — DM chat message broadcast.
@@ -806,6 +806,33 @@ export const DMSubscribedSchema = z.object({
   data: z.object({
     conversation_id: UUID,
     channel_id: UUID.optional(),
+  }),
+});
+
+/**
+ * `dm_conversation_hidden` — a participant's DM visibility state changed.
+ * Server emitter: `services/control-plane/internal/dm/visibility.go`
+ * (`emitDMVisibility` after HideConversation or UnhideConversation commits).
+ * `hidden_at` is null for an unhide event.
+ */
+export const DMConversationHiddenSchema = z.object({
+  type: z.literal('dm_conversation_hidden'),
+  data: z.object({
+    conversation_id: UUID,
+    hidden_at: ISOTimestamp.nullable(),
+  }),
+});
+
+/**
+ * `dm_conversation_cleared` — a participant's DM history clear range committed.
+ * Server emitter: `services/control-plane/internal/dm/visibility.go`
+ * (`emitDMVisibility` after ClearConversation commits).
+ */
+export const DMConversationClearedSchema = z.object({
+  type: z.literal('dm_conversation_cleared'),
+  data: z.object({
+    conversation_id: UUID,
+    cleared_at: ISOTimestamp,
   }),
 });
 
@@ -1727,7 +1754,7 @@ export const ServerPurgedSchema = z.object({
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// 4. The discriminated union (78 schemas: 75 subscriber + 3 envelope)
+// 4. The discriminated union (80 schemas: 77 subscriber + 3 envelope)
 // ════════════════════════════════════════════════════════════════════════
 
 /** Message-expiration policy change (#1351).
@@ -1828,6 +1855,8 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   DMRoleChangedSchema,
   DMGroupDeletedSchema,
   DMSubscribedSchema,
+  DMConversationHiddenSchema,
+  DMConversationClearedSchema,
 
   // Friend system (4)
   FriendRequestReceivedSchema,
@@ -1906,7 +1935,7 @@ export const WebSocketEventSchema = z.discriminatedUnion('type', [
   ConnectionReadySchema,
   HeartbeatAckSchema,
 ]);
-// TOTAL: 78 schemas (75 subscriber + 3 envelope-only;
+// TOTAL: 80 schemas (77 subscriber + 3 envelope-only;
 // +channel_purged/dm_purged/server_purged #1352; +heartbeat_ack CF keepalive;
 // +6 server-role events #2359).
 // The count is asserted in tests/unit/types/ws-events.test.ts so an addition
@@ -1937,6 +1966,8 @@ export type DMMessagePayload = z.infer<typeof DMMessageSchema>['data'];
 export type DMMessageAckPayload = z.infer<typeof DMMessageAckSchema>['data'];
 export type DMMessageUpdatePayload = z.infer<typeof DMMessageUpdateSchema>['data'];
 export type DMMessageDeletePayload = z.infer<typeof DMMessageDeleteSchema>['data'];
+export type DMConversationHiddenPayload = z.infer<typeof DMConversationHiddenSchema>['data'];
+export type DMConversationClearedPayload = z.infer<typeof DMConversationClearedSchema>['data'];
 export type DMTypingPayload = z.infer<typeof DMTypingSchema>['data'];
 export type DMUnreadNotifyPayload = z.infer<typeof DMUnreadNotifySchema>['data'];
 export type DMConversationCreatedPayload = z.infer<typeof DMConversationCreatedSchema>['data'];

@@ -28,7 +28,7 @@ describe("metric catalog", () => {
   it("assigns every fixed metric key to one primary home", () => {
     expect(PRIMARY_METRIC_MAP.hostOverview).toHaveLength(4);
     expect(PRIMARY_METRIC_MAP.services).toHaveLength(28);
-    expect(PRIMARY_METRIC_MAP.control).toHaveLength(10);
+    expect(PRIMARY_METRIC_MAP.control).toHaveLength(16);
     expect(PRIMARY_METRIC_MAP.mediaActivity).toHaveLength(9);
     expect(PRIMARY_METRIC_MAP.mediaEgress).toHaveLength(3);
     expect(PRIMARY_METRIC_MAP.participantHours).toHaveLength(3);
@@ -37,9 +37,21 @@ describe("metric catalog", () => {
     );
 
     const assigned = Object.values(PRIMARY_METRIC_MAP).flat();
-    expect(assigned).toHaveLength(66);
+    expect(assigned).toHaveLength(72);
     expect(new Set(assigned)).toEqual(new Set(METRIC_KEYS));
-    expect(COUNTER_METRIC_KEYS).toHaveLength(16);
+    expect(COUNTER_METRIC_KEYS).toHaveLength(22);
+
+    for (const key of [
+      "server_voice_terminal_outbox_captured_total",
+      "server_voice_terminal_outbox_delivered_total",
+      "server_voice_terminal_outbox_successor_suppressed_total",
+      "server_voice_terminal_outbox_channel_suppressed_total",
+      "server_voice_terminal_outbox_lock_retained_total",
+      "server_voice_terminal_outbox_queue_rescheduled_total",
+    ] as const) {
+      expect(PRIMARY_METRIC_MAP.control).toContain(key);
+      expect(COUNTER_METRIC_KEYS).toContain(key);
+    }
   });
 });
 

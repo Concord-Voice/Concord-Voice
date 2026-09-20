@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_dm_participants_hidden_conversation;

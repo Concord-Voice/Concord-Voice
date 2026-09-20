@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000137)
+## Existing Migrations (000001–000142)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -247,6 +247,11 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000135 | camera_layering_ops_metrics | Admit the camera-layering gate-flip and pressure-demand counters to the closed operations metric catalog (#3094) |
 | 000136 | presence_liveness_ops_metrics | Admit the presence-TTL-lapse and abnormal-socket-close counters to the closed operations metric catalog, so the two failure modes #3328 separated are countable rather than only described (#3328) |
 | 000137 | expiration_event_message_type | `messages.type` discriminator plus `expiration_event_payload` on `messages` and `dm_messages` — durable, server-authored system rows recording an expiration-policy change (#1351) |
+| 000138 | dm_participant_visibility_columns | Add per-participant DM `hidden_at` and `dm_message_hidden_ranges.includes_own` provenance (#2820) |
+| 000139 | dm_participant_hidden_index | Add the concurrent partial index for hidden DM participant rows (#2820) |
+| 000140 | add_server_voice_terminal_outbox | Add guarded Server Voice terminal obligations for stale-leave retry through local Hub admission (#3298) |
+| 000141 | add_server_voice_terminal_outbox_user_index | Add the user index supporting account-erasure cascades for terminal obligations (#3298) |
+| 000142 | server_voice_terminal_outbox_ops_metrics | Admit aggregate Server Voice terminal-outbox lifecycle counters to the closed operations metric catalog (#3298) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -261,6 +266,23 @@ constraint; its down migration restores the broader `NOT VALID` constraint from
 000130. Apply both before starting the expiry writer. A downgrade through
 000130 is refused while expiry audit evidence exists; it does not delete or
 rewrite that evidence.
+
+Migrations 000138–000139 add private participant visibility for DMs. `hidden_at`
+controls one participant's conversation-list visibility; `includes_own` marks
+the Clear-history ranges that also hide that participant's own messages. The
+000139 index is a separate one-statement `CREATE INDEX CONCURRENTLY` migration.
+Deploy the new columns and replace/drain the singleton control-plane reader
+before admitting Clear traffic. The 000138 down migration refuses live hide or
+Clear data and never deletes it.
+
+Migrations 000140–000141 add the guarded Server Voice terminal outbox and its
+account-erasure index. Deploy both before writer code; the schema-first rollout keeps
+the table empty while the transactional child index is created.
+
+Migration 000142 admits the six aggregate terminal-outbox counters. Apply it before
+deploying code that emits those keys. Its down migration removes only those six
+retired aggregate series under an `ACCESS EXCLUSIVE` lock, then restores the exact
+000136 catalog; it does not alter the outbox table.
 
 ## Troubleshooting
 

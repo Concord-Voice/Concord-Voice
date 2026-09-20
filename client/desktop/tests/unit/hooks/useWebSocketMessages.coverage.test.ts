@@ -3077,11 +3077,13 @@ describe('useWebSocketMessages — coverage boost', () => {
       });
     });
 
-    it('increments server voice count on joined', () => {
-      const { handler } = setupHandler('voice_state_update');
+    it('preserves a server count received before a joined frame', () => {
+      const { ws, handler } = setupHandler('voice_state_update');
       const incSpy = vi.spyOn(useVoiceStore.getState(), 'incrementServerVoiceCount');
 
+      const counts = requireHandler(ws, 'server_voice_counts');
       act(() => {
+        counts({ type: 'server_voice_counts', data: { counts: { 'server-1': 6 } } });
         handler({
           type: 'voice_state_update',
           data: {
@@ -3094,12 +3096,15 @@ describe('useWebSocketMessages — coverage boost', () => {
         });
       });
 
-      expect(incSpy).toHaveBeenCalledWith('server-1');
+      expect(incSpy).not.toHaveBeenCalled();
+      expect(useVoiceStore.getState().serverVoiceCounts['server-1']).toBe(6);
     });
 
-    it('decrements server voice count on left', () => {
+    it('preserves the authoritative server voice count on left', () => {
       const { handler } = setupHandler('voice_state_update');
       const decSpy = vi.spyOn(useVoiceStore.getState(), 'decrementServerVoiceCount');
+
+      useVoiceStore.getState().setServerVoiceCounts({ 'server-1': 4 });
 
       useVoiceStore.getState().addChannelVoiceMember('ch-voice', {
         userId: 'user-2',
@@ -3119,7 +3124,8 @@ describe('useWebSocketMessages — coverage boost', () => {
         });
       });
 
-      expect(decSpy).toHaveBeenCalledWith('server-1');
+      expect(decSpy).not.toHaveBeenCalled();
+      expect(useVoiceStore.getState().serverVoiceCounts['server-1']).toBe(4);
     });
 
     it('removes voice member from channel on left', () => {

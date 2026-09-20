@@ -1553,6 +1553,164 @@ func TestDownloadAttachmentSuccess(t *testing.T) {
 	assert.Equal(t, "ciphertext", w.Body.String())
 }
 
+func insertDMDownloadFixture(t *testing.T, ts *testSetup, uploader, conversationID string, payload []byte) (fileID, messageID string) {
+	t.Helper()
+	fileID = uuid.New().String()
+	storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+	require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader(payload), int64(len(payload)), mimeOctetStream))
+	_, err := ts.db.Exec(`
+		INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id)
+		VALUES ($1, $2, 'file', 2, 'application/octet-stream', $3, $4, 1, $5)`,
+		fileID, uploader, len(payload), storageKey, conversationID)
+	require.NoError(t, err)
+	messageID = uuid.New().String()
+	_, err = ts.db.Exec(`
+		INSERT INTO dm_messages (id, conversation_id, user_id, content, type)
+		VALUES ($1, $2, $3, 'encrypted attachment', 'text')`, messageID, conversationID, uploader)
+	require.NoError(t, err)
+	_, err = ts.db.Exec(`INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, 0)`, messageID, fileID)
+	require.NoError(t, err)
+	return fileID, messageID
+}
+
+func hideDMMessageForDownload(t *testing.T, ts *testSetup, viewer, conversationID string, from, to time.Time, includesOwn bool) {
+	t.Helper()
+	_, err := ts.db.Exec(`
+		INSERT INTO dm_message_hidden_ranges (user_id, conversation_id, hidden_from, hidden_to, includes_own)
+		VALUES ($1, $2, $3, $4, $5)`, viewer, conversationID, from, to, includesOwn)
+	require.NoError(t, err)
+}
+
+func TestDownloadAttachmentDMVisibility(t *testing.T) {
+	t.Run("hidden linked attachment is denied to actor but readable by peer", func(t *testing.T) {
+		ts := setupMediaTest(t)
+		actor := ts.createTestUser(t, "mediahiddenactor")
+		peer := ts.createTestUser(t, "mediahiddenpeer")
+		convID := ts.createTestDMConversation(t, actor, peer)
+		fileID, _ := insertDMDownloadFixture(t, ts, actor, convID, []byte("dm-secret"))
+		hideDMMessageForDownload(t, ts, actor, convID, time.Unix(0, 0), time.Now().Add(time.Minute), true)
+
+		actorResponse := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, actor, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusForbidden, actorResponse.Code)
+		assert.False(t, bytes.Contains(actorResponse.Body.Bytes(), []byte("dm-secret")))
+		peerResponse := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, peer, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusOK, peerResponse.Code)
+		assert.Equal(t, []byte("dm-secret"), peerResponse.Body.Bytes())
+	})
+
+	t.Run("visible later link keeps a shared file readable", func(t *testing.T) {
+		ts := setupMediaTest(t)
+		actor := ts.createTestUser(t, "medialateractor")
+		peer := ts.createTestUser(t, "medialaterpeer")
+		convID := ts.createTestDMConversation(t, actor, peer)
+		fileID, oldMessageID := insertDMDownloadFixture(t, ts, actor, convID, []byte("shared-bytes"))
+		laterMessageID := uuid.New().String()
+		_, err := ts.db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type, created_at) VALUES ($1, $2, $3, 'later', 'text', NOW() + INTERVAL '1 minute')`, laterMessageID, convID, peer)
+		require.NoError(t, err)
+		var oldCreated time.Time
+		require.NoError(t, ts.db.QueryRow(`SELECT created_at FROM dm_messages WHERE id = $1`, oldMessageID).Scan(&oldCreated))
+		hideDMMessageForDownload(t, ts, actor, convID, oldCreated.Add(-time.Second), time.Now().Add(30*time.Second), true)
+
+		beforeLaterLink := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, actor, gin.Params{{Key: "file_id", Value: fileID}})
+		require.Equal(t, http.StatusForbidden, beforeLaterLink.Code)
+		_, err = ts.db.Exec(`INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, 1)`, laterMessageID, fileID)
+		require.NoError(t, err)
+		response := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, actor, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.Equal(t, []byte("shared-bytes"), response.Body.Bytes())
+	})
+
+	t.Run("unlinked uploader preview survives clear while participant", func(t *testing.T) {
+		ts := setupMediaTest(t)
+		uploader := ts.createTestUser(t, "mediapreview")
+		peer := ts.createTestUser(t, "mediapreviewpeer")
+		convID := ts.createTestDMConversation(t, uploader, peer)
+		fileID := uuid.New().String()
+		storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+		require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("preview")), 7, mimeOctetStream))
+		_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id) VALUES ($1, $2, 'file', 2, 'application/octet-stream', 7, $3, 1, $4)`, fileID, uploader, storageKey, convID)
+		require.NoError(t, err)
+		before := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		require.Equal(t, http.StatusOK, before.Code)
+		_, err = ts.db.Exec(`UPDATE dm_participants SET hidden_at = NOW() WHERE conversation_id = $1 AND user_id = $2`, convID, uploader)
+		require.NoError(t, err)
+		_, err = ts.db.Exec(`INSERT INTO dm_message_hidden_ranges (user_id, conversation_id, hidden_from, hidden_to, includes_own) VALUES ($1, $2, '-infinity', NOW(), true)`, uploader, convID)
+		require.NoError(t, err)
+		after := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusOK, after.Code)
+		assert.Equal(t, []byte("preview"), after.Body.Bytes())
+		peerResponse := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, peer, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusForbidden, peerResponse.Code)
+		_, err = ts.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, uploader)
+		require.NoError(t, err)
+		removedUploader := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusForbidden, removedUploader.Code)
+	})
+
+	t.Run("unlinked group DM uploader preview requires current membership", func(t *testing.T) {
+		ts := setupMediaTest(t)
+		uploader := ts.createTestUser(t, "mediagrouppreview")
+		peer := ts.createTestUser(t, "mediagrouppreviewpeer")
+		convID := ts.createTestGroupDM(t, uploader, peer)
+		fileID := uuid.New().String()
+		storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+		require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("group-preview")), 13, mimeOctetStream))
+		_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id) VALUES ($1, $2, 'file', 2, 'application/octet-stream', 13, $3, 1, $4)`, fileID, uploader, storageKey, convID)
+		require.NoError(t, err)
+
+		visible := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		require.Equal(t, http.StatusOK, visible.Code)
+		assert.Equal(t, []byte("group-preview"), visible.Body.Bytes())
+
+		_, err = ts.db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, uploader)
+		require.NoError(t, err)
+		removed := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusForbidden, removed.Code)
+	})
+
+	t.Run("bridge outside conversation blocks preview fallback", func(t *testing.T) {
+		ts := setupMediaTest(t)
+		uploader := ts.createTestUser(t, "mediaotherbridge")
+		peer := ts.createTestUser(t, "mediaotherbridgepeer")
+		other := ts.createTestUser(t, "mediaotherbridgeother")
+		convID := ts.createTestDMConversation(t, uploader, peer)
+		otherConvID := ts.createTestDMConversation(t, uploader, other)
+		fileID := uuid.New().String()
+		storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+		require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("other")), 5, mimeOctetStream))
+		_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id) VALUES ($1, $2, 'file', 2, 'application/octet-stream', 5, $3, 1, $4)`, fileID, uploader, storageKey, convID)
+		require.NoError(t, err)
+		otherMessageID := uuid.New().String()
+		_, err = ts.db.Exec(`INSERT INTO dm_messages (id, conversation_id, user_id, content, type) VALUES ($1, $2, $3, 'other conversation', 'text')`, otherMessageID, otherConvID, uploader)
+		require.NoError(t, err)
+		_, err = ts.db.Exec(`INSERT INTO dm_message_attachments (message_id, file_id, position) VALUES ($1, $2, 0)`, otherMessageID, fileID)
+		require.NoError(t, err)
+		response := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusForbidden, response.Code)
+	})
+
+	t.Run("channel-only bridge blocks DM preview fallback", func(t *testing.T) {
+		ts := setupMediaTest(t)
+		uploader := ts.createTestUser(t, "mediachannelbridge")
+		peer := ts.createTestUser(t, "mediachannelbridgepeer")
+		convID := ts.createTestDMConversation(t, uploader, peer)
+		serverID := ts.createTestServer(t, uploader, "media bridge server")
+		channelID := ts.createTestChannel(t, serverID, "media bridge channel")
+		fileID := uuid.New().String()
+		storageKey := fmt.Sprintf(fmtAttachmentsKey, fileID)
+		require.NoError(t, ts.store.PutObject(context.Background(), storageKey, bytes.NewReader([]byte("channel-only")), 12, mimeOctetStream))
+		_, err := ts.db.Exec(`INSERT INTO media_files (id, uploader_id, file_type, media_tier, mime_type, file_size, storage_key, key_version, conversation_id) VALUES ($1, $2, 'file', 2, 'application/octet-stream', 12, $3, 1, $4)`, fileID, uploader, storageKey, convID)
+		require.NoError(t, err)
+		messageID := uuid.New().String()
+		_, err = ts.db.Exec(`INSERT INTO messages (id, channel_id, user_id, content) VALUES ($1, $2, $3, 'channel attachment')`, messageID, channelID, uploader)
+		require.NoError(t, err)
+		_, err = ts.db.Exec(`INSERT INTO message_attachments (message_id, file_id, position) VALUES ($1, $2, 0)`, messageID, fileID)
+		require.NoError(t, err)
+		response := ts.doJSON(ts.handler.DownloadAttachment, "GET", pathAttachmentsPrefix+fileID, uploader, gin.Params{{Key: "file_id", Value: fileID}})
+		assert.Equal(t, http.StatusForbidden, response.Code)
+	})
+}
+
 // CV-CAN-003: with a real resolver, a server MEMBER who lacks channel VIEW
 // (PermViewTextChannels) must NOT be able to download a channel attachment by
 // file UUID. This is the endpoint-level regression guard for the core download

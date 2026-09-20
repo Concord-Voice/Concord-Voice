@@ -552,10 +552,15 @@ func (h *Handler) publishEnforcement(subject, channelID, targetID, action string
 	}
 }
 
-// broadcastVoiceStateUpdate sends a voice_state_update WS event to all server members.
+// broadcastVoiceStateUpdate sends a voice_state_update WS event to current server
+// subscribers who retain permission to view the affected voice channel.
 func (h *Handler) broadcastVoiceStateUpdate(serverID, targetID, channelID, action string) {
-	serverUUID, _ := uuid.Parse(serverID)
-	h.hub.BroadcastToServer(serverUUID, websocket.OutgoingMessage{
+	serverUUID, serverErr := uuid.Parse(serverID)
+	channelUUID, channelErr := uuid.Parse(channelID)
+	if serverErr != nil || channelErr != nil {
+		return
+	}
+	h.hub.BroadcastToServerChannelAuthorized(serverUUID, channelUUID, websocket.OutgoingMessage{
 		Type: "voice_state_update",
 		Data: map[string]interface{}{
 			"action":     action,

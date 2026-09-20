@@ -3889,6 +3889,210 @@ paths:
           content:
             application/json:
               schema: *id001
+  /dm/conversations/{id}/hide:
+    post:
+      tags:
+      - DM
+      summary: Hide a DM conversation
+      description: >-
+        Hide this conversation from the authenticated participant's DM list.
+        Hide is private to the caller: it preserves message history and read
+        state, does not notify the other participants, and requires no
+        reauthentication. Repeating the request preserves the original
+        `hidden_at` timestamp. Rate limit: 10 requests per minute (user-based).
+      operationId: hideDMConversation
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Conversation UUID
+      responses:
+        '200':
+          description: Conversation hidden for the authenticated participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DMVisibilityResponse'
+        '400':
+          description: Invalid conversation ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Conversation not found or caller is not a participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Access-token credential epoch is stale
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Visibility update failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+      - DM
+      summary: Unhide a DM conversation
+      description: >-
+        Restore this conversation to the authenticated participant's DM list.
+        Unhide is private to the caller and does not change message history or
+        read state or require reauthentication. Rate limit: 10 requests per
+        minute (user-based).
+      operationId: unhideDMConversation
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Conversation UUID
+      responses:
+        '200':
+          description: Conversation restored for the authenticated participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DMVisibilityResponse'
+        '400':
+          description: Invalid conversation ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Conversation not found or caller is not a participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Access-token credential epoch is stale
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Visibility update failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /dm/conversations/{id}/clear:
+    post:
+      tags:
+      - DM
+      summary: Clear DM history for yourself
+      description: >-
+        Permanently hide all messages before the server-stamped cutoff from
+        the authenticated participant. The range is private: other
+        participants keep their existing view, and the operation does not
+        delete their messages. The default and fail-closed behavior requires
+        step-up authentication according to `require_auth_before_purge` in
+        the caller's Privacy & Security settings. When MFA is enabled, submit
+        `mfa_code` only; otherwise submit `current_password`. When protection
+        is disabled, `{}` is accepted and no factor is required. Unknown or
+        nonparticipant conversations return the same 404. A successful retry
+        advances the cutoff; after an ambiguous 500 response, refetch before
+        retrying because the prior transaction may have committed. The
+        server sends `dm_conversation_hidden` with `conversation_id` and
+        `hidden_at` (or null after Unhide), and
+        `dm_conversation_cleared` with `conversation_id` and `cleared_at` to
+        every session of the actor, including the initiating session. These
+        actor-only events are invalidation/refetch signals, not a durable
+        client-side state ledger. For a given actor and conversation, Hide,
+        Unhide, and Clear commit and enqueue their actor-only visibility events
+        in operation order. Message-derived delivery uses a separate database
+        visibility barrier and is not ordered by this event gate. When a
+        persisted DM message
+        respawns a hidden participant, it does so only when `hidden_at` is
+        strictly earlier than the persisted message `created_at`; equality
+        remains hidden. Clear shares the configurable fail-closed per-actor
+        destructive-operation limit with the other purge routes. Operators set
+        the request count and window with `PURGE_RATE_LIMIT` and
+        `PURGE_RATE_WINDOW_SEC`; an exceeded limit returns 429 with
+        `Retry-After` and the applicable rate-limit headers.
+      operationId: clearDMConversation
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Conversation UUID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearDMConversationRequest'
+      responses:
+        '200':
+          description: History cleared for the authenticated participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DMClearResponse'
+        '400':
+          description: Invalid conversation ID or request body, or protection is enabled but the account has no usable local verification factor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Access-token credential epoch is stale
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Required step-up verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Conversation not found or caller is not a participant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body exceeds the 1 KiB limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Visibility update failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /dm/conversations/{id}/messages:
     delete:
       tags:
@@ -16826,6 +17030,46 @@ components:
         updated_at:
           type: string
           format: date-time
+    ClearDMConversationRequest:
+      type: object
+      description: >-
+        Supply the active factor selected by the account policy. MFA-enabled
+        accounts use `mfa_code`; accounts without MFA use `current_password`.
+        When `require_auth_before_purge` is disabled, an empty object is
+        accepted and no factor is required.
+      properties:
+        current_password:
+          type: string
+          format: password
+        mfa_code:
+          type: string
+    DMVisibilityResponse:
+      type: object
+      required:
+      - conversation_id
+      - hidden_at
+      properties:
+        conversation_id:
+          type: string
+          format: uuid
+        hidden_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Null after Unhide; the first Hide timestamp is preserved on retries.
+    DMClearResponse:
+      type: object
+      required:
+      - conversation_id
+      - cleared_at
+      properties:
+        conversation_id:
+          type: string
+          format: uuid
+        cleared_at:
+          type: string
+          format: date-time
+          description: Server-stamped cutoff used by this clear operation.
     DMConversation:
       type: object
       properties:

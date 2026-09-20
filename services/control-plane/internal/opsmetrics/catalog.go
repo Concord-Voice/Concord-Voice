@@ -118,16 +118,22 @@ const (
 	// connection died -- both a per-user attribute and an externally observable
 	// branch -- and describeSocketFailure already carries the cause for a human
 	// reading logs, in a fixed shape that contains no bytes the peer chose.
-	MetricWebSocketAbnormalClosesTotal MetricKey = "websocket_abnormal_closes_total"
-	MetricRegisteredUsersCurrent       MetricKey = "registered_users_current"
-	MetricPendingRegistrationsCurrent  MetricKey = "pending_registrations_current"
-	MetricUsersOnlineCurrent           MetricKey = "users_online_current"
-	MetricActiveSessionsCurrent        MetricKey = "active_sessions_current"
-	MetricActiveUsers24H               MetricKey = "active_users_24h"
-	MetricActiveUsers7D                MetricKey = "active_users_7d"
-	MetricActiveUsers15D               MetricKey = "active_users_15d"
-	MetricActiveUsers30D               MetricKey = "active_users_30d"
-	MetricMediaUploadsTotal            MetricKey = "media_uploads_total"
+	MetricWebSocketAbnormalClosesTotal                      MetricKey = "websocket_abnormal_closes_total"
+	MetricServerVoiceTerminalOutboxCapturedTotal            MetricKey = "server_voice_terminal_outbox_captured_total"
+	MetricServerVoiceTerminalOutboxDeliveredTotal           MetricKey = "server_voice_terminal_outbox_delivered_total"
+	MetricServerVoiceTerminalOutboxSuccessorSuppressedTotal MetricKey = "server_voice_terminal_outbox_successor_suppressed_total"
+	MetricServerVoiceTerminalOutboxChannelSuppressedTotal   MetricKey = "server_voice_terminal_outbox_channel_suppressed_total"
+	MetricServerVoiceTerminalOutboxLockRetainedTotal        MetricKey = "server_voice_terminal_outbox_lock_retained_total"
+	MetricServerVoiceTerminalOutboxQueueRescheduledTotal    MetricKey = "server_voice_terminal_outbox_queue_rescheduled_total"
+	MetricRegisteredUsersCurrent                            MetricKey = "registered_users_current"
+	MetricPendingRegistrationsCurrent                       MetricKey = "pending_registrations_current"
+	MetricUsersOnlineCurrent                                MetricKey = "users_online_current"
+	MetricActiveSessionsCurrent                             MetricKey = "active_sessions_current"
+	MetricActiveUsers24H                                    MetricKey = "active_users_24h"
+	MetricActiveUsers7D                                     MetricKey = "active_users_7d"
+	MetricActiveUsers15D                                    MetricKey = "active_users_15d"
+	MetricActiveUsers30D                                    MetricKey = "active_users_30d"
+	MetricMediaUploadsTotal                                 MetricKey = "media_uploads_total"
 
 	MetricMediaRoomsCurrent                   MetricKey = "media_rooms_current"
 	MetricMediaParticipantsAudioCurrent       MetricKey = "media_participants_audio_current"
@@ -209,7 +215,7 @@ func serviceMetrics(running, healthy, cpu, memory MetricKey) []MetricDefinition 
 }
 
 var catalog = func() map[MetricKey]MetricDefinition {
-	definitions := make([]MetricDefinition, 0, 66)
+	definitions := make([]MetricDefinition, 0, 72)
 	definitions = append(definitions,
 		metric(MetricHostCPUPercent, SourceHost, UnitPercent, KindGauge, RollupAverage, 0, 100),
 		metric(MetricHostMemoryPercent, SourceHost, UnitPercent, KindGauge, RollupAverage, 0, 100),
@@ -225,6 +231,12 @@ var catalog = func() map[MetricKey]MetricDefinition {
 		metric(MetricPresenceAudienceSuppressedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricPresenceTTLLapsedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricWebSocketAbnormalClosesTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricServerVoiceTerminalOutboxCapturedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricServerVoiceTerminalOutboxDeliveredTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricServerVoiceTerminalOutboxSuccessorSuppressedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricServerVoiceTerminalOutboxChannelSuppressedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricServerVoiceTerminalOutboxLockRetainedTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
+		metric(MetricServerVoiceTerminalOutboxQueueRescheduledTotal, SourceControl, UnitCount, KindCounter, RollupLast, 0, maxCount),
 		metric(MetricRegisteredUsersCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricPendingRegistrationsCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),
 		metric(MetricUsersOnlineCurrent, SourceControl, UnitCount, KindGauge, RollupAverage, 0, maxCount),

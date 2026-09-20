@@ -352,6 +352,12 @@ components:
         - media_participant_hours_screenshare
         - media_camera_layering_gate_flips_total
         - media_camera_pressure_demands_total
+        - server_voice_terminal_outbox_captured_total
+        - server_voice_terminal_outbox_delivered_total
+        - server_voice_terminal_outbox_successor_suppressed_total
+        - server_voice_terminal_outbox_channel_suppressed_total
+        - server_voice_terminal_outbox_lock_retained_total
+        - server_voice_terminal_outbox_queue_rescheduled_total
     CounterMetricKey:
       type: string
       enum:
@@ -371,6 +377,12 @@ components:
         - websocket_abnormal_closes_total
         - media_camera_layering_gate_flips_total
         - media_camera_pressure_demands_total
+        - server_voice_terminal_outbox_captured_total
+        - server_voice_terminal_outbox_delivered_total
+        - server_voice_terminal_outbox_successor_suppressed_total
+        - server_voice_terminal_outbox_channel_suppressed_total
+        - server_voice_terminal_outbox_lock_retained_total
+        - server_voice_terminal_outbox_queue_rescheduled_total
     MetricSource:
       type: string
       enum:
@@ -487,7 +499,7 @@ components:
           # MUST equal the number of MetricKey enum entries: /metrics/current can
           # emit one point per catalog key, so a bound below the enum size rejects
           # a valid response. Pinned by TestOpenAPIMetricBoundsMatchTheEnums.
-          maxItems: 66
+          maxItems: 72
           items:
             $ref: '#/components/schemas/AdminMetricPoint'
     AdminCounterPoint:
@@ -532,7 +544,7 @@ components:
           # can emit one point per counter key, so a bound below the enum size rejects
           # a valid response. Same invariant as AdminCurrentResponse.metrics above,
           # which carried this note while this one did not.
-          maxItems: 16
+          maxItems: 22
           items:
             $ref: '#/components/schemas/AdminCounterPoint'
     AdminSeriesMetric:

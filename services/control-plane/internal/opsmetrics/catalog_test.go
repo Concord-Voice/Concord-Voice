@@ -84,7 +84,7 @@ func TestAccountActivityCatalogIsFixed(t *testing.T) {
 		opsmetrics.MetricMediaUploadsTotal:           opsmetrics.KindCounter,
 	}
 
-	require.Equal(t, 66, opsmetrics.CatalogSize())
+	require.Equal(t, 72, opsmetrics.CatalogSize())
 	for key, kind := range expected {
 		definition, ok := opsmetrics.Definition(key)
 		require.True(t, ok, "missing metric %q", key)

@@ -58,6 +58,14 @@ const (
 	bootstrapBufferCanceled
 )
 
+type dmMessageDeliveryEnqueueOutcome uint8
+
+const (
+	dmMessageDeliveryEnqueueDelivered dmMessageDeliveryEnqueueOutcome = iota
+	dmMessageDeliveryEnqueueBusy
+	dmMessageDeliveryEnqueueFailed
+)
+
 // Client represents a single WebSocket connection
 type Client struct {
 	// Unique client ID
@@ -308,6 +316,53 @@ func (c *Client) enqueueOutbound(data []byte) bool {
 	}
 }
 
+// tryEnqueueDMMessageDelivery keeps the visibility transaction from waiting on
+// a socket producer. A busy client drops this delivery; a closed or full queue
+// remains a real client failure for Run to unregister.
+func (c *Client) tryEnqueueDMMessageDelivery(data []byte) dmMessageDeliveryEnqueueOutcome {
+	if !c.bootstrapMu.TryLock() {
+		return dmMessageDeliveryEnqueueBusy
+	}
+	if c.bootstrapActive || c.bootstrapCanceled {
+		if c.bootstrapCanceled || c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
+			c.bootstrapMu.Unlock()
+			return dmMessageDeliveryEnqueueBusy
+		}
+		c.bootstrapLive = append(c.bootstrapLive, append([]byte(nil), data...))
+		c.bootstrapMu.Unlock()
+		return dmMessageDeliveryEnqueueDelivered
+	}
+	c.bootstrapMu.Unlock()
+
+	if !c.sendMu.TryLock() {
+		return dmMessageDeliveryEnqueueBusy
+	}
+	defer c.sendMu.Unlock()
+	if !c.bootstrapMu.TryLock() {
+		return dmMessageDeliveryEnqueueBusy
+	}
+	defer c.bootstrapMu.Unlock()
+	if c.bootstrapCanceled {
+		return dmMessageDeliveryEnqueueBusy
+	}
+	if c.bootstrapActive {
+		if c.bootstrapFailed || len(c.bootstrapReplay)+len(c.bootstrapLive) >= clientBootstrapBufferedFrameLimit {
+			return dmMessageDeliveryEnqueueBusy
+		}
+		c.bootstrapLive = append(c.bootstrapLive, append([]byte(nil), data...))
+		return dmMessageDeliveryEnqueueDelivered
+	}
+	if c.sendClosed || c.Send == nil {
+		return dmMessageDeliveryEnqueueFailed
+	}
+	select {
+	case c.Send <- data:
+		return dmMessageDeliveryEnqueueDelivered
+	default:
+		return dmMessageDeliveryEnqueueFailed
+	}
+}
+
 // enqueueOutboundBootstrapSafe delivers a frame whose loss is tolerable and
 // which must NEVER be able to fail a client's reconnect replacement.
 //
@@ -406,6 +461,26 @@ func (c *Client) closeOutbound() {
 	if c.Send != nil {
 		close(c.Send)
 	}
+}
+
+// forceRevoke closes the outbound queue while preserving a best-effort courtesy
+// frame. It is safe to call before handleUnregister, which repeats the ordinary
+// cancellation and close cleanup after it unpublishes the client.
+func (c *Client) forceRevoke(data []byte) {
+	c.cancelBootstrap()
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.sendClosed || c.Send == nil {
+		return
+	}
+	if data != nil {
+		select {
+		case c.Send <- data:
+		default:
+		}
+	}
+	c.sendClosed = true
+	close(c.Send)
 }
 
 // rateLimitAllow checks the token bucket and returns true if the message is allowed.

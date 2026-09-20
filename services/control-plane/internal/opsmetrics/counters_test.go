@@ -27,7 +27,7 @@ func TestCountersSnapshotIsClosedAndConcurrentSafe(t *testing.T) {
 	require.Equal(t, float64(800), snapshot[opsmetrics.MetricChannelMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricDMMessagesTotal])
 	require.Equal(t, float64(0), snapshot[opsmetrics.MetricMediaUploadsTotal])
-	require.Len(t, snapshot, 10)
+	require.Len(t, snapshot, 16)
 	for key := range snapshot {
 		definition, ok := opsmetrics.Definition(key)
 		require.True(t, ok)
@@ -67,6 +67,29 @@ func TestCountersTrackSuccessfulMediaUploads(t *testing.T) {
 	counters.Increment(opsmetrics.MetricMediaUploadsTotal)
 
 	require.Equal(t, float64(2), counters.Snapshot()[opsmetrics.MetricMediaUploadsTotal])
+}
+
+func TestCountersTrackTerminalOutboxOutcomesAndIgnoreNil(t *testing.T) {
+	var nilCounters *opsmetrics.Counters
+	nilCounters.Increment(opsmetrics.MetricServerVoiceTerminalOutboxCapturedTotal)
+
+	counters := opsmetrics.NewCounters()
+	keys := []opsmetrics.MetricKey{
+		opsmetrics.MetricServerVoiceTerminalOutboxCapturedTotal,
+		opsmetrics.MetricServerVoiceTerminalOutboxDeliveredTotal,
+		opsmetrics.MetricServerVoiceTerminalOutboxSuccessorSuppressedTotal,
+		opsmetrics.MetricServerVoiceTerminalOutboxChannelSuppressedTotal,
+		opsmetrics.MetricServerVoiceTerminalOutboxLockRetainedTotal,
+		opsmetrics.MetricServerVoiceTerminalOutboxQueueRescheduledTotal,
+	}
+	for _, key := range keys {
+		counters.Increment(key)
+	}
+
+	snapshot := counters.Snapshot()
+	for _, key := range keys {
+		require.Equal(t, float64(1), snapshot[key], "terminal outbox counter %q", key)
+	}
 }
 
 func TestCountersIgnoreKeysNotOwnedByControlPlane(t *testing.T) {

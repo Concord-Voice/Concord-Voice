@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/gin-gonic/gin"
@@ -24,10 +25,12 @@ const (
 // UpdateExpiration changes a DM conversation's shared message-expiration policy.
 func (h *Handler) UpdateExpiration(c *gin.Context) {
 	userID, conversationID := c.GetString("user_id"), c.Param("id")
-	if _, err := uuid.Parse(conversationID); err != nil {
+	conversationUUID, err := uuid.Parse(conversationID)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
 		return
 	}
+	conversationID = conversationUUID.String()
 	request, ok := h.bindExpirationRequest(c)
 	if !ok {
 		return
@@ -51,7 +54,7 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		return
 	}
 
-	if !h.authorizeDMExpirationTx(mutationCtx, c, tx, conversationID, userID) {
+	if !h.authorizeDMExpirationTx(mutationCtx, c, tx, conversationUUID, userID) {
 		return
 	}
 
@@ -63,7 +66,7 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 	}
 	policy := transition.Current
 
-	staged, ok := h.stageDMExpirationEvent(mutationCtx, c, tx, conversationID, userID, request, transition)
+	staged, ok := h.stageDMExpirationEvent(mutationCtx, c, tx, conversationUUID, userID, request, transition)
 	if !ok {
 		return
 	}
@@ -74,7 +77,7 @@ func (h *Handler) UpdateExpiration(c *gin.Context) {
 		return
 	}
 	if staged.Present {
-		h.broadcastDMExpirationEvent(conversationID, staged.MessageID, userID, staged.Payload, policy)
+		h.broadcastDMExpirationEvent(conversationUUID, staged.MessageID, userID, staged.Payload, policy)
 	}
 	if !policy.BackfillPending {
 		c.JSON(http.StatusOK, policy)
@@ -113,9 +116,10 @@ func (h *Handler) bindExpirationRequest(c *gin.Context) (expiration.Request, boo
 	return request, true
 }
 
-// authorizeDMExpirationTx locks the conversation and the actor's participant
-// row, then applies the group-admin rule. It writes its own response and
-// returns false when the caller must stop.
+// authorizeDMExpirationTx locks the conversation and every participant in
+// canonical order before it locks the actor's row and applies the group-admin
+// rule. This preserves membership stability and the users -> conversation ->
+// participants -> message lock order.
 //
 // A non-participant and a missing conversation deliberately return the same
 // 404: distinguishing them would tell a stranger that a conversation exists.
@@ -123,7 +127,8 @@ func (h *Handler) authorizeDMExpirationTx(
 	ctx context.Context,
 	c *gin.Context,
 	tx *sql.Tx,
-	conversationID, userID string,
+	conversationID uuid.UUID,
+	userID string,
 ) bool {
 	var isGroup bool
 	if err := tx.QueryRowContext(ctx,
@@ -137,9 +142,14 @@ func (h *Handler) authorizeDMExpirationTx(
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
 		return false
 	}
+	if err := dmvisibility.LockParticipantsForWrite(ctx, tx, conversationID); err != nil {
+		h.log.Error("Failed to lock DM expiration participant visibility", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateConversation})
+		return false
+	}
 	var role string
 	if err := tx.QueryRowContext(ctx,
-		`SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, conversationID, userID,
+		`SELECT role FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR UPDATE`, conversationID, userID,
 	).Scan(&role); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsgConversationNotFound})
@@ -164,7 +174,8 @@ func (h *Handler) stageDMExpirationEvent(
 	ctx context.Context,
 	c *gin.Context,
 	tx *sql.Tx,
-	conversationID, userID string,
+	conversationID uuid.UUID,
+	userID string,
 	request expiration.Request,
 	transition expiration.Transition,
 ) (expiration.StagedEvent, bool) {

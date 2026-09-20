@@ -38,6 +38,23 @@ func TestPersistDMMessage_UsesSharedExpirationPolicy(t *testing.T) {
 	}
 }
 
+func TestPersistDMMessage_ClearsOlderParticipantHides(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	hiddenAt := time.Now().UTC().Add(-time.Minute)
+	_, err := setup.db.Exec(`UPDATE dm_participants SET hidden_at = $1 WHERE conversation_id = $2`, hiddenAt, setup.convID)
+	require.NoError(t, err)
+
+	_, createdAt, _, _, _, err := setup.hub.persistDMMessageWithExpiry(
+		mustUUID(t, setup.convID), setup.user1, "", &dmMessageInput{content: "respawn", keyVersion: 1, msgType: "user"},
+	)
+	require.NoError(t, err)
+	require.True(t, createdAt.After(hiddenAt))
+
+	var hiddenCount int
+	require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM dm_participants WHERE conversation_id = $1 AND hidden_at IS NOT NULL`, setup.convID).Scan(&hiddenCount))
+	assert.Zero(t, hiddenCount, "a persisted DM message must respawn every participant hidden before its created_at")
+}
+
 func TestPersistMessage_UsesSharedExpirationPolicy(t *testing.T) {
 	setup := setupMessageTest(t)
 	channelID := mustUUID(t, setup.convID)
@@ -71,9 +88,13 @@ func TestPersistMessage_UsesSharedExpirationPolicy(t *testing.T) {
 
 func TestSendDMMessageAckIncludesExpiry(t *testing.T) {
 	setup := setupEpochTest(t, false, false)
+	var messageID uuid.UUID
+	require.NoError(t, setup.db.QueryRow(`
+		INSERT INTO dm_messages (conversation_id, user_id, content, type)
+		VALUES ($1, $2, 'persisted source', 'text') RETURNING id`, setup.convID, setup.user1).Scan(&messageID))
 	expiresAt := time.Now().UTC().Add(time.Hour)
 	setup.hub.sendDMMessageAck(dmMessageAckParams{
-		client: setup.client, nonce: "n", messageID: mustUUID(t, setup.convID), convUUID: mustUUID(t, setup.convID),
+		client: setup.client, nonce: "n", messageID: messageID, convUUID: mustUUID(t, setup.convID),
 		createdAt: time.Now().UTC(), updatedAt: time.Now().UTC(), expiresAt: &expiresAt,
 	})
 	select {

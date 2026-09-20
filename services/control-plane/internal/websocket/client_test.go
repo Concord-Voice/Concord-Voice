@@ -137,3 +137,95 @@ func TestClientChannels(t *testing.T) {
 	assert.False(t, client.Channels[ch1])
 	assert.Len(t, client.Channels, 1)
 }
+
+func TestTryEnqueueDMMessageDelivery_Outcomes(t *testing.T) {
+	data := []byte(`{"type":"dm_message"}`)
+	tests := []struct {
+		name       string
+		configure  func(*Client)
+		wantResult dmMessageDeliveryEnqueueOutcome
+		wantFrame  bool
+	}{
+		{
+			name:       "available client delivers",
+			configure:  func(*Client) {},
+			wantResult: dmMessageDeliveryEnqueueDelivered,
+			wantFrame:  true,
+		},
+		{
+			name: "full client reports failure",
+			configure: func(client *Client) {
+				client.Send <- []byte("full")
+			},
+			wantResult: dmMessageDeliveryEnqueueFailed,
+		},
+		{
+			name: "closed client reports failure",
+			configure: func(client *Client) {
+				client.closeOutbound()
+			},
+			wantResult: dmMessageDeliveryEnqueueFailed,
+		},
+		{
+			name: "active bootstrap buffers delivery",
+			configure: func(client *Client) {
+				client.beginBootstrap()
+			},
+			wantResult: dmMessageDeliveryEnqueueDelivered,
+		},
+		{
+			name: "canceled bootstrap is busy",
+			configure: func(client *Client) {
+				client.beginBootstrap()
+				client.cancelBootstrap()
+			},
+			wantResult: dmMessageDeliveryEnqueueBusy,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{ID: uuid.New(), UserID: uuid.New(), Send: make(chan []byte, 1)}
+			test.configure(client)
+			assert.Equal(t, test.wantResult, client.tryEnqueueDMMessageDelivery(data))
+			if test.wantFrame {
+				assert.Equal(t, data, <-client.Send)
+			}
+			if client.bootstrapActive {
+				assert.Len(t, client.bootstrapLive, 1)
+			}
+		})
+	}
+}
+
+func TestTryEnqueueDMMessageDelivery_BusyDoesNotUnregisterClient(t *testing.T) {
+	client := &Client{ID: uuid.New(), UserID: uuid.New(), Send: make(chan []byte, 1)}
+	hub := NewHub(nil, nil)
+	hub.clients[client.ID] = client
+	client.sendMu.Lock()
+	defer client.sendMu.Unlock()
+
+	assert.Equal(t, dmMessageDeliveryEnqueueBusy, client.tryEnqueueDMMessageDelivery([]byte("busy")))
+	_, registered := hub.clients[client.ID]
+	assert.True(t, registered)
+	assert.False(t, client.sendClosed)
+}
+
+func TestTryEnqueueDMMessageDelivery_BootstrapMutexBusy(t *testing.T) {
+	client := &Client{ID: uuid.New(), UserID: uuid.New(), Send: make(chan []byte, 1)}
+	client.bootstrapMu.Lock()
+	defer client.bootstrapMu.Unlock()
+
+	assert.Equal(t, dmMessageDeliveryEnqueueBusy, client.tryEnqueueDMMessageDelivery([]byte("busy")))
+}
+
+func TestForceRevoke_CourtesyFrameClosesTerminally(t *testing.T) {
+	client := &Client{ID: uuid.New(), UserID: uuid.New(), Send: make(chan []byte, 1)}
+	courtesy := []byte(`{"type":"session_revoked"}`)
+	client.forceRevoke(courtesy)
+
+	assert.Equal(t, courtesy, <-client.Send)
+	_, open := <-client.Send
+	assert.False(t, open)
+	assert.Equal(t, dmMessageDeliveryEnqueueBusy, client.tryEnqueueDMMessageDelivery([]byte("late")))
+}

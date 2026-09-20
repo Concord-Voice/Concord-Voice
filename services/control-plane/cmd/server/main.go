@@ -426,7 +426,7 @@ func runControlPlane() (runErr error) {
 			func(stage string, starved bool) {
 				class, detail := "shutdown_stage_overran", "used its whole share of the drain budget"
 				if starved {
-					class, detail = "shutdown_stage_starved", "arrived after an earlier stage had drained the shared budget, so it never ran"
+					class, detail = "shutdown_stage_starved", "received no shared waiting budget; the coordinator stopped waiting immediately"
 				}
 				log.Warn("shutdown stage abandoned; its remaining work is lost, but the "+
 					"stages after it still ran ("+detail+")",
@@ -702,9 +702,10 @@ const (
 // starved distinguishes the two ways a stage fails to finish, which the first
 // version of this conflated. A stage that HAD budget and used it all is slow
 // and worth investigating; a stage that arrived after an earlier one drained
-// the shared pot never ran at all, and reporting it identically sends an
-// operator after two innocent stages. One slow stage plus two starved ones is a
-// cascade with a single cause.
+// the shared pot received no shared waiting budget, and the coordinator
+// stopped waiting immediately. Reporting it identically sends an operator
+// after two innocent stages. One slow stage plus two starved ones is a cascade
+// with a single cause.
 func awaitStage(ctx context.Context, name string, fn func(), onAbandon func(name string, starved bool)) {
 	// Sampled BEFORE fn starts: afterwards the answer is "yes" either way.
 	starved := ctx.Err() != nil

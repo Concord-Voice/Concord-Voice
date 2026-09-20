@@ -33,6 +33,8 @@ import {
   DMRoleChangedSchema,
   DMGroupDeletedSchema,
   DMSubscribedSchema,
+  DMConversationHiddenSchema,
+  DMConversationClearedSchema,
   // Friend system (4)
   FriendRequestReceivedSchema,
   FriendRequestAcceptedSchema,
@@ -401,6 +403,24 @@ describe('ws-events schemas — happy path (one per event)', () => {
       data: {
         conversation_id: UUID_A,
       },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('DMConversationHiddenSchema accepts hidden and unhidden visibility envelopes', () => {
+    for (const hiddenAt of [ISO_NOW, null]) {
+      const result = DMConversationHiddenSchema.safeParse({
+        type: 'dm_conversation_hidden',
+        data: { conversation_id: UUID_A, hidden_at: hiddenAt },
+      });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  it('DMConversationClearedSchema accepts a canonical clear envelope', () => {
+    const result = DMConversationClearedSchema.safeParse({
+      type: 'dm_conversation_cleared',
+      data: { conversation_id: UUID_A, cleared_at: ISO_NOW },
     });
     expect(result.success).toBe(true);
   });
@@ -1658,6 +1678,36 @@ describe('ws-events schemas — rejection cases', () => {
 // ════════════════════════════════════════════════════════════════════════
 
 describe('WebSocketEventSchema — discriminated union behavior', () => {
+  it('routes DM visibility events through the union', () => {
+    const envelopes = [
+      {
+        type: 'dm_conversation_hidden',
+        data: { conversation_id: UUID_A, hidden_at: null },
+      },
+      {
+        type: 'dm_conversation_cleared',
+        data: { conversation_id: UUID_A, cleared_at: ISO_NOW },
+      },
+    ];
+
+    for (const envelope of envelopes) {
+      const result = WebSocketEventSchema.safeParse(envelope);
+      expect(result.success, `${envelope.type} must parse`).toBe(true);
+      if (result.success) expect(result.data.type).toBe(envelope.type);
+    }
+  });
+
+  it.each([
+    ['dm_conversation_hidden', { conversation_id: 'not-a-uuid', hidden_at: null }],
+    ['dm_conversation_hidden', { conversation_id: UUID_A, hidden_at: 'not-a-timestamp' }],
+    ['dm_conversation_hidden', { conversation_id: UUID_A }],
+    ['dm_conversation_cleared', { conversation_id: 'not-a-uuid', cleared_at: ISO_NOW }],
+    ['dm_conversation_cleared', { conversation_id: UUID_A, cleared_at: 'not-a-timestamp' }],
+    ['dm_conversation_cleared', { conversation_id: UUID_A }],
+  ] as const)('rejects malformed %s visibility payloads', (type, data) => {
+    expect(WebSocketEventSchema.safeParse({ type, data }).success).toBe(false);
+  });
+
   it('accepts a known event type (friend_removed — minimal payload)', () => {
     const result = WebSocketEventSchema.safeParse({
       type: 'friend_removed',
@@ -2287,9 +2337,9 @@ describe('Server role events (#2359)', () => {
     }
   });
 
-  it('WebSocketEventSchema has exactly 78 members', () => {
+  it('WebSocketEventSchema has exactly 80 members', () => {
     // Pins the count quoted in [internal]rules/frontend.md and in the ws-events.ts
     // header, so a future addition cannot silently drift the docs.
-    expect(WebSocketEventSchema.options).toHaveLength(78);
+    expect(WebSocketEventSchema.options).toHaveLength(80);
   });
 });

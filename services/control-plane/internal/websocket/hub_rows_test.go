@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -91,6 +92,67 @@ func openScriptedRowsDB(t *testing.T, columns []string, values [][]driver.Value,
 	return db
 }
 
+type blockingChannelContextDriver struct {
+	entered     chan struct{}
+	release     chan struct{}
+	hasDeadline chan bool
+	once        sync.Once
+}
+
+func (d *blockingChannelContextDriver) Open(string) (driver.Conn, error) {
+	return &blockingChannelContextConn{driver: d}, nil
+}
+
+type blockingChannelContextConn struct {
+	driver *blockingChannelContextDriver
+}
+
+func (c *blockingChannelContextConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare not supported")
+}
+
+func (c *blockingChannelContextConn) Close() error {
+	return nil
+}
+
+func (c *blockingChannelContextConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions not supported")
+}
+
+func (c *blockingChannelContextConn) QueryContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.driver.once.Do(func() {
+		close(c.driver.entered)
+		_, hasDeadline := ctx.Deadline()
+		c.driver.hasDeadline <- hasDeadline
+	})
+	select {
+	case <-c.driver.release:
+		return &scriptedRows{
+			columns: []string{"allow_embedded_content", "server_id", "type"},
+			values:  [][]driver.Value{{false, uuid.NewString(), "voice"}},
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+var _ driver.QueryerContext = (*blockingChannelContextConn)(nil)
+
+func openBlockingChannelContextDB(t *testing.T) (*sql.DB, *blockingChannelContextDriver) {
+	t.Helper()
+	driverName := "websocket-blocking-channel-context-" + uuid.NewString()
+	driver := &blockingChannelContextDriver{
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+		hasDeadline: make(chan bool, 1),
+	}
+	sql.Register(driverName, driver)
+	db, err := sql.Open(driverName, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return db, driver
+}
+
 func TestQueryServerVoiceCountsReturnsScanError(t *testing.T) {
 	db := openScriptedRowsDB(t, []string{"server_id", "count"}, [][]driver.Value{{"server-1", "not-an-int"}}, nil)
 	hub := NewHub(db, nil)
@@ -112,7 +174,7 @@ func TestQueryServerMembershipsReturnsScanError(t *testing.T) {
 	db := openScriptedRowsDB(t, []string{"server_id", "user_id"}, [][]driver.Value{{"not-a-uuid", uuid.NewString()}}, nil)
 	hub := NewHub(db, nil)
 
-	_, _, err := hub.queryServerMemberships([]interface{}{uuid.New()})
+	_, _, err := hub.queryServerMemberships([]uuid.UUID{uuid.New()})
 	require.Error(t, err)
 }
 
@@ -121,24 +183,7 @@ func TestQueryServerMembershipsReturnsIterationError(t *testing.T) {
 	db := openScriptedRowsDB(t, []string{"server_id", "user_id"}, nil, wantErr)
 	hub := NewHub(db, nil)
 
-	_, _, err := hub.queryServerMemberships([]interface{}{uuid.New()})
-	require.ErrorIs(t, err, wantErr)
-}
-
-func TestDMUnreadParticipantsReturnsInvalidUUIDError(t *testing.T) {
-	db := openScriptedRowsDB(t, []string{"user_id"}, [][]driver.Value{{"not-a-uuid"}}, nil)
-	hub := NewHub(db, nil)
-
-	_, err := hub.dmUnreadParticipants(uuid.New())
-	require.Error(t, err)
-}
-
-func TestDMUnreadParticipantsReturnsIterationError(t *testing.T) {
-	wantErr := errors.New("participant iteration failed")
-	db := openScriptedRowsDB(t, []string{"user_id"}, nil, wantErr)
-	hub := NewHub(db, nil)
-
-	_, err := hub.dmUnreadParticipants(uuid.New())
+	_, _, err := hub.queryServerMemberships([]uuid.UUID{uuid.New()})
 	require.ErrorIs(t, err, wantErr)
 }
 

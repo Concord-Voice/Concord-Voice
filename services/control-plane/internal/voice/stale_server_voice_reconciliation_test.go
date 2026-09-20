@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/voice"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -31,6 +33,7 @@ var (
 	errStaleLock      = errors.New("stale lock failed")
 	errStaleReread    = errors.New("stale reread failed")
 	errStaleDelete    = errors.New("stale delete failed")
+	errStaleCapture   = errors.New("stale capture failed")
 	errStaleAffected  = errors.New("stale rows affected failed")
 	errStaleCommit    = errors.New("stale commit failed")
 	errStaleBusy      = errors.New("stale lifecycle lock busy")
@@ -56,6 +59,7 @@ type staleVoiceConnector struct {
 	scenario        string
 	grantProbeCount *int
 	afterCommit     func()
+	channelID       string
 	serverID        string
 	state           *staleVoiceFixtureState
 }
@@ -63,10 +67,12 @@ type staleVoiceConnector struct {
 type staleVoiceFixtureState struct {
 	deleted            bool
 	successorCommitted bool
+	operationID        uuid.UUID
+	serverUUID         uuid.UUID
 }
 
 func (c staleVoiceConnector) Connect(context.Context) (driver.Conn, error) {
-	return &staleVoiceConn{scenario: c.scenario, grantProbeCount: c.grantProbeCount, afterCommit: c.afterCommit, serverID: c.serverID, state: c.state}, nil
+	return &staleVoiceConn{scenario: c.scenario, grantProbeCount: c.grantProbeCount, afterCommit: c.afterCommit, channelID: c.channelID, serverID: c.serverID, state: c.state}, nil
 }
 func (c staleVoiceConnector) Driver() driver.Driver { return staleVoiceDriver{} }
 
@@ -74,7 +80,9 @@ type staleVoiceConn struct {
 	scenario        string
 	grantProbeCount *int
 	lockAttempts    int
+	missingUserSeen bool
 	afterCommit     func()
+	channelID       string
 	serverID        string
 	state           *staleVoiceFixtureState
 }
@@ -94,9 +102,44 @@ func (c *staleVoiceConn) begin() (driver.Tx, error) {
 	return &staleVoiceTx{conn: c}, nil
 }
 
+func (c *staleVoiceConn) firstChannelID() string {
+	if c.channelID != "" {
+		return c.channelID
+	}
+	return staleVoiceCandidateChannel
+}
+
 func (c *staleVoiceConn) QueryContext(
 	_ context.Context, query string, args []driver.NamedValue,
 ) (driver.Rows, error) {
+	if c.scenario == "missing_user" && c.missingUserSeen {
+		return nil, errors.New("missing user must short-circuit stale cleanup")
+	}
+	if strings.Contains(query, "FROM server_voice_terminal_outbox") {
+		// Legacy reconciliation cases predate the durable obligation fixture.
+		// Keep pending discovery empty; retain the captured row for the exact
+		// post-capture reread so the legacy wire assertions still observe left.
+		if strings.Contains(query, "FOR UPDATE") && c.state != nil && c.state.operationID != uuid.Nil {
+			return &staleVoiceRowSet{
+				columns: []string{"operation_id", "server_id"},
+				values:  [][]driver.Value{{c.state.operationID.String(), c.state.serverUUID.String()}},
+			}, nil
+		}
+		return staleVoiceRows(5, nil, nil), nil
+	}
+	if strings.Contains(query, "FROM users") {
+		if c.scenario == "missing_user" {
+			c.missingUserSeen = true
+			return staleVoiceRows(1, nil, nil), nil
+		}
+		return staleVoiceRows(1, [][]driver.Value{{args[0].Value}}, nil), nil
+	}
+	if strings.Contains(query, "FROM channels WHERE id") {
+		if len(args) != 2 || args[0].Value != c.firstChannelID() || args[1].Value != c.serverID {
+			return nil, errors.New("unexpected stale voice terminal channel recheck arguments")
+		}
+		return staleVoiceRows(1, [][]driver.Value{{true}}, nil), nil
+	}
 	if strings.Contains(query, "FROM voice_participants AS participant") {
 		candidateServer := staleVoiceCandidateServer
 		if c.serverID != "" {
@@ -114,16 +157,16 @@ func (c *staleVoiceConn) QueryContext(
 		case "scan_error":
 			return staleVoiceRows(3, [][]driver.Value{{"not-a-uuid", staleVoiceCandidateUser, staleVoiceCandidateServer}}, nil), nil
 		case "iteration_error":
-			return staleVoiceRows(3, [][]driver.Value{{staleVoiceCandidateChannel, staleVoiceCandidateUser, staleVoiceCandidateServer}}, errStaleIteration), nil
+			return staleVoiceRows(3, [][]driver.Value{{c.firstChannelID(), staleVoiceCandidateUser, staleVoiceCandidateServer}}, errStaleIteration), nil
 		case "limit_zero", "limit_large":
 			return staleVoiceRows(3, nil, nil), nil
-		case "busy_two":
+		case "busy_two", "reread_error_two":
 			return staleVoiceRows(3, [][]driver.Value{
-				{staleVoiceCandidateChannel, staleVoiceCandidateUser, staleVoiceCandidateServer},
+				{c.firstChannelID(), staleVoiceCandidateUser, staleVoiceCandidateServer},
 				{staleVoiceSecondChannel, staleVoiceSecondUser, staleVoiceSecondServer},
 			}, nil), nil
 		default:
-			return staleVoiceRows(3, [][]driver.Value{{staleVoiceCandidateChannel, staleVoiceCandidateUser, candidateServer}}, nil), nil
+			return staleVoiceRows(3, [][]driver.Value{{c.firstChannelID(), staleVoiceCandidateUser, candidateServer}}, nil), nil
 		}
 	}
 	if strings.Contains(query, "SELECT EXISTS(") {
@@ -133,8 +176,8 @@ func (c *staleVoiceConn) QueryContext(
 		return staleVoiceRows(1, [][]driver.Value{{false}}, nil), nil
 	}
 	if strings.Contains(query, "SELECT 1") && strings.Contains(query, "FROM voice_participants") {
-		validFirst := len(args) == 2 && args[0].Value == staleVoiceCandidateChannel && args[1].Value == staleVoiceCandidateUser
-		validSecond := c.scenario == "busy_two" && len(args) == 2 && args[0].Value == staleVoiceSecondChannel && args[1].Value == staleVoiceSecondUser
+		validFirst := len(args) == 2 && args[0].Value == c.firstChannelID() && args[1].Value == staleVoiceCandidateUser
+		validSecond := (c.scenario == "busy_two" || c.scenario == "reread_error_two") && len(args) == 2 && args[0].Value == staleVoiceSecondChannel && args[1].Value == staleVoiceSecondUser
 		if !validFirst && !validSecond {
 			return nil, errors.New("unexpected stale voice handoff recheck arguments")
 		}
@@ -147,13 +190,16 @@ func (c *staleVoiceConn) QueryContext(
 		if len(args) != 3 {
 			return nil, errors.New("unexpected stale voice reread arguments")
 		}
-		validFirst := args[0].Value == staleVoiceCandidateChannel && args[1].Value == staleVoiceCandidateUser
-		validSecond := c.scenario == "busy_two" && args[0].Value == staleVoiceSecondChannel && args[1].Value == staleVoiceSecondUser
+		validFirst := args[0].Value == c.firstChannelID() && args[1].Value == staleVoiceCandidateUser
+		validSecond := (c.scenario == "busy_two" || c.scenario == "reread_error_two") && args[0].Value == staleVoiceSecondChannel && args[1].Value == staleVoiceSecondUser
 		if (!validFirst && !validSecond) || args[2].Value != int64(presence.ActivityStateTTL/time.Second) {
 			return nil, errors.New("unexpected stale voice reread arguments")
 		}
 		if c.scenario == "busy_two" && validFirst {
 			return nil, errors.New("busy candidate must not be reread")
+		}
+		if c.scenario == "reread_error_two" && validFirst {
+			return nil, errStaleReread
 		}
 		switch c.scenario {
 		case "reread_error":
@@ -183,6 +229,35 @@ func (c *staleVoiceConn) QueryContext(
 func (c *staleVoiceConn) ExecContext(
 	_ context.Context, query string, args []driver.NamedValue,
 ) (driver.Result, error) {
+	if c.scenario == "missing_user" && c.missingUserSeen {
+		return nil, errors.New("missing user must short-circuit stale cleanup")
+	}
+	if strings.Contains(query, "server_voice_terminal_outbox") {
+		if c.scenario == "capture_error" {
+			return nil, errStaleCapture
+		}
+		if c.state != nil && len(args) >= 4 {
+			operationString, ok := args[3].Value.(string)
+			if !ok {
+				return nil, fmt.Errorf("parse fixture operation ID type %T", args[3].Value)
+			}
+			operationID, err := uuid.Parse(operationString)
+			if err != nil {
+				return nil, fmt.Errorf("parse fixture operation ID: %w", err)
+			}
+			serverString, ok := args[2].Value.(string)
+			if !ok {
+				return nil, fmt.Errorf("parse fixture server ID type %T", args[2].Value)
+			}
+			serverID, err := uuid.Parse(serverString)
+			if err != nil {
+				return nil, fmt.Errorf("parse fixture server ID: %w", err)
+			}
+			c.state.operationID = operationID
+			c.state.serverUUID = serverID
+		}
+		return staleVoiceResult{rows: 1}, nil
+	}
 	if strings.Contains(query, "pg_advisory_xact_lock") {
 		if c.scenario == "lock_error" {
 			return nil, errStaleLock
@@ -199,8 +274,8 @@ func (c *staleVoiceConn) ExecContext(
 		if len(args) != 3 || args[2].Value != int64(presence.ActivityStateTTL/time.Second) {
 			return nil, errors.New("unexpected stale voice delete arguments")
 		}
-		validFirst := args[0].Value == staleVoiceCandidateChannel && args[1].Value == staleVoiceCandidateUser
-		validSecond := c.scenario == "busy_two" && args[0].Value == staleVoiceSecondChannel && args[1].Value == staleVoiceSecondUser
+		validFirst := args[0].Value == c.firstChannelID() && args[1].Value == staleVoiceCandidateUser
+		validSecond := (c.scenario == "busy_two" || c.scenario == "reread_error_two") && args[0].Value == staleVoiceSecondChannel && args[1].Value == staleVoiceSecondUser
 		if !validFirst && !validSecond {
 			return nil, errors.New("unexpected stale voice delete candidate")
 		}
@@ -221,7 +296,9 @@ func (c *staleVoiceConn) ExecContext(
 				c.state.deleted = true
 			}
 			return staleVoiceResult{rows: 1}, nil
-		case "busy_two":
+		case "capture_error":
+			return staleVoiceResult{rows: 1}, nil
+		case "busy_two", "reread_error_two":
 			return staleVoiceResult{rows: 1}, nil
 		}
 		return staleVoiceResult{rows: 0}, nil
@@ -240,7 +317,7 @@ func (tx *staleVoiceTx) Commit() error {
 	case "commit_error":
 		return errStaleCommit
 	}
-	if tx.conn.afterCommit != nil {
+	if tx.conn.afterCommit != nil && (tx.conn.state == nil || !tx.conn.state.successorCommitted) {
 		tx.conn.afterCommit()
 	}
 	return nil
@@ -303,11 +380,11 @@ func openStaleVoiceDBWithGrantProbeCounter(t *testing.T, scenario string, count 
 }
 
 func openStaleVoiceDBWithCommitHookForServer(
-	t *testing.T, scenario, serverID string, afterCommit func(), state *staleVoiceFixtureState,
+	t *testing.T, scenario, serverID, channelID string, afterCommit func(), state *staleVoiceFixtureState,
 ) *sql.DB {
 	t.Helper()
 	db := sql.OpenDB(staleVoiceConnector{
-		scenario: scenario, serverID: serverID, afterCommit: afterCommit, state: state,
+		scenario: scenario, serverID: serverID, channelID: channelID, afterCommit: afterCommit, state: state,
 	})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	return db
@@ -328,10 +405,12 @@ func TestReconcileStaleServerVoiceParticipants_GuardsAndFailurePaths(t *testing.
 		{name: "iteration error", scenario: "iteration_error", limit: 1, wantError: errStaleIteration},
 		{name: "begin error", scenario: "begin_error", limit: 1, wantError: errStaleBegin},
 		{name: "lock error", scenario: "lock_error", limit: 1, wantError: errStaleLock},
+		{name: "missing user is a no-op", scenario: "missing_user", limit: 1},
 		{name: "reread error", scenario: "reread_error", limit: 1, wantError: errStaleReread},
 		{name: "missing row is a no-op", scenario: "reread_no_rows", limit: 1},
 		{name: "fresh row is a no-op", scenario: "fresh", limit: 1},
 		{name: "delete error", scenario: "delete_error", limit: 1, wantError: errStaleDelete},
+		{name: "capture error propagates", scenario: "capture_error", limit: 1, wantError: errStaleCapture},
 		{name: "rows affected error", scenario: "affected_error", limit: 1, wantError: errStaleAffected},
 		{name: "invalid rows affected", scenario: "affected_many", limit: 1, contains: "affected 2 rows"},
 		{name: "commit error", scenario: "commit_error", limit: 1, wantError: errStaleCommit},
@@ -398,6 +477,18 @@ func TestReconcileStaleServerVoiceParticipants_SkipsBusyCandidate(t *testing.T) 
 	assert.Equal(t, 1, removed, "the later free candidate must still be cleaned")
 }
 
+func TestReconcileStaleServerVoiceParticipants_ContinuesPastPreAdmissionError(t *testing.T) {
+	db := openStaleVoiceDB(t, "reread_error_two")
+	sub := voice.NewNATSSubscriber(
+		db, logger.NewWithWriter(io.Discard), websocket.NewHub(nil, nil), nil, nil, nil, nil,
+	)
+	sub.CompleteServerVoiceCleanupGraceForTest()
+
+	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 2)
+	require.ErrorIs(t, err, errStaleReread)
+	assert.Equal(t, 1, removed, "the later candidate must still be cleaned")
+}
+
 func TestReconcileStaleServerVoiceParticipants_DoesNotProbeTemporaryGrant(t *testing.T) {
 	// #2907: stale participant convergence does not own the temporary-grant backstop.
 	var grantProbeCount int
@@ -443,10 +534,9 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 	for _, test := range []struct {
 		name          string
 		successorJoin bool
-		wantLeft      bool
 	}{
 		{name: "successor joined after cleanup commit", successorJoin: true},
-		{name: "ordinary expired cleanup announces leave", wantLeft: true},
+		{name: "ordinary expired cleanup announces leave"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ts := testhelpers.SetupTestServer(t)
@@ -454,6 +544,8 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 			viewer := ts.CreateTestUser(t, "stale-wire-viewer")
 			serverID := ts.CreateTestServer(t, owner.ID, "stale-wire-server")
 			ts.AddMemberToServer(t, serverID, viewer.ID, "member")
+			channelID := ts.CreateVoiceChannel(t, serverID, "stale-wire-channel")
+			ts.CreateChannelOverride(t, channelID, "user", viewer.ID, int64(rbac.PermViewVoiceChannels), 0)
 			hub, baseURL := newVoiceReplicaHub(t, ts)
 			conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
 			require.NoError(t, conn.WriteJSON(map[string]interface{}{
@@ -470,7 +562,7 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 					hub.BroadcastToServer(uuid.MustParse(serverID), websocket.OutgoingMessage{
 						Type: "voice_state_update",
 						Data: map[string]interface{}{
-							"channel_id": staleVoiceCandidateChannel,
+							"channel_id": channelID,
 							"user_id":    staleVoiceCandidateUser,
 							"action":     "joined",
 							"server_id":  serverID,
@@ -478,7 +570,7 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 					})
 				}
 			}
-			db := openStaleVoiceDBWithCommitHookForServer(t, "commit_control", serverID, afterCommit, state)
+			db := openStaleVoiceDBWithCommitHookForServer(t, "commit_control", serverID, channelID, afterCommit, state)
 			sub := voice.NewNATSSubscriber(
 				db, logger.NewWithWriter(io.Discard), hub, nil, nil, nil, nil,
 			)
@@ -490,32 +582,15 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 			require.Equal(t, test.successorJoin, state.successorCommitted,
 				"the successor state must be committed before cleanup's terminal handoff")
 
-			hub.BroadcastToServer(uuid.MustParse(serverID), websocket.OutgoingMessage{
-				Type: "stale_cleanup_sentinel",
-				Data: map[string]interface{}{},
-			})
-			sawJoined := false
-			sawLeft := false
-			require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
-			for {
-				var envelope voiceWireEnvelope
-				require.NoError(t, conn.ReadJSON(&envelope))
-				if envelope.Type == "voice_state_update" {
-					switch envelope.Data["action"] {
-					case "joined":
-						sawJoined = true
-					case "left":
-						sawLeft = true
-					}
-				}
-				if envelope.Type == "stale_cleanup_sentinel" {
-					break
-				}
+			envelope := waitForVoiceWireType(t, conn, "voice_state_update")
+			if test.successorJoin {
+				assert.Equal(t, "joined", envelope.Data["action"],
+					"the scripted commit boundary must expose the successor join before the terminal handoff")
+				requireNoVoiceWireType(t, conn, "voice_state_update")
+				return
 			}
-			assert.Equal(t, test.successorJoin, sawJoined,
-				"the scripted commit boundary must expose the successor join before the terminal handoff")
-			assert.Equal(t, test.wantLeft, sawLeft,
-				"stale cleanup must not enqueue a later left after a same-channel successor joins")
+			assert.Equal(t, "left", envelope.Data["action"],
+				"an expired participant must publish its terminal leave")
 		})
 	}
 }

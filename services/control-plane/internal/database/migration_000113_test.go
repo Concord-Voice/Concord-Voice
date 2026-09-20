@@ -77,10 +77,13 @@ func TestMigration000113_FilesAndSchemaLock(t *testing.T) {
 func TestMigration000113_UpDownReUp(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	ctx := context.Background()
+	tx, err := ts.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, tx.Rollback()) }()
 	const nodeID = "cvn_aaaaaaaaaaaaaaaa"
 
 	insert := func(ts2 string, value int) error {
-		_, err := ts.DB.ExecContext(ctx, `
+		_, err := tx.ExecContext(ctx, `
 			INSERT INTO ops_metric_samples (node_id, metric_key, ts, value)
 			VALUES ($1, $2, $3::timestamptz, $4)
 		`, nodeID, migration000113NewKey, ts2, value)
@@ -101,48 +104,33 @@ func TestMigration000113_UpDownReUp(t *testing.T) {
 	// sees 61 or 62 keys therefore depends on test ORDER within the package. The
 	// up migration is a DROP CONSTRAINT followed by an ADD, so re-applying it is
 	// idempotent and cheap.
-	_, err := ts.DB.ExecContext(ctx, upSQL)
+	_, err = tx.ExecContext(ctx, upSQL)
 	require.NoError(t, err, "failed to establish the up state")
 
-	// Self-clean before AND after. ops_metric_samples is not covered by the
-	// package's table truncation, and the primary key is (node_id, metric_key,
-	// ts) — all three fixed here — so a row left behind by an earlier failed run
-	// makes every later run fail on a duplicate key rather than on the constraint
-	// this test is about. Diagnosing that costs more than preventing it.
-	clearRows := func() {
-		_, err := ts.DB.ExecContext(ctx,
-			`DELETE FROM ops_metric_samples WHERE node_id = $1 AND metric_key = $2`,
-			nodeID, migration000113NewKey)
-		require.NoError(t, err)
-	}
-	clearRows()
-	t.Cleanup(clearRows)
-
+	// Keep the catalog roundtrip inside one transaction so rollback restores the
+	// live schema after the historical constraint is exercised.
 	require.NoError(t, insert("2026-08-28 12:00:00+00", 1),
 		"the applied 62-key constraint must accept this migration's key")
 
-	reapplied := false
-	t.Cleanup(func() {
-		if !reapplied {
-			_, err := ts.DB.ExecContext(ctx, upSQL)
-			require.NoError(t, err, "failed to restore the schema for subsequent tests")
-		}
-	})
-
-	_, err = ts.DB.ExecContext(ctx, downSQL)
+	_, err = tx.ExecContext(ctx, downSQL)
 	require.NoError(t, err, "the down migration must not fail on the row inserted above")
 
 	var remaining int
-	require.NoError(t, ts.DB.QueryRowContext(ctx,
+	require.NoError(t, tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM ops_metric_samples WHERE metric_key = $1`, migration000113NewKey).Scan(&remaining))
 	assert.Zero(t, remaining, "rollback must clear rows carrying the retired key")
 
+	_, err = tx.ExecContext(ctx, `SAVEPOINT migration000113_rejection`)
+	require.NoError(t, err)
 	require.Error(t, insert("2026-08-28 13:00:00+00", 2),
 		"the restored 61-key constraint must reject this migration's key")
-
-	_, err = ts.DB.ExecContext(ctx, upSQL)
+	_, err = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT migration000113_rejection`)
 	require.NoError(t, err)
-	reapplied = true
+	_, err = tx.ExecContext(ctx, `RELEASE SAVEPOINT migration000113_rejection`)
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(ctx, upSQL)
+	require.NoError(t, err)
 	require.NoError(t, insert("2026-08-28 14:00:00+00", 3),
 		"the reapplied 62-key constraint must accept this migration's key again")
 }

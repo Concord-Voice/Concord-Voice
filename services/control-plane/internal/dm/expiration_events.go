@@ -42,7 +42,8 @@ const wsDMExpirationEvent = "dm_expiration_event"
 func insertDMExpirationEvent(
 	ctx context.Context,
 	tx *sql.Tx,
-	conversationID, actorUserID string,
+	conversationID uuid.UUID,
+	actorUserID string,
 	payload expiration.EventPayload,
 ) (uuid.UUID, error) {
 	messageID := uuid.New()
@@ -50,36 +51,30 @@ func insertDMExpirationEvent(
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("marshal DM expiration event payload: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	var createdAt time.Time
+	if err := tx.QueryRowContext(ctx, `
 		INSERT INTO dm_messages (id, conversation_id, user_id, content, type, expiration_event_payload, created_at, expires_at)
 		VALUES ($1, $2, $3, '', $4, $5, $6::timestamptz,
 		        CASE WHEN $7::integer IS NULL THEN NULL ELSE $6::timestamptz + make_interval(secs => $7) END)
-	`, messageID, conversationID, actorUserID, expirationEventDMMessagesType, payloadJSON, payload.ChangedAt, payload.WindowSeconds); err != nil {
+		RETURNING created_at
+	`, messageID, conversationID, actorUserID, expirationEventDMMessagesType, payloadJSON, payload.ChangedAt, payload.WindowSeconds).Scan(&createdAt); err != nil {
 		return uuid.Nil, fmt.Errorf("insert dm_messages expiration_event row: %w", err)
+	}
+	if err := respawnDMParticipantVisibility(ctx, tx, conversationID, createdAt); err != nil {
+		return uuid.Nil, fmt.Errorf("respawn expiration-event participant visibility: %w", err)
 	}
 	return messageID, nil
 }
 
-// broadcastDMExpirationEvent sends the durable row to every participant,
-// including the acting user — their PATCH response carries only the Policy,
-// never this row, so they need the broadcast exactly like every other
-// participant. Uses the Hub's own BroadcastToDMParticipants (no exclusion),
-// matching the terminal ring-event broadcasts in handlers.go
-// (dm_voice_call_timed_out et al.) rather than the sender-excluding
-// h.broadcastToDMParticipants wrapper that dm_message_update/delete use for
-// a message the sender already has their own copy of.
-func (h *Handler) broadcastDMExpirationEvent(conversationID string, messageID uuid.UUID, actorUserID string, payload expiration.EventPayload, policy expiration.Policy) {
+// broadcastDMExpirationEvent sends the durable row to every participant who
+// can currently view it, including the acting user. Their PATCH response
+// carries only the Policy, never this row. Delivery derives its audience from
+// the inserted message so each participant's hidden-history ranges are respected.
+func (h *Handler) broadcastDMExpirationEvent(conversationID, messageID uuid.UUID, actorUserID string, payload expiration.EventPayload, policy expiration.Policy) {
 	// Both packages guard every other broadcast helper this way. Without it a nil hub
 	// panics here — after the policy row has already committed, so the write survives
 	// and the request 500s.
 	if h.hub == nil {
-		return
-	}
-	convUUID, err := uuid.Parse(conversationID)
-	if err != nil {
-		// Unreachable in production: conversationID is uuid.Parse-validated at
-		// the top of UpdateExpiration before this point is ever reached. Fail
-		// closed by skipping the broadcast rather than sending a zero UUID.
 		return
 	}
 	// Detached from the request on purpose — the policy write has already committed and
@@ -89,26 +84,31 @@ func (h *Handler) broadcastDMExpirationEvent(conversationID string, messageID uu
 	nameCtx, cancelName := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelName()
 	actorUsername, actorDisplayName := expiration.ActorName(nameCtx, h.db, actorUserID)
-	h.hub.BroadcastToDMParticipants(convUUID, websocket.OutgoingMessage{
-		Type: wsDMExpirationEvent,
-		Data: map[string]interface{}{
-			"id":                 messageID.String(),
-			"conversation_id":    conversationID,
-			"actor_user_id":      actorUserID,
-			"actor_username":     actorUsername,
-			"actor_display_name": actorDisplayName,
-			"kind":               payload.Kind,
-			"window_seconds":     payload.WindowSeconds,
-			"created_at":         payload.ChangedAt.UTC().Format(time.RFC3339),
-			// The policy's own revision travels with the event so the receiving
-			// client can advance its composer indicator in the same tick it renders
-			// the system row. Without it the row would announce a new window beside
-			// a bar still showing the old one until the next fetch. mergeExpirationPolicy
-			// fences on revision, so an out-of-order or replayed event is ignored
-			// rather than regressing the indicator.
-			"revision":         policy.Revision,
-			"updated_at":       expiration.UpdatedAtRFC3339(policy),
-			"backfill_pending": policy.BackfillPending,
+	h.hub.BroadcastToDMMessageAllParticipants(
+		conversationID,
+		websocket.NewDMMessageVisibilitySource(messageID),
+		uuid.Nil,
+		websocket.OutgoingMessage{
+			Type: wsDMExpirationEvent,
+			Data: map[string]interface{}{
+				"id":                 messageID.String(),
+				"conversation_id":    conversationID.String(),
+				"actor_user_id":      actorUserID,
+				"actor_username":     actorUsername,
+				"actor_display_name": actorDisplayName,
+				"kind":               payload.Kind,
+				"window_seconds":     payload.WindowSeconds,
+				"created_at":         payload.ChangedAt.UTC().Format(time.RFC3339),
+				// The policy's own revision travels with the event so the receiving
+				// client can advance its composer indicator in the same tick it renders
+				// the system row. Without it the row would announce a new window beside
+				// a bar still showing the old one until the next fetch. mergeExpirationPolicy
+				// fences on revision, so an out-of-order or replayed event is ignored
+				// rather than regressing the indicator.
+				"revision":         policy.Revision,
+				"updated_at":       expiration.UpdatedAtRFC3339(policy),
+				"backfill_pending": policy.BackfillPending,
+			},
 		},
-	})
+	)
 }

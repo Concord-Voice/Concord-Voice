@@ -1077,6 +1077,7 @@ func NewRouter(
 
 	// Start NATS voice event subscriber
 	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
+	voiceSub.SetOpsCounters(opsCounters)
 	activePlanReconciler.SetServerVoiceCleanup(voiceSub.ReconcileStaleServerVoiceParticipants)
 	// Temporary-SBAC revoke shares the one #2445 executor with the RBAC
 	// handler, so a presence-triggered revoke captures the same way an
@@ -2485,6 +2486,18 @@ func NewRouter(
 				dmRoutes.DELETE("/:id/messages",
 					middleware.RateLimitByUserFailClosed(redis, purgeRateLimit, purgeRateWindow),
 					dmHandler.PurgeConversation,
+				)
+				dmRoutes.POST("/:id/hide",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					dmHandler.HideConversation,
+				)
+				dmRoutes.DELETE("/:id/hide",
+					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					dmHandler.UnhideConversation,
+				)
+				dmRoutes.POST("/:id/clear",
+					middleware.RateLimitByUserFailClosed(redis, purgeRateLimit, purgeRateWindow),
+					dmHandler.ClearConversation,
 				)
 
 				// Open/get-or-create 1:1 DM conversation (10 requests per minute)

@@ -10,7 +10,13 @@ Concord Voice now keeps screen sharing steady when a capture changes, cleans up
 cancelled audio work before it can surface later, and records security outcomes
 without losing the observation that triggered them.
 
+### Changed
+
+- **The control plane now supports private DM hide and history-clear operations** ([#3306](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3306)) — authenticated API clients can hide a direct message or group chat from one participant's list, or clear that participant's history before a server-stamped cutoff. Hide preserves history, read state, and the original hide timestamp on retries. Clear uses MFA when enabled or the current password otherwise when Privacy & Security requires authentication; the existing permanent purge action keeps its current password-and-MFA behavior.
+
 ### Fixed
+
+- **Voice channel lists recover more reliably after stale sessions** ([#3304](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3304), [#3298](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3298)) — the server retries delayed leave updates, and repeated updates no longer lower the displayed participant count or replay leave sounds.
 
 - **Switching screen-share sources no longer drops or leaks per-app audio** ([#3369](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3369)) — a failed
   source switch now keeps the current share running, while cancelled or partially started captures

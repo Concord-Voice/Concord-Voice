@@ -3,6 +3,8 @@
 package dm
 
 import (
+	"database/sql"
+
 	"github.com/google/uuid"
 )
 
@@ -55,4 +57,16 @@ func NewPendingCallForTest(convID, caller uuid.UUID, callees []uuid.UUID) *Pendi
 // real timer. h must be a *Handler.
 func HandlerOnRingTimeoutForTest(h *Handler, convID uuid.UUID, ring *PendingCall) {
 	h.onRingTimeout(convID, ring)
+}
+
+// SetDMVisibilityCommitHookForTest pauses publication after a visibility
+// transaction commits. It is used by ordering tests to coordinate concurrent
+// requests without exposing a production hook.
+func SetDMVisibilityCommitHookForTest(h *Handler, hook func()) {
+	h.afterDMVisibilityCommitHook = hook
+}
+
+// SetDMClearCommitForTest replaces Clear's commit for an ambiguous-ack test.
+func SetDMClearCommitForTest(h *Handler, commit func(*sql.Tx) error) {
+	h.clearCommitForTest = commit
 }

@@ -53,6 +53,18 @@ export const METRIC_LABELS: Record<MetricKey, string> = {
   presence_audience_suppressed_total: "Presence broadcast suppressions",
   presence_ttl_lapsed_total: "Presence TTL lapses",
   websocket_abnormal_closes_total: "Abnormal socket closes",
+  server_voice_terminal_outbox_captured_total:
+    "Server Voice terminal outbox captures",
+  server_voice_terminal_outbox_delivered_total:
+    "Server Voice terminal Hub admissions",
+  server_voice_terminal_outbox_successor_suppressed_total:
+    "Server Voice terminal successor suppressions",
+  server_voice_terminal_outbox_channel_suppressed_total:
+    "Server Voice terminal channel suppressions",
+  server_voice_terminal_outbox_lock_retained_total:
+    "Server Voice terminal lock retentions",
+  server_voice_terminal_outbox_queue_rescheduled_total:
+    "Server Voice terminal queue reschedules",
   media_camera_layering_gate_flips_total: "Camera layering gate flips",
   media_camera_pressure_demands_total: "Camera pressure demands",
   registered_users_current: "Registered users",

@@ -89,6 +89,7 @@ func TestHandleDMMessage_UnreadNotifyCarriesRealAttachmentMetadata(t *testing.T)
 	client2 := registerUnsubscribedParticipant(setup)
 
 	setup.hub.handleDMMessage(dmMessageWithAttachments(setup, "check out this photo", fileID))
+	completePendingDMDeliveries(t, setup.hub)
 
 	notify := readClientMsg(t, client2)
 	assert.Equal(t, "dm_unread_notify", notify["type"])
@@ -112,6 +113,7 @@ func TestHandleDMMessage_UnreadNotifyUsesFirstAttachmentWhenMultiple(t *testing.
 	client2 := registerUnsubscribedParticipant(setup)
 
 	setup.hub.handleDMMessage(dmMessageWithAttachments(setup, "two attachments", fileID0, fileID1))
+	completePendingDMDeliveries(t, setup.hub)
 
 	notify := readClientMsg(t, client2)
 	data, ok := notify["data"].(map[string]interface{})

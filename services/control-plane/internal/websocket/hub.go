@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
@@ -102,6 +103,13 @@ const (
 	// precedes it, and replacing the queued value preserves eventual delivery of
 	// the final authoritative health state.
 	securityEventEmissionQueueLimit = 1
+	// Server Voice lifecycle delivery is ordered per server/channel. Keep a
+	// bounded backlog rather than spawning one waiting goroutine per event.
+	serverVoiceDeliveryQueueCapacity = 256
+	// Deferred Server Voice events remain bounded across keys while their
+	// per-key workers drain. One extra held event applies backpressure only
+	// after this shared bound is reached.
+	serverVoiceDeferredQueueCapacity = 256
 
 	// presenceAudienceMaxHandoff bounds how long a computed audience may sit
 	// between the query returning and Run applying it. Under ordinary load the
@@ -354,6 +362,10 @@ type Hub struct {
 	// Server-scoped broadcast messages (sent to all clients subscribed to a server)
 	serverBroadcast chan ServerBroadcastMessage
 
+	// Server Voice messages use an independent input queue so bounded delivery
+	// backpressure cannot delay ordinary server broadcasts.
+	serverVoiceBroadcast chan ServerBroadcastMessage
+
 	// Server-scoped eviction broadcasts (member_removed/banned + attached prune).
 	// Kept on a dedicated, priority-drained channel so a removed/banned member is
 	// evicted from serverSubscriptions BEFORE any other server fanout (e.g.
@@ -363,6 +375,13 @@ type Hub struct {
 
 	// DM-scoped broadcast messages (sent to all clients subscribed to a DM conversation)
 	dmBroadcast chan DMBroadcastMessage
+	// Typed DM visibility work is queued and sequenced by Run. Workers receive
+	// snapshots only and never inspect hub-owned maps.
+	dmDeliveryResults     chan dmMessageDeliveryResult
+	dmDeliveryQueues      map[uuid.UUID][]*dmMessageDeliveryJob
+	dmDeliveryActive      map[uuid.UUID]bool
+	dmDeliveryOutstanding int
+	dmDeliveryWg          sync.WaitGroup
 
 	// Force-disconnect all clients for a user (server-side session termination)
 	disconnectUser chan uuid.UUID
@@ -381,6 +400,16 @@ type Hub struct {
 	// Results from off-loop channel permission checks. The Run goroutine applies
 	// sends and subscription pruning so hub maps remain single-owner.
 	channelDeliveryResults chan channelDeliveryResult
+	// Per-delivery-key authorization versions prevent an authority change from
+	// applying an older Server Voice decision for that same channel.
+	serverVoiceAuthzEpochs map[serverVoiceDeliveryKey]uint64
+	// Authorized Server Voice events must reach each recipient in lifecycle
+	// order. Each key has one bounded worker which advances only after Run
+	// applies the prior result.
+	serverVoiceDeliveryMu      sync.Mutex
+	serverVoiceDeliveryStopped bool
+	serverVoiceDeliveryWg      sync.WaitGroup
+	serverVoiceDeliveryQueues  map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue
 
 	// Results from off-loop voice-count queries issued on subscribe_server. The
 	// query runs on a worker goroutine so a burst of subscriptions cannot stall
@@ -470,6 +499,7 @@ type channelDeliveryKind uint8
 const (
 	channelDeliveryBroadcast channelDeliveryKind = iota
 	channelDeliveryUnread
+	channelDeliveryServerBroadcast
 	channelDeliveryMention
 	channelDeliveryPrune
 )
@@ -480,12 +510,13 @@ type channelDeliveryRecipient struct {
 }
 
 type channelDeliveryRequest struct {
-	kind       channelDeliveryKind
-	serverID   uuid.UUID
-	channelID  uuid.UUID
-	viewPerm   int64
-	data       []byte
-	recipients []channelDeliveryRecipient
+	kind                    channelDeliveryKind
+	serverID                uuid.UUID
+	channelID               uuid.UUID
+	viewPerm                int64
+	data                    []byte
+	recipients              []channelDeliveryRecipient
+	requireVoiceChannelAuth bool
 }
 
 type channelDeliveryDecision struct {
@@ -499,53 +530,137 @@ type channelDeliveryResult struct {
 	kind          channelDeliveryKind
 	serverID      uuid.UUID
 	channelID     uuid.UUID
+	authzEpoch    uint64
 	data          []byte
 	decisions     []channelDeliveryDecision
 	deliveryProbe *securityEventProbe
+	deliveryDone  chan struct{}
+}
+
+type serverVoiceDeliveryKey struct {
+	serverID  uuid.UUID
+	channelID uuid.UUID
+}
+
+type serverVoiceDeliveryJob struct {
+	req             channelDeliveryRequest
+	permissionProbe securityEventProbe
+	deliveryProbe   securityEventProbe
+}
+
+type serverVoiceDeliveryQueue struct {
+	jobs   chan serverVoiceDeliveryJob
+	cancel context.CancelFunc
+}
+
+type serverVoiceDeferredBroadcasts struct {
+	queued  map[serverVoiceDeliveryKey][]ServerBroadcastMessage
+	count   int
+	blocked *ServerBroadcastMessage
+}
+
+func (d *serverVoiceDeferredBroadcasts) deferBroadcast(h *Hub, message ServerBroadcastMessage) bool {
+	key := serverVoiceDeliveryKey{serverID: message.ServerID, channelID: message.ChannelID}
+	if deferred := d.queued[key]; len(deferred) > 0 {
+		if d.count == serverVoiceDeferredQueueCapacity {
+			d.blocked = &message
+			return false
+		}
+		d.queued[key] = append(deferred, message)
+		d.count++
+		return true
+	}
+	if h.handleServerBroadcast(message) {
+		return true
+	}
+	if d.count == serverVoiceDeferredQueueCapacity {
+		d.blocked = &message
+		return false
+	}
+	d.queued[key] = append(d.queued[key], message)
+	d.count++
+	return true
+}
+
+func (d *serverVoiceDeferredBroadcasts) retry(h *Hub, key serverVoiceDeliveryKey) {
+	for {
+		deferred := d.queued[key]
+		if len(deferred) == 0 || !h.handleServerBroadcast(deferred[0]) {
+			return
+		}
+		d.count--
+		if len(deferred) == 1 {
+			delete(d.queued, key)
+		} else {
+			d.queued[key] = deferred[1:]
+		}
+	}
+}
+
+func (d *serverVoiceDeferredBroadcasts) releaseBlocked(h *Hub) {
+	if d.blocked == nil || d.count >= serverVoiceDeferredQueueCapacity {
+		return
+	}
+	message := *d.blocked
+	d.blocked = nil
+	d.deferBroadcast(h, message)
+}
+
+func (d *serverVoiceDeferredBroadcasts) handleDeliveryResult(h *Hub, result channelDeliveryResult) {
+	h.handleChannelDeliveryResult(result)
+	if result.kind == channelDeliveryServerBroadcast {
+		d.retry(h, serverVoiceDeliveryKey{serverID: result.serverID, channelID: result.channelID})
+	}
+	d.releaseBlocked(h)
 }
 
 // NewHub creates a new Hub
 func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *Hub {
 	hub := &Hub{
-		db:                       db,
-		redis:                    redisClient,
-		clients:                  make(map[uuid.UUID]*Client),
-		userClients:              make(map[uuid.UUID]map[uuid.UUID]bool),
-		lastInboundAt:            make(map[uuid.UUID]time.Time),
-		hiddenPresence:           make(map[uuid.UUID]string),
-		presenceRecovery:         make(map[uuid.UUID]presenceRecoveryState),
-		channelSubscriptions:     make(map[uuid.UUID]map[uuid.UUID]bool),
-		usernames:                make(map[uuid.UUID]string),
-		serverSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
-		dmSubscriptions:          make(map[uuid.UUID]map[uuid.UUID]bool),
-		register:                 make(chan *Client),
-		unregister:               make(chan *Client),
-		incoming:                 make(chan IncomingMessage, 256),
-		broadcast:                make(chan BroadcastMessage, 256),
-		globalBroadcast:          make(chan OutgoingMessage, 256),
-		userBroadcast:            make(chan UserBroadcastMessage, 256),
-		serverBroadcast:          make(chan ServerBroadcastMessage, 256),
-		evictBroadcast:           make(chan ServerBroadcastMessage, 16),
-		dmBroadcast:              make(chan DMBroadcastMessage, 256),
-		disconnectUser:           make(chan uuid.UUID, 16),
-		disconnectSession:        make(chan string, 16),
-		voiceCountSignal:         make(chan struct{}, 1),
-		revalidateChannel:        make(chan channelRevalidation, 256),
-		revalidateServer:         make(chan uuid.UUID, 16),
-		channelDeliveryResults:   make(chan channelDeliveryResult, 256),
-		voiceCountCatchupResults: make(chan voiceCountCatchup, 256),
-		done:                     make(chan struct{}),
-		stopped:                  make(chan struct{}),
-		onlineCountPending:       make(map[uuid.UUID]bool),
-		clientBootstrapSlots:     make(chan struct{}, clientBootstrapConcurrency),
-		presenceGeneration:       make(map[uuid.UUID]uint64),
-		presenceDispatchPending:  make(map[uuid.UUID]pendingPresence),
-		presenceInFlight:         make(map[uuid.UUID]struct{}),
-		presenceAudienceResults:  make(chan presenceAudienceResult, 256),
-		presenceAudienceSlots:    make(chan struct{}, presenceAudienceConcurrency),
-		suppressorPending:        make(map[uuid.UUID]struct{}),
-		clientBootstrapTimeout:   clientBootstrapTimeout,
-		securityEvents:           securityevent.Discard,
+		db:                        db,
+		redis:                     redisClient,
+		clients:                   make(map[uuid.UUID]*Client),
+		userClients:               make(map[uuid.UUID]map[uuid.UUID]bool),
+		lastInboundAt:             make(map[uuid.UUID]time.Time),
+		hiddenPresence:            make(map[uuid.UUID]string),
+		presenceRecovery:          make(map[uuid.UUID]presenceRecoveryState),
+		channelSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames:                 make(map[uuid.UUID]string),
+		serverSubscriptions:       make(map[uuid.UUID]map[uuid.UUID]bool),
+		dmSubscriptions:           make(map[uuid.UUID]map[uuid.UUID]bool),
+		register:                  make(chan *Client),
+		unregister:                make(chan *Client),
+		incoming:                  make(chan IncomingMessage, 256),
+		broadcast:                 make(chan BroadcastMessage, 256),
+		globalBroadcast:           make(chan OutgoingMessage, 256),
+		userBroadcast:             make(chan UserBroadcastMessage, 256),
+		serverBroadcast:           make(chan ServerBroadcastMessage, 256),
+		serverVoiceBroadcast:      make(chan ServerBroadcastMessage, 256),
+		evictBroadcast:            make(chan ServerBroadcastMessage, 16),
+		dmBroadcast:               make(chan DMBroadcastMessage, dmMessageDeliveryCapacity),
+		dmDeliveryResults:         make(chan dmMessageDeliveryResult, dmMessageDeliveryCapacity),
+		dmDeliveryQueues:          make(map[uuid.UUID][]*dmMessageDeliveryJob),
+		dmDeliveryActive:          make(map[uuid.UUID]bool),
+		disconnectUser:            make(chan uuid.UUID, 16),
+		disconnectSession:         make(chan string, 16),
+		voiceCountSignal:          make(chan struct{}, 1),
+		revalidateChannel:         make(chan channelRevalidation, 256),
+		revalidateServer:          make(chan uuid.UUID, 16),
+		channelDeliveryResults:    make(chan channelDeliveryResult, 256),
+		serverVoiceDeliveryQueues: make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue),
+		voiceCountCatchupResults:  make(chan voiceCountCatchup, 256),
+		done:                      make(chan struct{}),
+		stopped:                   make(chan struct{}),
+		onlineCountPending:        make(map[uuid.UUID]bool),
+		clientBootstrapSlots:      make(chan struct{}, clientBootstrapConcurrency),
+		presenceGeneration:        make(map[uuid.UUID]uint64),
+		presenceDispatchPending:   make(map[uuid.UUID]pendingPresence),
+		presenceInFlight:          make(map[uuid.UUID]struct{}),
+		presenceAudienceResults:   make(chan presenceAudienceResult, 256),
+		presenceAudienceSlots:     make(chan struct{}, presenceAudienceConcurrency),
+		suppressorPending:         make(map[uuid.UUID]struct{}),
+		clientBootstrapTimeout:    clientBootstrapTimeout,
+		securityEvents:            securityevent.Discard,
 	}
 	if len(opsCounters) > 0 {
 		hub.opsCounter = opsCounters[0]
@@ -760,7 +875,11 @@ func (h *Hub) drainSecurityEventEmissions(emission securityEventEmission) {
 
 // RevalidateChannelSubscriptions queues a visibility recheck for one channel.
 func (h *Hub) RevalidateChannelSubscriptions(serverID, channelID uuid.UUID) {
-	if h == nil || h.revalidateChannel == nil {
+	if h == nil {
+		return
+	}
+	h.invalidateServerVoiceDeliveryChannel(serverID, channelID)
+	if h.revalidateChannel == nil {
 		return
 	}
 	select {
@@ -772,7 +891,11 @@ func (h *Hub) RevalidateChannelSubscriptions(serverID, channelID uuid.UUID) {
 
 // RevalidateServerSubscriptions queues visibility rechecks for subscribed channels in a server.
 func (h *Hub) RevalidateServerSubscriptions(serverID uuid.UUID) {
-	if h == nil || h.revalidateServer == nil {
+	if h == nil {
+		return
+	}
+	h.invalidateServerVoiceDeliveryServer(serverID)
+	if h.revalidateServer == nil {
 		return
 	}
 	select {
@@ -894,11 +1017,18 @@ func (h *Hub) Run() {
 	// struct-literal test hub never spawns one (#2992).
 	go h.watchPresenceAuthzLevel()
 	go h.runPresenceLivenessSweeper()
+	deferredServerBroadcasts := serverVoiceDeferredBroadcasts{
+		queued: make(map[serverVoiceDeliveryKey][]ServerBroadcastMessage),
+	}
 	for {
 		// nil channel is never selected; active only when a debounce timer is pending
 		var onlineCountC <-chan time.Time
 		if h.onlineCountTimer != nil {
 			onlineCountC = h.onlineCountTimer.C
+		}
+		serverVoiceBroadcast := h.serverVoiceBroadcast
+		if deferredServerBroadcasts.blocked != nil {
+			serverVoiceBroadcast = nil
 		}
 
 		// Priority drain: process any pending eviction broadcast before other work.
@@ -938,8 +1068,14 @@ func (h *Hub) Run() {
 		case message := <-h.serverBroadcast:
 			h.handleServerBroadcast(message)
 
+		case message := <-serverVoiceBroadcast:
+			deferredServerBroadcasts.deferBroadcast(h, message)
+
 		case message := <-h.dmBroadcast:
 			h.handleDMBroadcast(message)
+
+		case result := <-h.dmDeliveryResults:
+			h.handleDMMessageDeliveryResult(result)
 
 		case userID := <-h.disconnectUser:
 			h.handleDisconnectUser(userID)
@@ -960,7 +1096,7 @@ func (h *Hub) Run() {
 			h.handleServerRevalidation(serverID)
 
 		case result := <-h.channelDeliveryResults:
-			h.handleChannelDeliveryResult(result)
+			deferredServerBroadcasts.handleDeliveryResult(h, result)
 
 		case c := <-h.voiceCountCatchupResults:
 			h.applyVoiceCountCatchup(c)
@@ -988,10 +1124,16 @@ func (h *Hub) shutdownClients() {
 	for _, userID := range connectedUsers {
 		h.transitionUserOffline(context.Background(), userID, true)
 	}
+	// Typed DM workers own database transactions but may retain client pointers
+	// until their result is applied or h.done abandons it. Join them before any
+	// outbound queue can close.
+	h.dmDeliveryWg.Wait()
+	// Server Voice workers own permission-check contexts. Cancel first, then
+	// join after the admission mutex establishes that no worker can be added.
+	h.stopServerVoiceDeliveryWorkers()
 
-	// Unpublish clients under the same lock held by typed delivery before
-	// closing their queues. A delivery already holding RLock completes first;
-	// a later delivery sees no connected target.
+	// Unpublish clients before closing their queues. Typed delivery workers were
+	// joined above and no longer retain client pointers.
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	connectedUsers = connectedUsers[:0]
@@ -1049,7 +1191,11 @@ func (h *Hub) shutdownClients() {
 // closes all client connections. Safe to call multiple times.
 func (h *Hub) Shutdown() {
 	h.closeOnce.Do(func() {
+		h.serverVoiceDeliveryMu.Lock()
+		h.serverVoiceDeliveryStopped = true
 		close(h.done)
+		h.cancelServerVoiceDeliveryWorkersLocked()
+		h.serverVoiceDeliveryMu.Unlock()
 	})
 	<-h.stopped
 	h.securityEventsMu.Lock()
@@ -1731,13 +1877,13 @@ func (h *Hub) clientHasChannelPermission(ctx context.Context, serverID, channelI
 	return hasPerm, true
 }
 
-func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) {
+func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) bool {
 	if len(req.recipients) == 0 {
-		return
+		return true
 	}
 	if req.viewPerm == 0 || req.serverID == uuid.Nil {
 		h.handleChannelDeliveryResult(allowAllChannelDelivery(req))
-		return
+		return true
 	}
 
 	checker := h.channelPermissionChecker
@@ -1745,17 +1891,20 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) {
 		h.completeSecurityEventProbeFailure(h.beginSecurityEventProbe(securityEventSourcePermissionAuthority))
 		log.Printf("Channel permission checker not configured")
 		h.handleChannelDeliveryResult(denyAllChannelDelivery(req))
-		return
+		return true
 	}
 
 	results := h.channelDeliveryResults
 	if results == nil {
 		h.completeSecurityEventProbeFailure(h.beginSecurityEventProbe(securityEventSourceChannelDelivery))
 		log.Printf("Channel delivery result queue not configured")
-		return
+		return true
 	}
 
 	done := h.done
+	if req.kind == channelDeliveryServerBroadcast {
+		return h.dispatchOrderedServerVoiceDelivery(req, checker, results, done)
+	}
 	permissionProbe := h.beginSecurityEventProbe(securityEventSourcePermissionAuthority)
 	deliveryProbe := h.beginSecurityEventProbe(securityEventSourceChannelDelivery)
 	go func() {
@@ -1766,6 +1915,171 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) {
 		case <-done:
 		}
 	}()
+	return true
+}
+
+func (h *Hub) dispatchOrderedServerVoiceDelivery(
+	req channelDeliveryRequest,
+	checker ChannelPermissionChecker,
+	results chan channelDeliveryResult,
+	done <-chan struct{},
+) bool {
+	key := serverVoiceDeliveryKey{serverID: req.serverID, channelID: req.channelID}
+
+	h.serverVoiceDeliveryMu.Lock()
+	if h.serverVoiceDeliveryStopped {
+		h.serverVoiceDeliveryMu.Unlock()
+		return false
+	}
+	select {
+	case <-h.done:
+		h.serverVoiceDeliveryMu.Unlock()
+		return false
+	default:
+	}
+	if h.serverVoiceDeliveryQueues == nil {
+		h.serverVoiceDeliveryQueues = make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue)
+	}
+	if h.serverVoiceAuthzEpochs == nil {
+		h.serverVoiceAuthzEpochs = make(map[serverVoiceDeliveryKey]uint64)
+	}
+	queue := h.serverVoiceDeliveryQueues[key]
+	if queue == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		queue = &serverVoiceDeliveryQueue{
+			jobs:   make(chan serverVoiceDeliveryJob, serverVoiceDeliveryQueueCapacity),
+			cancel: cancel,
+		}
+		h.serverVoiceDeliveryQueues[key] = queue
+		h.serverVoiceDeliveryWg.Add(1)
+		go func() {
+			defer h.serverVoiceDeliveryWg.Done()
+			defer cancel()
+			h.runServerVoiceDeliveryQueue(ctx, key, queue, checker, results, done)
+		}()
+	}
+	if len(queue.jobs) == cap(queue.jobs) {
+		h.serverVoiceDeliveryMu.Unlock()
+		return false
+	}
+	job := serverVoiceDeliveryJob{
+		req:             req,
+		permissionProbe: h.beginSecurityEventProbe(securityEventSourcePermissionAuthority),
+		deliveryProbe:   h.beginSecurityEventProbe(securityEventSourceChannelDelivery),
+	}
+	queue.jobs <- job
+	h.serverVoiceDeliveryMu.Unlock()
+	return true
+}
+
+func (h *Hub) runServerVoiceDeliveryQueue(
+	ctx context.Context,
+	key serverVoiceDeliveryKey,
+	queue *serverVoiceDeliveryQueue,
+	checker ChannelPermissionChecker,
+	results chan channelDeliveryResult,
+	done <-chan struct{},
+) {
+	defer h.removeServerVoiceDeliveryQueue(key, queue)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case job := <-queue.jobs:
+			authzEpoch := h.serverVoiceDeliveryAuthzEpoch(key)
+			result := h.checkChannelDeliveryPermissionsContext(ctx, job.req, checker, job.permissionProbe)
+			if ctx.Err() != nil {
+				return
+			}
+			result.authzEpoch = authzEpoch
+			result.deliveryProbe = &job.deliveryProbe
+			result.deliveryDone = make(chan struct{})
+			select {
+			case results <- result:
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+			select {
+			case <-result.deliveryDone:
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
+
+		if h.removeServerVoiceDeliveryQueueIfIdle(key, queue) {
+			return
+		}
+	}
+}
+
+func (h *Hub) cancelServerVoiceDeliveryWorkersLocked() {
+	for _, queue := range h.serverVoiceDeliveryQueues {
+		if queue.cancel != nil {
+			queue.cancel()
+		}
+	}
+}
+
+func (h *Hub) stopServerVoiceDeliveryWorkers() {
+	h.serverVoiceDeliveryMu.Lock()
+	h.serverVoiceDeliveryStopped = true
+	h.cancelServerVoiceDeliveryWorkersLocked()
+	// Releasing this mutex before Wait is the admission barrier: any Add that
+	// began before shutdown has completed, and cancellation rejects later ones.
+	h.serverVoiceDeliveryMu.Unlock()
+	h.serverVoiceDeliveryWg.Wait()
+}
+
+func (h *Hub) removeServerVoiceDeliveryQueue(key serverVoiceDeliveryKey, queue *serverVoiceDeliveryQueue) {
+	h.serverVoiceDeliveryMu.Lock()
+	if h.serverVoiceDeliveryQueues[key] == queue {
+		delete(h.serverVoiceDeliveryQueues, key)
+		delete(h.serverVoiceAuthzEpochs, key)
+	}
+	h.serverVoiceDeliveryMu.Unlock()
+}
+
+func (h *Hub) removeServerVoiceDeliveryQueueIfIdle(key serverVoiceDeliveryKey, queue *serverVoiceDeliveryQueue) bool {
+	h.serverVoiceDeliveryMu.Lock()
+	if h.serverVoiceDeliveryQueues[key] != queue || len(queue.jobs) != 0 {
+		h.serverVoiceDeliveryMu.Unlock()
+		return false
+	}
+	delete(h.serverVoiceDeliveryQueues, key)
+	delete(h.serverVoiceAuthzEpochs, key)
+	h.serverVoiceDeliveryMu.Unlock()
+	return true
+}
+
+func (h *Hub) invalidateServerVoiceDeliveryChannel(serverID, channelID uuid.UUID) {
+	key := serverVoiceDeliveryKey{serverID: serverID, channelID: channelID}
+	h.serverVoiceDeliveryMu.Lock()
+	defer h.serverVoiceDeliveryMu.Unlock()
+	if _, active := h.serverVoiceDeliveryQueues[key]; active {
+		h.serverVoiceAuthzEpochs[key]++
+	}
+}
+
+func (h *Hub) invalidateServerVoiceDeliveryServer(serverID uuid.UUID) {
+	h.serverVoiceDeliveryMu.Lock()
+	defer h.serverVoiceDeliveryMu.Unlock()
+	for key := range h.serverVoiceDeliveryQueues {
+		if key.serverID == serverID {
+			h.serverVoiceAuthzEpochs[key]++
+		}
+	}
+}
+
+func (h *Hub) serverVoiceDeliveryAuthzEpoch(key serverVoiceDeliveryKey) uint64 {
+	h.serverVoiceDeliveryMu.Lock()
+	defer h.serverVoiceDeliveryMu.Unlock()
+	return h.serverVoiceAuthzEpochs[key]
 }
 
 func allowAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
@@ -1807,30 +2121,80 @@ func denyAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 }
 
 func (h *Hub) checkChannelDeliveryPermissions(req channelDeliveryRequest, checker ChannelPermissionChecker, permissionProbe securityEventProbe) channelDeliveryResult {
+	return h.checkChannelDeliveryPermissionsContext(context.Background(), req, checker, permissionProbe)
+}
+
+func (h *Hub) checkChannelDeliveryPermissionsContext(
+	ctx context.Context,
+	req channelDeliveryRequest,
+	checker ChannelPermissionChecker,
+	permissionProbe securityEventProbe,
+) channelDeliveryResult {
+	if allowed, failed := h.authorizeVoiceChannelDelivery(ctx, req); !allowed {
+		if failed {
+			h.completeSecurityEventProbeFailure(permissionProbe)
+		}
+		return denyAllChannelDelivery(req)
+	}
+
 	result := channelDeliveryResult{
 		kind:      req.kind,
 		serverID:  req.serverID,
 		channelID: req.channelID,
 		data:      req.data,
-		decisions: make([]channelDeliveryDecision, 0, len(req.recipients)),
+	}
+	decisions, hadFailure := h.checkChannelDeliveryRecipients(ctx, req, checker)
+	result.decisions = decisions
+	if hadFailure {
+		h.completeSecurityEventProbeFailure(permissionProbe)
+	}
+	return result
+}
+
+func (h *Hub) authorizeVoiceChannelDelivery(ctx context.Context, req channelDeliveryRequest) (allowed, failed bool) {
+	if !req.requireVoiceChannelAuth {
+		return true, false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
-	defer cancel()
+	queryCtx, cancel := context.WithTimeout(ctx, channelAuthCtxTimeout)
+	channel, err := h.fetchChannelContextForAuthContext(queryCtx, req.channelID)
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, false
+		}
+		return false, !errors.Is(err, sql.ErrNoRows)
+	}
+	return channel.serverUUID == req.serverID && channel.channelType == "voice", false
+}
 
+func (h *Hub) checkChannelDeliveryRecipients(ctx context.Context, req channelDeliveryRequest, checker ChannelPermissionChecker) ([]channelDeliveryDecision, bool) {
+	decisions := make([]channelDeliveryDecision, 0, len(req.recipients))
 	hadFailure := false
 	for _, recipient := range req.recipients {
-		hasPerm, err := checker.HasChannelPermission(
-			ctx,
-			req.serverID.String(),
-			recipient.userID.String(),
-			req.channelID.String(),
-			req.viewPerm,
-		)
+		if ctx.Err() != nil {
+			return decisions, hadFailure
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, channelAuthCtxTimeout)
+		var hasPerm bool
+		var err error
+		if req.kind == channelDeliveryServerBroadcast {
+			hasPerm, err = checker.HasChannelPermissionsUncached(
+				queryCtx, req.serverID.String(), recipient.userID.String(), req.channelID.String(), req.viewPerm,
+			)
+		} else {
+			hasPerm, err = checker.HasChannelPermission(
+				queryCtx, req.serverID.String(), recipient.userID.String(), req.channelID.String(), req.viewPerm,
+			)
+		}
+		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return decisions, hadFailure
+			}
 			hadFailure = true
 			log.Printf("Failed to check channel delivery permission: %v", err)
-			result.decisions = append(result.decisions, channelDeliveryDecision{
+			decisions = append(decisions, channelDeliveryDecision{
 				clientID:   recipient.clientID,
 				userID:     recipient.userID,
 				allowed:    false,
@@ -1838,20 +2202,18 @@ func (h *Hub) checkChannelDeliveryPermissions(req channelDeliveryRequest, checke
 			})
 			continue
 		}
-		result.decisions = append(result.decisions, channelDeliveryDecision{
+		decisions = append(decisions, channelDeliveryDecision{
 			clientID:   recipient.clientID,
 			userID:     recipient.userID,
 			allowed:    hasPerm,
 			definitive: true,
 		})
 	}
-	if hadFailure {
-		h.completeSecurityEventProbeFailure(permissionProbe)
-	}
-	return result
+	return decisions, hadFailure
 }
 
 func (h *Hub) handleChannelDeliveryResult(result channelDeliveryResult) {
+	defer h.releaseServerVoiceDelivery(result)
 	if result.deliveryProbe != nil {
 		h.completeSecurityEventProbeSuccess(*result.deliveryProbe)
 	}
@@ -1860,11 +2222,20 @@ func (h *Hub) handleChannelDeliveryResult(result channelDeliveryResult) {
 		h.applyBroadcastDeliveryResult(result)
 	case channelDeliveryUnread:
 		h.applyUnreadDeliveryResult(result)
+	case channelDeliveryServerBroadcast:
+		h.applyServerBroadcastDeliveryResult(result)
 	case channelDeliveryMention:
 		h.applyMentionDeliveryResult(result)
 	case channelDeliveryPrune:
 		h.applyPruneDeliveryResult(result)
 	}
+}
+
+func (h *Hub) releaseServerVoiceDelivery(result channelDeliveryResult) {
+	if result.deliveryDone == nil {
+		return
+	}
+	close(result.deliveryDone)
 }
 
 func (h *Hub) applyBroadcastDeliveryResult(result channelDeliveryResult) {
@@ -1901,6 +2272,28 @@ func (h *Hub) applyUnreadDeliveryResult(result channelDeliveryResult) {
 			continue
 		}
 		client.enqueueOutbound(result.data)
+	}
+}
+
+func (h *Hub) applyServerBroadcastDeliveryResult(result channelDeliveryResult) {
+	key := serverVoiceDeliveryKey{serverID: result.serverID, channelID: result.channelID}
+	serverClients := h.serverSubscriptions[result.serverID]
+	for _, decision := range result.decisions {
+		client, ok := h.clients[decision.clientID]
+		if !ok || serverClients == nil || !serverClients[decision.clientID] || !decision.allowed {
+			continue
+		}
+
+		h.serverVoiceDeliveryMu.Lock()
+		if result.authzEpoch != h.serverVoiceAuthzEpochs[key] {
+			h.serverVoiceDeliveryMu.Unlock()
+			return
+		}
+		enqueued := client.enqueueOutbound(result.data)
+		h.serverVoiceDeliveryMu.Unlock()
+		if !enqueued {
+			h.handleUnregister(client)
+		}
 	}
 }
 
@@ -2489,19 +2882,23 @@ func (h *Hub) fetchChannelContext(msg IncomingMessage, channelUUID uuid.UUID) *c
 }
 
 func (h *Hub) fetchChannelContextForAuth(channelUUID uuid.UUID) (*channelContext, error) {
+	return h.fetchChannelContextForAuthContext(context.Background(), channelUUID)
+}
+
+func (h *Hub) fetchChannelContextForAuthContext(ctx context.Context, channelUUID uuid.UUID) (*channelContext, error) {
 	if h.db == nil {
 		return nil, errors.New("database not configured")
 	}
-	var ctx channelContext
-	err := h.db.QueryRow(
+	var channel channelContext
+	err := h.db.QueryRowContext(ctx,
 		`SELECT s.allow_embedded_content, c.server_id, c.type
 		 FROM channels c INNER JOIN servers s ON c.server_id = s.id
 		 WHERE c.id = $1`, channelUUID,
-	).Scan(&ctx.serverAllowEmbeds, &ctx.serverUUID, &ctx.channelType)
+	).Scan(&channel.serverAllowEmbeds, &channel.serverUUID, &channel.channelType)
 	if err != nil {
 		return nil, err
 	}
-	return &ctx, nil
+	return &channel, nil
 }
 
 func (h *Hub) deliveryAuthForChannel(channelID uuid.UUID) (uuid.UUID, int64, bool) {
@@ -3702,24 +4099,33 @@ func (h *Hub) BroadcastToAll(msg OutgoingMessage) {
 }
 
 // handleServerBroadcast sends a message to all clients subscribed to a server.
-func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) {
+// It returns false only when an authorized Server Voice delivery queue is full.
+func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) (admitted bool) {
+	admitted = true
 	// A prune attached to this broadcast (CV-CAN-027/028) must run AFTER delivery and
 	// regardless of the delivery outcome, so the security eviction is never skipped by
 	// an early return. Deferring keeps it in this same serialized hub operation, which
 	// guarantees it runs before any later server broadcast (e.g. key_revocation).
 	if msg.PruneUserAfter != nil {
-		defer h.evictServerSubscriber(msg.ServerID, *msg.PruneUserAfter)
-	}
-
-	subscribers, ok := h.serverSubscriptions[msg.ServerID]
-	if !ok {
-		return
+		defer func() {
+			if admitted {
+				h.evictServerSubscriber(msg.ServerID, *msg.PruneUserAfter)
+			}
+		}()
 	}
 
 	data, err := json.Marshal(msg.Data)
 	if err != nil {
 		log.Printf("Failed to marshal server broadcast: %v", err)
-		return
+		return admitted
+	}
+	if msg.RequireVoiceViewAuth {
+		return h.handleAuthorizedServerVoiceBroadcast(msg, data)
+	}
+
+	subscribers, ok := h.serverSubscriptions[msg.ServerID]
+	if !ok {
+		return true
 	}
 
 	for clientID := range subscribers {
@@ -3729,6 +4135,28 @@ func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) {
 		}
 		client.enqueueOutbound(data)
 	}
+	return true
+}
+
+func (h *Hub) handleAuthorizedServerVoiceBroadcast(msg ServerBroadcastMessage, data []byte) bool {
+	subscribers := h.serverSubscriptions[msg.ServerID]
+	recipients := make([]channelDeliveryRecipient, 0, len(subscribers))
+	for clientID := range subscribers {
+		client, ok := h.clients[clientID]
+		if !ok {
+			continue
+		}
+		recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
+	}
+	return h.dispatchChannelDelivery(channelDeliveryRequest{
+		kind:                    channelDeliveryServerBroadcast,
+		serverID:                msg.ServerID,
+		channelID:               msg.ChannelID,
+		viewPerm:                permViewVoiceChannels,
+		data:                    data,
+		recipients:              recipients,
+		requireVoiceChannelAuth: true,
+	})
 }
 
 // BroadcastToServer sends a message to all clients subscribed to a server
@@ -3763,6 +4191,47 @@ func (h *Hub) BroadcastToServerContext(
 	}
 	select {
 	case h.serverBroadcast <- serverMessage:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-h.done:
+		return false
+	}
+}
+
+// BroadcastToServerChannelAuthorized sends a server-scoped channel event only to
+// current server subscribers who retain view permission for that channel.
+func (h *Hub) BroadcastToServerChannelAuthorized(serverID, channelID uuid.UUID, msg OutgoingMessage) {
+	h.BroadcastToServerChannelAuthorizedContext(context.Background(), serverID, channelID, msg)
+}
+
+// BroadcastToServerChannelAuthorizedContext is the deadline-aware form used by
+// lifecycle callbacks. Channel resolution and recipient permission checks run
+// in an ordered worker; the return value covers only local queue admission.
+func (h *Hub) BroadcastToServerChannelAuthorizedContext(
+	ctx context.Context,
+	serverID, channelID uuid.UUID,
+	msg OutgoingMessage,
+) bool {
+	if ctx == nil {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	serverMessage := ServerBroadcastMessage{
+		ServerID:             serverID,
+		ChannelID:            channelID,
+		RequireVoiceViewAuth: true,
+		Data:                 msg,
+	}
+	select {
+	case h.serverVoiceBroadcast <- serverMessage:
 		return true
 	case <-ctx.Done():
 		return false
@@ -3949,6 +4418,7 @@ type dmMessageInput struct {
 // dmUnreadLastMessage holds last-message metadata included in dm_unread_notify
 // so that clients can update conversation previews and ordering in real-time.
 type dmUnreadLastMessage struct {
+	messageID uuid.UUID
 	content   string
 	userID    string
 	username  string
@@ -4163,6 +4633,9 @@ func (h *Hub) persistDMMessageWithExpiry(convUUID uuid.UUID, userID uuid.UUID, c
 	).Scan(new(int)); err != nil {
 		return messageID, createdAt, updatedAt, expiresAt, nil, fmt.Errorf("lock DM message participant: %w", err)
 	}
+	if err := dmvisibility.LockParticipantsForWrite(ctx, tx, convUUID); err != nil {
+		return messageID, createdAt, updatedAt, expiresAt, nil, err
+	}
 	var window any
 	if windowSeconds.Valid {
 		window = windowSeconds.Int64
@@ -4176,6 +4649,9 @@ func (h *Hub) persistDMMessageWithExpiry(convUUID uuid.UUID, userID uuid.UUID, c
 		 RETURNING created_at, updated_at, expires_at`,
 		messageID, convUUID, userID, input.content, input.keyVersion, input.msgType, input.gifSlug, window,
 	).Scan(&createdAt, &updatedAt, &expiresAt); err != nil {
+		return messageID, createdAt, updatedAt, expiresAt, nil, err
+	}
+	if err := respawnDMParticipantVisibility(ctx, tx, convUUID, createdAt); err != nil {
 		return messageID, createdAt, updatedAt, expiresAt, nil, err
 	}
 	attachmentSummaries, err = h.linkDMAttachments(ctx, tx, messageID, userID.String(), input.attachmentIDs, convUUID.String())
@@ -4217,9 +4693,14 @@ func (h *Hub) sendDMMessageAck(p dmMessageAckParams) {
 		dmAckData["attachments"] = p.attachments
 	}
 	ackMsg := OutgoingMessage{Type: "dm_message_ack", Data: dmAckData}
-	if ackData, ackErr := json.Marshal(ackMsg); ackErr == nil {
-		p.client.enqueueOutbound(ackData)
-	}
+	visibilitySource := NewDMMessageVisibilitySource(p.messageID)
+	h.deliverDMMessageDerived(DMBroadcastMessage{
+		ConversationID:   p.convUUID,
+		VisibilitySource: &visibilitySource,
+		VisibilityMode:   dmVisibilityDeliveryOriginClient,
+		OriginClientID:   &p.client.ID,
+		Data:             ackMsg,
+	})
 }
 
 // dmBroadcastCtx holds the data needed to build a DM message broadcast payload.
@@ -4262,10 +4743,13 @@ func (h *Hub) broadcastDMMessage(ctx dmBroadcastCtx) {
 	if !ctx.convPersonal {
 		excludeUser = &ctx.senderUserID
 	}
+	visibilitySource := NewDMMessageVisibilitySource(ctx.messageID)
 	h.dmBroadcast <- DMBroadcastMessage{
-		ConversationID: ctx.convUUID,
-		ExcludeUser:    excludeUser,
-		Data:           OutgoingMessage{Type: "dm_message", Data: dmBroadcastData},
+		ConversationID:   ctx.convUUID,
+		VisibilitySource: &visibilitySource,
+		VisibilityMode:   dmVisibilityDeliverySubscribers,
+		ExcludeUser:      excludeUser,
+		Data:             OutgoingMessage{Type: "dm_message", Data: dmBroadcastData},
 	}
 }
 
@@ -4309,6 +4793,7 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 		attachments: attachments, convPersonal: convPersonal,
 	})
 	lastMsg := dmUnreadLastMessage{
+		messageID: messageID,
 		content:   input.content,
 		userID:    msg.UserID.String(),
 		username:  client.Username,
@@ -4321,7 +4806,7 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 	h.sendDMUnreadNotify(convUUID, msg.UserID, lastMsg)
 
 	if input.mentionAddendum != nil {
-		h.routeDMMentionNotifications(convUUID, msg.UserID, input.mentionAddendum)
+		h.routeDMMentionNotificationsForMessage(convUUID, messageID, msg.UserID, input.mentionAddendum)
 	}
 }
 
@@ -4329,11 +4814,6 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 // subscribed to the conversation (they don't have it active). Includes
 // last-message metadata so clients can update previews and ordering.
 func (h *Hub) sendDMUnreadNotify(conversationID, senderUserID uuid.UUID, lastMsg dmUnreadLastMessage) {
-	participants, err := h.dmUnreadParticipants(conversationID)
-	if err != nil {
-		return
-	}
-
 	lastMessage := map[string]interface{}{
 		keyContent:   lastMsg.content,
 		keyUserID:    lastMsg.userID,
@@ -4356,49 +4836,434 @@ func (h *Hub) sendDMUnreadNotify(conversationID, senderUserID uuid.UUID, lastMsg
 			"last_message":    lastMessage,
 		},
 	}
-	data, marshalErr := json.Marshal(notifyMsg)
-	if marshalErr != nil {
+	visibilitySource := NewDMMessageVisibilitySource(lastMsg.messageID)
+	h.deliverDMMessageDerived(DMBroadcastMessage{
+		ConversationID:   conversationID,
+		VisibilitySource: &visibilitySource,
+		VisibilityMode:   dmVisibilityDeliveryUnreadUnsubscribed,
+		ExcludeUser:      &senderUserID,
+		Data:             notifyMsg,
+	})
+}
+
+type dmMessageDeliveryCandidate struct {
+	client *Client
+	userID uuid.UUID
+}
+
+const dmMessageDeliveryCapacity = 256
+
+type dmMessageDeliveryJob struct {
+	message    DMBroadcastMessage
+	deadline   time.Time
+	data       []byte
+	candidates []dmMessageDeliveryCandidate
+}
+
+type dmMessageDeliveryResult struct {
+	job            *dmMessageDeliveryJob
+	participantIDs map[uuid.UUID]bool
+	failedClients  []*Client
+	busyDrops      int
+	err            error
+	lookup         bool
+}
+
+// deliverDMMessageDerived is retained as the typed entry point; Run owns queueing
+// and starts the deadline only when this conversation reaches its FIFO head.
+func (h *Hub) deliverDMMessageDerived(msg DMBroadcastMessage) {
+	h.enqueueDMMessageDelivery(msg)
+}
+
+func (h *Hub) enqueueDMMessageDelivery(msg DMBroadcastMessage) {
+	if h.db == nil || msg.VisibilitySource == nil ||
+		(!msg.VisibilitySource.isPersisted() && !msg.VisibilitySource.isDeleted()) {
 		return
 	}
-
-	dmClients := h.dmSubscriptions[conversationID] // may be nil
-
-	for _, uid := range participants {
-		if uid == senderUserID {
-			continue
-		}
-		h.notifyUnsubscribedUser(uid, dmClients, data)
+	if h.dmDeliveryOutstanding >= dmMessageDeliveryCapacity {
+		log.Printf("DM message-derived delivery queue full")
+		return
+	}
+	job := &dmMessageDeliveryJob{message: msg}
+	h.dmDeliveryQueues[msg.ConversationID] = append(h.dmDeliveryQueues[msg.ConversationID], job)
+	h.dmDeliveryOutstanding++
+	if !h.dmDeliveryActive[msg.ConversationID] {
+		h.startDMMessageDelivery(job)
 	}
 }
 
-// dmUnreadParticipants queries all participant UUIDs for a DM conversation.
-func (h *Hub) dmUnreadParticipants(conversationID uuid.UUID) ([]uuid.UUID, error) {
-	rows, err := h.db.Query(`SELECT user_id FROM dm_participants WHERE conversation_id = $1`, conversationID)
+func (h *Hub) startDMMessageDelivery(job *dmMessageDeliveryJob) {
+	select {
+	case <-h.done:
+		h.finishDMMessageDelivery(job)
+		return
+	default:
+	}
+	conversationID := job.message.ConversationID
+	h.dmDeliveryActive[conversationID] = true
+	job.deadline = time.Now().Add(channelAuthCtxTimeout)
+	data, err := json.Marshal(job.message.Data)
 	if err != nil {
-		return nil, err
+		h.finishDMMessageDelivery(job)
+		log.Printf("Failed to prepare DM message-derived delivery: %T", err)
+		return
+	}
+	job.data = data
+	if job.message.VisibilityMode == dmVisibilityDeliveryAllConnected || job.message.VisibilityMode == dmVisibilityDeliveryUnreadUnsubscribed {
+		h.startDMMessageParticipantLookup(job)
+		return
+	}
+	job.candidates = h.snapshotDMMessageDeliveryCandidates(job.message, nil)
+	if len(job.candidates) == 0 {
+		h.finishDMMessageDelivery(job)
+		return
+	}
+	h.startDMMessageDeliveryWorker(job)
+}
+
+func (h *Hub) startDMMessageParticipantLookup(job *dmMessageDeliveryJob) {
+	h.dmDeliveryWg.Add(1)
+	go func() {
+		defer h.dmDeliveryWg.Done()
+		ctx, cancel := context.WithDeadline(context.Background(), job.deadline)
+		defer cancel()
+		participantIDs, err := h.resolveDMParticipantsContext(ctx, job.message.ConversationID)
+		result := dmMessageDeliveryResult{job: job, participantIDs: participantIDs, err: err, lookup: true}
+		select {
+		case h.dmDeliveryResults <- result:
+		case <-h.done:
+		}
+	}()
+}
+
+func (h *Hub) startDMMessageDeliveryWorker(job *dmMessageDeliveryJob) {
+	h.dmDeliveryWg.Add(1)
+	go func() {
+		defer h.dmDeliveryWg.Done()
+		ctx, cancel := context.WithDeadline(context.Background(), job.deadline)
+		defer cancel()
+		failedClients, busyDrops, err := deliverDMMessageDelivery(ctx, h.db, job.message, job.candidates, job.data)
+		result := dmMessageDeliveryResult{job: job, failedClients: failedClients, busyDrops: busyDrops, err: err}
+		select {
+		case h.dmDeliveryResults <- result:
+		case <-h.done:
+		}
+	}()
+}
+
+func (h *Hub) handleDMMessageDeliveryResult(result dmMessageDeliveryResult) {
+	job := result.job
+	if result.lookup {
+		if result.err != nil {
+			log.Printf("DM message-derived delivery candidate lookup failed: class=%s", dmMessageDeliveryFailureClass(result.err))
+			h.finishDMMessageDelivery(job)
+			return
+		}
+		job.candidates = h.snapshotDMMessageDeliveryCandidates(job.message, result.participantIDs)
+		if len(job.candidates) == 0 {
+			h.finishDMMessageDelivery(job)
+			return
+		}
+		h.startDMMessageDeliveryWorker(job)
+		return
+	}
+	if result.err != nil {
+		log.Printf("DM message-derived delivery failed: class=%s", dmMessageDeliveryFailureClass(result.err))
+	}
+	if result.busyDrops > 0 {
+		log.Printf("DM message-derived delivery dropped frames: class=busy count=%d", result.busyDrops)
+	}
+	for _, client := range result.failedClients {
+		if h.clients[client.ID] == client {
+			h.handleUnregister(client)
+		}
+	}
+	h.finishDMMessageDelivery(job)
+}
+
+func (h *Hub) finishDMMessageDelivery(job *dmMessageDeliveryJob) {
+	conversationID := job.message.ConversationID
+	queue := h.dmDeliveryQueues[conversationID]
+	if len(queue) > 0 && queue[0] == job {
+		queue = queue[1:]
+	}
+	h.dmDeliveryOutstanding--
+	if len(queue) == 0 {
+		delete(h.dmDeliveryQueues, conversationID)
+		delete(h.dmDeliveryActive, conversationID)
+	} else {
+		h.dmDeliveryQueues[conversationID] = queue
+		select {
+		case <-h.done:
+			h.dmDeliveryOutstanding -= len(queue)
+			delete(h.dmDeliveryQueues, conversationID)
+			delete(h.dmDeliveryActive, conversationID)
+		default:
+			h.startDMMessageDelivery(queue[0])
+		}
+	}
+}
+
+func (h *Hub) snapshotDMMessageDeliveryCandidates(msg DMBroadcastMessage, participants map[uuid.UUID]bool) []dmMessageDeliveryCandidate {
+	candidates := make([]dmMessageDeliveryCandidate, 0)
+	appendClient := func(client *Client) {
+		candidates = appendDMMessageDeliveryCandidate(candidates, client, msg.ExcludeUser)
+	}
+	switch msg.VisibilityMode {
+	case dmVisibilityDeliverySubscribers:
+		for clientID := range h.dmSubscriptions[msg.ConversationID] {
+			client, ok := h.clients[clientID]
+			if !ok {
+				continue
+			}
+			appendClient(client)
+		}
+	case dmVisibilityDeliveryAllConnected:
+		for userID := range participants {
+			for clientID := range h.userClients[userID] {
+				appendClient(h.clients[clientID])
+			}
+		}
+	case dmVisibilityDeliveryUnreadUnsubscribed:
+		candidates = h.dmMessageUnreadCandidates(msg, participants, candidates)
+	case dmVisibilityDeliveryMentionTargets:
+		candidates = h.dmMessageMentionCandidates(msg, candidates)
+	case dmVisibilityDeliveryOriginClient:
+		if msg.OriginClientID != nil {
+			appendClient(h.clients[*msg.OriginClientID])
+		}
+	}
+	return candidates
+}
+
+func (h *Hub) dmMessageUnreadCandidates(
+	msg DMBroadcastMessage,
+	participants map[uuid.UUID]bool,
+	candidates []dmMessageDeliveryCandidate,
+) []dmMessageDeliveryCandidate {
+	subscribers := h.dmSubscriptions[msg.ConversationID]
+	for userID := range participants {
+		if msg.ExcludeUser != nil && userID == *msg.ExcludeUser {
+			continue
+		}
+		clientIDs := h.userClients[userID]
+		if h.userHasDMSubscription(clientIDs, subscribers) {
+			continue
+		}
+		for clientID := range clientIDs {
+			candidates = appendDMMessageDeliveryCandidate(candidates, h.clients[clientID], nil)
+		}
+	}
+	return candidates
+}
+
+func (h *Hub) dmMessageMentionCandidates(msg DMBroadcastMessage, candidates []dmMessageDeliveryCandidate) []dmMessageDeliveryCandidate {
+	subscribers := h.dmSubscriptions[msg.ConversationID]
+	for userID := range msg.MentionTargets {
+		if msg.ExcludeUser != nil && userID == *msg.ExcludeUser {
+			continue
+		}
+		for clientID := range h.userClients[userID] {
+			if subscribers[clientID] {
+				continue
+			}
+			candidates = appendDMMessageDeliveryCandidate(candidates, h.clients[clientID], nil)
+		}
+	}
+	return candidates
+}
+
+func deliverDMMessageDelivery(ctx context.Context, db *sql.DB, msg DMBroadcastMessage, candidates []dmMessageDeliveryCandidate, data []byte) ([]*Client, int, error) {
+	txCtx, cancelTx := context.WithCancel(context.WithoutCancel(ctx))
+	stopDeadline := context.AfterFunc(ctx, cancelTx)
+	defer func() {
+		stopDeadline()
+		cancelTx()
+	}()
+
+	tx, err := db.BeginTx(txCtx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin DM message-derived delivery: %w", err)
+	}
+	locked, err := lockDMMessageDeliveryParticipants(ctx, tx, msg.ConversationID, candidates)
+	if err != nil {
+		rollbackDMMessageDelivery(tx)
+		return nil, 0, err
+	}
+	visible, err := visibleDMMessageDeliveryRecipients(ctx, tx, msg.ConversationID, *msg.VisibilitySource, locked)
+	if err != nil {
+		rollbackDMMessageDelivery(tx)
+		return nil, 0, err
+	}
+	if !stopDeadline() {
+		rollbackDMMessageDelivery(tx)
+		return nil, 0, fmt.Errorf("DM message-derived delivery deadline: %w", ctx.Err())
+	}
+	failed := make([]*Client, 0)
+	busyDrops := 0
+	for _, candidate := range candidates {
+		if !visible[candidate.userID] {
+			continue
+		}
+		switch candidate.client.tryEnqueueDMMessageDelivery(data) {
+		case dmMessageDeliveryEnqueueFailed:
+			failed = append(failed, candidate.client)
+		case dmMessageDeliveryEnqueueBusy:
+			busyDrops++
+		}
+	}
+	// Keep the participant locks through finalization, while allowing the
+	// immediate enqueue above to finish without deadline cancellation.
+	stopDeadline = context.AfterFunc(ctx, cancelTx)
+	if err := tx.Commit(); err != nil {
+		rollbackDMMessageDelivery(tx)
+		return failed, busyDrops, fmt.Errorf("commit DM message-derived delivery: %w", err)
+	}
+	return failed, busyDrops, nil
+}
+
+func dmMessageDeliveryFailureClass(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "database"
+	}
+}
+
+func appendDMMessageDeliveryCandidate(candidates []dmMessageDeliveryCandidate, client *Client, excludeUser *uuid.UUID) []dmMessageDeliveryCandidate {
+	if client == nil || (excludeUser != nil && client.UserID == *excludeUser) {
+		return candidates
+	}
+	return append(candidates, dmMessageDeliveryCandidate{client: client, userID: client.UserID})
+}
+
+func lockDMMessageDeliveryParticipants(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID uuid.UUID,
+	candidates []dmMessageDeliveryCandidate,
+) (locked map[uuid.UUID]bool, err error) {
+	userIDs := make([]string, 0, len(candidates))
+	seen := make(map[uuid.UUID]bool, len(candidates))
+	for _, candidate := range candidates {
+		if seen[candidate.userID] {
+			continue
+		}
+		seen[candidate.userID] = true
+		userIDs = append(userIDs, candidate.userID.String())
+	}
+	if len(userIDs) == 0 {
+		return make(map[uuid.UUID]bool), nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT user_id
+		FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = ANY($2::uuid[])
+		ORDER BY user_id FOR SHARE`, conversationID, uuidArrayParam(userIDs))
+	if err != nil {
+		return nil, fmt.Errorf("lock DM message delivery participants: %w", err)
 	}
 	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			log.Printf("Failed to close DM participant rows: %v", closeErr)
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			locked = nil
+			err = fmt.Errorf("close locked DM message delivery participants: %w", closeErr)
 		}
 	}()
 
-	var participants []uuid.UUID
+	locked = make(map[uuid.UUID]bool, len(userIDs))
 	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err != nil {
-			return nil, fmt.Errorf("scan DM participant: %w", err)
+		var userID uuid.UUID
+		if scanErr := rows.Scan(&userID); scanErr != nil {
+			return nil, fmt.Errorf("scan locked DM message delivery participant: %w", scanErr)
 		}
-		parsed, err := uuid.Parse(uid)
-		if err != nil {
-			return nil, fmt.Errorf("parse DM participant %q: %w", sanitizeLogValue(uid), err)
+		locked[userID] = true
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("iterate locked DM message delivery participants: %w", rowsErr)
+	}
+	return locked, nil
+}
+
+func visibleDMMessageDeliveryRecipients(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID uuid.UUID,
+	source DMMessageVisibilitySource,
+	lockedParticipants map[uuid.UUID]bool,
+) (recipients map[uuid.UUID]bool, err error) {
+	if len(lockedParticipants) == 0 {
+		return make(map[uuid.UUID]bool), nil
+	}
+	userIDs := make([]string, 0, len(lockedParticipants))
+	for userID := range lockedParticipants {
+		userIDs = append(userIDs, userID.String())
+	}
+
+	var rows *sql.Rows
+	if source.isPersisted() {
+		//nolint:gosec // G202: aliases are compile-time constants; values are parameterized.
+		rows, err = tx.QueryContext(ctx, `
+			SELECT dp.user_id
+			FROM dm_participants dp
+			JOIN dm_messages m ON m.id = $2 AND m.conversation_id = dp.conversation_id
+			WHERE dp.conversation_id = $1 AND dp.user_id = ANY($3::uuid[])`+
+			dmvisibility.HiddenRangeFilterForViewerExpr("m", "dp.user_id"),
+			conversationID, source.messageID, uuidArrayParam(userIDs))
+	} else if source.isDeleted() {
+		//nolint:gosec // G202: aliases are compile-time constants; values are parameterized.
+		rows, err = tx.QueryContext(ctx, `
+			WITH source AS (
+				SELECT $2::uuid AS user_id, $3::timestamptz AS created_at, $1::uuid AS conversation_id
+			)
+			SELECT dp.user_id
+			FROM dm_participants dp
+			CROSS JOIN source m
+			WHERE dp.conversation_id = $1 AND dp.user_id = ANY($4::uuid[])`+
+			dmvisibility.HiddenRangeFilterForViewerExpr("m", "dp.user_id"),
+			conversationID, source.deletedAuthorID, source.deletedCreatedAt, uuidArrayParam(userIDs))
+	} else {
+		return nil, errors.New("invalid DM message delivery source")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query DM message delivery visibility: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			recipients = nil
+			err = fmt.Errorf("close DM message delivery visibility: %w", closeErr)
 		}
-		participants = append(participants, parsed)
+	}()
+
+	recipients = make(map[uuid.UUID]bool, len(lockedParticipants))
+	for rows.Next() {
+		var userID uuid.UUID
+		if scanErr := rows.Scan(&userID); scanErr != nil {
+			return nil, fmt.Errorf("scan DM message delivery visibility: %w", scanErr)
+		}
+		recipients[userID] = true
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate DM participants: %w", err)
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("iterate DM message delivery visibility: %w", rowsErr)
 	}
-	return participants, nil
+	return recipients, nil
+}
+
+func rollbackDMMessageDelivery(tx *sql.Tx) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		log.Printf("DM message-derived delivery rollback failed: class=%s", dmMessageDeliveryFailureClass(err))
+	}
+}
+
+func respawnDMParticipantVisibility(ctx context.Context, tx *sql.Tx, conversationID uuid.UUID, createdAt time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE dm_participants SET hidden_at = NULL
+		WHERE conversation_id = $1 AND hidden_at < $2`, conversationID, createdAt); err != nil {
+		return fmt.Errorf("respawn DM participant visibility: %w", err)
+	}
+	return nil
 }
 
 // userHasDMSubscription checks whether any of a user's clients are subscribed
@@ -4413,28 +5278,6 @@ func (h *Hub) userHasDMSubscription(userClientIDs, dmClients map[uuid.UUID]bool)
 		}
 	}
 	return false
-}
-
-// notifyUnsubscribedUser sends data to all of a user's connected clients,
-// but only if none of them are already subscribed to the DM conversation.
-func (h *Hub) notifyUnsubscribedUser(uid uuid.UUID, dmClients map[uuid.UUID]bool, data []byte) {
-	userClientIDs, ok := h.userClients[uid]
-	if !ok {
-		return // user not connected
-	}
-	if h.userHasDMSubscription(userClientIDs, dmClients) {
-		return
-	}
-	h.sendToUserClients(userClientIDs, data)
-}
-
-// sendToUserClients sends raw message data to all of a user's connected clients.
-func (h *Hub) sendToUserClients(userClientIDs map[uuid.UUID]bool, data []byte) {
-	for clientID := range userClientIDs {
-		if c, ok := h.clients[clientID]; ok {
-			c.enqueueOutbound(data)
-		}
-	}
 }
 
 // handleDMTyping handles typing indicators for DM conversations.
@@ -4475,8 +5318,13 @@ func (h *Hub) handleDMTyping(msg IncomingMessage) {
 	}
 }
 
-// handleDMBroadcast sends a message to all subscribers of a DM conversation.
+// handleDMBroadcast sends an ordinary event or synchronously delivers a
+// message-derived event through its transaction-bound visibility path.
 func (h *Hub) handleDMBroadcast(msg DMBroadcastMessage) {
+	if msg.VisibilitySource != nil {
+		h.deliverDMMessageDerived(msg)
+		return
+	}
 	subscribers, ok := h.dmSubscriptions[msg.ConversationID]
 	if !ok {
 		return
@@ -4487,7 +5335,6 @@ func (h *Hub) handleDMBroadcast(msg DMBroadcastMessage) {
 		log.Printf("Failed to marshal DM broadcast message: %v", err)
 		return
 	}
-
 	for clientID := range subscribers {
 		client, ok := h.clients[clientID]
 		if !ok {
@@ -4530,6 +5377,35 @@ func (h *Hub) BroadcastToDM(conversationID uuid.UUID, msg OutgoingMessage) {
 	h.dmBroadcast <- DMBroadcastMessage{
 		ConversationID: conversationID,
 		Data:           msg,
+	}
+}
+
+// BroadcastToDMMessageRecipients sends a message-derived event only to
+// participants that can currently view its persisted source message.
+func (h *Hub) BroadcastToDMMessageRecipients(conversationID, messageID uuid.UUID, msg OutgoingMessage) {
+	visibilitySource := NewDMMessageVisibilitySource(messageID)
+	h.dmBroadcast <- DMBroadcastMessage{
+		ConversationID:   conversationID,
+		VisibilitySource: &visibilitySource,
+		VisibilityMode:   dmVisibilityDeliverySubscribers,
+		Data:             msg,
+	}
+}
+
+// BroadcastToDMMessageAllParticipants sends a message-derived event to every
+// connected participant who can currently view its source.
+func (h *Hub) BroadcastToDMMessageAllParticipants(
+	conversationID uuid.UUID,
+	source DMMessageVisibilitySource,
+	excludeUserID uuid.UUID,
+	msg OutgoingMessage,
+) {
+	h.dmBroadcast <- DMBroadcastMessage{
+		ConversationID:   conversationID,
+		VisibilitySource: &source,
+		VisibilityMode:   dmVisibilityDeliveryAllConnected,
+		ExcludeUser:      &excludeUserID,
+		Data:             msg,
 	}
 }
 
@@ -4626,11 +5502,7 @@ func (h *Hub) handleDisconnectUser(userID uuid.UUID) {
 		revokedMsg = nil
 	}
 	for _, client := range clients {
-		// Best-effort courtesy message (non-blocking)
-		if revokedMsg != nil {
-			client.enqueueOutbound(revokedMsg)
-		}
-		// Real enforcement: sever TCP connection
+		client.forceRevoke(revokedMsg)
 		h.handleUnregister(client)
 	}
 
@@ -4658,9 +5530,7 @@ func (h *Hub) handleDisconnectSession(sessionID string) {
 	var count int
 	for _, client := range h.clients {
 		if client.SessionID == sessionID {
-			if revokedMsg != nil {
-				client.enqueueOutbound(revokedMsg)
-			}
+			client.forceRevoke(revokedMsg)
 			h.handleUnregister(client)
 			count++
 		}
@@ -5729,42 +6599,27 @@ func (h *Hub) flushOnlineCounts() {
 	})
 }
 
-// collectPendingUsers drains onlineCountPending and returns the user IDs as query params.
-func (h *Hub) collectPendingUsers() []interface{} {
-	params := make([]interface{}, 0, len(h.onlineCountPending))
+// collectPendingUsers drains onlineCountPending and returns the user IDs.
+func (h *Hub) collectPendingUsers() []uuid.UUID {
+	userIDs := make([]uuid.UUID, 0, len(h.onlineCountPending))
 	for uid := range h.onlineCountPending {
-		params = append(params, uid)
+		userIDs = append(userIDs, uid)
 	}
 	clear(h.onlineCountPending)
-	return params
-}
-
-// buildPlaceholders creates a "$1,$2,..." parameterized IN clause for the given params.
-func buildPlaceholders(n int) string {
-	placeholders := make([]byte, 0, n*4)
-	for i := range n {
-		if i > 0 {
-			placeholders = append(placeholders, ',')
-		}
-		placeholders = append(placeholders, []byte(fmt.Sprintf("$%d", i+1))...)
-	}
-	return string(placeholders)
+	return userIDs
 }
 
 // queryServerMemberships returns all server->member mappings for servers that any of
 // the given users belong to, plus a set of all unique member IDs.
-func (h *Hub) queryServerMemberships(params []interface{}) (map[string][]uuid.UUID, map[uuid.UUID]bool, error) {
-	// Placeholders are safe — generated as $1,$2,… from loop index, not user input.
-	// nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query,concord-go-sql-sprintf — placeholders are $1,$2,… generated from loop index; values are parameterized
-	query := fmt.Sprintf( //nolint:gosec // G201
-		`SELECT sm.server_id, sm.user_id
+func (h *Hub) queryServerMemberships(userIDs []uuid.UUID) (map[string][]uuid.UUID, map[uuid.UUID]bool, error) {
+	const query = `SELECT sm.server_id, sm.user_id
 		FROM server_members sm
 		WHERE sm.server_id IN (
-			SELECT DISTINCT server_id FROM server_members WHERE user_id IN (%s)
+			SELECT DISTINCT server_id FROM server_members WHERE user_id = ANY($1::uuid[])
 		)
-	`, buildPlaceholders(len(params)))
+	`
 
-	rows, err := h.db.Query(query, params...)
+	rows, err := h.db.Query(query, pq.Array(userIDs))
 	if err != nil {
 		log.Printf("Failed to query memberships for online counts: %v", err)
 		return nil, nil, err

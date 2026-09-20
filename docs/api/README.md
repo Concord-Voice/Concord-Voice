@@ -63,7 +63,7 @@ It prints the union of supported operations from both surfaces and the
 `verify-openapi-coverage` CI job checks it against the router in both drift
 directions, so it cannot fall behind the way this table can.
 
-Counts as of 2026-08-28: 27 tags and 271 operations in `openapi.yaml`, plus 4
+Counts as of 2026-09-19: 27 tags and 277 operations in `openapi.yaml`, plus 4
 `Admin Metrics` operations in `admin-metrics.openapi.yaml`.
 
 | Tag | Ops | Representative paths | Auth |
@@ -78,7 +78,7 @@ Counts as of 2026-08-28: 27 tags and 271 operations in `openapi.yaml`, plus 4
 | Channels | 13 | `/channels`, `/channels/{id}`, `/channels/{id}/{read,overrides}` | Bearer |
 | ChannelGroups | 8 | `/servers/{id}/channel-groups`, `/categories/{id}/overrides`, `/categories/{id}/overrides/{override_id}` | Bearer |
 | Messages | 13 | `/channels/{id}/messages`, `/channels/{id}/messages/bulk`, `/channels/{id}/pins`, `/messages/{id}` | Bearer |
-| DM | 27 | `/dm/conversations`, `/dm/conversations/{personal,group}`, `/dm/conversations/{id}`, `/dm/conversations/{id}/{messages,members,keys,read}` | Bearer |
+| DM | 30 | `/dm/conversations`, `/dm/conversations/{personal,group}`, `/dm/conversations/{id}/{hide,clear}`, `/dm/conversations/{id}/{messages,members,keys,read}` | Bearer |
 | Direct Messages | 2 | `/dm/conversations/{id}/members/{userId}` | Bearer — a stray tag spelling of `DM` in the spec, listed so the row count reconciles |
 | E2EE | 9 | `/e2ee/pending-keys`, `/channels/{id}/keys`, `/channels/{id}/rotate-key`, `/dm/conversations/{id}/rotate-key` | Bearer |
 | Voice | 24 | `/channels/{id}/voice/{join,participants,authorize-action}`, `/servers/{id}/voice/{userId}/{mute,deafen,move,disconnect,temp-access}`, `/dm/conversations/{id}/voice/{join,ring,decline,cancel,participants}` | Bearer |
