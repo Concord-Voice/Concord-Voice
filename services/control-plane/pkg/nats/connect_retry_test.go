@@ -1,10 +1,26 @@
 package nats
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	natsgo "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFlushTimeoutRejectsANilClient(t *testing.T) {
+	var client *Client
+
+	require.ErrorIs(t, client.FlushTimeout(time.Second), natsgo.ErrInvalidConnection)
+}
+
+func TestRequestWithContextRejectsANilClient(t *testing.T) {
+	var client *Client
+
+	_, err := client.RequestWithContext(context.Background(), "voice.enforce.disconnect.ack", map[string]string{"action": "disconnect"})
+	require.ErrorIs(t, err, natsgo.ErrInvalidConnection)
+}
 
 // Issue #2854 finding A.
 //

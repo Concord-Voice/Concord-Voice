@@ -18,6 +18,8 @@ without losing the observation that triggered them.
 
 - **Voice channel lists recover more reliably after stale sessions** ([#3304](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3304), [#3298](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3298)) — the server retries delayed leave updates, and repeated updates no longer lower the displayed participant count or replay leave sounds.
 
+- **Dirty database migrations now require an explicit operator recovery** ([#3138](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3138)) — control-plane startup stops rather than guessing whether a partially applied migration can be replayed.
+
 - **Switching screen-share sources no longer drops or leaks per-app audio** ([#3369](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3369)) — a failed
   source switch now keeps the current share running, while cancelled or partially started captures
   release their audio process instead of publishing it later or leaving it behind.

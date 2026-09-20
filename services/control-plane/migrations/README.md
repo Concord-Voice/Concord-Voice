@@ -294,6 +294,10 @@ row and `pg_index.indisvalid`, then repair or drop only the identified partial
 concurrent index. Verify the intended schema and choose or force the correct clean
 version explicitly; never blindly force `version - 1`.
 
+Control-plane startup fails closed while the dirty marker is present; it does
+not clear the marker automatically. Inspect the schema and recover explicitly
+before restarting the service.
+
 ```bash
 # Inspect the dirty version and the affected indexes/schema
 make migrate-version

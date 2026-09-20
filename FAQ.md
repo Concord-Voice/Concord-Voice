@@ -790,6 +790,10 @@ make migrate-down
 docker exec -it concordvoice-postgres psql -U concord -d concord -c "SELECT version FROM schema_migrations;"
 ```
 
+If the reported migration is dirty, server startup stops because the applied
+schema is ambiguous. Inspect and correct it before using `cmd/migrate force`
+with the last verified-good version.
+
 ---
 
 ### WebSocket connection fails

@@ -2,6 +2,7 @@
 package nats
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,6 +93,24 @@ func (c *Client) Publish(subject string, data interface{}) error {
 	return c.conn.Publish(subject, payload)
 }
 
+// RequestWithContext sends a JSON request and returns the responder's raw JSON
+// reply. A caller that owns a durable outbox must validate the reply before
+// acknowledging its local obligation.
+func (c *Client) RequestWithContext(ctx context.Context, subject string, data interface{}) ([]byte, error) {
+	if c == nil || c.conn == nil {
+		return nil, nats.ErrInvalidConnection
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("nats marshal request: %w", err)
+	}
+	response, err := c.conn.RequestWithContext(ctx, subject, payload)
+	if err != nil {
+		return nil, fmt.Errorf("nats request: %w", err)
+	}
+	return response.Data, nil
+}
+
 // Flush blocks until the server has processed all buffered messages and
 // subscription interest from this connection. It closes the well-known NATS race
 // where a Subscribe followed by an immediate Publish on a different connection can
@@ -103,6 +122,16 @@ func (c *Client) Flush() error {
 		return nil
 	}
 	return c.conn.Flush()
+}
+
+// FlushTimeout waits for the NATS server round trip within the supplied bound.
+// It does not confirm JetStream persistence, consumer processing, or an
+// application-level acknowledgement.
+func (c *Client) FlushTimeout(timeout time.Duration) error {
+	if c == nil || c.conn == nil {
+		return nats.ErrInvalidConnection
+	}
+	return c.conn.FlushTimeout(timeout)
 }
 
 // Drain outcomes. These are OUR sentinels, not nats.go's, so callers classify

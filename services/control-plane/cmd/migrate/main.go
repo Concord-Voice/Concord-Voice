@@ -22,7 +22,7 @@ func main() {
 		steps          = flag.Int("steps", 0, "Number of migrations to run/rollback (0 = all)")
 		command        = flag.String("command", "", "Migration command: up, down, force, version, create")
 		migrationName  = flag.String("name", "", "Name for new migration (used with 'create' command)")
-		forceVersion   = flag.Int("force-version", -1, "Version to force (used with 'force' command)")
+		forceVersion   = flag.Int("force-version", -1, "Version to force after inspecting schema state (used with 'force' command)")
 	)
 	flag.Parse()
 
@@ -57,18 +57,18 @@ func printUsage() {
 	fmt.Println("\nCommands:")
 	fmt.Println("  up      - Apply all pending migrations (or use -steps=N for specific count)")
 	fmt.Println("  down    - Rollback migrations (use -steps=N, default=1)")
-	fmt.Println("  force   - Force migration version (fixes dirty state). Use -force-version=N")
+	fmt.Println("  force   - Explicit operator recovery after inspecting schema state; marks the target applied/skips it. Do not use to waive a failed safety preflight. Use -force-version=N")
 	fmt.Println("  version - Show current migration version")
 	fmt.Println("  create  - Create new migration files (requires -name)")
 	fmt.Println("\nOptions:")
 	fmt.Println("  -path           Path to migrations directory (default: migrations)")
 	fmt.Println("  -steps          Number of migrations to apply/rollback")
-	fmt.Println("  -force-version  Version number to force (used with 'force' command)")
+	fmt.Println("  -force-version  Version number to force after schema inspection; marks that migration applied/skips it")
 	fmt.Println("  -name           Name for new migration")
 	fmt.Println("\nExamples:")
 	fmt.Println("  migrate -command=up")
 	fmt.Println("  migrate -command=down -steps=1")
-	fmt.Println("  migrate -command=force -force-version=19")
+	fmt.Println("  migrate -command=force -force-version=19  # operator recovery only; inspect schema first")
 	fmt.Println("  migrate -command=create -name=add_user_status")
 }
 
@@ -152,16 +152,16 @@ func runDown(m *migrate.Migrate, steps int) {
 
 func runForce(m *migrate.Migrate, forceVersion int) {
 	if forceVersion < -1 {
-		log.Fatal("Force requires -force-version=N (use -1 to reset to no version)")
+		log.Fatal("Force requires -force-version=N (use -1 to reset to no version); use only for explicit operator recovery after schema inspection")
 	}
 	if err := m.Force(forceVersion); err != nil {
-		log.Fatalf("Force failed: %v", err)
+		log.Fatalf("Force failed (operator recovery only; do not use to waive a failed safety preflight): %v", err)
 	}
 	if forceVersion == -1 {
-		fmt.Println("Reset migration version to no version (clean)")
+		fmt.Println("Reset migration version to no version (clean); operator recovery only after schema inspection")
 		return
 	}
-	fmt.Printf("Forced migration version to %d (clean)\n", forceVersion)
+	fmt.Printf("Forced migration version to %d (clean; target marked applied/skipped; operator recovery only after schema inspection)\n", forceVersion)
 }
 
 func runVersion(m *migrate.Migrate) {
