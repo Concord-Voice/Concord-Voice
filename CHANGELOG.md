@@ -16,6 +16,13 @@ without losing the observation that triggered them.
 
 ### Fixed
 
+- **The Concord logo on the sign-in screens is readable in light themes** — the logo's
+  lettering was drawn in white, so with a light theme selected the word CONCORD and the
+  "Own your voice" line underneath all but disappeared, leaving only the moon. On a pure
+  white background it vanished completely. The sign-in, sign-up, account-recovery and
+  first-launch screens now show a dark-lettered version of the logo whenever a light theme
+  is active, and the original white one in dark themes. It also follows your system
+  setting if you have the theme set to match it, switching as soon as the system does.
 - **Voice channel lists recover more reliably after stale sessions** ([#3304](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3304), [#3298](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3298), [#3370](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3370)) — the server retries delayed leave updates, and repeated updates no longer lower the displayed participant count or replay leave sounds. A delayed old-channel leave can no longer overwrite a participant who has already moved or been removed.
 
 - **Dirty database migrations now require an explicit operator recovery** ([#3138](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3138)) — control-plane startup stops rather than guessing whether a partially applied migration can be replayed.

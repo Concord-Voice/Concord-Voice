@@ -890,8 +890,10 @@ describe('AccountRecovery', () => {
 
   it('renders the Concord Voice logo', () => {
     render(<AccountRecovery onBack={onBack} onComplete={onComplete} />);
-    const logo = screen.getByAltText('Concord Voice');
-    expect(logo).toBeInTheDocument();
+    // Both theme variants of the wordmark: CSS shows exactly one per theme (asserted in
+    // real Chromium by tests/e2e/auth-wordmark.spec.ts). Two here, rather than "at least
+    // one", is what catches a regression back to a bare white-only image.
+    expect(screen.getAllByAltText('Concord Voice')).toHaveLength(2);
   });
 
   // --- Upfront request_id validation ---

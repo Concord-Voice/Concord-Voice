@@ -6,8 +6,9 @@ Electron client. They are self-hosted (served from the packaged bundle / rendere
 
 ## Files shipped
 
-| File                               | Description                        | Owner / License                           |
-| ---------------------------------- | ---------------------------------- | ----------------------------------------- |
-| `main-logo-transparent-vector.svg` | Full Concord Voice logo (wordmark) | © Concord Voice LLC — all rights reserved |
-| `symbol-transparent-vector.svg`    | Concord Voice symbol mark (icon)   | © Concord Voice LLC — all rights reserved |
-| `logo-transparent-icon.png`        | Concord Voice icon (raster)        | © Concord Voice LLC — all rights reserved |
+| File                                     | Description                                       | Owner / License                           |
+| ---------------------------------------- | ------------------------------------------------- | ----------------------------------------- |
+| `main-logo-transparent-vector.svg`       | Full Concord Voice logo (wordmark)                | © Concord Voice LLC — all rights reserved |
+| `main-logo-transparent-vector-light.svg` | Full logo, light-theme variant (dark letterforms) | © Concord Voice LLC — all rights reserved |
+| `symbol-transparent-vector.svg`          | Concord Voice symbol mark (icon)                  | © Concord Voice LLC — all rights reserved |
+| `logo-transparent-icon.png`              | Concord Voice icon (raster)                       | © Concord Voice LLC — all rights reserved |

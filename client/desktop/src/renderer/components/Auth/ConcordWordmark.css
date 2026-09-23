@@ -1,0 +1,20 @@
+/* Show exactly one wordmark variant for the active theme. See ConcordWordmark.tsx.
+
+   These rules only ever HIDE, never show. An "un-hide" rule would have to pick a display
+   value, and `revert` means the UA default rather than whatever a call site's sizing class
+   declares — so it would silently fight any future `display` added to `.login-logo` and
+   friends. Hiding the wrong variant leaves the right one on its call site's own display.
+
+   Both selectors out-rank the call sites' single-class sizing rules on specificity alone
+   — (0,2,0) and (0,3,0) against (0,1,0) — so no source-order dependency is involved.
+
+   `:not([data-theme='light'])` rather than `[data-theme='dark']` so the dark variant is
+   the fallback: an unset or unexpected theme value shows the original asset, which is what
+   every auth screen rendered before this change. */
+[data-theme='light'] .concord-wordmark--dark-theme {
+  display: none;
+}
+
+:root:not([data-theme='light']) .concord-wordmark--light-theme {
+  display: none;
+}

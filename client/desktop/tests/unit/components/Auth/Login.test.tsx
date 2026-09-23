@@ -193,7 +193,8 @@ describe('Login', () => {
 
   it('renders Concord logo', () => {
     render(<Login {...defaultProps} />);
-    expect(screen.getByAltText('Concord Voice')).toBeInTheDocument();
+    // Both theme variants of the wordmark — see the note in AccountRecovery.test.tsx.
+    expect(screen.getAllByAltText('Concord Voice')).toHaveLength(2);
   });
 
   // ── Password visibility toggle (#1917) ──────────────────────────────────

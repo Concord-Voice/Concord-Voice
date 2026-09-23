@@ -48,6 +48,7 @@ import { Eye, EyeOff } from 'lucide-react';
 import { base64urlToBuffer } from '../../utils/crypto/base64url';
 import './Login.css';
 import './TOTPInput.css';
+import ConcordWordmark from './ConcordWordmark';
 
 const AuthenticatorTransportSchema = z.enum([
   'ble',
@@ -1436,11 +1437,7 @@ const Login: React.FC<LoginProps> = ({
       <div className="login-container">
         <div className="login-content">
           <div className="login-header">
-            <img
-              src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-              className="login-logo"
-              alt="Concord Voice"
-            />
+            <ConcordWordmark className="login-logo" />
             <h2 className="login-title">Two-Factor Authentication</h2>
             <p className="login-subtitle">{mfaSubtitle}</p>
           </div>
@@ -1564,11 +1561,7 @@ const Login: React.FC<LoginProps> = ({
       <div className="login-container">
         <div className="login-content">
           <div className="login-header">
-            <img
-              src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-              className="login-logo"
-              alt="Concord Voice"
-            />
+            <ConcordWordmark className="login-logo" />
             <h2 className="login-title">Welcome Back</h2>
             <p className="login-subtitle">
               {isEmpty
@@ -1610,11 +1603,7 @@ const Login: React.FC<LoginProps> = ({
       )}
       <div className="login-content">
         <div className="login-header">
-          <img
-            src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-            className="login-logo"
-            alt="Concord Voice"
-          />
+          <ConcordWordmark className="login-logo" />
           <h2 className="login-title">Welcome Back</h2>
           <p className="login-subtitle">Sign in to your Concord Voice account</p>
         </div>

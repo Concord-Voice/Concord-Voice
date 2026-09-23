@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ConnectionMode } from '../../types/auth';
 import './ConnectionSelector.css';
+import ConcordWordmark from './ConcordWordmark';
 
 const SELF_HOSTING_HELP_URL = 'https://concordvoice.com/self-hosting';
 
@@ -30,11 +31,7 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ onSelect }) => 
       <div className="connection-content">
         {/* Logo and Tagline */}
         <div className="connection-header">
-          <img
-            src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-            alt="Concord Voice"
-            className="connection-logo"
-          />
+          <ConcordWordmark className="connection-logo" />
         </div>
 
         {/* Connection Options */}

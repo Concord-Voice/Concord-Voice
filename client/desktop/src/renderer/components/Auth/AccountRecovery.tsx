@@ -15,6 +15,7 @@ import { apiUrl } from '../../services/system/runtimeServerBase';
 import { assertValidUUID, isValidUUID } from '../../utils/runtime/uuid';
 import LoadingSpinner from './LoadingSpinner';
 import './Login.css';
+import ConcordWordmark from './ConcordWordmark';
 
 type RecoveryStep =
   | 'email'
@@ -406,11 +407,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
       <div className="login-container">
         <div className="login-content">
           <div className="login-header">
-            <img
-              src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-              className="login-logo"
-              alt="Concord Voice"
-            />
+            <ConcordWordmark className="login-logo" />
             <h2 className="login-title">Password Reset Complete</h2>
             <p className="login-subtitle">{success}</p>
           </div>
@@ -428,11 +425,7 @@ const AccountRecovery: React.FC<AccountRecoveryProps> = ({ onBack, onComplete })
     <div className="login-container">
       <div className="login-content">
         <div className="login-header">
-          <img
-            src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-            className="login-logo"
-            alt="Concord Voice"
-          />
+          <ConcordWordmark className="login-logo" />
           <h2 className="login-title">Account Recovery</h2>
           <p className="login-subtitle">
             {step === 'email' && 'Enter your email to receive a recovery code'}

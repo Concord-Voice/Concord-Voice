@@ -17,6 +17,7 @@ import {
   type PendingRegistrationResponse,
 } from '../../stores/auth/pendingRegistrationStore';
 import './Register.css';
+import ConcordWordmark from './ConcordWordmark';
 
 export interface RegisterProps {
   onBack: () => void;
@@ -285,11 +286,7 @@ const Register: React.FC<RegisterProps> = ({ onBack, onSuccess, onSwitchToLogin 
     <div className="register-container">
       <div className="register-content">
         <div className="register-header">
-          <img
-            src="./branding/Concord-Voice/logos/main-logo-transparent-vector.svg"
-            className="register-logo"
-            alt="Concord Voice"
-          />
+          <ConcordWordmark className="register-logo" />
           <h2 className="register-title">Create Your Account</h2>
           <p className="register-subtitle">
             Join the Concord Voice network with end-to-end encryption
