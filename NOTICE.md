@@ -1,6 +1,6 @@
 # NOTICE — Third-Party Software Used by Concord Voice
 
-**Generated:** 2026-09-16
+**Generated:** 2026-09-23
 **MinIO distribution addendum updated:** 2026-07-12
 **Admin portal family added:** 2026-08-28
 **Concord Voice License:** [Concord Voice Source License 1.0 (CVSL 1.0)](./LICENSE) → AGPL-3.0-or-later on 2030-02-15
@@ -13,7 +13,7 @@ contributions of these projects to the Concord Voice platform.
 
 ## Summary
 
-Concord Voice distributes 398 third-party software components across its four
+Concord Voice distributes 399 third-party software components across its four
 CVSL application artifact families:
 
 - **59** Go modules linked into the control-plane runtime binaries. The image
@@ -21,7 +21,7 @@ CVSL application artifact families:
   `mfa-rekey` (`services/control-plane/Dockerfile:39-41,57-59`) — and the table
   is the union of what all three link. The image also carries the admin portal
   bundle below, so it is not Go-only.
-- **187** npm packages in the desktop client production bundle (plus Electron and its bundled components)
+- **188** npm packages in the desktop client production bundle (plus Electron and its bundled components)
 - **148** npm packages in the media-plane production bundle
 - **4** npm packages in the admin portal production bundle (`client/admin`),
   compiled by the `admin-ui-builder` stage and copied into the control-plane
@@ -37,7 +37,7 @@ Application-dependency license distribution:
 
 | License family | Share | Compatible with CVSL 1.0 + AGPL-3.0 |
 |---|---|---|
-| MIT | 82.4% (328) | ✓ |
+| MIT | 82.5% (329) | ✓ |
 | ISC | 6.3% (25) | ✓ |
 | Apache-2.0 | 4.5% (18) | ✓ |
 | BSD-3-Clause | 3.8% (15) | ✓ |
@@ -48,9 +48,9 @@ Application-dependency license distribution:
 | MPL-2.0 (build-time only) | not in the count above | ✓ |
 | CC-BY-3.0 / CC-BY-4.0 (build-data only) | not in the count above | ✓ (attribution required) |
 
-Shares are exact counts over the 398 components tabulated below, not estimates.
+Shares are exact counts over the 399 components tabulated below, not estimates.
 The final two rows cover build-time and build-data dependencies, which are not
-part of that 398 and therefore carry no share of it; see
+part of that 399 and therefore carry no share of it; see
 [docs/legal/dependency-license-audit.md](docs/legal/dependency-license-audit.md)
 for their treatment.
 
@@ -58,7 +58,7 @@ No GPL, AGPL, SSPL, BUSL, Elastic License, Commons Clause, or other strong
 copyleft / non-commercial dependency is linked into or bundled with the four
 CVSL application artifact families counted above. Concord's separately
 distributed MinIO server image is an AGPL-3.0-or-later upstream program and is
-recorded separately below; it is not part of the 398-component count.
+recorded separately below; it is not part of the 399-component count.
 
 ## License Texts
 
@@ -154,18 +154,18 @@ current tree rather than a guarantee.
 | github.com/boombuler/barcode | v1.1.0 | MIT |
 | github.com/cespare/xxhash/v2 | v2.3.0 | MIT |
 | github.com/coreos/go-oidc/v3 | v3.21.0 | Apache-2.0 |
-| github.com/dustin/go-humanize | v1.0.1 | MIT |
-| github.com/fxamacker/cbor/v2 | v2.9.3 | MIT |
+| github.com/dustin/go-humanize | v1.1.0 | MIT |
+| github.com/fxamacker/cbor/v2 | v2.9.4 | MIT |
 | github.com/gabriel-vasile/mimetype | v1.4.15 | MIT |
 | github.com/gin-contrib/sse | v1.1.2 | MIT |
 | github.com/gin-gonic/gin | v1.12.0 | MIT |
 | github.com/go-jose/go-jose/v4 | v4.1.5 | Apache-2.0 |
 | github.com/go-playground/locales | v0.14.1 | MIT |
-| github.com/go-playground/universal-translator | v0.18.1 | MIT |
-| github.com/go-playground/validator/v10 | v10.30.4 | MIT |
+| github.com/go-playground/universal-translator | v0.18.2 | MIT |
+| github.com/go-playground/validator/v10 | v10.30.5 | MIT |
 | github.com/go-viper/mapstructure/v2 | v2.5.0 | MIT |
-| github.com/go-webauthn/webauthn | v0.18.0 | BSD-3-Clause |
-| github.com/go-webauthn/x | v0.3.0 | BSD-3-Clause |
+| github.com/go-webauthn/webauthn | v0.18.2 | BSD-3-Clause |
+| github.com/go-webauthn/x | v0.3.1 | BSD-3-Clause |
 | github.com/goccy/go-yaml | v1.19.2 | MIT |
 | github.com/golang-jwt/jwt/v5 | v5.3.1 | MIT |
 | github.com/golang-migrate/migrate/v4 | v4.20.1 | MIT |
@@ -182,14 +182,14 @@ current tree rather than a guarantee.
 | github.com/minio/crc64nvme | v1.1.1 | Apache-2.0 |
 | github.com/minio/md5-simd | v1.1.2 | Apache-2.0 |
 | github.com/minio/minio-go/v7 | v7.3.0 | Apache-2.0 |
-| github.com/nats-io/nats.go | v1.53.1 | Apache-2.0 |
+| github.com/nats-io/nats.go | v1.54.0 | Apache-2.0 |
 | github.com/nats-io/nkeys | v0.4.16 | Apache-2.0 |
 | github.com/nats-io/nuid | v1.0.1 | Apache-2.0 |
 | github.com/pelletier/go-toml/v2 | v2.4.3 | MIT |
 | github.com/philhofer/fwd | v1.2.0 | MIT |
 | github.com/pquerna/otp | v1.5.0 | Apache-2.0 |
 | github.com/quic-go/qpack | v0.6.0 | MIT |
-| github.com/quic-go/quic-go | v0.62.0 | MIT |
+| github.com/quic-go/quic-go | v0.63.0 | MIT |
 | github.com/redis/go-redis/v9 | v9.22.0 | BSD-2-Clause |
 | github.com/rs/xid | v1.6.0 | MIT |
 | github.com/tinylib/msgp | v1.6.4 | MIT |
@@ -198,13 +198,13 @@ current tree rather than a guarantee.
 | github.com/vmihailenco/tagparser/v2 | v2.0.0 | BSD-2-Clause |
 | github.com/x448/float16 | v0.8.4 | MIT |
 | github.com/zeebo/xxh3 | v1.1.0 | BSD-2-Clause |
-| go.mongodb.org/mongo-driver/v2 | v2.9.0 | Apache-2.0 |
-| go.uber.org/atomic | v1.11.0 | MIT |
+| go.mongodb.org/mongo-driver/v2 | v2.9.1 | Apache-2.0 |
+| go.uber.org/atomic | v1.12.0 | MIT |
 | go.yaml.in/yaml/v3 | v3.0.5 | MIT |
 | golang.org/x/crypto | v0.57.0 | BSD-3-Clause |
 | golang.org/x/image | v0.46.0 | BSD-3-Clause |
-| golang.org/x/net | v0.58.0 | BSD-3-Clause |
-| golang.org/x/oauth2 | v0.36.0 | BSD-3-Clause |
+| golang.org/x/net | v0.59.0 | BSD-3-Clause |
+| golang.org/x/oauth2 | v0.37.0 | BSD-3-Clause |
 | golang.org/x/sync | v0.23.0 | BSD-3-Clause |
 | golang.org/x/sys | v0.48.0 | BSD-3-Clause |
 | golang.org/x/text | v0.42.0 | BSD-3-Clause |
@@ -224,6 +224,7 @@ bundle (client/desktop):
 | @lukeed/uuid | 2.0.1 | MIT | https://github.com/lukeed/uuid |
 | @msgpack/msgpack | 3.1.3 | ISC | https://github.com/msgpack/msgpack-javascript |
 | @noble/hashes | 2.4.0 | MIT | https://github.com/paulmillr/noble-hashes |
+| @remix-run/route-pattern | 0.22.1 | MIT | https://github.com/remix-run/remix |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/debug | 4.1.13 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/estree-jsx | 1.0.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
@@ -232,7 +233,7 @@ bundle (client/desktop):
 | @types/hast | 3.0.4 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/mdast | 4.0.4 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ms | 2.1.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/react | 19.2.18 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/react | 19.3.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/unist | 2.0.11 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/unist | 3.0.3 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @ungap/structured-clone | 1.3.0 | ISC | https://github.com/ungap/structured-clone |
@@ -300,7 +301,7 @@ bundle (client/desktop):
 | lodash.isequal | 4.5.0 | MIT | https://github.com/lodash/lodash |
 | longest-streak | 3.1.0 | MIT | https://github.com/wooorm/longest-streak |
 | lowlight | 3.3.0 | MIT | https://github.com/wooorm/lowlight |
-| lucide-react | 1.43.0 | ISC | https://github.com/lucide-icons/lucide |
+| lucide-react | 1.46.0 | ISC | https://github.com/lucide-icons/lucide |
 | markdown-table | 3.0.4 | MIT | https://github.com/wooorm/markdown-table |
 | mdast-util-find-and-replace | 3.0.2 | MIT | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | mdast-util-from-markdown | 2.0.3 | MIT | https://github.com/syntax-tree/mdast-util-from-markdown |
@@ -317,7 +318,7 @@ bundle (client/desktop):
 | mdast-util-to-hast | 13.2.1 | MIT | https://github.com/syntax-tree/mdast-util-to-hast |
 | mdast-util-to-markdown | 2.1.2 | MIT | https://github.com/syntax-tree/mdast-util-to-markdown |
 | mdast-util-to-string | 4.0.0 | MIT | https://github.com/syntax-tree/mdast-util-to-string |
-| mediasoup-client | 3.23.1 | ISC | https://github.com/versatica/mediasoup-client |
+| mediasoup-client | 3.23.2 | ISC | https://github.com/versatica/mediasoup-client |
 | micromark-core-commonmark | 2.0.3 | MIT | https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark |
 | micromark-extension-gfm-autolink-literal | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-autolink-literal |
 | micromark-extension-gfm-footnote | 2.1.0 | MIT | https://github.com/micromark/micromark-extension-gfm-footnote |
@@ -357,10 +358,10 @@ bundle (client/desktop):
 | pngjs | 5.0.0 | MIT | https://github.com/lukeapage/pngjs |
 | property-information | 7.1.0 | MIT | https://github.com/wooorm/property-information |
 | qrcode | 1.5.4 | MIT | https://github.com/soldair/node-qrcode |
-| react-dom | 19.2.8 | MIT | https://github.com/react/react |
+| react-dom | 19.3.0 | MIT | https://github.com/react/react |
 | react-markdown | 10.1.0 | MIT | https://github.com/remarkjs/react-markdown |
-| react-router | 8.3.1 | MIT | https://github.com/remix-run/react-router |
-| react | 19.2.8 | MIT | https://github.com/react/react |
+| react-router | 8.4.0 | MIT | https://github.com/remix-run/react-router |
+| react | 19.3.0 | MIT | https://github.com/react/react |
 | rehype-highlight | 7.0.2 | MIT | https://github.com/rehypejs/rehype-highlight |
 | rehype-sanitize | 6.0.0 | MIT | https://github.com/rehypejs/rehype-sanitize |
 | remark-gfm | 4.0.1 | MIT | https://github.com/remarkjs/remark-gfm |
@@ -370,7 +371,7 @@ bundle (client/desktop):
 | require-directory | 2.1.1 | MIT | https://github.com/troygoode/node-require-directory |
 | require-main-filename | 2.0.0 | ISC | https://github.com/yargs/require-main-filename |
 | sax | 1.6.0 | BlueOak-1.0.0 | https://github.com/isaacs/sax-js |
-| scheduler | 0.27.0 | MIT | https://github.com/facebook/react |
+| scheduler | 0.28.0 | MIT | https://github.com/react/react |
 | sdp-transform | 3.0.0 | MIT | https://github.com/clux/sdp-transform |
 | semver | 7.7.4 | ISC | https://github.com/npm/node-semver |
 | set-blocking | 2.0.0 | ISC | https://github.com/yargs/set-blocking |
@@ -394,7 +395,7 @@ bundle (client/desktop):
 | unist-util-visit-parents | 6.0.2 | MIT | https://github.com/syntax-tree/unist-util-visit-parents |
 | unist-util-visit | 5.1.0 | MIT | https://github.com/syntax-tree/unist-util-visit |
 | universalify | 2.0.1 | MIT | https://github.com/RyanZim/universalify |
-| use-sync-external-store | 1.6.0 | MIT | https://github.com/facebook/react |
+| use-sync-external-store | 1.7.0 | MIT | https://github.com/react/react |
 | vfile-message | 4.0.3 | MIT | https://github.com/vfile/vfile-message |
 | vfile | 6.0.3 | MIT | https://github.com/vfile/vfile |
 | which-module | 2.0.1 | ISC | https://github.com/nexdrew/which-module |
@@ -404,7 +405,7 @@ bundle (client/desktop):
 | y18n | 4.0.3 | ISC | https://github.com/yargs/y18n |
 | yargs-parser | 18.1.3 | ISC | https://github.com/yargs/yargs-parser |
 | yargs | 15.4.1 | MIT | https://github.com/yargs/yargs |
-| zod | 4.5.4 | MIT | https://github.com/colinhacks/zod |
+| zod | 4.6.5 | MIT | https://github.com/colinhacks/zod |
 | zustand | 5.0.13 | MIT | https://github.com/pmndrs/zustand |
 | zwitch | 2.0.4 | MIT | https://github.com/wooorm/zwitch |
 
@@ -428,7 +429,7 @@ bundle (services/media-plane):
 | @so-ric/colorspace | 1.1.6 | MIT | https://github.com/so-ric/colorspace |
 | @socket.io/component-emitter | 3.1.2 | MIT | https://github.com/socketio/emitter |
 | @types/cors | 2.8.19 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
-| @types/node | 26.5.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/node | 26.5.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/triple-beam | 1.3.5 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | accepts | 1.3.8 | MIT | https://github.com/jshttp/accepts |
@@ -584,10 +585,10 @@ guarantee — do not read either table as covering the other.
 
 | Package | Version | License | Repository |
 |---|---|---|---|
-| lucide-react | 1.43.0 | ISC | https://github.com/lucide-icons/lucide |
-| react-dom | 19.2.8 | MIT | https://github.com/react/react |
-| react | 19.2.8 | MIT | https://github.com/react/react |
-| scheduler | 0.27.0 | MIT | https://github.com/facebook/react |
+| lucide-react | 1.46.0 | ISC | https://github.com/lucide-icons/lucide |
+| react-dom | 19.3.0 | MIT | https://github.com/react/react |
+| react | 19.3.0 | MIT | https://github.com/react/react |
+| scheduler | 0.28.0 | MIT | https://github.com/react/react |
 
 ---
 
