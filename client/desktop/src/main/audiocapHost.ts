@@ -45,11 +45,17 @@
 //     MECHANISMS (spec §5 Q4) — inventing a "superseded" member to describe a
 //     caller bug would put a non-mechanism into user-facing copy.
 //
-// I4. THE PROMISE SETTLES EXACTLY ONCE, AND THE FIRST OUTCOME WINS. A child that
-//     says `hello` and then exits reported a capability; collapsing that into
-//     "child died" would turn a real answer into a spurious packaging defect.
-//     Inherited from `audiocapSmoke.ts`'s `settled` latch and still locked by
-//     its migrated vacuity control.
+// I4. THE PROMISE SETTLES EXACTLY ONCE, AND THE FIRST OUTCOME WINS. On the PROBE
+//     path a child that says `hello` and then exits reported a capability;
+//     collapsing that into "child died" would turn a real answer into a spurious
+//     packaging defect. Inherited from `audiocapSmoke.ts`'s `settled` latch and
+//     still locked by its migrated vacuity control.
+//
+//     A CAPTURE differs by design (#3394): its `hello` does not settle the
+//     promise -- it enters `starting`, and only the child's `started` ack does.
+//     A capture child that exits during `starting` has therefore reported nothing
+//     yet, and settling `child-crash` is the truth rather than a collapse: it died
+//     before it could say whether the tap exists.
 //
 // I5. MAIN DECIDES THE RUNG. `capability.perProcessAudio` arriving over
 //     `parentPort` is a NECESSARY INPUT that main ANDs with facts it owns; it is
@@ -75,8 +81,10 @@ import {
   QUANTUM_MS,
   RING_SLOTS,
   SAMPLE_RATE,
+  START_ACK_TIMEOUT_MS,
   isAudiocapFault,
   isAudiocapHello,
+  isAudiocapStarted,
   sanitizeDiagnostic,
   type AudiocapCapability,
   type AudiocapFaultStage,
@@ -90,11 +98,17 @@ import { NATIVE_ADDON_ENV, resolveNativeAddonPath } from './nativeAddonPath';
  * cause dimension on a counter, and never a privacy-decision discriminator (C8
  * principle 7).
  *
- * Six of the seven describe the capture child. `produce-rejected` is the one that
- * does not: the capture succeeded and the SFU refused to publish it — today only
- * `PARTICIPANT_PRODUCER_LIMITS['screen-audio'] === 1` can do that. It is still a
- * mechanism rather than a caller bug, which is the test spec §5 Q4 sets for
- * membership, and the share it describes is video-only exactly like the others.
+ * Every member but one describes the CAPTURE path: the child, the addon it hosts,
+ * or main's own refusal before any child is asked (`unsupported-os`, and the
+ * main-side legs of `target-unresolved` and `protocol-fault`). `produce-rejected`
+ * is the one that does not: the capture succeeded and the SFU refused to publish
+ * it — today only `PARTICIPANT_PRODUCER_LIMITS['screen-audio'] === 1` can do that.
+ * It is still a mechanism rather than a caller bug, which is the test spec §5 Q4
+ * sets for membership, and the share it describes is video-only exactly like the
+ * others.
+ *
+ * Deliberately no count. This said "Six of the seven" while the union held ten;
+ * `SCREEN_AUDIO_DEGRADE_REASONS` below is the membership list the compiler checks.
  */
 export type ScreenAudioDegradeReason =
   | 'no-backend'
@@ -118,8 +132,9 @@ export type ScreenAudioDegradeReason =
   // `kPermissionDenied` and `ThreadStartFailed` state it at their own
   // declarations: nothing produces it. The route the design names is
   // `status().faulted` -> `fault{stage:'run'}` -> here, and neither leg exists
-  // yet -- `QuantumPump::fault()` has no production caller and
-  // `AudiocapFaultStage` has no `'run'` member. #3198 PR 2 DECLINED this work,
+  // yet -- `QuantumPump::fault()` has a production caller (`tap_backend.h:245`,
+  // `kFormatChanged`), but nothing turns a latched fault into a host-visible outcome
+  // mid-share, and `AudiocapFaultStage` has no `'run'` member. #3198 PR 2 DECLINED this work,
   // deliberately: every fault routes to `retire()`, which reaps the capturing
   // child, so a mid-share silence latch would kill a live, correct share rather
   // than merely quiet one channel of it. Filed as its own follow-up issue at
@@ -188,17 +203,24 @@ export type AudiocapStartResult =
       /**
        * The child's CLAIM, already narrowed by `isAudiocapHello` — a truthy `1`
        * was refused before it got here. I5: a necessary input main ANDs with
-       * facts it owns, never a grant. This PR's ladder has no `'per-process'`
-       * rung for it to unlock; #3198 is where it becomes one input among
-       * several.
+       * facts it owns, never a grant.
+       *
+       * On the PROBE path this is the claim itself and may be `false`. On the
+       * CAPTURE path it is `true` by construction: `handleHello` refuses a
+       * capture whose claim is false (`no-backend`), and only `handleStarted`
+       * settles `ok: true` there, after the child reports the tap exists.
        */
       perProcessAudio: boolean;
     }
   | { ok: false; reason: ScreenAudioDegradeReason };
 
-/** Spec §6b. `capturing` is entered by the port handoff, which lands in Task 5/7. */
+/**
+ * Spec §6b, extended by #3394. A capture passes `handshaking → ready → starting →
+ * capturing`: `starting` is the window between posting `start` and hearing `started`,
+ * during which a fault still reaches the start promise. The probe stops at `ready`.
+ */
 type HostState =
-  'idle' | 'spawning' | 'handshaking' | 'ready' | 'capturing' | 'stopping' | 'faulted';
+  'idle' | 'spawning' | 'handshaking' | 'ready' | 'starting' | 'capturing' | 'stopping' | 'faulted';
 
 type ChildProcess = ReturnType<typeof utilityProcess.fork>;
 
@@ -218,6 +240,8 @@ interface HostSession {
   /** Resolves `startAudiocapHost`. Cleared by the first outcome (I4). */
   settle: ((result: AudiocapStartResult) => void) | null;
   handshakeTimer: NodeJS.Timeout | null;
+  /** Armed on entering `starting`; cleared by `started`, and by `clearTimers` on every exit. */
+  startAckTimer: NodeJS.Timeout | null;
   capability: AudiocapCapability | null;
 }
 
@@ -270,17 +294,16 @@ export const ENV_ALLOWLIST: readonly string[] = [
  * NO WATCHDOG RAIL HERE, DELIBERATELY (spec §6c rail 3, removed 2026-09-10).
  *
  * The rail's condition is "no credit ack AND no live share", which describes a
- * CAPTURING child. This PR has none: the only child it forks is the app-start
- * probe below, which main kills on the same turn the handshake settles. A timer
- * guarding nothing is the same "shipped code with no caller" defect the probe
- * exists to close, wearing a different costume — and §6c is explicit that an
- * unwired watchdog is UNFINISHED, not defence. #3198 PR 2 (this PR) wires the
- * capture child's own PID resolution (see `audiocapChild.ts`) but STILL forks
- * no capturing child in production — nothing yet posts the `{kind:'start'}`
- * control message that would start one (#3198 PR 3, tracked as Task 12a in the
- * implementation plan). `armWatchdog` / `noteAudiocapCreditAck` /
- * `setAudiocapShareLive` are reintroduced alongside that capturing child, not
- * before. Do not re-add them here.
+ * CAPTURING child. It was removed while no capturing child existed, because a
+ * timer guarding nothing is the "shipped code with no caller" defect §6c calls
+ * UNFINISHED rather than defence. That premise ended with #3198 PR 3, which
+ * posts `{kind:'start'}` (`beginCapture`, from `handleHello`); the rail was not
+ * reintroduced then.
+ * #3394 PR 1 closes the renderer-reload and renderer-crash halves of its case
+ * with `wireAudiocapRendererLoss`. What stays uncovered is a renderer that is
+ * alive but has stopped acking credits: the child drops quanta at its ring and
+ * keeps the OS tap until stop, supersede or quit. Reintroducing the rail for that
+ * case is an open decision, not one this file has taken.
  */
 
 let session: HostSession | null = null;
@@ -346,6 +369,10 @@ function clearTimers(live: HostSession): void {
     clearTimeout(live.handshakeTimer);
     live.handshakeTimer = null;
   }
+  if (live.startAckTimer) {
+    clearTimeout(live.startAckTimer);
+    live.startAckTimer = null;
+  }
 }
 
 /** I4: the first outcome wins; later ones are dropped rather than overwritten. */
@@ -406,6 +433,72 @@ export function killAudiocapHost(): void {
 }
 
 /**
+ * Retire the live CAPTURE session because the renderer that owned it is gone (#3394, spec C15).
+ *
+ * Before this, a reload or renderer crash left the capture child holding its OS tap until
+ * the next share or quit: `render-process-gone` only logged, and nothing watched a
+ * main-frame navigation. That is the privacy invariant #3197 exists for, reachable by an
+ * ordinary Cmd+R.
+ *
+ * SPARES THE PROBE. The app-start probe has no window and overlaps the first page load by
+ * design; killing it there would reap it before its `hello` on every cold start, memoizing
+ * `child-crash` as the probe result and leaving the machine-capability snapshot `null` until
+ * the first share's own `hello`. A start still pending in `'starting'` settles `child-crash`
+ * like any other kill; the renderer that would read it is the one that just went away.
+ *
+ * THE IMMEDIATE KILL, DELIBERATELY NOT THE GRACEFUL `stopAudiocapHost`. Process exit destroys
+ * the OS tap at once, and the document that owned it is already gone; the graceful stop would
+ * leave the tap alive for up to STOP_QUIESCE_MS while the child acted on `stop`, for a share
+ * nobody can see any more. The cost is stated rather than hidden: the child's `handleStop` is
+ * the only caller of the addon's `status()`, so on this path the R9 silence detector,
+ * `quiesceProved` and `destroyFailures` go unread.
+ */
+export function killAudiocapCapture(): void {
+  const live = session;
+  if (live?.windowHandle == null) return;
+  killAudiocapHost();
+}
+
+/**
+ * Counts renderer losses, so an `audiocap:start` still awaiting its window enumeration can
+ * see one that landed during the await. Without it the loss finds no session to kill, the
+ * start forks anyway, and the new document inherits a tap nobody reaps (red-team VULN-A).
+ */
+let rendererLossEpoch = 0;
+
+export function audiocapRendererLossEpoch(): number {
+  return rendererLossEpoch;
+}
+
+function noteRendererLoss(): void {
+  rendererLossEpoch += 1;
+  killAudiocapCapture();
+}
+
+/**
+ * Wire the renderer-loss signals. Extracted from `main.ts` so the predicate is tested
+ * here — `src/main/**` is outside coverage, and a wire nobody reaches is the failure mode
+ * this epic keeps meeting.
+ */
+export function wireAudiocapRendererLoss(contents: Pick<Electron.WebContents, 'on'>): void {
+  contents.on('render-process-gone', noteRendererLoss);
+  // `did-navigate`, NOT `did-start-navigation`. Electron fires `did-start-navigation`
+  // BEFORE `will-navigate`, so keying on it would end the capture for a link click that
+  // main.ts's `will-navigate` gate then cancels, silently dropping app audio from a live
+  // share. `did-navigate` fires only for the main frame and only once a cross-document
+  // navigation COMMITS; in-page navigations fire `did-navigate-in-page` instead. The
+  // cost is that on a real reload the tap outlives the old document until commit.
+  contents.on('did-navigate', noteRendererLoss);
+  // A main-frame navigation that FAILS commits an error page and fires no `did-navigate`,
+  // yet the document that owned the capture is gone (measured on Electron 44, red-team
+  // VULN-B). ERR_ABORTED (-3) is excluded, as in the self-heal filter: a cancelled
+  // navigation leaves the document in place.
+  contents.on('did-fail-load', (_event, errorCode, _description, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== -3) noteRendererLoss();
+  });
+}
+
+/**
  * How long a child gets to act on `stop` before it is reaped anyway.
  *
  * Short on purpose. The child's own teardown budget is #3197's 250 ms quiesce, and
@@ -447,11 +540,34 @@ function drainStoppingChild(): void {
  *
  * A non-zero `destroyFailures` means an OS tap may have outlived the share, and the
  * correct response is exactly what the timer already does: kill the process.
+ *
+ * ITS ONLY CALLER IS THE RENDERER'S `audiocap:stop` (`handleAudiocapStop`). The supersede
+ * and quit paths use `killAudiocapHost`, which is why the probe guard below lives here and
+ * not there.
  */
 export function stopAudiocapHost(): void {
-  drainStoppingChild();
-
   const live = session;
+  // SPARES THE PROBE (#3394 PR 1, R4), mirroring `killAudiocapCapture`: the windowless
+  // app-start probe is no renderer's capture, so a renderer's stop has nothing to end. This
+  // was worse than the supersede case, not equivalent to it. A share that reaps the probe
+  // heals the snapshot from its OWN `hello`; a stop forks nothing, so `child-crash` was
+  // memoized as the probe result, the machine-capability snapshot stayed `null`, and
+  // per-process audio was gone for the life of the process.
+  //
+  // `?.` against a STRICT `null` is the discriminator: no session reads `undefined` and falls
+  // through to the ordinary path below; only a live session with no window returns here.
+  // (`killAudiocapCapture` compares loosely because it has nothing to do in either case.)
+  //
+  // RETURNS BEFORE `drainStoppingChild()`, deliberately. By construction nothing is draining
+  // while the probe is live: the probe's own `startAudiocapHost` ran its I3 kill -- which
+  // drains -- before the probe's session existed, and `stopping` is written only below, after
+  // detaching a live CAPTURE session, which I1 says cannot coexist with the probe. And were a
+  // child quiescing anyway, a stop that found no capture to end has no business cutting that
+  // quiesce short: its reap is already owned by its own timer, and draining it early would
+  // forfeit exactly the `status()` read the graceful path exists to obtain.
+  if (live?.windowHandle === null) return;
+
+  drainStoppingChild();
   if (!live) return;
 
   // Detach first, for the same reason `retire` forgets before it kills: once `session`
@@ -460,7 +576,8 @@ export function stopAudiocapHost(): void {
   hostState = 'stopping';
   clearTimers(live);
   // A no-op once the start has settled, which is the ordinary case — a share cannot end
-  // before it began. It matters only for a stop that lands during the handshake.
+  // before it began. It matters only for a stop that lands during the handshake, or
+  // while `starting` -- after `start` was posted and before `started` (#3394).
   settleOnce(live, { ok: false, reason: 'child-crash' });
 
   const child = live.child;
@@ -518,9 +635,11 @@ export function stopAudiocapHost(): void {
  * (the surviving pid was gone once the parent died). So this strands a process
  * for the remaining life of the app, never beyond it.
  *
- * NOT REACHABLE IN #3195 -- `startAudiocapHost` has exactly one caller and it is
- * memoized to run once. It arms with #3198's share path, which is why it is fixed
- * here rather than left for that PR to inherit.
+ * REACHABLE SINCE #3198 PR 3. When #3195 wrote this, `startAudiocapHost` had exactly
+ * one caller, memoized to run once, so the window could not open. `audiocap:start`
+ * (`handleAudiocapStart`) is now a second caller a renderer can invoke repeatedly, and
+ * two starts in quick succession open it exactly as described above -- which is why it
+ * was fixed ahead of the share path rather than left for that path to inherit.
  *
  * `once('spawn')` rather than a timer: the event is the precise moment the OS
  * process exists, and an unreaped listener on a child that never spawns costs
@@ -584,12 +703,83 @@ function beginCapture(live: HostSession, windowHandle: number): boolean {
   }
 }
 
+function armStartAck(live: HostSession): void {
+  const timer = setTimeout(() => {
+    if (session !== live) return;
+    // Same reason as a missed hello: the child did not finish in time. The copy for
+    // it already says "didn't start in time", which is exactly what happened.
+    retire(live, { ok: false, reason: 'handshake-timeout' }, 'faulted');
+  }, START_ACK_TIMEOUT_MS);
+  // `unref` for the handshake timer's reason: a pending ack must never hold the loop open at quit.
+  timer.unref();
+  live.startAckTimer = timer;
+}
+
+/**
+ * The tap exists. ONLY legal in `starting` (§4a): a duplicate, a `started` before
+ * `hello`, or one from the probe is a child saying something outside its contract.
+ */
+function handleStarted(live: HostSession): void {
+  if (hostState !== 'starting') {
+    retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted');
+    return;
+  }
+  // The shared helper, not a hand-rolled clear of the one timer this arm armed: it is the
+  // same call every other exit from a pending state makes, so a timer added to the session
+  // later is cleared here without anyone remembering this site.
+  clearTimers(live);
+  hostState = 'capturing';
+  // `true` by construction: `handleHello` enters `starting` only on the arm where the
+  // child's validated capability was true (I5 — a necessary input, never a grant).
+  settleOnce(live, { ok: true, generation: live.generation, perProcessAudio: true });
+}
+
+function notifyMachineCapability(perProcessAudio: boolean): void {
+  // NOTIFY LAST, AND NEVER LET IT ABORT THE HANDSHAKE. Found by #3198's pre-PR
+  // adversarial pass. The listener reaches `webContents.send`; called before
+  // `settleOnce`, a throw there left the promise unsettled with `live.handshakeTimer`
+  // already cleared -- the host wedged in 'handshaking' forever and never reaped its
+  // child, and the throw then reached main's uncaughtException handler, which calls
+  // `app.exit(1)`.
+  //
+  // THE MECHANISM IS NOT "A DISPOSED RENDER FRAME", WHICH IS WHAT THIS COMMENT SAID
+  // UNTIL THE PHASE-8 PASS MEASURED IT. On real Electron 44.1.1, a disposed frame does
+  // not throw at all: neither a crashed renderer nor a saved `webContents` handle used
+  // after the window is destroyed. What throws is reading `.webContents` off a DESTROYED
+  // `BrowserWindow` -- on the property access, before `.send` -- and a `?.` null check
+  // does not cover that, which is why `main.ts` now guards both push sites with
+  // `isDestroyed()`. The fix here was right; its stated cause was not.
+  //
+  // Both halves are load-bearing, and each is pinned by its own test. The ORDERING
+  // guarantees the handshake completes -- proven by the re-entrant-listener case, not by
+  // the throwing-listener case, which the catch alone satisfies. The CATCH guarantees a
+  // send into a destroyed window cannot kill the app after it has.
+  //
+  // Swallowing is correct here rather than lossy: the value is monotone (a machine
+  // fact, identical on every hello), and `did-finish-load` re-pushes it on the next
+  // load -- so a dropped push self-heals against the very frame that could not take it.
+  //
+  // The drop is LOGGED, and the earlier "nothing is logged" rule over-read its own
+  // justification: observability.md principle 3 constrains the ERROR OBJECT (an
+  // `Error.cause` must not reach a sink), not the fact that a push was dropped. A fixed
+  // string carries no cause, no PII and no privacy discriminator. Without it, a listener
+  // that throws on EVERY invocation is indistinguishable from a machine with no
+  // per-process backend, permanently and with no signal anywhere.
+  try {
+    onMachineCapabilityChange?.(perProcessAudio);
+  } catch {
+    // Fixed string only -- never the caught value. See above.
+    console.warn('[audiocap] capability push dropped');
+  }
+}
+
 /**
  * The hello arm of `handleChildMessage`, extracted for S3776 (cognitive
  * complexity 18 > 15).
  *
  * EXTRACTED, NOT FLATTENED. The arm is one ordered sequence -- clear the
- * handshake timer, publish the snapshot, decide the rung, settle, notify -- and
+ * handshake timer, publish the snapshot, decide the rung, settle (or, for a
+ * capture, enter `starting` and wait for `started` -- #3394), notify -- and
  * each of its branches is a distinct refusal with its own reason. Collapsing
  * them into fewer conditionals would have traded this epic's whole product (a
  * reason string that names the mechanism that actually failed) for a metric. A
@@ -623,7 +813,9 @@ function handleHello(live: HostSession, message: AudiocapHello): void {
   // ladder and PR 2 the resolver; nothing anywhere posted `{kind:'start'}`, so
   // `AudiocapStart` had no constructor and the child's `handleStart` was
   // unreachable in production. `HostState` has carried a `'capturing'` member
-  // since #3195 with a comment saying the port handoff enters it. This is it.
+  // since #3195 with a comment saying the port handoff enters it. This is it --
+  // though since #3394 the handoff enters `starting`, and `capturing` waits for the
+  // child's `started` ack (see `handleStarted`).
   //
   // IT RUNS HERE, IN THE HELLO ARM, AND NOWHERE ELSE. This is the only point that
   // knows the child survived the handshake AND what it claims to support, which
@@ -647,7 +839,14 @@ function handleHello(live: HostSession, message: AudiocapHello): void {
       // it owns, never a grant.
       outcome = { ok: false, reason: 'no-backend' };
     } else if (beginCapture(live, live.windowHandle)) {
-      hostState = 'capturing';
+      // #3394: NOT `capturing`, and NOT settled. The child has been told to start and has
+      // not yet resolved its target or created its tap; every refusal from here on must
+      // still reach the start promise (spec C1). `started` settles it; a fault, an exit
+      // or START_ACK_TIMEOUT_MS retires it with the real reason.
+      hostState = 'starting';
+      armStartAck(live);
+      notifyMachineCapability(message.capability.perProcessAudio);
+      return;
     } else {
       // `beginCapture` returns false only when the channel or the `start` post
       // itself failed, so the child may be holding a tap nobody can hear. The
@@ -664,47 +863,17 @@ function handleHello(live: HostSession, message: AudiocapHello): void {
   } else {
     retire(live, outcome, 'faulted');
   }
-  // NOTIFY LAST, AND NEVER LET IT ABORT THE HANDSHAKE. Found by #3198's pre-PR
-  // adversarial pass. The listener reaches `webContents.send`; called before
-  // `settleOnce`, a throw there left the promise unsettled with `live.handshakeTimer`
-  // already cleared -- the host wedged in 'handshaking' forever and never reaped its
-  // child, and the throw then reached main's uncaughtException handler, which calls
-  // `app.exit(1)`.
-  //
-  // THE MECHANISM IS NOT "A DISPOSED RENDER FRAME", WHICH IS WHAT THIS COMMENT SAID
-  // UNTIL THE PHASE-8 PASS MEASURED IT. On real Electron 44.1.1, a disposed frame does
-  // not throw at all: neither a crashed renderer nor a saved `webContents` handle used
-  // after the window is destroyed. What throws is reading `.webContents` off a DESTROYED
-  // `BrowserWindow` -- on the property access, before `.send` -- and a `?.` null check
-  // does not cover that, which is why `main.ts` now guards both push sites with
-  // `isDestroyed()`. The fix here was right; its stated cause was not.
-  //
-  // Both halves are load-bearing, and each is pinned by its own test. The ORDERING
-  // guarantees the handshake completes -- proven by the re-entrant-listener case, not by
-  // the throwing-listener case, which the catch alone satisfies. The CATCH guarantees a
-  // send into a destroyed window cannot kill the app after it has.
-  //
-  // Swallowing is correct here rather than lossy: the value is monotone (a machine
-  // fact, identical on every hello), and `did-finish-load` re-pushes it on the next
-  // load -- so a dropped push self-heals against the very frame that could not take it.
-  //
-  // The drop is LOGGED, and the earlier "nothing is logged" rule over-read its own
-  // justification: observability.md principle 3 constrains the ERROR OBJECT (an
-  // `Error.cause` must not reach a sink), not the fact that a push was dropped. A fixed
-  // string carries no cause, no PII and no privacy discriminator. Without it, a listener
-  // that throws on EVERY invocation is indistinguishable from a machine with no
-  // per-process backend, permanently and with no signal anywhere.
-  try {
-    onMachineCapabilityChange?.(message.capability.perProcessAudio);
-  } catch {
-    // Fixed string only -- never the caught value. See above.
-    console.warn('[audiocap] capability push dropped');
-  }
+  notifyMachineCapability(message.capability.perProcessAudio);
 }
 
 function handleChildMessage(live: HostSession, message: unknown): void {
   if (isAudiocapHello(message)) {
     handleHello(live, message);
+    return;
+  }
+
+  if (isAudiocapStarted(message)) {
+    handleStarted(live);
     return;
   }
 
@@ -825,6 +994,7 @@ export function startAudiocapHost(
       windowHandle,
       settle: resolve,
       handshakeTimer: null,
+      startAckTimer: null,
       capability: null,
     };
     session = live;
@@ -862,15 +1032,6 @@ export function startAudiocapHost(
 // THE APP-START CAPABILITY PROBE
 // ---------------------------------------------------------------------------
 
-/**
- * The generation the probe forks under.
- *
- * It only has to be a value no live session is using, and at app start every
- * value qualifies: the probe runs before any share exists and kills its child on
- * the same turn the handshake settles. #3198's share path mints its own
- * generations, and a collision with this one is harmless because I2 fences on
- * session IDENTITY rather than on the number.
- */
 /// Bounds on the dev-only child-stderr echo. Neither exists in a packaged build,
 /// where nothing listens at all.
 ///
@@ -882,6 +1043,15 @@ export function startAudiocapHost(
 const CHILD_STDERR_ECHO_LIMIT = 200;
 const CHILD_STDERR_ECHO_MAX_CHARS = 4096;
 
+/**
+ * The generation the probe forks under.
+ *
+ * It only has to be a value no live session is using, and at app start every
+ * value qualifies: the probe runs before any share exists and kills its child on
+ * the same turn the handshake settles. #3198's share path mints its own
+ * generations, and a collision with this one is harmless because I2 fences on
+ * session IDENTITY rather than on the number.
+ */
 const PROBE_GENERATION = 1;
 
 /**
@@ -967,11 +1137,16 @@ export function audiocapProbeResult(): AudiocapProbeResult | null {
 
 async function runCapabilityProbe(): Promise<AudiocapProbeResult> {
   let result: AudiocapProbeResult;
+  // The probe's OWN session, read synchronously after the call (the executor assigns
+  // `session` before returning). `null` means the probe created no child to reap.
+  let probeOwn: HostSession | null = null;
   try {
     // `null`, and it is a statement rather than an omission: the probe asks whether
     // this MACHINE has a per-process backend, so it has no window and must never
     // reach the hello arm's `start` post. See the parameter's docblock.
-    const started = await startAudiocapHost(PROBE_GENERATION, null);
+    const pendingProbe = startAudiocapHost(PROBE_GENERATION, null);
+    probeOwn = session;
+    const started = await pendingProbe;
     result = started.ok
       ? { ok: true, perProcessAudio: started.perProcessAudio }
       : { ok: false, reason: started.reason };
@@ -983,10 +1158,11 @@ async function runCapabilityProbe(): Promise<AudiocapProbeResult> {
     // error itself is neither read nor logged — C8 gives it no path to a sink.
     result = { ok: false, reason: 'child-crash' };
   } finally {
-    // P3, unconditional. A validated `hello` deliberately does NOT kill the
-    // child — that is the share path's contract — and this PR has no share path
-    // to hand it to, so the probe reaps its own.
-    killAudiocapHost();
+    // P3. A validated `hello` deliberately does NOT kill the child — that is the
+    // share path's contract — so the probe reaps its own. ONLY its own (I2): a share
+    // that superseded the probe mid-handshake is live here, and a bare kill would
+    // end it as `child-crash` (red-team VULN-C).
+    if (probeOwn !== null && session === probeOwn) killAudiocapHost();
   }
   probeResult = result;
   // Mechanism strings and a boolean: no key material, no PII, no raw error, and

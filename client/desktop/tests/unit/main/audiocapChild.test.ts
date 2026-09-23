@@ -555,12 +555,41 @@ describe('audiocap child start-failure unwind', () => {
     // ordinary end of a share -- the one that must still work -- would be untested.
     const c = await startChild(() => ({ ok: true }));
     expect(c.stop).not.toHaveBeenCalled();
-    expect(c.posted).toEqual([expect.objectContaining({ kind: 'hello' })]);
+    // A successful start now also posts the tap-exists ack (#3394) -- the FULL
+    // sequence for the ordinary case, not just its absence of a fault.
+    expect(c.posted).toEqual([expect.objectContaining({ kind: 'hello' }), { kind: 'started' }]);
 
     c.sendStop();
     expect(c.stop).toHaveBeenCalledTimes(1);
     c.sendStop();
     expect(c.stop).toHaveBeenCalledTimes(1);
+  });
+
+  const isStarted = (m: unknown): boolean => (m as { kind?: string }).kind === 'started';
+
+  it('posts exactly one started when addon.start succeeds (#3394)', async () => {
+    const c = await startChild(() => ({ ok: true }));
+    expect(c.posted.filter(isStarted)).toEqual([{ kind: 'started' }]);
+    expect(c.posted.filter((m) => (m as { kind?: string }).kind === 'fault')).toHaveLength(0);
+  });
+
+  it.each([
+    ['NoTarget', 'target'],
+    ['DeviceError', 'start'],
+  ])(
+    'posts NO started when addon.start refuses with %s — only the fault',
+    async (reason, stage) => {
+      const c = await startChild(() => ({ ok: false, reason }));
+      expect(c.posted.filter(isStarted)).toHaveLength(0);
+      expect(c.posted).toContainEqual({ kind: 'fault', stage, message: expect.any(String) });
+    }
+  );
+
+  it('posts NO started when addon.start throws', async () => {
+    const c = await startChild(() => {
+      throw new Error('native refused');
+    });
+    expect(c.posted.filter(isStarted)).toHaveLength(0);
   });
 });
 

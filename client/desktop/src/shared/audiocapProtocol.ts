@@ -70,6 +70,18 @@ export const RING_SLOTS = 8;
 /** Ceiling on child spawn to `hello`; past it the host kills and goes video-only. */
 export const HANDSHAKE_TIMEOUT_MS = 10000;
 
+/**
+ * How long main waits between posting `start` and hearing `started` (#3394).
+ * SEPARATE from HANDSHAKE_TIMEOUT_MS because it bounds a different thing: tap creation,
+ * which on a first run may sit behind a macOS TCC prompt.
+ *
+ * 10000 is an INITIAL value, not a measured one. It is pending the T0 measurement recorded
+ * in ADR-0043 § As-built addendum — #3394 PR 1, which sets it to the measured worst case
+ * ×1.5, capped at 30 s. Nothing has measured it yet; do not cite this number as evidence
+ * of how long tap creation takes.
+ */
+export const START_ACK_TIMEOUT_MS = 10000;
+
 /** Cap for every diagnostic string on a `hello` (design section 4a). */
 export const DIAGNOSTIC_MAX_CHARS = 64;
 
@@ -197,6 +209,18 @@ export interface AudiocapFault {
   message: string;
 }
 
+/**
+ * The child's word that `addon.start` succeeded — the tap exists (#3394).
+ *
+ * This, not `hello`, is what settles main's start promise. Settling at `hello` resolved
+ * `ok:true` before the child had even resolved its target, so every later
+ * `fault{target|start}` found the promise already settled and was dropped (spec C1).
+ * Carries nothing main reads (D5); extra keys are tolerated and ignored.
+ */
+export interface AudiocapStarted {
+  kind: 'started';
+}
+
 export interface AudiocapStart {
   kind: 'start';
   quantumMs: typeof QUANTUM_MS;
@@ -225,7 +249,8 @@ export interface AudiocapStop {
  * `setSource`, and no "unknown message ignored" branch anywhere: a message
  * that matches none of these means kill the child.
  */
-export type AudiocapControlMessage = AudiocapHello | AudiocapFault | AudiocapStart | AudiocapStop;
+export type AudiocapControlMessage =
+  AudiocapHello | AudiocapFault | AudiocapStarted | AudiocapStart | AudiocapStop;
 
 export interface QuantumHeader {
   seq: number;
@@ -300,6 +325,10 @@ export function isAudiocapFault(v: unknown): v is AudiocapFault {
     AUDIOCAP_FAULT_STAGES.has(v.stage) &&
     typeof v.message === 'string'
   );
+}
+
+export function isAudiocapStarted(v: unknown): v is AudiocapStarted {
+  return isRecord(v) && v.kind === 'started';
 }
 
 // ---------------------------------------------------------------------------

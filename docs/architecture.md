@@ -202,8 +202,10 @@ floor `platformBackend()` returns `nullptr`, so `NoBackend` remains correct on b
 Two independent `MessagePort` pairs carry the two things that cross this boundary:
 
 - **Main ↔ child, control only, never PCM** — a `MessageChannelMain` pair created at fork. A
-  closed `hello` / `fault` / `start` / `stop` message set; anything else kills the child
-  (`src/main/audiocapHost.ts`, `src/main/audiocapChild.ts`).
+  closed `hello` / `fault` / `start` / `started` / `stop` message set; anything else kills the
+  child (`src/main/audiocapHost.ts`, `src/main/audiocapChild.ts`). `started` is the child's ack
+  after a successful `addon.start`, and `audiocap:start` settles on it rather than on `hello`
+  (#3394).
 - **Child → preload → main world, PCM only** — the child hands its PCM port to **preload**
   (`audiocap:port`; the current shell version is authoritative in
   `client/desktop/src/main/ipcContract.ts`), which validates every 3872-byte quantum and

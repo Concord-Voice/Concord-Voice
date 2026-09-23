@@ -82,11 +82,13 @@ let currentGeneration = 0;
  * Until PR 3 nothing started a capture, so no handoff was ever posted and the listener
  * `createScreenAudioBridge` installed for itself was sufficient by vacuity. With the
  * capture leg live the ordering is decided in the MAIN process and loses: main posts the
- * port to preload inside the same turn that settles the `audiocap:start` promise, and the
- * renderer can only construct a bridge after that promise crosses IPC and resolves. The
- * relay hands the main world its end with ONE `postMessage` and never repeats it — see
- * `audiocapRelay.ts`, "Hand the main world its end exactly once" — so a handoff with no
- * listener is not delayed, it is destroyed.
+ * port to preload when the child says `hello` (`beginCapture`), while `audiocap:start`
+ * settles only LATER, on the child's `started` ack (#3394) — so the port leads the
+ * resolution by at least the whole of tap creation, and the renderer can only construct a
+ * bridge after that promise crosses IPC and resolves. The relay hands the main world its
+ * end with ONE `postMessage` and never repeats it — see `audiocapRelay.ts`, "Hand the
+ * main world its end exactly once" — so a handoff with no listener is not delayed, it is
+ * destroyed.
  *
  * This is the `windowLoaded` trap from `[internal]rules/electron.md` § "IPC contract v27",
  * one layer up: *"Deferring construction until the IPC message with the port arrives
@@ -463,9 +465,9 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
   }
 
   // REGISTER, then DRAIN. Both halves are required and the order is the design: the
-  // handoff for this generation may already be sitting unclaimed (main posts it inside the
-  // turn that settles `audiocap:start`, which is strictly before this constructor can run),
-  // or it may still be in flight. Registering first means an in-flight one is routed the
+  // handoff for this generation may already be sitting unclaimed (main posts it at the
+  // child's `hello`, before `audiocap:start` settles on the later `started` ack, so strictly
+  // before this constructor can run), or it may still be in flight. Registering first means an in-flight one is routed the
   // moment it lands; draining second means an already-arrived one is picked up now.
   //
   // Registering AFTER the drain would reopen the race in miniature -- a handoff landing

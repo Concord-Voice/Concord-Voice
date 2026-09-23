@@ -35,7 +35,18 @@ const fork = vi.fn();
  */
 const appState = { isPackaged: true };
 
+/**
+ * `ipcMain.handle` + `desktopCapturer.getSources` (#3394 PR 1, R4/C6). Added so this file
+ * can import the REAL `src/main/ipc/audiocap.ts` alongside the REAL host -- a small number
+ * of cases below need genuine host state (probe handshaking, a real 'starting' session)
+ * that `audiocapIpc.test.ts`'s wholesale `vi.mock('.../audiocapHost', ...)` cannot produce.
+ */
+const ipcHandle = vi.fn();
+const getSources = vi.fn();
+
 vi.mock('electron', () => ({
+  ipcMain: { handle: (...args: unknown[]) => ipcHandle(...args) },
+  desktopCapturer: { getSources: (...args: unknown[]) => getSources(...args) },
   utilityProcess: { fork: (...args: unknown[]) => fork(...args) },
   // Minimal Option-B' stand-in (design §5 Q6). Task 3 does not exercise the port
   // handoff itself -- that is Task 5/6/7's territory -- but the host module
@@ -120,6 +131,9 @@ function validHello(): unknown {
 
 beforeEach(() => {
   fork.mockReset();
+  ipcHandle.mockReset();
+  getSources.mockReset();
+  getSources.mockResolvedValue([{ id: 'window:42:0', name: 'Some App' }]);
   vi.resetModules();
   appState.isPackaged = true;
   platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
@@ -652,6 +666,9 @@ describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
   });
 });
 
+/** The child's tap-exists ack (#3394): the capture path's start settles on this, not on hello. */
+const STARTED = { kind: 'started' } as const;
+
 /** `validHello()` with the capability bit flipped — everything else stays valid. */
 function helloWithCapability(perProcessAudio: boolean): unknown {
   const hello = validHello() as { capability: Record<string, unknown> };
@@ -877,6 +894,7 @@ describe('capture leg — start + port handoff (#3198 PR 3)', () => {
 
     const started = startAudiocapHost(5, handle);
     child.handlers.message(validHello());
+    child.handlers.message(STARTED);
     await expect(started).resolves.toEqual({
       ok: true,
       generation: 5,
@@ -916,6 +934,7 @@ describe('capture leg — start + port handoff (#3198 PR 3)', () => {
 
     const started = startAudiocapHost(1, 42);
     child.handlers.message(validHello());
+    child.handlers.message(STARTED);
     await started;
 
     // A renderer holding a port whose peer never reached a child waits forever with no
@@ -1001,6 +1020,7 @@ describe('graceful stop (#3198 PR 3)', () => {
 
       const started = startAudiocapHost(1, 42);
       child.handlers.message(validHello());
+      child.handlers.message(STARTED);
       await started;
       child.postMessage.mockClear();
       child.kill.mockClear();
@@ -1030,6 +1050,7 @@ describe('graceful stop (#3198 PR 3)', () => {
 
       const started = startAudiocapHost(1, 42);
       child.handlers.message(validHello());
+      child.handlers.message(STARTED);
       await started;
       child.kill.mockClear();
 
@@ -1053,6 +1074,7 @@ describe('graceful stop (#3198 PR 3)', () => {
 
       const started = startAudiocapHost(1, 42);
       first.handlers.message(validHello());
+      first.handlers.message(STARTED);
       await started;
       first.kill.mockClear();
 
@@ -1071,5 +1093,672 @@ describe('graceful stop (#3198 PR 3)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('start settles on the started ack, not on hello (#3394 PR 1, spec C1)', () => {
+  async function helloWithWindow() {
+    const host = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    return { host, child, started };
+  }
+
+  it('does NOT settle at hello for a capture — it waits for started', async () => {
+    const { child, started } = await helloWithWindow();
+    const settled = vi.fn();
+    void started.then(settled);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    child.handlers.message(STARTED);
+    await expect(started).resolves.toEqual({ ok: true, generation: 1, perProcessAudio: true });
+  });
+
+  // THE C1 REGRESSION. Must FAIL if settle is moved back to hello.
+  it.each([
+    ['target', 'target-unresolved'],
+    ['start', 'no-backend'],
+  ])('a %s fault after hello resolves the start with its real reason', async (stage, reason) => {
+    const { child, started } = await helloWithWindow();
+    child.handlers.message({ kind: 'fault', stage, message: 'refused' });
+    await expect(started).resolves.toEqual({ ok: false, reason });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('a child that exits while starting resolves child-crash', async () => {
+    const { child, started } = await helloWithWindow();
+    child.handlers.exit?.(1);
+    await expect(started).resolves.toEqual({ ok: false, reason: 'child-crash' });
+  });
+
+  it('times out to handshake-timeout when no started arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const { child, started } = await helloWithWindow();
+      const { START_ACK_TIMEOUT_MS } = await import('../../../src/shared/audiocapProtocol');
+      // C11: awaiting the raw promise under fake timers depends on the fake-timer
+      // implementation flushing the microtask queue at each `advanceTimersByTime`
+      // call. Drive a settled spy instead, so a hang reads as "settled was never
+      // called" -- a fast, synchronous assertion -- rather than the whole test
+      // timing out with no signal about which half is wrong.
+      const settled = vi.fn();
+      void started.then(settled);
+      vi.advanceTimersByTime(START_ACK_TIMEOUT_MS - 1);
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(settled).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      // One real microtask tick is enough to let the already-fired timer
+      // callback's synchronous `settleOnce` reach the `.then` above -- no
+      // further timer advancement, and no dependency on real elapsed time.
+      await Promise.resolve();
+      expect(settled).toHaveBeenCalledWith({ ok: false, reason: 'handshake-timeout' });
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // C8: START_ACK_TIMEOUT_MS and HANDSHAKE_TIMEOUT_MS are declared as the SAME numeric
+  // value (10000) today, so `expect(START_ACK_TIMEOUT_MS).toBe(10000)` in
+  // audiocapProtocol.test.ts cannot tell "its own constant" from "the handshake timeout
+  // reused" -- both readings produce an identical timer. This test drives them to
+  // DIFFERENT values via `vi.doMock` and proves the start-ack timer consults
+  // START_ACK_TIMEOUT_MS specifically: advancing to HANDSHAKE_TIMEOUT_MS must NOT kill
+  // the child, and only reaching the real (mocked) START_ACK_TIMEOUT_MS may.
+  it('START_ACK_TIMEOUT_MS is genuinely distinct from HANDSHAKE_TIMEOUT_MS (#3394 PR 1, C8)', async () => {
+    vi.doMock('../../../src/shared/audiocapProtocol', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../../src/shared/audiocapProtocol')>();
+      return { ...actual, START_ACK_TIMEOUT_MS: 30_000 };
+    });
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+      const { HANDSHAKE_TIMEOUT_MS } = await import('../../../src/shared/audiocapProtocol');
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+      const started = startAudiocapHost(1, 42);
+      child.handlers.message(validHello());
+      const settled = vi.fn();
+      void started.then(settled);
+
+      vi.advanceTimersByTime(HANDSHAKE_TIMEOUT_MS);
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(settled).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(30_000 - HANDSHAKE_TIMEOUT_MS);
+      await Promise.resolve();
+      expect(settled).toHaveBeenCalledWith({ ok: false, reason: 'handshake-timeout' });
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('../../../src/shared/audiocapProtocol');
+      vi.useRealTimers();
+    }
+  });
+
+  it('a started ack disarms the start-ack timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const { child, started } = await helloWithWindow();
+      child.handlers.message(STARTED);
+      await started;
+      child.kill.mockClear();
+      vi.advanceTimersByTime(60_000);
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a started before hello is a protocol fault (§4a)', async () => {
+    const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    setAudiocapPortSink(vi.fn());
+    const started = startAudiocapHost(1, 42);
+    child.handlers.message(STARTED);
+    await expect(started).resolves.toEqual({ ok: false, reason: 'protocol-fault' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('a duplicate started kills the child (§4a)', async () => {
+    const { child, started } = await helloWithWindow();
+    child.handlers.message(STARTED);
+    await started;
+    child.kill.mockClear();
+    child.handlers.message(STARTED);
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('a started on the probe path is a protocol fault — the probe never starts', async () => {
+    const { startAudiocapHost } = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    const started = startAudiocapHost(1, null);
+    child.handlers.message(validHello());
+    await expect(started).resolves.toMatchObject({ ok: true });
+    child.kill.mockClear();
+    child.handlers.message(STARTED);
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // C14 for `started`: a detached (stopping) session's message is dropped, NOT reaped.
+  it('a started from a child already being stopped is dropped without a reap', async () => {
+    vi.useFakeTimers();
+    try {
+      const { host, child, started } = await helloWithWindow();
+      host.stopAudiocapHost();
+      await expect(started).resolves.toEqual({ ok: false, reason: 'child-crash' });
+      child.kill.mockClear();
+      child.handlers.message(STARTED);
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('renderer loss kills the capture, never the probe (#3394 PR 1, spec C15)', () => {
+  function fakeContents() {
+    const handlers: Record<string, (...args: unknown[]) => void> = {};
+    return {
+      handlers,
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        handlers[event] = cb;
+      }),
+    };
+  }
+
+  async function capturing() {
+    const host = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    child.handlers.message(STARTED);
+    await started;
+    child.kill.mockClear();
+    const contents = fakeContents();
+    host.wireAudiocapRendererLoss(contents as never);
+    return { host, child, contents };
+  }
+
+  it('kills a capturing child when the renderer process goes away', async () => {
+    const { child, contents } = await capturing();
+    contents.handlers['render-process-gone']?.({}, { reason: 'crashed', exitCode: 1 });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('kills it once a main-frame navigation commits (reload)', async () => {
+    const { child, contents } = await capturing();
+    contents.handlers['did-navigate']?.({}, 'https://example.invalid/', 200, 'OK');
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('does NOT kill on did-start-navigation — a navigation will-navigate may still cancel', async () => {
+    const { child, contents } = await capturing();
+    // The absence is the contract: `did-start-navigation` fires BEFORE
+    // `will-navigate`, so wiring a kill on it would end the capture for a link
+    // click main.ts's `will-navigate` gate goes on to cancel. Without asserting
+    // the key is absent, this optional call is vacuous -- it would pass just as
+    // well against a handler that silently no-ops.
+    expect(contents.handlers['did-start-navigation']).toBeUndefined();
+    contents.handlers['did-start-navigation']?.({
+      isMainFrame: true,
+      isSameDocument: false,
+      url: 'x',
+    });
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it('spares the windowless app-start probe', async () => {
+    const host = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    void host.startAudiocapHost(1, null); // still handshaking: the probe's live window
+    const contents = fakeContents();
+    host.wireAudiocapRendererLoss(contents as never);
+    // C11: `?.()` on a registration this same test just made would silently no-op if the
+    // wire ever stopped registering a handler -- an existence assertion first turns that
+    // into a loud failure instead of a quietly-vacuous pass.
+    expect(contents.handlers['render-process-gone']).toBeTypeOf('function');
+    expect(contents.handlers['did-navigate']).toBeTypeOf('function');
+    contents.handlers['render-process-gone']!({}, { reason: 'crashed', exitCode: 1 });
+    contents.handlers['did-navigate']!({}, 'https://example.invalid/', 200, 'OK');
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it('registers all three renderer-loss handlers (did-navigate, render-process-gone, did-fail-load)', async () => {
+    const host = await loadHost();
+    const contents = fakeContents();
+    host.wireAudiocapRendererLoss(contents as never);
+    // THREE handlers as of the #3394 PR 1 fix: `did-fail-load` closes the VULN-B gap (a
+    // main-frame navigation that FAILS commits an error page and never reaches
+    // `did-navigate`, so nothing before this fix ever reaped the capture).
+    expect(Object.keys(contents.handlers).sort()).toEqual([
+      'did-fail-load',
+      'did-navigate',
+      'render-process-gone',
+    ]);
+  });
+
+  /**
+   * `did-fail-load` (#3394 PR 1 fix, red-team VULN-B). Electron's signature is
+   * `(event, errorCode, errorDescription, validatedURL, isMainFrame)`. The handler must
+   * count and kill ONLY when `isMainFrame && errorCode !== -3` -- `-3` is `ERR_ABORTED`,
+   * which fires on an ordinary cancelled/superseded load (ordinary link navigation, a
+   * `will-navigate` cancel) and must never end a live capture.
+   */
+  describe('did-fail-load ends a capture whose main-frame navigation never commits (#3394 PR 1 fix, VULN-B)', () => {
+    /** A capture still in `starting` -- hello sent, `started` not yet acked. */
+    async function startingCapture() {
+      const host = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      host.setAudiocapPortSink(vi.fn());
+      const started = host.startAudiocapHost(1, 42);
+      child.handlers.message(validHello());
+      const contents = fakeContents();
+      host.wireAudiocapRendererLoss(contents as never);
+      return { host, child, contents, started };
+    }
+
+    it('B1: a main-frame did-fail-load kills a pending capture and settles child-crash', async () => {
+      const { child, contents, started } = await startingCapture();
+      expect(contents.handlers['did-fail-load']).toBeTypeOf('function');
+      contents.handlers['did-fail-load']!(
+        {},
+        -6,
+        'ERR_FILE_NOT_FOUND',
+        'https://example.invalid/',
+        true,
+        1,
+        1
+      );
+      expect(child.kill).toHaveBeenCalled();
+      await expect(started).resolves.toEqual({ ok: false, reason: 'child-crash' });
+    });
+
+    it('B2: errorCode -3 (ERR_ABORTED) does not kill', async () => {
+      const { child, contents } = await capturing();
+      expect(contents.handlers['did-fail-load']).toBeTypeOf('function');
+      contents.handlers['did-fail-load']!(
+        {},
+        -3,
+        'ERR_ABORTED',
+        'https://example.invalid/',
+        true,
+        1,
+        1
+      );
+      expect(child.kill).not.toHaveBeenCalled();
+    });
+
+    it('B3: a subframe did-fail-load (isMainFrame: false) does not kill', async () => {
+      const { child, contents } = await capturing();
+      expect(contents.handlers['did-fail-load']).toBeTypeOf('function');
+      contents.handlers['did-fail-load']!(
+        {},
+        -6,
+        'ERR_FILE_NOT_FOUND',
+        'https://example.invalid/',
+        false,
+        1,
+        1
+      );
+      expect(child.kill).not.toHaveBeenCalled();
+    });
+
+    it('B4: spares the windowless app-start probe on a main-frame did-fail-load', async () => {
+      const host = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      void host.startAudiocapHost(1, null); // still handshaking: the probe's live window
+      const contents = fakeContents();
+      host.wireAudiocapRendererLoss(contents as never);
+      expect(contents.handlers['did-fail-load']).toBeTypeOf('function');
+      contents.handlers['did-fail-load']!(
+        {},
+        -6,
+        'ERR_FILE_NOT_FOUND',
+        'https://example.invalid/',
+        true,
+        1,
+        1
+      );
+      expect(child.kill).not.toHaveBeenCalled();
+    });
+
+    // C11: renamed from "B5: the epoch counts did-navigate/render-process-gone and a real
+    // did-fail-load, never -3 or a subframe". The BODY only ever fires `did-fail-load` --
+    // it never emits a `did-navigate` or `render-process-gone` event -- so the old title
+    // claimed coverage the test did not provide. C6's `it.each` below covers the other two
+    // events; this case is renamed to describe exactly what its body exercises.
+    it('B5: did-fail-load bumps the epoch only for a real main-frame failure, never -3 or a subframe', async () => {
+      const { host, contents } = await capturing();
+      expect(contents.handlers['did-fail-load']).toBeTypeOf('function');
+      const before = host.audiocapRendererLossEpoch();
+      contents.handlers['did-fail-load']!({}, -3, 'ERR_ABORTED', 'x', true, 1, 1);
+      contents.handlers['did-fail-load']!({}, -6, 'ERR_FILE_NOT_FOUND', 'x', false, 1, 1);
+      expect(host.audiocapRendererLossEpoch()).toBe(before);
+      contents.handlers['did-fail-load']!({}, -6, 'ERR_FILE_NOT_FOUND', 'x', true, 1, 1);
+      expect(host.audiocapRendererLossEpoch()).toBe(before + 1);
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// #3394 PR 1 (this PR): renderer-loss/host admission tests written against the
+// interface the accompanying engineer PR implements. C6/C9/C10 below are
+// COVERAGE tests and must pass against the CURRENT code. R4 (audiocap:stop
+// sparing the probe) is a RED test and is expected to fail until the fix
+// lands -- see the file-level report for the exact current failure.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('audiocapRendererLossEpoch always bumps on a recognized loss event, live capture or not (#3394 PR 1, C6)', () => {
+  function fakeContentsC6() {
+    const handlers: Record<string, (...args: unknown[]) => void> = {};
+    return {
+      handlers,
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        handlers[event] = cb;
+      }),
+    };
+  }
+
+  function fireLossEvent(
+    handlers: Record<string, (...args: unknown[]) => void>,
+    event: 'render-process-gone' | 'did-navigate' | 'did-fail-load'
+  ): void {
+    if (event === 'did-fail-load') {
+      handlers[event]!({}, -6, 'ERR_FILE_NOT_FOUND', 'https://example.invalid/', true, 1, 1);
+    } else if (event === 'render-process-gone') {
+      handlers[event]!({}, { reason: 'crashed', exitCode: 1 });
+    } else {
+      handlers[event]!({}, 'https://example.invalid/', 200, 'OK');
+    }
+  }
+
+  it.each(['render-process-gone', 'did-navigate', 'did-fail-load'] as const)(
+    '%s bumps the epoch with no session live at all',
+    async (event) => {
+      const host = await loadHost();
+      const contents = fakeContentsC6();
+      host.wireAudiocapRendererLoss(contents as never);
+      // Never `?.()` on an existence check -- asserting the value first is what makes a
+      // future dropped registration a loud failure here rather than a silent no-op below.
+      expect(contents.handlers[event]).toBeTypeOf('function');
+      const before = host.audiocapRendererLossEpoch();
+      fireLossEvent(contents.handlers, event);
+      expect(host.audiocapRendererLossEpoch()).toBe(before + 1);
+    }
+  );
+
+  it.each(['render-process-gone', 'did-navigate', 'did-fail-load'] as const)(
+    '%s bumps the epoch while only the windowless probe is live, and does NOT kill the probe',
+    async (event) => {
+      const host = await loadHost();
+      const probeChild = makeChild();
+      fork.mockReturnValue(probeChild);
+      void host.startAudiocapHost(1, null); // the probe: windowHandle === null
+      const contents = fakeContentsC6();
+      host.wireAudiocapRendererLoss(contents as never);
+      expect(contents.handlers[event]).toBeTypeOf('function');
+      const before = host.audiocapRendererLossEpoch();
+      fireLossEvent(contents.handlers, event);
+      // The epoch bump is unconditional -- it is NOT gated on a live capture existing.
+      // `killAudiocapCapture`'s own probe exemption is what spares the child; the epoch
+      // itself must still advance so a concurrently in-flight `audiocap:start` can see it.
+      expect(host.audiocapRendererLossEpoch()).toBe(before + 1);
+      expect(probeChild.kill).not.toHaveBeenCalled();
+    }
+  );
+
+  it('integration: a did-navigate during a pending audiocap:start enumeration refuses the start and never forks', async () => {
+    const host = await loadHost();
+    const { handleAudiocapStart } = await import('../../../src/main/ipc/audiocap');
+    let release!: (sources: Array<{ id: string; name: string }>) => void;
+    const pending = new Promise<Array<{ id: string; name: string }>>((resolve) => {
+      release = resolve;
+    });
+    getSources.mockReturnValueOnce(pending);
+
+    const mainWebContents = { mainFrame: { frameTreeNodeId: 1 } };
+    const getMainWindow = () =>
+      ({ isDestroyed: () => false, webContents: mainWebContents }) as never;
+    const trusted = {
+      senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 1 },
+      sender: mainWebContents,
+    } as never;
+
+    const contents = { handlers: {} as Record<string, (...a: unknown[]) => void>, on: vi.fn() };
+    (contents.on as ReturnType<typeof vi.fn>).mockImplementation(
+      (event: string, cb: (...a: unknown[]) => void) => {
+        contents.handlers[event] = cb;
+      }
+    );
+    host.wireAudiocapRendererLoss(contents as never);
+
+    const pendingStart = handleAudiocapStart(
+      trusted,
+      { sourceId: 'window:42:0' },
+      () => null,
+      getMainWindow
+    );
+    expect(contents.handlers['did-navigate']).toBeTypeOf('function');
+    contents.handlers['did-navigate']!({}, 'https://example.invalid/', 200, 'OK');
+    release([{ id: 'window:42:0', name: 'Some App' }]);
+
+    await expect(pendingStart).resolves.toEqual({ ok: false, reason: 'target-unresolved' });
+    expect(fork).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * THE PROBE'S OWN-SESSION FENCE (#3394 PR 1 fix, red-team VULN-C).
+ *
+ * `runCapabilityProbe`'s `finally` used to call `killAudiocapHost()` UNCONDITIONALLY --
+ * so a share that superseded an in-flight probe (I3) was reaped by the probe's own
+ * continuation resuming afterward, silently killing a live, correctly-started capture with
+ * no signal to its caller. The fix records the probe's own session and kills only when that
+ * session is still the live one, or when none was recorded.
+ */
+describe('the probe reaps only its own session (#3394 PR 1 fix, red-team VULN-C)', () => {
+  it('C1: a share started while the probe is mid-handshake is not killed when the probe settles', async () => {
+    const host = await loadHost();
+    const probeChild = makeChild();
+    const shareChild = makeChild();
+    fork.mockReturnValueOnce(probeChild).mockReturnValueOnce(shareChild);
+    host.setAudiocapPortSink(vi.fn());
+
+    const probe = host.probeAudiocapCapability(); // forks, still handshaking
+    const share = host.startAudiocapHost(7, 42); // I3 supersedes the probe's session
+    expect(host.currentAudiocapGeneration()).toBe(7);
+
+    // C11: await the REAL probe promise rather than counting microtask ticks by hand.
+    // `runCapabilityProbe` is an async function with its own `await` + `finally`, so a
+    // fixed tick count is a guess at how many microtasks its continuation needs -- too
+    // few silently checks state before the continuation ran (vacuous), too many is inert
+    // padding nobody can explain. Awaiting the promise directly waits for EXACTLY as many
+    // microtasks as the continuation needs, however many that is.
+    await expect(probe).resolves.toEqual({ ok: false, reason: 'child-crash' });
+
+    expect(shareChild.kill).not.toHaveBeenCalled();
+    expect(host.currentAudiocapGeneration()).toBe(7);
+
+    shareChild.handlers.message(validHello());
+    shareChild.handlers.message(STARTED);
+    await expect(share).resolves.toEqual({ ok: true, generation: 7, perProcessAudio: true });
+  });
+
+  it('C2 (regression): an undisturbed probe still reaps its own child', async () => {
+    const host = await loadHost();
+    const probeChild = makeChild();
+    fork.mockReturnValue(probeChild);
+    const probe = host.probeAudiocapCapability();
+    probeChild.handlers.message(validHello());
+    await expect(probe).resolves.toEqual({ ok: true, perProcessAudio: true });
+    expect(probeChild.kill).toHaveBeenCalled();
+    expect(host.currentAudiocapGeneration()).toBe(0);
+  });
+});
+
+describe('capability notification fires on the capture path too, exactly once (#3394 PR 1, C9)', () => {
+  it('notifies before started settles, and does not notify again once it does', async () => {
+    const { startAudiocapHost, setAudiocapPortSink, setAudiocapCapabilityListener } =
+      await loadHost();
+    const spy = vi.fn();
+    setAudiocapCapabilityListener(spy);
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    setAudiocapPortSink(vi.fn());
+
+    const started = startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    // BEFORE `started`: the hello arm notifies on every branch, including the one that
+    // enters `starting` and returns without settling (#3394's whole point -- a capture no
+    // longer settles at hello). A notify dropped from that branch (M21) would leave this
+    // assertion unmet while the promise is still pending.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(true);
+
+    child.handlers.message(STARTED);
+    await started;
+    // UNCHANGED after started: `handleStarted` carries no second notify call, and the
+    // snapshot is monotone -- a duplicate push here would not be a correctness bug on
+    // its own, but a change in call count is exactly what a mutated call site produces.
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('timer hygiene: no leaked timers after a starting-state exit (#3394 PR 1, C10)', () => {
+  it('a fault while starting leaves zero pending timers', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink } = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+      const started = startAudiocapHost(1, 42);
+      child.handlers.message(validHello());
+      child.handlers.message({ kind: 'fault', stage: 'start', message: 'refused' });
+      await started;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a renderer-loss kill during starting (B1-style) leaves zero pending timers', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink, wireAudiocapRendererLoss } = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+      const started = startAudiocapHost(1, 42);
+      child.handlers.message(validHello()); // 'starting' -- the ack timer is armed here
+      const handlers: Record<string, (...a: unknown[]) => void> = {};
+      const contents = {
+        on: vi.fn((event: string, cb: (...a: unknown[]) => void) => {
+          handlers[event] = cb;
+        }),
+      };
+      wireAudiocapRendererLoss(contents as never);
+      handlers['did-fail-load']!({}, -6, 'ERR_FILE_NOT_FOUND', 'https://example.invalid/', true);
+      await started;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a supersede kill while starting leaves zero pending timers (not via stopAudiocapHost)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink, killAudiocapHost } = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+      void startAudiocapHost(1, 42);
+      child.handlers.message(validHello()); // 'starting' -- the ack timer is armed here
+      // `killAudiocapHost` is the EXACT primitive `startAudiocapHost`'s I3 supersede calls
+      // first, before it forks a replacement. Driven directly (rather than by starting a
+      // second host) so this test is not confounded by a second child's own fresh
+      // handshake timer, which would legitimately leave the timer count non-zero.
+      killAudiocapHost();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('audiocap:stop spares the windowless app-start probe (#3394 PR 1, R4)', () => {
+  /**
+   * RED. `handleAudiocapStop` currently calls `stopAudiocapHost()` unconditionally, which
+   * ends WHATEVER session is live -- the app-start probe included. Unlike a share
+   * superseding the probe (which self-heals from the SHARE's own `hello`), a stop here
+   * never heals: no child ever says `hello`, `audiocapProbeResult()`/
+   * `audiocapMachineCapability()` memoize the `child-crash` outcome, and per-process audio
+   * is permanently unavailable for the rest of the process's life. See
+   * `[internal]worktrees/agent-af5fded6fe6f85402/client/desktop/tests/unit/main/redteam3394/poc2-stop-reaps-probe.test.ts`
+   * for the full red-team writeup this test converts into a permanent regression lock.
+   */
+  it('a renderer audiocap:stop during the probe handshake does not end the probe', async () => {
+    const host = await loadHost();
+    const { handleAudiocapStop } = await import('../../../src/main/ipc/audiocap');
+    const probeChild = makeChild();
+    fork.mockReturnValue(probeChild);
+
+    const probe = host.probeAudiocapCapability(); // app start: forks, handshaking
+    expect(fork).toHaveBeenCalledTimes(1);
+
+    const mainWebContents = { mainFrame: { frameTreeNodeId: 1 } };
+    const getMainWindow = () =>
+      ({ isDestroyed: () => false, webContents: mainWebContents }) as never;
+    const trusted = {
+      senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 1 },
+      sender: mainWebContents,
+    } as never;
+    handleAudiocapStop(trusted, () => null, getMainWindow);
+
+    probeChild.handlers.message(validHello());
+    await expect(probe).resolves.toEqual({ ok: true, perProcessAudio: true });
+    expect(host.audiocapMachineCapability()).toBe(true);
+    // Never re-asked: the machine capability question was answered once, by the probe
+    // that just survived.
+    expect(fork).toHaveBeenCalledTimes(1);
+  });
+
+  it('control: a stop during a REAL capture still stops it', async () => {
+    const host = await loadHost();
+    const { handleAudiocapStop } = await import('../../../src/main/ipc/audiocap');
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    child.handlers.message(STARTED);
+    await started;
+    child.postMessage.mockClear();
+
+    const mainWebContents = { mainFrame: { frameTreeNodeId: 1 } };
+    const getMainWindow = () =>
+      ({ isDestroyed: () => false, webContents: mainWebContents }) as never;
+    const trusted = {
+      senderFrame: { url: 'app://concord/index.html', frameTreeNodeId: 1 },
+      sender: mainWebContents,
+    } as never;
+    handleAudiocapStop(trusted, () => null, getMainWindow);
+
+    // The GRACEFUL stop, not a bare kill (electron.md "IPC contract v28" / #3198 PR 3
+    // rationale): a real capture must still be ended by a trusted stop.
+    expect(child.postMessage).toHaveBeenCalledWith({ kind: 'stop' });
   });
 });

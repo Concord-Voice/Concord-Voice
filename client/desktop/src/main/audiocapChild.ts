@@ -123,6 +123,7 @@ import {
   type AudiocapFault,
   type AudiocapFaultStage,
   type AudiocapHello,
+  type AudiocapStarted,
 } from '../shared/audiocapProtocol';
 
 // C1. ADR-0043 D5. A memory-safety bug in rt/ must not own the process holding
@@ -369,6 +370,11 @@ function postFault(stage: AudiocapFaultStage, message: string): void {
     message: sanitizeDiagnostic(message, FAULT_MESSAGE_MAX_CHARS),
   };
   process.parentPort.postMessage(fault);
+}
+
+function postStarted(): void {
+  const started: AudiocapStarted = { kind: 'started' };
+  process.parentPort.postMessage(started);
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +758,13 @@ function handleStart(
     // the defect the unwind exists to prevent.
     const stage: AudiocapFaultStage = reason === 'NoTarget' ? 'target' : 'start';
     unwindFailedStart(addon, startFailureMessage(reason), stage);
+    return;
   }
+
+  // THE TAP EXISTS. This ack — not `hello` — settles main's start promise (#3394, spec C1).
+  // Posted last, after every refusal above has returned, so a refusal can never be
+  // preceded by a `started` that already told the renderer the share has sound.
+  postStarted();
 }
 
 /**

@@ -5122,4 +5122,93 @@ describe('main.ts', () => {
       expect(capabilityPushes()).toEqual([]);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // RENDERER-LOSS WIRING ORDER (#3394 PR 1, R3).
+  //
+  // `createWindow` calls `wireAudiocapRendererLoss(mainWindow.webContents)` AFTER
+  // `await loadPackagedRenderer(...)` / `await loadDevRendererWithFallback(...)`. The
+  // renderer is live, shown (`ready-to-show`), and able to invoke `audiocap:start` long
+  // before that await resolves -- so a renderer loss (crash / reload) landing inside that
+  // window reaches NO audiocap listener, and the capture child keeps its OS tap for a
+  // document that no longer exists. Nothing later can see those events, because the wire
+  // that eventually registers only sees FUTURE ones.
+  //
+  // DELIBERATELY THE LAST DESCRIBE BLOCK IN THIS FILE. It is the only place in this suite
+  // that calls `vi.resetModules()` and re-imports `main.ts` a second time -- every other
+  // test in this file shares the SINGLE `beforeAll` import. A second import re-runs every
+  // module-scope side effect against the SAME hoisted `mockMainWindow` /
+  // `mockWebContents` singletons this file already uses, so ordering it last means no
+  // later test can observe the mutated mock state this block produces.
+  // ─────────────────────────────────────────────────────────────────────
+  describe('audiocap renderer-loss wiring order (#3394 PR 1, R3)', () => {
+    it('RED: a did-navigate landing before the initial load resolves still reaches the audiocap wire', async () => {
+      vi.resetModules();
+
+      // Hold the initial `loadFile` pending -- exactly as a real `loadFile`/`loadURL`
+      // stays pending until `did-finish-load`. `mockImplementationOnce` consumes exactly
+      // one call, so this does not affect any later use of the shared mock.
+      let releaseLoad!: () => void;
+      const pendingLoad = new Promise<void>((resolve) => {
+        releaseLoad = resolve;
+      });
+      (mockMainWindow.loadFile as Mock).mockImplementationOnce(() => pendingLoad);
+
+      // Snapshot the SHARED mocks' call histories before the second import, so only
+      // registrations made by THIS import are inspected below.
+      const onCallsBefore = mockWebContents.on.mock.calls.length;
+
+      await import('../../../src/main/main');
+      // createWindow is now parked awaiting the still-pending initial load. A real
+      // setTimeout drain (matching this file's own beforeAll pattern) lets every
+      // microtask up to that hung await settle, with no dependency on guessing a tick
+      // count.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const host = await import('../../../src/main/audiocapHost');
+      const epochBefore = host.audiocapRendererLossEpoch();
+
+      const newOnCalls = mockWebContents.on.mock.calls.slice(onCallsBefore);
+      const didNavigateHandler = newOnCalls.find((c) => c[0] === 'did-navigate')?.[1] as
+        ((...a: unknown[]) => void) | undefined;
+
+      // THE RED ASSERTION. Today `wireAudiocapRendererLoss` runs only after the awaited
+      // load resolves, so with the load still pending no `did-navigate` handler has been
+      // registered from THIS import yet, and firing one (if it existed) could not reach
+      // the wire. Once the fix moves the wire ahead of the load, this handler exists
+      // while the load is still pending, and firing it bumps the epoch.
+      expect(
+        didNavigateHandler,
+        'no did-navigate listener was registered before the initial load resolved'
+      ).toBeTypeOf('function');
+      didNavigateHandler!({}, 'https://example.invalid/', 200, 'OK');
+      expect(host.audiocapRendererLossEpoch()).toBe(epochBefore + 1);
+
+      // Release the held load so this import does not leave a permanently-pending
+      // promise hanging off the shared mock past this test.
+      releaseLoad();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    it('CONTROL (non-vacuity): the same did-navigate reaches the wire once the load has already resolved', async () => {
+      vi.resetModules();
+      const onCallsBefore = mockWebContents.on.mock.calls.length;
+
+      await import('../../../src/main/main');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const host = await import('../../../src/main/audiocapHost');
+      const epochBefore = host.audiocapRendererLossEpoch();
+
+      const newOnCalls = mockWebContents.on.mock.calls.slice(onCallsBefore);
+      const didNavigateHandler = newOnCalls.find((c) => c[0] === 'did-navigate')?.[1] as (
+        ...a: unknown[]
+      ) => void;
+      expect(didNavigateHandler).toBeTypeOf('function');
+      didNavigateHandler({}, 'https://example.invalid/', 200, 'OK');
+      // Proves the harness itself can observe an epoch bump when the wire IS registered --
+      // so the RED case above is a genuine finding, not a broken assertion.
+      expect(host.audiocapRendererLossEpoch()).toBe(epochBefore + 1);
+    });
+  });
 });

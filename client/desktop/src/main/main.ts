@@ -16,6 +16,7 @@ import {
   probeAudiocapCapability,
   setAudiocapCapabilityListener,
   setAudiocapPortSink,
+  wireAudiocapRendererLoss,
 } from './audiocapHost';
 import { registerVersionInfoIpc } from './ipc/versionInfo';
 import { buildBrowserWindowConfig } from './browserWindowConfig';
@@ -1337,6 +1338,15 @@ const createWindow = async (): Promise<void> => {
     resetDeepLinkDelivery();
   });
 
+  // #3394 C15: a reload or renderer crash must not leave the capture child's OS tap running.
+  // WIRED BEFORE THE FIRST LOAD, not after it: the renderer is live, shown and able to invoke
+  // `audiocap:start` long before the awaited load below resolves (`did-finish-load`, plus up
+  // to CONFIG_TIMEOUT_MS of `captureSpaHash` in remote mode), and a loss inside that window
+  // reached no listener at all -- a wire registered later sees only FUTURE events. The initial
+  // load's own `did-navigate` is harmless: no capture exists yet, and `killAudiocapCapture`
+  // spares the windowless app-start probe, which overlaps the first load by design.
+  wireAudiocapRendererLoss(mainWindow.webContents);
+
   // A RENDERER CREATED OR RELOADED AFTER THE SNAPSHOT SETTLED HEARS NOTHING FROM THE
   // change listener in the ready path — the push already happened. Re-send on every load:
   // the value is a machine fact, identical on every hello, so a duplicate is idempotent
@@ -1587,7 +1597,12 @@ app.whenReady().then(async () => {
   // sender-frame criterion binds; `audiocap:capability` is a push and has no sender
   // to validate. Same DI shape as its four siblings above, so the origin getter is
   // stubbable in tests rather than reached through a module import.
-  registerAudiocapIpc(getRemoteSpaBaseUrl);
+  //
+  // The window provider (#3394 PR 1, R5) narrows admission from "a permitted origin" to
+  // "the main window's own main frame" -- a PiP shares the origin. Late-bound like
+  // `registerWindowControlsIpc(() => mainWindow)`: `createWindow` has not run yet here, and
+  // the `closed` handler nulls the variable.
+  registerAudiocapIpc(getRemoteSpaBaseUrl, () => mainWindow);
   // Permission request handler: explicitly allow app-required permissions, deny risky ones.
   // Notifications are allowed (JIT-managed by permissionManager #197).
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {

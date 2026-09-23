@@ -4452,9 +4452,10 @@ class VoiceService {
 
     try {
       // ORDER-INDEPENDENT SINCE THE MODULE-SCOPE LISTENER LANDED. The port for this
-      // generation may already have arrived — main posts it in the same turn that
-      // settles the invoke above — in which case it is sitting buffered and this
-      // constructor adopts it synchronously. Before that fix this line was a race the
+      // generation has usually already arrived — main posts it at the child's `hello`,
+      // and the invoke above settles only later, on the child's `started` ack (#3394) —
+      // in which case it is sitting buffered and this constructor adopts it
+      // synchronously; the module-scope buffering by generation is why that works. Before that fix this line was a race the
       // renderer lost, and the symptom was a silent audio-free share.
       const bridge = createScreenAudioBridge(started.generation);
       // No supersede here any more: `stopScreenAudioHost()` above already stopped the

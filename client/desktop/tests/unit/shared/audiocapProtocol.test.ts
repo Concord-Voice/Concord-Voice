@@ -4,10 +4,13 @@ import {
   AUDIOCAP_FAULT_STAGES,
   QUANTUM_BYTES,
   HEADER_BYTES,
+  HANDSHAKE_TIMEOUT_MS,
+  START_ACK_TIMEOUT_MS,
   decodeQuantumHeader,
   encodeQuantumHeader,
   isAudiocapFault,
   isAudiocapHello,
+  isAudiocapStarted,
   sanitizeDiagnostic,
 } from '../../../src/shared/audiocapProtocol';
 
@@ -294,5 +297,43 @@ describe('AUDIOCAP_FAULT_STAGES — the #3198 addition', () => {
     // reads as a protocol fault and answers by killing the child.
     expect(isAudiocapFault({ kind: 'fault', stage: 'target', message: 'x' })).toBe(true);
     expect(isAudiocapFault({ kind: 'fault', stage: 'run', message: 'x' })).toBe(false);
+  });
+});
+
+describe('isAudiocapStarted (#3394 PR 1)', () => {
+  it('accepts the bare started ack', () => {
+    expect(isAudiocapStarted({ kind: 'started' })).toBe(true);
+  });
+
+  it('tolerates extra keys and never needs them (D5: nothing on it is read)', () => {
+    expect(isAudiocapStarted({ kind: 'started', extra: 1 })).toBe(true);
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a bare string', 'started'],
+    ['a wrong-case kind', { kind: 'Started' }],
+    ['another kind', { kind: 'hello' }],
+    ['no kind', {}],
+    ['a kind that is not a string', { kind: ['started'] }],
+  ])('refuses %s', (_label, value) => {
+    expect(isAudiocapStarted(value)).toBe(false);
+  });
+});
+
+describe('START_ACK_TIMEOUT_MS (#3394 PR 1)', () => {
+  it('is pinned to its current numeric value (T0-pending)', () => {
+    // Pinned so a T0-driven change is a deliberate edit to this line too.
+    //
+    // NOTE (#3394 PR 1, C8): this assertion alone CANNOT distinguish "its own constant"
+    // from "the handshake timeout constant, reused" — both constants are declared as
+    // 10000 today, so `toBe(10000)` passes identically whether audiocapHost.ts's start-ack
+    // timer reads START_ACK_TIMEOUT_MS or HANDSHAKE_TIMEOUT_MS. That behavioral claim is
+    // exercised, with the two constants driven to DIFFERENT values via `vi.doMock`, by
+    // "START_ACK_TIMEOUT_MS is genuinely distinct from HANDSHAKE_TIMEOUT_MS" in
+    // audiocapHost.test.ts. This test only pins the number this file quotes.
+    expect(START_ACK_TIMEOUT_MS).toBe(10000);
+    expect(HANDSHAKE_TIMEOUT_MS).toBe(10000);
   });
 });
