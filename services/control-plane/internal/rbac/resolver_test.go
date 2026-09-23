@@ -194,6 +194,82 @@ func TestHasPermissionBaseMember(t *testing.T) {
 	assert.False(t, hasPerm, "base member should not have PermKick")
 }
 
+func TestResolveChannelPermissionsTx_UsesTransactionScopedChannelOverrides(t *testing.T) {
+	resolver, ts := setupResolver(t)
+	owner := ts.CreateTestUser(t, "tx-owner"+uuid.NewString()[:8])
+	member := ts.CreateTestUser(t, "tx-member"+uuid.NewString()[:8])
+	serverID := ts.CreateTestServer(t, owner.ID, "tx-permissions")
+	ts.AddMemberToServer(t, serverID, member.ID, "member")
+	channelID := ts.CreateTestChannel(t, serverID, "tx-channel")
+	var defaultRoleID string
+	require.NoError(t, ts.DB.QueryRow(`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE LIMIT 1`, serverID).Scan(&defaultRoleID))
+	_, err := ts.DB.Exec(`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny) VALUES ($1, $2, 'role', $3, 0, $4)`, uuid.NewString(), channelID, defaultRoleID, int64(rbac.PermSendMessages))
+	require.NoError(t, err)
+
+	tx, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback() })
+	perms, err := resolver.ResolveChannelPermissionsTx(context.Background(), tx, serverID, member.ID, channelID)
+	require.NoError(t, err)
+	assert.False(t, perms.Has(rbac.PermSendMessages), "the transaction snapshot must apply the channel deny")
+
+	assert.True(t, perms.Has(rbac.PermViewTextChannels))
+
+	ownerPerms, err := resolver.ResolveChannelPermissionsTx(context.Background(), tx, serverID, owner.ID, channelID)
+	require.NoError(t, err)
+	assert.True(t, ownerPerms.Has(rbac.PermSendMessages), "owner permissions bypass channel overrides")
+}
+
+func TestHasTemporaryMoveGrantForChannelsTx_DetectsOnlyProtectedUserRows(t *testing.T) {
+	_, ts := setupResolver(t)
+	owner := ts.CreateTestUser(t, "grant-owner"+uuid.NewString()[:8])
+	member := ts.CreateTestUser(t, "grant-member"+uuid.NewString()[:8])
+	serverID := ts.CreateTestServer(t, owner.ID, "grant-gate")
+	channelID := ts.CreateVoiceChannel(t, serverID, "grant-channel")
+	_, err := ts.DB.Exec(`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at) VALUES ($1, $2, 'user', $3, 0, 0, TRUE, 'move_granted', NOW())`, uuid.NewString(), channelID, member.ID)
+	require.NoError(t, err)
+
+	tx, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback() })
+	protected, err := rbac.HasTemporaryMoveGrantForChannelsTx(context.Background(), tx, []string{channelID})
+	require.NoError(t, err)
+	assert.True(t, protected)
+
+	other, err := rbac.HasTemporaryMoveGrantForChannelsTx(context.Background(), tx, []string{})
+	require.NoError(t, err)
+	assert.False(t, other)
+}
+
+func TestReplaceCategoryOverridesForChannelsTx_ReplacesChildRows(t *testing.T) {
+	_, ts := setupResolver(t)
+	owner := ts.CreateTestUser(t, "category-owner"+uuid.NewString()[:8])
+	target := ts.CreateTestUser(t, "category-target"+uuid.NewString()[:8])
+	serverID := ts.CreateTestServer(t, owner.ID, "category-replace")
+	categoryID := uuid.NewString()
+	channelID := ts.CreateTestChannel(t, serverID, "category-channel")
+	roleID := uuid.NewString()
+	_, err := ts.DB.Exec(`INSERT INTO channel_groups (id, server_id, name, position) VALUES ($1, $2, 'category', 0)`, categoryID, serverID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny) VALUES ($1, $2, 'user', $3, $4, 0)`, uuid.NewString(), categoryID, target.ID, int64(rbac.PermViewTextChannels))
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny) VALUES ($1, $2, 'role', $3, 0, $4)`, uuid.NewString(), channelID, roleID, int64(rbac.PermSendMessages))
+	require.NoError(t, err)
+
+	tx, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, rbac.ReplaceCategoryOverridesForChannelsTx(context.Background(), tx, categoryID, []string{channelID}))
+	require.NoError(t, tx.Commit())
+
+	var targetType, targetID string
+	var allow, deny int64
+	require.NoError(t, ts.DB.QueryRow(`SELECT target_type, target_id, allow, deny FROM channel_permission_overrides WHERE channel_id = $1`, channelID).Scan(&targetType, &targetID, &allow, &deny))
+	assert.Equal(t, "user", targetType)
+	assert.Equal(t, target.ID, targetID)
+	assert.Equal(t, int64(rbac.PermViewTextChannels), allow)
+	assert.Zero(t, deny)
+}
+
 func TestHasPermissionAdministratorBypass(t *testing.T) {
 	resolver, ts := setupResolver(t)
 	ctx := context.Background()

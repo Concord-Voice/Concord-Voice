@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,24 +22,44 @@ func TestCategoryOverrideTransactionsFenceFinalAdmission(t *testing.T) {
 		{
 			name: "delete",
 			run: func(env *rbacPresenceEnv, categoryID, _ string) error {
-				return env.handler.deleteCategoryOverrideWithCapture(
-					context.Background(), env.serverID, categoryID, uuid.NewString(), "role", env.viewRole,
+				overrideID := uuid.NewString()
+				env.exec(`INSERT INTO category_permission_overrides
+					(id, category_id, target_type, target_id, allow, deny)
+					VALUES ($1, $2, 'role', $3, $4, 0)`,
+					overrideID, categoryID, env.viewRole, int64(PermViewVoiceChannels))
+				_, _, err := env.handler.deleteCategoryOverrideWithCapture(
+					context.Background(), categoryAuthorityRequest{
+						serverID: env.serverID, categoryID: categoryID, userID: env.serverOwnerID,
+					}, overrideID, "role", env.viewRole,
+					&[]keyrotation.Rotation{}, &map[string][]string{},
 				)
+				return err
 			},
 		},
 		{
-			name: "copy",
-			run: func(env *rbacPresenceEnv, categoryID, channelID string) error {
-				return env.handler.copyCategoryOverridesToChannel(
-					context.Background(), env.serverID, channelID, categoryID,
+			name: "upsert",
+			run: func(env *rbacPresenceEnv, categoryID, _ string) error {
+				req := UpsertOverrideRequest{
+					TargetType: "role", TargetID: env.viewRole, Allow: int64(PermViewVoiceChannels),
+				}
+				state := newCategoryOverrideWriteState(categoryID, req)
+				_, _, err := env.handler.upsertCategoryOverrideWithAuthority(
+					context.Background(), categoryAuthorityRequest{
+						serverID: env.serverID, categoryID: categoryID, userID: env.serverOwnerID,
+					}, req, &state,
 				)
+				return err
 			},
 		},
 		{
 			name: "sync",
-			run: func(env *rbacPresenceEnv, categoryID, _ string) error {
-				env.handler.syncCategoryOverridesToChannels(context.Background(), env.serverID, categoryID)
-				return nil
+			run: func(env *rbacPresenceEnv, categoryID, channelID string) error {
+				category := categoryID
+				_, _, _, err := env.handler.enableChannelPermissionSync(context.Background(), channelSyncRequest{
+					userID: env.serverOwnerID, channelID: channelID, serverID: env.serverID,
+					categoryID: &category, isVoice: true, syncPermissions: true,
+				})
+				return err
 			},
 		},
 	}
@@ -98,7 +119,9 @@ func TestDeleteCategoryOverride_CascadeNarrowing_ClearsExactlyTheLosingViewer(t 
 	env.exec(`INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
 	          VALUES ($1, $2, 'role', $3, $4, 0)`,
 		overrideID, category, grantRole, int64(PermViewVoiceChannels))
-	env.handler.syncCategoryOverridesToChannels(context.Background(), env.serverID, category)
+	env.exec(`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+	          SELECT gen_random_uuid(), $1, target_type, target_id, allow, deny
+	          FROM category_permission_overrides WHERE id = $2`, channel, overrideID)
 
 	// Retains sight through viewRole's base permissions, so the cascade must
 	// leave it alone — the no-false-clear half.
@@ -112,9 +135,14 @@ func TestDeleteCategoryOverride_CascadeNarrowing_ClearsExactlyTheLosingViewer(t 
 	sender := env.joinVoice(t, channel)
 	env.waitForDispatch(t)
 
-	require.NoError(t, env.handler.deleteCategoryOverrideWithCapture(
-		context.Background(), env.serverID, category, overrideID, "role", grantRole,
-	))
+	plan, _, err := env.handler.deleteCategoryOverrideWithCapture(
+		context.Background(), categoryAuthorityRequest{
+			serverID: env.serverID, categoryID: category, userID: env.serverOwnerID,
+		}, overrideID, "role", grantRole,
+		&[]keyrotation.Rotation{}, &map[string][]string{},
+	)
+	require.NoError(t, err)
+	env.handler.presenceExecute(plan)
 	env.waitForDispatch(t)
 
 	assert.False(t, env.viewerCanSeeChannel(t, channel, viewer),
@@ -140,13 +168,18 @@ func TestDeleteCategoryOverride_CaptureFailure_BlocksTheWrite(t *testing.T) {
 	env.exec(`INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
 	          VALUES ($1, $2, 'role', $3, $4, 0)`,
 		overrideID, category, env.viewRole, int64(PermViewVoiceChannels))
-	env.handler.syncCategoryOverridesToChannels(context.Background(), env.serverID, category)
+	env.exec(`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+	          SELECT gen_random_uuid(), $1, target_type, target_id, allow, deny
+	          FROM category_permission_overrides WHERE id = $2`, channel, overrideID)
 
 	env.injectCaptureFailure()
 	defer env.clearInjectedFailure()
 
-	err := env.handler.deleteCategoryOverrideWithCapture(
-		context.Background(), env.serverID, category, overrideID, "role", env.viewRole,
+	_, _, err := env.handler.deleteCategoryOverrideWithCapture(
+		context.Background(), categoryAuthorityRequest{
+			serverID: env.serverID, categoryID: category, userID: env.serverOwnerID,
+		}, overrideID, "role", env.viewRole,
+		&[]keyrotation.Rotation{}, &map[string][]string{},
 	)
 	require.Error(t, err, "a capture failure blocks the write here: nothing has committed yet")
 	require.Zero(t, env.handler.hub.PresenceAuthzOpenForTest())
@@ -159,11 +192,10 @@ func TestDeleteCategoryOverride_CaptureFailure_BlocksTheWrite(t *testing.T) {
 		"the parent override is rolled back, not left half-applied")
 }
 
-// Spec §12 test 8: the cascade hook lives inside syncCategoryOverridesToChannels'
-// existing transaction and captures exactly the SYNCED channel list it rewrites.
+// The live category-delete path captures exactly the synced children it rewrites.
 // Unsynced channels in the same category are untouched (F4/F5), and each sender
 // receives exactly one RefreshServerVoiceRecheck, UUID-ordered.
-func TestSyncCategoryOverridesToChannels_CapturesOnlySyncedChannels(t *testing.T) {
+func TestDeleteCategoryOverride_CapturesOnlySyncedChannels(t *testing.T) {
 	env := newRBACPresenceEnv(t)
 	defer env.Close()
 
@@ -186,10 +218,28 @@ func TestSyncCategoryOverridesToChannels_CapturesOnlySyncedChannels(t *testing.T
 	for _, channelID := range unsynced {
 		unsyncedSenders = append(unsyncedSenders, env.joinVoice(t, channelID))
 	}
-	viewer := env.addViewerWithSight(t, append(synced, unsynced...))
+	viewer := env.addMemberWithoutSight(t)
 
-	env.denyViewOnCategory(t, category)
-	env.handler.syncCategoryOverridesToChannels(context.Background(), env.serverID, category)
+	grantRole := env.createRole("cat-allow", 0)
+	env.assignRole(t, viewer, grantRole)
+	overrideID := uuid.NewString()
+	env.exec(`INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
+	          VALUES ($1, $2, 'role', $3, $4, 0)`,
+		overrideID, category, grantRole, int64(PermViewVoiceChannels))
+	for _, channelID := range synced {
+		env.exec(`INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+		          SELECT gen_random_uuid(), $1, target_type, target_id, allow, deny
+		          FROM category_permission_overrides WHERE id = $2`, channelID, overrideID)
+	}
+	env.resetRefreshes()
+	plan, _, err := env.handler.deleteCategoryOverrideWithCapture(
+		context.Background(), categoryAuthorityRequest{
+			serverID: env.serverID, categoryID: category, userID: env.serverOwnerID,
+		}, overrideID, "role", grantRole,
+		&[]keyrotation.Rotation{}, &map[string][]string{},
+	)
+	require.NoError(t, err)
+	env.handler.presenceExecute(plan)
 	env.waitForDispatch(t)
 
 	for _, senderID := range syncedSenders {
@@ -202,38 +252,4 @@ func TestSyncCategoryOverridesToChannels_CapturesOnlySyncedChannels(t *testing.T
 			"an unsynced channel is not rewritten, so its senders are untouched")
 	}
 	assert.True(t, env.refreshOrderIsUUIDSorted(), "dispatch order is deterministic")
-}
-
-// Spec §12 test 8 (second half): the two explicit non-hooks.
-func TestSetChannelPermissionSyncFlag_IsVisibilityInert_NoCapture(t *testing.T) {
-	env := newRBACPresenceEnv(t)
-	defer env.Close()
-
-	category := env.createCategory(t)
-	channelID := env.createVoiceChannel(t, category, false)
-	senderID := env.joinVoice(t, channelID)
-	env.addViewerWithSight(t, []string{channelID})
-
-	// `UPDATE channels SET sync_permissions` alone changes no visibility input:
-	// filterVisibleUserIDsForChannel reads neither sync_permissions nor
-	// category_permission_overrides.
-	env.setSyncFlagOnly(t, channelID, true)
-	env.waitForDispatch(t)
-
-	assert.Zero(t, env.refreshCount(senderID))
-}
-
-func TestInvalidateSyncedChannelCaches_PerformsNoWrite_NoCapture(t *testing.T) {
-	env := newRBACPresenceEnv(t)
-	defer env.Close()
-
-	category := env.createCategory(t)
-	channelID := env.createVoiceChannel(t, category, false)
-	senderID := env.joinVoice(t, channelID)
-
-	env.handler.invalidateSyncedChannelCaches(context.Background(), env.serverID, category)
-	env.waitForDispatch(t)
-
-	require.Zero(t, env.refreshCount(senderID),
-		"invalidateSyncedChannelCaches performs no write; it keeps only its recheckVoiceChannel loop")
 }

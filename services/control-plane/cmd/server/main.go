@@ -54,16 +54,18 @@ const (
 )
 
 type controlPlaneSubcommandRunners struct {
-	admin           func([]string) int
-	activityHistory func([]string) int
-	storageProbe    func([]string) int
+	admin                   func([]string) int
+	activityHistory         func([]string) int
+	storageProbe            func([]string) int
+	voiceEnforcementRollout func([]string) int
 }
 
 func dispatchControlPlaneSubcommand(args []string) (int, bool) {
 	return dispatchControlPlaneSubcommandWithRunners(args, controlPlaneSubcommandRunners{
-		admin:           admin.RunAdminCtl,
-		activityHistory: presencehistory.RunAdminCtl,
-		storageProbe:    probe.Run,
+		admin:                   admin.RunAdminCtl,
+		activityHistory:         presencehistory.RunAdminCtl,
+		storageProbe:            probe.Run,
+		voiceEnforcementRollout: runVoiceEnforcementRollout,
 	})
 }
 
@@ -81,13 +83,15 @@ func dispatchControlPlaneSubcommandWithRunners(
 		return runners.activityHistory(args[2:]), true
 	case "storage-probe":
 		return runners.storageProbe(args[2:]), true
+	case "voice-enforcement-rollout":
+		return runners.voiceEnforcementRollout(args[2:]), true
 	case "serve":
 		return 0, false
 	default:
 		if args[1] == "" {
 			return 0, false
 		}
-		fmt.Fprintln(os.Stderr, "usage: control-plane [admin|activity-history|storage-probe] ...")
+		fmt.Fprintln(os.Stderr, "usage: control-plane [admin|activity-history|storage-probe|voice-enforcement-rollout] ...")
 		return 64, true
 	}
 }

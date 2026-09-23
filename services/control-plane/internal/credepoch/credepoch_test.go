@@ -216,6 +216,55 @@ func TestOp_CommitSurvivesCanceledRequestContext(t *testing.T) {
 	assert.Equal(t, "active:"+op.NewEpochValue(), val)
 }
 
+func TestOp_CommitDoesNotWaitForMediaEviction(t *testing.T) {
+	f, _ := newFence(t)
+	op, err := f.Begin(context.Background(), "u1")
+	require.NoError(t, err)
+	op.previousCaptured = true
+
+	evictionStarted := make(chan struct{})
+	evictionRelease := make(chan struct{})
+	evictionDone := make(chan struct{})
+	releaseEviction := func() {
+		select {
+		case <-evictionRelease:
+		default:
+			close(evictionRelease)
+		}
+	}
+	defer releaseEviction()
+	f.SetPostCommitEvictor(func(ctx context.Context, _, _, _ string) {
+		close(evictionStarted)
+		select {
+		case <-evictionRelease:
+		case <-ctx.Done():
+		}
+		close(evictionDone)
+	})
+
+	commitDone := make(chan struct{})
+	go func() {
+		op.Commit(context.Background())
+		close(commitDone)
+	}()
+	select {
+	case <-commitDone:
+	case <-time.After(time.Second):
+		t.Fatal("Commit waited for the media eviction callback")
+	}
+	select {
+	case <-evictionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("media eviction callback did not start")
+	}
+	releaseEviction()
+	select {
+	case <-evictionDone:
+	case <-time.After(time.Second):
+		t.Fatal("media eviction callback did not finish")
+	}
+}
+
 func TestNewEpoch_ShapeAndUniqueness(t *testing.T) {
 	hex32 := regexp.MustCompile(`^[0-9a-f]{32}$`)
 	seen := make(map[string]bool)

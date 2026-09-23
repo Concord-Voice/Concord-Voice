@@ -25,6 +25,8 @@ without losing the observation that triggered them.
   how far it would go in a wider window. Picture-in-picture windows keep their normal size. A
   desktop app that has not updated yet keeps the previous 85–130% range.
 
+- **DM-block and credential-epoch cleanup now survives delivery failures** ([#3140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3140)) — guarded reconciliation records retryable voice-ejection obligations and fences stale callbacks by generation.
+
 ### Fixed
 
 - **Links opened from a picture-in-picture window now open in your browser** ([#3416](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3416)) — a link or pop-up

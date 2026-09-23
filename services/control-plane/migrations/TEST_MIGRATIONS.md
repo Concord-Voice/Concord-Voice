@@ -80,11 +80,16 @@ Expected output:
 Checking migration version...
 Building migrate tool...
 ./bin/migrate -command=version
-Current version: 133 (clean)
+Current version: 154 (clean)
 ```
 
 The number is the highest migration in `migrations/`. Run `ls migrations/*.up.sql | tail -1` to
 confirm the current value.
+
+Migration 000144 binds member roles to their server. Migrations 000145–000154 cover DM
+revocation serialization, durable block and voice-ejection reconciliation, credential-epoch
+ejections, rollout grace, blocked-friendship compatibility, and exact voice sessions. Apply
+them in order; do not reuse these numbers.
 
 #### Test Rollback
 ```bash
@@ -106,7 +111,7 @@ make migrate-version
 
 Expected output:
 ```
-Current version: 132 (clean)
+Current version: 153 (clean)
 ```
 
 The version is one lower than the value from the previous step.
@@ -181,15 +186,15 @@ Creating migration: add_test_field
 Building migrate tool...
 ./bin/migrate -command=create -name=add_test_field
 Created migration files:
-  - migrations/000134_add_test_field.up.sql
-  - migrations/000134_add_test_field.down.sql
+  - migrations/000155_add_test_field.up.sql
+  - migrations/000155_add_test_field.down.sql
 ```
 
 The number is the next one after the highest migration in `migrations/`.
 
 Verify files were created:
 ```bash
-ls -l migrations/000134_*
+ls -l migrations/000155_*
 ```
 
 ### 6. Test Server Startup with Auto-Migration

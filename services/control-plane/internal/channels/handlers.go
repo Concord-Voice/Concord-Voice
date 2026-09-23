@@ -9,12 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/keyrotation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
@@ -34,6 +34,9 @@ const (
 	maxChannelWrappedKeysRequestBytes = 512 * 1_024
 	maxDMWrappedKeys                  = 10
 	maxDMWrappedKeysRequestBytes      = 16 * 1_024
+	// A changed participant snapshot must restart the complete lock prefix;
+	// further churn fails closed rather than admitting stale topology.
+	dmDistributionTopologyAttempts = 2
 	// Per-conversation ceiling on DM key distribution (#1218). Sized by
 	// legitimate peer-fulfillment fan-out, not by attacker modelling:
 	// appendDMPendingRequests shows every key holder every non-self pending
@@ -3482,101 +3485,71 @@ func distributeOneDMKey(ctx context.Context, tx *sql.Tx, conversationID, memberU
 	return dmRecipientInserted, nil
 }
 
-// lockDMKeyDistributionUsers takes every user-row lock this request can need
-// before touching the DM scope. The UUID ordering is load-bearing: account
-// erasure locks its affected users before its conversation scopes, so lazy
-// recipient locks here could form a cycle with that path.
-func lockDMKeyDistributionUsers(ctx context.Context, tx *sql.Tx, actorID, tokenEpoch string, wrappedKeys map[string]string) (returnErr error) {
+// lockDMKeyDistributionUsers takes the users-only portion of the shared
+// dmblock prefix, then proves the claimant's credential epoch. The caller
+// takes the participant-set advisory lock before completing the parent and
+// blocked-pair preparation.
+func lockDMKeyDistributionUsers(ctx context.Context, tx *sql.Tx, conversationID, actorID, tokenEpoch string) ([]uuid.UUID, error) {
 	actorUUID, err := uuid.Parse(actorID)
 	if err != nil {
-		return fmt.Errorf("parse dm key distributor: %w", err)
+		return nil, fmt.Errorf("parse dm key distributor: %w", err)
 	}
-	userIDs := []uuid.UUID{actorUUID}
-	seen := map[uuid.UUID]struct{}{actorUUID: {}}
-	for recipientID := range wrappedKeys {
-		recipientUUID, parseErr := uuid.Parse(recipientID)
-		if parseErr != nil {
-			continue
-		}
-		if _, exists := seen[recipientUUID]; exists {
-			continue
-		}
-		seen[recipientUUID] = struct{}{}
-		userIDs = append(userIDs, recipientUUID)
-	}
-	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i].String() < userIDs[j].String() })
-	rawUserIDs := make([]string, 0, len(userIDs))
-	for _, userID := range userIDs {
-		rawUserIDs = append(rawUserIDs, userID.String())
-	}
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, credential_epoch
-		FROM users
-		WHERE id = ANY($1::uuid[])
-		ORDER BY id
-		FOR SHARE
-	`, pq.Array(rawUserIDs))
+	subjects, err := dmblock.LockConversationUsersTx(ctx, tx, conversationID, []uuid.UUID{actorUUID}, dmblock.LockShare)
 	if err != nil {
-		return fmt.Errorf("lock dm key distribution users: %w", err)
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("close dm key distribution users: %w", closeErr))
+		if errors.Is(err, dmblock.ErrUnavailable) || errors.Is(err, dmblock.ErrMembershipChanged) {
+			return nil, errDMKeyDistributorNotParticipant
 		}
-	}()
+		return nil, fmt.Errorf("lock dm key distribution users: %w", err)
+	}
 
-	actorFound := false
-	for rows.Next() {
-		var userID uuid.UUID
-		var credentialEpoch sql.NullString
-		if scanErr := rows.Scan(&userID, &credentialEpoch); scanErr != nil {
-			return fmt.Errorf("scan dm key distribution user: %w", scanErr)
+	var credentialEpoch sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT credential_epoch FROM users WHERE id = $1`, actorUUID).Scan(&credentialEpoch); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errDMKeyDistributorNotParticipant
 		}
-		if userID != actorUUID {
-			continue
-		}
-		actorFound = true
-		if epochErr := credepoch.MatchEpoch(credentialEpoch, tokenEpoch); epochErr != nil {
-			return epochErr
-		}
+		return nil, fmt.Errorf("read dm key distributor credential epoch: %w", err)
 	}
-	if rowsErr := rows.Err(); rowsErr != nil {
-		return fmt.Errorf("iterate dm key distribution users: %w", rowsErr)
+	if err := credepoch.MatchEpoch(credentialEpoch, tokenEpoch); err != nil {
+		return nil, err
 	}
-	if !actorFound {
-		return errDMKeyDistributorNotParticipant
-	}
-	return nil
+	return subjects, nil
 }
 
 func (h *Handler) distributeDMKeys(ctx context.Context, actorID, tokenEpoch, conversationID string, wrappedKeys map[string]string, wrappedKeyVersions map[string]int, explicitVersion *int) (int, error) {
-	// #2201 review: request context, same rationale as distributeChannelKeysToMembers.
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("begin dm distribution tx: %w", err)
-	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-			h.log.Error("Failed to rollback dm distribution tx", "error", rbErr)
-		}
-	}()
-	outcome, err := distributeDMKeysTx(ctx, tx, dmDistributionBatch{
+	batch := dmDistributionBatch{
 		actorID:            actorID,
 		tokenEpoch:         tokenEpoch,
 		conversationID:     conversationID,
 		wrappedKeys:        wrappedKeys,
 		wrappedKeyVersions: wrappedKeyVersions,
 		explicitVersion:    explicitVersion,
-	})
-	if err != nil {
-		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit dm distribution tx: %w", err)
+	for attempt := 0; attempt < dmDistributionTopologyAttempts; attempt++ {
+		// #2201 review: request context, same rationale as distributeChannelKeysToMembers.
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, fmt.Errorf("begin dm distribution tx: %w", err)
+		}
+		outcome, err := distributeDMKeysTx(ctx, tx, batch)
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				h.log.Error("Failed to rollback dm distribution tx", "error", rbErr)
+			}
+			if errors.Is(err, dmblock.ErrMembershipChanged) && attempt+1 < dmDistributionTopologyAttempts {
+				continue
+			}
+			return 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				h.log.Error("Failed to rollback dm distribution tx", "error", rbErr)
+			}
+			return 0, fmt.Errorf("commit dm distribution tx: %w", err)
+		}
+		h.notifyDMKeyDistribution(conversationID, outcome.delivered)
+		return len(outcome.delivered), nil
 	}
-	h.notifyDMKeyDistribution(conversationID, outcome.delivered)
-	return len(outcome.delivered), nil
+	return 0, fmt.Errorf("retry dm distribution topology: %w", dmblock.ErrMembershipChanged)
 }
 
 // dmDistributionOutcome is what one DM distribution transaction body wrote:
@@ -3635,23 +3608,18 @@ func distributeDMKeysTx(ctx context.Context, tx *sql.Tx, batch dmDistributionBat
 	if err != nil {
 		return dmDistributionOutcome{}, fmt.Errorf("parse dm conversation ID: %w", err)
 	}
-	if lockErr := lockDMKeyDistributionUsers(ctx, tx, actorID, tokenEpoch, wrappedKeys); lockErr != nil {
+	subjects, lockErr := lockDMKeyDistributionUsers(ctx, tx, conversationID, actorID, tokenEpoch)
+	if lockErr != nil {
 		return dmDistributionOutcome{}, lockErr
 	}
 	if err := dm.LockDMVoiceParticipantSetTx(ctx, tx, conversationUUID); err != nil {
 		return dmDistributionOutcome{}, err
 	}
-	var parentID string
-	err = tx.QueryRowContext(ctx, `
-		SELECT id FROM dm_conversations
-		WHERE id = $1
-		FOR UPDATE
-	`, conversationID).Scan(&parentID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return dmDistributionOutcome{}, errDMKeyDistributorNotParticipant
-	}
-	if err != nil {
-		return dmDistributionOutcome{}, fmt.Errorf("recheck dm key distributor conversation: %w", err)
+	if _, err := dmblock.PrepareConversationAfterUserLocksTx(ctx, tx, conversationID, subjects, dmblock.LockUpdate); err != nil {
+		if errors.Is(err, dmblock.ErrUnavailable) {
+			return dmDistributionOutcome{}, errDMKeyDistributorNotParticipant
+		}
+		return dmDistributionOutcome{}, fmt.Errorf("prepare dm key distribution conversation: %w", err)
 	}
 	var memberID string
 	err = tx.QueryRowContext(ctx, `

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
@@ -29,6 +30,15 @@ func openOrderingProbeDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func seedOrderingServer(t *testing.T, db *sql.DB, serverID string) uuid.UUID {
+	t.Helper()
+	owner := dbtest.CreateUser(t, db)
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'ordering-server', $2)`, serverID, owner)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
+	return owner
 }
 
 // advisoryLockIsHeld reports whether the derived per-server visibility-capture
@@ -69,6 +79,7 @@ func TestWithAuthorityCapture_PhaseOrdering_IsPrepareThenLockThenVisibilityThenW
 	probe := openOrderingProbeDB(t)
 	handlerDB := openOrderingProbeDB(t)
 	serverID := uuid.New().String()
+	owner := seedOrderingServer(t, handlerDB, serverID)
 
 	stub := &presenceRecheckStub{plan: &presenceRecheckPlanStub{work: true}}
 	h := &Handler{db: handlerDB}
@@ -93,6 +104,7 @@ func TestWithAuthorityCapture_PhaseOrdering_IsPrepareThenLockThenVisibilityThenW
 			_, execErr := tx.ExecContext(ctx, `SELECT 1`)
 			return execErr
 		},
+		authorityLifecyclePrincipal(owner.String()), owner.String(),
 	)
 
 	require.NoError(t, err)
@@ -117,6 +129,7 @@ func TestWithAuthorityCapture_CaptureVisibilityError_RollsBackAndReleasesTheLock
 	probe := openOrderingProbeDB(t)
 	handlerDB := openOrderingProbeDB(t)
 	serverID := uuid.New().String()
+	owner := seedOrderingServer(t, handlerDB, serverID)
 
 	stub := &presenceRecheckStub{
 		plan:          &presenceRecheckPlanStub{work: true},
@@ -129,6 +142,7 @@ func TestWithAuthorityCapture_CaptureVisibilityError_RollsBackAndReleasesTheLock
 	plan, err := h.withAuthorityCapture(
 		context.Background(), serverID, []string{uuid.New().String()}, nil,
 		func(context.Context, *sql.Tx) error { wrote = true; return nil },
+		authorityLifecyclePrincipal(owner.String()), owner.String(),
 	)
 
 	require.Error(t, err)
@@ -138,4 +152,59 @@ func TestWithAuthorityCapture_CaptureVisibilityError_RollsBackAndReleasesTheLock
 		"no Execute and no Abandon: nothing committed, so nothing to reconcile")
 	assert.False(t, advisoryLockIsHeld(t, probe, serverID),
 		"rollback releases the advisory lock")
+}
+
+// An authority writer must wait on the target's lifecycle advisory lock before
+// taking user/server/channel row locks. This lets an independent users-first
+// transaction acquire both FK and parent locks while the lifecycle transition
+// is in progress, ruling out the opposite lock order without sleeps.
+func TestWithAuthorityCapture_WaitsOnLifecycleBeforeUserAndServerLocks(t *testing.T) {
+	barrierDB := openOrderingProbeDB(t)
+	handlerDB := openOrderingProbeDB(t)
+	probeDB := openOrderingProbeDB(t)
+	serverID := uuid.New().String()
+	owner := seedOrderingServer(t, handlerDB, serverID)
+	lifecycleKey, err := ServerVoiceLifecycleAdvisoryKey(owner)
+	require.NoError(t, err)
+
+	barrierTx, err := barrierDB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = barrierTx.Rollback() })
+	require.NoError(t, LockServerVoiceLifecycleTx(context.Background(), barrierTx, owner))
+
+	stub := &presenceRecheckStub{plan: &presenceRecheckPlanStub{work: false}}
+	h := &Handler{db: handlerDB}
+	h.SetPresenceRecheck(stub)
+	bDone := make(chan error, 1)
+	go func() {
+		_, callErr := h.withAuthorityCapture(
+			context.Background(), serverID, nil, nil,
+			func(ctx context.Context, tx *sql.Tx) error {
+				_, execErr := tx.ExecContext(ctx, `SELECT 1`)
+				return execErr
+			}, authorityLifecyclePrincipal(owner.String()), owner.String(),
+		)
+		bDone <- callErr
+	}()
+
+	dbtest.WaitForAdvisoryLockWaiter(t, probeDB, lifecycleKey)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	independentTx, err := probeDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	var lockedUser string
+	require.NoError(t, independentTx.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE id = $1 FOR UPDATE`, owner).Scan(&lockedUser))
+	var lockedServer string
+	require.NoError(t, independentTx.QueryRowContext(ctx,
+		`SELECT id FROM servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&lockedServer))
+	require.NoError(t, independentTx.Commit())
+
+	require.NoError(t, barrierTx.Commit())
+	select {
+	case callErr := <-bDone:
+		require.NoError(t, callErr)
+	case <-time.After(time.Second):
+		t.Fatal("authority writer did not finish after lifecycle lock release")
+	}
 }

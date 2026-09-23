@@ -77,10 +77,11 @@ type Logger interface {
 
 // Fence verifies and mutates per-user credential-epoch state.
 type Fence struct {
-	db             RowQuerier
-	redis          *redis.Client
-	log            Logger
-	securityEvents securityevent.Emitter
+	db                RowQuerier
+	redis             *redis.Client
+	log               Logger
+	securityEvents    securityevent.Emitter
+	postCommitEvictor func(context.Context, string, string, string)
 }
 
 // New constructs the process-wide Fence over the shared DB pool and Redis client.
@@ -101,6 +102,12 @@ func (f *Fence) emitSecurityEvent(ctx context.Context, event securityevent.Event
 	if f.securityEvents != nil {
 		f.securityEvents.Emit(ctx, event)
 	}
+}
+
+// SetPostCommitEvictor wires the durable media-eviction fast path. It is called
+// only after a committed rotation; the durable row remains the retry authority.
+func (f *Fence) SetPostCommitEvictor(evictor func(context.Context, string, string, string)) {
+	f.postCommitEvictor = evictor
 }
 
 // Key returns the Redis key for a user's epoch state — the single source of
@@ -279,15 +286,34 @@ return 'skip'
 // Rollback (definite rollback) / neither (ambiguous commit — the blocked
 // marker's TTL plus read-through reconciles).
 type Op struct {
-	f        *Fence
-	userID   string
-	opID     string
-	newEpoch string
+	f                *Fence
+	userID           string
+	opID             string
+	newEpoch         string
+	previousEpoch    string
+	previousCaptured bool
 }
 
 // NewEpochValue exposes the epoch this operation installs — used by recovery
 // flows that execute SQL descriptors rather than callbacks, and by tests.
 func (o *Op) NewEpochValue() string { return o.newEpoch }
+
+// CapturePreviousEpochTx records the generation displaced by this operation
+// while the caller holds the user row used by the eventual rotation.
+func (o *Op) CapturePreviousEpochTx(ctx context.Context, tx RowQuerier) error {
+	if o.previousCaptured {
+		return nil
+	}
+	var epoch sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`, o.userID,
+	).Scan(&epoch); err != nil {
+		return fmt.Errorf("credepoch: capture prior epoch: %w", err)
+	}
+	o.previousEpoch = epoch.String
+	o.previousCaptured = true
+	return nil
+}
 
 // Begin publishes the blocked marker BEFORE the destructive transaction.
 // A Redis failure is logged and tolerated: an outage must not block account
@@ -314,6 +340,26 @@ func (f *Fence) Begin(ctx context.Context, userID string) (*Op, error) {
 // RotateTx stamps the new epoch inside the destructive flow's transaction.
 // Callers MUST already hold the user-row lock (FOR NO KEY UPDATE).
 func (o *Op) RotateTx(ctx context.Context, tx RowQuerier) error {
+	if err := o.CapturePreviousEpochTx(ctx, tx); err != nil {
+		return err
+	}
+	execTx, ok := tx.(interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	})
+	if !ok {
+		return errors.New("credepoch: rotation transaction cannot enqueue media eviction")
+	}
+	if _, err := execTx.ExecContext(ctx, `
+		INSERT INTO credential_epoch_voice_ejections
+			(user_id, superseded_credential_epoch, credential_epoch, generation, attempts, reconcile_after)
+		VALUES ($1, $2, $3, gen_random_uuid(), 0, clock_timestamp())
+		ON CONFLICT (user_id, superseded_credential_epoch) DO UPDATE SET
+			credential_epoch = EXCLUDED.credential_epoch,
+			generation = gen_random_uuid(), attempts = 0, failure_class = NULL,
+			reconcile_after = clock_timestamp(), updated_at = clock_timestamp()`,
+		o.userID, o.previousEpoch, o.newEpoch); err != nil {
+		return fmt.Errorf("credepoch: enqueue media eviction: %w", err)
+	}
 	var id string
 	if err := tx.QueryRowContext(ctx,
 		`UPDATE users SET credential_epoch = $1, updated_at = NOW() WHERE id = $2 RETURNING id`,
@@ -340,12 +386,45 @@ func (o *Op) RotateTx(ctx context.Context, tx RowQuerier) error {
 // needs no such retry: a failed blocked-marker clear leaves it to its TTL, which
 // is fail-CLOSED.
 func (o *Op) Commit(ctx context.Context) {
-	if o.runCommitScript(ctx) == nil {
+	if o.runCommitScript(ctx) != nil {
+		if err := o.runCommitScript(ctx); err != nil {
+			o.f.log.Warn("credepoch: commit marker update failed after retry; TTL + read-through will converge",
+				"reason", "redis_eval")
+		}
+	}
+	if o.f.postCommitEvictor != nil {
+		go o.EvictSuperseded(ctx)
+	}
+}
+
+// EvictSuperseded drives the low-latency exact-generation fast path after a
+// durable commit. Reordered requests cannot target a later epoch.
+func (o *Op) EvictSuperseded(ctx context.Context) {
+	if o == nil || o.f == nil || o.f.postCommitEvictor == nil || !o.previousCaptured {
 		return
 	}
-	if err := o.runCommitScript(ctx); err != nil {
-		o.f.log.Warn("credepoch: commit marker update failed after retry; TTL + read-through will converge",
-			"reason", "redis_eval")
+	deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeOpTimeout)
+	defer cancel()
+	o.f.postCommitEvictor(deliveryCtx, o.userID, o.newEpoch, o.previousEpoch)
+}
+
+// ReconcileCommittedEviction verifies that an ambiguous transaction committed
+// its durable row before attempting the same exact-generation fast path.
+func (o *Op) ReconcileCommittedEviction(ctx context.Context) {
+	if o == nil || o.f == nil || o.f.postCommitEvictor == nil || !o.previousCaptured || o.f.db == nil {
+		return
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeOpTimeout)
+	defer cancel()
+	var exists bool
+	if err := o.f.db.QueryRowContext(readCtx, `SELECT EXISTS(SELECT 1 FROM credential_epoch_voice_ejections WHERE user_id = $1 AND credential_epoch = $2 AND superseded_credential_epoch = $3)`, o.userID, o.newEpoch, o.previousEpoch).Scan(&exists); err != nil {
+		if o.f.log != nil {
+			o.f.log.Warn("credepoch: ambiguous media eviction lookup failed", "reason", "db_read")
+		}
+		return
+	}
+	if exists {
+		o.EvictSuperseded(ctx)
 	}
 }
 

@@ -219,6 +219,81 @@ func TestTriggerForChannel_UsesLedgerEpochAfterDeletingSoleHolder(t *testing.T) 
 	assert.Equal(t, 1, transitions, "rotation must advance the ledger from 2 to 3")
 }
 
+func TestRecordKeyRevocationAndPurgeUsersTxRemovesDeniedMaterialAtomically(t *testing.T) {
+	db := krSetupDB(t)
+	owner, serverID, channelID := krSeedServerChannel(t, db)
+	removed := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		VALUES ($1, 'krremoved@test.concord.chat', 'krremoved', $2, true, true)`, removed, krTestPasswordHash)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, removed)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'stale', 1)`, channelID, removed)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, removed)
+	require.NoError(t, err)
+
+	checker := rbac.NewResolver(db, nil, logger.New("test")).CanDistributeChannelKeyTx
+	tx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	rotation, err := keyrotation.RecordKeyRevocationAndPurgeUsersTx(context.Background(), tx, checker, channelID, "member_removed", owner, []string{removed})
+	require.NoError(t, err)
+	require.NotNil(t, rotation)
+	require.NoError(t, tx.Commit())
+
+	var keys, pending int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, removed).Scan(&keys))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, removed).Scan(&pending))
+	assert.Zero(t, keys)
+	assert.Zero(t, pending)
+}
+
+func TestRotatorReceiverRevocationAndPurgeWrappers(t *testing.T) {
+	db := krSetupDB(t)
+	owner, serverID, channelID := krSeedServerChannel(t, db)
+	removed := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+		VALUES ($1, 'krwrapper@test.concord.chat', 'krwrapper', $2, true, true)`, removed, krTestPasswordHash)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')`, serverID, removed)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'stale', 1)`, channelID, removed)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, removed)
+	require.NoError(t, err)
+
+	log := logger.New("test")
+	r := keyrotation.NewRotator(db, log, rbac.NewResolver(db, nil, log).CanDistributeChannelKeyTx, nil)
+	checker := rbac.NewResolver(db, nil, log).CanDistributeChannelKeyTx
+	tx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	rotation, err := r.RecordKeyRevocationTx(context.Background(), tx, channelID, "wrapper_rotation", owner, "")
+	require.NoError(t, err)
+	require.Equal(t, channelID, rotation.ChannelID)
+	require.NoError(t, tx.Commit())
+
+	tx, err = db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	rotation, err = r.RecordKeyRevocationAndPurgeUserTx(context.Background(), tx, channelID, "wrapper_purge", owner, removed)
+	require.NoError(t, err)
+	require.NotNil(t, rotation)
+	require.NoError(t, tx.Commit())
+
+	var keys, pending int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, removed).Scan(&keys))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, removed).Scan(&pending))
+	assert.Zero(t, keys)
+	assert.Zero(t, pending)
+
+	// The multi-user wrapper must still return a rotation when its recipient set is empty.
+	tx, err = db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	rotation, err = keyrotation.RecordKeyRevocationAndPurgeUsersTx(context.Background(), tx, checker, channelID, "wrapper_empty", owner, nil)
+	require.NoError(t, err)
+	require.NotNil(t, rotation)
+	require.NoError(t, tx.Commit())
+}
+
 // TestTriggerForChannel_DefaultsEpochWhenNoKeys verifies the
 // COALESCE(MAX(key_version),1) default fires when a channel has no channel_keys
 // rows yet (rotates 1 -> 2).

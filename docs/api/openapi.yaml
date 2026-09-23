@@ -3046,6 +3046,194 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /voice/enforcement-sessions:
+    post:
+      tags:
+      - Voice
+      summary: Register an exact media-plane voice session
+      description: 'Internal media-plane admission callback. The media plane registers the exact
+        provisional socket after A1 and before A2 promotion. The bearer token identifies the
+        authenticated user; the service-hop proof and registration HMAC bind the complete request
+        body to the media node and session generation. This row is durable enforcement evidence,
+        not a client-invokable admission operation.'
+      operationId: registerVoiceEnforcementSession
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: X-Concord-Service-Timestamp
+        in: header
+        required: true
+        schema:
+          type: integer
+          format: int64
+        description: Unix timestamp bound into the service-hop proof.
+      - name: X-Concord-Service-Proof
+        in: header
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        description: Domain-separated service-hop HMAC proof.
+      - name: X-Concord-Voice-Enforcement-Registration-Timestamp
+        in: header
+        required: true
+        schema:
+          type: integer
+          format: int64
+        description: Unix timestamp bound into the body-bound registration HMAC.
+      - name: X-Concord-Voice-Enforcement-Registration-Proof
+        in: header
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        description: HMAC-SHA256 proof over the token digest and every immutable session field.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceEnforcementRegistration'
+      responses:
+        '204':
+          description: Exact session registered or idempotently confirmed.
+        '400':
+          description: Invalid session shape or proof-bound request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Invalid service-hop proof, credential epoch, or admission fence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Session generation conflicts with a different immutable identity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Durable registration could not be completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /internal/voice/enforcement/health:
+    post:
+      tags:
+      - Voice
+      summary: Bootstrap the exact media-plane enforcement lease
+      description: 'Internal media-plane health bootstrap. The media plane sends a fresh
+        node boot ID and nonce with a body-bound HMAC. The control plane then challenges the
+        same exact `voice.enforce.session.<node_boot_id>` NATS request subscriber; only a
+        verified challenge receipt renews the media process''s monotonic 30-second lease.
+        The request body is capped at 4 KiB. This endpoint never mutates session-registry
+        rows or settles DM-block or credential-epoch parent obligations.'
+      operationId: bootstrapVoiceEnforcementHealth
+      parameters:
+      - name: X-Concord-Voice-Enforcement-Timestamp
+        in: header
+        required: true
+        schema:
+          type: integer
+          format: int64
+        description: Unix timestamp bound into the bootstrap HMAC.
+      - name: X-Concord-Voice-Enforcement-Proof
+        in: header
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        description: HMAC-SHA256 proof over the protocol version, timestamp, node boot ID, nonce, method, and path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceEnforcementHealthBootstrap'
+      responses:
+        '204':
+          description: Challenge published to the exact media-plane subscriber.
+        '400':
+          description: Invalid or oversized bootstrap body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Invalid bootstrap proof or node/nonce shape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Exact NATS challenge could not be published or completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /internal/voice/enforcement-sessions/release:
+    post:
+      tags:
+      - Voice
+      summary: Release an exact media-plane voice session
+      description: 'Internal media-plane terminal callback. This endpoint intentionally does not
+        accept a bearer token: credential-epoch enforcement may invalidate that token before the
+        target socket tears down. The HMAC binds every immutable session field and deletes only
+        the matching registry row. A missing row is idempotent success; a mismatched row is a
+        conflict and remains pending. The JSON body is capped at 4 KiB.'
+      operationId: releaseVoiceEnforcementSession
+      parameters:
+      - name: X-Concord-Voice-Enforcement-Timestamp
+        in: header
+        required: true
+        schema:
+          type: integer
+          format: int64
+        description: Unix timestamp bound into the release HMAC.
+      - name: X-Concord-Voice-Enforcement-Proof
+        in: header
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        description: HMAC-SHA256 proof over every immutable session field.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceEnforcementSession'
+      responses:
+        '204':
+          description: Exact session released or already absent.
+        '400':
+          description: Invalid session shape or proof-bound request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Invalid release proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Stored session identity does not match the release request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Durable release could not be completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /channels/{id}/voice/join:
     post:
       tags:
@@ -15314,6 +15502,92 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
   schemas:
+    VoiceEnforcementHealthBootstrap:
+      type: object
+      description: Body-bound bootstrap proof for the exact media-process NATS subscriber.
+      required:
+      - node_boot_id
+      - nonce
+      additionalProperties: false
+      properties:
+        node_boot_id:
+          type: string
+          format: uuid
+          description: Random process boot identity and exact NATS subject suffix.
+        nonce:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Fresh 32-byte random nonce, hex encoded.
+    VoiceEnforcementRegistration:
+      type: object
+      description: Immutable media-plane admission identity; the authenticated user is taken from the bearer token.
+      required:
+      - session_generation
+      - node_boot_id
+      - room_id
+      - room_kind
+      - credential_epoch
+      - socket_id
+      additionalProperties: false
+      properties:
+        session_generation:
+          type: string
+          format: uuid
+        node_boot_id:
+          type: string
+          format: uuid
+        room_id:
+          type: string
+          format: uuid
+        room_kind:
+          type: string
+          enum: [channel, dm]
+        credential_epoch:
+          type: string
+          pattern: '^([0-9a-f]{32})?$'
+        socket_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+    VoiceEnforcementSession:
+      type: object
+      description: Immutable identity of one exact media-plane Socket.IO session.
+      required:
+      - session_generation
+      - node_boot_id
+      - room_id
+      - room_kind
+      - user_id
+      - credential_epoch
+      - socket_id
+      additionalProperties: false
+      properties:
+        session_generation:
+          type: string
+          format: uuid
+          description: Exact admission generation; never reused for a successor socket.
+        node_boot_id:
+          type: string
+          format: uuid
+          description: Random media-process boot identity and targeted NATS address.
+        room_id:
+          type: string
+          format: uuid
+        room_kind:
+          type: string
+          enum: [channel, dm]
+        user_id:
+          type: string
+          format: uuid
+        credential_epoch:
+          type: string
+          description: Lowercase 32-character credential epoch, or empty for legacy tokens.
+          pattern: '^([0-9a-f]{32})?$'
+        socket_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Exact Socket.IO ID on the owning media process.
     Entitlement:
       type: object
       description: 'Capability set for one subscription tier — the single source of

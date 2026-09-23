@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmvisibility"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/klipy"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
@@ -178,6 +179,11 @@ const (
 var errPresenceNoDatabase = errors.New("presence audience: hub has no database")
 
 var errPresenceHubStopping = errors.New("presence audience: hub is stopping")
+
+var (
+	errDMNotParticipant  = errors.New("dm sender is not a current participant")
+	errDMKeyEpochRevoked = errors.New("dm message key epoch has been revoked")
+)
 
 type presenceRecoveryState struct {
 	status  string
@@ -408,7 +414,10 @@ type Hub struct {
 	// on the Run goroutine, which owns subscription maps.
 	revalidateChannel chan channelRevalidation
 	revalidateServer  chan uuid.UUID
-
+	// Overflow is coalesced into one eventual full subscription rescan. Writers
+	// may run off the hub loop, so only the atomic flag and wake channel cross it.
+	subscriptionRevalidationPending atomic.Bool
+	subscriptionRevalidationWake    chan struct{}
 	// Results from off-loop channel permission checks. The Run goroutine applies
 	// sends and subscription pruning so hub maps remain single-owner.
 	channelDeliveryResults chan channelDeliveryResult
@@ -722,51 +731,52 @@ func (d *serverVoiceDeferredBroadcasts) handleDeliveryResult(h *Hub, result chan
 // NewHub creates a new Hub
 func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *Hub {
 	hub := &Hub{
-		db:                        db,
-		redis:                     redisClient,
-		clients:                   make(map[uuid.UUID]*Client),
-		userClients:               make(map[uuid.UUID]map[uuid.UUID]bool),
-		lastInboundAt:             make(map[uuid.UUID]time.Time),
-		hiddenPresence:            make(map[uuid.UUID]string),
-		presenceRecovery:          make(map[uuid.UUID]presenceRecoveryState),
-		channelSubscriptions:      make(map[uuid.UUID]map[uuid.UUID]bool),
-		usernames:                 make(map[uuid.UUID]string),
-		serverSubscriptions:       make(map[uuid.UUID]map[uuid.UUID]bool),
-		dmSubscriptions:           make(map[uuid.UUID]map[uuid.UUID]bool),
-		register:                  make(chan *Client),
-		unregister:                make(chan *Client),
-		incoming:                  make(chan IncomingMessage, 256),
-		broadcast:                 make(chan BroadcastMessage, 256),
-		globalBroadcast:           make(chan OutgoingMessage, 256),
-		userBroadcast:             make(chan UserBroadcastMessage, 256),
-		serverBroadcast:           make(chan ServerBroadcastMessage, 256),
-		serverVoiceBroadcast:      make(chan ServerBroadcastMessage, 256),
-		evictBroadcast:            make(chan ServerBroadcastMessage, 16),
-		dmBroadcast:               make(chan DMBroadcastMessage, dmMessageDeliveryCapacity),
-		dmDeliveryResults:         make(chan dmMessageDeliveryResult, dmMessageDeliveryCapacity),
-		dmDeliveryQueues:          make(map[uuid.UUID][]*dmMessageDeliveryJob),
-		dmDeliveryActive:          make(map[uuid.UUID]bool),
-		disconnectUser:            make(chan uuid.UUID, 16),
-		disconnectSession:         make(chan string, 16),
-		voiceCountSignal:          make(chan struct{}, 1),
-		revalidateChannel:         make(chan channelRevalidation, 256),
-		revalidateServer:          make(chan uuid.UUID, 16),
-		channelDeliveryResults:    make(chan channelDeliveryResult, 256),
-		serverVoiceDeliveryQueues: make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue),
-		voiceCountCatchupResults:  make(chan voiceCountCatchup, 256),
-		done:                      make(chan struct{}),
-		stopped:                   make(chan struct{}),
-		onlineCountPending:        make(map[uuid.UUID]bool),
-		clientBootstrapSlots:      make(chan struct{}, clientBootstrapConcurrency),
-		presenceGeneration:        make(map[uuid.UUID]uint64),
-		presenceDispatchPending:   make(map[uuid.UUID]pendingPresence),
-		presenceInFlight:          make(map[uuid.UUID]struct{}),
-		presenceAudienceResults:   make(chan presenceAudienceResult, 256),
-		presenceAuthzChanged:      make(chan struct{}),
-		presenceAudienceSlots:     make(chan struct{}, presenceAudienceConcurrency),
-		suppressorPending:         make(map[uuid.UUID]struct{}),
-		clientBootstrapTimeout:    clientBootstrapTimeout,
-		securityEvents:            securityevent.Discard,
+		db:                           db,
+		redis:                        redisClient,
+		clients:                      make(map[uuid.UUID]*Client),
+		userClients:                  make(map[uuid.UUID]map[uuid.UUID]bool),
+		lastInboundAt:                make(map[uuid.UUID]time.Time),
+		hiddenPresence:               make(map[uuid.UUID]string),
+		presenceRecovery:             make(map[uuid.UUID]presenceRecoveryState),
+		channelSubscriptions:         make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames:                    make(map[uuid.UUID]string),
+		serverSubscriptions:          make(map[uuid.UUID]map[uuid.UUID]bool),
+		dmSubscriptions:              make(map[uuid.UUID]map[uuid.UUID]bool),
+		register:                     make(chan *Client),
+		unregister:                   make(chan *Client),
+		incoming:                     make(chan IncomingMessage, 256),
+		broadcast:                    make(chan BroadcastMessage, 256),
+		globalBroadcast:              make(chan OutgoingMessage, 256),
+		userBroadcast:                make(chan UserBroadcastMessage, 256),
+		serverBroadcast:              make(chan ServerBroadcastMessage, 256),
+		serverVoiceBroadcast:         make(chan ServerBroadcastMessage, 256),
+		evictBroadcast:               make(chan ServerBroadcastMessage, 16),
+		dmBroadcast:                  make(chan DMBroadcastMessage, dmMessageDeliveryCapacity),
+		dmDeliveryResults:            make(chan dmMessageDeliveryResult, dmMessageDeliveryCapacity),
+		dmDeliveryQueues:             make(map[uuid.UUID][]*dmMessageDeliveryJob),
+		dmDeliveryActive:             make(map[uuid.UUID]bool),
+		disconnectUser:               make(chan uuid.UUID, 16),
+		disconnectSession:            make(chan string, 16),
+		voiceCountSignal:             make(chan struct{}, 1),
+		revalidateChannel:            make(chan channelRevalidation, 256),
+		revalidateServer:             make(chan uuid.UUID, 16),
+		subscriptionRevalidationWake: make(chan struct{}, 1),
+		channelDeliveryResults:       make(chan channelDeliveryResult, 256),
+		serverVoiceDeliveryQueues:    make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue),
+		voiceCountCatchupResults:     make(chan voiceCountCatchup, 256),
+		done:                         make(chan struct{}),
+		stopped:                      make(chan struct{}),
+		onlineCountPending:           make(map[uuid.UUID]bool),
+		clientBootstrapSlots:         make(chan struct{}, clientBootstrapConcurrency),
+		presenceGeneration:           make(map[uuid.UUID]uint64),
+		presenceDispatchPending:      make(map[uuid.UUID]pendingPresence),
+		presenceInFlight:             make(map[uuid.UUID]struct{}),
+		presenceAudienceResults:      make(chan presenceAudienceResult, 256),
+		presenceAuthzChanged:         make(chan struct{}),
+		presenceAudienceSlots:        make(chan struct{}, presenceAudienceConcurrency),
+		suppressorPending:            make(map[uuid.UUID]struct{}),
+		clientBootstrapTimeout:       clientBootstrapTimeout,
+		securityEvents:               securityevent.Discard,
 	}
 	if len(opsCounters) > 0 {
 		hub.opsCounter = opsCounters[0]
@@ -991,7 +1001,7 @@ func (h *Hub) RevalidateChannelSubscriptions(serverID, channelID uuid.UUID) {
 	select {
 	case h.revalidateChannel <- channelRevalidation{serverID: serverID, channelID: channelID}:
 	default:
-		log.Printf("Channel subscription revalidation queue full")
+		h.scheduleSubscriptionRevalidation()
 	}
 }
 
@@ -1222,7 +1232,23 @@ func (h *Hub) RevalidateServerSubscriptions(serverID uuid.UUID) {
 	select {
 	case h.revalidateServer <- serverID:
 	default:
-		log.Printf("Server subscription revalidation queue full")
+		h.scheduleSubscriptionRevalidation()
+	}
+}
+
+func (h *Hub) scheduleSubscriptionRevalidation() {
+	h.subscriptionRevalidationPending.Store(true)
+	h.signalSubscriptionRevalidation()
+}
+
+func (h *Hub) markSubscriptionRevalidationPending() {
+	h.subscriptionRevalidationPending.Store(true)
+}
+
+func (h *Hub) signalSubscriptionRevalidation() {
+	select {
+	case h.subscriptionRevalidationWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -1415,6 +1441,9 @@ func (h *Hub) Run() {
 
 		case serverID := <-h.revalidateServer:
 			h.handleServerRevalidation(serverID)
+
+		case <-h.subscriptionRevalidationWake:
+			h.handlePendingSubscriptionRevalidation()
 
 		case result := <-h.channelDeliveryResults:
 			deferredServerBroadcasts.handleDeliveryResult(h, result)
@@ -3690,6 +3719,12 @@ func (h *Hub) linkDMAttachments(ctx context.Context, tx *sql.Tx, messageID uuid.
 	}, attachmentIDs)
 }
 
+// linkDMAttachmentsTx keeps the transactional DM attachment seam while sharing
+// the bounded, ordered linker with channel messages.
+func (h *Hub) linkDMAttachmentsTx(ctx context.Context, tx *sql.Tx, messageID, userID uuid.UUID, attachmentIDs []string, conversationID string) ([]models.AttachmentSummary, error) {
+	return h.linkDMAttachments(ctx, tx, messageID, userID.String(), attachmentIDs, conversationID)
+}
+
 // attachmentLinkCtx holds the context for linking attachments to a message.
 type attachmentLinkCtx struct {
 	messageID      uuid.UUID
@@ -4236,6 +4271,15 @@ func (h *Hub) handleServerRevalidation(serverID uuid.UUID) {
 	}
 	for channelID, viewPerm := range authByChannel {
 		h.pruneUnauthorizedChannelSubscribers(serverID, channelID, viewPerm)
+	}
+}
+
+func (h *Hub) handlePendingSubscriptionRevalidation() {
+	if !h.subscriptionRevalidationPending.Swap(false) {
+		return
+	}
+	for channelID := range h.channelSubscriptions {
+		h.handleChannelRevalidation(channelRevalidation{channelID: channelID})
 	}
 }
 
@@ -5000,9 +5044,28 @@ func (h *Hub) handleUserBroadcast(msg UserBroadcastMessage) {
 
 // BroadcastToUser sends a message to all connected clients of a specific user (thread-safe).
 func (h *Hub) BroadcastToUser(userID uuid.UUID, msg OutgoingMessage) {
-	h.userBroadcast <- UserBroadcastMessage{
-		UserID: userID,
-		Data:   msg,
+	h.BroadcastToUserContext(context.Background(), userID, msg)
+}
+
+// BroadcastToUserContext is the deadline-aware form used by bounded lifecycle
+// callbacks. It returns false when the caller is canceled, the Hub is stopped,
+// or the user queue cannot be drained before either condition occurs.
+func (h *Hub) BroadcastToUserContext(ctx context.Context, userID uuid.UUID, msg OutgoingMessage) bool {
+	if ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	select {
+	case h.userBroadcast <- UserBroadcastMessage{UserID: userID, Data: msg}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-h.done:
+		return false
 	}
 }
 
@@ -5286,38 +5349,68 @@ func (h *Hub) persistDMMessage(convUUID uuid.UUID, userID uuid.UUID, credEpoch s
 
 func (h *Hub) persistDMMessageWithExpiry(convUUID uuid.UUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (uuid.UUID, time.Time, time.Time, *time.Time, []models.AttachmentSummary, error) {
 	messageID := uuid.New()
+	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
+	defer cancel()
+	for attempt := 0; attempt < 2; attempt++ {
+		createdAt, updatedAt, expiresAt, attachments, err := h.persistDMMessageWithExpiryAttempt(ctx, messageID, convUUID, userID, credEpoch, input)
+		if errors.Is(err, dmblock.ErrMembershipChanged) && attempt == 0 {
+			continue
+		}
+		return messageID, createdAt, updatedAt, expiresAt, attachments, err
+	}
+	return messageID, time.Time{}, time.Time{}, nil, nil, dmblock.ErrMembershipChanged
+}
+
+func (h *Hub) persistDMMessageWithExpiryAttempt(ctx context.Context, messageID, convUUID, userID uuid.UUID, credEpoch string, input *dmMessageInput) (time.Time, time.Time, *time.Time, []models.AttachmentSummary, error) {
 	var createdAt, updatedAt time.Time
 	var expiresAt *time.Time
 	var attachmentSummaries []models.AttachmentSummary
-	ctx, cancel := context.WithTimeout(context.Background(), channelAuthCtxTimeout)
-	defer cancel()
-	tx, err := h.db.BeginTx(ctx, nil)
+	tx, err := h.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, err
+		return createdAt, updatedAt, expiresAt, nil, err
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 			log.Printf("Failed to rollback DM message transaction: %v", rollbackErr)
 		}
 	}()
+	// Preparation owns the users-before-parent lock prefix. A membership drift
+	// restarts the complete transaction before any ciphertext is inserted.
+	if _, err := dmblock.PrepareConversationTx(ctx, tx, convUUID.String(), []uuid.UUID{userID}, dmblock.LockShare, dmblock.LockNoKeyUpdate); err != nil {
+		return createdAt, updatedAt, expiresAt, nil, err
+	}
 	// #2201 (Codex #2397 review): fence the WS DM ciphertext write against a
 	// destructive reset that advanced the sender's epoch after connect.
 	if guardErr := credepoch.GuardTx(ctx, tx, userID.String(), credEpoch); guardErr != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, guardErr
+		return createdAt, updatedAt, expiresAt, nil, guardErr
 	}
 	var windowSeconds sql.NullInt64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT expiration_window_seconds FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, convUUID,
+		`SELECT expiration_window_seconds FROM dm_conversations WHERE id = $1`, convUUID,
 	).Scan(&windowSeconds); err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, err
+		return createdAt, updatedAt, expiresAt, nil, err
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT 1 FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR SHARE`, convUUID, userID,
 	).Scan(new(int)); err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, fmt.Errorf("lock DM message participant: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return createdAt, updatedAt, expiresAt, nil, errDMNotParticipant
+		}
+		return createdAt, updatedAt, expiresAt, nil, fmt.Errorf("lock DM message participant: %w", err)
 	}
 	if err := dmvisibility.LockParticipantsForWrite(ctx, tx, convUUID); err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, err
+		return createdAt, updatedAt, expiresAt, nil, err
+	}
+	var revoked bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM dm_key_revocations
+			WHERE conversation_id = $1 AND revoked_epoch = $2
+		)`, convUUID, input.keyVersion).Scan(&revoked); err != nil {
+		return createdAt, updatedAt, expiresAt, nil, fmt.Errorf("check DM message epoch: %w", err)
+	}
+	if revoked {
+		return createdAt, updatedAt, expiresAt, nil, errDMKeyEpochRevoked
 	}
 	var window any
 	if windowSeconds.Valid {
@@ -5332,19 +5425,19 @@ func (h *Hub) persistDMMessageWithExpiry(convUUID uuid.UUID, userID uuid.UUID, c
 		 RETURNING created_at, updated_at, expires_at`,
 		messageID, convUUID, userID, input.content, input.keyVersion, input.msgType, input.gifSlug, window,
 	).Scan(&createdAt, &updatedAt, &expiresAt); err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, err
+		return createdAt, updatedAt, expiresAt, nil, err
 	}
 	if err := respawnDMParticipantVisibility(ctx, tx, convUUID, createdAt); err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, err
+		return createdAt, updatedAt, expiresAt, nil, err
 	}
 	attachmentSummaries, err = h.linkDMAttachments(ctx, tx, messageID, userID.String(), input.attachmentIDs, convUUID.String())
 	if err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, fmt.Errorf("link DM attachments: %w", err)
+		return createdAt, updatedAt, expiresAt, nil, fmt.Errorf("link DM attachments: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return messageID, createdAt, updatedAt, expiresAt, nil, err
+		return createdAt, updatedAt, expiresAt, nil, err
 	}
-	return messageID, createdAt, updatedAt, expiresAt, attachmentSummaries, nil
+	return createdAt, updatedAt, expiresAt, attachmentSummaries, nil
 }
 
 // dmMessageAckParams holds the fields for a dm_message_ack response.
@@ -5453,6 +5546,11 @@ func (h *Hub) handleDMMessage(msg IncomingMessage) {
 
 	messageID, createdAt, updatedAt, expiresAt, attachments, err := h.persistDMMessageWithExpiry(convUUID, msg.UserID, msg.CredEpoch, input)
 	if err != nil {
+		if errors.Is(err, errDMNotParticipant) {
+			h.removeFromSubscriptionMap(h.dmSubscriptions, convUUID, client.ID)
+			h.sendError(msg.ClientID, "Not a participant of this conversation")
+			return
+		}
 		// Any guard/store failure logs and returns the retryable save error (a
 		// fenced epoch mismatch is caught by the client's next authoritative API
 		// call). The channel path additionally distinguishes an auth-shaped signal
@@ -6099,6 +6197,43 @@ func (h *Hub) BroadcastToDMMessageAllParticipants(
 // subscription-scoped broadcast as a graceful fallback.
 func (h *Hub) BroadcastToDMParticipants(conversationID uuid.UUID, msg OutgoingMessage) {
 	h.BroadcastToDMParticipantsContext(context.Background(), conversationID, msg)
+}
+
+// BroadcastToDMParticipantsExceptContext emits a committed topology change to
+// the remaining current participants. A participant lookup fault fails closed:
+// stale subscriptions cannot authorize a post-removal notification.
+func (h *Hub) BroadcastToDMParticipantsExceptContext(
+	ctx context.Context,
+	conversationID uuid.UUID,
+	excludeUser *uuid.UUID,
+	msg OutgoingMessage,
+) bool {
+	if ctx == nil || ctx.Err() != nil || h.db == nil {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	participants, err := h.resolveDMParticipantsContext(ctx, conversationID)
+	if err != nil {
+		log.Printf("Failed to resolve DM participants for topology delivery: %v", err)
+		return false
+	}
+	for userID := range participants {
+		if excludeUser != nil && userID == *excludeUser {
+			continue
+		}
+		select {
+		case h.userBroadcast <- UserBroadcastMessage{UserID: userID, Data: msg}:
+		case <-ctx.Done():
+			return false
+		case <-h.done:
+			return false
+		}
+	}
+	return true
 }
 
 // BroadcastToDMParticipantsContext sends a terminal frame to every current DM

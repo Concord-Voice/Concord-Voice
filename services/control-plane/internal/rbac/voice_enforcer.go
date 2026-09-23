@@ -33,16 +33,6 @@ func (h *Handler) SetVoiceEnforcer(e VoiceEnforcer) {
 	h.voiceEnforcer = e
 }
 
-// recheckVoiceUser, recheckVoiceChannel, and recheckVoiceServer are nil-safe
-// call-site helpers: RBAC mutation handlers call them immediately after the
-// matching PermissionCache invalidation, so the enforcer's re-resolve computes
-// from post-mutation state.
-func (h *Handler) recheckVoiceUser(serverID, userID string) {
-	if h.voiceEnforcer != nil {
-		h.voiceEnforcer.RecheckUser(serverID, userID)
-	}
-}
-
 func (h *Handler) recheckVoiceChannel(serverID, channelID string) {
 	if h.voiceEnforcer != nil {
 		h.voiceEnforcer.RecheckChannel(serverID, channelID)

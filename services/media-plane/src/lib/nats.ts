@@ -26,6 +26,7 @@ export class NatsService {
   private emitSecurityEvent: EmitSecurityEvent | undefined;
   private securityDegraded = false;
   private readonly failedSubscriptions = new Set<string>();
+  private readonly requestSubscriptions = new Set<string>();
   private closing = false;
 
   private observe(event: Parameters<EmitSecurityEvent>[0]): void {
@@ -38,6 +39,14 @@ export class NatsService {
 
   setSecurityEventEmitter(emit: EmitSecurityEvent | undefined): void {
     this.emitSecurityEvent = emit;
+  }
+
+  isConnected(): boolean {
+    return this.connected && this.nc !== null && !this.nc.isClosed();
+  }
+
+  isRequestSubscriptionHealthy(subject: string): boolean {
+    return this.isConnected() && this.requestSubscriptions.has(subject);
   }
 
   private security(
@@ -280,6 +289,52 @@ export class NatsService {
     });
   }
 
+  /**
+   * Subscribe to a JSON request and reply only after the handler confirms its
+   * terminal effect. A thrown handler deliberately sends no reply, so the
+   * requester retains its durable obligation for retry.
+   */
+  subscribeRequest(
+    subject: string,
+    handler: (
+      data: Record<string, unknown>
+    ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>
+  ): boolean {
+    if (!this.nc) {
+      this.degraded();
+      logger.warn('NATS not connected, cannot subscribe', { subject });
+      return false;
+    }
+    const nc = this.nc;
+    const sub = nc.subscribe(subject);
+    this.subscriptions.push(sub);
+    this.requestSubscriptions.add(subject);
+    (async () => {
+      for await (const msg of sub) {
+        try {
+          if (!msg.reply) continue;
+          const decoded = jsonCodec.decode(msg.data) as Record<string, unknown>;
+          const response = await handler(decoded);
+          if (response !== undefined) msg.respond(jsonCodec.encode(response));
+        } catch (err) {
+          logger.error('Failed to handle NATS request', { subject, error: err });
+        }
+      }
+      if (!this.closing && this.nc === nc) {
+        this.requestSubscriptions.delete(subject);
+        this.degraded();
+        logger.error('NATS request subscription ended', { subject });
+      }
+    })().catch((err) => {
+      if (!this.closing && this.nc === nc) {
+        this.requestSubscriptions.delete(subject);
+        this.degraded();
+      }
+      logger.error('NATS request subscription error', { subject, error: err });
+    });
+    return true;
+  }
+
   async close(): Promise<void> {
     this.closing = true;
     this.connected = false;
@@ -293,6 +348,7 @@ export class NatsService {
     }
     this.subscriptions.length = 0;
     this.failedSubscriptions.clear();
+    this.requestSubscriptions.clear();
 
     if (this.nc) {
       await this.nc.drain();

@@ -364,9 +364,11 @@ func TestServerVoiceCleanupWiredAtConstructionSite(t *testing.T) {
 	guard := "requireServerVoiceCleanupWired(log, activePlanReconciler)"
 	require.Equal(t, 1, strings.Count(source, presenceRecheck),
 		"presence recheck must be attached at exactly one construction site")
-	require.Less(t, strings.Index(source, callbackWiring), strings.Index(source, natsSubscription),
+	callbackIndex := strings.Index(source, callbackWiring)
+	natsIndex := callbackIndex + strings.Index(source[callbackIndex:], natsSubscription)
+	require.Less(t, callbackIndex, natsIndex,
 		"server voice cleanup must be wired before the conditional NATS subscription")
-	require.Less(t, strings.Index(source, presenceRecheck), strings.Index(source, natsSubscription),
+	require.Less(t, strings.Index(source, presenceRecheck), natsIndex,
 		"presence recheck must be wired before the conditional NATS subscription")
 	require.Less(t, strings.Index(source, callbackWiring), strings.Index(source, guard),
 		"server voice cleanup must be wired before its boot guard")

@@ -1534,6 +1534,16 @@ func TestAssignRole_Idempotent(t *testing.T) {
 	// Assign again — ON CONFLICT DO NOTHING, should still return 200
 	w = ts.DoRequest("POST", assignRolePath(serverID, member.ID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
+
+	var assignments, revocations int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT COUNT(*) FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3`,
+		serverID, member.ID, roleID).Scan(&assignments))
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT COUNT(*) FROM key_revocations WHERE channel_id IN (SELECT id FROM channels WHERE server_id = $1)`,
+		serverID).Scan(&revocations))
+	assert.Equal(t, 1, assignments, "idempotent assignment must not duplicate the role row")
+	assert.Zero(t, revocations, "idempotent assignment must not rotate or fence channel keys")
 }
 
 // TestAssignRole_PrivilegeEscalation locks the permission-subset guard (#2350).
@@ -2015,7 +2025,7 @@ func TestUpsertChannelOverride_Success(t *testing.T) {
 	assert.Equal(t, member.ID, override["target_id"])
 }
 
-func TestUpsertChannelOverride_RoleTarget(t *testing.T) {
+func TestUpsertChannelOverride_RoleTargetRotatesChannelEpoch(t *testing.T) {
 	ts, owner, _, serverID := setupOwnerAndMember(t)
 	channelID := ts.CreateTestChannel(t, serverID, "upsert-role-test")
 
@@ -2032,6 +2042,11 @@ func TestUpsertChannelOverride_RoleTarget(t *testing.T) {
 	}
 	w := ts.DoRequest("PUT", channelOverridesPath(channelID), body, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
+	var revocationCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID,
+	).Scan(&revocationCount))
+	assert.Equal(t, 1, revocationCount, "role-target overrides use the ordinary topology epoch fence")
 }
 
 func TestUpsertChannelOverride_UpsertUpdatesExisting(t *testing.T) {
@@ -2060,6 +2075,278 @@ func TestUpsertChannelOverride_UpsertUpdatesExisting(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &listResp)
 	overrides := listResp["overrides"].([]interface{})
 	assert.Equal(t, 1, len(overrides), "upsert should not create duplicates")
+}
+
+func TestUpsertChannelOverride_PermanentUpdateClearsTemporaryGrantMetadata(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateTestChannel(t, serverID, "upsert-clears-temporary-grant")
+
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())
+	`, uuid.NewString(), channelID, member.ID, int64(rbac.PermMoveMembers))
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
+		"target_type": "user",
+		"target_id":   member.ID,
+		"allow":       0,
+		"deny":        int64(rbac.PermMoveMembers),
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var allow, deny int64
+	var isTemporary bool
+	var reason sql.NullString
+	var grantedAt sql.NullTime
+	err = ts.DB.QueryRow(`
+		SELECT allow, deny, is_temporary, temporary_reason, granted_at
+		FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2
+	`, channelID, member.ID).Scan(&allow, &deny, &isTemporary, &reason, &grantedAt)
+	require.NoError(t, err)
+	assert.Zero(t, allow)
+	assert.Equal(t, int64(rbac.PermMoveMembers), deny)
+	assert.False(t, isTemporary)
+	assert.False(t, reason.Valid)
+	assert.False(t, grantedAt.Valid)
+}
+
+func TestUpsertChannelOverride_SupersededTemporaryGrantLosingViewRevokesKeys(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "upsert-supersede-temporary-deny-view")
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&allRoleID))
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+		VALUES ($1, $2, 'role', $3, 0, $4)`,
+		uuid.NewString(), channelID, allRoleID, int64(rbac.PermViewVoiceChannels),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		uuid.NewString(), channelID, member.ID, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped', 1)`,
+		channelID, member.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, member.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
+		"target_type": "user",
+		"target_id":   member.ID,
+		"allow":       0,
+		"deny":        int64(rbac.PermViewVoiceChannels),
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var isTemporary bool
+	var reason sql.NullString
+	var grantedAt sql.NullTime
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT is_temporary, temporary_reason, granted_at
+		FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2`, channelID, member.ID,
+	).Scan(&isTemporary, &reason, &grantedAt))
+	assert.False(t, isTemporary)
+	assert.False(t, reason.Valid)
+	assert.False(t, grantedAt.Valid)
+
+	var keyCount, pendingCount, revocationCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&keyCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&pendingCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID,
+	).Scan(&revocationCount))
+	assert.Zero(t, keyCount)
+	assert.Zero(t, pendingCount)
+	assert.Equal(t, 1, revocationCount)
+
+	// The durable permission and epoch authority reject the old local state even
+	// if the directed post-commit delivery was missed.
+	w = ts.DoRequest("POST", "/api/v1/e2ee/validate-epochs", map[string]interface{}{
+		"epochs": map[string]int{channelID: 1},
+	}, testhelpers.AuthHeaders(member.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var validation map[string]interface{}
+	testhelpers.ParseJSON(t, w, &validation)
+	assert.Equal(t, []interface{}{channelID}, validation["access_lost"])
+}
+
+func TestUpsertChannelOverride_SupersededTemporaryGrantRetainingViewDoesNotRotate(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "upsert-supersede-temporary-retain-view")
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		uuid.NewString(), channelID, member.ID, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped', 1)`,
+		channelID, member.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, member.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
+		"target_type": "user",
+		"target_id":   member.ID,
+		"allow":       int64(rbac.PermViewVoiceChannels),
+		"deny":        int64(rbac.PermJoinVoice),
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var keyCount, pendingCount, revocationCount int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&keyCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&pendingCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID,
+	).Scan(&revocationCount))
+	assert.Equal(t, 1, keyCount)
+	assert.Equal(t, 1, pendingCount)
+	assert.Zero(t, revocationCount)
+}
+
+func TestUpsertChannelOverride_SupersededTemporaryGrantPurgeFailureRollsBack(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "upsert-supersede-temporary-purge-failure")
+	var allRoleID string
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT id FROM roles WHERE server_id = $1 AND is_default = TRUE`, serverID,
+	).Scan(&allRoleID))
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+		VALUES ($1, $2, 'role', $3, 0, $4)`,
+		uuid.NewString(), channelID, allRoleID, int64(rbac.PermViewVoiceChannels),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		uuid.NewString(), channelID, member.ID, int64(rbac.PermViewVoiceChannels),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped', 1)`,
+		channelID, member.ID,
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, channelID, member.ID,
+	)
+	require.NoError(t, err)
+
+	_, err = ts.DB.Exec(`DROP TRIGGER IF EXISTS supersede_pending_purge ON pending_key_requests`)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		CREATE OR REPLACE FUNCTION supersede_pending_purge_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'forced pending-key purge failure'; END;
+		$$`)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		CREATE TRIGGER supersede_pending_purge BEFORE DELETE ON pending_key_requests
+		FOR EACH ROW EXECUTE FUNCTION supersede_pending_purge_fn()`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := ts.DB.Exec(`DROP TRIGGER IF EXISTS supersede_pending_purge ON pending_key_requests`)
+		require.NoError(t, cleanupErr)
+		_, cleanupErr = ts.DB.Exec(`DROP FUNCTION IF EXISTS supersede_pending_purge_fn()`)
+		require.NoError(t, cleanupErr)
+	})
+
+	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
+		"target_type": "user",
+		"target_id":   member.ID,
+		"allow":       0,
+		"deny":        int64(rbac.PermViewVoiceChannels),
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+
+	var isTemporary bool
+	var keyCount, pendingCount, revocationCount int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT is_temporary FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2`, channelID, member.ID,
+	).Scan(&isTemporary))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&keyCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM pending_key_requests WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&pendingCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID,
+	).Scan(&revocationCount))
+	assert.True(t, isTemporary)
+	assert.Equal(t, 1, keyCount)
+	assert.Equal(t, 1, pendingCount)
+	assert.Zero(t, revocationCount)
+}
+
+func TestUpsertChannelOverride_NonMoveTemporaryGrantUsesOrdinaryFence(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "upsert-non-move-temporary")
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'other_temporary_reason', NOW())`,
+		uuid.NewString(), channelID, member.ID, int64(rbac.PermViewVoiceChannels),
+	)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(
+		`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'wrapped', 1)`,
+		channelID, member.ID,
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("PUT", channelOverridesPath(channelID), map[string]interface{}{
+		"target_type": "user",
+		"target_id":   member.ID,
+		"allow":       0,
+		"deny":        int64(rbac.PermViewVoiceChannels),
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var isTemporary bool
+	var keyCount, revocationCount int
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT is_temporary FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2`, channelID, member.ID,
+	).Scan(&isTemporary))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM channel_keys WHERE channel_id = $1 AND user_id = $2`, channelID, member.ID,
+	).Scan(&keyCount))
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT COUNT(*) FROM key_revocations WHERE channel_id = $1`, channelID,
+	).Scan(&revocationCount))
+	assert.False(t, isTemporary)
+	assert.Zero(t, keyCount, "an ordinary permanent denial revokes the superseded temporary recipient")
+	assert.Equal(t, 1, revocationCount, "only move_granted uses the dedicated temporary-grant path")
 }
 
 func TestUpsertChannelOverride_BaseMember_Forbidden(t *testing.T) {
@@ -2205,6 +2492,71 @@ func TestDeleteChannelOverride_NotFound(t *testing.T) {
 
 	w := ts.DoRequest("DELETE", channelOverridePath(channelID, uuid.New().String()), nil, testhelpers.AuthHeaders(owner.AccessToken))
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestDeleteChannelOverride_RefusesSystemManagedTemporaryMoveGrant(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "delete-system-managed-temp-grant")
+	overrideID := uuid.NewString()
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		overrideID, channelID, member.ID, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice),
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("DELETE", channelOverridePath(channelID, overrideID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+
+	var isTemporary bool
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT is_temporary FROM channel_permission_overrides WHERE id = $1`, overrideID,
+	).Scan(&isTemporary))
+	assert.True(t, isTemporary, "generic override deletion must not bypass temporary-grant lifecycle cleanup")
+}
+
+func TestDeleteChannelOverride_AllowsOtherTemporaryReasons(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "delete-other-temporary-override")
+	overrideID := uuid.NewString()
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'other_temporary_reason', NOW())`,
+		overrideID, channelID, member.ID, int64(rbac.PermViewVoiceChannels),
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("DELETE", channelOverridePath(channelID, overrideID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channel_permission_overrides WHERE id = $1`, overrideID).Scan(&count))
+	assert.Zero(t, count)
+}
+
+func TestDeleteChannelOverride_AllowsRoleTargetTemporaryMoveGrant(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateVoiceChannel(t, serverID, "delete-role-temporary-override")
+	roleID := uuid.NewString()
+	overrideID := uuid.NewString()
+	_, err := ts.DB.Exec(`
+		INSERT INTO roles (id, server_id, name, permissions, position)
+		VALUES ($1, $2, 'temporary-role-target', 0, 1)`, roleID, serverID)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'role', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		overrideID, channelID, roleID, int64(rbac.PermViewVoiceChannels),
+	)
+	require.NoError(t, err)
+
+	w := ts.DoRequest("DELETE", channelOverridePath(channelID, overrideID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var count int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channel_permission_overrides WHERE id = $1`, overrideID).Scan(&count))
+	assert.Zero(t, count, "a role-target temporary row is not a voice-owned move grant")
 }
 
 func TestDeleteChannelOverride_BaseMember_Forbidden(t *testing.T) {
@@ -2610,6 +2962,72 @@ func TestSetChannelPermSync_EnableSync(t *testing.T) {
 	).Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count, "enabling sync should copy category overrides to channel")
+}
+
+func TestCategorySyncWriters_RefuseSystemManagedTemporaryMoveGrant(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	categoryID := createTestCategory(t, ts, serverID, "sync-preserves-temp-grant")
+	channelID := ts.CreateVoiceChannel(t, serverID, "sync-preserves-temp-grant-channel")
+	assignChannelToCategory(t, ts, channelID, categoryID, true)
+	_, err := ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		uuid.NewString(), channelID, member.ID, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice),
+	)
+	require.NoError(t, err)
+
+	categoryBody := map[string]interface{}{
+		"target_type": "user", "target_id": member.ID,
+		"allow": 0, "deny": int64(rbac.PermJoinVoice),
+	}
+	w := ts.DoRequest("PUT", categoryOverridesPath(categoryID), categoryBody, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	var categoryCount int
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM category_permission_overrides WHERE category_id = $1`, categoryID).Scan(&categoryCount))
+	assert.Zero(t, categoryCount, "a rejected category upsert must roll back its parent row with the child replacement")
+
+	// Seed the parent row only to exercise its otherwise-atomic delete cascade.
+	categoryOverrideID := uuid.NewString()
+	_, err = ts.DB.Exec(`
+		INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
+		VALUES ($1, $2, 'user', $3, 0, $4)`, categoryOverrideID, categoryID, member.ID, int64(rbac.PermJoinVoice))
+	require.NoError(t, err)
+	w = ts.DoRequest("DELETE", categoryOverridePath(categoryID, categoryOverrideID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM category_permission_overrides WHERE id = $1`, categoryOverrideID).Scan(&categoryCount))
+	assert.Equal(t, 1, categoryCount, "a rejected category delete must retain its parent row")
+
+	var (
+		isTemporary bool
+		allow       int64
+		deny        int64
+	)
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT is_temporary, allow, deny
+		FROM channel_permission_overrides
+		WHERE channel_id = $1 AND target_type = 'user' AND target_id = $2`, channelID, member.ID,
+	).Scan(&isTemporary, &allow, &deny))
+	assert.True(t, isTemporary)
+	assert.Equal(t, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice), allow)
+	assert.Zero(t, deny)
+
+	// Enabling sync performs the same replacement with the flag in the same
+	// transaction, so it also refuses and leaves the flag unchanged.
+	unsyncedChannelID := ts.CreateVoiceChannel(t, serverID, "sync-enable-refuses-temp-grant")
+	assignChannelToCategory(t, ts, unsyncedChannelID, categoryID, false)
+	_, err = ts.DB.Exec(`
+		INSERT INTO channel_permission_overrides
+			(id, channel_id, target_type, target_id, allow, deny, is_temporary, temporary_reason, granted_at)
+		VALUES ($1, $2, 'user', $3, $4, 0, TRUE, 'move_granted', NOW())`,
+		uuid.NewString(), unsyncedChannelID, member.ID, int64(rbac.PermViewVoiceChannels|rbac.PermJoinVoice),
+	)
+	require.NoError(t, err)
+	w = ts.DoRequest("PUT", channelPermSyncPath(unsyncedChannelID), map[string]interface{}{"sync_permissions": true}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	var syncEnabled bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT sync_permissions FROM channels WHERE id = $1`, unsyncedChannelID).Scan(&syncEnabled))
+	assert.False(t, syncEnabled, "a conflicting sync request must roll back the flag with its attempted replacement")
 }
 
 func TestSetChannelPermSync_DisableSync(t *testing.T) {

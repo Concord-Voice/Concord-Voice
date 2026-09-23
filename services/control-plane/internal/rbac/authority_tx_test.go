@@ -6,8 +6,13 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,6 +83,190 @@ func TestLockServerVisibilityCapture_InvalidInput_ErrorsBeforeAnyStatement(t *te
 			require.Error(t, err)
 		})
 	})
+}
+
+func TestWithAuthorityCapture_LocksUserForeignKeysBeforeServerParent(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(file), "authority_tx.go"))
+	require.NoError(t, err)
+	body := string(source)
+	start := strings.Index(body, "func (h *Handler) withAuthorityCapture(")
+	require.GreaterOrEqual(t, start, 0)
+	end := strings.Index(body[start:], "// LockAuthorityPrincipalsTx locks")
+	require.Greater(t, end, 0)
+	body = body[start : start+end]
+	principalLock := strings.Index(body, "LockAuthorityPrincipalsTx(ctx, tx, principalIDs)")
+	serverLock := strings.Index(body, "SELECT id FROM servers WHERE id = $1 FOR UPDATE")
+	require.GreaterOrEqual(t, principalLock, 0)
+	require.GreaterOrEqual(t, serverLock, 0)
+	assert.Less(t, principalLock, serverLock,
+		"user FKs must be locked before the server parent to prevent hidden-FK deadlocks")
+	lifecycleLock := strings.Index(body, "lockAuthorityLifecyclePrincipalsTx(ctx, tx, lifecyclePrincipalIDs)")
+	visibilityLock := strings.Index(body, "LockServerVisibilityCapture(ctx, tx, serverID)")
+	require.GreaterOrEqual(t, lifecycleLock, 0)
+	assert.Less(t, visibilityLock, lifecycleLock,
+		"visibility advisory lock must precede lifecycle advisory locks")
+	assert.Less(t, lifecycleLock, principalLock,
+		"lifecycle advisory locks must precede ordinary user locks")
+}
+
+func TestCaptureChannelKeyCandidatesTx_OversizedLegacyHistoryIsBounded(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	owner := dbtest.CreateUser(t, db)
+	serverID, channelID := uuid.NewString(), uuid.NewString()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'candidate-cap-server', $2)`, serverID, owner)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
+	_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, 'candidate-cap-channel', 'text')`, channelID, serverID)
+	require.NoError(t, err)
+	for i := 0; i < 501; i++ {
+		candidate := dbtest.CreateUser(t, db)
+		_, err = db.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'a2V5', 1)`, channelID, candidate)
+		require.NoError(t, err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	candidates, err := CaptureChannelKeyCandidatesTx(ctx, tx, []string{channelID}, 500)
+	require.NoError(t, err, "legacy oversized history must not abort the authority mutation")
+	assert.Len(t, candidates[channelID], 500, "cleanup candidates remain bounded")
+}
+
+func TestCaptureAuthorityCandidates_TargetedUserIsLimitedToDurableChannels(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	owner := dbtest.CreateUser(t, db)
+	target := dbtest.CreateUser(t, db)
+	serverID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'targeted-candidate-server', $2)`, serverID, owner)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
+
+	keyChannelID, pendingChannelID, hiddenChannelID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	for _, channelID := range []string{keyChannelID, pendingChannelID, hiddenChannelID} {
+		_, err = db.Exec(`INSERT INTO channels (id, server_id, name, type) VALUES ($1, $2, $3, 'text')`, channelID, serverID, channelID)
+		require.NoError(t, err)
+	}
+	_, err = db.Exec(`INSERT INTO channel_keys (channel_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'a2V5', 1)`, keyChannelID, target)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO pending_key_requests (channel_id, user_id) VALUES ($1, $2)`, pendingChannelID, target)
+	require.NoError(t, err)
+
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	targetID := target.String()
+	candidates, err := captureAuthorityCandidates(ctx, tx, []string{keyChannelID, pendingChannelID, hiddenChannelID}, &targetID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{targetID}, candidates[keyChannelID])
+	assert.Equal(t, []string{targetID}, candidates[pendingChannelID])
+	assert.Empty(t, candidates[hiddenChannelID], "a user with no durable key state must not receive a channel revocation")
+}
+
+func TestRecordDeniedChannelKeyCandidates_OmitsEmptyCandidateSets(t *testing.T) {
+	deniedByChannel := make(map[string][]string)
+	recordDeniedChannelKeyCandidates(deniedByChannel, "visible-channel", nil)
+	assert.NotContains(t, deniedByChannel, "visible-channel")
+
+	deniedUserIDs := []string{"denied-user"}
+	recordDeniedChannelKeyCandidates(deniedByChannel, "denied-channel", deniedUserIDs)
+	assert.Equal(t, deniedUserIDs, deniedByChannel["denied-channel"])
+}
+
+func TestLockAuthorityPrincipalsTx_ValidatesAndRequiresEveryUser(t *testing.T) {
+	ctx := context.Background()
+	t.Run("invalid id is rejected before the transaction is used", func(t *testing.T) {
+		assert.Error(t, LockAuthorityPrincipalsTx(ctx, nil, []string{"not-a-uuid"}))
+	})
+
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	userID := dbtest.CreateUser(t, db).String()
+
+	t.Run("existing user is locked", func(t *testing.T) {
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tx.Rollback() })
+		require.NoError(t, LockAuthorityPrincipalsTx(ctx, tx, []string{userID}))
+
+		probe, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = probe.Rollback() })
+		var lockedID string
+		err = probe.QueryRowContext(ctx,
+			`SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT`, userID,
+		).Scan(&lockedID)
+		require.Error(t, err, "a second transaction must not acquire the principal row lock")
+	})
+	t.Run("missing user fails closed", func(t *testing.T) {
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tx.Rollback() })
+		err = LockAuthorityPrincipalsTx(ctx, tx, []string{uuid.NewString()})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no longer exists")
+	})
+}
+
+func TestWithAuthorityCapture_WriteError_RollsBack(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	owner := dbtest.CreateUser(t, db)
+	serverID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'rollback-server', $2)`, serverID, owner)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
+
+	h := &Handler{db: db}
+	writeErr := errors.New("authority write failed")
+	_, err = h.withAuthorityCapture(ctx, serverID, nil, nil,
+		func(context.Context, *sql.Tx) error { return writeErr }, owner.String())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, writeErr)
+
+	var name string
+	require.NoError(t, db.QueryRow(`SELECT name FROM servers WHERE id = $1`, serverID).Scan(&name))
+	assert.Equal(t, "rollback-server", name)
+}
+
+func TestWithAuthorityCapture_CommitError_AbandonsPlanAfterCommit(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	owner := dbtest.CreateUser(t, db)
+	serverID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO servers (id, name, owner_id) VALUES ($1, 'before-commit', $2)`, serverID, owner)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM servers WHERE id = $1`, serverID) })
+
+	stub := &presenceRecheckStub{plan: &presenceRecheckPlanStub{work: true}}
+	h := &Handler{db: db}
+	h.SetPresenceRecheck(stub)
+	commitErr := errors.New("commit acknowledgement lost")
+	h.authorityCommit = func(tx *sql.Tx) error {
+		require.NoError(t, tx.Commit())
+		return commitErr
+	}
+
+	plan, err := h.withAuthorityCapture(ctx, serverID, nil, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			_, updateErr := tx.ExecContext(ctx, `UPDATE servers SET name = 'committed' WHERE id = $1`, serverID)
+			return updateErr
+		}, owner.String())
+	require.Error(t, err)
+	assert.True(t, IsAmbiguousAuthorityCommit(err))
+	assert.Nil(t, plan)
+	assert.Equal(t, []string{"PrepareCapture", "CaptureVisibility", "Abandon"}, stub.sequence)
+	assert.Equal(t, []string{"ambiguous_commit"}, stub.abandons)
+
+	var name string
+	require.NoError(t, db.QueryRow(`SELECT name FROM servers WHERE id = $1`, serverID).Scan(&name))
+	assert.Equal(t, "committed", name)
 }
 
 // ORDERING REGRESSION LOCK. Phase 1 must run BEFORE BeginTx, outside the

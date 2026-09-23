@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/graphpresence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
@@ -408,6 +409,8 @@ func TestBlockDegradesAndStillCommits(t *testing.T) {
 	require.NoError(t, err,
 		"the write must succeed after a degrade — a poisoned transaction here is "+
 			"the exact inertness the capture savepoint exists to prevent")
+	require.NoError(t, dmblock.RecordBlockTx(ctx, tx, a.String(), b.String(), uuid.NewString()),
+		"the block must record its directional reconciliation obligation")
 	require.NoError(t, r.Complete(ctx, tx, plan), "Complete must commit the transaction")
 
 	var status string
@@ -1266,6 +1269,9 @@ func TestCompleteTopologyPreparesAndCommitsThroughTheRealRail(t *testing.T) {
 			`, sender, friend); execErr != nil {
 				return execErr
 			}
+			if err := dmblock.RecordBlockTx(ctx, tx, sender.String(), friend.String(), uuid.NewString()); err != nil {
+				return err
+			}
 			return r.Complete(ctx, tx, plan)
 		})
 		require.NoError(t, err, "an inactive operation with a nil audience still prepares")
@@ -1722,6 +1728,9 @@ func TestC1DegradeLeavesTheTopologyMarkersIntact(t *testing.T) {
 			   OR (requester_id = $2 AND addressee_id = $1)
 		`, sender, viewer); execErr != nil {
 			return execErr
+		}
+		if err := dmblock.RecordBlockTx(ctx, tx, sender.String(), viewer.String(), uuid.NewString()); err != nil {
+			return err
 		}
 		return r.Complete(ctx, tx, plan)
 	})

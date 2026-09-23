@@ -16,6 +16,8 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
+const testPredecessorEpoch = "0123456789abcdef0123456789abcdef" // pragma: allowlist secret
+
 // Package-local coverage for the DB half of the fence: read-through +
 // back-fill, the Redis-transport-error fallback, GuardTx, and RotateTx.
 // (Go coverage is per-package: the cross-package integration suites exercise
@@ -145,6 +147,14 @@ func TestGuardTx_LifecycleAgainstRealRows(t *testing.T) {
 func TestOp_RotateTxStampsDurableEpoch(t *testing.T) {
 	f, mr, db, uid := newDBFence(t)
 	ctx := context.Background()
+	require.NoError(t, func() error {
+		_, err := db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, testPredecessorEpoch, uid)
+		return err
+	}())
+	evicted := make(chan []string, 1)
+	f.SetPostCommitEvictor(func(_ context.Context, userID, newEpoch, previousEpoch string) {
+		evicted <- []string{userID, newEpoch, previousEpoch}
+	})
 
 	op, err := f.Begin(ctx, uid)
 	require.NoError(t, err)
@@ -163,8 +173,66 @@ func TestOp_RotateTxStampsDurableEpoch(t *testing.T) {
 	assert.Equal(t, op.NewEpochValue(), stored.String)
 
 	op.Commit(ctx)
+	select {
+	case got := <-evicted:
+		require.Equal(t, []string{uid, op.NewEpochValue(), testPredecessorEpoch}, got)
+	case <-time.After(time.Second):
+		t.Fatal("media eviction callback did not run")
+	}
 	require.NoError(t, f.Check(ctx, uid, op.NewEpochValue()))
 	assert.ErrorIs(t, f.Check(ctx, uid, "pre-rotation"), ErrEpochMismatch)
+}
+
+func TestOp_ReconcileCommittedEvictionSkipsRollbackAndPublishesAdvancedEpoch(t *testing.T) {
+	f, _, db, uid := newDBFence(t)
+	ctx := context.Background()
+	require.NoError(t, func() error {
+		_, err := db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, testPredecessorEpoch, uid)
+		return err
+	}())
+	var calls int
+	f.SetPostCommitEvictor(func(_ context.Context, _, _, _ string) { calls++ })
+
+	op, err := f.Begin(ctx, uid)
+	require.NoError(t, err)
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, op.RotateTx(ctx, tx))
+	require.NoError(t, tx.Rollback())
+	op.ReconcileCommittedEviction(ctx)
+	require.Zero(t, calls, "unchanged predecessor proves rollback")
+
+	tx, err = db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, op.RotateTx(ctx, tx))
+	require.NoError(t, tx.Commit())
+	op.ReconcileCommittedEviction(ctx)
+	require.Equal(t, 1, calls, "advanced durable epoch publishes exact predecessor eviction")
+}
+
+func TestOp_RotateTxOutboxIsAtomicWithCredentialRotation(t *testing.T) {
+	f, _, db, uid := newDBFence(t)
+	ctx := context.Background()
+	_, err := db.Exec(`UPDATE users SET credential_epoch = $1 WHERE id = $2`, testPredecessorEpoch, uid)
+	require.NoError(t, err)
+	op, err := f.Begin(ctx, uid)
+	require.NoError(t, err)
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, op.RotateTx(ctx, tx))
+	require.NoError(t, tx.Rollback())
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id = $1`, uid).Scan(&count))
+	require.Zero(t, count)
+
+	op, err = f.Begin(ctx, uid)
+	require.NoError(t, err)
+	tx, err = db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, op.RotateTx(ctx, tx))
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM credential_epoch_voice_ejections WHERE user_id = $1 AND credential_epoch = $2 AND superseded_credential_epoch = $3`, uid, op.NewEpochValue(), testPredecessorEpoch).Scan(&count))
+	require.Equal(t, 1, count)
 }
 
 func TestOp_RotateTxUnknownUserErrors(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	"github.com/gin-gonic/gin"
@@ -78,6 +79,107 @@ func TestDMKeyDistributionDoesNotMintAfterMemberRemoval(t *testing.T) {
 		t.Fatal("DM key distribution did not finish after member removal committed")
 	}
 	assert.Zero(t, countDMKeysAtVersion(t, db, conversationID, 2), "removed actor must not mint an epoch-2 wrap")
+}
+
+func TestDMKeyDistributionDoesNotDeadlockWithMemberRemoval(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	actor, recipient := dbtest.CreateUser(t, db), dbtest.CreateUser(t, db)
+	conversationID := uuid.New()
+	_, err := db.Exec(`INSERT INTO dm_conversations (id, is_group, created_by) VALUES ($1, true, $2)`, conversationID, actor)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`, conversationID, actor, recipient)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	removalTx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() {
+		if rollbackErr := removalTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("rollback member removal transaction: %v", rollbackErr)
+		}
+	}()
+	require.NoError(t, dm.LockDMVoiceParticipantSetTx(ctx, removalTx, conversationID))
+	lockKey, err := dm.VoiceParticipantSetAdvisoryKey(conversationID)
+	require.NoError(t, err)
+
+	h := &Handler{db: db, log: logger.New("test")}
+	done := make(chan error, 1)
+	go func() {
+		_, distErr := h.distributeDMKeys(ctx, actor.String(), "", conversationID.String(), map[string]string{
+			recipient.String(): "successor-wrap",
+		}, nil, intPtr(2))
+		done <- distErr
+	}()
+	dbtest.WaitForAdvisoryLockWaiter(t, db, lockKey)
+
+	var lockedConversation uuid.UUID
+	require.NoError(t, removalTx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR NO KEY UPDATE`, conversationID).Scan(&lockedConversation))
+	_, err = removalTx.ExecContext(ctx,
+		`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, actor)
+	require.NoError(t, err)
+	require.NoError(t, removalTx.Commit())
+
+	select {
+	case distErr := <-done:
+		require.ErrorIs(t, distErr, errDMKeyDistributorNotParticipant)
+	case <-time.After(8 * time.Second):
+		t.Fatal("DM key distribution deadlocked with member removal")
+	}
+	assert.Zero(t, countDMKeysAtVersion(t, db, conversationID, 2), "removed claimant must not mint a successor")
+}
+
+func TestDMKeyDistributionRejectsBlockedParticipantSuccessorUntilParticipantRemoved(t *testing.T) {
+	db, cleanup := dbtest.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	survivor, blocked := dbtest.CreateUser(t, db), dbtest.CreateUser(t, db)
+	conversationID := uuid.New()
+	_, err := db.Exec(`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, 'accepted')`, survivor, blocked)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO dm_conversations (id, is_group, created_by) VALUES ($1, false, $2)`, conversationID, survivor)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`, conversationID, survivor, blocked)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO dm_channel_keys (conversation_id, user_id, wrapped_key, key_version) VALUES ($1, $2, 'survivor-v1', 1), ($1, $3, 'blocked-v1', 1)`, conversationID, survivor, blocked)
+	require.NoError(t, err)
+
+	blockTx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, dmblock.RecordBlockTx(context.Background(), blockTx, survivor.String(), blocked.String(), uuid.NewString()))
+	_, err = blockTx.Exec(`UPDATE friendships SET status = 'blocked' WHERE requester_id = $1 AND addressee_id = $2`, survivor, blocked)
+	require.NoError(t, err)
+	require.NoError(t, blockTx.Commit())
+
+	h := &Handler{db: db, log: logger.New("test")}
+	successorVersion := 2
+	distributed, distErr := h.distributeDMKeys(context.Background(), blocked.String(), "", conversationID.String(), map[string]string{
+		survivor.String(): "for-survivor",
+		blocked.String():  "for-blocked",
+	}, nil, &successorVersion)
+	require.ErrorIs(t, distErr, errDMKeyDistributorNotParticipant)
+	assert.Zero(t, distributed)
+	assert.Zero(t, countDMKeysAtVersion(t, db, conversationID, successorVersion), "blocked claimant must not mint successor wraps")
+
+	var revocations int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1`, conversationID).Scan(&revocations))
+	assert.Zero(t, revocations, "rejected successor claim must not record a revocation")
+
+	resolutionTx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	var lockedConversation uuid.UUID
+	err = resolutionTx.QueryRow(`SELECT id FROM dm_conversations WHERE id = $1 FOR UPDATE`, conversationID).Scan(&lockedConversation)
+	require.NoError(t, err)
+	_, err = resolutionTx.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, conversationID, blocked)
+	require.NoError(t, err)
+	require.NoError(t, resolutionTx.Commit())
+
+	distributed, distErr = h.distributeDMKeys(context.Background(), survivor.String(), "", conversationID.String(), map[string]string{
+		survivor.String(): "survivor-v2",
+	}, nil, &successorVersion)
+	require.NoError(t, distErr)
+	assert.Equal(t, 1, distributed, "remaining participant must still claim the successor after reconciliation")
 }
 
 func TestDMKeyDistributionSkipsRecipientRemovedWhileDistributionWaits(t *testing.T) {
@@ -216,7 +318,7 @@ func TestDMKeyDistributionWaitsForRecipientBeforeParticipantSet(t *testing.T) {
 	}()
 	dbtest.WaitForRowLockWaiter(t, db, recipientTxID)
 	require.False(t, grantedDistributionAdvisoryLock(t, db, lockKey),
-		"distribution blocked on recipient FK before acquiring participant-set advisory")
+		"distribution must lock participant users before acquiring participant-set advisory")
 	require.NoError(t, recipientTx.Commit())
 	select {
 	case result := <-done:

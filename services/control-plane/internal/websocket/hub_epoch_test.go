@@ -160,6 +160,12 @@ func setupEpochTest(t *testing.T, seedKey, seedRevocation bool) *hubTestSetup {
 	db := setupHubTestDB(t)
 	redisClient := setupHubTestRedis(t)
 	hub := NewHub(db, redisClient)
+	// setupHubTestDB registered its TRUNCATE cleanup first, so this later
+	// cleanup runs before it. Manual hub handlers can leave material DM results
+	// unconsumed in tests; join workers and release their read leases first.
+	t.Cleanup(func() {
+		hub.dmDeliveryWg.Wait()
+	})
 
 	user1ID := uuid.New()
 	user2ID := uuid.New()
@@ -274,6 +280,65 @@ func TestHandleDMMessageRevokedEpochRejected(t *testing.T) {
 	data := resp["data"].(map[string]interface{})
 	assert.Equal(t, "epoch_revoked", data["code"])
 	assert.Equal(t, float64(2), data["current_epoch"])
+}
+
+func TestHandleDMMessageRemovedGroupParticipantCannotUseAdvertisedSuccessorEpoch(t *testing.T) {
+	setup := setupEpochTest(t, true, true)
+	conversationID, err := uuid.Parse(setup.convID)
+	require.NoError(t, err)
+	_, err = setup.db.Exec(`UPDATE dm_conversations SET is_group = true WHERE id = $1`, conversationID)
+	require.NoError(t, err)
+
+	recipient := newTestClient(setup.hub, setup.user2)
+	setup.hub.clients[recipient.ID] = recipient
+	setup.hub.userClients[setup.user2] = map[uuid.UUID]bool{recipient.ID: true}
+	setup.hub.dmSubscriptions[conversationID][recipient.ID] = true
+
+	_, err = setup.db.Exec(
+		`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`,
+		conversationID, setup.user1,
+	)
+	require.NoError(t, err)
+
+	setup.hub.handleDMMessage(IncomingMessage{
+		Type:     msgTypeDM,
+		UserID:   setup.user1,
+		ClientID: setup.client.ID,
+		Data: map[string]interface{}{
+			keyConversationID: setup.convID,
+			keyContent:        "ciphertext from removed participant",
+			keyKeyVersion:     float64(2),
+		},
+	})
+
+	response := readClientMsg(t, setup.client)
+	require.Equal(t, "error", response["type"])
+	assert.Contains(t, response["data"].(map[string]interface{})[keyMessage], "Not a participant")
+
+	// If a regression reaches fanout, apply it exactly as Run would so the
+	// authorized remaining participant exposes the unsafe delivery.
+	select {
+	case broadcast := <-setup.hub.dmBroadcast:
+		setup.hub.handleDMBroadcast(broadcast)
+		select {
+		case result := <-setup.hub.dmDeliveryResults:
+			setup.hub.handleDMMessageDeliveryResult(result)
+		case <-time.After(time.Second):
+			t.Fatal("DM delivery result did not complete")
+		}
+	default:
+	}
+	assert.Empty(t, recipient.Send, "the removed sender must not fan out a DM message")
+	assert.NotContains(t, setup.hub.dmSubscriptions[conversationID], setup.client.ID,
+		"definitive nonmembership must prune the stale sender subscription")
+	assert.Contains(t, setup.hub.dmSubscriptions[conversationID], recipient.ID)
+
+	var inserted int
+	require.NoError(t, setup.db.QueryRow(
+		`SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $1 AND user_id = $2`,
+		conversationID, setup.user1,
+	).Scan(&inserted))
+	assert.Zero(t, inserted, "the removed sender must not persist a DM message")
 }
 
 func TestEnforceDMEpoch_CurrentEpochLookupFailureFailsClosed(t *testing.T) {

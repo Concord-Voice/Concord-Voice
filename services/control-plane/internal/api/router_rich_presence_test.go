@@ -90,3 +90,54 @@ func TestNewRouterWiresOneAuthoritativeRichPresenceBridgeIntoVoiceNATS(t *testin
 		senderPresence,
 	)`)
 }
+
+func TestNewRouterWiresDMBlockCleanupWithoutNATS(t *testing.T) {
+	sourceBytes, err := os.ReadFile("router.go") // #nosec G304 -- fixed test-only source path
+	require.NoError(t, err)
+	source := string(sourceBytes)
+	purge := strings.Index(source, "dmBlockReconciler.SetPurgeEngine(dmBlockAttachmentRetirer{engine: purgeEngine})")
+	notifier := strings.Index(source, "dmBlockReconciler.SetReconciliationNotifier(newDMBlockReconciliationNotifier(hub))")
+	cleanup := strings.Index(source, "reconciler.SetDMBlockCleanup(dmBlockReconciler.ReconcileDue)")
+	newRouter := strings.Index(source, "func NewRouter(")
+	require.NotEqual(t, -1, purge)
+	require.NotEqual(t, -1, notifier)
+	require.NotEqual(t, -1, cleanup)
+	require.NotEqual(t, -1, newRouter)
+	newRouterSource := source[newRouter:]
+	reconcilerWiring := strings.Index(newRouterSource, "wireDMBlockReconciler(")
+	cleanupInHelper := strings.Index(source, "reconciler.SetDMBlockCleanup(dmBlockReconciler.ReconcileDue)")
+	require.NotEqual(t, -1, reconcilerWiring)
+	require.NotEqual(t, -1, cleanupInHelper)
+	natsBranch := strings.Index(newRouterSource, "if natsClient != nil {")
+	require.NotEqual(t, -1, natsBranch)
+	require.Less(t, purge, cleanup, "attachment retirement must be wired before block cleanup can run")
+	require.Less(t, notifier, cleanup, "DM topology notifications must be wired before block cleanup can run")
+	require.Less(t, reconcilerWiring, natsBranch, "SQL-only block cleanup must be wired before the NATS-dependent branch")
+	require.Contains(t, source, "if !dmBlockCleanupWired(activePlanReconciler) {")
+}
+
+func TestNewRouterWiresDMBlockVoiceEjectionRequestReply(t *testing.T) {
+	sourceBytes, err := os.ReadFile("router.go") // #nosec G304 -- fixed test-only source path
+	require.NoError(t, err)
+	source := string(sourceBytes)
+	helperStart := strings.Index(source, "func wireDMBlockReconciler(")
+	require.NotEqual(t, -1, helperStart)
+	helperEnd := strings.Index(source[helperStart:], "\nfunc ")
+	require.Greater(t, helperEnd, 0)
+	helper := source[helperStart : helperStart+helperEnd]
+	construction := strings.Index(helper, "dmBlockReconciler.SetVoiceEjectV2(func(")
+	require.NotEqual(t, -1, construction)
+	guard := strings.Index(helper, "if natsClient != nil {")
+	require.NotEqual(t, -1, guard)
+	segment := helper[construction:]
+	require.Contains(t, segment, "func(ctx context.Context, conversationID string, userID, generation uuid.UUID) error {")
+	require.Contains(t, segment, "publishDurableDMBlockVoiceEjection(ctx, db, natsClient, jwtSecret, conversationID, userID, generation)")
+	require.NotContains(t, segment, "dmBlockReconciler.SetVoiceEject(func(")
+	// The durable publisher retains the legacy request/reply path as the
+	// compatibility arm until the rollout flag activates the registry-backed
+	// protocol.
+	runtimeBytes, err := os.ReadFile("dmblock_runtime.go") // #nosec G304 -- fixed test-only source path
+	require.NoError(t, err)
+	require.Contains(t, string(runtimeBytes), "publishDMBlockVoiceEjection(ctx, requester, secret, conversationID, userID)")
+	require.Less(t, guard, construction, "voice ejection must be enabled only inside the NATS guard")
+}

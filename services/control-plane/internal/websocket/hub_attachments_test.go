@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/models"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,44 @@ func beginAttachmentTx(t *testing.T, setup *hubTestSetup) *sql.Tx {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = tx.Rollback() })
 	return tx
+}
+
+func TestPersistDMMessageBlockedTopologyDoesNotPublishAttachment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		blocked bool
+	}{
+		{name: "active blocked friendship", blocked: true},
+		{name: "pending reconciliation marker"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup := setupEpochTest(t, false, false)
+			attachmentID := seedMediaFile(t, setup, 2)
+			_, err := setup.db.Exec(`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, 'accepted')`, setup.user1, setup.user2)
+			require.NoError(t, err)
+			tx, err := setup.db.BeginTx(context.Background(), nil)
+			require.NoError(t, err)
+			require.NoError(t, dmblock.RecordBlockTx(context.Background(), tx, setup.user1.String(), setup.user2.String(), uuid.NewString()))
+			if tc.blocked {
+				_, err = tx.Exec(`UPDATE friendships SET status = 'blocked' WHERE requester_id = $1 AND addressee_id = $2`, setup.user1, setup.user2)
+				require.NoError(t, err)
+			}
+			require.NoError(t, tx.Commit())
+
+			_, _, _, _, persistErr := setup.hub.persistDMMessage(uuid.MustParse(setup.convID), setup.user1, "", &dmMessageInput{
+				content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user", attachmentIDs: []string{attachmentID},
+			})
+			require.ErrorIs(t, persistErr, dmblock.ErrUnavailable)
+
+			var messages, links, media int
+			require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&messages))
+			require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM dm_message_attachments WHERE file_id = $1`, attachmentID).Scan(&links))
+			require.NoError(t, setup.db.QueryRow(`SELECT COUNT(*) FROM media_files WHERE id = $1 AND deleted_at IS NULL`, attachmentID).Scan(&media))
+			require.Zero(t, messages)
+			require.Zero(t, links)
+			require.Equal(t, 1, media, "the upload remains available even though message association is fenced")
+		})
+	}
 }
 
 const (

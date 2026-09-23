@@ -1,11 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHmac } from 'node:crypto';
 import './mocks/logger.js';
+
+vi.mock('../src/lib/voiceEnforcementSession.js', () => ({
+  releaseVoiceEnforcementSession: vi.fn().mockResolvedValue(undefined),
+}));
 
 import {
   handleForceDisconnect,
+  createCredentialEpochEjectionAckHandler,
+  createVoiceEnforcementSessionEjectionHandler,
   type ForceDisconnectRoomManager,
   type ForceDisconnectIO,
 } from '../src/lib/forceDisconnect.js';
+import { releaseVoiceEnforcementSession } from '../src/lib/voiceEnforcementSession.js';
+import {
+  VoiceEnforcementExpiryFence,
+  VoiceEnforcementLease,
+} from '../src/lib/voiceEnforcementLease.js';
 
 const CHANNEL_ID = 'ch-1';
 const USER_ID = 'u-1';
@@ -260,5 +272,439 @@ describe('handleForceDisconnect (#487 P3)', () => {
       })
     ).resolves.toBeUndefined();
     expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+  });
+});
+
+describe('durable exact-session ejection', () => {
+  const ids = {
+    parent: '11111111-1111-4111-8111-111111111111',
+    session: '22222222-2222-4222-8222-222222222222',
+    boot: '33333333-3333-4333-8333-333333333333',
+    room: '44444444-4444-4444-8444-444444444444',
+    user: '55555555-5555-4555-8555-555555555555',
+  };
+  const signingKey = 'fixture';
+
+  function command(sessionGeneration = ids.session) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nonce = 'a'.repeat(64);
+    const fields = [
+      ids.parent,
+      sessionGeneration,
+      ids.boot,
+      ids.room,
+      'dm',
+      ids.user,
+      '',
+      SOCKET_ID,
+      nonce,
+    ];
+    const key = createHmac('sha256', signingKey)
+      .update('concord/voice-enforcement-session/eject/request/v1')
+      .digest();
+    return {
+      version: 1,
+      parentGeneration: ids.parent,
+      sessionGeneration,
+      nodeBootId: ids.boot,
+      roomId: ids.room,
+      roomKind: 'dm',
+      userId: ids.user,
+      credentialEpoch: '',
+      socketId: SOCKET_ID,
+      timestamp,
+      nonce,
+      proof: createHmac('sha256', key)
+        .update(['v1', timestamp, ...fields].join('\n'))
+        .digest('hex'),
+    };
+  }
+
+  function healthCommand(challenge = 'b'.repeat(64)) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const key = createHmac('sha256', signingKey)
+      .update('concord/voice-enforcement-session/health/request/v1')
+      .digest();
+    return {
+      version: 2,
+      kind: 'health',
+      nodeBootId: ids.boot,
+      challenge,
+      timestamp,
+      proof: createHmac('sha256', key)
+        .update(['v1', timestamp, ids.boot, challenge, 'health'].join('\n'))
+        .digest('hex'),
+    };
+  }
+
+  it('tears down a provisional session before disconnect when registration races its response', async () => {
+    const remove = vi.fn().mockResolvedValue(true);
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(() => ({
+        socketId: SOCKET_ID,
+        credentialEpoch: '',
+        voiceEnforcementSessionGeneration: ids.session,
+      })),
+      getParticipant: vi.fn(() => undefined),
+      removeProvisionalParticipantForEnforcement: remove,
+      leaveRoomIfSocketOwned: vi.fn(),
+    };
+    const disconnect = vi.fn();
+    const io = {
+      sockets: { sockets: new Map([[SOCKET_ID, { emit: vi.fn(), disconnect, data: {} }]]) },
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      io,
+      signingKey,
+      ids.boot
+    );
+
+    await expect(handler(command())).resolves.toMatchObject({
+      ok: true,
+      sessionGeneration: ids.session,
+    });
+    expect(remove).toHaveBeenCalledWith(ids.room, ids.user, SOCKET_ID);
+    expect(disconnect).toHaveBeenCalledWith(true);
+    expect(releaseVoiceEnforcementSession).toHaveBeenCalledOnce();
+  });
+
+  it('retains an ambiguous reused socket rather than acknowledging a stale generation', async () => {
+    const remove = vi.fn();
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(() => ({
+        socketId: SOCKET_ID,
+        credentialEpoch: '',
+        voiceEnforcementSessionGeneration: ids.parent,
+      })),
+      getParticipant: vi.fn(() => undefined),
+      removeProvisionalParticipantForEnforcement: remove,
+      leaveRoomIfSocketOwned: vi.fn(),
+    };
+    const io = {
+      sockets: {
+        sockets: new Map([[SOCKET_ID, { emit: vi.fn(), disconnect: vi.fn(), data: {} }]]),
+      },
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      io,
+      signingKey,
+      ids.boot
+    );
+
+    await expect(handler(command())).resolves.toBeUndefined();
+    expect(remove).not.toHaveBeenCalled();
+    expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+  });
+
+  it('does not tear down an admitted reused socket without the exact generation', async () => {
+    const leave = vi.fn();
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(() => undefined),
+      getParticipant: vi.fn(() => ({
+        socketId: SOCKET_ID,
+        credentialEpoch: '',
+        voiceEnforcementSessionGeneration: ids.parent,
+      })),
+      removeProvisionalParticipantForEnforcement: vi.fn(),
+      leaveRoomIfSocketOwned: leave,
+    };
+    const exactSocketSession = {
+      sessionGeneration: ids.session,
+      nodeBootId: ids.boot,
+      roomId: ids.room,
+      roomKind: 'dm' as const,
+      userId: ids.user,
+      credentialEpoch: '',
+      socketId: SOCKET_ID,
+    };
+    const io = {
+      sockets: {
+        sockets: new Map([
+          [
+            SOCKET_ID,
+            {
+              emit: vi.fn(),
+              disconnect: vi.fn(),
+              data: { voiceEnforcementSession: exactSocketSession },
+            },
+          ],
+        ]),
+      },
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      io,
+      signingKey,
+      ids.boot
+    );
+
+    await expect(handler(command())).resolves.toBeUndefined();
+    expect(leave).not.toHaveBeenCalled();
+    expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+  });
+
+  it('releases a stale replaced socket while preserving its successor', async () => {
+    const successorSocketID = 'socket-successor';
+    const successorGeneration = '66666666-6666-4666-8666-666666666666';
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(() => undefined),
+      getParticipant: vi.fn(() => ({
+        socketId: successorSocketID,
+        credentialEpoch: '',
+        voiceEnforcementSessionGeneration: successorGeneration,
+      })),
+      removeProvisionalParticipantForEnforcement: vi.fn(),
+      leaveRoomIfSocketOwned: vi.fn(),
+    };
+    const oldDisconnect = vi.fn();
+    const successorDisconnect = vi.fn();
+    const exactOldSession = {
+      sessionGeneration: ids.session,
+      nodeBootId: ids.boot,
+      roomId: ids.room,
+      roomKind: 'dm' as const,
+      userId: ids.user,
+      credentialEpoch: '',
+      socketId: SOCKET_ID,
+    };
+    const io = {
+      sockets: {
+        sockets: new Map([
+          [
+            SOCKET_ID,
+            {
+              emit: vi.fn(),
+              disconnect: oldDisconnect,
+              data: { voiceEnforcementSession: exactOldSession },
+            },
+          ],
+          [successorSocketID, { emit: vi.fn(), disconnect: successorDisconnect, data: {} }],
+        ]),
+      },
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      io,
+      signingKey,
+      ids.boot
+    );
+
+    await expect(handler(command())).resolves.toMatchObject({ ok: true });
+    expect(oldDisconnect).toHaveBeenCalledWith(true);
+    expect(successorDisconnect).not.toHaveBeenCalled();
+    expect(releaseVoiceEnforcementSession).toHaveBeenCalledWith(exactOldSession);
+  });
+
+  it('fences expired media before a late valid health command can renew admission', async () => {
+    let now = 0;
+    const lease = new VoiceEnforcementLease(() => now, 30_000);
+    lease.renew();
+    now = 30_001;
+    const order: string[] = [];
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(),
+      getParticipant: vi.fn(),
+      removeProvisionalParticipantForEnforcement: vi.fn(),
+      leaveRoomIfSocketOwned: vi.fn(),
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      { sockets: { sockets: new Map() } },
+      signingKey,
+      ids.boot,
+      async () => {
+        if (!lease.valid()) {
+          order.push('fence');
+        }
+        lease.renew();
+        order.push('renew');
+      }
+    );
+    await expect(handler(healthCommand())).resolves.toMatchObject({ kind: 'health', ok: true });
+    expect(order).toEqual(['fence', 'renew']);
+    expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+    expect(lease.valid()).toBe(true);
+  });
+
+  it('renews a healthy lease without teardown', async () => {
+    const lease = new VoiceEnforcementLease(() => 0, 30_000);
+    lease.renew();
+    const fence = vi.fn();
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(),
+      getParticipant: vi.fn(),
+      removeProvisionalParticipantForEnforcement: vi.fn(),
+      leaveRoomIfSocketOwned: vi.fn(),
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      { sockets: { sockets: new Map() } },
+      signingKey,
+      ids.boot,
+      () => {
+        if (!lease.valid()) fence();
+        lease.renew();
+      }
+    );
+    await expect(handler(healthCommand())).resolves.toMatchObject({ kind: 'health', ok: true });
+    expect(fence).not.toHaveBeenCalled();
+    expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+  });
+
+  it('waits for an in-flight expiry teardown before a late health command reopens admission', async () => {
+    const now = 30_001;
+    const lease = new VoiceEnforcementLease(() => now, 30_000);
+    let releaseCloseAll!: () => void;
+    const closeAll = new Promise<void>((resolve) => {
+      releaseCloseAll = resolve;
+    });
+    const order: string[] = [];
+    const fenceExpired = new VoiceEnforcementExpiryFence(lease, async () => {
+      order.push('close-start');
+      await closeAll;
+      order.push('close-end');
+    });
+    // Start the watchdog's closeAll before the same target subscriber accepts a
+    // valid health command. This is the production overlap that must not reopen
+    // A1/A2 while closeAll still owns its room snapshot.
+    const watchdog = fenceExpired.enforce();
+    const roomManager = {
+      getProvisionalParticipant: vi.fn(),
+      getParticipant: vi.fn(),
+      removeProvisionalParticipantForEnforcement: vi.fn(),
+      leaveRoomIfSocketOwned: vi.fn(),
+    };
+    const handler = createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      { sockets: { sockets: new Map() } },
+      signingKey,
+      ids.boot,
+      async () => {
+        if (!lease.valid()) await fenceExpired.enforce();
+        lease.renew();
+        order.push('renew');
+      }
+    );
+
+    let healthSettled = false;
+    const health = handler(healthCommand()).then(() => {
+      healthSettled = true;
+    });
+    await Promise.resolve();
+    expect(order).toEqual(['close-start']);
+    expect(healthSettled).toBe(false);
+    expect(lease.valid()).toBe(false);
+    expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+
+    releaseCloseAll();
+    await Promise.all([watchdog, health]);
+    expect(order).toEqual(['close-start', 'close-end', 'renew']);
+    expect(lease.valid()).toBe(true);
+    expect(releaseVoiceEnforcementSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('credential-epoch ejection', () => {
+  const userId = 'user-credential-epoch';
+  const credentialEpoch = 'b'.repeat(32);
+  const supersededCredentialEpoch = 'a'.repeat(32);
+  const signingValue = 'credential-epoch-fixture';
+
+  function command(overrides: Record<string, unknown> = {}) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nonce = 'c'.repeat(64);
+    const key = createHmac('sha256', signingValue)
+      .update('concord/credential-epoch-voice-ejection/request/v1')
+      .digest();
+    const fields = [userId, credentialEpoch, supersededCredentialEpoch, 'disconnect', nonce];
+    return {
+      version: 1,
+      userId,
+      credentialEpoch,
+      supersededCredentialEpoch,
+      action: 'disconnect',
+      timestamp,
+      nonce,
+      proof: createHmac('sha256', key)
+        .update(['v1', timestamp, ...fields].join('\n'))
+        .digest('hex'),
+      ...overrides,
+    };
+  }
+
+  it('evicts superseded provisional, admitted, and matching live sessions', async () => {
+    const removeProvisional = vi.fn().mockResolvedValue(true);
+    const leaveRoom = vi.fn().mockResolvedValue(true);
+    const sessions = [
+      { roomId: 'room-pending', socketId: 'socket-pending', provisional: true },
+      { roomId: 'room-admitted', socketId: 'socket-admitted', provisional: false },
+      { roomId: 'room-missing', socketId: 'socket-missing', provisional: false },
+    ];
+    const sockets = new Map([
+      ['socket-pending', { emit: vi.fn(), disconnect: vi.fn(), data: {} }],
+      ['socket-admitted', { emit: vi.fn(), disconnect: vi.fn(), data: {} }],
+      [
+        'socket-live-only',
+        {
+          emit: vi.fn(),
+          disconnect: vi.fn(),
+          data: { userId, credentialEpoch: supersededCredentialEpoch },
+        },
+      ],
+      [
+        'socket-current',
+        {
+          emit: vi.fn(),
+          disconnect: vi.fn(),
+          data: { userId, credentialEpoch },
+        },
+      ],
+    ]);
+    const handler = createCredentialEpochEjectionAckHandler(
+      {
+        getSupersededCredentialEpochSessions: vi.fn(() => sessions),
+        removeProvisionalParticipantForEnforcement: removeProvisional,
+        leaveRoomIfSocketOwned: leaveRoom,
+      },
+      { sockets: { sockets } },
+      signingValue
+    );
+
+    await expect(handler(command())).resolves.toMatchObject({
+      ok: true,
+      userId,
+      supersededCredentialEpoch,
+    });
+    expect(removeProvisional).toHaveBeenCalledWith('room-pending', userId, 'socket-pending');
+    expect(leaveRoom).toHaveBeenCalledWith('room-admitted', userId, 'socket-admitted');
+    expect(leaveRoom).toHaveBeenCalledWith('room-missing', userId, 'socket-missing');
+    expect(sockets.get('socket-pending')?.emit).toHaveBeenCalledWith('force-disconnect', {
+      channelId: 'room-pending',
+      reason: 'credential_rotated',
+    });
+    expect(sockets.get('socket-admitted')?.disconnect).toHaveBeenCalledWith(true);
+    expect(sockets.get('socket-live-only')?.disconnect).toHaveBeenCalledWith(true);
+    expect(sockets.get('socket-current')?.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed or same-epoch commands before touching room state', async () => {
+    const getSessions = vi.fn(() => []);
+    const handler = createCredentialEpochEjectionAckHandler(
+      {
+        getSupersededCredentialEpochSessions: getSessions,
+        removeProvisionalParticipantForEnforcement: vi.fn(),
+        leaveRoomIfSocketOwned: vi.fn(),
+      },
+      { sockets: { sockets: new Map() } },
+      signingValue
+    );
+
+    await expect(
+      handler(command({ supersededCredentialEpoch: credentialEpoch }))
+    ).resolves.toBeUndefined();
+    await expect(handler(command({ proof: 'not-a-proof' }))).resolves.toBeUndefined();
+    expect(getSessions).not.toHaveBeenCalled();
   });
 });

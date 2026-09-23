@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/media"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -54,6 +55,10 @@ type DeleteSpec struct {
 	// after the transaction opens and before the victim row is locked; bulk
 	// purge paths never invoke it.
 	BeforeDeleteTx func(context.Context, *sql.Tx) error
+	// Guard runs in DeleteOne after its transaction starts and before its
+	// message/attachment locks. It repeats authority within the destructive
+	// transaction; Plan.Guard supplies the corresponding batch fence.
+	Guard func(context.Context, *sql.Tx) error
 }
 
 // Plan is built by a handler AFTER authorization. RangeFrom nil = All Time.
@@ -66,6 +71,12 @@ type Plan struct {
 	Reason      string       // "manual" | "ban" | "kick"
 	RangeFrom   *time.Time   // nil = All Time
 	Deletes     []DeleteSpec // >=1 (server purge = one per channel)
+	// Guard runs in every committed delete batch, so authorization cannot drift
+	// between a handler's preflight and destruction.
+	Guard func(context.Context, *sql.Tx, DeleteSpec) error
+	// DeferCompletion leaves the audit in_progress for a caller that must
+	// complete it atomically with a follow-on transaction.
+	DeferCompletion bool
 }
 
 // ExpiryPlan is the restricted, worker-only purge contract. It does not expose
@@ -233,13 +244,15 @@ func (e *Engine) Run(ctx context.Context, p Plan) (Result, error) {
 		}
 	}
 
-	if err := e.finalizeCompleted(ctx, purgeID, total); err != nil {
-		// The deletes are committed and irreversible even though the completion stamp
-		// failed, so record what was deleted rather than leaving the audit row reading
-		// in_progress/0 — the same false-compliance record recordPartialCount exists to
-		// prevent, and the reason the caller still gets its PurgeID/DeletedCount back.
-		total = e.recoverPartialCount(ctx, purgeID, total)
-		return Result{PurgeID: purgeID, DeletedCount: total}, err
+	if !p.DeferCompletion {
+		if err := e.finalizeCompleted(ctx, purgeID, total); err != nil {
+			// The deletes are committed and irreversible even though the completion stamp
+			// failed, so record what was deleted rather than leaving the audit row reading
+			// in_progress/0 — the same false-compliance record recordPartialCount exists to
+			// prevent, and the reason the caller still gets its PurgeID/DeletedCount back.
+			total = e.recoverPartialCount(ctx, purgeID, total)
+			return Result{PurgeID: purgeID, DeletedCount: total}, err
+		}
 	}
 	return Result{PurgeID: purgeID, DeletedCount: total}, nil
 }
@@ -475,6 +488,18 @@ func (e *Engine) deleteBatched(ctx context.Context, purgeID string, p Plan, ds D
 }
 
 func (e *Engine) deleteBatch(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		affected, refs, err := e.deleteBatchOnce(ctx, purgeID, queries, p, ds)
+		if !errors.Is(err, dmblock.ErrMembershipChanged) || attempt == 1 {
+			return affected, refs, err
+		}
+	}
+	return 0, nil, dmblock.ErrMembershipChanged
+}
+
+// deleteBatchOnce retries only a rolled-back membership-drift batch; prior
+// committed batches are never replayed.
+func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries deleteQuerySet, p Plan, ds DeleteSpec) (int, []media.BlobRef, error) {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("purge: begin batch tx: %w", err)
@@ -484,6 +509,11 @@ func (e *Engine) deleteBatch(ctx context.Context, purgeID string, queries delete
 			e.log.Warn("purge: failed to rollback batch transaction", "error", err)
 		}
 	}()
+	if p.Guard != nil {
+		if err := p.Guard(ctx, tx, ds); err != nil {
+			return 0, nil, fmt.Errorf("purge: transaction guard: %w", err)
+		}
+	}
 
 	rows, err := tx.QueryContext(ctx, queries.selectBatch, ds.ScopeID, p.RangeFrom, ds.Author, e.maxBatch)
 	if err != nil {
@@ -593,34 +623,54 @@ func (e *Engine) DeleteOne(ctx context.Context, messageID string, spec DeleteSpe
 		return err
 	}
 	queries := deleteQueries[spec.MessagesTable]
+	for attempt := 0; attempt < 2; attempt++ {
+		refs, err := e.deleteOneOnce(ctx, messageID, spec, queries)
+		if !errors.Is(err, dmblock.ErrMembershipChanged) || attempt == 1 {
+			if err == nil {
+				e.reaper.EnqueueBlobDeletes(refs)
+			}
+			return err
+		}
+	}
+	return dmblock.ErrMembershipChanged
+}
+
+// deleteOneOnce performs one atomic single-message delete. Membership drift
+// invalidates the transaction guard snapshot, so the caller retries once in a
+// fresh transaction.
+func (e *Engine) deleteOneOnce(ctx context.Context, messageID string, spec DeleteSpec, queries deleteQuerySet) ([]media.BlobRef, error) {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
-		return contextError(ctx, fmt.Errorf("purge: begin single delete tx: %w", err))
+		return nil, contextError(ctx, fmt.Errorf("purge: begin single delete tx: %w", err))
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
 			e.log.Warn("purge: failed to rollback single delete transaction", "error", rollbackErr)
 		}
 	}()
+	if spec.Guard != nil {
+		if err := spec.Guard(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
 	if spec.BeforeDeleteTx != nil {
 		if err := spec.BeforeDeleteTx(ctx, tx); err != nil {
-			return contextError(ctx, fmt.Errorf("purge: authorize single delete: %w", err))
+			return nil, contextError(ctx, fmt.Errorf("purge: authorize single delete: %w", err))
 		}
 	}
 
 	var lockedID string
 	if err := tx.QueryRowContext(ctx, queries.selectOne, messageID, spec.ScopeID).Scan(&lockedID); err != nil {
-		return contextError(ctx, fmt.Errorf("purge: lock message %s: %w", messageID, err))
+		return nil, contextError(ctx, fmt.Errorf("purge: lock message %s: %w", messageID, err))
 	}
 	_, refs, err := e.deleteMessagesTx(ctx, tx, queries, []string{lockedID})
 	if err != nil {
-		return contextError(ctx, err)
+		return nil, contextError(ctx, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("purge: commit single delete: %w", err)
+		return nil, fmt.Errorf("purge: commit single delete: %w", err)
 	}
-	e.reaper.EnqueueBlobDeletes(refs)
-	return nil
+	return refs, nil
 }
 
 // CaptureConversationBlobsTx captures all matching Tier-2 media IDs before the
@@ -755,6 +805,32 @@ func (e *Engine) FinalizeHidden(ctx context.Context, purgeID string, hidden int)
 		purgeID, hidden,
 	); err != nil {
 		return fmt.Errorf("purge: finalize hidden: %w", err)
+	}
+	return nil
+}
+
+// FinalizeHiddenTx records a receiver-hide count and completes the purge audit
+// in the same transaction. It verifies the durable deletion count rather than
+// rewriting evidence committed by each delete batch.
+func (e *Engine) FinalizeHiddenTx(ctx context.Context, tx *sql.Tx, purgeID string, expectedDeleted, hidden int) error {
+	if tx == nil {
+		return errors.New("purge: finalize hidden requires a transaction")
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE message_purges
+		SET status = 'completed', hidden_count = $3, completed_at = NOW()
+		WHERE id = $1 AND status = 'in_progress' AND deleted_count = $2`,
+		purgeID, expectedDeleted, hidden,
+	)
+	if err != nil {
+		return fmt.Errorf("purge: finalize hidden: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("purge: count finalized hidden audit row: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("purge: finalize hidden expected one in_progress audit row, got %d", affected)
 	}
 	return nil
 }

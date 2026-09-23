@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/invites"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencecapture"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
@@ -803,6 +804,15 @@ func (h *Handler) executeBlockTx(
 		return nil, fmt.Errorf("capture block presence: %w", err)
 	}
 
+	// Record the durable reconciliation obligation before changing the friendship.
+	// RecordBlockTx takes the users-first transition fence, so a concurrent
+	// participant insert cannot commit after observing the old friendship graph.
+	// The deferred friendship constraint then proves this transaction left current
+	// directional reconciliation evidence for every blocked pair.
+	if err := dmblock.RecordBlockTx(ctx, tx, userID, targetUserID, uuid.NewString()); err != nil {
+		return plan, fmt.Errorf("record block reconciliation: %w", err)
+	}
+
 	res, err := tx.ExecContext(ctx, `
 		UPDATE friendships SET status = 'blocked', updated_at = NOW()
 		WHERE (requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)
@@ -824,103 +834,6 @@ func (h *Handler) executeBlockTx(
 		}
 	}
 	return plan, nil
-}
-
-type convEpoch struct {
-	convID   string
-	maxEpoch int
-}
-
-// findDMRevocations discovers the shared DM conversations whose key material a
-// block must revoke. It returns an error so a failed DISCOVERY fails the block.
-//
-// Every failure here was previously reported as "no revocations": a query error
-// logged and returned nil, a scan error was `continue`d — conflated with the
-// benign maxEpoch == 0 case — and rows.Err() only logged. The caller then wrote
-// no `dm_key_revocations` row, deleted the keys, and COMMITTED, so the DM key
-// endpoint kept accepting stale key material because its revocation check reads
-// exactly that row. A scan error is client-side and does not poison the
-// transaction, so nothing downstream failed either — the block looked healthy
-// (PR #2738 review, CodeRabbit; CWE-703).
-func (h *Handler) findDMRevocations(
-	ctx context.Context, tx *sql.Tx, userID, targetUserID string,
-) ([]convEpoch, error) {
-	revokeRows, revokeErr := tx.QueryContext(ctx, `
-		SELECT dp1.conversation_id, COALESCE(MAX(dck.key_version), 0)
-		FROM dm_participants dp1
-		INNER JOIN dm_participants dp2 ON dp1.conversation_id = dp2.conversation_id
-		LEFT JOIN dm_channel_keys dck ON dck.conversation_id = dp1.conversation_id
-		WHERE dp1.user_id = $1 AND dp2.user_id = $2
-		GROUP BY dp1.conversation_id
-	`, userID, targetUserID)
-	if revokeErr != nil {
-		return nil, fmt.Errorf("query shared dm conversations for revocation: %w", revokeErr)
-	}
-	defer func() { _ = revokeRows.Close() }()
-
-	var revocations []convEpoch
-	for revokeRows.Next() {
-		var ce convEpoch
-		if err := revokeRows.Scan(&ce.convID, &ce.maxEpoch); err != nil {
-			return nil, fmt.Errorf("scan dm revocation row: %w", err)
-		}
-		if ce.maxEpoch == 0 {
-			// Genuinely nothing to revoke for this conversation — no key has
-			// ever been distributed. Distinct from a scan failure, which the
-			// old code conflated with this.
-			continue
-		}
-		revocations = append(revocations, ce)
-	}
-	if err := revokeRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate dm revocation rows: %w", err)
-	}
-	return revocations, nil
-}
-
-// revokeBlockedDMKeys revokes the blocked user's DM key material inside the
-// block transaction. It returns an error so a failed revocation FAILS THE BLOCK
-// rather than committing one.
-//
-// Every write here was previously discarded (`_, _ = tx.Exec`, and a
-// log-and-continue on the revocation insert), so a failed revocation of KEY
-// MATERIAL still committed the block and returned 200 — the caller believed the
-// blocked user had lost their keys when they had not. That is the incident class
-// `[internal]rules/backend.md` cites for #1154, in the same subsystem. Surfaced by
-// `@code-reviewer` and `@e2ee-reviewer` on PR #2738.
-func (h *Handler) revokeBlockedDMKeys(
-	ctx context.Context, tx *sql.Tx, userID, targetUserID string,
-) error {
-	revocations, err := h.findDMRevocations(ctx, tx, userID, targetUserID)
-	if err != nil {
-		return fmt.Errorf("find dm revocations: %w", err)
-	}
-	for _, ce := range revocations {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO dm_key_revocations (conversation_id, revoked_epoch, successor_epoch, reason, revoked_by)
-			VALUES ($1, $2, $3, 'user_blocked', $4)
-			ON CONFLICT (conversation_id, revoked_epoch) DO NOTHING
-		`, ce.convID, ce.maxEpoch, ce.maxEpoch+1, userID); err != nil {
-			return fmt.Errorf("record dm key revocation: %w", err)
-		}
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM dm_channel_keys
-		WHERE user_id = $2
-		  AND conversation_id IN (
-			SELECT dp1.conversation_id FROM dm_participants dp1
-			INNER JOIN dm_participants dp2 ON dp1.conversation_id = dp2.conversation_id
-			WHERE dp1.user_id = $1 AND dp2.user_id = $2
-		  )
-		  AND key_version = (
-			SELECT MAX(key_version) FROM dm_channel_keys dck2
-			WHERE dck2.conversation_id = dm_channel_keys.conversation_id
-		  )
-	`, userID, targetUserID); err != nil {
-		return fmt.Errorf("delete blocked dm keys: %w", err)
-	}
-	return nil
 }
 
 func (h *Handler) notifyBlock(userID, targetUserID string) {
@@ -946,7 +859,8 @@ func (h *Handler) notifyBlock(userID, targetUserID string) {
 }
 
 // BlockUser blocks another user. If a friendship exists, it is updated to 'blocked'.
-// If a DM conversation exists, the blocked user's current epoch key is revoked.
+// The transaction records a durable DM reconciliation obligation; the reconciler
+// later cues an atomic successor claim rather than revoking the current epoch.
 // POST /friends/:user_id/block
 func (h *Handler) BlockUser(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -1015,15 +929,6 @@ func (h *Handler) BlockUser(c *gin.Context) {
 		if blockErr != nil {
 			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
 			return blockErr
-		}
-
-		if revokeErr := h.revokeBlockedDMKeys(ctx, tx, userID, targetUserID); revokeErr != nil {
-			// A failed key revocation must not commit a block that claims to
-			// have revoked. The rollback discards the friendship write too, so
-			// nothing landed — hence CauseWriteFailed, which proves no commit
-			// and therefore disconnects nobody.
-			presencehook.Abandon(gated, plan, presencecapture.CauseWriteFailed)
-			return fmt.Errorf("revoke blocked DM keys: %w", revokeErr)
 		}
 
 		return presencehook.Complete(ctx, gated, tx, plan)

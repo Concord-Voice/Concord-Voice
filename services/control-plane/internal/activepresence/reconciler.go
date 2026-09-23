@@ -89,6 +89,7 @@ type Reconciler struct {
 	log                *logger.Logger
 	interval           time.Duration
 	serverVoiceCleanup func(context.Context, int) (int, error)
+	dmBlockCleanup     func(context.Context, int) (int, error)
 }
 
 // NewReconciler wires the pass. log may be nil.
@@ -120,9 +121,21 @@ func (r *Reconciler) SetServerVoiceCleanup(cleanup func(context.Context, int) (i
 	}
 }
 
+// SetDMBlockCleanup attaches durable DM-block reconciliation to this existing pass.
+func (r *Reconciler) SetDMBlockCleanup(cleanup func(context.Context, int) (int, error)) {
+	if r != nil {
+		r.dmBlockCleanup = cleanup
+	}
+}
+
 // HasServerVoiceCleanup reports whether the optional cleanup is wired.
 func (r *Reconciler) HasServerVoiceCleanup() bool {
 	return r != nil && r.serverVoiceCleanup != nil
+}
+
+// HasDMBlockCleanup reports whether durable DM-block reconciliation is wired.
+func (r *Reconciler) HasDMBlockCleanup() bool {
+	return r != nil && r.dmBlockCleanup != nil
 }
 
 // PassStats is the aggregate one pass reports. Counts only -- no subject, no
@@ -173,16 +186,7 @@ func (r *Reconciler) ReconcilePass(ctx context.Context, limit int) (PassStats, e
 	if r == nil || r.db == nil || r.gate == nil || r.deliverer == nil {
 		return PassStats{}, ErrReconcilerNotWired
 	}
-	stats := PassStats{}
-	if r.serverVoiceCleanup != nil {
-		cleanupCtx, cancelCleanup := context.WithTimeout(ctx, claimTimeout)
-		removed, cleanupErr := r.serverVoiceCleanup(cleanupCtx, limit)
-		cancelCleanup()
-		stats.ServerVoiceRemoved = removed
-		if cleanupErr != nil && r.log != nil {
-			r.log.Error("server voice participant cleanup failed", "failure_class", "server_voice_cleanup")
-		}
-	}
+	stats := PassStats{ServerVoiceRemoved: r.runPrePlanCleanup(ctx, limit)}
 	keys, err := DiscoverDue(ctx, r.db, limit)
 	if err != nil {
 		// Run discards this error, so without a line here a rail that can no
@@ -213,6 +217,94 @@ func (r *Reconciler) ReconcilePass(ctx context.Context, limit int) (PassStats, e
 	}
 	r.logPass(pass.stats)
 	return pass.stats, nil
+}
+
+type prePlanCleanupResult struct {
+	serverVoice bool
+	removed     int
+	err         error
+}
+
+// runPrePlanCleanup keeps all bounded cleanup rails under the existing pass budget.
+func (r *Reconciler) runPrePlanCleanup(ctx context.Context, limit int) int {
+	serverVoiceCleanup := r.serverVoiceCleanup
+	dmBlockCleanup := r.dmBlockCleanup
+	if serverVoiceCleanup == nil && dmBlockCleanup == nil {
+		return 0
+	}
+	cleanupCtx, cancelCleanup := context.WithTimeout(ctx, claimTimeout)
+	defer cancelCleanup()
+	results := make(chan prePlanCleanupResult, 2)
+	cleanupCount := 0
+	serverVoicePending := serverVoiceCleanup != nil
+	dmBlockPending := dmBlockCleanup != nil
+	if serverVoiceCleanup != nil {
+		cleanupCount++
+		go func() {
+			removed, err := serverVoiceCleanup(cleanupCtx, limit)
+			results <- prePlanCleanupResult{serverVoice: true, removed: removed, err: err}
+		}()
+	}
+	if dmBlockCleanup != nil {
+		cleanupCount++
+		go func() {
+			removed, err := dmBlockCleanup(cleanupCtx, limit)
+			results <- prePlanCleanupResult{removed: removed, err: err}
+		}()
+	}
+	serverVoiceRemoved := 0
+	for range cleanupCount {
+		result, ok := r.waitForPrePlanCleanupResult(cleanupCtx, results, serverVoicePending, dmBlockPending)
+		if !ok {
+			return serverVoiceRemoved
+		}
+		r.recordPrePlanCleanupResult(result, &serverVoiceRemoved, &serverVoicePending, &dmBlockPending)
+	}
+	return serverVoiceRemoved
+}
+
+func (r *Reconciler) waitForPrePlanCleanupResult(
+	ctx context.Context,
+	results <-chan prePlanCleanupResult,
+	serverVoicePending, dmBlockPending bool,
+) (prePlanCleanupResult, bool) {
+	select {
+	case result := <-results:
+		return result, true
+	case <-ctx.Done():
+		if serverVoicePending {
+			r.logCleanupFailure("server voice participant cleanup timed out", "server_voice_cleanup")
+		}
+		if dmBlockPending {
+			r.logCleanupFailure("DM block reconciliation timed out", "dm_block_cleanup")
+		}
+		return prePlanCleanupResult{}, false
+	}
+}
+
+func (r *Reconciler) recordPrePlanCleanupResult(
+	result prePlanCleanupResult,
+	serverVoiceRemoved *int,
+	serverVoicePending, dmBlockPending *bool,
+) {
+	if result.serverVoice {
+		*serverVoicePending = false
+		*serverVoiceRemoved = result.removed
+		if result.err != nil {
+			r.logCleanupFailure("server voice participant cleanup failed", "server_voice_cleanup")
+		}
+		return
+	}
+	*dmBlockPending = false
+	if result.err != nil {
+		r.logCleanupFailure("DM block reconciliation failed", "dm_block_cleanup")
+	}
+}
+
+func (r *Reconciler) logCleanupFailure(message, failureClass string) {
+	if r.log != nil {
+		r.log.Error(message, "failure_class", failureClass)
+	}
 }
 
 // resolveOneAlreadyGated MUST be called with the subject's sender gate already

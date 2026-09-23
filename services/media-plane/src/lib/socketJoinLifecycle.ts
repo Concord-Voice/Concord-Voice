@@ -168,15 +168,14 @@ export async function withKeyedJoinFence<Value>(
   }
 }
 
-/** Re-check a provisional DM join against the exact call ID returned by A1. */
-export async function reauthorizeDMAdmission<Access extends { callId?: string }>(
+/** Re-check admission after the participant becomes visible to enforcement. */
+export async function reauthorizeAdmission<Access extends { callId?: string }>(
   roomKind: 'channel' | 'dm',
   access: Access,
   requestedCallId: string | undefined,
   authorize: (exactCallId: string | undefined) => Promise<Access>
 ): Promise<Access> {
-  if (roomKind !== 'dm') return access;
-  return authorize(access.callId ?? requestedCallId);
+  return authorize(roomKind === 'dm' ? (access.callId ?? requestedCallId) : undefined);
 }
 
 export async function runSocketBoundJoin<Access, Value>({

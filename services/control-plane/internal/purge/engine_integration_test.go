@@ -11,6 +11,7 @@ package purge
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
@@ -560,6 +562,74 @@ func TestEngineDeleteOne_SerializesWithConcurrentAttachmentLink(t *testing.T) {
 	assert.Zero(t, bridgeCount, "the parent delete must remove the committed attachment bridge")
 }
 
+func TestEngineRun_RetriesOnlyMembershipDriftedBatch(t *testing.T) {
+	f := seedEngineFixture(t)
+	f.seedMessages(t, f.authorID, 2, 0)
+
+	plan := f.channelPlan()
+	guardCalls := 0
+	plan.Guard = func(_ context.Context, _ *sql.Tx, _ DeleteSpec) error {
+		guardCalls++
+		if guardCalls == 1 {
+			return dmblock.ErrMembershipChanged
+		}
+		return nil
+	}
+
+	res, err := f.newEngine(1).Run(context.Background(), plan)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.DeletedCount, "a rolled-back guard attempt must not be counted twice")
+	assert.Zero(t, f.countMessages(t), "the fresh transaction must complete the original batch")
+	assert.Equal(t, 4, guardCalls, "only the failed first batch is retried; prior committed batches are not replayed")
+
+	status, deleted, _ := f.auditRow(t)
+	assert.Equal(t, "completed", status)
+	assert.Equal(t, 2, deleted, "the audit count must exclude the rolled-back attempt")
+}
+
+func TestDeleteOne_RetriesMembershipDriftInFreshTransaction(t *testing.T) {
+	f := seedEngineFixture(t)
+	messageID, fileID, key := f.seedAttachedMessage(t, f.authorID, nil)
+	e := f.newEngine(5000)
+	transactionIDs := make([]int64, 0, 2)
+	spec := DeleteSpec{
+		MessagesTable: "messages", ScopeColumn: "channel_id", ScopeID: f.channelID,
+		AttachmentsTable: "message_attachments",
+		Guard: func(ctx context.Context, tx *sql.Tx) error {
+			var transactionID int64
+			if err := tx.QueryRowContext(ctx, `SELECT txid_current()`).Scan(&transactionID); err != nil {
+				return err
+			}
+			transactionIDs = append(transactionIDs, transactionID)
+			if len(transactionIDs) == 1 {
+				return dmblock.ErrMembershipChanged
+			}
+			return nil
+		},
+	}
+
+	require.NoError(t, e.DeleteOne(context.Background(), messageID, spec))
+	require.Len(t, transactionIDs, 2)
+	assert.NotEqual(t, transactionIDs[0], transactionIDs[1], "membership drift must restart DeleteOne in a fresh transaction")
+
+	var messageCount, bridgeCount int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messageCount))
+	require.NoError(t, f.db.QueryRow(
+		`SELECT count(*) FROM message_attachments WHERE message_id = $1 AND file_id = $2`, messageID, fileID).Scan(&bridgeCount))
+	assert.Zero(t, messageCount)
+	assert.Zero(t, bridgeCount)
+
+	var deletedAt sql.NullTime
+	require.NoError(t, f.db.QueryRow(`SELECT deleted_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.True(t, deletedAt.Valid, "only the committed retry may retire final-reference media")
+	select {
+	case ref := <-e.reaper.jobs:
+		assert.Equal(t, key, ref.Key)
+	default:
+		t.Fatal("committed retry did not queue final-reference attachment")
+	}
+}
+
 // TestEngineRun_LoopsUntilDrained proves the batch stride is not a cap: with
 // maxBatch=2 and 7 rows the loop must run until the predicate matches nothing.
 func TestEngineRun_LoopsUntilDrained(t *testing.T) {
@@ -661,6 +731,58 @@ func TestEngineRun_MultipleDeleteSpecs(t *testing.T) {
 	assert.Equal(t, 0, f.countMessages(t))
 }
 
+// A server purge rechecks each DeleteSpec in each committed batch. A guard
+// that denies the second channel must leave the first channel's already
+// committed batches intact while protecting the denied channel.
+func TestEngineRun_ServerPurgeGuardRunsForEveryBatchAndStopsStaleScope(t *testing.T) {
+	f := seedEngineFixture(t)
+	f.seedMessages(t, f.authorID, 3, 0)
+
+	var second string
+	require.NoError(t, f.db.QueryRow(`
+		INSERT INTO channels (server_id, name) VALUES ($1, 'guarded-second') RETURNING id`,
+		f.serverID).Scan(&second))
+	_, err := f.db.Exec(`
+		INSERT INTO messages (channel_id, user_id, content)
+		VALUES ($1, $2, 'must-survive')`, second, f.authorID)
+	require.NoError(t, err)
+
+	var guarded []string
+	plan := Plan{
+		ContextType: ContextServer,
+		ContextID:   f.serverID,
+		ServerID:    &f.serverID,
+		ActorID:     f.authorID,
+		Reason:      "manual",
+		Deletes: []DeleteSpec{
+			{MessagesTable: "messages", ScopeColumn: "channel_id", ScopeID: f.channelID, AttachmentsTable: "message_attachments"},
+			{MessagesTable: "messages", ScopeColumn: "channel_id", ScopeID: second, AttachmentsTable: "message_attachments"},
+		},
+		Guard: func(_ context.Context, _ *sql.Tx, ds DeleteSpec) error {
+			guarded = append(guarded, ds.ScopeID)
+			if ds.ScopeID == second {
+				return errors.New("stale channel permission")
+			}
+			return nil
+		},
+	}
+
+	res, err := f.newEngine(1).Run(context.Background(), plan)
+	require.Error(t, err)
+	assert.Equal(t, 3, res.DeletedCount)
+	assert.Equal(t, []string{f.channelID, f.channelID, f.channelID, f.channelID, second}, guarded,
+		"the guard must run for three delete batches, the final drained-batch probe, and the next DeleteSpec")
+	assert.Equal(t, 0, f.countMessages(t))
+	assert.Equal(t, 1, rowCountPurgeTest(t, f.db, second), "stale/denied scope must remain intact")
+}
+
+func rowCountPurgeTest(t *testing.T, db *sql.DB, channelID string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM messages WHERE channel_id = $1`, channelID).Scan(&count))
+	return count
+}
+
 // TestEngineRun_PartialDeleteIsAudited locks the audit's honesty when a purge is
 // interrupted after some batches have already committed (client disconnect, DB blip).
 // The rows are irreversibly gone, so `in_progress, deleted_count=0` would be a false
@@ -736,19 +858,30 @@ func TestEngineRun_RollsBackDeleteWhenBatchAuditUpdateFails(t *testing.T) {
 	assert.Zero(t, deleted)
 }
 
-// TestEngineFinalizeHidden covers the DM receiver-hide audit enrichment.
-func TestEngineFinalizeHidden(t *testing.T) {
+// TestEngineFinalizeHiddenTx covers atomic DM receiver-hide audit completion.
+func TestEngineFinalizeHiddenTx(t *testing.T) {
 	f := seedEngineFixture(t)
 	f.seedMessages(t, f.authorID, 1, 0)
 	e := f.newEngine(5000)
 
-	res, err := e.Run(context.Background(), f.channelPlan())
+	plan := f.channelPlan()
+	plan.DeferCompletion = true
+	res, err := e.Run(context.Background(), plan)
 	require.NoError(t, err)
 
-	require.NoError(t, e.FinalizeHidden(context.Background(), res.PurgeID, 4))
+	tx, err := f.db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, e.FinalizeHiddenTx(context.Background(), tx, res.PurgeID, res.DeletedCount, 4))
+	require.NoError(t, tx.Commit())
 
-	_, _, hidden := f.auditRow(t)
+	status, deleted, hidden := f.auditRow(t)
+	assert.Equal(t, "completed", status)
+	assert.Equal(t, res.DeletedCount, deleted)
 	assert.Equal(t, 4, hidden)
+	var completedAt sql.NullTime
+	require.NoError(t, f.db.QueryRow(
+		`SELECT completed_at FROM message_purges WHERE context_id = $1`, f.channelID).Scan(&completedAt))
+	assert.True(t, completedAt.Valid)
 }
 
 // TestEngineRun_EmptyContextIsNoOp: purging a context with nothing to delete still
@@ -1082,6 +1215,53 @@ func TestDeleteOne_QueuesExactBackendAfterCommit(t *testing.T) {
 	assert.Contains(t, dmRefs, r2DMKey)
 	if assert.NotNil(t, dmRefs[r2DMKey]) {
 		assert.Equal(t, r2, *dmRefs[r2DMKey])
+	}
+}
+
+func TestDeleteOne_RejectingGuardPreservesMessageAttachmentAndReaperState(t *testing.T) {
+	f := seedEngineFixture(t)
+	messageID, fileID, key := f.seedAttachedMessage(t, f.authorID, nil)
+	e := f.newEngine(5000)
+	guardErr := errors.New("purge guard rejected delete")
+	guardSawMessage := false
+	spec := DeleteSpec{
+		MessagesTable: "messages", ScopeColumn: "channel_id", ScopeID: f.channelID,
+		AttachmentsTable: "message_attachments",
+		Guard: func(ctx context.Context, tx *sql.Tx) error {
+			if tx == nil {
+				return errors.New("purge guard received nil transaction")
+			}
+			var messageCount int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messageCount); err != nil {
+				return err
+			}
+			guardSawMessage = messageCount == 1
+			return guardErr
+		},
+	}
+
+	err := e.DeleteOne(context.Background(), messageID, spec)
+	assert.ErrorIs(t, err, guardErr)
+	assert.True(t, guardSawMessage, "guard must run inside DeleteOne before the message is deleted")
+
+	var messageCount, bridgeCount int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM messages WHERE id = $1`, messageID).Scan(&messageCount))
+	require.NoError(t, f.db.QueryRow(
+		`SELECT count(*) FROM message_attachments WHERE message_id = $1 AND file_id = $2`, messageID, fileID).Scan(&bridgeCount))
+	assert.Equal(t, 1, messageCount)
+	assert.Equal(t, 1, bridgeCount)
+
+	var deletedAt, reapedAt sql.NullTime
+	require.NoError(t, f.db.QueryRow(
+		`SELECT deleted_at, blob_reaped_at FROM media_files WHERE id = $1`, fileID).Scan(&deletedAt, &reapedAt))
+	assert.False(t, deletedAt.Valid, "a rejected guard must not retire media")
+	assert.False(t, reapedAt.Valid, "a rejected guard must not mark the blob reaped")
+	select {
+	case ref := <-e.reaper.jobs:
+		assert.Failf(t, "rejected guard enqueued blob", "unexpected ref for %s", ref.Key)
+	default:
+		assert.NotEmpty(t, key, "fixture must provide a storage key")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/middleware"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 	"github.com/gin-gonic/gin"
@@ -240,6 +241,12 @@ func (h *Handler) consumeDMRotateBudget(key string) {
 	middleware.IsRateLimited(ctx, h.redis, key, dmRotateLimit, dmRotateWindow)
 }
 
+func (h *Handler) rollbackDMRotationTx(tx *sql.Tx) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		h.log.Error("Failed to rollback dm rotation tx", "error", err)
+	}
+}
+
 // rotateDMKeyTx runs the shared DM distribution transaction body as a successor
 // claim; distributeDMKeysTx records the revocation of the epoch it supersedes
 // in the same commit. The claim fences (next epoch only, current-key holder
@@ -248,17 +255,7 @@ func (h *Handler) consumeDMRotateBudget(key string) {
 // must ADVANCE — a batch at the current epoch is a rewrap, not a rotation,
 // and is refused here.
 func (h *Handler) rotateDMKeyTx(ctx context.Context, actorID, tokenEpoch, convID string, req DistributeChannelKeysRequest) (dmDistributionOutcome, error) {
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		return dmDistributionOutcome{}, fmt.Errorf("begin dm rotation tx: %w", err)
-	}
-	defer func() {
-		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			h.log.Error("Failed to rollback dm rotation tx", "error", rbErr)
-		}
-	}()
-
-	outcome, err := distributeDMKeysTx(ctx, tx, dmDistributionBatch{
+	batch := dmDistributionBatch{
 		actorID:            actorID,
 		tokenEpoch:         tokenEpoch,
 		conversationID:     convID,
@@ -266,17 +263,32 @@ func (h *Handler) rotateDMKeyTx(ctx context.Context, actorID, tokenEpoch, convID
 		wrappedKeyVersions: req.WrappedKeyVersions,
 		explicitVersion:    req.KeyVersion,
 		reason:             "manual_rotation",
-	})
-	if err != nil {
-		return dmDistributionOutcome{}, err
 	}
-	if outcome.keyVersion != outcome.previousVersion+1 {
-		return dmDistributionOutcome{}, &dmEpochClaimStaleError{current: outcome.previousVersion}
+	for attempt := 0; attempt < dmDistributionTopologyAttempts; attempt++ {
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			return dmDistributionOutcome{}, fmt.Errorf("begin dm rotation tx: %w", err)
+		}
+		defer h.rollbackDMRotationTx(tx)
+		outcome, err := distributeDMKeysTx(ctx, tx, batch)
+		if err != nil {
+			h.rollbackDMRotationTx(tx)
+			if errors.Is(err, dmblock.ErrMembershipChanged) && attempt+1 < dmDistributionTopologyAttempts {
+				continue
+			}
+			return dmDistributionOutcome{}, err
+		}
+		if outcome.keyVersion != outcome.previousVersion+1 {
+			h.rollbackDMRotationTx(tx)
+			return dmDistributionOutcome{}, &dmEpochClaimStaleError{current: outcome.previousVersion}
+		}
+		if err := tx.Commit(); err != nil {
+			h.rollbackDMRotationTx(tx)
+			return dmDistributionOutcome{}, fmt.Errorf("commit dm rotation tx: %w", err)
+		}
+		return outcome, nil
 	}
-	if err := tx.Commit(); err != nil {
-		return dmDistributionOutcome{}, fmt.Errorf("commit dm rotation tx: %w", err)
-	}
-	return outcome, nil
+	return dmDistributionOutcome{}, fmt.Errorf("retry dm rotation topology: %w", dmblock.ErrMembershipChanged)
 }
 
 // dmParticipantExists reports whether userID is a participant of an existing

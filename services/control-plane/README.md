@@ -64,7 +64,7 @@ The control plane is responsible for:
 control-plane/
 ├── cmd/
 │   └── server/           # Application entry point (main.go)
-├── internal/             # 51 packages — see the groups below
+├── internal/             # 56 packages — see the groups below
 ├── pkg/
 │   ├── config/           # Configuration management
 │   └── logger/           # Structured logging
@@ -82,7 +82,7 @@ Run `ls internal/` for the current package set. The packages group as follows.
 - **HTTP surface** — `api` (router setup), `middleware` (auth, rate limiting, CORS), `models` (data models), `database` (connections and migrations), `clientconfig`, `servercapabilities` (pre-auth capability descriptor)
 - **Identity and access** — `auth` (Argon2id, JWT, sessions), `mfa` (TOTP, WebAuthn), `oauth` (SSO providers), `sessions` (device tracking), `stepup` (password/MFA step-up), `rbac`, `credepoch` (per-user credential-epoch fence), `age` (identity-blind age verification), `attestation` (client attestation)
 - **Servers and membership** — `servers`, `members`, `channels`, `invites`, `ownership`, `friends`
-- **Messaging** — `messages` (CRUD with E2EE enforcement), `dm`, `websocket` (hub: messaging, presence, DMs), `purge` (message-purge engine), `keyrotation` (channel session key rotation), `klipy` (GIF integration)
+- **Messaging** — `messages` (CRUD with E2EE enforcement), `dm`, `dmblock` (durable blocked-pair reconciliation), `websocket` (hub: messaging, presence, DMs), `purge` (message-purge engine), `keyrotation` (channel session key rotation), `klipy` (GIF integration)
 - **Presence** — `presence` (audience authority), `activepresence`, `graphpresence`, `presencecapture`, `presencehistory` (Activity History), `presencehook`, `voicepresence`
 - **Media and storage** — `media` (file handling), `storage` (object storage abstraction), `voice` (NATS coordination with the media-plane)
 - **Accounts and commerce** — `users`, `privacy` (GDPR erasure), `notifications` (mute preferences), `subscriptions`, `entitlements`, `redemption` (redemption codes), `feedback`

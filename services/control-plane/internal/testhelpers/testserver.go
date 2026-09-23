@@ -16,6 +16,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/api"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehistory"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/rbac"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
@@ -435,12 +436,35 @@ func (ts *TestServer) CreateTestUserUnverified(t *testing.T, username string) Te
 func (ts *TestServer) CreateFriendship(t *testing.T, user1ID, user2ID, status string) {
 	t.Helper()
 
-	_, err := ts.DB.Exec(
+	if status != "blocked" {
+		_, err := ts.DB.Exec(
+			`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, $3)`,
+			user1ID, user2ID, status,
+		)
+		if err != nil {
+			t.Fatalf("testhelpers: failed to create friendship: %v", err)
+		}
+		return
+	}
+
+	tx, err := ts.DB.Begin()
+	if err != nil {
+		t.Fatalf("testhelpers: failed to begin friendship transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.Exec(
 		`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, $3)`,
 		user1ID, user2ID, status,
 	)
 	if err != nil {
 		t.Fatalf("testhelpers: failed to create friendship: %v", err)
+	}
+	if err := dmblock.RecordBlockTx(context.Background(), tx, user1ID, user2ID, uuid.NewString()); err != nil {
+		t.Fatalf("testhelpers: failed to record blocked friendship: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("testhelpers: failed to commit friendship: %v", err)
 	}
 }
 

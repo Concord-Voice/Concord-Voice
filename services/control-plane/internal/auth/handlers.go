@@ -2889,26 +2889,6 @@ func (h *Handler) beginRecoveryFence(c *gin.Context, userID, recoveryUsedKey, er
 	return fenceOp, true
 }
 
-// recoveryEpochRotationOps locks the user row and rotates the credential
-// epoch (#2201). These MUST be the first ops in every recovery reset: the
-// recovery path takes no user-row lock of its own, and the lock is what
-// serializes the reset against concurrent sensitive-write GuardTx FOR SHARE
-// reads. The SELECT executes via Exec (rows discarded) — the lock is the point.
-func recoveryEpochRotationOps(userID string, fenceOp *credepoch.Op) []recoveryTxOp {
-	return []recoveryTxOp{
-		{
-			`SELECT credential_epoch FROM users WHERE id = $1 FOR NO KEY UPDATE`,
-			[]interface{}{userID},
-			"Failed to lock user for epoch rotation",
-		},
-		{
-			`UPDATE users SET credential_epoch = $1, updated_at = NOW() WHERE id = $2`,
-			[]interface{}{fenceOp.NewEpochValue(), userID},
-			"Failed to rotate credential epoch",
-		},
-	}
-}
-
 // recoveryPresenceOverrideResetOps discards preference ciphertext encrypted
 // under the pre-recovery password-derived key. Deleting the preference
 // cascades to its materialized exception rows. The shared forced-clear helper
@@ -2923,11 +2903,17 @@ func recoveryPresenceOverrideResetOps(userID string) []recoveryTxOp {
 	}
 }
 
-func (h *Handler) recoveryWork(senderID uuid.UUID, ops []recoveryTxOp) recoveryWork {
+func (h *Handler) recoveryWork(senderID uuid.UUID, fenceOp *credepoch.Op, ops []recoveryTxOp) recoveryWork {
 	return func(ctx context.Context, tx *sql.Tx) (recoveryPresenceResult, error) {
+		if fenceOp == nil {
+			return recoveryPresenceResult{}, errors.New("recovery credential fence unavailable")
+		}
 		forcedClear, err := h.presenceHistory.BeginForcedSecurityClear(ctx, tx, senderID)
 		if err != nil {
 			return recoveryPresenceResult{}, err
+		}
+		if err := fenceOp.RotateTx(ctx, tx); err != nil {
+			return recoveryPresenceResult{}, fmt.Errorf("rotate recovery credential epoch: %w", err)
 		}
 		for _, op := range ops {
 			if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
@@ -2948,8 +2934,9 @@ func (h *Handler) recoveryWork(senderID uuid.UUID, ops []recoveryTxOp) recoveryW
 // DEFINITE rollback (fenceOp.Rollback — the deferred tx.Rollback ran before
 // any commit attempt); completion success is a DEFINITE commit
 // (fenceOp.Commit); a completion error that is not an explicit rollback is
-// AMBIGUOUS — neither is called, the blocked marker's TTL plus DB
-// read-through reconciles to whichever state actually committed.
+// AMBIGUOUS — ReconcileCommittedEviction checks the durable outbox row before
+// publishing the exact superseded generation; the blocked marker's TTL plus DB
+// read-through reconciles the cache state.
 func (h *Handler) execRecoveryTx(
 	ctx context.Context,
 	c *gin.Context,
@@ -3025,13 +3012,17 @@ func (h *Handler) beginRecoveryTx(ctx context.Context, c *gin.Context, recoveryU
 
 // classifyRecoveryFenceCompletion maps a failed forced-clear completion onto
 // the fence op (#2201): an explicit rollback outcome is DEFINITE (restore the
-// fence); any other completion error is an AMBIGUOUS commit — call neither
-// Commit nor Rollback, so the blocked marker's TTL plus DB read-through
-// reconciles to whichever state actually committed (spec §4.4 step 3c).
+// fence); any other completion error is an AMBIGUOUS commit, so reconcile the
+// durable media-eviction row without claiming a definite commit or rollback.
 func classifyRecoveryFenceCompletion(ctx context.Context, fenceOp *credepoch.Op, outcome presencehistory.ForcedClearOutcome) {
-	if fenceOp != nil && outcome == presencehistory.ForcedClearRolledBack {
-		fenceOp.Rollback(ctx)
+	if fenceOp == nil {
+		return
 	}
+	if outcome == presencehistory.ForcedClearRolledBack {
+		fenceOp.Rollback(ctx)
+		return
+	}
+	fenceOp.ReconcileCommittedEviction(ctx)
 }
 
 func (h *Handler) executeRecoveryTransaction(
@@ -3055,7 +3046,7 @@ func (h *Handler) executeRecoveryTransaction(
 		c.Request.Context(), senderID, presencehistory.ForcedSecurityClear, func() error {
 			workStarted = true
 			_, workErr := h.execRecoveryTx(
-				c.Request.Context(), c, recoveryUsedKey, errMsg, fenceOp, h.recoveryWork(senderID, ops),
+				c.Request.Context(), c, recoveryUsedKey, errMsg, fenceOp, h.recoveryWork(senderID, fenceOp, ops),
 			)
 			return workErr
 		})
@@ -3227,8 +3218,7 @@ func (h *Handler) RecoveryResetPassword(c *gin.Context) {
 		return
 	}
 
-	ops := make([]recoveryTxOp, 0, 7)
-	ops = append(ops, recoveryEpochRotationOps(claims.UserID, fenceOp)...)
+	ops := make([]recoveryTxOp, 0, 5)
 	ops = append(ops,
 		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
 			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},
@@ -3313,8 +3303,7 @@ func (h *Handler) RecoveryResetAccount(c *gin.Context) {
 		return
 	}
 
-	ops := make([]recoveryTxOp, 0, 11)
-	ops = append(ops, recoveryEpochRotationOps(claims.UserID, fenceOp)...)
+	ops := make([]recoveryTxOp, 0, 9)
 	ops = append(ops,
 		recoveryTxOp{`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
 			[]interface{}{passwordHash, claims.UserID}, "Failed to update password"},

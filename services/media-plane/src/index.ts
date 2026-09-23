@@ -11,7 +11,11 @@ import {
   parseMediaFrameCryptoVersion,
   RoomManager,
 } from './lib/roomManager.js';
-import type { DMParticipantPromotion, MediaSource } from './lib/roomManager.js';
+import type {
+  ChannelParticipantPromotion,
+  DMParticipantPromotion,
+  MediaSource,
+} from './lib/roomManager.js';
 import { emitCameraLayeringGate } from './lib/layeringGateBroadcast.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
 import {
@@ -29,7 +33,24 @@ import { createOriginGate } from './lib/originGate.js';
 import { createAdmissionGate } from './lib/admissionGate.js';
 import { SecurityEventWriter } from './lib/securityEvent.js';
 import type { EmitSecurityEvent } from './lib/securityEvent.js';
-import { handleForceDisconnect } from './lib/forceDisconnect.js';
+import {
+  createCredentialEpochEjectionAckHandler,
+  createDMBlockDisconnectAckHandler,
+  createVoiceEnforcementSessionEjectionHandler,
+  handleForceDisconnect,
+} from './lib/forceDisconnect.js';
+import {
+  registerVoiceEnforcementSession,
+  pollVoiceEnforcementHealth,
+} from './lib/voiceEnforcementSession.js';
+import type { VoiceEnforcementSession } from './lib/voiceEnforcementSession.js';
+import { voiceEnforcementNodeBootId } from './lib/voiceEnforcementIdentity.js';
+import {
+  releaseVoiceEnforcementSessionsAfterClose,
+  snapshotVoiceEnforcementSessions,
+  VoiceEnforcementSessionReleaseQueue,
+} from './lib/voiceEnforcementShutdown.js';
+import { VoiceEnforcementExpiryFence, VoiceEnforcementLease } from './lib/voiceEnforcementLease.js';
 import { handleEnforcePermissionsMessage } from './lib/enforcePermissions.js';
 import { handleNatsEnforcementCommand } from './lib/enforcementCommand.js';
 import { getIdentityAuthorityReasonCode } from './lib/identityAuthority.js';
@@ -43,7 +64,7 @@ import {
   cleanupEmptyDMJoin,
   DMJoinCallIdTracker,
   KeyedJoinFence,
-  reauthorizeDMAdmission,
+  reauthorizeAdmission,
   rollbackSocketRoomJoin,
   SocketRoomClaim,
   runSocketBoundJoin,
@@ -203,17 +224,28 @@ async function rollbackRegisteredRoomJoin({
 function registerJoinRoomHandler(
   socket: Socket,
   data: AuthenticatedSocketData,
-  roomManager: RoomManager,
-  dmJoinFence: KeyedJoinFence,
-  emitSecurityEvent: EmitSecurityEvent | undefined,
-  // Required: the per-connection wrapper carries this socket's security-event
-  // reporter. A module-level default existed and was unreachable -- the sole
-  // call site always passes one -- so it only hid a miswiring (PR #3157).
-  withRateLimit: <H extends SocketListener>(
-    socket: RateLimitedSocket,
-    event: RoomEventName,
-    handler: H
-  ) => void
+  {
+    roomManager,
+    dmJoinFence,
+    voiceEnforcementReleaseQueue,
+    emitSecurityEvent,
+    // Required: the per-connection wrapper carries this socket's security-event
+    // reporter. A module-level default existed and was unreachable -- the sole
+    // call site always passes one -- so it only hid a miswiring (PR #3157).
+    withRateLimit,
+    isShuttingDown,
+  }: {
+    roomManager: RoomManager;
+    dmJoinFence: KeyedJoinFence;
+    voiceEnforcementReleaseQueue: VoiceEnforcementSessionReleaseQueue;
+    emitSecurityEvent: EmitSecurityEvent | undefined;
+    withRateLimit: <H extends SocketListener>(
+      socket: RateLimitedSocket,
+      event: RoomEventName,
+      handler: H
+    ) => void;
+    isShuttingDown: () => boolean;
+  }
 ): void {
   const observe = (event: Parameters<EmitSecurityEvent>[0]) => {
     try {
@@ -230,6 +262,12 @@ function registerJoinRoomHandler(
     socket,
     'join-room',
     async ({ roomId, rtpCapabilities, mediaFrameCryptoVersion, callId }, callback?) => {
+      if (isShuttingDown()) {
+        const error = { error: 'Voice service is shutting down' };
+        if (callback) callback(error);
+        else socket.emit('error', error);
+        return;
+      }
       // Claim before the first await: socket.data can name only one room, so a
       // concurrent or subsequent admission must not create an untracked ghost.
       const releaseSocketRoomClaim = socketRoomClaim.claim(data.roomId, roomId);
@@ -261,10 +299,23 @@ function registerJoinRoomHandler(
         // through it silently missed exactly the participants this exists for.
         roomManager.emitCameraGateSnapshotFor(roomId, socket.id);
       };
+      const rollbackSocketMembership = () => {
+        data.roomId = undefined;
+        try {
+          socket.leave(roomId);
+        } catch (leaveError) {
+          logger.error('Failed to roll back Socket.IO room membership', {
+            error: leaveError,
+            roomId,
+            userId: data.userId,
+          });
+        }
+      };
 
       const roomKind: 'channel' | 'dm' =
         socket.handshake.auth.room_kind === 'dm' ? 'dm' : 'channel';
       const token = socket.handshake.auth.token;
+      let enforcementSession: VoiceEnforcementSession | undefined;
       const inputCallId = typeof callId === 'string' ? callId : undefined;
       const dmCallId = new DMJoinCallIdTracker(inputCallId);
       const cleanupDMJoin = async (authorizedCallId?: string) => {
@@ -333,7 +384,9 @@ function registerJoinRoomHandler(
                 (typeof authorizedAccess?.callId === 'string' &&
                   authorizedAccess.callId !== '' &&
                   access.callId === authorizedAccess.callId)),
-            isConnected: () => socket.connected,
+            // The lease fence is checked by runSocketBoundJoin before A1 and
+            // again before promotion, so a late expiry cannot promote a row.
+            isConnected: () => socket.connected && !isShuttingDown(),
             join: async (access) => {
               logger.debug('Channel access validated', { roomId, userId: data.userId });
               // Prefer the server-authoritative identity returned by the
@@ -343,6 +396,17 @@ function registerJoinRoomHandler(
                 displayName: data.displayName,
                 avatarUrl: data.avatarUrl,
               });
+              // Generate before A1 so a target command racing the registration
+              // response can identify this exact provisional participant.
+              enforcementSession = {
+                sessionGeneration: randomUUID(),
+                nodeBootId: voiceEnforcementNodeBootId,
+                roomId,
+                roomKind,
+                userId: data.userId,
+                credentialEpoch: data.credentialEpoch,
+                socketId: socket.id,
+              };
               // Thread the server-authoritative entitlement and permissions
               // into the participant; neither comes from the handshake.
               const result = await roomManager.joinRoom(
@@ -352,6 +416,8 @@ function registerJoinRoomHandler(
                 identity,
                 rtpCapabilities,
                 {
+                  credentialEpoch: data.credentialEpoch,
+                  voiceEnforcementSessionGeneration: enforcementSession.sessionGeneration,
                   entitlement: {
                     tier: access.userTier,
                     allowedAudioTiers: access.allowedAudioTiers,
@@ -372,18 +438,25 @@ function registerJoinRoomHandler(
                 }
               );
 
+              // A2 must see an enforcement-addressable exact socket before it
+              // can promote it. Failure is an admission failure: runSocketBoundJoin
+              // rolls this provisional candidate back without mutating the room.
+              await registerVoiceEnforcementSession(token, enforcementSession);
+              data.voiceEnforcementSession = enforcementSession;
+
               return {
                 authorizedCallId: access.callId,
                 identity,
                 promotion: undefined as DMParticipantPromotion | undefined,
+                channelPromotion: undefined as ChannelParticipantPromotion | undefined,
                 result,
               };
             },
-            // DM membership can change while the asynchronous RoomManager
-            // registration is in flight. Re-read the exact server-issued call
-            // ID after registration and before any socket.join/ack.
+            // Membership or credential epoch can change while asynchronous
+            // RoomManager registration is in flight. Reauthorize only after
+            // the exact session is visible to enforcement, before join/ack.
             reauthorize: (access) =>
-              reauthorizeDMAdmission(roomKind, access, inputCallId, authorizeRoom),
+              reauthorizeAdmission(roomKind, access, inputCallId, authorizeRoom),
             finalize: async (access, value) => {
               // The second authorization is authoritative for both channel and
               // Private Call moderator state. Apply it before socket.join/ack.
@@ -409,23 +482,45 @@ function registerJoinRoomHandler(
                 return;
               }
 
-              if (access.serverMuted) {
-                await roomManager.serverMuteUser(roomId, data.userId);
-                logger.info('Applied server-mute enforcement on join', {
-                  roomId,
-                  userId: data.userId,
-                });
-              }
-              if (access.serverDeafened) {
-                await roomManager.serverDeafenUser(roomId, data.userId);
-                logger.info('Applied server-deafen enforcement on join', {
-                  roomId,
-                  userId: data.userId,
-                });
-              }
+              const identity = resolveParticipantIdentity(access, {
+                username: data.username,
+                displayName: data.displayName,
+                avatarUrl: data.avatarUrl,
+              });
+              value.identity = identity;
+              value.channelPromotion = {
+                identity,
+                entitlement: {
+                  tier: access.userTier,
+                  allowedAudioTiers: access.allowedAudioTiers,
+                  minPtimeMs: access.minPtimeMs,
+                  maxManualBitrateBps: access.maxManualBitrateBps,
+                },
+                permissions: access.permissions,
+                serverMuted: access.serverMuted,
+                serverDeafened: access.serverDeafened,
+                ownerTier: access.roomOwnerTier,
+              };
             },
             commit: (_access, value) => {
-              if (roomKind === 'channel') return value;
+              if (roomKind === 'channel') {
+                if (!value.channelPromotion) {
+                  throw new Error('Channel admission is missing its A2 promotion state');
+                }
+                try {
+                  value.result = roomManager.promoteChannelParticipant(
+                    roomId,
+                    data.userId,
+                    socket.id,
+                    value.channelPromotion,
+                    commitSocketMembership
+                  );
+                } catch (error) {
+                  rollbackSocketMembership();
+                  throw error;
+                }
+                return value;
+              }
               if (!value.authorizedCallId || !value.promotion) {
                 throw new Error('DM admission is missing its A2 promotion state');
               }
@@ -441,22 +536,13 @@ function registerJoinRoomHandler(
               } catch (error) {
                 // A custom/failed adapter must not strand Socket.IO membership
                 // or socket.data when its synchronous join boundary throws.
-                data.roomId = undefined;
-                try {
-                  socket.leave(roomId);
-                } catch (leaveError) {
-                  logger.error('Failed to roll back Socket.IO room membership', {
-                    error: leaveError,
-                    roomId,
-                    userId: data.userId,
-                  });
-                }
+                rollbackSocketMembership();
                 throw error;
               }
               return value;
             },
-            rollback: (access) =>
-              rollbackRegisteredRoomJoin({
+            rollback: async (access) => {
+              await rollbackRegisteredRoomJoin({
                 roomManager,
                 cleanupDMJoin,
                 roomId,
@@ -464,7 +550,17 @@ function registerJoinRoomHandler(
                 socketId: socket.id,
                 roomKind,
                 callId: access.callId,
-              }),
+              });
+              if (enforcementSession) {
+                try {
+                  await voiceEnforcementReleaseQueue.releaseAfterTerminalClose(enforcementSession);
+                } finally {
+                  if (data.voiceEnforcementSession === enforcementSession) {
+                    data.voiceEnforcementSession = undefined;
+                  }
+                }
+              }
+            },
           });
 
           if (outcome.status === 'denied' || outcome.status === 'revoked') {
@@ -520,10 +616,6 @@ function registerJoinRoomHandler(
           const joinedParticipant = result.participants.find(
             (participant) => participant.userId === data.userId
           );
-          if (roomKind === 'channel') {
-            commitSocketMembership();
-          }
-
           // The per-sharer screen-layering gate has no room-wide late-join state.
           // A join simply recomputes each share it consumes (#1924).
 
@@ -625,6 +717,11 @@ async function main() {
 
   // Initialize NATS (inter-service messaging)
   const natsService = new NatsService();
+  const voiceEnforcementLease = new VoiceEnforcementLease();
+  let fenceExpiredVoiceEnforcementLease: () => Promise<void> = async () => {};
+  let voiceEnforcementSubscriptionReady = false;
+  let shuttingDown = false;
+  const voiceEnforcementSubject = `voice.enforce.session.${voiceEnforcementNodeBootId}`;
   natsService.setSecurityEventEmitter((event) => securityEvents.emit(event));
   try {
     await natsService.connect();
@@ -698,6 +795,19 @@ async function main() {
       metrics: mediaMetrics.getSnapshot(),
     });
   });
+  app.get('/readyz', (_req, res) => {
+    if (
+      shuttingDown ||
+      voiceEnforcementReleaseQueue.saturated() ||
+      !voiceEnforcementLease.valid() ||
+      !voiceEnforcementSubscriptionReady ||
+      !natsService.isRequestSubscriptionHealthy(voiceEnforcementSubject)
+    ) {
+      res.status(503).json({ ready: false });
+      return;
+    }
+    res.json({ ready: true, voiceEnforcementProtocol: 3 });
+  });
 
   // Express error handler — surface uncaught route errors via Winston with a
   // canonical 500 response. Per-event Socket.IO errors (post-upgrade) are
@@ -754,6 +864,32 @@ async function main() {
     // Compression on attacker-controlled inbound payloads is a
     // decompression-amplification vector. Do not enable it for "performance".
   });
+  const voiceEnforcementReleaseQueue = new VoiceEnforcementSessionReleaseQueue(
+    (capacity, overflowedCount) => {
+      logger.error('Voice enforcement release queue saturated; operator recovery required', {
+        capacity,
+        overflowedCount,
+      });
+    }
+  );
+  const voiceEnforcementExpiryFence = new VoiceEnforcementExpiryFence(
+    voiceEnforcementLease,
+    async () => {
+      await roomManager.closeAll();
+      // Snapshot only after terminal room teardown. Expiry cannot infer a
+      // release, so quarantine these exact sessions until a fresh signed health
+      // round trip reaches this same target subscriber.
+      const terminalSessions = snapshotVoiceEnforcementSessions(io.sockets.sockets.values());
+      voiceEnforcementReleaseQueue.holdAll(terminalSessions);
+      for (const socket of io.sockets.sockets.values()) {
+        // Disconnect cleanup normally releases a terminal session. Clear this
+        // exact local reference only after it has been held, so expiry cannot
+        // bypass quarantine through that ordinary path.
+        socket.data.voiceEnforcementSession = undefined;
+        socket.disconnect(true);
+      }
+    }
+  );
 
   // Socket.IO JWT authentication middleware (A2)
   io.use(createAuthMiddleware((event) => securityEvents.emit(event)));
@@ -873,6 +1009,63 @@ async function main() {
     }
   });
 
+  // Durable authority outboxes use request/reply: a signed acknowledgement is
+  // issued only after the existing RoomManager teardown has completed.
+  natsService.subscribeRequest(
+    'voice.enforce.disconnect.ack',
+    createDMBlockDisconnectAckHandler(roomManager, io, config.jwtSecret)
+  );
+  natsService.subscribeRequest(
+    'voice.enforce.credential_epoch.ack',
+    createCredentialEpochEjectionAckHandler(roomManager, io, config.jwtSecret)
+  );
+  voiceEnforcementSubscriptionReady = natsService.subscribeRequest(
+    voiceEnforcementSubject,
+    createVoiceEnforcementSessionEjectionHandler(
+      roomManager,
+      io,
+      config.jwtSecret,
+      voiceEnforcementNodeBootId,
+      async () => {
+        // A late valid command cannot revive a process that crossed expiry
+        // without first terminalizing all local media state.
+        await fenceExpiredVoiceEnforcementLease();
+        voiceEnforcementLease.renew();
+        // This is only a retry trigger after a verified same-subscriber health
+        // round trip; it never treats the timer expiry itself as settlement.
+        voiceEnforcementReleaseQueue.promoteHeld();
+        void voiceEnforcementReleaseQueue.retryPending();
+      }
+    )
+  );
+  voiceEnforcementSubscriptionReady =
+    voiceEnforcementSubscriptionReady &&
+    natsService.isRequestSubscriptionHealthy(voiceEnforcementSubject);
+
+  const enforceVoiceEnforcementLease = (): Promise<void> => {
+    if (shuttingDown) return Promise.resolve();
+    // All expiry observers share one terminalization barrier. In particular, a
+    // late signed health command must wait for this promise before it can renew
+    // admission, otherwise a join could escape closeAll's room snapshot.
+    return voiceEnforcementExpiryFence.enforce();
+  };
+  fenceExpiredVoiceEnforcementLease = enforceVoiceEnforcementLease;
+  const healthPoll = async () => {
+    try {
+      await pollVoiceEnforcementHealth(voiceEnforcementNodeBootId);
+    } catch {
+      /* lease remains expired */
+    }
+    await enforceVoiceEnforcementLease();
+  };
+  void healthPoll();
+  const voiceEnforcementHealthInterval = setInterval(() => {
+    void healthPoll();
+  }, 10_000);
+  const voiceEnforcementLeaseInterval = setInterval(() => {
+    void enforceVoiceEnforcementLease();
+  }, 1_000);
+
   // ── Mid-session permission push (CV-CAN-007 review P1) ────────────────
   // Control plane publishes voice.enforce.permissions {channelId, userId,
   // permissions} after an RBAC mutation touching a voice-connected member. The
@@ -943,14 +1136,15 @@ async function main() {
     });
 
     // ── join-room ────────────────────────────────────────────────────
-    registerJoinRoomHandler(
-      socket,
-      data,
+    registerJoinRoomHandler(socket, data, {
       roomManager,
       dmJoinFence,
-      emitSocketSecurityEvent,
-      withRateLimit
-    );
+      voiceEnforcementReleaseQueue,
+      emitSecurityEvent: emitSocketSecurityEvent,
+      withRateLimit,
+      isShuttingDown: () =>
+        shuttingDown || voiceEnforcementReleaseQueue.saturated() || !voiceEnforcementLease.valid(),
+    });
 
     // ── update-rtp-capabilities ─────────────────────────────────────
     // Client sends this after device.load() to provide its actual RTP capabilities
@@ -1457,6 +1651,20 @@ async function main() {
 
     if (!roomId || !userId) return;
 
+    const releaseEnforcementSession = async () => {
+      const session = socketData.voiceEnforcementSession;
+      if (!session) return;
+      try {
+        await voiceEnforcementReleaseQueue.releaseAfterTerminalClose(session);
+      } finally {
+        // A failed release keeps the DB row for durable retry, but it must not
+        // strand this locally departed socket in a pseudo-admitted state.
+        if (socketData.voiceEnforcementSession === session) {
+          socketData.voiceEnforcementSession = undefined;
+        }
+      }
+    };
+
     // Guard: only clean up if this socket still owns the participant.
     // Race condition: a newer socket may have already re-joined the room
     // (e.g. old socket disconnect fires AFTER new socket's join-room).
@@ -1472,21 +1680,27 @@ async function main() {
       });
       socketData.roomId = undefined;
       socket.leave(roomId);
+      // The old exact socket is no longer in the authoritative participant
+      // map, so it cannot forward media. Release only after that fact is known.
+      await releaseEnforcementSession();
       return;
     }
 
     // Clean up via RoomManager (closes transports, producers, consumers)
     await roomManager.leaveRoom(roomId, userId);
+    try {
+      await releaseEnforcementSession();
+    } finally {
+      // Recompute and broadcast codec floor if room still exists
+      if (roomManager.getRoom(roomId)) {
+        const codecFloor = roomManager.computeCodecFloor(roomId);
+        io.to(roomId).emit('room-codec-floor', { codecFloor });
+      }
 
-    // Recompute and broadcast codec floor if room still exists
-    if (roomManager.getRoom(roomId)) {
-      const codecFloor = roomManager.computeCodecFloor(roomId);
-      io.to(roomId).emit('room-codec-floor', { codecFloor });
+      // Always leave local state even when the durable release is retryable.
+      socket.leave(roomId);
+      socketData.roomId = undefined;
     }
-
-    // Leave Socket.IO room
-    socket.leave(roomId);
-    socketData.roomId = undefined;
   }
 
   // Wire up active speaker events to broadcast to room
@@ -1608,15 +1822,13 @@ async function main() {
     }
   });
 
-  // Graceful shutdown
-  const shutdown = async () => {
-    logger.info('Shutting down gracefully');
-    clearInterval(epochSyncInterval);
-    clearInterval(roomHeartbeatInterval);
-    await opsMetricsPublisher.stop();
+  // Compose grants the process 45 seconds to stop. Reserve the existing final
+  // 10 seconds for HTTP close, so unreleased exact rows fail visibly before a
+  // supervisor kill can discard the only live node_boot_id target.
+  const shutdownReleaseDrainTimeoutMs = 35_000;
 
-    // Close all rooms first (notifies participants, publishes NATS events)
-    await roomManager.closeAll();
+  const completeShutdown = async () => {
+    clearInterval(voiceEnforcementHealthInterval);
 
     // Close inter-service connections
     await natsService.close();
@@ -1634,11 +1846,71 @@ async function main() {
       process.exit(0);
     });
 
-    // Force exit after 10 seconds
+    // Force exit after 10 seconds.
     setTimeout(() => {
       logger.warn('Forced shutdown after timeout');
       process.exit(1);
     }, 10_000);
+  };
+
+  // Graceful shutdown
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      const shutdownStartedAt = Date.now();
+      // Reject A1/A2 work before closeAll so no registry row can race teardown.
+      shuttingDown = true;
+      logger.info('Shutting down gracefully');
+      clearInterval(epochSyncInterval);
+      clearInterval(roomHeartbeatInterval);
+      clearInterval(voiceEnforcementLeaseInterval);
+      await opsMetricsPublisher.stop();
+
+      // Close all rooms first (notifies participants, publishes NATS events)
+      await roomManager.closeAll();
+      const retainedReleases = await releaseVoiceEnforcementSessionsAfterClose(
+        io.sockets.sockets.values(),
+        voiceEnforcementReleaseQueue
+      );
+      const remainingReleaseDrainMs =
+        shutdownReleaseDrainTimeoutMs - (Date.now() - shutdownStartedAt);
+      if (remainingReleaseDrainMs <= 0) {
+        // RoomManager teardown has completed, so failing here cannot leave media
+        // forwarding. Exit visibly instead of consuming the final HTTP-close
+        // reserve and letting Docker SIGKILL this exact NATS target.
+        logger.error('Voice enforcement shutdown terminal teardown exceeded deadline', {
+          failureCount: retainedReleases,
+        });
+        process.exit(1);
+        return;
+      }
+      if (retainedReleases > 0) {
+        logger.warn('Voice enforcement releases retained during shutdown', {
+          failureCount: retainedReleases,
+        });
+        // Keep the exact NATS target and health poll alive. The signed health
+        // callback is the only retry trigger; neither elapsed time nor shutdown
+        // infers a release. The bounded failure below leaves durable rows for
+        // operator recovery instead of allowing an external SIGKILL to hide it.
+        const shutdownReleaseDeadline = setTimeout(() => {
+          const failureCount = voiceEnforcementReleaseQueue.outstandingCount();
+          if (failureCount === 0) return;
+          logger.error('Voice enforcement releases exceeded shutdown deadline', { failureCount });
+          process.exit(1);
+        }, remainingReleaseDrainMs);
+        const awaitRetainedReleases = setInterval(() => {
+          if (voiceEnforcementReleaseQueue.outstandingCount() !== 0) return;
+          clearInterval(awaitRetainedReleases);
+          clearTimeout(shutdownReleaseDeadline);
+          void completeShutdown();
+        }, 1_000);
+        return;
+      }
+
+      await completeShutdown();
+    })();
+    return shutdownPromise;
   };
 
   process.on('SIGTERM', shutdown);

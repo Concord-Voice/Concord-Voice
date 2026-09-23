@@ -27,6 +27,8 @@ import (
 
 var errForcedAmbiguousRecoveryCommit = errors.New("forced ambiguous recovery commit")
 
+const recoveryPredecessorCredentialEpoch = "0123456789abcdef0123456789abcdef" // pragma: allowlist secret
+
 // This test is in package auth, which cannot import testhelpers because that
 // package constructs an auth.Handler. Keep the recovery payload valid under the
 // public-key ingress contract while exercising its later commit paths.
@@ -89,6 +91,45 @@ type recoveryCommitDelivery struct {
 	err   error
 }
 
+type recoveryCredentialEpochEviction struct {
+	userID                    string
+	credentialEpoch           string
+	supersededCredentialEpoch string
+}
+
+type recoveryCredentialEpochEvictionRecorder struct {
+	events []recoveryCredentialEpochEviction
+	done   chan struct{}
+}
+
+func (r *recoveryCredentialEpochEvictionRecorder) bind(t *testing.T, handler *Handler) {
+	t.Helper()
+	require.NotNil(t, handler.credFence)
+	r.done = make(chan struct{})
+	handler.credFence.SetPostCommitEvictor(func(
+		_ context.Context,
+		userID string,
+		credentialEpoch string,
+		supersededCredentialEpoch string,
+	) {
+		r.events = append(r.events, recoveryCredentialEpochEviction{
+			userID:                    userID,
+			credentialEpoch:           credentialEpoch,
+			supersededCredentialEpoch: supersededCredentialEpoch,
+		})
+		close(r.done)
+	})
+}
+
+func (r *recoveryCredentialEpochEvictionRecorder) wait(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.done:
+	case <-time.After(time.Second):
+		t.Fatal("credential epoch eviction callback did not run")
+	}
+}
+
 func (d *recoveryCommitDelivery) DeliverCustomText(
 	_ context.Context,
 	plan presencehistory.DeliveryPlan,
@@ -147,6 +188,7 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 		t.Run(test.name, func(t *testing.T) {
 			db, _ := dbtest.SetupTestDB(t)
 			senderID := dbtest.CreateUser(t, db)
+			seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 			seedRecoveryCommitKeyRows(t, db, senderID)
 			rdb := setupAuthAttemptRedis(t)
 			claims := &RecoveryClaims{UserID: senderID.String(), JTI: uuid.NewString()}
@@ -175,6 +217,8 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 				// #2201: recovery resets fail closed (503) without the fence.
 				credFence: credepoch.New(db, rdb, logger.NewWithWriter(io.Discard)),
 			}
+			evictions := &recoveryCredentialEpochEvictionRecorder{}
+			evictions.bind(t, handler)
 
 			response := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(response)
@@ -206,6 +250,19 @@ func TestRecoveryCommitAmbiguityConsumesTokenAndAcknowledgesForcedClear(t *testi
 			require.NoError(t, err, "blocked marker must survive an ambiguous commit")
 			assert.True(t, strings.HasPrefix(epochVal, "blocked:"),
 				"ambiguous commit must retain blocked state, got %q", epochVal)
+
+			// #2907: a commit whose acknowledgement is ambiguous still made the
+			// RotateTx outbox row durable. Recovery must reconcile that exact row
+			// and publish only the credential generation it superseded.
+			committedEpoch := requireRecoveryCredentialEpochOutbox(
+				t, db, senderID, recoveryPredecessorCredentialEpoch,
+			)
+			evictions.wait(t)
+			require.Equal(t, []recoveryCredentialEpochEviction{{
+				userID:                    senderID.String(),
+				credentialEpoch:           committedEpoch,
+				supersededCredentialEpoch: recoveryPredecessorCredentialEpoch,
+			}}, evictions.events)
 		})
 	}
 }
@@ -228,6 +285,7 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 			t.Run(flow.name+"/"+test.name, func(t *testing.T) {
 				db, _ := dbtest.SetupTestDB(t)
 				senderID := dbtest.CreateUser(t, db)
+				seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 				seedRecoveryCommitKeyRows(t, db, senderID)
 				seedRecoveryForcedPresence(t, db, senderID)
 				rdb := setupAuthAttemptRedis(t)
@@ -273,6 +331,8 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 				})
 				t.Cleanup(restore)
 				handler := newRecoveryForcedHandler(db, rdb, hub, service, claims)
+				evictions := &recoveryCredentialEpochEvictionRecorder{}
+				evictions.bind(t, handler)
 				var logs bytes.Buffer
 				handler.log = logger.NewWithWriter(&logs)
 
@@ -302,6 +362,11 @@ func TestRecoveryCommitAmbiguityClassifiesOutcomesAndConsumesToken(t *testing.T)
 				switch test.outcome {
 				case presencehistory.ForcedClearRolledBack:
 					assert.Zero(t, pendingCount)
+					assertRecoveryCredentialEpochRollback(
+						t, db, senderID, recoveryPredecessorCredentialEpoch,
+					)
+					assert.Empty(t, evictions.events,
+						"read-back-confirmed rollback must not invoke media eviction")
 				case presencehistory.ForcedClearSuperseded:
 					assert.Equal(t, 1, pendingCount)
 					assert.Equal(t, laterOperationID, pendingID)
@@ -321,6 +386,7 @@ func TestRecoveryForcedClearArchivesHistoryBeforeSuccess(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			db, _ := dbtest.SetupTestDB(t)
 			senderID := dbtest.CreateUser(t, db)
+			seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 			seedRecoveryCommitKeyRows(t, db, senderID)
 			historyID := seedRecoveryForcedPresence(t, db, senderID)
 			rdb := setupAuthAttemptRedis(t)
@@ -329,6 +395,8 @@ func TestRecoveryForcedClearArchivesHistoryBeforeSuccess(t *testing.T) {
 			hub := &recoveryForcedEventRecorder{}
 			service := newRecoveryForcedService(t, db, delivery)
 			handler := newRecoveryForcedHandler(db, rdb, hub, service, claims)
+			evictions := &recoveryCredentialEpochEvictionRecorder{}
+			evictions.bind(t, handler)
 
 			response := invokeRecoveryForcedFlow(test, handler)
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -346,6 +414,18 @@ func TestRecoveryForcedClearArchivesHistoryBeforeSuccess(t *testing.T) {
 			).Scan(&pending))
 			assert.True(t, endedAt.Valid)
 			assert.Zero(t, pending)
+
+			// Definite success commits the epoch and its exact-generation outbox
+			// row atomically, then invokes the post-commit delivery terminal once.
+			committedEpoch := requireRecoveryCredentialEpochOutbox(
+				t, db, senderID, recoveryPredecessorCredentialEpoch,
+			)
+			evictions.wait(t)
+			require.Equal(t, []recoveryCredentialEpochEviction{{
+				userID:                    senderID.String(),
+				credentialEpoch:           committedEpoch,
+				supersededCredentialEpoch: recoveryPredecessorCredentialEpoch,
+			}}, evictions.events)
 		})
 	}
 }
@@ -683,19 +763,25 @@ func TestRecoveryForcedClearReadinessRetryAndOutcomeClasses(t *testing.T) {
 func TestRecoveryForcedClearStatementFailureReleasesTokenAndRollsBack(t *testing.T) {
 	db, _ := dbtest.SetupTestDB(t)
 	senderID := dbtest.CreateUser(t, db)
+	seedRecoveryCredentialEpoch(t, db, senderID, recoveryPredecessorCredentialEpoch)
 	seedRecoveryForcedPresence(t, db, senderID)
 	rdb := setupAuthAttemptRedis(t)
 	usedKey := "recovery_token_used:" + uuid.NewString()
 	require.NoError(t, rdb.Set(context.Background(), usedKey, "1", time.Minute).Err())
 	service := newRecoveryForcedService(t, db, &recoveryCommitDelivery{})
 	handler := &Handler{
-		redis: rdb, log: logger.NewWithWriter(io.Discard), presenceHistory: service,
+		db: db, redis: rdb, log: logger.NewWithWriter(io.Discard), presenceHistory: service,
+		credFence: credepoch.New(db, rdb, logger.NewWithWriter(io.Discard)),
 	}
+	evictions := &recoveryCredentialEpochEvictionRecorder{}
+	evictions.bind(t, handler)
+	fenceOp, err := handler.credFence.Begin(context.Background(), senderID.String())
+	require.NoError(t, err)
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
 	c.Request = httptest.NewRequest(http.MethodPost, "/recovery", nil)
 
-	err := handler.executeRecoveryTransaction(c, senderID, usedKey, errFailedResetPwd, nil, []recoveryTxOp{{
+	err = handler.executeRecoveryTransaction(c, senderID, usedKey, errFailedResetPwd, fenceOp, []recoveryTxOp{{
 		query: `UPDATE recovery_table_that_does_not_exist SET value = $1`,
 		args:  []interface{}{1},
 		desc:  "forced statement failure",
@@ -713,6 +799,10 @@ func TestRecoveryForcedClearStatementFailureReleasesTokenAndRollsBack(t *testing
 	).Scan(&tier, &text))
 	assert.Equal(t, 1, tier)
 	assert.Equal(t, "recovery visible", text)
+	assertRecoveryCredentialEpochRollback(
+		t, db, senderID, recoveryPredecessorCredentialEpoch,
+	)
+	assert.Empty(t, evictions.events, "definite rollback must not invoke media eviction")
 }
 
 func newRecoveryForcedService(
@@ -796,4 +886,60 @@ func seedRecoveryCommitKeyRows(t *testing.T, db *sql.DB, senderID uuid.UUID) {
 		 VALUES ($1, $2, 'old-public', 1)`, uuid.New(), senderID,
 	)
 	require.NoError(t, err)
+}
+
+func seedRecoveryCredentialEpoch(t *testing.T, db *sql.DB, senderID uuid.UUID, epoch string) {
+	t.Helper()
+	_, err := db.Exec(
+		`UPDATE users SET credential_epoch = $1 WHERE id = $2`, epoch, senderID,
+	)
+	require.NoError(t, err)
+}
+
+func requireRecoveryCredentialEpochOutbox(
+	t *testing.T,
+	db *sql.DB,
+	senderID uuid.UUID,
+	expectedSupersededEpoch string,
+) string {
+	t.Helper()
+	var durableEpoch sql.NullString
+	require.NoError(t, db.QueryRow(
+		`SELECT credential_epoch FROM users WHERE id = $1`, senderID,
+	).Scan(&durableEpoch))
+	require.True(t, durableEpoch.Valid)
+	require.NotEmpty(t, durableEpoch.String)
+	require.NotEqual(t, expectedSupersededEpoch, durableEpoch.String)
+
+	var credentialEpoch string
+	var supersededCredentialEpoch string
+	require.NoError(t, db.QueryRow(`
+		SELECT credential_epoch, superseded_credential_epoch
+		FROM credential_epoch_voice_ejections
+		WHERE user_id = $1 AND credential_epoch = $2
+	`, senderID, durableEpoch.String).Scan(&credentialEpoch, &supersededCredentialEpoch))
+	assert.Equal(t, durableEpoch.String, credentialEpoch)
+	assert.Equal(t, expectedSupersededEpoch, supersededCredentialEpoch)
+	return durableEpoch.String
+}
+
+func assertRecoveryCredentialEpochRollback(
+	t *testing.T,
+	db *sql.DB,
+	senderID uuid.UUID,
+	expectedEpoch string,
+) {
+	t.Helper()
+	var durableEpoch sql.NullString
+	require.NoError(t, db.QueryRow(
+		`SELECT credential_epoch FROM users WHERE id = $1`, senderID,
+	).Scan(&durableEpoch))
+	require.True(t, durableEpoch.Valid)
+	assert.Equal(t, expectedEpoch, durableEpoch.String)
+
+	var outboxRows int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM credential_epoch_voice_ejections WHERE user_id = $1`, senderID,
+	).Scan(&outboxRows))
+	assert.Zero(t, outboxRows, "rolled-back rotation must not leave a durable media eviction")
 }

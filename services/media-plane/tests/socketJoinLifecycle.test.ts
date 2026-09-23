@@ -3,7 +3,7 @@ import {
   cleanupEmptyDMJoin,
   DMJoinCallIdTracker,
   KeyedJoinFence,
-  reauthorizeDMAdmission,
+  reauthorizeAdmission,
   rollbackSocketRoomJoin,
   SocketRoomClaim,
   runSocketBoundJoin,
@@ -146,6 +146,33 @@ describe('runSocketBoundJoin', () => {
 
     expect(order).toEqual(['join', 'reauthorize', 'rollback']);
     expect(finalize).not.toHaveBeenCalled();
+  });
+
+  it('rolls back a registered channel session when its credential epoch rotates in flight', async () => {
+    const presentedEpoch = 'old';
+    let currentEpoch = presentedEpoch;
+    let registered = false;
+    const authorize = vi.fn(async () => ({ allowed: presentedEpoch === currentEpoch }));
+
+    await expect(
+      runSocketBoundJoin({
+        authorize,
+        isAllowed: (access) => access.allowed,
+        isConnected: () => true,
+        join: async () => {
+          registered = true;
+          currentEpoch = 'new';
+          return 'registered';
+        },
+        reauthorize: (access) => reauthorizeAdmission('channel', access, undefined, authorize),
+        rollback: async () => {
+          registered = false;
+        },
+      })
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    expect(authorize).toHaveBeenCalledTimes(2);
+    expect(registered).toBe(false);
   });
 
   it('finalizes admission from the revalidated moderation state', async () => {
@@ -297,25 +324,26 @@ describe('runSocketBoundJoin', () => {
   });
 });
 
-describe('reauthorizeDMAdmission', () => {
+describe('reauthorizeAdmission', () => {
   it('binds the second DM authorization to the exact call ID returned by the first', async () => {
     const access = { allowed: true, callId: 'server-call' };
     const authorize = vi.fn(async () => access);
 
-    await expect(reauthorizeDMAdmission('dm', access, 'client-call', authorize)).resolves.toBe(
+    await expect(reauthorizeAdmission('dm', access, 'client-call', authorize)).resolves.toBe(
       access
     );
     expect(authorize).toHaveBeenCalledExactlyOnceWith('server-call');
   });
 
-  it('does not duplicate channel authorization', async () => {
+  it('reauthorizes a channel join after registration', async () => {
     const access = { allowed: true, callId: 'channel-id' };
-    const authorize = vi.fn(async () => access);
+    const refreshed = { allowed: false, callId: 'channel-id' };
+    const authorize = vi.fn(async () => refreshed);
 
-    await expect(reauthorizeDMAdmission('channel', access, undefined, authorize)).resolves.toBe(
-      access
+    await expect(reauthorizeAdmission('channel', access, undefined, authorize)).resolves.toBe(
+      refreshed
     );
-    expect(authorize).not.toHaveBeenCalled();
+    expect(authorize).toHaveBeenCalledExactlyOnceWith(undefined);
   });
 });
 

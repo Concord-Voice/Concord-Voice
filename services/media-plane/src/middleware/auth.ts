@@ -2,7 +2,9 @@ import jwt from 'jsonwebtoken';
 import { createHash, createHmac } from 'node:crypto';
 import type { Socket, ExtendedError } from 'socket.io';
 import { config } from '../config/index.js';
+import { voiceEnforcementNodeBootId } from '../lib/voiceEnforcementIdentity.js';
 import { logger } from '../lib/logger.js';
+import type { VoiceEnforcementSession } from '../lib/voiceEnforcementSession.js';
 import { isCanonicalEnforcementUUID } from '../lib/enforcementCommand.js';
 import type { SecurityEventInput } from '../lib/securityEvent.js';
 import type { TokenBucket } from '../lib/rateLimit.js';
@@ -14,6 +16,8 @@ import type { TokenBucket } from '../lib/rateLimit.js';
 // cannot come from a valid rbac.Permission, so it is treated as malformed and
 // fails closed rather than having its low Speak/Video/ScreenShare bits honored.
 const MAX_PERMISSION_BITFIELD = (1n << 63n) - 1n;
+const VOICE_ENFORCEMENT_CAPABILITY_CONTEXT = 'concord/voice-enforcement-capability/v1';
+const VOICE_ENFORCEMENT_CAPABILITY_VERSION = 'v1';
 
 /**
  * Strict fail-closed parser for the server-authoritative permission bitfield
@@ -35,6 +39,7 @@ export function parsePermissionBitfield(raw: unknown): bigint | undefined {
 // ---------------------------------------------------------------------------
 interface JwtClaims {
   user_id: string;
+  cred_epoch?: string;
   tier?: string;
   jti?: string;
   iss?: string;
@@ -49,11 +54,15 @@ interface JwtClaims {
 // ---------------------------------------------------------------------------
 export interface AuthenticatedSocketData {
   userId: string;
+  /** Signed credential generation captured at socket upgrade. */
+  credentialEpoch: string;
   username: string;
   tier: string;
   displayName?: string;
   avatarUrl?: string;
   roomId?: string;
+  /** Durable, exact session address released only after local terminal teardown. */
+  voiceEnforcementSession?: VoiceEnforcementSession;
   rtpCapabilities?: unknown;
   /** Per-event rate-limit buckets (#2032). Freed with the socket. */
   rateBuckets?: Map<string, TokenBucket>;
@@ -167,6 +176,7 @@ export function createAuthMiddleware(onSecurityEvent?: (event: SecurityEventInpu
       // Attach authenticated user data to socket
       const socketData = socket.data as AuthenticatedSocketData;
       socketData.userId = decoded.user_id;
+      socketData.credentialEpoch = typeof decoded.cred_epoch === 'string' ? decoded.cred_epoch : '';
       // Entitlement tier rides the signed JWT claim (control-plane auth.Claims.Tier).
       // Absent or blank → 'free' (fail-closed). Consumption at the join/enforcement
       // boundary is #1300/#1542; here we only plumb it onto socket.data.
@@ -567,7 +577,7 @@ const SERVICE_HOP_PROOF_VERSION = 'v1';
  * timestamp bounds replay to the control plane's clock-skew window. A member
  * holds their bearer token but not the signing key, so they cannot mint one.
  */
-function serviceHopProofHeaders(
+export function createServiceHopProofHeaders(
   method: 'POST' | 'DELETE',
   path: string,
   token: string
@@ -581,6 +591,38 @@ function serviceHopProofHeaders(
   return {
     'X-Concord-Service-Timestamp': timestamp,
     'X-Concord-Service-Proof': createHmac('sha256', proofKey).update(payload).digest('hex'),
+  };
+}
+
+// After the durable protocol is activated, the control plane accepts media
+// service hops only from a binary that proves it can register exact sessions.
+// The proof binds the raw request body so an attacker with a bearer token
+// cannot transplant it onto a different DM call admission.
+export function createVoiceEnforcementCapabilityHeaders(
+  method: 'POST',
+  path: string,
+  token: string,
+  body: string
+): Record<string, string> {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const key = createHmac('sha256', config.jwtSecret)
+    .update(VOICE_ENFORCEMENT_CAPABILITY_CONTEXT)
+    .digest();
+  const fields = [
+    VOICE_ENFORCEMENT_CAPABILITY_VERSION,
+    timestamp,
+    method,
+    path,
+    createHash('sha256').update(token).digest('hex'),
+    voiceEnforcementNodeBootId,
+    createHash('sha256').update(body).digest('hex'),
+  ];
+  return {
+    'X-Concord-Voice-Enforcement-Capability-Timestamp': timestamp,
+    'X-Concord-Voice-Enforcement-Capability-Proof': createHmac('sha256', key)
+      .update(fields.join('\n'))
+      .digest('hex'),
+    'X-Concord-Voice-Enforcement-Node-Boot-ID': voiceEnforcementNodeBootId,
   };
 }
 
@@ -637,6 +679,7 @@ function dmVoiceMediaRequest(
   const proofKey = createHmac('sha256', config.jwtSecret)
     .update('concord/dm-voice-media-authorization/v1')
     .digest();
+  const body = JSON.stringify({ call_id: callId });
   return {
     method,
     // Both admission and rollback run under a per-room fence. Bound either
@@ -647,9 +690,17 @@ function dmVoiceMediaRequest(
       'Content-Type': 'application/json',
       'X-Concord-Media-Timestamp': timestamp,
       'X-Concord-Media-Proof': createHmac('sha256', proofKey).update(payload).digest('hex'),
-      ...serviceHopProofHeaders(method, dmVoiceAuthorizePath(channelId), token),
+      ...createServiceHopProofHeaders(method, dmVoiceAuthorizePath(channelId), token),
+      ...(method === 'POST'
+        ? createVoiceEnforcementCapabilityHeaders(
+            'POST',
+            dmVoiceAuthorizePath(channelId),
+            token,
+            body
+          )
+        : {}),
     },
-    body: JSON.stringify({ call_id: callId }),
+    body,
   };
 }
 
@@ -675,7 +726,8 @@ function channelAccessRequest(
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        ...serviceHopProofHeaders('POST', path, token),
+        ...createServiceHopProofHeaders('POST', path, token),
+        ...createVoiceEnforcementCapabilityHeaders('POST', path, token, ''),
       },
     },
   };

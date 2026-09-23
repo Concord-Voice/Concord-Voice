@@ -16,6 +16,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/clientconfig"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/email"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/feedback"
@@ -86,6 +87,26 @@ type permissionCheckerAdapter struct {
 
 type dmVoiceCallLeaseVerifier struct {
 	redis *redis.Client
+}
+
+func wireDMBlockReconciler(
+	db *sql.DB, log *logger.Logger, purgeEngine *purge.Engine, reconciler *activepresence.Reconciler, hub *websocket.Hub, natsClient *natsclient.Client, jwtSecret string,
+) *dmblock.Reconciler {
+	dmBlockReconciler := dmblock.New(db, log)
+	dmBlockReconciler.SetPurgeEngine(dmBlockAttachmentRetirer{engine: purgeEngine})
+	dmBlockReconciler.SetReconciliationNotifier(newDMBlockReconciliationNotifier(hub))
+	reconciler.SetDMBlockCleanup(dmBlockReconciler.ReconcileDue)
+	if natsClient != nil {
+		dmBlockReconciler.SetVoiceEjectV2(func(ctx context.Context, conversationID string, userID, generation uuid.UUID) error {
+			return publishDurableDMBlockVoiceEjection(ctx, db, natsClient, jwtSecret, conversationID, userID, generation)
+		})
+		dmBlockReconciler.SetCredentialEpochEjectV2(func(ctx context.Context, userID uuid.UUID, credentialEpoch, supersededCredentialEpoch string, generation uuid.UUID) error {
+			return publishDurableCredentialEpochVoiceEjection(ctx, db, natsClient, jwtSecret, credentialEpochVoiceEjection{
+				userID: userID, credentialEpoch: credentialEpoch, supersededCredentialEpoch: supersededCredentialEpoch,
+			}, generation)
+		})
+	}
+	return dmBlockReconciler
 }
 
 func (v dmVoiceCallLeaseVerifier) Matches(
@@ -260,6 +281,13 @@ func normalizeLifecycleContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+func normalizeSecurityEvents(events securityevent.Emitter) securityevent.Emitter {
+	if events == nil {
+		return securityevent.Discard
+	}
+	return events
 }
 
 // RouterDependencies groups runtime services that are injected into NewRouter.
@@ -485,6 +513,10 @@ func serverVoiceCleanupWired(reconciler *activepresence.Reconciler) bool {
 	return reconciler.HasServerVoiceCleanup()
 }
 
+func dmBlockCleanupWired(reconciler *activepresence.Reconciler) bool {
+	return reconciler != nil && reconciler.HasDMBlockCleanup()
+}
+
 // requireServerVoiceCleanupWired fatal-exits when the reaper is unwired.
 //
 // The branch lives here rather than at the call site for the reason
@@ -649,10 +681,7 @@ func NewRouter(
 	store := dependencies.Store
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
-	securityEvents := dependencies.SecurityEvents
-	if securityEvents == nil {
-		securityEvents = securityevent.Discard
-	}
+	securityEvents := normalizeSecurityEvents(dependencies.SecurityEvents)
 	router := gin.New()
 	configureTrustedProxies(router, cfg, log)
 
@@ -872,6 +901,7 @@ func NewRouter(
 	presenceHistoryHandler := presencehistory.NewHandler(presenceHistoryService)
 	serversHandler := servers.NewHandler(db, log, hub, rbacResolver, entCache, serverEntCache)
 	channelsHandler := channels.NewHandler(db, log, hub, rbacResolver, redis, serverEntCache)
+	voiceEnforcementSessionHandler := newVoiceEnforcementSessionHandler(db, cfg.JWTSecret, natsClient)
 	membersHandler := members.NewHandler(db, log, redis, hub, rbacResolver, auditWriter)
 	// A kick/leave/ban deletes membership but leaves any voice participant on its
 	// join-time snapshot — recheck evicts them from the room (CV-CAN-007 P1).
@@ -1087,6 +1117,15 @@ func NewRouter(
 	redemptionEntNotifier := NewEntitlementNotifier(hub, log)
 	redemptionHandler := buildRedemptionHandler(db, entCache, redemptionEntNotifier, cfg, log)
 
+	// DM-block convergence is pure SQL and must run on every Block-serving
+	// replica, including self-hosted deployments without NATS.
+	dmBlockReconciler := wireDMBlockReconciler(db, log, purgeEngine, activePlanReconciler, hub, natsClient, cfg.JWTSecret)
+	credFence.SetPostCommitEvictor(func(ctx context.Context, userID, credentialEpoch, supersededCredentialEpoch string) {
+		if err := dmBlockReconciler.DeliverCredentialEpochVoiceEjection(ctx, userID, credentialEpoch, supersededCredentialEpoch); err != nil {
+			log.Error("Credential media eviction retained", "failure_class", "delivery")
+		}
+	})
+
 	// Start NATS voice event subscriber
 	voiceSub := voice.NewNATSSubscriber(db, log, hub, natsClient, redis, rbacResolver, activityService)
 	voiceSub.SetOpsCounters(opsCounters)
@@ -1106,6 +1145,9 @@ func NewRouter(
 		}
 	}
 	requireServerVoiceCleanupWired(log, activePlanReconciler)
+	if !dmBlockCleanupWired(activePlanReconciler) {
+		log.Fatal("DM block reconciliation is not wired")
+	}
 	// API v1 routes
 	noStore := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
@@ -1403,6 +1445,15 @@ func NewRouter(
 		// (operators can revoke via direct DB + Redis until then).
 		v1.POST("/internal/attestation/publish/spa", attestationHandler.PublishSPA)
 		v1.POST("/internal/attestation/publish/binary", attestationHandler.PublishBinary)
+		// This internal release is HMAC-authenticated by the media plane and
+		// intentionally sits outside user auth: credential revocation can happen
+		// before the exact socket performs its terminal release.
+		// Release is HMAC-authenticated before any delete. Do not put a
+		// shared-IP application bucket here: one media node can legitimately
+		// release its whole shutdown burst, and a peer can otherwise poison that
+		// bucket to strand durable evidence. The handler caps JSON at 4 KiB.
+		v1.POST("/internal/voice/enforcement-sessions/release", voiceEnforcementSessionHandler.Release)
+		v1.POST("/internal/voice/enforcement/health", voiceEnforcementSessionHandler.HealthBootstrap)
 
 		// Protected routes — split into two tiers:
 		// pendingOK: authenticated but email may be unverified (verification, logout, basic profile)
@@ -1467,6 +1518,13 @@ func NewRouter(
 		protected := authRequired.Group("/")
 		protected.Use(middleware.RequireVerifiedEmail())
 		{
+			// The media plane records an exact A1 candidate before its A2
+			// promotion. The handler itself requires the service-hop proof;
+			// rate limiting is a backstop for an accidentally looping node.
+			protected.POST("/voice/enforcement-sessions",
+				middleware.RateLimitByUser(redis, 60, 1*time.Minute),
+				voiceEnforcementSessionHandler.Register,
+			)
 			// WebSocket ticket (short-lived, single-use)
 			protected.POST("/auth/ws-ticket",
 				middleware.RateLimitByUser(redis, 10, 1*time.Minute),
@@ -2287,6 +2345,7 @@ func NewRouter(
 				)
 				channelRoutes.POST("/:id/voice/join",
 					middleware.RateLimitByUser(redis, 10, 1*time.Minute),
+					voiceEnforcementSessionHandler.RequireMediaCapability,
 					voiceHandler.AuthorizeJoin,
 				)
 				channelRoutes.POST("/:id/voice/authorize-action",
@@ -2631,6 +2690,7 @@ func NewRouter(
 				// and a single legitimate call can produce several reconnects.
 				dmRoutes.POST("/:id/voice/authorize",
 					middleware.RateLimitByUser(redis, 60, 1*time.Minute),
+					voiceEnforcementSessionHandler.RequireMediaCapability,
 					dmHandler.AuthorizeDMVoiceForMediaPlane,
 				)
 				dmRoutes.DELETE("/:id/voice/authorize",

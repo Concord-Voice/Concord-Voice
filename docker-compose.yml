@@ -333,6 +333,10 @@ services:
       context: ./services/media-plane
       dockerfile: Dockerfile
     container_name: concordvoice-media-plane
+    # Reserve 35s for exact-session release retries after a control-plane
+    # outage, plus the process's final 10s forced-exit timer in index.ts.
+    # Keep Docker's SIGKILL deadline after both windows.
+    stop_grace_period: 45s
     environment:
       CONTROL_PLANE_URL: http://control-plane:8080
       NATS_URL: nats://nats:4222

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presence"
@@ -76,6 +77,13 @@ type passthroughGate struct{}
 
 func (passthroughGate) WithSenders(_ context.Context, _ []uuid.UUID, work func() error) error {
 	return work()
+}
+
+type logLines chan string
+
+func (lines logLines) Write(p []byte) (int, error) {
+	lines <- string(p)
+	return len(p), nil
 }
 
 // serializingGate reproduces presencehistory's real gate shape -- a buffer-1
@@ -557,4 +565,238 @@ func TestReconcilePassLogsAggregatesWithoutSubjectsOrErrors(t *testing.T) {
 		"a reconciliation log line must never carry a subject id")
 	require.NotContains(t, out, "redis refused",
 		"a wrapped database error must never reach a fixed class field")
+}
+
+func TestReconcilerServerVoiceCleanupCallbackContract(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	subject := dbtest.CreateUser(t, db)
+	insert(t, db, livePlan(subject))
+	var log bytes.Buffer
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, logger.NewWithWriter(&log))
+	assert.False(t, r.HasServerVoiceCleanup())
+	calls, gotLimit, hasDeadline, deadlineWithinBudget := 0, 0, false, false
+	r.SetServerVoiceCleanup(func(ctx context.Context, limit int) (int, error) {
+		calls++
+		gotLimit = limit
+		deadline, bounded := ctx.Deadline()
+		hasDeadline = bounded
+		deadlineWithinBudget = bounded && time.Until(deadline) <= claimTimeout
+		return 3, context.DeadlineExceeded
+	})
+	assert.True(t, r.HasServerVoiceCleanup())
+	stats, err := r.ReconcilePass(context.Background(), 17)
+	require.NoError(t, err, "cleanup failure must not stall the privacy reconciliation rail")
+	assert.Equal(t, 3, stats.ServerVoiceRemoved)
+	assert.Equal(t, 1, stats.Cleared, "cleanup failure must not stop due active plans")
+	assert.Contains(t, log.String(), "failure_class=server_voice_cleanup")
+	assert.NotContains(t, log.String(), context.DeadlineExceeded.Error())
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 17, gotLimit)
+	assert.True(t, hasDeadline, "cleanup must be bounded even when the pass context is not")
+	assert.True(t, deadlineWithinBudget)
+}
+
+func TestReconcilerDMBlockCleanupCallbackContract(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	var log bytes.Buffer
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, logger.NewWithWriter(&log))
+	assert.False(t, r.HasDMBlockCleanup())
+	calls, gotLimit, hasDeadline := 0, 0, false
+	r.SetDMBlockCleanup(func(ctx context.Context, limit int) (int, error) {
+		calls++
+		gotLimit = limit
+		_, bounded := ctx.Deadline()
+		hasDeadline = bounded
+		return 0, context.DeadlineExceeded
+	})
+	assert.True(t, r.HasDMBlockCleanup())
+	stats, err := r.ReconcilePass(context.Background(), 13)
+	require.NoError(t, err, "DM cleanup failure must not stall active presence reconciliation")
+	assert.Zero(t, stats.Cleared)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 13, gotLimit)
+	assert.Contains(t, log.String(), "failure_class=dm_block_cleanup")
+	assert.NotContains(t, log.String(), context.DeadlineExceeded.Error())
+	assert.True(t, hasDeadline, "DM cleanup must be bounded")
+}
+
+func TestReconcilePassRunsPrePlanCleanupUnderOneSharedDeadline(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, nil)
+	parentDeadline := time.Now().Add(time.Second)
+	parentCtx, cancelParent := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancelParent()
+	serverStarted := make(chan struct{})
+	dmStarted := make(chan struct{})
+	release := make(chan struct{})
+	serverDeadline := make(chan time.Time, 1)
+	dmDeadline := make(chan time.Time, 1)
+	r.SetServerVoiceCleanup(func(ctx context.Context, _ int) (int, error) {
+		deadline, _ := ctx.Deadline()
+		serverDeadline <- deadline
+		close(serverStarted)
+		<-release
+		return 0, nil
+	})
+	r.SetDMBlockCleanup(func(ctx context.Context, _ int) (int, error) {
+		deadline, _ := ctx.Deadline()
+		dmDeadline <- deadline
+		close(dmStarted)
+		return 0, nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = r.ReconcilePass(parentCtx, maxPlanBatch)
+		close(done)
+	}()
+	select {
+	case <-serverStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server voice cleanup did not start")
+	}
+	select {
+	case <-dmStarted:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-done
+		t.Fatal("DM cleanup was serialized behind server voice cleanup")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconciliation pass did not finish")
+	}
+	require.Equal(t, parentDeadline, <-serverDeadline,
+		"server voice cleanup must inherit the whole-pass deadline")
+	require.Equal(t, parentDeadline, <-dmDeadline,
+		"DM cleanup must inherit the whole-pass deadline")
+}
+
+func TestRunPrePlanCleanupStopsWaitingAtSharedDeadline(t *testing.T) {
+	r := &Reconciler{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseWorker)
+	finished := make(chan struct{})
+	r.SetServerVoiceCleanup(func(context.Context, int) (int, error) {
+		defer close(finished)
+		close(started)
+		<-release // Models a committed effect running on its detached context.
+		return 1, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- r.runPrePlanCleanup(ctx, maxPlanBatch) }()
+	<-started
+	cancel()
+
+	select {
+	case removed := <-done:
+		assert.Zero(t, removed)
+	case <-time.After(time.Second):
+		t.Fatal("pre-plan cleanup waited for a detached effect after its shared deadline")
+	}
+	releaseWorker()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("detached cleanup worker leaked after the caller stopped waiting")
+	}
+}
+
+func TestRunPrePlanCleanupLogsOnlyThePendingRailAtSharedDeadline(t *testing.T) {
+	logs := make(logLines, 3)
+	r := &Reconciler{log: logger.NewWithWriter(logs)}
+	r.SetServerVoiceCleanup(func(context.Context, int) (int, error) {
+		return 0, errors.New("completed rail failure")
+	})
+	dmStarted := make(chan struct{})
+	releaseDM := make(chan struct{})
+	dmFinished := make(chan struct{})
+	r.SetDMBlockCleanup(func(context.Context, int) (int, error) {
+		defer close(dmFinished)
+		close(dmStarted)
+		<-releaseDM
+		return 0, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- r.runPrePlanCleanup(ctx, maxPlanBatch) }()
+	<-dmStarted
+	completedLog := <-logs // The Server Voice result was consumed before cancellation.
+	cancel()
+
+	assert.Zero(t, <-done)
+	timeoutLog := <-logs
+	assert.Contains(t, completedLog, "failure_class=server_voice_cleanup")
+	assert.NotContains(t, completedLog, "timed out")
+	assert.Contains(t, timeoutLog, "DM block reconciliation timed out")
+	assert.Contains(t, timeoutLog, "failure_class=dm_block_cleanup")
+	select {
+	case extra := <-logs:
+		t.Fatalf("completed cleanup rail was logged twice: %s", extra)
+	default:
+	}
+	close(releaseDM)
+	<-dmFinished
+}
+
+func TestReconcilePassRunsDMBlockCleanupWhenNoPlansAreDue(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, nil)
+	removed, gotLimit := 0, 0
+	r.SetDMBlockCleanup(func(_ context.Context, limit int) (int, error) {
+		removed++
+		gotLimit = limit
+		return 4, nil
+	})
+	stats, err := r.ReconcilePass(context.Background(), maxPlanBatch)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed)
+	assert.Equal(t, maxPlanBatch, gotLimit)
+	assert.Zero(t, stats.ServerVoiceRemoved)
+}
+
+func TestReconcilePassRunsCleanupWhenNoActivePlansAreDue(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, nil)
+	r.SetServerVoiceCleanup(func(context.Context, int) (int, error) { return 2, nil })
+	stats, err := r.ReconcilePass(context.Background(), maxPlanBatch)
+	require.NoError(t, err)
+	assert.Equal(t, 2, stats.ServerVoiceRemoved)
+}
+
+func TestReconcilerRunInvokesCleanupOnExistingInterval(t *testing.T) {
+	db, _ := dbtest.SetupTestDB(t)
+	r := NewReconciler(db, passthroughGate{}, &fakeStateReader{}, &recordingDeleter{}, &recordingDeliverer{}, nil)
+	r.interval = 10 * time.Millisecond
+	called := make(chan struct{}, 1)
+	r.SetServerVoiceCleanup(func(context.Context, int) (int, error) {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		return 0, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	select {
+	case <-called:
+		cancel()
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("existing Run interval did not invoke cleanup")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconciler did not stop")
+	}
 }

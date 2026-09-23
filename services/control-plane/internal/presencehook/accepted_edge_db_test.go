@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dmblock"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/presencehook"
 	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
@@ -81,10 +82,15 @@ func TestAcceptedEdgeExistsAgainstARealDatabase(t *testing.T) {
 
 	t.Run("blocked is not accepted", func(t *testing.T) {
 		blocked := edgeTestUser(t, db)
-		_, err := db.Exec(
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+		_, err = tx.Exec(
 			`INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, 'blocked')`,
 			requester, blocked)
 		require.NoError(t, err)
+		require.NoError(t, dmblock.RecordBlockTx(ctx, tx, requester.String(), blocked.String(), uuid.NewString()))
+		require.NoError(t, tx.Commit())
 
 		got, err := presencehook.AcceptedEdgeExists(ctx, db, requester, blocked)
 		require.NoError(t, err)

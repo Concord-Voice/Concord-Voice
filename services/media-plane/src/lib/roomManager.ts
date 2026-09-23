@@ -179,6 +179,10 @@ function assertPublishPermitted(
 export interface Participant {
   userId: string;
   socketId: string;
+  /** Signed token credential generation captured at socket authentication. */
+  credentialEpoch: string;
+  /** Exact durable enforcement generation reserved before provisional creation. */
+  voiceEnforcementSessionGeneration?: string;
   username: string;
   displayName?: string;
   avatarUrl?: string;
@@ -279,6 +283,16 @@ export interface DMParticipantPromotion {
   serverDeafened: boolean;
 }
 
+/** Refreshed A2 authority applied only when a channel candidate is promoted. */
+export interface ChannelParticipantPromotion {
+  identity: { username: string; displayName?: string; avatarUrl?: string };
+  entitlement: MediaEntitlement;
+  permissions?: bigint;
+  serverMuted: boolean;
+  serverDeafened: boolean;
+  ownerTier?: string;
+}
+
 export interface ProvisionalDMParticipant {
   participant: Participant;
   callId: string;
@@ -335,6 +349,8 @@ export interface Room {
   participants: Map<string, Participant>;
   /** A1-authorized DM candidates, excluded from every authoritative projection until A2. */
   pendingDMParticipants: Map<string, ProvisionalDMParticipant>;
+  /** A1-authorized channel candidates, excluded from participants until A2. */
+  pendingChannelParticipants: Map<string, Participant>;
   createdAt: Date;
   e2eeEpoch: number;
   /** Room-wide media E2EE frame crypto format. Null until first participant joins. */
@@ -750,6 +766,10 @@ export interface TransportOptions {
 
 /** Trailing options for {@link RoomManager.joinRoom} (parameter-object per S107). */
 export interface JoinRoomOptions {
+  /** Credential generation captured at the Socket.IO authentication boundary. */
+  credentialEpoch: string;
+  /** Created before A1 so a target command can identify a provisional socket. */
+  voiceEnforcementSessionGeneration?: string;
   entitlement?: MediaEntitlement;
   /** unparsed — validated by parseMediaFrameCryptoVersion at the admission gate */
   mediaFrameCryptoVersion: unknown;
@@ -1262,6 +1282,7 @@ export class RoomManager {
         audioLevelObserver,
         participants: new Map(),
         pendingDMParticipants: new Map(),
+        pendingChannelParticipants: new Map(),
         createdAt: new Date(),
         e2eeEpoch: 0,
         mediaFrameCryptoVersion: null,
@@ -1349,6 +1370,7 @@ export class RoomManager {
     }
 
     room.pendingDMParticipants.clear();
+    room.pendingChannelParticipants.clear();
 
     // Cancel any pending per-sharer screen gate-OFF debounce timers (#1924 fix
     // "B") so a room teardown leaves no dangling setTimeout callbacks.
@@ -1397,7 +1419,14 @@ export class RoomManager {
     rtpCapabilities: RtpCapabilities | undefined,
     options: JoinRoomOptions
   ): Promise<JoinRoomResult> {
-    const { entitlement, mediaFrameCryptoVersion, roomContext, permissions } = options;
+    const {
+      entitlement,
+      mediaFrameCryptoVersion,
+      roomContext,
+      permissions,
+      credentialEpoch,
+      voiceEnforcementSessionGeneration,
+    } = options;
     this.assertDMCallOpen(roomContext);
     let parsedMediaFrameCryptoVersion: number;
     try {
@@ -1413,27 +1442,6 @@ export class RoomManager {
       return this.joinRoom(roomId, userId, socketId, identity, rtpCapabilities, options);
     }
 
-    // Refresh the channel owner cap tier on each join (#1542) so a mid-call
-    // owner subscription change is honored for NEW produces (existing ones
-    // grandfather). Idempotent for a stable owner; DM rooms carry no ownerTier.
-    if (roomContext?.roomKind === 'channel') {
-      room.ownerTier = roomContext.ownerTier;
-    }
-
-    // Keep media admission exactly aligned with the authoritative control-plane
-    // heartbeat bound. This section is synchronous through participants.set, so
-    // simultaneous boundary joins cannot both reserve the final slot. Existing
-    // users may reconnect at capacity without evicting their valid old session.
-    const existing = room.participants.get(userId);
-    if (
-      room.roomKind === 'channel' &&
-      !existing &&
-      room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS
-    ) {
-      this.securityDeny('structural_limit_exceeded', 'socket.join');
-      throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
-    }
-
     // Per-user media caps (#1300): from the parsed control-plane entitlement,
     // or the fail-closed free floor for pre-#1300 callers. Copy the tiers array
     // so a later mutation of the source can't leak into the participant.
@@ -1442,6 +1450,8 @@ export class RoomManager {
     const participant: Participant = {
       userId,
       socketId,
+      credentialEpoch,
+      voiceEnforcementSessionGeneration,
       username,
       displayName,
       avatarUrl,
@@ -1491,19 +1501,71 @@ export class RoomManager {
       );
     }
 
-    // Media-frame crypto-version admission gate for authoritative channel
-    // membership. A DM candidate does not seed an empty room until promotion.
-    let activeMediaFrameCryptoVersion: number;
-    try {
-      activeMediaFrameCryptoVersion = admitMediaFrameCryptoVersion(
-        room,
-        parsedMediaFrameCryptoVersion
-      );
-    } catch (error) {
-      this.securityDeny('crypto_version_invalid', 'socket.join');
-      throw error;
+    // A1 is visible to credential-epoch enforcement but is not authoritative:
+    // A stale candidate must never evict an admitted same-user session before A2.
+    room.pendingChannelParticipants.set(userId, participant);
+    return joinRoomResult(room, userId, parsedMediaFrameCryptoVersion);
+  }
+
+  /** Atomically promote one exact A1 channel candidate after the matching A2 check. */
+  promoteChannelParticipant(
+    roomId: string,
+    userId: string,
+    socketId: string,
+    promotion: ChannelParticipantPromotion,
+    commitSocketMembership: () => void
+  ): JoinRoomResult {
+    const room = this.rooms.get(roomId);
+    if (room?.roomKind !== 'channel' || room.router.closed) {
+      this.securityDeny('authorization_denied', 'socket.join');
+      throw new Error('Channel provisional room is not available');
     }
 
+    const pending = room.pendingChannelParticipants.get(userId);
+    if (!pending) {
+      const admitted = room.participants.get(userId);
+      if (admitted?.socketId !== socketId) {
+        this.securityDeny('authorization_denied', 'socket.join');
+        throw new Error('Channel provisional participant is not owned by this socket');
+      }
+      commitSocketMembership();
+      return joinRoomResult(room, userId, admitted.mediaFrameCryptoVersion);
+    }
+    if (pending.socketId !== socketId) {
+      this.securityDeny('authorization_denied', 'socket.join');
+      throw new Error('Channel provisional participant is not owned by this socket');
+    }
+
+    const existing = room.participants.get(userId);
+    if (!existing && room.participants.size >= MAX_SERVER_VOICE_PARTICIPANTS) {
+      this.securityDeny('structural_limit_exceeded', 'socket.join');
+      throw new Error(`Voice participant limit reached (max ${MAX_SERVER_VOICE_PARTICIPANTS})`);
+    }
+
+    pending.username = promotion.identity.username;
+    pending.displayName = promotion.identity.displayName;
+    pending.avatarUrl = promotion.identity.avatarUrl;
+    pending.tier = promotion.entitlement.tier;
+    pending.allowedAudioTiers = [...promotion.entitlement.allowedAudioTiers];
+    pending.minPtimeMs = promotion.entitlement.minPtimeMs;
+    pending.maxManualBitrateBps = promotion.entitlement.maxManualBitrateBps;
+    pending.permissions = promotion.permissions;
+    pending.serverMuted = promotion.serverMuted;
+    pending.serverDeafened = promotion.serverDeafened;
+    pending.joinedAt = new Date();
+
+    // Socket.IO membership must succeed before this candidate becomes visible
+    // in an authoritative room projection.
+    commitSocketMembership();
+
+    const activeMediaFrameCryptoVersion = this.guardSecurityDecision(
+      () => admitMediaFrameCryptoVersion(room, pending.mediaFrameCryptoVersion),
+      'crypto_version_invalid',
+      'socket.join'
+    );
+
+    // A2, not A1, supplies every authority-derived channel property.
+    room.ownerTier = promotion.ownerTier;
     if (existing) {
       logger.warn('User already in room, cleaning up old session', {
         roomId,
@@ -1514,7 +1576,8 @@ export class RoomManager {
       this.removeParticipantSession(room, roomId, userId);
     }
 
-    room.participants.set(userId, participant);
+    room.pendingChannelParticipants.delete(userId);
+    room.participants.set(userId, pending);
 
     // E2EE media-epoch (keyId) sync nudge — incremented on every join so
     // receivers ratchet their per-frame keyId in lockstep. NOT a forward-secrecy
@@ -1526,7 +1589,7 @@ export class RoomManager {
     logger.info('Participant joined room', {
       roomId,
       userId,
-      username,
+      username: pending.username,
       participantCount: room.participants.size,
     });
 
@@ -1534,9 +1597,9 @@ export class RoomManager {
       type: 'user-joined',
       roomId,
       userId,
-      username,
-      displayName,
-      avatarUrl,
+      username: pending.username,
+      displayName: pending.displayName,
+      avatarUrl: pending.avatarUrl,
       e2eeEpoch: room.e2eeEpoch,
       callId: room.callId,
     });
@@ -1681,25 +1744,32 @@ export class RoomManager {
     if (!this.removeParticipantSession(room, roomId, userId)) return;
 
     // Tear down room if empty
-    if (room.participants.size === 0 && room.pendingDMParticipants.size === 0) {
+    if (
+      room.participants.size === 0 &&
+      room.pendingDMParticipants.size === 0 &&
+      room.pendingChannelParticipants.size === 0
+    ) {
       await this.closeRoom(roomId, room);
     }
   }
 
-  /** Remove an exact A1 DM candidate without creating authoritative lifecycle. */
+  /** Remove an exact A1 candidate without creating authoritative lifecycle. */
   async removeProvisionalParticipantIfSocketOwned(
     roomId: string,
     userId: string,
     socketId: string
   ): Promise<boolean> {
     const room = this.rooms.get(roomId);
-    const pending = room?.pendingDMParticipants.get(userId);
-    if (!room || pending?.participant.socketId !== socketId) return false;
-
-    room.pendingDMParticipants.delete(userId);
+    const pendingDM = room?.pendingDMParticipants.get(userId);
+    const pendingChannel = room?.pendingChannelParticipants.get(userId);
+    if (!room) return false;
+    if (pendingDM?.participant.socketId === socketId) room.pendingDMParticipants.delete(userId);
+    else if (pendingChannel?.socketId === socketId) room.pendingChannelParticipants.delete(userId);
+    else return false;
     if (
       room.participants.size === 0 &&
       room.pendingDMParticipants.size === 0 &&
+      room.pendingChannelParticipants.size === 0 &&
       room.callParticipantHistory.size === 0
     ) {
       await this.closeRoom(roomId, room, false);
@@ -1719,12 +1789,22 @@ export class RoomManager {
     socketId: string
   ): Promise<boolean> {
     const room = this.rooms.get(roomId);
-    const pending = room?.pendingDMParticipants.get(userId);
-    if (!room || pending?.participant.socketId !== socketId) return false;
-
-    room.pendingDMParticipants.delete(userId);
-    if (room.participants.size === 0 && room.pendingDMParticipants.size === 0) {
-      await this.closeRoom(roomId, room, room.callParticipantHistory.size > 0);
+    const pendingDM = room?.pendingDMParticipants.get(userId);
+    const pendingChannel = room?.pendingChannelParticipants.get(userId);
+    if (!room) return false;
+    if (pendingDM?.participant.socketId === socketId) room.pendingDMParticipants.delete(userId);
+    else if (pendingChannel?.socketId === socketId) room.pendingChannelParticipants.delete(userId);
+    else return false;
+    if (
+      room.participants.size === 0 &&
+      room.pendingDMParticipants.size === 0 &&
+      room.pendingChannelParticipants.size === 0
+    ) {
+      await this.closeRoom(
+        roomId,
+        room,
+        room.roomKind === 'dm' && room.callParticipantHistory.size > 0
+      );
     }
     return true;
   }
@@ -1740,10 +1820,23 @@ export class RoomManager {
   /** Exact-socket rollback for channel admission, including normal empty-room closure. */
   async leaveRoomIfSocketOwned(roomId: string, userId: string, socketId: string): Promise<boolean> {
     const room = this.rooms.get(roomId);
-    const participant = room?.participants.get(userId);
-    if (!room || participant?.socketId !== socketId) return false;
-    if (!this.removeParticipantSession(room, roomId, userId)) return false;
-    if (room.participants.size === 0 && room.pendingDMParticipants.size === 0) {
+    const pendingChannel = room?.pendingChannelParticipants.get(userId);
+    if (!room) return false;
+    if (pendingChannel?.socketId === socketId) room.pendingChannelParticipants.delete(userId);
+    else {
+      const participant = room.participants.get(userId);
+      if (
+        participant?.socketId !== socketId ||
+        !this.removeParticipantSession(room, roomId, userId)
+      ) {
+        return false;
+      }
+    }
+    if (
+      room.participants.size === 0 &&
+      room.pendingDMParticipants.size === 0 &&
+      room.pendingChannelParticipants.size === 0
+    ) {
       await this.closeRoom(roomId, room);
     }
     return true;
@@ -1759,7 +1852,8 @@ export class RoomManager {
       room?.roomKind !== 'dm' ||
       room.callId !== expectedCallId ||
       room.participants.size !== 0 ||
-      room.pendingDMParticipants.size !== 0
+      room.pendingDMParticipants.size !== 0 ||
+      room.pendingChannelParticipants.size !== 0
     ) {
       return undefined;
     }
@@ -3253,9 +3347,62 @@ export class RoomManager {
     return this.rooms.get(roomId)?.participants.get(userId);
   }
 
-  /** Exact pending DM socket lookup for control-plane force-disconnect enforcement. */
+  /** Exact pending-admission socket lookup for control-plane force-disconnect enforcement. */
   getProvisionalParticipantSocketId(roomId: string, userId: string): string | undefined {
-    return this.rooms.get(roomId)?.pendingDMParticipants.get(userId)?.participant.socketId;
+    const room = this.rooms.get(roomId);
+    return (
+      room?.pendingDMParticipants.get(userId)?.participant.socketId ??
+      room?.pendingChannelParticipants.get(userId)?.socketId
+    );
+  }
+
+  /** Exact provisional identity for a durable enforcement-session command. */
+  getProvisionalParticipant(
+    roomId: string,
+    userId: string
+  ):
+    | { socketId: string; credentialEpoch: string; voiceEnforcementSessionGeneration?: string }
+    | undefined {
+    const room = this.rooms.get(roomId);
+    const pending =
+      room?.pendingDMParticipants.get(userId)?.participant ??
+      room?.pendingChannelParticipants.get(userId);
+    return pending
+      ? {
+          socketId: pending.socketId,
+          credentialEpoch: pending.credentialEpoch,
+          voiceEnforcementSessionGeneration: pending.voiceEnforcementSessionGeneration,
+        }
+      : undefined;
+  }
+
+  /**
+   * Snapshots only sessions authenticated under one exact superseded credential
+   * epoch. Equality (rather than a current-epoch mismatch) keeps delayed
+   * commands from evicting a later reauthenticated session.
+   * Exact socket ownership is checked again by the eviction teardown, so a
+   * reconnect that replaced a candidate after this scan is never removed.
+   */
+  getSupersededCredentialEpochSessions(
+    userId: string,
+    supersededCredentialEpoch: string
+  ): Array<{ roomId: string; socketId: string; provisional: boolean }> {
+    const sessions: Array<{ roomId: string; socketId: string; provisional: boolean }> = [];
+    for (const [roomId, room] of this.rooms) {
+      const provisional = room.pendingDMParticipants.get(userId)?.participant;
+      if (provisional?.credentialEpoch === supersededCredentialEpoch) {
+        sessions.push({ roomId, socketId: provisional.socketId, provisional: true });
+      }
+      const channelProvisional = room.pendingChannelParticipants.get(userId);
+      if (channelProvisional?.credentialEpoch === supersededCredentialEpoch) {
+        sessions.push({ roomId, socketId: channelProvisional.socketId, provisional: true });
+      }
+      const participant = room.participants.get(userId);
+      if (participant?.credentialEpoch === supersededCredentialEpoch) {
+        sessions.push({ roomId, socketId: participant.socketId, provisional: false });
+      }
+    }
+    return sessions;
   }
 
   /** Find which room a user is in (by socketId) */

@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000144)
+## Existing Migrations (000001–000154)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -254,6 +254,16 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000142 | server_voice_terminal_outbox_ops_metrics | Admit aggregate Server Voice terminal-outbox lifecycle counters to the closed operations metric catalog (#3298) |
 | 000143 | add_server_voice_terminal_delivery_claim | Add recoverable worker claim metadata for terminal-outbox delivery attempts (#3298) |
 | 000144 | member_roles_server_composite_fk | Composite `(role_id, server_id)` FK binding a membership to a role on the SAME server, plus non-negative CHECKs on all five permission-bitfield columns. A cross-server row or a negative grant fails the migration closed rather than being deleted or rewritten; a negative deny is normalised (#2869) |
+| 000145 | serialize_dm_revocation_parent_lock | Serialize DM revocation and membership mutations on the conversation parent |
+| 000146 | add_dm_block_reconciliation | Add durable directional DM block reconciliation markers |
+| 000147 | add_dm_block_voice_ejections | Add durable DM voice-ejection delivery/retry outbox |
+| 000148 | add_dm_block_voice_ejection_generation | Add nullable generation column for DM voice-ejection callbacks |
+| 000149 | backfill_dm_block_voice_ejection_generation | Backfill and default DM voice-ejection generations |
+| 000150 | enforce_dm_block_voice_ejection_generation | Validate and enforce DM voice-ejection generations |
+| 000151 | add_credential_epoch_voice_ejections | Add durable exact-generation credential-epoch media-ejection outbox |
+| 000152 | extend_voice_lifecycle_rollout_grace | Extend the Server Voice lifecycle rollout grace; irreversible timestamp repair, with documented no-op down migration |
+| 000153 | guard_blocked_friendship_reconciliation | Abort compatibility retrofit when final blocked friendships remain |
+| 000154 | add_voice_enforcement_sessions | Add the durable exact-session voice-enforcement registry and rollout activation singleton |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use

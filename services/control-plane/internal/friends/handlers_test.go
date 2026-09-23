@@ -88,9 +88,20 @@ func TestBlockUser_Success(t *testing.T) {
 	).Scan(&status)
 	require.NoError(t, err)
 	assert.Equal(t, statusBlocked, status)
+
+	// 000152 rejects the block at commit time unless this transaction left the
+	// canonical pair's reconciliation obligation behind.
+	var reconciliationCount int
+	err = ts.DB.QueryRow(`
+		SELECT count(*) FROM dm_block_reconciliations
+		WHERE user_a_id = LEAST($1::uuid, $2::uuid)
+		  AND user_b_id = GREATEST($1::uuid, $2::uuid)
+	`, user1.ID, user2.ID).Scan(&reconciliationCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, reconciliationCount)
 }
 
-func TestBlockUser_RecordsRevocation(t *testing.T) {
+func TestBlockUser_DefersRevocationUntilSuccessorClaim(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "blocker2")
 	user2 := ts.CreateTestUser(t, "blocked2")
@@ -102,21 +113,22 @@ func TestBlockUser_RecordsRevocation(t *testing.T) {
 	w := ts.DoRequest("POST", pathFriendsPrefix+user2.ID+pathBlock, nil, testhelpers.AuthHeaders(user1.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	// Verify revocation record
-	var reason, revokedBy string
-	var revokedEpoch, successorEpoch int
-	err := ts.DB.QueryRow(
-		`SELECT revoked_epoch, successor_epoch, reason, revoked_by FROM dm_key_revocations WHERE conversation_id = $1`,
-		convID,
-	).Scan(&revokedEpoch, &successorEpoch, &reason, &revokedBy)
+	var revocationCount int
+	err := ts.DB.QueryRow(`SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&revocationCount)
 	require.NoError(t, err)
-	assert.Equal(t, 1, revokedEpoch)
-	assert.Equal(t, 2, successorEpoch)
-	assert.Equal(t, "user_blocked", reason)
-	assert.Equal(t, user1.ID, revokedBy)
+	assert.Zero(t, revocationCount, "the block must not revoke an epoch before successor wraps exist")
+
+	var reconciliationCount int
+	err = ts.DB.QueryRow(`
+		SELECT count(*) FROM dm_block_reconciliations
+		WHERE user_a_id = LEAST($1::uuid, $2::uuid)
+		  AND user_b_id = GREATEST($1::uuid, $2::uuid)
+	`, user1.ID, user2.ID).Scan(&reconciliationCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, reconciliationCount)
 }
 
-func TestBlockUser_DeletesBlockedUserKey(t *testing.T) {
+func TestBlockUser_DefersBlockedUserKeyRemoval(t *testing.T) {
 	ts := setupTS(t)
 	user1 := ts.CreateTestUser(t, "blocker3")
 	user2 := ts.CreateTestUser(t, "blocked3")
@@ -128,22 +140,37 @@ func TestBlockUser_DeletesBlockedUserKey(t *testing.T) {
 	w := ts.DoRequest("POST", pathFriendsPrefix+user2.ID+pathBlock, nil, testhelpers.AuthHeaders(user1.AccessToken))
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	// Blocked user's key at version 1 should be deleted
+	// The durable reconciler emits a cue; only the successor claim may atomically
+	// write the ledger and replace this key material.
 	var keyCount int
 	err := ts.DB.QueryRow(
 		`SELECT COUNT(*) FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2`,
 		convID, user2.ID,
 	).Scan(&keyCount)
 	require.NoError(t, err)
-	assert.Equal(t, 0, keyCount, "blocked user's key should be deleted")
+	assert.Equal(t, 1, keyCount, "the block must not delete a key before successor wraps exist")
 
-	// Blocker's key should still exist
+	// The blocker's current key also remains readable until the successor claim.
 	err = ts.DB.QueryRow(
 		`SELECT COUNT(*) FROM dm_channel_keys WHERE conversation_id = $1 AND user_id = $2`,
 		convID, user1.ID,
 	).Scan(&keyCount)
 	require.NoError(t, err)
-	assert.Equal(t, 1, keyCount, "blocker's key should remain")
+	assert.Equal(t, 1, keyCount)
+
+	var revocationCount int
+	err = ts.DB.QueryRow(`SELECT count(*) FROM dm_key_revocations WHERE conversation_id = $1`, convID).Scan(&revocationCount)
+	require.NoError(t, err)
+	assert.Zero(t, revocationCount, "the block must not revoke an epoch before successor wraps exist")
+
+	var reconciliationCount int
+	err = ts.DB.QueryRow(`
+		SELECT count(*) FROM dm_block_reconciliations
+		WHERE user_a_id = LEAST($1::uuid, $2::uuid)
+		  AND user_b_id = GREATEST($1::uuid, $2::uuid)
+	`, user1.ID, user2.ID).Scan(&reconciliationCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, reconciliationCount)
 }
 
 func TestBlockUser_NoDMConversation(t *testing.T) {

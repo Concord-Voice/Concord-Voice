@@ -39,7 +39,7 @@ import (
 // (*Executor)(nil)`), so an in-package `package rbac` test file importing
 // voicepresence is an import cycle and does not compile. `package rbac` is
 // forced because the Task-4 cascade suite drives unexported handler methods
-// (syncCategoryOverridesToChannels, invalidateSyncedChannelCaches).
+// (the live category override paths and their exact-set cache invalidation).
 //
 // What the harness substitutes is ONLY the executor's own glue — its bounded
 // dispatch queue and failure classification, which internal/voicepresence/
@@ -929,6 +929,12 @@ func (e *rbacPresenceEnv) refreshCount(senderID string) int {
 		}
 	}
 	return count
+}
+
+func (e *rbacPresenceEnv) resetRefreshes() {
+	e.recheck.mu.Lock()
+	defer e.recheck.mu.Unlock()
+	e.recheck.refreshes = nil
 }
 
 func (e *rbacPresenceEnv) refreshOrderIsUUIDSorted() bool {

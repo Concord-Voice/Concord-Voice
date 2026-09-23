@@ -1442,7 +1442,8 @@ export const KeyNeededSchema = z.object({
  * (`internal/friends/handlers.go`, no channel_id — the handler's early return
  * makes that branch a no-op), group-DM membership changes
  * (`internal/dm/handlers.go` `dmKeyRevocationEvent`, reasons member_added /
- * member_removed / member_left — a CUE: no ledger row exists yet, the
+ * member_removed / member_left; `internal/dmblock`, reason user_blocked — a
+ * CUE: no ledger row exists yet, the
  * successor claim the coordinator makes writes it), and the DM manual rotation
  * (`internal/channels/dm_rotation.go`, reason manual_rotation, after commit).
  */

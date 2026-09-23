@@ -18,6 +18,7 @@ import (
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
+	"github.com/lib/pq"
 )
 
 // Rotation is a committed channel-key outcome ready for broadcast.
@@ -35,6 +36,12 @@ type Rotation struct {
 // committed. The websocket package supplies the production adapter.
 type Broadcaster func(Rotation)
 
+// ContextBroadcaster delivers a committed key-revocation outcome without
+// outliving the caller's lifecycle deadline.
+type ContextBroadcaster func(context.Context, Rotation) error
+
+var errContextBroadcasterUnavailable = errors.New("context key-revocation broadcaster unavailable")
+
 // InitialDistributorChecker verifies that a fenced creator can still distribute
 // a channel key within the revocation transaction.
 type InitialDistributorChecker func(context.Context, *sql.Tx, string, string, string) (bool, error)
@@ -43,15 +50,41 @@ type InitialDistributorChecker func(context.Context, *sql.Tx, string, string, st
 // broadcast the rotation. It is constructed once per consuming handler and is
 // safe to share (it holds no mutable state of its own).
 type Rotator struct {
-	db            *sql.DB
-	log           *logger.Logger
-	canDistribute InitialDistributorChecker
-	broadcastFn   Broadcaster
+	db                 *sql.DB
+	log                *logger.Logger
+	canDistribute      InitialDistributorChecker
+	broadcastFn        Broadcaster
+	contextBroadcastFn ContextBroadcaster
 }
 
 // NewRotator builds a Rotator bound to a DB, logger, and committed-event broadcaster.
 func NewRotator(db *sql.DB, log *logger.Logger, canDistribute InitialDistributorChecker, broadcastFn Broadcaster) *Rotator {
 	return &Rotator{db: db, log: log, canDistribute: canDistribute, broadcastFn: broadcastFn}
+}
+
+// NewContextRotator builds the deadline-aware variant used only by bounded
+// cleanup flows. Existing callers keep NewRotator and its Background wrappers.
+func NewContextRotator(db *sql.DB, log *logger.Logger, canDistribute InitialDistributorChecker, broadcastFn ContextBroadcaster) *Rotator {
+	return &Rotator{db: db, log: log, canDistribute: canDistribute, contextBroadcastFn: broadcastFn}
+}
+
+// RecordKeyRevocationTx records a key transition in the caller's existing
+// transaction so authorization state can commit atomically with its revocation.
+func (r *Rotator) RecordKeyRevocationTx(ctx context.Context, tx *sql.Tx, channelID, reason, actorID, removedUserID string) (*Rotation, error) {
+	return RecordKeyRevocationTx(ctx, tx, r.canDistribute, channelID, reason, actorID, removedUserID)
+}
+
+// RecordKeyRevocationAndPurgeUserTx keeps a revoked user's wrapped channel
+// material in the same transaction as the epoch transition. It is shared by
+// temporary-access cleanup and a permanent override superseding that access.
+func (r *Rotator) RecordKeyRevocationAndPurgeUserTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	channelID, reason, actorID, removedUserID string,
+) (*Rotation, error) {
+	return RecordKeyRevocationAndPurgeUserTx(
+		ctx, tx, r.canDistribute, channelID, reason, actorID, removedUserID,
+	)
 }
 
 // RecordKeyRevocationTx serializes an epoch transition with the channel and its
@@ -98,6 +131,62 @@ func RecordKeyRevocationTx(ctx context.Context, tx *sql.Tx, canDistribute Initia
 	rotation.RevokedEpoch = maxEpoch
 	rotation.SuccessorEpoch = maxEpoch + 1
 	return insertKeyRevocationTx(ctx, tx, rotation, actorID)
+}
+
+// RecordKeyRevocationAndPurgeUserTx records a channel epoch transition and
+// deletes the revoked user's wrapped key and pending request atomically.
+func RecordKeyRevocationAndPurgeUserTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	canDistribute InitialDistributorChecker,
+	channelID, reason, actorID, removedUserID string,
+) (*Rotation, error) {
+	rotation, err := RecordKeyRevocationTx(
+		ctx, tx, canDistribute, channelID, reason, actorID, removedUserID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_keys WHERE user_id = $1 AND channel_id = $2`, removedUserID, channelID); err != nil {
+		return nil, fmt.Errorf("purge revoked user channel keys: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pending_key_requests WHERE user_id = $1 AND channel_id = $2`, removedUserID, channelID); err != nil {
+		return nil, fmt.Errorf("purge revoked user pending key requests: %w", err)
+	}
+	return rotation, nil
+}
+
+// RecordKeyRevocationAndPurgeUsersTx records one channel epoch transition and
+// deletes every denied durable recipient's wrapped key and pending request.
+// Callers pass a bounded, deduplicated recipient set captured while the
+// channel row is locked, so one authority change advances one epoch.
+func RecordKeyRevocationAndPurgeUsersTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	canDistribute InitialDistributorChecker,
+	channelID, reason, actorID string,
+	removedUserIDs []string,
+) (*Rotation, error) {
+	rotation, err := RecordKeyRevocationTx(ctx, tx, canDistribute, channelID, reason, actorID, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(removedUserIDs) == 0 {
+		return rotation, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM channel_keys
+		WHERE channel_id = $1 AND user_id = ANY($2::uuid[])`, channelID, pq.Array(removedUserIDs)); err != nil {
+		return nil, fmt.Errorf("purge denied users channel keys: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM pending_key_requests
+		WHERE channel_id = $1 AND user_id = ANY($2::uuid[])`, channelID, pq.Array(removedUserIDs)); err != nil {
+		return nil, fmt.Errorf("purge denied users pending key requests: %w", err)
+	}
+	return rotation, nil
 }
 
 func recordInitialKeyRevocationTx(ctx context.Context, tx *sql.Tx, canDistribute InitialDistributorChecker, rotation Rotation, actorID string, creatorID sql.NullString, markerEpoch int) (*Rotation, error) {
@@ -295,10 +384,9 @@ func (r *Rotator) revokeChannelKey(ctx context.Context, channelID, reason, actor
 		r.log.Error("Failed to record key revocation", "error", err)
 		return
 	}
-	if rotation == nil {
-		return
+	if rotation != nil {
+		r.broadcast(*rotation)
 	}
-	r.broadcast(*rotation)
 }
 
 func (r *Rotator) recordRotation(ctx context.Context, channelID, reason, actorID, removedUserID string) (*Rotation, error) {
@@ -325,4 +413,14 @@ func (r *Rotator) broadcast(rotation Rotation) {
 	if r.broadcastFn != nil {
 		r.broadcastFn(rotation)
 	}
+}
+
+// BroadcastContext emits a committed rotation through the configured bounded
+// broadcaster. It fails closed rather than falling back to an unbounded legacy
+// broadcaster.
+func (r *Rotator) BroadcastContext(ctx context.Context, rotation Rotation) error {
+	if r.contextBroadcastFn == nil {
+		return errContextBroadcasterUnavailable
+	}
+	return r.contextBroadcastFn(ctx, rotation)
 }

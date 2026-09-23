@@ -58,7 +58,6 @@ import {
   ABSOLUTE_AUDIO_LAST_N_CEILING,
   SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
   parseMediaFrameCryptoVersion,
-  CryptoVersionMismatchError,
   SCREEN_GATE_OFF_DEBOUNCE_MS,
   FREE_MEDIA_ENTITLEMENT,
   MAX_RECV_TRANSPORTS_PER_PARTICIPANT,
@@ -156,6 +155,23 @@ function promoteDMParticipant(
   );
 }
 
+function promoteChannelParticipant(
+  manager: RoomManager,
+  roomId: string,
+  userId: string,
+  socketId: string,
+  promotion: {
+    identity: { username: string; displayName?: string; avatarUrl?: string };
+    entitlement: TestDMParticipantPromotion['entitlement'];
+    permissions?: bigint;
+    serverMuted: boolean;
+    serverDeafened: boolean;
+    ownerTier?: string;
+  }
+): JoinRoomResult {
+  return manager.promoteChannelParticipant(roomId, userId, socketId, promotion, () => undefined);
+}
+
 async function removeProvisionalParticipantIfSocketOwned(
   manager: RoomManager,
   roomId: string,
@@ -198,7 +214,15 @@ async function joinRoomWithSupportedCrypto(
     mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
     roomContext: effectiveRoomContext,
   });
-  if (effectiveRoomContext?.roomKind !== 'dm') return result;
+  if (effectiveRoomContext?.roomKind !== 'dm') {
+    return promoteChannelParticipant(manager, roomId, userId, socketId, {
+      identity,
+      entitlement: entitlement ?? { ...FREE_MEDIA_ENTITLEMENT },
+      serverMuted: false,
+      serverDeafened: false,
+      ownerTier: effectiveRoomContext?.ownerTier,
+    });
+  }
 
   return promoteDMParticipant(manager, roomId, userId, socketId, effectiveRoomContext.callId, {
     callId: effectiveRoomContext.callId,
@@ -964,6 +988,82 @@ describe('RoomManager', () => {
       });
     });
 
+    it('does not let a revoked stale channel candidate evict a newer admitted session (#3140)', async () => {
+      const roomId = 'channel-credential-race';
+      const events: RoomEvent[] = [];
+      manager.onEvent((event) => events.push(event));
+
+      await manager.joinRoom(roomId, 'u-1', 'sock-stale', { username: 'stale-a1' }, undefined, {
+        credentialEpoch: 'revoked',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+      });
+      await manager.joinRoom(roomId, 'u-1', 'sock-current', { username: 'current-a1' }, undefined, {
+        credentialEpoch: 'current',
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+      });
+      promoteChannelParticipant(manager, roomId, 'u-1', 'sock-current', {
+        identity: { username: 'current-a2' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
+      });
+
+      expect(() =>
+        promoteChannelParticipant(manager, roomId, 'u-1', 'sock-stale', {
+          identity: { username: 'stale-a2' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+        })
+      ).toThrow('Channel provisional participant is not owned by this socket');
+
+      expect(manager.getParticipant(roomId, 'u-1')).toMatchObject({
+        socketId: 'sock-current',
+        credentialEpoch: 'current',
+        username: 'current-a2',
+      });
+      expect(events.filter((event) => event.type === 'user-left')).toHaveLength(0);
+      expect(events.filter((event) => event.type === 'user-joined')).toHaveLength(1);
+    });
+
+    it('does not seed channel crypto before Socket.IO membership commits (#3140)', async () => {
+      await manager.joinRoom(
+        'channel-adapter-failure',
+        'u-1',
+        'sock-current',
+        { username: 'a1' },
+        undefined,
+        {
+          mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+          roomContext: { roomKind: 'channel' },
+        }
+      );
+      const room = manager.getRoom('channel-adapter-failure')!;
+      const adapterFailure = new Error('socket adapter failed');
+
+      expect(() =>
+        manager.promoteChannelParticipant(
+          'channel-adapter-failure',
+          'u-1',
+          'sock-current',
+          {
+            identity: { username: 'a2' },
+            entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+            serverMuted: false,
+            serverDeafened: false,
+          },
+          () => {
+            throw adapterFailure;
+          }
+        )
+      ).toThrow(adapterFailure);
+      expect(room.mediaFrameCryptoVersion).toBeNull();
+      expect(room.participants).toHaveLength(0);
+      expect(room.pendingChannelParticipants.get('u-1')?.socketId).toBe('sock-current');
+    });
+
     it('discards only the exact empty unadmitted DM room without a terminal event', async () => {
       const callId = '11111111-1111-4111-8111-111111111111';
       const events: RoomEvent[] = [];
@@ -1255,18 +1355,32 @@ describe('RoomManager', () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 3,
       });
+      promoteChannelParticipant(manager, 'r', 'u1', 's1', {
+        identity: { username: 'a' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
+      });
       const room = manager.getRoom('r')!;
       const epochBefore = room.e2eeEpoch;
 
-      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+      await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
         mediaFrameCryptoVersion: 5,
       });
-      await expect(promise).rejects.toMatchObject({
-        code: 'crypto_version_mismatch',
-        roomVersion: 3,
-        joinVersion: 5,
-      });
-      await expect(promise).rejects.toBeInstanceOf(CryptoVersionMismatchError);
+      expect(() =>
+        promoteChannelParticipant(manager, 'r', 'u2', 's2', {
+          identity: { username: 'b' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+        })
+      ).toThrow(
+        expect.objectContaining({
+          code: 'crypto_version_mismatch',
+          roomVersion: 3,
+          joinVersion: 5,
+        })
+      );
 
       expect(room.mediaFrameCryptoVersion).toBe(3);
       expect(room.participants.has('u2')).toBe(false);
@@ -1277,8 +1391,20 @@ describe('RoomManager', () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 5,
       });
-      const res = await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+      promoteChannelParticipant(manager, 'r', 'u1', 's1', {
+        identity: { username: 'a' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
+      });
+      await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
         mediaFrameCryptoVersion: 5,
+      });
+      const res = promoteChannelParticipant(manager, 'r', 'u2', 's2', {
+        identity: { username: 'b' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
       });
 
       expect(res.mediaFrameCryptoVersion).toBe(5);
@@ -1289,18 +1415,32 @@ describe('RoomManager', () => {
       await manager.joinRoom('r', 'u1', 's1', { username: 'a' }, undefined, {
         mediaFrameCryptoVersion: 5,
       });
+      promoteChannelParticipant(manager, 'r', 'u1', 's1', {
+        identity: { username: 'a' },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        serverMuted: false,
+        serverDeafened: false,
+      });
       const room = manager.getRoom('r')!;
       const epochBefore = room.e2eeEpoch;
 
-      const promise = manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
+      await manager.joinRoom('r', 'u2', 's2', { username: 'b' }, undefined, {
         mediaFrameCryptoVersion: 3,
       });
-      await expect(promise).rejects.toMatchObject({
-        code: 'crypto_version_mismatch',
-        roomVersion: 5,
-        joinVersion: 3,
-      });
-      await expect(promise).rejects.toBeInstanceOf(CryptoVersionMismatchError);
+      expect(() =>
+        promoteChannelParticipant(manager, 'r', 'u2', 's2', {
+          identity: { username: 'b' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+        })
+      ).toThrow(
+        expect.objectContaining({
+          code: 'crypto_version_mismatch',
+          roomVersion: 5,
+          joinVersion: 3,
+        })
+      );
 
       // Gate must fire BEFORE participant storage / epoch mutation.
       expect(room.mediaFrameCryptoVersion).toBe(5);
@@ -2864,10 +3004,17 @@ describe('RoomManager', () => {
     const PERM_VOICE = PERM_VIEW_VOICE | PERM_JOIN_VOICE;
 
     async function joinChannelWithPerms(userId: string, socketId: string, permissions: bigint) {
-      return manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
+      await manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
         mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
         roomContext: { roomKind: 'channel' },
         permissions,
+      });
+      return promoteChannelParticipant(manager, 'room-1', userId, socketId, {
+        identity: { username: userId },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        permissions,
+        serverMuted: false,
+        serverDeafened: false,
       });
     }
 
@@ -3185,10 +3332,17 @@ describe('RoomManager', () => {
     const PERM_VOICE = PERM_VIEW_VOICE | PERM_JOIN_VOICE;
 
     async function joinChannelWithPerms(userId: string, socketId: string, permissions: bigint) {
-      return manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
+      await manager.joinRoom('room-1', userId, socketId, { username: userId }, undefined, {
         mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
         roomContext: { roomKind: 'channel' },
         permissions,
+      });
+      return promoteChannelParticipant(manager, 'room-1', userId, socketId, {
+        identity: { username: userId },
+        entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+        permissions,
+        serverMuted: false,
+        serverDeafened: false,
       });
     }
 

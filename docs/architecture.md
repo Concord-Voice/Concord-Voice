@@ -413,6 +413,16 @@ erDiagram
     }
 ```
 
+**Durable DM-block and credential-epoch enforcement:**
+
+DM-block reconciliation records directional obligations under the canonical
+subject and conversation locks. Membership is re-read before an obligation is
+acknowledged, and stale callbacks are fenced by the captured generation. Voice
+ejection delivery and credential-epoch ejection are independent durable outboxes;
+negative, timeout, and no-responder results remain retryable. The reconciliation
+worker has no WebSocket dependency and emits effects only after the guarded
+transaction commits.
+
 **Messaging & DM system (the 8-table DM core plus later message extensions):**
 
 ```mermaid
@@ -606,7 +616,7 @@ erDiagram
 | MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045)                                                        |
 | Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087); `activity_settings_pending_cleanups` (000098, durable Rich Presence policy-cleanup evidence) |
 | Activity history    | `presence_history` (000087, category-neutral self-owned interval ledger)                                                                                                                                                                                                                                     |
-| Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133; 000140 adds `server_voice_terminal_outbox` for retrying stale-leave notifications through local Hub admission, 000141 adds its account-erasure index, 000142 admits six aggregate operations counters, and 000143 adds its recoverable delivery claim. |
+| Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133; 000140 adds `server_voice_terminal_outbox` for retrying stale-leave notifications through local Hub admission, 000141 adds its account-erasure index, 000142 admits six aggregate operations counters, and 000143 adds its recoverable delivery claim. DM block enforcement adds `dm_block_reconciliations` (000146), `dm_block_voice_ejections` (000147), and `credential_epoch_voice_ejections` (000151). Durable exact-session voice enforcement adds `voice_enforcement_sessions` and its rollout singleton (000154). |
 | Media                | `media_files` (000042)                                                                                                                                                                                                                                                                                        |
 | Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047)                                                                                                                                                                                                                            |
 | Compliance           | `audit_log` (000035); `account_deletions` (000059); `tier1_erasure_delete_obligations` (000117, 000118); immutable profile generations, slots, and pre-PUT intents (000119–000126)                                                                                                                                                  |
@@ -628,6 +638,7 @@ erDiagram
 > - migrations 000132–000133 added the database-observed Server Voice participant lease used by the bounded active-presence reconciliation pass
 > - migration 000134 repairs far-future DM voice lifecycle stamps; migrations 000135–000136 add the camera-layering and presence-liveness operations metrics, migration 000137 adds durable expiration-policy system-message rows, and migrations 000138–000139 add per-participant DM list hides, Clear-history provenance, and the concurrent partial index supporting hidden-participant lookups
 > - migrations 000140–000143 add the guarded Server Voice terminal outbox, its account-erasure index, six aggregate operations counters, a recoverable delivery claim, and retry delivery through local Hub admission; account erasure or channel deletion cancels a retained user-owned obligation
+> - migration 000144 binds member roles to their server; migrations 000145–000153 serialize DM revocation, add durable block and media-ejection reconciliation, fence delivery generations, add credential-epoch ejections and rollout grace, and validate blocked-friendship compatibility
 
 DM participant visibility is private to the requesting account. `dm_participants.hidden_at`
 removes one participant's conversation from list reads without changing read state;
@@ -717,7 +728,7 @@ The SFU forwards opaque, E2EE-encrypted RTP frames (see [Media E2EE](#media-e2ee
 - `MediasoupService` (`src/lib/mediasoup.ts`) owns **workers and routers only** — `init()` creates the worker pool, `getOrCreateRouter(roomId)` / `removeRouter(roomId)` manage one router per room. It holds no participant state.
 - `RoomManager` (`src/lib/roomManager.ts`) is **authoritative for everything else** — `joinRoom` / `leaveRoom`, `createTransport`, `connectTransport`, `closeRecvTransport`, `produce` / `consume`, producer/consumer pause/resume/close, and the server-mute/deafen methods. `MediasoupService` is injected as a dependency. The `Room` struct carries `{ id, router, audioLevelObserver, participants, createdAt, e2eeEpoch, mediaFrameCryptoVersion }` — **no `isEncrypted` field**.
 
-**Transport encryption is structurally mandatory.** Every transport comes from `router.createWebRtcTransport`, which is DTLS-SRTP by construction. There is no `createPlainRtpTransport` path and no per-room encryption flag anywhere in `src/`. The `e2eeEpoch` counter increments on every authoritative participant join/leave to synchronize the media keyId ratchet. A DM A1 candidate remains provisional, and only successful A2 promotion advances the epoch. Channel-key rotation/re-wrap, not this counter, is the membership access boundary.
+**Transport encryption is structurally mandatory.** Every transport comes from `router.createWebRtcTransport`, which is DTLS-SRTP by construction. There is no `createPlainRtpTransport` path and no per-room encryption flag anywhere in `src/`. The `e2eeEpoch` counter increments on every authoritative participant join/leave to synchronize the media keyId ratchet. Channel and DM A1 candidates remain provisional, and only successful A2 promotion advances the epoch. Channel-key rotation/re-wrap, not this counter, is the membership access boundary.
 
 **Origin gate.** The Socket.IO `cors.origin` callback (`src/lib/originGate.ts`) maintains semantic parity with the control-plane CORS middleware:
 
@@ -731,7 +742,7 @@ The SFU forwards opaque, E2EE-encrypted RTP frames (see [Media E2EE](#media-e2ee
 
 Room broadcasts include `participant-testing-changed` and `camera-layering-gate`. The server targets `screen-layering-gate` only to the sharer.
 
-`join-room` carries `mediaFrameCryptoVersion`. An empty channel room seeds from its first accepted joiner. An empty DM room seeds only when an A2-approved candidate is promoted. Every later authoritative join must exactly match the occupied room. Both higher and lower mismatches receive the same typed `CryptoVersionMismatchError`. The server never ratchets a live room underneath existing peers.
+`join-room` carries `mediaFrameCryptoVersion`. A channel A1 candidate lives only in `pendingChannelParticipants`; A2 reauthorizes its credential epoch and membership before one synchronous promotion applies refreshed authority, commits Socket.IO membership, and may replace an admitted same-user session. An empty channel or DM room seeds its crypto version only when an A2-approved candidate is promoted. Every later authoritative join must exactly match the occupied room. Both higher and lower mismatches receive the same typed `CryptoVersionMismatchError`. The server never ratchets a live room underneath existing peers.
 
 `join-room` participant summaries carry `isTesting`, so clients can render in-call device tests. The peer-facing `user-joined` event carries identity, epoch, and optional authoritative `isDeafened` / `isTesting` values. Desktop merges only present booleans, so a no-leave reconnect clears stale flags without clobbering legacy or consume-race media state.
 
@@ -1045,6 +1056,42 @@ Rich Presence reconnect. Permission batches coalesce by channel and drain in
 keyed-FIFO order so requeued work cannot starve another channel. Private Call's
 255-participant lifecycle bound and the 512-candidate Rich Presence reconnect
 snapshot bound remain independent.
+
+Voice enforcement is addressed to the exact admitted socket, not merely to a
+user or room. Migration 000154 stores each A2-approved session's immutable
+`session_generation`, media-process `node_boot_id`, room and user identity,
+credential epoch, and Socket.IO ID. Registration uses the same credential and
+DM membership/block locks as A2, so the registry row is evidence of admission,
+not a parallel admission path. The control plane retains the existing durable
+DM-block and credential-epoch parent obligations, then publishes a signed
+command to the exact `node_boot_id`. The media plane proves the full immutable
+identity, tears down the local participant before disconnecting its socket, and
+returns a signed acknowledgement plus a body-bound release. A transient release
+failure after terminal local teardown is retained by the media process in a
+bounded exact-session retry queue and retried after verified health recovery. A
+parent obligation is settled only after a rescan finds no matching registry
+rows; a non-owner or stale reply is never treated as completion. Rows have no
+TTL or lease-based auto-pruning: a crash or restart can still leave evidence
+pending until the node/container recovery is human-verified.
+
+The media process also has an expired-by-default authority lease. Every 10
+seconds it sends a body-bound, HMAC-authenticated bootstrap to
+`POST /api/v1/internal/voice/enforcement/health` (maximum body: 4 KiB). The
+control plane publishes a challenge to the same exact
+`voice.enforce.session.<node_boot_id>` NATS request subscriber; only a verified
+challenge receipt renews the monotonic 30-second lease. Expiry closes local
+rooms and disconnects sockets, but never releases registry rows or settles a
+parent obligation on timer inference. `/readyz` reports protocol 3 only while
+the lease and exact subscriber are healthy.
+
+The registry is introduced in compatibility mode. Operators drain the old media
+plane, start the new binary, and require its `GET /readyz` response to be
+`200 {"ready":true,"voiceEnforcementProtocol":3}` before recording the
+activation receipt. The local `voice-enforcement-rollout activate
+--confirm-drained` command is the only activation mutation; deactivation is
+required before an old media image is restored. Once active, media admission
+also requires the signed node capability proof, preventing an old binary from
+creating an unregistered session.
 
 Queued Server Voice frames take final local-Hub admission atomically with
 authorization invalidation. Any overlap with membership, authority,

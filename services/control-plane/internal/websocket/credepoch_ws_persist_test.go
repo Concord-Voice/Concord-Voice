@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/credepoch"
+	dbtest "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
 )
 
 // #2201 (Codex #2397 review): a WS message frame carrying a stale credential
@@ -337,8 +338,13 @@ func TestPersistDMMessage_StaleEpochRejected(t *testing.T) {
 		VALUES ($1, $2, $3, $4, 'newEpoch', true, true)`,
 		userID.String(), "wsstaledm@test.concord.chat", "wsstaledm", wsPersistArgonHash)
 	require.NoError(t, err)
+	conversationID := uuid.New()
+	_, err = db.Exec(`INSERT INTO dm_conversations (id, is_group, is_personal, created_by) VALUES ($1, true, false, $2)`, conversationID, userID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO dm_participants (conversation_id, user_id) VALUES ($1, $2)`, conversationID, userID)
+	require.NoError(t, err)
 
-	_, _, _, _, gErr := hub.persistDMMessage(uuid.New(), userID, "staleEpoch", &dmMessageInput{
+	_, _, _, _, gErr := hub.persistDMMessage(conversationID, userID, "staleEpoch", &dmMessageInput{
 		content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user",
 	})
 	assert.ErrorIs(t, gErr, credepoch.ErrEpochMismatch, "stale-epoch WS DM send must fail closed")
@@ -381,4 +387,102 @@ func TestPersistDMMessage_AttachmentLockHonorsTimeout(t *testing.T) {
 	var count int
 	require.NoError(t, setup.db.QueryRow(`SELECT count(*) FROM dm_messages WHERE conversation_id = $1`, setup.convID).Scan(&count))
 	assert.Zero(t, count, "a timed-out DM attachment link must roll back its message")
+}
+
+func TestPersistDMMessageMembershipRemovalWinsRaceWithoutInsert(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	conversationID := uuid.MustParse(setup.convID)
+
+	removalTx, err := setup.db.Begin()
+	require.NoError(t, err)
+	defer func() { _ = removalTx.Rollback() }()
+	var removalTxID int64
+	require.NoError(t, removalTx.QueryRow(`SELECT txid_current()`).Scan(&removalTxID))
+	var lockedUser uuid.UUID
+	require.NoError(t, removalTx.QueryRow(
+		`SELECT user_id FROM dm_participants WHERE conversation_id = $1 AND user_id = $2 FOR UPDATE`,
+		conversationID, setup.user1,
+	).Scan(&lockedUser))
+
+	persistResult := make(chan error, 1)
+	go func() {
+		_, _, _, _, persistErr := setup.hub.persistDMMessage(
+			conversationID,
+			setup.user1,
+			"",
+			&dmMessageInput{content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user"},
+		)
+		persistResult <- persistErr
+	}()
+
+	dbtest.WaitForRowLockWaiter(t, setup.db, removalTxID)
+
+	_, err = removalTx.Exec(
+		`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`,
+		conversationID, setup.user1,
+	)
+	require.NoError(t, err)
+	require.NoError(t, removalTx.Commit())
+
+	select {
+	case persistErr := <-persistResult:
+		assert.ErrorIs(t, persistErr, errDMNotParticipant)
+	case <-time.After(3 * time.Second):
+		t.Fatal("DM writer did not resume after participant removal committed")
+	}
+
+	var inserted int
+	require.NoError(t, setup.db.QueryRow(
+		`SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $1 AND user_id = $2`,
+		conversationID, setup.user1,
+	).Scan(&inserted))
+	assert.Zero(t, inserted, "a removal that wins the lock race must prevent the DM insert")
+}
+
+func TestPersistDMMessageRetriesMembershipSnapshotWithoutDuplicateInsert(t *testing.T) {
+	setup := setupEpochTest(t, false, false)
+	conversationID := uuid.MustParse(setup.convID)
+
+	removalTx, err := setup.db.Begin()
+	require.NoError(t, err)
+	defer func() { _ = removalTx.Rollback() }()
+	var removalTxID int64
+	require.NoError(t, removalTx.QueryRow(`SELECT txid_current()`).Scan(&removalTxID))
+	var lockedUser uuid.UUID
+	require.NoError(t, removalTx.QueryRow(
+		`SELECT id FROM users WHERE id = $1 FOR UPDATE`, setup.user2,
+	).Scan(&lockedUser))
+
+	persistResult := make(chan error, 1)
+	go func() {
+		_, _, _, _, persistErr := setup.hub.persistDMMessage(
+			conversationID,
+			setup.user1,
+			"",
+			&dmMessageInput{content: "Y2lwaGVydGV4dA==", keyVersion: 1, msgType: "user"},
+		)
+		persistResult <- persistErr
+	}()
+
+	dbtest.WaitForRowLockWaiter(t, setup.db, removalTxID)
+	_, err = removalTx.Exec(
+		`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`,
+		conversationID, setup.user2,
+	)
+	require.NoError(t, err)
+	require.NoError(t, removalTx.Commit())
+
+	select {
+	case persistErr := <-persistResult:
+		require.NoError(t, persistErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("DM writer did not retry after membership snapshot drift")
+	}
+
+	var inserted int
+	require.NoError(t, setup.db.QueryRow(
+		`SELECT COUNT(*) FROM dm_messages WHERE conversation_id = $1 AND user_id = $2`,
+		conversationID, setup.user1,
+	).Scan(&inserted))
+	assert.Equal(t, 1, inserted, "the rolled-back first attempt must not duplicate the persisted DM message")
 }

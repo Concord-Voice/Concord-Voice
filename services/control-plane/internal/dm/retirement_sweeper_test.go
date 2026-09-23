@@ -454,7 +454,13 @@ func TestRetirementSweeperDefersWhenUngatedVoiceCandidateAppearsAfterUsersLock(t
 	insertDMVoiceParticipant(t, db, conversationID)
 	sweeper := newRetirementSweeperForTest(t, db, newRetirementRail(t, db), logger.NewWithWriter(io.Discard))
 	sweeper.afterUsersLockHook = func(*sql.Tx) {
-		insertHiddenDMVoiceParticipant(t, db, conversationID)
+		// The second member already exists; inserting a member here would block on
+		// the block-reconciliation trigger's lock of the first, locked user.
+		_, err := db.Exec(`INSERT INTO dm_voice_participants (conversation_id, user_id)
+			SELECT dp.conversation_id, dp.user_id FROM dm_participants dp
+			JOIN dm_conversations dc ON dc.id = dp.conversation_id
+			WHERE dp.conversation_id = $1 AND dp.user_id <> dc.created_by`, conversationID)
+		require.NoError(t, err)
 	}
 
 	result, err := sweeper.RunPass(context.Background())
