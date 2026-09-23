@@ -93,6 +93,7 @@ without losing the observation that triggered them.
 - **The desktop runtime now carries the current Chromium, V8, and PDFium security backports** ([#3132](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3132)) — Electron was updated
   from 44.3.0 to 44.4.3, which includes upstream fixes for the five browser-engine
   vulnerabilities tracked by #3132 without changing app settings or saved data.
+- **macOS installer builds no longer pull the legacy DMG dependency chain** ([#2727](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2727), [#3396](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3396)) — the build now uses the existing packaging library directly, removing the vulnerable parser from build-time dependencies. The app runtime and ZIP-based auto-updates are unchanged.
 - **Account safety checks now agree on one spelling of your account's identifier** ([#3362](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/3362)) — every
   account has an internal identifier, and the same identifier can be written in several ways
   that all mean the same account. Concord's database treats those spellings as one account, but

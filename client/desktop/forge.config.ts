@@ -1,8 +1,8 @@
 import type { ForgeConfig } from '@electron-forge/shared-types';
 import { MakerNsis } from './build/makerNsis';
+import { MakerDmg } from './build/makerDmg';
 import { ALLOWED_WINDOWS_PUBLISHERS } from './src/shared/allowedWindowsPublishers';
 import { MakerZIP } from '@electron-forge/maker-zip';
-import { MakerDMG } from '@electron-forge/maker-dmg';
 import { MakerDeb } from '@electron-forge/maker-deb';
 import { MakerRpm } from '@electron-forge/maker-rpm';
 import { MakerAppImage } from '@reforged/maker-appimage';
@@ -426,22 +426,25 @@ const config: ForgeConfig = {
     // ZIP above remains the canonical artifact for electron-updater's auto-update
     // chain (see latest-mac.yml generator in .github/workflows/build-desktop.yml).
     // The .dmg is install-only; do NOT add it to the latest-mac.yml glob.
-    new MakerDMG(
+    new MakerDmg(
       {
-        background: './build/dmg-background.png',
-        icon: './build/icon.icns',
-        format: 'ULFO',
-        // Icon centers per design handoff spec
-        // ([internal]artifacts/2026-05-22-macos-install-ux-handoff.md §"Coordinates"):
-        //   .app icon center: (130, 200) on the 540×380 canvas
-        //   Applications shortcut center: (410, 200)
-        contents: (opts) => [
-          { x: 130, y: 200, type: 'file', path: opts.appPath },
-          { x: 410, y: 200, type: 'link', path: '/Applications' },
-        ],
-        additionalDMGOptions: {
+        appId: 'com.concordvoice.desktop',
+        productName: 'Concord Voice',
+        dmg: {
+          background: './build/dmg-background.png',
+          icon: './build/icon.icns',
+          format: 'ULFO',
+          // Icon centers per design handoff spec
+          // ([internal]artifacts/2026-05-22-macos-install-ux-handoff.md §"Coordinates"):
+          //   .app icon center: (130, 200) on the 540×380 canvas
+          //   Applications shortcut center: (410, 200)
+          contents: [
+            { x: 130, y: 200, type: 'file' },
+            { x: 410, y: 200, type: 'link', path: '/Applications' },
+          ],
           window: {
-            size: { width: 540, height: 380 },
+            width: 540,
+            height: 380,
           },
         },
       },

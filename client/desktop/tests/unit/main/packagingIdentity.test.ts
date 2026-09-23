@@ -636,6 +636,31 @@ describe('Packaging Identity (#382)', () => {
     });
   });
 
+  describe('forge.config.ts — MakerDmg (macOS .dmg)', () => {
+    it('registers the local DMG maker for darwin', async () => {
+      const config = await loadForgeConfig();
+      const dmg = getMakerOptions(config, 'Dmg');
+      expect(dmg).not.toBeNull();
+      expect(dmg.appId).toBe('com.concordvoice.desktop');
+      expect(dmg.productName).toBe(EXPECTED_DISPLAY_NAME);
+    });
+
+    it('keeps the branded background, icon, format, and drag-to-Applications layout', async () => {
+      const config = await loadForgeConfig();
+      const dmg = getMakerOptions(config, 'Dmg');
+      expect(dmg.dmg).toMatchObject({
+        background: './build/dmg-background.png',
+        icon: './build/icon.icns',
+        format: 'ULFO',
+        contents: [
+          { x: 130, y: 200, type: 'file' },
+          { x: 410, y: 200, type: 'link', path: '/Applications' },
+        ],
+        window: { width: 540, height: 380 },
+      });
+    });
+  });
+
   describe('forge.config.ts — MakerDeb (Linux .deb)', () => {
     // NOTE: Linux package conventions require lowercase, no-space binary names
     // (debian-policy §5.6.7). The display name (executableName) carries spaces

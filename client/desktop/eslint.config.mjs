@@ -89,6 +89,8 @@ export default [
             // build tooling, not app source — so it belongs to no TS project and
             // projectService cannot parse it without this entry.
             'build/makerNsis.ts',
+            // The local Forge DMG maker is the same build-tooling category.
+            'build/makerDmg.ts',
             // ADR-0043: the concord-audiocap loader and its public typings. Same
             // category as build/makerNsis.ts above — real code that belongs to no
             // tsconfig, because native/ is a separate toolchain (node-gyp) whose
