@@ -1,7 +1,8 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webFrame } from 'electron';
 
 // TYPE-ONLY, and that is load-bearing rather than stylistic: the comment below
-// records that `audiocapRelay` is the file's ONLY runtime local import, a property
+// records that `audiocapRelay` and `uiZoom` are the file's ONLY runtime local
+// imports, both inlined rather than `require`d — a property
 // `tests/integration/preload-sandbox-contract.test.ts` pins. `import type` is erased
 // by esbuild, so this adds no `require`. Same shape as the `ipcContract` import above.
 import type { AudiocapStartResult } from '../main/audiocapHost';
@@ -16,11 +17,12 @@ import type {
 } from '../shared/sso';
 import type { SpaFallbackDiagnostic } from '../shared/spaIpcTypes';
 
-// The ONLY runtime local import in this file. `scripts/build-preload.mjs` runs
-// esbuild with `bundle: true, external: ['electron']`, so it is inlined into
-// `dist/preload/preload.js` rather than becoming a `require` — which is what
+// The ONLY two runtime local imports in this file. `scripts/build-preload.mjs`
+// runs esbuild with `bundle: true, external: ['electron']`, so both are inlined
+// into `dist/preload/preload.js` rather than becoming a `require` — which is what
 // keeps `tests/integration/preload-sandbox-contract.test.ts` green.
 import { AUDIOCAP_PORT_TAG, installAudiocapRelay, type AudiocapRelayWindow } from './audiocapRelay';
+import { createSetZoomFactor } from './uiZoom';
 
 // `tsconfig.preload.json` pins `lib` to ES2022 with no DOM, so the global
 // `window` has no type in this build leg. Declare exactly the slice the relay
@@ -481,6 +483,12 @@ contextBridge.exposeInMainWorld('electron', {
     quit: (): Promise<void> => ipcRenderer.invoke('window:quit'),
     setTitleBarOverlayColor: (options: { color: string; symbolColor: string }): Promise<void> =>
       ipcRenderer.invoke('window:setTitleBarOverlayColor', options),
+    // UI Scale on page zoom (#2367 part 2, IPC contract v29). NOT an IPC channel:
+    // it zooms THIS frame through `webFrame`, so there is no main handler and no
+    // sender to check. The main world may be remote-SPA code, so `uiZoom.ts`
+    // re-validates every factor — a non-number or non-finite value is ignored, the
+    // rest clamped to 0.5–2 — rather than trusting the renderer's own clamp.
+    setZoomFactor: createSetZoomFactor(webFrame),
   },
 
   // Version surface (#806): packaged app version + active SPA hash for the
@@ -851,6 +859,10 @@ export interface ElectronAPI {
     setClientBehavior: (cb: { toTray: string; toToolbar: string }) => Promise<void>;
     quit: () => Promise<void>;
     setTitleBarOverlayColor: (options: { color: string; symbolColor: string }) => Promise<void>;
+    // Optional by design (the v21 `abandonReservation` precedent): a shell older
+    // than IPC contract v29 does not expose it, and the renderer feature-detects
+    // it (`utils/ui/uiZoom.ts` getZoomBridge) and keeps the legacy `--ui-scale`.
+    setZoomFactor?: (factor: number) => void;
   };
 
   // Version + SPA hash surface (#806)

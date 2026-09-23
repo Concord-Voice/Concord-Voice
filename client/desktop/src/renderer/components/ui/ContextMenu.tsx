@@ -13,6 +13,32 @@ interface ContextMenuProps {
 
 const CLOSE_DURATION = 150; // ms — matches CSS animation
 
+/** Minimum gap kept between a menu (or submenu) and the viewport edge. */
+const VIEWPORT_MARGIN = 8;
+
+/** Gap between a submenu and its trigger — `.ctx-submenu`'s side margin in the CSS. */
+const SUBMENU_GAP = 6;
+
+/**
+ * Clamp one axis of a box into `[VIEWPORT_MARGIN, viewport − size − VIEWPORT_MARGIN]`.
+ * A box larger than the space available pins to the margin, and its overflow is
+ * made scrollable by `fitToViewport` — it never escapes past the top or left
+ * edge, where nothing could ever scroll it back into reach.
+ */
+function clampToViewport(start: number, size: number, viewport: number): number {
+  return Math.max(VIEWPORT_MARGIN, Math.min(start, viewport - size - VIEWPORT_MARGIN));
+}
+
+/** Cap a box taller than the viewport to the viewport minus margins and let it
+ *  scroll. Applied only when it is actually needed — see the note on
+ *  `.ctx-menu` overflow in ContextMenu.css for why this is not unconditional. */
+function fitToViewport(el: HTMLElement, height: number, viewportHeight: number): void {
+  const available = viewportHeight - 2 * VIEWPORT_MARGIN;
+  if (height <= available) return;
+  el.style.maxHeight = `${available}px`;
+  el.style.overflowY = 'auto';
+}
+
 const ContextMenuRoot: React.FC<ContextMenuProps> = ({ position, onClose, children }) => {
   const menuRef = useRef<HTMLDivElement>(null);
   const [closing, setClosing] = useState(false);
@@ -49,20 +75,32 @@ const ContextMenuRoot: React.FC<ContextMenuProps> = ({ position, onClose, childr
     };
   }, [animateClose]);
 
-  // Viewport overflow adjustment
+  // Viewport overflow adjustment: flip to the other side of the cursor when the
+  // menu would overflow, then CLAMP. Flipping alone put a menu taller than the
+  // space above the cursor at a negative `top` — measured at y=−55 for a click
+  // at y=383 under 2× UI scale — where its first items were unreachable.
+  //
+  // Sized from `offsetWidth`/`offsetHeight`, the layout box, not
+  // `getBoundingClientRect()`: the `ctxMenuIn` entrance animation starts at
+  // `scale(0.92)`, so a rect read on mount under-measures the menu by 8 %.
   useEffect(() => {
-    if (menuRef.current) {
-      const rect = menuRef.current.getBoundingClientRect();
-      const viewportHeight = globalThis.innerHeight;
-      const viewportWidth = globalThis.innerWidth;
+    const el = menuRef.current;
+    if (!el) return;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const viewportHeight = globalThis.innerHeight;
+    const viewportWidth = globalThis.innerWidth;
 
-      if (rect.bottom > viewportHeight) {
-        menuRef.current.style.top = `${position.y - rect.height}px`;
-      }
-      if (rect.right > viewportWidth) {
-        menuRef.current.style.left = `${position.x - rect.width}px`;
-      }
-    }
+    const flippedTop = position.y + height > viewportHeight ? position.y - height : position.y;
+    const flippedLeft = position.x + width > viewportWidth ? position.x - width : position.x;
+    const top = clampToViewport(flippedTop, height, viewportHeight);
+    const left = clampToViewport(flippedLeft, width, viewportWidth);
+
+    // Written only when it differs from the rendered position, so a menu that
+    // already fits is left exactly where React put it.
+    if (top !== position.y) el.style.top = `${top}px`;
+    if (left !== position.x) el.style.left = `${left}px`;
+    fitToViewport(el, height, viewportHeight);
   }, [position]);
 
   return (
@@ -170,19 +208,50 @@ const SubMenu: React.FC<SubMenuProps> = ({ children, closing }) => {
   useEffect(() => {
     if (!subRef.current) return;
     const el = subRef.current;
-    const rect = el.getBoundingClientRect();
+    // Measured from the layout box, not the submenu's own rect: `ctxSubMenuIn`
+    // starts at `translateX(-8px) scale(0.96)`, so a rect read on mount is shifted
+    // and under-measures the size — the root menu's defect, documented above.
+    // Position comes from the positioned parent (not animated once the root menu
+    // has settled) plus the layout offset.
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const parentRect = (el.offsetParent as HTMLElement | null)?.getBoundingClientRect();
+    const rect = {
+      top: (parentRect?.top ?? 0) + el.offsetTop,
+      left: (parentRect?.left ?? 0) + el.offsetLeft,
+      height,
+    };
     const vw = globalThis.innerWidth;
     const vh = globalThis.innerHeight;
 
-    // Flip to the left side if overflowing right
-    if (rect.right > vw) {
+    // Flip to the left side if overflowing right — then CLAMP, as the root menu
+    // does. Flipped, the submenu's right edge sits SUBMENU_GAP left of its
+    // trigger, so one wider than the space there (a wide root menu pinned to the
+    // right of an 800px layout) put its leading items at a negative `left`.
+    if (rect.left + width > vw) {
       setFlipped(true);
+      const parentLeft = parentRect?.left ?? 0;
+      const flippedLeft = parentLeft - SUBMENU_GAP - width;
+      const left = clampToViewport(flippedLeft, width, vw);
+      if (left !== flippedLeft) {
+        // Pin the measured width: moving `left` changes the space this
+        // shrink-to-fit box is laid out in, and with it the width just measured.
+        el.style.width = `${width}px`;
+        el.style.left = `${left - parentLeft}px`;
+        el.style.right = 'auto';
+      }
     }
 
-    // Nudge up if overflowing bottom
-    if (rect.bottom > vh) {
-      const overflow = rect.bottom - vh + 8;
-      el.style.top = `${-overflow}px`;
+    // Nudge up if overflowing bottom — by no more than keeps the top edge on
+    // screen. The unbounded nudge had the root menu's defect: a submenu taller
+    // than the space above its trigger was pushed past the top of the viewport.
+    // `top` is relative to the trigger's wrapper, so the viewport shift is
+    // applied to the current offset rather than written as an absolute.
+    if (rect.top + height > vh) {
+      const shift = clampToViewport(rect.top, rect.height, vh) - rect.top;
+      el.style.top = `${el.offsetTop + shift}px`;
+      // A submenu has no nested flyout of its own, so scrolling it clips nothing.
+      fitToViewport(el, rect.height, vh);
     }
   }, []);
 

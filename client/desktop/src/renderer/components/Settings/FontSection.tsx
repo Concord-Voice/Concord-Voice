@@ -31,7 +31,8 @@ const FONT_OPTIONS: { id: AppearanceSettings['appFont']; label: string; family: 
 ];
 
 // The discrete size steps. `--font-scale-discrete` for each lives in index.css
-// (`[data-fontsize='…']`) and compounds with the UI Scale slider's `--ui-scale`.
+// (`[data-fontsize='…']`) and compounds with UI Scale — page zoom on a shell with
+// the zoom bridge, `--ui-scale` on an older one (#2367 part 2).
 const FONT_SIZE_OPTIONS: { value: AppearanceSettings['fontSize']; label: string }[] = [
   { value: 'small', label: 'Small' },
   { value: 'default', label: 'Default' },

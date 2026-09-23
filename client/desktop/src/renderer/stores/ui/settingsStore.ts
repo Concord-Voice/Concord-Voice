@@ -22,6 +22,14 @@ import {
   RESOLVER_CONFIG,
 } from '../../utils/ui/effectiveFont';
 import type { GifPlaybackMode } from '../../utils/ui/gifPlayback';
+import {
+  type SetZoomFactor,
+  UI_ZOOM_EPSILON,
+  computeAppliedZoom,
+  cssUiScaleFor,
+  getZoomBridge,
+  isPipWindow,
+} from '../../utils/ui/uiZoom';
 
 export interface AppearanceSettings {
   theme: 'dark' | 'light' | 'system';
@@ -46,10 +54,13 @@ export interface AppearanceSettings {
   compactMode: boolean;
   reduceAnimations: boolean;
   /**
-   * Continuous UI scale multiplier. Coexists with `fontSize` (discrete) —
-   * uiScale compounds into `--ui-scale` and is multiplied by `--sp-base`
-   * + `--font-scale` so the two controls stack rather than override each
-   * other. Clamped to [0.85, 1.5]; default 1.0 is a no-op.
+   * The user's CHOSEN UI scale, clamped to [UI_SCALE_MIN, UI_SCALE_MAX]; default
+   * 1.0 is a no-op. What it drives depends on the shell (#2367 part 2,
+   * `utils/ui/uiZoom.ts`): with the zoom bridge it is Electron page zoom, capped
+   * by window width and with `--ui-scale` pinned to 1; without it, `--ui-scale`
+   * gets the legacy 0.85–1.3 clamp. Either way it compounds with the discrete
+   * `fontSize` rather than overriding it. Never read this as "the current
+   * `--ui-scale`" — use `cssUiScaleFor`.
    */
   uiScale: number;
   /**
@@ -74,17 +85,20 @@ export interface AppearanceSettings {
   gifPlayback: GifPlaybackMode;
 }
 
-/** Lower + upper bound for uiScale; defaults match the slider range.
+/** Lower + upper bound for the STORED uiScale — the zoom-bridge slider range.
  *
- * Max is capped at 1.30 (not the original 1.50) so users can't push the UI
- * into a layout-breaking zone — the chat preview tile and a few other
- * narrow surfaces start collapsing past ~1.20 even with a responsive grid.
- * Layout robustness is the right long-term answer; until every surface is
- * known-safe at 1.50, the cap protects the user from a usability cliff.
- * Font Size's discrete "Large" still compounds on top, so the practical
- * upper limit is 1.175 × 1.30 ≈ 1.53 — comparable to the original cap. */
-export const UI_SCALE_MIN = 0.85;
-export const UI_SCALE_MAX = 1.3;
+ * Storage is not capability-dependent: every shell stores 0.5–2.0, and the
+ * apply path narrows it. With page zoom (#2367 part 2) the whole layout scales
+ * together, so 2.0 is safe wherever the window is wide enough — and where it is
+ * not, the applier caps the zoom by width instead of the user's choice.
+ *
+ * The old 1.30 cap ("not 1.50, the chat preview tile and a few other narrow
+ * surfaces start collapsing past ~1.20") is still true, but ONLY of the legacy
+ * `--ui-scale` engine, which scales text inside unscaled boxes. It now lives on
+ * as `UI_SCALE_LEGACY_MAX` (`utils/ui/uiZoom.ts`), applied only on a shell
+ * without the zoom bridge, where the slider keeps its 0.85–1.3 range. */
+export const UI_SCALE_MIN = 0.5;
+export const UI_SCALE_MAX = 2;
 export const UI_SCALE_DEFAULT = 1;
 
 /** Clamp + sanity-check uiScale on the way in (slider, persisted state). */
@@ -120,6 +134,14 @@ interface SettingsState {
    * exists (worth adding when NSFW-marked channels land and the second consumer appears).
    */
   allowNsfwContent: boolean;
+  /**
+   * The page zoom factor last handed to the zoom bridge, or `null` when none has
+   * been (a shell without the bridge, a PiP window, or not yet applied). Runtime
+   * only — excluded from persistence by `partialize`, because it describes this
+   * window at its current width, not a preference. Read by the UI Scale slider
+   * to say when the choice is being limited. Written only by `applyUiZoom`.
+   */
+  appliedUiZoom: number | null;
   setTheme: (theme: AppearanceSettings['theme']) => void;
   setColorScheme: (scheme: AppearanceSettings['colorScheme']) => void;
   setFontSize: (size: AppearanceSettings['fontSize']) => void;
@@ -184,12 +206,73 @@ function applyReduceAnimations(enabled: boolean) {
   document.documentElement.dataset.reduceAnimations = enabled ? 'true' : 'false';
 }
 
-function applyUiScale(value: number) {
-  // Apply via custom property so existing var(--sp-base, ...) and
-  // var(--font-scale, ...) consumers compound with it without code change.
+function applyUiScale(chosen: number) {
+  const setZoom = getZoomBridge();
   // The CSS layer in index.css multiplies --sp-base and --font-scale by
-  // --ui-scale via calc().
-  document.documentElement.style.setProperty('--ui-scale', String(clampUiScale(value)));
+  // --ui-scale via calc(). With the zoom bridge it is pinned to 1 — page zoom
+  // already scales text, and doing both would scale it twice. Without it this
+  // is the pre-#2367 engine, clamped to the legacy band.
+  document.documentElement.style.setProperty('--ui-scale', String(cssUiScaleFor(chosen)));
+  applyUiZoom(chosen, setZoom);
+}
+
+/**
+ * Drive Electron page zoom from the chosen scale (#2367 part 2). Runs on every
+ * uiScale change and on every window `resize`.
+ *
+ * INVARIANT: after this returns, the page's zoom factor equals
+ * `appliedUiZoom`, and `appliedUiZoom` equals `computeAppliedZoom` for the
+ * current chosen scale and unzoomed width — exactly when that value is an
+ * endpoint (the chosen scale, or 1), otherwise to within `UI_ZOOM_EPSILON`. What
+ * breaks it, and why each is handled:
+ *  - A page whose zoom we do not know (first run in this document; a factor
+ *    that may have survived a reload). `appliedUiZoom` starts `null`, and the
+ *    first call is unconditional, so the page is brought to a known factor. If
+ *    the width we measured was itself distorted by an unknown factor, the
+ *    `resize` that zooming fires corrects it on the next pass.
+ *  - Feedback. Zooming fires `resize`, which calls back in here. The change
+ *    guard makes the no-loop property STRUCTURAL rather than arithmetic: the
+ *    recompute is idempotent, but only the guard stops a second bridge call (see
+ *    `UI_ZOOM_EPSILON` for why rounding noise always lands inside it).
+ *  - A zero-width window (minimised, or not yet laid out). Its width says
+ *    nothing about the layout, so the last factor is kept; the resize that
+ *    restores it recomputes.
+ *  - PiP windows share this module and this store, but must stay at 1x.
+ */
+function applyUiZoom(chosen: number, setZoom: SetZoomFactor | null): void {
+  if (setZoom === null || isPipWindow()) return;
+  const innerWidth = globalThis.innerWidth;
+  if (!Number.isFinite(innerWidth) || innerWidth <= 0) return;
+  const current = useSettingsStore.getState().appliedUiZoom;
+  const next = computeAppliedZoom(chosen, innerWidth * (current ?? 1));
+  // The epsilon absorbs only width-cap rounding noise. An exact endpoint — the
+  // chosen scale, or 1 — always goes through: with the guard alone, a 1.59375
+  // cap that became an uncapped 1.6 was a 0.006 step, so the page stayed short
+  // of the choice for good and the hint read "Limited to 159%" on a wide screen.
+  // Still loop-free: at an endpoint the zoom-induced resize recomputes that same
+  // value (skipped as equal) or a cap within 0.0025 of it (skipped by epsilon).
+  const isEndpoint = next === chosen || next === 1;
+  if (
+    current !== null &&
+    (next === current || (!isEndpoint && Math.abs(next - current) < UI_ZOOM_EPSILON))
+  ) {
+    return;
+  }
+  // Record BEFORE calling: a resize delivered re-entrantly must see the factor
+  // already in flight, or the change guard compares against a stale value. The
+  // guard holds today only because Electron fires `resize` asynchronously.
+  useSettingsStore.setState({ appliedUiZoom: next });
+  setZoom(next);
+}
+
+/** The slice of live state storage may never overwrite on rehydration: every
+ *  action, and the runtime-only `appliedUiZoom`. */
+function runtimeOnlySettings(state: SettingsState): Partial<SettingsState> {
+  const kept: Record<string, unknown> = { appliedUiZoom: state.appliedUiZoom };
+  for (const [key, value] of Object.entries(state)) {
+    if (typeof value === 'function') kept[key] = value;
+  }
+  return kept as Partial<SettingsState>;
 }
 
 function applyHighContrast(enabled: boolean) {
@@ -206,8 +289,8 @@ function applyEffectiveFont(id: AppFontId) {
 
 // v0 → v1 (#1099): the #1383 interim default {toTray:'none', toToolbar:'minimize'}
 // was snapshotted into localStorage for any user who changed ANY setting while
-// it was live (no partialize — the whole store persists, and merge spreads
-// persisted over defaults). Map the EXACT interim-default combo back to the
+// it was live (the whole store persists — `partialize` drops only the runtime
+// `appliedUiZoom` — and merge spreads persisted over defaults). Map the EXACT interim-default combo back to the
 // intended default; any other combo is a deliberate user choice and passes
 // through untouched. Exported for unit tests.
 export function migratePersistedSettings(persisted: unknown, version: number): unknown {
@@ -230,6 +313,7 @@ export const useSettingsStore = wrapStore(
         clientBehavior: DEFAULT_CLIENT_BEHAVIOR,
         subscriptionResetAcknowledged: false,
         allowNsfwContent: false,
+        appliedUiZoom: null,
 
         setTheme: (theme) =>
           set((state) => ({
@@ -309,17 +393,31 @@ export const useSettingsStore = wrapStore(
         // already casts `persisted as Partial<SettingsState>`).
         migrate: (persistedState, version) =>
           migratePersistedSettings(persistedState, version) as SettingsState,
+        // `appliedUiZoom` is a fact about this window at its current width, not
+        // a preference: persisting it would hand the next launch a stale factor
+        // the applier then trusts as the page's zoom.
+        partialize: ({ appliedUiZoom: _appliedUiZoom, ...rest }) => rest,
         merge: (persisted, current) => {
           const p = persisted as Partial<SettingsState> | undefined;
+          const appearance = { ...defaultAppearance, ...p?.appearance };
           return {
             ...current,
             ...p,
-            appearance: { ...defaultAppearance, ...p?.appearance },
+            // Re-clamp on the way in: storage is outside the setter's reach, so
+            // a hand-edited or corrupt value must not reach the apply path.
+            appearance: { ...appearance, uiScale: clampUiScale(appearance.uiScale) },
             clientBehavior: { ...DEFAULT_CLIENT_BEHAVIOR, ...p?.clientBehavior },
             // Default false when a pre-#1301 snapshot has no ack flag (the
             // `...p` spread already carries it forward when present).
             subscriptionResetAcknowledged: p?.subscriptionResetAcknowledged ?? false,
             allowNsfwContent: p?.allowNsfwContent ?? false,
+            // Storage restores PREFERENCES only. `partialize` keeps runtime state
+            // out of what is written, but the `...p` spread would carry a
+            // hand-edited or corrupt key back in: a stored `appliedUiZoom` stands in
+            // for the page's real zoom and suppresses the first, unconditional
+            // apply, and a stored action key (`"setUiScale": 0`) replaces the setter
+            // so the slider throws. Both always come from the live store.
+            ...runtimeOnlySettings(current),
           };
         },
       }
@@ -402,6 +500,13 @@ useSettingsStore.subscribe(
   (uiScale) => applyUiScale(uiScale),
   { fireImmediately: true }
 );
+
+// Re-evaluate the width cap when the window resizes (#2367 part 2). Registered
+// unconditionally and cheap when it has nothing to do: `applyUiZoom` returns at
+// once without the zoom bridge or in a PiP window.
+globalThis.addEventListener?.('resize', () => {
+  applyUiZoom(useSettingsStore.getState().appearance.uiScale, getZoomBridge());
+});
 
 // Subscribe to high contrast changes and apply to DOM
 useSettingsStore.subscribe(

@@ -244,8 +244,24 @@
  *        `typeof globalThis.electron?.audiocap?.onCapability !== 'function'`, and a shell
  *        without the push never leaves the pre-addon rungs — video-only, never a system
  *        mix (C9). Capability, not demand.
+ * - v29: UI zoom bridge (#2367 part 2): `window.setZoomFactor(factor)` on the
+ *        preload bridge calls `webFrame.setZoomFactor` for the calling frame, so
+ *        UI Scale can be real page zoom (50–200%) instead of the `--ui-scale`
+ *        variable. There is NO channel: nothing crosses to main, so there is no
+ *        handler and no sender to check. It still bumps, because it is a new shell
+ *        capability the renderer probes for — the question this number answers.
+ *
+ *        The preload does not trust the renderer's clamp (`src/preload/uiZoom.ts`):
+ *        a non-number or non-finite factor is ignored, anything else is clamped to
+ *        0.5–2, because the main world may be remote-SPA code. What it grants is no
+ *        more than CSS `zoom` on the caller's own document: its own frame, inside a
+ *        bounded range, and — measured — not the same-origin PiP window.
+ *
+ *        The SERVER's spaIpcContract stays 19: the renderer feature-detects with
+ *        `typeof …window.setZoomFactor === 'function'`, and a shell without it keeps
+ *        the legacy `--ui-scale` engine at 0.85–1.3. Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 28;
+export const IPC_CONTRACT_VERSION = 29;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.

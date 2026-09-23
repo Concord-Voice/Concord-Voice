@@ -110,7 +110,11 @@
    * Custom properties resolve at use time, so the existing
    * `data-fontsize='small'` / `'large'` rules only need to set the
    * discrete variant; the compounding calc() in :root resolves against
-   * the cascaded value automatically. */
+   * the cascaded value automatically.
+   *
+   * #2367 part 2: on a shell with the zoom bridge the UI scale is Electron
+   * page zoom instead, and settingsStore pins `--ui-scale` to 1 — the discrete
+   * bucket then compounds with the zoom, not with this variable. */
   --ui-scale: 1;
   --font-scale-discrete: 1;
   --sp-base-discrete: 1;

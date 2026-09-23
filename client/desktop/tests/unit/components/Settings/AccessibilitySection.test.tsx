@@ -114,9 +114,13 @@ const installSpeechSynthesis = (value: SpeechSynthesis | undefined) => {
 installSpeechSynthesis(mockSpeechSynthesis);
 
 import AccessibilitySection from '@/renderer/components/Settings/AccessibilitySection';
+import { useDraftAppearance } from '@/renderer/hooks/ui/useDraftSettings';
+import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { resetAllStores } from '../../../helpers/store-helpers';
 
 describe('AccessibilitySection', () => {
   beforeEach(() => {
+    resetAllStores();
     vi.clearAllMocks();
     mockGetVoices.mockReturnValue([
       {
@@ -422,5 +426,145 @@ describe('AccessibilitySection', () => {
   it('volume description mentions volume level', () => {
     render(<AccessibilitySection />);
     expect(screen.getByText(/Volume level for text-to-speech playback/)).toBeInTheDocument();
+  });
+
+  // ─── #2367 part 2 — UI Scale range and the width-cap hint ────────────────
+
+  describe('UI Scale on page zoom', () => {
+    type ElectronStub = { window?: unknown };
+    const electron = globalThis.electron as unknown as ElectronStub;
+    const baseAppearance = vi.mocked(useDraftAppearance).getMockImplementation();
+
+    const withChosenScale = (uiScale: number) => {
+      vi.mocked(useDraftAppearance).mockImplementation(() => ({
+        ...(baseAppearance?.() as ReturnType<typeof useDraftAppearance>),
+        uiScale,
+      }));
+    };
+    const slider = () => screen.getByRole('slider', { name: 'UI Scale' });
+
+    afterEach(() => {
+      delete electron.window;
+      if (baseAppearance) vi.mocked(useDraftAppearance).mockImplementation(baseAppearance);
+    });
+
+    it('offers 50–200% on a shell with the zoom bridge', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      render(<AccessibilitySection />);
+      expect(slider()).toHaveAttribute('min', '0.5');
+      expect(slider()).toHaveAttribute('max', '2');
+    });
+
+    it('keeps the legacy 85–130% range, and no hint, on a shell without it', () => {
+      render(<AccessibilitySection />);
+      expect(slider()).toHaveAttribute('min', '0.85');
+      expect(slider()).toHaveAttribute('max', '1.3');
+      expect(slider()).not.toHaveAttribute('aria-describedby');
+    });
+
+    it('shows a stored 200% as the 130% a legacy shell actually applies', () => {
+      withChosenScale(2);
+      render(<AccessibilitySection />);
+      expect(slider()).toHaveValue('1.3');
+      expect(screen.getByText('130%')).toBeInTheDocument();
+    });
+
+    it('says when the window width limits the zoom, and ties the hint to the slider', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      withChosenScale(2);
+      useSettingsStore.setState({ appliedUiZoom: 1.6 });
+      render(<AccessibilitySection />);
+      const hint = screen.getByText(
+        'Limited to 160% at this window size — widen the window to use 200%.'
+      );
+      const describedBy = slider().getAttribute('aria-describedby');
+      expect(describedBy).toBeTruthy();
+      expect(hint.id).toBe(describedBy);
+    });
+
+    it('shows no hint when the applied zoom matches the choice', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      withChosenScale(2);
+      useSettingsStore.setState({ appliedUiZoom: 2 });
+      render(<AccessibilitySection />);
+      expect(screen.queryByText(/Limited to/)).not.toBeInTheDocument();
+    });
+
+    it('shows no hint when the gap is only rounding below a whole percent', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      withChosenScale(2);
+      useSettingsStore.setState({ appliedUiZoom: 1.998 });
+      render(<AccessibilitySection />);
+      expect(screen.queryByText(/Limited to/)).not.toBeInTheDocument();
+    });
+
+    // Zooming on every drag step re-lays out the slider under the pointer; in
+    // Electron that ran the value backwards mid-drag. So a drag only previews, and
+    // the native `change` event (release, or a keyboard step) commits.
+    it('previews a drag without writing the draft, and commits on release', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      render(<AccessibilitySection />);
+      fireEvent.input(slider(), { target: { value: '1.5' } });
+      expect(screen.getByText('150%')).toBeInTheDocument();
+      expect(mockSetDraftAppearanceSetting).not.toHaveBeenCalledWith('uiScale', expect.anything());
+
+      fireEvent.change(slider(), { target: { value: '1.5' } });
+      expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('uiScale', 1.5);
+    });
+
+    it('follows the store again once a change is committed', () => {
+      // The draft stays at 1 (the setter is mocked), so after the commit the slider
+      // must read the store, not the value it was dragged to.
+      electron.window = { setZoomFactor: vi.fn() };
+      render(<AccessibilitySection />);
+      fireEvent.change(slider(), { target: { value: '1.5' } });
+      expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('uiScale', 1.5);
+      expect(slider()).toHaveValue('1');
+    });
+
+    // The drag's local value is keyed to `base`, the stored value it started
+    // from. Without that key, a drag left uncommitted (no `change` — Reset or
+    // Revert moved the store instead) pins the thumb at the stale value forever.
+    it('drops a stale drag once the store moves on without a commit (96c2395df)', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      withChosenScale(1.5);
+      const { rerender } = render(<AccessibilitySection />);
+      fireEvent.input(slider(), { target: { value: '1.7' } });
+      expect(screen.getByText('170%')).toBeInTheDocument();
+      // A second drag step, still no `change` — the draft never moved.
+      fireEvent.input(slider(), { target: { value: '1.5' } });
+      expect(screen.getByText('150%')).toBeInTheDocument();
+
+      // The store moves on (e.g. Reset) with no `change` event ever firing.
+      withChosenScale(1);
+      rerender(<AccessibilitySection />);
+      expect(slider()).toHaveValue('1');
+    });
+
+    // A live region must exist BEFORE its text changes to be announced — see the
+    // "always mounted" comment on the <output> in AccessibilitySection.tsx.
+    it('mounts the live region empty and updates the SAME element in place', () => {
+      electron.window = { setZoomFactor: vi.fn() };
+      withChosenScale(2);
+      useSettingsStore.setState({ appliedUiZoom: 2 });
+      const { container } = render(<AccessibilitySection />);
+
+      const region = container.querySelector('.ui-scale-limit-hint');
+      expect(region).not.toBeNull();
+      expect(region?.textContent).toBe('');
+      const regionId = region?.id;
+      expect(regionId).toBeTruthy();
+
+      act(() => {
+        useSettingsStore.setState({ appliedUiZoom: 1.6 });
+      });
+
+      const updated = container.querySelector('.ui-scale-limit-hint');
+      expect(updated).toBe(region);
+      expect(updated?.id).toBe(regionId);
+      expect(updated?.textContent).toBe(
+        'Limited to 160% at this window size — widen the window to use 200%.'
+      );
+    });
   });
 });

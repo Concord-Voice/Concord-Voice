@@ -1,11 +1,17 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useId } from 'react';
 import {
   useDraftTtsSetting,
   setDraftTtsSetting,
   useDraftAppearance,
   setDraftAppearanceSetting,
 } from '../../hooks/ui/useDraftSettings';
-import { UI_SCALE_MIN, UI_SCALE_MAX } from '../../stores/ui/settingsStore';
+import { UI_SCALE_MIN, UI_SCALE_MAX, useSettingsStore } from '../../stores/ui/settingsStore';
+import {
+  UI_SCALE_LEGACY_MAX,
+  UI_SCALE_LEGACY_MIN,
+  hasZoomBridge,
+  legacyUiScale,
+} from '../../utils/ui/uiZoom';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
@@ -24,9 +30,55 @@ import {
 // Application Font in #2367: the three discrete steps are an everyday display
 // preference that people look for beside the typeface, while the continuous
 // slider — the fine-grained, accessibility-oriented control — stays here.
+//
+// #2367 part 2: on a shell with the zoom bridge the slider drives real page zoom
+// over 50–200 %, capped by window width; on an older shell it keeps the legacy
+// 0.85–1.3 `--ui-scale` range. See utils/ui/uiZoom.ts.
+
+const toPercent = (factor: number): number => Math.round(factor * 100);
 
 const DisplaySection: React.FC = () => {
   const appearance = useDraftAppearance();
+  const limitHintId = useId();
+  // Process-static: a shell either exposes the bridge or it does not.
+  const zoomBridge = hasZoomBridge();
+  const appliedUiZoom = useSettingsStore((s) => s.appliedUiZoom);
+  const chosen = appearance.uiScale;
+  // On a legacy shell show what `--ui-scale` actually carries, so a value stored
+  // by a zoom-capable shell (up to 2.0) never reads as more than is applied.
+  const shown = zoomBridge ? chosen : legacyUiScale(chosen);
+  // Compared in whole percent: the width cap is continuous, and "limited to
+  // 200 %, widen the window to use 200 %" would be a lie told by rounding.
+  const limitHint =
+    zoomBridge && appliedUiZoom !== null && toPercent(appliedUiZoom) < toPercent(chosen)
+      ? `Limited to ${toPercent(appliedUiZoom)}% at this window size — widen the window to use ${toPercent(chosen)}%.`
+      : null;
+
+  // A drag moves only a local value; the draft — and so the page zoom — is written
+  // on the native `change` event, which fires on pointer release and on each
+  // keyboard step. Zooming on every `input` event re-lays out the slider under a
+  // stationary pointer: measured in Electron 44, a 200 px drag then ran the value
+  // backwards twice and stopped at 1.35 instead of 1.75. React's onChange cannot
+  // carry the commit: it is the `input` event, and on release the value has not
+  // changed since the last one, so React does not fire it at all.
+  //
+  // `base` is the stored value the drag started from. Chromium fires no `change`
+  // when a drag ends where it began, so a drag can be left behind uncommitted;
+  // keying it to `base` makes it ignored the moment the store moves on (Reset,
+  // Revert), instead of pinning the thumb to a stale value.
+  const [drag, setDrag] = useState<{ value: number; base: number } | null>(null);
+  const sliderRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const el = sliderRef.current;
+    if (!el) return;
+    const commit = () => {
+      setDraftAppearanceSetting('uiScale', Number.parseFloat(el.value));
+      setDrag(null);
+    };
+    el.addEventListener('change', commit);
+    return () => el.removeEventListener('change', commit);
+  }, []);
+  const sliderValue = drag !== null && drag.base === shown ? drag.value : shown;
 
   return (
     <CollapsibleSection id="section-display" title="Display">
@@ -39,27 +91,44 @@ const DisplaySection: React.FC = () => {
         <div className="ui-scale-slider-row">
           <input
             type="range"
-            min={UI_SCALE_MIN}
-            max={UI_SCALE_MAX}
+            min={zoomBridge ? UI_SCALE_MIN : UI_SCALE_LEGACY_MIN}
+            max={zoomBridge ? UI_SCALE_MAX : UI_SCALE_LEGACY_MAX}
             step={0.05}
-            value={appearance.uiScale}
-            onChange={(e) =>
-              setDraftAppearanceSetting('uiScale', Number.parseFloat(e.target.value))
-            }
+            ref={sliderRef}
+            value={sliderValue}
+            onChange={(e) => {
+              // Only a drag step. A `change` that React also reports (a keyboard step
+              // that moved the value) has already been committed by the listener
+              // above; re-storing it here would pin the thumb against later store
+              // updates such as Reset.
+              if (e.nativeEvent.type === 'input') {
+                setDrag({ value: Number.parseFloat(e.target.value), base: shown });
+              }
+            }}
             aria-label="UI Scale"
+            aria-describedby={zoomBridge ? limitHintId : undefined}
             className="ui-scale-slider"
           />
-          <span className="ui-scale-value">{Math.round(appearance.uiScale * 100)}%</span>
+          <span className="ui-scale-value">{toPercent(sliderValue)}%</span>
           <button
             type="button"
             className="ui-scale-reset-btn"
             onClick={() => setDraftAppearanceSetting('uiScale', 1)}
-            disabled={appearance.uiScale === 1}
+            disabled={chosen === 1}
             aria-label="Reset UI scale to 100%"
           >
             Reset
           </button>
         </div>
+        {/* Always mounted on a zoom-capable shell, empty until the width cap
+            bites: a live region must exist BEFORE its text changes to be
+            announced, and the text changes as a side effect of resizing the
+            window, not of touching this control. Text, not colour. */}
+        {zoomBridge && (
+          <output id={limitHintId} className="settings-row-hint ui-scale-limit-hint">
+            {limitHint}
+          </output>
+        )}
       </div>
 
       <div className="settings-row">

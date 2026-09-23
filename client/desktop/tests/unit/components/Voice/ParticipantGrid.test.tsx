@@ -846,6 +846,28 @@ describe('UserFrameGrid', () => {
       }
     });
 
+    it('does not scale the pill band by uiScale when page zoom does the scaling (#2367 part 2)', () => {
+      // With the zoom bridge `--ui-scale` is pinned to 1 and page zoom scales the
+      // pill and the band together, so a stored 2.0 must NOT double the band:
+      // ceil(24 × 1.175 × 1) = 29px, not ceil(24 × 1.175 × 2) = 57px.
+      const electron = globalThis.electron as unknown as { window?: unknown };
+      electron.window = { setZoomFactor: vi.fn() };
+      useSettingsStore.setState((s) => ({
+        appearance: { ...s.appearance, fontSize: 'large', uiScale: 2 },
+      }));
+      try {
+        const { container } = render(<UserFrameGrid includeStreamTiles />);
+        const grid = container.querySelector('.user-frame-grid') as HTMLElement;
+        expect(grid.style.getPropertyValue('--pill-space')).toBe('29px');
+      } finally {
+        delete electron.window;
+        useSettingsStore.setState((s) => ({
+          appearance: { ...s.appearance, fontSize: 'default', uiScale: 1 },
+          appliedUiZoom: null,
+        }));
+      }
+    });
+
     it('renders a Tune In pill (untuned share) even without includeStreamTiles', () => {
       useVoiceStore.setState({ tunedInScreenShares: {} });
       render(<UserFrameGrid />);

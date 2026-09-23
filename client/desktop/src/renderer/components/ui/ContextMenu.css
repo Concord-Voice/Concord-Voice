@@ -19,6 +19,12 @@
   pointer-events: none;
 }
 
+/* Deliberately NO max-height/overflow-y here. `.ctx-submenu` flyouts are
+   absolutely positioned descendants that sit OUTSIDE this box (`left: 100%`),
+   and any non-visible overflow on `.ctx-menu` clips them — an unconditional
+   `overflow-y: auto` would hide every submenu in the app. ContextMenu.tsx sets
+   max-height + overflow-y inline only when the menu is taller than the viewport,
+   the one case where scrolling beats items that cannot be reached at all. */
 .ctx-menu {
   position: fixed;
   min-width: 180px;
@@ -186,6 +192,10 @@
   left: 100%;
   margin-left: 6px;
   min-width: 150px;
+  /* A shrink-to-fit box beside its trigger is as wide as its longest unbreakable
+     word, so an unbroken 100-character role name made this ~700px wide. Breaking
+     anywhere bounds it to min-width; ordinary labels already wrap at spaces. */
+  overflow-wrap: anywhere;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;

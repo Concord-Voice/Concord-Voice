@@ -708,7 +708,8 @@
 }
 
 /* ─── UI Scale slider (#489) ───────────────────────────────────────────────
-   Coexists with the discrete Font Size selector; CSS compounding lives in
+   Coexists with the discrete Font Size selector. It compounds with it through
+   Electron page zoom where the shell offers it (#2367 part 2), otherwise in
    :root via `--ui-scale × --font-scale-discrete`. */
 .ui-scale-slider-row {
   display: flex;
@@ -753,6 +754,18 @@
 .ui-scale-reset-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* "Limited to N% at this window size" (#2367 part 2). An <output> is inline by
+   default; it sits on its own line under the slider, and collapses to nothing
+   while empty so the always-mounted live region costs no space. */
+.ui-scale-limit-hint {
+  display: block;
+  margin-top: calc(6px * var(--sp, 1));
+}
+
+.ui-scale-limit-hint:empty {
+  margin-top: 0;
 }
 
 /* Toggle switch */

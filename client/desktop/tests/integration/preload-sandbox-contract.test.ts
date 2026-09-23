@@ -66,6 +66,15 @@ describe('preload sandbox contract (integration)', () => {
     expect(content).toContain('sso:abandonReservation');
   });
 
+  it('bundles the UI zoom bridge behind its preload-side validator (#2367)', () => {
+    const content = readFileSync(preloadPath, 'utf-8');
+    expect(content).toContain('setZoomFactor');
+    // Inlined, not required (the no-relative-require case above), so the
+    // validator's own name reaches the bundle beside the webFrame it wraps.
+    expect(content).toContain('createSetZoomFactor');
+    expect(content).toContain('webFrame');
+  });
+
   it('exposes only typed content-protection channels', () => {
     const content = readFileSync(preloadPath, 'utf-8');
     expect(content).toContain('app:getContentProtection');

@@ -13,6 +13,7 @@ import { VOICE_MAX_SCALE, useVoiceMagnification } from './useVoiceMagnification'
 import { useGridLayout } from '../../hooks/ui/useGridLayout';
 import { useScreenTileVideo } from '../../hooks/voice/useScreenTileVideo';
 import { errorMessage } from '../../utils/runtime/redactError';
+import { cssUiScaleFor } from '../../utils/ui/uiZoom';
 // Static, not the dynamic import() the sibling voice components use: the fork
 // below must be decided SYNCHRONOUSLY inside the setup effect, before the
 // element is muted and played. An awaited import would build the element
@@ -33,9 +34,12 @@ const AVATAR_FRAME_CAP_PX = 320;
 
 /** Discrete font-size buckets, mirrored from the `[data-fontsize]` rules in
  *  styles/index.css. The effective `--font-scale` the pill band tracks is this
- *  discrete value times the continuous `--ui-scale` (uiScale). Keeping this map
- *  in sync with that CSS lets us derive the band from settings-store state
- *  instead of a synchronous getComputedStyle read on every voice re-render. */
+ *  discrete value times the continuous `--ui-scale` — which is NOT the stored
+ *  uiScale on a zoom-capable shell (#2367 part 2), where page zoom scales the
+ *  pill and the band together and `--ui-scale` is pinned to 1; `cssUiScaleFor`
+ *  resolves it. Keeping this map in sync with that CSS lets us derive the band
+ *  from settings-store state instead of a synchronous getComputedStyle read on
+ *  every voice re-render. */
 const FONT_SCALE_DISCRETE: Record<AppearanceSettings['fontSize'], number> = {
   small: 0.825,
   default: 1,
@@ -45,9 +49,9 @@ const FONT_SCALE_DISCRETE: Record<AppearanceSettings['fontSize'], number> = {
 /** The pill's height tracks --font-scale (accessibility font sizes); keep the
  *  reserved band in sync so a scaled pill is never clipped or overlapped by
  *  the magnified active-speaker frame. `fontScale` is the effective
- *  `--font-scale` (discrete bucket × uiScale) derived from the settings store,
- *  so this stays a pure calc off already-reactive state rather than reading
- *  computed styles inline during render. */
+ *  `--font-scale` (discrete bucket × applied `--ui-scale`) derived from the
+ *  settings store, so this stays a pure calc off already-reactive state rather
+ *  than reading computed styles inline during render. */
 function pillSpacePx(fontScale: number): number {
   const scale = Number.isFinite(fontScale) && fontScale > 0 ? fontScale : 1;
   return Math.ceil(PILL_SPACE_BASE * scale);
@@ -675,11 +679,11 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
   const setVoiceViewMode = useVoiceStore((s) => s.setVoiceViewMode);
   const setStageLayout = useVoiceStore((s) => s.setStageLayout);
   const localStreamPaused = useVoiceStore((s) => s.localStreamPaused);
-  // Effective --font-scale inputs (discrete bucket × continuous uiScale). Read
-  // from the store so the pill band recomputes only when the accessibility font
-  // setting actually changes, not on every speaking-state toggle.
+  // Effective --font-scale inputs (discrete bucket × the applied --ui-scale).
+  // Read from the store so the pill band recomputes only when the accessibility
+  // font setting actually changes, not on every speaking-state toggle.
   const fontSize = useSettingsStore((s) => s.appearance.fontSize);
-  const uiScale = useSettingsStore((s) => s.appearance.uiScale);
+  const uiScale = useSettingsStore((s) => cssUiScaleFor(s.appearance.uiScale));
   const participantList = Object.values(participants);
   const scales = useVoiceMagnification(participants);
   // Active-speaker dominance (#1040): only meaningful with >1 tile (a lone tile
