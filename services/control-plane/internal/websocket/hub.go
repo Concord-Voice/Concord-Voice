@@ -433,6 +433,8 @@ type Hub struct {
 	// Test seam invoked after Server Voice authorization is checked and before
 	// the frame is admitted to a client queue.
 	serverVoiceDeliveryBeforeEnqueue func()
+	// Test seam invoked when a delivery observes an open channel mutation fence.
+	serverVoiceDeliveryMutationWaitHook func(uuid.UUID, uuid.UUID)
 
 	// Results from off-loop voice-count queries issued on subscribe_server. The
 	// query runs on a worker goroutine so a burst of subscriptions cannot stall
@@ -1191,12 +1193,21 @@ func (h *Hub) waitForServerVoiceChannelMutationClear(
 		}
 		changed := gate.changed
 		gate.mu.Unlock()
+		if h.serverVoiceDeliveryMutationWaitHook != nil {
+			h.serverVoiceDeliveryMutationWaitHook(key.serverID, key.channelID)
+		}
 		select {
 		case <-changed:
 		case <-done:
 			return 0, false
 		}
 	}
+}
+
+// SetServerVoiceDeliveryMutationWaitHookForTest observes a worker blocked by a
+// channel mutation. Set it before starting delivery workers.
+func (h *Hub) SetServerVoiceDeliveryMutationWaitHookForTest(hook func(uuid.UUID, uuid.UUID)) {
+	h.serverVoiceDeliveryMutationWaitHook = hook
 }
 
 // RevalidateServerSubscriptions queues visibility rechecks for subscribed channels in a server.

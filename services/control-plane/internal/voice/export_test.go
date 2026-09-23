@@ -195,10 +195,11 @@ func (s *NATSSubscriber) HandlePresenceErasureClearedForTest(data []byte) {
 func (s *NATSSubscriber) ApplyServerVoiceParticipantMutationForTest(
 	serverID, channelID uuid.UUID,
 	oldScope presence.Scope,
+	oldServerID uuid.UUID,
 	hasOldScope bool,
 	mutation func() (bool, error),
 ) (bool, error) {
-	return s.applyServerVoiceParticipantMutation(serverID, channelID, oldScope, hasOldScope, mutation)
+	return s.applyServerVoiceParticipantMutation(serverID, channelID, oldScope, oldServerID, hasOldScope, mutation)
 }
 
 // RunVoiceLifecycleMutationForTest exercises the same claim-then-mutate

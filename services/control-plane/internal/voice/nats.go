@@ -3324,30 +3324,32 @@ func moveServerVoiceParticipant(
 func (s *NATSSubscriber) currentServerVoiceScope(
 	ctx context.Context,
 	senderID uuid.UUID,
-) (presence.Scope, bool, error) {
+) (presence.Scope, uuid.UUID, bool, error) {
 	var (
-		scope presence.Scope
-		count int
+		scope       presence.Scope
+		oldServerID uuid.UUID
+		count       int
 	)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT channel_id, lifecycle_event_at, COUNT(*) OVER ()
-		FROM voice_participants
-		WHERE user_id = $1
-		ORDER BY channel_id
+		SELECT vp.channel_id, c.server_id, vp.lifecycle_event_at, COUNT(*) OVER ()
+		FROM voice_participants vp
+		JOIN channels c ON c.id = vp.channel_id
+		WHERE vp.user_id = $1
+		ORDER BY vp.channel_id
 		LIMIT 1
-	`, senderID).Scan(&scope.RoomID, &scope.EventAt, &count)
+	`, senderID).Scan(&scope.RoomID, &oldServerID, &scope.EventAt, &count)
 	if errors.Is(err, sql.ErrNoRows) {
-		return presence.Scope{}, false, nil
+		return presence.Scope{}, uuid.Nil, false, nil
 	}
 	if err != nil {
-		return presence.Scope{}, false, fmt.Errorf("query current server voice scope: %w", err)
+		return presence.Scope{}, uuid.Nil, false, fmt.Errorf("query current server voice scope: %w", err)
 	}
 	if count != 1 {
-		return presence.Scope{}, false, errAmbiguousServerVoiceScope
+		return presence.Scope{}, uuid.Nil, false, errAmbiguousServerVoiceScope
 	}
 	scope.Category = presence.CategoryServerVoice
 	scope.LifecycleID = scope.RoomID
-	return scope, true, nil
+	return scope, oldServerID, true, nil
 }
 
 // SetPermissionEnforcer wires the mid-session permission push into the
@@ -5151,7 +5153,7 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 	if !s.serverVoiceJoinHasCapacity(ctx, channelID, senderID) {
 		return false
 	}
-	oldScope, hasOldScope, scopeErr := s.currentServerVoiceScope(ctx, senderID)
+	oldScope, oldServerID, hasOldScope, scopeErr := s.currentServerVoiceScope(ctx, senderID)
 	ambiguousOldScope := errors.Is(scopeErr, errAmbiguousServerVoiceScope)
 	if scopeErr != nil && !ambiguousOldScope {
 		s.log.Error("Server voice Rich Presence prior-state read failed", "failure_class", "state_read")
@@ -5163,7 +5165,8 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 		hasOldScope = false
 	}
 	result, activityErr := s.applyServerHeartbeatParticipant(
-		ctx, room.serverUUID, channelID, senderID, eventAt, oldScope, hasOldScope,
+		ctx, room.serverUUID, channelID, senderID, eventAt,
+		previousServerVoiceScope{scope: oldScope, serverID: oldServerID, exists: hasOldScope},
 	)
 	if activityErr != nil {
 		s.log.Error("Server voice Rich Presence refresh failed",
@@ -7046,7 +7049,7 @@ func (s *NATSSubscriber) refreshServerHeartbeatParticipant(
 	channelID, participantID uuid.UUID,
 	eventAt time.Time,
 ) (added bool, deliveryFailed bool) {
-	oldScope, hasOldScope, scopeErr := s.currentServerVoiceScope(ctx, participantID)
+	oldScope, oldServerID, hasOldScope, scopeErr := s.currentServerVoiceScope(ctx, participantID)
 	ambiguousOldScope := errors.Is(scopeErr, errAmbiguousServerVoiceScope)
 	if scopeErr != nil && !ambiguousOldScope {
 		s.log.Error("Server voice Rich Presence heartbeat prior-state read failed",
@@ -7059,7 +7062,8 @@ func (s *NATSSubscriber) refreshServerHeartbeatParticipant(
 		hasOldScope = false
 	}
 	mutationResult, activityErr := s.applyServerHeartbeatParticipant(
-		ctx, room.serverUUID, channelID, participantID, eventAt, oldScope, hasOldScope,
+		ctx, room.serverUUID, channelID, participantID, eventAt,
+		previousServerVoiceScope{scope: oldScope, serverID: oldServerID, exists: hasOldScope},
 	)
 	if activityErr != nil {
 		s.log.Error("Server voice Rich Presence heartbeat refresh failed",
@@ -7086,12 +7090,17 @@ func (s *NATSSubscriber) refreshServerHeartbeatParticipant(
 	return mutationResult.added, !delivered || !removedDelivered
 }
 
+type previousServerVoiceScope struct {
+	scope    presence.Scope
+	serverID uuid.UUID
+	exists   bool
+}
+
 func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 	ctx context.Context,
 	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
-	oldScope presence.Scope,
-	hasOldScope bool,
+	previous previousServerVoiceScope,
 ) (serverVoiceMutationResult, error) {
 	newScope := presence.Scope{
 		Category: presence.CategoryServerVoice, RoomID: channelID,
@@ -7116,7 +7125,7 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 			return mutationApplied || mutationResult.applied, mutationErr
 		}
 		_, mutationErr = s.applyServerVoiceParticipantMutation(
-			serverID, channelID, oldScope, hasOldScope, applyMutation,
+			serverID, channelID, previous.scope, previous.serverID, previous.exists, applyMutation,
 		)
 		if mutationErr == nil && mutationApplied {
 			mutationResult, mutationErr = s.finishServerVoiceParticipantUpsert(
@@ -7128,9 +7137,9 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 		}
 		return mutationResult.applied, mutationErr
 	}
-	if hasOldScope && oldScope.RoomID != channelID {
+	if previous.exists && previous.scope.RoomID != channelID {
 		return mutationResult, s.activity.MoveServerVoice(
-			ctx, participantID, oldScope, newScope, mutation,
+			ctx, participantID, previous.scope, newScope, mutation,
 		)
 	}
 	return mutationResult, s.activity.RefreshServerVoice(
@@ -7141,6 +7150,7 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 func (s *NATSSubscriber) applyServerVoiceParticipantMutation(
 	serverID, channelID uuid.UUID,
 	oldScope presence.Scope,
+	oldServerID uuid.UUID,
 	hasOldScope bool,
 	mutation func() (bool, error),
 ) (bool, error) {
@@ -7149,7 +7159,7 @@ func (s *NATSSubscriber) applyServerVoiceParticipantMutation(
 		// installs the new one. Open both keyed fences so an old-channel terminal
 		// leave cannot settle as a successor while that delete is in flight.
 		return s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, func() (bool, error) {
-			return s.hub.ApplyServerVoiceChannelMutation(serverID, oldScope.RoomID, mutation)
+			return s.hub.ApplyServerVoiceChannelMutation(oldServerID, oldScope.RoomID, mutation)
 		})
 	}
 	return s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, mutation)

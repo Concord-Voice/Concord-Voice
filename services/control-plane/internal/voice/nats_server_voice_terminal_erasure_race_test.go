@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -121,7 +122,7 @@ func TestServerVoiceMoveFencesTheRemovedChannelTerminalDelivery(t *testing.T) {
 	go func() {
 		_, err := sub.ApplyServerVoiceParticipantMutationForTest(
 			uuid.MustParse(serverID), uuid.MustParse(newChannelID),
-			presence.Scope{RoomID: uuid.MustParse(oldChannelID)}, true,
+			presence.Scope{RoomID: uuid.MustParse(oldChannelID)}, uuid.MustParse(serverID), true,
 			func() (bool, error) {
 				close(mutationStarted)
 				<-release
@@ -170,6 +171,108 @@ func TestServerVoiceMoveFencesTheRemovedChannelTerminalDelivery(t *testing.T) {
 		require.Equal(t, concordws.ServerVoiceTerminalDeliveryApplied, outcome)
 	case <-time.After(2 * time.Second):
 		t.Fatal("removed-channel terminal delivery did not settle after move commit")
+	}
+}
+
+func TestServerVoiceCrossServerMoveFencesTheRemovedChannelTerminalDelivery(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "cross-server-move-fence-owner")
+	participant := ts.CreateTestUser(t, "cross-server-move-fence-participant")
+	viewer := ts.CreateTestUser(t, "cross-server-move-fence-viewer")
+	oldServerID := ts.CreateTestServer(t, owner.ID, "cross-server-move-fence-old-server")
+	newServerID := ts.CreateTestServer(t, owner.ID, "cross-server-move-fence-new-server")
+	ts.AddMemberToServer(t, oldServerID, viewer.ID, "member")
+	ts.AddMemberToServer(t, newServerID, viewer.ID, "member")
+	oldChannelID := ts.CreateVoiceChannel(t, oldServerID, "cross-server-move-fence-old")
+	newChannelID := ts.CreateVoiceChannel(t, newServerID, "cross-server-move-fence-new")
+	hub, baseURL := newVoiceReplicaHub(t, ts)
+	sub := newTestSubscriberWithHub(ts, hub)
+	joinedAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	sub.HandleJoined(mustJSON(t, map[string]interface{}{
+		"channelId": oldChannelID, "userId": participant.ID, "username": participant.Username,
+		"timestamp": joinedAt.Format(time.RFC3339Nano),
+	}))
+	require.True(t, voiceParticipantExists(t, ts.DB, oldChannelID, participant.ID))
+	conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
+	require.NoError(t, conn.WriteJSON(map[string]interface{}{
+		"type": "subscribe_server",
+		"data": map[string]interface{}{"server_id": oldServerID},
+	}))
+	synchronizeVoiceWireClient(t, conn)
+
+	mutationStarted := make(chan struct{})
+	release := make(chan struct{})
+	reachedOldFence := make(chan struct{}, 1)
+	hub.SetServerVoiceDeliveryMutationWaitHookForTest(func(serverID, channelID uuid.UUID) {
+		if serverID == uuid.MustParse(oldServerID) && channelID == uuid.MustParse(oldChannelID) {
+			select {
+			case reachedOldFence <- struct{}{}:
+			default:
+			}
+		}
+	})
+	var claimedOnce sync.Once
+	sub.SetVoiceLifecycleClaimedHookForTest(func(category presence.Category, senderID uuid.UUID, _ time.Time) {
+		if category == presence.CategoryServerVoice && senderID == uuid.MustParse(participant.ID) {
+			claimedOnce.Do(func() { close(mutationStarted) })
+			<-release
+		}
+	})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	movePayload := mustJSON(t, map[string]interface{}{
+		"channelId": newChannelID, "userId": participant.ID, "username": participant.Username,
+		"timestamp": joinedAt.Add(time.Second).Format(time.RFC3339Nano),
+	})
+	moveDone := make(chan struct{})
+	go func() {
+		defer close(moveDone)
+		sub.HandleJoined(movePayload)
+	}()
+	select {
+	case <-mutationStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cross-server move did not reach its guarded mutation")
+	}
+
+	delivery, queued := hub.BroadcastToServerVoiceParticipantReliableContext(
+		context.Background(), uuid.MustParse(oldServerID), uuid.MustParse(oldChannelID), uuid.MustParse(participant.ID),
+		concordws.OutgoingMessage{Type: "voice_state_update", Data: map[string]interface{}{
+			"channel_id": oldChannelID, "user_id": participant.ID, "action": "left", "server_id": oldServerID,
+		}},
+	)
+	require.True(t, queued)
+	select {
+	case outcome := <-delivery.Outcome:
+		t.Fatalf("cross-server removed-channel terminal delivery settled before move commit: %v", outcome)
+	case <-reachedOldFence:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal delivery did not reach the old-channel mutation fence")
+	}
+	select {
+	case outcome := <-delivery.Outcome:
+		t.Fatalf("cross-server removed-channel terminal delivery settled at the mutation fence: %v", outcome)
+	default:
+	}
+
+	close(release)
+	released = true
+	select {
+	case <-moveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cross-server move did not complete")
+	}
+	require.False(t, voiceParticipantExists(t, ts.DB, oldChannelID, participant.ID))
+	require.True(t, voiceParticipantExists(t, ts.DB, newChannelID, participant.ID))
+	select {
+	case outcome := <-delivery.Outcome:
+		require.Equal(t, concordws.ServerVoiceTerminalDeliveryApplied, outcome)
+	case <-time.After(2 * time.Second):
+		t.Fatal("cross-server removed-channel terminal delivery did not settle after move commit")
 	}
 }
 
