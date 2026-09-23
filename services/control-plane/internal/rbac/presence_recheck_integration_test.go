@@ -235,6 +235,16 @@ type harnessRecheck struct {
 	refreshes         []uuid.UUID
 	refreshErrs       []error
 	visibilityQueries int
+	captureEntered    chan struct{}
+	captureRelease    chan struct{}
+}
+
+func (r *harnessRecheck) blockCapture() (entered, release chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.captureEntered = make(chan struct{})
+	r.captureRelease = make(chan struct{})
+	return r.captureEntered, r.captureRelease
 }
 
 func (r *harnessRecheck) failCapture() {
@@ -301,6 +311,13 @@ func (r *harnessRecheck) CaptureVisibility(
 	typed, ok := plan.(*harnessPlan)
 	if !ok {
 		return nil
+	}
+	r.mu.Lock()
+	entered, release := r.captureEntered, r.captureRelease
+	r.mu.Unlock()
+	if entered != nil {
+		close(entered)
+		<-release
 	}
 	for index := range typed.senders {
 		sender := &typed.senders[index]

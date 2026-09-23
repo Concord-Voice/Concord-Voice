@@ -83,7 +83,7 @@ DROP INDEX IF EXISTS idx_users_status;
 ALTER TABLE users DROP COLUMN IF EXISTS status;
 ```
 
-## Existing Migrations (000001–000142)
+## Existing Migrations (000001–000143)
 
 ### Phase 1A — Authentication & E2EE
 | # | Name | Tables/Changes |
@@ -252,6 +252,7 @@ ALTER TABLE users DROP COLUMN IF EXISTS status;
 | 000140 | add_server_voice_terminal_outbox | Add guarded Server Voice terminal obligations for stale-leave retry through local Hub admission (#3298) |
 | 000141 | add_server_voice_terminal_outbox_user_index | Add the user index supporting account-erasure cascades for terminal obligations (#3298) |
 | 000142 | server_voice_terminal_outbox_ops_metrics | Admit aggregate Server Voice terminal-outbox lifecycle counters to the closed operations metric catalog (#3298) |
+| 000143 | add_server_voice_terminal_delivery_claim | Add recoverable worker claim metadata for terminal-outbox delivery attempts (#3298) |
 
 Migration 000017 converted `messages.created_at` to `TIMESTAMPTZ`, and migration
 000026 declared `dm_messages.created_at` as `TIMESTAMPTZ`; expiration backfills use
@@ -283,6 +284,10 @@ Migration 000142 admits the six aggregate terminal-outbox counters. Apply it bef
 deploying code that emits those keys. Its down migration removes only those six
 retired aggregate series under an `ACCESS EXCLUSIVE` lock, then restores the exact
 000136 catalog; it does not alter the outbox table.
+
+Migration 000143 adds nullable delivery-claim metadata. Apply it before code that
+claims terminal delivery; its down migration removes only that ephemeral metadata
+and leaves terminal obligations intact.
 
 ## Troubleshooting
 

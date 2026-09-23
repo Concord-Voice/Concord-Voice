@@ -206,6 +206,8 @@ func (m *tempGrantManager) deleteTemporaryGrantWithCapture(
 		plan = prepared
 	}
 
+	defer m.hub.BeginAudienceRevocation()()
+
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("temp revoke begin: %w", err)

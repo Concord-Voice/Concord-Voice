@@ -2341,6 +2341,8 @@ func (h *Handler) deleteCategoryOverrideWithCapture(
 		return fmt.Errorf("prepare category override presence capture: %w", err)
 	}
 
+	defer h.hub.BeginAudienceRevocation()()
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2386,6 +2388,8 @@ func (h *Handler) copyCategoryOverridesToChannel(
 	if err != nil {
 		return fmt.Errorf("prepare channel presence capture: %w", err)
 	}
+
+	defer h.hub.BeginAudienceRevocation()()
 
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2509,6 +2513,8 @@ func (h *Handler) syncCategoryOverridesToChannels(ctx context.Context, serverID,
 			"failure_class", "cascade_capture_unavailable", "error", err)
 		plan = nil
 	}
+
+	defer h.hub.BeginAudienceRevocation()()
 
 	// Wrap in transaction for atomicity — all channels update or none do
 	tx, err := h.db.BeginTx(ctx, nil)

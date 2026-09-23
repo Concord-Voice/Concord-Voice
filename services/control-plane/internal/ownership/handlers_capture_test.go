@@ -108,6 +108,22 @@ func TestInsertTransferRecordReturnsServerLockError(t *testing.T) {
 	require.Equal(t, 500, recorder.Code)
 }
 
+func TestWithOwnershipCapture_FencesOwnershipWrite(t *testing.T) {
+	trace := []string{}
+	db := sql.OpenDB(ambiguousConnector{trace: &trace, commitOK: true})
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	hub := websocket.NewHub(nil, nil)
+	h := &Handler{db: db, hub: hub, log: logger.New("ownership-test")}
+
+	_, changed, err := h.withOwnershipCapture(context.Background(), uuid.NewString(), func(context.Context, *sql.Tx) (bool, error) {
+		require.NotZero(t, hub.PresenceAuthzOpenForTest(), "ownership write must fence Server Voice delivery")
+		return true, nil
+	})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Zero(t, hub.PresenceAuthzOpenForTest(), "ownership fence must close after the transaction resolves")
+}
+
 type blockingCacheHook struct {
 	once    sync.Once
 	started chan struct{}

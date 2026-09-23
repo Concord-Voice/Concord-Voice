@@ -129,6 +129,8 @@ func (h *Handler) withAuthorityCapture(
 		return nil, err
 	}
 
+	defer h.hub.BeginAudienceRevocation()()
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin authority transaction: %w", err)

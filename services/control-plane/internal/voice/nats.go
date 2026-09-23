@@ -197,6 +197,9 @@ const (
 	maxPrivateVoiceParticipantIDs        = 255
 	maxServerVoiceParticipantIDs         = 1000
 	serverHeartbeatParticipantWorkers    = 5
+	serverVoiceTerminalClaimLease        = 15 * time.Second
+	serverVoiceTerminalClaimRenew        = 5 * time.Second
+	serverVoiceTerminalClaimDBTimeout    = 5 * time.Second
 	logPrivateBridgeUnavailable          = "Private Call Rich Presence bridge unavailable"
 	logPrivateLifecycleDependencyFailure = "Private Call lifecycle dependency failure"
 	logPrivatePreMutationReadFailure     = "Private Call pre-mutation participant read failed"
@@ -3166,6 +3169,22 @@ func (s *NATSSubscriber) upsertServerVoiceParticipant(
 	channelID, senderID uuid.UUID,
 	eventAt time.Time,
 ) (serverVoiceMutationResult, error) {
+	mutationResult, applied, claimStatus, err := s.mutateServerVoiceParticipant(
+		ctx, channelID, senderID, eventAt,
+	)
+	if err != nil || !applied {
+		return mutationResult, err
+	}
+	return s.finishServerVoiceParticipantUpsert(
+		ctx, channelID, senderID, eventAt, mutationResult, claimStatus,
+	)
+}
+
+func (s *NATSSubscriber) mutateServerVoiceParticipant(
+	ctx context.Context,
+	channelID, senderID uuid.UUID,
+	eventAt time.Time,
+) (serverVoiceMutationResult, bool, voiceLifecycleClaimStatus, error) {
 	var mutationResult serverVoiceMutationResult
 	applied, claimStatus, err := s.withVoiceLifecycleClaimStatus(
 		ctx,
@@ -3186,12 +3205,16 @@ func (s *NATSSubscriber) upsertServerVoiceParticipant(
 			return mutationResult.applied, mutationErr
 		},
 	)
-	if err != nil {
-		return mutationResult, err
-	}
-	if !applied {
-		return mutationResult, nil
-	}
+	return mutationResult, applied, claimStatus, err
+}
+
+func (s *NATSSubscriber) finishServerVoiceParticipantUpsert(
+	ctx context.Context,
+	channelID, senderID uuid.UUID,
+	eventAt time.Time,
+	mutationResult serverVoiceMutationResult,
+	claimStatus voiceLifecycleClaimStatus,
+) (serverVoiceMutationResult, error) {
 	if claimStatus == voiceLifecycleFresh && !mutationResult.removedAudienceUnknown {
 		if replayErr := s.storeServerVoiceMutationReplay(
 			ctx, senderID, channelID, eventAt, mutationResult,
@@ -3419,9 +3442,10 @@ const serverVoiceTerminalOutboxDiscoverySQL = `
 		WITH cutoff AS MATERIALIZED (
 		    SELECT clock_timestamp() AS due_before
 		)
-		SELECT channel_id, user_id, operation_id
-		FROM server_voice_terminal_outbox
-		WHERE reconcile_after <= (SELECT due_before FROM cutoff)
+	SELECT channel_id, user_id, operation_id
+	FROM server_voice_terminal_outbox
+	WHERE reconcile_after <= (SELECT due_before FROM cutoff)
+	  AND (delivery_claim_until IS NULL OR delivery_claim_until <= (SELECT due_before FROM cutoff))
 		ORDER BY reconcile_after, created_at, channel_id, user_id
 		LIMIT $1;
 	`
@@ -3659,7 +3683,9 @@ func (s *NATSSubscriber) reconcileStaleServerVoiceParticipant(
 			SET server_id = EXCLUDED.server_id,
 				operation_id = EXCLUDED.operation_id,
 				created_at = EXCLUDED.created_at,
-				reconcile_after = EXCLUDED.reconcile_after
+				reconcile_after = EXCLUDED.reconcile_after,
+				delivery_claim_id = NULL,
+				delivery_claim_until = NULL
 		`, candidate.channelID, candidate.userID, candidate.serverID, operationID); err != nil {
 			return false, false, fmt.Errorf("capture stale server voice terminal obligation: %w", err)
 		}
@@ -3787,19 +3813,22 @@ func (s *NATSSubscriber) drainServerVoiceTerminalOutboxCandidate(
 	}
 
 	var operationID, serverID uuid.UUID
+	var claimActive bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT operation_id, server_id
+		SELECT operation_id,
+		       server_id,
+		       delivery_claim_until IS NOT NULL AND delivery_claim_until > clock_timestamp()
 		FROM server_voice_terminal_outbox
 		WHERE channel_id = $1 AND user_id = $2
 		FOR UPDATE
-	`, candidate.channelID, candidate.userID).Scan(&operationID, &serverID)
+	`, candidate.channelID, candidate.userID).Scan(&operationID, &serverID, &claimActive)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("lock server voice terminal obligation: %w", err)
 	}
-	if operationID != candidate.operationID {
+	if operationID != candidate.operationID || claimActive {
 		return false, nil
 	}
 	var channelExists bool
@@ -3865,50 +3894,166 @@ func (s *NATSSubscriber) drainServerVoiceTerminalOutboxCandidate(
 		return false, fmt.Errorf("recheck server voice terminal successor: %w", err)
 	}
 
-	enqueueCtx, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
-	queued := s.broadcastServerVoiceParticipantContext(enqueueCtx, &roomContext{
+	claimID := uuid.New()
+	claimResult, err := tx.ExecContext(ctx, `
+		UPDATE server_voice_terminal_outbox
+		SET delivery_claim_id = $4,
+		    delivery_claim_until = clock_timestamp() + ($5::bigint * INTERVAL '1 second')
+		WHERE channel_id = $1
+		  AND user_id = $2
+		  AND operation_id = $3
+		  AND (delivery_claim_until IS NULL OR delivery_claim_until <= clock_timestamp())
+	`, candidate.channelID, candidate.userID, candidate.operationID, claimID, int64(serverVoiceTerminalClaimLease/time.Second))
+	if err != nil {
+		return false, fmt.Errorf("claim server voice terminal obligation: %w", err)
+	}
+	claimRows, err := claimResult.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read server voice terminal claim result: %w", err)
+	}
+	if claimRows != 1 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit server voice terminal delivery claim: %w", err)
+	}
+
+	// The durable claim was committed above, so enqueue recovery must outlive the
+	// current drain turn while retaining its context values.
+	claimCtx := context.WithoutCancel(ctx)
+	enqueueCtx, cancel := context.WithTimeout(claimCtx, 5*time.Millisecond)
+	delivery, queued := s.broadcastServerVoiceTerminalContext(enqueueCtx, &roomContext{
 		serverID: serverID.String(), serverUUID: serverID,
 	}, candidate.channelID, candidate.userID, "left")
 	cancel()
 	if !queued {
-		result, err := tx.ExecContext(ctx, `
-			UPDATE server_voice_terminal_outbox
-			SET reconcile_after = clock_timestamp() + INTERVAL '5 seconds'
-			WHERE channel_id = $1 AND user_id = $2 AND operation_id = $3
-		`, candidate.channelID, candidate.userID, candidate.operationID)
-		if err != nil {
-			return false, fmt.Errorf("reschedule server voice terminal obligation: %w", err)
+		if err := s.rescheduleServerVoiceTerminalClaim(claimCtx, candidate, claimID); err != nil {
+			return false, err
 		}
-		rowsAffected, err := result.RowsAffected()
-		if err != nil {
-			return false, fmt.Errorf("read server voice terminal reschedule result: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("commit server voice terminal reschedule: %w", err)
-		}
-		if rowsAffected == 1 {
-			outcomes.queueRescheduled++
-		}
+		outcomes.queueRescheduled++
 		return false, nil
 	}
-	admitted = true
-	outcomes.delivered++
 
-	result, err := tx.ExecContext(ctx, `
-		DELETE FROM server_voice_terminal_outbox
-		WHERE channel_id = $1 AND user_id = $2 AND operation_id = $3
-	`, candidate.channelID, candidate.userID, candidate.operationID)
-	if err != nil {
-		return true, fmt.Errorf("ack delivered server voice terminal obligation: %w", err)
-	}
-	_, err = result.RowsAffected()
-	if err != nil {
-		return true, fmt.Errorf("read delivered terminal acknowledgement result: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return true, fmt.Errorf("commit delivered server voice terminal obligation: %w", err)
-	}
+	outcomes.delivered++
+	go s.awaitServerVoiceTerminalDelivery(context.WithoutCancel(ctx), candidate, claimID, delivery)
 	return true, nil
+}
+
+func (s *NATSSubscriber) awaitServerVoiceTerminalDelivery(
+	ctx context.Context,
+	candidate serverVoiceTerminalOutboxCandidate,
+	claimID uuid.UUID,
+	delivery websocket.ServerVoiceTerminalDelivery,
+) {
+	renew := time.NewTicker(serverVoiceTerminalClaimRenew)
+	defer renew.Stop()
+	for {
+		select {
+		case outcome := <-delivery.Outcome:
+			s.settleServerVoiceTerminalDelivery(ctx, candidate, claimID, outcome)
+			return
+		case <-delivery.Stopped:
+			// A receipt buffered immediately before Hub shutdown is authoritative:
+			// replaying that completed leave would be avoidable duplicate delivery.
+			select {
+			case outcome := <-delivery.Outcome:
+				s.settleServerVoiceTerminalDelivery(ctx, candidate, claimID, outcome)
+				return
+			default:
+			}
+			if err := s.rescheduleServerVoiceTerminalClaim(ctx, candidate, claimID); err != nil {
+				s.log.Warn("Server Voice terminal delivery recovery failed", "failure_class", "delivery_claim_recovery")
+			}
+			return
+		case <-renew.C:
+			if err := s.renewServerVoiceTerminalClaim(ctx, candidate, claimID); err != nil {
+				s.log.Warn("Server Voice terminal delivery claim renewal failed", "failure_class", "delivery_claim_renewal")
+			}
+		}
+	}
+}
+
+func (s *NATSSubscriber) settleServerVoiceTerminalDelivery(
+	ctx context.Context,
+	candidate serverVoiceTerminalOutboxCandidate,
+	claimID uuid.UUID,
+	outcome websocket.ServerVoiceTerminalDeliveryOutcome,
+) {
+	if outcome == websocket.ServerVoiceTerminalDeliveryApplied ||
+		outcome == websocket.ServerVoiceTerminalDeliverySuppressedErased ||
+		outcome == websocket.ServerVoiceTerminalDeliverySuppressedSuccessor {
+		if err := s.ackServerVoiceTerminalClaim(ctx, candidate, claimID); err != nil {
+			s.log.Warn("Server Voice terminal delivery acknowledgement failed", "failure_class", "delivery_claim_acknowledgement")
+		}
+		return
+	}
+	if err := s.rescheduleServerVoiceTerminalClaim(ctx, candidate, claimID); err != nil {
+		s.log.Warn("Server Voice terminal delivery reschedule failed", "failure_class", "delivery_claim_reschedule")
+	}
+}
+
+func (s *NATSSubscriber) ackServerVoiceTerminalClaim(
+	ctx context.Context,
+	candidate serverVoiceTerminalOutboxCandidate,
+	claimID uuid.UUID,
+) error {
+	ctx, cancel := context.WithTimeout(ctx, serverVoiceTerminalClaimDBTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM server_voice_terminal_outbox
+		WHERE channel_id = $1 AND user_id = $2 AND operation_id = $3 AND delivery_claim_id = $4
+	`, candidate.channelID, candidate.userID, candidate.operationID, claimID)
+	if err != nil {
+		return fmt.Errorf("ack delivered server voice terminal obligation: %w", err)
+	}
+	if _, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("read delivered terminal acknowledgement result: %w", err)
+	}
+	return nil
+}
+
+func (s *NATSSubscriber) rescheduleServerVoiceTerminalClaim(
+	ctx context.Context,
+	candidate serverVoiceTerminalOutboxCandidate,
+	claimID uuid.UUID,
+) error {
+	ctx, cancel := context.WithTimeout(ctx, serverVoiceTerminalClaimDBTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE server_voice_terminal_outbox
+		SET delivery_claim_id = NULL,
+		    delivery_claim_until = NULL,
+		    reconcile_after = clock_timestamp() + INTERVAL '5 seconds'
+		WHERE channel_id = $1 AND user_id = $2 AND operation_id = $3 AND delivery_claim_id = $4
+	`, candidate.channelID, candidate.userID, candidate.operationID, claimID)
+	if err != nil {
+		return fmt.Errorf("reschedule server voice terminal obligation: %w", err)
+	}
+	if _, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("read server voice terminal reschedule result: %w", err)
+	}
+	return nil
+}
+
+func (s *NATSSubscriber) renewServerVoiceTerminalClaim(
+	ctx context.Context,
+	candidate serverVoiceTerminalOutboxCandidate,
+	claimID uuid.UUID,
+) error {
+	ctx, cancel := context.WithTimeout(ctx, serverVoiceTerminalClaimDBTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE server_voice_terminal_outbox
+		SET delivery_claim_until = clock_timestamp() + ($5::bigint * INTERVAL '1 second')
+		WHERE channel_id = $1 AND user_id = $2 AND operation_id = $3 AND delivery_claim_id = $4
+	`, candidate.channelID, candidate.userID, candidate.operationID, claimID, int64(serverVoiceTerminalClaimLease/time.Second))
+	if err != nil {
+		return fmt.Errorf("renew server voice terminal delivery claim: %w", err)
+	}
+	if _, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("read server voice terminal claim renewal result: %w", err)
+	}
+	return nil
 }
 
 func (s *NATSSubscriber) disconnectAllRichPresenceClients() {
@@ -4497,6 +4642,13 @@ func (s *NATSSubscriber) handlePresenceErasureCleared(data []byte) {
 	if verified {
 		s.erasureSeen.Mark(erased.String())
 	}
+	// This replica may have a Server Voice delivery for this sender already
+	// between its subject-state check and final admission. Fence that sender only:
+	// forged distinct UUIDs are admissible at this untrusted NATS boundary and
+	// must not churn unrelated lifecycle retries.
+	if s.hub != nil {
+		s.hub.InvalidateServerVoiceParticipantDelivery(erased)
+	}
 
 	if s.clearErasedSenderHook != nil {
 		s.clearErasedSenderHook(erased)
@@ -5005,7 +5157,7 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 		hasOldScope = false
 	}
 	result, activityErr := s.applyServerHeartbeatParticipant(
-		ctx, channelID, senderID, eventAt, oldScope, hasOldScope,
+		ctx, room.serverUUID, channelID, senderID, eventAt, oldScope, hasOldScope,
 	)
 	if activityErr != nil {
 		s.log.Error("Server voice Rich Presence refresh failed",
@@ -5022,7 +5174,7 @@ func (s *NATSSubscriber) handleServerVoiceJoined(
 	}
 	s.convergeServerVoiceParticipant(ctx, room, channelID, senderID)
 	s.broadcastRemovedServerVoiceRooms(ctx, senderID, result.removedRoomIDs)
-	s.hub.BroadcastToServerChannelAuthorized(room.serverUUID, channelID, websocket.OutgoingMessage{
+	s.hub.BroadcastToServerVoiceParticipant(room.serverUUID, channelID, senderID, websocket.OutgoingMessage{
 		Type: "voice_state_update",
 		Data: map[string]interface{}{
 			"channel_id": event.ChannelID, "user_id": event.UserID,
@@ -5322,6 +5474,7 @@ func (s *NATSSubscriber) broadcastPrivateVoiceOldScopeLeaves(
 
 type serverVoiceLeaveMutation struct {
 	subscriber *NATSSubscriber
+	serverID   uuid.UUID
 	channelID  uuid.UUID
 	senderID   uuid.UUID
 	eventAt    time.Time
@@ -5354,9 +5507,13 @@ func (mutation *serverVoiceLeaveMutation) deleteRow(
 
 func (mutation *serverVoiceLeaveMutation) apply(ctx context.Context) (bool, error) {
 	var err error
-	mutation.applied, err = mutation.subscriber.withVoiceLifecycleClaim(
-		ctx, presence.CategoryServerVoice, mutation.senderID,
-		mutation.channelID, mutation.eventAt, false, mutation.deleteRow,
+	mutation.applied, err = mutation.subscriber.hub.ApplyServerVoiceChannelMutation(
+		mutation.serverID, mutation.channelID, func() (bool, error) {
+			return mutation.subscriber.withVoiceLifecycleClaim(
+				ctx, presence.CategoryServerVoice, mutation.senderID,
+				mutation.channelID, mutation.eventAt, false, mutation.deleteRow,
+			)
+		},
 	)
 	if err == nil && mutation.applied {
 		presence.InvalidateActivityBuildCache(ctx)
@@ -5385,7 +5542,7 @@ func (s *NATSSubscriber) handleServerVoiceLeft(
 		return false
 	}
 	mutation := &serverVoiceLeaveMutation{
-		subscriber: s, channelID: channelID, senderID: senderID, eventAt: eventAt,
+		subscriber: s, serverID: room.serverUUID, channelID: channelID, senderID: senderID, eventAt: eventAt,
 	}
 	activityErr := s.activity.ClearServerVoice(
 		ctx,
@@ -6896,7 +7053,7 @@ func (s *NATSSubscriber) refreshServerHeartbeatParticipant(
 		hasOldScope = false
 	}
 	mutationResult, activityErr := s.applyServerHeartbeatParticipant(
-		ctx, channelID, participantID, eventAt, oldScope, hasOldScope,
+		ctx, room.serverUUID, channelID, participantID, eventAt, oldScope, hasOldScope,
 	)
 	if activityErr != nil {
 		s.log.Error("Server voice Rich Presence heartbeat refresh failed",
@@ -6925,7 +7082,7 @@ func (s *NATSSubscriber) refreshServerHeartbeatParticipant(
 
 func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 	ctx context.Context,
-	channelID, participantID uuid.UUID,
+	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
 	oldScope presence.Scope,
 	hasOldScope bool,
@@ -6939,10 +7096,27 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 		if s.serverVoiceScopeObservedHook != nil {
 			s.serverVoiceScopeObservedHook(participantID, channelID, eventAt)
 		}
-		var mutationErr error
-		mutationResult, mutationErr = s.upsertServerVoiceParticipant(
-			mutationCtx, channelID, participantID, eventAt,
+		var (
+			mutationApplied bool
+			claimStatus     voiceLifecycleClaimStatus
+			mutationErr     error
 		)
+		applyMutation := func() (bool, error) {
+			mutationResult, mutationApplied, claimStatus, mutationErr = s.mutateServerVoiceParticipant(
+				mutationCtx, channelID, participantID, eventAt,
+			)
+			// A commit error can leave the database outcome indeterminate. Fence
+			// that result too so terminal delivery retries rather than crossing it.
+			return mutationApplied || mutationResult.applied, mutationErr
+		}
+		_, mutationErr = s.applyServerVoiceParticipantMutation(
+			serverID, channelID, oldScope, hasOldScope, applyMutation,
+		)
+		if mutationErr == nil && mutationApplied {
+			mutationResult, mutationErr = s.finishServerVoiceParticipantUpsert(
+				mutationCtx, channelID, participantID, eventAt, mutationResult, claimStatus,
+			)
+		}
 		if mutationErr == nil && mutationResult.applied {
 			presence.InvalidateActivityBuildCache(mutationCtx)
 		}
@@ -6956,6 +7130,23 @@ func (s *NATSSubscriber) applyServerHeartbeatParticipant(
 	return mutationResult, s.activity.RefreshServerVoice(
 		ctx, participantID, newScope, mutation,
 	)
+}
+
+func (s *NATSSubscriber) applyServerVoiceParticipantMutation(
+	serverID, channelID uuid.UUID,
+	oldScope presence.Scope,
+	hasOldScope bool,
+	mutation func() (bool, error),
+) (bool, error) {
+	if hasOldScope && oldScope.RoomID != channelID {
+		// A move deletes the old participant row in the same transaction that
+		// installs the new one. Open both keyed fences so an old-channel terminal
+		// leave cannot settle as a successor while that delete is in flight.
+		return s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, func() (bool, error) {
+			return s.hub.ApplyServerVoiceChannelMutation(serverID, oldScope.RoomID, mutation)
+		})
+	}
+	return s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, mutation)
 }
 
 func serverHeartbeatMutationNeedsReconnect(
@@ -6992,7 +7183,7 @@ func (s *NATSSubscriber) broadcastServerVoiceParticipant(
 	channelID, participantID uuid.UUID,
 	action string,
 ) {
-	s.hub.BroadcastToServerChannelAuthorized(room.serverUUID, channelID, websocket.OutgoingMessage{
+	s.hub.BroadcastToServerVoiceParticipant(room.serverUUID, channelID, participantID, websocket.OutgoingMessage{
 		Type: "voice_state_update",
 		Data: map[string]interface{}{
 			"channel_id": channelID.String(),
@@ -7009,7 +7200,24 @@ func (s *NATSSubscriber) broadcastServerVoiceParticipantContext(
 	channelID, participantID uuid.UUID,
 	action string,
 ) bool {
-	return s.hub.BroadcastToServerChannelAuthorizedContext(ctx, room.serverUUID, channelID, websocket.OutgoingMessage{
+	return s.hub.BroadcastToServerVoiceParticipantContext(ctx, room.serverUUID, channelID, participantID, websocket.OutgoingMessage{
+		Type: "voice_state_update",
+		Data: map[string]interface{}{
+			"channel_id": channelID.String(),
+			"user_id":    participantID.String(),
+			"action":     action,
+			"server_id":  room.serverID,
+		},
+	})
+}
+
+func (s *NATSSubscriber) broadcastServerVoiceTerminalContext(
+	ctx context.Context,
+	room *roomContext,
+	channelID, participantID uuid.UUID,
+	action string,
+) (websocket.ServerVoiceTerminalDelivery, bool) {
+	return s.hub.BroadcastToServerVoiceParticipantReliableContext(ctx, room.serverUUID, channelID, participantID, websocket.OutgoingMessage{
 		Type: "voice_state_update",
 		Data: map[string]interface{}{
 			"channel_id": channelID.String(),
@@ -7097,7 +7305,7 @@ func (s *NATSSubscriber) reconcileServerHeartbeatParticipants(
 	var reconcileErrors sync.Mutex
 	forEachServerHeartbeatParticipant(ctx, staleParticipantIDs, func(participantID uuid.UUID) {
 		applied, activityErr := s.clearStaleServerHeartbeatParticipant(
-			ctx, channelID, participantID, eventAt,
+			ctx, room.serverUUID, channelID, participantID, eventAt,
 		)
 		if applied {
 			removed.Store(true)
@@ -7130,7 +7338,7 @@ func (s *NATSSubscriber) reconcileServerHeartbeatParticipants(
 
 func (s *NATSSubscriber) clearStaleServerHeartbeatParticipant(
 	ctx context.Context,
-	channelID, participantID uuid.UUID,
+	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
 ) (bool, error) {
 	applied := false
@@ -7143,7 +7351,7 @@ func (s *NATSSubscriber) clearStaleServerHeartbeatParticipant(
 		},
 		func(mutationCtx context.Context) (bool, error) {
 			mutationApplied, mutationErr := s.deleteStaleServerHeartbeatParticipant(
-				mutationCtx, channelID, participantID, eventAt,
+				mutationCtx, serverID, channelID, participantID, eventAt,
 			)
 			if mutationErr == nil && mutationApplied {
 				presence.InvalidateActivityBuildCache(mutationCtx)
@@ -7157,37 +7365,39 @@ func (s *NATSSubscriber) clearStaleServerHeartbeatParticipant(
 
 func (s *NATSSubscriber) deleteStaleServerHeartbeatParticipant(
 	ctx context.Context,
-	channelID, participantID uuid.UUID,
+	serverID, channelID, participantID uuid.UUID,
 	eventAt time.Time,
 ) (bool, error) {
-	return s.withVoiceLifecycleClaim(
-		ctx,
-		presence.CategoryServerVoice,
-		participantID,
-		channelID,
-		eventAt,
-		false,
-		func(ctx context.Context, tx *sql.Tx) (bool, error) {
-			result, execErr := tx.ExecContext(ctx, `
+	return s.hub.ApplyServerVoiceChannelMutation(serverID, channelID, func() (bool, error) {
+		return s.withVoiceLifecycleClaim(
+			ctx,
+			presence.CategoryServerVoice,
+			participantID,
+			channelID,
+			eventAt,
+			false,
+			func(ctx context.Context, tx *sql.Tx) (bool, error) {
+				result, execErr := tx.ExecContext(ctx, `
 				DELETE FROM voice_participants
 				WHERE channel_id = $1 AND user_id = $2
 				  AND lifecycle_event_at <= $3
 			`, channelID, participantID, eventAt)
-			if execErr != nil {
-				return false, fmt.Errorf("delete stale server voice participant: %w", execErr)
-			}
-			rowsAffected, rowsErr := result.RowsAffected()
-			if rowsErr != nil {
-				return false, fmt.Errorf("read server heartbeat delete result: %w", rowsErr)
-			}
-			if rowsAffected > 1 {
-				return false, fmt.Errorf(
-					"server heartbeat delete affected %d rows", rowsAffected,
-				)
-			}
-			return rowsAffected == 1, nil
-		},
-	)
+				if execErr != nil {
+					return false, fmt.Errorf("delete stale server voice participant: %w", execErr)
+				}
+				rowsAffected, rowsErr := result.RowsAffected()
+				if rowsErr != nil {
+					return false, fmt.Errorf("read server heartbeat delete result: %w", rowsErr)
+				}
+				if rowsAffected > 1 {
+					return false, fmt.Errorf(
+						"server heartbeat delete affected %d rows", rowsAffected,
+					)
+				}
+				return rowsAffected == 1, nil
+			},
+		)
+	})
 }
 
 func parseSortedVoiceParticipantIDs(rawIDs []string, participantLimit int) ([]uuid.UUID, error) {

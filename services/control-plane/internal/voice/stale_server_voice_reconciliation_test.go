@@ -121,8 +121,8 @@ func (c *staleVoiceConn) QueryContext(
 		// post-capture reread so the legacy wire assertions still observe left.
 		if strings.Contains(query, "FOR UPDATE") && c.state != nil && c.state.operationID != uuid.Nil {
 			return &staleVoiceRowSet{
-				columns: []string{"operation_id", "server_id"},
-				values:  [][]driver.Value{{c.state.operationID.String(), c.state.serverUUID.String()}},
+				columns: []string{"operation_id", "server_id", "claim_active"},
+				values:  [][]driver.Value{{c.state.operationID.String(), c.state.serverUUID.String(), false}},
 			}, nil
 		}
 		return staleVoiceRows(5, nil, nil), nil
@@ -546,6 +546,12 @@ func TestReconcileStaleServerVoiceParticipants_DoesNotLeaveSuccessorStale(t *tes
 			ts.AddMemberToServer(t, serverID, viewer.ID, "member")
 			channelID := ts.CreateVoiceChannel(t, serverID, "stale-wire-channel")
 			ts.CreateChannelOverride(t, channelID, "user", viewer.ID, int64(rbac.PermViewVoiceChannels), 0)
+			_, err := ts.DB.Exec(
+				`INSERT INTO users (id, email, username, password_hash, age_verified, email_verified)
+				 VALUES ($1, 'stale-wire-participant@test.concord.chat', 'stale-wire-participant', $2, true, true)`,
+				staleVoiceCandidateUser, testhelpers.TestAuthHash,
+			)
+			require.NoError(t, err)
 			hub, baseURL := newVoiceReplicaHub(t, ts)
 			conn := connectVoiceWireClientAtURL(t, ts.Redis, hub, baseURL, viewer)
 			require.NoError(t, conn.WriteJSON(map[string]interface{}{

@@ -4,12 +4,73 @@ package rbac
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCategoryOverrideTransactionsFenceFinalAdmission(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*rbacPresenceEnv, string, string) error
+	}{
+		{
+			name: "delete",
+			run: func(env *rbacPresenceEnv, categoryID, _ string) error {
+				return env.handler.deleteCategoryOverrideWithCapture(
+					context.Background(), env.serverID, categoryID, uuid.NewString(), "role", env.viewRole,
+				)
+			},
+		},
+		{
+			name: "copy",
+			run: func(env *rbacPresenceEnv, categoryID, channelID string) error {
+				return env.handler.copyCategoryOverridesToChannel(
+					context.Background(), env.serverID, channelID, categoryID,
+				)
+			},
+		},
+		{
+			name: "sync",
+			run: func(env *rbacPresenceEnv, categoryID, _ string) error {
+				env.handler.syncCategoryOverridesToChannels(context.Background(), env.serverID, categoryID)
+				return nil
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newRBACPresenceEnv(t)
+			defer env.Close()
+
+			categoryID := env.createCategory(t)
+			channelID := env.createVoiceChannel(t, categoryID, true)
+			env.joinVoice(t, channelID)
+			entered, release := env.recheck.blockCapture()
+			var releaseOnce sync.Once
+			releaseCapture := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseCapture)
+
+			result := make(chan error, 1)
+			go func() { result <- test.run(env, categoryID, channelID) }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("phase-two capture did not start")
+			}
+			require.NotZero(t, env.handler.hub.PresenceAuthzOpenForTest())
+
+			releaseCapture()
+			require.NoError(t, <-result)
+			require.Zero(t, env.handler.hub.PresenceAuthzOpenForTest())
+		})
+	}
+}
 
 // DeleteCategoryOverride's child cascade was the one narrowing write in the
 // RBAC family left unhooked by #2445 — absent from the design's §6.7 matrix,
@@ -88,6 +149,7 @@ func TestDeleteCategoryOverride_CaptureFailure_BlocksTheWrite(t *testing.T) {
 		context.Background(), env.serverID, category, overrideID, "role", env.viewRole,
 	)
 	require.Error(t, err, "a capture failure blocks the write here: nothing has committed yet")
+	require.Zero(t, env.handler.hub.PresenceAuthzOpenForTest())
 
 	var remaining int
 	require.NoError(t, env.db.QueryRow(

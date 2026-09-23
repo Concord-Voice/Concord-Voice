@@ -1100,6 +1100,10 @@ func (h *Handler) authorizeRemoval(c *gin.Context, serverID, userID, targetUserI
 // including BroadcastToServerAndPrune's deliver-then-prune ordering — is
 // untouched: the presence work has already completed by then.
 func (h *Handler) execRemovalTx(ctx context.Context, serverID, targetUserID, actorID string) error {
+	if h.graphPresence == nil {
+		defer h.hub.BeginAudienceRevocation()()
+	}
+
 	spec := presencehook.Spec{
 		Family:      presencecapture.FamilyMemberRemove,
 		Posture:     presencecapture.FailClosedBlockWrite,
@@ -1396,6 +1400,9 @@ func (h *Handler) execBanTx(
 	if gated != nil && !probedMember {
 		gated = nil
 		skipGateForProbe = true
+	}
+	if gated == nil && !skipGateForProbe {
+		defer h.hub.BeginAudienceRevocation()()
 	}
 
 	spec := presencehook.Spec{

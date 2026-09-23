@@ -557,10 +557,11 @@ func (h *Handler) publishEnforcement(subject, channelID, targetID, action string
 func (h *Handler) broadcastVoiceStateUpdate(serverID, targetID, channelID, action string) {
 	serverUUID, serverErr := uuid.Parse(serverID)
 	channelUUID, channelErr := uuid.Parse(channelID)
-	if serverErr != nil || channelErr != nil {
+	targetUUID, targetErr := uuid.Parse(targetID)
+	if serverErr != nil || channelErr != nil || targetErr != nil {
 		return
 	}
-	h.hub.BroadcastToServerChannelAuthorized(serverUUID, channelUUID, websocket.OutgoingMessage{
+	h.hub.BroadcastToServerVoiceParticipant(serverUUID, channelUUID, targetUUID, websocket.OutgoingMessage{
 		Type: "voice_state_update",
 		Data: map[string]interface{}{
 			"action":     action,

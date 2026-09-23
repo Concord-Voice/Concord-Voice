@@ -928,6 +928,11 @@ func (h *Handler) withOwnershipCaptureOutcome(
 		plan = prepared
 	}
 
+	// Ownership changes can revoke the prior owner's Server Voice visibility.
+	// Bracket the transaction so an in-flight authorization cannot be admitted
+	// after this write commits.
+	defer h.hub.BeginAudienceRevocation()()
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, ownershipWriteUnchanged, fmt.Errorf("begin ownership transaction: %w", err)

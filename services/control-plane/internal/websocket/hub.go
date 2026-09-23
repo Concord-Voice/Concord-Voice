@@ -96,8 +96,11 @@ const (
 	// it was failing, the fence discards it exactly as it would any stale result.
 	// Three attempts, not more: the failure this repairs is pool contention, which
 	// clears in hundreds of milliseconds or is not going to clear at all.
-	presenceAudienceMaxAttempts  = 3
-	presenceAudienceRetryBackoff = 250 * time.Millisecond
+	presenceAudienceMaxAttempts              = 3
+	presenceAudienceRetryBackoff             = 250 * time.Millisecond
+	serverVoiceParticipantCheckMaxAttempts   = 3
+	serverVoiceAuthorizationRetryMaxAttempts = 3
+	serverVoiceDeliveryRetryBackoff          = 50 * time.Millisecond
 	// A blocked telemetry emitter must not let health transition flaps consume
 	// unbounded memory. One queued value is sufficient: the in-flight emission
 	// precedes it, and replacing the queued value preserves eventual delivery of
@@ -106,6 +109,9 @@ const (
 	// Server Voice lifecycle delivery is ordered per server/channel. Keep a
 	// bounded backlog rather than spawning one waiting goroutine per event.
 	serverVoiceDeliveryQueueCapacity = 256
+	// Tracks one channel's terminal-admission fence without retaining a lock per
+	// historical channel forever.
+	serverVoiceDeliveryGateCount = 64
 	// Deferred Server Voice events remain bounded across keys while their
 	// per-key workers drain. One extra held event applies backpressure only
 	// after this shared bound is reached.
@@ -304,7 +310,11 @@ type Hub struct {
 	// unenforced ordering convention — the writer must raise open before epoch,
 	// the reader must load epoch before open — and reversing either lets a
 	// revocation slip past both checks with no test necessarily failing.
-	presenceAuthzState    atomic.Uint64
+	presenceAuthzState atomic.Uint64
+	// Closed and replaced with each authorization-state change so an ordered
+	// Server Voice worker can wait for an in-flight revocation to resolve
+	// without repeatedly querying permissions.
+	presenceAuthzChanged  chan struct{}
 	presenceAudienceSlots chan struct{}
 	// Joined by shutdownClients so hub-owned database work cannot outlive
 	// Shutdown and hold pool connections while cmd/server closes the database.
@@ -316,6 +326,8 @@ type Hub struct {
 	// leaves such a test green on a loaded runner. Same idiom as the
 	// customText*BeforeEnqueue seams above.
 	presenceAudienceJoinReached func()
+	// Test seam invoked immediately before a revocation opens its fence.
+	audienceRevocationBeforeOpen func()
 
 	// Test/benchmark seam for the audience query. Nil uses the production
 	// presence.ComputePresenceAudience against h.db. Exists because h.db is a
@@ -406,10 +418,21 @@ type Hub struct {
 	// Authorized Server Voice events must reach each recipient in lifecycle
 	// order. Each key has one bounded worker which advances only after Run
 	// applies the prior result.
-	serverVoiceDeliveryMu      sync.Mutex
+	// Serializes final Server Voice admission against every authorization
+	// invalidation while also protecting the per-key delivery queues.
+	serverVoiceDeliveryMu      sync.RWMutex
 	serverVoiceDeliveryStopped bool
 	serverVoiceDeliveryWg      sync.WaitGroup
 	serverVoiceDeliveryQueues  map[serverVoiceDeliveryKey]*serverVoiceDeliveryQueue
+	// Stripes only protect the keyed gate map; each full delivery key has its
+	// own mutation generation and cannot interfere with another channel.
+	serverVoiceDeliveryGates [serverVoiceDeliveryGateCount]serverVoiceDeliveryGateStripe
+	// Participant fences retain only while a matching delivery is in flight, so
+	// forged erasure clears cannot accumulate state or disturb other senders.
+	serverVoiceParticipantFences map[uuid.UUID]*serverVoiceParticipantFence
+	// Test seam invoked after Server Voice authorization is checked and before
+	// the frame is admitted to a client queue.
+	serverVoiceDeliveryBeforeEnqueue func()
 
 	// Results from off-loop voice-count queries issued on subscribe_server. The
 	// query runs on a worker goroutine so a burst of subscriptions cannot stall
@@ -510,13 +533,16 @@ type channelDeliveryRecipient struct {
 }
 
 type channelDeliveryRequest struct {
-	kind                    channelDeliveryKind
-	serverID                uuid.UUID
-	channelID               uuid.UUID
-	viewPerm                int64
-	data                    []byte
-	recipients              []channelDeliveryRecipient
-	requireVoiceChannelAuth bool
+	kind                             channelDeliveryKind
+	serverID                         uuid.UUID
+	channelID                        uuid.UUID
+	viewPerm                         int64
+	data                             []byte
+	recipients                       []channelDeliveryRecipient
+	requireVoiceChannelAuth          bool
+	serverVoiceParticipantID         uuid.UUID
+	retryOnAuthorizationInvalidation bool
+	serverVoiceTerminalReceipt       chan ServerVoiceTerminalDeliveryOutcome
 }
 
 type channelDeliveryDecision struct {
@@ -527,19 +553,90 @@ type channelDeliveryDecision struct {
 }
 
 type channelDeliveryResult struct {
-	kind          channelDeliveryKind
-	serverID      uuid.UUID
-	channelID     uuid.UUID
-	authzEpoch    uint64
-	data          []byte
-	decisions     []channelDeliveryDecision
-	deliveryProbe *securityEventProbe
-	deliveryDone  chan struct{}
+	kind                             channelDeliveryKind
+	serverID                         uuid.UUID
+	channelID                        uuid.UUID
+	authzEpoch                       uint64
+	data                             []byte
+	decisions                        []channelDeliveryDecision
+	authzState                       uint64
+	retryOnAuthorizationInvalidation bool
+	serverVoiceMutationEpoch         uint64
+	serverVoiceParticipantFence      *serverVoiceParticipantFence
+	serverVoiceParticipantEpoch      uint64
+	retryableDependency              bool
+	deliveryProbe                    *securityEventProbe
+	deliveryDone                     chan serverVoiceDeliveryOutcome
+}
+
+type serverVoiceDeliveryOutcome uint8
+
+const (
+	serverVoiceDeliveryApplied serverVoiceDeliveryOutcome = iota
+	serverVoiceDeliverySuppressed
+	serverVoiceDeliveryRetry
+	serverVoiceDeliveryRetryAfterAudienceRevocation
+	serverVoiceDeliveryRetryableDependency
+)
+
+type serverVoiceDeliveryAttemptOutcome uint8
+
+const (
+	serverVoiceDeliveryAttemptProceed serverVoiceDeliveryAttemptOutcome = iota
+	serverVoiceDeliveryAttemptRetry
+	serverVoiceDeliveryAttemptFinished
+	serverVoiceDeliveryAttemptStopped
+)
+
+// ServerVoiceTerminalDeliveryOutcome reports the final disposition of a
+// durable Server Voice terminal delivery attempt.
+type ServerVoiceTerminalDeliveryOutcome uint8
+
+const (
+	// ServerVoiceTerminalDeliveryApplied acknowledges a frame admitted to clients.
+	ServerVoiceTerminalDeliveryApplied ServerVoiceTerminalDeliveryOutcome = iota
+	// ServerVoiceTerminalDeliverySuppressedErased suppresses an erased sender.
+	ServerVoiceTerminalDeliverySuppressedErased
+	// ServerVoiceTerminalDeliverySuppressedSuccessor suppresses a rejoined sender.
+	ServerVoiceTerminalDeliverySuppressedSuccessor
+	// ServerVoiceTerminalDeliveryRetryableAuthorization retains work for retry.
+	ServerVoiceTerminalDeliveryRetryableAuthorization
+	// ServerVoiceTerminalDeliveryRetryableDependency retains work after a dependency fault.
+	ServerVoiceTerminalDeliveryRetryableDependency
+)
+
+// ServerVoiceTerminalDelivery carries the terminal disposition and signals a
+// Hub shutdown so the durable outbox claim can be released for recovery.
+type ServerVoiceTerminalDelivery struct {
+	Outcome <-chan ServerVoiceTerminalDeliveryOutcome
+	Stopped <-chan struct{}
 }
 
 type serverVoiceDeliveryKey struct {
 	serverID  uuid.UUID
 	channelID uuid.UUID
+}
+
+// serverVoiceDeliveryGate is a per-channel generation fence. Mutations may run
+// together; terminal admission waits until none is in flight, then compares
+// generation. refs keeps it alive while an ordered terminal queue can still
+// hold a state snapshot.
+type serverVoiceDeliveryGate struct {
+	mu      sync.Mutex
+	open    int
+	refs    int
+	epoch   uint64
+	changed chan struct{}
+}
+
+type serverVoiceDeliveryGateStripe struct {
+	mu    sync.Mutex
+	gates map[serverVoiceDeliveryKey]*serverVoiceDeliveryGate
+}
+
+type serverVoiceParticipantFence struct {
+	refs  int
+	epoch uint64
 }
 
 type serverVoiceDeliveryJob struct {
@@ -551,6 +648,12 @@ type serverVoiceDeliveryJob struct {
 type serverVoiceDeliveryQueue struct {
 	jobs   chan serverVoiceDeliveryJob
 	cancel context.CancelFunc
+}
+
+type serverVoiceDeliveryAttemptState struct {
+	participantFence           *serverVoiceParticipantFence
+	participantCheckAttempts   int
+	authorizationRetryAttempts int
 }
 
 type serverVoiceDeferredBroadcasts struct {
@@ -657,6 +760,7 @@ func NewHub(db *sql.DB, redisClient *redis.Client, opsCounters ...OpsCounter) *H
 		presenceDispatchPending:   make(map[uuid.UUID]pendingPresence),
 		presenceInFlight:          make(map[uuid.UUID]struct{}),
 		presenceAudienceResults:   make(chan presenceAudienceResult, 256),
+		presenceAuthzChanged:      make(chan struct{}),
 		presenceAudienceSlots:     make(chan struct{}, presenceAudienceConcurrency),
 		suppressorPending:         make(map[uuid.UUID]struct{}),
 		clientBootstrapTimeout:    clientBootstrapTimeout,
@@ -886,6 +990,212 @@ func (h *Hub) RevalidateChannelSubscriptions(serverID, channelID uuid.UUID) {
 	case h.revalidateChannel <- channelRevalidation{serverID: serverID, channelID: channelID}:
 	default:
 		log.Printf("Channel subscription revalidation queue full")
+	}
+}
+
+// InvalidateServerVoiceChannelDelivery prevents an already-authorized queued
+// Server Voice frame from crossing a newer channel lifecycle transition.
+func (h *Hub) InvalidateServerVoiceChannelDelivery(serverID, channelID uuid.UUID) {
+	if h == nil {
+		return
+	}
+	h.invalidateServerVoiceDeliveryChannel(serverID, channelID)
+}
+
+// ApplyServerVoiceChannelMutation makes a committed lifecycle mutation and its
+// local delivery-epoch bump one ordered transition. Post-mutation work belongs
+// after this returns.
+func (h *Hub) ApplyServerVoiceChannelMutation(
+	serverID, channelID uuid.UUID,
+	mutation func() (bool, error),
+) (bool, error) {
+	if h == nil {
+		return mutation()
+	}
+	key := serverVoiceDeliveryKey{serverID: serverID, channelID: channelID}
+	gate := h.beginServerVoiceChannelMutation(key)
+	applied, err := mutation()
+	h.finishServerVoiceChannelMutation(key, gate, applied)
+	return applied, err
+}
+
+func serverVoiceDeliveryGateStripeIndex(key serverVoiceDeliveryKey) int {
+	return (int(key.serverID[0]) ^ int(key.serverID[15]) ^
+		int(key.channelID[0]) ^ int(key.channelID[15])) &
+		(serverVoiceDeliveryGateCount - 1)
+}
+
+func (h *Hub) serverVoiceDeliveryGate(key serverVoiceDeliveryKey) *serverVoiceDeliveryGate {
+	stripe := &h.serverVoiceDeliveryGates[serverVoiceDeliveryGateStripeIndex(key)]
+	stripe.mu.Lock()
+	if stripe.gates == nil {
+		stripe.gates = make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryGate)
+	}
+	gate := stripe.gates[key]
+	if gate == nil {
+		gate = &serverVoiceDeliveryGate{}
+		stripe.gates[key] = gate
+	}
+	stripe.mu.Unlock()
+	return gate
+}
+
+func (h *Hub) beginServerVoiceChannelMutation(
+	key serverVoiceDeliveryKey,
+) *serverVoiceDeliveryGate {
+	stripe := &h.serverVoiceDeliveryGates[serverVoiceDeliveryGateStripeIndex(key)]
+	stripe.mu.Lock()
+	if stripe.gates == nil {
+		stripe.gates = make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryGate)
+	}
+	gate := stripe.gates[key]
+	if gate == nil {
+		gate = &serverVoiceDeliveryGate{}
+		stripe.gates[key] = gate
+	}
+	gate.mu.Lock()
+	if gate.open == 0 {
+		gate.changed = make(chan struct{})
+	}
+	gate.open++
+	gate.mu.Unlock()
+	stripe.mu.Unlock()
+	return gate
+}
+
+func (h *Hub) finishServerVoiceChannelMutation(
+	key serverVoiceDeliveryKey,
+	gate *serverVoiceDeliveryGate,
+	applied bool,
+) {
+	gate.mu.Lock()
+	if applied {
+		gate.epoch++
+		h.invalidateServerVoiceDeliveryChannel(key.serverID, key.channelID)
+	}
+	gate.open--
+	if gate.open == 0 {
+		close(gate.changed)
+		gate.changed = nil
+	}
+	gate.mu.Unlock()
+	h.releaseServerVoiceDeliveryGateIfUnused(key, gate)
+}
+
+func (h *Hub) retainServerVoiceDeliveryGate(key serverVoiceDeliveryKey) {
+	stripe := &h.serverVoiceDeliveryGates[serverVoiceDeliveryGateStripeIndex(key)]
+	stripe.mu.Lock()
+	if stripe.gates == nil {
+		stripe.gates = make(map[serverVoiceDeliveryKey]*serverVoiceDeliveryGate)
+	}
+	gate := stripe.gates[key]
+	if gate == nil {
+		gate = &serverVoiceDeliveryGate{}
+		stripe.gates[key] = gate
+	}
+	gate.mu.Lock()
+	gate.refs++
+	gate.mu.Unlock()
+	stripe.mu.Unlock()
+}
+
+func (h *Hub) releaseServerVoiceDeliveryGate(key serverVoiceDeliveryKey) {
+	stripe := &h.serverVoiceDeliveryGates[serverVoiceDeliveryGateStripeIndex(key)]
+	stripe.mu.Lock()
+	gate := stripe.gates[key]
+	if gate != nil {
+		gate.mu.Lock()
+		gate.refs--
+		gate.mu.Unlock()
+	}
+	stripe.mu.Unlock()
+	if gate != nil {
+		h.releaseServerVoiceDeliveryGateIfUnused(key, gate)
+	}
+}
+
+func (h *Hub) releaseServerVoiceDeliveryGateIfUnused(
+	key serverVoiceDeliveryKey,
+	gate *serverVoiceDeliveryGate,
+) {
+	stripe := &h.serverVoiceDeliveryGates[serverVoiceDeliveryGateStripeIndex(key)]
+	stripe.mu.Lock()
+	if stripe.gates[key] == gate {
+		gate.mu.Lock()
+		unused := gate.open == 0 && gate.refs == 0
+		gate.mu.Unlock()
+		if unused {
+			delete(stripe.gates, key)
+		}
+	}
+	stripe.mu.Unlock()
+}
+
+func (h *Hub) retainServerVoiceParticipantFence(participantID uuid.UUID) *serverVoiceParticipantFence {
+	if participantID == uuid.Nil {
+		return nil
+	}
+	h.serverVoiceDeliveryMu.Lock()
+	defer h.serverVoiceDeliveryMu.Unlock()
+	if h.serverVoiceParticipantFences == nil {
+		h.serverVoiceParticipantFences = make(map[uuid.UUID]*serverVoiceParticipantFence)
+	}
+	fence := h.serverVoiceParticipantFences[participantID]
+	if fence == nil {
+		fence = &serverVoiceParticipantFence{}
+		h.serverVoiceParticipantFences[participantID] = fence
+	}
+	fence.refs++
+	return fence
+}
+
+func (h *Hub) releaseServerVoiceParticipantFence(
+	participantID uuid.UUID,
+	fence *serverVoiceParticipantFence,
+) {
+	if fence == nil {
+		return
+	}
+	h.serverVoiceDeliveryMu.Lock()
+	defer h.serverVoiceDeliveryMu.Unlock()
+	fence.refs--
+	if fence.refs == 0 && h.serverVoiceParticipantFences[participantID] == fence {
+		delete(h.serverVoiceParticipantFences, participantID)
+	}
+}
+
+// InvalidateServerVoiceParticipantDelivery prevents an in-flight frame for one
+// erased participant from crossing local admission without perturbing others.
+func (h *Hub) InvalidateServerVoiceParticipantDelivery(participantID uuid.UUID) {
+	if h == nil || participantID == uuid.Nil {
+		return
+	}
+	h.serverVoiceDeliveryMu.Lock()
+	if fence := h.serverVoiceParticipantFences[participantID]; fence != nil {
+		fence.epoch++
+	}
+	h.serverVoiceDeliveryMu.Unlock()
+}
+
+func (h *Hub) waitForServerVoiceChannelMutationClear(
+	key serverVoiceDeliveryKey,
+	done <-chan struct{},
+) (uint64, bool) {
+	gate := h.serverVoiceDeliveryGate(key)
+	for {
+		gate.mu.Lock()
+		if gate.open == 0 {
+			epoch := gate.epoch
+			gate.mu.Unlock()
+			return epoch, true
+		}
+		changed := gate.changed
+		gate.mu.Unlock()
+		select {
+		case <-changed:
+		case <-done:
+			return 0, false
+		}
 	}
 }
 
@@ -1879,6 +2189,7 @@ func (h *Hub) clientHasChannelPermission(ctx context.Context, serverID, channelI
 
 func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) bool {
 	if len(req.recipients) == 0 {
+		h.completeServerVoiceTerminalReceipt(req, ServerVoiceTerminalDeliveryApplied)
 		return true
 	}
 	if req.viewPerm == 0 || req.serverID == uuid.Nil {
@@ -1890,6 +2201,7 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) bool {
 	if checker == nil {
 		h.completeSecurityEventProbeFailure(h.beginSecurityEventProbe(securityEventSourcePermissionAuthority))
 		log.Printf("Channel permission checker not configured")
+		h.completeServerVoiceTerminalReceipt(req, ServerVoiceTerminalDeliveryRetryableDependency)
 		h.handleChannelDeliveryResult(denyAllChannelDelivery(req))
 		return true
 	}
@@ -1898,6 +2210,7 @@ func (h *Hub) dispatchChannelDelivery(req channelDeliveryRequest) bool {
 	if results == nil {
 		h.completeSecurityEventProbeFailure(h.beginSecurityEventProbe(securityEventSourceChannelDelivery))
 		log.Printf("Channel delivery result queue not configured")
+		h.completeServerVoiceTerminalReceipt(req, ServerVoiceTerminalDeliveryRetryableDependency)
 		return true
 	}
 
@@ -1944,19 +2257,18 @@ func (h *Hub) dispatchOrderedServerVoiceDelivery(
 		h.serverVoiceAuthzEpochs = make(map[serverVoiceDeliveryKey]uint64)
 	}
 	queue := h.serverVoiceDeliveryQueues[key]
+	createdQueue := false
+	var queueCtx context.Context
+	var queueCancel context.CancelFunc
 	if queue == nil {
-		ctx, cancel := context.WithCancel(context.Background())
+		queueCtx, queueCancel = context.WithCancel(context.Background())
 		queue = &serverVoiceDeliveryQueue{
 			jobs:   make(chan serverVoiceDeliveryJob, serverVoiceDeliveryQueueCapacity),
-			cancel: cancel,
+			cancel: queueCancel,
 		}
 		h.serverVoiceDeliveryQueues[key] = queue
 		h.serverVoiceDeliveryWg.Add(1)
-		go func() {
-			defer h.serverVoiceDeliveryWg.Done()
-			defer cancel()
-			h.runServerVoiceDeliveryQueue(ctx, key, queue, checker, results, done)
-		}()
+		createdQueue = true
 	}
 	if len(queue.jobs) == cap(queue.jobs) {
 		h.serverVoiceDeliveryMu.Unlock()
@@ -1969,6 +2281,14 @@ func (h *Hub) dispatchOrderedServerVoiceDelivery(
 	}
 	queue.jobs <- job
 	h.serverVoiceDeliveryMu.Unlock()
+	if createdQueue {
+		h.retainServerVoiceDeliveryGate(key)
+		go func(ctx context.Context) {
+			defer h.serverVoiceDeliveryWg.Done()
+			defer queue.cancel()
+			h.runServerVoiceDeliveryQueue(ctx, key, queue, checker, results, done)
+		}(queueCtx)
+	}
 	return true
 }
 
@@ -1988,26 +2308,7 @@ func (h *Hub) runServerVoiceDeliveryQueue(
 		case <-done:
 			return
 		case job := <-queue.jobs:
-			authzEpoch := h.serverVoiceDeliveryAuthzEpoch(key)
-			result := h.checkChannelDeliveryPermissionsContext(ctx, job.req, checker, job.permissionProbe)
-			if ctx.Err() != nil {
-				return
-			}
-			result.authzEpoch = authzEpoch
-			result.deliveryProbe = &job.deliveryProbe
-			result.deliveryDone = make(chan struct{})
-			select {
-			case results <- result:
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
-			}
-			select {
-			case <-result.deliveryDone:
-			case <-ctx.Done():
-				return
-			case <-done:
+			if !h.runServerVoiceDeliveryJob(ctx, key, job, checker, results, done) {
 				return
 			}
 		}
@@ -2016,6 +2317,180 @@ func (h *Hub) runServerVoiceDeliveryQueue(
 			return
 		}
 	}
+}
+
+func (h *Hub) runServerVoiceDeliveryJob(
+	ctx context.Context,
+	key serverVoiceDeliveryKey,
+	job serverVoiceDeliveryJob,
+	checker ChannelPermissionChecker,
+	results chan channelDeliveryResult,
+	done <-chan struct{},
+) bool {
+	participantFence := h.retainServerVoiceParticipantFence(job.req.serverVoiceParticipantID)
+	defer h.releaseServerVoiceParticipantFence(job.req.serverVoiceParticipantID, participantFence)
+
+	state := &serverVoiceDeliveryAttemptState{participantFence: participantFence}
+	for {
+		switch h.runServerVoiceDeliveryAttempt(
+			ctx, key, job, checker, results, done, state,
+		) {
+		case serverVoiceDeliveryAttemptFinished:
+			return true
+		case serverVoiceDeliveryAttemptStopped:
+			return false
+		case serverVoiceDeliveryAttemptRetry:
+			if !waitForServerVoiceDeliveryRetry(done) {
+				return false
+			}
+		}
+	}
+}
+
+func (h *Hub) runServerVoiceDeliveryAttempt(
+	ctx context.Context,
+	key serverVoiceDeliveryKey,
+	job serverVoiceDeliveryJob,
+	checker ChannelPermissionChecker,
+	results chan channelDeliveryResult,
+	done <-chan struct{},
+	state *serverVoiceDeliveryAttemptState,
+) serverVoiceDeliveryAttemptOutcome {
+	if !h.waitForServerVoiceAuthorizationClear(done) {
+		return serverVoiceDeliveryAttemptStopped
+	}
+	mutationEpoch := uint64(0)
+	if job.req.retryOnAuthorizationInvalidation {
+		var mutationsClear bool
+		mutationEpoch, mutationsClear = h.waitForServerVoiceChannelMutationClear(key, done)
+		if !mutationsClear {
+			return serverVoiceDeliveryAttemptStopped
+		}
+	}
+	h.serverVoiceDeliveryMu.RLock()
+	participantEpoch := uint64(0)
+	if state.participantFence != nil {
+		participantEpoch = state.participantFence.epoch
+	}
+	h.serverVoiceDeliveryMu.RUnlock()
+	authzState := h.presenceAuthzState.Load()
+	authzEpoch := h.serverVoiceDeliveryAuthzEpoch(key)
+
+	preflight := h.preflightServerVoiceTerminalDelivery(
+		ctx, key, job, mutationEpoch, &state.participantCheckAttempts, &state.authorizationRetryAttempts,
+	)
+	if preflight != serverVoiceDeliveryAttemptProceed {
+		return preflight
+	}
+	result := h.checkChannelDeliveryPermissionsContext(ctx, job.req, checker, job.permissionProbe)
+	if ctx.Err() != nil {
+		return serverVoiceDeliveryAttemptStopped
+	}
+	result.authzEpoch = authzEpoch
+	if job.req.retryOnAuthorizationInvalidation {
+		result.authzState = authzState
+		result.serverVoiceMutationEpoch = mutationEpoch
+	}
+	result.serverVoiceParticipantFence = state.participantFence
+	result.serverVoiceParticipantEpoch = participantEpoch
+	result.deliveryProbe = &job.deliveryProbe
+	return h.dispatchServerVoiceDeliveryResult(ctx, job, result, results, done, &state.authorizationRetryAttempts)
+}
+
+func (h *Hub) preflightServerVoiceTerminalDelivery(
+	ctx context.Context,
+	key serverVoiceDeliveryKey,
+	job serverVoiceDeliveryJob,
+	mutationEpoch uint64,
+	participantCheckAttempts, authorizationRetryAttempts *int,
+) serverVoiceDeliveryAttemptOutcome {
+	if job.req.serverVoiceParticipantID == uuid.Nil {
+		return serverVoiceDeliveryAttemptProceed
+	}
+	// Preserve the pre-query state: a revocation that overlaps the existence query
+	// must invalidate its result at final admission.
+	exists, successor, err := h.serverVoiceTerminalParticipantState(
+		ctx, job.req.channelID, job.req.serverVoiceParticipantID,
+	)
+	if err != nil {
+		*participantCheckAttempts++
+		if *participantCheckAttempts == serverVoiceParticipantCheckMaxAttempts {
+			h.completeSecurityEventProbeFailure(job.permissionProbe)
+			h.completeSecurityEventProbeFailure(job.deliveryProbe)
+			h.completeServerVoiceTerminalReceipt(job.req, ServerVoiceTerminalDeliveryRetryableDependency)
+			return serverVoiceDeliveryAttemptFinished
+		}
+		return serverVoiceDeliveryAttemptRetry
+	}
+	if exists && (job.req.serverVoiceTerminalReceipt == nil || !successor) {
+		return serverVoiceDeliveryAttemptProceed
+	}
+	// A participant removal may have changed the state observed above. Re-sample
+	// its keyed delivery epoch before settling this terminal claim.
+	gate := h.serverVoiceDeliveryGate(key)
+	gate.mu.Lock()
+	staleParticipantState := gate.open != 0 || mutationEpoch != gate.epoch
+	gate.mu.Unlock()
+	if staleParticipantState {
+		*authorizationRetryAttempts++
+		if *authorizationRetryAttempts == serverVoiceAuthorizationRetryMaxAttempts {
+			h.completeServerVoiceTerminalReceipt(job.req, ServerVoiceTerminalDeliveryRetryableAuthorization)
+			return serverVoiceDeliveryAttemptFinished
+		}
+		return serverVoiceDeliveryAttemptRetry
+	}
+	if !exists {
+		h.completeServerVoiceTerminalReceipt(job.req, ServerVoiceTerminalDeliverySuppressedErased)
+		return serverVoiceDeliveryAttemptFinished
+	}
+	h.completeServerVoiceTerminalReceipt(job.req, ServerVoiceTerminalDeliverySuppressedSuccessor)
+	return serverVoiceDeliveryAttemptFinished
+}
+
+func (h *Hub) dispatchServerVoiceDeliveryResult(
+	ctx context.Context,
+	job serverVoiceDeliveryJob,
+	result channelDeliveryResult,
+	results chan channelDeliveryResult,
+	done <-chan struct{},
+	authorizationRetryAttempts *int,
+) serverVoiceDeliveryAttemptOutcome {
+	result.deliveryDone = make(chan serverVoiceDeliveryOutcome, 1)
+	select {
+	case results <- result:
+	case <-ctx.Done():
+		return serverVoiceDeliveryAttemptStopped
+	case <-done:
+		return serverVoiceDeliveryAttemptStopped
+	}
+	var outcome serverVoiceDeliveryOutcome
+	select {
+	case outcome = <-result.deliveryDone:
+	case <-ctx.Done():
+		return serverVoiceDeliveryAttemptStopped
+	case <-done:
+		return serverVoiceDeliveryAttemptStopped
+	}
+	if !isRetryableServerVoiceDeliveryOutcome(outcome) {
+		h.completeServerVoiceTerminalReceipt(job.req, ServerVoiceTerminalDeliveryApplied)
+		return serverVoiceDeliveryAttemptFinished
+	}
+	*authorizationRetryAttempts++
+	if *authorizationRetryAttempts != serverVoiceAuthorizationRetryMaxAttempts {
+		return serverVoiceDeliveryAttemptRetry
+	}
+	terminalOutcome := ServerVoiceTerminalDeliveryRetryableAuthorization
+	if outcome == serverVoiceDeliveryRetryableDependency {
+		terminalOutcome = ServerVoiceTerminalDeliveryRetryableDependency
+	}
+	h.completeServerVoiceTerminalReceipt(job.req, terminalOutcome)
+	return serverVoiceDeliveryAttemptFinished
+}
+
+func isRetryableServerVoiceDeliveryOutcome(outcome serverVoiceDeliveryOutcome) bool {
+	return outcome == serverVoiceDeliveryRetry ||
+		outcome == serverVoiceDeliveryRetryAfterAudienceRevocation ||
+		outcome == serverVoiceDeliveryRetryableDependency
 }
 
 func (h *Hub) cancelServerVoiceDeliveryWorkersLocked() {
@@ -2036,13 +2511,40 @@ func (h *Hub) stopServerVoiceDeliveryWorkers() {
 	h.serverVoiceDeliveryWg.Wait()
 }
 
+func (h *Hub) completeServerVoiceTerminalReceipt(
+	req channelDeliveryRequest,
+	outcome ServerVoiceTerminalDeliveryOutcome,
+) {
+	if req.serverVoiceTerminalReceipt == nil {
+		return
+	}
+	select {
+	case req.serverVoiceTerminalReceipt <- outcome:
+	default:
+	}
+}
+
+func waitForServerVoiceDeliveryRetry(done <-chan struct{}) bool {
+	select {
+	case <-time.After(serverVoiceDeliveryRetryBackoff):
+		return true
+	case <-done:
+		return false
+	}
+}
+
 func (h *Hub) removeServerVoiceDeliveryQueue(key serverVoiceDeliveryKey, queue *serverVoiceDeliveryQueue) {
 	h.serverVoiceDeliveryMu.Lock()
+	removed := false
 	if h.serverVoiceDeliveryQueues[key] == queue {
 		delete(h.serverVoiceDeliveryQueues, key)
 		delete(h.serverVoiceAuthzEpochs, key)
+		removed = true
 	}
 	h.serverVoiceDeliveryMu.Unlock()
+	if removed {
+		h.releaseServerVoiceDeliveryGate(key)
+	}
 }
 
 func (h *Hub) removeServerVoiceDeliveryQueueIfIdle(key serverVoiceDeliveryKey, queue *serverVoiceDeliveryQueue) bool {
@@ -2054,6 +2556,7 @@ func (h *Hub) removeServerVoiceDeliveryQueueIfIdle(key serverVoiceDeliveryKey, q
 	delete(h.serverVoiceDeliveryQueues, key)
 	delete(h.serverVoiceAuthzEpochs, key)
 	h.serverVoiceDeliveryMu.Unlock()
+	h.releaseServerVoiceDeliveryGate(key)
 	return true
 }
 
@@ -2077,18 +2580,19 @@ func (h *Hub) invalidateServerVoiceDeliveryServer(serverID uuid.UUID) {
 }
 
 func (h *Hub) serverVoiceDeliveryAuthzEpoch(key serverVoiceDeliveryKey) uint64 {
-	h.serverVoiceDeliveryMu.Lock()
-	defer h.serverVoiceDeliveryMu.Unlock()
+	h.serverVoiceDeliveryMu.RLock()
+	defer h.serverVoiceDeliveryMu.RUnlock()
 	return h.serverVoiceAuthzEpochs[key]
 }
 
 func allowAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 	result := channelDeliveryResult{
-		kind:      req.kind,
-		serverID:  req.serverID,
-		channelID: req.channelID,
-		data:      req.data,
-		decisions: make([]channelDeliveryDecision, 0, len(req.recipients)),
+		kind:                             req.kind,
+		serverID:                         req.serverID,
+		channelID:                        req.channelID,
+		data:                             req.data,
+		decisions:                        make([]channelDeliveryDecision, 0, len(req.recipients)),
+		retryOnAuthorizationInvalidation: req.retryOnAuthorizationInvalidation,
 	}
 	for _, recipient := range req.recipients {
 		result.decisions = append(result.decisions, channelDeliveryDecision{
@@ -2103,11 +2607,12 @@ func allowAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 
 func denyAllChannelDelivery(req channelDeliveryRequest) channelDeliveryResult {
 	result := channelDeliveryResult{
-		kind:      req.kind,
-		serverID:  req.serverID,
-		channelID: req.channelID,
-		data:      req.data,
-		decisions: make([]channelDeliveryDecision, 0, len(req.recipients)),
+		kind:                             req.kind,
+		serverID:                         req.serverID,
+		channelID:                        req.channelID,
+		data:                             req.data,
+		decisions:                        make([]channelDeliveryDecision, 0, len(req.recipients)),
+		retryOnAuthorizationInvalidation: req.retryOnAuthorizationInvalidation,
 	}
 	for _, recipient := range req.recipients {
 		result.decisions = append(result.decisions, channelDeliveryDecision{
@@ -2130,22 +2635,34 @@ func (h *Hub) checkChannelDeliveryPermissionsContext(
 	checker ChannelPermissionChecker,
 	permissionProbe securityEventProbe,
 ) channelDeliveryResult {
+	authzState := uint64(0)
+	result := channelDeliveryResult{
+		kind:                             req.kind,
+		serverID:                         req.serverID,
+		channelID:                        req.channelID,
+		data:                             req.data,
+		decisions:                        make([]channelDeliveryDecision, 0, len(req.recipients)),
+		retryOnAuthorizationInvalidation: req.retryOnAuthorizationInvalidation,
+	}
+	if req.kind == channelDeliveryServerBroadcast {
+		// The authorization result is only usable while no revocation overlaps
+		// its query and no revocation begins before delivery on Run.
+		authzState = h.presenceAuthzState.Load()
+	}
 	if allowed, failed := h.authorizeVoiceChannelDelivery(ctx, req); !allowed {
+		result = denyAllChannelDelivery(req)
 		if failed {
+			result.retryableDependency = true
 			h.completeSecurityEventProbeFailure(permissionProbe)
 		}
-		return denyAllChannelDelivery(req)
+		return result
 	}
 
-	result := channelDeliveryResult{
-		kind:      req.kind,
-		serverID:  req.serverID,
-		channelID: req.channelID,
-		data:      req.data,
-	}
+	result.authzState = authzState
 	decisions, hadFailure := h.checkChannelDeliveryRecipients(ctx, req, checker)
 	result.decisions = decisions
 	if hadFailure {
+		result.retryableDependency = true
 		h.completeSecurityEventProbeFailure(permissionProbe)
 	}
 	return result
@@ -2155,7 +2672,6 @@ func (h *Hub) authorizeVoiceChannelDelivery(ctx context.Context, req channelDeli
 	if !req.requireVoiceChannelAuth {
 		return true, false
 	}
-
 	queryCtx, cancel := context.WithTimeout(ctx, channelAuthCtxTimeout)
 	channel, err := h.fetchChannelContextForAuthContext(queryCtx, req.channelID)
 	cancel()
@@ -2213,29 +2729,39 @@ func (h *Hub) checkChannelDeliveryRecipients(ctx context.Context, req channelDel
 }
 
 func (h *Hub) handleChannelDeliveryResult(result channelDeliveryResult) {
-	defer h.releaseServerVoiceDelivery(result)
-	if result.deliveryProbe != nil {
+	outcome := h.applyChannelDeliveryResult(result)
+	if result.deliveryProbe != nil && !isRetryableServerVoiceDeliveryOutcome(outcome) {
 		h.completeSecurityEventProbeSuccess(*result.deliveryProbe)
 	}
+	h.releaseServerVoiceDelivery(result, outcome)
+}
+
+func (h *Hub) applyChannelDeliveryResult(result channelDeliveryResult) serverVoiceDeliveryOutcome {
+	outcome := serverVoiceDeliveryApplied
 	switch result.kind {
 	case channelDeliveryBroadcast:
 		h.applyBroadcastDeliveryResult(result)
 	case channelDeliveryUnread:
 		h.applyUnreadDeliveryResult(result)
 	case channelDeliveryServerBroadcast:
-		h.applyServerBroadcastDeliveryResult(result)
+		if result.retryableDependency && result.retryOnAuthorizationInvalidation {
+			outcome = serverVoiceDeliveryRetryableDependency
+		} else {
+			outcome = h.applyServerBroadcastDeliveryResult(result)
+		}
 	case channelDeliveryMention:
 		h.applyMentionDeliveryResult(result)
 	case channelDeliveryPrune:
 		h.applyPruneDeliveryResult(result)
 	}
+	return outcome
 }
 
-func (h *Hub) releaseServerVoiceDelivery(result channelDeliveryResult) {
+func (h *Hub) releaseServerVoiceDelivery(result channelDeliveryResult, outcome serverVoiceDeliveryOutcome) {
 	if result.deliveryDone == nil {
 		return
 	}
-	close(result.deliveryDone)
+	result.deliveryDone <- outcome
 }
 
 func (h *Hub) applyBroadcastDeliveryResult(result channelDeliveryResult) {
@@ -2275,26 +2801,116 @@ func (h *Hub) applyUnreadDeliveryResult(result channelDeliveryResult) {
 	}
 }
 
-func (h *Hub) applyServerBroadcastDeliveryResult(result channelDeliveryResult) {
+func (h *Hub) applyServerBroadcastDeliveryResult(result channelDeliveryResult) serverVoiceDeliveryOutcome {
 	key := serverVoiceDeliveryKey{serverID: result.serverID, channelID: result.channelID}
+	if result.retryOnAuthorizationInvalidation {
+		gate := h.serverVoiceDeliveryGate(key)
+		gate.mu.Lock()
+		defer gate.mu.Unlock()
+		if gate.open != 0 || result.serverVoiceMutationEpoch != gate.epoch {
+			return serverVoiceDeliveryRetry
+		}
+	}
+	h.serverVoiceDeliveryMu.RLock()
+	outcome := h.serverVoiceDeliveryAdmissionOutcomeLocked(key, result)
+	if outcome != serverVoiceDeliveryApplied {
+		h.serverVoiceDeliveryMu.RUnlock()
+		return outcome
+	}
+	if h.serverVoiceDeliveryBeforeEnqueue != nil {
+		h.serverVoiceDeliveryBeforeEnqueue()
+	}
+	failedClients := h.enqueueServerBroadcastDeliveryLocked(result)
+	h.serverVoiceDeliveryMu.RUnlock()
+	for _, client := range failedClients {
+		h.handleUnregister(client)
+	}
+	return serverVoiceDeliveryApplied
+}
+
+func (h *Hub) serverVoiceDeliveryAdmissionOutcomeLocked(
+	key serverVoiceDeliveryKey,
+	result channelDeliveryResult,
+) serverVoiceDeliveryOutcome {
+	if h.serverVoiceDeliveryStopped {
+		return serverVoiceDeliveryRetryOrSuppress(result, serverVoiceDeliveryRetry)
+	}
+	if result.serverVoiceParticipantFence != nil &&
+		result.serverVoiceParticipantEpoch != result.serverVoiceParticipantFence.epoch {
+		return serverVoiceDeliveryRetry
+	}
+	if result.authzState&presenceAuthzOpenMask != 0 ||
+		result.authzState>>presenceAuthzEpochShift != h.presenceAuthzState.Load()>>presenceAuthzEpochShift {
+		return serverVoiceDeliveryRetryOrSuppress(result, serverVoiceDeliveryRetryAfterAudienceRevocation)
+	}
+	if result.authzEpoch != h.serverVoiceAuthzEpochs[key] {
+		return serverVoiceDeliveryRetryOrSuppress(result, serverVoiceDeliveryRetry)
+	}
+	return serverVoiceDeliveryApplied
+}
+
+func serverVoiceDeliveryRetryOrSuppress(
+	result channelDeliveryResult,
+	retryOutcome serverVoiceDeliveryOutcome,
+) serverVoiceDeliveryOutcome {
+	if result.retryOnAuthorizationInvalidation {
+		return retryOutcome
+	}
+	return serverVoiceDeliverySuppressed
+}
+
+func (h *Hub) enqueueServerBroadcastDeliveryLocked(result channelDeliveryResult) []*Client {
 	serverClients := h.serverSubscriptions[result.serverID]
+	var failedClients []*Client
 	for _, decision := range result.decisions {
 		client, ok := h.clients[decision.clientID]
 		if !ok || serverClients == nil || !serverClients[decision.clientID] || !decision.allowed {
 			continue
 		}
-
-		h.serverVoiceDeliveryMu.Lock()
-		if result.authzEpoch != h.serverVoiceAuthzEpochs[key] {
-			h.serverVoiceDeliveryMu.Unlock()
-			return
-		}
-		enqueued := client.enqueueOutbound(result.data)
-		h.serverVoiceDeliveryMu.Unlock()
-		if !enqueued {
-			h.handleUnregister(client)
+		if !client.enqueueOutbound(result.data) {
+			failedClients = append(failedClients, client)
 		}
 	}
+	return failedClients
+}
+
+func (h *Hub) waitForServerVoiceAuthorizationClear(done <-chan struct{}) bool {
+	for {
+		h.serverVoiceDeliveryMu.RLock()
+		state := h.presenceAuthzState.Load()
+		changed := h.presenceAuthzChanged
+		h.serverVoiceDeliveryMu.RUnlock()
+		if state&presenceAuthzOpenMask == 0 || changed == nil {
+			return true
+		}
+		select {
+		case <-changed:
+		case <-done:
+			return false
+		}
+	}
+}
+
+func (h *Hub) serverVoiceTerminalParticipantState(
+	ctx context.Context,
+	channelID, participantID uuid.UUID,
+) (bool, bool, error) {
+	if participantID == uuid.Nil {
+		return true, false, nil
+	}
+	if h.db == nil {
+		return false, false, errPresenceNoDatabase
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, channelAuthCtxTimeout)
+	defer cancel()
+	var exists, successor bool
+	if err := h.db.QueryRowContext(queryCtx, `
+		SELECT EXISTS(SELECT 1 FROM users WHERE id = $1),
+		       EXISTS(SELECT 1 FROM voice_participants WHERE channel_id = $2 AND user_id = $1)
+	`, participantID, channelID).Scan(&exists, &successor); err != nil {
+		return false, false, err
+	}
+	return exists, successor, nil
 }
 
 func (h *Hub) applyMentionDeliveryResult(result channelDeliveryResult) {
@@ -4117,6 +4733,12 @@ func (h *Hub) handleServerBroadcast(msg ServerBroadcastMessage) (admitted bool) 
 	data, err := json.Marshal(msg.Data)
 	if err != nil {
 		log.Printf("Failed to marshal server broadcast: %v", err)
+		if msg.serverVoiceTerminalReceipt != nil {
+			select {
+			case msg.serverVoiceTerminalReceipt <- ServerVoiceTerminalDeliveryRetryableDependency:
+			default:
+			}
+		}
 		return admitted
 	}
 	if msg.RequireVoiceViewAuth {
@@ -4149,13 +4771,16 @@ func (h *Hub) handleAuthorizedServerVoiceBroadcast(msg ServerBroadcastMessage, d
 		recipients = append(recipients, channelDeliveryRecipient{clientID: clientID, userID: client.UserID})
 	}
 	return h.dispatchChannelDelivery(channelDeliveryRequest{
-		kind:                    channelDeliveryServerBroadcast,
-		serverID:                msg.ServerID,
-		channelID:               msg.ChannelID,
-		viewPerm:                permViewVoiceChannels,
-		data:                    data,
-		recipients:              recipients,
-		requireVoiceChannelAuth: true,
+		kind:                             channelDeliveryServerBroadcast,
+		serverID:                         msg.ServerID,
+		channelID:                        msg.ChannelID,
+		viewPerm:                         permViewVoiceChannels,
+		data:                             data,
+		recipients:                       recipients,
+		requireVoiceChannelAuth:          true,
+		serverVoiceParticipantID:         msg.serverVoiceParticipantID,
+		retryOnAuthorizationInvalidation: msg.serverVoiceRetryOnAuthorizationInvalidation,
+		serverVoiceTerminalReceipt:       msg.serverVoiceTerminalReceipt,
 	})
 }
 
@@ -4213,6 +4838,50 @@ func (h *Hub) BroadcastToServerChannelAuthorizedContext(
 	serverID, channelID uuid.UUID,
 	msg OutgoingMessage,
 ) bool {
+	return h.broadcastToServerChannelAuthorizedContext(ctx, serverID, channelID, uuid.Nil, true, nil, msg)
+}
+
+// BroadcastToServerVoiceParticipant sends an ordinary participant lifecycle
+// event with the identity needed to suppress an erased sender after a retry.
+func (h *Hub) BroadcastToServerVoiceParticipant(
+	serverID, channelID, participantID uuid.UUID,
+	msg OutgoingMessage,
+) {
+	h.BroadcastToServerVoiceParticipantContext(context.Background(), serverID, channelID, participantID, msg)
+}
+
+// BroadcastToServerVoiceParticipantContext is the deadline-aware form used by
+// ordinary Server Voice lifecycle callbacks.
+func (h *Hub) BroadcastToServerVoiceParticipantContext(
+	ctx context.Context,
+	serverID, channelID, participantID uuid.UUID,
+	msg OutgoingMessage,
+) bool {
+	return h.broadcastToServerChannelAuthorizedContext(ctx, serverID, channelID, participantID, true, nil, msg)
+}
+
+// BroadcastToServerVoiceParticipantReliableContext is the terminal-lifecycle
+// variant with a durable delivery receipt and participant-state settlement.
+func (h *Hub) BroadcastToServerVoiceParticipantReliableContext(
+	ctx context.Context,
+	serverID, channelID, participantID uuid.UUID,
+	msg OutgoingMessage,
+) (ServerVoiceTerminalDelivery, bool) {
+	receipt := make(chan ServerVoiceTerminalDeliveryOutcome, 1)
+	delivery := ServerVoiceTerminalDelivery{Outcome: receipt, Stopped: h.done}
+	accepted := h.broadcastToServerChannelAuthorizedContext(
+		ctx, serverID, channelID, participantID, true, receipt, msg,
+	)
+	return delivery, accepted
+}
+
+func (h *Hub) broadcastToServerChannelAuthorizedContext(
+	ctx context.Context,
+	serverID, channelID, participantID uuid.UUID,
+	retryOnAuthorizationInvalidation bool,
+	terminalReceipt chan ServerVoiceTerminalDeliveryOutcome,
+	msg OutgoingMessage,
+) bool {
 	if ctx == nil {
 		return false
 	}
@@ -4225,10 +4894,13 @@ func (h *Hub) BroadcastToServerChannelAuthorizedContext(
 		return false
 	}
 	serverMessage := ServerBroadcastMessage{
-		ServerID:             serverID,
-		ChannelID:            channelID,
-		RequireVoiceViewAuth: true,
-		Data:                 msg,
+		ServerID:                 serverID,
+		ChannelID:                channelID,
+		RequireVoiceViewAuth:     true,
+		serverVoiceParticipantID: participantID,
+		serverVoiceRetryOnAuthorizationInvalidation: retryOnAuthorizationInvalidation,
+		serverVoiceTerminalReceipt:                  terminalReceipt,
+		Data:                                        msg,
 	}
 	select {
 	case h.serverVoiceBroadcast <- serverMessage:
@@ -5923,7 +6595,10 @@ func (h *Hub) applyPresenceAudience(result presenceAudienceResult) {
 // the voice, active-presence and voice-presence reactions — for which a post-hoc
 // bump is all a reaction can offer.
 func (h *Hub) InvalidatePresenceAudiences() {
+	h.serverVoiceDeliveryMu.Lock()
+	defer h.serverVoiceDeliveryMu.Unlock()
 	h.presenceAuthzState.Add(1 << presenceAuthzEpochShift)
+	h.signalPresenceAuthzChangeLocked()
 }
 
 // BeginAudienceRevocation opens a revocation bracket and returns its closer.
@@ -5958,11 +6633,30 @@ func (h *Hub) BeginAudienceRevocation() func() {
 			// call with no branch.
 		}
 	}
+	if h.audienceRevocationBeforeOpen != nil {
+		h.audienceRevocationBeforeOpen()
+	}
+	h.serverVoiceDeliveryMu.Lock()
 	h.presenceAuthzState.Add(1<<presenceAuthzEpochShift | 1)
+	h.signalPresenceAuthzChangeLocked()
+	h.serverVoiceDeliveryMu.Unlock()
 	var once sync.Once
 	return func() {
-		once.Do(func() { h.presenceAuthzState.Add(^uint64(0)) })
+		once.Do(func() {
+			h.serverVoiceDeliveryMu.Lock()
+			h.presenceAuthzState.Add(^uint64(0))
+			h.signalPresenceAuthzChangeLocked()
+			h.serverVoiceDeliveryMu.Unlock()
+		})
 	}
+}
+
+func (h *Hub) signalPresenceAuthzChangeLocked() {
+	if h.presenceAuthzChanged == nil {
+		return
+	}
+	close(h.presenceAuthzChanged)
+	h.presenceAuthzChanged = make(chan struct{})
 }
 
 // presenceAuthzWatchdogTick advances the episode counter for one observation and

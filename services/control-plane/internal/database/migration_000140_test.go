@@ -39,7 +39,7 @@ func TestMigration000140_ServerVoiceTerminalOutboxContract(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 	require.NoError(t, rows.Close())
-	require.Len(t, columns, 6)
+	require.GreaterOrEqual(t, len(columns), 6)
 	for _, name := range []string{"channel_id", "user_id", "server_id", "operation_id"} {
 		assert.Equal(t, "uuid", columns[name].dataType)
 		assert.Equal(t, "NO", columns[name].nullable)

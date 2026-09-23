@@ -604,7 +604,7 @@ erDiagram
 | MFA / recovery       | `user_mfa_totp`, `user_mfa_webauthn` (000029); `user_recovery_keys` (000043); `trusted_recovery_devices`, `recovery_requests` (000044); `recovery_circles`, `recovery_circle_shares`, `recovery_circle_requests`, `recovery_circle_responses` (000045)                                                        |
 | Profile / prefs      | `user_preferences` (000016); `privacy_settings` (000027); `username_history` (000046); `saved_gifs` (000055); `notification_preferences` (000063, polymorphic target); `user_presence_settings` (000074, eight Activity History fields added by 000087 and five category controls by 000089); `friend_organization` (000075); `presence_override_preferences`, `user_presence_overrides` (000084); `presence_settings_pending_operations` (000087); `activity_settings_pending_cleanups` (000098, durable Rich Presence policy-cleanup evidence) |
 | Activity history    | `presence_history` (000087, category-neutral self-owned interval ledger)                                                                                                                                                                                                                                     |
-| Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133; 000140 adds `server_voice_terminal_outbox` for retrying stale-leave notifications through local Hub admission, 000141 adds its account-erasure index, and 000142 admits six aggregate operations counters. |
+| Voice                | `voice_participants` (000020) and `dm_voice_participants` (000026). Both gain authoritative `lifecycle_event_at` watermarks in 000093. Server Voice gains the PostgreSQL-observed `lifecycle_observed_at` lease in 000132, preserved on exact replays by 000133; 000140 adds `server_voice_terminal_outbox` for retrying stale-leave notifications through local Hub admission, 000141 adds its account-erasure index, 000142 admits six aggregate operations counters, and 000143 adds its recoverable delivery claim. |
 | Media                | `media_files` (000042)                                                                                                                                                                                                                                                                                        |
 | Social / server-mgmt | `friend_codes` (000027); `server_invites` (000009); `ownership_transfers` (000047)                                                                                                                                                                                                                            |
 | Compliance           | `audit_log` (000035); `account_deletions` (000059); `tier1_erasure_delete_obligations` (000117, 000118); immutable profile generations, slots, and pre-PUT intents (000119–000126)                                                                                                                                                  |
@@ -625,7 +625,7 @@ erDiagram
 > - migrations 000130–000131 add and validate the audited `expiry` purge reason used by the startup preflight and five-minute sweeper
 > - migrations 000132–000133 added the database-observed Server Voice participant lease used by the bounded active-presence reconciliation pass
 > - migration 000134 repairs far-future DM voice lifecycle stamps; migrations 000135–000136 add the camera-layering and presence-liveness operations metrics, migration 000137 adds durable expiration-policy system-message rows, and migrations 000138–000139 add per-participant DM list hides, Clear-history provenance, and the concurrent partial index supporting hidden-participant lookups
-> - migrations 000140–000142 add the guarded Server Voice terminal outbox, its account-erasure index, retry delivery through local Hub admission, and six aggregate operations counters; account erasure or channel deletion cancels a retained user-owned obligation
+> - migrations 000140–000143 add the guarded Server Voice terminal outbox, its account-erasure index, six aggregate operations counters, a recoverable delivery claim, and retry delivery through local Hub admission; account erasure or channel deletion cancels a retained user-owned obligation
 
 DM participant visibility is private to the requesting account. `dm_participants.hidden_at`
 removes one participant's conversation from list reads without changing read state;
@@ -1043,6 +1043,14 @@ Rich Presence reconnect. Permission batches coalesce by channel and drain in
 keyed-FIFO order so requeued work cannot starve another channel. Private Call's
 255-participant lifecycle bound and the 512-candidate Rich Presence reconnect
 snapshot bound remain independent.
+
+Queued Server Voice frames take final local-Hub admission atomically with
+authorization invalidation. Any overlap with membership, authority,
+temporary-grant, or account-erasure revocation suppresses ordinary frames.
+Durable terminal leaves hold a recoverable outbox claim until delivery is
+settled: the outbox drain or Hub can confirm that a successor or erased account
+makes suppression safe, otherwise the Hub delivers the frame. A retryable
+admission failure releases the claim for a later attempt.
 
 ### DM Voice Calls & Ringing
 

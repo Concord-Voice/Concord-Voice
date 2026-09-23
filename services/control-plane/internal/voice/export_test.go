@@ -162,6 +162,37 @@ func (s *NATSSubscriber) DrainServerVoiceTerminalOutboxCandidateForTest(
 	return err
 }
 
+// DeleteServerVoiceParticipantForTest exercises the ordinary leave mutation
+// without routing a synthetic NATS event through unrelated validation.
+func (s *NATSSubscriber) DeleteServerVoiceParticipantForTest(
+	ctx context.Context,
+	serverID, channelID, participantID uuid.UUID,
+	eventAt time.Time,
+) (bool, error) {
+	mutation := serverVoiceLeaveMutation{
+		subscriber: s, serverID: serverID, channelID: channelID,
+		senderID: participantID, eventAt: eventAt,
+	}
+	return mutation.apply(ctx)
+}
+
+// HandlePresenceErasureClearedForTest delivers a remote erasure clear to this
+// replica without requiring a live NATS connection.
+func (s *NATSSubscriber) HandlePresenceErasureClearedForTest(data []byte) {
+	s.handlePresenceErasureCleared(data)
+}
+
+// ApplyServerVoiceParticipantMutationForTest runs the same one- or two-channel
+// delivery fence that production uses around a Server Voice lifecycle mutation.
+func (s *NATSSubscriber) ApplyServerVoiceParticipantMutationForTest(
+	serverID, channelID uuid.UUID,
+	oldScope presence.Scope,
+	hasOldScope bool,
+	mutation func() (bool, error),
+) (bool, error) {
+	return s.applyServerVoiceParticipantMutation(serverID, channelID, oldScope, hasOldScope, mutation)
+}
+
 // RunVoiceLifecycleMutationForTest exercises the same claim-then-mutate
 // ordering as production. It intentionally mirrors the pre-fence behavior
 // until withVoiceLifecycleClaim replaces this body during the TDD cycle.

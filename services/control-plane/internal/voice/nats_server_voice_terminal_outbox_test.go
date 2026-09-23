@@ -31,6 +31,15 @@ func insertServerVoiceTerminalOutbox(t *testing.T, db *sql.DB, channelID, userID
 	require.NoError(t, err)
 }
 
+func requireServerVoiceTerminalOutboxCount(t *testing.T, db *sql.DB, operationID uuid.UUID, want int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var got int
+		err := db.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, operationID).Scan(&got)
+		return err == nil && got == want
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
 func installServerVoiceTerminalAckFailureForOperation(t *testing.T, db *sql.DB, operationID uuid.UUID) {
 	t.Helper()
 	_, err := db.Exec(`
@@ -208,7 +217,7 @@ func TestServerVoiceTerminalOutbox_DrainWaitsForAccountErasure(t *testing.T) {
 	assert.Zero(t, pending, "account erasure must cascade the unadmitted terminal obligation")
 }
 
-func TestServerVoiceTerminalOutbox_AckFailureStopsBatch(t *testing.T) {
+func TestServerVoiceTerminalOutbox_AckFailureRetainsButDoesNotStopBatch(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	owner := ts.CreateTestUser(t, "terminal-drain-continue-owner")
 	firstUser := ts.CreateTestUser(t, "terminal-drain-continue-first")
@@ -222,14 +231,11 @@ func TestServerVoiceTerminalOutbox_AckFailureStopsBatch(t *testing.T) {
 
 	sub := newTestSubscriber(ts)
 	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 2)
-	require.ErrorContains(t, err, "ack delivered server voice terminal obligation")
+	require.NoError(t, err)
 	assert.Zero(t, removed)
 
-	var firstRemaining, secondRemaining int
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, firstOp).Scan(&firstRemaining))
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, secondOp).Scan(&secondRemaining))
-	assert.Equal(t, 1, firstRemaining)
-	assert.Equal(t, 1, secondRemaining, "an acknowledgement failure after Hub admission must stop later work")
+	requireServerVoiceTerminalOutboxCount(t, ts.DB, firstOp, 1)
+	requireServerVoiceTerminalOutboxCount(t, ts.DB, secondOp, 0)
 }
 
 func TestServerVoiceTerminalOutbox_SuccessorAckFailureDoesNotStopBatch(t *testing.T) {
@@ -250,11 +256,8 @@ func TestServerVoiceTerminalOutbox_SuccessorAckFailureDoesNotStopBatch(t *testin
 	require.ErrorContains(t, err, "ack successor-suppressed server voice terminal obligation")
 	assert.Zero(t, removed)
 
-	var firstRemaining, secondRemaining int
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, firstOp).Scan(&firstRemaining))
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, secondOp).Scan(&secondRemaining))
-	assert.Equal(t, 1, firstRemaining)
-	assert.Zero(t, secondRemaining, "a pre-admission failure must not skip later selected work")
+	requireServerVoiceTerminalOutboxCount(t, ts.DB, firstOp, 1)
+	requireServerVoiceTerminalOutboxCount(t, ts.DB, secondOp, 0)
 }
 
 func TestServerVoiceTerminalOutbox_CaptureFailureRollsBackStaleDelete(t *testing.T) {
@@ -365,13 +368,15 @@ func TestServerVoiceTerminalOutbox_AckFailureRetainsAndLaterSettles(t *testing.T
 	err = sub.DrainServerVoiceTerminalOutboxCandidateForTest(
 		context.Background(), uuid.MustParse(channelID), uuid.MustParse(user.ID), op,
 	)
-	require.ErrorContains(t, err, "ack delivered server voice terminal obligation")
-	require.ErrorContains(t, err, "forced server voice terminal acknowledgement failure")
-	var stored uuid.UUID
-	require.NoError(t, ts.DB.QueryRow(`
-		SELECT operation_id FROM server_voice_terminal_outbox WHERE channel_id = $1 AND user_id = $2
-	`, channelID, user.ID).Scan(&stored))
-	assert.Equal(t, op, stored)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var claimed int
+		err := ts.DB.QueryRow(`
+			SELECT COUNT(*) FROM server_voice_terminal_outbox
+			WHERE operation_id = $1 AND delivery_claim_id IS NOT NULL
+		`, op).Scan(&claimed)
+		return err == nil && claimed == 1
+	}, 2*time.Second, 10*time.Millisecond)
 
 	_, err = ts.DB.Exec(`
 		DROP TRIGGER test_fail_server_voice_terminal_ack ON server_voice_terminal_outbox;
@@ -379,15 +384,17 @@ func TestServerVoiceTerminalOutbox_AckFailureRetainsAndLaterSettles(t *testing.T
 	`)
 	require.NoError(t, err)
 	triggerInstalled = false
+	_, err = ts.DB.Exec(`
+		UPDATE server_voice_terminal_outbox
+		SET delivery_claim_until = clock_timestamp() - interval '1 second'
+		WHERE operation_id = $1
+	`, op)
+	require.NoError(t, err)
 
 	require.NoError(t, sub.DrainServerVoiceTerminalOutboxCandidateForTest(
 		context.Background(), uuid.MustParse(channelID), uuid.MustParse(user.ID), op,
 	))
-	var outboxCount int
-	require.NoError(t, ts.DB.QueryRow(`
-		SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1
-	`, op).Scan(&outboxCount))
-	assert.Zero(t, outboxCount)
+	requireServerVoiceTerminalOutboxCount(t, ts.DB, op, 0)
 }
 
 func TestServerVoiceTerminalOutbox_AckFailureStillBroadcastsCountsAfterLocalLeave(t *testing.T) {
@@ -410,7 +417,7 @@ func TestServerVoiceTerminalOutbox_AckFailureStillBroadcastsCountsAfterLocalLeav
 
 	sub := newTestSubscriberWithHub(ts, hub)
 	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 1)
-	require.ErrorContains(t, err, "ack delivered server voice terminal obligation")
+	require.NoError(t, err)
 	assert.Zero(t, removed)
 
 	sawLeft, sawCounts := false, false
@@ -481,6 +488,47 @@ func TestServerVoiceTerminalOutbox_StaleOperationCannotSettleReplacement(t *test
 	assert.Equal(t, newOperation, stored)
 }
 
+func TestServerVoiceTerminalOutbox_CaptureReplacementClearsActiveClaim(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	owner := ts.CreateTestUser(t, "terminal-claim-replacement-owner")
+	user := ts.CreateTestUser(t, "terminal-claim-replacement-user")
+	serverID := ts.CreateTestServer(t, owner.ID, "terminal-claim-replacement-server")
+	channelID := ts.CreateVoiceChannel(t, serverID, "terminal-claim-replacement-channel")
+	insertVoiceParticipant(t, ts.DB, channelID, user.ID)
+	oldOperation := uuid.New()
+	insertServerVoiceTerminalOutbox(t, ts.DB, uuid.MustParse(channelID), uuid.MustParse(user.ID), uuid.MustParse(serverID), oldOperation)
+	_, err := ts.DB.Exec(`
+		UPDATE server_voice_terminal_outbox
+		SET delivery_claim_id = $1,
+		    delivery_claim_until = clock_timestamp() + interval '1 hour'
+		WHERE operation_id = $2
+	`, uuid.New(), oldOperation)
+	require.NoError(t, err)
+	_, err = ts.DB.Exec(`
+		UPDATE voice_participants
+		SET lifecycle_observed_at = clock_timestamp() - interval '2 minutes'
+		WHERE channel_id = $1 AND user_id = $2
+	`, channelID, user.ID)
+	require.NoError(t, err)
+
+	ts.Hub.Shutdown()
+	sub := newTestSubscriber(ts)
+	sub.CompleteServerVoiceCleanupGraceForTest()
+	removed, err := sub.ReconcileStaleServerVoiceParticipants(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, removed)
+
+	var operationID uuid.UUID
+	var claimID uuid.NullUUID
+	require.NoError(t, ts.DB.QueryRow(`
+		SELECT operation_id, delivery_claim_id
+		FROM server_voice_terminal_outbox
+		WHERE channel_id = $1 AND user_id = $2
+	`, channelID, user.ID).Scan(&operationID, &claimID))
+	assert.NotEqual(t, oldOperation, operationID)
+	assert.False(t, claimID.Valid, "a replacement obligation must not inherit an old delivery claim")
+}
+
 func TestServerVoiceTerminalOutbox_SuccessorSuppressesAndSettles(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	owner := ts.CreateTestUser(t, "terminal-successor-owner")
@@ -524,9 +572,7 @@ func TestServerVoiceTerminalOutbox_PendingDrainsDuringStartupGraceBeforeFreshDis
 	require.NoError(t, err)
 	assert.Zero(t, removed, "startup grace must defer fresh discovery")
 	assert.True(t, voiceParticipantExists(t, ts.DB, channelID, freshUser.ID))
-	var pendingCount int
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, operationID).Scan(&pendingCount))
-	assert.Zero(t, pendingCount, "pending obligations remain eligible during startup grace")
+	requireServerVoiceTerminalOutboxCount(t, ts.DB, operationID, 0)
 }
 
 func TestServerVoiceTerminalOutbox_FullQueueReschedulesThenNewHubDelivers(t *testing.T) {
@@ -563,9 +609,10 @@ func TestServerVoiceTerminalOutbox_FullQueueReschedulesThenNewHubDelivers(t *tes
 	require.NoError(t, sub.DrainServerVoiceTerminalOutboxCandidateForTest(context.Background(), uuid.MustParse(channelID), uuid.MustParse(user.ID), op))
 	envelope := waitForVoiceWireType(t, conn, "voice_state_update")
 	assert.Equal(t, "left", envelope.Data["action"])
-	var count int
-	require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, op).Scan(&count))
-	assert.Zero(t, count)
+	require.Eventually(t, func() bool {
+		var count int
+		return ts.DB.QueryRow(`SELECT COUNT(*) FROM server_voice_terminal_outbox WHERE operation_id = $1`, op).Scan(&count) == nil && count == 0
+	}, 3*time.Second, 20*time.Millisecond)
 }
 
 func TestServerVoiceTerminalOutbox_HeldLifecycleLockRetainsThenDelivers(t *testing.T) {
