@@ -214,9 +214,15 @@ func (h *Handler) ListMembers(c *gin.Context) {
 	}
 
 	h.populateLastSeen(members)
-	h.populateRBAcRoles(serverID, members)
+	// A failure here must not degrade to role-less members: `roles: []` reads
+	// as "has no roles", and the client builds assign/unassign from it.
+	if err := h.populateRBAcRoles(serverID, members); err != nil {
+		h.log.Error("Failed to fetch member roles", "server_id", serverID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedFetchMembers})
+		return
+	}
 	h.ensureRolesNotNil(members)
-	h.maskOwnerRole(c, serverID, userID, members)
+	h.maskOwnerRole(userID, members)
 
 	c.JSON(http.StatusOK, gin.H{"members": members})
 }
@@ -336,7 +342,7 @@ func (h *Handler) queryServerMembers(serverID string) ([]MemberWithUser, error) 
 		)
 		if err != nil {
 			h.log.Error("Failed to scan member", "error", err)
-			continue
+			return nil, err // skipping would drop a member from a 200
 		}
 		if timedOutUntil.Valid {
 			t := timedOutUntil.Time
@@ -363,6 +369,8 @@ func (h *Handler) populateLastSeen(members []MemberWithUser) {
 	ctx := context.Background()
 	vals, err := h.redis.MGet(ctx, keys...).Result()
 	if err != nil {
+		// last_seen is optional; an absent value honestly means "unknown".
+		h.log.Warn("Failed to fetch member last_seen", "error", err)
 		return
 	}
 	for i, val := range vals {
@@ -381,19 +389,17 @@ func (h *Handler) populateLastSeen(members []MemberWithUser) {
 }
 
 // populateRBAcRoles fetches RBAC roles for all members in a server and attaches them.
-func (h *Handler) populateRBAcRoles(serverID string, members []MemberWithUser) {
-	if len(members) == 0 {
-		return
-	}
+// On error the caller must discard members: the map may be partially applied.
+func (h *Handler) populateRBAcRoles(serverID string, members []MemberWithUser) error {
 	roleRows, err := h.db.Query(`
-		SELECT mr.user_id, r.id, r.name, r.color, r.emoji, r.position, r.display_separately
+		SELECT mr.user_id, r.id, r.name, r.color, r.emoji, r.position, COALESCE(r.display_separately, FALSE)
 		FROM member_roles mr
-		INNER JOIN roles r ON mr.role_id = r.id
+		INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 		WHERE mr.server_id = $1
 		ORDER BY r.position DESC
 	`, serverID)
 	if err != nil {
-		return
+		return fmt.Errorf("query member roles: %w", err)
 	}
 	defer func() { _ = roleRows.Close() }()
 
@@ -404,7 +410,7 @@ func (h *Handler) populateRBAcRoles(serverID string, members []MemberWithUser) {
 		var position int
 		var displaySeparately bool
 		if err := roleRows.Scan(&uid, &roleID, &roleName, &roleColor, &roleEmoji, &position, &displaySeparately); err != nil {
-			continue
+			return fmt.Errorf("scan member role: %w", err)
 		}
 		memberRoleMap[uid] = append(memberRoleMap[uid], MemberRoleInfo{
 			RoleID:            roleID,
@@ -420,6 +426,7 @@ func (h *Handler) populateRBAcRoles(serverID string, members []MemberWithUser) {
 			members[i].Roles = roles
 		}
 	}
+	return roleRows.Err()
 }
 
 // ensureRolesNotNil ensures Roles is never null in JSON output.
@@ -433,25 +440,21 @@ func (h *Handler) ensureRolesNotNil(members []MemberWithUser) {
 
 // maskOwnerRole masks the owner's role for non-owner viewers (#244: Hidden Owner Role).
 // Non-owners see the owner's highest RBAC role name instead of "owner".
-func (h *Handler) maskOwnerRole(c *gin.Context, serverID, viewerUserID string, members []MemberWithUser) {
-	var serverOwnerID string
-	if err := h.db.QueryRowContext(c.Request.Context(), `SELECT owner_id FROM servers WHERE id = $1`, serverID).Scan(&serverOwnerID); err != nil {
-		h.log.Error("Failed to fetch server owner for role masking", "error", err, "server_id", serverID)
-		return
-	}
-	if viewerUserID == serverOwnerID {
-		return // Owner sees their own "owner" role
-	}
+//
+// The owner is found by server_members.role, which ownership transfer swaps in
+// the same transaction as servers.owner_id. An earlier version looked owner_id up
+// separately and, when that lookup failed, returned WITHOUT masking -- disclosing
+// the owner to every viewer. There is no lookup left to fail.
+func (h *Handler) maskOwnerRole(viewerUserID string, members []MemberWithUser) {
 	for i := range members {
-		if members[i].UserID != serverOwnerID || members[i].Role != "owner" {
-			continue
+		if members[i].Role != "owner" || members[i].UserID == viewerUserID {
+			continue // the owner sees their own "owner" role
 		}
 		if len(members[i].Roles) > 0 {
 			members[i].Role = members[i].Roles[0].RoleName // highest position (sorted DESC)
 		} else {
 			members[i].Role = "member"
 		}
-		break
 	}
 }
 

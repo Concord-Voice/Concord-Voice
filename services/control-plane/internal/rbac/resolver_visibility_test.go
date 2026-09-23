@@ -534,7 +534,7 @@ func TestFilterVisibleUserIDsForChannelFreshMatchesPerViewerVisibility(t *testin
 	require.Nil(t, invalid, "one malformed candidate must fail the whole fresh decision")
 }
 
-func TestFilterVisibleUserIDsForChannelFreshIgnoresCrossServerRoleMapping(t *testing.T) {
+func TestFilterVisibleUserIDsForChannelFreshRefusesCrossServerRoleMapping(t *testing.T) {
 	resolver, ts := setupResolver(t)
 	ctx := context.Background()
 
@@ -559,19 +559,40 @@ func TestFilterVisibleUserIDsForChannelFreshIgnoresCrossServerRoleMapping(t *tes
 	ownerB := ts.CreateTestUser(t, "channelviewcrossownerb")
 	serverB := ts.CreateTestServer(t, ownerB.ID, "Channel Viewer Cross B")
 	foreignRole := ts.CreateTestRole(t, serverB, "Foreign Viewer", 2, 0)
+
+	// This row -- serverA's id paired with a serverB role -- was schema-legal until
+	// migration 000144 (#2869) replaced member_roles' existence-only role_id FK with
+	// the composite member_roles_role_server_fkey. The test used to seed it and pin
+	// that the resolver declined to honour the foreign role's override; it now pins
+	// that the mapping cannot be created at all. The declining half still matters
+	// for a row that bypasses the FK, and TestCrossServerMemberRoleRowGrantsNothing
+	// plants one to cover it.
 	_, err = ts.DB.Exec(
 		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`,
 		serverA,
 		member.ID,
 		foreignRole,
 	)
-	require.NoError(t, err, "schema permits the malformed cross-server role mapping fixture")
-	ts.CreateChannelOverride(t, channelA, "role", foreignRole, viewVoice, 0)
+	require.Error(t, err, "000144's composite FK must refuse the cross-server role mapping")
+	require.Contains(t, err.Error(), "member_roles_role_server_fkey",
+		"must be refused by the composite FK, not incidentally by another constraint")
+
+	// CONTROL, in both directions, on a SAME-server role. Without it this test would
+	// assert only that one insert fails -- which a constraint rejecting everything
+	// would also satisfy -- and would stop covering the override handling in
+	// FilterVisibleUserIDsForChannelFresh entirely. The default role still has
+	// viewVoice removed above, so the allow below is what grants visibility.
+	localRole := ts.CreateTestRole(t, serverA, "Local Viewer", 2, 0)
+	ts.AssignRoleToUser(t, serverA, member.ID, localRole)
+	ts.CreateChannelOverride(t, channelA, "role", localRole, viewVoice, 0)
 
 	viewers, err := resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverA, channelA, []string{member.ID})
 	require.NoError(t, err)
-	require.Empty(t, viewers, "a foreign role allow must not authorize this server")
+	require.Equal(t, []string{member.ID}, viewers, "a same-server role allow must authorize")
 
+	// Restore viewVoice to the default role and flip the override to a deny, so the
+	// second half exercises subtraction rather than re-testing absence: without the
+	// restore, the member would lack viewVoice anyway and an inert deny would pass.
 	_, err = ts.DB.Exec(
 		`UPDATE roles SET permissions = permissions | $1::bigint WHERE id = $2`,
 		viewVoice,
@@ -583,13 +604,13 @@ func TestFilterVisibleUserIDsForChannelFreshIgnoresCrossServerRoleMapping(t *tes
 		 WHERE channel_id = $2 AND target_type = 'role' AND target_id = $3`,
 		viewVoice,
 		channelA,
-		foreignRole,
+		localRole,
 	)
 	require.NoError(t, err)
 
 	viewers, err = resolver.FilterVisibleUserIDsForChannelFresh(ctx, serverA, channelA, []string{member.ID})
 	require.NoError(t, err)
-	require.Equal(t, []string{member.ID}, viewers, "a foreign role deny must not hide this server")
+	require.Empty(t, viewers, "a same-server role deny must hide the channel")
 }
 
 func TestFilterVisibleUserIDsForChannelFreshUsesOneQueryForCandidateSet(t *testing.T) {

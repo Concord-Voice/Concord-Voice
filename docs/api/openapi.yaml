@@ -2005,7 +2005,7 @@ paths:
                   override:
                     $ref: '#/components/schemas/CategoryOverride'
         '400':
-          description: Invalid category ID or request body
+          description: Invalid category ID or request body, a negative allow or deny value, or a role target that belongs to a different server
           content:
             application/json:
               schema:
@@ -2687,7 +2687,7 @@ paths:
                   override:
                     $ref: '#/components/schemas/ChannelOverride'
         '400':
-          description: Invalid channel ID or request body
+          description: Invalid channel ID or request body, a negative allow or deny value, or a role target that belongs to a different server
           content:
             application/json:
               schema:
@@ -12085,7 +12085,7 @@ paths:
                   role:
                     $ref: '#/components/schemas/Role'
         '400':
-          description: Invalid server ID, request body, or color format
+          description: Invalid server ID, request body, color format, or a negative permissions value
           content:
             application/json:
               schema:
@@ -12204,7 +12204,7 @@ paths:
                   role:
                     $ref: '#/components/schemas/Role'
         '400':
-          description: Invalid IDs, request body, color format, or no fields to update
+          description: Invalid IDs, request body, color format, a negative permissions value, or no fields to update
           content:
             application/json:
               schema:

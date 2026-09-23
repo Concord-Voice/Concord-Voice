@@ -737,3 +737,81 @@ func TestResolver_InvalidateChannel_DelegatesToCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), existsAfter, "InvalidateChannel should clear the channel-scoped cache entry")
 }
+
+// Every channel-scoped entry point takes serverID and channelID separately and
+// resolves base permissions from the first and overrides from the second. The
+// owner (and administrator) short-circuit used to return the full base set for a
+// channel of ANY server, so the owner of server A resolved owner permissions on
+// server B's channel. Each entry point must refuse the pair, and the refusal must
+// be ErrNotMember-shaped so existing callers deny it (#2869).
+func TestChannelScopedResolveRefusesChannelOfAnotherServer(t *testing.T) {
+	ctx := context.Background()
+	resolver, ts := setupResolver(t)
+
+	ownerA := ts.CreateTestUser(t, "xchanownera")
+	ownerB := ts.CreateTestUser(t, "xchanownerb")
+	serverA := ts.CreateTestServer(t, ownerA.ID, "Cross Channel A")
+	serverB := ts.CreateTestServer(t, ownerB.ID, "Cross Channel B")
+	channelA := ts.CreateTestChannel(t, serverA, "home")
+	channelB := ts.CreateTestChannel(t, serverB, "foreign")
+
+	inTx := func(fn func(tx *sql.Tx)) {
+		tx, err := ts.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				t.Errorf("rollback transaction: %v", rollbackErr)
+			}
+		}()
+		fn(tx)
+	}
+
+	// CONTROL: the same owner on their own server's channel is fully authorized
+	// through every entry point, so the refusals below are about the pairing.
+	t.Run("control: own channel resolves", func(t *testing.T) {
+		ok, err := resolver.HasPermission(ctx, serverA, ownerA.ID, channelA, rbac.PermSendMessages)
+		require.NoError(t, err)
+		assert.True(t, ok)
+		perms, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverA, ownerA.ID, []string{channelA})
+		require.NoError(t, err)
+		assert.True(t, perms[channelA].Has(rbac.PermSendMessages))
+		inTx(func(tx *sql.Tx) {
+			p, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverA, ownerA.ID, channelA)
+			require.NoError(t, err)
+			assert.True(t, p.Has(rbac.PermSendMessages))
+		})
+	})
+
+	t.Run("HasPermission denies", func(t *testing.T) {
+		ok, err := resolver.HasPermission(ctx, serverA, ownerA.ID, channelB, rbac.PermSendMessages)
+		require.NoError(t, err)
+		assert.False(t, ok)
+	})
+
+	t.Run("GetEffectivePermissions and Fresh refuse", func(t *testing.T) {
+		_, err := resolver.GetEffectivePermissions(ctx, serverA, ownerA.ID, channelB)
+		require.ErrorIs(t, err, rbac.ErrChannelNotInServer)
+		require.ErrorIs(t, err, rbac.ErrNotMember)
+		_, err = resolver.ResolveEffectivePermissionsFresh(ctx, serverA, ownerA.ID, channelB)
+		require.ErrorIs(t, err, rbac.ErrChannelNotInServer)
+	})
+
+	t.Run("batch and uncached refuse, even mixed with a home channel", func(t *testing.T) {
+		_, err := resolver.ResolveEffectivePermissionsForChannelsFresh(ctx, serverA, ownerA.ID, []string{channelA, channelB})
+		require.ErrorIs(t, err, rbac.ErrChannelNotInServer)
+		_, err = resolver.ResolveEffectivePermissionsUncached(ctx, serverA, ownerA.ID, channelB)
+		require.ErrorIs(t, err, rbac.ErrChannelNotInServer)
+	})
+
+	t.Run("ResolveChannelPermissionsTx refuses", func(t *testing.T) {
+		inTx(func(tx *sql.Tx) {
+			_, err := resolver.ResolveChannelPermissionsTx(ctx, tx, serverA, ownerA.ID, channelB)
+			require.ErrorIs(t, err, rbac.ErrChannelNotInServer)
+		})
+	})
+
+	t.Run("a refused pair is never cached", func(t *testing.T) {
+		_, cached := rbac.NewPermissionCache(ts.Redis).Get(ctx, serverA, ownerA.ID, channelB)
+		assert.False(t, cached)
+	})
+}

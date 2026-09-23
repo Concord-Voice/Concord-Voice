@@ -465,47 +465,6 @@ func TestCreateRole_ActorAtPositionTwo_Succeeds(t *testing.T) {
 	assert.Equal(t, 0, defaultPosition, "the default role must never be shifted")
 }
 
-// member_roles has no composite FK to roles(id, server_id) -- role_id references
-// roles(id) alone -- so a row whose server_id differs from its role's server is
-// schema-legal. Every ceiling aggregate that joins on role_id ALONE would then
-// import a foreign role's position as this server's ceiling.
-//
-// No first-party path can create such a row: all four production INSERT sites
-// scope the role to the same server. This test seeds it directly, which is the
-// only way to reach the state, and pins that the server-qualified join refuses
-// to import it. Without `AND r.server_id = mr.server_id` the foreign position
-// becomes the ceiling and the new role lands above the victim server's admin --
-// re-opening the very bug this PR closes.
-//
-// Defence-in-depth, not a live exploit. The durable fix is a composite FK, the
-// shape migration 000082 used for channel groups; tracked separately.
-func TestCreateRole_ForeignServerRoleDoesNotInflateCeiling(t *testing.T) {
-	ts, owner, member, serverID := setupOwnerAndMember(t)
-	_ = grantPermToUser(t, ts, serverID, owner.ID, 10, int64(rbac.AdminPermissions))
-	_ = grantPermToUser(t, ts, serverID, member.ID, 5, int64(rbac.PermManageRoles))
-
-	// A second server the member is not scoped to, carrying a very high role.
-	otherServerID := ts.CreateTestServer(t, owner.ID, "Other Server")
-	foreignRoleID := ts.CreateTestRole(t, otherServerID, "Foreign", 999, 0)
-
-	// Schema-legal, unreachable through the API: this server's id, that server's role.
-	_, err := ts.DB.Exec(
-		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`,
-		serverID, member.ID, foreignRoleID)
-	require.NoError(t, err, "the row is schema-legal, which is the point")
-	invalidatePermCache(t, ts, serverID, member.ID)
-
-	w := ts.DoRequest("POST", rolesPath(serverID),
-		map[string]interface{}{"name": "ShouldNotOutrank", "permissions": "0"},
-		testhelpers.AuthHeaders(member.AccessToken))
-	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
-
-	pos := rolePositionFromCreateResponse(t, w)
-	assert.Less(t, pos, 10, "must not outrank this server's admin role")
-	assert.Less(t, pos, 999, "the foreign role's position must not become the ceiling")
-	assert.Equal(t, 5, pos, "ceiling must come from this server's roles only")
-}
-
 // The FIRST role an owner creates on a fresh server lands at position 1, because
 // a new server holds only the default role at 0. Granting that role is the
 // ordinary way to delegate Manage Roles -- so position 1 is not an edge case,
@@ -3850,4 +3809,132 @@ func TestGetAuditLogMemberWithViewAuditLog(t *testing.T) {
 	testhelpers.ParseJSON(t, w, &resp)
 	entries := resp["entries"].([]interface{})
 	assert.GreaterOrEqual(t, len(entries), 1)
+}
+
+// Negative permission bitfields are refused at the request boundary (#2869).
+// Each route below could reach the database with one: the owner through
+// UpdateRole's owner bypass, a PermAdministrator holder through the override
+// allow bypass, and anyone with PermManageChannels through deny, which is never
+// subset-checked. Migration 000144's CHECKs turned those into 500s; the binding
+// tags make them 400s. CreateRole was already refused, by the subset check, and
+// is covered so the refusal no longer depends on that incidental path.
+//
+// Every refusal is paired with a CONTROL of the identical request shape carrying
+// PermKick, so a 400 cannot come from a malformed body -- and so a refused
+// UpdateRole is distinguishable from the control's own write.
+func TestPermissionBitfieldWrites_RejectNegatives(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateTestChannel(t, serverID, "neg-bits")
+	categoryID := createTestCategory(t, ts, serverID, "neg-bits-cat")
+	target := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "NegTarget", 0)
+	grantPermToUser(t, ts, serverID, member.ID, 50, int64(rbac.PermAdministrator|rbac.PermManageChannels))
+
+	roleBody := func(v int64) interface{} {
+		return map[string]interface{}{"name": "Neg " + uuid.New().String()[:8], "permissions": fmt.Sprintf("%d", v)}
+	}
+	overrideBody := func(field string) func(int64) interface{} {
+		return func(v int64) interface{} {
+			return map[string]interface{}{"target_type": "role", "target_id": target, field: v}
+		}
+	}
+	for _, tc := range []struct {
+		name, token, method, path string
+		body                      func(int64) interface{}
+	}{
+		{"owner UpdateRole", owner.AccessToken, "PATCH", rolePath(serverID, target), roleBody},
+		{"owner CreateRole", owner.AccessToken, "POST", rolesPath(serverID), roleBody},
+		{"administrator channel allow", member.AccessToken, "PUT", channelOverridesPath(channelID), overrideBody("allow")},
+		{"channel deny", owner.AccessToken, "PUT", channelOverridesPath(channelID), overrideBody("deny")},
+		{"administrator category allow", member.AccessToken, "PUT", categoryOverridesPath(categoryID), overrideBody("allow")},
+		{"category deny", owner.AccessToken, "PUT", categoryOverridesPath(categoryID), overrideBody("deny")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := ts.DoRequest(tc.method, tc.path, tc.body(int64(rbac.PermKick)), testhelpers.AuthHeaders(tc.token))
+			require.Less(t, w.Code, 300, "CONTROL: the same request with PermKick must succeed; body: %s", w.Body.String())
+
+			w = ts.DoRequest(tc.method, tc.path, tc.body(-1), testhelpers.AuthHeaders(tc.token))
+			assert.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+		})
+	}
+
+	var perms int64
+	require.NoError(t, ts.DB.QueryRow(`SELECT permissions FROM roles WHERE id = $1`, target).Scan(&perms))
+	assert.Equal(t, int64(rbac.PermKick), perms, "a refused UpdateRole must leave the control's value in place")
+}
+
+// An override naming ANOTHER server's role is refused (#2869). target_id has no
+// FK, so only the write can keep such a row out; every reader already ignores
+// it. A same-server role and a user target (user ids are global and cannot cross
+// servers) are the controls, through the identical request.
+func TestOverrideUpsert_RejectsForeignRoleTarget(t *testing.T) {
+	ts, owner, member, serverID := setupOwnerAndMember(t)
+	channelID := ts.CreateTestChannel(t, serverID, "foreign-target")
+	categoryID := createTestCategory(t, ts, serverID, "foreign-target-cat")
+	homeRole := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "Home", 0)
+	foreignRole := ts.CreateTestRole(t, ts.CreateTestServer(t, owner.ID, "Other Server"), "Foreign", 1, 0)
+
+	for _, path := range []string{channelOverridesPath(channelID), categoryOverridesPath(categoryID)} {
+		for _, tc := range []struct {
+			targetType, targetID string
+			want                 int
+		}{
+			{"role", homeRole, http.StatusOK},
+			{"user", member.ID, http.StatusOK},
+			{"role", foreignRole, http.StatusBadRequest},
+		} {
+			w := ts.DoRequest("PUT", path, map[string]interface{}{
+				"target_type": tc.targetType, "target_id": tc.targetID, "allow": 0, "deny": 0,
+			}, testhelpers.AuthHeaders(owner.AccessToken))
+			assert.Equal(t, tc.want, w.Code, "%s %s: %s", path, tc.targetType, w.Body.String())
+		}
+	}
+
+	var stored int
+	require.NoError(t, ts.DB.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM channel_permission_overrides WHERE target_id = $1) +
+		(SELECT COUNT(*) FROM category_permission_overrides WHERE target_id = $1)`, foreignRole).Scan(&stored))
+	assert.Zero(t, stored, "a refused upsert must write nothing")
+}
+
+// A foreign-role category override written BEFORE the upsert guard existed must
+// not be re-copied into channels by either cascade: the sync that runs after a
+// category upsert, and the copy that runs when a channel turns sync on. The row
+// is inert either way; the point is that the shape the guard refuses cannot
+// spread. A same-server role through the same path is the control (#2869).
+func TestCategoryCascadeDropsLegacyForeignRoleTarget(t *testing.T) {
+	ts, owner, _, serverID := setupOwnerAndMember(t)
+	categoryID := createTestCategory(t, ts, serverID, "legacy-cascade")
+	syncedCh := ts.CreateTestChannel(t, serverID, "synced")
+	assignChannelToCategory(t, ts, syncedCh, categoryID, true)
+	laterCh := ts.CreateTestChannel(t, serverID, "turns-sync-on")
+	assignChannelToCategory(t, ts, laterCh, categoryID, false)
+
+	homeRole := createRoleViaAPI(t, ts, serverID, owner.AccessToken, "Home", 0)
+	foreignRole := ts.CreateTestRole(t, ts.CreateTestServer(t, owner.ID, "Legacy Other"), "Foreign", 1, 0)
+	_, err := ts.DB.Exec(`INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
+		VALUES ($1, $2, 'role', $3, 0, 0)`, uuid.New().String(), categoryID, foreignRole)
+	require.NoError(t, err, "plant the pre-guard row the upsert would now refuse")
+
+	copied := func(channelID, roleID string) int {
+		var n int
+		require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM channel_permission_overrides
+			WHERE channel_id = $1 AND target_type = 'role' AND target_id = $2`, channelID, roleID).Scan(&n))
+		return n
+	}
+
+	// Sync cascade: a guard-passing category upsert re-copies the category.
+	w := ts.DoRequest("PUT", categoryOverridesPath(categoryID), map[string]interface{}{
+		"target_type": "role", "target_id": homeRole, "allow": 0, "deny": 0,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 1, copied(syncedCh, homeRole), "CONTROL: the same-server role is synced")
+	assert.Zero(t, copied(syncedCh, foreignRole), "sync must not copy a foreign-role target")
+
+	// Copy cascade: turning sync on copies the category into the channel.
+	w = ts.DoRequest("PUT", channelPermSyncPath(laterCh), map[string]interface{}{
+		"sync_permissions": true,
+	}, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 1, copied(laterCh, homeRole), "CONTROL: the same-server role is copied")
+	assert.Zero(t, copied(laterCh, foreignRole), "copy must not copy a foreign-role target")
 }

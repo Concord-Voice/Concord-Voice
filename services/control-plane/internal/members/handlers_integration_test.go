@@ -150,6 +150,23 @@ func TestListMembersOwnerRoleMaskedForNonOwner(t *testing.T) {
 	}
 }
 
+// roles.display_separately is nullable (000035) and is scanned into a bool. Before
+// the read was COALESCEd, a NULL failed the scan: the role was silently dropped,
+// and since #2869 the whole list would fail with a 500.
+func TestListMembersToleratesNullDisplaySeparately(t *testing.T) {
+	ts := setupTS(t)
+	owner := ts.CreateTestUser(t, "nulldispown")
+	serverID := ts.CreateTestServer(t, owner.ID, "NullDisplayServer")
+	roleID := ts.CreateTestRole(t, serverID, "Null Display", 5, 0)
+	_, err := ts.DB.Exec(`UPDATE roles SET display_separately = NULL WHERE id = $1`, roleID)
+	require.NoError(t, err)
+	ts.AssignRoleToUser(t, serverID, owner.ID, roleID)
+
+	w := ts.DoRequest("GET", membersPath(serverID), nil, testhelpers.AuthHeaders(owner.AccessToken))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), roleID, "the NULL-flag role must still be listed")
+}
+
 func TestListMembersOwnerSeesOwnRole(t *testing.T) {
 	ts := setupTS(t)
 	owner := ts.CreateTestUser(t, "ownerself")

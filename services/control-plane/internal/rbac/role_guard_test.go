@@ -303,6 +303,44 @@ func TestRoleGuardQueries_BothDeriveFromRoleGuardSelect(t *testing.T) {
 		"they must not collapse into one constant: that would put a lock on the pool")
 }
 
+// The pre-check's actor_base_permissions (the r3 join in roleGuardSelect) is
+// invisible over HTTP: when it over-allows, the request falls through to the
+// in-transaction check, which refuses with the same body. Called directly it is
+// observable. A role of ANOTHER server carrying PermBan is planted onto the
+// actor past the FK (#2869); the pre-check must not count its bits. The r2
+// ceiling join is covered by TestCrossServerMemberRoleRowGrantsNothing.
+func TestPreCheckRoleMutation_IgnoresCrossServerActorRole(t *testing.T) {
+	f := newGuardFixture(t)
+	ctx := context.Background()
+	f.grantActorRole(t, 10, PermManageRolesAssign)
+	prize := f.createRole(t, "prize", 5, PermBan) // below the actor: only the subset check can refuse
+
+	otherServer := uuid.New().String()
+	guardExec(t, f.db, `INSERT INTO servers (id, name, owner_id) VALUES ($1, 'Other', $2)`, otherServer, f.ownerID)
+	foreignRole := uuid.New().String()
+	guardExec(t, f.db, `INSERT INTO roles (id, server_id, name, position, permissions, is_default, is_managed)
+		VALUES ($1, $2, 'foreign', 1, $3, FALSE, FALSE)`, foreignRole, otherServer, int64(PermBan))
+	tx, err := f.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, `SET LOCAL session_replication_role = 'replica'`)
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2, $3)`,
+			f.serverID, f.actorID, foreignRole)
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		require.NoError(t, err, "planting past the FK needs a superuser test role")
+	}
+	require.NoError(t, tx.Commit())
+
+	require.ErrorIs(t, f.h.preCheckRoleMutation(ctx, f.serverID, f.actorID, prize, confersTargetRole, 0),
+		errEscalationDenied, "the foreign role's PermBan must not count toward the actor's bits")
+
+	// CONTROL: the same bit held through a same-server role lets the same request pass.
+	f.grantActorRole(t, 9, PermBan)
+	require.NoError(t, f.h.preCheckRoleMutation(ctx, f.serverID, f.actorID, prize, confersTargetRole, 0))
+}
+
 // The sentinels are distinct values: mapGuardError branches on identity, and two
 // sentinels that compared equal would collapse a 403 into a 404 on the wire.
 func TestRoleGuardSentinelsAreDistinct(t *testing.T) {

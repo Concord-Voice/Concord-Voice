@@ -154,16 +154,28 @@ type roleGuardResult struct {
 // cannot interleave at all. Do not reinstate the one-directional-wait argument;
 // it describes a world that no longer exists, and the rejected variant above is
 // rejected on its own merits regardless of who else holds the advisory lock.
+//
+// BOTH actor subqueries below server-qualify their roles join (#2869). Until
+// migration 000144 they did not, while reorderGuardQuery and resolveNewRolePosition
+// already did — so this guard, the one that refuses a cross-server role assignment
+// via `WHERE r.id = $1 AND r.server_id = $2`, was computing the ACTOR's own ceiling
+// and permission bits through exactly the hole it exists to close. A single foreign
+// member_roles row raised actor_max_position to that role's position and ORed its
+// bits (including bit 62) into actor_base_permissions, opening the hierarchy and
+// subset checks together. Proven twice by @red-team, in #2850 and again in #3350.
+// 000144's composite FK now makes such a row unrepresentable; keep these predicates
+// anyway — they are what holds for a row arriving by a route the FK does not cover,
+// and they cost nothing, since mr.server_id is already pinned by the WHERE clause.
 const roleGuardSelect = `
 	SELECT r.is_managed, r.is_default, r.position, r.permissions,
 	       (SELECT COALESCE(MAX(r2.position), 0)
 	          FROM member_roles mr
-	          INNER JOIN roles r2 ON mr.role_id = r2.id
+	          INNER JOIN roles r2 ON mr.role_id = r2.id AND r2.server_id = mr.server_id
 	         WHERE mr.server_id = $2 AND mr.user_id = $3) AS actor_max_position,
 	       (SELECT s.owner_id FROM servers s WHERE s.id = r.server_id) AS owner_id,
 	       (SELECT COALESCE(BIT_OR(r3.permissions), 0)
 	          FROM member_roles mr3
-	          INNER JOIN roles r3 ON mr3.role_id = r3.id
+	          INNER JOIN roles r3 ON mr3.role_id = r3.id AND r3.server_id = mr3.server_id
 	         WHERE mr3.server_id = $2 AND mr3.user_id = $3) AS actor_base_permissions
 	  FROM roles r
 	 WHERE r.id = $1 AND r.server_id = $2`
@@ -341,9 +353,12 @@ func (h *Handler) evaluateRoleGuard(
 
 	// Owner bypasses the subset check for UpdateRole and AssignRole, matching
 	// pre-#2721 behaviour. CreateRole does NOT route through this guard and has
-	// no owner bypass at all — that omission, not the subset test, is what keeps
-	// bit 62 (PermAdministrator) out of a server, because OwnerPermissions
-	// excludes it.
+	// no owner bypass at all, so because OwnerPermissions excludes bit 62 an owner
+	// cannot CREATE a role carrying PermAdministrator. That does not keep bit 62
+	// out of a server: this bypass lets an owner write it into an existing role
+	// through UpdateRole (#2869). Owners may delegate PermAdministrator by
+	// decision, so this bypass is intended; CreateRole's refusal is the defect,
+	// tracked as #3407. Do not cite CreateRole as containment.
 	if mode == confersNothing || res.IsOwner {
 		return res, nil
 	}

@@ -43,6 +43,7 @@ const (
 	errMsgFailedFetchPermissions  = "Failed to fetch permissions"
 	errMsgFailedUpdateSync        = "Failed to update sync"
 	errMsgCannotGrantPerms        = "Cannot grant permissions you do not have"
+	errMsgForeignRoleTarget       = "Override target role does not belong to this server"
 	errMsgFailedGetServerOwner    = "Failed to get server owner"
 	errMsgFailedGetActorPosition  = "Failed to get actor role position"
 	errMsgNoLegalRolePosition     = "No available role position below your own"
@@ -51,7 +52,25 @@ const (
 	errMsgFailedQueryChannel      = "Failed to query channel"
 	errMsgFailedQueryCategory     = "Failed to query category"
 	errMsgFailedGetActorPerms     = "Failed to get actor permissions"
+
+	logMsgCacheInvalidateFailed = "Failed to invalidate permission cache"
 )
+
+// copyCategoryOverridesSQL copies a category's overrides into one channel
+// ($1 channel, $2 category, $3 server). It is the single statement both copy
+// cascades run. The role filter keeps targets the upserts would accept today:
+// the upsert guard refuses a foreign role target, but rows written before it
+// (#2869) can still sit in category_permission_overrides, and without the
+// filter every later sync would re-copy them into each synced channel. They
+// grant nothing — every reader matches role targets against this server's
+// roles — so the filter keeps a refused shape from spreading, it does not close
+// a grant.
+const copyCategoryOverridesSQL = `
+	INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
+	SELECT gen_random_uuid(), $1, target_type, target_id, allow, deny
+	FROM category_permission_overrides
+	WHERE category_id = $2
+	  AND (target_type <> 'role' OR target_id IN (SELECT id FROM roles WHERE server_id = $3))`
 
 // Handler handles RBAC-related HTTP requests
 type Handler struct {
@@ -150,7 +169,7 @@ type CreateRoleRequest struct {
 	Name              string  `json:"name" binding:"required,min=1,max=100"`
 	Color             *string `json:"color,omitempty"`
 	Emoji             *string `json:"emoji,omitempty"`
-	Permissions       int64   `json:"permissions,string"`
+	Permissions       int64   `json:"permissions,string" binding:"gte=0"` // bit 63 is not a permission (#2869)
 	Mentionable       bool    `json:"mentionable"`
 	DisplaySeparately bool    `json:"display_separately"`
 }
@@ -160,7 +179,7 @@ type UpdateRoleRequest struct {
 	Name              *string `json:"name,omitempty"`
 	Color             *string `json:"color,omitempty"`
 	Emoji             *string `json:"emoji,omitempty"`
-	Permissions       *int64  `json:"permissions,string,omitempty"`
+	Permissions       *int64  `json:"permissions,string,omitempty" binding:"omitempty,gte=0"` // #2869: the owner bypass writes this unmasked
 	Mentionable       *bool   `json:"mentionable,omitempty"`
 	DisplaySeparately *bool   `json:"display_separately,omitempty"`
 }
@@ -209,6 +228,25 @@ func resolveRoleListViewer(ctx context.Context, q rowQuerier, serverID, userID s
 		return RoleListViewer{Kind: viewerKindOwner}, nil
 	}
 	return RoleListViewer{Kind: viewerKindBounded, MaxRolePosition: &maxPosition}, nil
+}
+
+// logIfErr records a failure that must not fail the request, because the write
+// it follows has already committed. It must not pass silently either: a failed
+// cache invalidation leaves a stale grant readable for up to the cache TTL, which
+// after a revoke is a live over-grant (backend.md: no blank discards).
+func (h *Handler) logIfErr(msg string, err error) {
+	if err != nil {
+		h.log.Error(msg, "error", err)
+	}
+}
+
+// logAudit writes an audit entry, logging rather than discarding a failure: the
+// audited change has already committed, and a silent gap in the trail is what an
+// incident review cannot see.
+func (h *Handler) logAudit(ctx context.Context, serverID string, actorID *string, action, targetType string, targetID *string, metadata map[string]interface{}) {
+	if err := h.audit.Log(ctx, serverID, actorID, action, targetType, targetID, metadata); err != nil {
+		h.log.Error("Failed to write audit log", "action", action, "error", err)
+	}
 }
 
 // ListRoles returns all roles for a server
@@ -507,10 +545,12 @@ func (h *Handler) CreateRole(c *gin.Context) {
 			return toErr
 		}
 
-		// Cache-free and in-transaction. There is deliberately NO owner bypass
-		// here: an owner's effective set is OwnerPermissions, which EXCLUDES bit
-		// 62, so this is what actually keeps PermAdministrator out of a server.
-		// Do not add a bypass for symmetry with UpdateRole/AssignRole.
+		// Cache-free and in-transaction. There is no owner bypass here, so an
+		// owner is bounded by OwnerPermissions, which EXCLUDES bit 62: an owner
+		// cannot CREATE a role carrying PermAdministrator. That does not keep bit
+		// 62 out of a server - UpdateRole's owner bypass writes it - and owners
+		// may delegate it by decision; letting CreateRole confer exactly that bit
+		// for the owner is #3407.
 		actorPerms, permErr := h.resolver.ResolveServerPermissionsTx(ctx, tx, serverID, userID)
 		if permErr != nil {
 			// %w, not %v: errors.Is unwraps, so ErrNotMember stays matchable and
@@ -578,10 +618,10 @@ func (h *Handler) CreateRole(c *gin.Context) {
 func (h *Handler) announceRoleCreated(
 	c *gin.Context, serverID, userID, roleID string, req CreateRoleRequest, role Role, shifted bool,
 ) {
-	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(c.Request.Context(), serverID))
 
 	if h.audit != nil {
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "role_created", "role", &roleID,
+		h.logAudit(c.Request.Context(), serverID, &userID, "role_created", "role", &roleID,
 			map[string]interface{}{"role_name": req.Name, "permissions": req.Permissions})
 	}
 
@@ -700,7 +740,7 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 		return
 	}
 
-	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(c.Request.Context(), serverID))
 	h.recheckVoiceServer(serverID)
 	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
@@ -797,7 +837,7 @@ func (h *Handler) auditRoleUpdate(c *gin.Context, serverID, userID, roleID strin
 	if req.Permissions != nil {
 		metadata["new_permissions"] = *req.Permissions
 	}
-	_ = h.audit.Log(c.Request.Context(), serverID, &userID, "role_updated", "role", &roleID, metadata)
+	h.logAudit(c.Request.Context(), serverID, &userID, "role_updated", "role", &roleID, metadata)
 }
 
 // broadcastRoleUpdated sends a role_updated WebSocket event to server members.
@@ -916,14 +956,14 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 	}
 
 	// Invalidate cache
-	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(c.Request.Context(), serverID))
 	h.recheckVoiceServer(serverID)
 	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
 	if h.audit != nil {
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "role_deleted", "role", &roleID, nil)
+		h.logAudit(c.Request.Context(), serverID, &userID, "role_deleted", "role", &roleID, nil)
 	}
 
 	// Broadcast role_deleted event
@@ -1190,10 +1230,10 @@ func (h *Handler) ReorderRoles(c *gin.Context) {
 		return
 	}
 
-	_ = h.cache.InvalidateServer(c.Request.Context(), serverID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateServer(c.Request.Context(), serverID))
 
 	if h.audit != nil {
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "roles_reordered", "role", nil,
+		h.logAudit(c.Request.Context(), serverID, &userID, "roles_reordered", "role", nil,
 			map[string]interface{}{"new_order": req.RoleIDs})
 	}
 
@@ -1394,14 +1434,14 @@ func (h *Handler) AssignRole(c *gin.Context) {
 	}
 
 	// Invalidate cache
-	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.Invalidate(c.Request.Context(), serverID, targetUserID))
 	h.recheckVoiceUser(serverID, targetUserID)
 	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
 	if h.audit != nil {
-		_ = h.audit.Log(c.Request.Context(), serverID, &actorID, "role_assigned", "member", &targetUserID,
+		h.logAudit(c.Request.Context(), serverID, &actorID, "role_assigned", "member", &targetUserID,
 			map[string]interface{}{"role_id": req.RoleID})
 	}
 
@@ -1516,14 +1556,14 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 	}
 
 	// Invalidate cache
-	_ = h.cache.Invalidate(c.Request.Context(), serverID, targetUserID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.Invalidate(c.Request.Context(), serverID, targetUserID))
 	h.recheckVoiceUser(serverID, targetUserID)
 	h.presenceExecute(plan)
 	h.revalidateServerSubscribers(serverID)
 
 	// Audit log
 	if h.audit != nil {
-		_ = h.audit.Log(c.Request.Context(), serverID, &actorID, "role_unassigned", "member", &targetUserID,
+		h.logAudit(c.Request.Context(), serverID, &actorID, "role_unassigned", "member", &targetUserID,
 			map[string]interface{}{"role_id": roleID})
 	}
 
@@ -1614,8 +1654,8 @@ type ChannelOverride struct {
 type UpsertOverrideRequest struct {
 	TargetType string `json:"target_type" binding:"required,oneof=user role"`
 	TargetID   string `json:"target_id" binding:"required,uuid"`
-	Allow      int64  `json:"allow"`
-	Deny       int64  `json:"deny"`
+	Allow      int64  `json:"allow" binding:"gte=0"` // #2869: administrators skip the allow subset check
+	Deny       int64  `json:"deny" binding:"gte=0"`  // #2869: deny is never subset-checked
 }
 
 // ListChannelOverrides returns all permission overrides for a channel
@@ -1747,7 +1787,11 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	// Upsert override
 	query := `
 		INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		SELECT $1::uuid, $2::uuid, $3::varchar, $4::uuid, $5::bigint, $6::bigint
+		-- A role target must be a role of THIS server (#2869). target_id has no FK,
+		-- and no reader honours a foreign role, but the row should not exist.
+		-- User ids are global, so a user target cannot cross servers.
+		WHERE $3::varchar <> 'role' OR EXISTS (SELECT 1 FROM roles WHERE id = $4::uuid AND server_id = $7::uuid)
 		ON CONFLICT (channel_id, target_type, target_id) DO UPDATE
 		SET allow = EXCLUDED.allow, deny = EXCLUDED.deny, updated_at = NOW()
 		RETURNING id, created_at, updated_at, (xmax = 0) AS is_insert
@@ -1768,10 +1812,14 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	plan, err := h.withAuthorityCapture(c.Request.Context(), serverID, []string{channelID}, nil,
 		func(ctx context.Context, tx *sql.Tx) error {
 			return tx.QueryRowContext(ctx, query,
-				overrideID, channelID, req.TargetType, req.TargetID, req.Allow, req.Deny,
+				overrideID, channelID, req.TargetType, req.TargetID, req.Allow, req.Deny, serverID,
 			).Scan(&override.ID, &override.CreatedAt, &override.UpdatedAt, &isInsert)
 		},
 	)
+	if errors.Is(err, sql.ErrNoRows) { // the role-target guard selected no row
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignRoleTarget})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to upsert override", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSaveOverride})
@@ -1779,7 +1827,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 	}
 
 	// Invalidate cache for affected channel
-	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID))
 	h.recheckVoiceChannel(serverID, channelID)
 	h.presenceExecute(plan)
 	h.revalidateChannelSubscribers(serverID, channelID)
@@ -1790,7 +1838,7 @@ func (h *Handler) UpsertChannelOverride(c *gin.Context) {
 		if isInsert {
 			action = "channel_override_created"
 		}
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, action, "channel", &channelID,
+		h.logAudit(c.Request.Context(), serverID, &userID, action, "channel", &channelID,
 			map[string]interface{}{
 				"target_type": req.TargetType,
 				"target_id":   req.TargetID,
@@ -1874,14 +1922,14 @@ func (h *Handler) DeleteChannelOverride(c *gin.Context) {
 	}
 
 	// Invalidate cache
-	_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+	h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID))
 	h.recheckVoiceChannel(serverID, channelID)
 	h.presenceExecute(plan)
 	h.revalidateChannelSubscribers(serverID, channelID)
 
 	// Audit log
 	if h.audit != nil {
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "channel_override_deleted", "channel", &channelID,
+		h.logAudit(c.Request.Context(), serverID, &userID, "channel_override_deleted", "channel", &channelID,
 			map[string]interface{}{"override_id": overrideID})
 	}
 
@@ -2083,7 +2131,11 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 	// Upsert category override
 	query := `
 		INSERT INTO category_permission_overrides (id, category_id, target_type, target_id, allow, deny)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		SELECT $1::uuid, $2::uuid, $3::varchar, $4::uuid, $5::bigint, $6::bigint
+		-- A role target must be a role of THIS server (#2869). target_id has no FK,
+		-- and no reader honours a foreign role, but the row should not exist.
+		-- User ids are global, so a user target cannot cross servers.
+		WHERE $3::varchar <> 'role' OR EXISTS (SELECT 1 FROM roles WHERE id = $4::uuid AND server_id = $7::uuid)
 		ON CONFLICT (category_id, target_type, target_id) DO UPDATE
 		SET allow = EXCLUDED.allow, deny = EXCLUDED.deny, updated_at = NOW()
 		RETURNING id, created_at, updated_at, (xmax = 0) AS is_insert
@@ -2099,8 +2151,12 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 	override.Deny = req.Deny
 
 	var isInsert bool
-	err = h.db.QueryRow(query, overrideID, categoryID, req.TargetType, req.TargetID, req.Allow, req.Deny).
+	err = h.db.QueryRow(query, overrideID, categoryID, req.TargetType, req.TargetID, req.Allow, req.Deny, serverID).
 		Scan(&override.ID, &override.CreatedAt, &override.UpdatedAt, &isInsert)
+	if errors.Is(err, sql.ErrNoRows) { // the role-target guard selected no row
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgForeignRoleTarget})
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to upsert category override", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedSaveOverride})
@@ -2120,7 +2176,7 @@ func (h *Handler) UpsertCategoryOverride(c *gin.Context) {
 			action = "category_override_created"
 		}
 		catID := categoryID
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, action, "category", &catID,
+		h.logAudit(c.Request.Context(), serverID, &userID, action, "category", &catID,
 			map[string]interface{}{
 				"target_type": req.TargetType,
 				"target_id":   req.TargetID,
@@ -2202,7 +2258,7 @@ func (h *Handler) DeleteCategoryOverride(c *gin.Context) {
 	// Audit log
 	if h.audit != nil {
 		catID := categoryID
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "category_override_deleted", "category", &catID,
+		h.logAudit(c.Request.Context(), serverID, &userID, "category_override_deleted", "category", &catID,
 			map[string]interface{}{"override_id": overrideID})
 	}
 
@@ -2277,14 +2333,14 @@ func (h *Handler) SetChannelPermissionSync(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedUpdateSync})
 			return
 		}
-		_ = h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID)
+		h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateChannel(c.Request.Context(), serverID, channelID))
 		h.recheckVoiceChannel(serverID, channelID)
 		h.revalidateChannelSubscribers(serverID, channelID)
 	}
 
 	if h.audit != nil {
 		chID := channelID
-		_ = h.audit.Log(c.Request.Context(), serverID, &userID, "channel_sync_updated", "channel", &chID,
+		h.logAudit(c.Request.Context(), serverID, &userID, "channel_sync_updated", "channel", &chID,
 			map[string]interface{}{"sync_permissions": req.SyncPermissions})
 	}
 
@@ -2409,12 +2465,7 @@ func (h *Handler) copyCategoryOverridesToChannel(
 		return fmt.Errorf("delete existing overrides: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
-		SELECT gen_random_uuid(), $1, target_type, target_id, allow, deny
-		FROM category_permission_overrides
-		WHERE category_id = $2
-	`, channelID, categoryID); err != nil {
+	if _, err := tx.ExecContext(ctx, copyCategoryOverridesSQL, channelID, categoryID, serverID); err != nil {
 		return fmt.Errorf("copy category overrides: %w", err)
 	}
 
@@ -2546,12 +2597,7 @@ func (h *Handler) syncCategoryOverridesToChannels(ctx context.Context, serverID,
 			h.log.Error("Failed to delete channel overrides during sync", "error", err, "channel_id", chID)
 			return
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO channel_permission_overrides (id, channel_id, target_type, target_id, allow, deny)
-			SELECT gen_random_uuid(), $1, target_type, target_id, allow, deny
-			FROM category_permission_overrides
-			WHERE category_id = $2
-		`, chID, categoryID); err != nil {
+		if _, err := tx.ExecContext(ctx, copyCategoryOverridesSQL, chID, categoryID, serverID); err != nil {
 			h.log.Error("Failed to copy category overrides during sync", "error", err, "channel_id", chID)
 			return
 		}
@@ -2579,7 +2625,7 @@ func (h *Handler) invalidateSyncedChannelCaches(ctx context.Context, serverID, c
 	for rows.Next() {
 		var chID string
 		if err := rows.Scan(&chID); err == nil {
-			_ = h.cache.InvalidateChannel(ctx, serverID, chID)
+			h.logIfErr(logMsgCacheInvalidateFailed, h.cache.InvalidateChannel(ctx, serverID, chID))
 			h.recheckVoiceChannel(serverID, chID)
 			h.revalidateChannelSubscribers(serverID, chID)
 		}

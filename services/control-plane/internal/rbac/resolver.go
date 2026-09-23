@@ -17,7 +17,38 @@ var (
 
 	// ErrHierarchyViolation is returned when attempting to modify a user with equal/higher role
 	ErrHierarchyViolation = errors.New("cannot modify member with equal or higher role position")
+
+	// ErrChannelNotInServer is returned when a channel-scoped resolve names a
+	// channel that does not belong to the server it was asked about. It wraps
+	// ErrNotMember, so every caller that already denies a non-member denies this
+	// too (#2869).
+	ErrChannelNotInServer = fmt.Errorf("%w: channel is not in this server", ErrNotMember)
 )
+
+// channelsInServerQuery is true iff every id in $2 names a channel of server $1.
+const channelsInServerQuery = `
+	SELECT NOT EXISTS (
+		SELECT 1 FROM unnest($2::uuid[]) AS want(id)
+		WHERE NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = want.id AND c.server_id = $1)
+	)`
+
+// requireChannelsInServer is the channel half of every channel-scoped resolve.
+// Base permissions come from serverID and overrides from channelID, and nothing
+// else ties the two together: without this, an owner or administrator of one
+// server would be handed their full base set for any channel ID a caller passed
+// alongside it. Every production caller derives the server from the channel row
+// today; this keeps a future caller that takes them from separate request fields
+// from turning that into a cross-server grant (#2869).
+func requireChannelsInServer(ctx context.Context, q rowQuerier, serverID string, channelIDs []string) error {
+	var ok bool
+	if err := q.QueryRowContext(ctx, channelsInServerQuery, serverID, pq.Array(channelIDs)).Scan(&ok); err != nil {
+		return fmt.Errorf("failed to check channel server: %w", err)
+	}
+	if !ok {
+		return ErrChannelNotInServer
+	}
+	return nil
+}
 
 const (
 	// errMsgHierarchyCheckFailed is the format string for errors wrapping DB failures in CheckHierarchy.
@@ -41,6 +72,14 @@ func NewResolver(db *sql.DB, cache *PermissionCache, log *logger.Logger) *Resolv
 		db:    db,
 		cache: cache,
 		log:   log,
+	}
+}
+
+// cacheSet publishes a computed value. A failed write costs only a recompute on
+// the next read, so it is logged rather than returned.
+func (r *Resolver) cacheSet(ctx context.Context, serverID, userID, channelID string, perm Permission) {
+	if err := r.cache.Set(ctx, serverID, userID, channelID, perm); err != nil && r.log != nil {
+		r.log.Warn("Failed to cache permissions", "error", err)
 	}
 }
 
@@ -69,7 +108,7 @@ func (r *Resolver) HasPermission(ctx context.Context, serverID, userID, channelI
 	}
 
 	// Cache result
-	_ = r.cache.Set(ctx, serverID, userID, channelID, effectivePerm)
+	r.cacheSet(ctx, serverID, userID, channelID, effectivePerm)
 
 	return effectivePerm.Has(perm), nil
 }
@@ -88,7 +127,7 @@ func (r *Resolver) GetEffectivePermissions(ctx context.Context, serverID, userID
 		return 0, err
 	}
 
-	_ = r.cache.Set(ctx, serverID, userID, channelID, effectivePerm)
+	r.cacheSet(ctx, serverID, userID, channelID, effectivePerm)
 	return effectivePerm, nil
 }
 
@@ -104,7 +143,7 @@ func (r *Resolver) ResolveEffectivePermissionsFresh(ctx context.Context, serverI
 		return 0, err
 	}
 	if r.cache != nil {
-		_ = r.cache.Set(ctx, serverID, userID, channelID, perms)
+		r.cacheSet(ctx, serverID, userID, channelID, perms)
 	}
 	return perms, nil
 }
@@ -172,6 +211,9 @@ func (r *Resolver) ResolveChannelPermissionsTx(
 	if err != nil {
 		return 0, err
 	}
+	if err := requireChannelsInServer(ctx, tx, serverID, []string{channelID}); err != nil {
+		return 0, err
+	}
 	if isOwner || basePerms.Has(PermAdministrator) {
 		return basePerms, nil
 	}
@@ -205,6 +247,9 @@ func (r *Resolver) ResolveEffectivePermissionsForChannelsFresh(ctx context.Conte
 
 	basePerms, isOwner, err := r.resolveServerPermissions(ctx, tx, serverID, userID)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireChannelsInServer(ctx, tx, serverID, channelIDs); err != nil {
 		return nil, err
 	}
 	for _, channelID := range channelIDs {
@@ -262,12 +307,17 @@ func (r *Resolver) computeEffectivePermissions(ctx context.Context, serverID, us
 	if err != nil {
 		return 0, err
 	}
-	if isOwner {
-		return basePerms, nil
-	}
 
 	// If no channel specified, return base permissions.
 	if channelID == "" {
+		return basePerms, nil
+	}
+	// Before the owner short-circuit, which would otherwise return the owner's
+	// full set for a channel of any server.
+	if err := requireChannelsInServer(ctx, r.db, serverID, []string{channelID}); err != nil {
+		return 0, err
+	}
+	if isOwner {
 		return basePerms, nil
 	}
 
@@ -317,7 +367,8 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 	return basePerms, false, nil
 }
 
-// computeRolePermissions computes base permissions by OR'ing all user's role permissions
+// computeRolePermissions computes base permissions by OR'ing all user's role permissions.
+//
 // NOTE: this server-scope derivation is MIRRORED in raw SQL by
 // servers.ListServers (internal/servers/handlers.go), which inlines the same
 // owner short-circuit and BIT_OR to avoid N round-trips on a login-path query.
@@ -325,11 +376,29 @@ func (r *Resolver) resolveServerPermissions(ctx context.Context, db rowQuerier, 
 // term here — a member-timeout gate, a server-level SBAC tier, an epoch fence —
 // add it there too, or the API will report permissions the enforcer does not
 // grant. That copy fails in the PERMISSIVE direction for the UI.
+//
+// #2869 is the first change to test that warning, and it held: the server
+// predicate below was added to BOTH copies in the same commit. Do not treat the
+// mirror as documentation — it is a second enforcement surface.
+//
+// Every member_roles read in this file that turns a role_id into authority joins
+// roles with `AND r.server_id = mr.server_id` (#2869) -- including the user_roles
+// lists matched against override target_id, which need no column from roles and
+// join it for the predicate alone, because mr.server_id names the membership's
+// server, not the role's. Do NOT delete one as redundant now that migration
+// 000144's composite FK makes a cross-server row unrepresentable: the predicate is
+// what keeps a read correct for a row that reaches the table by a route the FK
+// does not cover -- a replica running ahead of the migration, a restore from a
+// pre-000144 dump, or direct database access. It costs one comparison on a row
+// the join already fetched. cross_server_row_test.go plants such a row and asks
+// every entry point. This aggregate feeds authorizeRoleMutationTx's actorPerms, so
+// a foreign role's bits landing here open the escalation guard rather than merely
+// widening a read.
 func (r *Resolver) computeRolePermissions(ctx context.Context, db rowQuerier, serverID, userID string) (Permission, error) {
 	query := `
 		SELECT COALESCE(BIT_OR(r.permissions), 0) AS total_permissions
 		FROM member_roles mr
-		INNER JOIN roles r ON mr.role_id = r.id
+		INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 		WHERE mr.server_id = $1 AND mr.user_id = $2
 	`
 
@@ -366,6 +435,7 @@ func (r *Resolver) applyChannelOverrides(ctx context.Context, channelID, userID 
 		      OR (target_type = 'role' AND target_id IN (
 		          SELECT mr.role_id FROM member_roles mr
 		          INNER JOIN channels c ON c.server_id = mr.server_id
+		          INNER JOIN roles r ON r.id = mr.role_id AND r.server_id = mr.server_id
 		          WHERE mr.user_id = $2 AND c.id = $1
 		      ))
 		  )
@@ -442,13 +512,16 @@ const sbacChannelOverrideColumns = `
 
 const batchChannelOverrideQuery = `
 	WITH user_roles AS (
-		SELECT role_id
-		FROM member_roles
-		WHERE server_id = $2 AND user_id = $3
+		SELECT mr.role_id
+		FROM member_roles mr
+		INNER JOIN roles r ON r.id = mr.role_id AND r.server_id = mr.server_id
+		WHERE mr.server_id = $2 AND mr.user_id = $3
 	)
 	SELECT cpo.channel_id,` + sbacChannelOverrideColumns + `
 	FROM channel_permission_overrides cpo
 	WHERE cpo.channel_id = ANY($1::uuid[])
+	  -- A channel from another server must not borrow $2's role overrides (#2869).
+	  AND cpo.channel_id IN (SELECT id FROM channels WHERE server_id = $2)
 	  AND (
 	      (cpo.target_type = 'role' AND cpo.target_id IN (SELECT role_id FROM user_roles))
 	      OR (cpo.target_type = 'user' AND cpo.target_id = $3)
@@ -523,12 +596,13 @@ func (r *Resolver) visibleChannelIDs(ctx context.Context, serverID, userID strin
 		return r.getAllChannelIDs(ctx, serverID)
 	}
 
-	// Compute base role permissions (single query, same as computeRolePermissions)
+	// Compute base role permissions (single query, same as computeRolePermissions,
+	// including its server-qualifying join predicate -- see that function's comment)
 	var basePerms int64
 	roleQuery := `
 		SELECT COALESCE(BIT_OR(r.permissions), 0)
 		FROM member_roles mr
-		INNER JOIN roles r ON mr.role_id = r.id
+		INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 		WHERE mr.server_id = $1 AND mr.user_id = $2
 	`
 	if err := r.db.QueryRowContext(ctx, roleQuery, serverID, userID).Scan(&basePerms); err != nil {
@@ -557,6 +631,7 @@ func (r *Resolver) visibleChannelIDs(ctx context.Context, serverID, userID strin
 		WITH user_roles AS (
 			SELECT mr.role_id
 			FROM member_roles mr
+			INNER JOIN roles r ON r.id = mr.role_id AND r.server_id = mr.server_id
 			WHERE mr.server_id = $1 AND mr.user_id = $2
 		),
 		channel_overrides AS (
@@ -646,13 +721,18 @@ func (r *Resolver) allVisibleChannelIDs(ctx context.Context, userID string, also
 		user_roles AS (
 			SELECT mr.role_id, mr.server_id
 			FROM member_roles mr
+			INNER JOIN roles r ON r.id = mr.role_id AND r.server_id = mr.server_id
 			WHERE mr.user_id = $1
 		),
+		-- This CTE spans EVERY server the user is in and groups by mr.server_id, so
+		-- an unqualified join would OR a foreign role's bits into the wrong server's
+		-- row -- the multi-server analogue of the scoping the channel_overrides CTE
+		-- below already documents for role overrides (#2869).
 		base_perms AS (
 			SELECT mr.server_id,
 				COALESCE(BIT_OR(r.permissions), 0) AS perms
 			FROM member_roles mr
-			INNER JOIN roles r ON mr.role_id = r.id
+			INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 			WHERE mr.user_id = $1
 			GROUP BY mr.server_id
 		),
@@ -755,8 +835,10 @@ func (r *Resolver) queryChannelIDs(ctx context.Context, wrapMsg, query string, a
 // Returns nil if actor outranks target, ErrHierarchyViolation otherwise
 //
 // Bypass rules (checked before position comparison):
-// - Server owner always outranks everyone (owner gets permissions via owner-id bypass, not via roles)
-// - Users with PermAdministrator always outrank non-administrators
+//   - Server owner always outranks everyone (owner gets permissions via owner-id bypass, not via roles)
+//   - Users with PermAdministrator outrank every non-owner, other administrators
+//     included - position is not consulted, so a lower-positioned administrator
+//     may moderate a higher one (recorded as intended in #3407)
 func (r *Resolver) CheckHierarchy(ctx context.Context, serverID, actorID, targetID string) error {
 	return r.checkHierarchy(ctx, r.db, serverID, actorID, targetID)
 }
@@ -802,13 +884,13 @@ func (r *Resolver) checkHierarchy(ctx context.Context, q rowQuerier, serverID, a
 		WITH actor_max AS (
 			SELECT COALESCE(MAX(r.position), 0) AS pos
 			FROM member_roles mr
-			INNER JOIN roles r ON mr.role_id = r.id
+			INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 			WHERE mr.server_id = $1 AND mr.user_id = $2
 		),
 		target_max AS (
 			SELECT COALESCE(MAX(r.position), 0) AS pos
 			FROM member_roles mr
-			INNER JOIN roles r ON mr.role_id = r.id
+			INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 			WHERE mr.server_id = $1 AND mr.user_id = $3
 		)
 		SELECT actor_max.pos > target_max.pos AS can_modify

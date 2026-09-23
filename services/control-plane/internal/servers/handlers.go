@@ -110,7 +110,13 @@ func (h *Handler) ListServers(c *gin.Context) {
 
 	// The permissions column mirrors rbac.resolveServerPermissions for the
 	// SERVER scope exactly: owner short-circuits to OwnerPermissions, everyone
-	// else gets BIT_OR over their roles. It is inlined rather than resolved
+	// else gets BIT_OR over their roles — including, since #2869, the
+	// `AND r.server_id = mr.server_id` predicate every member_roles reader that
+	// turns a role_id into authority carries. This copy is the first thing to test the warning on
+	// computeRolePermissions ("if you add a term here, add it there too"), and it
+	// matters more here than almost anywhere: this is the login path, the value
+	// is what the UI advertises as the member's permissions, and it fails in the
+	// PERMISSIVE direction. It is inlined rather than resolved
 	// per row because this is a login-path query — one resolver call per server
 	// would be N round trips, and GET /servers/{id}/permissions is capped at
 	// 30/min/user, so a client fanning out instead would exhaust that budget on
@@ -130,7 +136,7 @@ func (h *Handler) ListServers(c *gin.Context) {
 				ELSE COALESCE((
 					SELECT BIT_OR(r.permissions)
 					FROM member_roles mr
-					INNER JOIN roles r ON mr.role_id = r.id
+					INNER JOIN roles r ON mr.role_id = r.id AND r.server_id = mr.server_id
 					WHERE mr.server_id = s.id AND mr.user_id = $1
 				), 0)
 			END AS permissions
