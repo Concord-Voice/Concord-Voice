@@ -1,0 +1,38 @@
+# OSV-Scanner exceptions for client/desktop/package-lock.json ONLY — osv-scanner
+# applies an osv-scanner.toml to lockfiles in its own directory and never to
+# child or sibling directories.
+#
+# Mirror of accepted entries in ./.audit-allowlist.json (canonical; see its `//`
+# note). effectiveUntil = review_by; what expiry does is in
+# [internal]quality-gate-definition.md ("npm-audit gate").
+#
+# Scoped by package, exact version, ecosystem and the dev group rather than by
+# advisory id: an id-only IgnoredVulns entry would keep muting an advisory that
+# is amended onto another package or whose package becomes runtime-reachable —
+# the exact cases the allowlist's `package` + `scope: dev` checks fail closed on.
+# Each override below fails closed the same way: a version bump, a plain
+# production path, or a different package all fall outside it. One exception:
+# a package reached through a production optionalDependencies edge is npm
+# `devOptional`, which OSV still groups as dev; the npm-audit gate's
+# `--omit=dev` check catches that case. What OSV config
+# cannot express is "only these ids", so a NEW advisory against the same dev
+# package version is muted here too until effectiveUntil; the npm-audit gate,
+# which matches by id, still fails on a new HIGH/CRITICAL one.
+
+[[PackageOverrides]]
+name = "extract-zip"
+version = "2.0.1"
+ecosystem = "npm"
+group = "dev"
+vulnerability.ignore = true
+effectiveUntil = 2026-11-13
+reason = "GHSA-jmr9-qjv8-65gv and GHSA-7pqw-9j4j-h8q3 (symlink traversal / write): no fixed extract-zip. Dev-only, build-time via @electron-forge 7.11.2 -> @electron/packager 18.4.4 on integrity-checked Electron archives; the fix needs packager >= 20.3.0, which stable forge does not allow yet. Accepted in #2734."
+
+[[PackageOverrides]]
+name = "image-size"
+version = "0.7.5"
+ecosystem = "npm"
+group = "dev"
+vulnerability.ignore = true
+effectiveUntil = 2026-11-11
+reason = "GHSA-w3rx-r6r6-pgpr (ICNS DoS, no fix on any line) and GHSA-5p2g-fcmc-qvqq (JXL/HEIF DoS, inapplicable: 0.7.5 ships no JXL or HEIF parser). Dev+optional, packaging-time only via @electron-forge/maker-dmg -> appdmg. Accepted in #2727."
