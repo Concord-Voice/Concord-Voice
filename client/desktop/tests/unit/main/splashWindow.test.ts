@@ -89,6 +89,23 @@ describe('splashWindow', () => {
       closeSplash();
     });
 
+    it('creates the splash window sandboxed with contextIsolation and no Node integration', async () => {
+      const { showSplash, closeSplash } = await loadModule();
+      showSplash();
+
+      expect(MockBrowserWindow).toHaveBeenCalledWith(
+        expect.objectContaining({
+          webPreferences: expect.objectContaining({
+            sandbox: true,
+            contextIsolation: true,
+            nodeIntegration: false,
+          }),
+        })
+      );
+
+      closeSplash();
+    });
+
     it('centers the window on the primary display when no saved position', async () => {
       const { showSplash, closeSplash } = await loadModule();
       showSplash();

@@ -27,6 +27,11 @@ without losing the observation that triggered them.
 
 ### Fixed
 
+- **Links opened from a picture-in-picture window now open in your browser** ([#3416](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3416)) — a link or pop-up
+  started inside a picture-in-picture window could open a new Concord window. Picture-in-picture
+  windows now follow the same rule as the main window: secure (`https`) links open in your browser,
+  and anything else is blocked.
+
 - **Sharing an app with its sound now tells you when the sound could not be captured** ([#3405](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3405)) — when Concord could not
   capture an app's sound (for example a Finder window, which has never played audio), the share
   could still show app sound as on while none was being sent. It now says "We couldn't capture that

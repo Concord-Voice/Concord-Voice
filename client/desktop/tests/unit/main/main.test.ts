@@ -392,6 +392,14 @@ let klipyInterceptor: {
   ) => void;
 } | null = null;
 
+// Fake `contents` passed to the `web-contents-created` callback. Every window's
+// contents now gets a window-open handler registered on it (the PiP-gap fix —
+// see externalizeWindowOpen in main.ts), so a fake missing setWindowOpenHandler
+// throws the instant the callback under test runs.
+function createMockContents(): { on: Mock; setWindowOpenHandler: Mock } {
+  return { on: vi.fn(), setWindowOpenHandler: vi.fn() };
+}
+
 // #2354: dialog calls attributable to main.ts's module load + init, captured before
 // any test can add its own. Order-independent, unlike reading the mock later.
 let dialogCallsAfterImport = -1;
@@ -2244,6 +2252,17 @@ describe('main.ts', () => {
       return closed!;
     }
 
+    it('creates the PiP window sandboxed with contextIsolation and no Node integration', async () => {
+      const { BrowserWindow } = await import('electron');
+      const before = (BrowserWindow as unknown as Mock).mock.calls.length;
+      const closed = await openPip('sandbox-lock-pip');
+      const pipCall = (BrowserWindow as unknown as Mock).mock.calls[before];
+      expect(pipCall[0].webPreferences.sandbox).toBe(true);
+      expect(pipCall[0].webPreferences.contextIsolation).toBe(true);
+      expect(pipCall[0].webPreferences.nodeIntegration).toBe(false);
+      closed();
+    });
+
     it('lets the opener focus, update, and close its PiP window', async () => {
       const { BrowserWindow } = await import('electron');
       const before = (BrowserWindow as unknown as Mock).mock.calls.length;
@@ -2648,12 +2667,34 @@ describe('main.ts', () => {
       expect(mockMainWindow.once).toHaveBeenCalledWith('ready-to-show', expect.any(Function));
     });
 
+    it('constructs the main window sandboxed with contextIsolation and no Node integration (dev build)', async () => {
+      const { BrowserWindow } = await import('electron');
+      const mainCall = (BrowserWindow as unknown as Mock).mock.calls.find((c) =>
+        (c[0]?.webPreferences?.preload as string | undefined)?.endsWith('preload/preload.js')
+      );
+      expect(mainCall).toBeDefined();
+      const webPreferences = mainCall![0].webPreferences;
+      expect(webPreferences.sandbox).toBe(true);
+      expect(webPreferences.contextIsolation).toBe(true);
+      expect(webPreferences.nodeIntegration).toBe(false);
+    });
+
     it('registers closed handler', () => {
       expect(mockMainWindow.on).toHaveBeenCalledWith('closed', expect.any(Function));
     });
 
-    it('registers window open handler for external links', () => {
-      expect(mockWebContents.setWindowOpenHandler).toHaveBeenCalled();
+    it('registers window open handler for external links', async () => {
+      // The handler is registered per-contents inside the `web-contents-created`
+      // callback (externalizeWindowOpen, main.ts), not directly on the main
+      // window's webContents — invoke that callback to observe it.
+      const { app } = await import('electron');
+      const webContentsCreated = (app.on as Mock).mock.calls.find(
+        (c: unknown[]) => c[0] === 'web-contents-created'
+      );
+      expect(webContentsCreated).toBeDefined();
+      const mockContents = createMockContents();
+      webContentsCreated![1]({}, mockContents);
+      expect(mockContents.setWindowOpenHandler).toHaveBeenCalled();
     });
   });
 
@@ -4399,11 +4440,21 @@ describe('main.ts', () => {
     });
 
     it('window open handler allows https and denies others', async () => {
-      const handlerCall = mockWebContents.setWindowOpenHandler.mock.calls[0];
+      // The handler is externalizeWindowOpen, registered per-contents inside
+      // the `web-contents-created` callback — read it off a fake contents
+      // rather than off mockWebContents directly (see the registration test
+      // above).
+      const { app, shell } = await import('electron');
+      const webContentsCreated = (app.on as Mock).mock.calls.find(
+        (c: unknown[]) => c[0] === 'web-contents-created'
+      );
+      expect(webContentsCreated).toBeDefined();
+      const mockContents = createMockContents();
+      webContentsCreated![1]({}, mockContents);
+
+      const handlerCall = mockContents.setWindowOpenHandler.mock.calls[0];
       expect(handlerCall).toBeDefined();
       const handler = handlerCall[0] as (details: { url: string }) => { action: string };
-
-      const { shell } = await import('electron');
 
       // HTTPS opens external
       (shell.openExternal as Mock).mockClear();
@@ -4435,6 +4486,27 @@ describe('main.ts', () => {
       expect(shell.openExternal).not.toHaveBeenCalled();
       expect(result5.action).toBe('deny');
     });
+
+    // Regression for the PiP gap: the window-open handler is registered on
+    // EVERY web contents via `web-contents-created`, not only the main
+    // window's — a PiP window (or any other window) must get the same policy.
+    it('registers a window open handler on every window, not only the main window', async () => {
+      const { app } = await import('electron');
+      const webContentsCreated = (app.on as Mock).mock.calls.find(
+        (c: unknown[]) => c[0] === 'web-contents-created'
+      );
+      expect(webContentsCreated).toBeDefined();
+
+      // A fresh fake contents standing in for a non-main window (e.g. PiP).
+      const pipContents = createMockContents();
+      webContentsCreated![1]({}, pipContents);
+
+      expect(pipContents.setWindowOpenHandler).toHaveBeenCalled();
+      const handler = pipContents.setWindowOpenHandler.mock.calls[0][0] as (details: {
+        url: string;
+      }) => { action: string };
+      expect(handler({ url: 'https://example.com' })).toEqual({ action: 'deny' });
+    });
   });
 
   describe('navigation guard', () => {
@@ -4446,7 +4518,7 @@ describe('main.ts', () => {
       expect(webContentsCreated).toBeDefined();
 
       // Invoke web-contents-created to get the will-navigate handler
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated![1]({}, mockContents);
 
       const willNavigateCall = mockContents.on.mock.calls.find(
@@ -4475,7 +4547,7 @@ describe('main.ts', () => {
       const webContentsCreated = (app.on as Mock).mock.calls.find(
         (c: unknown[]) => c[0] === 'web-contents-created'
       );
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated![1]({}, mockContents);
       const willNavigate = mockContents.on.mock.calls.find(
         (c: unknown[]) => c[0] === 'will-navigate'
@@ -4494,7 +4566,7 @@ describe('main.ts', () => {
       const webContentsCreated = (app.on as Mock).mock.calls.find(
         (c: unknown[]) => c[0] === 'web-contents-created'
       );
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated![1]({}, mockContents);
       const willNavigate = mockContents.on.mock.calls.find(
         (c: unknown[]) => c[0] === 'will-navigate'
@@ -4513,7 +4585,7 @@ describe('main.ts', () => {
       const webContentsCreated = (app.on as Mock).mock.calls.find(
         (c: unknown[]) => c[0] === 'web-contents-created'
       );
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated![1]({}, mockContents);
       const willNavigate = mockContents.on.mock.calls.find(
         (c: unknown[]) => c[0] === 'will-navigate'
@@ -4532,7 +4604,7 @@ describe('main.ts', () => {
       const webContentsCreated = (app.on as Mock).mock.calls.find(
         (c: unknown[]) => c[0] === 'web-contents-created'
       );
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated![1]({}, mockContents);
       const willNavigate = mockContents.on.mock.calls.find(
         (c: unknown[]) => c[0] === 'will-navigate'
@@ -4551,7 +4623,7 @@ describe('main.ts', () => {
       const webContentsCreated = (app.on as Mock).mock.calls.find(
         (c: unknown[]) => c[0] === 'web-contents-created'
       );
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated![1]({}, mockContents);
       const willNavigate = mockContents.on.mock.calls.find(
         (c: unknown[]) => c[0] === 'will-navigate'
@@ -4581,7 +4653,7 @@ describe('main.ts', () => {
         const webContentsCreated = (app.on as Mock).mock.calls.find(
           (c: unknown[]) => c[0] === 'web-contents-created'
         );
-        const mockContents = { on: vi.fn() };
+        const mockContents = createMockContents();
         webContentsCreated![1]({}, mockContents);
         const willNavigate = mockContents.on.mock.calls.find(
           (c: unknown[]) => c[0] === 'will-navigate'
@@ -4618,7 +4690,7 @@ describe('main.ts', () => {
         const webContentsCreated = (app.on as Mock).mock.calls.find(
           (c: unknown[]) => c[0] === 'web-contents-created'
         );
-        const mockContents = { on: vi.fn() };
+        const mockContents = createMockContents();
         webContentsCreated![1]({}, mockContents);
         const willNavigate = mockContents.on.mock.calls.find(
           (c: unknown[]) => c[0] === 'will-navigate'
@@ -4642,7 +4714,7 @@ describe('main.ts', () => {
         const webContentsCreated = (app.on as Mock).mock.calls.find(
           (c: unknown[]) => c[0] === 'web-contents-created'
         );
-        const mockContents = { on: vi.fn() };
+        const mockContents = createMockContents();
         webContentsCreated![1]({}, mockContents);
         const willNavigate = mockContents.on.mock.calls.find(
           (c: unknown[]) => c[0] === 'will-navigate'
@@ -4673,7 +4745,7 @@ describe('main.ts', () => {
         const webContentsCreated = (app.on as Mock).mock.calls.find(
           (c: unknown[]) => c[0] === 'web-contents-created'
         );
-        const mockContents = { on: vi.fn() };
+        const mockContents = createMockContents();
         webContentsCreated![1]({}, mockContents);
         const willNavigate = mockContents.on.mock.calls.find(
           (c: unknown[]) => c[0] === 'will-navigate'
@@ -4699,7 +4771,7 @@ describe('main.ts', () => {
         const webContentsCreated = (app.on as Mock).mock.calls.find(
           (c: unknown[]) => c[0] === 'web-contents-created'
         );
-        const mockContents = { on: vi.fn() };
+        const mockContents = createMockContents();
         webContentsCreated![1]({}, mockContents);
         const willNavigate = mockContents.on.mock.calls.find(
           (c: unknown[]) => c[0] === 'will-navigate'
@@ -4982,7 +5054,7 @@ describe('main.ts', () => {
     function getDidFailLoadHandler(): CallbackFn {
       const webContentsCreated = appOnCallbacks.get('web-contents-created');
       expect(webContentsCreated).toBeDefined();
-      const mockContents = { on: vi.fn() };
+      const mockContents = createMockContents();
       webContentsCreated!({}, mockContents);
 
       const call = mockContents.on.mock.calls.find(([event]) => event === 'did-fail-load');

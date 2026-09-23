@@ -1436,29 +1436,6 @@ const createWindow = async (): Promise<void> => {
     }
   });
 
-  // Open external links in browser. https-only after #754 tightening —
-  // see [internal]specs/2026-04-26-754-externalize-blocked-nav-design.md
-  // and [internal]rules/electron.md "External-link scheme policy" for the
-  // threat-model rationale (passive nav is held to a stricter scheme set
-  // than the user-clicked Markdown-link IPC path).
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const parsed = new URL(url);
-      if (parsed.protocol === 'https:') {
-        // Fire-and-forget — main process can't surface a result here. .catch
-        // suppresses unhandled-rejection if the OS denies (sandbox, no handler).
-        // Symmetric with the IPC handler at src/main/ipc/openExternal.ts.
-        shell.openExternal(url).catch(() => {});
-      }
-      // http: intentionally rejected — Electron app externalization is
-      // https-only. Markdown-rendered chat links keep http: via
-      // the open-external IPC handler (different consent model).
-    } catch {
-      // Invalid URL — ignore (no externalization, deny in-app open).
-    }
-    return { action: 'deny' };
-  });
-
   // Client Behavior [X] close intercept (#806). When the user clicks the
   // native close button, route based on the cached Client Behavior:
   //   - 'tray'    -> hide() (stays running, accessed from system tray, #1099)
@@ -3105,7 +3082,33 @@ function isPermittedPackagedNavTarget(parsedUrl: URL, spaOrigin: string | null):
 // silently failing. https-only, symmetric with setWindowOpenHandler.
 // See [internal]specs/2026-04-26-754-externalize-blocked-nav-design.md
 // and [internal]rules/electron.md "External-link scheme policy".
+//
+// Window-open policy: every in-app window.open / target=_blank is denied, and
+// https: is handed to the OS browser. https-only after #754 tightening (passive
+// nav is held to a stricter scheme set than the user-clicked Markdown-link IPC
+// path). Registered below on EVERY web contents, not per window: the PiP window
+// once had no handler at all, so its window.open created an app-owned child.
+function externalizeWindowOpen({ url }: { url: string }): { action: 'deny' } {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'https:') {
+      // Fire-and-forget — main process can't surface a result here. .catch
+      // suppresses unhandled-rejection if the OS denies (sandbox, no handler).
+      // Symmetric with the IPC handler at src/main/ipc/openExternal.ts.
+      shell.openExternal(url).catch(() => {});
+    }
+    // http: intentionally rejected — Electron app externalization is
+    // https-only. Markdown-rendered chat links keep http: via
+    // the open-external IPC handler (different consent model).
+  } catch {
+    // Invalid URL — ignore (no externalization, deny in-app open).
+  }
+  return { action: 'deny' };
+}
+
 app.on('web-contents-created', (_, contents) => {
+  contents.setWindowOpenHandler(externalizeWindowOpen);
+
   contents.on('will-navigate', (event, navigationUrl) => {
     let parsedUrl: URL;
     try {

@@ -28,7 +28,11 @@ export function buildBrowserWindowConfig(
       preload: input.preloadPath,
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: input.isPackaged,
+      // Unconditional, dev included. Dev once ran unsandboxed (#567) to avoid
+      // CORS/file:// friction with Vite, but that is webSecurity's job, not the
+      // sandbox's; the preload bundle requires only `electron`
+      // (enforced by tests/integration/preload-sandbox-contract.test.ts).
+      sandbox: true,
       webSecurity: input.isPackaged,
     },
   };

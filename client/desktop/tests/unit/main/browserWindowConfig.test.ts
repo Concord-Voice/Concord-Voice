@@ -2,6 +2,31 @@ import { describe, it, expect } from 'vitest';
 import { buildBrowserWindowConfig } from '../../../src/main/browserWindowConfig';
 
 describe('buildBrowserWindowConfig', () => {
+  it.each([
+    ['darwin', false, true],
+    ['darwin', false, false],
+    ['win32', false, true],
+    ['win32', false, false],
+    ['linux', false, true],
+    ['linux', false, false],
+    ['linux', true, true],
+    ['linux', true, false],
+  ] as const)(
+    'keeps sandbox/contextIsolation/nodeIntegration locked and webSecurity === isPackaged (%s, wayland=%s, isPackaged=%s)',
+    (platform, isWayland, isPackaged) => {
+      const config = buildBrowserWindowConfig({
+        platform,
+        isWayland,
+        preloadPath: '/preload.js',
+        isPackaged,
+      });
+      expect(config.webPreferences?.sandbox).toBe(true);
+      expect(config.webPreferences?.contextIsolation).toBe(true);
+      expect(config.webPreferences?.nodeIntegration).toBe(false);
+      expect(config.webPreferences?.webSecurity).toBe(isPackaged);
+    }
+  );
+
   it('returns hiddenInset for darwin (macOS)', () => {
     const config = buildBrowserWindowConfig({
       platform: 'darwin',
@@ -65,14 +90,14 @@ describe('buildBrowserWindowConfig', () => {
     expect(config.webPreferences?.sandbox).toBe(true);
   });
 
-  it('disables sandbox + webSecurity when not packaged (dev mode)', () => {
+  it('keeps the sandbox on but relaxes webSecurity when not packaged (dev mode)', () => {
     const config = buildBrowserWindowConfig({
       platform: 'darwin',
       isWayland: false,
       preloadPath: '/preload.js',
       isPackaged: false,
     });
-    expect(config.webPreferences?.sandbox).toBe(false);
+    expect(config.webPreferences?.sandbox).toBe(true);
     expect(config.webPreferences?.webSecurity).toBe(false);
   });
 });
