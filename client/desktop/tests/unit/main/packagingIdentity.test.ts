@@ -308,6 +308,9 @@ describe('Packaging Identity (#382)', () => {
       '/index.html',
       '/README.md',
       '/wrangler.toml',
+      // OSV-Scanner's allowlist config (#3400). CI reads it from the source tree;
+      // shipped inside app.asar it failed the payload-boundary check.
+      '/osv-scanner.toml',
       '/dist/main/main.js.map',
       // TypeScript declarations. tsconfig.main.json inherits declaration +
       // declarationMap, so `npm run build:main` writes these beside the .js it

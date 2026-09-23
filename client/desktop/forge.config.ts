@@ -308,7 +308,7 @@ const config: ForgeConfig = {
       // an untracked local `.env` would ship whatever it holds.
       /^\/\.[^/]+$/,
       // Root-level tooling config and docs.
-      /^\/(tsconfig[^/]*\.json|[^/]+\.config\.[cm]?[jt]s|index\.html|README\.md|wrangler\.toml)$/,
+      /^\/(tsconfig[^/]*\.json|[^/]+\.config\.[cm]?[jt]s|index\.html|README\.md|wrangler\.toml|osv-scanner\.toml)$/,
     ],
     name: 'Concord Voice',
     // Per-platform executable name (#1077 follow-up).
