@@ -30,6 +30,7 @@ vi.mock('@/renderer/hooks/messaging/useMessageFetch', () => ({
     hasMore: false,
     error: null,
     handleLoadMore: vi.fn(),
+    isHistoryReady: true,
   })),
 }));
 
@@ -173,6 +174,27 @@ describe('VoiceTextChat', () => {
     expect(screen.getByTestId('message-list')).toHaveTextContent('voice-chat');
   });
 
+  it('forwards unsettled history readiness to MessageList', async () => {
+    const { useMessageFetch } = await import('@/renderer/hooks/messaging/useMessageFetch');
+    (useMessageFetch as ReturnType<typeof vi.fn>).mockReturnValue({
+      messages: [],
+      isLoading: true,
+      hasMore: false,
+      error: null,
+      handleLoadMore: vi.fn(),
+      isHistoryReady: false,
+    });
+    useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
+    useChannelStore.setState({ channels: [linkedTextChannel] });
+
+    render(<VoiceTextChat />);
+
+    expect(capturedMessageListProps).toMatchObject({
+      isHistoryReady: false,
+      hasInitialHistoryError: false,
+    });
+  });
+
   it('renders MessageInput with correct placeholder', () => {
     useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
     useChannelStore.setState({ channels: [linkedTextChannel] });
@@ -278,12 +300,14 @@ describe('VoiceTextChat', () => {
       hasMore: false,
       error: 'Failed to load messages',
       handleLoadMore: vi.fn(),
+      isHistoryReady: true,
     });
 
     useVoiceStore.setState({ activeChannelId: VOICE_CHANNEL_ID });
     useChannelStore.setState({ channels: [linkedTextChannel] });
     render(<VoiceTextChat />);
     expect(screen.getByText('Failed to load messages')).toBeInTheDocument();
+    expect(capturedMessageListProps).toHaveProperty('hasInitialHistoryError', true);
   });
 
   it('calls sendMessage with opts pattern when user sends a message', async () => {

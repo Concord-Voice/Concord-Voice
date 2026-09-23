@@ -60,6 +60,10 @@ export interface MessageListProps {
    * because both callers remount.
    */
   persistenceKey?: string;
+  /** Whether the initial history attempt for persistenceKey has settled. */
+  isHistoryReady?: boolean;
+  /** Whether the initial history attempt failed and can be retried. */
+  hasInitialHistoryError?: boolean;
 }
 
 export interface MessageListHandle {
@@ -153,6 +157,83 @@ type LandingTarget = {
    *  unread is on an older page. */
   exhausted: boolean;
 };
+
+type PendingAnchor = {
+  key: string;
+  anchor: ScrollAnchor;
+  provisionalLatest: boolean;
+};
+
+function shouldDeferMissingAnchor(
+  anchor: ScrollAnchor | undefined,
+  anchorRow: HTMLElement | null,
+  hasMore: boolean,
+  isLoading: boolean,
+  hasInitialHistoryError: boolean
+): boolean {
+  return Boolean(anchor && !anchorRow && (hasMore || isLoading || hasInitialHistoryError));
+}
+
+function prepareProvisionalLanding(
+  pending: PendingAnchor | null,
+  list: HTMLElement,
+  setShowScrollButton: (show: boolean) => void
+): boolean {
+  if (!pending || pending.provisionalLatest) return false;
+  pending.provisionalLatest = true;
+  setShowScrollButton(false);
+  list.scrollTop = list.scrollHeight;
+  return true;
+}
+
+function resolveMountedLandingTarget(
+  list: HTMLElement,
+  rows: MessageWithStatus[],
+  anchor: ScrollAnchor | undefined,
+  anchorRow: HTMLElement | null,
+  unreadOnOpen: number,
+  currentUserId: string
+): LandingTarget | null {
+  if (anchor && anchorRow) {
+    return { row: anchorRow, offset: anchor.offset, unread: false, exhausted: false };
+  }
+  return resolveLandingTarget(list, rows, undefined, unreadOnOpen, currentUserId);
+}
+
+function collectAppendedMessages(
+  messages: MessageWithStatus[],
+  previousIds: Set<string>,
+  dismissedAnchor: string | null
+): { appended: MessageWithStatus[]; dismissedAnchorPresent: boolean } {
+  const previousFirstIndex = messages.findIndex((message) => previousIds.has(message.id));
+  return {
+    appended: messages.filter(
+      (message, index) =>
+        !previousIds.has(message.id) && index > previousFirstIndex && message.id !== dismissedAnchor
+    ),
+    dismissedAnchorPresent: Boolean(
+      dismissedAnchor && messages.some((message) => message.id === dismissedAnchor)
+    ),
+  };
+}
+
+function updateArrivalPresentation(
+  list: HTMLElement | null,
+  previousLastRow: HTMLElement | null,
+  isFollowing: boolean,
+  others: MessageWithStatus[],
+  standOnAppended: (list: HTMLElement, others: MessageWithStatus[]) => boolean,
+  followLatest: (list: HTMLElement | null, others: MessageWithStatus[]) => void,
+  noteAway: (count: number) => void
+): void {
+  const previousLatestIsNearBottom =
+    list !== null && previousLastRow !== null && rowNearBottom(list, previousLastRow);
+  if (isFollowing || previousLatestIsNearBottom) {
+    if (!list || !standOnAppended(list, others)) followLatest(list, others);
+    return;
+  }
+  if (others.length > 0) noteAway(others.length);
+}
 
 /** Where a fresh mount of a thread lands: the saved anchor when its row is
  *  still mounted, else the first unread row when there are unread rows, else
@@ -250,10 +331,17 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       onPinToggle,
       canPin,
       persistenceKey,
+      isHistoryReady = true,
+      hasInitialHistoryError = false,
     },
     ref
   ) => {
     const listRef = useRef<HTMLDivElement>(null);
+    const lastListRef = useRef<HTMLDivElement | null>(null);
+    const setListRef = useCallback((node: HTMLDivElement | null) => {
+      listRef.current = node;
+      if (node) lastListRef.current = node;
+    }, []);
     const contentRef = useRef<HTMLDivElement>(null);
     const bottomRef = useRef<HTMLDivElement>(null);
     const isNearBottomRef = useRef(true);
@@ -303,6 +391,10 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
     const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const landedKeyRef = useRef<string | null>(null);
+    const pendingAnchorRef = useRef<PendingAnchor | null>(null);
+    // An explicitly dismissed pending anchor is still historical when its row
+    // arrives. Do not count that row as a live arrival and land on it again.
+    const dismissedPendingAnchorRef = useRef<{ key: string; messageId: string } | null>(null);
     // scrollTop the landing left the list at, until its scroll event echoes.
     const landingScrollTopRef = useRef<number | null>(null);
     const [unreadOnOpen] = useState(() => readUnreadOnOpen(chatContext, persistenceKey));
@@ -437,8 +529,9 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
 
     // Reading position across channel/DM switches (persistenceKey).
     //
-    // Landing runs once per key, the first time the list has rows, and takes
-    // the first rule that applies:
+    // Landing runs once per key after the initial history attempt settles,
+    // retrying while a saved anchor is still outside the fetched pages. It
+    // takes the first rule that applies:
     //   1. a saved anchor → put that message back where it was;
     //   2. unread messages that overflow the viewport → open at the first
     //      unread so the user reads forward, with Return to Latest offered
@@ -447,14 +540,13 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // Rules 1 and 2 mark the list as not following; geometry decides only the
     // button. Leaving saves an anchor only when the user was above the Return
     // to Latest threshold; from the bottom it clears the entry, so the next
-    // visit lands on the latest message. The cleanup pairs every landing with
-    // a leave, so a key change on a surviving instance, a StrictMode replay,
-    // and a list that empties and refills all land afresh. There is no pixel
-    // offset anywhere: GIF and image rows are skeletons until their bytes
-    // resolve, so a scrollTop measured after they settled lands short when
-    // replayed before they do, and pinning isNearBottom=false on top of that
-    // disabled the re-pin that would have corrected it — the recurring
-    // "soft-lock above the bottom".
+    // visit lands on the latest message. An unresolved anchor stays saved
+    // until it arrives or history ends. There is no pixel offset anywhere:
+    // GIF and image rows are skeletons until their bytes resolve, so a
+    // scrollTop measured after they settled lands short when replayed before
+    // they do, and pinning isNearBottom=false on top of that disabled the
+    // re-pin that would have corrected it — the recurring "soft-lock above
+    // the bottom".
     //
     // Rule 2 was tried and pulled once already: the server read marker only
     // advanced when a thread was opened, so a message that arrived while the
@@ -468,18 +560,57 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
     // early — a gap the read-marker fix above does not touch, since it's about
     // the client's row cache, not the server's count.
     const hasRows = messages.length > 0;
-    useLayoutEffect(() => {
-      if (!persistenceKey || !hasRows) return;
-      const list = listRef.current;
-      if (!list) return;
 
-      if (landedKeyRef.current !== persistenceKey) {
+    const settleEmptyHistory = useCallback(() => {
+      if (!persistenceKey) return;
+      const store = useChannelScrollStore.getState();
+      const anchor = store.getAnchor(persistenceKey);
+      const settled = landedKeyRef.current === persistenceKey && Boolean(anchor);
+      if (anchor && isHistoryReady && !hasMore && !isLoading && !hasInitialHistoryError) {
+        pendingAnchorRef.current = null;
+        store.clearAnchor(persistenceKey);
+        return;
+      }
+      if (settled) {
+        pendingAnchorRef.current = null;
+        return;
+      }
+      // A settled anchor must not be reopened by a same-key purge/refetch:
+      // the store entry is still the old landing, not the user's current
+      // position. A genuinely pending landing, or an anchorless landing,
+      // still resets so the next page can land normally.
+      landedKeyRef.current = null;
+      pendingAnchorRef.current = anchor
+        ? { key: persistenceKey, anchor, provisionalLatest: false }
+        : null;
+    }, [persistenceKey, isHistoryReady, hasMore, isLoading, hasInitialHistoryError]);
+
+    const landMountedHistory = useCallback(
+      (list: HTMLElement) => {
+        if (!persistenceKey) return;
+        if (landedKeyRef.current === persistenceKey) return;
+        const pending =
+          pendingAnchorRef.current?.key === persistenceKey ? pendingAnchorRef.current : null;
+        const anchor =
+          pending?.anchor ?? useChannelScrollStore.getState().getAnchor(persistenceKey);
+        const anchorRow = anchor ? findRow(list, anchor.messageId) : null;
+
+        if (
+          shouldDeferMissingAnchor(anchor, anchorRow, hasMore, isLoading, hasInitialHistoryError)
+        ) {
+          if (prepareProvisionalLanding(pending, list, setShowScrollButton)) {
+            isNearBottomRef.current = true;
+          }
+          return;
+        }
         landedKeyRef.current = persistenceKey;
-        const anchor = useChannelScrollStore.getState().getAnchor(persistenceKey);
-        const target = resolveLandingTarget(
+        pendingAnchorRef.current = null;
+        if (anchor && !anchorRow) useChannelScrollStore.getState().clearAnchor(persistenceKey);
+        const target = resolveMountedLandingTarget(
           list,
           messagesRef.current,
           anchor,
+          anchorRow,
           unreadOnOpen,
           currentUserId
         );
@@ -493,6 +624,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         // replay, and applyLanding pinned the list rather than leaving it to
         // the messages effect, whose deps do not change on a key change.
         isNearBottomRef.current = following;
+        // eslint-disable-next-line @eslint-react/set-state-in-effect -- Landing intentionally derives the initial button state from scroll geometry.
         setShowScrollButton(!following && !isNearBottom(list));
         // For both rules the badge shows how many unread rows are still
         // below the viewport, re-counted on every scroll: the open-time read
@@ -508,8 +640,12 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         // load-more check in handleScroll would never run: request it here.
         // The landing does not re-run when that page prepends; the user reads
         // up from where the loaded history starts.
-        const { hasMore, onLoadMore, isLoading } = loadMoreRef.current;
-        if (target?.exhausted && hasMore && onLoadMore && !isLoading) onLoadMore();
+        const {
+          hasMore: canLoadMore,
+          onLoadMore,
+          isLoading: loadMoreLoading,
+        } = loadMoreRef.current;
+        if (target?.exhausted && canLoadMore && onLoadMore && !loadMoreLoading) onLoadMore();
         // The align fires a scroll event a frame later. The handler must
         // recognise that echo and not re-decide from whatever geometry the
         // viewport has at that instant (siblings below the list are still
@@ -520,15 +656,67 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         // landing: there the ref is true, and eating the first user scroll-up
         // would keep it true.
         if (!following && list.scrollTop !== before) landingScrollTopRef.current = list.scrollTop;
-      }
+      },
+      [
+        persistenceKey,
+        hasMore,
+        isLoading,
+        hasInitialHistoryError,
+        unreadOnOpen,
+        currentUserId,
+        refreshBadge,
+      ]
+    );
 
-      // Use the element captured at setup so cleanup measures the same node;
-      // it is still attached when a deleted component's layout cleanup runs.
+    // Save only when leaving a key. A page update must not run this cleanup:
+    // while an anchor is absent from the current page, the saved entry is the
+    // state needed for the next page to restore it.
+    useLayoutEffect(() => {
+      if (!persistenceKey) return;
+      const anchor = useChannelScrollStore.getState().getAnchor(persistenceKey);
+      pendingAnchorRef.current = anchor
+        ? { key: persistenceKey, anchor, provisionalLatest: false }
+        : null;
+      landedKeyRef.current = null;
       return () => {
-        landedKeyRef.current = null;
+        const list = lastListRef.current;
+        // An unresolved anchor is intentionally left in the store. A page
+        // fetched by the caller can still contain it after this cleanup.
+        if (pendingAnchorRef.current?.key === persistenceKey) return;
+        // A detached node has no geometry to decide from, so it writes
+        // nothing: neither a bogus anchor nor a clear that drops a real one.
+        if (!list?.isConnected) return;
         recordLeave(list, persistenceKey, isNearBottomRef.current);
       };
-    }, [persistenceKey, hasRows, unreadOnOpen, currentUserId, refreshBadge]);
+    }, [persistenceKey]);
+
+    // Retry landing when history pages change. Initial cached rows can arrive
+    // before the fetch effect marks its first attempt settled, so readiness is
+    // keyed to the active history request rather than inferred from rows.
+    useLayoutEffect(() => {
+      if (!persistenceKey) return;
+      if (!hasRows) {
+        settleEmptyHistory();
+        return;
+      }
+      if (!isHistoryReady) return;
+      const list = listRef.current;
+      if (!list) return;
+      landMountedHistory(list);
+    }, [
+      persistenceKey,
+      hasRows,
+      messages,
+      isHistoryReady,
+      hasMore,
+      isLoading,
+      hasInitialHistoryError,
+      unreadOnOpen,
+      currentUserId,
+      refreshBadge,
+      settleEmptyHistory,
+      landMountedHistory,
+    ]);
 
     // Others' rows arriving while following: seen if the window is visible
     // AND actually being looked at (focused) — advance the read marker.
@@ -636,8 +824,19 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       // by pagination, history rather than arrivals; counting them would badge
       // and report old rows as unread. With nothing held, every row is new.
       const prevIds = prevIdsRef.current;
-      const prevFirstIdx = messages.findIndex((m) => prevIds.has(m.id));
-      const appended = messages.filter((m, i) => !prevIds.has(m.id) && i > prevFirstIdx);
+      const dismissedPendingAnchor = dismissedPendingAnchorRef.current;
+      const dismissedAnchor =
+        persistenceKey && dismissedPendingAnchor?.key === persistenceKey
+          ? dismissedPendingAnchor.messageId
+          : null;
+      const { appended, dismissedAnchorPresent } = collectAppendedMessages(
+        messages,
+        prevIds,
+        dismissedAnchor
+      );
+      if (dismissedAnchorPresent) {
+        dismissedPendingAnchorRef.current = null;
+      }
       const arrived = appended.length > 0 && isArrival(prevId);
       const prevLast = arrived && list && prevId !== null ? findRow(list, prevId) : null;
       const others = arrived ? appended.filter((m) => m.user_id !== currentUserId) : [];
@@ -649,13 +848,19 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       // new one has already grown the content by the time this runs. Only an
       // arrival may promote geometry to following — on mount the geometry is
       // skeleton-height and the landing has decided.
-      if (isNearBottomRef.current || (list && prevLast && rowNearBottom(list, prevLast))) {
-        if (!(list && standOnAppended(list, others))) followLatest(list, others);
-      } else if (others.length > 0) {
-        // Scrolled up and others' messages arrived — count them.
-        arrivedWhileAwayRef.current += others.length;
-        setNewMessageCount((c) => c + others.length);
-      }
+      updateArrivalPresentation(
+        list,
+        prevLast,
+        isNearBottomRef.current,
+        others,
+        standOnAppended,
+        followLatest,
+        (count) => {
+          // Scrolled up and others' messages arrived — count them.
+          arrivedWhileAwayRef.current += count;
+          setNewMessageCount((current) => current + count);
+        }
+      );
 
       prevLastMessageIdRef.current = lastId;
       prevIdsRef.current = new Set(messages.map((m) => m.id));
@@ -739,24 +944,39 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
       return () => observer.disconnect();
     }, [messages.length, refreshBadge]);
 
-    const scrollToBottom = useCallback((smooth = true) => {
-      // Reaching the bottom with unseen messages pending counts as reading
-      // them, whoever they're from — the count only ever holds others' messages.
-      if (newMessageCountRef.current > 0) {
-        onLatestSeenRef.current?.();
-      }
-      setNewMessageCount(0);
-      arrivedWhileAwayRef.current = 0;
-      seededRef.current = 0;
-      setShowScrollButton(false);
-      isNearBottomRef.current = true;
-      if (listRef.current) {
-        listRef.current.scrollTo({
-          top: listRef.current.scrollHeight,
-          behavior: smooth ? 'smooth' : 'auto',
-        });
-      }
-    }, []);
+    const scrollToBottom = useCallback(
+      (smooth = true, cancelPending = false) => {
+        if (cancelPending && persistenceKey) {
+          const pending = pendingAnchorRef.current;
+          if (pending?.key === persistenceKey) {
+            dismissedPendingAnchorRef.current = {
+              key: persistenceKey,
+              messageId: pending.anchor.messageId,
+            };
+            landedKeyRef.current = persistenceKey;
+          }
+          pendingAnchorRef.current = null;
+          useChannelScrollStore.getState().clearAnchor(persistenceKey);
+        }
+        // Reaching the bottom with unseen messages pending counts as reading
+        // them, whoever they're from — the count only ever holds others' messages.
+        if (newMessageCountRef.current > 0) {
+          onLatestSeenRef.current?.();
+        }
+        setNewMessageCount(0);
+        arrivedWhileAwayRef.current = 0;
+        seededRef.current = 0;
+        setShowScrollButton(false);
+        isNearBottomRef.current = true;
+        if (listRef.current) {
+          listRef.current.scrollTo({
+            top: listRef.current.scrollHeight,
+            behavior: smooth ? 'smooth' : 'auto',
+          });
+        }
+      },
+      [persistenceKey]
+    );
 
     const handleScroll = useCallback(() => {
       const list = listRef.current;
@@ -875,7 +1095,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
 
     return (
       <div className="message-list-container">
-        <div className="message-list" ref={listRef} onScroll={handleScroll}>
+        <div className="message-list" ref={setListRef} onScroll={handleScroll}>
           {/* Inner content wrapper: the ResizeObserver above watches it for
               media-load growth, since a scroll container's own box does not
               grow with its content. The container is observed too, for
@@ -985,7 +1205,7 @@ const MessageList = forwardRef<MessageListHandle, MessageListProps>(
         {showScrollButton && (
           <button
             className="scroll-to-bottom"
-            onClick={() => scrollToBottom(false)}
+            onClick={() => scrollToBottom(false, true)}
             aria-label="Return to latest"
           >
             {newMessageCount > 0 && (

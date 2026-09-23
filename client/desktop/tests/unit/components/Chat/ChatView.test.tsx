@@ -223,6 +223,19 @@ describe('ChatView', () => {
     );
   });
 
+  it('forwards history readiness from loading through settled fetch', async () => {
+    const request = deferred<{ ok: boolean; json: () => Promise<unknown> }>();
+    mockApiFetch.mockImplementationOnce(() => request.promise);
+    useChannelStore.setState({ activeChannelId: 'channel-1' });
+    render(<ChatView />);
+    expect(capturedMessageListProps).toHaveProperty('isHistoryReady', false);
+
+    await act(async () => {
+      request.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    await waitFor(() => expect(capturedMessageListProps).toHaveProperty('isHistoryReady', true));
+  });
+
   it('shows error when fetch fails', async () => {
     mockApiFetch.mockResolvedValue({
       ok: false,

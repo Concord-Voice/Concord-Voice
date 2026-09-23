@@ -58,7 +58,7 @@ func TestCompleteTopologyBatchDetachesFromCanceledRequest(t *testing.T) {
 	assert.Equal(t, 0, task8PendingCount(t, db, senderID))
 }
 
-func TestCompleteTopologyPlansShareOneAggregateDeadline(t *testing.T) {
+func TestCompleteTopologyPlansCancelAggregateOnFirstExactDelivery(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -69,12 +69,14 @@ func TestCompleteTopologyPlansShareOneAggregateDeadline(t *testing.T) {
 	for _, senderID := range senderIDs {
 		seedTopologyStatus(t, db, senderID, 1, "secret")
 	}
-	delivery := &task8Delivery{deliver: func(ctx context.Context, plan DeliveryPlan) error {
-		if plan.Mode != DeliveryExactDelta {
-			return nil
+	var cancel context.CancelFunc
+	completionCtx, cancel := context.WithCancel(ctx)
+	delivery := &task8Delivery{deliver: func(deliveryCtx context.Context, plan DeliveryPlan) error {
+		if plan.Mode == DeliveryExactDelta {
+			cancel()
+			return deliveryCtx.Err()
 		}
-		<-ctx.Done()
-		return ctx.Err()
+		return nil
 	}}
 	service := NewService(db, DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(delivery))
@@ -89,12 +91,11 @@ func TestCompleteTopologyPlansShareOneAggregateDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	completionCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
 	defer cancel()
 	err = service.completeTopologyPlans(completionCtx, batch.plans)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	assert.Equal(t, 2, task8PendingCount(t, db, batch.operations[0].SenderID)+
-		task8PendingCount(t, db, batch.operations[1].SenderID))
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, task8PendingCount(t, db, batch.operations[0].SenderID))
+	assert.Equal(t, 1, task8PendingCount(t, db, batch.operations[1].SenderID))
 	plans := delivery.snapshot()
 	require.Len(t, plans, 2)
 	assert.Equal(t, DeliveryExactDelta, plans[0].Mode)

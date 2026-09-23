@@ -19,6 +19,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/opsmetrics"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 	"net/http"
 	"net/http/httptest"
 	"syscall"
@@ -356,7 +357,7 @@ func serverOpsMetricsMigration(t *testing.T, name string) string {
 func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 	httpStarted := make(chan struct{})
 	releaseHTTP := make(chan struct{})
-	events := make(chan string, 7)
+	events := make(chan string, 8)
 	result := make(chan error, 1)
 
 	go func() {
@@ -370,6 +371,7 @@ func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 				events <- "http"
 				return nil
 			},
+			func() { events <- "attestation" },
 			func() { events <- "activity" },
 			func() { events <- "presence" },
 			func() { events <- "hub" },
@@ -394,14 +396,50 @@ func TestShutdownControlPlaneWaitsForHTTPDrain(t *testing.T) {
 		t.Fatalf("shutdownControlPlane returned error: %v", err)
 	}
 
-	got := []string{<-events, <-events, <-events, <-events, <-events, <-events, <-events}
+	got := []string{<-events, <-events, <-events, <-events, <-events, <-events, <-events, <-events}
 	// presence BEFORE hub: both presence dispatch workers fail-closed-abandon
 	// through the hub during their drain, so a hub closed first would silently
 	// discard exactly the disconnects that drain exists to deliver (#2738).
-	want := []string{"http", "activity", "presence", "hub", "metrics", "admin_reader", "nats"}
+	want := []string{"http", "attestation", "activity", "presence", "hub", "metrics", "admin_reader", "nats"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("shutdown order = %v, want %v", got, want)
 	}
+}
+
+func TestShutdownControlPlaneDrainsHTTPBeforeCancellingAttestation(t *testing.T) {
+	attestationCtx, cancelAttestation := context.WithCancel(context.Background())
+	defer cancelAttestation()
+	stoppedAfterDrain := make(chan bool, 1)
+
+	gotErr := shutdownControlPlane(
+		context.Background(),
+		nil,
+		func() {},
+		func() error {
+			select {
+			case <-attestationCtx.Done():
+				t.Fatal("attestation stopped before HTTP drain completed")
+			default:
+			}
+			return nil
+		},
+		cancelAttestation,
+		func() {
+			select {
+			case <-attestationCtx.Done():
+				stoppedAfterDrain <- true
+			default:
+				stoppedAfterDrain <- false
+			}
+		},
+		func() {},
+		func() {},
+		func() error { return nil },
+		func() error { return nil },
+		func() {},
+	)
+	require.NoError(t, gotErr)
+	require.True(t, <-stoppedAfterDrain, "attestation remained live after HTTP drain")
 }
 
 func TestShutdownControlPlaneCleansUpAfterHTTPError(t *testing.T) {
@@ -418,6 +456,7 @@ func TestShutdownControlPlaneCleansUpAfterHTTPError(t *testing.T) {
 			events = append(events, "http")
 			return wantErr
 		},
+		func() { events = append(events, "attestation") },
 		func() { events = append(events, "activity") },
 		func() { events = append(events, "presence") },
 		func() { events = append(events, "hub") },
@@ -438,7 +477,7 @@ func TestShutdownControlPlaneCleansUpAfterHTTPError(t *testing.T) {
 	// The presence drain must still run when the HTTP drain errored — a failed
 	// drain is exactly when stale presence is most likely to be left behind.
 	wantEvents := []string{
-		"cancel", "http", "activity", "presence", "hub", "metrics", "admin_reader", "nats",
+		"cancel", "http", "attestation", "activity", "presence", "hub", "metrics", "admin_reader", "nats",
 	}
 	if !reflect.DeepEqual(events, wantEvents) {
 		t.Fatalf("shutdown order = %v, want %v", events, wantEvents)

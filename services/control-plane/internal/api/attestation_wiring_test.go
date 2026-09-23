@@ -140,7 +140,7 @@ func TestBuildAttestationHandler_DisabledWithBadOIDC(t *testing.T) {
 	// nil rdb + nil nats are accepted on the disabled path: Cache.Start
 	// skips the NATS subscriptions when nc is nil and skips the Redis-backed
 	// IsRevoked check when rdb is nil.
-	h := buildAttestationHandler(db, nil, nil, cfg, log)
+	h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
 	require.NotNil(t, h, "buildAttestationHandler must return non-nil when REQUIRE_CLIENT_ATTESTATION=false even with bad OIDC")
 }
 
@@ -155,7 +155,7 @@ func TestBuildAttestationHandler_DisabledAcceptsNilNats(t *testing.T) {
 	cfg := newDisabledAttestationConfig()
 
 	require.NotPanics(t, func() {
-		h := buildAttestationHandler(db, nil, nil, cfg, log)
+		h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
 		require.NotNil(t, h)
 	})
 }
@@ -170,7 +170,7 @@ func TestBuildAttestationHandler_DisabledAcceptsNilRedis(t *testing.T) {
 	log := logger.New("test")
 	cfg := newDisabledAttestationConfig()
 
-	h := buildAttestationHandler(db, nil, nil, cfg, log)
+	h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
 	require.NotNil(t, h, "nil rdb must be tolerated on the disabled path")
 }
 
@@ -191,7 +191,7 @@ func TestBuildAttestationHandler_DisabledWithValidOIDCIssuer(t *testing.T) {
 	cfg.OIDCIssuer = "https://token.actions.githubusercontent.com"
 
 	require.NotPanics(t, func() {
-		h := buildAttestationHandler(db, nil, nil, cfg, log)
+		h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
 		require.NotNil(t, h)
 	})
 }
@@ -227,7 +227,7 @@ func TestHydrateCache_DisabledSucceedsOnEmptyTables(t *testing.T) {
 	// This is the same wiring step the wiring helper takes.
 	cfg := newDisabledAttestationConfig()
 	require.NotPanics(t, func() {
-		h := buildAttestationHandler(db, nil, nil, cfg, log)
+		h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
 		require.NotNil(t, h)
 	})
 }
@@ -240,7 +240,7 @@ func TestStartCache_DisabledNilNATSSpawnsPollOnly(t *testing.T) {
 	log := logger.New("test")
 	cfg := newDisabledAttestationConfig()
 	require.NotPanics(t, func() {
-		h := buildAttestationHandler(db, nil, nil, cfg, log)
+		h := buildAttestationHandler(t.Context(), db, nil, nil, cfg, log)
 		require.NotNil(t, h, "nil NATS on disabled path must succeed and spawn poll-only refresh loop")
 	})
 }

@@ -255,8 +255,18 @@ func configureOpsMetricsAndRecovery(router *gin.Engine, enabled bool) *opsmetric
 	return counters
 }
 
+func normalizeLifecycleContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 // RouterDependencies groups runtime services that are injected into NewRouter.
 type RouterDependencies struct {
+	// Store is the process-wide legacy object store. Per-object and per-purpose
+	// routing below can override it where a storage registry is available.
+	Store            media.ObjectStore
 	OpsMetricsReader opsmetrics.Reader
 	PresenceHistory  *presencehistory.Service
 	SecurityEvents   securityevent.Emitter
@@ -627,14 +637,16 @@ func newAuditWriterWithSecurityEvents(db *sql.DB, log *logger.Logger, events sec
 
 // NewRouter creates a new API router and returns its background runtime dependencies.
 func NewRouter(
+	lifecycleCtx context.Context,
 	db *sql.DB,
 	redis *redis.Client,
-	store media.ObjectStore,
 	cfg *config.Config,
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
 ) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Reconciler, func(context.Context), error) {
+	lifecycleCtx = normalizeLifecycleContext(lifecycleCtx)
+	store := dependencies.Store
 	metricsReader := dependencies.OpsMetricsReader
 	presenceHistoryService := dependencies.PresenceHistory
 	securityEvents := dependencies.SecurityEvents
@@ -747,7 +759,7 @@ func NewRouter(
 	// nothing else here
 	// exercises this wiring: every prober test constructs one directly and
 	// calls Start itself.
-	go readinessProber.Start(context.Background())
+	go readinessProber.Start(lifecycleCtx)
 	readyzHandler := ReadyzHandler(readinessProber)
 	router.GET("/readyz", readyzHandler)
 	router.HEAD("/readyz", readyzHandler)
@@ -1050,7 +1062,7 @@ func NewRouter(
 	// When true, the OIDC verifier is constructed eagerly and a failed
 	// discovery (network down at startup) is treated as fatal — that matches
 	// the fail-closed posture required by D2.
-	attestationHandler := buildAttestationHandlerWithSecurityEvents(db, redis, natsClient, cfg, log, securityEvents)
+	attestationHandler := buildAttestationHandlerWithSecurityEvents(lifecycleCtx, db, redis, natsClient, cfg, log, securityEvents)
 
 	// Age-verification claim handler (#1623). hub satisfies age.SessionDisconnector
 	// for the terminal-disable live-session kick on valid_age=false.

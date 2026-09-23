@@ -1387,18 +1387,23 @@ func TestHandleHeartbeat_ServerAccepts256Participants(t *testing.T) {
 	require.Len(t, userIDs, 256)
 
 	heartbeatAt := rowAt.Add(time.Minute)
-	sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
-		"channelId": channelID,
-		"userIds":   userIDs,
-		"timestamp": heartbeatAt.Format(time.RFC3339Nano),
-	}))
-
 	var participantCount, refreshedCount int
-	require.NoError(t, ts.DB.QueryRow(`
-		SELECT COUNT(*), COUNT(*) FILTER (WHERE lifecycle_event_at = $2)
-		FROM voice_participants
-		WHERE channel_id = $1
-	`, channelID, heartbeatAt).Scan(&participantCount, &refreshedCount))
+	for range 15 {
+		sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
+			"channelId": channelID,
+			"userIds":   userIDs,
+			"timestamp": heartbeatAt.Format(time.RFC3339Nano),
+		}))
+		require.NoError(t, ts.DB.QueryRow(`
+			SELECT COUNT(*), COUNT(*) FILTER (WHERE lifecycle_event_at = $2)
+			FROM voice_participants
+			WHERE channel_id = $1
+		`, channelID, heartbeatAt).Scan(&participantCount, &refreshedCount))
+		require.Equal(t, 256, participantCount)
+		if refreshedCount == 256 {
+			break
+		}
+	}
 	require.Equal(t, 256, participantCount)
 	require.Equal(t, 256, refreshedCount,
 		"every admitted server participant must advance on the authoritative heartbeat")
@@ -1488,7 +1493,9 @@ func TestHandleHeartbeat_ServerReconcilesFullStaleSetAt1000ParticipantLimit(t *t
 	) {
 		firstReplacementOnce.Do(func() {
 			firstReplacementObserved = true
-			firstReplacementProbeErr = ts.DB.QueryRow(`
+			probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			firstReplacementProbeErr = ts.DB.QueryRowContext(probeCtx, `
 				SELECT COUNT(*)
 				FROM voice_participants
 				WHERE channel_id = $1
@@ -1499,7 +1506,7 @@ func TestHandleHeartbeat_ServerReconcilesFullStaleSetAt1000ParticipantLimit(t *t
 	var participantCount, refreshedCount int
 	heartbeatAt := rowAt.Add(time.Minute)
 	// Retry one logical heartbeat so deadline-limited partial work accumulates.
-	for range 15 {
+	for range 30 {
 		sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
 			"channelId": channelID,
 			"userIds":   mediaUserIDs,
@@ -2180,12 +2187,30 @@ func TestUpsertPrivateVoiceParticipant_ConcurrentJoinsCannotExceedParticipantCap
 
 	firstClaimed := make(chan struct{})
 	releaseFirst := make(chan struct{})
+	secondAttempted := make(chan struct{})
+	claimedOnce := sync.Once{}
+	secondAttemptOnce := sync.Once{}
+	releaseOnce := sync.Once{}
+	joinDeadline := time.Now().Add(30 * time.Second)
+	if testDeadline, ok := t.Deadline(); ok && testDeadline.Before(joinDeadline) {
+		joinDeadline = testDeadline
+	}
+	joinCtx, cancelJoins := context.WithDeadline(context.Background(), joinDeadline)
+	defer cancelJoins()
 	winner.SetVoiceLifecycleClaimedHookForTest(func(
 		category presence.Category, senderID uuid.UUID, _ time.Time,
 	) {
 		if category == presence.CategoryPrivateCall && senderID == uuid.MustParse(firstJoiner.ID) {
-			close(firstClaimed)
-			<-releaseFirst
+			claimedOnce.Do(func() { close(firstClaimed) })
+			select {
+			case <-releaseFirst:
+			case <-joinCtx.Done():
+			}
+		}
+	})
+	waiter.SetPrivateVoiceParticipantSetLockAttemptHookForTest(func(id uuid.UUID) {
+		if id == conversationID {
+			secondAttemptOnce.Do(func() { close(secondAttempted) })
 		}
 	})
 	type result struct {
@@ -2193,33 +2218,63 @@ func TestUpsertPrivateVoiceParticipant_ConcurrentJoinsCannotExceedParticipantCap
 		err     error
 	}
 	firstDone := make(chan result, 1)
+	secondDone := make(chan result, 1)
+	firstObserved := false
+	secondStarted := false
+	secondObserved := false
 	go func() {
 		applied, joinErr := winner.UpsertPrivateVoiceParticipantForTest(
-			context.Background(), conversationID, uuid.MustParse(firstJoiner.ID), callID, eventAt,
+			joinCtx, conversationID, uuid.MustParse(firstJoiner.ID), callID, eventAt,
 		)
 		firstDone <- result{applied: applied, err: joinErr}
 	}()
+	defer func() {
+		cancelJoins()
+		releaseOnce.Do(func() { close(releaseFirst) })
+		if !firstObserved {
+			<-firstDone
+		}
+		if secondStarted && !secondObserved {
+			<-secondDone
+		}
+		winner.SetVoiceLifecycleClaimedHookForTest(nil)
+		waiter.SetPrivateVoiceParticipantSetLockAttemptHookForTest(nil)
+	}()
 	select {
 	case <-firstClaimed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first join did not pause while holding the conversation participant-set lock")
+	case first := <-firstDone:
+		firstObserved = true
+		t.Fatalf("first join finished before claiming the participant-set lock: %+v", first)
+	case <-joinCtx.Done():
+		t.Fatalf("first join did not pause while holding the conversation participant-set lock: %v", joinCtx.Err())
 	}
-	secondDone := make(chan result, 1)
+	secondStarted = true
 	go func() {
 		applied, joinErr := waiter.UpsertPrivateVoiceParticipantForTest(
-			context.Background(), conversationID, uuid.MustParse(secondJoiner.ID), callID,
+			joinCtx, conversationID, uuid.MustParse(secondJoiner.ID), callID,
 			eventAt.Add(time.Microsecond),
 		)
 		secondDone <- result{applied: applied, err: joinErr}
 	}()
 	select {
+	case <-secondAttempted:
 	case premature := <-secondDone:
+		secondObserved = true
+		t.Fatalf("second join finished before attempting the participant-set lock: %+v", premature)
+	case <-joinCtx.Done():
+		t.Fatalf("second join did not reach the participant-set lock: %v", joinCtx.Err())
+	}
+	select {
+	case premature := <-secondDone:
+		secondObserved = true
 		t.Fatalf("second join bypassed participant-set serialization: %+v", premature)
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(releaseFirst)
+	releaseOnce.Do(func() { close(releaseFirst) })
 	first := <-firstDone
+	firstObserved = true
 	second := <-secondDone
+	secondObserved = true
 	require.NoError(t, first.err)
 	require.True(t, first.applied)
 	require.ErrorContains(t, second.err, "participant limit exceeded")

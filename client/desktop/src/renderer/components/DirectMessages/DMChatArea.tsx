@@ -301,7 +301,7 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
   }, [selectedThreadId, clearUnread]);
 
   // Shared fetch/decrypt/paginate logic
-  const { messages, isLoading, hasMore, error, handleLoadMore } = useMessageFetch(
+  const { messages, isLoading, hasMore, error, handleLoadMore, isHistoryReady } = useMessageFetch(
     selectedThreadId,
     { type: 'dm', onFetchComplete: handleFetchComplete }
   );
@@ -529,6 +529,8 @@ const DMChatArea: React.FC<DMChatAreaProps> = ({ selectedThreadId }) => {
             onPinToggle={handlePinToggle}
             canPin={true}
             persistenceKey={selectedThreadId}
+            isHistoryReady={isHistoryReady}
+            hasInitialHistoryError={error !== null}
           />
         </div>
 

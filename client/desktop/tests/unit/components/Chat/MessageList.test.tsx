@@ -4,7 +4,7 @@ import { mockMessage, mockMessage2 } from '../../../mocks/fixtures';
 import { useChannelScrollStore } from '@/renderer/stores/chat/channelScrollStore';
 import { useUnreadStore } from '@/renderer/stores/chat/unreadStore';
 import { useDMStore } from '@/renderer/stores/chat/dmStore';
-import { vi } from 'vitest';
+import { beforeEach, vi } from 'vitest';
 import { StrictMode } from 'react';
 import { render as bareRender } from '@testing-library/react';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -15,6 +15,10 @@ vi.mock('@/renderer/components/Chat/Message', () => ({
 }));
 
 describe('MessageList', () => {
+  beforeEach(() => {
+    resetAllStores();
+  });
+
   it('renders messages', () => {
     render(<MessageList messages={[mockMessage, mockMessage2]} currentUserId="user-1" />);
     expect(screen.getByText('Hello, world!')).toBeInTheDocument();
@@ -602,6 +606,35 @@ describe('MessageList', () => {
       expect(returnToLatest()).not.toBeInTheDocument();
     });
 
+    it('does not restore a settled anchor after a same-key empty refetch', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { rerender, unmount } = render(
+        <MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />
+      );
+      const list = getList();
+      expect(list.scrollTop).toBe(330);
+
+      // The saved anchor is stale once the user has moved elsewhere while
+      // this mounted instance remains settled.
+      list.scrollTop = 500;
+      fireEvent.scroll(list);
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+
+      rerender(<MessageList messages={[]} currentUserId="user-1" persistenceKey="k" isLoading />);
+      rerender(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+
+      expect(getList().scrollTop).toBe(500);
+      expect(getList().scrollTop).not.toBe(330);
+      unmount();
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-5',
+        offset: 0,
+      });
+    });
+
     it('finds the anchored row by attribute, so an id that breaks a selector still restores', () => {
       const odd = rows.map((m, i) => (i === 3 ? { ...m, id: 'msg"]3' } : m));
       useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg"]3', offset: 30 });
@@ -629,6 +662,295 @@ describe('MessageList', () => {
       );
       rerender(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
       expect(getList().scrollTop).toBe(330);
+    });
+
+    it('keeps a missing saved anchor pending until a later page contains it', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { rerender } = render(
+        <MessageList
+          messages={rows.filter((message) => message.id !== 'msg-3')}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+          isLoading
+        />
+      );
+      const list = getList();
+      expect(list.scrollTop).toBe(900);
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+
+      act(() => {
+        rerender(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      });
+
+      expect(list.scrollTop, 'later page must restore the saved row, not latest').toBe(330);
+    });
+
+    it('does not repin a pending anchor when a missing page starts loading', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { rerender } = render(
+        <MessageList
+          messages={rows.filter((message) => message.id !== 'msg-3')}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+        />
+      );
+      const list = getList();
+      list.scrollTop = 0;
+      fireEvent.scroll(list);
+      expect(screen.getByRole('button', { name: /return to latest/i })).toBeVisible();
+
+      act(() => {
+        rerender(
+          <MessageList
+            messages={rows.filter((message) => message.id !== 'msg-3')}
+            currentUserId="user-1"
+            persistenceKey="k"
+            hasMore
+            isLoading
+          />
+        );
+      });
+
+      expect(list.scrollTop, 'loading an absent page must preserve user position').toBe(0);
+      expect(screen.getByRole('button', { name: /return to latest/i })).toBeVisible();
+    });
+
+    it('waits for history readiness before restoring an anchor in cached rows', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const notReady = { isHistoryReady: false };
+      const { rerender } = render(
+        <MessageList {...notReady} messages={rows} currentUserId="user-1" persistenceKey="k" />
+      );
+      const list = getList();
+      expect(list.scrollTop, 'cached rows must not restore before initial history settles').toBe(
+        1000
+      );
+
+      act(() => {
+        rerender(
+          <MessageList
+            {...{ isHistoryReady: true }}
+            messages={rows}
+            currentUserId="user-1"
+            persistenceKey="k"
+          />
+        );
+      });
+      expect(list.scrollTop).toBe(330);
+    });
+
+    it('preserves a cached anchor when the initial history fetch fails without the row', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const cachedRows = rows.filter((message) => message.id !== 'msg-3');
+      const { rerender } = render(
+        <MessageList
+          messages={cachedRows}
+          currentUserId="user-1"
+          persistenceKey="k"
+          isHistoryReady={false}
+          hasMore={false}
+          isLoading={false}
+        />
+      );
+
+      act(() => {
+        rerender(
+          <MessageList
+            messages={cachedRows}
+            currentUserId="user-1"
+            persistenceKey="k"
+            isHistoryReady
+            hasMore={false}
+            isLoading={false}
+            hasInitialHistoryError
+          />
+        );
+      });
+
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+      expect(getList().scrollTop, 'failed initial fetch must not discard the saved anchor').toBe(
+        900
+      );
+    });
+
+    it('clears a saved anchor after a successful empty initial history settles', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { rerender } = render(
+        <MessageList
+          messages={[]}
+          currentUserId="user-1"
+          persistenceKey="k"
+          isHistoryReady={false}
+          hasMore={false}
+          isLoading
+        />
+      );
+
+      act(() => {
+        rerender(
+          <MessageList
+            messages={[]}
+            currentUserId="user-1"
+            persistenceKey="k"
+            isHistoryReady
+            hasMore={false}
+            isLoading={false}
+          />
+        );
+      });
+
+      expect(useChannelScrollStore.getState().getAnchor('k')).toBeUndefined();
+    });
+
+    it('keeps a missing anchor while a pending-key replacement fetch is in flight', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const cachedRows = rows.filter((message) => message.id !== 'msg-3');
+      const { rerender } = render(
+        <MessageList
+          messages={cachedRows}
+          currentUserId="user-1"
+          persistenceKey="k"
+          isHistoryReady
+          hasInitialHistoryError
+          hasMore={false}
+          isLoading={false}
+        />
+      );
+
+      act(() => {
+        rerender(
+          <MessageList
+            messages={cachedRows}
+            currentUserId="user-1"
+            persistenceKey="k"
+            isHistoryReady={false}
+            hasMore={false}
+            isLoading={false}
+          />
+        );
+      });
+
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+    });
+
+    it('preserves the cached anchor when unmounted before history becomes ready', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const notReady = { isHistoryReady: false };
+      const { unmount } = render(
+        <MessageList {...notReady} messages={rows} currentUserId="user-1" persistenceKey="k" />
+      );
+
+      unmount();
+
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+    });
+
+    it('preserves a pending anchor across cleanup while history can continue', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { unmount } = render(
+        <MessageList
+          messages={rows.filter((message) => message.id !== 'msg-3')}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+        />
+      );
+
+      unmount();
+
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+    });
+
+    it('clears a missing anchor only after history is exhausted', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { rerender } = render(
+        <MessageList
+          messages={rows.filter((message) => message.id !== 'msg-3')}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+          isLoading
+        />
+      );
+      const list = getList();
+      expect(useChannelScrollStore.getState().getAnchor('k')).toEqual({
+        messageId: 'msg-3',
+        offset: 30,
+      });
+
+      act(() => {
+        rerender(
+          <MessageList
+            messages={rows.filter((message) => message.id !== 'msg-3')}
+            currentUserId="user-1"
+            persistenceKey="k"
+            hasMore={false}
+            isLoading={false}
+          />
+        );
+      });
+      expect(list.scrollTop, 'exhausted history falls back to latest').toBe(900);
+      expect(useChannelScrollStore.getState().getAnchor('k')).toBeUndefined();
+    });
+
+    it('lets Return to Latest cancel a pending anchor before the row arrives', () => {
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const { rerender } = render(
+        <MessageList
+          messages={rows.filter((message) => message.id !== 'msg-3')}
+          currentUserId="user-1"
+          persistenceKey="k"
+          hasMore
+        />
+      );
+      const list = getList();
+      stubScrollTo(list);
+      list.scrollTop = 0;
+      fireEvent.scroll(list);
+      fireEvent.click(screen.getByRole('button', { name: /return to latest/i }));
+
+      act(() => {
+        rerender(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+      });
+
+      expect(list.scrollTop, 'explicit latest must prevent a deferred anchor restore').toBe(1000);
+      expect(useChannelScrollStore.getState().getAnchor('k')).toBeUndefined();
+    });
+
+    it('keeps Return to Latest settled when a canceled anchor refills with unread rows', () => {
+      useUnreadStore.getState().setUnreadCount('k', 4);
+      useChannelScrollStore.getState().saveAnchor('k', { messageId: 'msg-3', offset: 30 });
+      const cachedRows = rows.filter((message) => message.id !== 'msg-3');
+      const { rerender } = render(
+        <MessageList messages={cachedRows} currentUserId="user-1" persistenceKey="k" hasMore />
+      );
+      const list = getList();
+      stubScrollTo(list);
+      list.scrollTop = 0;
+      fireEvent.scroll(list);
+      fireEvent.click(screen.getByRole('button', { name: /return to latest/i }));
+      expect(list.scrollTop).toBe(900);
+
+      rerender(<MessageList messages={rows} currentUserId="user-1" persistenceKey="k" />);
+
+      expect(list.scrollTop, 'a canceled anchor must stay at latest after refill').toBe(1000);
     });
 
     it('falls back to the bottom when the anchored message is no longer in the list', () => {

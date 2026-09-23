@@ -236,7 +236,7 @@ func TestTask4AssemblySecurityEventInjection(t *testing.T) {
 
 	t.Run("attestation handler", func(t *testing.T) {
 		recorder := &eventRecorder{}
-		handler := buildAttestationHandlerWithSecurityEvents(openWiringTestDB(t), nil, nil, newDisabledAttestationConfig(), log, recorder)
+		handler := buildAttestationHandlerWithSecurityEvents(t.Context(), openWiringTestDB(t), nil, nil, newDisabledAttestationConfig(), log, recorder)
 		response := httptest.NewRecorder()
 		requestContext, _ := gin.CreateTestContext(response)
 		requestContext.Request = httptest.NewRequest(http.MethodPost, "/api/v1/attestation/verify", bytes.NewBufferString(`{"version":"1.0.0","platform":"web","spa_version":"20260901","spa_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))

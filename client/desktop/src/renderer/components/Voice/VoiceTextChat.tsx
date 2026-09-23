@@ -101,10 +101,13 @@ const VoiceTextChat: React.FC = () => {
       });
   }, [isDMCall, targetId, readPath]);
 
-  const { messages, isLoading, hasMore, error, handleLoadMore } = useMessageFetch(targetId, {
-    type: fetchType,
-    onFetchComplete: handleFetchComplete,
-  });
+  const { messages, isLoading, hasMore, error, handleLoadMore, isHistoryReady } = useMessageFetch(
+    targetId,
+    {
+      type: fetchType,
+      onFetchComplete: handleFetchComplete,
+    }
+  );
 
   const currentUserId = user?.id || '';
 
@@ -185,6 +188,8 @@ const VoiceTextChat: React.FC = () => {
           channelName={targetName}
           isLoading={isLoading}
           hasMore={hasMore}
+          isHistoryReady={isHistoryReady}
+          hasInitialHistoryError={error !== null}
           onLoadMore={handleLoadMore}
           onEditMessage={editMessage}
           onDeleteMessage={deleteMessage}

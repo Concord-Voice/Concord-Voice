@@ -15,6 +15,9 @@ import (
 
 // buildAttestationHandler wires the attestation package (#677, ADR-0010).
 //
+// ctx owns the cache's fallback worker and must be canceled before its database
+// and NATS dependencies are torn down.
+//
 // Initialization is best-effort when REQUIRE_CLIENT_ATTESTATION=false (self-
 // hosted default): if OIDC discovery or cache hydration fails we log a
 // warning and return a Handler whose verify endpoint will be reachable but
@@ -26,16 +29,18 @@ import (
 // initialization failures are fatal — matches the fail-closed posture
 // required by ADR-0010 D2.
 func buildAttestationHandler(
+	ctx context.Context,
 	db *sql.DB,
 	rdb *redis.Client,
 	nc *natsclient.Client,
 	cfg *config.Config,
 	log *logger.Logger,
 ) *attestation.Handler {
-	return buildAttestationHandlerWithSecurityEvents(db, rdb, nc, cfg, log, securityevent.Discard)
+	return buildAttestationHandlerWithSecurityEvents(ctx, db, rdb, nc, cfg, log, securityevent.Discard)
 }
 
 func buildAttestationHandlerWithSecurityEvents(
+	ctx context.Context,
 	db *sql.DB,
 	rdb *redis.Client,
 	nc *natsclient.Client,
@@ -43,7 +48,6 @@ func buildAttestationHandlerWithSecurityEvents(
 	log *logger.Logger,
 	events securityevent.Emitter,
 ) *attestation.Handler {
-	ctx := context.Background()
 	repo := attestation.NewRepository(db)
 	oidcVerifier := buildOIDCVerifier(ctx, cfg, log)
 	cache := attestation.NewCache(repo, nc, rdb, log)

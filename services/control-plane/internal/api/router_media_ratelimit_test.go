@@ -20,9 +20,9 @@ import (
 func TestPublicMediaRateLimitExceededResponsesAreNotStored(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, err := api.NewRouter(
+		t.Context(),
 		ts.DB,
 		ts.Redis,
-		&stubAvatarStore{},
 		&config.Config{
 			Environment:             "test",
 			JWTSecret:               testhelpers.TestJWTSecret,
@@ -34,7 +34,7 @@ func TestPublicMediaRateLimitExceededResponsesAreNotStored(t *testing.T) {
 		},
 		nil,
 		logger.NewWithWriter(io.Discard),
-		api.RouterDependencies{PresenceHistory: presencehistory.NewService(
+		api.RouterDependencies{Store: &stubAvatarStore{}, PresenceHistory: presencehistory.NewService(
 			ts.DB,
 			presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: "saas"}),
 			true,

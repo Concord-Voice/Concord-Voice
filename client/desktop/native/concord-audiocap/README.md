@@ -73,7 +73,7 @@ PCM transport seam (#3195, #3197).
 
 **macOS has a real backend since #3197 PR 2.** `start()` on a macOS 14.4+ machine
 no longer answers `NoBackend`; with no target supplied it answers `NoTarget`,
-which is the refusal happening *before* any Core Audio call. The state machine
+which is the refusal happening _before_ any Core Audio call. The state machine
 lives in `rt/platform/macos/tap_backend.h` — header-only and free of any Apple
 header, over a POD of function pointers in `hal_api.h` — so all of it runs on the
 Linux ASAN/UBSAN/TSAN legs against a fake HAL. `tap_backend.mm` is ten wrappers,
@@ -215,6 +215,16 @@ clang++ -std=c++17 -Wall -Wextra -Werror -g -O1 -pthread \
     test/quantum_ring_test.cc -o /tmp/quantum_ring_test && /tmp/quantum_ring_test
 clang++ -std=c++17 -Wall -Wextra -Werror -g -O1 -pthread \
     test/rt_contract_test.cc -o /tmp/rt_contract_test && /tmp/rt_contract_test
+```
+
+The macOS adapter regression test is local-only. It substitutes Core Audio calls, so it checks
+cleanup-handle forwarding without starting a real audio capture session. CI does not run this test
+yet.
+
+```bash
+clang++ -std=c++17 -Wall -Wextra -Werror -fobjc-arc -pthread -I. \
+    test/macos_partial_handle_test.mm -framework Foundation -framework CoreAudio \
+    -o /tmp/macos_partial_handle_test && /tmp/macos_partial_handle_test
 ```
 
 `rt_contract_test.cc` is the backend-contract, gate and teardown suite; it uses a bare

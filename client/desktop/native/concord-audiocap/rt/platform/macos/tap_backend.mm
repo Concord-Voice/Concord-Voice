@@ -178,7 +178,8 @@ u32 halCreateTap(const u32* processObjects, u32 count, u32* outTap) noexcept {
 
     AudioObjectID tap = kAudioObjectUnknown;
     const OSStatus s  = AudioHardwareCreateProcessTap(desc, &tap);
-    if (s == noErr) { *outTap = static_cast<u32>(tap); }
+    // Preserve any published handle for TapBackend's partial-failure cleanup.
+    *outTap = static_cast<u32>(tap);
     return static_cast<u32>(s);
   }
 }
@@ -245,7 +246,7 @@ u32 halCreateAggregate(u32 tap, u32* outAggregate) noexcept {
     AudioObjectID agg = kAudioObjectUnknown;
     const OSStatus s =
         AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)composition, &agg);
-    if (s == noErr) { *outAggregate = static_cast<u32>(agg); }
+    *outAggregate = static_cast<u32>(agg);
     return static_cast<u32>(s);
   }
 }
@@ -263,12 +264,12 @@ u32 halCreateIoProc(u32 aggregate, HalApi::IoProcFn fn, void* ctx,
   AudioDeviceIOProcID procId = nullptr;
   const OSStatus s = AudioDeviceCreateIOProcID(static_cast<AudioObjectID>(aggregate),
                                                ioProcThunk, nullptr, &procId);
+  *outProcId = reinterpret_cast<void*>(procId);
   if (s != noErr) {
     g_ioProcFn.store(nullptr, std::memory_order_release);
     g_ioProcCtx.store(nullptr, std::memory_order_release);
     return static_cast<u32>(s);
   }
-  *outProcId = reinterpret_cast<void*>(procId);
   return static_cast<u32>(noErr);
 }
 

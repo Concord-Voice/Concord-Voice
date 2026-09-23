@@ -52,9 +52,12 @@ const ChatView: React.FC = () => {
   useChannelSubscription(activeChannelId);
 
   // Shared fetch/decrypt/paginate logic
-  const { messages, isLoading, hasMore, error, handleLoadMore } = useMessageFetch(activeChannelId, {
-    type: 'channel',
-  });
+  const { messages, isLoading, hasMore, error, handleLoadMore, isHistoryReady } = useMessageFetch(
+    activeChannelId,
+    {
+      type: 'channel',
+    }
+  );
 
   // Active channel info
   const activeChannel = channels.find((c) => c.id === activeChannelId);
@@ -390,6 +393,8 @@ const ChatView: React.FC = () => {
           onPinToggle={handlePinToggle}
           canPin={canPin}
           persistenceKey={activeChannelId || undefined}
+          isHistoryReady={isHistoryReady}
+          hasInitialHistoryError={error !== null}
         />
       </div>
 

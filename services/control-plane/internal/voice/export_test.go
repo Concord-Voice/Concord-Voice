@@ -107,6 +107,14 @@ func (s *NATSSubscriber) SetPrivateJoinHooksForTest(
 	s.privateJoinBroadcastHook = beforeBroadcast
 }
 
+// SetPrivateVoiceParticipantSetLockAttemptHookForTest exposes the handoff
+// immediately before a private participant-set lock is acquired.
+func (s *NATSSubscriber) SetPrivateVoiceParticipantSetLockAttemptHookForTest(
+	hook func(uuid.UUID),
+) {
+	s.privateVoiceParticipantSetLockAttemptHook = hook
+}
+
 // SetPrivateVoiceDurabilityHooksForTest exposes deterministic post-commit and
 // base-state boundaries for focused Private Call durability regressions.
 func (s *NATSSubscriber) SetPrivateVoiceDurabilityHooksForTest(

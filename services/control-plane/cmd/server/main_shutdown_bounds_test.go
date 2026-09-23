@@ -50,6 +50,7 @@ func stagesFor(t *testing.T, budget time.Duration, block string) ([]string, []st
 		},
 		func() { note("cancel") },
 		func() error { note("http"); return nil },
+		stage("attestation"),
 		stage("activity"),
 		stage("presence"),
 		stage("hub"),
@@ -118,7 +119,7 @@ func TestAWedgedStageNoLongerSkipsEveryStageAfterIt(t *testing.T) {
 func TestEveryStageStillRunsInOrderWhenNothingOverruns(t *testing.T) {
 	order, abandoned := stagesFor(t, time.Minute, "")
 
-	want := []string{"cancel", "http", "activity", "presence", "hub", "metrics", "reader", "nats"}
+	want := []string{"cancel", "http", "attestation", "activity", "presence", "hub", "metrics", "reader", "nats"}
 	if len(order) != len(want) {
 		t.Fatalf("order = %v, want %v", order, want)
 	}

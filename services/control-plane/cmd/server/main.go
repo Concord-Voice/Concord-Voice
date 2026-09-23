@@ -211,6 +211,10 @@ func runControlPlane() (runErr error) {
 	// Start background cleanup job (reaps expired tokens, stale sessions, orphaned presence)
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	defer cleanupCancel()
+	// Attestation cache work must outlive ordinary background cleanup until the
+	// HTTP listener has drained, then stop before its dependencies do.
+	attestationCtx, attestationCancel := context.WithCancel(context.Background())
+	defer attestationCancel()
 
 	// ONE readiness flag, declared in the scope that bindRouter,
 	// cleanupRuntime and the runControlPlaneServer call site all close
@@ -256,13 +260,14 @@ func runControlPlane() (runErr error) {
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
 			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck,
 				closePresence, activePlans, completeExpiredTransfers, routerErr := api.NewRouter(
+				attestationCtx,
 				db,
 				redisClient,
-				mediaStore,
 				cfg,
 				liveSpa,
 				log,
 				api.RouterDependencies{
+					Store:              mediaStore,
 					OpsMetricsReader:   adminMetricsRouterReader,
 					PresenceHistory:    presenceHistoryService,
 					SecurityEvents:     securityEvents,
@@ -439,6 +444,7 @@ func runControlPlane() (runErr error) {
 				liveSpa.Stop()
 			},
 			func() error { return srv.Shutdown(httpCtx) },
+			attestationCancel,
 			waitBackgroundWorkers,
 			func() { closePresenceWorkers() },
 			func() { hub.Shutdown() },
@@ -803,6 +809,9 @@ func shutdownControlPlane(
 	onStageAbandoned func(stage string, starved bool),
 	stopBackground func(),
 	shutdownHTTP func() error,
+	// stopAttestation runs after active HTTP handlers drain, while the
+	// attestation cache's database and NATS dependencies are still live.
+	stopAttestation func(),
 	waitActivityWorkers func(),
 	// closePresenceWorkers drains the #2445 and #2446 presence dispatch queues.
 	// It sits BEFORE shutdownHub on purpose: their fail-closed abandons
@@ -816,6 +825,7 @@ func shutdownControlPlane(
 ) error {
 	stopBackground()
 	shutdownErr := shutdownHTTP()
+	stopAttestation()
 	// Each of these three takes no context of its own, so the bound has to be
 	// applied here. They consume ONE budget in order: a fast HTTP drain leaves
 	// more for the hub, which is the right dynamic.

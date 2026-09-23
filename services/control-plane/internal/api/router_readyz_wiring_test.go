@@ -36,7 +36,7 @@ import (
 //
 //   - the prober argument must be the selector `dependencies.Readiness`, so
 //     hoisting it to a local (`ready := dependencies.Readiness`) reddens this;
-//   - `go readinessProber.Start(context.Background())` must be a DIRECT child
+//   - `go readinessProber.Start(lifecycleCtx)` must be a DIRECT child
 //     of NewRouter's body, so moving it into a helper or an if-block reddens
 //     this even though the goroutine still starts;
 //   - the handler argument must be the call `ReadyzHandler(readinessProber)`,
@@ -170,16 +170,16 @@ func servesReadyzProber(args []ast.Expr, bindings map[string][]handlerBinding) b
 // parseReadinessLog and readinessLogLevel, and for the same reason: a reader
 // debugging a red here wants the assertion, not the walk.
 type readinessWiring struct {
-	proberArg            ast.Expr
-	proberArgs           []ast.Expr
-	started              bool
-	stopped              bool
-	getRoute             bool
-	headRoute            bool
-	getServesProber      bool
-	headServesProber     bool
-	startsWithBackground bool
-	wiresSeverityAdapter bool
+	proberArg                  ast.Expr
+	proberArgs                 []ast.Expr
+	started                    bool
+	stopped                    bool
+	getRoute                   bool
+	headRoute                  bool
+	getServesProber            bool
+	headServesProber           bool
+	startsWithLifecycleContext bool
+	wiresSeverityAdapter       bool
 }
 
 func (w *readinessWiring) noteProberConstruction(call *ast.CallExpr) {
@@ -239,8 +239,8 @@ func (w *readinessWiring) noteStart(body *ast.BlockStmt) {
 		if len(g.Call.Args) != 1 {
 			continue
 		}
-		if c, ok := g.Call.Args[0].(*ast.CallExpr); ok && selectorIs(c.Fun, "context", "Background") {
-			w.startsWithBackground = true
+		if selectorIsIdent(g.Call.Args[0], "lifecycleCtx") {
+			w.startsWithLifecycleContext = true
 		}
 	}
 }
@@ -273,7 +273,7 @@ func TestNewRouterWiresTheReadinessProberToTheSharedDrainFlag(t *testing.T) {
 	started, stopped := w.started, w.stopped
 	getRoute, headRoute := w.getRoute, w.headRoute
 	getServesProber, headServesProber := w.getServesProber, w.headServesProber
-	startsWithBackground, wiresSeverityAdapter := w.startsWithBackground, w.wiresSeverityAdapter
+	startsWithLifecycleContext, wiresSeverityAdapter := w.startsWithLifecycleContext, w.wiresSeverityAdapter
 
 	if proberArg == nil {
 		t.Fatal("NewRouter no longer constructs a health.NewProber")
@@ -307,16 +307,13 @@ func TestNewRouterWiresTheReadinessProberToTheSharedDrainFlag(t *testing.T) {
 			"other handler (healthHandler is an unconditional 200) reports ready "+
 			"through the entire drain.", getServesProber, headServesProber)
 	}
-	// M6/M4: the AST sees a GoStmt whose callee is Start; it cannot see
-	// reachability or context lifetime. `proberCtx, cancel := ...; defer
-	// cancel(); go Start(proberCtx)` makes Start publish one verdict and
-	// return, so /readyz answers probe_stale forever -- and router.go's own
-	// comment about the CancelFunc lint invites exactly that edit.
-	if !startsWithBackground {
-		t.Fatal("`go readinessProber.Start(...)` must be passed context.Background() " +
-			"and sit directly in NewRouter's body. A cancellable context, or a call " +
-			"nested in a closure that is never invoked, publishes at most one verdict " +
-			"and then /readyz answers probe_stale for the process lifetime.")
+	// M6/M4: the readiness worker must share NewRouter's caller-owned lifetime.
+	// A fresh context.Background() would outlive shutdown; a locally cancelled
+	// context could stop the prober before the process is drained.
+	if !startsWithLifecycleContext {
+		t.Fatal("`go readinessProber.Start(...)` must be passed lifecycleCtx " +
+			"and sit directly in NewRouter's body. A fresh or locally cancelled " +
+			"context can outlive shutdown or stop the prober before the process drains.")
 	}
 	// M8: the constants are pinned by value elsewhere, but not the ORDER they
 	// are passed in. Transposed, interval becomes 20s and staleAfter 5s, which

@@ -54,13 +54,13 @@ func TestNewRouterRequiresOneUnboundActivityHistoryService(t *testing.T) {
 	cfg := &config.Config{Environment: "test"}
 	log := logger.NewWithWriter(io.Discard)
 
-	_, _, _, _, _, _, _, _, _, err := api.NewRouter(nil, nil, nil, cfg, nil, log, api.RouterDependencies{})
+	_, _, _, _, _, _, _, _, _, err := api.NewRouter(t.Context(), nil, nil, cfg, nil, log, api.RouterDependencies{})
 	require.Error(t, err)
 
 	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(preboundActivityHistoryDelivery{}))
 	_, _, _, _, _, _, _, _, _, err = api.NewRouter(
-		nil,
+		t.Context(),
 		nil,
 		nil,
 		cfg,

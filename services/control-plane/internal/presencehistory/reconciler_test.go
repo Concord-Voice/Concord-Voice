@@ -1622,7 +1622,7 @@ func TestRunPendingReconcilerRetriesOnCadenceAndStopsOnCancel(t *testing.T) {
 	assert.Equal(t, 0, task8PendingCount(t, db, senderID))
 }
 
-func TestReconcilePendingCountsGateCancellationAsRetained(t *testing.T) {
+func TestReconcilePendingCountsCanceledReconcileAsRetained(t *testing.T) {
 	db, cleanup := testhelpers.SetupTestDB(t)
 	defer cleanup()
 	senderID := testhelpers.CreateUser(t, db)
@@ -1630,27 +1630,34 @@ func TestReconcilePendingCountsGateCancellationAsRetained(t *testing.T) {
 	seedTask8Pending(t, db, senderID, operationID, operationID, 0, true, CustomTextState{})
 	service := NewService(db, DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(&task8Delivery{}))
-	held := make(chan struct{})
-	release := make(chan struct{})
-	holderDone := make(chan error, 1)
+	enteredReconcile := make(chan struct{})
+	releaseReconcile := make(chan struct{})
+	restore := service.SetTransactionTestHooks(TransactionTestHooks{
+		Begin: func(ctx context.Context, _ *sql.TxOptions) (*sql.Tx, error) {
+			close(enteredReconcile)
+			<-releaseReconcile
+			return nil, ctx.Err()
+		},
+	})
+	defer restore()
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		stats ReconcileStats
+		err   error
+	}
+	finished := make(chan outcome, 1)
 	go func() {
-		holderDone <- service.WithSender(context.Background(), senderID, func() error {
-			close(held)
-			<-release
-			return nil
-		})
+		stats, err := service.ReconcilePending(ctx, 10)
+		finished <- outcome{stats: stats, err: err}
 	}()
-	task8Receive(t, held, "sender gate was not held")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	stats, err := service.ReconcilePending(ctx, 10)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	assert.Equal(t, 1, stats.DiscoveredCount)
-	assert.Equal(t, 1, stats.RetainedCount)
-	assert.Equal(t, 1, stats.FailedCount)
-	close(release)
-	require.NoError(t, task8ReceiveError(t, holderDone, "sender gate holder did not finish"))
+	task8Receive(t, enteredReconcile, "reconciliation did not run after discovery")
+	cancel()
+	close(releaseReconcile)
+	result := <-finished
+	require.ErrorIs(t, result.err, context.Canceled)
+	assert.Equal(t, 1, result.stats.DiscoveredCount)
+	assert.Equal(t, 1, result.stats.RetainedCount)
+	assert.Equal(t, 1, result.stats.FailedCount)
 }
 
 func TestClaimAndReconcileFailClosedWithoutDependencies(t *testing.T) {

@@ -23,6 +23,15 @@ without losing the observation that triggered them.
 - **Switching screen-share sources no longer drops or leaks per-app audio** ([#3369](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3369)) — a failed
   source switch now keeps the current share running, while cancelled or partially started captures
   release their audio process instead of publishing it later or leaving it behind.
+- **Returning to the latest message now stays there while older chat history loads** — if
+  a saved reading position was on a page that had not arrived yet, choosing Return to Latest
+  could take you back to that old message as it loaded. The chat now keeps you at the latest
+  message instead.
+- **A saved chat position now waits for the right history page** — returning to a conversation no
+  longer gives up when the first page does not contain the saved message. Concord keeps the saved
+  position pending and restores it when a later page you load includes that message. It waits for
+  the initial history request to settle, including after a recoverable failure, and it does not
+  fetch extra pages by itself.
 - **Dyslexic Support now changes every piece of text, not just some of it** ([#2366](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2366)) — turning on
   Dyslexic Support said it applied "across the app", but headings, the server and channel list
   down the side, and the window title all kept the old lettering. Only ordinary body text

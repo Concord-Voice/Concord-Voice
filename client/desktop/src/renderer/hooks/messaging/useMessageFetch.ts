@@ -303,12 +303,13 @@ function handleFetchError(
   fallbackError: string,
   retry: () => void,
   setError: (error: string) => void
-) {
+): boolean {
   if (isPendingKeyError(err)) {
     retry();
-    return;
+    return true;
   }
   setError(err instanceof Error ? err.message : fallbackError);
+  return false;
 }
 
 async function loadOlderMessagesAttempt({
@@ -395,8 +396,10 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
   const [isLoading, setIsLoading] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [historySettledForChannelId, setHistorySettledForChannelId] = useState<string | null>(null);
   const [fetchTrigger, setFetchTrigger] = useState(0);
   const retryFetch = useCallback(() => {
+    setHistorySettledForChannelId(null);
     setFetchTrigger((prev) => prev + 1);
   }, []);
 
@@ -426,12 +429,12 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     const handler = (e: Event) => {
       const { channelId: deliveredId } = (e as CustomEvent).detail;
       if (deliveredId === channelId) {
-        setFetchTrigger((prev) => prev + 1);
+        retryFetch();
       }
     };
     globalThis.addEventListener('e2ee-key-delivered', handler);
     return () => globalThis.removeEventListener('e2ee-key-delivered', handler);
-  }, [channelId]);
+  }, [channelId, retryFetch]);
 
   // #2329: after a Recovery-A reconnect the WebSocket replays only subscriptions
   // + a presence snapshot, so messages sent during the outage are never
@@ -441,10 +444,10 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
   // keep this session-safe.
   useEffect(() => {
     if (!channelId) return;
-    const handler = () => setFetchTrigger((prev) => prev + 1);
+    const handler = () => retryFetch();
     globalThis.addEventListener('connection-recovered', handler);
     return () => globalThis.removeEventListener('connection-recovered', handler);
-  }, [channelId]);
+  }, [channelId, retryFetch]);
 
   // A purge clears the scope wholesale; the server is the only source of truth for
   // what survived. One seam covers channels and DMs alike — useMessageFetch already
@@ -460,11 +463,11 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
       // match this hook's channel exactly.
       if (scopeId != null && scopeId !== channelId) return;
       recordScopePurge(channelId);
-      setFetchTrigger((prev) => prev + 1);
+      retryFetch();
     };
     globalThis.addEventListener('messages-purged', handler);
     return () => globalThis.removeEventListener('messages-purged', handler);
-  }, [channelId]);
+  }, [channelId, retryFetch]);
 
   // Retry key fetch when messages are stuck in pending state.
   // Only retry when E2EE is initialized — fail-closed also sets pendingKeys
@@ -477,22 +480,29 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
       try {
         await e2eeService.getChannelKey(channelId);
         // Key is now available — re-fetch messages to decrypt using the cached key
-        setFetchTrigger((prev) => prev + 1);
+        retryFetch();
       } catch {
         // Still pending — will retry
       }
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [channelId, hasPendingKeys]);
+  }, [channelId, hasPendingKeys, retryFetch]);
 
   // Fetch message history when channel changes or keys are delivered
   useEffect(() => {
+    // Reset only when the active scope changes; same-key background retries
+    // intentionally preserve readiness after the initial attempt settles.
+    // eslint-disable-next-line @eslint-react/set-state-in-effect -- scope fence must invalidate stale readiness before a new fetch can settle
+    setHistorySettledForChannelId((settledChannelId) =>
+      settledChannelId === channelId ? settledChannelId : null
+    );
     if (!channelId) return;
 
     let aborted = false;
 
     const fetchMessages = async () => {
+      let retrying = false;
       setIsLoading(true);
       setError(null);
       const idsAtRequestStart = new Set(
@@ -533,7 +543,10 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
         operationGuard.assertCurrent();
         // A purge landed after this request started: everything below it is
         // deleted plaintext. The refetch the purge queued establishes truth.
-        if (currentPurgeGeneration(channelId) !== purgeGenerationAtRequestStart) return;
+        if (currentPurgeGeneration(channelId) !== purgeGenerationAtRequestStart) {
+          retrying = true;
+          return;
+        }
         unsubscribeInvalidations();
         indexDecryptedMessages(channelId, merged);
         setMessages(channelId, merged);
@@ -543,19 +556,21 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
           // An edit/delete for an unloaded row can only tombstone this stale
           // snapshot. Fetch once more so the authoritative post-event state
           // (updated row or confirmed absence) is not missing until remount.
-          setFetchTrigger((prev) => prev + 1);
+          retrying = true;
+          retryFetch();
         }
       } catch (err) {
         if (!aborted) {
           // A key rotation invalidated this batch after decryption. Start a
           // fresh request with the new generation; access revocations use a
           // terminal NOT_MEMBER fence and never enter this retry path.
-          handleFetchError(err, 'Failed to load messages', retryFetch, setError);
+          retrying = handleFetchError(err, 'Failed to load messages', retryFetch, setError);
         }
       } finally {
         unsubscribeInvalidations();
         if (!aborted) {
           setIsLoading(false);
+          if (!retrying) setHistorySettledForChannelId(channelId);
         }
       }
     };
@@ -575,6 +590,7 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     const channelMessages = useChatStore.getState().messagesByChannel.get(requestChannelId);
     if (!channelMessages || channelMessages.length === 0) return;
 
+    setError(null);
     const oldestMessage = channelMessages[0];
     const purgeGenerationAtRequestStart = currentPurgeGeneration(requestChannelId);
 
@@ -611,5 +627,12 @@ export function useMessageFetch(channelId: string | null, options: UseMessageFet
     }
   }, [channelId, isLoading, hasMore, prependMessages, retryFetch, type, limit]);
 
-  return { messages, isLoading, hasMore, error, handleLoadMore };
+  return {
+    messages,
+    isLoading,
+    hasMore,
+    error,
+    handleLoadMore,
+    isHistoryReady: historySettledForChannelId === channelId,
+  };
 }

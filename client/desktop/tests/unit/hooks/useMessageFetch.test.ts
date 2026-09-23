@@ -3,6 +3,8 @@ import { useChatStore } from '@/renderer/stores/chat/chatStore';
 import { mockMessage, mockMessage2, mockPendingMessage } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { MessageWithStatus } from '@/renderer/types/chat';
+import { E2EEKeyUnavailableError } from '@/renderer/services/e2ee/e2eeErrors';
+import { removeMessage } from '@/renderer/services/messaging/searchService';
 
 // Mock apiFetch and safeJson
 const mockApiFetch = vi.fn();
@@ -77,10 +79,11 @@ describe('useMessageFetch', () => {
     // Neither mock carries a default to restore.
     mockApiFetch.mockReset();
     mockSafeJson.mockReset();
-    mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
+    resetAllStores();
     useChatStore.setState({
       messagesByChannel: new Map(),
     });
+    mockOperationGuard.assertCurrent.mockImplementation(() => undefined);
   });
 
   // --- Basic fetch ---
@@ -179,12 +182,137 @@ describe('useMessageFetch', () => {
     await waitFor(() => {
       expect(result.current.isLoading).toBe(false);
     });
+    expect(result.current).toHaveProperty('isHistoryReady', true);
 
     // Messages should be stored (server returns DESC, hook reverses to ASC)
     const stored = useChatStore.getState().messagesByChannel.get('channel-1');
     expect(stored).toBeDefined();
     expect(stored![0].id).toBe('msg-1');
     expect(stored![1].id).toBe('msg-2');
+  });
+
+  it('does not report initial history ready from cached rows before fetch settles', async () => {
+    const cached = { ...mockMessage, id: 'cached-row' };
+    useChatStore.getState().setMessages('channel-1', [cached]);
+    mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+    mockSafeJson.mockResolvedValueOnce({ messages: [cached] });
+
+    const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+
+    expect(result.current).toHaveProperty('isHistoryReady', false);
+  });
+
+  it('reports initial history ready after a recoverable fetch failure', async () => {
+    mockFetchResponse([], false);
+
+    const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+
+    await waitFor(() => expect(result.current).toHaveProperty('isHistoryReady', true));
+  });
+
+  it('resets settled history before a same-key purge refetch', async () => {
+    mockFetchResponse([mockMessage]);
+    const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+    await waitFor(() => expect(result.current.isHistoryReady).toBe(true));
+
+    const replacement = deferred<{ ok: boolean; status: number }>();
+    mockApiFetch.mockReturnValueOnce(replacement.promise);
+    mockSafeJson.mockResolvedValueOnce({ messages: [mockMessage] });
+
+    act(() => {
+      globalThis.dispatchEvent(
+        new CustomEvent('messages-purged', { detail: { scopeId: 'channel-1' } })
+      );
+    });
+
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    expect(result.current.isHistoryReady).toBe(false);
+
+    await act(async () => {
+      replacement.resolve({ ok: true, status: 200 });
+    });
+    await waitFor(() => expect(result.current.isHistoryReady).toBe(true));
+  });
+
+  it('keeps initial history unready while a pending-key replacement fetch is in flight', async () => {
+    const retryResponse = deferred<{ ok: boolean; status: number }>();
+    const pendingKeyError = new E2EEKeyUnavailableError('NO_KEY_YET', true);
+    const expiringGuard = {
+      assertCurrent: vi.fn(() => {
+        throw pendingKeyError;
+      }),
+    };
+    const callEvent = {
+      ...mockMessage,
+      id: 'pending-key-initial',
+      content: '',
+      type: 'call_event',
+    } as MessageWithStatus;
+
+    mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+    mockSafeJson.mockResolvedValueOnce({ messages: [callEvent] });
+    mockApiFetch.mockReturnValueOnce(retryResponse.promise);
+    mockSafeJson.mockResolvedValueOnce({ messages: [callEvent] });
+    mockCreateChannelOperationGuard
+      .mockReturnValueOnce(expiringGuard)
+      .mockReturnValueOnce(mockOperationGuard);
+
+    const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    expect(result.current.isHistoryReady).toBe(false);
+
+    await act(async () => {
+      retryResponse.resolve({ ok: true, status: 200 });
+    });
+    await waitFor(() => expect(result.current.isHistoryReady).toBe(true));
+  });
+
+  it('resets initial readiness for a new scope while its fetch is pending', async () => {
+    mockFetchResponse([{ ...mockMessage, id: 'a-row' }]);
+    const { result, rerender } = renderHook(
+      ({ channelId }) => useMessageFetch(channelId, { type: 'channel' }),
+      { initialProps: { channelId: 'channel-a' } }
+    );
+    await waitFor(() => expect(result.current).toHaveProperty('isHistoryReady', true));
+
+    mockApiFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+    mockSafeJson.mockResolvedValueOnce({ messages: [{ ...mockMessage, id: 'b-row' }] });
+    rerender({ channelId: 'channel-b' });
+
+    expect(result.current).toHaveProperty('isHistoryReady', false);
+  });
+
+  it('does not reuse readiness when switching A to B and back before B settles', async () => {
+    mockFetchResponse([{ ...mockMessage, id: 'a-initial' }]);
+    const { result, rerender } = renderHook(
+      ({ channelId }) => useMessageFetch(channelId, { type: 'channel' }),
+      { initialProps: { channelId: 'channel-a' } }
+    );
+    await waitFor(() => {
+      expect(useChatStore.getState().messagesByChannel.get('channel-a')).toHaveLength(1);
+    });
+
+    const bFetch = deferred<{ ok: boolean; status: number }>();
+    const aRetry = deferred<{ ok: boolean; status: number }>();
+    mockApiFetch.mockImplementationOnce(() => bFetch.promise);
+    mockApiFetch.mockImplementationOnce(() => aRetry.promise);
+    mockSafeJson.mockResolvedValueOnce({ messages: [{ ...mockMessage, id: 'b-pending' }] });
+    mockSafeJson.mockResolvedValueOnce({ messages: [{ ...mockMessage, id: 'a-retry' }] });
+
+    rerender({ channelId: 'channel-b' });
+    rerender({ channelId: 'channel-a' });
+
+    try {
+      expect(result.current).toHaveProperty('isHistoryReady', false);
+    } finally {
+      // Keep deferred requests from leaking into later tests when this red
+      // assertion runs against the pre-readiness production hook.
+      await act(async () => {
+        bFetch.resolve({ ok: true, status: 200 });
+        aRetry.resolve({ ok: true, status: 200 });
+      });
+    }
   });
 
   it('does not route call_event rows through e2ee decryption', async () => {
@@ -408,6 +536,66 @@ describe('useMessageFetch', () => {
     expect(mockApiFetch).toHaveBeenLastCalledWith(expect.stringContaining('before='));
   });
 
+  it('clears a pagination error after a successful pagination retry', async () => {
+    const currentCallEvent = {
+      ...mockMessage,
+      id: 'current-call-event',
+      content: '',
+      type: 'call_event',
+    } as MessageWithStatus;
+    const olderCallEvent = {
+      ...mockMessage,
+      id: 'older-call-event',
+      content: '',
+      type: 'call_event',
+    } as MessageWithStatus;
+    mockFetchResponse([currentCallEvent]);
+
+    const { result } = renderHook(() =>
+      useMessageFetch('channel-1', { type: 'channel', limit: 1 })
+    );
+    await waitFor(() => expect(result.current.hasMore).toBe(true));
+
+    mockFetchResponse([], false);
+    await act(async () => {
+      await result.current.handleLoadMore();
+    });
+    expect(result.current.error).toBe('Server error');
+
+    mockFetchResponse([olderCallEvent]);
+    await act(async () => {
+      await result.current.handleLoadMore();
+    });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('keeps initial history unready until an authoritative replacement settles', async () => {
+    const initialDecrypt = deferred<string>();
+    const replacementResponse = deferred<{ ok: boolean; status: number }>();
+    const encryptedMessage = { ...mockMessage, id: 'invalidated-initial', content: 'ciphertext' };
+    mockGetChannelKey.mockResolvedValue({} as CryptoKey);
+    mockDecryptWithKey.mockReturnValueOnce(initialDecrypt.promise);
+    mockFetchResponse([encryptedMessage]);
+    mockApiFetch.mockReturnValueOnce(replacementResponse.promise);
+    mockSafeJson.mockResolvedValueOnce({ messages: [encryptedMessage] });
+
+    const { result } = renderHook(() => useMessageFetch('channel-1', { type: 'channel' }));
+    await waitFor(() => expect(mockDecryptWithKey).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      removeMessage('invalidated-initial');
+      initialDecrypt.resolve('stale plaintext');
+    });
+
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+    expect(result.current.isHistoryReady).toBe(false);
+
+    await act(async () => {
+      replacementResponse.resolve({ ok: true, status: 200 });
+    });
+    await waitFor(() => expect(result.current.isHistoryReady).toBe(true));
+  });
+
   // --- onFetchComplete callback ---
 
   it('calls onFetchComplete after successful initial fetch', async () => {
@@ -553,7 +741,9 @@ describe('useMessageFetch', () => {
       mockApiFetch.mockResolvedValueOnce(response);
       mockSafeJson.mockReturnValueOnce(purgedPage.promise);
 
-      renderHook(() => useMessageFetch('channel-purge-window', { type: 'channel' }));
+      const { result } = renderHook(() =>
+        useMessageFetch('channel-purge-window', { type: 'channel' })
+      );
       await waitFor(() => expect(mockSafeJson).toHaveBeenCalledTimes(1));
 
       // The refetch the purge queues never resolves, so the store's final
@@ -588,6 +778,10 @@ describe('useMessageFetch', () => {
       // row from the same mechanics minus the purge.
       const stored = useChatStore.getState().messagesByChannel.get('channel-purge-window') ?? [];
       expect(stored).toEqual([]);
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+      // The refetch is the authoritative state after a purge. Reporting ready
+      // while it remains pending lets MessageList discard a saved anchor.
+      expect(result.current.isHistoryReady).toBe(false);
     });
 
     // Positive control for the fence above. An empty store is also what you get

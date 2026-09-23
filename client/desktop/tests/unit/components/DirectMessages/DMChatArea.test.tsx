@@ -575,6 +575,19 @@ describe('DMChatArea', () => {
     expect(screen.getByTestId('message-list')).toBeInTheDocument();
   });
 
+  it('forwards history readiness from loading through settled fetch', async () => {
+    const request = deferred<{ ok: boolean; json: () => Promise<unknown> }>();
+    mockApiFetch.mockImplementationOnce(() => request.promise);
+    useDMStore.setState({ conversations: [makeConversation()] });
+    render(<DMChatArea selectedThreadId="conv-1" />);
+    expect(capturedMLProps).toHaveProperty('isHistoryReady', false);
+
+    await act(async () => {
+      request.resolve({ ok: true, json: async () => ({ messages: [] }) });
+    });
+    await waitFor(() => expect(capturedMLProps).toHaveProperty('isHistoryReady', true));
+  });
+
   it('renders MessageInput when thread is selected', () => {
     useDMStore.setState({
       conversations: [makeConversation()],

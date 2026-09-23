@@ -56,12 +56,15 @@ type NATSSubscriber struct {
 	serverVoiceScopeObservedHook func(uuid.UUID, uuid.UUID, time.Time)
 	// privateJoinBeforeMutationHook and privateJoinBroadcastHook are deterministic
 	// test seams around the private joined transaction and its base-state frame.
-	privateJoinBeforeMutationHook  func(uuid.UUID, uuid.UUID)
-	privateJoinBroadcastHook       func(uuid.UUID, uuid.UUID)
-	privateLeaveAfterCommitHook    func()
-	dmHeartbeatPostCommitHook      func()
-	privateVoiceStateBroadcastHook func(uuid.UUID, uuid.UUID, string)
-	dmRoomEmptyVerificationHook    func() error
+	privateJoinBeforeMutationHook func(uuid.UUID, uuid.UUID)
+	privateJoinBroadcastHook      func(uuid.UUID, uuid.UUID)
+	// privateVoiceParticipantSetLockAttemptHook reports a test's exact handoff
+	// into the participant-set lock acquisition.
+	privateVoiceParticipantSetLockAttemptHook func(uuid.UUID)
+	privateLeaveAfterCommitHook               func()
+	dmHeartbeatPostCommitHook                 func()
+	privateVoiceStateBroadcastHook            func(uuid.UUID, uuid.UUID, string)
+	dmRoomEmptyVerificationHook               func() error
 	// dmTerminalDeleteObservedHook reports the outcome of ONE DM terminal
 	// participant delete: whether the row was actually removed, and the error
 	// the clear path returned.
@@ -2422,6 +2425,9 @@ func (s *NATSSubscriber) lockPrivateVoiceParticipantUpsert(
 	memberships, err := s.collectPrivateVoiceScopeMembershipsFrom(ctx, tx, participantIDs)
 	if err != nil {
 		return false, err
+	}
+	if s.privateVoiceParticipantSetLockAttemptHook != nil {
+		s.privateVoiceParticipantSetLockAttemptHook(request.conversationID)
 	}
 	lockedConversationIDs, err := lockPrivateVoiceParticipantSets(
 		ctx, tx, groupedPrivateVoiceConversationIDs(request.conversationID, memberships),
