@@ -550,7 +550,7 @@ func (h *Handler) deleteGroupRowsTx(
 	if err != nil {
 		return groupDeleteResult{}, err
 	}
-	keys, err := h.captureGroupPlans(ctx, tx, candidates)
+	keys, err := capturePrivateCallPlans(ctx, tx, h.activePlans, candidates)
 	if err != nil {
 		return groupDeleteResult{}, err
 	}
@@ -703,11 +703,12 @@ func revalidateVoiceCandidates(
 	return nil
 }
 
-// captureGroupPlans writes one obligation per candidate and returns the keys
-// the post-commit completion will resolve.
-func (h *Handler) captureGroupPlans(
+// capturePrivateCallPlans writes one conservative obligation per candidate and
+// returns the keys the post-commit completion will resolve.
+func capturePrivateCallPlans(
 	ctx context.Context,
 	tx *sql.Tx,
+	rail ActivePlanRail,
 	candidates []uuid.UUID,
 ) ([]activepresence.PlanKey, error) {
 	now := time.Now()
@@ -728,10 +729,18 @@ func (h *Handler) captureGroupPlans(
 			SubjectID: id, Category: activepresence.CategoryPrivateCall,
 		})
 	}
-	if err := h.activePlans.CapturePlansTx(ctx, tx, plans); err != nil {
+	if err := rail.CapturePlansTx(ctx, tx, plans); err != nil {
 		return nil, fmt.Errorf("capture active-category plans: %w", err)
 	}
 	return keys, nil
+}
+
+func (h *Handler) captureGroupPlans(
+	ctx context.Context,
+	tx *sql.Tx,
+	candidates []uuid.UUID,
+) ([]activepresence.PlanKey, error) {
+	return capturePrivateCallPlans(ctx, tx, h.activePlans, candidates)
 }
 
 // readVoiceCandidates lists the conversation's active-call participants. The

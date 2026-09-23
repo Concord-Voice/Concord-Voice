@@ -7,7 +7,7 @@ import (
 
 func TestNormalizeLifecycleContext(t *testing.T) {
 	t.Run("uses a usable background context when omitted", func(t *testing.T) {
-		ctx := normalizeLifecycleContext(nil)
+		ctx := normalizeLifecycleContext(nil) //nolint:staticcheck // nil exercises the documented fallback path.
 		if ctx == nil {
 			t.Fatal("nil lifecycle context was not normalized")
 		}

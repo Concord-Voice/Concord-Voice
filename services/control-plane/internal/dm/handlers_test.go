@@ -23,6 +23,8 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/testhelpers/testdb"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/config"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 	natsclient "github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/nats"
 	"github.com/gin-gonic/gin"
@@ -5148,6 +5150,27 @@ func TestAuthorizeVoiceJoin_StaleRingCannotAcceptReplacement(t *testing.T) {
 	assert.False(t, dm.PendingDMCallExistsForTest(convUUID), "replacement ring clears after exact accept")
 }
 
+func TestAuthorizeVoiceJoin_ExpiredLegacyRingCannotFallThroughToDirectCall(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	t.Cleanup(dm.ResetPendingDMCallsForTest)
+
+	caller := ts.CreateTestUser(t, "auth_expired_legacy_caller")
+	callee := ts.CreateTestUser(t, "auth_expired_legacy_callee")
+	convID := ts.CreateDMConversation(t, caller.ID, callee.ID)
+	convUUID := uuid.MustParse(convID)
+	ring := dm.NewPendingCallForTest(convUUID, uuid.MustParse(caller.ID), []uuid.UUID{uuid.MustParse(callee.ID)})
+	ring.RingStartedAt = time.Now().Add(-time.Duration(dm.DefaultRingTimeoutSeconds+1) * time.Second)
+	dm.StoreRingForTest(convUUID, ring)
+
+	w := ts.DoRequest("POST", pathDMConversationsPrefix+convID+pathVoiceJoin, nil,
+		testhelpers.AuthHeaders(callee.AccessToken))
+	require.Equal(t, http.StatusConflict, w.Code, "expired legacy ring must not become a direct call; body: %s", w.Body.String())
+
+	_, found, err := dm.LookupDMVoiceCallLease(context.Background(), ts.Redis, convUUID)
+	require.NoError(t, err)
+	assert.False(t, found, "expired ring must not create a direct-call lease")
+}
+
 func TestAuthorizeVoiceJoin_CanceledRingCannotFallThroughToDirectCall(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	t.Cleanup(dm.ResetPendingDMCallsForTest)
@@ -5400,6 +5423,37 @@ func TestAuthorizeVoiceJoin_MediaEntitlements_Premium(t *testing.T) {
 	assert.Equal(t, "premium", me["tier"])
 	assert.EqualValues(t, 10, me["min_ptime_ms"])
 	assert.EqualValues(t, 20000000, me["max_manual_bitrate_bps"]) // premium stream ceiling (#1602: 10M->20M matching matrix "<=20 Mbps stream")
+}
+
+func TestAuthorizeVoiceJoin_ReleasesMembershipLockBeforeEntitlementLookup(t *testing.T) {
+	ts := setupTS(t)
+	user1 := ts.CreateTestUser(t, "dmme_lock1")
+	user2 := ts.CreateTestUser(t, "dmme_lock2")
+	ts.CreateFriendship(t, user1.ID, user2.ID, statusAccepted)
+	convID := ts.CreateDMConversation(t, user1.ID, user2.ID)
+	insertDMSubscription(t, ts, user1.ID, entitlements.TierPremium)
+
+	db, err := sql.Open("postgres", testdb.DatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db.SetMaxOpenConns(1)
+	h := dm.NewHandler(dm.HandlerDeps{
+		DB: db, Log: logger.New("test"), Hub: ts.Hub, Redis: ts.Redis,
+		Cfg: &config.Config{}, EntCache: entitlements.NewCache(ts.Redis, db),
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: convID}}
+	c.Request = httptest.NewRequest(http.MethodPost, pathDMConversationsPrefix+convID+pathVoiceJoin, nil).WithContext(ctx)
+	c.Set("user_id", user1.ID)
+	h.AuthorizeVoiceJoin(c)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	testhelpers.ParseJSON(t, w, &body)
+	assertDMMediaEntitlements(t, body, entitlements.TierPremium)
 }
 
 // A DM peer with no active subscription gets the free floor (fail-closed). Here

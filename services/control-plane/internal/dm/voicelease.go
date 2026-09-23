@@ -12,6 +12,7 @@ import (
 
 const (
 	dmVoiceCallLeaseKeyPrefix     = "dm_voice_call_lease:"
+	dmVoicePendingCallKeyPrefix   = "dm_voice_pending_call:"
 	dmVoiceCallClosedKeyPrefix    = "dm_voice_call_closed:"
 	dmVoiceCallCleanupKeyPrefix   = "dm_voice_call_cleanup:"
 	dmVoiceJoinAdmissionKeyPrefix = "dm_voice_join_admission:"
@@ -24,6 +25,11 @@ const (
 	// DMVoiceCallLeaseTTL allows three missed 30-second media-room heartbeats to
 	// bound stale state without expiring a live call during a brief reconnect.
 	DMVoiceCallLeaseTTL = 90 * time.Second
+	// DMPendingVoiceCallTTL is a bounded shared retirement fence. A process
+	// paused for two minutes can lose this marker; RingStartedAt then prevents
+	// ordinary stale publication, but closing the remaining scheduling window
+	// would require a durable ring protocol.
+	DMPendingVoiceCallTTL = 2 * time.Minute
 )
 
 var (
@@ -48,6 +54,10 @@ type VoiceCallLease struct {
 
 func dmVoiceCallLeaseKey(conversationID uuid.UUID) string {
 	return dmVoiceCallLeaseKeyPrefix + conversationID.String()
+}
+
+func dmVoicePendingCallKey(conversationID uuid.UUID) string {
+	return dmVoicePendingCallKeyPrefix + conversationID.String()
 }
 
 func dmVoiceCallClosedKey(callID uuid.UUID) string {
@@ -311,6 +321,53 @@ func boolToRedisFlag(value bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+// MarkDMPendingVoiceCall fences retirement while a ring is being published.
+// The marker is intentionally allowed to expire: an abandoned marker only
+// defers retirement, while a live ring must not lose its parent conversation.
+func MarkDMPendingVoiceCall(
+	ctx context.Context,
+	client *redis.Client,
+	conversationID, ringID uuid.UUID,
+) error {
+	if client == nil {
+		return errors.New("DM voice call lease store unavailable")
+	}
+	if conversationID == uuid.Nil || ringID == uuid.Nil {
+		return errors.New("invalid DM pending voice call identity")
+	}
+	if err := client.Set(ctx, dmVoicePendingCallKey(conversationID), ringID.String(), DMPendingVoiceCallTTL).Err(); err != nil {
+		return fmt.Errorf("mark DM pending voice call: %w", err)
+	}
+	return nil
+}
+
+// HasDMPendingVoiceCall reports whether a valid cross-process pending-ring
+// marker is present. Corrupt marker data fails closed so it cannot be used to
+// retire an active conversation.
+func HasDMPendingVoiceCall(
+	ctx context.Context,
+	client *redis.Client,
+	conversationID uuid.UUID,
+) (bool, error) {
+	if client == nil {
+		return false, errors.New("DM voice call lease store unavailable")
+	}
+	if conversationID == uuid.Nil {
+		return false, errors.New("invalid DM pending voice call identity")
+	}
+	rawRingID, err := client.Get(ctx, dmVoicePendingCallKey(conversationID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup DM pending voice call: %w", err)
+	}
+	if ringID, err := uuid.Parse(rawRingID); err != nil || ringID == uuid.Nil {
+		return false, errors.New("invalid stored DM pending voice call ID")
+	}
+	return true, nil
 }
 
 // LookupDMVoiceCallLease returns the current unexpired shared call identity.

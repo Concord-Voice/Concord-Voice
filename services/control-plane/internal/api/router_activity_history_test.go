@@ -54,12 +54,12 @@ func TestNewRouterRequiresOneUnboundActivityHistoryService(t *testing.T) {
 	cfg := &config.Config{Environment: "test"}
 	log := logger.NewWithWriter(io.Discard)
 
-	_, _, _, _, _, _, _, _, _, err := api.NewRouter(t.Context(), nil, nil, cfg, nil, log, api.RouterDependencies{})
+	_, _, _, _, _, _, _, _, _, _, err := api.NewRouter(t.Context(), nil, nil, cfg, nil, log, api.RouterDependencies{})
 	require.Error(t, err)
 
 	service := presencehistory.NewService(nil, presencehistory.DisclosureState{}, false)
 	require.NoError(t, service.BindDelivery(preboundActivityHistoryDelivery{}))
-	_, _, _, _, _, _, _, _, _, err = api.NewRouter(
+	_, _, _, _, _, _, _, _, _, _, err = api.NewRouter(
 		t.Context(),
 		nil,
 		nil,
@@ -92,8 +92,10 @@ func TestNewRouterActivityHistoryWiringOrderIsSingleAndFinal(t *testing.T) {
 		// instead of a second one under no guard.
 		// #2666 added a 10th: the ownership expiry callback, carried out so
 		// scheduled ownership writes use the same capture-bound transaction.
+		// #2821 added an 11th: the active-plan rail, carried out so the DM
+		// retirement sweeper shares the router's durable presence terminal.
 		"return router, hub, natsClient, opsRuntime, voicePermEnforcer, " +
-			"presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, " +
+			"presenceRecheckExecutor, closePresenceWorkers, activePlanRail, activePlanReconciler, " +
 			"ownershipHandler.CompleteExpiredTransfers, nil",
 	}
 	prior := -1

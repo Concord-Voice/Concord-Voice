@@ -120,7 +120,7 @@ func TestPendingCall_TransitionsSerializeDeclineAndAccept(t *testing.T) {
 	<-declineEnqueued
 
 	type acceptTransitionResult struct {
-		accepted bool
+		accepted acceptTransition
 		err      error
 	}
 	acceptResult := make(chan acceptTransitionResult, 1)
@@ -138,7 +138,7 @@ func TestPendingCall_TransitionsSerializeDeclineAndAccept(t *testing.T) {
 	assert.Equal(t, declineTransitionPending, <-declineResult)
 	result := <-acceptResult
 	require.NoError(t, result.err)
-	require.True(t, result.accepted)
+	require.Equal(t, acceptTransitionAccepted, result.accepted)
 	assert.True(t, ring.terminalOwned)
 	assert.True(t, ring.isCurrentLockedForTest())
 
@@ -158,7 +158,7 @@ func TestPendingCall_AcceptCallbackFailureRollsBackTransition(t *testing.T) {
 	wantErr := errors.New("lease unavailable")
 	accepted, err := ring.tryAccept(acceptor, func() error { return wantErr })
 	require.ErrorIs(t, err, wantErr)
-	assert.False(t, accepted)
+	assert.Equal(t, acceptTransitionInactive, accepted)
 	assert.False(t, ring.terminalOwned)
 	assert.Contains(t, ring.RingingUserIDs, acceptor)
 	assert.NotContains(t, ring.AcceptedUserIDs, acceptor)
@@ -166,7 +166,79 @@ func TestPendingCall_AcceptCallbackFailureRollsBackTransition(t *testing.T) {
 
 	accepted, err = ring.tryAccept(acceptor, nil)
 	require.NoError(t, err)
-	assert.True(t, accepted)
+	assert.Equal(t, acceptTransitionAccepted, accepted)
+}
+
+func TestPendingCall_ExpiredRingCannotBeAccepted(t *testing.T) {
+	convID := uuid.New()
+	acceptor := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{acceptor}, time.Second)
+	ring.RingStartedAt = time.Now().Add(-((time.Duration(DefaultRingTimeoutSeconds) + 1) * time.Second))
+	pendingDMCalls.Store(convID, ring)
+	t.Cleanup(func() { pendingDMCalls.Delete(convID) })
+
+	callbackCalled := false
+	accepted, err := ring.tryAccept(acceptor, func() error {
+		callbackCalled = true
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, acceptTransitionExpired, accepted)
+	assert.False(t, callbackCalled)
+	assert.True(t, PendingDMCallExistsForTest(convID))
+	assert.Contains(t, ring.RingingUserIDs, acceptor)
+	assert.NotContains(t, ring.AcceptedUserIDs, acceptor)
+}
+
+func TestPendingCall_ExpiredAcceptLeavesTimeoutTransitionAvailable(t *testing.T) {
+	convID := uuid.New()
+	acceptor := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{acceptor}, time.Second)
+	ring.RingStartedAt = time.Now().Add(-((time.Duration(DefaultRingTimeoutSeconds) + 1) * time.Second))
+	pendingDMCalls.Store(convID, ring)
+	t.Cleanup(func() {
+		ring.StopTimer()
+		pendingDMCalls.Delete(convID)
+	})
+
+	timedOut := make(chan bool, 1)
+	ring.StartTimer(10*time.Millisecond, func() {
+		owned := ring.tryTerminate()
+		if owned {
+			ring.finalizeTerminal()
+		}
+		timedOut <- owned
+	})
+	accepted, err := ring.tryAccept(acceptor, nil)
+	require.NoError(t, err)
+	require.Equal(t, acceptTransitionExpired, accepted)
+
+	select {
+	case owned := <-timedOut:
+		require.True(t, owned, "the timeout transition must remain able to claim an expired ring")
+	case <-time.After(time.Second):
+		t.Fatal("expired ring timeout transition did not run")
+	}
+	_, loaded := pendingDMCalls.Load(convID)
+	assert.False(t, loaded)
+}
+
+func TestPendingCall_AcceptAfterTimeoutClaimReportsExpired(t *testing.T) {
+	convID := uuid.New()
+	acceptor := uuid.New()
+	ring := newPendingCall(convID, uuid.New(), []uuid.UUID{acceptor}, time.Second)
+	ring.RingStartedAt = time.Now().Add(-((time.Duration(DefaultRingTimeoutSeconds) + 1) * time.Second))
+	pendingDMCalls.Store(convID, ring)
+	t.Cleanup(func() {
+		ring.finalizeTerminal()
+		pendingDMCalls.Delete(convID)
+	})
+
+	require.True(t, ring.tryTerminate(), "timeout must claim the current expired ring")
+	accepted, err := ring.tryAccept(acceptor, nil)
+	require.NoError(t, err)
+	require.Equal(t, acceptTransitionExpired, accepted)
+	assert.True(t, PendingDMCallExistsForTest(convID), "timeout-owned ring stays mapped until terminal side effects finish")
 }
 
 func TestPendingCall_InitializationPrecedesTerminalTransition(t *testing.T) {

@@ -132,7 +132,7 @@ func SetupTestServer(t *testing.T) *TestServer {
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, completeExpiredTransfers, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, completeExpiredTransfers, err := api.NewRouter(
 		t.Context(),
 		db,
 		redisClient,

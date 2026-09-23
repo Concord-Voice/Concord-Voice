@@ -21,6 +21,8 @@ without losing the observation that triggered them.
 
 ### Fixed
 
+- **Empty, hidden direct and group conversations are cleaned up** ([#3402](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3402), [#2821](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2821)) — after everyone has hidden a conversation and no messages remain, Concord removes its unused server data. Pending or active voice calls keep the conversation intact. The last member of a group can also leave when nobody remains to take ownership.
+
 - **The Concord logo on the sign-in screens is readable in light themes** — the logo's
   lettering was drawn in white, so with a light theme selected the word CONCORD and the
   "Own your voice" line underneath all but disappeared, leaving only the moon. On a pure

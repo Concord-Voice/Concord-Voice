@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -44,6 +45,16 @@ func TestRunExpirationPreflight_ReturnsRunErrorWithoutSignal(t *testing.T) {
 	want := errors.New("preflight failed")
 	quit := make(chan os.Signal, 1)
 	assert.ErrorIs(t, runExpirationPreflight(context.Background(), quit, func(context.Context) error { return want }), want)
+}
+
+func TestMainExpirationPreflightComposesRetirementAfterExpiry(t *testing.T) {
+	body, err := os.ReadFile("main.go")
+	require.NoError(t, err)
+	source := string(body)
+	expiry := strings.Index(source, "expirySweeper.RunPreflight(ctx)")
+	retirement := strings.Index(source, "retirementSweeper.RunPreflight(ctx)")
+	require.GreaterOrEqual(t, expiry, 0)
+	require.Greater(t, retirement, expiry)
 }
 
 func TestMainExpirationPreflightErrorIsCheckedBeforeListenAndServe(t *testing.T) {

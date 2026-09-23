@@ -19,7 +19,7 @@ import (
 
 func TestPublicMediaRateLimitExceededResponsesAreNotStored(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, _, err := api.NewRouter(
 		t.Context(),
 		ts.DB,
 		ts.Redis,
@@ -92,4 +92,31 @@ func TestPublicMediaRateLimitExceededResponsesAreNotStored(t *testing.T) {
 			assert.Equal(t, "no-store", recording.Header().Get("Cache-Control"))
 		})
 	}
+}
+
+func TestNewRouterReturnsActivePlanRail(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	_, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, rail, _, _, err := api.NewRouter(
+		t.Context(), ts.DB, ts.Redis,
+		&config.Config{
+			Environment: "test", JWTSecret: testhelpers.TestJWTSecret, AllowedOrigins: []string{"*"},
+			MFAEncryptionKey:        "0000000000000000000000000000000000000000000000000000000000000000",
+			MFAEncryptionKeyVersion: 1, WebAuthnRPID: "localhost", WebAuthnRPOrigins: []string{"http://localhost:3001"},
+		},
+		nil, logger.NewWithWriter(io.Discard),
+		api.RouterDependencies{Store: &stubAvatarStore{}, PresenceHistory: presencehistory.NewService(
+			ts.DB, presencehistory.BuildDisclosure(presencehistory.DisclosureOptions{InstanceType: "saas"}), true,
+		)},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, rail)
+	t.Cleanup(func() {
+		closePresence()
+		hub.Shutdown()
+		permissionEnforcer.Close()
+		if natsClient != nil {
+			_ = natsClient.Close()
+		}
+		require.NoError(t, opsRuntime.Stop(context.Background()))
+	})
 }

@@ -55,6 +55,7 @@ const (
 	errMsgInvalidVoiceCallRequest    = "Invalid voice call request"
 	errMsgAlreadyRinging             = "already ringing"
 	errMsgVoiceCallRingChanged       = "Voice call ring has changed"
+	errMsgVoiceCallRingExpired       = "Voice call ring expired"
 	errMsgVoiceCallNoLongerActive    = "Voice call is no longer active"
 	errMsgVoiceCallAlreadyActive     = "voice call already active"
 	errMsgCannotTargetSelf           = "Cannot mute yourself"
@@ -1332,7 +1333,7 @@ func (h *Handler) readMemberRemovalPreflight(
 
 	preflight.successorID, err = selectReplacementCreator(ctx, h.db, convID, targetID.String())
 	if errors.Is(err, sql.ErrNoRows) {
-		return memberRemovalPreflight{}, errMemberRemovalStateDrifted
+		return preflight, nil
 	}
 	if err != nil {
 		return memberRemovalPreflight{}, err
@@ -1530,6 +1531,9 @@ func (h *Handler) transferMemberRemovalCreator(
 	}
 	newCreatorID, err := selectReplacementCreator(ctx, tx, convID, targetID.String())
 	if errors.Is(err, sql.ErrNoRows) {
+		if preflightSuccessorID == "" {
+			return "", nil
+		}
 		return "", errMemberRemovalStateDrifted
 	}
 	if err != nil {
@@ -1973,6 +1977,70 @@ func (h *Handler) loadVoiceJoinState(c *gin.Context, convID, userID string) (voi
 	return state, true
 }
 
+// beginDMVoiceMembershipTx holds the parent and caller membership through a
+// Redis voice-state mutation. Retirement's FOR UPDATE waits on this key-share
+// lock, so a successful voice transition cannot lose its conversation parent.
+func (h *Handler) beginDMVoiceMembershipTx(c *gin.Context, convID, userID string) (*sql.Tx, bool) {
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		h.log.Error("Failed to begin DM voice membership transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return nil, false
+	}
+	if err := lockDMVoiceMembership(c.Request.Context(), tx, convID, userID); err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			h.log.Error("Failed to roll back DM voice membership transaction", "error", rollbackErr)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+			return nil, false
+		}
+		h.log.Error("Failed to lock DM voice membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return nil, false
+	}
+	return tx, true
+}
+
+func lockDMVoiceMembership(ctx context.Context, tx *sql.Tx, convID, userID string) error {
+	var lockedConversationID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM dm_conversations WHERE id = $1 FOR KEY SHARE`, convID,
+	).Scan(&lockedConversationID); err != nil {
+		return fmt.Errorf("lock DM voice conversation: %w", err)
+	}
+	var lockedMemberID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT user_id FROM dm_participants
+		WHERE conversation_id = $1 AND user_id = $2 FOR KEY SHARE`, convID, userID,
+	).Scan(&lockedMemberID); err != nil {
+		return fmt.Errorf("lock DM voice member: %w", err)
+	}
+	return nil
+}
+
+func rollbackDMVoiceMembershipTx(tx *sql.Tx, log *logger.Logger) {
+	// Join and media authorization only read under these locks. Rollback releases
+	// them without making an already-published Redis transition depend on Commit.
+	if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		log.Error("Failed to roll back DM voice membership transaction", "error", rollbackErr)
+	}
+}
+
+func loadVoiceJoinStateTx(ctx context.Context, tx *sql.Tx, convID, userID string) (voiceJoinState, error) {
+	var state voiceJoinState
+	err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.server_muted, dp.server_deafened, dp.role
+		FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		WHERE dc.id = $1
+	`, convID, userID).Scan(&state.isGroup, &state.serverMuted, &state.serverDeafened, &state.callerRole)
+	if err != nil {
+		return voiceJoinState{}, fmt.Errorf("load locked DM voice join state: %w", err)
+	}
+	return state, nil
+}
+
 func (h *Handler) promotePendingDMVoiceCall(ctx context.Context, convUUID uuid.UUID, ring *PendingCall) error {
 	if err := RefreshDMVoiceCallLease(ctx, h.redis, VoiceCallLease{
 		ConversationID: convUUID,
@@ -2010,7 +2078,7 @@ func (h *Handler) acceptPendingDMVoiceCall(
 		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingChanged})
 		return uuid.Nil, false
 	}
-	accepted, err := ring.tryAccept(userUUID, func() error {
+	transition, err := ring.tryAccept(userUUID, func() error {
 		return h.promotePendingDMVoiceCall(c.Request.Context(), convUUID, ring)
 	})
 	if err != nil {
@@ -2019,7 +2087,11 @@ func (h *Handler) acceptPendingDMVoiceCall(
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
 		return uuid.Nil, false
 	}
-	if !accepted {
+	if transition == acceptTransitionExpired {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
+		return uuid.Nil, false
+	}
+	if transition != acceptTransitionAccepted {
 		return uuid.Nil, true
 	}
 	ring.finalizeTerminal()
@@ -2128,6 +2200,17 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 	// timeout fires even though the callee already joined the room.
 	unlockLifecycle := LockDMCallLifecycle(convUUID)
 	defer unlockLifecycle()
+	tx, locked := h.beginDMVoiceMembershipTx(c, convID, userID)
+	if !locked {
+		return
+	}
+	defer rollbackDMVoiceMembershipTx(tx, h.log)
+	joinState, err := loadVoiceJoinStateTx(c.Request.Context(), tx, convID, userID)
+	if err != nil {
+		h.log.Error("Failed to recheck locked DM voice membership", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
 	callID, resolved := h.resolveVoiceJoinCallID(c, convUUID, userUUID, requestedRingID)
 	if !resolved {
 		return
@@ -2146,7 +2229,8 @@ func (h *Handler) AuthorizeVoiceJoin(c *gin.Context) {
 			return
 		}
 	}
-
+	// A cache miss below may query through this DB pool; release the read locks first.
+	rollbackDMVoiceMembershipTx(tx, h.log)
 	// Resolve the joining user's media entitlements server-side from the
 	// AUTHENTICATED user_id (never a client value). Per-user enforcement is
 	// room-kind-independent, so DM voice joins carry the same media_entitlements
@@ -3337,18 +3421,44 @@ func (h *Handler) initializePendingDMCall(
 	isGroup bool,
 	callerInfo map[string]interface{},
 	callees []uuid.UUID,
-) {
-	ring.startTimerLocked(time.Duration(DefaultRingTimeoutSeconds)*time.Second, func() {
-		h.onRingTimeout(convUUID, ring)
-	})
+) bool {
+	if ring.isExpired(time.Now()) {
+		return false
+	}
 
 	invitedPayload := dmVoiceInvitedData(convUUID, isGroup, callerInfo, ring, DefaultRingTimeoutSeconds)
 	for _, calleeID := range callees {
+		if ring.isExpired(time.Now()) {
+			return false
+		}
 		h.hub.BroadcastToUser(calleeID, websocket.OutgoingMessage{
 			Type: "dm_voice_call_invited",
 			Data: invitedPayload,
 		})
 	}
+	remaining := time.Until(ring.RingStartedAt.Add(time.Duration(DefaultRingTimeoutSeconds) * time.Second))
+	if remaining <= 0 {
+		return false
+	}
+	ring.startTimerLocked(remaining, func() {
+		h.onRingTimeout(convUUID, ring)
+	})
+	return true
+}
+
+func (h *Handler) cancelFailedPendingDMCall(convUUID uuid.UUID, ring *PendingCall) {
+	if !ring.tryTerminate() {
+		return
+	}
+	defer ring.finalizeTerminal()
+	h.hub.BroadcastToDMParticipants(convUUID, websocket.OutgoingMessage{
+		Type: "dm_voice_call_canceled",
+		Data: map[string]interface{}{
+			"conversation_id": convUUID.String(),
+			"ring_id":         ring.RingID.String(),
+			"canceled_by":     "server_error",
+		},
+	})
 }
 
 // RingDMCall initiates a DM voice call ring. POST /api/v1/dm/conversations/:id/voice/ring.
@@ -3381,6 +3491,10 @@ func (h *Handler) RingDMCall(c *gin.Context) {
 	// pending map entry was released.
 	unlockLifecycle := LockDMCallLifecycle(convUUID)
 	defer unlockLifecycle()
+	if !h.isParticipant(convIDStr, callerIDStr) {
+		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+		return
+	}
 
 	// Do not create a second ring while an accepted or active media call owns
 	// the conversation. The shared expiring lease is refreshed by joined and
@@ -3417,14 +3531,52 @@ func (h *Handler) RingDMCall(c *gin.Context) {
 	// window where two concurrent requests could both pass the Load check
 	// before either Stores.
 	ring := newPendingCall(convUUID, callerUUID, recipients.calleeIDs, time.Duration(DefaultRingTimeoutSeconds)*time.Second)
+	tx, locked := h.beginDMVoiceMembershipTx(c, convIDStr, callerIDStr)
+	if !locked {
+		return
+	}
+	defer rollbackDMVoiceMembershipTx(tx, h.log)
+	if err := MarkDMPendingVoiceCall(c.Request.Context(), h.redis, convUUID, ring.RingID); err != nil {
+		h.log.Error("Failed to mark pending DM voice call", "error", err,
+			"conversation_id", sanitizeLogValue(convIDStr))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	if ring.isExpired(time.Now()) {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
+		return
+	}
+	// The membership transaction validates the durable prerequisite for this
+	// ring. Keep it private until commit succeeds: timeout and terminal
+	// handlers use the pending map as their admission point and must never emit
+	// history for an uncommitted ring.
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit pending DM voice call", "error", err,
+			"conversation_id", sanitizeLogValue(convIDStr))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
+	published := false
 	existingAny, loaded := loadOrStoreInitializedPendingCall(ring, func() {
-		// Arm the timeout and enqueue every invitation while the ring's
-		// transition lock is held. A fast accept/cancel can load the claimed
-		// ring, but cannot terminally own it until initialization completes.
-		h.initializePendingDMCall(ring, convUUID, recipients.isGroup, callerInfo, recipients.calleeIDs)
+		// Enqueue invitations and arm the timeout from the absolute ring
+		// deadline while the transition lock is held. A fast accept/cancel can
+		// load the claimed ring, but cannot terminally own it until initialization completes.
+		initialized := h.initializePendingDMCall(ring, convUUID, recipients.isGroup, callerInfo, recipients.calleeIDs)
+		stored, active := pendingDMCalls.Load(convUUID)
+		published = initialized && active && stored == ring
 	})
 	if loaded {
 		writeRingConflict(c, existingAny)
+		return
+	}
+	if !published {
+		h.cancelFailedPendingDMCall(convUUID, ring)
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
+		return
+	}
+	stored, active := pendingDMCalls.Load(convUUID)
+	if !active || stored != ring {
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgVoiceCallRingExpired})
 		return
 	}
 
@@ -3719,6 +3871,33 @@ func (h *Handler) loadDMVoiceAuthorizeIdentity(
 	return identity, true
 }
 
+func loadDMVoiceAuthorizeIdentityTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	convID, userID string,
+) (dmVoiceAuthorizeIdentity, error) {
+	var identity dmVoiceAuthorizeIdentity
+	err := tx.QueryRowContext(ctx, `
+		SELECT dc.is_group, dp.server_muted, dp.server_deafened,
+		       u.username, u.display_name, u.avatar_url
+		FROM dm_conversations dc
+		JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
+		JOIN users u ON u.id = dp.user_id
+		WHERE dc.id = $1
+	`, convID, userID).Scan(
+		&identity.isGroup,
+		&identity.serverMuted,
+		&identity.serverDeafened,
+		&identity.username,
+		&identity.displayName,
+		&identity.avatarURL,
+	)
+	if err != nil {
+		return dmVoiceAuthorizeIdentity{}, fmt.Errorf("load locked DM voice authorization identity: %w", err)
+	}
+	return identity, nil
+}
+
 func (h *Handler) resolveDMVoiceAuthorizeLease(
 	c *gin.Context,
 	convUUID, userUUID, requestedCallID uuid.UUID,
@@ -3822,6 +4001,17 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 	// eliminating the authorize->voice.joined gap.
 	unlockLifecycle := LockDMCallLifecycle(convUUID)
 	defer unlockLifecycle()
+	tx, locked := h.beginDMVoiceMembershipTx(c, convID, userID)
+	if !locked {
+		return
+	}
+	defer rollbackDMVoiceMembershipTx(tx, h.log)
+	identity, err := loadDMVoiceAuthorizeIdentityTx(c.Request.Context(), tx, convID, userID)
+	if err != nil {
+		h.log.Error("Failed to recheck locked DM voice authorization", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedAuthorize})
+		return
+	}
 
 	lease, hasLease, resolved := h.resolveDMVoiceAuthorizeLease(c, convUUID, userUUID, requestedCallID)
 	if !resolved {
@@ -3845,7 +4035,6 @@ func (h *Handler) AuthorizeDMVoiceForMediaPlane(c *gin.Context) {
 			return
 		}
 	}
-
 	response := gin.H{
 		"authorized":         true,
 		"is_group":           identity.isGroup,

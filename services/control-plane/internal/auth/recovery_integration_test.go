@@ -99,7 +99,7 @@ func setupRecoverySMTPFailureTS(t *testing.T, closeDelay time.Duration) *testhel
 		redisCleanup()
 		dbCleanup()
 	})
-	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, err := api.NewRouter(
+	router, hub, natsClient, opsRuntime, permissionEnforcer, _, closePresence, _, _, _, err := api.NewRouter(
 		t.Context(),
 		db,
 		redisClient,

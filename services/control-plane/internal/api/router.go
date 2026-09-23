@@ -644,7 +644,7 @@ func NewRouter(
 	liveSpa *config.LiveSpaConfig,
 	log *logger.Logger,
 	dependencies RouterDependencies,
-) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Reconciler, func(context.Context), error) {
+) (*gin.Engine, *websocket.Hub, *natsclient.Client, *OpsMetricsRuntime, *voice.PermissionEnforcer, rbac.PresenceRecheck, func(), *activepresence.Rail, *activepresence.Reconciler, func(context.Context), error) {
 	lifecycleCtx = normalizeLifecycleContext(lifecycleCtx)
 	store := dependencies.Store
 	metricsReader := dependencies.OpsMetricsReader
@@ -674,7 +674,7 @@ func NewRouter(
 	// Initialize WebSocket hub
 	hub := newHubWithSecurityEvents(db, redis, opsCounters, securityEvents)
 	if err := bindPresenceHistoryRuntime(hub, presenceHistoryService); err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Initialize NATS (inter-service messaging with media plane)
@@ -2862,7 +2862,7 @@ func NewRouter(
 		presenceCloser()
 	}
 
-	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanReconciler, ownershipHandler.CompleteExpiredTransfers, nil
+	return router, hub, natsClient, opsRuntime, voicePermEnforcer, presenceRecheckExecutor, closePresenceWorkers, activePlanRail, activePlanReconciler, ownershipHandler.CompleteExpiredTransfers, nil
 }
 
 // nightwatchSecurityObserver records only a closed route template or a closed

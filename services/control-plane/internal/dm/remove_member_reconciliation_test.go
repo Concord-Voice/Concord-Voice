@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,8 @@ import (
 	"github.com/google/uuid"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
 func invokeRemoveMember(t *testing.T, h *Handler, convID, callerID, targetID string) *httptest.ResponseRecorder {
@@ -82,21 +85,62 @@ func TestRemoveMemberWithoutActiveCallCapturesNothing(t *testing.T) {
 	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
 }
 
-func TestRemoveMemberLastCreatorReturnsConflict(t *testing.T) {
-	db, convID, creator, successor, h, _ := seedMemberRemovalFixture(t, true)
-	_, err := db.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, successor)
+func TestRemoveMemberLastCreatorLeavesEmptyConversationForRetirement(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		voice      bool
+		makeActive func(*testing.T, *sql.DB, string, uuid.UUID)
+	}{
+		{name: "inactive", voice: false},
+		{
+			name:  "active",
+			voice: true,
+			makeActive: func(t *testing.T, db *sql.DB, convID string, creator uuid.UUID) {
+				_, err := db.Exec(`INSERT INTO dm_voice_participants (conversation_id, user_id) VALUES ($1, $2)`, convID, creator)
+				require.NoError(t, err)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, convID, creator, successor, h, _ := seedMemberRemovalFixture(t, tc.voice)
+			if tc.makeActive != nil {
+				tc.makeActive(t, db, convID, creator)
+			}
+			_, err := db.Exec(`DELETE FROM dm_voice_participants WHERE conversation_id = $1 AND user_id = $2`, convID, successor)
+			require.NoError(t, err)
+			_, err = db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, successor)
+			require.NoError(t, err)
+
+			r := invokeRemoveMember(t, h, convID, creator.String(), creator.String())
+			require.Equal(t, http.StatusOK, r.Code,
+				"final creator self-leave must succeed and create a retirement candidate")
+			require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_participants WHERE conversation_id = $1`, convID))
+			require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
+
+			_, err = newRetirementSweeperForTest(t, db, h.activePlans, logger.NewWithWriter(io.Discard)).RunPass(context.Background())
+			require.NoError(t, err)
+			require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID),
+				"retirement sweeper must collect the empty conversation after final creator self-leave")
+		})
+	}
+}
+
+func TestRemoveMemberLastCreatorPreservesConversationHistoryForRetirement(t *testing.T) {
+	db, convID, creator, successor, h, _ := seedMemberRemovalFixture(t, false)
+	_, err := db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, successor)
 	require.NoError(t, err)
-	_, err = db.Exec(`DELETE FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, successor)
-	require.NoError(t, err)
+	insertRetirementMessage(t, db, convID)
 
 	r := invokeRemoveMember(t, h, convID, creator.String(), creator.String())
-	require.Equal(t, http.StatusConflict, r.Code,
-		"removing the last participant must return retryable state drift, not an internal error")
-	require.JSONEq(t, `{"error":"Failed to remove member"}`, r.Body.String())
-	require.Equal(t, 1, countRows(t, db,
-		`SELECT count(*) FROM dm_conversations WHERE id = $1`, convID))
-	require.Equal(t, 1, countRows(t, db,
-		`SELECT count(*) FROM dm_participants WHERE conversation_id = $1 AND user_id = $2`, convID, creator))
+	require.Equal(t, http.StatusOK, r.Code)
+	require.Zero(t, countRows(t, db, `SELECT count(*) FROM dm_participants WHERE conversation_id = $1`, convID))
+	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_messages WHERE conversation_id = $1`, convID))
+
+	_, err = newRetirementSweeperForTest(t, db, h.activePlans, logger.NewWithWriter(io.Discard)).RunPass(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_conversations WHERE id = $1`, convID),
+		"message history must prevent final-member retirement")
+	require.Equal(t, 1, countRows(t, db, `SELECT count(*) FROM dm_messages WHERE conversation_id = $1`, convID))
 }
 
 type failingRemovalRail struct {

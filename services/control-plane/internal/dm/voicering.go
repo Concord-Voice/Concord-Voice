@@ -36,11 +36,19 @@ type PendingCall struct {
 
 type declineTransition uint8
 
+type acceptTransition uint8
+
 const (
 	declineTransitionInactive declineTransition = iota
 	declineTransitionNotRinging
 	declineTransitionPending
 	declineTransitionTerminal
+)
+
+const (
+	acceptTransitionInactive acceptTransition = iota
+	acceptTransitionExpired
+	acceptTransitionAccepted
 )
 
 // pendingDMCalls is the process-local map of active rings, keyed by
@@ -207,15 +215,27 @@ func (p *PendingCall) isCurrentLocked() bool {
 	return loaded && stored == p
 }
 
-// tryAccept claims the terminal transition for one exact live ring. The
-// callback runs while the ring lock is held so accepted-call correlation and
-// its WebSocket signal become visible before a concurrent accepter can inspect
-// the terminal state.
-func (p *PendingCall) tryAccept(user uuid.UUID, onAccepted func() error) (bool, error) {
+func (p *PendingCall) isExpired(now time.Time) bool {
+	return !now.Before(p.RingStartedAt.Add(time.Duration(DefaultRingTimeoutSeconds) * time.Second))
+}
+
+// tryAccept claims the terminal transition for one exact live ring. An expired
+// result leaves terminal ownership to the timeout callback. The callback runs
+// while the ring lock is held so accepted-call correlation and its WebSocket
+// signal become visible before a concurrent accepter can inspect terminal state.
+func (p *PendingCall) tryAccept(user uuid.UUID, onAccepted func() error) (acceptTransition, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.terminalOwned || !p.isCurrentLocked() {
-		return false, nil
+	if !p.isCurrentLocked() {
+		return acceptTransitionInactive, nil
+	}
+	if p.isExpired(time.Now()) {
+		// The timeout callback owns expired-ring cleanup so it can persist and
+		// broadcast the missed-call terminal event.
+		return acceptTransitionExpired, nil
+	}
+	if p.terminalOwned {
+		return acceptTransitionInactive, nil
 	}
 	p.terminalOwned = true
 	delete(p.RingingUserIDs, user)
@@ -225,10 +245,10 @@ func (p *PendingCall) tryAccept(user uuid.UUID, onAccepted func() error) (bool, 
 			p.terminalOwned = false
 			delete(p.AcceptedUserIDs, user)
 			p.RingingUserIDs[user] = struct{}{}
-			return false, err
+			return acceptTransitionInactive, err
 		}
 	}
-	return true, nil
+	return acceptTransitionAccepted, nil
 }
 
 // tryDecline applies a decline only while this exact ring still owns the map

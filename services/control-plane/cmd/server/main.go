@@ -21,6 +21,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/attestation"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/auth"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/database"
+	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/dm"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/entitlements"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/expiration"
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/health"
@@ -237,6 +238,7 @@ func runControlPlane() (runErr error) {
 	// there). The nightly temp-grant sweep constructs its own tempGrantManager
 	// out here, so the executor is carried out to wire it.
 	var voicePresenceRecheck rbac.PresenceRecheck
+	var activePlanRail *activepresence.Rail
 	completeExpiredOwnershipTransfers := func(context.Context) {}
 	// Closes both presence dispatch workers; ordered before hub.Shutdown so
 	// their fail-closed drains can still reach live sockets (#2738).
@@ -259,7 +261,7 @@ func runControlPlane() (runErr error) {
 		reconcileDisclosure: presenceHistoryService.ReconcileStaleDisclosure,
 		bindRouter: func() (*gin.Engine, *websocket.Hub, *natsclient.Client, error) {
 			router, hub, natsClient, metricsRuntime, permissionEnforcer, presenceRecheck,
-				closePresence, activePlans, completeExpiredTransfers, routerErr := api.NewRouter(
+				closePresence, activeRail, activePlans, completeExpiredTransfers, routerErr := api.NewRouter(
 				attestationCtx,
 				db,
 				redisClient,
@@ -285,6 +287,7 @@ func runControlPlane() (runErr error) {
 			voicePermissionEnforcer = permissionEnforcer
 			voicePresenceRecheck = presenceRecheck
 			closePresenceWorkers = closePresence
+			activePlanRail = activeRail
 			activePlanReconciler = activePlans
 			completeExpiredOwnershipTransfers = completeExpiredTransfers
 			return router, hub, natsClient, nil
@@ -573,10 +576,16 @@ func runControlPlane() (runErr error) {
 	if err != nil {
 		return fmt.Errorf("initialize expiration sweeper: %w", err)
 	}
-	if err := runExpirationPreflight(context.Background(), quit, expirySweeper.RunPreflight); err != nil {
+	retirementSweeper := dm.NewRetirementSweeper(db, redisClient, activePlanRail, log)
+	if err := runExpirationPreflight(context.Background(), quit, func(ctx context.Context) error {
+		if err := expirySweeper.RunPreflight(ctx); err != nil {
+			return err
+		}
+		return retirementSweeper.RunPreflight(ctx)
+	}); err != nil {
 		return fmt.Errorf("run expiration preflight: %w", err)
 	}
-	expirationWorkers.Add(3)
+	expirationWorkers.Add(4)
 	go func() {
 		defer expirationWorkers.Done()
 		purgeReaper.StartWorker(cleanupCtx)
@@ -588,6 +597,10 @@ func runControlPlane() (runErr error) {
 	go func() {
 		defer expirationWorkers.Done()
 		expirySweeper.RunWorker(cleanupCtx, expiration.DefaultExpirySweepInterval)
+	}()
+	go func() {
+		defer expirationWorkers.Done()
+		retirementSweeper.RunWorker(cleanupCtx, expiration.DefaultExpirySweepInterval)
 	}()
 
 	log.Info("Starting Control Plane server", "port", cfg.Port, "env", cfg.Environment)
