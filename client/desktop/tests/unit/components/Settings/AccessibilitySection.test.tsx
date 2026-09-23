@@ -147,6 +147,13 @@ describe('AccessibilitySection', () => {
     expect(screen.getByText('Enable Dyslexic Support')).toBeInTheDocument();
   });
 
+  it('points the disabled Dyslexic hint at the picker by its real section title', () => {
+    // FontSection renders under the heading "Application Font"; the hint used to say
+    // "Fonts", a section that does not exist.
+    render(<AccessibilitySection />);
+    expect(screen.getByText(/Appearance ▸ Application Font picker/)).toBeInTheDocument();
+  });
+
   it('toggling Dyslexic Support writes ONLY dyslexicSupport (never appFont — Q2-restore)', () => {
     render(<AccessibilitySection />);
     const row = screen.getByText('Enable Dyslexic Support').closest('.settings-row');

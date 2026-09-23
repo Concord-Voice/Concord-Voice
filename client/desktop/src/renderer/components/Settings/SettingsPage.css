@@ -644,8 +644,22 @@
   margin-top: 8px;
 }
 
+/* A fieldset of native radios since #2367 (was a <button> group with no checked
+   state or group role for assistive tech). Reset the fieldset's UA chrome so the
+   visual design is unchanged; the legend keeps `.form-label`'s look. */
+.font-size-fieldset {
+  /* Separates the legend from the font list it follows in Application Font. */
+  margin: 16px 0 0 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+}
+
 .font-size-option {
   flex: 1;
+  /* Anchors the visually-hidden radio below, so focusing it cannot scroll the page
+     toward some distant positioned ancestor. */
+  position: relative;
   padding: 10px 16px;
   background: var(--bg-tertiary);
   border: 2px solid var(--border-color);
@@ -665,6 +679,22 @@
 .font-size-option.selected {
   border-color: var(--accent-primary);
   color: var(--text-primary);
+}
+
+/* The radio is visually hidden but stays focusable and in the tab order, so the
+   focus ring is drawn on the visible <label> via :focus-within — a sibling
+   selector on the input would match nothing, since what follows it is text. */
+.font-size-radio {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+
+.font-size-option:focus-within {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
 }
 
 .font-size-option.small {

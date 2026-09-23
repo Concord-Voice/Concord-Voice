@@ -5,7 +5,7 @@ import {
   useDraftAppearance,
   setDraftAppearanceSetting,
 } from '../../hooks/ui/useDraftSettings';
-import { UI_SCALE_MIN, UI_SCALE_MAX, type AppearanceSettings } from '../../stores/ui/settingsStore';
+import { UI_SCALE_MIN, UI_SCALE_MAX } from '../../stores/ui/settingsStore';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
 import CustomSelect from '../ui/CustomSelect';
@@ -17,17 +17,13 @@ import {
   stop as stopTTS,
 } from '../../services/system/ttsService';
 
-const fontSizes: { value: AppearanceSettings['fontSize']; label: string }[] = [
-  { value: 'small', label: 'Small' },
-  { value: 'default', label: 'Default' },
-  { value: 'large', label: 'Large' },
-];
-
 // ─── Display Section ─────────────────────────────────────────────────────────
-// Moved from Appearance (#489) — font size + compact + reduce animations are
-// accessibility concerns. Added: UI Scale (continuous, coexists with the
-// discrete font-size selector via the compounding calc() in index.css) and
-// High Contrast (token overrides for text/border).
+// Moved from Appearance (#489). Added there: UI Scale (continuous, compounding
+// with the discrete Font Size via the calc() in index.css) and High Contrast
+// (token overrides for text/border). Font Size itself went back to Appearance ▸
+// Application Font in #2367: the three discrete steps are an everyday display
+// preference that people look for beside the typeface, while the continuous
+// slider — the fine-grained, accessibility-oriented control — stays here.
 
 const DisplaySection: React.FC = () => {
   const appearance = useDraftAppearance();
@@ -35,25 +31,10 @@ const DisplaySection: React.FC = () => {
   return (
     <CollapsibleSection id="section-display" title="Display">
       <div className="form-group">
-        <span className="form-label">Font Size</span>
-        <div className="font-size-selector">
-          {fontSizes.map((fs) => (
-            <button
-              key={fs.value}
-              className={`font-size-option ${fs.value} ${appearance.fontSize === fs.value ? 'selected' : ''}`}
-              onClick={() => setDraftAppearanceSetting('fontSize', fs.value)}
-            >
-              {fs.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="form-group">
         <span className="form-label">UI Scale</span>
         <p className="settings-section-description">
-          Adjust the size of the entire interface. Compounds with Font Size — so "Large" + 1.2×
-          makes everything ≈ 1.4× the baseline.
+          Adjust the size of the entire interface. Compounds with Font Size (Appearance ▸
+          Application Font) — so "Large" + 1.2× makes everything ≈ 1.4× the baseline.
         </p>
         <div className="ui-scale-slider-row">
           <input
@@ -144,7 +125,7 @@ const DisplaySection: React.FC = () => {
           <span className="settings-row-hint">
             {appearance.dyslexicSupport
               ? 'Enabled. OpenDyslexic overrides all font choices (including theme fonts) across the app, and the Appearance font picker is locked.'
-              : 'Disabled. Use the Appearance ▸ Fonts picker to choose a font.'}
+              : 'Disabled. Use the Appearance ▸ Application Font picker to choose a font.'}
           </span>
         </div>
         <ToggleSwitch

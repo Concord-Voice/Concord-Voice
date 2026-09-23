@@ -18,15 +18,18 @@ interface GifPlaybackControlProps {
 /**
  * Settings ▸ Accessibility ▸ Display — the GIF playback tri-state (#2369).
  *
- * WHY NATIVE RADIOS RATHER THAN THE THREE `<button>` GROUPS ALREADY IN THIS FILE
- * (`.font-option`, `.theme-option`, `.font-size-option`): those expose no
- * `aria-checked` and no group role, which is a live WCAG 4.1.2 gap in the
- * precedent. The accessibility floor is not a tradeoff input, so this control
- * does not inherit the gap — a `<fieldset>` of real radios gets the group
- * semantics, the checked state and arrow-key navigation from the platform for
- * free. Settings now carries two option-group idioms; retrofitting the other
- * three is deliberately out of scope here (spec §5 residual 5) and this
- * component touches none of them. The drawing is identical either way.
+ * WHY NATIVE RADIOS RATHER THAN THE `<button>` GROUPS ELSEWHERE IN SETTINGS
+ * (`.font-option`, `.theme-option`): neither gives a single choice its semantics,
+ * which is a live WCAG 4.1.2 gap in the precedent. `.theme-option` has no group
+ * role and no state at all; `.font-option` has a fieldset but marks the pick with
+ * `aria-pressed`, which announces independent toggles. The accessibility floor
+ * is not a tradeoff input, so this control does not inherit the gap — a
+ * `<fieldset>` of real radios gets the group semantics, the checked state and
+ * arrow-key navigation from the platform for free. `.font-size-option` was the
+ * third group listed here; #2367 rebuilt it as radios when it moved Font Size to
+ * Appearance, so two remain. Retrofitting those was deliberately out of scope
+ * here (spec §5 residual 5) and this component touches none of them. The
+ * drawing is identical either way.
  *
  * The hint is a `role="status"` region referenced by the fieldset's
  * `aria-describedby` because its text changes as a side effect of a DIFFERENT

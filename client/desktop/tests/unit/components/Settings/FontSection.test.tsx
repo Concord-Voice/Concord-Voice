@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, userEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import { vi } from 'vitest';
 import { useSettingsNavStore } from '@/renderer/stores/ui/settingsNavStore';
 
@@ -8,12 +8,13 @@ const mockSetDraftAppearanceSetting = vi.fn();
 let mockAppFont = 'default';
 let mockColorScheme = 'concord';
 let mockDyslexicSupport = false;
+let mockFontSize = 'default';
 
 vi.mock('@/renderer/hooks/ui/useDraftSettings', () => ({
   useDraftAppearance: vi.fn(() => ({
     theme: 'dark',
     colorScheme: mockColorScheme,
-    fontSize: 'default',
+    fontSize: mockFontSize,
     compactMode: false,
     reduceAnimations: false,
     uiScale: 1,
@@ -31,6 +32,7 @@ beforeEach(() => {
   mockAppFont = 'default';
   mockColorScheme = 'concord';
   mockDyslexicSupport = false;
+  mockFontSize = 'default';
   mockSetDraftAppearanceSetting.mockClear();
   useSettingsNavStore.getState().clearFocusRequest();
 });
@@ -126,5 +128,42 @@ describe('FontSection (Appearance ▸ Fonts)', () => {
       section: 'accessibility',
       controlId: 'toggle-dyslexic-support',
     });
+  });
+});
+
+describe('FontSection — Font Size (moved from Accessibility, #2367)', () => {
+  it('renders Font Size as a labelled radio group with the current size checked', () => {
+    mockFontSize = 'large';
+    render(<FontSection />);
+    const group = screen.getByRole('group', { name: 'Font Size' });
+    const radios = within(group).getAllByRole('radio');
+    expect(radios.map((r) => r.getAttribute('value'))).toEqual(['small', 'default', 'large']);
+    expect(within(group).getByRole('radio', { name: 'Large' })).toBeChecked();
+    expect(within(group).getByRole('radio', { name: 'Small' })).not.toBeChecked();
+  });
+
+  it('writes the chosen size to the draft store', () => {
+    render(<FontSection />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Small' }));
+    expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('fontSize', 'small');
+  });
+
+  it('stays usable while Dyslexic Support locks the typeface', () => {
+    // The lock is about WHICH face renders text; size is independent of face. The
+    // typeface lock is enforced per option (aria-disabled + an activation guard), not by
+    // a disabled fieldset, so this pins the observable property rather than placement:
+    // gating the size radios on the lock — native `disabled`, `aria-disabled`, an
+    // early-return guard, or a later `<fieldset disabled>` around both groups — fails here.
+    mockDyslexicSupport = true;
+    render(<FontSection />);
+
+    // Precondition: the typeface options really are locked in this render.
+    expect(screen.getByRole('button', { name: /Inter/i })).toHaveAttribute('aria-disabled', 'true');
+
+    const small = screen.getByRole('radio', { name: 'Small' });
+    expect(small).toBeEnabled();
+    expect(small).not.toHaveAttribute('aria-disabled');
+    fireEvent.click(small);
+    expect(mockSetDraftAppearanceSetting).toHaveBeenCalledWith('fontSize', 'small');
   });
 });

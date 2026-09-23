@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, within } from '../../../test-utils';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
 import { useAuthStore } from '@/renderer/stores/auth/authStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -98,17 +98,27 @@ describe('SettingsPage', () => {
     expect(screen.getByText('System')).toBeInTheDocument();
   });
 
-  // #489 — Display settings (font size, compact mode, reduce animations) plus
-  // UI Scale and High Contrast moved from Appearance to Accessibility. These
-  // tests navigate to the new tab before asserting.
+  // #489 — Display settings (compact mode, reduce animations) plus UI Scale and
+  // High Contrast moved from Appearance to Accessibility. Font Size went with them
+  // and came back to Appearance ▸ Application Font in #2367. These tests navigate
+  // to the owning tab before asserting.
 
-  it('renders font size options under Accessibility', () => {
+  it('renders font size options under Appearance, not Accessibility', () => {
     render(<SettingsPage />);
+    fireEvent.click(screen.getByText('Appearance'));
+    const group = screen.getByRole('group', { name: 'Font Size' });
+    for (const label of ['Small', 'Default', 'Large']) {
+      expect(within(group).getByRole('radio', { name: label })).toBeInTheDocument();
+    }
+
+    // Moved, not duplicated: two controls writing one setting would disagree the
+    // moment either tab showed a stale draft.
     fireEvent.click(screen.getByText('Accessibility'));
-    expect(screen.getByText('Font Size')).toBeInTheDocument();
-    expect(screen.getByText('Small')).toBeInTheDocument();
-    expect(screen.getByText('Default')).toBeInTheDocument();
-    expect(screen.getByText('Large')).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Font Size' })).not.toBeInTheDocument();
+    // The pre-#2367 block had no group role (a label span + plain buttons), so the
+    // query above alone would pass if a bad merge restored it. Match its shape too.
+    expect(screen.queryByText('Font Size', { exact: true })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Large' })).not.toBeInTheDocument();
   });
 
   it('renders compact mode toggle under Accessibility', () => {
@@ -149,11 +159,18 @@ describe('SettingsPage', () => {
     expect(useSettingsStore.getState().appearance.theme).toBe('light');
   });
 
-  it('changes font size on click', () => {
+  it.each([
+    ['Large', 'large'],
+    ['Small', 'small'],
+  ] as const)('selects font size %s from Appearance', (label, value) => {
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Accessibility'));
-    fireEvent.click(screen.getByText('Large'));
-    expect(useSettingsStore.getState().appearance.fontSize).toBe('large');
+    fireEvent.click(screen.getByText('Appearance'));
+    const group = screen.getByRole('group', { name: 'Font Size' });
+    const radio = within(group).getByRole('radio', { name: label });
+    fireEvent.click(radio);
+    expect(useSettingsStore.getState().appearance.fontSize).toBe(value);
+    // Controlled radios: the checked state must follow the draft, not just the store.
+    expect(radio).toBeChecked();
   });
 
   it('renders color scheme options', () => {
@@ -195,13 +212,6 @@ describe('SettingsPage', () => {
     expect(useSettingsStore.getState().appearance.colorScheme).toBe('defacto');
     fireEvent.click(circles[2]); // Eclipse
     expect(useSettingsStore.getState().appearance.colorScheme).toBe('eclipse');
-  });
-
-  it('changes font size to small', () => {
-    render(<SettingsPage />);
-    fireEvent.click(screen.getByText('Accessibility'));
-    fireEvent.click(screen.getByText('Small'));
-    expect(useSettingsStore.getState().appearance.fontSize).toBe('small');
   });
 
   it('renders system theme option', () => {

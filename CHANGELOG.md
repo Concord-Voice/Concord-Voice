@@ -13,6 +13,11 @@ without losing the observation that triggered them.
 ### Changed
 
 - **The control plane now supports private DM hide and history-clear operations** ([#3306](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3306)) — authenticated API clients can hide a direct message or group chat from one participant's list, or clear that participant's history before a server-stamped cutoff. Hide preserves history, read state, and the original hide timestamp on retries. Clear uses MFA when enabled or the current password otherwise when Privacy & Security requires authentication; the existing permanent purge action keeps its current password-and-MFA behavior.
+- **Font Size is back under Appearance** ([#3401](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3401), [#2367](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2367)) — the
+  Small / Default / Large text size now sits in Appearance ▸ Application Font, next to the font it
+  changes, instead of in Accessibility ▸ Display. The UI Scale slider stays in Accessibility. Font
+  Size stays usable while Dyslexic Support is on, and screen readers now announce which size is
+  selected.
 
 ### Fixed
 

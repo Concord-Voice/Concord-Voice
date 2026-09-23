@@ -30,6 +30,14 @@ const FONT_OPTIONS: { id: AppearanceSettings['appFont']; label: string; family: 
   },
 ];
 
+// The discrete size steps. `--font-scale-discrete` for each lives in index.css
+// (`[data-fontsize='…']`) and compounds with the UI Scale slider's `--ui-scale`.
+const FONT_SIZE_OPTIONS: { value: AppearanceSettings['fontSize']; label: string }[] = [
+  { value: 'small', label: 'Small' },
+  { value: 'default', label: 'Default' },
+  { value: 'large', label: 'Large' },
+];
+
 const FontSection: React.FC = () => {
   const appearance = useDraftAppearance();
   const { appFont, dyslexicSupport, colorScheme } = appearance;
@@ -112,6 +120,40 @@ const FontSection: React.FC = () => {
           </button>
         </p>
       )}
+
+      {/* Font Size lives beside the typeface because both answer "how does text look"
+          (#2367 — it moved to Accessibility with #489; the discrete size is an everyday
+          display preference, while the continuous UI Scale slider stays in
+          Accessibility). It sits OUTSIDE the fieldset above on purpose: Dyslexic
+          Support locks the TYPEFACE, and a size has nothing to do with typeface, so
+          turning the accommodation on must never lock text size too.
+
+          Native radios in a fieldset rather than the `<button>` group this used to be.
+          The buttons carried their selected state in a CSS class alone — no
+          `aria-checked`, no group role — the WCAG 4.1.2 gap GifPlaybackControl.tsx
+          records for this exact class family. Radios get the checked state, the group
+          semantics and arrow-key movement from the platform. */}
+      <fieldset className="font-size-fieldset">
+        <legend className="form-label">Font Size</legend>
+        <div className="font-size-selector">
+          {FONT_SIZE_OPTIONS.map((fs) => (
+            <label
+              key={fs.value}
+              className={`font-size-option ${fs.value} ${appearance.fontSize === fs.value ? 'selected' : ''}`}
+            >
+              <input
+                type="radio"
+                name="font-size"
+                className="font-size-radio"
+                value={fs.value}
+                checked={appearance.fontSize === fs.value}
+                onChange={() => setDraftAppearanceSetting('fontSize', fs.value)}
+              />
+              {fs.label}
+            </label>
+          ))}
+        </div>
+      </fieldset>
     </CollapsibleSection>
   );
 };
