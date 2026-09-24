@@ -2503,6 +2503,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '500':
+          description: Purge failed or timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
     get:
@@ -4337,6 +4343,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '403':
           description: Not a participant, or step-up verification required/failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Purge failed or timed out
           content:
             application/json:
               schema:

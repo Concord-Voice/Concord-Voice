@@ -47,6 +47,10 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsgInvalidConversationID})
 		return
 	}
+	// One deadline covers every read and write below, as in the channel and
+	// server purges (#2344).
+	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), purge.SynchronousRunTimeout)
+	defer cancel()
 
 	var req dmPurgeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -59,15 +63,20 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 		return
 	}
 
-	isGroup, isAdmin, isParticipant := h.resolveDMRole(c.Request.Context(), convID, userID)
-	if !isParticipant {
+	isGroup, isAdmin, err := h.resolveDMRole(purgeCtx, convID, userID)
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusForbidden, gin.H{"error": errMsgNotParticipant})
+		return
+	}
+	if err != nil {
+		h.log.Error("DM purge role lookup failed", "error", err, "conversation_id", convID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
 		return
 	}
 
 	// Step-up BEFORE any mutation. Failure paths inside write their own response.
-	if h.requireAuthBeforePurge(c.Request.Context(), userID) {
-		if !h.verifyPurgeStepUp(c, userID, req.CurrentPassword, req.MFACode) {
+	if h.requireAuthBeforePurge(purgeCtx, userID) {
+		if !h.verifyPurgeStepUp(purgeCtx, c, userID, req.CurrentPassword, req.MFACode) {
 			return
 		}
 	}
@@ -99,19 +108,23 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 			AttachmentsTable: "dm_message_attachments",
 			Author:           author,
 		}},
+		// With a hide to follow, the audit row stays in_progress until
+		// applyReceiverHide completes it in the hide's own transaction.
+		DeferCompletion: hide,
 	}
-	res, err := h.purgeEngine.Run(c.Request.Context(), plan)
+
+	res, err := h.purgeEngine.Run(purgeCtx, plan)
 	if err != nil {
-		h.log.Error("DM purge failed", "error", err, "conversation_id", convID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+		h.log.Error("DM purge failed", "error", err, "conversation_id", convID, "deleted", res.DeletedCount)
+		h.failPartialPurge(c, convID, userID, req.Range, res.DeletedCount)
 		return
 	}
 
 	if hide {
-		hidden, err := h.applyReceiverHide(c.Request.Context(), userID, convID, rangeFrom, res.PurgeID)
+		hidden, err := h.applyReceiverHide(purgeCtx, userID, convID, rangeFrom, res.PurgeID, res.DeletedCount)
 		if err != nil {
-			h.log.Error("DM purge hide failed", "error", err, "conversation_id", convID)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+			h.log.Error("DM purge hide failed", "error", err, "conversation_id", convID, "deleted", res.DeletedCount)
+			h.failPartialPurge(c, convID, userID, req.Range, res.DeletedCount)
 			return
 		}
 		res.HiddenCount = hidden
@@ -123,11 +136,22 @@ func (h *Handler) PurgeConversation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted_count": res.DeletedCount, "hidden_count": res.HiddenCount})
 }
 
+// failPartialPurge answers a purge that stopped partway. Deletes that already
+// committed cannot be undone, so peers and the actor's other sessions still get
+// dm_purged for them — the same rule the channel and server purges follow.
+func (h *Handler) failPartialPurge(c *gin.Context, convID, actorID, rng string, deleted int) {
+	if deleted > 0 {
+		h.emitDMPurged(convID, actorID, deleted, rng)
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgPurgeFailed})
+}
+
 // applyReceiverHide records the actor's hidden window for messages they cannot
 // delete-for-both and returns how many of the peers' messages it covers. The hide
-// runs in its own transaction; a failure leaves the audit row at in_progress, which
-// is the recovery handle for the accepted delete/hide TOCTOU (spec §7).
-func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, rangeFrom *time.Time, purgeID string) (int, error) {
+// and the audit completion commit in one transaction, so a failure leaves the
+// audit row in_progress with the committed deleted_count — the recovery handle
+// for the accepted delete/hide TOCTOU (spec §7).
+func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, rangeFrom *time.Time, purgeID string, deleted int) (int, error) {
 	// Hidden window: [range cutoff (or epoch for All Time), now].
 	from := time.Time{}
 	if rangeFrom != nil {
@@ -160,30 +184,29 @@ func (h *Handler) applyReceiverHide(ctx context.Context, userID, convID string, 
 	if err != nil {
 		return 0, fmt.Errorf("insert hidden range: %w", err)
 	}
+	if err := h.purgeEngine.FinalizeHiddenTx(ctx, tx, purgeID, deleted, hidden); err != nil {
+		return 0, err
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit hide tx: %w", err)
-	}
-
-	if err := h.purgeEngine.FinalizeHidden(ctx, purgeID, hidden); err != nil {
-		// Audit enrichment only — the hide itself is committed. Log, don't fail.
-		h.log.Error("DM purge: finalize hidden_count failed", "error", err, "purge_id", purgeID)
 	}
 	return hidden, nil
 }
 
-// resolveDMRole resolves (isGroup, isAdmin, isParticipant) for one query round-trip.
-// Errors fail closed (not a participant).
-func (h *Handler) resolveDMRole(ctx context.Context, convID, userID string) (isGroup, isAdmin, isParticipant bool) {
+// resolveDMRole resolves the actor's group flag and admin role in one query.
+// sql.ErrNoRows means the actor is not a participant; any other error is a
+// failed lookup. Both deny the purge.
+func (h *Handler) resolveDMRole(ctx context.Context, convID, userID string) (isGroup, isAdmin bool, err error) {
 	var role string
-	err := h.db.QueryRowContext(ctx, `
+	err = h.db.QueryRowContext(ctx, `
 		SELECT dc.is_group, dp.role
 		FROM dm_conversations dc
 		INNER JOIN dm_participants dp ON dp.conversation_id = dc.id AND dp.user_id = $2
 		WHERE dc.id = $1`, convID, userID).Scan(&isGroup, &role)
 	if err != nil {
-		return false, false, false
+		return false, false, err
 	}
-	return isGroup, role == "admin", true
+	return isGroup, role == "admin", nil
 }
 
 // requireAuthBeforePurge reads the actor's privacy_settings.require_auth_before_purge.
@@ -198,6 +221,9 @@ func (h *Handler) requireAuthBeforePurge(ctx context.Context, userID string) boo
 		`SELECT require_auth_before_purge FROM privacy_settings WHERE user_id = $1`,
 		userID).Scan(&v)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			h.log.Error("Purge step-up setting lookup failed; requiring step-up", "error", err)
+		}
 		return true // fail-closed: no row OR query error → require step-up
 	}
 	return v
@@ -217,9 +243,7 @@ var purgeStepUpCopy = stepup.Copy{
 //
 // Policy lives in internal/stepup (#2765); this is the DM binding of it. There
 // is no enclosing transaction here, so the non-tx MFA form is correct.
-func (h *Handler) verifyPurgeStepUp(c *gin.Context, userID, currentPassword, mfaCode string) bool {
-	ctx := c.Request.Context()
-
+func (h *Handler) verifyPurgeStepUp(ctx context.Context, c *gin.Context, userID, currentPassword, mfaCode string) bool {
 	subj, sErr := stepup.LoadSubject(ctx, h.db, userID, h.mfaVerifier)
 	if sErr != nil {
 		h.logPurgeStepUpFailure(sErr)

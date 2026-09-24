@@ -16,10 +16,7 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/internal/websocket"
 )
 
-const (
-	errMsgPurgeFailed       = "Purge failed"
-	synchronousPurgeTimeout = 10 * time.Second
-)
+const errMsgPurgeFailed = "Purge failed"
 
 type channelScope struct {
 	id          string
@@ -44,23 +41,12 @@ type purgeRequest struct {
 func (h *Handler) PurgeChannel(c *gin.Context) {
 	userID := c.GetString("user_id")
 	channelID := c.Param("id")
-	if _, err := uuid.Parse(channelID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid channel ID"})
+	req, rangeFrom, ok := bindPurgeRequest(c, channelID, "Invalid channel ID")
+	if !ok {
 		return
 	}
-	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), synchronousPurgeTimeout)
+	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), purge.SynchronousRunTimeout)
 	defer cancel()
-
-	var req purgeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
-		return
-	}
-	rangeFrom, err := purge.ParseRange(req.Range)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid range"})
-		return
-	}
 
 	var serverID, channelType string
 	if err := h.db.QueryRowContext(purgeCtx,
@@ -136,23 +122,12 @@ const (
 func (h *Handler) PurgeServer(c *gin.Context) {
 	userID := c.GetString("user_id")
 	serverID := c.Param("id")
-	if _, err := uuid.Parse(serverID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid server ID"})
+	req, rangeFrom, ok := bindPurgeRequest(c, serverID, "Invalid server ID")
+	if !ok {
 		return
 	}
-	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), synchronousPurgeTimeout)
+	purgeCtx, cancel := context.WithTimeout(c.Request.Context(), purge.SynchronousRunTimeout)
 	defer cancel()
-
-	var req purgeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
-		return
-	}
-	rangeFrom, err := purge.ParseRange(req.Range)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid range"})
-		return
-	}
 
 	deleted, status, err := h.purgeServerCore(
 		purgeCtx, serverID, userID, req.TargetUserID, "manual", rangeFrom, req.Range)
@@ -418,4 +393,24 @@ func (h *Handler) emitServerPurged(serverID, actorID, rng string) {
 			"range":     rng,
 		},
 	})
+}
+
+// bindPurgeRequest validates the scope ID and request body shared by the channel
+// and server purges. It writes the 400 itself and reports false on failure.
+func bindPurgeRequest(c *gin.Context, scopeID, invalidIDMsg string) (purgeRequest, *time.Time, bool) {
+	var req purgeRequest
+	if _, err := uuid.Parse(scopeID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidIDMsg})
+		return req, nil, false
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return req, nil, false
+	}
+	rangeFrom, err := purge.ParseRange(req.Range)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid range"})
+		return req, nil, false
+	}
+	return req, rangeFrom, true
 }

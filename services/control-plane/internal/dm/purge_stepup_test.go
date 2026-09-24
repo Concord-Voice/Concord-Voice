@@ -86,7 +86,7 @@ func TestVerifyPurgeStepUp_SubjectLoadFailureIs500(t *testing.T) {
 	h := stepUpHandler(&fakeMFAVerifier{}, db)
 	c, w := testCtx()
 
-	ok := h.verifyPurgeStepUp(c, "user-1", "anything", "")
+	ok := h.verifyPurgeStepUp(c.Request.Context(), c, "user-1", "anything", "")
 
 	assert.False(t, ok)
 	assert.Equal(t, http.StatusInternalServerError, w.Code)

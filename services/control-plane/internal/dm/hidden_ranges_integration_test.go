@@ -118,7 +118,7 @@ func TestApplyReceiverHideLocksParentsBeforeParticipant(t *testing.T) {
 				err    error
 			}, 1)
 			go func() {
-				hidden, hideErr := h.applyReceiverHide(hideCtx, actor, convID, nil, purgeID)
+				hidden, hideErr := h.applyReceiverHide(hideCtx, actor, convID, nil, purgeID, 0)
 				hideDone <- struct {
 					hidden int
 					err    error
@@ -142,10 +142,12 @@ func TestApplyReceiverHideLocksParentsBeforeParticipant(t *testing.T) {
 			}
 
 			var ranges, hiddenCount int
+			var status string
 			require.NoError(t, db.QueryRow(`SELECT count(*) FROM dm_message_hidden_ranges WHERE conversation_id = $1 AND user_id = $2`, convID, actor).Scan(&ranges))
-			require.NoError(t, db.QueryRow(`SELECT hidden_count FROM message_purges WHERE id = $1`, purgeID).Scan(&hiddenCount))
+			require.NoError(t, db.QueryRow(`SELECT hidden_count, status FROM message_purges WHERE id = $1`, purgeID).Scan(&hiddenCount, &status))
 			assert.Equal(t, 1, ranges)
 			assert.Equal(t, 1, hiddenCount)
+			assert.Equal(t, "completed", status, "the hide completes the audit row in its own transaction")
 		})
 	}
 }

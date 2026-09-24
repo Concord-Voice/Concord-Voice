@@ -24,6 +24,11 @@ import (
 	"github.com/Concord-Voice/Concord-Voice-Alpha/services/control-plane/pkg/logger"
 )
 
+// SynchronousRunTimeout bounds a handler-driven purge — its preflight reads and
+// the engine run — so the request fits the control plane's 15-second HTTP write
+// deadline (#2344). Channel, server and DM purges all use it.
+const SynchronousRunTimeout = 10 * time.Second
+
 // ContextType is the audited purge context.
 type ContextType string
 
@@ -333,14 +338,8 @@ func (e *Engine) deleteExpiryBatch(
 	if err != nil {
 		return 0, nil, err
 	}
-	if affected > 0 {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE message_purges SET deleted_count = deleted_count + $2 WHERE id = $1`, purgeID, affected); err != nil {
-			return 0, nil, fmt.Errorf("purge: record expiry batch count: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, nil, fmt.Errorf("purge: commit expiry batch tx: %w", err)
+	if err := recordBatchAndCommit(ctx, tx, purgeID, affected, "expiry batch"); err != nil {
+		return 0, nil, err
 	}
 	return affected, refs, nil
 }
@@ -542,16 +541,25 @@ func (e *Engine) deleteBatchOnce(ctx context.Context, purgeID string, queries de
 	if err != nil {
 		return 0, nil, err
 	}
+	if err := recordBatchAndCommit(ctx, tx, purgeID, affected, "batch"); err != nil {
+		return 0, nil, err
+	}
+	return affected, refs, nil
+}
+
+// recordBatchAndCommit adds a batch's deletions to the audit row and commits the
+// batch transaction, so the count and the deletes it describes land together.
+func recordBatchAndCommit(ctx context.Context, tx *sql.Tx, purgeID string, affected int, label string) error {
 	if affected > 0 {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE message_purges SET deleted_count = deleted_count + $2 WHERE id = $1`, purgeID, affected); err != nil {
-			return 0, nil, fmt.Errorf("purge: record batch count: %w", err)
+			return fmt.Errorf("purge: record %s count: %w", label, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, nil, fmt.Errorf("purge: commit batch tx: %w", err)
+		return fmt.Errorf("purge: commit %s tx: %w", label, err)
 	}
-	return affected, refs, nil
+	return nil
 }
 
 // deleteMessagesTx locks attached media before deleting messages. This parent →
@@ -794,17 +802,6 @@ func (e *Engine) finalizeCompleted(ctx context.Context, purgeID string, deleted 
 		purgeID, deleted,
 	); err != nil {
 		return fmt.Errorf("purge: finalize completed: %w", err)
-	}
-	return nil
-}
-
-// FinalizeHidden updates an already-written audit row's hidden_count (DM receiver-hide).
-func (e *Engine) FinalizeHidden(ctx context.Context, purgeID string, hidden int) error {
-	if _, err := e.db.ExecContext(ctx, `
-		UPDATE message_purges SET hidden_count = $2 WHERE id = $1`,
-		purgeID, hidden,
-	); err != nil {
-		return fmt.Errorf("purge: finalize hidden: %w", err)
 	}
 	return nil
 }

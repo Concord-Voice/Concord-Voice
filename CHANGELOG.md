@@ -47,6 +47,11 @@ that keeps sending far more than your plan allows.
 
 ### Fixed
 
+- **Purging a direct message can no longer hang** ([#3442](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3442)) — Purge Messages in a
+  direct message or group chat now stops after 10 seconds, the same limit channel and server purges
+  already have. If it runs out of time you see that some messages may already have been purged, and
+  the conversation refreshes. Messages it had already removed also disappear for the other people in
+  the conversation straight away, instead of only after they reload.
 - **The "Verify Your Identity" prompt can no longer get stuck behind Settings** ([#3423](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3423)) — when Concord
   asked you to confirm your identity while Settings or another dialog was open, the prompt opened
   underneath it and could not be reached, and the action you were taking stayed on "Processing…"

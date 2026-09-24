@@ -5,11 +5,16 @@ package dm_test
 // persistent receiver-hide (M3 serve filters), and group-admin delete-all.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	gorillaWS "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -109,6 +114,153 @@ func TestPurgeConversation_DeleteOwnHideOther(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.False(t, strings.Contains(w.Body.String(), "bob-1"),
 		"hidden content leaked into the actor's conversation-list preview")
+}
+
+// purgeUnderTableLock runs actor's All Time DM purge while lockQuery holds a
+// table lock, and returns the response the synchronous purge deadline produced
+// (mirrors assertPurgeChannelPreflightTimeout in
+// internal/messages/purge_integration_test.go). The lock is released before
+// returning, so callers may read the locked table.
+func purgeUnderTableLock(t *testing.T, ts *testhelpers.TestServer, lockQuery string, actor testhelpers.TestUser, convID string) *httptest.ResponseRecorder {
+	t.Helper()
+	lockTx, err := ts.DB.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	_, err = lockTx.Exec(lockQuery)
+	require.NoError(t, err)
+
+	responses := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		responses <- ts.DoRequest(http.MethodDelete, purgeConvPath(convID),
+			map[string]any{"range": "all", "current_password": actor.Password},
+			testhelpers.AuthHeaders(actor.AccessToken))
+	}()
+
+	select {
+	case w := <-responses:
+		require.NoError(t, lockTx.Rollback())
+		return w
+	case <-time.After(11 * time.Second):
+		require.NoError(t, lockTx.Rollback())
+		select {
+		case <-responses:
+		case <-time.After(time.Second):
+			t.Fatal("DM purge request did not complete after releasing the table lock")
+		}
+		t.Fatal("DM purge did not honor the synchronous purge timeout")
+		return nil
+	}
+}
+
+// dialDMObserver opens a WebSocket for userID subscribed to convID.
+func dialDMObserver(t *testing.T, ts *testhelpers.TestServer, userID, convID string) *gorillaWS.Conn {
+	t.Helper()
+	ticket := "dm-purge-observer-" + uuid.NewString()
+	require.NoError(t, ts.Redis.Set(t.Context(), "ws_ticket:"+ticket, userID+":purge-observer", time.Minute).Err())
+	wsServer := httptest.NewServer(ts.Router)
+	t.Cleanup(wsServer.Close)
+	conn, _, err := gorillaWS.DefaultDialer.Dial("ws"+wsServer.URL[4:]+"/api/v1/ws?ticket="+ticket, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	readUntilDMEvent(t, conn, "connected")
+	require.NoError(t, conn.WriteJSON(map[string]interface{}{
+		"type": "subscribe_dm",
+		"data": map[string]interface{}{"conversation_id": convID},
+	}))
+	readUntilDMEvent(t, conn, "dm_subscribed")
+	return conn
+}
+
+// readUntilDMEvent reads frames until one of eventType arrives and returns its data.
+func readUntilDMEvent(t *testing.T, conn *gorillaWS.Conn, eventType string) map[string]interface{} {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	for {
+		var event struct {
+			Type string                 `json:"type"`
+			Data map[string]interface{} `json:"data"`
+		}
+		require.NoError(t, conn.ReadJSON(&event), "waiting for %s", eventType)
+		if event.Type == eventType {
+			return event.Data
+		}
+	}
+}
+
+// TestPurgeConversation_RoleLookupHonorsSynchronousTimeout proves the deadline
+// starts before the preflight reads, as it does for channel and server purges:
+// a blocked participant lookup answers 500 inside the budget instead of holding
+// the request past the control plane's 15-second write deadline.
+func TestPurgeConversation_RoleLookupHonorsSynchronousTimeout(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "purge_role_to_alice")
+	bob := ts.CreateTestUser(t, "purge_role_to_bob")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+	insertDMMsg(t, ts, convID, alice.ID, "alice-1")
+
+	w := purgeUnderTableLock(t, ts, `LOCK TABLE dm_participants IN ACCESS EXCLUSIVE MODE`, alice, convID)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	assert.Equal(t, 1, countDMMessages(t, ts, convID))
+}
+
+// TestPurgeConversation_EngineRunHonorsSynchronousTimeout proves the engine run
+// is bounded: a blocked audit INSERT answers 500 with no audit row and no delete.
+func TestPurgeConversation_EngineRunHonorsSynchronousTimeout(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "purge_to_alice")
+	bob := ts.CreateTestUser(t, "purge_to_bob")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+	insertDMMsg(t, ts, convID, alice.ID, "alice-1")
+
+	w := purgeUnderTableLock(t, ts, `LOCK TABLE message_purges IN ACCESS EXCLUSIVE MODE`, alice, convID)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	var audits int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT count(*) FROM message_purges WHERE context_id = $1`, convID).Scan(&audits))
+	assert.Equal(t, 0, audits)
+	assert.Equal(t, 1, countDMMessages(t, ts, convID))
+}
+
+// TestPurgeConversation_ReceiverHideTimeoutKeepsAuditOpenAndBroadcasts covers a
+// deadline that fires after the actor's messages are deleted but before the
+// hide lands. The deletes are irreversible, so the peer still gets dm_purged;
+// the audit row stays in_progress with the committed deleted_count instead of
+// claiming a completed purge.
+func TestPurgeConversation_ReceiverHideTimeoutKeepsAuditOpenAndBroadcasts(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	alice := ts.CreateTestUser(t, "purge_hide_to_alice")
+	bob := ts.CreateTestUser(t, "purge_hide_to_bob")
+	convID := ts.CreateDMConversation(t, alice.ID, bob.ID)
+	insertDMMsg(t, ts, convID, alice.ID, "alice-1")
+	insertDMMsg(t, ts, convID, bob.ID, "bob-1")
+	bobConn := dialDMObserver(t, ts, bob.ID, convID)
+
+	w := purgeUnderTableLock(t, ts, `LOCK TABLE dm_message_hidden_ranges IN ACCESS EXCLUSIVE MODE`, alice, convID)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	var aliceMsgs, bobMsgs int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_messages WHERE conversation_id = $1 AND user_id = $2`, convID, alice.ID).Scan(&aliceMsgs))
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_messages WHERE conversation_id = $1 AND user_id = $2`, convID, bob.ID).Scan(&bobMsgs))
+	assert.Equal(t, 0, aliceMsgs, "the engine run committed before the hide timed out")
+	assert.Equal(t, 1, bobMsgs)
+
+	var ranges int
+	require.NoError(t, ts.DB.QueryRow(`SELECT count(*) FROM dm_message_hidden_ranges WHERE conversation_id = $1 AND user_id = $2`, convID, alice.ID).Scan(&ranges))
+	assert.Equal(t, 0, ranges)
+
+	var status string
+	var deleted, hidden int
+	require.NoError(t, ts.DB.QueryRow(
+		`SELECT status, deleted_count, hidden_count FROM message_purges WHERE context_id = $1`, convID).Scan(&status, &deleted, &hidden))
+	assert.Equal(t, "in_progress", status, "a purge whose hide failed must not read as completed")
+	assert.Equal(t, 1, deleted)
+	assert.Equal(t, 0, hidden)
+
+	event := readUntilDMEvent(t, bobConn, "dm_purged")
+	assert.Equal(t, convID, event["conversation_id"])
+	assert.EqualValues(t, 1, event["deleted_count"])
 }
 
 // TestPurgeConversation_StepUpWrongPassword403 locks the step-up gate: a wrong
