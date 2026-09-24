@@ -46,6 +46,11 @@ that keeps sending far more than your plan allows.
 
 ### Fixed
 
+- **The Basic / Advanced Settings switch in Audio and Video Configuration now works with a keyboard and
+  screen reader** ([#3428](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3428)) — screen readers announce the two options as a choice of two instead of as tabs,
+  the arrow keys move between them, Tab stops once per switch, and a focus ring shows which option
+  has keyboard focus. It looks the same as before.
+
 - **A damaged two-factor record no longer crashes sign-in checks or the MFA key-rotation tool** ([#3420](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3420)) — if the
   stored authenticator-app secret for an account was damaged, checking that account's two-factor
   code crashed the request, which answered with an empty server error. It now fails with a normal

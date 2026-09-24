@@ -180,39 +180,31 @@ const AudioConfigSection: React.FC = () => {
 
   return (
     <CollapsibleSection id="section-audio-config" title="Audio Configuration">
-      {/* ── Mode Toggle ── */}
-      <div className="settings-mode-toggle" role="tablist">
-        <span
-          className={`settings-mode-pill ${advancedMode ? '' : 'active'}`}
-          role="tab"
-          tabIndex={0}
-          aria-selected={!advancedMode}
-          onClick={() => handleAdvancedToggle(false)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              handleAdvancedToggle(false);
-            }
-          }}
-        >
-          Basic Settings
-        </span>
-        <span
-          className={`settings-mode-pill ${advancedMode ? 'active' : ''}`}
-          role="tab"
-          tabIndex={0}
-          aria-selected={advancedMode}
-          onClick={() => handleAdvancedToggle(true)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              handleAdvancedToggle(true);
-            }
-          }}
-        >
-          Advanced Settings
-        </span>
-      </div>
+      {/* ── Mode Toggle ── native radios: this persists a setting, it does not
+          switch views, so a tablist would announce a tabpanel that isn't there. */}
+      <fieldset className="settings-mode-toggle">
+        <legend className="settings-mode-legend">Audio settings mode</legend>
+        <label className="settings-mode-pill">
+          <input
+            type="radio"
+            name="audio-settings-mode"
+            className="settings-mode-radio"
+            checked={!advancedMode}
+            onChange={() => handleAdvancedToggle(false)}
+          />
+          {'Basic Settings'}
+        </label>
+        <label className="settings-mode-pill">
+          <input
+            type="radio"
+            name="audio-settings-mode"
+            className="settings-mode-radio"
+            checked={advancedMode}
+            onChange={() => handleAdvancedToggle(true)}
+          />
+          {'Advanced Settings'}
+        </label>
+      </fieldset>
 
       {advancedMode && (
         <p className="settings-mode-notice">

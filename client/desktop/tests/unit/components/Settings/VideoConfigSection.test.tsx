@@ -124,7 +124,7 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
 }));
 
 // ─── Component imports (AFTER mocks) ────────────────────────────────────────
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import VideoConfigSection from '@/renderer/components/Settings/VideoConfigSection';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
@@ -1150,33 +1150,22 @@ describe('VideoConfigSection', () => {
   // ─── 16. Mode toggle keyboard interaction ────────────────────────────────
 
   describe('mode toggle', () => {
-    it('calls setVideoAdvancedMode(true) on Enter key on Advanced pill', () => {
+    it('ArrowRight from Basic selects and persists Advanced', async () => {
+      const user = userEvent.setup();
       renderComponent();
-      const advancedPill = screen.getByText('Advanced Settings');
-      fireEvent.keyDown(advancedPill, { key: 'Enter' });
+      screen.getByRole('radio', { name: 'Basic Settings' }).focus();
+      await user.keyboard('{ArrowRight}');
+      expect(mockSetVideoAdvancedMode).toHaveBeenCalledTimes(1);
       expect(mockSetVideoAdvancedMode).toHaveBeenCalledWith(true);
     });
 
-    it('calls setVideoAdvancedMode(true) on Space key on Advanced pill', () => {
-      renderComponent();
-      const advancedPill = screen.getByText('Advanced Settings');
-      fireEvent.keyDown(advancedPill, { key: ' ' });
-      expect(mockSetVideoAdvancedMode).toHaveBeenCalledWith(true);
-    });
-
-    it('calls setVideoAdvancedMode(false) on Enter key on Basic pill', () => {
+    it('ArrowLeft from Advanced selects and persists Basic', async () => {
       mockVideoSettingsStore({ videoAdvancedMode: true });
+      const user = userEvent.setup();
       renderComponent();
-      const basicPill = screen.getByText('Basic Settings');
-      fireEvent.keyDown(basicPill, { key: 'Enter' });
-      expect(mockSetVideoAdvancedMode).toHaveBeenCalledWith(false);
-    });
-
-    it('calls setVideoAdvancedMode(false) on Space key on Basic pill', () => {
-      mockVideoSettingsStore({ videoAdvancedMode: true });
-      renderComponent();
-      const basicPill = screen.getByText('Basic Settings');
-      fireEvent.keyDown(basicPill, { key: ' ' });
+      screen.getByRole('radio', { name: 'Advanced Settings' }).focus();
+      await user.keyboard('{ArrowLeft}');
+      expect(mockSetVideoAdvancedMode).toHaveBeenCalledTimes(1);
       expect(mockSetVideoAdvancedMode).toHaveBeenCalledWith(false);
     });
 
@@ -1187,10 +1176,34 @@ describe('VideoConfigSection', () => {
       expect(mockSetVideoAdvancedMode).toHaveBeenCalledWith(true);
     });
 
-    it('does not trigger on non-Enter/Space keys', () => {
+    it('calls setVideoAdvancedMode(false) when Basic is clicked in advanced mode', () => {
+      mockVideoSettingsStore({ videoAdvancedMode: true });
       renderComponent();
-      const advancedPill = screen.getByText('Advanced Settings');
-      fireEvent.keyDown(advancedPill, { key: 'Tab' });
+      fireEvent.click(screen.getByText('Basic Settings'));
+      expect(mockSetVideoAdvancedMode).toHaveBeenCalledWith(false);
+    });
+
+    // Re-selecting the checked option is a no-op: a radio's change event does not
+    // fire for it, where a click handler would re-write the same value.
+    it('clicking the already-selected Basic option changes nothing', () => {
+      renderComponent();
+      fireEvent.click(screen.getByRole('radio', { name: 'Basic Settings' }));
+      expect(mockSetVideoAdvancedMode).not.toHaveBeenCalled();
+    });
+
+    // One Tab stop per group: Tab leaves the group instead of landing on the
+    // unchecked option, and moving focus never changes the persisted mode.
+    it('Tab leaves the mode group without stopping on the other option', async () => {
+      const user = userEvent.setup();
+      renderComponent();
+      const basic = screen.getByRole('radio', { name: 'Basic Settings' });
+      basic.focus();
+      expect(basic).toHaveFocus();
+      await user.tab();
+      expect(screen.getByRole('radio', { name: 'Advanced Settings' })).not.toHaveFocus();
+      expect(screen.getByRole('group', { name: 'Video settings mode' })).not.toContainElement(
+        document.activeElement as HTMLElement
+      );
       expect(mockSetVideoAdvancedMode).not.toHaveBeenCalled();
     });
   });
@@ -1998,24 +2011,23 @@ describe('VideoConfigSection', () => {
     });
   });
 
-  // ─── 25. Mode pills aria attributes ──────────────────────────────────────
+  // ─── 25. Mode radio group semantics ──────────────────────────────────────
 
-  describe('mode pill aria attributes', () => {
-    it('marks Basic as selected in basic mode', () => {
+  describe('mode radio group', () => {
+    it('checks Basic in basic mode, inside a named group with no tab roles', () => {
       renderComponent();
-      const basicPill = screen.getByText('Basic Settings');
-      expect(basicPill.getAttribute('aria-selected')).toBe('true');
-      const advancedPill = screen.getByText('Advanced Settings');
-      expect(advancedPill.getAttribute('aria-selected')).toBe('false');
+      const group = screen.getByRole('group', { name: 'Video settings mode' });
+      expect(within(group).getByRole('radio', { name: 'Basic Settings' })).toBeChecked();
+      expect(within(group).getByRole('radio', { name: 'Advanced Settings' })).not.toBeChecked();
+      expect(screen.queryAllByRole('tab', { name: /^(Basic|Advanced) Settings$/ })).toHaveLength(0);
+      expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
     });
 
-    it('marks Advanced as selected in advanced mode', () => {
+    it('checks Advanced in advanced mode', () => {
       mockVideoSettingsStore({ videoAdvancedMode: true });
       renderComponent();
-      const basicPill = screen.getByText('Basic Settings');
-      expect(basicPill.getAttribute('aria-selected')).toBe('false');
-      const advancedPill = screen.getByText('Advanced Settings');
-      expect(advancedPill.getAttribute('aria-selected')).toBe('true');
+      expect(screen.getByRole('radio', { name: 'Basic Settings' })).not.toBeChecked();
+      expect(screen.getByRole('radio', { name: 'Advanced Settings' })).toBeChecked();
     });
   });
 

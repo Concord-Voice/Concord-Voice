@@ -1008,38 +1008,31 @@ const VideoConfigSection: React.FC = () => {
 
   return (
     <CollapsibleSection id="section-video-screen" title="Video Configuration">
-      <div className="settings-mode-toggle" role="tablist">
-        <span
-          className={`settings-mode-pill ${videoAdvancedMode ? '' : 'active'}`}
-          role="tab"
-          tabIndex={0}
-          aria-selected={!videoAdvancedMode}
-          onClick={() => useVideoSettingsStore.getState().setVideoAdvancedMode(false)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              useVideoSettingsStore.getState().setVideoAdvancedMode(false);
-            }
-          }}
-        >
-          Basic Settings
-        </span>
-        <span
-          className={`settings-mode-pill ${videoAdvancedMode ? 'active' : ''}`}
-          role="tab"
-          tabIndex={0}
-          aria-selected={videoAdvancedMode}
-          onClick={() => useVideoSettingsStore.getState().setVideoAdvancedMode(true)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              useVideoSettingsStore.getState().setVideoAdvancedMode(true);
-            }
-          }}
-        >
-          Advanced Settings
-        </span>
-      </div>
+      {/* Native radios, same as the audio toggle; a distinct `name` keeps the two
+          groups independent when both render on one page. */}
+      <fieldset className="settings-mode-toggle">
+        <legend className="settings-mode-legend">Video settings mode</legend>
+        <label className="settings-mode-pill">
+          <input
+            type="radio"
+            name="video-settings-mode"
+            className="settings-mode-radio"
+            checked={!videoAdvancedMode}
+            onChange={() => useVideoSettingsStore.getState().setVideoAdvancedMode(false)}
+          />
+          {'Basic Settings'}
+        </label>
+        <label className="settings-mode-pill">
+          <input
+            type="radio"
+            name="video-settings-mode"
+            className="settings-mode-radio"
+            checked={videoAdvancedMode}
+            onChange={() => useVideoSettingsStore.getState().setVideoAdvancedMode(true)}
+          />
+          {'Advanced Settings'}
+        </label>
+      </fieldset>
 
       {/* ── Camera ── */}
       <h3 className="settings-subsection-title">Camera</h3>

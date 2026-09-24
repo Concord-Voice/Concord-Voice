@@ -1493,17 +1493,39 @@
 
 /* ─── Basic / Advanced Mode Toggle ──────────────────────────────── */
 
+/* Basic/Advanced mode toggle — a <fieldset> of native radios (Audio and Video
+   Configuration). The mode is a persisted setting, so it is a radio group, not a
+   tablist; the platform supplies the checked state, one Tab stop per group, and
+   arrow-key movement. The fieldset's UA border, padding and margins are reset so
+   the container renders exactly as the old <div> did. */
 .settings-mode-toggle {
   display: flex;
   gap: 0;
   background: var(--bg-tertiary);
   border-radius: 8px;
   padding: 3px;
-  margin-bottom: 16px;
+  margin: 0 0 16px;
   border: 1px solid var(--border-color);
+  min-width: 0;
+}
+
+/* The section title already names the group for sighted users; the legend names
+   it for assistive tech. Clipped rather than `display: none`, which would drop it
+   from the accessibility tree too. Absolute positioning also keeps it from being
+   the fieldset's rendered legend, which would notch the top border. */
+.settings-mode-legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .settings-mode-pill {
+  position: relative;
   flex: 1;
   text-align: center;
   padding: 6px 12px;
@@ -1516,14 +1538,27 @@
   user-select: none;
 }
 
-.settings-mode-pill:hover {
-  color: var(--text-secondary);
-}
-
-.settings-mode-pill.active {
+.settings-mode-pill:has(.settings-mode-radio:checked) {
   background: var(--bg-secondary);
   color: var(--text-primary);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+/* The radio is never drawn — the pill IS the control. It stays in the layout (not
+   `display: none`) so it remains focusable and keeps native arrow-key movement. */
+.settings-mode-radio {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+
+/* Focus lands on the hidden input, so the ring is drawn on the visible pill.
+   `:focus-visible` rather than `:focus-within`, so a mouse click draws no ring. */
+.settings-mode-pill:has(.settings-mode-radio:focus-visible) {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
 }
 
 /* ─── Codec & Hardware Section ─────────────────────────────────────── */

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import { vi } from 'vitest';
 
 const mockSetQualityTier = vi.fn();
@@ -188,10 +188,33 @@ Object.defineProperty(navigator, 'mediaDevices', {
 });
 
 import VoiceAudioSection from '@/renderer/components/Settings/VoiceAudioSection';
+import { useAudioSettingsStore } from '@/renderer/stores/audio/audioSettingsStore';
+import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useDraftAudioSetting } from '@/renderer/hooks/ui/useDraftSettings';
+import { useMicTest } from '@/renderer/hooks/device/useMicTest';
+
+function setAudioAdvancedMode(advancedMode: boolean) {
+  (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+    (s: (state: Record<string, unknown>) => unknown) =>
+      s({ advancedMode, setAdvancedMode: vi.fn() })
+  );
+}
 
 describe('VoiceAudioSection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks keeps implementations, so an override in one test would leak into
+    // every later one. mockReset() restores each mock's vi.fn(impl) factory default.
+    for (const mock of [
+      useAudioSettingsStore,
+      useVideoSettingsStore,
+      useVoiceStore,
+      useDraftAudioSetting,
+      useMicTest,
+    ]) {
+      (mock as unknown as ReturnType<typeof vi.fn>).mockReset();
+    }
   });
 
   it('renders device configuration section', () => {
@@ -326,29 +349,27 @@ describe('VoiceAudioSection', () => {
     expect(screen.getByText('Input Noise Gate')).toBeInTheDocument();
     expect(screen.getByText('Boost Quiet Users')).toBeInTheDocument();
   });
-  it('renders mode tabs', () => {
+  it('renders an audio and a video mode radio group', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getAllByText('Basic Settings').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText('Advanced Settings').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole('group', { name: 'Audio settings mode' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'Video settings mode' })).toBeInTheDocument();
   });
-  it('basic tab is active by default', () => {
+  it('audio Basic radio is checked by default', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getAllByText('Basic Settings')[0]).toHaveAttribute('aria-selected', 'true');
+    const audio = screen.getByRole('group', { name: 'Audio settings mode' });
+    expect(within(audio).getByRole('radio', { name: 'Basic Settings' })).toBeChecked();
   });
-  it('advanced tab is inactive by default', () => {
+  it('audio Advanced radio is unchecked by default', () => {
     render(<VoiceAudioSection />);
-    expect(screen.getAllByText('Advanced Settings')[0]).toHaveAttribute('aria-selected', 'false');
+    const audio = screen.getByRole('group', { name: 'Audio settings mode' });
+    expect(within(audio).getByRole('radio', { name: 'Advanced Settings' })).not.toBeChecked();
   });
   it('hides advanced sections in basic mode', () => {
     render(<VoiceAudioSection />);
     expect(screen.queryByText('Opus Codec')).not.toBeInTheDocument();
   });
   it('shows advanced sections when enabled', async () => {
-    const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
-    (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      (s: (state: Record<string, unknown>) => unknown) =>
-        s({ advancedMode: true, setAdvancedMode: vi.fn() })
-    );
+    setAudioAdvancedMode(true);
     render(<VoiceAudioSection />);
     expect(screen.getByText('Opus Codec')).toBeInTheDocument();
     expect(screen.getByText('Music Mode')).toBeInTheDocument();
@@ -422,13 +443,21 @@ describe('VoiceAudioSection', () => {
 
   // GPU vendor icon test removed — same mock cache limitation.
 
-  // ===== Video basic mode tabs =====
+  // ===== Mode radio groups: independence =====
 
-  it('video basic tab active by default', () => {
+  // Both groups render on one page, and radios that share a `name` form ONE group
+  // however they are nested. Arrow keys walk the whole group, so with a shared name
+  // ArrowRight from the last audio option would land in the video control instead of
+  // wrapping to the first audio option. (A render-only check cannot catch a shared
+  // name here: jsdom never unchecks the rest of a group when a checked radio is
+  // attached, so both groups still read as checked. Chromium would uncheck one.)
+  it('arrow keys wrap within the audio group, never into the video group', async () => {
+    const user = userEvent.setup();
     render(<VoiceAudioSection />);
-    const tabs = screen.getAllByRole('tab');
-    // There should be 4 tabs total (2 audio + 2 video)
-    expect(tabs.length).toBeGreaterThanOrEqual(4);
+    const audio = screen.getByRole('group', { name: 'Audio settings mode' });
+    within(audio).getByRole('radio', { name: 'Advanced Settings' }).focus();
+    await user.keyboard('{ArrowRight}');
+    expect(within(audio).getByRole('radio', { name: 'Basic Settings' })).toHaveFocus();
   });
 
   // ===== Quiet boost setting =====
@@ -442,8 +471,9 @@ describe('VoiceAudioSection', () => {
 
   it('renders quality tier description in basic mode', () => {
     render(<VoiceAudioSection />);
-    // Standard tier description (first line after split on \n) should be visible
-    expect(screen.getByText(/96 kbps/)).toBeInTheDocument();
+    // The basic-mode description for the Standard tier. (This used to match /96 kbps/,
+    // which only passed while an earlier test's advanced-mode override leaked here.)
+    expect(screen.getByText(/The Concord default/)).toBeInTheDocument();
   });
 
   it('renders kbps label', () => {
@@ -466,13 +496,12 @@ describe('VoiceAudioSection', () => {
     expect(mockSetQualityTier).toHaveBeenCalledWith('minimum');
   });
 
-  // ===== Mode toggle keyboard interaction =====
+  // ===== Mode radio semantics =====
 
-  it('renders Advanced Settings tab as keyboard-accessible', () => {
+  it('exposes the mode options as native radios, never as tabs', () => {
     render(<VoiceAudioSection />);
-    const advTab = screen.getAllByText('Advanced Settings')[0];
-    expect(advTab).toHaveAttribute('role', 'tab');
-    expect(advTab).toHaveAttribute('tabIndex', '0');
+    expect(screen.getAllByRole('radio', { name: 'Advanced Settings' })).toHaveLength(2);
+    expect(screen.queryAllByRole('tab', { name: /^(Basic|Advanced) Settings$/ })).toHaveLength(0);
   });
 
   // ===== Volume slider rendering =====
@@ -556,11 +585,7 @@ describe('VoiceAudioSection', () => {
   // ===== AudioConfigSection: Advanced mode features =====
 
   it('shows advanced audio features: FEC, NACK, Silence Detection, Frame Size, QoS, Stereo', async () => {
-    const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
-    (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      (s: (state: Record<string, unknown>) => unknown) =>
-        s({ advancedMode: true, setAdvancedMode: vi.fn() })
-    );
+    setAudioAdvancedMode(true);
     render(<VoiceAudioSection />);
     expect(screen.getByText('Music Mode')).toBeInTheDocument();
     expect(screen.getByText('Adaptive Frame Size (AFS)')).toBeInTheDocument();
@@ -573,22 +598,14 @@ describe('VoiceAudioSection', () => {
   });
 
   it('shows Error Correction & Reliability and Transport subsection headers in advanced mode', async () => {
-    const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
-    (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      (s: (state: Record<string, unknown>) => unknown) =>
-        s({ advancedMode: true, setAdvancedMode: vi.fn() })
-    );
+    setAudioAdvancedMode(true);
     render(<VoiceAudioSection />);
     expect(screen.getByText('Error Correction & Reliability')).toBeInTheDocument();
     expect(screen.getByText('Transport')).toBeInTheDocument();
   });
 
   it('shows advanced mode notice banner', async () => {
-    const { useAudioSettingsStore } = await import('@/renderer/stores/audio/audioSettingsStore');
-    (useAudioSettingsStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      (s: (state: Record<string, unknown>) => unknown) =>
-        s({ advancedMode: true, setAdvancedMode: vi.fn() })
-    );
+    setAudioAdvancedMode(true);
     render(<VoiceAudioSection />);
     expect(
       screen.getByText(/These settings override the quality tier presets/)

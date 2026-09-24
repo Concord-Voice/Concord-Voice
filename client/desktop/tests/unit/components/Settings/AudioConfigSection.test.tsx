@@ -109,7 +109,7 @@ vi.mock('@/renderer/components/Settings/AudioOpusSection', () => ({
 
 // ─── Component import (AFTER mocks) ────────────────────────────────────────
 
-import { render, screen, fireEvent } from '../../../test-utils';
+import { render, screen, fireEvent, userEvent, within } from '../../../test-utils';
 import AudioConfigSection from '@/renderer/components/Settings/AudioConfigSection';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -214,12 +214,15 @@ describe('AudioConfigSection', () => {
     expect(screen.getByText('Boost Quiet Users')).toBeInTheDocument();
   });
 
-  it('renders mode tabs with Basic active by default', () => {
+  // The mode is a persisted setting, not a view switch, so it is a named radio
+  // group — a tablist would promise a tabpanel that does not exist.
+  it('renders the mode as a named radio group with Basic checked by default', () => {
     render(<AudioConfigSection />);
-    const basicTab = screen.getByText('Basic Settings');
-    const advancedTab = screen.getByText('Advanced Settings');
-    expect(basicTab).toHaveAttribute('aria-selected', 'true');
-    expect(advancedTab).toHaveAttribute('aria-selected', 'false');
+    const group = screen.getByRole('group', { name: 'Audio settings mode' });
+    expect(within(group).getByRole('radio', { name: 'Basic Settings' })).toBeChecked();
+    expect(within(group).getByRole('radio', { name: 'Advanced Settings' })).not.toBeChecked();
+    expect(screen.queryAllByRole('tab', { name: /^(Basic|Advanced) Settings$/ })).toHaveLength(0);
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
   });
 
   it('renders tier slider with correct min/max', () => {
@@ -258,11 +261,11 @@ describe('AudioConfigSection', () => {
     expect(screen.queryByText(/The Concord default/)).not.toBeInTheDocument();
   });
 
-  it('advanced tab is active in advanced mode', async () => {
+  it('checks the Advanced radio in advanced mode', async () => {
     await enableAdvancedMode();
     render(<AudioConfigSection />);
-    expect(screen.getByText('Advanced Settings')).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByText('Basic Settings')).toHaveAttribute('aria-selected', 'false');
+    expect(screen.getByRole('radio', { name: 'Advanced Settings' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Basic Settings' })).not.toBeChecked();
   });
 
   // ===== 3. handleTierSlider =====
@@ -320,6 +323,24 @@ describe('AudioConfigSection', () => {
     expect(mockStashAndSwap).toHaveBeenCalledWith(false, 'standard');
   });
 
+  // stashAndSwapAudioMode is not idempotent: running it for the mode already active
+  // overwrites the stash with the current values. Re-selecting the checked option
+  // must therefore do nothing — true of a radio's change event, not of a click handler.
+  it('clicking the already-selected Basic option changes nothing', () => {
+    render(<AudioConfigSection />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Basic Settings' }));
+    expect(mockSetAdvancedMode).not.toHaveBeenCalled();
+    expect(mockStashAndSwap).not.toHaveBeenCalled();
+  });
+
+  it('clicking the already-selected Advanced option changes nothing', async () => {
+    await enableAdvancedMode();
+    render(<AudioConfigSection />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Advanced Settings' }));
+    expect(mockSetAdvancedMode).not.toHaveBeenCalled();
+    expect(mockStashAndSwap).not.toHaveBeenCalled();
+  });
+
   // ===== 5. Tier label onClick =====
 
   it('sets quality tier when clicking a tier label in basic mode', async () => {
@@ -362,28 +383,44 @@ describe('AudioConfigSection', () => {
     expect(mockSetQualityTier).not.toHaveBeenCalled();
   });
 
-  // ===== 7. Mode pill onKeyDown =====
+  // ===== 7. Mode radio keyboard =====
 
-  it('toggles advanced mode on Enter key on mode pill', () => {
+  it('ArrowRight from Basic selects and persists Advanced', async () => {
+    const user = userEvent.setup();
     render(<AudioConfigSection />);
-    const advPill = screen.getByText('Advanced Settings');
-    fireEvent.keyDown(advPill, { key: 'Enter' });
+    screen.getByRole('radio', { name: 'Basic Settings' }).focus();
+    await user.keyboard('{ArrowRight}');
+    expect(mockSetAdvancedMode).toHaveBeenCalledTimes(1);
     expect(mockSetAdvancedMode).toHaveBeenCalledWith(true);
+    expect(mockStashAndSwap).toHaveBeenCalledTimes(1);
     expect(mockStashAndSwap).toHaveBeenCalledWith(true, 'standard');
   });
 
-  it('toggles advanced mode on Space key on mode pill', () => {
+  it('ArrowLeft from Advanced selects and persists Basic', async () => {
+    await enableAdvancedMode();
+    const user = userEvent.setup();
     render(<AudioConfigSection />);
-    const advPill = screen.getByText('Advanced Settings');
-    fireEvent.keyDown(advPill, { key: ' ' });
-    expect(mockSetAdvancedMode).toHaveBeenCalledWith(true);
-    expect(mockStashAndSwap).toHaveBeenCalledWith(true, 'standard');
+    screen.getByRole('radio', { name: 'Advanced Settings' }).focus();
+    await user.keyboard('{ArrowLeft}');
+    expect(mockSetAdvancedMode).toHaveBeenCalledTimes(1);
+    expect(mockSetAdvancedMode).toHaveBeenCalledWith(false);
+    expect(mockStashAndSwap).toHaveBeenCalledTimes(1);
+    expect(mockStashAndSwap).toHaveBeenCalledWith(false, 'standard');
   });
 
-  it('does not toggle mode on other keys', () => {
+  // One Tab stop per group: Tab leaves the group instead of landing on the
+  // unchecked option, and moving focus never changes the persisted mode.
+  it('Tab leaves the mode group without stopping on the other option', async () => {
+    const user = userEvent.setup();
     render(<AudioConfigSection />);
-    const advPill = screen.getByText('Advanced Settings');
-    fireEvent.keyDown(advPill, { key: 'Tab' });
+    const basic = screen.getByRole('radio', { name: 'Basic Settings' });
+    basic.focus();
+    expect(basic).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole('radio', { name: 'Advanced Settings' })).not.toHaveFocus();
+    expect(screen.getByRole('group', { name: 'Audio settings mode' })).not.toContainElement(
+      document.activeElement as HTMLElement
+    );
     expect(mockSetAdvancedMode).not.toHaveBeenCalled();
   });
 
