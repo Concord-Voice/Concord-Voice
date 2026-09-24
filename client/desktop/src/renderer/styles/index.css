@@ -213,6 +213,9 @@
   --font-stack-lexend: 'Lexend', 'SourceSans', sans-serif;
   --font-stack-lato: 'Lato', 'SourceSans', sans-serif;
   --font-stack-atkinson: 'Atkinson Hyperlegible Next', 'SourceSans', sans-serif;
+  /* The brand display face, for the derived Headings value 'concord' only: Concord
+     Voice Default pins it on every theme, Agency's Atkinson display face included. */
+  --font-stack-concord: 'Droidiga', system-ui, sans-serif;
   /* The titlebar wordmark's face. It resolves HERE, on <html>, against the theme's
      display face, so a Headings pick (declared on body) cannot reach it. Only Dyslexic
      Support redefines it (data-font-brand, end of file). */
@@ -2558,6 +2561,10 @@ a[target='_blank']:not(.update-security-banner__cta, .attestation-modal__downloa
 [data-font-headings='atkinson'] body,
 [data-font-headings='atkinson'] body [data-scheme] {
   --font-display-stack: var(--font-stack-atkinson);
+}
+[data-font-headings='concord'] body,
+[data-font-headings='concord'] body [data-scheme] {
+  --font-display-stack: var(--font-stack-concord);
 }
 
 [data-font-nav='sourcesans']

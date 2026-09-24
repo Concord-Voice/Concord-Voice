@@ -1541,7 +1541,14 @@
 .settings-mode-pill:has(.settings-mode-radio:checked) {
   background: var(--bg-secondary);
   color: var(--text-primary);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+  /* The fill alone measures 1.06-1.27:1 against the track, below WCAG 1.4.11's 3:1 for
+     a state indicator, so an inset ring carries the selection. --text-primary clears 3:1
+     against both --bg-secondary and --bg-tertiary in every block (worst 8.76:1, Foxden
+     dark); --accent-primary misses it in three (worst 2.19:1, Concord light). Inset, so
+     nothing shifts, and distinct from the --state-focused outline drawn 2px outside. */
+  box-shadow:
+    inset 0 0 0 1px var(--text-primary),
+    0 1px 3px rgba(0, 0, 0, 0.15);
 }
 
 /* The radio is never drawn — the pill IS the control. It stays in the layout (not

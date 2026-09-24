@@ -95,7 +95,6 @@ src/renderer/components/Settings/AboutUpdateSection.css	.about-update-btn	2.68
 src/renderer/components/Settings/AboutUpdateSection.css	.about-update-chip:focus-visible	2.68
 src/renderer/components/Settings/AboutUpdateSection.css	.about-update-chip:hover	2.68
 src/renderer/components/Settings/ActivityHistory.css	.activity-history-card__danger-button:hover:not(:disabled)	2.63
-src/renderer/components/Settings/FontSection.css	.font-option-theme-badge	2.68
 src/renderer/components/Settings/MFA.css	.btn-danger	3.83
 src/renderer/components/Settings/MFA.css	.btn-danger:hover:not(:disabled)	4.04
 src/renderer/components/Settings/MFA.css	.btn-reset-danger:hover:not(:disabled)	3.83

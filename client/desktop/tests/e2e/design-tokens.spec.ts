@@ -414,6 +414,31 @@ test(
 );
 
 test(
+  'Concord Voice Default pins the base pair on a bundling theme: Source Sans + Droidiga',
+  { tag: '@renderer-only' },
+  async ({ page }) => {
+    await page.goto('/');
+    // What the resolver emits for appFont 'sourcesans' under Agency (headings 'concord').
+    await applyFontContext(page, 'agency', 'light', {
+      appfont: 'sourcesans',
+      fontHeadings: 'concord',
+      fontNav: 'default',
+      fontMessages: 'default',
+      fontBrand: 'default',
+    });
+    const p = await probe(page);
+    expect(p.body).toContain('SourceSans');
+    // Agency's own display face is Atkinson; the pin must beat it on body and inside regions.
+    expect(p.display).toContain('Droidiga');
+    expect(p.display).not.toContain('Atkinson');
+    expect(p.navDisplay).toContain('Droidiga');
+    expect(p.msgDisplay).toContain('Droidiga');
+    // The wordmark keeps the theme's face; only Dyslexic Support moves it.
+    expect(p.brand).toContain('Atkinson');
+  }
+);
+
+test(
   "'default' everywhere leaves the theme's faces standing (#2366)",
   { tag: '@renderer-only' },
   async ({ page }) => {

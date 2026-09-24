@@ -42,6 +42,16 @@ that keeps sending far more than your plan allows.
   boxes that used to show the system font, even with Dyslexic Support on (for example "Forgot
   password?" on the sign-in screen). Those controls are the one change you will see if you never
   picked a font.
+- **Application Font now shows your mode and says what each default does** ([#3457](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3457)) —
+  the One Font / Font by Area switch highlights the mode you are in again. Headings, Messages and
+  Navigation now default to **Match Interface**, and a Headings default follows your Interface font
+  in both modes. The Interface list starts with two defaults: **Theme Default** uses your theme's
+  font (Atkinson Hyperlegible Next with Agency, Concord's own fonts with every other theme), and
+  **Concord Voice Default** keeps Concord's own fonts whichever theme you choose; each default
+  now has a one-line description. While Theme Default is selected, a small "Active with the
+  current theme" tag marks the font in use. The selected side of the One Font / Font by Area,
+  Audio and Video Basic / Advanced switches now also has an outline, so it stands out in every
+  theme.
 
 - **DM-block and credential-epoch cleanup now survives delivery failures** ([#3140](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3140)) — guarded reconciliation records retryable voice-ejection obligations and fences stale callbacks by generation.
 

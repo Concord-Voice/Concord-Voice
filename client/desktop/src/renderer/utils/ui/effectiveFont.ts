@@ -9,8 +9,8 @@ import type { AppearanceSettings } from '../../stores/ui/settingsStore';
 /** Every AppFontId. The type derives from this list, so storage/sync validation
  *  (isAppFontId) can never lag a newly added face (#2366). */
 export const APP_FONT_IDS = [
-  'default', // Concord Voice Default (brand) — ALSO the "no explicit pick" sentinel
-  'sourcesans', // #2366: explicit Source Sans pick — distinct from the 'default' no-pick sentinel
+  'default', // "Theme Default" (dynamic) — ALSO the "no explicit pick" sentinel
+  'sourcesans', // explicit Source Sans; "Concord Voice Default" in the Interface list (CONCORD_DEFAULT_FONT)
   'system', // OS UI font stack
   'opendyslexic',
   'inter',
@@ -23,6 +23,15 @@ export type AppFontId = (typeof APP_FONT_IDS)[number];
 
 export const DYSLEXIA_FONT: AppFontId = 'opendyslexic';
 export const APP_DEFAULT_FONT: AppFontId = 'default';
+/**
+ * "Concord Voice Default" in the Interface list: the base body face, kept whatever the
+ * theme bundles. Its headings are the brand display face (see `HeadingsFontId`), so under
+ * the shipped user-wins config the pick keeps the base body and heading faces on every
+ * theme — identical to Theme Default on all but a bundling scheme. Two things it does not
+ * reach: the titlebar wordmark, which keeps the theme's face (only Dyslexic Support moves
+ * it), and a theme-wins config, where the theme's font overrides any pick.
+ */
+export const CONCORD_DEFAULT_FONT: AppFontId = 'sourcesans';
 
 export interface FontResolverConfig {
   // Q1: does an explicit user pick override a font-bundling theme?
@@ -117,9 +126,15 @@ export interface FontLayersInput extends FontResolverInput {
   fontMessages: AppFontId;
 }
 
+/**
+ * The Headings layer adds one value no other layer takes: 'concord', the brand display
+ * face (Droidiga) pinned by Concord Voice Default. It is derived, never stored.
+ */
+export type HeadingsFontId = AppFontId | 'concord';
+
 export interface FontLayers {
   interface: AppFontId;
-  headings: AppFontId;
+  headings: HeadingsFontId;
   navigation: AppFontId;
   messages: AppFontId;
   brand: BrandFontId;
@@ -128,10 +143,26 @@ export interface FontLayers {
 }
 
 /**
+ * What Headings resolve to when they "Match Interface": the Interface pick, the brand
+ * display face ('concord') for Concord Voice Default, or the theme's display face
+ * (`'default'`) while Interface is Theme Default. A theme-bundled font is a body font —
+ * it never reaches headings, and under theme-wins a pick the theme overrode must not
+ * reach them either. Exported so the picker previews exactly what the resolver applies.
+ */
+export function headingsMatchingInterface(
+  appFont: AppFontId,
+  lockReason: FontResolution['lockReason']
+): HeadingsFontId {
+  if (lockReason === 'theme') return APP_DEFAULT_FONT;
+  return appFont === CONCORD_DEFAULT_FONT ? 'concord' : appFont;
+}
+
+/**
  * One resolver call for every font layer (#2366). Interface precedence is exactly
  * `resolveEffectiveFont`'s; the other layers are decided here and nowhere else.
- * 'default' on a layer means "no override": Headings keep the theme's display face,
- * Navigation and Messages match the rest of the app.
+ * 'default' on an area means "Match Interface": Headings follow the Interface pick
+ * (see `headingsMatchingInterface`) in BOTH modes; Navigation and Messages inherit, so
+ * their text follows Interface and their headers follow Headings.
  */
 export function resolveFontLayers(input: FontLayersInput, cfg: FontResolverConfig): FontLayers {
   const base = resolveEffectiveFont(input, cfg);
@@ -152,20 +183,19 @@ export function resolveFontLayers(input: FontLayersInput, cfg: FontResolverConfi
     pickerLocked: base.pickerLocked,
     lockReason: base.lockReason,
   };
+  const matched = headingsMatchingInterface(input.appFont, base.lockReason);
   if (input.fontMode === 'area') {
     return {
       ...shared,
-      headings: input.fontHeadings,
+      headings: input.fontHeadings === APP_DEFAULT_FONT ? matched : input.fontHeadings,
       navigation: input.fontNavigation,
       messages: input.fontMessages,
     };
   }
-  // One Font: an explicit pick also drives headings; the regions inherit, so they need
-  // no override. A theme-bundled font is a body font — it never reaches headings, and
-  // under theme-wins a pick the theme overrode must not reach them either.
+  // One Font: headings match Interface; the regions inherit, so they need no override.
   return {
     ...shared,
-    headings: base.lockReason === 'theme' ? APP_DEFAULT_FONT : input.appFont,
+    headings: matched,
     navigation: APP_DEFAULT_FONT,
     messages: APP_DEFAULT_FONT,
   };

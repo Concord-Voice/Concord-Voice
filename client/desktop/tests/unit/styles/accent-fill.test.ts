@@ -165,6 +165,7 @@ describe('--accent-fill button/highlight indirection', () => {
     const lightHalo = haloSet('rgba(255, 255, 255');
 
     let accentFillSurfaces = 0;
+    const surfaces = new Set<string>();
     const missingHalo: string[] = [];
     const unclassified: string[] = [];
 
@@ -179,6 +180,7 @@ describe('--accent-fill button/highlight indirection', () => {
           .filter(Boolean)) {
           accentFillSurfaces++;
           const canon = canonicalizeSelector(sel);
+          surfaces.add(canon);
           if (white) {
             if (!darkHalo.has(canon)) missingHalo.push(`${sel} (white text → needs a dark halo)`);
           } else if (dark) {
@@ -204,6 +206,13 @@ describe('--accent-fill button/highlight indirection', () => {
       unclassified,
       'un-haloed --accent-fill surface(s) with no co-located text color — add each to a ' +
         `pride-flourishes halo group (if it paints text) or KNOWN_TEXT_FREE_FILLS (if text-free):\n  ${unclassified.join('\n  ')}`
+    ).toEqual([]);
+    // The reverse direction: a halo entry whose surface was renamed or repainted is dead
+    // weight the checks above cannot see (#3457 left `.font-option-theme-badge` behind).
+    const orphaned = [...darkHalo, ...lightHalo].filter((canon) => !surfaces.has(canon));
+    expect(
+      orphaned,
+      `pride-flourishes halo entr(ies) naming no --accent-fill surface — delete them:\n  ${orphaned.join('\n  ')}`
     ).toEqual([]);
   });
 });

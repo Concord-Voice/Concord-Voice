@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { APP_FONT_IDS } from '@/renderer/utils/ui/effectiveFont';
+import { APP_FONT_IDS, themeBundledFontFor } from '@/renderer/utils/ui/effectiveFont';
 
 const ALL_23_TOKENS = [
   // State (3)
@@ -216,9 +216,9 @@ describe('application-font sink (#2366)', () => {
   const picker = readFileSync(pickerPath, 'utf-8');
 
   // Start at the `= [` rather than at the declaration, and end at a `];` that begins a
-  // line. The obvious `indexOf('];')` lands INSIDE the type annotation — which reads
-  // `{ id: AppearanceSettings['appFont']; … }` and so contains `];` before the array
-  // ever opens — leaving an empty slice, zero parsed ids, and every assertion below
+  // line. The obvious `indexOf('];')` can land INSIDE a type annotation — this one once
+  // read `{ id: AppearanceSettings['appFont']; … }` and so contained `];` before the
+  // array opened — leaving an empty slice, zero parsed ids, and every assertion below
   // running against nothing. The guard below caught exactly that.
   const optionsStart = picker.indexOf('const FONT_OPTIONS');
   const arrayStart = picker.indexOf('= [', optionsStart);
@@ -330,6 +330,45 @@ describe('application-font sink (#2366)', () => {
     expect(flat.match(/\[data-font-nav='[a-z]+'\] :is\([^)]*\) \[data-scheme\]/g)).toHaveLength(
       explicitIds.length
     );
+  });
+
+  // Concord Voice Default drives the derived Headings value 'concord', which is not an
+  // AppFontId, so the per-id loops above never see it.
+  it("the derived 'concord' headings value has its stack and both rules (#3457)", () => {
+    const root = extractBlockBody(css, ':root') ?? '';
+    expect(root).toContain("--font-stack-concord: 'Droidiga', system-ui, sans-serif;");
+    for (const selector of [
+      "[data-font-headings='concord'] body",
+      "[data-font-headings='concord'] body [data-scheme]",
+    ]) {
+      expect(flat).toContain(selector);
+    }
+  });
+
+  // The "Active with the current theme" chip marks Concord Voice Default as what Theme
+  // Default applies on every non-bundling theme. That is only true while each such block
+  // declares the same display face the 'concord' pin applies — a scheme that changes its
+  // heading face without bundling a body font would make the chip lie.
+  it('every non-bundling theme block declares the display face Concord Voice Default pins', () => {
+    const pinned = /--font-stack-concord:\s*([^;]+);/.exec(
+      extractBlockBody(css, ':root') ?? ''
+    )?.[1];
+    expect(pinned).toBeDefined();
+    const drifted: string[] = [];
+    let checked = 0;
+    for (const block of ALL_32_BLOCKS) {
+      const scheme = /data-scheme='([a-z]+)'/.exec(block)?.[1];
+      if (scheme && themeBundledFontFor(scheme as Parameters<typeof themeBundledFontFor>[0])) {
+        continue;
+      }
+      const declared = /--font-display-stack:\s*([^;]+);/.exec(
+        extractBlockBody(css, block) ?? ''
+      )?.[1];
+      checked++;
+      if (declared?.trim() !== pinned?.trim()) drifted.push(`${block}: ${declared}`);
+    }
+    expect(checked).toBe(30);
+    expect(drifted).toEqual([]);
   });
 
   // A control that names a body family itself ignores every font setting, Dyslexic

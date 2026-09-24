@@ -183,6 +183,32 @@ describe('resolveFontLayers (#2366)', () => {
     });
   });
 
+  it('Font by Area: a default Headings matches Interface, exactly as One Font does', () => {
+    const area = { ...base, fontMode: 'area' as FontMode };
+    // Interface on Theme Default → headings keep the theme's display face.
+    expect(resolveFontLayers(area, RESOLVER_CONFIG).headings).toBe('default');
+    // An Interface pick carries into headings…
+    expect(resolveFontLayers({ ...area, appFont: 'inter' }, RESOLVER_CONFIG).headings).toBe(
+      'inter'
+    );
+    // …a theme-bundled BODY font does not…
+    expect(
+      resolveFontLayers({ ...area, themeBundledFont: 'atkinson' }, RESOLVER_CONFIG).headings
+    ).toBe('default');
+    // …Concord Voice Default pins the brand heading face, even on a bundling theme…
+    expect(
+      resolveFontLayers(
+        { ...area, appFont: 'sourcesans', themeBundledFont: 'atkinson' },
+        RESOLVER_CONFIG
+      )
+    ).toMatchObject({ interface: 'sourcesans', headings: 'concord' });
+    // …and an explicit Headings pick still wins.
+    expect(
+      resolveFontLayers({ ...area, appFont: 'inter', fontHeadings: 'lexend' }, RESOLVER_CONFIG)
+        .headings
+    ).toBe('lexend');
+  });
+
   it('a theme-bundled font drives interface only; headings keep the theme face (Agency, no pick)', () => {
     expect(
       resolveFontLayers({ ...base, themeBundledFont: 'atkinson' }, RESOLVER_CONFIG)
@@ -246,6 +272,15 @@ describe('resolveFontLayers (#2366)', () => {
       interface: 'inter',
       headings: 'inter',
     });
+  });
+
+  it('One Font: Concord Voice Default keeps the base pair on any theme', () => {
+    expect(
+      resolveFontLayers(
+        { ...base, appFont: 'sourcesans', themeBundledFont: 'atkinson' },
+        RESOLVER_CONFIG
+      )
+    ).toMatchObject({ interface: 'sourcesans', headings: 'concord', lockReason: null });
   });
 
   it('an ordinary OpenDyslexic PICK goes everywhere except the wordmark', () => {
