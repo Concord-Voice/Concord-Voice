@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -117,6 +118,10 @@ func runControlPlane() (runErr error) {
 
 	// Initialize logger
 	log := logger.New(cfg.Environment)
+	// slog's built-in default handler writes the message unescaped (CWE-117). Installing
+	// the escaping pkg/logger handler covers slog.Default(), the package-level slog
+	// functions, and stdlib log output, which SetDefault routes through the same handler.
+	slog.SetDefault(log.Logger)
 	securityEvents := securityevent.Discard
 	if cfg.Environment == "production" {
 		writer, openErr := securityevent.Open(securityevent.ControlPlanePath, securityevent.ServiceControlPlane, log)

@@ -2,6 +2,8 @@ package logger
 
 import (
 	"bytes"
+	"fmt"
+	"log"
 	"log/slog"
 	"strings"
 	"testing"
@@ -121,4 +123,60 @@ func TestHandlersEscapeControlCharsInAttrValues(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(strings.TrimRight(buf.String(), "\n"), "\n")+1,
 			"the forged record must stay on ONE physical line")
 	})
+
+	// The CodeQL query concord/go/log-injection-unstructured treats a constant-keyed
+	// attribute value as sanitized for EVERY slog call, including ones that reach
+	// slog's built-in default handler. This subtest locks that assumption.
+	t.Run("slog default handler", func(t *testing.T) {
+		buf := captureStdlibLog(t)
+		require.Equal(t, "*slog.defaultHandler", fmt.Sprintf("%T", slog.Default().Handler()),
+			"precondition: another test left a non-default slog handler installed")
+		slog.Info("Channel purged", "channel_id", forgedAttr)
+
+		assert.NotContains(t, buf.String(), "\nlevel=ERROR",
+			"the default handler let a raw newline through an attribute value")
+		assert.Equal(t, 1, strings.Count(strings.TrimRight(buf.String(), "\n"), "\n")+1)
+	})
+}
+
+// forgedMessage puts the attacker's newline in the MESSAGE. slog's built-in default
+// handler writes the message unescaped, which is why cmd/server installs the
+// pkg/logger handler with slog.SetDefault.
+const forgedMessage = "login failed for abc\n2026/09/24 12:00:00 ERROR FORGED ADMIN ACTION"
+
+func captureStdlibLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prevDefault, prevW, prevF := slog.Default(), log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	t.Cleanup(func() {
+		slog.SetDefault(prevDefault)
+		log.SetOutput(prevW)
+		log.SetFlags(prevF)
+	})
+	return &buf
+}
+
+func TestSlogDefaultHandlerForgesMessageWithoutSetDefault(t *testing.T) {
+	// Positive control: proves the hazard that TestSetDefaultEscapesMessages removes.
+	buf := captureStdlibLog(t)
+	require.Equal(t, "*slog.defaultHandler", fmt.Sprintf("%T", slog.Default().Handler()))
+	slog.Info(forgedMessage)
+
+	assert.Contains(t, buf.String(), "\n2026/09/24 12:00:00 ERROR FORGED",
+		"the default handler no longer forges; revisit the SetDefault call in cmd/server and the CodeQL query comment")
+}
+
+func TestSetDefaultEscapesMessages(t *testing.T) {
+	captureStdlibLog(t) // restores the slog default and stdlib log state afterwards
+	var buf bytes.Buffer
+	slog.SetDefault(NewWithWriter(&buf).Logger)
+
+	slog.Info(forgedMessage)
+	slog.Default().Warn(forgedMessage)
+	log.Printf("stdlib bridge: %s", forgedMessage)
+
+	out := strings.TrimRight(buf.String(), "\n")
+	assert.Equal(t, 3, strings.Count(out, "\n")+1, "three calls must produce three physical records:\n%s", out)
+	assert.NotContains(t, out, "\n2026/09/24 12:00:00 ERROR FORGED")
 }
