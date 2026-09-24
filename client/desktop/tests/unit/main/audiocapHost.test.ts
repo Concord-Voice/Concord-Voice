@@ -1064,6 +1064,36 @@ describe('graceful stop (#3198 PR 3)', () => {
     }
   });
 
+  // One Stop-sharing click sends `audiocap:stop` twice (the renderer's
+  // `stopScreenAudioHost` sits on several teardowns). Measured during #3394's T0: the
+  // second stop drained the first stop's child 16 ms in, inside `addon.stop()`, so no
+  // graceful stop ever wrote its liveness line.
+  it('a redundant stop leaves the quiescing child to its own reap timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const { startAudiocapHost, setAudiocapPortSink, stopAudiocapHost } = await loadHost();
+      const child = makeChild();
+      fork.mockReturnValue(child);
+      setAudiocapPortSink(vi.fn());
+
+      const started = startAudiocapHost(1, 42);
+      child.handlers.message(validHello());
+      child.handlers.message(STARTED);
+      await started;
+      child.kill.mockClear();
+
+      stopAudiocapHost();
+      stopAudiocapHost();
+      expect(child.kill).not.toHaveBeenCalled();
+
+      // The timer still owns the reap: redundancy defers nothing past the window.
+      vi.advanceTimersByTime(200);
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a supersede drains a still-quiescing child rather than letting two taps overlap', async () => {
     vi.useFakeTimers();
     try {

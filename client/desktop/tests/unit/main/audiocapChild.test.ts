@@ -573,6 +573,33 @@ describe('audiocap child start-failure unwind', () => {
     expect(c.posted.filter((m) => (m as { kind?: string }).kind === 'fault')).toHaveLength(0);
   });
 
+  // The host echoes ONLY the child's stderr in an unpackaged build and drains
+  // stdout unread (audiocapHost.ts). In Node, console.debug/log/info write to
+  // stdout and console.warn/error to stderr, so the METHOD is the stream. The
+  // line shipped on console.debug and reached nobody — found by running T0
+  // (#3394) and reading an empty log where the liveness line should have been.
+  it('writes the liveness line on a stderr-bound console method, the only stream the host echoes', async () => {
+    const stdoutBound = [
+      vi.spyOn(console, 'debug').mockImplementation(() => {}),
+      vi.spyOn(console, 'log').mockImplementation(() => {}),
+      vi.spyOn(console, 'info').mockImplementation(() => {}),
+    ];
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const c = await startChild(() => ({ ok: true }));
+      c.sendStop();
+      expect(warn).toHaveBeenCalledWith(
+        '[audiocap] liveness',
+        expect.objectContaining({ callbackTotal: 0, poisoned: false })
+      );
+      for (const spy of stdoutBound) {
+        expect(spy).not.toHaveBeenCalledWith('[audiocap] liveness', expect.anything());
+      }
+    } finally {
+      for (const spy of [...stdoutBound, warn]) spy.mockRestore();
+    }
+  });
+
   it.each([
     ['NoTarget', 'target'],
     ['DeviceError', 'start'],

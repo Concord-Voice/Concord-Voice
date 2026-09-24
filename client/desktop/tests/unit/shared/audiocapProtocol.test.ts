@@ -323,7 +323,7 @@ describe('isAudiocapStarted (#3394 PR 1)', () => {
 });
 
 describe('START_ACK_TIMEOUT_MS (#3394 PR 1)', () => {
-  it('is pinned to its current numeric value (T0-pending)', () => {
+  it('is pinned to its T0-measured value', () => {
     // Pinned so a T0-driven change is a deliberate edit to this line too.
     //
     // NOTE (#3394 PR 1, C8): this assertion alone CANNOT distinguish "its own constant"

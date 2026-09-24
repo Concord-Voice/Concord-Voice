@@ -826,7 +826,10 @@ function reportLiveness(addon: AudiocapAddon): void {
   }
   if (!isRecord(snapshot)) return;
   // Counters and booleans only — no key material, no PII, no raw error (C8).
-  console.debug('[audiocap] liveness', {
+  // console.warn, never debug/log/info: those write to STDOUT, which the host
+  // drains unread; it echoes only STDERR. This shipped on console.debug and
+  // reached nobody until T0 (#3394) read the log and found it empty.
+  console.warn('[audiocap] liveness', {
     callbackTotal: snapshot.callbackTotal,
     quantaTotal: snapshot.quantaTotal,
     signalTotal: snapshot.signalTotal,

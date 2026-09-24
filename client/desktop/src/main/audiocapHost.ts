@@ -567,8 +567,15 @@ export function stopAudiocapHost(): void {
   // forfeit exactly the `status()` read the graceful path exists to obtain.
   if (live?.windowHandle === null) return;
 
-  drainStoppingChild();
+  // THE SAME RULE, FOR THE SAME REASON, when there is no session at all. It used to drain
+  // first and return second, so a REDUNDANT stop killed the child the previous stop had just
+  // started quiescing -- and a single Stop-sharing click sends two, because the renderer's
+  // `stopScreenAudioHost` invokes `audiocap:stop` from every teardown it sits on. Measured
+  // (#3394 T0): stop at t, second stop and `reapChild` at t+16 ms, inside `addon.stop()`, so
+  // the liveness line was never written on ANY graceful stop. Draining belongs only to the
+  // case below, where a new live session needs the single `stopping` slot the old child holds.
   if (!live) return;
+  drainStoppingChild();
 
   // Detach first, for the same reason `retire` forgets before it kills: once `session`
   // is null a late `exit` finds `session !== live` and does nothing.

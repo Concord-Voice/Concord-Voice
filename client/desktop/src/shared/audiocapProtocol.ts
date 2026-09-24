@@ -73,12 +73,13 @@ export const HANDSHAKE_TIMEOUT_MS = 10000;
 /**
  * How long main waits between posting `start` and hearing `started` (#3394).
  * SEPARATE from HANDSHAKE_TIMEOUT_MS because it bounds a different thing: tap creation,
- * which on a first run may sit behind a macOS TCC prompt.
+ * which on a first run was expected to sit behind a macOS TCC prompt.
  *
- * 10000 is an INITIAL value, not a measured one. It is pending the T0 measurement recorded
- * in ADR-0043 § As-built addendum — #3394 PR 1, which sets it to the measured worst case
- * ×1.5, capped at 30 s. Nothing has measured it yet; do not cite this number as evidence
- * of how long tap creation takes.
+ * T0 MEASURED IT (2026-09-23, macOS 26.6.2, dev Electron, audio grant reset): `start` to a
+ * live share took 1-2 s and NO prompt appeared -- tap creation does not wait on the user,
+ * so an ungranted tap starts at once and delivers silence. 10000 is therefore ~5x the
+ * measured value, not a guess. Not measured: a Developer-ID-signed packaged build, whose
+ * TCC path may differ. See ADR-0043 § As-built addendum — #3394 PR 1.
  */
 export const START_ACK_TIMEOUT_MS = 10000;
 
