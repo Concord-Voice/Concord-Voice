@@ -3,6 +3,7 @@ import {
   SCREEN_RES_DIMS,
   resolveScreenDims,
   highestFreeScreenResolution,
+  largestDisplayDims,
 } from '@/renderer/utils/ui/screenResolution';
 
 describe('#2163 screenResolution', () => {
@@ -40,6 +41,38 @@ describe('#2163 screenResolution', () => {
     });
     it('floors to 720p below the smallest preset', () => {
       expect(highestFreeScreenResolution(500)).toBe('720p');
+    });
+  });
+
+  describe('largestDisplayDims', () => {
+    it('returns null for an empty report', () => {
+      expect(largestDisplayDims([])).toBeNull();
+    });
+    it('returns the largest-area display', () => {
+      expect(
+        largestDisplayDims([
+          { width: 1920, height: 1080 },
+          { width: 3440, height: 1440 },
+          { width: 2560, height: 1440 },
+        ])
+      ).toEqual({ w: 3440, h: 1440 });
+    });
+    it.each([
+      ['0-sized', { width: 0, height: 0 }],
+      ['0-height', { width: 3840, height: 0 }],
+      ['negative', { width: -1920, height: -1080 }],
+      ['NaN', { width: Number.NaN, height: Number.NaN }],
+    ])('returns null when the only display is malformed (%s)', (_label, d) => {
+      expect(largestDisplayDims([d])).toBeNull();
+    });
+    it('skips a malformed display, even when it is listed first', () => {
+      expect(
+        largestDisplayDims([
+          { width: Number.NaN, height: Number.NaN },
+          { width: 0, height: 0 },
+          { width: 1920, height: 1080 },
+        ])
+      ).toEqual({ w: 1920, h: 1080 });
     });
   });
 });

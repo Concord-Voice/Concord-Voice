@@ -265,8 +265,11 @@ describe('VideoConfigSection — L6 native-exceeds guard', () => {
     await waitFor(() =>
       expect(document.querySelector('.settings-native-exceeds-note')).toBeInTheDocument()
     );
-    expect(document.querySelector('.settings-native-exceeds-note')?.textContent).toContain(
-      'Your device supports more'
+    // Exact text: the note once rendered a literal "—" because JSX text does not
+    // process string escapes, and a substring check on "Your device supports more"
+    // passed straight through it.
+    expect(document.querySelector('.settings-native-exceeds-note')?.textContent).toBe(
+      'Your device supports more — unlock with Premium'
     );
   });
 
@@ -602,5 +605,216 @@ describe('VideoConfigSection — L5 manual CAMERA bitrate clamp', () => {
     const slider = document.querySelector('.settings-volume-slider') as HTMLInputElement;
     expect(slider.max).toBe('6');
     expect(document.querySelector('.settings-bitrate-ghost-zone')).not.toBeInTheDocument();
+  });
+});
+
+// ─── Settings Native gate (regression: free users defaulted to the Premium-gated Source Native, reported 2026-09-23) ─
+//
+// Oracle: for a hydrated FREE user whose largest display is taller than the stream
+// height cap (1080), the Resolution select never holds or sends 'source' -- Native
+// is present, labelled Premium, and DISABLED, and the selection is '1080p'. The
+// selection is derived, never persisted, so an upgrade restores Native on its own.
+// At-cap, premium and pre-hydrate displays keep Native enabled and selected; those
+// controls first wait for an option only loaded display info renders, because
+// 'source' is already the value while displays load.
+describe('VideoConfigSection — Settings Native gate', () => {
+  const nativeOption = (): HTMLOptionElement =>
+    Array.from(screenResolutionSelect().options).find((o) => o.value === 'source')!;
+  const resolutionHint = () => screen.getByText(/Default capture resolution for screen sharing/);
+  const exceedsNote = () => document.querySelector('.settings-native-exceeds-note');
+  const displayOption = (label: string) =>
+    Array.from(screenResolutionSelect().options).find((o) => o.textContent === label);
+
+  it('free + 4K (default display): select resolves to 1080p, Native disabled+Premium, hint drops "Currently Native", nothing persisted', async () => {
+    render(<VideoConfigSection />);
+    openDetails();
+
+    // select value: the default fixture's display (3840x2160) exceeds the free
+    // 1080 cap, so the resolved selection must be '1080p', never the raw 'source'.
+    await waitFor(() => expect(screenResolutionSelect().value).toBe('1080p'));
+    // Native must be disabled for free over-cap, and labelled Premium.
+    expect(nativeOption().disabled).toBe(true);
+    expect(nativeOption().textContent).toContain('Premium');
+    // The hint describes what is actually captured. Asserting it pins the derived value:
+    // select.value alone could come from React's first-enabled-option fallback.
+    expect(resolutionHint().textContent).toContain('Currently 1080p.');
+    // Nothing persisted: the derived override must not write back into the draft.
+    expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith(
+      'screenResolution',
+      expect.anything()
+    );
+  });
+
+  it('free + 3440x1440 ultrawide: fps options follow the resolved 1080p (30 offered), not the 22fps source budget', async () => {
+    // 'source' on 3440x1440 clamps to 2580x1080 (22fps budget, so 30/24 are withheld);
+    // the resolved selection is 1080p, which admits 30. The fps list must describe
+    // the resolution that will actually be captured.
+    globalThis.electron = {
+      getDisplayInfo: vi
+        .fn()
+        .mockResolvedValue([
+          { width: 3440, height: 1440, refreshRate: 60, scaleFactor: 1, isPrimary: true },
+        ]),
+    } as unknown as typeof globalThis.electron;
+    render(<VideoConfigSection />);
+    openDetails();
+
+    await waitFor(() => expect(screenResolutionSelect().value).toBe('1080p'));
+    expect(screen.getByRole('option', { name: '30 FPS' })).toBeInTheDocument();
+  });
+
+  it('free + 4K: the bitrate estimate describes the resolved 1080p capture, not the 4K display', async () => {
+    videoAdvancedMode = true; // the estimate lives in the advanced Bandwidth section
+    mockDraft({ screenFrameRate: 30 }); // fixed fps, so only the resolution moves the estimate
+    render(<VideoConfigSection />);
+    openDetails();
+
+    // Gate on the 4K display having loaded: before it does, the default 1920x1080
+    // display yields the same 4.4 Mbps, so an ungated check would pass vacuously.
+    await waitFor(() => expect(screenResolutionSelect().value).toBe('1080p'));
+    // 1920x1080 x 30fps x 0.07 bpp = 4.4 Mbps; estimating off the raw 4K 'source' gives 17.4.
+    expect(document.querySelector('.settings-estimated-bitrate')?.textContent).toContain(
+      '~4.4 Mbps'
+    );
+  });
+
+  it('control: free + 1920x1080@60 (at cap) -- Native stays enabled, unmarked, and selected', async () => {
+    globalThis.electron = {
+      getDisplayInfo: vi
+        .fn()
+        .mockResolvedValue([
+          { width: 1920, height: 1080, refreshRate: 60, scaleFactor: 1, isPrimary: true },
+        ]),
+    } as unknown as typeof globalThis.electron;
+    render(<VideoConfigSection />);
+    openDetails();
+
+    await waitFor(() => expect(displayOption('1920×1080 (Primary)')).toBeDefined());
+    expect(screenResolutionSelect().value).toBe('source');
+    expect(nativeOption().disabled).toBe(false);
+    expect(nativeOption().textContent).not.toContain('Premium');
+  });
+
+  it('control: premium (native stream caps) + 4K -- Native stays enabled and selected', async () => {
+    setEntitlement({ streamMaxHeight: -1, streamMaxFps: -1, streamMaxPixelRate: -1 });
+    render(<VideoConfigSection />);
+    openDetails();
+
+    await waitFor(() => expect(displayOption('3840×2160 (Primary)')).toBeDefined());
+    expect(screenResolutionSelect().value).toBe('source');
+    expect(nativeOption().disabled).toBe(false);
+  });
+
+  it('free -> premium after mount: Native is restored with no user action, nothing persisted', async () => {
+    const { rerender } = render(<VideoConfigSection />);
+    openDetails();
+    await waitFor(() => expect(screenResolutionSelect().value).toBe('1080p'));
+
+    setEntitlement({ streamMaxHeight: -1, streamMaxFps: -1, streamMaxPixelRate: -1 });
+    rerender(<VideoConfigSection />);
+
+    await waitFor(() => expect(screenResolutionSelect().value).toBe('source'));
+    expect(nativeOption().disabled).toBe(false);
+    expect(mockSetDraftVideoSetting).not.toHaveBeenCalledWith(
+      'screenResolution',
+      expect.anything()
+    );
+  });
+
+  it('control: pre-hydrate + 4K -- fails open, Native stays enabled and selected', async () => {
+    useSubscriptionStore.setState({ hydrated: false, degraded: false });
+    render(<VideoConfigSection />);
+    openDetails();
+
+    await waitFor(() => expect(displayOption('3840×2160 (Primary)')).toBeDefined());
+    expect(screenResolutionSelect().value).toBe('source');
+    expect(nativeOption().disabled).toBe(false);
+  });
+
+  // Unavailable display info must describe the capture path's 4K fallback
+  // (voiceService.resolveCaptureDims, and the picker's sourceDims), which clamps a
+  // free share to 1080p. Settings used to assume a 1080p display here and kept
+  // Native selected -- promising a resolution the share would not deliver.
+  it.each([
+    ['bridge absent', () => ({})],
+    ['IPC rejects', () => ({ getDisplayInfo: vi.fn().mockRejectedValue(new Error('ipc')) })],
+    ['empty display list', () => ({ getDisplayInfo: vi.fn().mockResolvedValue([]) })],
+  ])(
+    'free + display info unavailable (%s): matches the 4K capture fallback -- 1080p, Native disabled',
+    async (_label, bridge) => {
+      globalThis.electron = bridge() as unknown as typeof globalThis.electron;
+      render(<VideoConfigSection />);
+      openDetails();
+
+      await waitFor(() => expect(screenResolutionSelect().value).toBe('1080p'));
+      expect(nativeOption().disabled).toBe(true);
+      expect(resolutionHint().textContent).toContain('Currently 1080p.');
+      // Settings detected no display, so it must not claim this device "supports more".
+      expect(exceedsNote()).toBeNull();
+    }
+  );
+
+  // A 0-sized report is malformed; resolveCaptureDims captures it as 4K, so Settings
+  // must too -- not a 0x0 display that "fits" under the cap and keeps Native selected.
+  // A NaN size is malformed the same way (resolveCaptureDims accepts only w > 0 && h > 0).
+  it.each([
+    {
+      label: '0-sized display: 1080p, Native disabled, no device claim',
+      sizes: [{ width: 0, height: 0 }],
+      expected: '1080p',
+      disabled: true,
+      note: false,
+    },
+    {
+      label: 'NaN-sized display report: 1080p, Native disabled, no device claim',
+      sizes: [{ width: Number.NaN, height: Number.NaN }],
+      expected: '1080p',
+      disabled: true,
+      note: false,
+    },
+    {
+      label: 'control: a 0-sized display beside a real 1080p one -- the real one wins',
+      sizes: [
+        { width: 0, height: 0 },
+        { width: 1920, height: 1080 },
+      ],
+      expected: 'source',
+      disabled: false,
+      // A detected 1080p/60Hz display genuinely exceeds the free 1080p30 tier.
+      note: true,
+      loaded: '1920×1080',
+    },
+  ])('free + $label', async ({ sizes, expected, disabled, note, loaded }) => {
+    globalThis.electron = {
+      getDisplayInfo: vi
+        .fn()
+        .mockResolvedValue(
+          sizes.map((s) => ({ ...s, refreshRate: 60, scaleFactor: 1, isPrimary: false }))
+        ),
+    } as unknown as typeof globalThis.electron;
+    render(<VideoConfigSection />);
+    openDetails();
+
+    // 'source' is already the value while displays load, so a 'source' row must first
+    // see something only loaded display info renders.
+    if (loaded) await waitFor(() => expect(displayOption(loaded)).toBeDefined());
+    await waitFor(() => expect(screenResolutionSelect().value).toBe(expected));
+    expect(nativeOption().disabled).toBe(disabled);
+    expect(resolutionHint().textContent).toContain(
+      expected === 'source' ? 'Currently Native' : `Currently ${expected}.`
+    );
+    expect(exceedsNote() !== null).toBe(note);
+  });
+
+  it('control: free + display info still loading -- fails open, Native stays enabled and selected', async () => {
+    globalThis.electron = {
+      getDisplayInfo: vi.fn(() => new Promise(() => {})), // never settles
+    } as unknown as typeof globalThis.electron;
+    render(<VideoConfigSection />);
+    openDetails();
+    await Promise.resolve();
+
+    expect(screenResolutionSelect().value).toBe('source');
+    expect(nativeOption().disabled).toBe(false);
   });
 });

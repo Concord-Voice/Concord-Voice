@@ -64,6 +64,12 @@ that keeps sending far more than your plan allows.
   key. It now reports that account as failed and carries on with the rest. Accounts whose
   two-factor record is intact are not affected.
 
+- **Screen sharing no longer starts free accounts on a Premium resolution** ([#3436](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3436)) — on a
+  display larger than 1080p, the screen-share picker opened on "Source Native (Premium)" for free
+  accounts and then quietly shared at 1080p. The picker and Settings ▸ Audio & Video now select
+  1080p instead, and show Source Native as a Premium option you cannot select. Upgrading brings
+  Source Native back without changing any setting.
+
 - **Links opened from a picture-in-picture window now open in your browser** ([#3416](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3416)) — a link or pop-up
   started inside a picture-in-picture window could open a new Concord window. Picture-in-picture
   windows now follow the same rule as the main window: secure (`https`) links open in your browser,

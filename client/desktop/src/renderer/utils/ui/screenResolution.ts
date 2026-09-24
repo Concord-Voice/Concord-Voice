@@ -26,6 +26,22 @@ export function resolveScreenDims(
 }
 
 /**
+ * The largest-area valid display in a getDisplayInfo report, or null when there is
+ * none: an empty report, or one whose every display is malformed (a width or height
+ * that is not > 0, which also rejects NaN). The picker, Settings and the capture path
+ * (voiceService.resolveCaptureDims) all read 'source' through this and fall back to
+ * 4K on null, so they cannot disagree about what counts as a real display.
+ */
+export function largestDisplayDims(
+  displays: readonly { width: number; height: number }[]
+): { w: number; h: number } | null {
+  const valid = displays.filter((d) => d.width > 0 && d.height > 0);
+  if (valid.length === 0) return null;
+  const best = valid.reduce((b, d) => (d.width * d.height > b.width * b.height ? d : b), valid[0]);
+  return { w: best.width, h: best.height };
+}
+
+/**
  * Highest fixed screen-share resolution whose height fits the ceiling (#2163).
  * Native/Infinity → '4K' (largest). Below 720p → '720p' (floor fallback).
  */

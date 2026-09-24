@@ -39,7 +39,11 @@ import {
   shouldEnforceForSubscription,
   type VideoAxisLimit,
 } from '../../utils/policy/videoLimits';
-import { SCREEN_RES_DIMS } from '../../utils/ui/screenResolution';
+import {
+  SCREEN_RES_DIMS,
+  highestFreeScreenResolution,
+  largestDisplayDims,
+} from '../../utils/ui/screenResolution';
 import PremiumChip from '../common/PremiumChip';
 import ToggleSwitch from './ToggleSwitch';
 import CollapsibleSection from './CollapsibleSection';
@@ -618,7 +622,14 @@ function buildResolutionOptions(args: {
   const offer4K = bestDisplayHeight >= 2160 && clampedHeight >= 2160;
   const offer1440 = bestDisplayHeight >= 1440 && clampedHeight >= 1440;
   return [
-    { value: 'source', label: 'Native', group: 'Common Resolutions' },
+    // Mirrors the picker's Source Native: a display taller than the cap is a Premium
+    // capture, so Native is marked and disabled (the select shows 1080p instead).
+    {
+      value: 'source',
+      label: bestDisplayHeight > clampedHeight ? 'Native \u{1F512} Premium' : 'Native',
+      group: 'Common Resolutions',
+      disabled: bestDisplayHeight > clampedHeight,
+    },
     ...(offer4K ? [{ value: '4K', label: '4K (3840×2160)', group: 'Common Resolutions' }] : []),
     ...(offer1440
       ? [{ value: '1440p', label: '1440p (2560×1440)', group: 'Common Resolutions' }]
@@ -834,40 +845,63 @@ const VideoConfigSection: React.FC = () => {
     }
   }, [preferredVideoCodec, codecCapabilities, hdrEncoding]);
 
+  // null = getDisplayInfo still pending; [] = unavailable (no bridge, rejected, or
+  // empty). The two resolve differently below, exactly as in ScreenSharePicker.
   const [displayInfo, setDisplayInfo] = useState<
-    {
-      width: number;
-      height: number;
-      refreshRate: number;
-      scaleFactor: number;
-      isPrimary: boolean;
-    }[]
-  >([]);
+    | {
+        width: number;
+        height: number;
+        refreshRate: number;
+        scaleFactor: number;
+        isPrimary: boolean;
+      }[]
+    | null
+  >(null);
 
   useEffect(() => {
-    globalThis.electron?.getDisplayInfo?.().then((displays) => {
-      if (displays) setDisplayInfo(displays);
-    });
+    (globalThis.electron?.getDisplayInfo?.() ?? Promise.resolve([]))
+      .then((displays) => setDisplayInfo(displays ?? []))
+      .catch(() => setDisplayInfo([]));
   }, []);
 
-  // Display-derived values for screen share options
+  // Display-derived values for screen share options. detectedDisplay is a display
+  // that was actually reported; null while pending, unavailable or malformed. The
+  // "your device supports more" claim reads it, never the 4K fallback below.
+  const detectedDisplay = useMemo(
+    () => (displayInfo === null ? null : largestDisplayDims(displayInfo)),
+    [displayInfo]
+  );
   const bestDisplay = useMemo(() => {
-    if (displayInfo.length === 0) return { width: 1920, height: 1080, refreshRate: 60 };
-    return displayInfo.reduce(
-      (best, d) => (d.width * d.height > best.width * best.height ? d : best),
-      displayInfo[0]
-    );
-  }, [displayInfo]);
+    // Pending: a 1080 display never exceeds the cap, so the Native gate fails open.
+    if (displayInfo === null) return { width: 1920, height: 1080 };
+    // Unavailable or malformed: the capture path (resolveCaptureDims) and the picker
+    // assume 4K, so describe what a share will actually do -- for a free user, 1080p.
+    const dims = detectedDisplay ?? SCREEN_RES_DIMS['4K'];
+    return { width: dims.w, height: dims.h };
+  }, [displayInfo, detectedDisplay]);
+
+  // The resolution a share will actually run at -- the same derivation as the picker's
+  // effectiveResolution, so the two surfaces cannot disagree. 'source' on a display
+  // taller than the stream axis is a Premium capture (produce clamps it), so the select,
+  // hint, fps ceiling and bitrate recommendation describe the highest entitled fixed
+  // resolution instead. Derived, never written to the draft: an upgrade restores Native.
+  // Fails open with effectiveStream (pre-hydrate, degraded premium) and while displays
+  // load (bestDisplay is 1080 while pending, which never exceeds the cap).
+  const effectiveScreenResolution =
+    screenResolution === 'source' && bestDisplay.height > effectiveStream.height
+      ? highestFreeScreenResolution(effectiveStream.height)
+      : screenResolution;
 
   const maxRefreshRate = useMemo(() => {
-    if (displayInfo.length === 0) return 60;
+    if (!displayInfo?.length) return 60;
     return Math.round(Math.max(...displayInfo.map((d) => d.refreshRate || 60)));
   }, [displayInfo]);
 
   // Unique display resolutions for the "Your Displays" optgroup
   const uniqueDisplayResolutions = useMemo(() => {
     const seen = new Set<string>();
-    return displayInfo
+    return (displayInfo ?? [])
+      .filter((d) => d.width > 0 && d.height > 0)
       .map((d) => ({ width: d.width, height: d.height, isPrimary: d.isPrimary }))
       .filter((d) => {
         const key = `${d.width}x${d.height}`;
@@ -882,7 +916,7 @@ const VideoConfigSection: React.FC = () => {
   // The estimation logic lives in pure module helpers; this memo only wires the
   // current draft state into them (keeps the component's cognitive complexity low).
   const recommendedBitrate = useMemo(() => {
-    const res = resolveScreenResolution(screenResolution, bestDisplay);
+    const res = resolveScreenResolution(effectiveScreenResolution, bestDisplay);
     const effectiveFps = screenFrameRate === 0 ? maxRefreshRate : screenFrameRate;
     return computeRecommendedBitrate({
       res,
@@ -891,7 +925,7 @@ const VideoConfigSection: React.FC = () => {
       targetCodec: targetCodecKey,
     });
   }, [
-    screenResolution,
+    effectiveScreenResolution,
     screenFrameRate,
     activeScreenCodec,
     targetCodecKey,
@@ -943,8 +977,8 @@ const VideoConfigSection: React.FC = () => {
     [effectiveStream]
   );
   const streamFpsCeiling = useMemo(
-    () => streamFpsCeilingFor(resolveScreenResolution(screenResolution, bestDisplay)),
-    [streamFpsCeilingFor, screenResolution, bestDisplay]
+    () => streamFpsCeilingFor(resolveScreenResolution(effectiveScreenResolution, bestDisplay)),
+    [streamFpsCeilingFor, effectiveScreenResolution, bestDisplay]
   );
 
   // ── L6: device-derived resolution / frame-rate native-exceeds guard ─────
@@ -1151,15 +1185,15 @@ const VideoConfigSection: React.FC = () => {
         <div className="settings-row-info">
           <span className="settings-row-label">Resolution</span>
           <span className="settings-row-hint">
-            {screenResolution === 'source'
+            {effectiveScreenResolution === 'source'
               ? "Default capture resolution for screen sharing. Currently Native \u2014 captures at your display's full resolution."
-              : `Default capture resolution for screen sharing. Currently ${screenResolution}.`}
+              : `Default capture resolution for screen sharing. Currently ${effectiveScreenResolution}.`}
           </span>
-          {nativeGuard.exceeds && (
+          {nativeGuard.exceeds && detectedDisplay !== null && (
             <span className="settings-row-premium-note">
               <PremiumChip label="your device supports more" />
               <span className="settings-native-exceeds-note">
-                Your device supports more \u2014 unlock with Premium
+                Your device supports more — unlock with Premium
               </span>
             </span>
           )}
@@ -1176,7 +1210,7 @@ const VideoConfigSection: React.FC = () => {
             clampedHeight: nativeGuard.clampedHeight,
             uniqueDisplayResolutions,
           })}
-          value={screenResolution}
+          value={effectiveScreenResolution}
           onChange={handleScreenResolutionChange}
         />
       </div>

@@ -10,7 +10,12 @@ import { getFocusable } from '../ui/Modal';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { useSubscriptionStore } from '../../stores/auth/subscriptionStore';
 import { effectiveStreamAxis, clampScreenCapture } from '../../utils/policy/videoLimits';
-import { resolveScreenDims } from '../../utils/ui/screenResolution';
+import {
+  SCREEN_RES_DIMS,
+  resolveScreenDims,
+  highestFreeScreenResolution,
+  largestDisplayDims,
+} from '../../utils/ui/screenResolution';
 import {
   canCarryScreenAudio,
   verdictOffersAudio,
@@ -458,16 +463,39 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
       .catch(() => setDisplayInfo([]));
   }, []);
 
-  // 'source' resolves to the largest display (matches produceScreen's
-  // resolveCaptureDims); 4K fallback when display info is unavailable.
-  const sourceDims = useMemo(() => {
-    if (!displayInfo || displayInfo.length === 0) return { w: 3840, h: 2160 };
-    const best = displayInfo.reduce(
-      (b, d) => (d.width * d.height > b.width * b.height ? d : b),
-      displayInfo[0]
-    );
-    return { w: best.width, h: best.height };
-  }, [displayInfo]);
+  // 'source' resolves to the largest valid display, through the same helper as
+  // produceScreen's resolveCaptureDims; 4K when there is none (pending, unavailable or
+  // malformed -- pending is failed open separately via displayInfo === null below).
+  const sourceDims = useMemo(
+    () => largestDisplayDims(displayInfo ?? []) ?? { ...SCREEN_RES_DIMS['4K'] },
+    [displayInfo]
+  );
+
+  // 'Source Native' promises the display's full resolution, but for a free user on an
+  // above-cap display produceScreen clamps the capture height down (e.g. 4K/1440p to
+  // 1080p). Uses the SAME effectiveStreamAxis as the fps tiering, so it fails OPEN
+  // pre-hydrate or for a degraded premium (streamLimit height Infinity) and while the
+  // real source dims are still loading (displayInfo === null).
+  const sourceIsClamped = useMemo(
+    () =>
+      displayInfo !== null &&
+      clampScreenCapture(sourceDims.w, sourceDims.h, streamLimit.fps, streamLimit).height <
+        sourceDims.h,
+    [displayInfo, sourceDims, streamLimit]
+  );
+  // What the share will actually run at. #2172 made the gate display-only -- Source
+  // Native stayed selected with a Premium marker while produce clamped underneath -- so
+  // a free user's first-run default ('source') opened on a Premium option. A clamped
+  // 'source' now resolves to the highest entitled fixed resolution, and the option is
+  // disabled below. DERIVED, never written back: it re-resolves on its own when hydrate
+  // or getDisplayInfo flips sourceIsClamped after mount, and the stored preference keeps
+  // 'source', so an upgrade restores Native with no user action. Mirrors Settings.
+  // ponytail: highestFreeScreenResolution can return '1440p'/'4K' for a cap between
+  // tiers; no such tier exists (free 1080 / premium Infinity) -- add those options then.
+  const effectiveResolution =
+    resolution === 'source' && sourceIsClamped
+      ? highestFreeScreenResolution(streamLimit.height)
+      : resolution;
 
   // Highest fps a resolution can actually deliver under the stream entitlement
   // (tiered pixel-rate). Premium/native returns Infinity (no marking, no snap).
@@ -484,7 +512,10 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
     },
     [sourceDims, streamLimit, displayInfo]
   );
-  const fpsCeiling = useMemo(() => fpsCeilingFor(resolution), [fpsCeilingFor, resolution]);
+  const fpsCeiling = useMemo(
+    () => fpsCeilingFor(effectiveResolution),
+    [fpsCeilingFor, effectiveResolution]
+  );
   // Clamp the transient fps to the tiered ceiling — but do NOT snap it down to a
   // listed option. This value flows into produceScreen (handleConfirm), which is the
   // AUTHORITATIVE entitlement clamp; snapping here to the {5,15,30,60} option list
@@ -507,26 +538,16 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
     return base;
   }, [fpsCeiling, effectiveFrameRate]);
 
-  // #2172: 'Source Native' promises the display's full resolution, but for a free user on
-  // an above-cap display produceScreen clamps the capture height down (e.g. 4K/1440p to
-  // 1080p), so the shared video is not native. Mark the option Premium in that case so the
-  // label matches what capture produces, mirroring the Settings native-exceeds gate. Uses
-  // the SAME effectiveStreamAxis as the fps tiering, so it fails OPEN pre-hydrate or for a
-  // degraded premium (streamLimit height Infinity, no clamp, no marker) and while the real
-  // source dims are still loading (displayInfo === null). Display-only: 'source' is still
-  // sent unchanged and the produce boundary stays authoritative (no resolution snap-down).
-  const sourceIsClamped = useMemo(
-    () =>
-      displayInfo !== null &&
-      clampScreenCapture(sourceDims.w, sourceDims.h, streamLimit.fps, streamLimit).height <
-        sourceDims.h,
-    [displayInfo, sourceDims, streamLimit]
-  );
+  // A clamped Source Native is marked Premium AND disabled, mirroring Settings' Native.
+  // Native `disabled`, not aria-disabled + a guard: the focusable control is the <select>,
+  // which stays in the tab order; the option is still listed and announced unavailable,
+  // and native disabled -- unlike aria-disabled on an <option> -- actually blocks the pick.
   const resolutionOptions = useMemo(
     () => [
       {
         value: 'source',
         label: sourceIsClamped ? 'Source Native \u{1F512} Premium' : 'Source Native',
+        disabled: sourceIsClamped,
       },
       { value: '1080p', label: '1080p' },
       { value: '720p', label: '720p' },
@@ -586,7 +607,7 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
     // an audio-capable target, so a window share does not rewrite the user's preference.
     if (audioCapable) setSavedStreamAudio(streamAudio);
     onSelect(selected, {
-      resolution,
+      resolution: effectiveResolution,
       frameRate: effectiveFrameRate,
       contentType,
       streamAudio: audioCapable && streamAudio,
@@ -720,10 +741,10 @@ const ScreenSharePicker: React.FC<ScreenSharePickerProps> = ({
             <CustomSelect
               id="screen-resolution"
               className="screen-picker__quality-select"
-              // #2172: 'Source Native' carries a Premium marker when the display exceeds
-              // the tiered height cap (capture clamps below native); see resolutionOptions.
+              // A free user on an above-cap display gets Source Native disabled and the
+              // highest entitled resolution selected; see effectiveResolution.
               options={resolutionOptions}
-              value={resolution}
+              value={effectiveResolution}
               onChange={handleScreenResolutionChange}
             />
           </div>

@@ -129,7 +129,11 @@ import {
   effectiveCameraSpatialCap,
   resolveSessionCameraCap,
 } from '../../utils/policy/videoLimits';
-import { SCREEN_RES_DIMS, resolveScreenDims } from '../../utils/ui/screenResolution';
+import {
+  SCREEN_RES_DIMS,
+  resolveScreenDims,
+  largestDisplayDims,
+} from '../../utils/ui/screenResolution';
 import {
   canCarryScreenAudio,
   verdictOffersAudio,
@@ -4214,20 +4218,11 @@ class VoiceService {
     if (resolution === 'source') {
       try {
         const displays = (await globalThis.electron?.getDisplayInfo?.()) ?? [];
-        if (displays.length > 0) {
-          // Seed reduce with displays[0]; never reduce an array without an initial
-          // value (throws on empty, and keeps the SonarQube reduce-init gate clean).
-          const best = displays.reduce(
-            (a, d) => (d.width * d.height > a.width * a.height ? d : a),
-            displays[0]
-          );
-          // Guard against a 0-sized / malformed display report (Gitar review #2172):
-          // a {0,0} source would feed resolveScreenDims → clampScreenToEntitlement a
-          // 0-pixel target, which trivially admits any fps. Fall back to 4K instead.
-          if (best.width > 0 && best.height > 0) {
-            sourceDims = { w: best.width, h: best.height };
-          }
-        }
+        // largestDisplayDims skips 0-sized / malformed reports (Gitar review #2172): a
+        // {0,0} source would feed resolveScreenDims → clampScreenToEntitlement a 0-pixel
+        // target, which trivially admits any fps. None valid keeps the 4K fallback. The
+        // picker and Settings read 'source' through the same helper.
+        sourceDims = largestDisplayDims(displays) ?? sourceDims;
       } catch (err) {
         // A rejected getDisplayInfo IPC must degrade to the conservative 4K
         // fallback, NOT propagate out of produceScreen (Gitar review #2172): this

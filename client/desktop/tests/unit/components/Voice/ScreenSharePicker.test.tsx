@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, fireEvent, waitFor } from '../../../test-utils';
+import { render, screen, fireEvent, waitFor, act } from '../../../test-utils';
 import { useVideoSettingsStore } from '@/renderer/stores/voice/videoSettingsStore';
 import { useSubscriptionStore, FREE_ENTITLEMENT } from '@/renderer/stores/auth/subscriptionStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
@@ -7,7 +7,9 @@ import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 
 vi.mock('@/renderer/components/Voice/ScreenSharePicker.css', () => ({}));
 
-// Mock CustomSelect to simplify testing
+// Mock CustomSelect to simplify testing. `disabled` is passed through to the
+// rendered <option> -- without this every disabled-option assertion below is
+// vacuous, since the mock would silently drop the very prop being asserted on.
 vi.mock('@/renderer/components/ui/CustomSelect', () => ({
   default: ({
     value,
@@ -17,12 +19,12 @@ vi.mock('@/renderer/components/ui/CustomSelect', () => ({
   }: {
     value: string;
     onChange: (v: string) => void;
-    options: { value: string; label: string }[];
+    options: { value: string; label: string; disabled?: boolean }[];
     id?: string;
   }) => (
     <select data-testid={id} value={value} onChange={(e) => onChange(e.target.value)}>
       {options.map((o) => (
-        <option key={o.value} value={o.value}>
+        <option key={o.value} value={o.value} disabled={o.disabled}>
           {o.label}
         </option>
       ))}
@@ -544,20 +546,26 @@ describe('ScreenSharePicker', () => {
       );
     });
 
-    it('free ultrawide source injects the deliverable fps as its own option (no blank control, no snap-down)', async () => {
+    it('free 2560x1080 ultrawide source injects the deliverable fps as its own option (no blank control, no snap-down)', async () => {
+      // Re-fixtured from a 3440x1440 display (post-fix, 1440 > the 1080 cap, so
+      // 'source' resolves to 1080p/30 and this test would lose its purpose: pinning
+      // the injection of a non-listed fps with 'source' retained). 2560x1080's
+      // height (1080) fits the free cap exactly, so 'source' stays unclamped both
+      // before and after the fix. Its pixel-rate ceiling is
+      // floor(62_208_000 / (2560*1080)) = 22fps -- verified by running this test.
       (globalThis as Record<string, unknown>).electron = {
         ...(globalThis.electron || {}),
         getDesktopSources: vi.fn().mockResolvedValue(mockSources),
-        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3440, height: 1440 }]),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 2560, height: 1080 }]),
       };
       useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 60 });
       render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
       await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
 
-      // 3440x1440 'source' clamps to 2580x1080 => 22fps, the actual deliverable ceiling.
-      // 22 is not a discrete choice, so it is injected as its own option and the value
-      // holds it — the shown/captured fps equals what produce delivers (22), NOT a
-      // snapped-down 15 that would under-deliver (#2172).
+      // 2560x1080 'source' is unclamped (height fits the cap) => 22fps, the actual
+      // deliverable ceiling. 22 is not a discrete choice, so it is injected as its
+      // own option and the value holds it — the shown/captured fps equals what
+      // produce delivers (22), NOT a snapped-down 15 that would under-deliver (#2172).
       const fpsSelect = screen.getByTestId('screen-framerate') as HTMLSelectElement;
       await waitFor(() => expect(fpsSelect.value).toBe('22'));
       expect(fpsSelect.selectedIndex).toBeGreaterThanOrEqual(0);
@@ -566,7 +574,7 @@ describe('ScreenSharePicker', () => {
       fireEvent.click(screen.getByText('Share'));
       expect(mockOnSelect).toHaveBeenCalledWith(
         'screen:0',
-        expect.objectContaining({ frameRate: 22 })
+        expect.objectContaining({ resolution: 'source', frameRate: 22 })
       );
     });
 
@@ -729,13 +737,16 @@ describe('ScreenSharePicker', () => {
       );
     });
 
-    it('free over-cap display marks Source Native Premium but still sends resolution:source (#2172 Codex)', async () => {
+    // Inverted (regression: free users defaulted to the Premium-gated Source Native,
+    // reported 2026-09-23): this pinned the OLD display-only contract, where Source
+    // Native stayed selectable/selected while merely relabeled Premium and the
+    // capture still silently clamped underneath it. The fix disables the option and
+    // resolves the sent value to match what capture actually produces.
+    it('free over-cap display marks Source Native Premium, disables it, and sends resolution:1080p', async () => {
       // A free user on a 1440p display leaving the picker at Source Native: produceScreen
-      // clamps the capture to 1080p, so the label must not promise Native. Mark it Premium
-      // to match what capture produces, but keep sending 'source' (display-only, the
-      // produce boundary stays authoritative). resetAllStores does NOT reset the
-      // subscription store, so pin the free entitlement (a prior test may have left it
-      // premium/native).
+      // clamps the capture to 1080p, so the option must neither promise Native nor stay
+      // selectable. resetAllStores does NOT reset the subscription store, so pin the free
+      // entitlement (a prior test may have left it premium/native).
       useSubscriptionStore.setState({ entitlement: FREE_ENTITLEMENT });
       (globalThis as Record<string, unknown>).electron = {
         ...(globalThis.electron || {}),
@@ -746,16 +757,18 @@ describe('ScreenSharePicker', () => {
       render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
       await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
 
-      await waitFor(() =>
-        expect(screen.getByRole('option', { name: /Source Native/ }).textContent).toContain(
-          'Premium'
-        )
-      );
+      const sourceOption = () =>
+        screen.getByRole('option', { name: /Source Native/ }) as HTMLOptionElement;
+      await waitFor(() => expect(sourceOption().textContent).toContain('Premium'));
+      // Source Native must be disabled for free over-cap.
+      expect(sourceOption().disabled).toBe(true);
+
       fireEvent.click(screen.getByText('Entire Screen'));
       fireEvent.click(screen.getByText('Share'));
+      // onSelect resolution: must resolve to '1080p', never the raw 'source'.
       expect(mockOnSelect).toHaveBeenCalledWith(
         'screen:0',
-        expect.objectContaining({ resolution: 'source' })
+        expect.objectContaining({ resolution: '1080p' })
       );
     });
 
@@ -816,6 +829,465 @@ describe('ScreenSharePicker', () => {
       expect(screen.getByRole('option', { name: /Source Native/ }).textContent).not.toContain(
         'Premium'
       );
+    });
+  });
+
+  // ─── free-tier Source Native gate ────────────────────────────────────────
+  // regression: free users defaulted to the Premium-gated Source Native (reported 2026-09-23)
+  //
+  // Oracle: for a hydrated FREE user whose largest display is taller than the stream
+  // height cap (1080), the Resolution control never holds or sends 'source' -- Source
+  // Native is present, labelled Premium, and DISABLED, and the selection is '1080p'.
+  // Unavailable or malformed display info counts as 4K, as resolveCaptureDims does.
+  // The selection is derived, never persisted, so an upgrade restores Source Native on
+  // its own. The at/under-cap display, premium, degraded-premium and pre-hydrate cells
+  // (6-9) are controls: Source Native stays enabled and kept.
+  describe('free-tier Source Native gate', () => {
+    const resolutionSelect = () => screen.getByTestId('screen-resolution') as HTMLSelectElement;
+    const sourceOption = () =>
+      Array.from(resolutionSelect().querySelectorAll('option')).find(
+        (o) => (o as HTMLOptionElement).value === 'source'
+      ) as HTMLOptionElement;
+
+    // Cell 1: free + hydrated + 2560x1440 (over-cap), saved 'source'/30fps.
+    it('free hydrated 2560x1440 saved source/30: select value, Source Native disabled+Premium, onSelect resolution+frameRate', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 2560, height: 1440 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      // select value: must resolve to 1080p, never the raw Premium-gated 'source'.
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+      // Source Native must be disabled for free over-cap.
+      expect(sourceOption().disabled).toBe(true);
+      expect(sourceOption().textContent).toContain('Premium');
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      // onSelect resolution + frameRate.
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '1080p', frameRate: 30 })
+      );
+      // Sent, not saved: the stored preference keeps 'source' so an upgrade restores it.
+      expect(useVideoSettingsStore.getState().screenResolution).toBe('source');
+    });
+
+    // Cell 2: free + hydrated + 3840x2160, getDisplayInfo resolves LATE.
+    it('free hydrated 3840x2160 late-resolving display info: fails open before resolve, becomes 1080p/disabled after', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      let resolveDisplayInfo: (v: { width: number; height: number }[]) => void = () => {};
+      const displayInfoPromise = new Promise<{ width: number; height: number }[]>((resolve) => {
+        resolveDisplayInfo = resolve;
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockReturnValue(displayInfoPromise),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      // Before resolve: displayInfo is still null -- fail OPEN. Source Native stays
+      // enabled and selected.
+      expect(resolutionSelect().value).toBe('source');
+      expect(sourceOption().disabled).toBe(false);
+
+      await act(async () => {
+        resolveDisplayInfo([{ width: 3840, height: 2160 }]);
+        await displayInfoPromise;
+      });
+
+      // After resolve: select value becomes 1080p and Source Native is disabled.
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+      expect(sourceOption().disabled).toBe(true);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '1080p' })
+      );
+    });
+
+    // Cell 3: free + 3840x2160 resolved, starting PRE-HYDRATE.
+    it('free 3840x2160 resolved, pre-hydrate: fails open, becomes 1080p/disabled once hydrated', async () => {
+      useSubscriptionStore.setState({
+        hydrated: false,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3840, height: 2160 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('source'));
+      expect(sourceOption().disabled).toBe(false);
+
+      act(() => {
+        useSubscriptionStore.setState({ hydrated: true });
+      });
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+      expect(sourceOption().disabled).toBe(true);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '1080p' })
+      );
+    });
+
+    // Cell 4: frame-rate pairing, free + hydrated + 2560x1440, saved 'source'/60fps.
+    it('free hydrated 2560x1440 saved source/60: sends 1080p/30, then an explicit 720p sends 720p/60', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 2560, height: 1440 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 60 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '1080p', frameRate: 30 })
+      );
+
+      fireEvent.change(resolutionSelect(), { target: { value: '720p' } });
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '720p', frameRate: 60 })
+      );
+    });
+
+    // Cell 5: forcing the select back to 'source' still sends the resolved '1080p'.
+    it('free hydrated 2560x1440: forcing the select to source anyway still sends 1080p', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 2560, height: 1440 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+
+      // A forced selection (bypassing the disabled option) must not survive to Share.
+      fireEvent.change(resolutionSelect(), { target: { value: 'source' } });
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '1080p' })
+      );
+    });
+
+    // Cell 5b: the fps ceiling must follow the resolution actually SENT. A 3440x1440
+    // 'source' clamps to 2580x1080 (22fps budget), but 1080p admits 30 -- tiering fps
+    // off the raw 'source' would send 1080p at 22, under-delivering the free tier.
+    it('free hydrated 3440x1440 saved source/60: fps follows the sent 1080p (30), not the ultrawide source (22)', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3440, height: 1440 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 60 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: '1080p', frameRate: 30 })
+      );
+    });
+
+    // Cell 6 (control): free + hydrated + 1920x1080 (at cap).
+    it('control: free hydrated at-cap 1920x1080 -- Source Native stays enabled and source is sent', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 1920, height: 1080 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('source'));
+      expect(sourceOption().disabled).toBe(false);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: 'source' })
+      );
+    });
+
+    // Cell 7 (control): premium (native stream caps) + 3840x2160.
+    it('control: premium native caps 3840x2160 -- Source Native stays enabled and source is sent', async () => {
+      const ent = useSubscriptionStore.getState().entitlement;
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: { ...ent, streamMaxHeight: -1, streamMaxFps: -1, streamMaxPixelRate: -1 },
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3840, height: 2160 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('source'));
+      expect(sourceOption().disabled).toBe(false);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: 'source' })
+      );
+    });
+
+    // Cell 8 (control): pre-hydrate + 3840x2160 (stays pre-hydrate).
+    it('control: pre-hydrate 3840x2160 -- fails open, Source Native stays enabled, source is sent', async () => {
+      useSubscriptionStore.setState({
+        hydrated: false,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3840, height: 2160 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('source'));
+      expect(sourceOption().disabled).toBe(false);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: 'source' })
+      );
+    });
+
+    // Cell 9 (control): degraded premium + 3840x2160.
+    it('control: degraded premium 3840x2160 -- fails open, Source Native stays enabled, source is kept', async () => {
+      const ent = useSubscriptionStore.getState().entitlement;
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: true,
+        entitlement: {
+          ...ent,
+          tier: 'premium',
+          streamMaxHeight: -1,
+          streamMaxFps: -1,
+          streamMaxPixelRate: -1,
+        },
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3840, height: 2160 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('source'));
+      expect(sourceOption().disabled).toBe(false);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: 'source' })
+      );
+    });
+
+    // A 0-sized display report is malformed, and resolveCaptureDims captures it as 4K
+    // (clamped to 1080p for free). The picker must describe that, not a 0x0 display
+    // that "fits" under the cap and keeps Source Native selected. A NaN size is
+    // malformed the same way (resolveCaptureDims accepts only w > 0 && h > 0).
+    it.each([
+      {
+        label: '0-sized display: resolves to 1080p, Source Native disabled',
+        displays: [{ width: 0, height: 0 }],
+        expected: '1080p',
+        disabled: true,
+      },
+      {
+        label: 'NaN-sized display report: resolves to 1080p, Source Native disabled',
+        displays: [{ width: Number.NaN, height: Number.NaN }],
+        expected: '1080p',
+        disabled: true,
+      },
+      {
+        label:
+          'control: a 0-sized display beside a real 1080p one -- the real one wins, source kept',
+        displays: [
+          { width: 0, height: 0 },
+          { width: 1920, height: 1080 },
+        ],
+        expected: 'source',
+        disabled: false,
+        // 'source' is already the value while displays load; the 1080p display's
+        // 30fps tier marks 60 FPS Premium only once it has loaded.
+        loaded: true,
+      },
+    ])('free hydrated, $label', async ({ displays, expected, disabled, loaded }) => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue(displays),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+      if (loaded) {
+        const framerate = () => screen.getByTestId('screen-framerate') as HTMLSelectElement;
+        await waitFor(() =>
+          expect(
+            Array.from(framerate().options).some(
+              (o) => o.textContent === '60 FPS \u{1F512} Premium'
+            )
+          ).toBe(true)
+        );
+      }
+      await waitFor(() => expect(resolutionSelect().value).toBe(expected));
+      expect(sourceOption().disabled).toBe(disabled);
+
+      fireEvent.click(screen.getByText('Entire Screen'));
+      fireEvent.click(screen.getByText('Share'));
+      expect(mockOnSelect).toHaveBeenCalledWith(
+        'screen:0',
+        expect.objectContaining({ resolution: expected })
+      );
+    });
+
+    // Unavailable display info is not pending: it counts as the 4K capture fallback.
+    it.each([
+      ['bridge absent', () => ({})],
+      ['IPC rejects', () => ({ getDisplayInfo: vi.fn().mockRejectedValue(new Error('ipc')) })],
+      ['empty display list', () => ({ getDisplayInfo: vi.fn().mockResolvedValue([]) })],
+    ])(
+      'free hydrated, display info unavailable (%s): resolves to 1080p, Source Native disabled, sends 1080p',
+      async (_label, bridge) => {
+        useSubscriptionStore.setState({
+          hydrated: true,
+          degraded: false,
+          entitlement: FREE_ENTITLEMENT,
+        });
+        (globalThis as Record<string, unknown>).electron = {
+          getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+          ...bridge(),
+        };
+        useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+        render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+        await waitFor(() => expect(screen.getByText('Entire Screen')).toBeInTheDocument());
+
+        await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+        expect(sourceOption().disabled).toBe(true);
+
+        fireEvent.click(screen.getByText('Entire Screen'));
+        fireEvent.click(screen.getByText('Share'));
+        expect(mockOnSelect).toHaveBeenCalledWith(
+          'screen:0',
+          expect.objectContaining({ resolution: '1080p' })
+        );
+      }
+    );
+
+    it('free -> premium after mount: Source Native is restored with no user action', async () => {
+      useSubscriptionStore.setState({
+        hydrated: true,
+        degraded: false,
+        entitlement: FREE_ENTITLEMENT,
+      });
+      (globalThis as Record<string, unknown>).electron = {
+        ...(globalThis.electron || {}),
+        getDesktopSources: vi.fn().mockResolvedValue(mockSources),
+        getDisplayInfo: vi.fn().mockResolvedValue([{ width: 3840, height: 2160 }]),
+      };
+      useVideoSettingsStore.setState({ screenResolution: 'source', screenFrameRate: 30 });
+      render(<ScreenSharePicker onSelect={mockOnSelect} onCancel={mockOnCancel} />);
+      await waitFor(() => expect(resolutionSelect().value).toBe('1080p'));
+
+      act(() => {
+        useSubscriptionStore.setState({
+          entitlement: {
+            ...FREE_ENTITLEMENT,
+            tier: 'premium',
+            streamMaxHeight: -1,
+            streamMaxFps: -1,
+            streamMaxPixelRate: -1,
+          },
+        });
+      });
+
+      await waitFor(() => expect(resolutionSelect().value).toBe('source'));
+      expect(sourceOption().disabled).toBe(false);
     });
   });
 
