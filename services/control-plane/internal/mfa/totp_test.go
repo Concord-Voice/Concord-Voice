@@ -1,6 +1,9 @@
 package mfa
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"testing"
@@ -93,6 +96,36 @@ func TestDecryptSecretWrongKey(t *testing.T) {
 	_, err = DecryptSecret(ct, nonce, wrongKey)
 	if err == nil {
 		t.Error("expected error decrypting with wrong key")
+	}
+}
+
+// aes.NewCipher accepts 16- and 24-byte keys, so without their own length
+// checks EncryptSecret would seal under AES-128/192 and DecryptSecret would
+// open it. Other lengths already fail inside aes.NewCipher and pin nothing.
+func TestEncryptDecryptSecretRejectShortAESKeys(t *testing.T) {
+	for _, n := range []int{16, 24} {
+		key := make([]byte, n)
+		if _, _, err := EncryptSecret([]byte("secret"), key); err == nil {
+			t.Errorf("EncryptSecret accepted a %d-byte key", n)
+		}
+
+		// Sealed under this same short key, so only the length check can refuse it.
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			t.Fatalf("aes.NewCipher(%d bytes): %v", n, err)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			t.Fatalf("cipher.NewGCM: %v", err)
+		}
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			t.Fatalf("rand.Read: %v", err)
+		}
+		ct := gcm.Seal(nil, nonce, []byte("secret"), nil)
+		if got, err := DecryptSecret(ct, nonce, key); err == nil {
+			t.Errorf("DecryptSecret opened a %d-byte-key ciphertext: %q", n, got)
+		}
 	}
 }
 
@@ -194,5 +227,26 @@ func TestVerifyBackupCode(t *testing.T) {
 	idx, ok = VerifyBackupCode("XXXXXXXX", hashes, used)
 	if ok {
 		t.Errorf("invalid code matched at index %d", idx)
+	}
+}
+
+// The hash and used arrays are written together, so a used array shorter
+// than the hashes is a damaged row. A code with no used flag must not match:
+// the caller indexes used[i] to spend it.
+func TestVerifyBackupCodeShortUsedArrayFailsClosed(t *testing.T) {
+	codes, hashes, err := GenerateBackupCodes()
+	if err != nil {
+		t.Fatalf("GenerateBackupCodes failed: %v", err)
+	}
+	used := make([]bool, 2)
+
+	if idx, ok := VerifyBackupCode(codes[0], hashes, used); !ok || idx != 0 {
+		t.Fatalf("code with a used flag: idx=%d, ok=%v, want idx=0, ok=true", idx, ok)
+	}
+	if idx, ok := VerifyBackupCode(codes[5], hashes, used); ok {
+		t.Errorf("code %d has no used flag but matched", idx)
+	}
+	if idx, ok := VerifyBackupCode(codes[0], hashes, nil); ok {
+		t.Errorf("nil used array: code %d matched", idx)
 	}
 }

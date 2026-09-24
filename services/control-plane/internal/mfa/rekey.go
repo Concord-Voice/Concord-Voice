@@ -7,7 +7,8 @@ import (
 )
 
 // RekeyFailure records a row the backfill could not re-seal. The row is left
-// untouched (still decryptable by whoever holds its sealing key).
+// untouched: restoring its sealing key recovers it, unless the row itself is
+// damaged, in which case no key does.
 type RekeyFailure struct {
 	UserID        string
 	SealedVersion int

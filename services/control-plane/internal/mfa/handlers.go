@@ -188,7 +188,7 @@ func (h *Handler) verifyCodeMatchedMethod(ctx context.Context, store codeVerific
 	if err == nil && totpEnabled && totpConfirmed {
 		secret, decErr := h.keyring.Open(secretEnc, secretNonce, keyVersion)
 		if decErr != nil {
-			h.log.Error("TOTP secret decryption failed — likely encryption key mismatch",
+			h.log.Error("TOTP secret decryption failed",
 				"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
 			return false, "", fmt.Errorf("TOTP secret decryption failed: %w", decErr)
 		}
@@ -452,6 +452,10 @@ func (h *Handler) requirePasswordAndMFA(c *gin.Context, userID, password, mfaCod
 			return false
 		}
 		ok, verifyErr := h.VerifyCode(ctx, userID, mfaCode)
+		if verifyErr != nil {
+			// Same 403 as a wrong code, but a server-side failure must be visible.
+			h.log.Error("MFA code verification error during step-up", "user_id", userID, "error", verifyErr)
+		}
 		if verifyErr != nil || !ok {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Invalid MFA code"})
 			return false
@@ -670,7 +674,7 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	secret, err := h.keyring.Open(secretEnc, secretNonce, keyVersion)
 	if err != nil {
 		h.log.Error("Failed to decrypt TOTP secret",
-			"sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", err)
+			"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify code"})
 		return
 	}
@@ -804,7 +808,7 @@ func (h *Handler) TOTPDisable(c *gin.Context) {
 	valid, err := h.VerifyCode(ctx, userID, req.Code)
 	if err != nil {
 		h.log.Error("MFA code verification error during TOTP disable", "user_id", userID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "MFA verification error. The server may have been restarted with a different encryption key."})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "MFA verification failed because of a server error. Contact support if this continues."})
 		return
 	}
 	if !valid {
@@ -868,7 +872,7 @@ func (h *Handler) RegenerateBackupCodes(c *gin.Context) {
 		// with the versions so it stays diagnosable, matching the other decrypt
 		// sites. The client still sees the same 403 (no oracle).
 		h.log.Error("Failed to decrypt TOTP secret",
-			"sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
+			"user_id", userID, "sealed_version", keyVersion, "active_version", h.keyring.ActiveVersion(), "error", decErr)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid TOTP code"})
 		return
 	}

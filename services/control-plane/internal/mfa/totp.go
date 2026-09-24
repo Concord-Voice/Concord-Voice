@@ -12,7 +12,6 @@ import (
 	"io"
 	"math/big"
 	"strings"
-
 	"time"
 
 	"github.com/pquerna/otp"
@@ -58,6 +57,11 @@ func ValidateCode(secret, code string) bool {
 // EncryptSecret encrypts a TOTP secret using AES-256-GCM.
 // Returns ciphertext and nonce. The encKey must be exactly 32 bytes.
 func EncryptSecret(plaintext, encKey []byte) (ciphertext, nonce []byte, err error) {
+	// aes.NewCipher also accepts 16- and 24-byte keys, which would silently
+	// downgrade to AES-128/192.
+	if len(encKey) != 32 {
+		return nil, nil, fmt.Errorf("key must be 32 bytes, got %d", len(encKey))
+	}
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create cipher: %w", err)
@@ -79,6 +83,9 @@ func EncryptSecret(plaintext, encKey []byte) (ciphertext, nonce []byte, err erro
 
 // DecryptSecret decrypts an AES-256-GCM encrypted TOTP secret.
 func DecryptSecret(ciphertext, nonce, encKey []byte) ([]byte, error) {
+	if len(encKey) != 32 {
+		return nil, fmt.Errorf("key must be 32 bytes, got %d", len(encKey))
+	}
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
 		return nil, fmt.Errorf("create cipher: %w", err)
@@ -87,6 +94,12 @@ func DecryptSecret(ciphertext, nonce, encKey []byte) ([]byte, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("create GCM: %w", err)
+	}
+
+	// gcm.Open panics, rather than erroring, on a wrong-length nonce, and the
+	// nonce comes from a stored row, so corrupt or hand-written data must fail here.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("decrypt: invalid nonce length %d, want %d", len(nonce), gcm.NonceSize())
 	}
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
@@ -141,8 +154,11 @@ func VerifyBackupCode(code string, hashes []string, used []bool) (index int, mat
 	codeHex := hex.EncodeToString(codeHash[:])
 
 	for i, storedHash := range hashes {
-		if i < len(used) && used[i] {
-			continue // skip already-used codes
+		// A code with no used flag is treated as used: the arrays are written
+		// together, so a short one is a damaged row, and the caller indexes
+		// used[i] to mark the match.
+		if i >= len(used) || used[i] {
+			continue
 		}
 		if subtle.ConstantTimeCompare([]byte(codeHex), []byte(storedHash)) == 1 {
 			return i, true

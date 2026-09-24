@@ -120,6 +120,53 @@ func TestRekey_UndecryptableRowLeftUntouchedAndReported(t *testing.T) {
 	assert.Equal(t, 3, ver, "failed row must be left untouched")
 }
 
+// A row whose stored nonce is the wrong length used to panic inside gcm.Open
+// and end the whole backfill. It must be reported, left byte-for-byte
+// untouched, and the rows after it must still converge.
+func TestRekey_WrongLengthNonceRowReportedAndRunContinues(t *testing.T) {
+	ts := setupTS(t)
+	ring := rotatedRing(t)
+	u1 := seedSealedRow(t, ts, v1OnlyRing(t), "rekeynonce1", "JBSWY3DPEHPK3PXP")
+	u2 := seedSealedRow(t, ts, v1OnlyRing(t), "rekeynonce2", "KRSXG5CTMVRXEZLU")
+
+	// Rekey walks rows in user_id order, so damaging the lower ID puts a good
+	// row after it: the run has to get past the damaged row to converge it.
+	bad, good := u1, u2
+	if good < bad {
+		bad, good = good, bad
+	}
+	_, err := ts.DB.Exec(`UPDATE user_mfa_totp SET totp_secret_nonce = substring(totp_secret_nonce from 1 for 11) WHERE user_id = $1`, bad)
+	require.NoError(t, err)
+	var beforeEnc, beforeNonce []byte
+	require.NoError(t, ts.DB.QueryRow(`SELECT totp_secret_enc, totp_secret_nonce FROM user_mfa_totp WHERE user_id = $1`, bad).Scan(&beforeEnc, &beforeNonce))
+
+	var res mfa.RekeyResult
+	require.NotPanics(t, func() {
+		res, err = mfa.Rekey(context.Background(), ts.DB, ring, 1, false)
+	})
+	require.NoError(t, err)
+
+	var found *mfa.RekeyFailure
+	for i := range res.Failed {
+		if res.Failed[i].UserID == bad {
+			found = &res.Failed[i]
+		}
+	}
+	require.NotNil(t, found, "damaged row must be reported")
+	assert.Equal(t, 1, found.SealedVersion)
+	assert.ErrorContains(t, found.Err, "invalid nonce length")
+
+	var enc, nonce []byte
+	var ver int
+	require.NoError(t, ts.DB.QueryRow(`SELECT totp_secret_enc, totp_secret_nonce, key_version FROM user_mfa_totp WHERE user_id = $1`, bad).Scan(&enc, &nonce, &ver))
+	assert.Equal(t, beforeEnc, enc, "damaged row's ciphertext changed")
+	assert.Equal(t, beforeNonce, nonce, "damaged row's nonce changed")
+	assert.Equal(t, 1, ver, "damaged row's key_version changed")
+
+	require.NoError(t, ts.DB.QueryRow(`SELECT key_version FROM user_mfa_totp WHERE user_id = $1`, good).Scan(&ver))
+	assert.Equal(t, 2, ver, "the row after the damaged one did not converge")
+}
+
 // TestRekey_CASGuardSkipsConcurrentlyRewrittenRow exercises the UPDATE's
 // compare-and-swap tail directly: if the stored ciphertext no longer matches
 // what the backfill read, the write must affect 0 rows.

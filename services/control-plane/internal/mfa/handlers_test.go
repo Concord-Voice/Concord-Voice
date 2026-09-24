@@ -23,6 +23,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"github.com/redis/go-redis/v9"
@@ -1138,7 +1139,8 @@ func TestEmailSmsVerifyWithCode(t *testing.T) {
 	enrollTOTP(t, ts, user)
 
 	// Ensure hardened mode is off for this user
-	_, _ = ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
 	// Seed a verification code directly in Redis (bypasses email delivery)
 	ctx := context.Background()
@@ -2116,7 +2118,8 @@ func TestEmailSmsVerifyWrongCode(t *testing.T) {
 	user := ts.CreateTestUser(t, "emailsmswrong")
 	enrollTOTP(t, ts, user)
 
-	_, _ = ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	key := fmt.Sprintf(redisEmailSmsSetup, user.ID)
@@ -2150,7 +2153,8 @@ func TestEmailSmsVerifyHardenedMissingSms(t *testing.T) {
 	enrollTOTP(t, ts, user)
 
 	// Enable hardened mode
-	_, _ = ts.DB.Exec(`UPDATE users SET recovery_hardened = TRUE WHERE id = $1`, user.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = TRUE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	ts.Redis.Set(ctx, fmt.Sprintf(redisEmailSmsSetup, user.ID), "123456", 10*time.Minute)
@@ -2173,7 +2177,8 @@ func TestEmailSmsVerifyHardenedMissingEmail(t *testing.T) {
 	user := ts.CreateTestUser(t, "hardemail")
 	enrollTOTP(t, ts, user)
 
-	_, _ = ts.DB.Exec(`UPDATE users SET recovery_hardened = TRUE WHERE id = $1`, user.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = TRUE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	ts.Redis.Set(ctx, fmt.Sprintf("mfa_emailsms_setup:%s:sms", user.ID), "654321", 10*time.Minute)
@@ -2777,7 +2782,8 @@ func TestGetStatusSelfHeal(t *testing.T) {
 	enrollTOTP(t, ts, user)
 
 	// Manually desync the denormalized flags by removing 'totp' from mfa_methods
-	_, _ = ts.DB.Exec(`UPDATE users SET mfa_methods = '{}' WHERE id = $1`, user.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET mfa_methods = '{}' WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
 	// GetStatus should self-heal and re-sync
 	w := ts.DoRequest("GET", urlMFAStatus, nil, testhelpers.AuthHeaders(user.AccessToken))
@@ -2826,25 +2832,81 @@ func TestTOTPDisableNotEnrolledIdempotent(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-// --- TOTP Disable: Encryption key mismatch error path ---
+// --- TOTP Disable: undecryptable stored secret ---
 
+// decryptErrorBody is what the disable handler writes when the stored TOTP
+// secret cannot be decrypted.
+const decryptErrorBody = "MFA verification failed because of a server error. Contact support if this continues."
+
+// A stored secret that cannot be decrypted must refuse the disable with the
+// same error body whether its nonce is the wrong length or it was sealed
+// under another key, and must leave the TOTP row in place.
 func TestTOTPDisableDecryptionError(t *testing.T) {
-	ts := setupTS(t)
-	user := ts.CreateTestUser(t, "disabledecerr")
-
-	// Insert a TOTP row with garbage encryption data
-	_, err := ts.DB.Exec(`INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, enabled, confirmed) VALUES ($1, $2, $3, true, true)`,
-		user.ID, []byte("bad-encrypted-data"), []byte("bad-nonce"))
+	wrongKeyCT, wrongKeyNonce, err := mfa.EncryptSecret([]byte("JBSWY3DPEHPK3PXP"), bytes.Repeat([]byte{0x01}, 32))
 	require.NoError(t, err)
-	_, _ = ts.DB.Exec(`UPDATE users SET mfa_enabled = true, mfa_methods = '{totp}' WHERE id = $1`, user.ID)
 
-	w := ts.DoRequest("POST", urlTOTPDisable, map[string]interface{}{
-		"password": testPassword,
-		"code":     "123456",
-	}, testhelpers.AuthHeaders(user.AccessToken))
+	tests := []struct {
+		name       string
+		username   string
+		ciphertext []byte
+		nonce      []byte
+	}{
+		{"wrong-length nonce", "decnonce", []byte("bad-encrypted-data"), []byte("bad-nonce")},
+		{"sealed under another key", "deckey", wrongKeyCT, wrongKeyNonce},
+	}
 
-	// The VerifyCode call should fail with decryption error
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	ts := setupTS(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user := ts.CreateTestUser(t, tt.username)
+			_, err := ts.DB.Exec(`INSERT INTO user_mfa_totp (user_id, totp_secret_enc, totp_secret_nonce, enabled, confirmed) VALUES ($1, $2, $3, true, true)`,
+				user.ID, tt.ciphertext, tt.nonce)
+			require.NoError(t, err)
+			_, err = ts.DB.Exec(`UPDATE users SET mfa_enabled = true, mfa_methods = '{totp}' WHERE id = $1`, user.ID)
+			require.NoError(t, err)
+
+			w := ts.DoRequest("POST", urlTOTPDisable, map[string]interface{}{
+				"password": testPassword,
+				"code":     "123456",
+			}, testhelpers.AuthHeaders(user.AccessToken))
+
+			// The status alone cannot tell the handler's error branch from a
+			// panic: gin.Recovery also answers 500, with an empty body.
+			require.Equal(t, http.StatusInternalServerError, w.Code, "body: %s", w.Body.String())
+			require.NotEmpty(t, w.Body.String(), "empty 500 body: gin.Recovery answered, so the decrypt panicked instead of erroring")
+			var body struct {
+				Error string `json:"error"`
+			}
+			testhelpers.ParseJSON(t, w, &body)
+			assert.Equal(t, decryptErrorBody, body.Error)
+
+			var rows int
+			require.NoError(t, ts.DB.QueryRow(`SELECT COUNT(*) FROM user_mfa_totp WHERE user_id = $1`, user.ID).Scan(&rows))
+			assert.Equal(t, 1, rows, "a refused disable deleted the TOTP row")
+		})
+	}
+}
+
+// consumeBackupCode runs only after the TOTP secret decrypts, so a damaged
+// secret must refuse a valid backup code without spending it.
+func TestVerifyCodeDecryptFailureLeavesBackupCodeUnused(t *testing.T) {
+	ts := setupTS(t)
+	user := ts.CreateTestUser(t, "decbackup")
+	_, backupCodes := enrollTOTP(t, ts, user)
+	_, err := ts.DB.Exec(`UPDATE user_mfa_totp SET totp_secret_nonce = substring(totp_secret_nonce from 1 for 11) WHERE user_id = $1`, user.ID)
+	require.NoError(t, err)
+
+	ring, err := mfa.ParseKeyring(strings.Repeat("00", 32), 1, "")
+	require.NoError(t, err)
+	handler := mfa.NewHandler(ts.DB, ts.Redis, logger.New("test"), ring, testhelpers.TestJWTSecret, nil, "test")
+
+	verified, err := handler.VerifyCode(context.Background(), user.ID, backupCodes[0].(string))
+	require.ErrorContains(t, err, "invalid nonce length")
+	assert.False(t, verified)
+
+	var used []bool
+	require.NoError(t, ts.DB.QueryRow(`SELECT backup_codes_used FROM user_mfa_totp WHERE user_id = $1`, user.ID).Scan(pq.Array(&used)))
+	assert.NotContains(t, used, true, "a refused verification spent a backup code")
 }
 
 // --- Recovery Circle: Invalid encrypted_share format ---
@@ -3121,7 +3183,8 @@ func TestEmailSmsVerifyBothMethods(t *testing.T) {
 	user := ts.CreateTestUser(t, "emailsmsboth")
 	enrollTOTP(t, ts, user)
 
-	_, _ = ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	_, err := ts.DB.Exec(`UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	ts.Redis.Set(ctx, fmt.Sprintf(redisEmailSmsSetup, user.ID), "111111", 10*time.Minute)
@@ -3687,7 +3750,8 @@ func TestEmailSmsVerifySuccess(t *testing.T) {
 
 	ctx := context.Background()
 	// Ensure recovery_hardened is false for this test
-	_, _ = ts.DB.ExecContext(ctx, `UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	_, err := ts.DB.ExecContext(ctx, `UPDATE users SET recovery_hardened = FALSE WHERE id = $1`, user.ID)
+	require.NoError(t, err)
 	ts.Redis.Set(ctx, fmt.Sprintf(redisEmailSmsSetup, user.ID), "123456", 10*time.Minute)
 
 	w := ts.DoRequest("POST", urlEmailSmsVerify, map[string]interface{}{

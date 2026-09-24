@@ -46,6 +46,14 @@ that keeps sending far more than your plan allows.
 
 ### Fixed
 
+- **A damaged two-factor record no longer crashes sign-in checks or the MFA key-rotation tool** ([#3420](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3420)) — if the
+  stored authenticator-app secret for an account was damaged, checking that account's two-factor
+  code crashed the request, which answered with an empty server error. It now fails with a normal
+  error message, and the code is still refused. The `mfa-rekey` tool, which moves stored secrets to
+  a new encryption key, used to stop at such an account and leave every account after it on the old
+  key. It now reports that account as failed and carries on with the rest. Accounts whose
+  two-factor record is intact are not affected.
+
 - **Links opened from a picture-in-picture window now open in your browser** ([#3416](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3416)) — a link or pop-up
   started inside a picture-in-picture window could open a new Concord window. Picture-in-picture
   windows now follow the same rule as the main window: secure (`https`) links open in your browser,
