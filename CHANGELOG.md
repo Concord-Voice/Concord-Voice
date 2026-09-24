@@ -64,6 +64,12 @@ that keeps sending far more than your plan allows.
   shortcuts still work while it is showing, it fits a zoomed or small window, and a check that
   takes too long stops with a message instead of locking the prompt. A wrong code now says what
   went wrong, including for single sign-on accounts, and puts the cursor back in the code box.
+- **Turning on two-factor authentication no longer asks for your code a second time** ([#3437](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3437)) — after
+  you set up an authenticator app, a security key or email codes, Concord used to ask for a code
+  again a few minutes later on the same device. The device you set it up on is now trusted straight
+  away. Your other signed-in devices still confirm the new factor once, as before. If setup hits a
+  server error, trying again now finishes it instead of saying it is already on, and a brief server
+  fault during setup can no longer switch two-factor authentication off without telling you.
 - **Voice activity now clears before a privacy change reconnects the app** ([#3412](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3412)) — lowering Rich Presence visibility,
   leaving a voice session, or disconnecting can no longer briefly deliver an older activity
   update after its removal.

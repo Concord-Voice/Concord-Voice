@@ -35,6 +35,15 @@ const (
 	redisKeyEmailSmsEnabledEmail   = "mfa_emailsms_enabled:%s:email"
 	redisKeyEmailSmsSetup          = "mfa_emailsms_setup:%s:%s"
 	redisKeyWebAuthnReg            = "webauthn_reg:%s"
+	redisKeyTOTPSetupSession       = "mfa_totp_setup_session:%s"
+
+	// mfaUpgradeBypassTTL bounds a one-refresh exemption from the pre-MFA
+	// session lock (auth.checkPreMFASessionLock): long enough for the refresh
+	// that follows, never a standing exemption.
+	mfaUpgradeBypassTTL = 30 * time.Second
+	// totpSetupSessionTTL bounds how long confirm-setup can match the session
+	// that proved the code at verify-setup.
+	totpSetupSessionTTL = 15 * time.Minute
 
 	// Error messages
 	errMsgPasswordRequired           = "Password is required"
@@ -42,6 +51,7 @@ const (
 	errMsgCodeRequired               = "Code is required"
 	errMsgFailedBackupCodes          = "Failed to generate backup codes"
 	errMsgFailedStartReg             = "Failed to start registration"
+	errMsgFailedActivateMFA          = "Failed to activate MFA"
 	errMsgInvalidSessionData         = "Invalid session data"
 	errMsgFailedListDevices          = "Failed to list trusted devices"
 	errMsgFailedListRecoveryReqs     = "Failed to list recovery requests"
@@ -372,31 +382,70 @@ func containsStr(ss []string, target string) bool {
 	return false
 }
 
+// mfaNeverEnabled reports whether MFA has never been active on the account.
+// Read it before an enable writes users.mfa_enabled_at. A read error answers
+// false, which keeps the pre-MFA challenge.
+func (h *Handler) mfaNeverEnabled(ctx context.Context, userID string) bool {
+	var never bool
+	if err := h.db.QueryRowContext(ctx, `SELECT mfa_enabled_at IS NULL FROM users WHERE id = $1`, userID).Scan(&never); err != nil {
+		h.log.Error("Failed to read MFA enablement for the enrollment upgrade", "user_id", userID, "error", err)
+		return false
+	}
+	return never
+}
+
+// grantEnrollmentUpgrade exempts the enrolling session from the pre-MFA refresh
+// challenge. That challenge makes every session older than mfa_enabled_at prove
+// the new factor once, and this session just did. Call it only for the first
+// activation: a session older than an EXISTING mfa_enabled_at keeps its
+// challenge even when it adds a factor. A token without a sid keeps it too.
+func (h *Handler) grantEnrollmentUpgrade(ctx context.Context, userID, sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	if err := h.redis.Set(ctx, auth.MFAUpgradeBypassKey(userID, sessionID), "1", mfaUpgradeBypassTTL).Err(); err != nil {
+		// The enable succeeded; this session is simply challenged as before.
+		h.log.Error("Failed to exempt the enrolling session from the MFA upgrade challenge", "user_id", userID, "error", err)
+	}
+}
+
 // updateUserMFAFlags recalculates and updates the denormalized mfa_enabled and mfa_methods on users.
+// Every read must succeed before it writes: a method it failed to read would be
+// counted as absent, and with none left it takes the disable branch, clearing
+// mfa_enabled and mfa_enabled_at on an account that has MFA.
 func (h *Handler) updateUserMFAFlags(ctx context.Context, userID string) error {
 	methods := make([]string, 0) // must be non-nil for pq.Array to produce '{}' not NULL
 
-	// Check TOTP
+	// Check TOTP (no row means no TOTP)
 	var totpActive bool
 	err := h.db.QueryRowContext(ctx,
 		`SELECT enabled AND confirmed FROM user_mfa_totp WHERE user_id = $1`, userID,
 	).Scan(&totpActive)
-	if err == nil && totpActive {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read TOTP state: %w", err)
+	}
+	if totpActive {
 		methods = append(methods, "totp")
 	}
 
 	// Check WebAuthn
 	var webauthnCount int
-	_ = h.db.QueryRowContext(ctx,
+	if err := h.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM user_mfa_webauthn WHERE user_id = $1`, userID,
-	).Scan(&webauthnCount)
+	).Scan(&webauthnCount); err != nil {
+		return fmt.Errorf("count WebAuthn credentials: %w", err)
+	}
 	if webauthnCount > 0 {
 		methods = append(methods, "webauthn")
 	}
 
 	// Check Email/SMS (dev stub — tracked via Redis flag)
 	for _, m := range []string{"email", "sms"} {
-		if h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, m)).Val() > 0 {
+		n, err := h.redis.Exists(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, m)).Result()
+		if err != nil {
+			return fmt.Errorf("read %s MFA flag: %w", m, err)
+		}
+		if n > 0 {
 			methods = append(methods, m)
 		}
 	}
@@ -625,6 +674,15 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 		h.log.Error("Failed to sync MFA flags after TOTP re-enrollment", "error", err)
 	}
 
+	// The secret was replaced, so a session that verified the previous one must
+	// not match at confirm-setup for this one. Stop if the record survives: the
+	// user retries setup, and nothing is lost.
+	if err := h.redis.Del(ctx, fmt.Sprintf(redisKeyTOTPSetupSession, userID)).Err(); err != nil {
+		h.log.Error("Failed to clear the TOTP setup session", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store MFA secret"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"otpauth_url": key.URL(),
 		"secret":      key.Secret(),
@@ -645,9 +703,16 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 		return
 	}
 
-	// Rate limit: check for MFA setup lockout
+	// Rate limit: check for MFA setup lockout. An unreadable lockout stops the
+	// request; checking codes without it would lift the attempt limit.
 	lockoutKey := fmt.Sprintf("mfa_setup_lockout:%s", userID)
-	if h.redis.Exists(ctx, lockoutKey).Val() > 0 {
+	locked, err := h.redis.Exists(ctx, lockoutKey).Result()
+	if err != nil {
+		h.log.Error("Failed to read the MFA setup lockout", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify code"})
+		return
+	}
+	if locked > 0 {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many failed attempts. Try again later."})
 		return
 	}
@@ -657,7 +722,7 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	var keyVersion int
 	var enabled bool
 
-	err := h.db.QueryRowContext(ctx,
+	err = h.db.QueryRowContext(ctx,
 		`SELECT totp_secret_enc, totp_secret_nonce, key_version, enabled FROM user_mfa_totp WHERE user_id = $1`,
 		userID,
 	).Scan(&secretEnc, &secretNonce, &keyVersion, &enabled)
@@ -680,14 +745,7 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	}
 
 	if !ValidateCode(string(secret), req.Code) {
-		// Track failed attempts
-		attemptsKey := fmt.Sprintf("mfa_setup_attempts:%s", userID)
-		attempts := h.redis.Incr(ctx, attemptsKey).Val()
-		h.redis.Expire(ctx, attemptsKey, 5*time.Minute)
-		if attempts >= 5 {
-			h.redis.Set(ctx, lockoutKey, "1", 15*time.Minute)
-			h.redis.Del(ctx, attemptsKey)
-		}
+		h.recordFailedSetupAttempt(ctx, userID, lockoutKey)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid code"})
 		return
 	}
@@ -715,7 +773,17 @@ func (h *Handler) TOTPVerifySetup(c *gin.Context) {
 	}
 
 	// Clear attempt tracking
-	h.redis.Del(ctx, fmt.Sprintf("mfa_setup_attempts:%s", userID))
+	if err := h.redis.Del(ctx, fmt.Sprintf("mfa_setup_attempts:%s", userID)).Err(); err != nil {
+		h.log.Error("Failed to reset the MFA setup attempt count", "error", err)
+	}
+
+	// confirm-setup takes no code, so it may exempt a session from the pre-MFA
+	// challenge only if that session is the one that proved the code here.
+	if sid := middleware.TokenSessionID(c); sid != "" {
+		if err := h.redis.Set(ctx, fmt.Sprintf(redisKeyTOTPSetupSession, userID), sid, totpSetupSessionTTL).Err(); err != nil {
+			h.log.Error("Failed to record the TOTP setup session", "error", err)
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"backup_codes": codes,
@@ -742,28 +810,97 @@ func (h *Handler) TOTPConfirmSetup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "TOTP code not yet verified. Complete verify-setup first."})
 		return
 	}
-	if confirmed {
-		c.JSON(http.StatusConflict, gin.H{"error": "TOTP MFA is already active"})
+	if confirmed && h.totpAlreadyActive(c, userID) {
 		return
 	}
 
-	// Activate MFA
+	firstActivation := h.mfaNeverEnabled(ctx, userID)
 
-	_, err = h.db.ExecContext(ctx, `
-		UPDATE user_mfa_totp SET confirmed = TRUE, confirmed_at = NOW(), updated_at = NOW() WHERE user_id = $1
-	`, userID)
-	if err != nil {
-		h.log.Error("Failed to confirm TOTP setup", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to activate MFA"})
-		return
+	// Activate MFA. A retry that is finishing an earlier activation finds the
+	// row already confirmed and goes straight to the flags write.
+	if !confirmed {
+		_, err = h.db.ExecContext(ctx, `
+			UPDATE user_mfa_totp SET confirmed = TRUE, confirmed_at = NOW(), updated_at = NOW() WHERE user_id = $1
+		`, userID)
+		if err != nil {
+			h.log.Error("Failed to confirm TOTP setup", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
+			return
+		}
 	}
 
+	// Fatal on this enable path, as in activateEmailSmsMethods: login and the
+	// pre-MFA session lock read these flags, so telling the user MFA is on
+	// while they are unset leaves both unenforced. GetStatus re-syncs them.
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
 		h.log.Error("Failed to update user MFA flags", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
+		return
+	}
+
+	// A missing or unreadable record matches no session, so it keeps the challenge.
+	provedBy, getErr := h.redis.GetDel(ctx, fmt.Sprintf(redisKeyTOTPSetupSession, userID)).Result()
+	if getErr != nil && !errors.Is(getErr, redis.Nil) {
+		h.log.Error("Failed to read the TOTP setup session", "error", getErr)
+	}
+	sid := middleware.TokenSessionID(c)
+	if firstActivation && sid != "" && subtle.ConstantTimeCompare([]byte(sid), []byte(provedBy)) == 1 {
+		h.grantEnrollmentUpgrade(ctx, userID, sid)
 	}
 
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled, AuthMethod: securityevent.AuthTOTP})
 	c.JSON(http.StatusOK, gin.H{"message": "MFA is now active"})
+}
+
+// recordFailedSetupAttempt counts a wrong verify-setup code and locks setup
+// after five. Its Redis errors are logged rather than answered. The lockout
+// read at the top of verify-setup fails closed, so an outage that fails reads
+// stops setup entirely. An outage that fails only writes (out of memory, a
+// read-only replica) leaves no attempt limit here; the caller is guessing a
+// code for a secret it was just shown.
+func (h *Handler) recordFailedSetupAttempt(ctx context.Context, userID, lockoutKey string) {
+	attemptsKey := fmt.Sprintf("mfa_setup_attempts:%s", userID)
+	attempts, err := h.redis.Incr(ctx, attemptsKey).Result()
+	if err != nil {
+		h.log.Error("Failed to count an MFA setup attempt", "error", err)
+		return
+	}
+	if err := h.redis.Expire(ctx, attemptsKey, 5*time.Minute).Err(); err != nil {
+		h.log.Error("Failed to expire the MFA setup attempt count", "error", err)
+	}
+	if attempts < 5 {
+		return
+	}
+	if err := h.redis.Set(ctx, lockoutKey, "1", 15*time.Minute).Err(); err != nil {
+		// Keep the count, so the next wrong code tries the lockout again.
+		h.log.Error("Failed to lock MFA setup", "error", err)
+		return
+	}
+	if err := h.redis.Del(ctx, attemptsKey).Err(); err != nil {
+		h.log.Error("Failed to reset the MFA setup attempt count", "error", err)
+	}
+}
+
+// totpAlreadyActive answers confirm-setup for a row that is already confirmed,
+// and reports whether it did. confirm-setup commits confirmed = TRUE before it
+// writes the account flags, so a retry after that write failed finds the row
+// confirmed while mfa_methods lacks TOTP. That retry must finish the
+// activation; only a completed one is a 409.
+func (h *Handler) totpAlreadyActive(c *gin.Context, userID string) bool {
+	var active bool
+	err := h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE('totp' = ANY(mfa_methods), FALSE) FROM users WHERE id = $1`, userID,
+	).Scan(&active)
+	switch {
+	case err != nil:
+		h.log.Error("Failed to read the TOTP activation state", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
+		return true
+	case active:
+		c.JSON(http.StatusConflict, gin.H{"error": "TOTP MFA is already active"})
+		return true
+	}
+	return false
 }
 
 // TOTPDisable disables TOTP MFA. Requires password + a valid MFA code.
@@ -995,13 +1132,13 @@ func (h *Handler) WebAuthnRegisterFinish(c *gin.Context) {
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
 
-	// Retrieve session data from Redis
-	metaJSON, err := h.redis.Get(ctx, fmt.Sprintf(redisKeyWebAuthnReg, userID)).Bytes()
+	// Read and delete the session data in one step, so no failed delete can
+	// leave it replayable until its TTL runs out.
+	metaJSON, err := h.redis.GetDel(ctx, fmt.Sprintf(redisKeyWebAuthnReg, userID)).Bytes()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No registration in progress or session expired"})
 		return
 	}
-	h.redis.Del(ctx, fmt.Sprintf(redisKeyWebAuthnReg, userID))
 
 	var meta struct {
 		Session        string `json:"session"`
@@ -1032,6 +1169,8 @@ func (h *Handler) WebAuthnRegisterFinish(c *gin.Context) {
 		return
 	}
 
+	firstActivation := h.mfaNeverEnabled(ctx, userID)
+
 	// Store credential in DB
 	transports := make([]string, 0, len(credential.Transport))
 	for _, t := range credential.Transport {
@@ -1050,7 +1189,22 @@ func (h *Handler) WebAuthnRegisterFinish(c *gin.Context) {
 	}
 
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
+		// Fatal for the same reason as TOTPConfirmSetup's flag write. Take the
+		// credential back out, so a retry registers the key again rather than
+		// adding a second one beside a key login does not know MFA is on for.
 		h.log.Error("Failed to update user MFA flags after WebAuthn register", "error", err)
+		if _, delErr := h.db.ExecContext(ctx,
+			`DELETE FROM user_mfa_webauthn WHERE user_id = $1 AND credential_id = $2`, userID, credential.ID,
+		); delErr != nil {
+			h.log.Error("Failed to remove the unactivated WebAuthn credential", "user_id", userID, "error", delErr)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgFailedActivateMFA})
+		return
+	}
+	// The proof is the attestation this request just verified, so the session
+	// finishing registration holds the new key, whichever session began it.
+	if firstActivation {
+		h.grantEnrollmentUpgrade(ctx, userID, middleware.TokenSessionID(c))
 	}
 	h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventMFA, Outcome: securityevent.OutcomeSuccess, Severity: securityevent.SeverityInformational, ReasonCode: securityevent.ReasonFactorEnabled, AuthMethod: securityevent.AuthWebAuthn})
 
@@ -1466,7 +1620,7 @@ func (h *Handler) completeVerifyPurpose(ctx context.Context, c *gin.Context, cla
 
 	case PurposeMFAUpgrade:
 		bypassKey := auth.MFAUpgradeBypassKey(claims.UserID, claims.RefreshSessionID)
-		if err := h.redis.Set(ctx, bypassKey, "1", 30*time.Second).Err(); err != nil {
+		if err := h.redis.Set(ctx, bypassKey, "1", mfaUpgradeBypassTTL).Err(); err != nil {
 			h.emitHTTPEvent(c, securityevent.Event{EventType: securityevent.EventDependency, Outcome: securityevent.OutcomeDegraded, Severity: securityevent.SeverityHigh, ReasonCode: securityevent.ReasonDependencyUnavailable, RouteTemplate: securityevent.RouteAuthMFAVerify})
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgMFAVerificationUnavailable})
 			return false
@@ -2098,7 +2252,7 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 
 	// Extracted to keep EmailSmsVerify under the cognitive-complexity budget
 	// (go:S3776). The sequencing rationale lives on the helper.
-	if err := h.activateEmailSmsMethods(ctx, userID, verified); err != nil {
+	if err := h.activateEmailSmsMethods(ctx, userID, middleware.TokenSessionID(c), verified); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to activate MFA methods"})
 		return
 	}
@@ -2131,7 +2285,12 @@ func (h *Handler) EmailSmsVerify(c *gin.Context) {
 // write would leave those sessions silently never challenged while the user is
 // told MFA is on. EmailSmsDisable deliberately keeps log-and-continue — a failed
 // write there leaves MFA ON, which is already fail-closed.
-func (h *Handler) activateEmailSmsMethods(ctx context.Context, userID string, verified []string) error {
+//
+// This request checked the code, so the session activating the method is the
+// one that proved it, and a first activation exempts that session as TOTP and
+// WebAuthn do.
+func (h *Handler) activateEmailSmsMethods(ctx context.Context, userID, sessionID string, verified []string) error {
+	firstActivation := h.mfaNeverEnabled(ctx, userID)
 	for _, method := range verified {
 		if err := h.redis.Set(ctx, fmt.Sprintf(redisKeyEmailSmsEnabled, userID, method), "1", 0).Err(); err != nil {
 			h.log.Error("Failed to persist MFA method activation", "method", method, "error", err)
@@ -2142,6 +2301,9 @@ func (h *Handler) activateEmailSmsMethods(ctx context.Context, userID string, ve
 	if err := h.updateUserMFAFlags(ctx, userID); err != nil {
 		h.log.Error("Failed to update MFA flags after email/sms enable", "error", err)
 		return err
+	}
+	if firstActivation {
+		h.grantEnrollmentUpgrade(ctx, userID, sessionID)
 	}
 
 	// Best-effort cleanup, and only now that the activation is durable. The

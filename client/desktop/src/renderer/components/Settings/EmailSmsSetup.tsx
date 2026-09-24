@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { apiFetch } from '../../services/system/apiClient';
+import { apiFetch, refreshAccessToken } from '../../services/system/apiClient';
 
 type Step = 'password' | 'verify' | 'done';
 
@@ -53,6 +53,8 @@ const EmailSmsSetup: React.FC<EmailSmsSetupProps> = ({ mfaActive, onComplete, on
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Verification failed');
 
+      // Uses the enrollment exemption, as after TOTP confirm in MFASetup.
+      void refreshAccessToken().catch(() => console.warn('[mfa] Refresh after enrollment failed'));
       setStep('done');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Verification failed');

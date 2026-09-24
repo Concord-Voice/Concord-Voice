@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import QRCode from 'qrcode';
-import { apiFetch } from '../../services/system/apiClient';
+import { apiFetch, refreshAccessToken } from '../../services/system/apiClient';
 import { errorMessage } from '../../utils/runtime/redactError';
 import { base64urlToBuffer, bufferToBase64url } from '../../utils/crypto/base64url';
 import TOTPInput from '../Auth/TOTPInput';
@@ -214,6 +214,13 @@ const MFASetup: React.FC<MFASetupProps> = ({
       setLoading(false);
       return;
     }
+    // The server exempts this session from the pre-MFA challenge for 30 s after
+    // a first enrollment. Refresh now to use it, rather than being asked for the
+    // code again at the next token refresh. Not awaited: if no exemption was
+    // granted, the refresh raises that challenge, which must not block setup.
+    // A refresh already in flight is reused instead; it predates the grant, so
+    // that session is challenged once at its next refresh, as before this fix.
+    void refreshAccessToken().catch(() => console.warn('[mfa] Refresh after enrollment failed'));
 
     // Generate and store recovery key
     setRecoveryLoading(true);
@@ -300,6 +307,8 @@ const MFASetup: React.FC<MFASetupProps> = ({
         const finishData = await finishRes.json();
         throw new Error(finishData.error || 'Registration failed');
       }
+      // Uses the enrollment exemption, as after TOTP confirm.
+      void refreshAccessToken().catch(() => console.warn('[mfa] Refresh after enrollment failed'));
       setWebauthnStep('done');
     } catch (err) {
       const msg = classifyWebAuthnError(err);

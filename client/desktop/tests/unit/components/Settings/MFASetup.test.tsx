@@ -4,9 +4,11 @@ import { vi } from 'vitest';
 // ── Mocks ──────────────────────────────────────────────────────────────
 
 const mockApiFetch = vi.fn();
+const mockRefreshAccessToken = vi.fn(() => Promise.resolve<string | null>(null));
 
 vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
+  refreshAccessToken: () => mockRefreshAccessToken(),
 }));
 
 vi.mock('qrcode', () => ({
@@ -384,6 +386,10 @@ describe('MFASetup', () => {
       await vi.waitFor(() => {
         expect(screen.getByText('Session expired')).toBeInTheDocument();
       });
+      expect(
+        mockRefreshAccessToken,
+        'MFA did not activate, so there is no grant to use'
+      ).not.toHaveBeenCalled();
     });
 
     it('advances to backup codes after TOTP verification', async () => {
@@ -414,7 +420,8 @@ describe('MFASetup', () => {
       });
     });
 
-    it('completes full TOTP flow through recovery key', async () => {
+    // Drives TOTP setup through confirm-setup to the recovery-key step.
+    async function completeTOTPToRecoveryKey() {
       mockApiFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({ otpauth_url: 'otpauth://totp/test', secret: 'TESTSECRET' }),
@@ -444,6 +451,15 @@ describe('MFASetup', () => {
         expect(screen.getByTestId('recovery-key-display')).toBeInTheDocument();
         expect(screen.getByText('AAAA-BBBB-CCCC-DDDD')).toBeInTheDocument();
       });
+      return user;
+    }
+
+    it('completes full TOTP flow through recovery key', async () => {
+      const user = await completeTOTPToRecoveryKey();
+      // The server exempts this session from the pre-MFA challenge for 30 s
+      // after enrollment; refreshing now uses that grant instead of prompting
+      // for the code again at the next token refresh.
+      expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
 
       await user.click(screen.getByTestId('recovery-confirm'));
 
@@ -453,6 +469,20 @@ describe('MFASetup', () => {
 
       await user.click(screen.getByText('Done'));
       expect(onComplete).toHaveBeenCalled();
+    });
+
+    // The refresh is not awaited, so a rejection must be caught where it is
+    // made; setup still finishes (frontend review, PR #3437).
+    it('finishes TOTP setup when the refresh after enrollment rejects', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockRefreshAccessToken.mockRejectedValueOnce(new Error('ipc unavailable'));
+
+      await completeTOTPToRecoveryKey();
+
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith('[mfa] Refresh after enrollment failed')
+      );
+      warn.mockRestore();
     });
 
     it('skips recovery key when skip is clicked', async () => {
@@ -869,6 +899,75 @@ describe('MFASetup', () => {
       await vi.waitFor(() => {
         expect(screen.getByText('Waiting for your security key...')).toBeInTheDocument();
       });
+    });
+
+    // Registers a security key whose finish request answers finishOk.
+    async function registerSecurityKey(finishOk: boolean) {
+      mockApiFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            publicKey: {
+              challenge: 'dGVzdC1jaGFsbGVuZ2U',
+              rp: { name: 'Concord', id: 'localhost' },
+              user: { id: 'dXNlci0x', name: 'test@example.com', displayName: 'Test' },
+              pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+            },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: finishOk,
+          json: async () => (finishOk ? {} : { error: 'Registration failed' }),
+        });
+      const buffer = new Uint8Array([1, 2, 3]).buffer;
+      Object.defineProperty(navigator, 'credentials', {
+        value: {
+          create: vi.fn().mockResolvedValue({
+            id: 'credential-id',
+            rawId: buffer,
+            type: 'public-key',
+            response: { attestationObject: buffer, clientDataJSON: buffer },
+          }),
+        },
+        writable: true,
+        configurable: true,
+      });
+
+      const user = userEvent.setup();
+      render(<MFASetup method="webauthn" onComplete={onComplete} onCancel={onCancel} />);
+      await user.type(screen.getByPlaceholderText('Your password'), 'mypassword');
+      await user.click(screen.getByText('Register Key'));
+      await vi.waitFor(() =>
+        expect(
+          screen.getByText(finishOk ? 'Security Key Registered!' : 'Registration failed')
+        ).toBeInTheDocument()
+      );
+    }
+
+    // The server exempts the registering session from the pre-MFA challenge for
+    // 30 s after a first enrollment; refreshing now uses that grant instead of
+    // prompting for the new factor again at the next token refresh.
+    it.each([
+      [true, 1],
+      [false, 0],
+    ] as const)(
+      'refreshes the session right after registration only when it succeeds (finish ok: %s)',
+      async (finishOk, refreshes) => {
+        await registerSecurityKey(finishOk);
+        expect(mockRefreshAccessToken).toHaveBeenCalledTimes(refreshes);
+      }
+    );
+
+    it('finishes registration when the refresh after it rejects', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockRefreshAccessToken.mockRejectedValueOnce(new Error('ipc unavailable'));
+
+      await registerSecurityKey(true);
+
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith('[mfa] Refresh after enrollment failed')
+      );
+      warn.mockRestore();
     });
 
     it('shows Registering... text while loading', async () => {

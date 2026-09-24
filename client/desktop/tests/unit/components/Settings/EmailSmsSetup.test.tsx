@@ -2,8 +2,10 @@ import { render, screen, fireEvent, waitFor } from '../../../test-utils';
 import { vi } from 'vitest';
 
 const mockApiFetch = vi.fn();
+const mockRefreshAccessToken = vi.fn(() => Promise.resolve<string | null>(null));
 vi.mock('@/renderer/services/system/apiClient', () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
+  refreshAccessToken: () => mockRefreshAccessToken(),
   API_BASE: 'http://localhost:8080',
 }));
 
@@ -172,6 +174,7 @@ describe('EmailSmsSetup', () => {
     fireEvent.click(screen.getByText('Verify & Activate'));
 
     await waitFor(() => expect(screen.getByText('Invalid code')).toBeInTheDocument());
+    expect(mockRefreshAccessToken).not.toHaveBeenCalled();
   });
 
   it('shows done step and calls onComplete', async () => {
@@ -183,7 +186,26 @@ describe('EmailSmsSetup', () => {
     fireEvent.click(screen.getByText('Verify & Activate'));
 
     await waitFor(() => expect(screen.getByText('Email MFA Activated!')).toBeInTheDocument());
+    // Refreshes at once so a first activation's exemption is used within its TTL.
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText('Done'));
     expect(onComplete).toHaveBeenCalled();
+  });
+
+  // The refresh is not awaited, so a rejection must be caught where it is made;
+  // activation still finishes (frontend review, PR #3437).
+  it('finishes activation when the refresh after it rejects', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockRefreshAccessToken.mockRejectedValueOnce(new Error('ipc unavailable'));
+    await startEmailSetup();
+    fireEvent.change(screen.getByPlaceholderText('6-digit email code'), {
+      target: { value: '111111' },
+    });
+    mockApiFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    fireEvent.click(screen.getByText('Verify & Activate'));
+
+    await waitFor(() => expect(screen.getByText('Email MFA Activated!')).toBeInTheDocument());
+    await waitFor(() => expect(warn).toHaveBeenCalledWith('[mfa] Refresh after enrollment failed'));
+    warn.mockRestore();
   });
 });
