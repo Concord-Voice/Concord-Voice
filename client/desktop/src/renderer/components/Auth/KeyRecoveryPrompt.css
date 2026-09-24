@@ -1,7 +1,9 @@
-/* Native <dialog> opened via showModal(): the UA centers it in the top layer
-   and renders ::backdrop for the dim. We reset its default chrome and let the
-   inner card carry the surface styling. */
+/* Native <dialog> opened via showModal(): it sits in the top layer and
+   renders ::backdrop for the dim. `margin: auto` restores the UA centring that
+   the global `* { margin: 0 }` reset in styles/index.css removes. We reset its
+   default chrome and let the inner card carry the surface styling. */
 .key-recovery-prompt {
+  margin: auto;
   border: none;
   padding: 0;
   background: transparent;

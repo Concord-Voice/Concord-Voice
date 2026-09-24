@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Download, RefreshCw, Loader, ExternalLink } from 'lucide-react';
 import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
+import { useTopLayerDialog } from '../../hooks/ui/useTopLayerDialog';
 import {
   compareStableDesktopVersions,
   getDesktopClientVersion,
@@ -212,7 +213,10 @@ const ForceUpdateOverlay: React.FC = () => {
     globalThis.electron?.installUpdate();
   }, []);
 
-  if (!updateRequired || (configOnlyRequiresUpdate && configOnlyDismissed)) return null;
+  const visible = updateRequired && !(configOnlyRequiresUpdate && configOnlyDismissed);
+  const { dialogRef, titleId, descriptionId } = useTopLayerDialog(visible);
+
+  if (!visible) return null;
 
   const showEscape =
     configOnlyRequiresUpdate &&
@@ -220,14 +224,25 @@ const ForceUpdateOverlay: React.FC = () => {
     phase === 'error' &&
     failureCountRef.current >= ESCAPE_AFTER_FAILURES;
 
+  // A modal dialog so the update stays reachable over Settings and any open
+  // ui/Modal. closedby="none": the update is mandatory, so Escape does nothing
+  // (measured, Chromium 152: no cancel or close event fires).
   return (
-    <div className="force-update-overlay">
+    <dialog
+      ref={dialogRef}
+      className="force-update-overlay"
+      closedby="none"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+    >
       <div className="force-update-card">
         <div className="force-update-icon">
           <AlertTriangle size={48} />
         </div>
-        <h2 className="force-update-title">Update Required</h2>
-        <p className="force-update-message">
+        <h2 id={titleId} className="force-update-title">
+          Update Required
+        </h2>
+        <p id={descriptionId} className="force-update-message">
           {appVersion
             ? `Your version (v${appVersion}) is below the minimum required version`
             : 'This server requires an update'}
@@ -304,7 +319,7 @@ const ForceUpdateOverlay: React.FC = () => {
           </button>
         )}
       </div>
-    </div>
+    </dialog>
   );
 };
 

@@ -1,7 +1,9 @@
 import React, { useState, useCallback, useMemo, useEffect, useId, useRef } from 'react';
-import { createPortal } from 'react-dom';
 import { useMFAChallengeStore, type MFAVerifyResponse } from '../../stores/auth/mfaChallengeStore';
 import { useModalStack } from '../ui/ModalContext';
+// The challenge registers at the global overlays' depth, above any ui/Modal, so
+// the modals under it go inert and their Escape and Tab handlers stand down.
+import { TOP_LAYER_DEPTH } from '../../hooks/ui/useTopLayerDialog';
 import { ensureMachineId, safeJson } from '../../services/system/apiClient';
 import { apiUrl, captureRuntimeServerSelection } from '../../services/system/runtimeServerBase';
 import {
@@ -22,11 +24,6 @@ import './TOTPInput.css';
 // Settings chunk, so a challenge raised before Settings was ever opened (login,
 // SSO) rendered unstyled and in page flow.
 import '../Settings/MFA.css';
-
-// ModalContext treats the highest depth as topmost. The challenge outranks any
-// ui/Modal stack, so the modals under it go inert and their document-level
-// Escape and Tab handlers stand down.
-const CHALLENGE_STACK_DEPTH = Number.MAX_SAFE_INTEGER;
 
 // A proof in flight disables Cancel, and a close re-shows the dialog for it, so
 // a request that never settles would leave the challenge with no way out.
@@ -234,7 +231,7 @@ const MFAChallengeModal: React.FC = () => {
     };
     dlg.addEventListener('focusin', trackFocus);
     if (!dlg.open) dlg.showModal();
-    register(stackId, CHALLENGE_STACK_DEPTH, null);
+    register(stackId, TOP_LAYER_DEPTH, null);
 
     // The top layer is last-showModal()-wins, so a dialog shown after the
     // challenge (Settings from a shortcut, a network-driven attestation
@@ -299,9 +296,9 @@ const MFAChallengeModal: React.FC = () => {
   else if (mode === 'email-sms') subtitle = 'Enter the verification code sent to you';
   else subtitle = 'Select a verification method';
 
-  // Portaled beside #root, which ModalContext makes inert while any ui/Modal is
-  // open.
-  return createPortal(
+  // No portal: #root goes inert while a ui/Modal is open, but a showModal()
+  // dialog escapes an inert ancestor (measured, Chromium 152).
+  return (
     <dialog
       ref={dialogRef}
       className="mfa-challenge-dialog"
@@ -421,8 +418,7 @@ const MFAChallengeModal: React.FC = () => {
           Cancel
         </button>
       </div>
-    </dialog>,
-    document.body
+    </dialog>
   );
 };
 

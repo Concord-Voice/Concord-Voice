@@ -1,8 +1,9 @@
-import { useEffect, useRef, type MouseEvent } from 'react';
+import { useEffect, type MouseEvent } from 'react';
 import {
   useAttestationFailureStore,
   type TerminalAttestationCode,
 } from '../stores/auth/attestationFailureStore';
+import { useTopLayerDialog } from '../hooks/ui/useTopLayerDialog';
 import './AttestationFailedModal.css';
 
 /**
@@ -53,16 +54,10 @@ export function AttestationFailedModal({
     downloadHelpUrl !== undefined && SAFE_PROTOCOLS.test(downloadHelpUrl)
       ? downloadHelpUrl
       : undefined;
-  const dialogRef = useRef<HTMLDialogElement>(null);
-
-  // Open the native <dialog> imperatively. showModal() gives us native modal
-  // behavior: focus trap, ::backdrop dimming, Escape-to-close. Mirrors the
-  // SettingsOverlayHost / DMProfileModal pattern in this codebase.
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg || dlg.open) return;
-    dlg.showModal();
-  }, []);
+  // A top-layer modal dialog: focus trap, ::backdrop dimming, Escape-to-close,
+  // and reachable over Settings and any open ui/Modal (the topmost ModalContext
+  // entry keeps their Escape and Tab handlers off this dialog's keys).
+  const { dialogRef } = useTopLayerDialog(true);
 
   // Native <dialog> fires a 'cancel' event before Escape closes it, followed by
   // 'close'. Attestation failures remain dismissible.
@@ -77,7 +72,7 @@ export function AttestationFailedModal({
     return () => {
       dlg.removeEventListener('close', handleClose);
     };
-  }, [onDismiss]);
+  }, [dialogRef, onDismiss]);
 
   const handleDownloadClick = (e: MouseEvent<HTMLAnchorElement>): void => {
     // Type-narrowing guard, not a runtime branch: the anchor only mounts when
@@ -105,42 +100,40 @@ export function AttestationFailedModal({
   };
 
   return (
-    <div className="attestation-modal-overlay">
-      <dialog
-        ref={dialogRef}
-        aria-modal="true"
-        aria-labelledby="attestation-modal-title"
-        className="attestation-modal"
-        data-attestation-code={code}
-      >
-        <h2 id="attestation-modal-title">Update Required</h2>
+    <dialog
+      ref={dialogRef}
+      aria-labelledby="attestation-modal-title"
+      aria-describedby="attestation-modal-description"
+      className="attestation-modal"
+      data-attestation-code={code}
+    >
+      <h2 id="attestation-modal-title">Update Required</h2>
+      <p id="attestation-modal-description">
+        concordvoice.chat requires an official Concord Voice client. Self-hosted servers may accept
+        your build, but this server only accepts official signed releases.
+      </p>
+      {requiredMinVersion && (
         <p>
-          concordvoice.chat requires an official Concord Voice client. Self-hosted servers may
-          accept your build, but this server only accepts official signed releases.
+          Required minimum version: <strong>{requiredMinVersion}</strong>
         </p>
-        {requiredMinVersion && (
-          <p>
-            Required minimum version: <strong>{requiredMinVersion}</strong>
-          </p>
+      )}
+      <div className="attestation-modal__actions">
+        {downloadUrl && (
+          <a
+            href={downloadUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="attestation-modal__download-link"
+            onClick={handleDownloadClick}
+          >
+            Download Official Client
+          </a>
         )}
-        <div className="attestation-modal__actions">
-          {downloadUrl && (
-            <a
-              href={downloadUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="attestation-modal__download-link"
-              onClick={handleDownloadClick}
-            >
-              Download Official Client
-            </a>
-          )}
-          <button type="button" className="btn btn-secondary" onClick={onDismiss}>
-            Dismiss
-          </button>
-        </div>
-      </dialog>
-    </div>
+        <button type="button" className="btn btn-secondary" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    </dialog>
   );
 }
 

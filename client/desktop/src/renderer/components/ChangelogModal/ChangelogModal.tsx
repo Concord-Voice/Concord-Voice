@@ -13,6 +13,7 @@ import {
   type ChangelogSection,
 } from '../../services/system/changelog';
 import { useChangelogStore } from '../../stores/ui/changelogStore';
+import { useTopLayerDialog } from '../../hooks/ui/useTopLayerDialog';
 import { useAuthStore } from '../../stores/auth/authStore';
 import { useAttestationFailureStore } from '../../stores/auth/attestationFailureStore';
 import { useClientConfigStore } from '../../stores/ui/clientConfigStore';
@@ -79,16 +80,14 @@ export function ChangelogModal({
   sections,
   onDismiss,
 }: Readonly<ChangelogModalProps>) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
+  // A top-layer modal dialog (mirrors AttestationFailedModal): focus trap,
+  // ::backdrop, Escape-to-close, and reachable over Settings and any open
+  // ui/Modal. The hook's showModal() runs first; initial focus then moves to
+  // the close button imperatively — deterministic and avoids the autoFocus
+  // a11y lint.
+  const { dialogRef } = useTopLayerDialog(true);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
-
-  // Native <dialog> modal behavior: focus trap, ::backdrop, Escape-to-close
-  // (mirrors AttestationFailedModal). Initial focus is placed on the close
-  // button imperatively — deterministic and avoids the autoFocus a11y lint.
   useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg || dlg.open) return;
-    dlg.showModal();
     closeButtonRef.current?.focus();
   }, []);
 
@@ -101,7 +100,7 @@ export function ChangelogModal({
     return () => {
       dlg.removeEventListener('close', handleClose);
     };
-  }, [onDismiss]);
+  }, [dialogRef, onDismiss]);
 
   const visible = sections.slice(0, MAX_RENDERED_SECTIONS);
   const earlierCount = sections.length - visible.length;
@@ -115,7 +114,6 @@ export function ChangelogModal({
     <div className="changelog-modal-overlay">
       <dialog
         ref={dialogRef}
-        aria-modal="true"
         aria-labelledby="changelog-modal-title"
         aria-describedby="changelog-modal-summary"
         className="changelog-modal"

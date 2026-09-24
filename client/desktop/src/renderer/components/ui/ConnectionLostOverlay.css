@@ -1,18 +1,21 @@
+/* A showModal() <dialog> shell in the browser top layer, above Settings and any
+   ui/Modal, so no z-index. The card inside carries the surface; ::backdrop dims
+   and blurs everything behind. `margin: auto` restores the UA centring that the
+   global `* { margin: 0 }` reset in styles/index.css removes. The dialog keeps
+   its UA `overflow: auto` so a card taller than the window still scrolls to its
+   buttons; the transparent padding gives the card's shadow room inside it. */
 .connection-lost-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  margin: auto;
+  padding: 40px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.connection-lost-overlay::backdrop {
   background: rgba(0, 0, 0, 0.6);
   backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 9999;
   animation: modalOverlayFadeIn 0.3s ease-out;
-  pointer-events: all;
 }
 
 .connection-lost-card {
@@ -57,7 +60,10 @@
   margin: 0 0 12px;
 }
 
+/* An <output>: its implicit status role makes the message a live region, so a
+   phase change is announced. It is inline by default. */
 .connection-lost-message {
+  display: block;
   font-size: calc(14px * var(--font-scale, 1));
   color: var(--text-secondary);
   line-height: 1.6;

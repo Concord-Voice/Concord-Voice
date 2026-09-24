@@ -2365,15 +2365,19 @@ body {
  * picks up the banner's local foreground (white-on-critical-red), which
  * is the only readable choice against the danger-tinted background. The
  * banner's own CSS already specifies the underline, so visually nothing
- * changes — we just stop fighting its deliberate color decision. */
-a[target='_blank']:not(.update-security-banner__cta) {
+ * changes — we just stop fighting its deliberate color decision.
+ * `.attestation-modal__download-link` is excluded for the same reason: it is
+ * an accent-filled button whose own `color: var(--on-accent)` loses to this
+ * (0,2,1) selector otherwise, and in the default dark scheme `--link-color`
+ * and the fill are the same token, so its label rendered invisible. */
+a[target='_blank']:not(.update-security-banner__cta, .attestation-modal__download-link) {
   color: var(--link-color);
   text-decoration: underline;
   text-underline-offset: 2px;
   transition: color 0.15s ease;
 }
 
-a[target='_blank']:not(.update-security-banner__cta):hover {
+a[target='_blank']:not(.update-security-banner__cta, .attestation-modal__download-link):hover {
   color: var(--link-color-hover);
 }
 

@@ -1085,3 +1085,31 @@ describe('exemption discipline', () => {
     }
   });
 });
+
+// An accent-filled button that is an external link must opt out of the global
+// `a[target='_blank']:not(…)` colour rule. That selector scores (0,2,1) and beats
+// the button's own (0,1,0) `color: var(--on-accent)`, painting `--link-color` on
+// an accent fill. In the default dark scheme both are `--accent-primary`, so the
+// attestation modal's "Download Official Client" label rendered invisible.
+describe('external-link colour rule exempts accent-filled button links', () => {
+  const indexCss = readFileSync(
+    resolve(__dirname, '../../../src/renderer/styles/index.css'),
+    'utf-8'
+  );
+  const selectors = indexCss
+    .split('\n')
+    .filter((line) => line.startsWith("a[target='_blank']:not(") && line.trimEnd().endsWith('{'));
+
+  it('finds the rule and its :hover (positive control for the parse)', () => {
+    expect(selectors.length, 'the external-link rule and its :hover must both be found').toBe(2);
+  });
+
+  it.each(['.update-security-banner__cta', '.attestation-modal__download-link'])(
+    'exempts %s from the rule and its :hover',
+    (cls) => {
+      for (const sel of selectors) {
+        expect(sel, `${sel.trim()} must exclude ${cls} from the link colour`).toContain(cls);
+      }
+    }
+  );
+});

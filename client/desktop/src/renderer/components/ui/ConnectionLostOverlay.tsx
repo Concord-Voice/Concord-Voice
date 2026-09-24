@@ -9,6 +9,7 @@ import {
 // recoveryService remains lazy. resetService is eagerly registered by main.tsx;
 // local dynamic imports avoid a direct feature-module dependency.
 import { runRecoveryModule } from '../../utils/runtime/runRecoveryModule';
+import { useTopLayerDialog } from '../../hooks/ui/useTopLayerDialog';
 import './ConnectionLostOverlay.css';
 
 /** Display text per CheckResult value. Extracted from the inline ternary
@@ -64,9 +65,13 @@ function DiagnosticDisplay({ diagnostics }: Readonly<{ diagnostics: DiagnosticRe
 function PhaseContent({
   phase,
   diagnostics,
+  titleId,
+  descriptionId,
 }: Readonly<{
   phase: RecoveryPhase;
   diagnostics: DiagnosticResults | null;
+  titleId: string;
+  descriptionId: string;
 }>) {
   const handleRetry = useCallback(async () => {
     const store = useConnectionStore.getState();
@@ -155,10 +160,12 @@ function PhaseContent({
           <div className="connection-lost-icon spinning">
             <Loader size={48} />
           </div>
-          <h2 className="connection-lost-title">Running Diagnostics</h2>
-          <p className="connection-lost-message">
+          <h2 id={titleId} className="connection-lost-title">
+            Running Diagnostics
+          </h2>
+          <output id={descriptionId} className="connection-lost-message">
             Checking connectivity and session status&hellip;
-          </p>
+          </output>
         </>
       );
 
@@ -168,14 +175,14 @@ function PhaseContent({
           <div className="connection-lost-icon">
             <Wifi size={48} />
           </div>
-          <h2 className="connection-lost-title">
+          <h2 id={titleId} className="connection-lost-title">
             {diagnostics?.internet === 'failed' ? 'No Internet' : 'Waiting for Server'}
           </h2>
-          <p className="connection-lost-message">
+          <output id={descriptionId} className="connection-lost-message">
             {diagnostics?.internet === 'failed'
               ? 'Your internet connection appears to be down. Reconnection will happen automatically when connectivity is restored.'
               : 'The server appears to be unreachable. Reconnection attempts are ongoing in the background.'}
-          </p>
+          </output>
           <DiagnosticDisplay diagnostics={diagnostics} />
           <div className="connection-lost-actions">
             <button className="connection-lost-btn primary" onClick={handleRetry}>
@@ -196,10 +203,12 @@ function PhaseContent({
           <div className="connection-lost-icon spinning">
             <RefreshCw size={48} />
           </div>
-          <h2 className="connection-lost-title">Restarting Client</h2>
-          <p className="connection-lost-message">
+          <h2 id={titleId} className="connection-lost-title">
+            Restarting Client
+          </h2>
+          <output id={descriptionId} className="connection-lost-message">
             Detected a client-side issue. Performing a soft restart to recover your session&hellip;
-          </p>
+          </output>
         </>
       );
 
@@ -209,14 +218,14 @@ function PhaseContent({
           <div className="connection-lost-icon error">
             <AlertTriangle size={48} />
           </div>
-          <h2 className="connection-lost-title">
+          <h2 id={titleId} className="connection-lost-title">
             {diagnostics?.sessionRevoked ? 'Session Revoked' : 'Connection Failed'}
           </h2>
-          <p className="connection-lost-message">
+          <output id={descriptionId} className="connection-lost-message">
             {diagnostics?.sessionRevoked
               ? 'Your session was terminated by the server. This may happen when logging in from another device or when your session expires.'
               : 'Unable to restore your connection after multiple attempts.'}
-          </p>
+          </output>
           <DiagnosticDisplay diagnostics={diagnostics} />
           <div className="connection-lost-actions">
             <button className="connection-lost-btn primary" onClick={handleRestart}>
@@ -241,14 +250,30 @@ const ConnectionLostOverlay: React.FC = () => {
   const diagnostics = useConnectionStore((s) => s.diagnostics);
 
   // Only show overlay for phases beyond grace_period
-  if (phase === 'stable' || phase === 'grace_period') return null;
+  const visible = phase !== 'stable' && phase !== 'grace_period';
+  const { dialogRef, titleId, descriptionId } = useTopLayerDialog(visible);
+  if (!visible) return null;
 
+  // A modal dialog so Retry / Exit stay reachable over Settings and any open
+  // ui/Modal. closedby="none": only reconnecting or exiting dismisses it, so
+  // Escape does nothing (measured, Chromium 152: no cancel or close event).
   return (
-    <div className="connection-lost-overlay">
+    <dialog
+      ref={dialogRef}
+      className="connection-lost-overlay"
+      closedby="none"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+    >
       <div className="connection-lost-card">
-        <PhaseContent phase={phase} diagnostics={diagnostics} />
+        <PhaseContent
+          phase={phase}
+          diagnostics={diagnostics}
+          titleId={titleId}
+          descriptionId={descriptionId}
+        />
       </div>
-    </div>
+    </dialog>
   );
 };
 

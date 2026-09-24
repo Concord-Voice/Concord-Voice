@@ -13,9 +13,10 @@
  * Stacking choice — z-index 950: deliberately sits between SettingsOverlayHost
  * (900) and Modal (1000). Above all standard renderer-content layers
  * (panels, autocomplete, search at z-index 100) so the diagnostic always
- * wins over routine UI; below modals, ConnectionLostOverlay (9999),
- * ForceUpdateOverlay (10000), and ContextMenu (100000+) so true
- * blocking surfaces still cover it. Position fixed at top:0.
+ * wins over routine UI; below modals and ContextMenu (100000+) so true
+ * blocking surfaces still cover it. ConnectionLostOverlay and
+ * ForceUpdateOverlay are showModal() dialogs in the top layer, above every
+ * z-index. Position fixed at top:0.
  */
 
 .spa-fallback-overlay {

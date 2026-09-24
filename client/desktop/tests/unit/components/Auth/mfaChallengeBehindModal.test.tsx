@@ -1,14 +1,17 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { render, screen, fireEvent, act } from '../../../test-utils';
 import { vi } from 'vitest';
 import { useMFAChallengeStore } from '@/renderer/stores/auth/mfaChallengeStore';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import Modal from '@/renderer/components/ui/Modal';
-import { ModalPortalHostContext } from '@/renderer/components/ui/ModalContext';
 import MFAChallengeModal from '@/renderer/components/Auth/MFAChallengeModal';
 import AttestationFailedModalHost from '@/renderer/components/AttestationFailedModal';
 import { useAttestationFailureStore } from '@/renderer/stores/auth/attestationFailureStore';
+import {
+  installTopLayerEmulation,
+  installRootHarness,
+  SettingsStandIn,
+  topDialog,
+} from '../../../helpers/topLayerEmulation';
 
 // MFAChallengeModal reaches these services at import/verify time; mock only
 // what's needed to import cleanly (mirrors MFAChallengeModal.test.tsx). This
@@ -25,128 +28,13 @@ vi.mock('@/renderer/services/system/apiClient', () => ({
   safeJson: async <T,>(res: { json: () => Promise<T> }): Promise<T> => res.json(),
 }));
 
-// ── jsdom gap emulation ──────────────────────────────────────────────────
-// jsdom implements neither the `inert` attribute's focus-blocking behavior
-// nor the browser's top-layer / showModal() modality. Both are load-bearing
-// for this regression: ModalContext's syncInert sets `inert` on #root and on
-// non-topmost modal overlays, and SettingsOverlayHost opens its <dialog> with
-// showModal(), which in a real browser blocks focus/Tab/Escape from reaching
-// anything outside the top-layer dialog. Without emulating both rules here,
-// every assertion in this file would trivially pass regardless of whether the
-// production bug is present.
-let dialogStack: HTMLDialogElement[];
-let originalShowModal: typeof HTMLDialogElement.prototype.showModal;
-let originalFocus: typeof HTMLElement.prototype.focus;
-
-function topDialog(): HTMLDialogElement | undefined {
-  for (let i = dialogStack.length - 1; i >= 0; i--) {
-    const d = dialogStack[i];
-    if (d.isConnected && d.open) return d;
-  }
-  return undefined;
-}
-
-function isFocusBlocked(el: HTMLElement): boolean {
-  // (a) an [inert] ancestor-or-self blocks focus, but a modal dialog escapes
-  // an inert ancestor (whatwg/html#7808): only an inert found between the
-  // element and its nearest open modal dialog counts
-  const inert = el.closest('[inert]');
-  const modal = el.closest('dialog');
-  if (inert && !(modal?.matches(':modal') && !modal.contains(inert))) return true;
-  // (a2) a closed <dialog> is not rendered, so nothing inside it can take
-  // focus (React's autoFocus fires before the effect that opens the dialog)
-  if (el.closest('dialog:not([open])')) return true;
-  // (b) while any showModal()-opened <dialog> is open and connected, every
-  // element NOT inside the most-recently-shown such dialog is blocked
-  const top = topDialog();
-  if (top && !top.contains(el)) return true;
-  return false;
-}
-
-beforeEach(() => {
-  dialogStack = [];
-  originalShowModal = HTMLDialogElement.prototype.showModal;
-  originalFocus = HTMLElement.prototype.focus;
-
-  // A showModal() adds the dialog at the TOP of the top layer, including one
-  // that was already in it (HTML "add an element to the top layer").
-  vi.spyOn(HTMLDialogElement.prototype, 'showModal').mockImplementation(function (
-    this: HTMLDialogElement
-  ) {
-    originalShowModal.call(this);
-    const i = dialogStack.indexOf(this);
-    if (i !== -1) dialogStack.splice(i, 1);
-    dialogStack.push(this);
-    // The dialog focusing steps: showModal() moves focus into the dialog.
-    this.querySelector<HTMLElement>('input, button, [tabindex]:not([tabindex="-1"])')?.focus();
-  });
-  // Chromium QUEUES the close event (HTML "close the dialog"); the setup.ts
-  // polyfill fires it synchronously, which no browser does.
-  vi.spyOn(HTMLDialogElement.prototype, 'close').mockImplementation(function (
-    this: HTMLDialogElement
-  ) {
-    this.removeAttribute('open');
-    queueMicrotask(() => this.dispatchEvent(new Event('close')));
-  });
-
-  vi.spyOn(HTMLElement.prototype, 'focus').mockImplementation(function (
-    this: HTMLElement,
-    ...args: Parameters<typeof HTMLElement.prototype.focus>
-  ) {
-    if (isFocusBlocked(this)) return;
-    originalFocus.apply(this, args);
-  });
-});
-
-afterEach(() => {
-  vi.restoreAllMocks();
-});
-
-// ── #root harness ────────────────────────────────────────────────────────
-// ModalContext's syncInert targets document.getElementById('root'), which
-// test-utils' default RTL container does not provide.
-let root: HTMLDivElement;
-
-beforeEach(() => {
-  root = document.createElement('div');
-  root.id = 'root';
-  document.body.appendChild(root);
-});
-
-afterEach(() => {
-  root.remove();
-});
-
-// ── S1 stand-in for SettingsOverlayHost ─────────────────────────────────
-// A minimal native-<dialog> host that mirrors SettingsOverlayHost's shape
-// (callback ref -> useState -> ModalPortalHostContext), WITHOUT its
-// jsdom-only Escape fallback (SettingsOverlayHost only installs a manual
-// Escape listener when `dialogCancelsOnEscape` is false, which would muddy
-// the Escape assertion this test cares about — the real
-// showModal()-opened <dialog> already owns Escape in a real browser).
-function SettingsStandIn({ children }: { children: React.ReactNode }) {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  const [portalHost, setPortalHost] = useState<HTMLDialogElement | null>(null);
-  const setDialogRef = useCallback((dialog: HTMLDialogElement | null) => {
-    dialogRef.current = dialog;
-    setPortalHost(dialog);
-  }, []);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (dlg && !dlg.open) dlg.showModal();
-  }, [portalHost]);
-
-  return createPortal(
-    <dialog ref={setDialogRef} aria-label="Settings">
-      {/* eslint-disable-next-line @eslint-react/no-context-provider -- test stand-in mirrors SettingsOverlayHost's own provider usage */}
-      <ModalPortalHostContext.Provider value={portalHost}>
-        {portalHost ? children : null}
-      </ModalPortalHostContext.Provider>
-    </dialog>,
-    document.body
-  );
-}
+// jsdom-gap emulation (showModal()/inert focus blocking) and the #root /
+// SettingsStandIn harness are shared with the rest of the "global overlay
+// reachable over Settings" regression family — see
+// tests/helpers/topLayerEmulation.tsx and [internal]rules/frontend.md § "A
+// global overlay must be reachable over the Settings dialog".
+installTopLayerEmulation();
+const getRoot = installRootHarness();
 
 function openChallenge() {
   act(() => {
@@ -177,7 +65,7 @@ describe('MFA challenge reachability while a ui/Modal is open (regression)', () 
         <button type="button">Outside</button>
         <MFAChallengeModal />
       </>,
-      { container: root }
+      { container: getRoot() }
     );
 
     // Positive controls first — prove the emulation is not blocking
@@ -236,7 +124,7 @@ describe('MFA challenge reachability while a plain ui/Modal is open (no Settings
         </Modal>
         <MFAChallengeModal />
       </>,
-      { container: root }
+      { container: getRoot() }
     );
 
     const disableButton = screen.getByRole('button', { name: 'Disable' });
@@ -294,7 +182,7 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
         <MFAChallengeModal />
         <AttestationFailedModalHost />
       </>,
-      { container: root }
+      { container: getRoot() }
     );
     openChallenge();
     const challenge = document.querySelector('dialog.mfa-challenge-dialog') as HTMLDialogElement;
@@ -336,7 +224,7 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
           <summary>More</summary>
         </details>
       </>,
-      { container: root }
+      { container: getRoot() }
     );
     openChallenge();
     const showModal = vi.mocked(HTMLDialogElement.prototype.showModal);
@@ -356,7 +244,7 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
         <MFAChallengeModal />
         <dialog id="non-modal">note</dialog>
       </>,
-      { container: root }
+      { container: getRoot() }
     );
     openChallenge();
     const showModal = vi.mocked(HTMLDialogElement.prototype.showModal);
@@ -372,9 +260,9 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
   });
 
   it('keeps focus on the control the user was typing in when it retakes the top', async () => {
-    // The file's showModal() runs the dialog focusing steps, as Chromium does,
+    // The shared emulation's showModal() runs the dialog focusing steps, as Chromium does,
     // so the burying dialog has taken focus before the observer's callback.
-    render(<MFAChallengeModal />, { container: root });
+    render(<MFAChallengeModal />, { container: getRoot() });
     openChallenge();
     const typing = screen.getByLabelText('Digit 3');
     typing.focus();
@@ -382,16 +270,19 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
     const burying = document.createElement('dialog');
     burying.append(document.createElement('button'));
     document.body.append(burying);
-    act(() => {
-      burying.showModal();
-    });
-    expect(document.activeElement, 'the burying dialog took focus first').toBe(
-      burying.querySelector('button')
-    );
-    await flushObservers();
+    try {
+      act(() => {
+        burying.showModal();
+      });
+      expect(document.activeElement, 'the burying dialog took focus first').toBe(
+        burying.querySelector('button')
+      );
+      await flushObservers();
 
-    expect(document.activeElement, 'focus must return to the digit being typed').toBe(typing);
-    burying.remove();
+      expect(document.activeElement, 'focus must return to the digit being typed').toBe(typing);
+    } finally {
+      burying.remove(); // a failed assertion must not leak an open modal into the next test
+    }
   });
 
   it('stops watching once the challenge settles', async () => {
@@ -400,7 +291,7 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
         <MFAChallengeModal />
         <dialog id="later">later</dialog>
       </>,
-      { container: root }
+      { container: getRoot() }
     );
     openChallenge();
     act(() => {
@@ -424,7 +315,7 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
         <button type="button">second</button>
         <MFAChallengeModal />
       </>,
-      { container: root }
+      { container: getRoot() }
     );
     const first = screen.getByRole('button', { name: 'first' });
     const second = screen.getByRole('button', { name: 'second' });
@@ -451,7 +342,7 @@ describe('MFA challenge stays on top of a dialog opened after it', () => {
         <button type="button">invoker</button>
         <MFAChallengeModal />
       </>,
-      { container: root }
+      { container: getRoot() }
     );
     const invoker = screen.getByRole('button', { name: 'invoker' });
     invoker.focus();
@@ -493,7 +384,7 @@ describe('focus after a failed proof', () => {
           })
       )
     );
-    render(<MFAChallengeModal />, { container: root });
+    render(<MFAChallengeModal />, { container: getRoot() });
     openChallenge();
     const first = screen.getByLabelText('Digit 1');
     fireEvent.paste(first, { clipboardData: { getData: () => '123456' } });
@@ -530,19 +421,21 @@ describe('an empty challenge token is no challenge', () => {
   });
 
   it('a live challenge replaced by an empty token leaves nothing inert', () => {
-    render(<MFAChallengeModal />, { container: root });
+    render(<MFAChallengeModal />, { container: getRoot() });
     openChallenge();
-    expect(root.hasAttribute('inert')).toBe(true);
+    expect(getRoot().hasAttribute('inert')).toBe(true);
 
     act(() => {
       useMFAChallengeStore.setState({ challengeToken: '' });
     });
     expect(document.querySelector('dialog.mfa-challenge-dialog')).toBeNull();
-    expect(root.hasAttribute('inert'), 'nothing is on screen, so nothing may be inert').toBe(false);
+    expect(getRoot().hasAttribute('inert'), 'nothing is on screen, so nothing may be inert').toBe(
+      false
+    );
   });
 
   it('a real token after an empty one is shown, not rendered into a closed dialog', () => {
-    render(<MFAChallengeModal />, { container: root });
+    render(<MFAChallengeModal />, { container: getRoot() });
     act(() => {
       useMFAChallengeStore.setState({
         challengeToken: '',
@@ -566,7 +459,7 @@ describe('the default verification method', () => {
   });
 
   it('is never a recovery-only method', () => {
-    render(<MFAChallengeModal />, { container: root });
+    render(<MFAChallengeModal />, { container: getRoot() });
     act(() => {
       void useMFAChallengeStore
         .getState()

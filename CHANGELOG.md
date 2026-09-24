@@ -74,6 +74,17 @@ that keeps sending far more than your plan allows.
   leaving a voice session, or disconnecting can no longer briefly deliver an older activity
   update after its removal.
 
+- **Update, reconnection and what's-new windows now work while Settings is open** ([#3424](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3424)) — when Concord required an
+  update, lost its connection, rejected an unofficial build or showed what's new while Settings or
+  another window was open, the buttons in that window could not be clicked or reached with the
+  keyboard, and Escape or Tab acted on the window behind it. These windows now always open on top
+  and take the keyboard, and keyboard shortcuts such as the one for Settings no longer open
+  anything over them. Pressing Escape in the update or reconnection window no longer closes a
+  window hidden behind it, and screen readers now read each window's message and announce when
+  the connection state changes. The encryption key recovery prompt now opens centred instead of
+  in the top-left corner, and the "Download Official Client" button label is readable again in
+  dark themes.
+
 - **The Basic / Advanced Settings switch in Audio and Video Configuration now works with a keyboard and
   screen reader** ([#3428](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3428)) — screen readers announce the two options as a choice of two instead of as tabs,
   the arrow keys move between them, Tab stops once per switch, and a focus ring shows which option

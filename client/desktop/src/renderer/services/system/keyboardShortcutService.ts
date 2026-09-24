@@ -1,8 +1,17 @@
 import { useKeyboardShortcutStore, type KeyCombo } from '../../stores/ui/keyboardShortcutStore';
 import { useMFAChallengeStore } from '../../stores/auth/mfaChallengeStore';
 
-/** Shortcuts that open no dialog and never use Escape, so a pending MFA challenge lets them run. */
-const RUNS_DURING_CHALLENGE: ReadonlySet<string> = new Set(['toggle-mute', 'toggle-deafen']);
+/**
+ * Marks a global overlay's <dialog> (set by useTopLayerDialog). While one is
+ * open, only the shortcuts in RUNS_BEHIND_OVERLAY run: see handleKeyDown.
+ */
+export const GLOBAL_OVERLAY_ATTRIBUTE = 'data-global-overlay';
+
+/**
+ * Shortcuts that open no dialog and never use Escape, so they still run behind
+ * a pending MFA challenge or an open global overlay.
+ */
+const RUNS_BEHIND_OVERLAY: ReadonlySet<string> = new Set(['toggle-mute', 'toggle-deafen']);
 
 class KeyboardShortcutService {
   private readonly handlers = new Map<string, () => void>();
@@ -60,9 +69,13 @@ class KeyboardShortcutService {
   private handleKeyDown(event: KeyboardEvent): void {
     if (!this.enabled) return;
     // A pending identity challenge owns the keyboard: a shortcut would open a
-    // dialog over it, or cancel the Escape keydown that closes it. Mute and
-    // deafen do neither, and a user in a call must still be able to use them.
-    const challengePending = !!useMFAChallengeStore.getState().challengeToken;
+    // dialog over it, or cancel the Escape keydown that closes it. An open
+    // global overlay owns it for the same two reasons (Ctrl/Cmd+, would show
+    // Settings above it in the top layer). Mute and deafen do neither, and a
+    // user in a call must still be able to use them.
+    const overlayOwnsKeys =
+      !!useMFAChallengeStore.getState().challengeToken ||
+      document.querySelector(`dialog[open][${GLOBAL_OVERLAY_ATTRIBUTE}]`) !== null;
 
     const { shortcuts } = useKeyboardShortcutStore.getState();
     const inInput = this.isInTextInput(event);
@@ -70,7 +83,7 @@ class KeyboardShortcutService {
     for (const shortcut of shortcuts) {
       if (!this.matchesCombo(event, shortcut.combo)) continue;
       if (inInput && !shortcut.allowInInput) continue;
-      if (challengePending && !RUNS_DURING_CHALLENGE.has(shortcut.id)) continue;
+      if (overlayOwnsKeys && !RUNS_BEHIND_OVERLAY.has(shortcut.id)) continue;
 
       const handler = this.handlers.get(shortcut.id);
       if (handler) {

@@ -108,7 +108,8 @@ describe('ForceUpdateOverlay', () => {
     expect(container.querySelector('.force-update-overlay')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Update Now' })).toBeInTheDocument();
     expect(screen.getByText('v1.2.3')).toBeInTheDocument();
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    // The force-update overlay is the only dialog: the attestation modal stays hidden.
+    expect(screen.getByRole('dialog')).toBe(container.querySelector('.force-update-overlay'));
     expect(getVersion).toHaveBeenCalledTimes(1);
   });
 

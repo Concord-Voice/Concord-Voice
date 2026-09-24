@@ -11,7 +11,7 @@ vi.mock('../../../src/renderer/stores/ui/keyboardShortcutStore', () => ({
 }));
 
 // Import after mocking
-const { keyboardShortcutService } =
+const { keyboardShortcutService, GLOBAL_OVERLAY_ATTRIBUTE } =
   await import('../../../src/renderer/services/system/keyboardShortcutService');
 
 /** Helper to build a shortcut definition for tests */
@@ -324,6 +324,38 @@ describe('KeyboardShortcutService', () => {
       document.dispatchEvent(event);
       expect(handler).toHaveBeenCalledOnce();
       expect(event.defaultPrevented).toBe(true);
+    });
+  });
+
+  // A global overlay's dialog can be closed but still mounted: between a
+  // queued close and the unmount, or a dismissible overlay the user closed.
+  // Only an OPEN one owns the keys.
+  describe('while a global overlay dialog is mounted', () => {
+    let overlay: HTMLDialogElement;
+    beforeEach(() => {
+      overlay = document.createElement('dialog');
+      overlay.setAttribute(GLOBAL_OVERLAY_ATTRIBUTE, '');
+      document.body.append(overlay);
+    });
+    afterEach(() => {
+      overlay.remove();
+    });
+
+    it('runs no shortcut while it is open, and runs them once it has closed', () => {
+      const handler = vi.fn();
+      mockGetState.mockReturnValue({
+        shortcuts: [makeShortcut({ id: 'open-settings', combo: { key: ',', ctrl: true } })],
+      });
+      keyboardShortcutService.init();
+      keyboardShortcutService.registerHandler('open-settings', handler);
+
+      overlay.setAttribute('open', '');
+      document.dispatchEvent(createKeyEvent(',', { ctrlKey: true }));
+      expect(handler, 'an open overlay owns the keys').not.toHaveBeenCalled();
+
+      overlay.removeAttribute('open');
+      document.dispatchEvent(createKeyEvent(',', { ctrlKey: true }));
+      expect(handler, 'a closed overlay that is still mounted owns nothing').toHaveBeenCalledOnce();
     });
   });
 });

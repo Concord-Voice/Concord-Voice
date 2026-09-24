@@ -48,11 +48,11 @@ describe('AttestationFailedModal (presentational)', () => {
   });
 
   // 1. Dialog role + accessible name
-  it('renders a dialog with role="dialog", aria-modal="true", and title "Update Required"', () => {
+  it('renders a modal dialog titled "Update Required"', () => {
     renderPresentation();
     const dialog = screen.getByRole('dialog');
     expect(dialog).toBeInTheDocument();
-    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog.matches(':modal'), 'opened with showModal()').toBe(true);
     // The dialog is labelled by #attestation-modal-title which reads "Update Required"
     expect(screen.getByRole('heading', { name: 'Update Required' })).toBeInTheDocument();
   });

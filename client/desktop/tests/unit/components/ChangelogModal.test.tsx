@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+// test-utils wraps ModalProvider: the modal registers in the ModalContext stack.
+import { render, screen, fireEvent, waitFor } from '../../test-utils';
 import ChangelogModalHost, {
   ChangelogModal,
   MAX_RENDERED_SECTIONS,
@@ -11,15 +12,11 @@ import { useClientConfigStore } from '../../../src/renderer/stores/ui/clientConf
 import { resetAllStores } from '../../helpers/store-helpers';
 import type { ChangelogSection } from '../../../src/renderer/services/system/changelog';
 
-// jsdom has no <dialog>.showModal — spy it like SubscriptionResetModal.test.tsx does.
+// tests/setup.ts polyfills showModal(), and :modal matches only a dialog it
+// opened, so the dialog's modality is observable without a local stub.
 beforeEach(() => {
   resetAllStores();
   vi.restoreAllMocks();
-  vi.spyOn(HTMLDialogElement.prototype, 'showModal').mockImplementation(function (
-    this: HTMLDialogElement
-  ) {
-    this.setAttribute('open', '');
-  });
 });
 
 const section = (version: string, body: string, preamble = ''): ChangelogSection => ({
@@ -31,7 +28,7 @@ const section = (version: string, body: string, preamble = ''): ChangelogSection
 });
 
 describe('ChangelogModal (presentational)', () => {
-  it('renders an aria-modal dialog with labelled title, describedby summary, and initial focus on the close button', () => {
+  it('renders a modal dialog with labelled title, describedby summary, and initial focus on the close button', () => {
     render(
       <ChangelogModal
         currentVersion="0.2.21"
@@ -40,7 +37,7 @@ describe('ChangelogModal (presentational)', () => {
       />
     );
     const dialog = screen.getByRole('dialog');
-    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog.matches(':modal'), 'opened with showModal()').toBe(true);
     expect(dialog).toHaveAttribute('aria-labelledby', 'changelog-modal-title');
     expect(dialog).toHaveAttribute('aria-describedby', 'changelog-modal-summary');
     expect(screen.getByText(/What's new in v0\.2\.21/)).toBeInTheDocument();

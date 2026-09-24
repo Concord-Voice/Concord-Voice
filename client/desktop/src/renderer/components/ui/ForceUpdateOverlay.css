@@ -1,18 +1,21 @@
+/* A showModal() <dialog> shell in the browser top layer, above Settings and any
+   ui/Modal, so no z-index. The card inside carries the surface; ::backdrop dims
+   and blurs everything behind. `margin: auto` restores the UA centring that the
+   global `* { margin: 0 }` reset in styles/index.css removes. The dialog keeps
+   its UA `overflow: auto` so a card taller than the window still scrolls to its
+   buttons; the transparent padding gives the card's shadow room inside it. */
 .force-update-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  margin: auto;
+  padding: 40px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.force-update-overlay::backdrop {
   background: rgba(0, 0, 0, 0.7);
   backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10000;
   animation: modalOverlayFadeIn 0.3s ease-out;
-  pointer-events: all;
 }
 
 .force-update-card {
