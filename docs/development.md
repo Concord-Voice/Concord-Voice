@@ -9,6 +9,8 @@ cd /path/to/Concord
 ./scripts/install-git-hooks.sh
 ```
 
+On macOS, the hooks refuse to run under bash 5.1.0–5.3.15 (usually an out-of-date Homebrew bash), which can hang forever on a large heredoc. Run `brew upgrade bash` if the installer or a commit reports this.
+
 See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for full GitHub collaboration workflow.
 
 ## Prerequisites

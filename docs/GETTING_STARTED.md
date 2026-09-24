@@ -79,7 +79,9 @@ pip install pre-commit        # or: brew install pre-commit / pipx install pre-c
 ./scripts/install-git-hooks.sh
 ```
 
-This installs 22 hooks covering security scanning, linting, formatting, and commit message validation. See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for details.
+This installs every hook in `.pre-commit-config.yaml`: security scanning, linting, formatting, and commit message validation. See [SETUP_GITHUB.md](./SETUP_GITHUB.md) for details.
+
+**macOS:** the hooks run under the first `bash` on your `PATH`. bash 5.1.0 through 5.3.15 (usually an out-of-date Homebrew bash) can hang forever on a large heredoc, so the first hook refuses to run under it. Run `brew upgrade bash` if the installer or a commit reports this.
 
 ### Step 3: Start Infrastructure (2 min)
 
