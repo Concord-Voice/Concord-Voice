@@ -562,3 +562,91 @@ describe('ParticipantTile — DM call (no server scope)', () => {
     }
   });
 });
+
+describe('#2153 paused camera', () => {
+  // Same stub + play spy as the file's existing video case.
+  const stream = { id: 'stream-1', active: true } as unknown as MediaStream;
+
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    useVoiceStore.setState({ activeServerId: 'server-1', activeChannelId: 'voice-1' });
+    vi.spyOn(HTMLVideoElement.prototype, 'play').mockResolvedValue(undefined);
+  });
+
+  it('hides the video of a paused camera', () => {
+    const { container } = render(
+      <ParticipantTile
+        participant={makeParticipant({
+          isVideoOn: true,
+          videoStream: stream,
+          isCameraPaused: true,
+        })}
+      />
+    );
+    expect(container.querySelector('video')).toBeNull();
+  });
+
+  it('CONTROL: an unpaused camera renders its video', () => {
+    const { container } = render(
+      <ParticipantTile participant={makeParticipant({ isVideoOn: true, videoStream: stream })} />
+    );
+    expect(container.querySelector('video')).not.toBeNull();
+  });
+
+  // F2: `participant.videoStream`'s identity does not change across a
+  // pause/resume cycle, so a resumed camera's <video> — freshly mounted,
+  // since it unmounts while paused — must still get a srcObject on resume.
+  it('re-attaches the stream after a pause/resume cycle', () => {
+    const participant = makeParticipant({ isVideoOn: true, videoStream: stream });
+    const { container, rerender } = render(<ParticipantTile participant={participant} />);
+    expect((container.querySelector('video') as HTMLVideoElement)?.srcObject).toBe(stream);
+
+    rerender(<ParticipantTile participant={{ ...participant, isCameraPaused: true }} />);
+    expect(container.querySelector('video')).toBeNull();
+
+    rerender(<ParticipantTile participant={{ ...participant, isCameraPaused: false }} />);
+    expect((container.querySelector('video') as HTMLVideoElement)?.srcObject).toBe(stream);
+  });
+
+  it('re-attaches the stream when mounted paused and then resumed', () => {
+    const participant = makeParticipant({
+      isVideoOn: true,
+      videoStream: stream,
+      isCameraPaused: true,
+    });
+    const { container, rerender } = render(<ParticipantTile participant={participant} />);
+    expect(container.querySelector('video')).toBeNull();
+
+    rerender(<ParticipantTile participant={{ ...participant, isCameraPaused: false }} />);
+    expect((container.querySelector('video') as HTMLVideoElement)?.srcObject).toBe(stream);
+  });
+
+  it('a paused camera is indistinguishable from camera-off (no glyph reveals the cause, T12)', () => {
+    const paused = render(
+      <ParticipantTile
+        participant={makeParticipant({
+          isVideoOn: true,
+          videoStream: stream,
+          isCameraPaused: true,
+        })}
+      />
+    );
+    const pausedHtml = paused.container.innerHTML;
+    paused.unmount();
+    const off = render(<ParticipantTile participant={makeParticipant({ isVideoOn: false })} />);
+    expect(pausedHtml).toBe(off.container.innerHTML);
+  });
+
+  // ParticipantStatusOverlay renders ONE glyph by precedence: serverDeafened > serverMuted >
+  // isDeafened > isMuted, so each row isolates one branch.
+  it.each([
+    [{ isMuted: true }, 'Muted'],
+    [{ isDeafened: true }, 'Deafened'],
+    [{ serverMuted: true }, 'Server muted'],
+    [{ serverDeafened: true }, 'Server deafened'],
+  ])('status glyph %o has an accessible name (1.1.1 tidy-up)', (over, name) => {
+    render(<ParticipantTile participant={makeParticipant(over)} />);
+    expect(screen.getByRole('img', { name })).toBeInTheDocument();
+  });
+});

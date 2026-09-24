@@ -11,6 +11,10 @@ export interface ModalProps {
   width?: 'small' | 'medium' | 'large' | 'xlarge';
   dismissable?: boolean;
   initialFocusRef?: React.RefObject<HTMLElement | null>;
+  /** F17: id of an element (typically the body's explanatory text) to set as
+   *  aria-describedby on the <dialog>, so its content is announced on open —
+   *  not just the title, which aria-labelledby already covers. */
+  describedById?: string;
 }
 
 // Focusable descendants of a modal container, in DOM order, for the Tab trap.
@@ -33,6 +37,7 @@ const Modal: React.FC<ModalProps> = ({
   width = 'medium',
   dismissable = true,
   initialFocusRef,
+  describedById,
 }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDialogElement>(null);
@@ -155,6 +160,7 @@ const Modal: React.FC<ModalProps> = ({
         className={`modal-container modal-${width}`}
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={describedById}
         tabIndex={-1}
         ref={containerRef}
         open

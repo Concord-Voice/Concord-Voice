@@ -30,6 +30,11 @@ const StageVideo: React.FC<{
   sharerUserId?: string;
   /** Render-size role bucket for the screen demand report (#1924). */
   renderRole?: RemoteVideoRole;
+  /**
+   * #2153: a REMOTE share whose producer is paused (policer or any other cause).
+   * Required, so every call site states it. The wording is generic and true for any cause.
+   */
+  remotePaused: boolean;
 }> = ({
   stream,
   sharerName,
@@ -39,6 +44,7 @@ const StageVideo: React.FC<{
   audioControlUserId,
   sharerUserId,
   renderRole = 'focus',
+  remotePaused,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const tileId = useId();
@@ -72,19 +78,31 @@ const StageVideo: React.FC<{
     };
   }, [stream]);
 
+  // A nested ternary would trip Sonar S3358.
+  let body: React.ReactNode;
+  if (isPaused) {
+    body = (
+      <div className="voice-stage__paused-placeholder">
+        <span className="voice-stage__paused-title">Your Screen Is Still Streaming</span>
+        <span className="voice-stage__paused-hint">
+          If you want it to stay on even when Concord Voice is in the background, use the Auto-Pause
+          button in the Controls Panel below.
+        </span>
+      </div>
+    );
+  } else if (remotePaused) {
+    body = (
+      <div className="voice-stage__paused-placeholder voice-stage__paused-placeholder--remote">
+        <span className="voice-stage__paused-title">Screen share paused</span>
+      </div>
+    );
+  } else {
+    body = <video ref={videoRef} className="voice-stage__video" autoPlay playsInline muted />;
+  }
+
   return (
     <div className="voice-stage__cell">
-      {isPaused ? (
-        <div className="voice-stage__paused-placeholder">
-          <span className="voice-stage__paused-title">Your Screen Is Still Streaming</span>
-          <span className="voice-stage__paused-hint">
-            If you want it to stay on even when Concord Voice is in the background, use the
-            Auto-Pause button in the Controls Panel below.
-          </span>
-        </div>
-      ) : (
-        <video ref={videoRef} className="voice-stage__video" autoPlay playsInline muted />
-      )}
+      {body}
       {showOverlay && (
         <div className="voice-stage__cell-overlay">
           <span className="voice-stage__sharer-name">{label || `${sharerName}\u2019s screen`}</span>
@@ -127,6 +145,7 @@ const VoiceStage: React.FC = () => {
         isLocal: meta?.isLocal ?? false,
         userId: meta?.userId,
         hasScreenAudio: !!participant?.screenAudioStream,
+        paused: meta?.paused ?? false,
       };
     },
     [activeScreenShares, participants]
@@ -184,13 +203,16 @@ const VoiceStage: React.FC = () => {
 
         <div className="voice-stage__grid" data-count={tunedInIds.length}>
           {tunedInIds.map((producerId) => {
-            const { name, stream, isLocal, userId, hasScreenAudio } = resolveShare(producerId);
+            const { name, stream, isLocal, userId, hasScreenAudio, paused } =
+              resolveShare(producerId);
+            const hidden = isLocal ? localStreamPaused : paused;
             return (
               <StageVideo
                 key={producerId}
-                stream={isLocal && localStreamPaused ? undefined : stream}
+                stream={hidden ? undefined : stream}
                 sharerName={name}
                 isPaused={isLocal && localStreamPaused}
+                remotePaused={!isLocal && paused}
                 audioControlUserId={!isLocal && hasScreenAudio && userId ? userId : undefined}
                 sharerUserId={!isLocal && userId ? userId : undefined}
                 // A single equal-layout share fills the stage, so it should demand the
@@ -207,13 +229,16 @@ const VoiceStage: React.FC = () => {
 
   // ── Focus mode: single dominant stream ──────────────────────────────
   const isDominantLocal = dominant?.isLocal ?? false;
+  const dominantRemotePaused = !isDominantLocal && (dominant?.paused ?? false);
+  const dominantHidden = isDominantLocal ? localStreamPaused : dominantRemotePaused;
   return (
     <div className="voice-stage">
       <StageVideo
-        stream={isDominantLocal && localStreamPaused ? undefined : dominant?.stream}
+        stream={dominantHidden ? undefined : dominant?.stream}
         sharerName={dominantSharerName}
         showOverlay={false}
         isPaused={isDominantLocal && localStreamPaused}
+        remotePaused={dominantRemotePaused}
         sharerUserId={isDominantLocal ? undefined : dominant?.userId}
         renderRole="focus"
       />

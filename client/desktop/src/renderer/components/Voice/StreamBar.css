@@ -139,3 +139,15 @@
   color: var(--text-secondary);
   font-weight: 500;
 }
+
+/* #2153 remote-paused placeholder: --text-primary on --bg-tertiary (handoff §4), measured
+   by contrast-pairs.test.ts. The text span sets --text-secondary for the local "Paused"
+   state, so the remote variant hands it the container's colour instead. */
+.stream-thumbnail__paused--remote {
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+}
+
+.stream-thumbnail__paused--remote .stream-thumbnail__paused-text {
+  color: inherit;
+}

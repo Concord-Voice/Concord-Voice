@@ -1,0 +1,62 @@
+/* client/desktop/src/renderer/components/Voice/MediaPolicyNotice.css
+ * #2153 owner strip. Tokens only (handoff §4): text --text-primary on --bg-tertiary is
+ * measured by contrast-pairs.test.ts; glyph + border --text-warning-strong at 3:1 by
+ * link-contrast.test.ts. --danger is reserved for the eviction dialog (Von Restorff), and
+ * AlertTriangle + --text-warning-strong is reserved for this strip: a future QoS indicator
+ * must not reuse the pair (T17). */
+
+.media-policy-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.media-policy-notice__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: calc(8px * var(--sp, 1)) calc(12px * var(--sp, 1));
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--text-warning-strong);
+  border-radius: 6px;
+  font-size: calc(13px * var(--font-scale, 1));
+  line-height: 1.4;
+  /* Wrap, never ellipsis: the remedy clause is the only actionable text (T15). */
+  overflow-wrap: anywhere;
+  animation: media-policy-notice-enter 150ms ease-out;
+}
+
+.media-policy-notice__glyph {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--text-warning-strong);
+}
+
+@keyframes media-policy-notice-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes media-policy-notice-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Last in the file (handoff §4 Motion): opacity only. No exit motion exists (T16). */
+@media (prefers-reduced-motion: reduce) {
+  .media-policy-notice__row {
+    animation-name: media-policy-notice-fade;
+  }
+}

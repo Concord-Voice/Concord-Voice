@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createMockRouter,
   createMockTransport,
@@ -61,6 +61,7 @@ import {
   SCREEN_GATE_OFF_DEBOUNCE_MS,
   FREE_MEDIA_ENTITLEMENT,
   MAX_RECV_TRANSPORTS_PER_PARTICIPANT,
+  KEYFRAME_REQUEST_DELAY_MS,
 } from '../src/lib/roomManager.js';
 import type { Room, Participant, RoomEvent, MediaSource } from '../src/lib/roomManager.js';
 import {
@@ -72,6 +73,12 @@ import {
 // importing it here gives us the SAME mocked object to assert on.
 import { logger } from '../src/lib/logger.js';
 import { config as mockedConfig } from '@/config/index.js';
+import { MediaPolicyCooldownError, type PolicedProducerRef } from '../src/lib/roomManager.js';
+import {
+  COOLDOWN_MS,
+  MediaPolicyLedger,
+  POLICER_READ_TIMEOUT_MS,
+} from '../src/lib/mediaPolicer.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -977,7 +984,9 @@ describe('RoomManager', () => {
           manager as unknown as ForceDisconnectRoomManager,
           io,
           roomId,
-          'u-1'
+          'u-1',
+          undefined,
+          { reason: 'access_revoked' }
         );
 
         expect(disconnect).toHaveBeenCalledWith(true);
@@ -1836,7 +1845,7 @@ describe('RoomManager', () => {
       expect(room.screenLayerDemands.has(consumer.id)).toBe(false);
     });
 
-    it('replaces old send transport if one exists', async () => {
+    it('refuses a second send transport while the first is open (#2153 D1)', async () => {
       const oldTransport = createMockTransport();
       const newTransport = createMockTransport();
       mockRouter.createWebRtcTransport
@@ -1844,11 +1853,74 @@ describe('RoomManager', () => {
         .mockResolvedValueOnce(newTransport);
 
       await manager.createTransport('room-1', 'u-1', 'send');
-      await manager.createTransport('room-1', 'u-1', 'send');
 
-      expect(oldTransport.close).toHaveBeenCalled();
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).rejects.toThrow(
+        'Participant already has an active send transport'
+      );
+
+      expect(oldTransport.close).not.toHaveBeenCalled();
+      const participant = manager.getParticipant('room-1', 'u-1');
+      expect(participant?.sendTransport?.id).toBe(oldTransport.id);
+    });
+
+    it('allows a second send transport once the first is closed (#2153 D1)', async () => {
+      const oldTransport = createMockTransport();
+      const newTransport = createMockTransport();
+      mockRouter.createWebRtcTransport
+        .mockResolvedValueOnce(oldTransport)
+        .mockResolvedValueOnce(newTransport);
+
+      await manager.createTransport('room-1', 'u-1', 'send');
+      oldTransport.closed = true;
+
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).resolves.toBeDefined();
       const participant = manager.getParticipant('room-1', 'u-1');
       expect(participant?.sendTransport?.id).toBe(newTransport.id);
+    });
+
+    it('under a concurrent send-transport race, exactly one commits and the loser closes its OWN transport (#2153 D1)', async () => {
+      const deferredA = policerDeferred<ReturnType<typeof createMockTransport>>();
+      const deferredB = policerDeferred<ReturnType<typeof createMockTransport>>();
+      const transportA = createMockTransport();
+      const transportB = createMockTransport();
+      mockRouter.createWebRtcTransport
+        .mockImplementationOnce(() => deferredA.promise)
+        .mockImplementationOnce(() => deferredB.promise);
+
+      // Both calls pass the synchronous D1 pre-check (`refuseIfSendTransportOpen`)
+      // before either `createWebRtcTransport` resolves — the real TOCTOU window.
+      const callA = manager.createTransport('room-1', 'u-1', 'send');
+      const callB = manager.createTransport('room-1', 'u-1', 'send');
+
+      deferredA.resolve(transportA);
+      deferredB.resolve(transportB);
+
+      const results = await Promise.allSettled([callA, callB]);
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason.message).toBe(
+        'Participant already has an active send transport'
+      );
+
+      const winnerId = (fulfilled[0] as PromiseFulfilledResult<{ id: string }>).value.id;
+      const [winner, loser] =
+        winnerId === transportA.id ? [transportA, transportB] : [transportB, transportA];
+
+      const participant = manager.getParticipant('room-1', 'u-1');
+      expect(participant?.sendTransport?.id).toBe(winner.id);
+      expect(winner.close).not.toHaveBeenCalled();
+      expect(loser.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('receive transports are unaffected by an open send transport (#2153 D1)', async () => {
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).resolves.toBeDefined();
+      await expect(manager.createTransport('room-1', 'u-1', 'recv')).resolves.toBeDefined();
+
+      const participant = manager.getParticipant('room-1', 'u-1');
+      expect(participant?.sendTransport).toBeDefined();
+      expect(participant?.recvTransports.size).toBe(1);
     });
 
     it('throws if room not found', async () => {
@@ -4194,10 +4266,17 @@ describe('RoomManager', () => {
       );
     });
 
-    it('does not cap send transports (one per participant, replaced in place)', async () => {
-      for (let i = 0; i < MAX_RECV_TRANSPORTS_PER_PARTICIPANT + 2; i += 1) {
-        await expect(manager.createTransport('room-1', 'u-1', 'send')).resolves.toBeDefined();
+    it('send transports are not capped by the recv limit, but a second send is refused while the first is open (#2153 D1)', async () => {
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).resolves.toBeDefined();
+
+      // The recv cap is a fully independent axis from the (now singular) send slot.
+      for (let i = 0; i < MAX_RECV_TRANSPORTS_PER_PARTICIPANT; i += 1) {
+        await expect(manager.createTransport('room-1', 'u-1', 'recv')).resolves.toBeDefined();
       }
+
+      await expect(manager.createTransport('room-1', 'u-1', 'send')).rejects.toThrow(
+        'Participant already has an active send transport'
+      );
     });
 
     it('closes the orphan and fails closed when the participant left mid-create', async () => {
@@ -7795,5 +7874,1273 @@ describe('ICE outcome counters (#3104)', () => {
     expect(orphan.close).not.toHaveBeenCalled();
     expect(onIceTerminalWithoutConnect).toHaveBeenCalledTimes(1);
     expect(events).toEqual(['callback']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2153 media-rate policer seams
+// ---------------------------------------------------------------------------
+
+const POLICER_ROOM = 'room-1';
+const POLICER_USER = 'u-1';
+/** What FREE_MEDIA_ENTITLEMENT resolves to as policer caps. */
+const POLICER_FREE_CAPS = {
+  audioCeilingBps: 96_000,
+  minPtimeMs: 20,
+  maxManualBitrateBps: 5_000_000,
+};
+const MIC_STATS = [
+  { type: 'inbound-rtp', ssrc: 1111, byteCount: 4_000, packetCount: 50, bitrate: 6_400 },
+];
+const CAMERA_STATS = [
+  { type: 'inbound-rtp', ssrc: 2221, byteCount: 90_000, packetCount: 100, rid: 'l' },
+  { type: 'inbound-rtp', ssrc: 2222, byteCount: 300_000, packetCount: 280, rid: 'h' },
+];
+const TRANSPORT_STATS = [
+  { type: 'webrtc-transport', rtpBytesReceived: 1_000, rtxBytesReceived: 10 },
+  { type: 'webrtc-transport', rtpBytesReceived: 500, rtxBytesReceived: 5 },
+];
+
+interface PolicerHarness {
+  manager: RoomManager;
+  router: ReturnType<typeof createMockRouter>;
+  mediasoup: ReturnType<typeof createMockMediasoupService>;
+  /** The injected monotonic clock reads `clock.now`. */
+  clock: { now: number };
+}
+
+function createPolicerHarness(): PolicerHarness {
+  const router = createMockRouter();
+  const mediasoup = createMockMediasoupService(router);
+  const manager = new RoomManager(mediasoup as any);
+  const clock = { now: 10_000 };
+  manager.setMonotonicClock(() => clock.now);
+  return { manager, router, mediasoup, clock };
+}
+
+async function joinWithSendTransport(
+  h: PolicerHarness,
+  userId = POLICER_USER,
+  transportOverrides: Record<string, unknown> = {}
+) {
+  await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, userId, `sock-${userId}`, {
+    username: userId,
+  });
+  const transport = createMockTransport({
+    getStats: vi.fn(() => Promise.resolve(TRANSPORT_STATS)),
+    ...transportOverrides,
+  });
+  h.router.createWebRtcTransport.mockResolvedValueOnce(transport);
+  await h.manager.createTransport(POLICER_ROOM, userId, 'send');
+  return transport;
+}
+
+async function producePoliced(
+  h: PolicerHarness,
+  transport: ReturnType<typeof createMockTransport>,
+  source: MediaSource,
+  overrides: Record<string, unknown> = {},
+  userId = POLICER_USER
+) {
+  const kind = source === 'mic' || source === 'screen-audio' ? 'audio' : 'video';
+  const producer = createMockProducer({
+    kind,
+    pause: vi.fn(() => Promise.resolve()),
+    resume: vi.fn(() => Promise.resolve()),
+    getStats: vi.fn(() => Promise.resolve(kind === 'audio' ? MIC_STATS : CAMERA_STATS)),
+    ...overrides,
+  });
+  transport.produce.mockResolvedValueOnce(producer);
+  await h.manager.produce(
+    POLICER_ROOM,
+    userId,
+    transport.id,
+    kind,
+    createRtpParameters() as any,
+    source
+  );
+  return producer;
+}
+
+function policerEntry(h: PolicerHarness, producerId: string, userId = POLICER_USER) {
+  return h.manager.getParticipant(POLICER_ROOM, userId)?.producers.get(producerId);
+}
+
+describe('RoomManager #2153 — ProducerEntry and monotonic stamps', () => {
+  let h: PolicerHarness;
+  beforeEach(() => {
+    h = createPolicerHarness();
+  });
+
+  it('joins with no send-transport stamp', async () => {
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-u-1', {
+      username: 'alice',
+    });
+    expect(h.manager.getParticipant(POLICER_ROOM, POLICER_USER)?.sendTransportCreatedAtMs).toBe(
+      null
+    );
+  });
+
+  it('stamps the send transport and each producer from the injected clock', async () => {
+    const transport = await joinWithSendTransport(h);
+    const participant = h.manager.getParticipant(POLICER_ROOM, POLICER_USER);
+    expect(participant?.sendTransportCreatedAtMs).toBe(10_000);
+
+    h.clock.now = 12_500;
+    const mic = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, mic.id)).toEqual({
+      producer: mic,
+      source: 'mic',
+      kind: 'audio',
+      policed: false,
+      createdAtMs: 12_500,
+    });
+
+    // A recv transport never restamps the send baseline.
+    h.clock.now = 20_000;
+    await h.manager.createTransport(POLICER_ROOM, POLICER_USER, 'recv');
+    expect(participant?.sendTransportCreatedAtMs).toBe(10_000);
+
+    // A replacement send transport starts a new baseline, once the first is
+    // closed — a second open send transport is refused outright (#2153 D1).
+    transport.closed = true;
+    h.clock.now = 30_000;
+    h.router.createWebRtcTransport.mockResolvedValueOnce(createMockTransport());
+    await h.manager.createTransport(POLICER_ROOM, POLICER_USER, 'send');
+    expect(participant?.sendTransportCreatedAtMs).toBe(30_000);
+  });
+
+  it('returns the paused entry kind and source from pauseProducer', async () => {
+    const transport = await joinWithSendTransport(h);
+    const camera = await producePoliced(h, transport, 'camera');
+    await expect(h.manager.pauseProducer(POLICER_ROOM, POLICER_USER, camera.id)).resolves.toEqual({
+      kind: 'video',
+      source: 'camera',
+    });
+    expect(camera.pause).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('RoomManager #2153 D3 — keyFrameRequestDelay', () => {
+  let h: PolicerHarness;
+  beforeEach(() => {
+    h = createPolicerHarness();
+  });
+
+  it('creates a VIDEO producer with keyFrameRequestDelay', async () => {
+    const transport = await joinWithSendTransport(h);
+    await producePoliced(h, transport, 'camera');
+
+    expect(transport.produce).toHaveBeenCalledWith(
+      expect.objectContaining({ keyFrameRequestDelay: KEYFRAME_REQUEST_DELAY_MS })
+    );
+  });
+
+  it('creates an AUDIO producer with no keyFrameRequestDelay key at all', async () => {
+    const transport = await joinWithSendTransport(h);
+    await producePoliced(h, transport, 'mic');
+
+    const call = transport.produce.mock.calls[0][0];
+    expect(call).not.toHaveProperty('keyFrameRequestDelay');
+  });
+});
+
+function policedRef(
+  h: PolicerHarness,
+  producerId: string,
+  userId = POLICER_USER
+): PolicedProducerRef {
+  const participant = h.manager.getParticipant(POLICER_ROOM, userId);
+  const entry = participant?.producers.get(producerId);
+  if (!participant || !entry) throw new Error(`test setup: no producer ${producerId}`);
+  return { roomId: POLICER_ROOM, userId, producerId, participant, entry };
+}
+
+function policerDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flushPolicerMicrotasks(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
+describe('RoomManager #2153 — collectProducerIngressSample', () => {
+  let h: PolicerHarness;
+  beforeEach(() => {
+    h = createPolicerHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('reads every producer, latched ones included, and sums the transport counters', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.clock.now = 12_500;
+    const mic = await producePoliced(h, transport, 'mic');
+    const camera = await producePoliced(h, transport, 'camera');
+    policedRef(h, camera.id).entry.policed = true;
+    // A participant with no send transport has nothing to meter.
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, 'u-2', 'sock-u-2', {
+      username: 'bob',
+    });
+
+    const sample = await h.manager.collectProducerIngressSample();
+
+    expect(camera.getStats).toHaveBeenCalledTimes(1);
+    expect(sample.participants).toEqual([
+      {
+        roomId: POLICER_ROOM,
+        userId: POLICER_USER,
+        participant: h.manager.getParticipant(POLICER_ROOM, POLICER_USER),
+        sendTransportId: transport.id,
+        sendTransportCreatedAtMs: 10_000,
+        caps: POLICER_FREE_CAPS,
+        outcome: 'ok',
+        rtpBytesReceived: 1_500,
+        rtxBytesReceived: 15,
+        producers: [
+          {
+            ref: policedRef(h, mic.id),
+            streams: [{ ssrc: 1111, byteCount: 4_000, packetCount: 50 }],
+          },
+          {
+            ref: policedRef(h, camera.id),
+            streams: [
+              { ssrc: 2221, byteCount: 90_000, packetCount: 100 },
+              { ssrc: 2222, byteCount: 300_000, packetCount: 280 },
+            ],
+          },
+        ],
+        capturedProducerIds: [mic.id, camera.id],
+      },
+    ]);
+  });
+
+  it('drops a producer whose read failed because it closed (departed), keeping the participant', async () => {
+    const transport = await joinWithSendTransport(h);
+    const camera = await producePoliced(h, transport, 'camera');
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => {
+        mic.closed = true;
+        return Promise.reject(new Error('Producer closed'));
+      }),
+    });
+
+    const [participant] = (await h.manager.collectProducerIngressSample()).participants;
+
+    expect(participant.outcome).toBe('ok');
+    expect(participant.producers.map((p) => p.ref.producerId)).toEqual([camera.id]);
+    expect(participant.capturedProducerIds).toEqual([camera.id, mic.id]);
+  });
+
+  it('marks the whole participant failed when an open producer read rejects', async () => {
+    const transport = await joinWithSendTransport(h);
+    const camera = await producePoliced(h, transport, 'camera');
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+
+    const [participant] = (await h.manager.collectProducerIngressSample()).participants;
+
+    expect(participant).toMatchObject({
+      outcome: 'failed',
+      rtpBytesReceived: 0,
+      rtxBytesReceived: 0,
+      producers: [],
+      capturedProducerIds: [camera.id, mic.id],
+    });
+  });
+
+  it('drops a participant whose closed transport read failed, and fails one whose open transport read failed', async () => {
+    const closing = await joinWithSendTransport(h, 'u-1', {
+      getStats: vi.fn(() => {
+        closing.closed = true;
+        return Promise.reject(new Error('Transport closed'));
+      }),
+    });
+    await joinWithSendTransport(h, 'u-2', {
+      getStats: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+
+    const sample = await h.manager.collectProducerIngressSample();
+
+    expect(sample.participants.map((p) => [p.userId, p.outcome])).toEqual([['u-2', 'failed']]);
+  });
+
+  it('counts a read that outlives POLICER_READ_TIMEOUT_MS as failed', async () => {
+    const transport = await joinWithSendTransport(h);
+    await producePoliced(h, transport, 'mic', { getStats: vi.fn(() => new Promise(() => {})) });
+    vi.useFakeTimers();
+
+    let settled = false;
+    const collecting = h.manager.collectProducerIngressSample().then((sample) => {
+      settled = true;
+      return sample;
+    });
+    await vi.advanceTimersByTimeAsync(POLICER_READ_TIMEOUT_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect((await collecting).participants[0].outcome).toBe('failed');
+  });
+
+  it('clears every read timer as soon as its read settles', async () => {
+    const transport = await joinWithSendTransport(h);
+    await producePoliced(h, transport, 'mic');
+    vi.useFakeTimers();
+
+    const sample = await h.manager.collectProducerIngressSample();
+
+    expect(sample.participants[0].outcome).toBe('ok');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not reissue a read while the previous one is outstanding, and reads again once it settles', async () => {
+    const transport = await joinWithSendTransport(h);
+    const hung = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn().mockReturnValueOnce(hung.promise).mockResolvedValue(MIC_STATS),
+    });
+    vi.useFakeTimers();
+
+    const first = h.manager.collectProducerIngressSample();
+    await vi.advanceTimersByTimeAsync(POLICER_READ_TIMEOUT_MS);
+    expect((await first).participants[0].outcome).toBe('failed');
+
+    const second = await h.manager.collectProducerIngressSample();
+    expect(second.participants[0].outcome).toBe('failed');
+    expect(mic.getStats).toHaveBeenCalledTimes(1);
+
+    hung.resolve(MIC_STATS);
+    await flushPolicerMicrotasks();
+    const third = await h.manager.collectProducerIngressSample();
+    expect(third.participants[0].outcome).toBe('ok');
+    expect(mic.getStats).toHaveBeenCalledTimes(2);
+  });
+
+  // #2153 F10: a malformed `getStats()` result throws inside `toStreamCounters`/
+  // `sumTransportCounters`. That throw must fail only the participant whose
+  // conversion threw, not the whole `Promise.all` in `collectProducerIngressSample`.
+  it('fails only the participant whose getStats result is malformed, not the whole sample', async () => {
+    const malformedTransport = await joinWithSendTransport(h, 'u-1');
+    await producePoliced(
+      h,
+      malformedTransport,
+      'mic',
+      { getStats: vi.fn(() => Promise.resolve(null as unknown as typeof MIC_STATS)) },
+      'u-1'
+    );
+    const okTransport = await joinWithSendTransport(h, 'u-2');
+    await producePoliced(h, okTransport, 'mic', {}, 'u-2');
+
+    const sample = await h.manager.collectProducerIngressSample();
+
+    expect(sample.participants.map((p) => [p.userId, p.outcome])).toEqual([
+      ['u-1', 'failed'],
+      ['u-2', 'ok'],
+    ]);
+  });
+});
+
+describe('RoomManager #2153 — settleIngressSample', () => {
+  let h: PolicerHarness;
+  beforeEach(() => {
+    h = createPolicerHarness();
+  });
+
+  it('turns an ok sample into a reading, reading the latch at settle time', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.clock.now = 12_500;
+    const mic = await producePoliced(h, transport, 'mic');
+    const sample = await h.manager.collectProducerIngressSample();
+    policedRef(h, mic.id).entry.policed = true; // a latch that landed after the reads
+
+    const settled = h.manager.settleIngressSample(sample, 42_000);
+
+    expect(settled.observation).toEqual({
+      nowMs: 42_000,
+      readings: [
+        {
+          roomId: POLICER_ROOM,
+          userId: POLICER_USER,
+          caps: POLICER_FREE_CAPS,
+          sendTransportId: transport.id,
+          sendTransportCreatedAtMs: 10_000,
+          rtpBytesReceived: 1_500,
+          rtxBytesReceived: 15,
+          producers: [
+            {
+              producerId: mic.id,
+              kind: 'audio',
+              source: 'mic',
+              policed: true,
+              createdAtMs: 12_500,
+              streams: [{ ssrc: 1111, byteCount: 4_000, packetCount: 50 }],
+            },
+          ],
+        },
+      ],
+      failed: [],
+    });
+    expect(settled.refs.get(mic.id)?.entry).toBe(policedRef(h, mic.id).entry);
+  });
+
+  it('turns a failed sample into a FailedParticipant carrying every captured producer', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+    const sample = await h.manager.collectProducerIngressSample();
+
+    const settled = h.manager.settleIngressSample(sample, 42_000);
+
+    expect(settled.observation.readings).toEqual([]);
+    expect(settled.observation.failed).toEqual([
+      {
+        roomId: POLICER_ROOM,
+        userId: POLICER_USER,
+        sendTransportId: transport.id,
+        producerIds: [mic.id],
+      },
+    ]);
+    expect(settled.refs.size).toBe(0);
+  });
+
+  it('drops a participant replaced while its reads were in flight (identity fence)', async () => {
+    const transport = await joinWithSendTransport(h);
+    await producePoliced(h, transport, 'mic');
+    await joinWithSendTransport(h, 'u-2', {
+      getStats: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+    const sample = await h.manager.collectProducerIngressSample();
+
+    // Both users reconnect: new Participant objects under the same userIds.
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-new-1', {
+      username: 'alice',
+    });
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, 'u-2', 'sock-new-2', {
+      username: 'bob',
+    });
+    const settled = h.manager.settleIngressSample(sample, 42_000);
+
+    expect(settled.observation.readings).toEqual([]);
+    expect(settled.observation.failed).toEqual([]);
+    expect(settled.refs.size).toBe(0);
+  });
+
+  it('drops a producer closed between the read and the settle', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const camera = await producePoliced(h, transport, 'camera');
+    const sample = await h.manager.collectProducerIngressSample();
+
+    await h.manager.closeProducer(POLICER_ROOM, POLICER_USER, mic.id);
+    const settled = h.manager.settleIngressSample(sample, 42_000);
+
+    expect(settled.observation.readings[0].producers.map((p) => p.producerId)).toEqual([camera.id]);
+    expect([...settled.refs.keys()]).toEqual([camera.id]);
+  });
+});
+
+describe('RoomManager #2153 — latch, policed pause and latch-aware resume', () => {
+  let h: PolicerHarness;
+  beforeEach(() => {
+    h = createPolicerHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('latches once, synchronously, and names the owner socket', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const ref = policedRef(h, mic.id);
+
+    expect(h.manager.latchPolicedProducer(ref)).toEqual({
+      kind: 'audio',
+      source: 'mic',
+      socketId: 'sock-u-1',
+    });
+    expect(ref.entry.policed).toBe(true);
+    expect(mic.pause).not.toHaveBeenCalled();
+    expect(h.manager.latchPolicedProducer(ref)).toBeNull();
+  });
+
+  it('refuses to latch a replaced participant, a replaced entry, or a closed producer', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const closedRef = policedRef(h, mic.id);
+    mic.closed = true;
+    expect(h.manager.latchPolicedProducer(closedRef)).toBeNull();
+    mic.closed = false;
+
+    await h.manager.closeProducer(POLICER_ROOM, POLICER_USER, mic.id);
+    const successor = await producePoliced(h, transport, 'mic');
+    expect(h.manager.latchPolicedProducer(closedRef)).toBeNull();
+
+    const successorRef = policedRef(h, successor.id);
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-new', {
+      username: 'alice',
+    });
+    expect(h.manager.latchPolicedProducer(successorRef)).toBeNull();
+    expect(successorRef.entry.policed).toBe(false);
+  });
+
+  it('pauses a latched producer that is still current', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+
+    await expect(h.manager.pausePolicedProducer(ref)).resolves.toBe('paused');
+    expect(mic.pause).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports gone, without pausing, once the participant was replaced', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-new', {
+      username: 'alice',
+    });
+
+    await expect(h.manager.pausePolicedProducer(ref)).resolves.toBe('gone');
+    expect(mic.pause).not.toHaveBeenCalled();
+  });
+
+  it('refuses to latch or pause once the participant left the room, even before its producers are torn down', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const ref = policedRef(h, mic.id);
+    // Only the room entry is gone: the entry is still in the old participant's
+    // map and the producer is still open, so the participant term alone decides.
+    h.manager.getRoom(POLICER_ROOM)?.participants.delete(POLICER_USER);
+
+    expect(h.manager.latchPolicedProducer(ref)).toBeNull();
+    expect(ref.entry.policed).toBe(false);
+    await expect(h.manager.pausePolicedProducer(ref)).resolves.toBe('gone');
+    expect(mic.pause).not.toHaveBeenCalled();
+  });
+
+  it('reports gone when the participant is replaced while pause() is in flight', async () => {
+    const transport = await joinWithSendTransport(h);
+    const pausing = policerDeferred<void>();
+    const mic = await producePoliced(h, transport, 'mic', { pause: vi.fn(() => pausing.promise) });
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+
+    const outcome = h.manager.pausePolicedProducer(ref);
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-new', {
+      username: 'alice',
+    });
+    pausing.resolve();
+
+    await expect(outcome).resolves.toBe('gone');
+  });
+
+  it('closes a still-current producer whose pause() rejected (fail closed)', async () => {
+    const events: RoomEvent[] = [];
+    h.manager.onEvent((event) => events.push(event));
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      pause: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+
+    await expect(h.manager.pausePolicedProducer(ref)).resolves.toBe('closed');
+    expect(mic.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, mic.id)).toBeUndefined();
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'producer-removed', producerId: mic.id, source: 'mic' })
+    );
+  });
+
+  it('fails closed when pause() outlives POLICER_READ_TIMEOUT_MS', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      pause: vi.fn(() => new Promise(() => {})),
+    });
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+    vi.useFakeTimers();
+
+    let outcome: string | undefined;
+    void h.manager.pausePolicedProducer(ref).then((value) => {
+      outcome = value;
+    });
+    await vi.advanceTimersByTimeAsync(POLICER_READ_TIMEOUT_MS - 1);
+    expect(outcome).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome).toBe('closed');
+    expect(mic.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, mic.id)).toBeUndefined();
+  });
+
+  it('never closes anything when pause() rejects after the participant was replaced', async () => {
+    const transport = await joinWithSendTransport(h);
+    const pausing = policerDeferred<void>();
+    const mic = await producePoliced(h, transport, 'mic', { pause: vi.fn(() => pausing.promise) });
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+
+    const outcome = h.manager.pausePolicedProducer(ref);
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-new', {
+      username: 'alice',
+    });
+    const closesBefore = mic.close.mock.calls.length;
+    pausing.reject(new Error('worker error'));
+
+    await expect(outcome).resolves.toBe('gone');
+    expect(mic.close).toHaveBeenCalledTimes(closesBefore);
+  });
+
+  it('refuses to resume a latched audio or video producer before touching the worker', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const camera = await producePoliced(h, transport, 'camera');
+    h.manager.latchPolicedProducer(policedRef(h, mic.id));
+    h.manager.latchPolicedProducer(policedRef(h, camera.id));
+
+    await expect(h.manager.resumeProducer(POLICER_ROOM, POLICER_USER, mic.id)).resolves.toBe(
+      'media_policy_paused'
+    );
+    await expect(h.manager.resumeProducer(POLICER_ROOM, POLICER_USER, camera.id)).resolves.toBe(
+      'media_policy_paused'
+    );
+    expect(mic.resume).not.toHaveBeenCalled();
+    expect(camera.resume).not.toHaveBeenCalled();
+  });
+
+  it('resumes an unlatched producer', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+
+    await expect(h.manager.resumeProducer(POLICER_ROOM, POLICER_USER, mic.id)).resolves.toBe(
+      'resumed'
+    );
+    expect(mic.resume).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports media_policy_paused when the latch lands while resume() is in flight', async () => {
+    const transport = await joinWithSendTransport(h);
+    const resuming = policerDeferred<void>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      resume: vi.fn(() => resuming.promise),
+    });
+
+    const outcome = h.manager.resumeProducer(POLICER_ROOM, POLICER_USER, mic.id);
+    expect(mic.resume).toHaveBeenCalledTimes(1);
+    h.manager.latchPolicedProducer(policedRef(h, mic.id));
+    resuming.resolve();
+
+    await expect(outcome).resolves.toBe('media_policy_paused');
+  });
+
+  it('leaves the latch alone on serverUnmuteUser and serverUndeafenUser', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+
+    await h.manager.serverDeafenUser(POLICER_ROOM, POLICER_USER);
+    await h.manager.serverUnmuteUser(POLICER_ROOM, POLICER_USER);
+    await h.manager.serverUndeafenUser(POLICER_ROOM, POLICER_USER);
+
+    expect(ref.entry.policed).toBe(true);
+    expect(mic.resume).not.toHaveBeenCalled();
+    await expect(h.manager.resumeProducer(POLICER_ROOM, POLICER_USER, mic.id)).resolves.toBe(
+      'media_policy_paused'
+    );
+  });
+
+  it('removes the latch with its entry on closeProducer and on transportclose', async () => {
+    const transport = await joinWithSendTransport(h);
+    const first = await producePoliced(h, transport, 'mic');
+    h.manager.latchPolicedProducer(policedRef(h, first.id));
+
+    await h.manager.closeProducer(POLICER_ROOM, POLICER_USER, first.id);
+    expect(policerEntry(h, first.id)).toBeUndefined();
+    // One mic per participant (F9): the successor exists only because the latched entry left.
+    const second = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, second.id)?.policed).toBe(false);
+
+    h.manager.latchPolicedProducer(policedRef(h, second.id));
+    second._emit('transportclose');
+    expect(policerEntry(h, second.id)).toBeUndefined();
+    const third = await producePoliced(h, transport, 'mic');
+    await expect(h.manager.resumeProducer(POLICER_ROOM, POLICER_USER, third.id)).resolves.toBe(
+      'resumed'
+    );
+  });
+
+  // #2153 F4: `pausePolicedProducer` is documented "never rejects" — the
+  // fallback close itself can throw, and that must still resolve to a verdict.
+  it('never rejects when pause() rejects and the fallback close also throws', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      pause: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+    const closeProducerSpy = vi
+      .spyOn(h.manager, 'closeProducer')
+      .mockRejectedValueOnce(new Error('close also failed'));
+
+    await expect(h.manager.pausePolicedProducer(ref)).resolves.toBe('gone');
+
+    expect(closeProducerSpy).toHaveBeenCalledTimes(1);
+    expect(mic.closed).toBe(false);
+    expect(logger.error).toHaveBeenCalledWith('Media policer fallback close failed', {
+      roomId: ref.roomId,
+      userId: ref.userId,
+      producerId: ref.producerId,
+      error: 'close also failed',
+    });
+  });
+
+  // #2153 F11: the pause-failure warn names its cause rather than collapsing
+  // a rejection and a timeout into the same log line.
+  it('names reason "rejected" in the pause-failure warn when pause() itself rejects', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      pause: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+    const ref = policedRef(h, mic.id);
+    h.manager.latchPolicedProducer(ref);
+
+    await h.manager.pausePolicedProducer(ref);
+
+    expect(logger.warn).toHaveBeenCalledWith('Media policer pause failed; closing producer', {
+      roomId: ref.roomId,
+      userId: ref.userId,
+      producerId: ref.producerId,
+      reason: 'rejected',
+    });
+  });
+});
+
+describe('RoomManager #2153 — media-policy cooldown gate', () => {
+  let h: PolicerHarness;
+  let ledger: MediaPolicyLedger;
+  let securityEvents: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    h = createPolicerHarness();
+    ledger = new MediaPolicyLedger();
+    securityEvents = vi.fn();
+    h.manager.setSecurityEventEmitter(securityEvents);
+    vi.mocked(logger.warn).mockClear();
+  });
+
+  function startCooldown(userId = POLICER_USER): void {
+    expect(ledger.strike(userId, h.clock.now)).toBe('pause');
+    expect(ledger.strike(userId, h.clock.now)).toBe('evict');
+  }
+
+  it('refuses produce during a cooldown before touching the transport', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.manager.setMediaPolicyGate(ledger);
+    startCooldown();
+
+    const refusal = producePoliced(h, transport, 'mic');
+
+    await expect(refusal).rejects.toBeInstanceOf(MediaPolicyCooldownError);
+    await expect(refusal).rejects.toMatchObject({
+      code: 'media_policy_cooldown',
+      retryAfterSec: 900,
+      message: 'Media policy cooldown',
+      name: 'MediaPolicyCooldownError',
+    });
+    expect(transport.produce).not.toHaveBeenCalled();
+    expect(securityEvents).toHaveBeenCalledWith({
+      eventType: 'media_admission',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'structural_limit_exceeded',
+      routeTemplate: 'socket.produce',
+    });
+    expect(logger.warn).toHaveBeenCalledWith('Media policer refused produce during cooldown', {
+      roomId: POLICER_ROOM,
+      userId: POLICER_USER,
+      retryAfterSec: 900,
+    });
+  });
+
+  it('admits produce again once the cooldown has expired', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.manager.setMediaPolicyGate(ledger);
+    startCooldown();
+
+    h.clock.now += COOLDOWN_MS;
+    const mic = await producePoliced(h, transport, 'mic');
+
+    expect(policerEntry(h, mic.id)).toBeDefined();
+    expect(securityEvents).not.toHaveBeenCalled();
+  });
+
+  it('refuses a channel join at the very top, before any room is created', async () => {
+    h.manager.setMediaPolicyGate(ledger);
+    startCooldown();
+
+    const refusal = h.manager.joinRoom(
+      POLICER_ROOM,
+      POLICER_USER,
+      'sock-u-1',
+      { username: 'alice' },
+      undefined,
+      {
+        entitlement: undefined,
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'channel' },
+      }
+    );
+
+    await expect(refusal).rejects.toMatchObject({
+      code: 'media_policy_cooldown',
+      retryAfterSec: 900,
+    });
+    expect(h.mediasoup.getOrCreateRouter).not.toHaveBeenCalled();
+    expect(h.manager.getRoom(POLICER_ROOM)).toBeUndefined();
+    expect(securityEvents).toHaveBeenCalledWith({
+      eventType: 'media_admission',
+      outcome: 'denied',
+      severity: 'medium',
+      reasonCode: 'structural_limit_exceeded',
+      routeTemplate: 'socket.join',
+    });
+    expect(logger.warn).toHaveBeenCalledWith('Media policer refused join during cooldown', {
+      roomId: POLICER_ROOM,
+      userId: POLICER_USER,
+      retryAfterSec: 900,
+    });
+  });
+
+  it('refuses a DM join before any provisional participant exists', async () => {
+    h.manager.setMediaPolicyGate(ledger);
+    h.clock.now = 50_000;
+    startCooldown();
+    h.clock.now += 1; // 899.999 s remain: rounds up
+
+    const refusal = h.manager.joinRoom(
+      'dm-1',
+      POLICER_USER,
+      'sock-u-1',
+      { username: 'alice' },
+      undefined,
+      {
+        entitlement: undefined,
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm', callId: 'call-dm-1', callCallerUserId: POLICER_USER },
+      }
+    );
+
+    await expect(refusal).rejects.toMatchObject({ retryAfterSec: 900 });
+    expect(h.mediasoup.getOrCreateRouter).not.toHaveBeenCalled();
+    expect(h.manager.getRoom('dm-1')).toBeUndefined();
+  });
+
+  it('admits a user who is not cooling down', async () => {
+    h.manager.setMediaPolicyGate(ledger);
+    startCooldown('someone-else');
+
+    await expect(
+      joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-u-1', {
+        username: 'alice',
+      })
+    ).resolves.toBeDefined();
+    expect(securityEvents).not.toHaveBeenCalled();
+  });
+
+  // #2153 F1: the pre-await gate cannot see a cooldown armed WHILE the call is
+  // already in flight. Hold the awaited step pending, arm the cooldown, then
+  // resolve — proving the post-await re-check catches what the entry gate missed.
+
+  it('rejects produce when the cooldown arms while sendTransport.produce is pending, and releases its reservations', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.manager.setMediaPolicyGate(ledger);
+
+    const deferredProduce = policerDeferred<ReturnType<typeof createMockProducer>>();
+    const firstProducer = createMockProducer({ kind: 'audio' });
+    transport.produce.mockImplementationOnce(() => deferredProduce.promise);
+
+    const call = h.manager.produce(
+      POLICER_ROOM,
+      POLICER_USER,
+      transport.id,
+      'audio',
+      createRtpParameters() as any,
+      'mic'
+    );
+
+    await flushPolicerMicrotasks();
+    startCooldown();
+    deferredProduce.resolve(firstProducer);
+
+    await expect(call).rejects.toBeInstanceOf(MediaPolicyCooldownError);
+    expect(firstProducer.close).toHaveBeenCalledTimes(1);
+    expect(policerEntry(h, firstProducer.id)).toBeUndefined();
+
+    // The mic reservation was released, not leaked: a fresh produce of the same
+    // source succeeds once the cooldown ends.
+    h.clock.now += COOLDOWN_MS;
+    const mic = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, mic.id)).toBeDefined();
+  });
+
+  it('rejects a DM join when the cooldown arms while the room is still being created, leaving no participant or provisional entry', async () => {
+    h.manager.setMediaPolicyGate(ledger);
+    const deferredRouter = policerDeferred<ReturnType<typeof createMockRouter>>();
+    h.mediasoup.getOrCreateRouter.mockImplementationOnce(() => deferredRouter.promise);
+
+    const call = h.manager.joinRoom(
+      'dm-1',
+      POLICER_USER,
+      'sock-u-1',
+      { username: 'alice' },
+      undefined,
+      {
+        entitlement: undefined,
+        mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+        roomContext: { roomKind: 'dm', callId: 'call-dm-1', callCallerUserId: POLICER_USER },
+      }
+    );
+
+    await flushPolicerMicrotasks();
+    startCooldown();
+    deferredRouter.resolve(h.router);
+
+    await expect(call).rejects.toBeInstanceOf(MediaPolicyCooldownError);
+    const room = h.manager.getRoom('dm-1') as ProvisionalTestRoom | undefined;
+    expect(room).toBeDefined();
+    expect(room?.participants.size ?? -1).toBe(0);
+    expect(room?.pendingDMParticipants?.size ?? 0).toBe(0);
+  });
+
+  // joinRoom's re-check runs before the voice-enforcement session registration
+  // and reauthorization that index.ts awaits between A1 (joinRoom) and the
+  // synchronous A2 promotion. A cooldown armed in that gap is only visible at
+  // promotion, which must refuse before Socket.IO membership commits.
+  it('rejects channel promotion when the cooldown arms after joinRoom, before membership commits', async () => {
+    h.manager.setMediaPolicyGate(ledger);
+    await h.manager.joinRoom(POLICER_ROOM, POLICER_USER, 'sock-u-1', { username: 'alice' }, undefined, {
+      entitlement: undefined,
+      mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+      roomContext: undefined,
+    });
+    startCooldown();
+    const commitSocketMembership = vi.fn();
+
+    expect(() =>
+      h.manager.promoteChannelParticipant(
+        POLICER_ROOM,
+        POLICER_USER,
+        'sock-u-1',
+        {
+          identity: { username: 'alice' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+        },
+        commitSocketMembership
+      )
+    ).toThrow(MediaPolicyCooldownError);
+    expect(commitSocketMembership).not.toHaveBeenCalled();
+    expect(h.manager.getRoom(POLICER_ROOM)?.participants.has(POLICER_USER)).toBe(false);
+  });
+
+  it('rejects DM promotion when the cooldown arms after joinRoom, before membership commits', async () => {
+    h.manager.setMediaPolicyGate(ledger);
+    await h.manager.joinRoom('dm-1', POLICER_USER, 'sock-u-1', { username: 'alice' }, undefined, {
+      entitlement: undefined,
+      mediaFrameCryptoVersion: SUPPORTED_MEDIA_FRAME_CRYPTO_VERSION,
+      roomContext: { roomKind: 'dm', callId: 'call-dm-1', callCallerUserId: POLICER_USER },
+    });
+    startCooldown();
+    const commitSocketMembership = vi.fn();
+
+    expect(() =>
+      promoteDMParticipant(
+        h.manager,
+        'dm-1',
+        POLICER_USER,
+        'sock-u-1',
+        'call-dm-1',
+        {
+          callId: 'call-dm-1',
+          identity: { username: 'alice' },
+          entitlement: { ...FREE_MEDIA_ENTITLEMENT },
+          serverMuted: false,
+          serverDeafened: false,
+        },
+        commitSocketMembership
+      )
+    ).toThrow(MediaPolicyCooldownError);
+    expect(commitSocketMembership).not.toHaveBeenCalled();
+    expect(h.manager.getRoom('dm-1')?.participants.has(POLICER_USER)).toBe(false);
+  });
+
+  // #2153 F12: with no gate wired, `cooldownRetryAfterSec` must fail OPEN
+  // (never refuse) while still surfacing the wiring defect exactly once per
+  // RoomManager, not once per call.
+  it('does not refuse join or produce when no media-policy gate is wired, and warns exactly once', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, mic.id)).toBeDefined();
+
+    await expect(joinWithSendTransport(h, 'u-2')).resolves.toBeDefined();
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Media policy gate is unset — cooldown enforcement is disabled'
+    );
+  });
+});
+
+describe('RoomManager #2153 — closeProducerFromClient final sample', () => {
+  let h: PolicerHarness;
+  let finalizer: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    h = createPolicerHarness();
+    finalizer = vi.fn();
+    h.manager.setIngressFinalizer(finalizer);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('takes a final sample, then closes in the same synchronous continuation', async () => {
+    const transport = await joinWithSendTransport(h);
+    h.clock.now = 12_500;
+    const mic = await producePoliced(h, transport, 'mic');
+    let entryPresentAtFinalize = false;
+    let closesSeenByNextMicrotask = -1;
+    finalizer.mockImplementation(() => {
+      entryPresentAtFinalize = policerEntry(h, mic.id) !== undefined;
+      queueMicrotask(() => {
+        closesSeenByNextMicrotask = mic.close.mock.calls.length;
+      });
+    });
+
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id)
+    ).resolves.toBe('mic');
+
+    expect(finalizer).toHaveBeenCalledTimes(1);
+    expect(finalizer).toHaveBeenCalledWith({
+      roomId: POLICER_ROOM,
+      userId: POLICER_USER,
+      producerId: mic.id,
+      kind: 'audio',
+      source: 'mic',
+      createdAtMs: 12_500,
+      caps: POLICER_FREE_CAPS,
+      streams: [{ ssrc: 1111, byteCount: 4_000, packetCount: 50 }],
+    });
+    expect(entryPresentAtFinalize).toBe(true);
+    expect(closesSeenByNextMicrotask).toBe(1);
+    expect(policerEntry(h, mic.id)).toBeUndefined();
+  });
+
+  it('returns null without a final sample when the entry left during the read', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+    mic._emit('transportclose');
+    reading.resolve(MIC_STATS);
+
+    await expect(closing).resolves.toBeNull();
+    expect(finalizer).not.toHaveBeenCalled();
+  });
+
+  it('returns null without a final sample when the participant was replaced during the read', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+    await joinRoomWithSupportedCrypto(h.manager, POLICER_ROOM, POLICER_USER, 'sock-new', {
+      username: 'alice',
+    });
+    reading.resolve(MIC_STATS);
+
+    await expect(closing).resolves.toBeNull();
+    expect(finalizer).not.toHaveBeenCalled();
+  });
+
+  it('tolerates a failed final read and still closes', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => Promise.reject(new Error('worker error'))),
+    });
+
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id)
+    ).resolves.toBe('mic');
+    expect(finalizer).toHaveBeenCalledWith(expect.objectContaining({ streams: null }));
+    expect(mic.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds the final read by POLICER_READ_TIMEOUT_MS', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => new Promise(() => {})),
+    });
+    vi.useFakeTimers();
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+    await vi.advanceTimersByTimeAsync(POLICER_READ_TIMEOUT_MS);
+
+    await expect(closing).resolves.toBe('mic');
+    expect(finalizer).toHaveBeenCalledWith(expect.objectContaining({ streams: null }));
+  });
+
+  it('closes video, latched audio, and any producer with no finalizer set without a read', async () => {
+    const transport = await joinWithSendTransport(h);
+    const camera = await producePoliced(h, transport, 'camera');
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, camera.id)
+    ).resolves.toBe('camera');
+    expect(camera.getStats).not.toHaveBeenCalled();
+
+    const latched = await producePoliced(h, transport, 'mic');
+    h.manager.latchPolicedProducer(policedRef(h, latched.id));
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, latched.id)
+    ).resolves.toBe('mic');
+    expect(latched.getStats).not.toHaveBeenCalled();
+
+    h.manager.setIngressFinalizer(undefined);
+    const unwatched = await producePoliced(h, transport, 'mic');
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, unwatched.id)
+    ).resolves.toBe('mic');
+    expect(unwatched.getStats).not.toHaveBeenCalled();
+    expect(finalizer).not.toHaveBeenCalled();
+    expect([camera, latched, unwatched].map((p) => p.close.mock.calls.length)).toEqual([1, 1, 1]);
+  });
+
+  it('skips the final sample, but still closes, when a latch lands during the read', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+    h.manager.latchPolicedProducer(policedRef(h, mic.id));
+    reading.resolve(MIC_STATS);
+
+    await expect(closing).resolves.toBe('mic');
+    expect(finalizer).not.toHaveBeenCalled();
+    expect(mic.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('never keeps a producer open because the finalizer threw', async () => {
+    const transport = await joinWithSendTransport(h);
+    const mic = await producePoliced(h, transport, 'mic');
+    finalizer.mockImplementation(() => {
+      throw new Error('policer bug');
+    });
+
+    await expect(
+      h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id)
+    ).resolves.toBe('mic');
+    expect(mic.close).toHaveBeenCalledTimes(1);
+    expect(logger.error).toHaveBeenCalledWith('Media policer final sample failed', {
+      roomId: POLICER_ROOM,
+      userId: POLICER_USER,
+      producerId: mic.id,
+      error: 'policer bug',
+    });
+  });
+
+  // #2153 F8a: `entry.closing` excludes the departing entry from
+  // `reserveParticipantProducerSlot`'s live count (screen-audio's
+  // one-per-participant limit), so a replacement can produce while the old
+  // entry's final read is still outstanding.
+  it('F8a: a new mic produce succeeds while an unlatched mic close awaits its final read', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+
+    const next = await producePoliced(h, transport, 'mic');
+    expect(policerEntry(h, next.id)).toBeDefined();
+
+    reading.resolve(MIC_STATS);
+    await expect(closing).resolves.toBe('mic');
+  });
+
+  // #2153 F9: `closeProducerFromClient` routes its final read through the same
+  // outstanding-read guard (`guardedIngressRead`) a tick uses, so the two can
+  // never both dispatch a `getStats()` to the same producer. Here the TICK's
+  // read is already outstanding when the close starts, so the close's own
+  // read is the one skipped.
+  it('F9: issues no second getStats call when a tick read of the same producer is already outstanding', async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const collecting = h.manager.collectProducerIngressSample();
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+    expect(mic.getStats).toHaveBeenCalledTimes(1);
+
+    reading.resolve(MIC_STATS);
+    await collecting;
+
+    await expect(closing).resolves.toBe('mic');
+    expect(mic.getStats).toHaveBeenCalledTimes(1);
+    expect(mic.close).toHaveBeenCalledTimes(1);
+    expect(finalizer).toHaveBeenCalledWith(expect.objectContaining({ streams: null }));
+  });
+
+  // #2153 F8b: the mirror of F9 — the CLOSE's read is the one outstanding when
+  // a tick starts, so the tick's own read of that producer is the one
+  // skipped. `captureIngressParticipant` still captures the closing entry
+  // (F8), so the tick observes it rather than silently omitting it — the
+  // producer is still open (not yet closed), so a skipped read fails the
+  // whole participant for that tick rather than being dropped as departed.
+  it("F8b: a tick racing a close's outstanding read on the same producer fails that participant for the tick, without losing the producer id", async () => {
+    const transport = await joinWithSendTransport(h);
+    const reading = policerDeferred<typeof MIC_STATS>();
+    const mic = await producePoliced(h, transport, 'mic', {
+      getStats: vi.fn(() => reading.promise),
+    });
+
+    const closing = h.manager.closeProducerFromClient(POLICER_ROOM, POLICER_USER, mic.id);
+    const sample = await h.manager.collectProducerIngressSample();
+    const settled = h.manager.settleIngressSample(sample, 42_000);
+
+    expect(sample.participants).toEqual([
+      expect.objectContaining({ userId: POLICER_USER, outcome: 'failed' }),
+    ]);
+    expect(settled.observation.failed).toEqual([
+      expect.objectContaining({ userId: POLICER_USER, producerIds: [mic.id] }),
+    ]);
+    expect(settled.refs.size).toBe(0);
+
+    reading.resolve(MIC_STATS);
+    await closing;
   });
 });

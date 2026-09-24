@@ -103,7 +103,9 @@ export async function handlePermissionsUpdate(
   // (leaveRoom closes transports/producers/consumers and emits user-left).
   // Administrator bypasses (mirrors publishPermitted / rbac.Permission.Has).
   if (!hasVoiceAccess(permissions)) {
-    await handleForceDisconnect(roomManager, io, channelId, userId, emit);
+    await handleForceDisconnect(roomManager, io, channelId, userId, emit, {
+      reason: 'access_revoked',
+    });
     logger.info('Force-disconnected peer on mid-session voice-access revocation', {
       channelId,
       userId,

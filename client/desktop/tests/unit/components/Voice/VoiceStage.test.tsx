@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '../../../test-utils';
+import { render, screen, act } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore, type VoiceParticipant } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -432,4 +432,69 @@ describe('VoiceStage', () => {
     render(<VoiceStage />);
     expect(screen.queryByLabelText('Screen share volume')).not.toBeInTheDocument();
   });
+});
+
+describe('#2153 remote screen pause', () => {
+  // Top-level describe: inherits no hook from describe('VoiceStage').
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    HTMLVideoElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+  });
+
+  const share = (paused?: boolean) => ({
+    'scr-1': { producerId: 'scr-1', userId: 'peer', username: 'peer', isLocal: false, paused },
+  });
+
+  it.each(['focus', 'equal'] as const)(
+    'shows "Screen share paused" instead of a frozen frame (%s)',
+    (stageLayout) => {
+      setStageState({
+        stageLayout,
+        tunedInScreenShares: { 'scr-1': 'c-1' },
+        dominantScreenShareId: 'scr-1',
+        activeScreenShares: share(true),
+        participants: { peer: mockParticipant({ userId: 'peer', username: 'peer' }) },
+      });
+      const { container } = render(<VoiceStage />);
+      expect(screen.getByText('Screen share paused')).toBeInTheDocument();
+      expect(container.querySelector('video')).toBeNull();
+    }
+  );
+
+  it.each(['focus', 'equal'] as const)(
+    'CONTROL: an unpaused remote share renders its video (%s)',
+    (stageLayout) => {
+      setStageState({
+        stageLayout,
+        tunedInScreenShares: { 'scr-1': 'c-1' },
+        dominantScreenShareId: 'scr-1',
+        activeScreenShares: share(),
+        participants: { peer: mockParticipant({ userId: 'peer', username: 'peer' }) },
+      });
+      const { container } = render(<VoiceStage />);
+      expect(screen.queryByText('Screen share paused')).toBeNull();
+      expect(container.querySelector('video')).not.toBeNull();
+    }
+  );
+
+  it.each(['focus', 'equal'] as const)(
+    'resuming re-attaches the live stream to the new <video> (%s)',
+    (stageLayout) => {
+      // The stream is withheld while paused so the [stream]-keyed srcObject effect re-runs
+      // on resume; handing the <video> an unchanged stream would leave it black.
+      const peer = mockParticipant({ userId: 'peer', username: 'peer' });
+      setStageState({
+        stageLayout,
+        tunedInScreenShares: { 'scr-1': 'c-1' },
+        dominantScreenShareId: 'scr-1',
+        activeScreenShares: share(true),
+        participants: { peer },
+      });
+      const { container } = render(<VoiceStage />);
+      act(() => useVoiceStore.setState({ activeScreenShares: share(false) }));
+      const video = container.querySelector('video') as HTMLVideoElement;
+      expect(video.srcObject).toBe(peer.screenStream);
+    }
+  );
 });

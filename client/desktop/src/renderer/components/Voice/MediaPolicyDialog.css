@@ -1,0 +1,47 @@
+/* #2153 eviction / cooldown dialog.
+ * No body text colour rule: the body inherits Modal's already-measured text colour
+ * (handoff §4 gate 3). --danger is the eviction glyph only, never label text. */
+.media-policy-dialog {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.media-policy-dialog__glyph {
+  flex-shrink: 0;
+  color: var(--danger);
+}
+
+.media-policy-dialog__body {
+  margin: 0;
+}
+
+.media-policy-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* The single dismiss action mirrors .purge-modal__done: there is no global modal button
+   class, so a component-scoped rule keeps it independent of which modal CSS is loaded. */
+.media-policy-dialog__close {
+  padding: 12px 24px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.media-policy-dialog__close:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+[data-reduce-animations='true'] .media-policy-dialog__close {
+  transition: none;
+}

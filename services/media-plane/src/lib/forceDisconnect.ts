@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { RoomManager } from './roomManager.js';
 import { logger } from './logger.js';
-import type { EmitSecurityEvent } from './securityEvent.js';
+import type { EmitSecurityEvent, SecurityEventInput } from './securityEvent.js';
 import {
   releaseVoiceEnforcementSession,
   type VoiceEnforcementSession,
@@ -420,7 +420,68 @@ export function createVoiceEnforcementSessionEjectionHandler(
 }
 
 /**
- * Handles a `voice.enforce.disconnect` command from the control plane (#487 P3).
+ * Why a peer is being evicted. Required, because the reason selects both the
+ * `force-disconnect` payload and the security event: a media-policy eviction
+ * (#2153) must never be reported as a permission revocation.
+ */
+export type ForceDisconnectOptions =
+  | { readonly reason: 'access_revoked' }
+  | { readonly reason: 'media_policy'; readonly retryAfterSec: number };
+
+/** The `force-disconnect` payload the evicted socket receives. */
+export type ForceDisconnectPayload =
+  | { channelId: string; reason: 'access_revoked' }
+  | { channelId: string; reason: 'media_policy'; retryAfterSec: number };
+
+interface ResolvedReason {
+  payload: ForceDisconnectPayload;
+  event: SecurityEventInput;
+  logMessage: string;
+  logDetail: Record<string, number>;
+}
+
+function unhandledReason(_options: never): never {
+  throw new Error('Unhandled force-disconnect reason');
+}
+
+/** Exhaustive by construction: a new reason is a compile error here, not a mislabelled event. */
+function resolveReason(channelId: string, options: ForceDisconnectOptions): ResolvedReason {
+  switch (options.reason) {
+    case 'access_revoked':
+      return {
+        payload: { channelId, reason: 'access_revoked' },
+        event: {
+          eventType: 'media_authorization',
+          outcome: 'success',
+          severity: 'high',
+          reasonCode: 'revocation_enforced',
+          routeTemplate: 'socket.force_disconnect',
+        },
+        logMessage: 'Force-disconnected participant via voice.enforce.disconnect',
+        logDetail: {},
+      };
+    case 'media_policy':
+      return {
+        payload: { channelId, reason: 'media_policy', retryAfterSec: options.retryAfterSec },
+        event: {
+          eventType: 'media_admission',
+          outcome: 'denied',
+          severity: 'high',
+          reasonCode: 'structural_limit_exceeded',
+          routeTemplate: 'socket.force_disconnect',
+        },
+        logMessage: 'Media policer evicted participant',
+        logDetail: { retryAfterSec: options.retryAfterSec },
+      };
+    default:
+      return unhandledReason(options);
+  }
+}
+
+/**
+ * Evicts a peer from one room: `voice.enforce.disconnect` from the control
+ * plane (#487 P3, reason `access_revoked`) or the media policer's repeat-offender
+ * eviction (#2153, reason `media_policy`).
  *
  * Revoking a user's VIEW/CONNECT permission does NOT eject an already-connected
  * peer, so the control plane publishes this command to authoritatively remove the
@@ -445,8 +506,11 @@ export async function handleForceDisconnect(
   io: ForceDisconnectIO,
   channelId: string,
   userId: string,
-  emit?: EmitSecurityEvent
+  emit: EmitSecurityEvent | undefined,
+  options: ForceDisconnectOptions
 ): Promise<void> {
+  // Resolved before any teardown, so a malformed reason touches no session.
+  const resolved = resolveReason(channelId, options);
   const participant = roomManager.getParticipant(channelId, userId);
   const provisionalSocketId = roomManager.getProvisionalParticipantSocketId(channelId, userId);
   if (!participant && !provisionalSocketId) {
@@ -486,28 +550,19 @@ export async function handleForceDisconnect(
   for (const socketId of socketIds) {
     const socket = io.sockets.sockets.get(socketId);
     if (!socket) continue;
-    socket.emit('force-disconnect', { channelId, reason: 'access_revoked' });
+    socket.emit('force-disconnect', resolved.payload);
     socket.disconnect(true);
   }
 
   if (changed) {
     try {
-      emit?.({
-        eventType: 'media_authorization',
-        outcome: 'success',
-        severity: 'high',
-        reasonCode: 'revocation_enforced',
-        routeTemplate: 'socket.force_disconnect',
-      });
+      emit?.(resolved.event);
     } catch {
       // An audit observer cannot alter an authoritative teardown.
     }
   }
 
-  logger.info('Force-disconnected participant via voice.enforce.disconnect', {
-    channelId,
-    userId,
-  });
+  logger.info(resolved.logMessage, { channelId, userId, ...resolved.logDetail });
 }
 
 // createDMBlockDisconnectAckHandler acknowledges only after the existing,
@@ -539,7 +594,9 @@ export function createDMBlockDisconnectAckHandler(
       return undefined;
     }
 
-    await handleForceDisconnect(roomManager, io, channelId, userId);
+    await handleForceDisconnect(roomManager, io, channelId, userId, undefined, {
+      reason: 'access_revoked',
+    });
     const acknowledgementKey = proofKey(sharedSecret, DM_BLOCK_DISCONNECT_ACK_PROOF);
     if (!acknowledgementKey) return undefined;
     const proof = signProof(

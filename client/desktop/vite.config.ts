@@ -100,6 +100,10 @@ export default defineConfig(() => {
           '**/*.d.ts',
           // Test files are not coverage targets themselves.
           '**/*.test.{ts,tsx,mts}',
+          // Manual live-session harnesses (a GUI, a dev stack, signed-in clients) that no test
+          // imports. Loaded as "uncovered" files, a `#!` shebang fails the whole coverage run
+          // (#2153); Sonar does not measure scripts/ either (sonar.sources).
+          'scripts/*-probe/**',
         ],
         // Coverage thresholds enforced by SonarQube Quality Gate, not here.
       },

@@ -8,6 +8,7 @@ import { logger } from './lib/logger.js';
 import { MediasoupService } from './lib/mediasoup.js';
 import {
   CryptoVersionMismatchError,
+  MediaPolicyCooldownError,
   parseMediaFrameCryptoVersion,
   RoomManager,
 } from './lib/roomManager.js';
@@ -18,6 +19,9 @@ import type {
 } from './lib/roomManager.js';
 import { emitCameraLayeringGate } from './lib/layeringGateBroadcast.js';
 import { MediaMetrics } from './lib/mediaMetrics.js';
+import { MediaPolicer, MediaPolicyLedger } from './lib/mediaPolicer.js';
+import { createMediaPolicerTick } from './lib/mediaPolicerTick.js';
+import { MEDIA_POLICY_PAUSED_RESUME_ACK, mediaPolicyCooldownAck } from './lib/mediaPolicyWire.js';
 import {
   createAuthMiddleware,
   releaseDMVoiceAuthorization,
@@ -140,10 +144,27 @@ function logSocketHandlerFailure(event: RoomEventName, userId: string): void {
   logger.error('Socket handler failed', { event, userId });
 }
 
+/**
+ * The join-room failure ack: a structured crypto_version_mismatch (so a
+ * lower-version client can prompt "update required"), a media-policy cooldown
+ * with its retry-after (#2153), or the generic failure.
+ */
+function joinErrorAck(error: unknown): object {
+  if (error instanceof CryptoVersionMismatchError) {
+    return {
+      error: error.message,
+      code: error.code,
+      roomVersion: error.roomVersion,
+      joinVersion: error.joinVersion,
+    };
+  }
+  if (error instanceof MediaPolicyCooldownError) return mediaPolicyCooldownAck(error);
+  return { error: 'Failed to join room' };
+}
+
 // #1878: extracted from the join-room handler's catch block so that handler
 // stays under the S3776 cognitive-complexity limit. Logs the failure and sends
-// the structured crypto_version_mismatch ack (so a lower-version client can
-// prompt "update required") or a generic failure ack to the client.
+// the ack joinErrorAck selects.
 function emitJoinError(
   socket: Socket,
   roomId: string,
@@ -151,21 +172,18 @@ function emitJoinError(
   error: unknown,
   callback?: (payload: unknown) => void
 ): void {
-  logger.error('Error joining room', {
-    error: error instanceof Error ? error.message : error,
-    stack: error instanceof Error ? error.stack : undefined,
-    roomId,
-    userId,
-  });
-  const errPayload =
-    error instanceof CryptoVersionMismatchError
-      ? {
-          error: error.message,
-          code: error.code,
-          roomVersion: error.roomVersion,
-          joinVersion: error.joinVersion,
-        }
-      : { error: 'Failed to join room' };
+  // #2153: a cooldown refusal is an expected outcome, already logged (warn) where
+  // RoomManager decided it. Logging it again here as an error with a stack would turn
+  // every retry of a user in cooldown into a crash-shaped log line.
+  if (!(error instanceof MediaPolicyCooldownError)) {
+    logger.error('Error joining room', {
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined,
+      roomId,
+      userId,
+    });
+  }
+  const errPayload = joinErrorAck(error);
   if (callback) {
     callback(errPayload);
     return;
@@ -894,6 +912,27 @@ async function main() {
   // Socket.IO JWT authentication middleware (A2)
   io.use(createAuthMiddleware((event) => securityEvents.emit(event)));
 
+  // ── Media-rate policer (#2153) ────────────────────────────────────────
+  // Installed before the first socket can connect, so no join or produce is
+  // ever admitted without the cooldown gate. One monotonic clock feeds the
+  // RoomManager stamps, the gate and the tick. Every decision lives in
+  // lib/mediaPolicer.ts, lib/mediaPolicerTick.ts and RoomManager.
+  const mediaPolicyClock = (): number => performance.now();
+  const mediaPolicer = new MediaPolicer();
+  const mediaPolicyLedger = new MediaPolicyLedger();
+  roomManager.setMonotonicClock(mediaPolicyClock);
+  roomManager.setMediaPolicyGate(mediaPolicyLedger);
+  roomManager.setIngressFinalizer((sample) => mediaPolicer.recordFinal(sample));
+  const mediaPolicerTick = createMediaPolicerTick({
+    roomManager,
+    io,
+    policer: mediaPolicer,
+    ledger: mediaPolicyLedger,
+    emit: (event) => securityEvents.emit(event),
+    now: mediaPolicyClock,
+  });
+  mediaPolicerTick.start();
+
   // ── NATS subscriptions for enforcement commands from control plane ────
 
   /** Creates a NATS handler for server-level toggle enforcement (mute/deafen). */
@@ -968,7 +1007,12 @@ async function main() {
             if (participant) {
               for (const [producerId, entry] of participant.producers) {
                 if (entry.kind === 'audio') {
-                  io.to(channelId).emit('producer-paused', { producerId, userId });
+                  io.to(channelId).emit('producer-paused', {
+                    producerId,
+                    userId,
+                    kind: entry.kind,
+                    source: entry.source,
+                  });
                 }
               }
             }
@@ -998,8 +1042,13 @@ async function main() {
         undefined,
         ({ channelId, userId }) => {
           cmd = { channelId, userId };
-          return handleForceDisconnect(roomManager, io, channelId, userId, (event) =>
-            securityEvents.emit(event)
+          return handleForceDisconnect(
+            roomManager,
+            io,
+            channelId,
+            userId,
+            (event) => securityEvents.emit(event),
+            { reason: 'access_revoked' }
           );
         },
         (event) => securityEvents.emit(event)
@@ -1294,12 +1343,20 @@ async function main() {
           callback({ id: producerInfo.producerId });
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to produce';
-          logger.error('Error producing', {
-            error: message,
-            userId: data.userId,
-          });
-          // Surface limit errors to client (e.g. "Video participant limit reached (max 25)")
-          callback({ error: message });
+          // #2153: a cooldown refusal is already logged (warn) where RoomManager decided it.
+          if (!(error instanceof MediaPolicyCooldownError)) {
+            logger.error('Error producing', {
+              error: message,
+              userId: data.userId,
+            });
+          }
+          // Surface limit errors to client (e.g. "Video participant limit reached (max 25)"),
+          // and a media-policy cooldown with its retry-after (#2153).
+          callback(
+            error instanceof MediaPolicyCooldownError
+              ? mediaPolicyCooldownAck(error)
+              : { error: message }
+          );
         }
       }
     );
@@ -1519,12 +1576,14 @@ async function main() {
           return;
         }
 
-        await roomManager.pauseProducer(roomId, data.userId, producerId);
+        const { kind, source } = await roomManager.pauseProducer(roomId, data.userId, producerId);
 
         // Notify others
         socket.to(roomId).emit('producer-paused', {
           producerId,
           userId: data.userId,
+          kind,
+          source,
         });
 
         if (callback) callback({ success: true });
@@ -1545,22 +1604,31 @@ async function main() {
 
         // Block resume if server-muted and this is an audio producer
         const participant = roomManager.getParticipant(roomId, data.userId);
-        if (participant?.serverMuted) {
-          const producerEntry = participant.producers.get(producerId);
-          if (producerEntry?.kind === 'audio') {
-            if (callback)
-              return callback({ error: 'server_muted', message: 'Server-muted by moderator' });
-            return;
-          }
+        const producerEntry = participant?.producers.get(producerId);
+        if (participant?.serverMuted && producerEntry?.kind === 'audio') {
+          if (callback)
+            return callback({ error: 'server_muted', message: 'Server-muted by moderator' });
+          return;
         }
 
-        await roomManager.resumeProducer(roomId, data.userId, producerId);
+        // #2153: a policer-latched producer stays paused. RoomManager refuses
+        // before its await and re-checks after it, so no producer-resumed follows.
+        const outcome = await roomManager.resumeProducer(roomId, data.userId, producerId);
+        if (outcome === 'media_policy_paused') {
+          if (callback) return callback(MEDIA_POLICY_PAUSED_RESUME_ACK);
+          return;
+        }
 
-        // Notify others
-        socket.to(roomId).emit('producer-resumed', {
-          producerId,
-          userId: data.userId,
-        });
+        // Notify others. resumeProducer throws for an unknown producer, so the
+        // entry read above is the one it just resumed.
+        if (producerEntry) {
+          socket.to(roomId).emit('producer-resumed', {
+            producerId,
+            userId: data.userId,
+            kind: producerEntry.kind,
+            source: producerEntry.source,
+          });
+        }
 
         if (callback) callback({ success: true });
       } catch (error) {
@@ -1595,7 +1663,8 @@ async function main() {
           return;
         }
 
-        const source = await roomManager.closeProducer(roomId, data.userId, producerId);
+        // #2153: the client-close path takes the final ingress sample first.
+        const source = await roomManager.closeProducerFromClient(roomId, data.userId, producerId);
 
         // Notify others
         if (source) {
@@ -1864,6 +1933,7 @@ async function main() {
       logger.info('Shutting down gracefully');
       clearInterval(epochSyncInterval);
       clearInterval(roomHeartbeatInterval);
+      mediaPolicerTick.stop();
       clearInterval(voiceEnforcementLeaseInterval);
       await opsMetricsPublisher.stop();
 

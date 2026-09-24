@@ -27,6 +27,10 @@ const PersistentVoiceBar: React.FC = () => {
   const voiceTextChatLayout = useVoiceStore((s) => s.voiceTextChatLayout);
   const persistentTextChatHeight = useVoiceStore((s) => s.persistentTextChatHeight);
   const setPersistentTextChatHeight = useVoiceStore((s) => s.setPersistentTextChatHeight);
+  // #2153: a latch force-reveals an UNPINNED bar — the notice and the locked mic live in
+  // it, and a dead mic with no visible cause is worse than a layout override. The stored
+  // voiceControlsPinned preference is never written (handoff T3).
+  const policyReveal = useVoiceStore((s) => Object.keys(s.mediaPolicyPaused).length > 0);
 
   const hasLinkedText = useHasVoiceTextTarget();
   const isVertical = voiceTextChatLayout === 'vertical';
@@ -117,7 +121,7 @@ const PersistentVoiceBar: React.FC = () => {
   return (
     <div
       ref={containerRef}
-      className={`persistent-voice-bar ${voiceControlsPinned ? 'persistent-voice-bar--pinned' : 'persistent-voice-bar--unpinned'}`}
+      className={`persistent-voice-bar ${voiceControlsPinned ? 'persistent-voice-bar--pinned' : 'persistent-voice-bar--unpinned'}${policyReveal ? ' persistent-voice-bar--policy-reveal' : ''}`}
     >
       {/* Text chat drawer (above controls) */}
       {showChat && voiceControlsPinned && (

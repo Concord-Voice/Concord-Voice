@@ -17,8 +17,11 @@ export default [
       // `npm run lint` and the hook cover the same effective file set.
       '*.mjs',
       '*.mts',
-      'scripts/*.mjs',
-      'scripts/*.mts',
+      // `**`, not `*`: a nested probe (scripts/media-policer-probe/probe.mjs) is the
+      // same file class, and scripts/tsconfig.json includes no .mjs, so unignored it
+      // fails a full-tree `npm run lint` with "not found by the project service".
+      'scripts/**/*.mjs',
+      'scripts/**/*.mts',
       // Cloudflare Pages Functions (Workers runtime, not the app TS project; #2173).
       // Type-aware linting them would require adding them to a tsconfig + Workers
       // globals; the /assets/* caching Function is regression-locked by

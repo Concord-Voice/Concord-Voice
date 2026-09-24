@@ -25,6 +25,21 @@
   pointer-events: none;
 }
 
+/* #2153 force-reveal. Same specificity as --unpinned, so it MUST stay after it: source
+   order is the override. Reveals the layout only; voiceControlsPinned is never written. */
+.persistent-voice-bar--policy-reveal {
+  transform: translateY(0);
+  max-height: 600px;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .persistent-voice-bar--policy-reveal {
+    transition: opacity 0.25s ease;
+  }
+}
+
 /* ─── Chat Drawer ──────────────────────────────────────────────── */
 
 .persistent-voice-bar__chat-drawer {

@@ -6,6 +6,8 @@ import type { CallState } from '../../services/voice/voiceService/callStateMachi
 // re-declaring them here would let the two lists drift silently.
 import type { ScreenAudioDegradeReason } from '../../../main/audiocapHost';
 import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
+import type { AudioQualityTier } from './audioQualityTiers';
+import type { MediaPolicySource } from '../../services/voice/mediaPolicyEvents';
 
 // ---------------------------------------------------------------------------
 // Persisted device settings (per-machine via localStorage)
@@ -100,6 +102,12 @@ export interface VoiceParticipant {
   isVideoOn: boolean;
   isScreenSharing: boolean;
   isSpeaking: boolean;
+  /**
+   * #2153: a peer's camera producer is paused (policer or any other cause). Hides the
+   * video exactly like camera-off, with NO extra glyph: an ordinary camera-off has none,
+   * so a glyph would reveal the cause (handoff T12).
+   */
+  isCameraPaused?: boolean;
   audioStream?: MediaStream;
   videoStream?: MediaStream;
   screenStream?: MediaStream;
@@ -112,94 +120,15 @@ export interface VoiceParticipant {
 export type DMCallerRole = 'admin' | 'member' | null;
 
 // ---------------------------------------------------------------------------
-// Audio quality tiers (must match server-side AUDIO_QUALITY_TIERS)
+// Audio quality tiers (must match server-side AUDIO_QUALITY_TIERS). Defined in
+// ./audioQualityTiers so the media plane's parity test can import them without
+// this store (#2153); re-exported here so no importer changes.
 // ---------------------------------------------------------------------------
-export type AudioQualityTier =
-  'minimum' | 'low' | 'moderate' | 'standard' | 'high' | 'hifi' | 'studio';
-
-export interface AudioQualityTierConfig {
-  label: string;
-  description: string;
-  maxBitrate: number;
-  opusDtx: boolean;
-  opusFec: boolean;
-  opusStereo: boolean;
-  preferredFrameSize: 10 | 20 | 40 | 60;
-  premium: boolean;
-}
-
-export const AUDIO_QUALITY_TIERS: Record<AudioQualityTier, AudioQualityTierConfig> = {
-  minimum: {
-    label: 'Minimum',
-    description: 'Optimized for pure survival over quality',
-    maxBitrate: 16_000,
-    opusDtx: true,
-    opusFec: true,
-    opusStereo: false,
-    preferredFrameSize: 60,
-    premium: false,
-  },
-  low: {
-    label: 'Low',
-    description: 'Prioritizes keeping you in the conversation',
-    maxBitrate: 32_000,
-    opusDtx: true,
-    opusFec: true,
-    opusStereo: false,
-    preferredFrameSize: 40,
-    premium: false,
-  },
-  moderate: {
-    label: 'Moderate',
-    description: 'The industry standard sweet spot',
-    maxBitrate: 64_000,
-    opusDtx: true,
-    opusFec: true,
-    opusStereo: false,
-    preferredFrameSize: 20,
-    premium: false,
-  },
-  standard: {
-    label: 'Standard',
-    description: 'The Concord default, maximum clarity',
-    maxBitrate: 96_000,
-    opusDtx: true,
-    opusFec: true,
-    opusStereo: false,
-    preferredFrameSize: 20,
-    premium: false,
-  },
-  high: {
-    label: 'High',
-    description: 'Virtually transparent clarity',
-    maxBitrate: 192_000,
-    opusDtx: false,
-    opusFec: true,
-    opusStereo: false,
-    preferredFrameSize: 10,
-    premium: true,
-  },
-  hifi: {
-    label: 'Hi-Fi',
-    description: 'Maximum fidelity for power users',
-    maxBitrate: 256_000,
-    opusDtx: false,
-    opusFec: false,
-    opusStereo: true,
-    preferredFrameSize: 10,
-    premium: true,
-  },
-  studio: {
-    label: 'Studio',
-    description: 'The absolute ceiling, acoustically transparent 48kHz/16-bit',
-    maxBitrate: 510_000,
-    opusDtx: false,
-    opusFec: false,
-    opusStereo: true,
-    preferredFrameSize: 10,
-    premium: true,
-  },
-};
+export {
+  AUDIO_QUALITY_TIERS,
+  type AudioQualityTier,
+  type AudioQualityTierConfig,
+} from './audioQualityTiers';
 
 /** The 7-tier audio ladder, ascending. Single source for slider ordering.
  *  Mirrors the Go entitlements.audioTierOrder. */
@@ -254,7 +183,12 @@ export interface ActiveScreenShare {
   username: string;
   displayName?: string;
   isLocal: boolean;
+  /** #2153: the share's producer is paused; screen surfaces show "Screen share paused". */
+  paused?: boolean;
 }
+
+/** #2153 eviction/cooldown dialog state. `rejoinAt` is an absolute ms instant, or null when unknown. */
+export type MediaPolicyInterrupt = { reason: 'evicted' | 'cooldown'; rejoinAt: number | null };
 
 // ---------------------------------------------------------------------------
 // Channel voice members (sidebar display — who's in each voice channel)
@@ -626,6 +560,18 @@ interface VoiceState {
   screenShareMuted: Record<string, boolean>;
   setScreenShareMuted: (userId: string, muted: boolean) => void;
 
+  /** #2153 owner latch: source → producerId the media plane holds paused. Call-scoped. */
+  mediaPolicyPaused: Partial<Record<MediaPolicySource, string>>;
+  /** #2153 eviction/cooldown dialog. PRESERVED by reset(); cleared by dismiss + resetService. */
+  mediaPolicyInterrupt: MediaPolicyInterrupt | null;
+  setMediaPolicyPaused: (source: MediaPolicySource, producerId: string) => void;
+  clearMediaPolicyPausedByProducer: (producerId: string) => void;
+  setMediaPolicyInterrupt: (value: MediaPolicyInterrupt) => void;
+  /** F13: was two identically-bodied actions (dismiss/clear) — collapsed to one. Clears the
+   *  eviction/cooldown dialog interrupt; called both by the dialog's own dismiss and by
+   *  resetService on an account change. */
+  clearMediaPolicyInterrupt: () => void;
+
   // Full reset (on disconnect)
   reset: () => void;
 }
@@ -649,6 +595,8 @@ const initialState = {
   localIsTesting: false,
   participants: {} as Record<string, VoiceParticipant>,
   screenShareMuted: {} as Record<string, boolean>,
+  mediaPolicyPaused: {} as Partial<Record<MediaPolicySource, string>>,
+  mediaPolicyInterrupt: null as MediaPolicyInterrupt | null,
   activeSpeakerId: null as string | null,
   audioInputDeviceId: persisted.audioInputDeviceId ?? null,
   audioOutputDeviceId: persisted.audioOutputDeviceId ?? null,
@@ -925,6 +873,21 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       screenShareMuted: { ...state.screenShareMuted, [userId]: muted },
     })),
 
+  setMediaPolicyPaused: (source, producerId) =>
+    set((state) => ({ mediaPolicyPaused: { ...state.mediaPolicyPaused, [source]: producerId } })),
+  clearMediaPolicyPausedByProducer: (producerId) =>
+    set((state) => {
+      const entries = Object.entries(state.mediaPolicyPaused) as [MediaPolicySource, string][];
+      if (!entries.some(([, id]) => id === producerId)) return state;
+      return {
+        mediaPolicyPaused: Object.fromEntries(
+          entries.filter(([, id]) => id !== producerId)
+        ) as Partial<Record<MediaPolicySource, string>>,
+      };
+    }),
+  setMediaPolicyInterrupt: (mediaPolicyInterrupt) => set({ mediaPolicyInterrupt }),
+  clearMediaPolicyInterrupt: () => set({ mediaPolicyInterrupt: null }),
+
   // Channel voice members (sidebar)
   setChannelVoiceMembers: (channelId, members) =>
     set((state) => ({
@@ -1194,6 +1157,12 @@ export const useVoiceStore = createStore<VoiceState>()((set) => ({
       // `did-finish-load`, so wiping it here would leave the ladder on the pre-addon
       // rungs for every call after the first -- degraded (never widened), but wrong.
       machineScreenAudioCapable: state.machineScreenAudioCapable,
+      // Preserve the #2153 eviction/cooldown interrupt. The server's force-disconnect
+      // lands BEFORE the 'io server disconnect' that runs emergencyCleanup() → reset(),
+      // and handleJoinFailure resets before its 'error' transition; wiping it here would
+      // tear down the one explanation the user gets. resetService clears it on account
+      // change instead, and the dialog clears it on dismiss.
+      mediaPolicyInterrupt: state.mediaPolicyInterrupt,
       // Preserve device settings across join/leave (they're persisted to localStorage)
       audioInputDeviceId: state.audioInputDeviceId,
       audioOutputDeviceId: state.audioOutputDeviceId,

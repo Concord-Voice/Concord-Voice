@@ -21,6 +21,8 @@ const StreamThumbnail: React.FC<{
    * share (we never consume our own screen).
    */
   sharerUserId?: string;
+  /** #2153: a REMOTE share whose producer is paused. Required so every call site states it. */
+  remotePaused: boolean;
   onSelect: () => void;
   onTuneOut: () => void;
 }> = ({
@@ -29,12 +31,37 @@ const StreamThumbnail: React.FC<{
   sharerName,
   isPaused = false,
   sharerUserId,
+  remotePaused,
   onSelect,
   onTuneOut,
 }) => {
   // #1924: reports this thumbnail's rendered size/visibility for the remote
   // screen and owns the srcObject lifecycle (shared tile wiring).
-  const videoRef = useScreenTileVideo({ sharerUserId, stream, isPaused, role: 'thumbnail' });
+  const videoRef = useScreenTileVideo({
+    sharerUserId,
+    stream,
+    isPaused: isPaused || remotePaused, // no demand report for a paused producer
+    role: 'thumbnail',
+  });
+
+  let preview: React.ReactNode;
+  if (isPaused) {
+    preview = (
+      <div className="stream-thumbnail__paused">
+        <span className="stream-thumbnail__paused-text">Paused</span>
+      </div>
+    );
+  } else if (remotePaused) {
+    preview = (
+      <div className="stream-thumbnail__paused stream-thumbnail__paused--remote">
+        <span className="stream-thumbnail__paused-text">Screen share paused</span>
+      </div>
+    );
+  } else {
+    preview = (
+      <video ref={videoRef} className="stream-thumbnail__video" autoPlay playsInline muted />
+    );
+  }
 
   return (
     <div className="stream-thumbnail">
@@ -44,13 +71,7 @@ const StreamThumbnail: React.FC<{
         onClick={onSelect}
         title={`View ${sharerName}'s screen`}
       >
-        {isPaused ? (
-          <div className="stream-thumbnail__paused">
-            <span className="stream-thumbnail__paused-text">Paused</span>
-          </div>
-        ) : (
-          <video ref={videoRef} className="stream-thumbnail__video" autoPlay playsInline muted />
-        )}
+        {preview}
         <div className="stream-thumbnail__label">{sharerName}</div>
       </button>
       <button
@@ -94,13 +115,16 @@ const StreamBar: React.FC<{ height: number }> = ({ height }) => {
           const owner = meta ? participants[meta.userId] : undefined;
           const sharerName = meta?.displayName || meta?.username || 'Unknown';
           const isLocalSharer = meta?.isLocal ?? false;
+          const remotePaused = !isLocalSharer && (meta?.paused ?? false);
+          const hidden = (isLocalSharer && localStreamPaused) || remotePaused;
           return (
             <StreamThumbnail
               key={producerId}
               producerId={producerId}
-              stream={isLocalSharer && localStreamPaused ? undefined : owner?.screenStream}
+              stream={hidden ? undefined : owner?.screenStream}
               sharerName={sharerName}
               isPaused={isLocalSharer && localStreamPaused}
+              remotePaused={remotePaused}
               sharerUserId={!isLocalSharer && meta?.userId ? meta.userId : undefined}
               onSelect={() => setDominantScreenShare(producerId)}
               onTuneOut={() => {

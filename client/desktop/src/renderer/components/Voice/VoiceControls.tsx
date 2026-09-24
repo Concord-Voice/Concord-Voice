@@ -35,6 +35,7 @@ import { useHasVoiceTextTarget } from '../../hooks/voice/useVoiceTextChatTarget'
 import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
 // voiceService is loaded on-demand via dynamic import() — see voiceService.ts
 import ScreenSharePicker from './ScreenSharePicker';
+import MediaPolicyNotice, { mediaPolicyNoticeRowId } from './MediaPolicyNotice';
 import './VoiceControls.css';
 
 /**
@@ -55,11 +56,21 @@ async function checkPermissionOrWarn(
   return false;
 }
 
-/** Compute mute button tooltip based on enforcement state. */
-function muteTitle(serverMuted: boolean, selfMuted: boolean): string {
+/**
+ * Compute mute button tooltip based on enforcement state. All three arguments are
+ * REQUIRED: a defaulted `policed` would have exactly one caller that forgot it.
+ */
+function muteTitle(policed: boolean, serverMuted: boolean, selfMuted: boolean): string {
+  // The #2153 latch wins: serverUnmuteUser cannot lift it (handoff §1a precedence).
+  if (policed) return 'Microphone paused — leave and rejoin to use it';
   if (serverMuted) return 'Server-muted by a moderator';
   if (selfMuted) return 'Unmute';
   return 'Mute';
+}
+
+function micActiveLabel(policed: boolean, serverMuted: boolean): string {
+  if (policed) return 'Paused';
+  return serverMuted ? 'Muted' : 'Unmute';
 }
 
 /**
@@ -254,6 +265,8 @@ interface MediaButtonProps {
   activeLabel: string;
   inactiveLabel: string;
   locked?: boolean;
+  /** id of the element that explains a locked state (#2153: the mic notice row). */
+  describedBy?: string;
 }
 
 /** Generic media toggle button — mic, deafen, video, screen share. */
@@ -266,6 +279,7 @@ const MediaButton: React.FC<MediaButtonProps> = ({
   activeLabel,
   inactiveLabel,
   locked = false,
+  describedBy,
 }) => {
   const classes = [
     'voice-controls__btn',
@@ -286,6 +300,7 @@ const MediaButton: React.FC<MediaButtonProps> = ({
       }}
       title={title}
       aria-disabled={locked}
+      aria-describedby={describedBy}
     >
       {isActive ? activeIcon : inactiveIcon}
       <span className="voice-controls__btn-label">{isActive ? activeLabel : inactiveLabel}</span>
@@ -403,6 +418,9 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   );
   const isServerMuted = localParticipant?.serverMuted || false;
   const isServerDeafened = localParticipant?.serverDeafened || false;
+  // #2153: only the MIC locks. Camera / screen / sound stay live — their Stop/Off IS the
+  // remedy, and locking them would remove it (handoff T6).
+  const micPoliced = useVoiceStore((s) => s.mediaPolicyPaused.mic !== undefined);
 
   const hasLinkedText = useHasVoiceTextTarget();
 
@@ -530,147 +548,154 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   return (
     <>
       <div ref={controlsRef} className="voice-controls voice-controls--full">
-        {/* Pin/Unpin button — persistent context only */}
-        {context === 'persistent' && (
-          <div className="voice-controls__persistent-actions">
-            <button
-              className="voice-controls__pin-btn"
-              onClick={toggleVoiceControlsPinned}
-              title={voiceControlsPinned ? 'Unpin controls' : 'Pin controls'}
-            >
-              {voiceControlsPinned ? <PinOff size={14} /> : <Pin size={14} />}
-            </button>
-          </div>
-        )}
+        <MediaPolicyNotice />
 
-        <div className="voice-controls__buttons">
-          {/* Four clusters — Self, Share, Utility, Danger. The bar had eleven
+        {/* The pin is centred on its containing block, so it must share one with the
+            buttons alone: when the strip was in the same box, 50% landed on its border. */}
+        <div className="voice-controls__row">
+          {/* Pin/Unpin button — persistent context only */}
+          {context === 'persistent' && (
+            <div className="voice-controls__persistent-actions">
+              <button
+                className="voice-controls__pin-btn"
+                onClick={toggleVoiceControlsPinned}
+                title={voiceControlsPinned ? 'Unpin controls' : 'Pin controls'}
+              >
+                {voiceControlsPinned ? <PinOff size={14} /> : <Pin size={14} />}
+              </button>
+            </div>
+          )}
+
+          <div className="voice-controls__buttons">
+            {/* Four clusters — Self, Share, Utility, Danger. The bar had eleven
               equal-weight pills in one undifferentiated row; grouping by what a
               control ACTS ON is what makes it scannable. Spacing carries the
               grouping (Proximity); see the CSS for why there is no divider. */}
-          <div className="voice-controls__cluster">
-            <MediaButton
-              isActive={isMuted || isServerMuted}
-              onClick={handleToggleMute}
-              title={muteTitle(isServerMuted, isMuted)}
-              activeIcon={<MicOff size={18} />}
-              inactiveIcon={<Mic size={18} />}
-              activeLabel={isServerMuted ? 'Muted' : 'Unmute'}
-              inactiveLabel="Mute"
-              locked={isServerMuted}
-            />
+            <div className="voice-controls__cluster">
+              <MediaButton
+                isActive={isMuted || isServerMuted || micPoliced}
+                onClick={handleToggleMute}
+                title={muteTitle(micPoliced, isServerMuted, isMuted)}
+                activeIcon={<MicOff size={18} />}
+                inactiveIcon={<Mic size={18} />}
+                activeLabel={micActiveLabel(micPoliced, isServerMuted)}
+                inactiveLabel="Mute"
+                locked={isServerMuted || micPoliced}
+                describedBy={micPoliced ? mediaPolicyNoticeRowId('mic') : undefined}
+              />
 
-            <MediaButton
-              isActive={isDeafened || isServerDeafened}
-              onClick={handleToggleDeafen}
-              title={deafenTitle(isServerDeafened, isDeafened)}
-              activeIcon={<HeadphoneOff size={18} />}
-              inactiveIcon={<Headphones size={18} />}
-              activeLabel={isServerDeafened ? 'Deafened' : 'Undeafen'}
-              inactiveLabel="Deafen"
-              locked={isServerDeafened}
-            />
+              <MediaButton
+                isActive={isDeafened || isServerDeafened}
+                onClick={handleToggleDeafen}
+                title={deafenTitle(isServerDeafened, isDeafened)}
+                activeIcon={<HeadphoneOff size={18} />}
+                inactiveIcon={<Headphones size={18} />}
+                activeLabel={isServerDeafened ? 'Deafened' : 'Undeafen'}
+                inactiveLabel="Deafen"
+                locked={isServerDeafened}
+              />
 
-            <MediaButton
-              isActive={isVideoOn}
-              onClick={handleToggleVideo}
-              title={isVideoOn ? 'Stop Video' : 'Start Video'}
-              activeIcon={<VideoOff size={18} />}
-              inactiveIcon={<Video size={18} />}
-              activeLabel="Stop Video"
-              inactiveLabel="Video"
-            />
-          </div>
+              <MediaButton
+                isActive={isVideoOn}
+                onClick={handleToggleVideo}
+                title={isVideoOn ? 'Stop Video' : 'Start Video'}
+                activeIcon={<VideoOff size={18} />}
+                inactiveIcon={<Video size={18} />}
+                activeLabel="Stop Video"
+                inactiveLabel="Video"
+              />
+            </div>
 
-          {/* Everything scoped to the outgoing share. The two toggles below are
+            {/* Everything scoped to the outgoing share. The two toggles below are
               literally gated on isScreenSharing, so they cannot belong anywhere
               else — yet Chat used to sit between them and the Share button. */}
-          <div className="voice-controls__cluster">
-            {/* Idle: one button that starts a share. Live: Switch and Stop as one
+            <div className="voice-controls__cluster">
+              {/* Idle: one button that starts a share. Live: Switch and Stop as one
                 object — they act on the same share. */}
-            {isScreenSharing ? (
-              <ShareSegmentedControl onSwitch={handleSwitchScreen} onStop={handleToggleScreen} />
-            ) : (
-              <MediaButton
-                isActive={false}
-                onClick={handleToggleScreen}
-                title="Share Screen"
-                activeIcon={<Monitor size={18} />}
-                inactiveIcon={<Monitor size={18} />}
-                activeLabel="Screen"
-                inactiveLabel="Screen"
-              />
-            )}
+              {isScreenSharing ? (
+                <ShareSegmentedControl onSwitch={handleSwitchScreen} onStop={handleToggleScreen} />
+              ) : (
+                <MediaButton
+                  isActive={false}
+                  onClick={handleToggleScreen}
+                  title="Share Screen"
+                  activeIcon={<Monitor size={18} />}
+                  inactiveIcon={<Monitor size={18} />}
+                  activeLabel="Screen"
+                  inactiveLabel="Screen"
+                />
+              )}
 
-            {isScreenSharing && (
-              <MediaButton
-                isActive={isScreenAudioOn}
-                onClick={handleToggleScreenAudio}
-                locked={!verdictOffersAudio(screenAudioVerdict)}
-                title={screenAudioTitle(screenAudioVerdict, isScreenAudioOn)}
-                activeIcon={<Volume2 size={18} />}
-                inactiveIcon={<VolumeX size={18} />}
-                activeLabel={screenAudioVerdict === 'per-process' ? 'App sound' : 'Desktop sound'}
-                inactiveLabel="Share sound"
-              />
-            )}
-          </div>
+              {isScreenSharing && (
+                <MediaButton
+                  isActive={isScreenAudioOn}
+                  onClick={handleToggleScreenAudio}
+                  locked={!verdictOffersAudio(screenAudioVerdict)}
+                  title={screenAudioTitle(screenAudioVerdict, isScreenAudioOn)}
+                  activeIcon={<Volume2 size={18} />}
+                  inactiveIcon={<VolumeX size={18} />}
+                  activeLabel={screenAudioVerdict === 'per-process' ? 'App sound' : 'Desktop sound'}
+                  inactiveLabel="Share sound"
+                />
+              )}
+            </div>
 
-          {/* Acts on how YOU view the call, not on what you send. Every member is
+            {/* Acts on how YOU view the call, not on what you send. Every member is
               conditional, so this cluster can render empty — see the :empty rule. */}
-          <div className="voice-controls__cluster">
-            {/* Tune Everywhere + view-mode switch (voiceView context only) */}
-            <StreamControls context={context} />
+            <div className="voice-controls__cluster">
+              {/* Tune Everywhere + view-mode switch (voiceView context only) */}
+              <StreamControls context={context} />
 
-            {hasLinkedText && (
-              <button
-                className={`voice-controls__btn ${showVoiceTextChat ? 'voice-controls__btn--chat-active' : ''}`}
-                onClick={toggleVoiceTextChat}
-                title={showVoiceTextChat ? 'Hide Text Chat' : 'Show Text Chat'}
-              >
-                {showVoiceTextChat ? <MessageSquareOff size={18} /> : <MessageSquare size={18} />}
-                <span className="voice-controls__btn-label">Chat</span>
-              </button>
-            )}
+              {hasLinkedText && (
+                <button
+                  className={`voice-controls__btn ${showVoiceTextChat ? 'voice-controls__btn--chat-active' : ''}`}
+                  onClick={toggleVoiceTextChat}
+                  title={showVoiceTextChat ? 'Hide Text Chat' : 'Show Text Chat'}
+                >
+                  {showVoiceTextChat ? <MessageSquareOff size={18} /> : <MessageSquare size={18} />}
+                  <span className="voice-controls__btn-label">Chat</span>
+                </button>
+              )}
 
-            {/* `||`, not `&&`: the menu now also carries the keep-active preference,
+              {/* `||`, not `&&`: the menu now also carries the keep-active preference,
                 which is share-scoped and has nothing to do with Electron. Gating the
                 trigger on hasElectronPip alone would make that preference
                 unreachable on any build without pop-out windows. */}
-            {(hasElectronPip || isScreenSharing) && (
-              <div ref={utilityWrapRef} className="voice-controls__utility-wrap">
-                <button
-                  className="voice-controls__btn"
-                  onClick={() => setShowUtilityMenu((v) => !v)}
-                  title="More controls"
-                  aria-expanded={showUtilityMenu}
-                >
-                  <MoreHorizontal size={18} />
-                  <span className="voice-controls__btn-label">More</span>
+              {(hasElectronPip || isScreenSharing) && (
+                <div ref={utilityWrapRef} className="voice-controls__utility-wrap">
+                  <button
+                    className="voice-controls__btn"
+                    onClick={() => setShowUtilityMenu((v) => !v)}
+                    title="More controls"
+                    aria-expanded={showUtilityMenu}
+                  >
+                    <MoreHorizontal size={18} />
+                    <span className="voice-controls__btn-label">More</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Pop-Out controls button — persistent context only */}
+              {context === 'persistent' && onPopOut && (
+                <button className="voice-controls__btn" onClick={onPopOut} title="Pop out controls">
+                  <ExternalLink size={18} />
+                  <span className="voice-controls__btn-label">Pop Out</span>
                 </button>
-              </div>
-            )}
+              )}
+            </div>
 
-            {/* Pop-Out controls button — persistent context only */}
-            {context === 'persistent' && onPopOut && (
-              <button className="voice-controls__btn" onClick={onPopOut} title="Pop out controls">
-                <ExternalLink size={18} />
-                <span className="voice-controls__btn-label">Pop Out</span>
-              </button>
-            )}
-          </div>
-
-          {/* Alone, so the one irreversible action in the bar is never adjacent to
+            {/* Alone, so the one irreversible action in the bar is never adjacent to
               a toggle someone meant to press. */}
-          <div className="voice-controls__cluster">
-            <button
-              className="voice-controls__btn voice-controls__btn--danger"
-              onClick={handleLeave}
-              title="Leave Voice"
-            >
-              <PhoneOff size={18} />
-              <span className="voice-controls__btn-label">Leave</span>
-            </button>
+            <div className="voice-controls__cluster">
+              <button
+                className="voice-controls__btn voice-controls__btn--danger"
+                onClick={handleLeave}
+                title="Leave Voice"
+              >
+                <PhoneOff size={18} />
+                <span className="voice-controls__btn-label">Leave</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>

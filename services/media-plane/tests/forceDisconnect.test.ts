@@ -10,9 +10,11 @@ import {
   handleForceDisconnect,
   createCredentialEpochEjectionAckHandler,
   createVoiceEnforcementSessionEjectionHandler,
-  type ForceDisconnectRoomManager,
   type ForceDisconnectIO,
+  type ForceDisconnectOptions,
+  type ForceDisconnectRoomManager,
 } from '../src/lib/forceDisconnect.js';
+import { logger } from '../src/lib/logger.js';
 import { releaseVoiceEnforcementSession } from '../src/lib/voiceEnforcementSession.js';
 import {
   VoiceEnforcementExpiryFence,
@@ -22,6 +24,8 @@ import {
 const CHANNEL_ID = 'ch-1';
 const USER_ID = 'u-1';
 const SOCKET_ID = 'socket-abc';
+const REVOKED: ForceDisconnectOptions = { reason: 'access_revoked' };
+const POLICED: ForceDisconnectOptions = { reason: 'media_policy', retryAfterSec: 900 };
 
 /** Builds a fake RoomManager surface. */
 function makeRoomManager(
@@ -75,7 +79,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     const { rm, getParticipant, leaveRoomIfSocketOwned } = makeRoomManager({ socketId: SOCKET_ID });
     const { io, emit, disconnect } = makeIO(SOCKET_ID);
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
     expect(getParticipant).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
     // Notifies the client then force-closes the socket.
@@ -92,7 +96,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     const { rm, leaveRoomIfSocketOwned } = makeRoomManager(undefined);
     const { io, emit, disconnect } = makeIO();
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
     expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
@@ -106,7 +110,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     const { rm, leaveRoomIfSocketOwned } = makeRoomManager({ socketId: SOCKET_ID });
     const { io } = makeIO(/* no socket registered */);
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
     expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
   });
@@ -121,7 +125,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     } = makeRoomManager(undefined, pendingSocketId);
     const { io, emit, disconnect } = makeIO(pendingSocketId);
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
     expect(getProvisionalParticipantSocketId).toHaveBeenCalledWith(CHANNEL_ID, USER_ID);
     expect(emit).toHaveBeenCalledWith('force-disconnect', {
@@ -143,7 +147,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
       makeRoomManager({ socketId: SOCKET_ID }, pendingSocketId);
     const { io, emit, disconnect } = makeIO(SOCKET_ID, pendingSocketId);
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
     expect(emit).toHaveBeenCalledTimes(2);
     expect(disconnect).toHaveBeenCalledTimes(2);
@@ -200,7 +204,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
       },
     } as unknown as ForceDisconnectIO;
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
 
     expect(removeProvisionalParticipantIfSocketOwned).toHaveBeenCalledWith(
       CHANNEL_ID,
@@ -216,7 +220,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     const { rm } = makeRoomManager({ socketId: SOCKET_ID });
     const { io } = makeIO(SOCKET_ID);
     const emit = vi.fn();
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit, REVOKED);
     expect(emit).toHaveBeenCalledOnce();
     expect(emit).toHaveBeenCalledWith(
       expect.objectContaining({ reasonCode: 'revocation_enforced' })
@@ -244,7 +248,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     } as unknown as ForceDisconnectIO;
     const emit = vi.fn();
 
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit, REVOKED);
 
     expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
     expect(disconnect).toHaveBeenCalledWith(true);
@@ -259,7 +263,7 @@ describe('handleForceDisconnect (#487 P3)', () => {
     leaveRoomIfSocketOwned.mockResolvedValueOnce(false);
     const { io } = makeIO(SOCKET_ID);
     const emit = vi.fn();
-    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, emit, REVOKED);
     expect(emit).not.toHaveBeenCalled();
   });
 
@@ -267,11 +271,140 @@ describe('handleForceDisconnect (#487 P3)', () => {
     const { rm, leaveRoomIfSocketOwned } = makeRoomManager({ socketId: SOCKET_ID });
     const { io } = makeIO(SOCKET_ID);
     await expect(
-      handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, () => {
-        throw new Error('observer failure');
-      })
+      handleForceDisconnect(
+        rm,
+        io,
+        CHANNEL_ID,
+        USER_ID,
+        () => {
+          throw new Error('observer failure');
+        },
+        REVOKED
+      )
     ).resolves.toBeUndefined();
     expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+  });
+});
+
+describe('handleForceDisconnect reasons (#2153)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('sends a media-policy eviction its retryAfterSec', async () => {
+    const { rm, leaveRoomIfSocketOwned } = makeRoomManager({ socketId: SOCKET_ID });
+    const { io, emit, disconnect } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, POLICED);
+
+    expect(emit.mock.calls).toStrictEqual([
+      ['force-disconnect', { channelId: CHANNEL_ID, reason: 'media_policy', retryAfterSec: 900 }],
+    ]);
+    expect(disconnect).toHaveBeenCalledWith(true);
+    expect(leaveRoomIfSocketOwned).toHaveBeenCalledWith(CHANNEL_ID, USER_ID, SOCKET_ID);
+  });
+
+  it('keeps the access-revoked payload free of retryAfterSec', async () => {
+    const { rm } = makeRoomManager({ socketId: SOCKET_ID });
+    const { io, emit } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
+
+    expect(emit.mock.calls).toStrictEqual([
+      ['force-disconnect', { channelId: CHANNEL_ID, reason: 'access_revoked' }],
+    ]);
+  });
+
+  it('reports a policer eviction as a media-admission denial, never as a revocation', async () => {
+    const { rm } = makeRoomManager({ socketId: SOCKET_ID });
+    const { io } = makeIO(SOCKET_ID);
+    const securityEmit = vi.fn();
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, securityEmit, POLICED);
+
+    expect(securityEmit.mock.calls).toStrictEqual([
+      [
+        {
+          eventType: 'media_admission',
+          outcome: 'denied',
+          severity: 'high',
+          reasonCode: 'structural_limit_exceeded',
+          routeTemplate: 'socket.force_disconnect',
+        },
+      ],
+    ]);
+  });
+
+  it('reports an access revocation with the unchanged revocation event', async () => {
+    const { rm } = makeRoomManager({ socketId: SOCKET_ID });
+    const { io } = makeIO(SOCKET_ID);
+    const securityEmit = vi.fn();
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, securityEmit, REVOKED);
+
+    expect(securityEmit.mock.calls).toStrictEqual([
+      [
+        {
+          eventType: 'media_authorization',
+          outcome: 'success',
+          severity: 'high',
+          reasonCode: 'revocation_enforced',
+          routeTemplate: 'socket.force_disconnect',
+        },
+      ],
+    ]);
+  });
+
+  it('emits no policer event when the session races out before teardown', async () => {
+    const { rm, leaveRoomIfSocketOwned } = makeRoomManager({ socketId: SOCKET_ID });
+    leaveRoomIfSocketOwned.mockResolvedValueOnce(false);
+    const { io } = makeIO(SOCKET_ID);
+    const securityEmit = vi.fn();
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, securityEmit, POLICED);
+
+    expect(securityEmit).not.toHaveBeenCalled();
+  });
+
+  it('logs each reason under its own grep string', async () => {
+    const { rm } = makeRoomManager({ socketId: SOCKET_ID });
+    const { io } = makeIO(SOCKET_ID);
+
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, POLICED);
+    await handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, REVOKED);
+
+    expect(vi.mocked(logger.info).mock.calls).toStrictEqual([
+      [
+        'Media policer evicted participant',
+        { channelId: CHANNEL_ID, userId: USER_ID, retryAfterSec: 900 },
+      ],
+      [
+        'Force-disconnected participant via voice.enforce.disconnect',
+        { channelId: CHANNEL_ID, userId: USER_ID },
+      ],
+    ]);
+  });
+
+  it('refuses an unknown reason before touching any session', async () => {
+    const {
+      rm,
+      getParticipant,
+      leaveRoomIfSocketOwned,
+      removeProvisionalParticipantIfSocketOwned,
+    } = makeRoomManager({ socketId: SOCKET_ID }, 'socket-pending');
+    const { io, emit, disconnect } = makeIO(SOCKET_ID, 'socket-pending');
+
+    await expect(
+      handleForceDisconnect(rm, io, CHANNEL_ID, USER_ID, undefined, {
+        reason: 'bogus',
+      } as unknown as ForceDisconnectOptions)
+    ).rejects.toThrow('Unhandled force-disconnect reason');
+
+    expect(getParticipant).not.toHaveBeenCalled();
+    expect(removeProvisionalParticipantIfSocketOwned).not.toHaveBeenCalled();
+    expect(leaveRoomIfSocketOwned).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
   });
 });
 

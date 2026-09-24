@@ -24,6 +24,7 @@ import { voiceService } from '@/renderer/services/voice/voiceService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
+import { useSubscriptionStore } from '@/renderer/stores/auth/subscriptionStore';
 
 const LOCAL_USER = 'local-user';
 const REMOTE_USER = 'remote-user';
@@ -226,6 +227,44 @@ describe('voiceService screen-audio teardown choke point (#3195 section 6c)', ()
     expect(audioProducer.close).toHaveBeenCalled();
     expect(stop).toHaveBeenCalledTimes(1);
     expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'off', overrun: 0 });
+  });
+
+  it('#2153 T0: screen audio is produced at the highest allowed tier rate, never uncapped', async () => {
+    // Measured in T0: with no cap, stereo system audio ran at 537 kbps and the policer paused
+    // it. A studio-entitled user proves the cap follows the entitlement, not a constant.
+    useSubscriptionStore.setState({
+      entitlement: {
+        ...useSubscriptionStore.getState().entitlement,
+        allowedAudioTiers: ['minimum', 'low', 'moderate', 'standard', 'high', 'hifi', 'studio'],
+      },
+    });
+    delete svc.produceScreenAudioFromStream;
+    svc.produceEncrypted = vi.fn().mockResolvedValue(producerStub('screen-audio-1'));
+
+    await svc.produceScreenAudioFromStream(svc.localScreenStream);
+
+    expect(svc.produceEncrypted).toHaveBeenCalledTimes(1); // positive control: it produced
+    const opts = svc.produceEncrypted.mock.calls[0][1];
+    expect(opts.encodings?.[0]?.maxBitrate).toBe(510_000);
+    expect(opts.codecOptions?.opusMaxAverageBitrate).toBe(510_000);
+  });
+
+  // Mirrors the media plane's resolveAllowedOpusBitrateCeiling: an unknown tier contributes
+  // nothing, and a list with no known tier floors at `standard`, never at 0.
+  it.each([
+    [['bogus'], 96_000],
+    [['bogus', 'high'], 192_000],
+  ])('#2153 T0: allowed tiers %j cap screen audio at %i', async (tiers, expected) => {
+    useSubscriptionStore.setState({
+      entitlement: { ...useSubscriptionStore.getState().entitlement, allowedAudioTiers: tiers },
+    });
+    delete svc.produceScreenAudioFromStream;
+    svc.produceEncrypted = vi.fn().mockResolvedValue(producerStub('screen-audio-1'));
+
+    await svc.produceScreenAudioFromStream(svc.localScreenStream);
+
+    expect(svc.produceEncrypted).toHaveBeenCalledTimes(1); // positive control: it produced
+    expect(svc.produceEncrypted.mock.calls[0][1].encodings?.[0]?.maxBitrate).toBe(expected);
   });
 
   it('LOCAL: the audio producer’s transportclose routes through the choke point', async () => {

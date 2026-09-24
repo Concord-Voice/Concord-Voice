@@ -915,6 +915,36 @@ describe('UserFrameGrid', () => {
       expect(screen.getByText('Your Screen Is Still Streaming')).toBeInTheDocument();
     });
 
+    it('#2153: shows "Screen share paused" (not a frozen frame) for a paused REMOTE share', () => {
+      // The fourth screen surface. VoiceStage and StreamBar got this in 6e; the Tile view
+      // renders the same remote stream and must not freeze where they explain.
+      useVoiceStore.setState({
+        activeScreenShares: {
+          'prod-1': {
+            producerId: 'prod-1',
+            userId: 'u1',
+            username: 'alice',
+            isLocal: false,
+            paused: true,
+          },
+        },
+      });
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      expect(container.querySelector('.stream-grid-tile__video')).toBeNull();
+      expect(screen.getByText('Screen share paused')).toBeInTheDocument();
+    });
+
+    it('#2153: resuming a paused REMOTE share re-attaches the live stream in Tile view', () => {
+      const remote = (paused: boolean) => ({
+        'prod-1': { producerId: 'prod-1', userId: 'u1', username: 'alice', isLocal: false, paused },
+      });
+      useVoiceStore.setState({ activeScreenShares: remote(true) });
+      const { container } = render(<UserFrameGrid includeStreamTiles />);
+      act(() => useVoiceStore.setState({ activeScreenShares: remote(false) }));
+      const video = container.querySelector('.stream-grid-tile__video') as HTMLVideoElement;
+      expect(video.srcObject).toEqual({ id: 'stream-1' });
+    });
+
     it('keeps the local preview stream attached in Tile view when not paused', () => {
       useVoiceStore.setState({
         activeScreenShares: {

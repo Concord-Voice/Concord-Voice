@@ -628,14 +628,39 @@ const StreamGridTile: React.FC<{
    * Undefined for a local share (we never consume our own screen).
    */
   sharerUserId?: string;
+  /** #2153: a REMOTE share whose producer is paused. Required so every call site states it. */
+  remotePaused: boolean;
   onFocus: (producerId: string) => void;
-}> = ({ producerId, name, stream, isPaused = false, sharerUserId, onFocus }) => {
+}> = ({ producerId, name, stream, isPaused = false, sharerUserId, remotePaused, onFocus }) => {
   // #1924: reports this Tile-view cell's rendered size/visibility for the remote
   // screen so the SFU can forward its smallest-sufficient layer and flip the
   // screen-layering gate, and owns the srcObject lifecycle (shared tile wiring).
   // role 'grid' — it is a grid sibling of the participant frames. Inert for a
   // local share.
-  const videoRef = useScreenTileVideo({ sharerUserId, stream, isPaused, role: 'grid' });
+  const videoRef = useScreenTileVideo({
+    sharerUserId,
+    stream,
+    isPaused: isPaused || remotePaused, // no demand report for a paused producer
+    role: 'grid',
+  });
+
+  // A nested ternary would trip Sonar S3358.
+  let body: React.ReactNode;
+  if (isPaused) {
+    body = (
+      <div className="stream-grid-tile__paused">
+        <span className="stream-grid-tile__paused-title">Your Screen Is Still Streaming</span>
+      </div>
+    );
+  } else if (remotePaused) {
+    body = (
+      <div className="stream-grid-tile__paused stream-grid-tile__paused--remote">
+        <span className="stream-grid-tile__paused-title">Screen share paused</span>
+      </div>
+    );
+  } else {
+    body = <video ref={videoRef} className="stream-grid-tile__video" autoPlay playsInline muted />;
+  }
 
   return (
     <button
@@ -645,13 +670,7 @@ const StreamGridTile: React.FC<{
       title="Show front 'n center"
       aria-label={`Focus ${name}'s screen`}
     >
-      {isPaused ? (
-        <div className="stream-grid-tile__paused">
-          <span className="stream-grid-tile__paused-title">Your Screen Is Still Streaming</span>
-        </div>
-      ) : (
-        <video ref={videoRef} className="stream-grid-tile__video" autoPlay playsInline muted />
-      )}
+      {body}
       <span className="stream-grid-tile__name">{`${name}’s screen`}</span>
     </button>
   );
@@ -700,6 +719,7 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
         const isLocal = meta?.isLocal ?? false;
         const stream = meta ? participants[meta.userId]?.screenStream : undefined;
         const paused = isLocal && localStreamPaused;
+        const remotePaused = !isLocal && (meta?.paused ?? false);
         return {
           producerId,
           name: meta?.displayName || meta?.username || 'Unknown',
@@ -710,8 +730,9 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
           // VoiceView sets localStreamPaused and the stage/stream-bar paths drop
           // the local stream. Do the same here so the Tile view does not keep the
           // local capture attached and rendering while unfocused.
-          stream: paused ? undefined : stream,
+          stream: paused || remotePaused ? undefined : stream,
           paused,
+          remotePaused,
         };
       })
     : [];
@@ -786,6 +807,7 @@ export const UserFrameGrid: React.FC<UserFrameGridProps> = ({ includeStreamTiles
             name={tile.name}
             stream={tile.stream}
             isPaused={tile.paused}
+            remotePaused={tile.remotePaused}
             sharerUserId={tile.sharerUserId}
             onFocus={handleFocusStream}
           />

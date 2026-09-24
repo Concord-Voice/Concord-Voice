@@ -247,3 +247,49 @@ describe('StreamBar', () => {
     expect(screen.queryByText('Alice')).not.toBeInTheDocument();
   });
 });
+
+describe('#2153 remote screen pause in the stream bar', () => {
+  // Top-level describe: inherits no hook from describe('StreamBar').
+  beforeEach(() => {
+    resetAllStores();
+    vi.clearAllMocks();
+    HTMLVideoElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+  });
+
+  // scr-2 is dominant, so only scr-1 renders as a thumbnail.
+  const state = (paused?: boolean) => ({
+    tunedInScreenShares: { 'scr-1': 'c-1', 'scr-2': 'c-2' },
+    dominantScreenShareId: 'scr-2',
+    activeScreenShares: {
+      'scr-1': { producerId: 'scr-1', userId: 'peer', username: 'peer', isLocal: false, paused },
+      'scr-2': { producerId: 'scr-2', userId: 'peer2', username: 'peer2', isLocal: false },
+    },
+    participants: {
+      peer: mockParticipant({ userId: 'peer', username: 'peer' }),
+      peer2: mockParticipant({ userId: 'peer2', username: 'peer2' }),
+    },
+  });
+
+  it('shows "Screen share paused" on a paused remote thumbnail', () => {
+    setStreamBarState(state(true));
+    const { container } = render(<StreamBar height={120} />);
+    expect(screen.getByText('Screen share paused')).toBeInTheDocument();
+    expect(container.querySelectorAll('video')).toHaveLength(0);
+  });
+
+  it('CONTROL: an unpaused remote thumbnail renders its video', () => {
+    setStreamBarState(state());
+    const { container } = render(<StreamBar height={120} />);
+    expect(screen.queryByText('Screen share paused')).toBeNull();
+    expect(container.querySelectorAll('video')).toHaveLength(1);
+  });
+
+  it('resuming re-attaches the live stream to the new thumbnail <video>', () => {
+    const paused = state(true);
+    setStreamBarState(paused);
+    const { container } = render(<StreamBar height={120} />);
+    act(() => useVoiceStore.setState({ activeScreenShares: state(false).activeScreenShares }));
+    const video = container.querySelector('video') as HTMLVideoElement;
+    expect(video.srcObject).toBe(paused.participants.peer.screenStream);
+  });
+});

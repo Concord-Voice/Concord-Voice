@@ -2,14 +2,14 @@ package entitlements
 
 // audioTierOrder is the canonical 7-tier audio ladder, ascending. Index = rank.
 // MIRRORS the client AUDIO_QUALITY_TIERS
-// (client/desktop/src/renderer/stores/voice/voiceStore.ts), the media-plane
+// (client/desktop/src/renderer/stores/voice/audioQualityTiers.ts), the media-plane
 // AUDIO_QUALITY_TIERS config, and the
 // media-plane AUDIO_TIER_OPUS_BITRATE_CEILING_BPS enforcement map. Keep all
 // mirrors in lockstep.
 var audioTierOrder = []string{"minimum", "low", "moderate", "standard", "high", "hifi", "studio"}
 
 // audioTierPtimeMs is each tier's Opus frame size (ms). high/hifi/studio use
-// 10ms; the rest ≥20ms. Mirrors preferredFrameSize in voiceStore.ts.
+// 10ms; the rest ≥20ms. Mirrors preferredFrameSize in audioQualityTiers.ts.
 var audioTierPtimeMs = map[string]int{
 	"minimum": 60, "low": 40, "moderate": 20, "standard": 20,
 	"high": 10, "hifi": 10, "studio": 10,

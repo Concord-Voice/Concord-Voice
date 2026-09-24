@@ -14,6 +14,7 @@ const PipWindow = lazy(() => import('./components/Voice/PipWindow'));
 import ForceUpdateOverlay from './components/ui/ForceUpdateOverlay';
 import UpdateBanner from './components/ui/UpdateBanner';
 import { UpdateSecurityBanner } from './components/Updates/UpdateSecurityBanner';
+import MediaPolicyDialog from './components/Voice/MediaPolicyDialog';
 import { IncomingCallBanner } from './components/Voice/IncomingCallBanner';
 import { OutgoingCallModal } from './components/Voice/OutgoingCallModal';
 import { AudioOutputs } from './components/Voice/ParticipantGrid';
@@ -650,6 +651,8 @@ function App() {
         <div className="app">
           {!isPipWindow && <Titlebar />}
           <UpdateSecurityBanner />
+          {/* #2153: outlives the voice UI teardown an eviction causes. */}
+          <MediaPolicyDialog />
           <UpdateBanner />
           {/* DM voice call ring UI (#1209). IncomingCallBanner: corner banner
               for callee. OutgoingCallModal: bottom-right non-modal prompt for

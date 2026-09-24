@@ -4,6 +4,8 @@ import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // ── Child component mocks ────────────────────────────────────────────────────
 vi.mock('@/renderer/components/Voice/VoiceControls', () => ({
@@ -290,5 +292,34 @@ describe('PersistentVoiceBar', () => {
       expect(handle).toHaveAttribute('aria-label', 'Resize voice text chat');
       expect(handle).not.toHaveAttribute('aria-hidden');
     });
+  });
+});
+
+describe('#2153 force-reveal of an unpinned bar', () => {
+  // Top-level describe: inherits no hook from describe('PersistentVoiceBar').
+  beforeEach(() => resetAllStores());
+
+  it('reveals while any latch exists and never writes the pin preference', () => {
+    setBarState({ voiceControlsPinned: false, mediaPolicyPaused: { mic: 'mic-1' } });
+    const { container } = render(<PersistentVoiceBar />);
+    expect(container.firstElementChild).toHaveClass('persistent-voice-bar--policy-reveal');
+    expect(useVoiceStore.getState().voiceControlsPinned).toBe(false);
+  });
+
+  it('honours the pin when nothing is latched', () => {
+    setBarState({ voiceControlsPinned: false, mediaPolicyPaused: {} });
+    const { container } = render(<PersistentVoiceBar />);
+    expect(container.firstElementChild).not.toHaveClass('persistent-voice-bar--policy-reveal');
+  });
+
+  it('declares the reveal AFTER --unpinned so equal specificity resolves to the reveal', () => {
+    const css = readFileSync(
+      resolve(__dirname, '../../../../src/renderer/components/Voice/PersistentVoiceBar.css'),
+      'utf8'
+    );
+    const unpinned = css.indexOf('.persistent-voice-bar--unpinned {');
+    const reveal = css.indexOf('.persistent-voice-bar--policy-reveal {');
+    expect(unpinned).toBeGreaterThan(-1);
+    expect(reveal).toBeGreaterThan(unpinned);
   });
 });

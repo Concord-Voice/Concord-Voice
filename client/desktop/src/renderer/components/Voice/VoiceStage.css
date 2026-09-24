@@ -340,3 +340,10 @@
     transition: none;
   }
 }
+
+/* #2153 remote-paused placeholder: --text-primary on --bg-tertiary (handoff §4), measured
+   by contrast-pairs.test.ts. */
+.voice-stage__paused-placeholder--remote {
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+}

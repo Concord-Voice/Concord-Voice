@@ -87,6 +87,7 @@ import { clearIndex, indexMessage, isIndexed } from '@/renderer/services/messagi
 import { useDraftMessageStore } from '@/renderer/stores/chat/draftMessageStore';
 import { useE2EEStore } from '@/renderer/stores/auth/e2eeStore';
 import { useSettingsStore } from '@/renderer/stores/ui/settingsStore';
+import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { mockServer } from '../../mocks/fixtures';
 import { resetAllStores } from '../../helpers/store-helpers';
 
@@ -132,6 +133,12 @@ describe('resetService', () => {
   });
 
   describe('gracefulReset', () => {
+    it('gracefulReset clears the preserved media-policy interrupt so it cannot leak into the next account (#2153)', () => {
+      useVoiceStore.getState().setMediaPolicyInterrupt({ reason: 'evicted', rejoinAt: 1_900_000 });
+      gracefulReset();
+      expect(useVoiceStore.getState().mediaPolicyInterrupt).toBeNull();
+    });
+
     it('clears every rich-presence category while preserving no self state on account reset', () => {
       const store = useRichPresenceStore.getState() as unknown as {
         replaceOtherPresence?: (next: Record<string, Record<string, unknown>>) => void;

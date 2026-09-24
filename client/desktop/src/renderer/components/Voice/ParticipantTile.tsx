@@ -59,7 +59,8 @@ function ParticipantStatusOverlay({
         className="participant-tile__status participant-tile__status--server-deafened"
         title="Server Deafened"
       >
-        <HeadphoneOff size={iconSize} />
+        {/* Named on the icon itself (#2153 1.1.1 tidy-up); lucide keeps the lock badge hidden. */}
+        <HeadphoneOff size={iconSize} role="img" aria-label="Server deafened" />
         <Lock size={lockSize} className="participant-tile__lock-badge" />
       </div>
     );
@@ -70,7 +71,7 @@ function ParticipantStatusOverlay({
         className="participant-tile__status participant-tile__status--server-muted"
         title="Server Muted"
       >
-        <MicOff size={iconSize} />
+        <MicOff size={iconSize} role="img" aria-label="Server muted" />
         <Lock size={lockSize} className="participant-tile__lock-badge" />
       </div>
     );
@@ -78,14 +79,14 @@ function ParticipantStatusOverlay({
   if (participant.isDeafened) {
     return (
       <div className="participant-tile__status participant-tile__status--deafened">
-        <HeadphoneOff size={iconSize} />
+        <HeadphoneOff size={iconSize} role="img" aria-label="Deafened" />
       </div>
     );
   }
   if (participant.isMuted) {
     return (
       <div className="participant-tile__status participant-tile__status--muted">
-        <MicOff size={iconSize} />
+        <MicOff size={iconSize} role="img" aria-label="Muted" />
       </div>
     );
   }
@@ -242,11 +243,23 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const tileRef = useRef<HTMLDivElement>(null);
 
+  // Auto-pause only applies to screen shares (VoiceStage/StreamBar), not camera video
+  // #2153: a paused camera renders exactly like camera-off — the same placeholder and
+  // no extra glyph, because camera-off has none (handoff T12).
+  const hasVideo =
+    participant.isVideoOn && !!participant.videoStream && !participant.isCameraPaused;
+  // Withhold the stream while paused/off, same as the screen surfaces (VoiceStage,
+  // StreamBar, ParticipantGrid's stream tiles): `participant.videoStream`'s identity
+  // does not change across a pause/resume cycle, so keying the effect on the raw
+  // stream would never re-run on resume and the freshly-mounted <video> (gated on
+  // hasVideo below) would attach nothing (#2153).
+  const attachedVideoStream = hasVideo ? participant.videoStream : undefined;
+
   // Attach video stream to video element
   useEffect(() => {
     const el = videoRef.current;
-    if (el && participant.videoStream) {
-      el.srcObject = participant.videoStream;
+    if (el && attachedVideoStream) {
+      el.srcObject = attachedVideoStream;
       el.play().catch(() => {});
     }
     return () => {
@@ -256,7 +269,7 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
         el.srcObject = null;
       }
     };
-  }, [participant.videoStream]);
+  }, [attachedVideoStream]);
 
   const displayName = participant.displayName || participant.username;
 
@@ -282,8 +295,6 @@ const ParticipantTile: React.FC<ParticipantTileProps> = ({
     // bookkeeping here and the two values cannot drift apart.
     setParticipantVolume(participant.userId, mutedByMe ? (previousVolume ?? 100) : 0);
   };
-  // Auto-pause only applies to screen shares (VoiceStage/StreamBar), not camera video
-  const hasVideo = participant.isVideoOn && !!participant.videoStream;
   // Stable per-instance key: the same participant can render in several tiles at once
   // (grid + bar + PiP), so the voice service tracks visibility per tile, not per user.
   const tileId = useId();

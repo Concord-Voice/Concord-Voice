@@ -157,6 +157,13 @@ const CONTRAST_PAIRS: readonly ContrastPair[] = [
     standard: 'WCAG AA text',
   },
   {
+    // #2153: the notice strip's glyph and 1px border sit on --bg-tertiary (handoff §4 gate 2).
+    foreground: '--text-warning-strong',
+    background: '--bg-tertiary',
+    threshold: WCAG_NON_TEXT_THRESHOLD,
+    standard: 'WCAG 1.4.11 non-text',
+  },
+  {
     foreground: '--state-focused',
     background: '--bg-primary',
     threshold: WCAG_NON_TEXT_THRESHOLD,

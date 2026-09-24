@@ -734,6 +734,35 @@ describe('VoiceService', () => {
       expect(critical?.message).toBe('This voice call requires the same media-security version.');
     });
 
+    it('a media_policy_cooldown join ack reaches the error state WITH the cooldown interrupt (#2153)', async () => {
+      // Caller-level on purpose: the mediaPolicy suite drives handleJoinFailure
+      // directly, which proves the branch is OBEYED. Only joinChannel proves a
+      // rejected join-room ack actually REACHES it (tests.md).
+      setupAuth();
+      mockApiFetch.mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue(makeJoinResponse()),
+      });
+      mockSocket.connected = true;
+      setupEmitResponses({
+        'join-room': {
+          error: 'Media policy cooldown',
+          code: 'media_policy_cooldown',
+          retryAfterSec: 600,
+        },
+      });
+
+      const before = Date.now();
+      await expect(voiceService.joinChannel('channel-1')).rejects.toThrow('Media policy cooldown');
+      const after = Date.now();
+
+      const s = useVoiceStore.getState();
+      expect(s.connectionState).toBe('error');
+      expect(s.mediaPolicyInterrupt?.reason).toBe('cooldown');
+      expect(s.mediaPolicyInterrupt?.rejoinAt).toBeGreaterThanOrEqual(before + 600_000);
+      expect(s.mediaPolicyInterrupt?.rejoinAt).toBeLessThanOrEqual(after + 600_000);
+    });
+
     it('falls back to personal tier when channel tier invalid', async () => {
       useVoiceStore.getState().setQualityTier('standard');
       await joinVoiceChannel({ audio_quality_tier: 'bogus' });
@@ -4446,6 +4475,99 @@ describe('VoiceService', () => {
       expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(false);
     });
 
+    describe('producer pause kind (#2153 regression)', () => {
+      // regression for #2153
+      //
+      // The media plane now sends {producerId, userId, kind: 'audio'|'video', source}
+      // on both producer-paused and producer-resumed. A video pause/resume (camera or
+      // screen) must never touch isMuted -- only an audio (or legacy kind-less) event
+      // may. The handlers resolve the source before acting (see
+      // `applyProducerStateChange` in voiceService.ts), so the video cases below pass.
+
+      async function setupPeer(initialIsMuted: boolean) {
+        await joinVoiceChannel();
+
+        useVoiceStore.getState().addParticipant({
+          userId: 'user-2',
+          username: 'other',
+          isMuted: initialIsMuted,
+          isDeafened: false,
+          isSpeaking: false,
+          isVideoOn: false,
+          isScreenSharing: false,
+        });
+
+        const svc = voiceService as any;
+        const consumer = createMockConsumer('cons-2', 'audio', 'prod-2');
+        svc.consumers.set('cons-2', consumer);
+        svc.consumerMeta.set('cons-2', {
+          source: 'mic',
+          producerUserId: 'user-2',
+          producerId: 'prod-2',
+        });
+      }
+
+      it('video producer-paused (camera) leaves an unmuted peer unmuted', async () => {
+        await setupPeer(false);
+
+        const handler = socketListeners['producer-paused']?.[0];
+        expect(handler).toBeTypeOf('function');
+        handler?.({ producerId: 'prod-2', userId: 'user-2', kind: 'video', source: 'camera' });
+
+        expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(false);
+      });
+
+      it('video producer-paused (screen) leaves an unmuted peer unmuted', async () => {
+        await setupPeer(false);
+
+        const handler = socketListeners['producer-paused']?.[0];
+        expect(handler).toBeTypeOf('function');
+        handler?.({ producerId: 'prod-2', userId: 'user-2', kind: 'video', source: 'screen' });
+
+        expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(false);
+      });
+
+      it('video producer-resumed (camera) leaves a muted peer muted', async () => {
+        await setupPeer(true);
+
+        const handler = socketListeners['producer-resumed']?.[0];
+        expect(handler).toBeTypeOf('function');
+        handler?.({ producerId: 'prod-2', userId: 'user-2', kind: 'video', source: 'camera' });
+
+        expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(true);
+      });
+
+      it('audio producer-paused (mic) mutes the peer', async () => {
+        await setupPeer(false);
+
+        const handler = socketListeners['producer-paused']?.[0];
+        expect(handler).toBeTypeOf('function');
+        handler?.({ producerId: 'prod-2', userId: 'user-2', kind: 'audio', source: 'mic' });
+
+        expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(true);
+      });
+
+      it('kind-less producer-paused (legacy media plane) mutes the peer', async () => {
+        await setupPeer(false);
+
+        const handler = socketListeners['producer-paused']?.[0];
+        expect(handler).toBeTypeOf('function');
+        handler?.({ producerId: 'prod-2', userId: 'user-2' });
+
+        expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(true);
+      });
+
+      it('audio producer-resumed (mic) unmutes the peer', async () => {
+        await setupPeer(true);
+
+        const handler = socketListeners['producer-resumed']?.[0];
+        expect(handler).toBeTypeOf('function');
+        handler?.({ producerId: 'prod-2', userId: 'user-2', kind: 'audio', source: 'mic' });
+
+        expect(useVoiceStore.getState().participants['user-2']?.isMuted).toBe(false);
+      });
+    });
+
     it('handles participant-testing-changed event', async () => {
       await joinVoiceChannel();
 
@@ -5061,10 +5183,29 @@ describe('VoiceService', () => {
       expect(sendTransport.produce).toHaveBeenCalledWith(
         expect.objectContaining({
           appData: { source: 'screen-audio' },
-          codecOptions: { opusStereo: true, opusDtx: false },
+          codecOptions: expect.objectContaining({ opusStereo: true, opusDtx: false }),
         })
       );
       expect(svc.producers.get('screen-audio')).toBe(newProducer);
+    });
+
+    it('#2153 T0: re-produced screen audio is capped at the user audio ceiling (free = 96 kbps)', async () => {
+      // Measured in T0: with no cap, stereo system audio ran at 537 kbps, 2.5x the free
+      // audio limit, and the policer paused it. The cap is the highest allowed tier's rate.
+      const { sendTransport } = await joinVoiceChannel();
+      const svc = voiceService as any;
+      svc.producers.set('screen-audio', createMockProducer('prod-sa-old', 'screen-audio'));
+      svc.localScreenStream = createMockMediaStream([{ kind: 'audio', id: 'sa-1' }]);
+      sendTransport.produce.mockResolvedValue(createMockProducer('prod-sa-new', 'screen-audio'));
+
+      await svc.reProduceScreenAudio();
+
+      const call = sendTransport.produce.mock.calls.find(
+        (c: any) => c[0].appData?.source === 'screen-audio'
+      );
+      expect(call).toBeDefined(); // positive control: the re-produce ran
+      expect(call?.[0].encodings?.[0]?.maxBitrate).toBe(96_000);
+      expect(call?.[0].codecOptions?.opusMaxAverageBitrate).toBe(96_000);
     });
 
     it('handles produce failure gracefully', async () => {

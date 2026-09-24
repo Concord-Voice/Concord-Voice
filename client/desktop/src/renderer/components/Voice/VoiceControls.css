@@ -188,9 +188,19 @@
 
 /* ─── Persistent context (pin/unpin actions) ─────────────────── */
 
+/* The pin's containing block (#2153). It holds the buttons and nothing else, so
+   `top: 50%` centres the pin on them however much stacks above in the column. */
+.voice-controls__row {
+  position: relative;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+}
+
 .voice-controls__persistent-actions {
   position: absolute;
-  left: 8px;
+  /* 8px from the bar's edge, as before; the row starts inside the bar's padding. */
+  left: calc(8px - 12px * var(--sp, 1));
   top: 50%;
   transform: translateY(-50%);
   display: flex;

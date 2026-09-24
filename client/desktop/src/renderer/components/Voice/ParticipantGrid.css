@@ -126,3 +126,15 @@
   color: var(--text-secondary);
   font-size: calc(11px * var(--font-scale, 1));
 }
+
+/* #2153 remote-paused Tile-view placeholder: --text-primary on --bg-tertiary (handoff §4),
+   measured by contrast-pairs.test.ts. The title sets --text-secondary for the local
+   Auto-Pause state, so the remote variant hands it the container's colour instead. */
+.stream-grid-tile__paused--remote {
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+}
+
+.stream-grid-tile__paused--remote .stream-grid-tile__paused-title {
+  color: inherit;
+}

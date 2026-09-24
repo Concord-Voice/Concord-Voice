@@ -26,6 +26,7 @@ import {
   AUDIO_QUALITY_TIERS,
   MAX_TUNED_SCREEN_SHARES,
   type AudioQualityTier,
+  type MediaPolicyInterrupt,
   type VoiceParticipant,
 } from '../../stores/voice/voiceStore';
 import { useAudioSettingsStore, type AudioPriority } from '../../stores/audio/audioSettingsStore';
@@ -98,6 +99,17 @@ import {
 } from './avSyncDriftDetector';
 import { ConsumerPauseCoordinator } from './consumerPauseCoordinator';
 import { buildCameraEncodingPlan, simulcastLadderBitrates } from './cameraLayering';
+import { calculateFecBitrate as computeFecBitrate } from './fecHeadroom';
+import {
+  MEDIA_POLICY_SOURCES,
+  parseForceDisconnect,
+  parseMediaPolicyNotice,
+  parseProducerStateChange,
+  parseRetryAfterSec,
+  rejoinAtFrom,
+  resolvePausedSource,
+  type MediaPolicySource,
+} from './mediaPolicyEvents';
 import {
   computeRemoteVideoLayerRequest,
   maxPressureSteps,
@@ -402,6 +414,29 @@ if (E2EE_VERBOSE) {
 // ---------------------------------------------------------------------------
 // Helpers to reduce cognitive complexity (extracted from class methods)
 // ---------------------------------------------------------------------------
+
+/**
+ * Codec options for screen audio, capped at the highest tier the user may produce (#2153 T0).
+ * The mic's stats loop rewrites its maxBitrate every 5 s; nothing does that for screen audio,
+ * which ran at ~537 kbps uncapped and tripped the media policer on stock settings. The ceiling
+ * mirrors the media plane's resolveAllowedOpusBitrateCeiling: max over the allowed tiers, and
+ * `standard` when none is recognised. maxBitrate binds the encoder; opusMaxAverageBitrate
+ * only states the same figure in the SDP.
+ */
+function screenAudioProduceOptions(): {
+  encodings: mediasoupTypes.RtpEncodingParameters[];
+  codecOptions: mediasoupTypes.ProducerCodecOptions;
+} {
+  let ceiling = 0;
+  for (const tier of useSubscriptionStore.getState().entitlement.allowedAudioTiers) {
+    ceiling = Math.max(ceiling, AUDIO_QUALITY_TIERS[tier as AudioQualityTier]?.maxBitrate ?? 0);
+  }
+  if (ceiling === 0) ceiling = AUDIO_QUALITY_TIERS.standard.maxBitrate;
+  return {
+    encodings: [{ maxBitrate: ceiling }],
+    codecOptions: { opusStereo: true, opusDtx: false, opusMaxAverageBitrate: ceiling },
+  };
+}
 
 /** Resolve effective Opus codec settings from advanced settings + tier config. */
 function resolveOpusSettings(
@@ -1208,14 +1243,8 @@ class VoiceService {
     tierMaxBitrate: number,
     effectiveHeadroom: boolean
   ): number {
-    if (!effectiveHeadroom || lossPercent <= 0) return tierMaxBitrate;
-
-    let K: number;
-    if (tierMaxBitrate < 64_000) K = 4;
-    else if (tierMaxBitrate < 128_000) K = 2.5;
-    else K = 1.5;
-    const headroomPercent = Math.min(50, lossPercent * K);
-    return Math.round(tierMaxBitrate * (1 + headroomPercent / 100));
+    // Pure, and pinned against the media plane's FEC_HEADROOM (#2153).
+    return computeFecBitrate(lossPercent, tierMaxBitrate, effectiveHeadroom);
   }
 
   private startPacketLossMonitor(): void {
@@ -2500,7 +2529,7 @@ class VoiceService {
     try {
       const newAudioProducer = await this.produceEncrypted(transport, {
         track: audioTrack,
-        codecOptions: { opusStereo: true, opusDtx: false },
+        ...screenAudioProduceOptions(),
         stopTracks: false,
         appData: { source: 'screen-audio' },
       });
@@ -3306,6 +3335,11 @@ class VoiceService {
     // reset() restores the default 'disconnected' connectionState.
     store.reset();
     store.setConnectionState('error');
+    // #2153 §1d: a join refused during a policer cooldown opens the app-level dialog.
+    // Set AFTER reset() — reset preserves the field, but ordering it last means the
+    // interrupt does not depend on that preservation to survive this path.
+    const cooldown = this.mediaPolicyCooldownFrom(err);
+    if (cooldown) store.setMediaPolicyInterrupt(cooldown);
   }
 
   /** Leave the current voice channel */
@@ -3642,6 +3676,9 @@ class VoiceService {
     this.stopScreenAudioHost();
 
     for (const [, producer] of this.producers) {
+      // #2153 A1 (a), as closeProducer does: nothing else can retire this latch. The
+      // old session's producer-closed reaches the room before the rejoining socket does.
+      vs.clearMediaPolicyPausedByProducer(producer.id);
       try {
         producer.close();
       } catch {
@@ -4523,7 +4560,7 @@ class VoiceService {
     try {
       const audioProducer = await this.produceEncrypted(this.sendTransport, {
         track: audioTrack,
-        codecOptions: { opusStereo: true, opusDtx: false },
+        ...screenAudioProduceOptions(),
         // Track owned by localScreenStream and reused across re-produces
         // (reProduceScreenAudio); stopTracks:false keeps close() from stopping it.
         stopTracks: false,
@@ -4837,6 +4874,107 @@ class VoiceService {
     this.applyOptimisticLocalState(store, { isMuted: muted }, 'applyOptimisticMute');
   }
 
+  /** True while the media plane holds this LOCAL producer paused by policy (#2153 §1a). */
+  private isMediaPolicyLatched(producerId: string): boolean {
+    return Object.values(useVoiceStore.getState().mediaPolicyPaused).includes(producerId);
+  }
+
+  /** producerId → source for every local producer and every consumed remote one. */
+  private mediaPolicySourceMap(): Map<string, MediaPolicySource> {
+    const isSource = (s: string): s is MediaPolicySource =>
+      (MEDIA_POLICY_SOURCES as readonly string[]).includes(s);
+    const map = new Map<string, MediaPolicySource>();
+    for (const [source, producer] of this.producers) {
+      if (isSource(source)) map.set(producer.id, source);
+    }
+    for (const meta of this.consumerMeta.values()) {
+      if (isSource(meta.source)) map.set(meta.producerId, meta.source);
+    }
+    return map;
+  }
+
+  /**
+   * producer-paused / producer-resumed, kind-aware (#2153 handoff §1b). Peers never see
+   * policy language: each row looks exactly like the voluntary state it resembles, and
+   * an unknown source falls back to the legacy mute so an old media plane behaves as today.
+   */
+  private applyProducerStateChange(payload: unknown, paused: boolean): void {
+    const event = parseProducerStateChange(payload);
+    if (!event) {
+      console.warn('[media-policy] rejected malformed producer state change');
+      return;
+    }
+    const store = useVoiceStore.getState();
+    const source = resolvePausedSource(event, this.mediaPolicySourceMap());
+    switch (source) {
+      case 'camera':
+        store.updateParticipant(event.userId, { isCameraPaused: paused });
+        return;
+      case 'screen': {
+        const share = store.activeScreenShares[event.producerId];
+        if (share) store.registerActiveScreenShare({ ...share, paused });
+        return;
+      }
+      case 'screen-audio':
+        return; // no "sound on" indicator exists, so there is nothing to switch (handoff T13)
+      case 'mic':
+      case null:
+        store.updateParticipant(event.userId, { isMuted: paused });
+        return;
+      default: {
+        const unhandled: never = source;
+        return unhandled;
+      }
+    }
+  }
+
+  /** media-policy-notice → owner latch (#2153 handoff §1a). */
+  private handleMediaPolicyNotice(payload: unknown): void {
+    const notice = parseMediaPolicyNotice(payload);
+    if (!notice) {
+      console.warn('[media-policy] rejected malformed media-policy-notice');
+      return;
+    }
+    // A notice that crossed a local close in flight would pin a row nothing but reset()
+    // could clear (A1 a) — only a producer this client still owns can be latched.
+    if (this.producers.get(notice.source)?.id !== notice.producerId) return;
+    const store = useVoiceStore.getState();
+    store.setMediaPolicyPaused(notice.source, notice.producerId);
+    if (notice.source !== 'mic') return; // camera/screen/sound: their Stop/Off IS the remedy
+    // The server already paused it; pausing locally stops the encoder and, with VAD off,
+    // the owner's own tile can never show "speaking" while nobody can hear them. isMuted
+    // keeps the solo-exit resume loop (which skips a muted mic) from resuming it.
+    const mic = this.producers.get('mic');
+    if (mic && !mic.paused) mic.pause();
+    this.stopLocalVAD();
+    store.setMuted(true);
+    this.applyOptimisticMute(store, true);
+  }
+
+  /** force-disconnect → the eviction dialog. Only media_policy has anything to explain. */
+  private handleForceDisconnectEvent(payload: unknown): void {
+    const event = parseForceDisconnect(payload);
+    if (!event) {
+      console.warn('[media-policy] rejected malformed force-disconnect');
+      return;
+    }
+    if (event.reason !== 'media_policy') return;
+    useVoiceStore.getState().setMediaPolicyInterrupt({
+      reason: 'evicted',
+      rejoinAt: rejoinAtFrom(event.retryAfterSec, Date.now()),
+    });
+  }
+
+  private mediaPolicyCooldownFrom(err: unknown): MediaPolicyInterrupt | null {
+    if (!(err instanceof Error)) return null;
+    const typed = err as Error & { code?: string; retryAfterSec?: number };
+    if (typed.code !== 'media_policy_cooldown') return null;
+    return {
+      reason: 'cooldown',
+      rejoinAt: rejoinAtFrom(parseRetryAfterSec(typed.retryAfterSec), Date.now()),
+    };
+  }
+
   /**
    * Optimistically reflect the local user's self-deafen in both the participant
    * map and the channel-sidebar member list (#685) — symmetric with
@@ -4946,6 +5084,7 @@ class VoiceService {
     if (!this.testSuspendedProducerIds.has(producer.id)) return;
     if (!this.testRestoreEligibleProducerIds.has(producer.id)) return;
     if (!producer.paused || producer.closed) return;
+    if (this.isMediaPolicyLatched(producer.id)) return; // #2153: never resume a policed producer
     if (policy.keepProducersPaused) return;
     if (source === 'mic' && policy.keepMicPaused) return;
 
@@ -5072,6 +5211,10 @@ class VoiceService {
     const store = useVoiceStore.getState();
     const producer = this.producers.get('mic');
     if (!producer) return;
+    // #2153: a policed mic can only come back through a rejoin. resume-producer carries no
+    // ack, so the server's refusal would be invisible — this is the second guard behind
+    // the locked MediaButton, and it also covers the PiP controls' toggle-mute action.
+    if (this.isMediaPolicyLatched(producer.id)) return;
 
     const wasMuted = store.isMuted;
     try {
@@ -5822,7 +5965,7 @@ class VoiceService {
   /** Resume a local producer by source name */
   resumeLocalProducer(source: string): void {
     const producer = this.producers.get(source);
-    if (!producer?.paused) return;
+    if (!producer?.paused || this.isMediaPolicyLatched(producer.id)) return; // #2153
     producer.resume();
     this.socket?.emit('resume-producer', { producerId: producer.id });
   }
@@ -5880,7 +6023,7 @@ class VoiceService {
     // Respect current mute state — don't resume mic if user is muted
     for (const [source, producer] of this.producers) {
       if (source === 'mic' && store.isMuted) continue; // stay paused if intentionally muted
-      if (producer.paused) {
+      if (producer.paused && !this.isMediaPolicyLatched(producer.id)) {
         producer.resume();
         this.socket?.emit('resume-producer', { producerId: producer.id });
       }
@@ -6880,6 +7023,8 @@ class VoiceService {
       producer.close();
       await this.drainSendTransportQueue();
       this.producers.delete(source);
+      // #2153 A1 (a): a local close retires the latch without waiting for the echo.
+      useVoiceStore.getState().clearMediaPolicyPausedByProducer(producer.id);
       this.socket?.emit('close-producer', { producerId: producer.id });
     }
 
@@ -7821,13 +7966,21 @@ class VoiceService {
 
     this.socket.on('new-producer', (event) => this.handleNewProducer(event));
 
-    this.socket.on('producer-paused', ({ producerId: _producerId, userId }) => {
-      useVoiceStore.getState().updateParticipant(userId, { isMuted: true });
-    });
+    this.socket.on('producer-paused', (payload: unknown) =>
+      this.applyProducerStateChange(payload, true)
+    );
 
-    this.socket.on('producer-resumed', ({ producerId: _producerId, userId }) => {
-      useVoiceStore.getState().updateParticipant(userId, { isMuted: false });
-    });
+    this.socket.on('producer-resumed', (payload: unknown) =>
+      this.applyProducerStateChange(payload, false)
+    );
+
+    this.socket.on('media-policy-notice', (payload: unknown) =>
+      this.handleMediaPolicyNotice(payload)
+    );
+
+    this.socket.on('force-disconnect', (payload: unknown) =>
+      this.handleForceDisconnectEvent(payload)
+    );
 
     // Self-deafen broadcast from another participant (#685) — mirrors the
     // producer-paused/resumed mute handlers above.
@@ -7846,6 +7999,39 @@ class VoiceService {
     );
 
     this.socket.on('producer-closed', ({ producerId, userId, source }) => {
+      // #2153 A1 (b): the self-echo clears an owner latch. Unconditional on userId —
+      // mediaPolicyPaused only ever holds this client's producerIds, and they are unique.
+      useVoiceStore.getState().clearMediaPolicyPausedByProducer(producerId);
+
+      // F6: when the server's pause of a policed producer fails, it closes the
+      // producer outright and the owner receives ONLY this self-echo. Screen-audio
+      // already stops capture below (gated on the local userId); mic and camera did
+      // not, so the device kept running and the UI kept showing unmuted/on until the
+      // user left. Mirror the permissions-changed handler's ownership check: a
+      // producer this client STILL HOLDS locally (this.producers keeps this client's
+      // own producers only, keyed by source) means this client did NOT initiate the
+      // close — closeProducer() deletes the map entry before it ever emits, so a
+      // locally-initiated close's own echo always misses here and stays a no-op.
+      if (
+        (source === 'mic' || source === 'camera') &&
+        this.producers.get(source)?.id === producerId
+      ) {
+        void this.closeProducer(source).catch((err) =>
+          console.warn(
+            '[media-policy] server-initiated producer close cleanup failed:',
+            errorMessage(err)
+          )
+        );
+        if (source === 'mic') {
+          // closeProducer('mic') stops capture but never touches mute state (same gap
+          // the permissions-changed handler below already covers) — without this the
+          // toolbar kept reading "unmuted" over a producer the server had closed.
+          const store = useVoiceStore.getState();
+          store.setMuted(true);
+          this.applyOptimisticMute(store, true);
+        }
+      }
+
       // Find and close the corresponding consumer
       for (const [consumerId, consumer] of this.consumers) {
         if (consumer.producerId === producerId) {
@@ -7861,7 +8047,11 @@ class VoiceService {
 
       const store = useVoiceStore.getState();
       if (source === 'camera')
-        store.updateParticipant(userId, { isVideoOn: false, videoStream: undefined });
+        store.updateParticipant(userId, {
+          isVideoOn: false,
+          videoStream: undefined,
+          isCameraPaused: false, // #2153: a re-produced camera must not inherit the pause
+        });
       else if (source === 'screen') {
         this.handleScreenProducerClosed(producerId, userId, store);
       } else if (source === 'screen-audio') {
@@ -7882,11 +8072,13 @@ class VoiceService {
     // permissions-changed (CV-CAN-007 P1): the control plane revoked this peer's
     // mid-session voice permissions and the media plane already closed the listed
     // producers server-side, so forwarding has stopped. But that server-side close
-    // does NOT stop THIS client's local capture — the producer-closed self-echo
-    // above only tears down consumers/store state — so the camera/mic hardware
-    // (and its indicator light) would keep running after the revocation. Close each
-    // revoked source through the normal local-cleanup path (closeProducer stops the
-    // underlying tracks and resets store state). Awaited sequentially so the paired
+    // does NOT stop THIS client's local capture. The producer-closed self-echo
+    // above closes a still-held mic or camera producer (#2153 F6) and stops the
+    // screen-audio capture host, but it does not close a screen or screen-audio
+    // producer, and it may arrive after this event. Close each revoked
+    // source through the normal local-cleanup path (closeProducer stops the
+    // underlying tracks and resets store state; a source the echo already closed
+    // is a no-op, because closeProducer finds no producer). Awaited sequentially so the paired
     // screen / screen-audio cleanup cannot race. Idempotent: the server producer is
     // already gone, so the redundant close-producer emit is a server-side no-op.
     this.socket.on(
@@ -7903,8 +8095,8 @@ class VoiceService {
           await this.closeProducer(source);
         }
         // closeProducer('mic') stops the local mic tracks/VAD via cleanupMicState
-        // but never touches mute state, and the producer-closed self-echo has no
-        // mic branch. Left alone the UI would still show the user as unmuted after
+        // but never touches mute state. The self-echo's mic branch (#2153 F6) mutes
+        // only when it wins the race to close. Left alone the UI would still show the user as unmuted after
         // the server revoked their mic, and toggleMute() would early-return because
         // there is no mic producer to resume. Reflect the forced mic-off in the
         // store and channel sidebar so local state matches the SFU.
@@ -10017,19 +10209,30 @@ class VoiceService {
         reject(new Error(`Socket emit timeout: ${event}`));
       }, 10_000);
 
-      this.socket.emit(event, data, (response: T & { error?: string; code?: string }) => {
-        clearTimeout(timeout);
-        if (response && typeof response === 'object' && 'error' in response) {
-          // Preserve a typed `code` (e.g. #1878 'crypto_version_mismatch') on the
-          // rejected error so callers can branch on it. emitAsync otherwise
-          // discards every ack field but `error`; the bare Error loses the code.
-          const err = new Error(response.error) as Error & { code?: string };
-          if (typeof response.code === 'string') err.code = response.code;
-          reject(err);
-        } else {
-          resolve(response);
+      this.socket.emit(
+        event,
+        data,
+        (response: T & { error?: string; code?: string; retryAfterSec?: unknown }) => {
+          clearTimeout(timeout);
+          if (response && typeof response === 'object' && 'error' in response) {
+            // Preserve a typed `code` (e.g. #1878 'crypto_version_mismatch') on the
+            // rejected error so callers can branch on it. emitAsync otherwise
+            // discards every ack field but `error`; the bare Error loses the code.
+            const err = new Error(response.error) as Error & {
+              code?: string;
+              retryAfterSec?: number;
+            };
+            if (typeof response.code === 'string') err.code = response.code;
+            // #2153 A3: the cooldown ack's retryAfterSec, only when it passes the same
+            // (0, 86400] validation the force-disconnect payload does.
+            const retryAfterSec = parseRetryAfterSec(response.retryAfterSec);
+            if (retryAfterSec !== null) err.retryAfterSec = retryAfterSec;
+            reject(err);
+          } else {
+            resolve(response);
+          }
         }
-      });
+      );
     });
   }
 

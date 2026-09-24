@@ -7,11 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 Concord Voice now keeps screen sharing steady when a capture changes, cleans up
-cancelled audio work before it can surface later, and records security outcomes
-without losing the observation that triggered them.
+cancelled audio work before it can surface later, records security outcomes
+without losing the observation that triggered them, and pauses a voice stream
+that keeps sending far more than your plan allows.
 
 ### Changed
 
+- **Voice now pauses a stream that keeps sending far more than your plan allows** ([#3413](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3413), [#2153](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2153)) — the voice server now
+  measures how much each person actually sends. A microphone, camera or screen share that keeps sending
+  well above what your plan allows is paused, and you see a notice saying which one and what to do;
+  everyone else just sees it as muted or paused. If it happens a second time within an hour, you are
+  removed from the call and can rejoin after 15 minutes. The Concord app stays within these limits on
+  its own: screen sharing with sound now sends at your plan's audio quality (96 kbps on the free plan)
+  instead of an uncapped rate.
 - **The control plane now supports private DM hide and history-clear operations** ([#3306](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3306)) — authenticated API clients can hide a direct message or group chat from one participant's list, or clear that participant's history before a server-stamped cutoff. Hide preserves history, read state, and the original hide timestamp on retries. Clear uses MFA when enabled or the current password otherwise when Privacy & Security requires authentication; the existing permanent purge action keeps its current password-and-MFA behavior.
 - **Font Size is back under Appearance** ([#3401](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3401), [#2367](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2367)) — the
   Small / Default / Large text size now sits in Appearance ▸ Application Font, next to the font it

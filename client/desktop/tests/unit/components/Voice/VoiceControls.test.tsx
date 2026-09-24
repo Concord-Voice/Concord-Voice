@@ -1,5 +1,7 @@
 import React from 'react';
-import { render, screen, fireEvent, act } from '../../../test-utils';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
@@ -75,6 +77,7 @@ vi.mock('@/renderer/components/Voice/ScreenSharePicker', () => ({
 vi.mock('@/renderer/components/Voice/VoiceControls.css', () => ({}));
 
 import VoiceControls from '@/renderer/components/Voice/VoiceControls';
+import { MEDIA_POLICY_NOTICE_COPY } from '@/renderer/components/Voice/MediaPolicyNotice';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const VOICE_CHANNEL_ID = 'voice-1';
@@ -1313,5 +1316,90 @@ describe('VoiceControls — live screen switching and audio toggle (R5/R6)', () 
 
     // ...and neither belongs with the self-controls.
     expect(clusterOf(mute)).not.toBe(clusterOf(stop));
+  });
+});
+
+describe('#2153 media-policy latch in the toolbar', () => {
+  const me = {
+    userId: 'me',
+    username: 'me',
+    isMuted: false,
+    isDeafened: false,
+    serverMuted: false,
+    serverDeafened: false,
+    isVideoOn: true,
+    isScreenSharing: false,
+    isSpeaking: false,
+  };
+
+  beforeEach(() => {
+    // Top-level describe: inherits no hook from describe('VoiceControls').
+    resetAllStores();
+    vi.clearAllMocks();
+    useUserStore.setState({ user: { id: 'me' } as never });
+    setVoiceState({ isVideoOn: true, participants: { me } });
+  });
+
+  it('locks the latched mic, labels it Paused, points it at its notice row, and blocks the click', () => {
+    useVoiceStore.setState({ isMuted: true, mediaPolicyPaused: { mic: 'mic-1' } });
+    render(<VoiceControls />);
+    const mic = screen.getByTitle('Microphone paused — leave and rejoin to use it');
+    expect(mic).toHaveAttribute('aria-disabled', 'true');
+    expect(mic).toHaveTextContent('Paused');
+    const rowId = mic.getAttribute('aria-describedby') ?? '';
+    expect(document.getElementById(rowId)).toHaveTextContent(MEDIA_POLICY_NOTICE_COPY.mic);
+    fireEvent.click(mic);
+    expect(mockToggleMute).not.toHaveBeenCalled();
+  });
+
+  it('the latch wins the title over a server mute (serverUnmuteUser cannot lift it)', () => {
+    useVoiceStore.setState({
+      isMuted: true,
+      mediaPolicyPaused: { mic: 'mic-1' },
+      participants: { me: { ...me, serverMuted: true } },
+    });
+    render(<VoiceControls />);
+    expect(screen.getByTitle('Microphone paused — leave and rejoin to use it')).toBeInTheDocument();
+    expect(screen.queryByTitle('Server-muted by a moderator')).toBeNull();
+  });
+
+  it('does NOT lock the camera while the camera is latched — Stop Video is the remedy', async () => {
+    useVoiceStore.setState({ mediaPolicyPaused: { camera: 'cam-1' } });
+    render(<VoiceControls />);
+    const camera = screen.getByTitle('Stop Video');
+    expect(camera).toHaveAttribute('aria-disabled', 'false');
+    fireEvent.click(camera);
+    await waitFor(() => expect(mockToggleVideo).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('status')).toHaveTextContent(MEDIA_POLICY_NOTICE_COPY.camera);
+  });
+
+  it('a MIC latch leaves the camera live (only the latched mic locks, handoff T6)', () => {
+    useVoiceStore.setState({ isMuted: true, mediaPolicyPaused: { mic: 'mic-1' } });
+    render(<VoiceControls />);
+    expect(screen.getByTitle('Stop Video')).toHaveAttribute('aria-disabled', 'false');
+  });
+
+  it('an unlatched mic keeps today’s title and stays unlocked', () => {
+    render(<VoiceControls />);
+    expect(screen.getByTitle('Mute')).toHaveAttribute('aria-disabled', 'false');
+  });
+
+  it('anchors the persistent pin to the button row, never to a box that also holds the strip', () => {
+    // Task 9 C3/C4: the pin is centred at `top: 50%` of its positioned ancestor. While that
+    // ancestor also held the notice strip, 50% landed on the strip's lower border and the pin
+    // overlapped it. jsdom computes no layout, so this pins the two things that layout needs:
+    // the structure, and the row being the pin's containing block.
+    useVoiceStore.setState({ isMuted: true, mediaPolicyPaused: { mic: 'mic-1' } });
+    render(<VoiceControls context="persistent" />);
+    const row = screen.getByTitle(/pin controls/i).closest('.voice-controls__row');
+    expect(row).not.toBeNull();
+    expect(row?.querySelector('.voice-controls__buttons')).not.toBeNull();
+    expect(row?.contains(screen.getByRole('status'))).toBe(false);
+
+    const css = readFileSync(
+      resolve(__dirname, '../../../../src/renderer/components/Voice/VoiceControls.css'),
+      'utf-8'
+    );
+    expect(css).toMatch(/\.voice-controls__row\s*\{[^}]*position:\s*relative/);
   });
 });
