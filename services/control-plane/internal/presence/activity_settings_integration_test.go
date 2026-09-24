@@ -16,13 +16,15 @@ import (
 
 type settingsActivityDelivery struct {
 	targeted []map[uuid.UUID]bool
+	plans    []presence.DeliveryPlan
 	all      int
 }
 
-func (*settingsActivityDelivery) DeliverRichPresence(
-	context.Context,
-	presence.DeliveryPlan,
+func (d *settingsActivityDelivery) DeliverRichPresence(
+	_ context.Context,
+	plan presence.DeliveryPlan,
 ) error {
+	d.plans = append(d.plans, plan)
 	return nil
 }
 
@@ -41,6 +43,128 @@ func (d *settingsActivityDelivery) DisconnectRichPresenceClients(
 func (d *settingsActivityDelivery) DisconnectAllRichPresenceClients(context.Context) error {
 	d.all++
 	return nil
+}
+
+// A sender can be present in Server Voice with no Private Call activity when it
+// goes offline. Hidden-sender cleanup evaluates both widest-prior categories;
+// the absent sibling must not turn the valid Server Voice audience into a
+// replica-wide disconnect before its terminal clear is delivered.
+func TestHiddenSenderSuppression_ServerVoiceWithAbsentPrivateCallTargetsServerAudience(t *testing.T) {
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(dbCleanup)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	senderID := testhelpers.CreateUser(t, db)
+	_, serverID, channelID := createServerVoiceBuilderFixtureForUser(
+		t, db, senderID, "Presence", "Terminal",
+	)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddServerMember(t, db, serverID, viewerID)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	lifecycleAt := time.Date(2026, 9, 23, 13, 0, 0, 0, time.UTC)
+	_, err := db.Exec(`
+		INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, channelID, senderID, lifecycleAt)
+	require.NoError(t, err)
+	// The viewer is a real prior recipient: Server Voice was published at the
+	// Servers tier before the sender became hidden.
+	_, err = db.Exec(`
+		INSERT INTO user_presence_settings (user_id, server_voice_tier)
+		VALUES ($1, 2)
+		ON CONFLICT (user_id) DO UPDATE
+		SET server_voice_tier = EXCLUDED.server_voice_tier
+	`, senderID)
+	require.NoError(t, err)
+
+	store := presence.NewActivityStore(redisClient)
+	state := presence.ActivityState{
+		SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+		Payload: json.RawMessage(`{"server_id":"presence"}`), UpdatedAt: lifecycleAt.Unix(),
+	}
+	stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryServerVoice, state)
+	require.NoError(t, err)
+	require.True(t, stored)
+	seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, state)
+
+	delivery := &settingsActivityDelivery{}
+	service := presence.NewActivityService(
+		presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+		presence.NewActivityBuilder(db, nil, store), store, db,
+		activitySnapshotVisibility{allow: true}, delivery, permitAllPresence{},
+	)
+
+	err = service.ForceSuppressHiddenSenderActivityAlreadyGated(ctx, senderID)
+
+	require.NoError(t, err)
+	assert.Zero(t, delivery.all, "a missing inactive sibling category is not unknown audience evidence")
+	require.Len(t, delivery.plans, 1, "only the stored Server Voice category is cleared")
+	for _, plan := range delivery.plans {
+		assert.Equal(t, senderID, plan.SenderID)
+		assert.Equal(t, presence.CategoryServerVoice, plan.Category)
+		assert.NotContains(t, plan.ClearRecipients, senderID)
+		assert.Contains(t, plan.ClearRecipients, viewerID)
+	}
+}
+
+// A settings tier-down refreshes prior recipients so revoked viewers lose the
+// badge and retained viewers fetch the reduced projection. The publisher is
+// not an audience: closing its last application socket makes it appear offline
+// and can erase the still-active generation before retained viewers snapshot.
+func TestSettingsTierDown_ExcludesPublisherAndRetainsGenerationForEligibleViewer(t *testing.T) {
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
+	t.Cleanup(dbCleanup)
+	t.Cleanup(redisCleanup)
+	ctx := context.Background()
+	senderID := testhelpers.CreateUser(t, db)
+	_, serverID, channelID := createServerVoiceBuilderFixtureForUser(
+		t, db, senderID, "Presence", "Tier Down",
+	)
+	viewerID := testhelpers.CreateUser(t, db)
+	testhelpers.AddServerMember(t, db, serverID, viewerID)
+	testhelpers.AddFriendship(t, db, senderID, viewerID)
+	lifecycleAt := time.Date(2026, 9, 23, 13, 5, 0, 0, time.UTC)
+	_, err := db.Exec(`
+		INSERT INTO voice_participants (channel_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, channelID, senderID, lifecycleAt)
+	require.NoError(t, err)
+
+	store := presence.NewActivityStore(redisClient)
+	state := presence.ActivityState{
+		SourceToken: channelID, SourceVersion: lifecycleAt.UnixMicro(),
+		Payload: json.RawMessage(`{"server_id":"tier-down"}`), UpdatedAt: lifecycleAt.Unix(),
+	}
+	stored, err := store.CompareAndSet(ctx, senderID, presence.CategoryServerVoice, state)
+	require.NoError(t, err)
+	require.True(t, stored)
+	seedActivitySnapshotLifecycle(t, redisClient, senderID, presence.CategoryServerVoice, state)
+
+	delivery := &settingsActivityDelivery{}
+	service := presence.NewActivityService(
+		presencehistory.NewService(nil, presencehistory.DisclosureState{}, false),
+		presence.NewActivityBuilder(db, nil, store), store, db,
+		activitySnapshotVisibility{allow: true}, delivery, permitAllPresence{},
+	)
+	before := presence.ActivityPolicySettings{
+		MasterEnabled: true, ServerVoiceTier: presence.TierServers,
+		ServerVoiceShowDetails: true, PrivateCallTier: presence.TierOff,
+	}
+	after := before
+	after.ServerVoiceTier = presence.TierFriends
+
+	err = service.ApplySettingsSuppressionAlreadyGated(ctx, senderID, before, after)
+
+	require.NoError(t, err)
+	require.Len(t, delivery.plans, 1)
+	assert.Equal(t, map[uuid.UUID]bool{viewerID: true}, delivery.plans[0].ClearRecipients)
+	require.Len(t, delivery.targeted, 1)
+	assert.Equal(t, map[uuid.UUID]bool{viewerID: true}, delivery.targeted[0])
+	_, found, err := store.Get(ctx, senderID, presence.CategoryServerVoice)
+	require.NoError(t, err)
+	assert.True(t, found, "the retained viewer needs the active generation on its reconnect snapshot")
 }
 
 type settingsFlipVisibility struct {
@@ -107,7 +231,7 @@ func TestActivitySettingsResolver_MismatchedPrivateLeaseFailsConservatively(t *t
 	assert.Empty(t, delivery.targeted)
 }
 
-func TestActivitySettingsResolver_PrivateOffTargetsOnlyCurrentParticipantsAndSender(t *testing.T) {
+func TestActivitySettingsResolver_PrivateOffTargetsOnlyCurrentParticipants(t *testing.T) {
 	db, dbCleanup := testhelpers.SetupTestDB(t)
 	redisClient, redisCleanup := testhelpers.SetupTestRedis(t)
 	t.Cleanup(dbCleanup)
@@ -156,9 +280,9 @@ func TestActivitySettingsResolver_PrivateOffTargetsOnlyCurrentParticipantsAndSen
 	require.NoError(t, err)
 	require.Len(t, delivery.targeted, 1)
 	assert.Equal(t, map[uuid.UUID]bool{
-		senderID:      true,
 		participantID: true,
 	}, delivery.targeted[0])
+	assert.NotContains(t, delivery.targeted[0], senderID)
 	assert.NotContains(t, delivery.targeted[0], unrelatedFriendID)
 	assert.Zero(t, delivery.all)
 }

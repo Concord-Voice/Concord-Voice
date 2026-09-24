@@ -27,6 +27,13 @@ type Delivery interface {
 	DisconnectAllRichPresenceClients(context.Context) error
 }
 
+// clearThenDisconnectDeliverer preserves a clear on the socket writer before
+// the reconnect fallback closes that socket. Delivery implementations without
+// this optional capability retain the conservative fallback at each caller.
+type clearThenDisconnectDeliverer interface {
+	DeliverRichPresenceClearsThenDisconnect(context.Context, []DeliveryPlan, map[uuid.UUID]bool) error
+}
+
 type activityBuilder interface {
 	Build(context.Context, uuid.UUID, Scope) (BuiltActivity, error)
 }
@@ -46,18 +53,50 @@ type activitySettingsRecipientResolver func(
 	uuid.UUID,
 	ActivityPolicySettings,
 	ActivityPolicySettings,
-) (map[uuid.UUID]bool, error)
+) (activitySettingsRecipients, error)
+
+// activitySettingsRecipients keeps each activity category's prior audience
+// separate. A clear frame is category-specific; only reconnect recovery may
+// use the union.
+type activitySettingsRecipients map[Category]map[uuid.UUID]bool
+
+func (recipients activitySettingsRecipients) without(userID uuid.UUID) activitySettingsRecipients {
+	out := make(activitySettingsRecipients, len(recipients))
+	for category, audience := range recipients {
+		filtered := make(map[uuid.UUID]bool, len(audience))
+		for recipient, included := range audience {
+			if included && recipient != userID {
+				filtered[recipient] = true
+			}
+		}
+		out[category] = filtered
+	}
+	return out
+}
+
+func (recipients activitySettingsRecipients) union() map[uuid.UUID]bool {
+	out := make(map[uuid.UUID]bool)
+	for _, audience := range recipients {
+		mergeAudience(out, audience)
+	}
+	return out
+}
+
+func (recipients activitySettingsRecipients) only(category Category) activitySettingsRecipients {
+	return activitySettingsRecipients{category: recipients[category]}
+}
 
 // ActivityService bridges authoritative media lifecycle state to Redis and
 // privacy-critical local delivery.
 type ActivityService struct {
-	coordinator        SenderCoordinator
-	builder            activityBuilder
-	store              activityStateStore
-	authorize          activityAuthorizer
-	delivery           Delivery
-	senderPresence     SenderPresenceResolver
-	settingsRecipients activitySettingsRecipientResolver
+	coordinator              SenderCoordinator
+	builder                  activityBuilder
+	store                    activityStateStore
+	authorize                activityAuthorizer
+	delivery                 Delivery
+	senderPresence           SenderPresenceResolver
+	settingsRecipients       activitySettingsRecipientResolver
+	hiddenSettingsRecipients activitySettingsRecipientResolver
 }
 
 // NewActivityService creates the authoritative Rich Presence lifecycle bridge.
@@ -85,19 +124,28 @@ func NewActivityService(
 		delivery,
 	)
 	service.senderPresence = senderPresence
+	dependencies := activitySettingsRecipientDependencies{
+		db: db, visibility: visibility, builder: builder, store: store,
+	}
 	service.settingsRecipients = func(
 		ctx context.Context,
 		userID uuid.UUID,
 		before, after ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		return computeActivitySettingsRecipients(
-			ctx,
-			activitySettingsRecipientDependencies{
-				db: db, visibility: visibility, builder: builder, store: store,
-			},
-			userID,
-			before,
-			after,
+			ctx, dependencies, userID, before, after, false,
+		)
+	}
+	// Hidden-sender cleanup can encounter an absent sibling category while the
+	// other category has a stored, published generation. Absence is authoritative
+	// for that sibling only; unreadable or stale stored evidence still fails closed.
+	service.hiddenSettingsRecipients = func(
+		ctx context.Context,
+		userID uuid.UUID,
+		before, after ActivityPolicySettings,
+	) (activitySettingsRecipients, error) {
+		return computeActivitySettingsRecipients(
+			ctx, dependencies, userID, before, after, true,
 		)
 	}
 	return service
@@ -388,13 +436,65 @@ func (s *ActivityService) suppressRefreshedActivity(
 	}
 	if decision.SuppressedBySenderPresence {
 		return s.suppressHiddenSenderGeneration(
-			ctx, request.senderID, request.category,
-			built.SourceToken, built.SourceVersion,
+			ctx, request.senderID, request.category, built,
+		)
+	}
+	// A removed participant signals a leave: its mutation may already have
+	// deleted the survivor's published generation and lost the old audience.
+	if len(request.recheckViewers) == 0 && isUnpublishedOneMemberPrivateCall(built.Input, request.senderID) {
+		return s.suppressUnpublishedOneMemberPrivateCall(
+			ctx, request.senderID, built.SourceToken, built.SourceVersion,
 		)
 	}
 	return s.suppressGeneration(
 		ctx, request.senderID, request.category, built.SourceToken, built.SourceVersion,
 	)
+}
+
+// isUnpublishedOneMemberPrivateCall recognizes the initial Private Call state
+// where the sender is the only authoritative participant. It has no possible
+// Rich Presence recipient; an absent activity generation is therefore a benign
+// no-op, unlike an ordinary settings suppression with an unknown prior audience.
+func isUnpublishedOneMemberPrivateCall(input PolicyInput, senderID uuid.UUID) bool {
+	return input.Category == CategoryPrivateCall &&
+		input.SenderID == senderID &&
+		input.PrivateCall != nil &&
+		len(input.PrivateCall.Context.ParticipantIDs) == 1 &&
+		input.PrivateCall.Context.ParticipantIDs[0] == senderID
+}
+
+// suppressUnpublishedOneMemberPrivateCall preserves the fail-closed behavior
+// for any stored or unreadable generation. Only a confirmed absent state is
+// benign: the authoritative one-member call had no audience to receive it.
+func (s *ActivityService) suppressUnpublishedOneMemberPrivateCall(
+	ctx context.Context,
+	senderID, sourceToken uuid.UUID,
+	sourceVersion int64,
+) error {
+	deleteCtx, cancelDelete := boundedActivityCleanupContext(ctx)
+	deleted, deleteErr := s.store.CompareAndDelete(
+		deleteCtx, senderID, CategoryPrivateCall, sourceToken, sourceVersion,
+	)
+	cancelDelete()
+	if deleteErr != nil {
+		return errors.Join(
+			wrapActivityError("delete suppressed rich-presence activity", deleteErr),
+			s.disconnectAll(ctx),
+		)
+	}
+	if deleted {
+		return s.disconnectAll(ctx)
+	}
+	inspectCtx, cancelInspect := boundedActivityCleanupContext(ctx)
+	_, found, inspectErr := s.store.Get(inspectCtx, senderID, CategoryPrivateCall)
+	cancelInspect()
+	if inspectErr != nil {
+		return errors.Join(inspectErr, s.disconnectAll(ctx))
+	}
+	if found {
+		return s.disconnectAll(ctx)
+	}
+	return nil
 }
 
 func (s *ActivityService) persistAndDeliverRefreshedActivity(
@@ -484,6 +584,15 @@ func (s *ActivityService) clearAlreadyGated(
 	request clearActivityRequest,
 ) error {
 	prepared := s.prepareOldActivity(ctx, request)
+	var hiddenRecipients activitySettingsRecipients
+	var hiddenRecipientsErr error
+	if prepared.decision.SuppressedBySenderPresence {
+		// A terminal voice mutation invalidates the lifecycle proof required by
+		// the settings resolver. Capture the previously eligible audience while
+		// that proof still exists, then delete and deliver only after the
+		// authoritative mutation has committed.
+		hiddenRecipients, hiddenRecipientsErr = s.hiddenSenderRecipients(ctx, request.senderID)
+	}
 	applied, err := s.runClearMutation(ctx, request, prepared)
 	if err != nil || !applied {
 		return err
@@ -505,9 +614,9 @@ func (s *ActivityService) clearAlreadyGated(
 		// Rich-Presence client on the replica -- on an ordinary user action
 		// (#2444).
 		if prepared.decision.SuppressedBySenderPresence {
-			return s.suppressHiddenSenderGeneration(
-				ctx, request.senderID, request.category,
-				prepared.built.SourceToken, prepared.built.SourceVersion,
+			return s.suppressHiddenSenderGenerationWithRecipients(
+				ctx, request.senderID, request.category, prepared.built,
+				hiddenRecipients, hiddenRecipientsErr, true,
 			)
 		}
 		return s.suppressGeneration(
@@ -598,8 +707,20 @@ func (s *ActivityService) deleteAndDeliverActivityClear(
 			audience,
 		)
 	}
+	if len(audience) == 0 {
+		return nil
+	}
 	plan := DeliveryPlan{
 		SenderID: request.senderID, Category: request.category, ClearRecipients: audience,
+	}
+	if delivery, ok := s.delivery.(clearThenDisconnectDeliverer); ok {
+		if err := delivery.DeliverRichPresenceClearsThenDisconnect(ctx, []DeliveryPlan{plan}, audience); err != nil {
+			return errors.Join(
+				fmt.Errorf("deliver %s rich-presence clear and reconnect: %w", request.category, err),
+				s.disconnectKnown(ctx, audience),
+			)
+		}
+		return nil
 	}
 	if err := s.delivery.DeliverRichPresence(ctx, plan); err != nil {
 		return errors.Join(
@@ -689,8 +810,40 @@ func (s *ActivityService) suppressHiddenSenderGeneration(
 	ctx context.Context,
 	senderID uuid.UUID,
 	category Category,
-	sourceToken uuid.UUID,
-	sourceVersion int64,
+	built BuiltActivity,
+) error {
+	recipients, resolveErr := s.hiddenSenderRecipients(ctx, senderID)
+	return s.suppressHiddenSenderGenerationWithRecipients(
+		ctx, senderID, category, built, recipients, resolveErr, false,
+	)
+}
+
+func (s *ActivityService) hiddenSenderRecipients(
+	ctx context.Context,
+	senderID uuid.UUID,
+) (activitySettingsRecipients, error) {
+	resolver := s.hiddenSettingsRecipients
+	if resolver == nil {
+		// Unit fixtures that predate the hidden-sender-specific resolver retain
+		// their explicit generic resolver.
+		resolver = s.settingsRecipients
+	}
+	if resolver == nil {
+		return nil, nil
+	}
+	return resolver(
+		ctx, senderID, hiddenSenderWidestPriorSettings, hiddenSenderSuppressedSettings,
+	)
+}
+
+func (s *ActivityService) suppressHiddenSenderGenerationWithRecipients(
+	ctx context.Context,
+	senderID uuid.UUID,
+	category Category,
+	built BuiltActivity,
+	recipients activitySettingsRecipients,
+	resolveErr error,
+	writerOrdered bool,
 ) error {
 	// Resolve the audience BEFORE deleting, mirroring the edge arm's ordering.
 	//
@@ -706,17 +859,9 @@ func (s *ActivityService) suppressHiddenSenderGeneration(
 	// steady state (nothing stored), where its error is discarded and the benign
 	// terminal below is taken. That is the cheaper mistake: the alternative is an
 	// extra existence read for the same information.
-	var recipients map[uuid.UUID]bool
-	var resolveErr error
-	if s.settingsRecipients != nil {
-		recipients, resolveErr = s.settingsRecipients(
-			ctx, senderID, hiddenSenderWidestPriorSettings, hiddenSenderSuppressedSettings,
-		)
-	}
-
 	deleteCtx, cancelDelete := boundedActivityCleanupContext(ctx)
 	deleted, deleteErr := s.store.CompareAndDelete(
-		deleteCtx, senderID, category, sourceToken, sourceVersion,
+		deleteCtx, senderID, category, built.SourceToken, built.SourceVersion,
 	)
 	cancelDelete()
 
@@ -740,12 +885,16 @@ func (s *ActivityService) suppressHiddenSenderGeneration(
 				s.disconnectAllWithinBudget(ctx),
 			)
 		}
+		recipients = recipients.only(category)
+		if writerOrdered {
+			return s.deliverHiddenSenderTerminalClears(ctx, senderID, recipients)
+		}
 		return s.deliverHiddenSenderClears(ctx, senderID, recipients)
 	}
 
 	// Nothing stored. Distinguish "already gone" (benign) from "a newer
 	// generation exists that we must not silently ignore".
-	successor, inspectErr := s.hasGenerationSuccessor(ctx, senderID, category, sourceVersion)
+	successor, inspectErr := s.hasGenerationSuccessor(ctx, senderID, category, built.SourceVersion)
 	if inspectErr != nil {
 		return errors.Join(inspectErr, s.disconnectAll(ctx))
 	}
@@ -753,6 +902,30 @@ func (s *ActivityService) suppressHiddenSenderGeneration(
 		return s.disconnectAll(ctx)
 	}
 	return nil // benign terminal — the steady state for an invisible sender
+}
+
+func (s *ActivityService) deliverHiddenSenderTerminalClears(
+	ctx context.Context,
+	userID uuid.UUID,
+	recipients activitySettingsRecipients,
+) error {
+	delivery, ok := s.delivery.(clearThenDisconnectDeliverer)
+	if !ok {
+		return s.deliverHiddenSenderClears(ctx, userID, recipients)
+	}
+	recipients = recipients.without(userID)
+	audience := recipients.union()
+	if len(audience) == 0 {
+		return nil
+	}
+	plans := hiddenSenderClearPlans(userID, recipients)
+	if err := delivery.DeliverRichPresenceClearsThenDisconnect(ctx, plans, audience); err != nil {
+		return errors.Join(
+			wrapActivityError("deliver hidden-sender activity clear and reconnect", err),
+			s.disconnectKnown(ctx, audience),
+		)
+	}
+	return nil
 }
 
 func (s *ActivityService) suppressMovedGeneration(

@@ -14,6 +14,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type settingsClearThenDisconnectStub struct {
+	*activityServiceDeliveryStub
+	plans                  [][]DeliveryPlan
+	recipients             []map[uuid.UUID]bool
+	clearThenDisconnectErr error
+}
+
+func (d *settingsClearThenDisconnectStub) DeliverRichPresenceClearsThenDisconnect(
+	_ context.Context,
+	plans []DeliveryPlan,
+	recipients map[uuid.UUID]bool,
+) error {
+	d.plans = append(d.plans, append([]DeliveryPlan(nil), plans...))
+	d.recipients = append(d.recipients, copyActivityAudience(recipients))
+	return d.clearThenDisconnectErr
+}
+
 func TestActivityService_ApplySettingsSuppressionAlreadyGated(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -89,6 +106,38 @@ func TestActivityService_ApplySettingsSuppressionAlreadyGated(t *testing.T) {
 	}
 }
 
+func TestActivityService_MasterSuppressionKeepsCategoryAudiencesSeparate(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.settingsRecipients = func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ ActivityPolicySettings, _ ActivityPolicySettings,
+	) (activitySettingsRecipients, error) {
+		return activitySettingsRecipients{
+			CategoryServerVoice: {activityServiceViewer: true},
+			CategoryPrivateCall: {activityServiceOther: true},
+		}, nil
+	}
+	before := testActivityPolicySettings(true, TierFriends, TierFriends)
+	after := before
+	after.MasterEnabled = false
+
+	require.NoError(t, service.ApplySettingsSuppressionAlreadyGated(
+		context.Background(), activityServiceSender, before, after,
+	))
+
+	assert.Equal(t, []DeliveryPlan{
+		{
+			SenderID: activityServiceSender, Category: CategoryServerVoice,
+			ClearRecipients: map[uuid.UUID]bool{activityServiceViewer: true},
+		},
+		{
+			SenderID: activityServiceSender, Category: CategoryPrivateCall,
+			ClearRecipients: map[uuid.UUID]bool{activityServiceOther: true},
+		},
+	}, delivery.plans)
+}
+
 func TestActivitySettingsQueriesStayCandidateCorrelated(t *testing.T) {
 	source, err := os.ReadFile("activity_settings.go")
 	require.NoError(t, err)
@@ -131,15 +180,15 @@ func TestActivityService_SettingsChangeTargetsOnlyAffectedCurrentRecipients(t *t
 		_ context.Context,
 		userID uuid.UUID,
 		gotBefore, gotAfter ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		resolverCalls++
 		assert.Equal(t, activityServiceSender, userID)
 		assert.Equal(t, before, gotBefore)
 		assert.Equal(t, after, gotAfter)
-		return map[uuid.UUID]bool{
+		return activitySettingsRecipients{CategoryServerVoice: {
 			activityServiceSender: true,
 			activityServiceViewer: true,
-		}, nil
+		}}, nil
 	}
 
 	err := service.ApplySettingsSuppressionAlreadyGated(
@@ -148,12 +197,66 @@ func TestActivityService_SettingsChangeTargetsOnlyAffectedCurrentRecipients(t *t
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, resolverCalls)
+	assert.Equal(t, []DeliveryPlan{{
+		SenderID: activityServiceSender,
+		Category: CategoryServerVoice,
+		ClearRecipients: map[uuid.UUID]bool{
+			activityServiceViewer: true,
+		},
+	}}, delivery.plans)
 	assert.Equal(t, []map[uuid.UUID]bool{{
-		activityServiceSender: true,
 		activityServiceViewer: true,
 	}}, delivery.disconnects)
 	assert.Zero(t, delivery.disconnectAllCalls)
 	assert.Zero(t, coordinator.calls, "caller already owns the sender gate")
+}
+
+func TestActivityService_SettingsTierDownUsesClearBeforeReconnectDelivery(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	settingsDelivery := &settingsClearThenDisconnectStub{activityServiceDeliveryStub: delivery}
+	service.delivery = settingsDelivery
+	before := testActivityPolicySettings(true, TierServers, TierFriends)
+	after := before
+	after.ServerVoiceTier = TierFriends
+
+	require.NoError(t, service.ApplySettingsSuppressionAlreadyGated(
+		context.Background(), activityServiceSender, before, after,
+	))
+
+	require.Equal(t, [][]DeliveryPlan{{{
+		SenderID: activityServiceSender, Category: CategoryServerVoice,
+		ClearRecipients: map[uuid.UUID]bool{
+			activityServiceViewer: true,
+		},
+	}}}, settingsDelivery.plans)
+	assert.Equal(t, []map[uuid.UUID]bool{{
+		activityServiceViewer: true,
+	}}, settingsDelivery.recipients)
+	assert.Empty(t, delivery.plans, "the clear and close must share the writer-owned delivery path")
+	assert.Empty(t, delivery.disconnects)
+}
+
+func TestActivityService_SettingsOrderedReconnectFailureDisconnectsAudience(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	orderedErr := errors.New("forced settings ordered reconnect failure")
+	settingsDelivery := &settingsClearThenDisconnectStub{
+		activityServiceDeliveryStub: delivery,
+		clearThenDisconnectErr:      orderedErr,
+	}
+	service.delivery = settingsDelivery
+	disconnectErr := errors.New("forced settings reconnect fallback failure")
+	delivery.disconnectErr = disconnectErr
+	before := testActivityPolicySettings(true, TierServers, TierFriends)
+	after := before
+	after.ServerVoiceTier = TierFriends
+
+	err := service.ApplySettingsSuppressionAlreadyGated(
+		context.Background(), activityServiceSender, before, after,
+	)
+
+	assert.ErrorIs(t, err, orderedErr)
+	assert.ErrorIs(t, err, disconnectErr)
+	assert.Equal(t, []map[uuid.UUID]bool{{activityServiceViewer: true}}, delivery.disconnects)
 }
 
 func TestActivityService_SettingsChangeSameValueOrInactiveDisconnectsNobody(t *testing.T) {
@@ -167,9 +270,9 @@ func TestActivityService_SettingsChangeSameValueOrInactiveDisconnectsNobody(t *t
 		resolverCalls := 0
 		service.settingsRecipients = func(
 			context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-		) (map[uuid.UUID]bool, error) {
+		) (activitySettingsRecipients, error) {
 			resolverCalls++
-			return map[uuid.UUID]bool{activityServiceViewer: true}, nil
+			return activitySettingsRecipients{CategoryServerVoice: {activityServiceViewer: true}}, nil
 		}
 
 		err := service.ApplySettingsSuppressionAlreadyGated(
@@ -187,8 +290,8 @@ func TestActivityService_SettingsChangeSameValueOrInactiveDisconnectsNobody(t *t
 		service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
 		service.settingsRecipients = func(
 			context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-		) (map[uuid.UUID]bool, error) {
-			return map[uuid.UUID]bool{}, nil
+		) (activitySettingsRecipients, error) {
+			return activitySettingsRecipients{}, nil
 		}
 		after := settings
 		after.ServerVoiceShowDetails = false
@@ -270,6 +373,20 @@ func TestActivityService_SettingsCleanupMissingStateUsesPriorEligibility(t *test
 	}
 }
 
+func TestSettingsRecipientsWithoutState_HiddenSenderAllowsOnlyConfirmedAbsentSibling(t *testing.T) {
+	_, active, err := settingsRecipientsWithoutState(CategoryPrivateCall, true, false)
+	require.Error(t, err, "ordinary settings tier-down must fail closed on missing prior-eligible evidence")
+	assert.False(t, active)
+
+	recipients, active, err := settingsRecipientsWithoutState(CategoryPrivateCall, true, true)
+	require.NoError(t, err, "hidden-sender cleanup may skip a confirmed absent sibling category")
+	assert.False(t, active)
+	assert.Nil(t, recipients)
+
+	_, _, err = settingsRecipientsWithoutState(Category("invalid"), true, true)
+	require.ErrorIs(t, err, ErrInvalidActivityState)
+}
+
 func TestActivityService_ApplySettingsSuppressionAlreadyGatedAttemptsAllCleanup(t *testing.T) {
 	deleteErr := errors.New("delete unavailable")
 	disconnectErr := errors.New("disconnect unavailable")
@@ -337,7 +454,7 @@ func TestActivityService_SettingsRecipientFailureKeepsDisconnectWithinCallerBudg
 		_ uuid.UUID,
 		_ ActivityPolicySettings,
 		_ ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		resolverCtx = ctx
 		return nil, resolverErr
 	}
@@ -378,7 +495,7 @@ func TestActivityService_SettingsRecipientDeadlineExceededUsesRemainingCallerBud
 		_ uuid.UUID,
 		_ ActivityPolicySettings,
 		_ ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		var bounded bool
 		resolverDeadline, bounded = ctx.Deadline()
 		require.True(t, bounded)
@@ -416,9 +533,9 @@ func TestActivityService_SettingsSuppressionInsufficientBudgetDisconnectsWithout
 		uuid.UUID,
 		ActivityPolicySettings,
 		ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		resolverCalls++
-		return map[uuid.UUID]bool{}, nil
+		return activitySettingsRecipients{}, nil
 	}
 	callerCtx, cancelCaller := context.WithTimeout(
 		context.Background(), activityCleanupTimeout,
@@ -585,9 +702,9 @@ func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
 	var gotBefore, gotAfter ActivityPolicySettings
 	service.settingsRecipients = func(
 		_ context.Context, _ uuid.UUID, before ActivityPolicySettings, after ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		gotBefore, gotAfter = before, after
-		return map[uuid.UUID]bool{activityServiceViewer: true}, nil
+		return activitySettingsRecipients{CategoryServerVoice: {activityServiceViewer: true}}, nil
 	}
 
 	err := service.SuppressHiddenSenderActivityAlreadyGated(
@@ -598,7 +715,7 @@ func TestSuppressHiddenSenderActivity_ClearsWithoutDisconnecting(t *testing.T) {
 	assert.Zero(t, delivery.disconnectAllCalls,
 		"total suppression is expressible as a clear; do not disconnect the audience")
 	assert.Empty(t, delivery.disconnects)
-	require.Len(t, delivery.plans, 2, "one clear per supported category")
+	require.Len(t, delivery.plans, 1, "one clear for the stored category")
 	for _, plan := range delivery.plans {
 		assert.Contains(t, plan.ClearRecipients, activityServiceViewer)
 		assert.Empty(t, plan.UpdateRecipients)
@@ -649,7 +766,7 @@ func TestSuppressHiddenSenderActivity_VisibleSenderDoesNothing(t *testing.T) {
 	)
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		t.Fatal("a visible sender must not resolve recipients for stale suppression work")
 		return nil, nil
 	}
@@ -673,7 +790,7 @@ func TestSuppressHiddenSenderActivity_ResolutionErrorDisconnects(t *testing.T) {
 	resolverErr := errors.New("hidden-sender recipient resolution failed")
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		return nil, resolverErr
 	}
 
@@ -697,8 +814,8 @@ func TestSuppressHiddenSenderActivity_EmptyAudienceIsQuiet(t *testing.T) {
 	// and this never reaches the empty-audience path
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
-		return map[uuid.UUID]bool{}, nil
+	) (activitySettingsRecipients, error) {
+		return activitySettingsRecipients{}, nil
 	}
 
 	err := service.SuppressHiddenSenderActivityAlreadyGated(
@@ -715,8 +832,8 @@ func TestSuppressHiddenSenderActivity_SenderIsNeverItsOwnRecipient(t *testing.T)
 	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
-		return map[uuid.UUID]bool{activityServiceSender: true}, nil
+	) (activitySettingsRecipients, error) {
+		return activitySettingsRecipients{CategoryServerVoice: {activityServiceSender: true}}, nil
 	}
 
 	err := service.SuppressHiddenSenderActivityAlreadyGated(

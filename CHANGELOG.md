@@ -47,6 +47,10 @@ that keeps sending far more than your plan allows.
 
 ### Fixed
 
+- **Voice activity now clears before a privacy change reconnects the app** ([#3412](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3412)) — lowering Rich Presence visibility,
+  leaving a voice session, or disconnecting can no longer briefly deliver an older activity
+  update after its removal.
+
 - **The Basic / Advanced Settings switch in Audio and Video Configuration now works with a keyboard and
   screen reader** ([#3428](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3428)) — screen readers announce the two options as a choice of two instead of as tabs,
   the arrow keys move between them, Tab stops once per switch, and a focus ring shows which option
@@ -72,7 +76,6 @@ that keeps sending far more than your plan allows.
   that app's sound straight away; before, the capture kept running in the background until you
   quit. Starting a share with app sound can take a moment longer, because it now waits until the
   sound capture is ready.
-
 - **Empty, hidden direct and group conversations are cleaned up** ([#3402](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3402), [#2821](https://github.com/Concord-Voice/Concord-Voice-Alpha/issues/2821)) — after everyone has hidden a conversation and no messages remain, Concord removes its unused server data. Pending or active voice calls keep the conversation intact. The last member of a group can also leave when nobody remains to take ownership.
 
 - **Moving between voice channels on different servers no longer loses the old-channel leave** ([#3415](https://github.com/Concord-Voice/Concord-Voice-Alpha/pull/3415)) — the old channel's participant update now waits for the move to commit, so its count cannot be left stale by a fast delivery.

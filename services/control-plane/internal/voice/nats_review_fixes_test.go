@@ -1473,6 +1473,63 @@ func TestPrivateJoinStaleTargetRowPreservesPeerSuccessorState(t *testing.T) {
 	require.Equal(t, successorAt.UnixMicro(), state.SourceVersion)
 }
 
+func TestPrivateJoinStaleTargetReconnectsAllRichPresenceClients(t *testing.T) {
+	ts := testhelpers.SetupTestServer(t)
+	sub := newTestSubscriber(ts)
+	joiner := ts.CreateTestUser(t, "rp_stale_target_joiner")
+	stalePeer := ts.CreateTestUser(t, "rp_stale_target_peer")
+	viewer := ts.CreateTestUser(t, "rp_stale_target_viewer")
+	conversationID := uuid.MustParse(ts.CreateDMConversation(t, joiner.ID, stalePeer.ID))
+	ts.CreateFriendship(t, stalePeer.ID, viewer.ID, "accepted")
+	_, err := ts.DB.Exec(`
+		INSERT INTO user_presence_settings
+			(user_id, master_enabled, private_call_tier, private_call_show_details)
+		VALUES ($1, TRUE, $2, TRUE)
+	`, stalePeer.ID, presence.TierFriends)
+	require.NoError(t, err)
+
+	viewerConn := connectVoiceWireClient(t, ts, viewer)
+	synchronizeVoiceWireClient(t, viewerConn)
+	oldCallID := uuid.New()
+	newCallID := uuid.New()
+	oldAt := time.Date(2026, 9, 23, 22, 0, 0, 0, time.UTC)
+	require.NoError(t, dm.RefreshDMVoiceCallLease(
+		context.Background(), ts.Redis, dm.VoiceCallLease{
+			ConversationID: conversationID,
+			CallID:         oldCallID,
+			CallerUserID:   uuid.MustParse(stalePeer.ID),
+		}, dm.DMVoiceCallLeaseTTL, true,
+	))
+	sub.HandleJoined(mustJSON(t, map[string]interface{}{
+		"channelId": conversationID.String(), "callId": oldCallID.String(),
+		"userId": stalePeer.ID, "username": stalePeer.Username,
+		"timestamp": oldAt.Format(time.RFC3339Nano),
+	}))
+	update := waitForPrivateVoiceWireSender(t, viewerConn, "rich_presence_update", stalePeer.ID)
+	require.Equal(t, stalePeer.ID, update.Data["user_id"])
+
+	require.NoError(t, dm.DeleteDMVoiceCallLease(
+		context.Background(), ts.Redis, conversationID, oldCallID,
+	))
+	require.NoError(t, dm.RefreshDMVoiceCallLease(
+		context.Background(), ts.Redis, dm.VoiceCallLease{
+			ConversationID: conversationID,
+			CallID:         newCallID,
+			CallerUserID:   uuid.MustParse(joiner.ID),
+		}, dm.DMVoiceCallLeaseTTL, true,
+	))
+	sub.HandleJoined(mustJSON(t, map[string]interface{}{
+		"channelId": conversationID.String(), "callId": newCallID.String(),
+		"userId": joiner.ID, "username": joiner.Username,
+		"timestamp": oldAt.Add(time.Second).Format(time.RFC3339Nano),
+	}))
+
+	require.Eventually(t, func() bool {
+		return ts.Hub.GetUserClientCount(uuid.MustParse(viewer.ID)) == 0
+	}, time.Second, 10*time.Millisecond,
+		"stale-target cleanup must reconnect viewers with an unprovable prior audience")
+}
+
 func TestPrivateHeartbeatExactDuplicateReconnectsReplicaWithLostRemovalEvidence(t *testing.T) {
 	ts := testhelpers.SetupTestServer(t)
 	winningReplica := newTestSubscriber(ts)
@@ -1637,10 +1694,8 @@ func TestPrivateHeartbeatMovesMemberToOneCallAndRejectsDelayedOldScope(t *testin
 
 	require.False(t, dmVoiceParticipantExists(t, ts.DB, oldConversation.String(), sender.ID))
 	require.True(t, dmVoiceParticipantExists(t, ts.DB, newConversation.String(), sender.ID))
-	require.Eventually(t, func() bool {
-		return ts.Hub.GetUserClientCount(uuid.MustParse(newPeer.ID)) == 0
-	}, time.Second, 10*time.Millisecond,
-		"removing an unknown old private-call audience must force a conservative reconnect")
+	require.Equal(t, 1, ts.Hub.GetUserClientCount(uuid.MustParse(newPeer.ID)),
+		"a confirmed one-member old scope must not reconnect an unrelated viewer")
 
 	sub.HandleHeartbeat(mustJSON(t, map[string]interface{}{
 		"channelId": oldConversation.String(), "callId": oldCallID.String(),
@@ -1660,6 +1715,7 @@ func TestPrivateCrossScopeMoveWithoutOldLeasePreservesUnknownOldPeer(t *testing.
 			mover := ts.CreateTestUser(t, "rp_missing_old_lease_mover_"+eventType)
 			oldPeer := ts.CreateTestUser(t, "rp_missing_old_lease_old_peer_"+eventType)
 			newPeer := ts.CreateTestUser(t, "rp_missing_old_lease_new_peer_"+eventType)
+			viewer := ts.CreateTestUser(t, "rp_missing_old_lease_viewer_"+eventType)
 			oldConversationID := uuid.MustParse(ts.CreateDMConversation(t, mover.ID, oldPeer.ID))
 			newConversationID := uuid.MustParse(ts.CreateDMConversation(t, mover.ID, newPeer.ID))
 			oldCallID := uuid.New()
@@ -1708,6 +1764,7 @@ func TestPrivateCrossScopeMoveWithoutOldLeasePreservesUnknownOldPeer(t *testing.
 			require.NoError(t, err)
 			require.True(t, found)
 			connectVoiceWireClient(t, ts, oldPeer)
+			connectVoiceWireClient(t, ts, viewer)
 
 			switch eventType {
 			case "join":
@@ -1754,6 +1811,10 @@ func TestPrivateCrossScopeMoveWithoutOldLeasePreservesUnknownOldPeer(t *testing.
 				return ts.Hub.GetUserClientCount(oldPeerID) == 0
 			}, time.Second, 10*time.Millisecond,
 				"an unverifiable old audience requires conservative reconnect")
+			require.Eventually(t, func() bool {
+				return ts.Hub.GetUserClientCount(uuid.MustParse(viewer.ID)) == 0
+			}, time.Second, 10*time.Millisecond,
+				"an unverifiable old audience requires reconnecting a nonparticipant viewer")
 		})
 	}
 }

@@ -149,6 +149,25 @@ func waitForVoiceWireType(
 	}
 }
 
+func waitForPrivateVoiceWireSender(
+	t *testing.T,
+	conn *gorillaWS.Conn,
+	wantType, senderID string,
+) voiceWireEnvelope {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	for {
+		var envelope voiceWireEnvelope
+		require.NoError(t, conn.ReadJSON(&envelope))
+		if envelope.Data["user_id"] != senderID ||
+			envelope.Data["category"] != string(presence.CategoryPrivateCall) {
+			continue
+		}
+		require.Equal(t, wantType, envelope.Type)
+		return envelope
+	}
+}
+
 func synchronizeVoiceWireClient(t *testing.T, conn *gorillaWS.Conn) {
 	t.Helper()
 	require.NoError(t, conn.WriteJSON(map[string]interface{}{
@@ -651,8 +670,9 @@ func TestVoiceLifecycle_ComposedPrivateRichPresenceWireJoinLeaveEnd(t *testing.T
 	sub := newTestSubscriber(ts)
 	caller := ts.CreateTestUser(t, "rp_wire_dm_caller")
 	peer := ts.CreateTestUser(t, "rp_wire_dm_peer")
+	stabilizer := ts.CreateTestUser(t, "rp_wire_dm_stabilizer")
 	outsider := ts.CreateTestUser(t, "rp_wire_dm_outsider")
-	conversationID := ts.CreateDMConversation(t, caller.ID, peer.ID)
+	conversationID := ts.CreateGroupDMConversation(t, caller.ID, peer.ID, stabilizer.ID)
 	callID := uuid.New()
 	_, err := ts.DB.Exec(`
 		INSERT INTO user_presence_settings
@@ -667,33 +687,80 @@ func TestVoiceLifecycle_ComposedPrivateRichPresenceWireJoinLeaveEnd(t *testing.T
 	`, peer.ID, presence.TierOff)
 	require.NoError(t, err)
 	callerJoinedAt := time.Date(2026, 7, 16, 1, 5, 0, 123456000, time.UTC)
+	callerConn := connectVoiceWireClient(t, ts, caller)
+	stalePeerConn := connectVoiceWireClient(t, ts, peer)
+	outsiderConn := connectVoiceWireClient(t, ts, outsider)
+	for _, conn := range []*gorillaWS.Conn{callerConn, stalePeerConn, outsiderConn} {
+		synchronizeVoiceWireClient(t, conn)
+	}
+	staleCallID := uuid.New()
+	_, err = ts.DB.Exec(`
+		INSERT INTO dm_voice_participants
+			(conversation_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, conversationID, peer.ID, callerJoinedAt.Add(-time.Second))
+	require.NoError(t, err)
+	seedLifecycle := func(participantID, lifecycleID uuid.UUID) {
+		lifecycleKey, keyErr := presence.VoiceLifecycleKey(
+			participantID, presence.CategoryPrivateCall,
+		)
+		require.NoError(t, keyErr)
+		require.NoError(t, ts.Redis.HSet(
+			context.Background(), lifecycleKey,
+			"token", lifecycleID.String(), "version", callerJoinedAt.Add(-time.Second).UnixMicro(), "active", "1",
+		).Err())
+		require.NoError(t, ts.Redis.PExpire(
+			context.Background(), lifecycleKey, presence.ActivityStateTTL,
+		).Err())
+	}
+	seedLifecycle(uuid.MustParse(peer.ID), staleCallID)
+	// A current non-sender participant keeps the TierOff decision non-empty so
+	// this test reaches the reconnect path rather than its expected one-member
+	// suppression fallback.
+	_, err = ts.DB.Exec(`
+		INSERT INTO dm_voice_participants
+			(conversation_id, user_id, joined_at, lifecycle_event_at)
+		VALUES ($1, $2, $3, $3)
+	`, conversationID, stabilizer.ID, callerJoinedAt.Add(-time.Second))
+	require.NoError(t, err)
+	seedLifecycle(uuid.MustParse(stabilizer.ID), callID)
 	sub.HandleJoined(mustJSON(t, map[string]interface{}{
 		"channelId": conversationID, "callId": callID.String(),
 		"userId": caller.ID, "username": caller.Username,
 		"timestamp": callerJoinedAt.Format(time.RFC3339Nano),
 	}))
-
-	callerConn := connectVoiceWireClient(t, ts, caller)
+	require.Eventually(t, func() bool {
+		return ts.Hub.GetUserClientCount(uuid.MustParse(caller.ID)) == 0 &&
+			ts.Hub.GetUserClientCount(uuid.MustParse(peer.ID)) == 0 &&
+			ts.Hub.GetUserClientCount(uuid.MustParse(outsider.ID)) == 0
+	}, time.Second, 10*time.Millisecond,
+		"a stale target requires reconnecting its unprovable prior audience")
+	callerConn = connectVoiceWireClient(t, ts, caller)
+	outsiderConn = connectVoiceWireClient(t, ts, outsider)
 	peerConn := connectVoiceWireClient(t, ts, peer)
-	outsiderConn := connectVoiceWireClient(t, ts, outsider)
-	for _, conn := range []*gorillaWS.Conn{callerConn, peerConn, outsiderConn} {
+	for _, conn := range []*gorillaWS.Conn{callerConn, outsiderConn, peerConn} {
 		synchronizeVoiceWireClient(t, conn)
 	}
+
 	peerJoinedAt := callerJoinedAt.Add(time.Microsecond)
 	sub.HandleJoined(mustJSON(t, map[string]interface{}{
 		"channelId": conversationID, "callId": callID.String(),
 		"userId": peer.ID, "username": peer.Username,
 		"timestamp": peerJoinedAt.Format(time.RFC3339Nano),
 	}))
-	callerUpdate := waitForVoiceWireType(t, peerConn, "rich_presence_update")
+	callerUpdate := waitForPrivateVoiceWireSender(
+		t, peerConn, "rich_presence_update", caller.ID,
+	)
 	require.Equal(t, caller.ID, callerUpdate.Data["user_id"])
 	require.Equal(t, string(presence.CategoryPrivateCall), callerUpdate.Data["category"])
 	require.Equal(t, true, callerUpdate.Data["minimized"])
 	callerPayload, ok := callerUpdate.Data["payload"].(map[string]interface{})
 	require.True(t, ok)
-	require.Equal(t, "dm", callerPayload["call_type"])
+	require.Equal(t, "group", callerPayload["call_type"])
 	require.NotContains(t, callerPayload, "participant_count")
-	peerUpdate := waitForVoiceWireType(t, callerConn, "rich_presence_update")
+	peerUpdate := waitForPrivateVoiceWireSender(
+		t, callerConn, "rich_presence_update", peer.ID,
+	)
 	require.Equal(t, peer.ID, peerUpdate.Data["user_id"])
 	require.Equal(t, true, peerUpdate.Data["minimized"])
 	requireNoVoiceWireType(t, outsiderConn, "rich_presence_update")
@@ -711,12 +778,12 @@ func TestVoiceLifecycle_ComposedPrivateRichPresenceWireJoinLeaveEnd(t *testing.T
 	sub.HandleRoomEmpty(mustJSON(t, map[string]interface{}{
 		"channelId": conversationID, "callId": callID.String(),
 		"ringId": callID.String(), "callerUserId": caller.ID,
-		"participantUserIds": []string{caller.ID, peer.ID},
+		"participantUserIds": []string{caller.ID, peer.ID, stabilizer.ID},
 		"startedAt":          callerJoinedAt.Format(time.RFC3339Nano),
 		"timestamp":          endedAt.Format(time.RFC3339Nano),
 	}))
 	require.Equal(t, 0, countDMVoiceParticipants(t, ts.DB, conversationID))
-	for _, participant := range []testhelpers.TestUser{caller, peer} {
+	for _, participant := range []testhelpers.TestUser{caller, peer, stabilizer} {
 		state, found, getErr := presence.NewActivityStore(ts.Redis).Get(
 			context.Background(), uuid.MustParse(participant.ID), presence.CategoryPrivateCall,
 		)

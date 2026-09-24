@@ -77,12 +77,10 @@ func TestActivityService_HiddenSenderLevelArmClearsStoredRowPrecisely(t *testing
 		assert.NotContains(t, plan.ClearRecipients, activityServiceSender,
 			"the sender is never its own recipient (spec 7.1)")
 	}
-	// The clear covers both categories: the widest prior audience is a superset of
-	// whoever could hold a badge, and clearing a category that held nothing is inert.
 	assert.Equal(t,
-		map[Category]int{CategoryServerVoice: 1, CategoryPrivateCall: 1},
+		map[Category]int{CategoryServerVoice: 1},
 		planCategories(delivery.plans),
-		"one clear frame per supported category")
+		"one clear frame for the stored category")
 }
 
 // U10 (spec 8.1): when the precise clear cannot be delivered, the fallback is a
@@ -153,6 +151,36 @@ func TestActivityService_HiddenSenderEdgeCoversBothCategoriesInOnePass(t *testin
 		"AlreadyGated: the caller owns the sender gate; re-acquiring it would deadlock")
 }
 
+func TestActivityService_HiddenSenderSuppressionKeepsCategoryAudiencesSeparate(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.settingsRecipients = func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ ActivityPolicySettings, _ ActivityPolicySettings,
+	) (activitySettingsRecipients, error) {
+		return activitySettingsRecipients{
+			CategoryServerVoice: {activityServiceViewer: true},
+			CategoryPrivateCall: {activityServiceOther: true},
+		}, nil
+	}
+	store.exactDeleteResult = true
+
+	require.NoError(t, service.SuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	))
+
+	assert.Equal(t, []DeliveryPlan{
+		{
+			SenderID: activityServiceSender, Category: CategoryServerVoice,
+			ClearRecipients: map[uuid.UUID]bool{activityServiceViewer: true},
+		},
+		{
+			SenderID: activityServiceSender, Category: CategoryPrivateCall,
+			ClearRecipients: map[uuid.UUID]bool{activityServiceOther: true},
+		},
+	}, delivery.plans)
+}
+
 // The resolver is the only source of the audience, so a nil resolver must fail
 // closed to a disconnect rather than silently leaving a badge published.
 func TestActivityService_HiddenSenderLevelArmWithoutResolverFailsClosed(t *testing.T) {
@@ -178,7 +206,7 @@ func TestActivityService_HiddenSenderLevelArmResolutionFailureDisconnectsAll(t *
 	resolveErr := errors.New("forced hidden-sender level-arm resolution failure")
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		return nil, resolveErr
 	}
 
@@ -281,7 +309,7 @@ func storeBackedRecipientResolver(
 ) activitySettingsRecipientResolver {
 	return func(
 		ctx context.Context, userID uuid.UUID, _ ActivityPolicySettings, _ ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		if _, found, err := store.Get(ctx, userID, CategoryServerVoice); err != nil {
 			return nil, err
 		} else if !found {
@@ -289,7 +317,7 @@ func storeBackedRecipientResolver(
 				"rich-presence server-voice settings evidence unavailable for prior-eligible policy",
 			)
 		}
-		return audience, nil
+		return activitySettingsRecipients{CategoryServerVoice: audience}, nil
 	}
 }
 
@@ -357,7 +385,7 @@ func TestSuppressHiddenSenderActivity_NothingStoredNeverDisconnectsOnResolverFai
 	store.getFound = false // the steady state: this sender published nothing
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		return nil, errors.New(
 			"rich-presence server_voice settings evidence unavailable for prior-eligible policy",
 		)
@@ -411,9 +439,9 @@ func TestSuppressHiddenSenderActivity_NothingStoredDeliversNoClears(t *testing.T
 	resolved := false
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		resolved = true
-		return map[uuid.UUID]bool{activityServiceViewer: true}, nil
+		return activitySettingsRecipients{CategoryServerVoice: {activityServiceViewer: true}}, nil
 	}
 
 	err := service.SuppressHiddenSenderActivityAlreadyGated(
@@ -426,6 +454,42 @@ func TestSuppressHiddenSenderActivity_NothingStoredDeliversNoClears(t *testing.T
 	assert.Empty(t, delivery.plans)
 	assert.Zero(t, delivery.disconnectAllCalls)
 	assert.Empty(t, delivery.disconnects)
+}
+
+// Hidden-sender cleanup is the sole path allowed to treat an absent sibling
+// category as inactive. A generic settings resolver would fail closed for that
+// same absence; choosing it here disconnects every client before the stored
+// Server Voice generation can clear its known audience.
+func TestSuppressHiddenSenderActivity_UsesAbsentSiblingTolerantResolver(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	store.exactDeleteResult = true
+	genericCalls := 0
+	hiddenCalls := 0
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (activitySettingsRecipients, error) {
+		genericCalls++
+		return nil, errors.New("private-call settings evidence unavailable")
+	}
+	service.hiddenSettingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (activitySettingsRecipients, error) {
+		hiddenCalls++
+		return activitySettingsRecipients{CategoryServerVoice: {activityServiceViewer: true}}, nil
+	}
+
+	err := service.ForceSuppressHiddenSenderActivityAlreadyGated(
+		context.Background(), activityServiceSender,
+	)
+
+	require.NoError(t, err)
+	assert.Zero(t, genericCalls, "ordinary settings cleanup remains fail-closed")
+	assert.Equal(t, 1, hiddenCalls)
+	assert.Zero(t, delivery.disconnectAllCalls)
+	require.Len(t, delivery.plans, 1)
+	for _, plan := range delivery.plans {
+		assert.Contains(t, plan.ClearRecipients, activityServiceViewer)
+	}
 }
 
 // The invariant PR #3238 initially broke and CI caught: a recipient-resolution
@@ -450,7 +514,7 @@ func TestSuppressHiddenSenderActivity_ResolverFailureDeletesNothing(t *testing.T
 			store.exactDeleteResult = true // would be observable IF a delete ran
 			service.settingsRecipients = func(
 				context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-			) (map[uuid.UUID]bool, error) {
+			) (activitySettingsRecipients, error) {
 				return nil, errors.New("forced hidden-sender resolution failure")
 			}
 
@@ -474,7 +538,7 @@ func TestSuppressHiddenSenderActivity_ProbeFailureFailsClosed(t *testing.T) {
 	store.getErr = errors.New("forced hidden-sender probe failure")
 	service.settingsRecipients = func(
 		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
+	) (activitySettingsRecipients, error) {
 		return nil, errors.New("forced hidden-sender resolution failure")
 	}
 

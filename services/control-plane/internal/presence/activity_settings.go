@@ -85,7 +85,7 @@ func (s *ActivityService) ApplySettingsSuppressionAlreadyGated(
 	workCtx, cancelWork := context.WithTimeout(ctx, activityCleanupTimeout)
 	defer cancelWork()
 
-	cleanupErrors := s.disconnectActivitySettingsRecipients(
+	cleanupErrors := s.clearAndDisconnectActivitySettingsRecipients(
 		workCtx, ctx, userID, before, after,
 	)
 	// This caller only aggregates errors: the settings-change arm already knows a
@@ -122,7 +122,11 @@ func validateActivitySettingsCleanup(
 	return nil
 }
 
-func (s *ActivityService) disconnectActivitySettingsRecipients(
+// clearAndDisconnectActivitySettingsRecipients sends the active-category clear
+// before forcing the existing reconnect snapshot. The clear removes a revoked
+// viewer's DOM state immediately; reconnect remains the conservative recovery
+// path for every recipient, including viewers whose policy still permits it.
+func (s *ActivityService) clearAndDisconnectActivitySettingsRecipients(
 	workCtx context.Context,
 	suppressionCtx context.Context,
 	userID uuid.UUID,
@@ -138,16 +142,60 @@ func (s *ActivityService) disconnectActivitySettingsRecipients(
 		}
 		return cleanupErrors
 	}
-	if len(recipients) == 0 {
+	// A publisher is never an audience for its own Rich Presence. In particular,
+	// closing the publisher's final app socket makes it look offline and can
+	// suppress the still-active generation before retained viewers snapshot it.
+	recipients = recipients.without(userID)
+	audience := recipients.union()
+	if len(audience) == 0 {
 		return cleanupErrors
 	}
-	if disconnectErr := s.delivery.DisconnectRichPresenceClients(workCtx, recipients); disconnectErr != nil {
+	plans := make([]DeliveryPlan, 0, 2)
+	for _, category := range changedActivitySettingsCategories(before, after) {
+		if categoryRecipients := recipients[category]; len(categoryRecipients) > 0 {
+			plans = append(plans, DeliveryPlan{
+				SenderID: userID, Category: category, ClearRecipients: categoryRecipients,
+			})
+		}
+	}
+	if delivery, supported := s.delivery.(clearThenDisconnectDeliverer); supported {
+		if deliveryErr := delivery.DeliverRichPresenceClearsThenDisconnect(workCtx, plans, audience); deliveryErr != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf(
+				"deliver and disconnect affected rich-presence clients: %w", deliveryErr,
+			))
+			if disconnectErr := s.disconnectKnown(workCtx, audience); disconnectErr != nil {
+				cleanupErrors = append(cleanupErrors, disconnectErr)
+			}
+		}
+		return cleanupErrors
+	}
+	for _, plan := range plans {
+		if deliverErr := s.delivery.DeliverRichPresence(workCtx, plan); deliverErr != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf(
+				"deliver affected %s rich-presence clear: %w", plan.Category, deliverErr,
+			))
+		}
+	}
+	if disconnectErr := s.delivery.DisconnectRichPresenceClients(workCtx, audience); disconnectErr != nil {
 		cleanupErrors = append(
 			cleanupErrors,
 			fmt.Errorf("disconnect affected rich-presence clients: %w", disconnectErr),
 		)
 	}
 	return cleanupErrors
+}
+
+func changedActivitySettingsCategories(
+	before, after ActivityPolicySettings,
+) []Category {
+	categories := make([]Category, 0, 2)
+	if serverActivityPolicyChanged(before, after) {
+		categories = append(categories, CategoryServerVoice)
+	}
+	if privateActivityPolicyChanged(before, after) {
+		categories = append(categories, CategoryPrivateCall)
+	}
+	return categories
 }
 
 // deleteSuppressedActivity removes each newly-suppressed category and reports
@@ -198,27 +246,28 @@ func computeActivitySettingsRecipients(
 	userID uuid.UUID,
 	before ActivityPolicySettings,
 	after ActivityPolicySettings,
-) (map[uuid.UUID]bool, error) {
+	allowAbsentCategory bool,
+) (activitySettingsRecipients, error) {
 	if dependencies.db == nil || dependencies.builder == nil || dependencies.store == nil {
 		return nil, errors.New("rich-presence settings recipient resolver unavailable")
 	}
-	recipients := make(map[uuid.UUID]bool)
+	recipients := make(activitySettingsRecipients)
 	serverRecipients, serverActive, err := changedServerSettingsRecipients(
-		ctx, dependencies, userID, before, after,
+		ctx, dependencies, userID, before, after, allowAbsentCategory,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := mergeActiveSettingsRecipients(recipients, serverRecipients, serverActive, userID); err != nil {
+	if err := mergeActiveSettingsRecipients(recipients, CategoryServerVoice, serverRecipients, serverActive); err != nil {
 		return nil, err
 	}
 	privateRecipients, privateActive, err := changedPrivateSettingsRecipients(
-		ctx, dependencies, userID, before, after,
+		ctx, dependencies, userID, before, after, allowAbsentCategory,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := mergeActiveSettingsRecipients(recipients, privateRecipients, privateActive, userID); err != nil {
+	if err := mergeActiveSettingsRecipients(recipients, CategoryPrivateCall, privateRecipients, privateActive); err != nil {
 		return nil, err
 	}
 	return recipients, nil
@@ -230,6 +279,7 @@ func changedServerSettingsRecipients(
 	userID uuid.UUID,
 	before ActivityPolicySettings,
 	after ActivityPolicySettings,
+	allowAbsentCategory bool,
 ) (map[uuid.UUID]bool, bool, error) {
 	if !serverActivityPolicyChanged(before, after) {
 		return nil, false, nil
@@ -240,6 +290,7 @@ func changedServerSettingsRecipients(
 		userID,
 		maxEnabledServerTier(before, after),
 		before.MasterEnabled && before.ServerVoiceTier != TierOff,
+		allowAbsentCategory,
 	)
 }
 
@@ -249,33 +300,32 @@ func changedPrivateSettingsRecipients(
 	userID uuid.UUID,
 	before ActivityPolicySettings,
 	after ActivityPolicySettings,
+	allowAbsentCategory bool,
 ) (map[uuid.UUID]bool, bool, error) {
 	if !privateActivityPolicyChanged(before, after) {
 		return nil, false, nil
 	}
 	return currentPrivateSettingsRecipients(
 		ctx,
-		dependencies.db,
-		dependencies.builder,
-		dependencies.store,
+		dependencies,
 		userID,
 		maxEnabledPrivateTier(before, after),
 		before.MasterEnabled,
+		allowAbsentCategory,
 	)
 }
 
 func mergeActiveSettingsRecipients(
-	into map[uuid.UUID]bool,
+	into activitySettingsRecipients,
+	category Category,
 	recipients map[uuid.UUID]bool,
 	active bool,
-	userID uuid.UUID,
 ) error {
 	if !active {
 		return nil
 	}
-	recipients[userID] = true
-	mergeAudience(into, recipients)
-	if len(into) > activitySettingsRecipientLimit {
+	into[category] = recipients
+	if len(into.union()) > activitySettingsRecipientLimit {
 		return errors.New("rich-presence settings recipient union limit exceeded")
 	}
 	return nil
@@ -321,13 +371,14 @@ func currentServerSettingsRecipients(
 	userID uuid.UUID,
 	tier Tier,
 	priorEligible bool,
+	allowAbsentCategory bool,
 ) (map[uuid.UUID]bool, bool, error) {
 	state, found, err := dependencies.store.Get(ctx, userID, CategoryServerVoice)
 	if err != nil {
 		return nil, false, err
 	}
 	if !found {
-		return settingsRecipientsWithoutState(CategoryServerVoice, priorEligible)
+		return settingsRecipientsWithoutState(CategoryServerVoice, priorEligible, allowAbsentCategory)
 	}
 	built, err := loadCurrentServerSettingsActivity(
 		ctx, dependencies.builder, dependencies.store, userID, state,
@@ -501,21 +552,20 @@ func serverSettingsCandidates(
 
 func currentPrivateSettingsRecipients(
 	ctx context.Context,
-	db DBTX,
-	builder activityBuilder,
-	store *ActivityStore,
+	dependencies activitySettingsRecipientDependencies,
 	userID uuid.UUID,
 	tier Tier,
 	priorEligible bool,
+	allowAbsentCategory bool,
 ) (map[uuid.UUID]bool, bool, error) {
-	state, found, err := store.Get(ctx, userID, CategoryPrivateCall)
+	state, found, err := dependencies.store.Get(ctx, userID, CategoryPrivateCall)
 	if err != nil {
 		return nil, false, err
 	}
 	if !found {
-		return settingsRecipientsWithoutState(CategoryPrivateCall, priorEligible)
+		return settingsRecipientsWithoutState(CategoryPrivateCall, priorEligible, allowAbsentCategory)
 	}
-	active, err := store.IsActiveGeneration(
+	active, err := dependencies.store.IsActiveGeneration(
 		ctx, userID, CategoryPrivateCall, state.SourceToken, state.SourceVersion,
 	)
 	if err != nil {
@@ -526,11 +576,11 @@ func currentPrivateSettingsRecipients(
 			"rich-presence private settings lifecycle unavailable for stored state",
 		)
 	}
-	conversationID, err := exactCurrentPrivateCallScope(ctx, db, userID, state)
+	conversationID, err := exactCurrentPrivateCallScope(ctx, dependencies.db, userID, state)
 	if err != nil {
 		return nil, false, err
 	}
-	built, err := builder.Build(ctx, userID, Scope{
+	built, err := dependencies.builder.Build(ctx, userID, Scope{
 		Category: CategoryPrivateCall, RoomID: conversationID,
 		LifecycleID: state.SourceToken, EventAt: time.UnixMicro(state.SourceVersion),
 	})
@@ -542,7 +592,7 @@ func currentPrivateSettingsRecipients(
 		built.Input.PrivateCall.Context.ConversationID != conversationID {
 		return nil, false, errors.New("rich-presence private settings generation changed")
 	}
-	recipients, err := queryBoundedSettingsRecipients(ctx, db, `
+	recipients, err := queryBoundedSettingsRecipients(ctx, dependencies.db, `
 		WITH candidates AS (
 			SELECT participant.user_id
 			FROM dm_voice_participants participant
@@ -593,7 +643,7 @@ func currentPrivateSettingsRecipients(
 	if err != nil {
 		return nil, false, err
 	}
-	stillActive, err := store.IsActiveGeneration(
+	stillActive, err := dependencies.store.IsActiveGeneration(
 		ctx, userID, CategoryPrivateCall, state.SourceToken, state.SourceVersion,
 	)
 	if err != nil {
@@ -608,6 +658,7 @@ func currentPrivateSettingsRecipients(
 func settingsRecipientsWithoutState(
 	category Category,
 	priorEligible bool,
+	allowAbsentCategory bool,
 ) (map[uuid.UUID]bool, bool, error) {
 	switch category {
 	case CategoryServerVoice, CategoryPrivateCall:
@@ -615,6 +666,9 @@ func settingsRecipientsWithoutState(
 		return nil, false, ErrInvalidActivityState
 	}
 	if !priorEligible {
+		return nil, false, nil
+	}
+	if allowAbsentCategory {
 		return nil, false, nil
 	}
 	return nil, false, fmt.Errorf(
@@ -780,9 +834,7 @@ func (s *ActivityService) suppressHiddenSenderActivityAlreadyGated(
 	// Resolve the audience BEFORE deleting: the resolver reconstructs each
 	// category's scope from the stored generation, so deleting first would erase
 	// the evidence it needs.
-	recipients, resolveErr := s.settingsRecipients(
-		ctx, userID, hiddenSenderWidestPriorSettings, hiddenSenderSuppressedSettings,
-	)
+	recipients, resolveErr := s.hiddenSenderRecipients(ctx, userID)
 
 	if resolveErr != nil {
 		// A resolver failure must NOT delete anything. The stored generation is
@@ -883,31 +935,35 @@ func (s *ActivityService) hasPublishedActivity(
 func (s *ActivityService) deliverHiddenSenderClears(
 	ctx context.Context,
 	userID uuid.UUID,
-	recipients map[uuid.UUID]bool,
+	recipients activitySettingsRecipients,
 ) error {
-	if len(recipients) == 0 {
-		return nil
-	}
 	// The sender is never its own recipient for this purpose; self-view is a
 	// separate product decision (spec 7.1).
-	delete(recipients, userID)
-	if len(recipients) == 0 {
+	recipients = recipients.without(userID)
+	if len(recipients.union()) == 0 {
 		return nil
 	}
 
 	var errs []error
-	for _, category := range []Category{CategoryServerVoice, CategoryPrivateCall} {
-		plan := DeliveryPlan{
-			SenderID:        userID,
-			Category:        category,
-			ClearRecipients: recipients,
-		}
+	for _, plan := range hiddenSenderClearPlans(userID, recipients) {
 		if err := s.delivery.DeliverRichPresence(ctx, plan); err != nil {
 			errs = append(errs,
 				wrapActivityError("deliver hidden-sender activity clear", err),
-				s.disconnectKnown(ctx, recipients),
+				s.disconnectKnown(ctx, plan.ClearRecipients),
 			)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func hiddenSenderClearPlans(userID uuid.UUID, recipients activitySettingsRecipients) []DeliveryPlan {
+	plans := make([]DeliveryPlan, 0, 2)
+	for _, category := range []Category{CategoryServerVoice, CategoryPrivateCall} {
+		if audience := recipients[category]; len(audience) > 0 {
+			plans = append(plans, DeliveryPlan{
+				SenderID: userID, Category: category, ClearRecipients: audience,
+			})
+		}
+	}
+	return plans
 }

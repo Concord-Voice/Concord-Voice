@@ -132,6 +132,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		Send:                        make(chan []byte, 256),
 		Channels:                    make(map[uuid.UUID]bool),
 		activityRichPresenceCapable: activityRichPresenceCapable,
+		privacyClearThenCloseWake:   make(chan struct{}, 1),
 	}
 
 	// Register client with hub. This channel is UNBUFFERED (hub.go:322) and that is

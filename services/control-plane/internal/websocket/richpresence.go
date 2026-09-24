@@ -94,6 +94,80 @@ func (h *Hub) DeliverRichPresence(ctx context.Context, plan presence.DeliveryPla
 	return nil
 }
 
+// DeliverRichPresenceClearsThenDisconnect sends committed revocation clears
+// through the writer before closing each affected client for its fresh
+// snapshot. It is intentionally separate from DisconnectRichPresenceClients:
+// ordinary revocations must close immediately so queued pre-revocation frames
+// cannot reach the client.
+func (h *Hub) DeliverRichPresenceClearsThenDisconnect(
+	ctx context.Context,
+	plans []presence.DeliveryPlan,
+	recipients map[uuid.UUID]bool,
+) error {
+	frames, err := h.clearThenDisconnectFrames(plans)
+	if err != nil {
+		return err
+	}
+
+	// This remains the committed-revocation observation point for the audience
+	// fence even though the settings path owns its socket close ordering.
+	h.InvalidatePresenceAudiences()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var deliveryErr error
+	for userID, included := range recipients {
+		if !included {
+			continue
+		}
+		deliveryErr = errors.Join(deliveryErr, h.deliverClearsThenDisconnectUser(userID, frames, plans))
+	}
+	return errors.Join(deliveryErr, ctx.Err())
+}
+
+func (h *Hub) clearThenDisconnectFrames(plans []presence.DeliveryPlan) ([][]byte, error) {
+	frames := make([][]byte, len(plans))
+	for index, plan := range plans {
+		if err := validateRichPresenceDeliveryPlan(plan); err != nil {
+			return nil, err
+		}
+		if privacyCriticalRecipientCount(plan.ClearRecipients) == 0 ||
+			privacyCriticalRecipientCount(plan.UpdateRecipients) != 0 {
+			return nil, fmt.Errorf("%w: clear-then-disconnect delivery requires clear-only plans", ErrRichPresenceDeliveryPlan)
+		}
+		data, err := h.marshalRichPresenceDeliveryFrame(plan.SenderID, plan.Category, false, nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		frames[index] = data
+	}
+	return frames, nil
+}
+
+func (h *Hub) deliverClearsThenDisconnectUser(
+	userID uuid.UUID,
+	frames [][]byte,
+	plans []presence.DeliveryPlan,
+) error {
+	userFrames := make([][]byte, 0, len(frames))
+	for index, plan := range plans {
+		if plan.ClearRecipients[userID] {
+			userFrames = append(userFrames, frames[index])
+		}
+	}
+	var deliveryErr error
+	for clientID := range h.userClients[userID] {
+		client, connected := h.clients[clientID]
+		if !connected {
+			continue
+		}
+		if activityRichPresenceClient(client) && client.schedulePrivacyClearsThenClose(userFrames) {
+			continue
+		}
+		deliveryErr = errors.Join(deliveryErr, h.disconnectPrivacyCriticalClient(client))
+	}
+	return deliveryErr
+}
+
 func activityRichPresenceClient(client *Client) bool {
 	return client != nil && client.activityRichPresenceCapable
 }

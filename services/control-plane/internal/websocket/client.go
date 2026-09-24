@@ -159,8 +159,17 @@ type Client struct {
 	// locks acquires sendMu before bootstrapMu. The reconnect replacement
 	// holds it across its full multi-frame flush so unrelated events cannot
 	// consume reserved capacity or interleave between snapshot/replay/live.
-	sendMu     sync.Mutex
-	sendClosed bool
+	sendMu                sync.Mutex
+	sendClosed            bool
+	outboundWriteInFlight bool // Guarded by sendMu.
+	// privacyClearThenClose is a terminal settings-revocation path. The writer
+	// owns the socket, so it sends these clear frames ahead of queued ordinary
+	// frames and then closes. This prevents a direct Conn.Close from dropping a
+	// successful clear before the browser can remove its stale projection.
+	privacyClearThenCloseMu        sync.Mutex
+	privacyClearThenClose          [][]byte
+	privacyClearThenCloseScheduled bool
+	privacyClearThenCloseWake      chan struct{}
 
 	// Channels the user is subscribed to
 	Channels map[uuid.UUID]bool
@@ -468,8 +477,31 @@ func (c *Client) closeOutbound() {
 // cancellation and close cleanup after it unpublishes the client.
 func (c *Client) forceRevoke(data []byte) {
 	c.cancelBootstrap()
-	c.sendMu.Lock()
+	// A pending privacy clear deliberately owns sendClosed while its writer drains
+	// the ordered terminal frames. Auth/session revocation supersedes that
+	// best-effort ordering: close the transport now, otherwise both this method
+	// and handleUnregister's closeOutbound return without reaching the socket.
+	if c.privacyClearThenClosePending() {
+		c.closeRevokedConnection()
+		return
+	}
+	// An in-flight writer may be sending a clear or an ordinary frame. A forced
+	// auth/session revocation cannot wait for its write deadline.
+	if !c.sendMu.TryLock() {
+		c.closeRevokedConnection()
+		return
+	}
 	defer c.sendMu.Unlock()
+	// schedulePrivacyClearsThenClose can win after the first check and before
+	// TryLock. Recheck while serializing producers so that state also closes now.
+	if c.privacyClearThenClosePending() {
+		c.closeRevokedConnection()
+		return
+	}
+	if c.outboundWriteInFlight {
+		c.closeRevokedConnection()
+		return
+	}
 	if c.sendClosed || c.Send == nil {
 		return
 	}
@@ -481,6 +513,58 @@ func (c *Client) forceRevoke(data []byte) {
 	}
 	c.sendClosed = true
 	close(c.Send)
+}
+
+func (c *Client) closeRevokedConnection() {
+	if c.Conn == nil {
+		return
+	}
+	if err := c.Conn.Close(); err != nil && !alreadyDisconnected(err) {
+		log.Printf("Failed to close revoked WebSocket: %s", describeSocketFailure(err))
+	}
+}
+
+// schedulePrivacyClearsThenClose terminates a settings-revoked connection on
+// the writer goroutine. Queued ordinary frames must not flush first: they may
+// contain the projection the committed policy change just revoked. If an
+// ordinary frame already owns the writer, the caller closes the socket
+// immediately: waiting for its write deadline would hold the Hub read lock
+// while a stale projection remains in flight.
+func (c *Client) schedulePrivacyClearsThenClose(frames [][]byte) bool {
+	if c == nil || c.Conn == nil || c.privacyClearThenCloseWake == nil {
+		return false
+	}
+	c.cancelBootstrap()
+	if !c.sendMu.TryLock() {
+		return false
+	}
+	defer c.sendMu.Unlock()
+	if c.outboundWriteInFlight {
+		return false
+	}
+	c.privacyClearThenCloseMu.Lock()
+	defer c.privacyClearThenCloseMu.Unlock()
+	if c.privacyClearThenCloseScheduled {
+		// The writer may already have copied the first clear batch. A second
+		// revocation cannot be appended without racing that write, so terminate
+		// rather than leave its projection visible until the write deadline.
+		c.closeRevokedConnection()
+		return true
+	}
+	if c.sendClosed || c.Send == nil {
+		return false
+	}
+	c.privacyClearThenClose = make([][]byte, len(frames))
+	for index, frame := range frames {
+		c.privacyClearThenClose[index] = append([]byte(nil), frame...)
+	}
+	c.privacyClearThenCloseScheduled = true
+	c.sendClosed = true
+	select {
+	case c.privacyClearThenCloseWake <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 // rateLimitAllow checks the token bucket and returns true if the message is allowed.
@@ -598,59 +682,109 @@ func (c *Client) writePump() {
 	}()
 
 	for {
+		if c.writePrivacyClearsThenClose() {
+			return
+		}
 		select {
-		case message, ok := <-c.Send:
-			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// Hub closed the channel. The close frame below carries an EMPTY
-				// payload, i.e. no status code, which a browser surfaces as 1006
-				// "reason: none" -- indistinguishable from a dead TCP connection.
-				// Log it so a deliberate server-side close can be told apart from
-				// a network failure without attaching a debugger.
-				log.Print("WebSocket closed: hub closed the send channel")
-				_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+		case <-c.privacyClearThenCloseWake:
+			if c.writePrivacyClearsThenClose() {
 				return
 			}
 
-			// Send each message as its own WebSocket frame to ensure valid JSON
-			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+		case message, ok := <-c.Send:
+			if c.writePumpMessage(message, ok) {
 				return
 			}
 			wroteSinceLastTick = true
 
 		case <-ticker.C:
-			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if c.writePumpTick(wroteSinceLastTick) {
 				return
-			}
-
-			// Unsolicited transport keepalive.
-			//
-			// The protocol PING above keeps the ORIGIN leg alive; it does not keep
-			// the Cloudflare EDGE leg alive, because CF does not reliably count
-			// control frames against its ~100s idle tracking (see heartbeatAckFrame
-			// in messages.go for the incident). Before this, the only origin->client
-			// application traffic on an idle socket was the ECHO of a client
-			// heartbeat -- which rides a renderer timer Electron is free to throttle
-			// or suspend. The server now owns the transport deadline outright.
-			//
-			// This MUST NOT refresh the presence TTL. It is origin->client and
-			// proves nothing about whether the renderer is alive; wiring it to
-			// presence would be socket-open-as-presence, which this design rejected
-			// because Chromium's network service answers pings without renderer JS,
-			// so a wedged client would read as online indefinitely.
-			//
-			// The solicited echo (hub.handlePresenceIncoming) is UNCHANGED and must
-			// stay: this is an addition, never a replacement.
-			if !wroteSinceLastTick {
-				_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-				if err := c.Conn.WriteMessage(websocket.TextMessage, heartbeatAckFrame); err != nil {
-					return
-				}
 			}
 			wroteSinceLastTick = false
 		}
 	}
+}
+
+func (c *Client) writePumpMessage(message []byte, ok bool) bool {
+	if !c.claimOutboundWrite() {
+		return c.writePrivacyClearsThenClose()
+	}
+	defer c.releaseOutboundWrite()
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if !ok {
+		// Hub closed the channel. The empty close payload surfaces in browsers as
+		// 1006, so retain this fixed server-side diagnostic.
+		log.Print("WebSocket closed: hub closed the send channel")
+		_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+		return true
+	}
+	return c.Conn.WriteMessage(websocket.TextMessage, message) != nil
+}
+
+func (c *Client) writePumpTick(wroteSinceLastTick bool) bool {
+	if !c.claimOutboundWrite() {
+		return c.writePrivacyClearsThenClose()
+	}
+	defer c.releaseOutboundWrite()
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if c.Conn.WriteMessage(websocket.PingMessage, nil) != nil {
+		return true
+	}
+	if wroteSinceLastTick {
+		return false
+	}
+	// The application frame keeps Cloudflare's edge leg alive without treating
+	// an origin-to-client write as user presence.
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	return c.Conn.WriteMessage(websocket.TextMessage, heartbeatAckFrame) != nil
+}
+
+// claimOutboundWrite makes the scheduler's sendMu arbitration cover the gap
+// between dequeuing a frame and completing its socket write without making Hub
+// producers wait for that network I/O.
+func (c *Client) claimOutboundWrite() bool {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.privacyClearThenClosePending() {
+		return false
+	}
+	c.outboundWriteInFlight = true
+	return true
+}
+
+func (c *Client) releaseOutboundWrite() {
+	c.sendMu.Lock()
+	c.outboundWriteInFlight = false
+	c.sendMu.Unlock()
+}
+
+func (c *Client) privacyClearThenClosePending() bool {
+	if c == nil {
+		return false
+	}
+	c.privacyClearThenCloseMu.Lock()
+	defer c.privacyClearThenCloseMu.Unlock()
+	return c.privacyClearThenCloseScheduled
+}
+
+func (c *Client) writePrivacyClearsThenClose() bool {
+	c.privacyClearThenCloseMu.Lock()
+	if !c.privacyClearThenCloseScheduled {
+		c.privacyClearThenCloseMu.Unlock()
+		return false
+	}
+	frames := append([][]byte(nil), c.privacyClearThenClose...)
+	c.privacyClearThenCloseMu.Unlock()
+	for _, frame := range frames {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := c.Conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+			return true
+		}
+	}
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+	return true
 }
 
 // describeSocketFailure renders a socket death in a fixed shape that contains no

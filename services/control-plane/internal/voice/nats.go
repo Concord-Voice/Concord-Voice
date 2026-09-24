@@ -1031,6 +1031,7 @@ type privateVoiceLifecycleClaimsResult struct {
 
 type privateVoiceParticipantUpsertResult struct {
 	reconnectParticipantIDs []uuid.UUID
+	requiresFullReconnect   bool
 	oldScopeRevisions       []privateVoiceOldScopeRevision
 	oldScopeBaseDeltas      []privateVoiceScopeBaseDelta
 }
@@ -2339,22 +2340,22 @@ type privateVoiceParticipantUpsertRequest struct {
 }
 
 type privateVoiceParticipantUpsertState struct {
-	request                  privateVoiceParticipantUpsertRequest
-	scopeMemberships         []privateVoiceScopeMembership
-	existingRecords          []voiceParticipantRecord
-	existingParticipantIDs   []uuid.UUID
-	oldScopePost             map[uuid.UUID][]uuid.UUID
-	oldScopeStale            map[uuid.UUID][]uuid.UUID
-	oldScopeCallIDs          map[uuid.UUID]uuid.UUID
-	oldScopeMoved            map[uuid.UUID]map[uuid.UUID]bool
-	seenOldScopes            map[uuid.UUID]bool
-	oldScopeRevisions        []privateVoiceOldScopeRevision
-	reconnectUnknownOldScope bool
-	postParticipantIDs       []uuid.UUID
-	postParticipantSet       map[uuid.UUID]bool
-	staleParticipantIDs      []uuid.UUID
-	claimStatus              voiceLifecycleClaimStatus
-	rowsAffected             int64
+	request                privateVoiceParticipantUpsertRequest
+	scopeMemberships       []privateVoiceScopeMembership
+	existingRecords        []voiceParticipantRecord
+	existingParticipantIDs []uuid.UUID
+	oldScopePost           map[uuid.UUID][]uuid.UUID
+	oldScopeStale          map[uuid.UUID][]uuid.UUID
+	oldScopeCallIDs        map[uuid.UUID]uuid.UUID
+	oldScopeMoved          map[uuid.UUID]map[uuid.UUID]bool
+	seenOldScopes          map[uuid.UUID]bool
+	oldScopeRevisions      []privateVoiceOldScopeRevision
+	unknownOldScopeIDs     []uuid.UUID
+	postParticipantIDs     []uuid.UUID
+	postParticipantSet     map[uuid.UUID]bool
+	staleParticipantIDs    []uuid.UUID
+	claimStatus            voiceLifecycleClaimStatus
+	rowsAffected           int64
 }
 
 func (s *NATSSubscriber) upsertPrivateVoiceParticipant(
@@ -2407,6 +2408,7 @@ func (s *NATSSubscriber) upsertPrivateVoiceParticipant(
 	}
 	return state.rowsAffected == 1, &privateVoiceParticipantUpsertResult{
 		reconnectParticipantIDs: state.staleParticipantIDs,
+		requiresFullReconnect:   len(state.unknownOldScopeIDs) > 0,
 		oldScopeRevisions:       state.oldScopeRevisions,
 		oldScopeBaseDeltas:      privateVoiceMovedScopeBaseDeltas(state.oldScopeMoved),
 	}, nil
@@ -2532,7 +2534,7 @@ func (s *NATSSubscriber) preparePrivateVoiceParticipantUpsertOldScope(
 	}
 	if !found || lease.CallID == uuid.Nil {
 		state.oldScopePost[conversationID] = nil
-		state.reconnectUnknownOldScope = true
+		state.unknownOldScopeIDs = append(state.unknownOldScopeIDs, participantIDs...)
 		return participantIDs, false, nil
 	}
 	state.oldScopeCallIDs[conversationID] = lease.CallID
@@ -2686,11 +2688,9 @@ func (s *NATSSubscriber) applyPrivateVoiceParticipantUpsert(
 	if err := deletePrivateVoiceParticipantOtherScopes(ctx, tx, state); err != nil {
 		return err
 	}
-	if state.reconnectUnknownOldScope {
-		state.staleParticipantIDs = append(
-			state.staleParticipantIDs, state.request.senderID,
-		)
-	}
+	state.staleParticipantIDs = append(
+		state.staleParticipantIDs, state.unknownOldScopeIDs...,
+	)
 	deletedOldScope, err := deletePrivateVoiceParticipantOldScopeStale(ctx, tx, state)
 	if err != nil {
 		return err
@@ -4910,6 +4910,7 @@ type privateVoiceJoinMutation struct {
 	durablyApplied          bool
 	baseBroadcasted         bool
 	reconnectParticipantIDs []uuid.UUID
+	requiresFullReconnect   bool
 	oldScopeRevisions       []privateVoiceOldScopeRevision
 	oldScopeBaseDeltas      []privateVoiceScopeBaseDelta
 }
@@ -4923,6 +4924,7 @@ func (mutation *privateVoiceJoinMutation) apply(ctx context.Context) (bool, erro
 		mutation.reconnectParticipantIDs = append(
 			mutation.reconnectParticipantIDs[:0], result.reconnectParticipantIDs...,
 		)
+		mutation.requiresFullReconnect = result.requiresFullReconnect
 		mutation.oldScopeRevisions = result.oldScopeRevisions
 		mutation.oldScopeBaseDeltas = result.oldScopeBaseDeltas
 	}
@@ -5085,7 +5087,7 @@ func (s *NATSSubscriber) finishPrivateVoiceJoin(
 		s.disconnectAllRichPresenceClients()
 		return false
 	}
-	if len(mutation.reconnectParticipantIDs) > 0 {
+	if mutation.requiresFullReconnect || len(mutation.reconnectParticipantIDs) > 0 {
 		s.disconnectAllRichPresenceClients()
 	}
 	s.refreshPrivateVoicePeers(

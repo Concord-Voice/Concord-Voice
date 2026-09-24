@@ -4,6 +4,10 @@ const E2E_API_PORT = process.env.E2E_API_PORT ?? process.env.VITE_API_PORT ?? '8
 const E2E_UI_PORT = Number(process.env.E2E_UI_PORT ?? '3001');
 const E2E_UI_BASE = `http://localhost:${E2E_UI_PORT}`;
 const E2E_BROWSER_EXECUTABLE = process.env.E2E_BROWSER_EXECUTABLE;
+const browserLaunchOptions = {
+  args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'],
+  ...(E2E_BROWSER_EXECUTABLE ? { executablePath: E2E_BROWSER_EXECUTABLE } : {}),
+};
 
 /**
  * Playwright E2E test configuration for Concord Voice Desktop.
@@ -28,7 +32,7 @@ export default defineConfig({
 
   use: {
     baseURL: E2E_UI_BASE,
-    launchOptions: E2E_BROWSER_EXECUTABLE ? { executablePath: E2E_BROWSER_EXECUTABLE } : undefined,
+    launchOptions: browserLaunchOptions,
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },

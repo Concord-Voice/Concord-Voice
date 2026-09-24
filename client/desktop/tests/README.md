@@ -108,12 +108,12 @@ Tests run in GitHub Actions via `.github/workflows/build.yml`, invoked via `work
 
 ### E2E (Playwright)
 
-The 10 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e`. #1435 removed CI enforcement, because the signal was advisory-only and macOS visual baselines were flaky. See the historical playwright ADR-0011.
+The 12 e2e specs in `tests/e2e/` run **manually** via `npm run test:e2e`. #1435 removed CI enforcement, because the signal was advisory-only and macOS visual baselines were flaky. See the historical playwright ADR-0011.
 
 No Playwright CI job exists for the desktop client — that change deleted `playwright.yml`, so nothing below runs on a PR. The only Playwright in CI is the Admin Portal's own browser-test step in `build.yml` (`.github/workflows/build.yml:717-723`). The tags below still help a local run:
 
-- **Renderer-only specs** (`visual-regression`, `design-tokens`, `bundled-fallback-login`) — tagged with `{ tag: '@renderer-only' }`. Need only the Vite dev server.
-- **Full-stack specs** (`auth`, `channels`, `invites`, `messaging`, `servers`) — untagged (default). Need a running backend (Postgres + Redis + control-plane).
+- **Renderer-only specs** (`visual-regression`, `design-tokens`, `bundled-fallback-login`, `auth-wordmark`) — tagged with `{ tag: '@renderer-only' }`. Need only the Vite dev server.
+- **Full-stack specs** (`auth`, `channels`, `invites`, `messaging`, `servers`, `rich-presence`, `activity-history`, `rich-presence-overrides`) — untagged (default). Need a running backend (Postgres + Redis + control-plane).
 
 The committed visual baselines are Mac-captured (`*-chromium-darwin.png` in `tests/e2e/visual-regression.spec.ts-snapshots/`). `visual-regression.spec.ts` therefore only produces meaningful diffs on macOS.
 
@@ -127,12 +127,31 @@ npx playwright test --grep @renderer-only
 To run e2e locally (all specs, requires backend running at `http://localhost:8080`):
 
 ```bash
-# In a separate shell, start the backend stack
-./scripts/concord-dev.sh up
+# In separate shells, start an isolated test stack: migrated PostgreSQL,
+# authenticated Redis on a non-default database, NATS, and media-plane.
+# Export that stack's DATABASE_URL, REDIS_URL, and NATS_URL in the control-plane shell.
+# Do not point this suite at a shared dev stack.
+cd services/control-plane
+: "${DATABASE_URL:?set isolated PostgreSQL URL}"
+: "${REDIS_URL:?set isolated Redis database URL}"
+: "${NATS_URL:?set isolated NATS URL}"
+CONCORD_ENV=test go run ./cmd/server
+```
 
-# Then run e2e
+In another shell, from the repository root, set `REDIS_URL` to the exact same isolated
+Redis URL and database used by the control-plane, then run the browser tests:
+
+```bash
 cd client/desktop
-npx playwright test
+REDIS_URL="${REDIS_URL:?set the control-plane's isolated Redis URL}" npx playwright test
+```
+
+To run only the Rich Presence acceptance spec, add the isolated stack's ports:
+
+```bash
+REDIS_URL="${REDIS_URL:?set the control-plane's isolated Redis URL}" \
+  E2E_API_PORT=8080 E2E_UI_PORT=3001 \
+  npm run test:e2e -- tests/e2e/rich-presence.spec.ts
 ```
 
 Pre-commit hooks (`./scripts/install-git-hooks.sh`) run local linting and type-checking before push.

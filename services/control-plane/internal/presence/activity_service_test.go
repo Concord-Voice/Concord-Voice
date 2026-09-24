@@ -54,6 +54,57 @@ func TestActivityService_ClearAuthorizesOldStateBeforeMutation(t *testing.T) {
 	assert.Empty(t, delivery.plans[0].UpdateRecipients)
 }
 
+func TestActivityService_ClearUsesWriterOrderedReconnect(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	ordered := &activityServiceClearThenDisconnectStub{activityServiceDeliveryStub: delivery}
+	service.delivery = ordered
+
+	require.NoError(t, service.ClearServerVoice(
+		context.Background(), activityServiceSender, serverActivityScope(),
+		func(context.Context) (bool, error) { return true, nil },
+	))
+	require.Len(t, ordered.clearThenDisconnectPlans, 1)
+	assert.Equal(t, map[uuid.UUID]bool{activityServiceViewer: true}, ordered.clearThenDisconnectPlans[0].ClearRecipients)
+	assert.Empty(t, delivery.plans)
+}
+
+func TestActivityService_ClearOrderedReconnectFailureDisconnectsAudience(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	orderedErr := errors.New("forced ordered reconnect failure")
+	ordered := &activityServiceClearThenDisconnectStub{
+		activityServiceDeliveryStub: delivery,
+		clearThenDisconnectErr:      orderedErr,
+	}
+	service.delivery = ordered
+	disconnectErr := errors.New("forced ordered reconnect fallback failure")
+	delivery.disconnectErr = disconnectErr
+
+	err := service.ClearServerVoice(
+		context.Background(), activityServiceSender, serverActivityScope(),
+		func(context.Context) (bool, error) { return true, nil },
+	)
+
+	assert.ErrorIs(t, err, orderedErr)
+	assert.ErrorIs(t, err, disconnectErr)
+	assert.Equal(t, []map[uuid.UUID]bool{{activityServiceViewer: true}}, delivery.disconnects)
+}
+
+func TestActivityService_ClearWithNoAudienceSkipsDelivery(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	ordered := &activityServiceClearThenDisconnectStub{activityServiceDeliveryStub: delivery}
+	service.delivery = ordered
+	service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+		return Decision{Payload: json.RawMessage(`{"server_id":"visible"}`)}, nil
+	}
+
+	require.NoError(t, service.ClearServerVoice(
+		context.Background(), activityServiceSender, serverActivityScope(),
+		func(context.Context) (bool, error) { return true, nil },
+	))
+	assert.Empty(t, ordered.clearThenDisconnectPlans)
+	assert.Empty(t, delivery.plans)
+}
+
 func TestActivityService_RefreshBuildsPostMutationAndPersistsOnlyPolicyDecision(t *testing.T) {
 	service, builder, store, delivery, coordinator := newActivityServiceFixture(CategoryServerVoice)
 	var events []string
@@ -846,6 +897,86 @@ func TestActivityService_HiddenSenderClearDoesNotDisconnectAll(t *testing.T) {
 	assert.Empty(t, delivery.plans)
 }
 
+// A sender may become offline before its terminal Server Voice mutation runs.
+// The clear must resolve the existing generation's audience first: the resolver
+// validates that the matching voice lifecycle is still active, which a terminal
+// mutation deliberately makes false. Once the mutation commits, the clear is
+// delivered only after the exact Redis generation delete.
+func TestActivityService_HiddenSenderClearResolvesAudienceBeforeTerminalMutation(t *testing.T) {
+	service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+		return Decision{
+			Audience:                   map[uuid.UUID]bool{},
+			SuppressedBySenderPresence: true,
+		}, nil
+	}
+
+	var events []string
+	terminalMutationApplied := false
+	service.settingsRecipients = func(
+		context.Context, uuid.UUID, ActivityPolicySettings, ActivityPolicySettings,
+	) (activitySettingsRecipients, error) {
+		events = append(events, "resolve")
+		if terminalMutationApplied {
+			return nil, errors.New("terminal lifecycle erased activity audience evidence")
+		}
+		return activitySettingsRecipients{
+			CategoryServerVoice: {activityServiceViewer: true},
+		}, nil
+	}
+	store.onDelete = func() {
+		events = append(events, "delete")
+		assert.True(t, terminalMutationApplied, "the exact delete follows the terminal mutation")
+	}
+	delivery.onDeliver = func() {
+		events = append(events, "deliver")
+		assert.True(t, terminalMutationApplied, "the clear is delivered after the mutation commits")
+	}
+
+	err := service.ClearServerVoice(
+		context.Background(), activityServiceSender, serverActivityScope(),
+		func(context.Context) (bool, error) {
+			events = append(events, "mutate")
+			terminalMutationApplied = true
+			return true, nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"resolve", "mutate", "delete", "deliver"}, events)
+	assert.Zero(t, delivery.disconnectAllCalls)
+	assert.Equal(t,
+		[]DeliveryPlan{
+			{
+				SenderID: activityServiceSender, Category: CategoryServerVoice,
+				ClearRecipients: map[uuid.UUID]bool{activityServiceViewer: true},
+			},
+		},
+		delivery.plans,
+	)
+}
+
+func TestActivityService_HiddenSenderTerminalClearUsesWriterOrderedReconnect(t *testing.T) {
+	service, _, _, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
+	service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+		return Decision{SuppressedBySenderPresence: true}, nil
+	}
+	ordered := &activityServiceClearThenDisconnectStub{activityServiceDeliveryStub: delivery}
+	service.delivery = ordered
+
+	require.NoError(t, service.ClearServerVoice(
+		context.Background(), activityServiceSender, serverActivityScope(),
+		func(context.Context) (bool, error) { return true, nil },
+	))
+	assert.Equal(t, []DeliveryPlan{
+		{
+			SenderID: activityServiceSender, Category: CategoryServerVoice,
+			ClearRecipients: map[uuid.UUID]bool{activityServiceViewer: true},
+		},
+	}, ordered.clearThenDisconnectPlans)
+	assert.Empty(t, delivery.plans)
+}
+
 func TestActivityService_SuppressionClassifiesMissingGeneration(t *testing.T) {
 	newSuppressedFixture := func() (*ActivityService, *activityServiceStoreStub, *activityServiceDeliveryStub) {
 		service, _, store, delivery, _ := newActivityServiceFixture(CategoryServerVoice)
@@ -915,6 +1046,78 @@ func TestActivityService_SuppressionClassifiesMissingGeneration(t *testing.T) {
 		require.ErrorContains(t, err, "not a successor")
 		assert.Len(t, store.gets, 1)
 		assert.Equal(t, 1, delivery.disconnectAllCalls)
+	})
+}
+
+func TestActivityService_OneMemberPrivateCallSuppressesOnlyConfirmedAbsence(t *testing.T) {
+	newOneMemberFixture := func() (*ActivityService, *activityServiceBuilderStub, *activityServiceStoreStub, *activityServiceDeliveryStub) {
+		service, builder, store, delivery, _ := newActivityServiceFixture(CategoryPrivateCall)
+		builder.built.Input.PrivateCall.Context.ParticipantIDs = []uuid.UUID{activityServiceSender}
+		service.authorize = func(context.Context, PolicyInput) (Decision, error) {
+			return Decision{Audience: map[uuid.UUID]bool{}}, nil
+		}
+		store.deleteResult = false
+		return service, builder, store, delivery
+	}
+
+	t.Run("missing generation has no audience to disconnect", func(t *testing.T) {
+		service, _, store, delivery := newOneMemberFixture()
+
+		err := service.RefreshPrivateCall(
+			context.Background(), activityServiceSender, privateActivityScope(), nil, nil,
+		)
+
+		require.NoError(t, err)
+		assert.Len(t, store.deletes, 1)
+		assert.Len(t, store.gets, 1)
+		assert.Zero(t, delivery.disconnectAllCalls)
+		assert.Empty(t, delivery.plans)
+	})
+
+	t.Run("missing generation disconnects stale recheck viewers", func(t *testing.T) {
+		service, _, store, delivery := newOneMemberFixture()
+
+		err := service.RefreshPrivateCall(
+			context.Background(), activityServiceSender, privateActivityScope(),
+			map[uuid.UUID]bool{activityServiceViewer: true}, nil,
+		)
+
+		require.NoError(t, err)
+		assert.Len(t, store.gets, 1)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+		assert.Empty(t, delivery.plans)
+	})
+
+	t.Run("stored generation still fails closed", func(t *testing.T) {
+		service, _, store, delivery := newOneMemberFixture()
+		store.getFound = true
+		store.getState = ActivityState{
+			SourceToken: uuid.New(), SourceVersion: privateActivityScope().EventAt.Add(time.Second).UnixMicro(),
+			Payload: json.RawMessage(`{"call_type":"dm"}`), UpdatedAt: time.Now().Unix(),
+		}
+
+		err := service.RefreshPrivateCall(
+			context.Background(), activityServiceSender, privateActivityScope(), nil, nil,
+		)
+
+		require.NoError(t, err)
+		assert.Len(t, store.gets, 1)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+		assert.Empty(t, delivery.plans)
+	})
+
+	t.Run("unreadable state still fails closed", func(t *testing.T) {
+		service, _, store, delivery := newOneMemberFixture()
+		inspectErr := errors.New("forced one-member activity inspection failure")
+		store.getErr = inspectErr
+
+		err := service.RefreshPrivateCall(
+			context.Background(), activityServiceSender, privateActivityScope(), nil, nil,
+		)
+
+		require.ErrorIs(t, err, inspectErr)
+		assert.Equal(t, 1, delivery.disconnectAllCalls)
+		assert.Empty(t, delivery.plans)
 	})
 }
 
@@ -1266,10 +1469,16 @@ func newActivityServiceFixture(category Category) (
 		uuid.UUID,
 		ActivityPolicySettings,
 		ActivityPolicySettings,
-	) (map[uuid.UUID]bool, error) {
-		return map[uuid.UUID]bool{
-			activityServiceSender: true,
-			activityServiceViewer: true,
+	) (activitySettingsRecipients, error) {
+		return activitySettingsRecipients{
+			CategoryServerVoice: {
+				activityServiceSender: true,
+				activityServiceViewer: true,
+			},
+			CategoryPrivateCall: {
+				activityServiceSender: true,
+				activityServiceViewer: true,
+			},
 		}, nil
 	}
 	return service, builder, store, delivery, coordinator
@@ -1451,6 +1660,21 @@ type activityServiceDeliveryStub struct {
 	disconnectContexts         []context.Context
 	disconnectAllContextErrors []error
 	disconnectAllContexts      []context.Context
+}
+
+type activityServiceClearThenDisconnectStub struct {
+	*activityServiceDeliveryStub
+	clearThenDisconnectPlans []DeliveryPlan
+	clearThenDisconnectErr   error
+}
+
+func (d *activityServiceClearThenDisconnectStub) DeliverRichPresenceClearsThenDisconnect(
+	_ context.Context,
+	plans []DeliveryPlan,
+	_ map[uuid.UUID]bool,
+) error {
+	d.clearThenDisconnectPlans = append(d.clearThenDisconnectPlans, plans...)
+	return d.clearThenDisconnectErr
 }
 
 func (d *activityServiceDeliveryStub) DeliverRichPresence(ctx context.Context, plan DeliveryPlan) error {
