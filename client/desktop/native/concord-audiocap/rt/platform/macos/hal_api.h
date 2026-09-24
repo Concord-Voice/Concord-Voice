@@ -28,6 +28,10 @@ namespace macos {
 
 constexpr u32 kNoErr         = 0u;   // OSStatus noErr
 constexpr u32 kObjectUnknown = 0u;   // kAudioObjectUnknown
+/// processObjectList's refusal when the system holds more HAL clients than the
+/// caller's buffer. A four-char code in OSStatus style, so failStatus() reads
+/// the same way as a real Core Audio refusal.
+constexpr u32 kStatusListOverflow = 0x6F76666Cu;  // 'ovfl'
 
 struct HalApi {
   /// Delivers ONE callback's frames.
@@ -77,6 +81,27 @@ struct HalApi {
   u32 (*destroyIoProc)(u32 aggregate, void* procId) noexcept;
   u32 (*destroyAggregate)(u32 aggregate) noexcept;
   u32 (*destroyTap)(u32 tap) noexcept;
+
+  // #3394 PR 2 -- the process-tree entries. APPENDED, never interleaved:
+  // realHal() in tap_backend.mm initialises this table positionally.
+
+  /// kAudioHardwarePropertyProcessObjectList: every client process currently
+  /// connected to the HAL. A list longer than `capacity` REFUSES (non-kNoErr,
+  /// *outCount = 0); it never truncates on its own account, because a truncated
+  /// list could omit the helper that renders.
+  ///
+  /// ONE RESIDUAL THE WRAPPER CANNOT CLOSE: the size read and the data read are
+  /// two HAL calls, so a list that grew past `capacity` between them comes back
+  /// FULL -- exactly `capacity` entries, indistinguishable here from a list that
+  /// really was that long. The caller owns that ambiguity and refuses a full
+  /// buffer (TapBackend::resolveTree); this entry reports what it read.
+  u32 (*processObjectList)(u32* outObjects, u32 capacity, u32* outCount) noexcept;
+  /// kAudioProcessPropertyPID of one process object.
+  u32 (*processObjectPid)(u32 object, u32* outPid) noexcept;
+  /// proc_pidinfo(PROC_PIDTBSDINFO).pbi_ppid. false when unreadable.
+  bool (*parentPid)(u32 pid, u32* outParent) noexcept;
+  /// getppid() of this utility process, which is the Electron main process.
+  u32 (*hostRootPid)() noexcept;
 };
 
 }  // namespace macos

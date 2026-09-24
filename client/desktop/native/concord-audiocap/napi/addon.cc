@@ -1013,13 +1013,15 @@ napi_status parseTarget(napi_env env, napi_value options, rt::CaptureTarget* tar
 // drain(), adds no second threadsafe function, and cannot smuggle audio: every
 // field below is a counter or a flag.
 //
-// SAFE AFTER stop(), which is the property that makes it a post-mortem rather
-// than a monitor. It reads only atomics in static storage -- it never touches the
-// gate, the backend pointer or the threadsafe function, all three of which
-// teardown may have torn down or abandoned. ALLOCATION-FREE ON THE PRODUCER
-// SIDE: the six reads are plain atomic loads, and the only allocation is the
-// result object, which is created on the JS thread after every value has already
-// been read.
+// SAFE BOTH WHILE A CAPTURE IS RUNNING AND AFTER stop(). Since #3394 PR 2 the
+// capture child's fault watch polls this once a second for the life of a
+// running capture -- not only in the post-mortem read the child's handleStop
+// performs after stop() -- so this function DOES read g_capture.backend, live,
+// alongside the atomics in static storage; it never touches the gate or the
+// threadsafe function, either of which teardown may have closed or abandoned.
+// ALLOCATION-FREE ON THE PRODUCER SIDE: every read here is a plain atomic load
+// or a backend-getter call, and the only allocation is the result object,
+// which is created on the JS thread after every value has already been read.
 napi_value Status_JS(napi_env env, napi_callback_info /*info*/) {
   const bool             running  = g_capture.running.load(std::memory_order_acquire);
   const rt::PumpCounters counters = g_pump.counters();
@@ -1028,12 +1030,17 @@ napi_value Status_JS(napi_env env, napi_callback_info /*info*/) {
   // return value and reads the latch instead, and until PR #3262 the latch was
   // readable only from inside this file -- so the one state the design says the
   // host must respond to by KILLING THE CHILD (design section 4.3) was invisible
-  // to the host. #3198 owns the watchdog that consumes it; the signal exists now
-  // so that watchdog is wiring rather than a new native surface.
+  // to the host. It is now POSTED: the capture child's handleStop (#3198 PR 3)
+  // forwards it in its post-mortem status() read. The live fault watch (#3394
+  // PR 2) computes it on every poll too -- this call still reads it below -- but
+  // does not forward it: that watch reads only faulted/faultReason off the
+  // object this call returns. Nothing yet ACTS on a posted `poisoned`; that
+  // consumer remains unbuilt.
   //
   // It is a plain bool read on the JS thread, which is the only thread that ever
-  // writes it, so this stays the allocation-free post-mortem the doc above
-  // describes: it touches neither the gate, the backend, nor the handle.
+  // writes it, so reading it here stays allocation-free and touches neither the
+  // gate, the backend, nor the handle -- true whether this call is the live
+  // fault-watch poll or the post-mortem read.
   const bool             poisoned = g_teardown.poisoned();
 
   napi_value result = nullptr;
@@ -1049,7 +1056,10 @@ napi_value Status_JS(napi_env env, napi_callback_info /*info*/) {
   //
   // ADVISORY. It is not a fault, it does not stop a capture, and it cannot
   // distinguish denial from a user sharing a paused app -- nothing at this seam
-  // can. #3198 owns whatever consumes it.
+  // can. The capture child's post-mortem reader, handleStop (#3198 PR 3), is
+  // what consumes these two. The LIVE reader added since -- the fault watch,
+  // #3394 PR 2 -- polls this same call once a second while a capture is
+  // running but reads only faulted/faultReason off it, not these.
   NAPI_CALL(env, setUint32Prop(env, result, "signalTotal", counters.signalTotal));
   NAPI_CALL(env, setBoolProp(env, result, "silentSinceStart", counters.silentSinceStart));
   NAPI_CALL(env, setUint32Prop(env, result, "overrunTotal", overrun));
@@ -1067,10 +1077,14 @@ napi_value Status_JS(napi_env env, napi_callback_info /*info*/) {
   // destroyTapFailures is the one that matters: the destroy status used to be
   // discarded and the handle cleared on the next line, so a live OS tap on
   // another application's audio could survive a share with nothing in the
-  // process able to observe it. #3198's watchdog reads this alongside poisoned.
-  // Read live while a capture is running, from the snapshot afterwards. The
-  // snapshot is the load-bearing half: teardownStopBackend nulls the pointer,
-  // and after a share is exactly when these are asked.
+  // process able to observe it. The capture child's handleStop (#3198 PR 3)
+  // reads this alongside poisoned, as a post-mortem, once the share has ended.
+  // g_capture.backend is read LIVE here too, while a capture is running -- the
+  // fault watch (#3394 PR 2) polls this call once a second for that whole
+  // duration, though it forwards only faulted/faultReason and not this.
+  // g_backendEvidence is the snapshot for the case that matters most:
+  // teardownStopBackend nulls the live pointer, and after a share is exactly
+  // when the post-mortem read is asked.
   const rt::CaptureBackend* backend = g_capture.backend;
   const bool    proved  = backend != nullptr ? backend->quiesceProved()
                                              : g_backendEvidence.quiesceProved;

@@ -15,6 +15,7 @@
 #include <atomic>
 
 #include "../../capture_backend.h"
+#include "../../process_tree.h"
 #include "../../quantum_pump.h"
 #include "../../sink_gate.h"
 #include "hal_api.h"
@@ -25,13 +26,21 @@ namespace audiocap {
 namespace rt {
 namespace macos {
 
+/// start()'s `objects[]` is shared by the translate path (at most
+/// kMaxTargetPids entries) and the tree path (at most kMaxTreeObjects), so it is
+/// sized for the larger and this pins which one that is.
+static_assert(kMaxTreeObjects >= static_cast<u32>(kMaxTargetPids),
+              "objects[] holds either path");
+
 /// WHICH Core Audio call refused, so an operator reading status() learns more
 /// than "a Core Audio call failed". Every kDeviceError arm in start() records
 /// one of these plus the raw OSStatus: the closed BackendStart vocabulary stays
 /// closed, and the diagnostic sits beside it rather than inside it.
+///
+/// APPEND ONLY. kListProcesses (#3394 PR 2) is last so no existing value moves.
 enum class StartStage : u32 {
   kNone = 0u, kTranslatePid, kCreateTap, kTapFormat,
-  kCreateAggregate, kCreateIoProc, kStartDevice
+  kCreateAggregate, kCreateIoProc, kStartDevice, kListProcesses
 };
 
 class TapBackend final : public CaptureBackend {
@@ -99,30 +108,43 @@ class TapBackend final : public CaptureBackend {
     if (target.pidCount == 0u)                      { return BackendStart::kNoTarget; }
     if (target.pidCount > kMaxTargetPids)           { return BackendStart::kNoTarget; }
 
-    // allowDescendants is READ BY NOTHING HERE, deliberately: CATapDescription
-    // has no process-tree form, so macOS cannot honour it and the caller must
-    // resolve the full PID list itself (#3198 owns that). Named rather than
-    // silently ignored -- an option nothing reads is the silent-ignore trap
-    // targetPids was fixed for in PR 1.
-
-    // 1. PID -> process object. BOTH the status AND the object are tested:
-    //    kAudioHardwarePropertyTranslatePIDToProcessObject returns kNoErr while
-    //    yielding kObjectUnknown for a pid with no audio object -- measured --
-    //    and checking only the status hands that straight to CATapDescription
-    //    as though it were a resolved target.
+    // 1. The process objects the tap will name. TWO PATHS, chosen by
+    //    allowDescendants, and they share nothing but the output buffer.
     //
-    //    The two arms are DIFFERENT IN KIND and no longer share a reason: a
-    //    non-kNoErr status is the HAL refusing to answer, which is a device
-    //    error; kObjectUnknown is the normal, explicable "this app has never
-    //    played a sound". Collapsing them made a support ticket and a user's
-    //    own choice of window indistinguishable at the seam.
-    u32 objects[kMaxTargetPids];
-    for (u8 i = 0u; i < target.pidCount; ++i) {
-      u32 obj = kObjectUnknown;
-      const u32 st = hal_.translatePidToProcessObject(target.pids[i], &obj);
-      if (st != kNoErr) { return fail(StartStage::kTranslatePid, st); }
-      if (obj == kObjectUnknown) { return BackendStart::kNoTarget; }
-      objects[i] = obj;
+    //    allowDescendants: CATapDescription has no process-tree form, so this
+    //    backend EXPANDS the one owner itself (#3394 PR 2 §3) -- enumerate the
+    //    HAL's process objects, keep those whose pid descends from the owner and
+    //    lies outside Concord's own subtree (rt/process_tree.h holds that rule),
+    //    and refuse rather than subset. resolveTree() never calls
+    //    translatePidToProcessObject: an owner with no object of its own is the
+    //    normal case there (E1: only a helper renders), not a refusal.
+    //
+    //    Otherwise: the caller's list, translated pid by pid, below.
+    u32 objects[kMaxTreeObjects];
+    u32 objectCount = 0u;
+    if (target.allowDescendants) {
+      const BackendStart resolved = resolveTree(target, objects, &objectCount);
+      if (resolved != BackendStart::kOk) { return resolved; }
+    } else {
+      // PID -> process object. BOTH the status AND the object are tested:
+      // kAudioHardwarePropertyTranslatePIDToProcessObject returns kNoErr while
+      // yielding kObjectUnknown for a pid with no audio object -- measured --
+      // and checking only the status hands that straight to CATapDescription
+      // as though it were a resolved target.
+      //
+      // The two arms are DIFFERENT IN KIND and no longer share a reason: a
+      // non-kNoErr status is the HAL refusing to answer, which is a device
+      // error; kObjectUnknown is the normal, explicable "this app has never
+      // played a sound". Collapsing them made a support ticket and a user's
+      // own choice of window indistinguishable at the seam.
+      for (u8 i = 0u; i < target.pidCount; ++i) {
+        u32 obj = kObjectUnknown;
+        const u32 st = hal_.translatePidToProcessObject(target.pids[i], &obj);
+        if (st != kNoErr) { return fail(StartStage::kTranslatePid, st); }
+        if (obj == kObjectUnknown) { return BackendStart::kNoTarget; }
+        objects[i] = obj;
+      }
+      objectCount = static_cast<u32>(target.pidCount);
     }
 
     // 2. The tap. INCLUDE form only -- see hal_api.h on the sibling selector.
@@ -135,8 +157,7 @@ class TapBackend final : public CaptureBackend {
     //    whatever is set, and destroyArtefacts()'s sentinel skips make that
     //    safe when nothing was.
     {
-      const u32 st = hal_.createProcessTap(
-          objects, static_cast<u32>(target.pidCount), &tap_);
+      const u32 st = hal_.createProcessTap(objects, objectCount, &tap_);
       if (st != kNoErr) { teardown(); return fail(StartStage::kCreateTap, st); }
     }
 
@@ -260,6 +281,62 @@ class TapBackend final : public CaptureBackend {
     failStage_  = stage;
     failStatus_ = status;
     return BackendStart::kDeviceError;
+  }
+
+  /// #3394 PR 2 §3: the owner's object-holding descendants, minus the host's
+  /// own subtree. Refuses (no tap) on an empty set, on more than kMaxTreeObjects,
+  /// on a root <= 1, and when the list cannot be read. A failed per-object pid
+  /// read skips that object: under-capture, never widening.
+  ///
+  /// NO OS ARTEFACT EXISTS ON ANY ARM OF THIS FUNCTION. Every refusal returns
+  /// before start() reaches createProcessTap, so none of them owes teardown().
+  ///
+  /// `out` is an ARRAY REFERENCE rather than a pointer so its bound is part of
+  /// the type (AV 215): the cap test directly above the only write is what keeps
+  /// `matched` inside it.
+  BackendStart resolveTree(const CaptureTarget& target,
+                           u32 (&out)[kMaxTreeObjects], u32* outCount) noexcept {
+    *outCount = 0u;
+    if (target.pidCount != 1u)  { return BackendStart::kNoTarget; }
+    const u32 root = target.pids[0];
+    // BEFORE ENUMERATION. launchd's tree is the whole system -- #2161 by
+    // another name -- so a root <= 1 is refused without asking the HAL anything.
+    // inTree() refuses it too; this line is what keeps the refusal free of an
+    // OS call, and it is asserted by order, not by verdict.
+    if (root <= 1u)             { return BackendStart::kNoTarget; }
+    u32 all[kMaxProcessObjects];
+    u32 total = 0u;
+    const u32 st = hal_.processObjectList(all, kMaxProcessObjects, &total);
+    if (st != kNoErr) { return fail(StartStage::kListProcesses, st); }
+    // A FULL BUFFER REFUSES, not merely an over-full one. The HAL's size read
+    // and data read are two calls, so a list that grew past the buffer between
+    // them comes back holding exactly kMaxProcessObjects entries -- a
+    // truncation that looks identical to a list that really was that long.
+    // Refusing both is the only reading that never classifies a subset.
+    if (total >= kMaxProcessObjects) {
+      return fail(StartStage::kListProcesses, kStatusListOverflow);
+    }
+    const u32 excludeRoot = hal_.hostRootPid();
+    u32 matched = 0u;
+    for (u32 i = 0u; i < total; ++i) {
+      u32 pid = 0u;
+      if (hal_.processObjectPid(all[i], &pid) != kNoErr) { continue; }
+      if (inTree(pid, root, excludeRoot, &parentThunk, this) != TreeVerdict::kIncluded) {
+        continue;
+      }
+      if (matched == kMaxTreeObjects) { return BackendStart::kNoTarget; }  // never a subset
+      out[matched] = all[i];
+      matched = matched + 1u;
+    }
+    if (matched == 0u) { return BackendStart::kNoTarget; }
+    *outCount = matched;
+    return BackendStart::kOk;
+  }
+
+  /// inTree()'s parent lookup, routed through the HAL table so the fake can
+  /// script it. Static because ParentOf is a plain function pointer.
+  static bool parentThunk(void* ctx, u32 pid, u32* outParent) noexcept {
+    return static_cast<const TapBackend*>(ctx)->hal_.parentPid(pid, outParent);
   }
 
   /// THE BARRIER, and the ONLY path by which this backend releases anything.
@@ -401,10 +478,21 @@ class TapBackend final : public CaptureBackend {
   }
 
  public:
-  /// Read from the JS thread after stop(), for status(). None of these change
-  /// a decision inside rt/ -- they are the evidence that the decisions taken
-  /// were the ones intended, which is the thing this backend previously had no
-  /// way to report. See design section 9.4.
+  /// Read from the JS thread -- LIVE while a capture is running (the capture
+  /// child's fault watch, #3394 PR 2, polling napi/'s status() once a second)
+  /// AND after stop() (handleStop's post-mortem read). None of these change a
+  /// decision inside rt/ -- they are the evidence that the decisions taken were
+  /// the ones intended, which is the thing this backend previously had no way
+  /// to report. See design section 9.4.
+  ///
+  /// SAFE TO READ LIVE BY CONSTRUCTION, NOT BY ATOMICITY. quiesceProved_,
+  /// destroyFailures_, failStage_ and failStatus_ below are plain members, and
+  /// their only writers are start() and teardown() -- both invoked from the
+  /// same JS/main thread these getters are read from. ioProcEntry, the sole
+  /// audio-callback-thread entry point, never touches any of the four. A
+  /// backend that instead writes its own equivalents from its callback thread
+  /// must make that storage atomic; see rt/capture_backend.h's evidence-getter
+  /// contract.
   ///
   /// quiesceProved(): false for BOTH the expired wait and the skipped one. The
   /// two are the same fact -- "this backend did not observe its callbacks stop"

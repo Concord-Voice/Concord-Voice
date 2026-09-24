@@ -5,6 +5,7 @@ import type { CallState } from '../../services/voice/voiceService/callStateMachi
 // The degrade reasons are AUTHORED in the host because the host is what produces them;
 // re-declaring them here would let the two lists drift silently.
 import type { ScreenAudioDegradeReason } from '../../../main/audiocapHost';
+import type { ScreenAudioInterruptReason } from '../../../shared/audiocapProtocol';
 import type { ScreenAudioVerdict } from '../../utils/policy/screenAudioCapability';
 import { AUDIO_QUALITY_TIERS, type AudioQualityTier } from './audioQualityTiers';
 import type { MediaPolicySource } from '../../services/voice/mediaPolicyEvents';
@@ -93,7 +94,24 @@ export type ScreenAudioState =
        */
       overrun: number;
     }
-  | { mode: 'degraded'; reason: ScreenAudioDegradeReason; overrun: number };
+  | { mode: 'degraded'; reason: ScreenAudioDegradeReason; overrun: number }
+  | {
+      /**
+       * A LIVE per-process share lost its audio without the user asking (#3394 PR 2
+       * §4.5) -- the share itself is still running, only its audio ended. Distinct
+       * from `degraded`, which describes a START that never carried audio: this arm
+       * exists only after `per-process` was reached.
+       */
+      mode: 'interrupted';
+      reason: ScreenAudioInterruptReason;
+      /**
+       * The generation the interrupt was for. Beyond what spec §4.5 states -- §4.6's
+       * announce-once-per-generation needs it in the component to tell a fresh
+       * interrupt from a remount of the same one.
+       */
+      generation: number;
+      overrun: 0;
+    };
 
 // ---------------------------------------------------------------------------
 // Voice participant state

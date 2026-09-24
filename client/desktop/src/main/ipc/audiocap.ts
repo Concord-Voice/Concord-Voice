@@ -211,9 +211,11 @@ export async function handleAudiocapStart(
  * is the outcome ADR-0043 exists to prevent.
  *
  * `stopAudiocapHost`, never `killAudiocapHost`: the graceful path posts `{kind:'stop'}`
- * first, and the child's `handleStop` is the only caller of the addon's `status()` -- the
- * R9 silence detector, `quiesceProved` and `destroyFailures`. Killing outright destroys
- * the tap just as well and reads none of them.
+ * first, and the child's `handleStop` is the only reader of the liveness and teardown
+ * evidence the addon's `status()` carries -- the R9 silence detector, `quiesceProved` and
+ * `destroyFailures`. (The child's fault watch also calls `status()` while a capture is
+ * live, #3394 PR 2, but reads only `faulted` and `faultReason`.) Killing outright destroys
+ * the tap just as well and reads none of that evidence.
  *
  * Returns nothing. There is no outcome to report: the stop is unconditional, and a
  * renderer that calls it when nothing is live simply gets a no-op -- as does one that

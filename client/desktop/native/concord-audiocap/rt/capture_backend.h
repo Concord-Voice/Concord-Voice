@@ -10,7 +10,11 @@
 // WHY THE TARGET IS A BOUNDED LIST AND NOT A PID.
 // ADR-0043 risk 2 is that the window's PID is not the process rendering the
 // audio. Windows expresses that with INCLUDE_TARGET_PROCESS_TREE on one PID;
-// macOS cannot -- CATapDescription takes an explicit process-object list. A
+// macOS cannot -- CATapDescription takes an explicit process-object list, so
+// since #3394 PR 2 the macOS backend expands ONE owner into that list itself
+// (rt/process_tree.h). `allowDescendants` therefore means "the app's process
+// tree" (macOS today; the Windows backend, #3196, is not built), and
+// buildTarget admits it with exactly one PID. A
 // single-u32 field would force one of the two backends to reopen this contract,
 // and not reopening it is what the rollout ordering exists to protect.
 // kMaxTargetPids is a bound on a caller-supplied array length, not a claim about
@@ -180,6 +184,10 @@ inline bool buildTarget(const u32* pids, u32 count, bool allowDescendants,
   if (pids == nullptr) { return false; }
   if (count == 0u) { return false; }
   if (count > static_cast<u32>(kMaxTargetPids)) { return false; }
+  // ONE ROOT FOR A TREE (#3394 PR 2). Windows' INCLUDE_TARGET_PROCESS_TREE takes
+  // one PID and macOS expands one owner natively, so a multi-PID descendant
+  // request has no meaning on either backend and is refused, not guessed at.
+  if (allowDescendants && count != 1u) { return false; }
 
   // Validated WHOLE before anything is written, which is what makes the refusal
   // arm publish nothing. The duplicate test is the inner loop: count is at most
@@ -289,6 +297,16 @@ class CaptureBackend {
   /// exist because stop() is `void` by contract and a backend that could not
   /// keep its post-condition had no way to say so. Defaults are what a backend
   /// that declines to answer means, and they are the pessimistic readings.
+  ///
+  /// READ WHILE A CAPTURE IS LIVE, NOT ONLY AFTER stop() -- the obligation
+  /// #3196 owes equally. Since #3394 PR 2 the capture child's fault watch polls
+  /// napi/'s status() once a second for the life of a running capture, which
+  /// calls straight through to these three getters on the JS thread (see
+  /// napi/addon.cc's Status_JS). A backend's storage for them must therefore be
+  /// safe to read from that thread CONCURRENTLY with its own audio-callback
+  /// thread writing it -- not merely safe to read once stop() has returned. A
+  /// backend that only guards these against its own start()/stop() thread and
+  /// never against a live callback thread has not met this.
   ///
   /// Did this backend OBSERVE its own callbacks stop before stop() returned?
   /// FALSE is both "I waited and they did not" and "I could not wait" -- the

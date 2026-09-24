@@ -103,4 +103,39 @@ describe('voiceStore.screenAudio', () => {
 
     expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'off', overrun: 0 });
   });
+
+  // #3394 PR 2 T5a: `ScreenAudioState` does not carry an `'interrupted'` arm yet (the
+  // plan's Step 3 adds it to `voiceStore.ts:71-87`), so the write below is cast rather
+  // than typed -- per this task's instructions, drop the cast once the arm lands.
+  it('round-trips an interrupted verdict, including its generation', () => {
+    const store = useVoiceStore.getState();
+
+    store.setScreenAudioState({
+      mode: 'interrupted',
+      reason: 'child-crash',
+      generation: 7,
+      overrun: 0,
+    } as Parameters<typeof store.setScreenAudioState>[0]);
+
+    expect(useVoiceStore.getState().screenAudio).toEqual({
+      mode: 'interrupted',
+      reason: 'child-crash',
+      generation: 7,
+      overrun: 0,
+    });
+  });
+
+  it('resets an interrupted verdict back to off, like every other verdict', () => {
+    const store = useVoiceStore.getState();
+    store.setScreenAudioState({
+      mode: 'interrupted',
+      reason: 'protocol-fault',
+      generation: 3,
+      overrun: 0,
+    } as Parameters<typeof store.setScreenAudioState>[0]);
+
+    store.reset();
+
+    expect(useVoiceStore.getState().screenAudio).toEqual({ mode: 'off', overrun: 0 });
+  });
 });

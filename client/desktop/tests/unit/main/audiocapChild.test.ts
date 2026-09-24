@@ -706,7 +706,7 @@ describe('audiocap child target resolution (#3198)', () => {
     // THE NON-VACUITY CLAUSE, and the reason this case is worth writing.
     // Without it the test passes when the child falls straight through to the
     // addon, because a real backend handed no target refuses with `NoTarget`
-    // and `unwindFailedStart` posts a fault too -- at stage `'start'`, which
+    // and `unwindCapture` posts a fault too -- at stage `'start'`, which
     // main maps to `no-backend` and shows the user as "this machine cannot do
     // per-process audio". The stage assertion alone cannot tell the two apart
     // on a fake whose `start` returns ok; this one can.
@@ -755,11 +755,6 @@ describe('audiocap child target resolution (#3198)', () => {
     expect(c.start).toHaveBeenCalledTimes(1);
     const options = c.start.mock.calls[0][0] as Record<string, unknown>;
     expect(options.targetPids).toEqual([4242]);
-    // Not set, and not set to `false` either: `allowDescendants` is
-    // platform-asymmetric (macOS wants a caller-expanded list, Windows honours
-    // INCLUDE_TARGET_PROCESS_TREE on one PID) and choosing a policy is its own
-    // decision. Absent is the only form that does not claim one.
-    expect('allowDescendants' in options).toBe(false);
   });
 
   it('never lets the resolved PID cross back to main (I-PID)', async () => {
@@ -810,5 +805,308 @@ describe('audiocap child target resolution (#3198)', () => {
 
     expect(c.faults.map((f) => f.stage)).toEqual(['target']);
     expect(c.start).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * FAULT WATCH (#3394 PR 2, Task T2; spec §4.1 + §8 row "audiocapChild").
+ *
+ * A running capture is currently unmonitored: `addon.status()` is read exactly
+ * once, from `reportLiveness`, and only on `stop`. A mid-share native fault
+ * (a dropped device, a format change) has no path to main until the user ends
+ * the share. This suite pins the post-`started` poll that reports one.
+ *
+ * `FAULT_WATCH_INTERVAL_MS` and `RUN_FAULT_PHRASE` do not exist on
+ * `audiocapChild.ts` yet -- they are read off the DYNAMICALLY IMPORTED module
+ * object (never a static top-of-file import), because a static import runs at
+ * module-graph-load time, before any test's `setProcessType('utility')`, and
+ * would trip the D5 guard immediately.
+ */
+function runFaults(posted: unknown[]): unknown[] {
+  return posted.filter(
+    (m) => (m as { kind?: string }).kind === 'fault' && (m as { stage?: string }).stage === 'run'
+  );
+}
+
+/**
+ * A capturing child wired with a controllable `status()` and `stop()`, plus an
+ * `order` log recording 'stop' and 'post:<kind>' in the sequence they actually
+ * happened. `stop` (a vi.fn) and `posted` (a plain array `installParentPort`
+ * pushes into) have no shared clock on their own -- `order` is what lets a case
+ * assert "the addon was stopped BEFORE the fault was posted" rather than merely
+ * "both happened this tick".
+ */
+async function startFaultWatchChild(
+  status: ReturnType<typeof vi.fn>,
+  opts: { startResult?: unknown; messageOverrides?: Record<string, unknown> } = {}
+): Promise<{
+  posted: unknown[];
+  stop: ReturnType<typeof vi.fn>;
+  order: string[];
+  sendStop: () => void;
+  FAULT_WATCH_INTERVAL_MS: number;
+  RUN_FAULT_PHRASE: Record<string, string>;
+}> {
+  setProcessType('utility');
+  const order: string[] = [];
+  const stop = vi.fn(() => {
+    order.push('stop');
+  });
+  addonRequireImpl = () => ({
+    capability: () => ({
+      platform: 'darwin',
+      osVersion: '14.4',
+      perProcessAudio: true,
+      reason: '',
+    }),
+    // `startResult` defaults to a success so every existing case need not
+    // pass it; gap test (a) below overrides it with a refusal to prove the
+    // watch is armed only PAST a successful start.
+    start: vi.fn(() => opts.startResult ?? { ok: true }),
+    drain: () => ({ ok: true }),
+    resolveWindowOwner: () => 4242,
+    stop,
+    status,
+  });
+  const { posted, handlers } = installParentPort();
+
+  // Wrap postMessage onto the SAME order log as `stop`. Production calls
+  // `process.parentPort.postMessage(...)` freshly at each call site, so
+  // replacing the property before import still intercepts every later call.
+  const fakePort = process.parentPort as unknown as { postMessage: (m: unknown) => void };
+  const originalPost = fakePort.postMessage.bind(fakePort);
+  fakePort.postMessage = (m: unknown) => {
+    order.push(`post:${(m as { kind?: string }).kind}`);
+    originalPost(m);
+  };
+
+  vi.resetModules();
+  const mod = await import('../../../src/main/audiocapChild');
+
+  // Precondition, not an optional-chained fire: without a registered listener
+  // every assertion below would be vacuous.
+  expect(typeof handlers.message).toBe('function');
+  const { port1: childEnd } = new MessageChannel();
+  handlers.message({
+    data: {
+      kind: 'start',
+      quantumMs: 10,
+      sampleRate: 48000,
+      channels: 2,
+      frameCount: 480,
+      creditBound: 8,
+      ringSlots: 8,
+      windowHandle: 4242,
+      ...opts.messageOverrides,
+    },
+    ports: [childEnd],
+  });
+
+  return {
+    posted,
+    stop,
+    order,
+    sendStop: () => handlers.message({ data: { kind: 'stop' } }),
+    FAULT_WATCH_INTERVAL_MS: (mod as unknown as { FAULT_WATCH_INTERVAL_MS: number })
+      .FAULT_WATCH_INTERVAL_MS,
+    RUN_FAULT_PHRASE: (mod as unknown as { RUN_FAULT_PHRASE: Record<string, string> })
+      .RUN_FAULT_PHRASE,
+  };
+}
+
+describe('audiocap child fault watch (#3394 PR 2, Task T2)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Mutation target: the `addon.start(...)` call inside `handleStart`, which
+  // passes `allowDescendants: true` alongside the resolved PID (spec §3/§4.1;
+  // ADR-0043 § As-built addendum -- #3394 PR 2). The tap now targets the
+  // owner's whole process tree, not the owner process alone.
+  it('calls addon.start with targetPids: [pid] and allowDescendants: true', async () => {
+    const c = await startTargetHarness(4242);
+    c.sendStart(99);
+
+    expect(c.start).toHaveBeenCalledTimes(1);
+    const options = c.start.mock.calls[0][0] as Record<string, unknown>;
+    expect(options.targetPids).toEqual([4242]);
+    expect(options.allowDescendants).toBe(true);
+  });
+
+  // Mutation target: wherever the fault-watch `setInterval`/`setTimeout` chain
+  // is armed -- it must be armed AFTER `postStarted()`, never before or during
+  // the rest of `handleStart`.
+  it('arms the fault watch only after `started` is posted -- no status() read before it', async () => {
+    const status = vi.fn(() => ({ faulted: false, faultReason: 'None' }));
+    const { posted, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    expect(posted).toContainEqual({ kind: 'started' });
+    expect(status).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS);
+    expect(status).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutation target: the branch (or its absence) deciding whether to post when
+  // `status().faulted` is false.
+  it('posts no fault across 3 intervals when faulted stays false', async () => {
+    const status = vi.fn(() => ({ faulted: false, faultReason: 'None' }));
+    const { posted, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS * 3);
+
+    // Non-vacuity: proves the watch actually ticked 3 times, not merely that
+    // nothing was posted because nothing ever ran.
+    expect(status).toHaveBeenCalledTimes(3);
+    expect(runFaults(posted)).toHaveLength(0);
+  });
+
+  // Mutation target: the run-fault branch itself, and the ordering of
+  // `addon.stop()` relative to `postFault('run', ...)`.
+  it('posts exactly one run fault for FormatChanged, stopping the addon before the post', async () => {
+    const status = vi.fn(() => ({ faulted: true, faultReason: 'FormatChanged' }));
+    const { posted, stop, order, FAULT_WATCH_INTERVAL_MS, RUN_FAULT_PHRASE } =
+      await startFaultWatchChild(status);
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS);
+
+    expect(runFaults(posted)).toEqual([
+      { kind: 'fault', stage: 'run', message: RUN_FAULT_PHRASE.FormatChanged },
+    ]);
+    expect(stop).toHaveBeenCalledTimes(1);
+    const stopIdx = order.indexOf('stop');
+    const postIdx = order.indexOf('post:fault');
+    expect(stopIdx).toBeGreaterThanOrEqual(0);
+    expect(postIdx).toBeGreaterThan(stopIdx);
+
+    // No second fault on later ticks.
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS * 5);
+    expect(runFaults(posted)).toHaveLength(1);
+  });
+
+  // Mutation target: the try/catch (or its absence) around the `status()` call
+  // inside the fault-watch tick.
+  it('posts nothing when status() throws, but the tick still runs', async () => {
+    const status = vi.fn(() => {
+      throw new Error('native status blew up');
+    });
+    const { posted, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    expect(() => vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS)).not.toThrow();
+    // Non-vacuity: proves the throwing status() was actually invoked, not
+    // skipped by a watch that never armed.
+    expect(status).toHaveBeenCalledTimes(1);
+    expect(runFaults(posted)).toHaveLength(0);
+  });
+
+  // Mutation target: whichever teardown (`handleStop` / `clearInterval`) is
+  // supposed to disarm the fault watch on a `stop` control message.
+  it('a fault latched before stop never re-posts after the stop message', async () => {
+    const status = vi.fn(() => ({ faulted: true, faultReason: 'FormatChanged' }));
+    const { posted, sendStop, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS);
+    // Non-vacuity: proves a fault was genuinely posted before stop, so the
+    // absence checked below is a suppression, not a watch that never fired.
+    expect(runFaults(posted)).toHaveLength(1);
+
+    sendStop();
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS * 5);
+    expect(runFaults(posted)).toHaveLength(1);
+  });
+
+  // Mutation target: the fallback arm of the run-fault message builder, for a
+  // `faultReason` outside the closed native union.
+  it('posts the fixed fallback message for an unrecognised faultReason', async () => {
+    const status = vi.fn(() => ({ faulted: true, faultReason: 'Whatever' }));
+    const { posted, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS);
+
+    expect(runFaults(posted)).toEqual([
+      { kind: 'fault', stage: 'run', message: 'the capture failed' },
+    ]);
+  });
+
+  // Mutation target: the `RUN_FAULT_PHRASE` map declaration itself, against the
+  // `faultReason` union in `native/concord-audiocap/index.d.ts`.
+  it('RUN_FAULT_PHRASE covers exactly the native faultReason union', async () => {
+    const status = vi.fn(() => ({ faulted: false, faultReason: 'None' }));
+    const { RUN_FAULT_PHRASE } = await startFaultWatchChild(status);
+
+    expect(Object.keys(RUN_FAULT_PHRASE).sort()).toEqual(
+      ['DeviceLost', 'FormatChanged', 'NoCallbacks', 'None', 'PermissionLost'].sort()
+    );
+  });
+
+  // Mutation target: an `armFaultWatch` call moved to the TOP of `handleStart`,
+  // before any refusal returns. A GEOMETRY-mismatch refusal is the case that
+  // actually exposes this -- it returns directly from `postFault('start', ...)`
+  // with NO teardown call (unlike an `addon.start()` refusal, which routes
+  // through `unwindCapture` -> `handleStop`, whose own FIRST statement is
+  // `clearFaultWatch()` and would silently absorb a watch armed too early).
+  it('never arms the fault watch for a refused start', async () => {
+    const status = vi.fn(() => ({ faulted: true, faultReason: 'FormatChanged' }));
+    const { posted, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status, {
+      messageOverrides: { quantumMs: 999 },
+    });
+
+    // Control: the refusal reached `handleStart`'s geometry-mismatch branch and
+    // posted its own fault -- a `start`-stage refusal, distinct from `'run'`.
+    const faults = posted.filter((m) => (m as { kind?: string }).kind === 'fault');
+    expect(faults).toEqual([{ kind: 'fault', stage: 'start', message: expect.any(String) }]);
+    // Non-vacuity for the control itself: no teardown ran on this path, so
+    // `status()` was never touched by the refusal.
+    expect(status).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS * 3);
+
+    // If the watch had been armed before this refusal returned, these three
+    // intervals would each read `status()` and post a `fault{run}` -- for a
+    // capture that never started.
+    expect(status).not.toHaveBeenCalled();
+    expect(runFaults(posted)).toHaveLength(0);
+  });
+
+  // Mutation target: `clearFaultWatch()` deleted from `handleStop`.
+  it('stop disarms the fault watch, so a later status() flip never posts', async () => {
+    const status = vi.fn(() => ({ faulted: false, faultReason: 'None' }));
+    const { posted, sendStop, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS);
+    // Non-vacuity: proves the watch was genuinely armed and ticking before stop.
+    expect(status).toHaveBeenCalled();
+
+    sendStop();
+    // `handleStop`'s own `reportLiveness` reads `status()` once, synchronously,
+    // as part of the stop -- captured so it is not mistaken for a later tick.
+    const callsAtStop = status.mock.calls.length;
+    status.mockImplementation(() => ({ faulted: true, faultReason: 'DeviceLost' }));
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS * 3);
+
+    // If `clearFaultWatch()` had been deleted from `handleStop`, each of these
+    // three intervals would read the now-faulted status() and post `fault{run}`.
+    expect(status.mock.calls.length).toBe(callsAtStop);
+    expect(runFaults(posted)).toHaveLength(0);
+  });
+
+  // Mutation target: `Object.hasOwn(RUN_FAULT_PHRASE, reason)` weakened to
+  // `reason in RUN_FAULT_PHRASE`, which is true for an inherited
+  // `Object.prototype` key like `'constructor'` and would fail the closed set
+  // open (mirrors `startFailureMessage`'s own `Object.hasOwn` reasoning).
+  it('posts the closed-set fallback for a prototype-chain faultReason like "constructor"', async () => {
+    const status = vi.fn(() => ({ faulted: true, faultReason: 'constructor' }));
+    const { posted, FAULT_WATCH_INTERVAL_MS } = await startFaultWatchChild(status);
+
+    vi.advanceTimersByTime(FAULT_WATCH_INTERVAL_MS);
+
+    expect(runFaults(posted)).toEqual([
+      { kind: 'fault', stage: 'run', message: 'the capture failed' },
+    ]);
   });
 });

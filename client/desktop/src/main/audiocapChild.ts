@@ -38,11 +38,14 @@
 //     so main can CLASSIFY that stage, never so this file can SEND it; nothing
 //     in this file posts it, and nothing should.
 //
-// C2. THE CHILD NEVER DIES SILENTLY WHERE IT COULD SPEAK. Four stages are
+// C2. THE CHILD NEVER DIES SILENTLY WHERE IT COULD SPEAK. Six stages are
 //     reported rather than fallen over: a loader throw is `fault{stage:'load'}`,
 //     a `capability()` throw or unusable return is `fault{stage:'capability'}`, a
-//     refused or failed `start` is `fault{stage:'start'}`, and a second PCM-port
-//     protocol violation is `fault{stage:'protocol'}`. That is what gives the
+//     window handle that resolves to no live owner (or a `NoTarget` refusal) is
+//     `fault{stage:'target'}` (#3198), a refused or failed `start` is
+//     `fault{stage:'start'}`, a second PCM-port protocol violation is
+//     `fault{stage:'protocol'}`, and a pump fault that latched AFTER `started` is
+//     `fault{stage:'run'}` (#3394 PR 2, the fault watch). That is what gives the
 //     parent's `exit` handler a single meaning — the child died without a word,
 //     which is the packaging defect it should mean (`audiocapHost.ts` I6) — and
 //     it is inherited item (d) from #3194's review.
@@ -167,10 +170,16 @@ interface AudiocapAddon {
    * the addon than the production type was.
    *
    * `unknown` for the reason the other three are: the `.d.ts` is a claim about a
-   * native binary, not a guarantee from one. Nothing in this file calls it yet —
-   * `status().poisoned` is the signal #3198's watchdog reads to decide the child
-   * must be killed rather than asked to stop again — and it is declared now so
-   * that lands as wiring rather than as a new native surface.
+   * native binary, not a guarantee from one.
+   *
+   * TWO READERS, and they read different things. `reportLiveness` is the
+   * post-mortem read on `handleStop`: the R9 liveness counters and the teardown
+   * evidence (`quiesceProved`, `destroyFailures`, `lastDeviceStatus`). The fault
+   * watch (#3394 PR 2) polls it while a capture is live and reads `faulted` and
+   * `faultReason` ONLY — nothing else it returns ever reaches a posted message.
+   * `status().poisoned` has no reader yet; it is the signal the still-unbuilt
+   * watchdog rail would read to decide the child must be killed rather than
+   * asked to stop again.
    */
   status: () => unknown;
   /**
@@ -203,13 +212,30 @@ interface AddonStartOptions {
    * starts a capture without a target, so "forgot the target" is a compile error
    * rather than a start the addon refuses with `NoTarget` (or, on a future
    * backend, one that captures more than it was asked to).
-   *
-   * `allowDescendants` is deliberately ABSENT rather than `false`. It is
-   * platform-asymmetric (macOS documents the list as already expanded by the
-   * caller; Windows honours `INCLUDE_TARGET_PROCESS_TREE`), and choosing a
-   * descendant-expansion policy is its own decision with its own review.
    */
   targetPids: number[];
+  /**
+   * THE REQUIRED LITERAL `true`, not `boolean` and not optional (#3394 PR 2,
+   * design spec §3 and §4.1; ADR-0043 § As-built addendum — #3394 PR 2). A
+   * window's audio is usually rendered by a helper process the window's owner
+   * launched, not by the owner itself, so an owner-only tap is a share that goes
+   * live SILENT with no error. The target is therefore the owner's process tree:
+   * this child passes exactly ONE root PID, and the addon expands it natively —
+   * so no expanded PID ever exists outside the addon (I-PID) — and refuses a
+   * second root with `BadOptions`.
+   *
+   * The literal type is the mechanism: a forgotten flag is a compile error rather
+   * than a silent owner-only tap, and `false` cannot be written here at all. What
+   * the tree contains — descendants only, never the host's own subtree, a cap that
+   * refuses rather than subsets, and no launchd-parented XPC helper, which is not a
+   * descendant — is native policy in `rt/process_tree.h`, not a decision this file
+   * makes.
+   *
+   * This REVERSES the #3198 PR 2 position that the option stay deliberately
+   * absent pending "its own decision with its own review" — spec §3 is that
+   * decision.
+   */
+  allowDescendants: true;
 }
 
 /**
@@ -289,6 +315,58 @@ export const START_FAILURE_REASONS: Readonly<Record<AudioCapStartFailure, string
 };
 
 /**
+ * `AudioCapStatus.faultReason`, restated for the reason `AudioCapStartFailure`
+ * is: `native/concord-audiocap/index.d.ts` is the authority and cannot be an
+ * import here. The fault-watch suite in `audiocapChild.test.ts` pins the key set
+ * against that union.
+ */
+type AudioCapFaultReason =
+  'None' | 'DeviceLost' | 'PermissionLost' | 'NoCallbacks' | 'FormatChanged';
+
+/**
+ * How often the child reads `status().faulted` while a capture is live (#3394
+ * PR 2, spec §4.1). One field per second: the watch detects nothing itself, it
+ * only notices a latch the native pump already made.
+ */
+export const FAULT_WATCH_INTERVAL_MS = 1000;
+
+/**
+ * A latched pump fault, as the phrase a `fault{stage:'run'}` carries. CLOSED AND
+ * PID-FREE BY CONSTRUCTION — every value is a literal written here, so nothing
+ * the addon returns is ever echoed (I-PID; observability.md principles 3 and 7).
+ * Main derives the renderer's interrupt reason from the STAGE, never from this
+ * text, which exists only for a developer reading main's log.
+ *
+ * A `Record` keyed by the union, like `START_FAILURE_REASONS`, so a member added
+ * to the native union without a phrase here is a compile error.
+ *
+ * Only `FormatChanged` has a macOS producer today (`rt/platform/macos/
+ * tap_backend.h`, the `kFormatChanged` fault). The other members are declared by
+ * the native contract for the Windows backend and are phrased now so that
+ * backend lands as wiring rather than as a hole in this map.
+ */
+export const RUN_FAULT_PHRASE: Readonly<Record<AudioCapFaultReason, string>> = {
+  None: 'the capture reported a fault with no reason',
+  FormatChanged: 'the captured audio format changed',
+  DeviceLost: 'the capture device was lost', // no producer on macOS; #3196
+  PermissionLost: 'capture permission was lost', // no producer on macOS; #3196
+  NoCallbacks: 'the capture stopped delivering audio', // no producer on macOS; #3196
+};
+
+/**
+ * A `faultReason`, named only when it is one this build knows. `Object.hasOwn`
+ * for the reason `startFailureMessage` gives: a bare lookup of `'constructor'`
+ * would return an inherited FUNCTION and fail the closed set open. Anything else
+ * — a non-string, an unknown member, a prototype key — gets the fixed fallback.
+ */
+function runFaultMessage(reason: unknown): string {
+  if (typeof reason === 'string' && Object.hasOwn(RUN_FAULT_PHRASE, reason)) {
+    return (RUN_FAULT_PHRASE as Record<string, string>)[reason];
+  }
+  return 'the capture failed';
+}
+
+/**
  * `audiocapProtocol.ts` caps `hello.envKeys` at a module-private 16 and
  * `isAudiocapHello` REJECTS a longer array — and a rejected hello is a killed
  * child with no diagnosis at all. Truncating here keeps that receiver strict
@@ -307,6 +385,8 @@ let pcmPort: PcmPort | null = null;
 let outstanding = 0;
 let protocolViolations = 0;
 let capturing = false;
+/** The live capture's fault watch, or `null` when none is armed. See `armFaultWatch`. */
+let faultWatch: ReturnType<typeof setInterval> | null = null;
 
 // ---------------------------------------------------------------------------
 // Diagnostics — the only place an unknown value becomes an outbound string
@@ -343,13 +423,16 @@ function errorMessage(err: unknown, fallback: string): string {
  * diagnostic a packaging or device fault leaves behind, and a PID is the only
  * part of it that is forbidden.
  *
- * TWO CALL SITES, AND THEY ARE A PAIR. Both are on the `start` stage, which runs
- * after `resolveTargetPid` succeeded: the `addon.start` catch, and the teardown
- * exception inside `unwindFailedStart`. The first shipped sanitised and the second
- * did not, which left the invariant broken through the other door — the two halves
- * are concatenated into ONE `postFault('start', ...)`, so a PID in either reaches
- * the same log line. If a third forwarding site is ever added on this stage, it
- * belongs here too; grep `errorMessage(` before assuming there are only two.
+ * TWO CALL SITES, AND THEY ARE A PAIR. Both run only after `resolveTargetPid`
+ * succeeded: the `addon.start` catch, and the teardown exception inside
+ * `unwindCapture`. The first shipped sanitised and the second did not, which left
+ * the invariant broken through the other door — the two halves are concatenated
+ * into ONE `postFault(stage, ...)`, so a PID in either reaches the same log line.
+ * The teardown half is posted on whichever stage the unwind reports — `'start'`,
+ * `'target'` for a `NoTarget` refusal, or `'run'` from the fault watch — and every
+ * one of those follows target resolution. If a third forwarding site is ever added
+ * after target resolution, it belongs here too; grep `errorMessage(` before
+ * assuming there are only two.
  *
  * The `load` and `capability` stages run BEFORE any PID exists and deliberately
  * keep their text intact — sanitising them would cost diagnostics for no gain.
@@ -535,6 +618,10 @@ function handlePcmMessage(addon: AudiocapAddon, data: unknown): void {
   // C6. Counted, then terminal.
   protocolViolations += 1;
   if (protocolViolations < PCM_PROTOCOL_FAULT_LIMIT) return;
+  // Disarmed BEFORE the post: `fault{protocol}` is this capture's one terminal
+  // report, and main retires the child on it. A pump fault latching in the gap
+  // before the kill must not add a second, contradictory `fault{run}`.
+  clearFaultWatch();
   postFault('protocol', 'the PCM port carried a message that is not a single credit');
   closePcmPort();
 }
@@ -596,7 +683,7 @@ function resolveTargetPid(addon: AudiocapAddon, windowHandle: unknown): number |
   // GUARDED, like every other native call in this file. It was not, and a red-team
   // PoC proved what that cost: a throw escaped resolveTargetPid -> handleStart ->
   // handleControlMessage -> the parentPort listener, and the child died as an
-  // uncaught exception having posted NOTHING. That breaks unwindFailedStart's own
+  // uncaught exception having posted NOTHING. That breaks unwindCapture's own
   // stated invariant ("exactly one fault is posted on every path") and lands main
   // on `child-crash`, which audiocapHost.ts documents as a PACKAGING DEFECT — so
   // the user reads "App sound stopped unexpectedly" for a window that simply could
@@ -711,7 +798,10 @@ function handleStart(
         channels: CHANNELS,
         frameCount: FRAME_COUNT,
         ringSlots: RING_SLOTS,
+        // ONE root, and the addon expands it to the owner's process tree natively
+        // (see `AddonStartOptions.allowDescendants`). No descendant PID exists here.
         targetPids: [pid],
+        allowDescendants: true,
       },
       () => {
         drainAvailable(addon);
@@ -723,10 +813,10 @@ function handleStart(
     // two") — so this closes the port, drops `capturing` and calls
     // `addon.stop()`, where it previously closed the port and left the addon
     // running. Guarded, because the seam has already failed once: see
-    // unwindFailedStart.
+    // unwindCapture.
     // pidFreeErrorMessage, NOT errorMessage: `pid` is in scope here and the native
     // text is unvalidated. See that function for the I-PID reasoning.
-    unwindFailedStart(addon, pidFreeErrorMessage(err, 'capture did not start'));
+    unwindCapture(addon, pidFreeErrorMessage(err, 'capture did not start'), 'start');
     return;
   }
 
@@ -757,7 +847,7 @@ function handleStart(
     // skipping the unwind here would leave a possibly-armed addon behind, which is
     // the defect the unwind exists to prevent.
     const stage: AudiocapFaultStage = reason === 'NoTarget' ? 'target' : 'start';
-    unwindFailedStart(addon, startFailureMessage(reason), stage);
+    unwindCapture(addon, startFailureMessage(reason), stage);
     return;
   }
 
@@ -765,6 +855,69 @@ function handleStart(
   // Posted last, after every refusal above has returned, so a refusal can never be
   // preceded by a `started` that already told the renderer the share has sound.
   postStarted();
+  // Armed only now, and only here: this is the one line every refusal above returns
+  // before, so no watch ever runs for a capture that never started, and main can
+  // never receive `fault{run}` ahead of the `started` it describes.
+  armFaultWatch(addon);
+}
+
+// ---------------------------------------------------------------------------
+// The fault watch (#3394 PR 2, spec §4.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Disarm the watch. Idempotent. Every path that ends a capture calls it, and
+ * `handleStop` calls it as its FIRST statement, ahead of its own `capturing`
+ * guard, so no teardown can leave a watch polling a capture that is over.
+ */
+function clearFaultWatch(): void {
+  if (faultWatch === null) return;
+  clearInterval(faultWatch);
+  faultWatch = null;
+}
+
+/**
+ * A WATCH, NOT AN EVENT. `QuantumPump::fault()` latches without signalling, and
+ * after a format change every callback takes the fault arm, so no quantum is
+ * emitted and the drain callback never runs again — an event-driven report would
+ * need `rt/` to raise the availability signal on a fault, and that signal is
+ * dropped when it lands while this child is credit-blocked (C4). One field read
+ * per second has neither problem (spec §4.1, §13 decision 1).
+ *
+ * THIS IS NOT C4'S FORBIDDEN TIMER. C4 bans a timer that DRAINS, because that
+ * makes the consumer the clock and moves the drop site off the ring. This one
+ * never touches `drain`, the port or `outstanding`; flow control is unchanged.
+ *
+ * What it may do is bounded by I1: it can only END a capture, never select a
+ * target, a scope or a mode. On a latched fault it disarms itself, then runs the
+ * same wrapped teardown a failed start does — the addon is stopped and
+ * `reportLiveness` runs BEFORE the fault is posted — and posts exactly one
+ * `fault{stage:'run'}` whose text comes from the closed `RUN_FAULT_PHRASE` map.
+ * Nothing else `status()` returns reaches the wire (I-PID).
+ *
+ * A throwing `status()`, a throwing property read, or a malformed snapshot skips
+ * that tick silently: the caught value is native and unvalidated, and there is no
+ * sink here it may reach (observability.md principle 3). `unref()` so a watch can
+ * never be what keeps this process alive.
+ */
+function armFaultWatch(addon: AudiocapAddon): void {
+  clearFaultWatch();
+  faultWatch = setInterval(() => {
+    let faulted: unknown;
+    let reason: unknown;
+    try {
+      const snapshot = addon.status();
+      if (!isRecord(snapshot)) return;
+      faulted = snapshot.faulted;
+      reason = snapshot.faultReason;
+    } catch {
+      return;
+    }
+    if (faulted !== true) return;
+    clearFaultWatch();
+    unwindCapture(addon, runFaultMessage(reason), 'run');
+  }, FAULT_WATCH_INTERVAL_MS);
+  faultWatch.unref();
 }
 
 /**
@@ -772,15 +925,25 @@ function handleStart(
  * main kills the child (spec §4a), and a child that exited itself here would
  * reach main's `exit` handler as `child-crash`, i.e. as a packaging defect.
  *
- * `addon.stop()` is documented synchronous and idempotent and is called LAST, so
- * a native throw cannot leave the port open. It is deliberately not wrapped: at
- * this point main has already asked for teardown and is about to kill us, so an
- * empty catch would only convert a native defect into silence.
+ * `addon.stop()` is documented synchronous and idempotent and is called only after
+ * `capturing` is dropped and the port is closed, so a native throw cannot leave the
+ * port open. It is deliberately not wrapped HERE: on the ordinary `stop` path main
+ * has already asked for teardown and is about to kill us, so an empty catch would
+ * only convert a native defect into silence. The two paths that need a report to
+ * survive a throwing `stop()` — a failed start and a run fault — reach this through
+ * `unwindCapture`, which wraps it.
  */
 function handleStop(addon: AudiocapAddon): void {
-  // ALSO THE UNWIND FOR A FAILED START (see handleStart), which is why the guard
-  // below is a no-op rather than a fault: a `stop` arriving after a start that
-  // already tore itself down is the ordinary case, not a protocol error.
+  // FIRST, AHEAD OF THE GUARD, deliberately. Disarming is correct whether or not a
+  // capture is live, and placing it after `if (!capturing) return;` would make it
+  // conditional on a flag it has nothing to do with — a watch that outlived its
+  // capture would then keep reading `status()` and could post a `fault{run}` after
+  // main had already asked for teardown.
+  clearFaultWatch();
+  // ALSO THE UNWIND FOR A FAILED START AND FOR A RUN FAULT (see unwindCapture),
+  // which is why the guard below is a no-op rather than a fault: a `stop` arriving
+  // after a capture that already tore itself down is the ordinary case, not a
+  // protocol error.
   if (!capturing) return;
   capturing = false;
   closePcmPort();
@@ -789,7 +952,11 @@ function handleStop(addon: AudiocapAddon): void {
 }
 
 /**
- * DESIGN §6.2's CONSENT/LIVENESS LINE — the one reader `status()` has.
+ * DESIGN §6.2's CONSENT/LIVENESS LINE — the post-mortem reader of `status()`.
+ *
+ * It is one of two readers. The fault watch also calls `status()` while a capture
+ * is live, but reads only `faulted` and `faultReason`; the counters and the
+ * teardown evidence below are read here and nowhere else.
  *
  * R9 measured that TCC denial on macOS 26 yields on-schedule, correctly-shaped,
  * ZERO-FILLED callbacks with every Core Audio API returning `noErr`. There is no
@@ -798,12 +965,15 @@ function handleStop(addon: AudiocapAddon): void {
  * Without this call they were computed on every callback and read by nobody:
  * `status()` had no caller anywhere in the desktop tree.
  *
- * WHY IT IS A LOG AND NOT A MESSAGE. The host protocol is a closed set —
- * `hello`, `fault`, `start`, `stop` — and nothing in it carries counters. Adding
- * a fifth kind would be the watchdog surface #3198 owns, and this epic has
- * already decided that question once: #3195 DELETED an unwired watchdog rather
- * than ship it inert. So this reports through the channel that already exists
- * and stays a developer diagnostic until there is something to consume it.
+ * WHY IT IS A LOG AND NOT A MESSAGE. The child→main protocol is a closed set —
+ * `hello`, `started`, `fault` — and nothing in it carries counters. #3394 PR 2
+ * decided against carrying them: its mid-share report rides the existing `fault`
+ * kind as stage `'run'` rather than a new kind, and the silence advisory that would
+ * have consumed these counters was dropped, because the measurements it was built
+ * for showed neither of its triggers occurs as designed. This epic had already
+ * decided the underlying question once, too: #3195 DELETED an unwired watchdog
+ * rather than ship it inert. So this reports through the channel that already
+ * exists and stays a developer diagnostic.
  *
  * It is read only in an unpackaged build — `audiocapHost.ts` echoes this child's
  * stderr there and discards it otherwise — so this is a dev diagnostic by
@@ -844,17 +1014,27 @@ function reportLiveness(addon: AudiocapAddon): void {
 }
 
 /**
- * The unwind for a FAILED start, and the only place `addon.stop()` is wrapped.
+ * The unwind for a capture that ended on its own — a FAILED start, or a pump fault
+ * the watch found latched mid-share — and the only place `addon.stop()` is wrapped.
  *
  * `handleStop` leaves it unwrapped deliberately (see its docblock), and that is
  * right for the ordinary `stop` path: main has already asked for teardown and is
  * about to kill us, so there is no diagnostic a catch could protect and an empty
  * one would only convert a native defect into silence. Here the situation is the
- * opposite. The seam has ALREADY thrown or refused once, so a second throw from
+ * opposite. The seam has ALREADY thrown, refused or faulted once, so a throw from
  * `stop()` on the same broken module is plausible — and it would propagate past
  * the caller's `postFault`, killing the child with the original reason never
- * reported. The whole point of routing a failed start through teardown is to end
+ * reported. The whole point of routing these ends through teardown is to end
  * with a clean fault; an unguarded call can swallow exactly that.
+ *
+ * TEARDOWN FIRST, THEN THE REPORT, on every path. A `fault` main receives means the
+ * tap is already destroyed, never that it is about to be.
+ *
+ * `stage` IS REQUIRED, with no default. It had one (`'start'`), and a defaulted
+ * parameter is the `screenAudioRefusalMessage(platform = null)` defect shape: a
+ * caller that forgets it compiles, and here it would report a run fault as a
+ * failed start — which main maps to "this computer cannot do it" rather than "the
+ * share lost its sound". Every caller names its stage.
  *
  * `handleStop` drops `capturing` and closes the PCM port BEFORE calling
  * `addon.stop()`, so a throw from it leaves this side already torn down and only
@@ -867,11 +1047,7 @@ function reportLiveness(addon: AudiocapAddon): void {
  * both causes in one fault and return; main kills us, which is the documented
  * teardown. Exactly one fault is posted on every path.
  */
-function unwindFailedStart(
-  addon: AudiocapAddon,
-  message: string,
-  stage: AudiocapFaultStage = 'start'
-): void {
+function unwindCapture(addon: AudiocapAddon, message: string, stage: AudiocapFaultStage): void {
   try {
     handleStop(addon);
   } catch (unwindErr) {
@@ -880,10 +1056,11 @@ function unwindFailedStart(
     // that is cut. The separator avoids `(` `)` and `:` because DIAGNOSTIC_STRIP
     // deletes them silently -- composing punctuation the sink is known to remove
     // is how a message ends up reading as though words were missing.
-    // BOTH HALVES ARE PID-FREE, not just the caller's. `message` already came
-    // through `pidFreeErrorMessage` at the call site, and this half must match:
-    // it is the SAME `postFault('start', ...)`, on a path that only runs after
-    // target resolution, and a native `stop()` diagnostic is target-scoped, so a
+    // BOTH HALVES ARE PID-FREE, not just the caller's. `message` is already
+    // PID-free — `pidFreeErrorMessage` at the throw site, a closed phrase map at
+    // every other — and this half must match: it is the SAME `postFault(stage, ...)`,
+    // on a path that only runs after target resolution, and a native `stop()`
+    // diagnostic is target-scoped, so a
     // backend naming the process it failed to release lands the PID here instead.
     // Sanitising the first half and not the second leaves the invariant exactly
     // as broken as before, through the other door (#3198 PR 2 review, CWE-209).

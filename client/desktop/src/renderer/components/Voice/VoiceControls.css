@@ -41,6 +41,7 @@
 }
 
 .voice-controls__btn {
+  position: relative; /* anchors .voice-controls__badge (#3394 PR 2) */
   display: flex;
   align-items: center;
   gap: 4px;
@@ -141,7 +142,12 @@
   margin-bottom: 8px;
   padding: 8px 16px;
   border-radius: 6px;
-  background-color: color-mix(in srgb, var(--text-warning-strong) 15%, transparent);
+  /* OPAQUE. This was a 15% tint over `transparent`, so whatever the toast sat on
+     showed through its text: #3394 PR 2's M3 capture had the stage tile's
+     "test1's screen" label printed across the message. A 15% tint over
+     `--bg-secondary` instead measures 4.48:1 in high-contrast light (below 4.5);
+     plain `--bg-secondary` measures 5.50:1 minimum across all 34 blocks. */
+  background-color: var(--bg-secondary);
   border: 1px solid color-mix(in srgb, var(--text-warning-strong) 30%, transparent);
   color: var(--text-warning-strong);
   font-size: calc(12px * var(--font-scale, 1));
@@ -161,6 +167,56 @@
     opacity: 1;
     transform: translateX(-50%) translateY(0);
   }
+}
+
+/* ─── Interrupted screen-audio badge/toast (#3394 PR 2 §4.6) ────── */
+/* T17: `AlertTriangle` + `--text-warning-strong` is reserved for the #2153
+   policer notice strip. This is a plain dot with no `AlertTriangle`, so the
+   reservation is not reused. */
+
+.voice-controls__badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-warning-strong);
+  box-shadow: 0 0 0 2px var(--bg-secondary);
+}
+
+.voice-controls__audio-toast {
+  max-width: 320px;
+  padding: 8px 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--text-warning-strong);
+  border-radius: 8px;
+  animation: slot-error-in 160ms ease-out;
+}
+
+.voice-controls__audio-toast .voice-controls__badge {
+  position: static;
+  flex: none;
+  margin-top: 5px;
+}
+
+/* Visually-hidden helpers for the interrupted-state description span and the
+   announce-once-per-generation live region (same pattern as MessageInput's
+   L7 threshold announcer). */
+.voice-controls__sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ─── Full variant (inside VoiceView) ─────────────────────────── */
@@ -279,4 +335,15 @@
 .voice-controls__utility-menu-item:disabled:hover {
   background: transparent;
   color: var(--text-secondary);
+}
+
+/* Reduced-motion arm goes LAST — a media query ties on specificity with the
+   plain rules above and wins only on source order (#3394 PR 2 §4.6). The
+   boy-scout half: `.voice-controls__slot-error` had no reduced-motion arm
+   before this, and now does too. */
+@media (prefers-reduced-motion: reduce) {
+  .voice-controls__audio-toast,
+  .voice-controls__slot-error {
+    animation: none;
+  }
 }

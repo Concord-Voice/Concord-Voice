@@ -15,6 +15,7 @@ import {
   killAudiocapHost,
   probeAudiocapCapability,
   setAudiocapCapabilityListener,
+  setAudiocapInterruptListener,
   setAudiocapPortSink,
   wireAudiocapRendererLoss,
 } from './audiocapHost';
@@ -1570,6 +1571,54 @@ app.whenReady().then(async () => {
   registerSaveImageHandler(() => mainWindow, getRemoteSpaBaseUrl);
   registerSSOIPC(getRemoteSpaBaseUrl);
   registerAttestationIpc(getRemoteSpaBaseUrl);
+  // A LIVE per-process capture ended without the user asking (#3394 PR 2, contract 30):
+  // the tap faulted mid-share, the child crashed, or it broke protocol after `started`.
+  // `audiocapHost`'s `retire()` is the only caller, and it never calls this for a stop, a
+  // kill, a supersede or the probe -- so every push here is news the renderer cannot
+  // learn any other way, and there is no re-push to fall back on.
+  //
+  // A PUSH, like `'audiocap:capability'`: no sender to validate, and the same
+  // `isDestroyed()` guard for the same measured reason (see the `did-finish-load`
+  // re-push). The payload is RE-MINTED from the two fields, never forwarded: the host
+  // already mints it from main-owned values, but passing the reference on would make
+  // what reaches the renderer depend on every future edit to that object rather than
+  // on this line.
+  //
+  // ORDERING, BY CONSTRUCTION. This and the port sink below are registered ABOVE
+  // `registerAudiocapIpc`, which installs the `audiocap:start` handler -- the only way a
+  // capture can begin. A capture that interrupts with no listener is silently dropped
+  // (`retire()` treats `null` as "nobody to tell"), and a start with no port sink
+  // retires the session. Both setters only capture the late-bound `mainWindow` and guard
+  // it, so registering them first costs nothing and no later `await` can reorder them.
+  setAudiocapInterruptListener((interrupt) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('audiocap:interrupted', {
+      generation: interrupt.generation,
+      reason: interrupt.reason,
+    });
+  });
+
+  // Hand the renderer end of a capture channel to the preload relay (#3198 PR 3).
+  //
+  // `postMessage`, NOT `send`: this carries a `MessagePortMain` in a transfer list, and
+  // `webContents.send` has no transfer list. The channel name is spelled here rather
+  // than imported because `AUDIOCAP_PORT_CHANNEL` lives in `src/preload/audiocapRelay.ts`,
+  // which imports `ipcRenderer` — pulling a preload module into main to borrow a string
+  // constant is a worse trade than the literal. Same choice the two
+  // `'audiocap:capability'` sends in this file already make.
+  //
+  // THIS SINK THROWS RATHER THAN RETURNING, and that is the contract `audiocapHost`
+  // expects: a port that cannot reach the renderer means the child is capturing into
+  // nothing, so the host retires the session instead of reporting a started share. That
+  // is the opposite of the capability push (below), which swallows because its value is
+  // monotone and re-pushed on the next `did-finish-load`. A port is neither.
+  setAudiocapPortSink((generation, port) => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      throw new Error('audiocap port sink: no live window');
+    }
+    mainWindow.webContents.postMessage('audiocap:port', { generation }, [port]);
+  });
+
   // #3198 PR 3 — the `audiocap:start` invoke. This is the ONE audiocap handler the
   // sender-frame criterion binds; `audiocap:capability` is a push and has no sender
   // to validate. Same DI shape as its four siblings above, so the origin getter is
@@ -1801,27 +1850,6 @@ app.whenReady().then(async () => {
   setAudiocapCapabilityListener((perProcessAudio) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send('audiocap:capability', { perProcessAudio });
-  });
-
-  // Hand the renderer end of a capture channel to the preload relay (#3198 PR 3).
-  //
-  // `postMessage`, NOT `send`: this carries a `MessagePortMain` in a transfer list, and
-  // `webContents.send` has no transfer list. The channel name is spelled here rather
-  // than imported because `AUDIOCAP_PORT_CHANNEL` lives in `src/preload/audiocapRelay.ts`,
-  // which imports `ipcRenderer` — pulling a preload module into main to borrow a string
-  // constant is a worse trade than the literal. Same choice the two
-  // `'audiocap:capability'` sites above already make.
-  //
-  // THIS SINK THROWS RATHER THAN RETURNING, and that is the contract `audiocapHost`
-  // expects: a port that cannot reach the renderer means the child is capturing into
-  // nothing, so the host retires the session instead of reporting a started share. That
-  // is the opposite of the capability push above, which swallows because its value is
-  // monotone and re-pushed on the next `did-finish-load`. A port is neither.
-  setAudiocapPortSink((generation, port) => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      throw new Error('audiocap port sink: no live window');
-    }
-    mainWindow.webContents.postMessage('audiocap:port', { generation }, [port]);
   });
 
   // ─── concord-audiocap capability probe (#3195, ADR-0043) ──────────

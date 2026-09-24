@@ -639,11 +639,14 @@ describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
   // be type-checked and could never fail. The Readonly<Record<Union, true>> in
   // audiocapHost.ts is what makes a missing member a compile error; this asserts
   // the set that error protects.
-  it('has exactly the ten members, including capture-starved and target-unresolved', () => {
+  // #3394 PR 2 §4.3: `capture-starved` leaves the union (10 -> 9 members) — a
+  // `'run'` fault is now reported through `AudiocapInterrupted`, not a
+  // start-time degrade reason. Mutation guard: leaving `capture-starved` in
+  // `SCREEN_AUDIO_DEGRADE_REASONS` (audiocapHost.ts) turns this red.
+  it('has exactly the nine members, including target-unresolved and no capture-starved', () => {
     expect(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS).sort()).toEqual(
       [
         'capability-fault',
-        'capture-starved',
         'child-crash',
         'handshake-timeout',
         'load-fault',
@@ -654,6 +657,7 @@ describe('SCREEN_AUDIO_DEGRADE_REASONS — the #3197 PR 2 addition', () => {
         'unsupported-os',
       ].sort()
     );
+    expect(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS)).not.toContain('capture-starved');
   });
 
   it('does not carry consent-denied', () => {
@@ -1790,5 +1794,337 @@ describe('audiocap:stop spares the windowless app-start probe (#3394 PR 1, R4)',
     // The GRACEFUL stop, not a bare kill (electron.md "IPC contract v28" / #3198 PR 3
     // rationale): a real capture must still be ended by a trusted stop.
     expect(child.postMessage).toHaveBeenCalledWith({ kind: 'stop' });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// #3394 PR 2, Task T3 Step 2: mid-share interrupt publication.
+//
+// `setAudiocapInterruptListener` does not exist yet -- every case below fails
+// with "setAudiocapInterruptListener is not a function" (or an assertion on a
+// value that can never be produced) until audiocapHost.ts implements it. That
+// is the expected RED per superpowers:test-driven-development.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('mid-share interrupt publication (#3394 PR 2)', () => {
+  /**
+   * Drives a session from fork through `hello` -> `start` -> `started`, i.e. into
+   * `'capturing'`, and registers `onInterrupted` via `setAudiocapInterruptListener`
+   * -- mirroring the `capturing()` / `helloWithWindow()` helpers used earlier in
+   * this file (renderer-loss describe, "start settles on the started ack" describe).
+   */
+  async function capturing(onInterrupted: (interrupt: unknown) => void = vi.fn()) {
+    const host = await loadHost();
+    host.setAudiocapInterruptListener(onInterrupted);
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    child.handlers.message(STARTED);
+    await expect(started).resolves.toEqual({ ok: true, generation: 1, perProcessAudio: true });
+    child.kill.mockClear();
+    return { host, child, onInterrupted };
+  }
+
+  // Mutation guard: dropping the `'run'` arm of `interruptReasonFor` (or leaving
+  // `reasonForFaultStage` unnarrowed so it still accepts `'run'`) turns the first
+  // row red; dropping the `stage === 'protocol'` / start-phase-while-capturing /
+  // unknown-message arms of the interrupt mapping in `retire()`'s callers turns
+  // the remaining rows red.
+  it.each([
+    ['run', 'capture-interrupted'],
+    ['protocol', 'protocol-fault'],
+    ['target', 'protocol-fault'],
+  ] as const)(
+    "in 'capturing', a fault{%s} publishes %s once and reaps the child",
+    async (stage, reason) => {
+      const onInterrupted = vi.fn();
+      const { child } = await capturing(onInterrupted);
+
+      child.handlers.message({ kind: 'fault', stage, message: 'x' });
+
+      expect(onInterrupted).toHaveBeenCalledTimes(1);
+      expect(onInterrupted).toHaveBeenCalledWith({ generation: 1, reason });
+      expect(child.kill).toHaveBeenCalled();
+    }
+  );
+
+  // Mutation guard: dropping the `'child-crash'` arm of the exit-site `retire()`
+  // call (audiocapHost.ts, the `child.on('exit', ...)` wiring) turns this red.
+  it("in 'capturing', a child exit publishes child-crash once and reaps", async () => {
+    const onInterrupted = vi.fn();
+    const { child } = await capturing(onInterrupted);
+
+    child.handlers.exit(1);
+
+    expect(onInterrupted).toHaveBeenCalledTimes(1);
+    expect(onInterrupted).toHaveBeenCalledWith({ generation: 1, reason: 'child-crash' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // Mutation guard: dropping the "unknown message" fallback's interrupt argument
+  // in `handleChildMessage` (audiocapHost.ts) turns this red.
+  it("in 'capturing', an unknown message publishes protocol-fault once and reaps", async () => {
+    const onInterrupted = vi.fn();
+    const { child } = await capturing(onInterrupted);
+
+    child.handlers.message({ kind: 'nonsense' });
+
+    expect(onInterrupted).toHaveBeenCalledTimes(1);
+    expect(onInterrupted).toHaveBeenCalledWith({ generation: 1, reason: 'protocol-fault' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // Mutation guard: dropping the interrupt argument on `handleStarted`'s
+  // illegal-state `retire()` call turns this red.
+  it("in 'capturing', a duplicate started publishes protocol-fault once and reaps", async () => {
+    const onInterrupted = vi.fn();
+    const { child } = await capturing(onInterrupted);
+
+    child.handlers.message(STARTED);
+
+    expect(onInterrupted).toHaveBeenCalledTimes(1);
+    expect(onInterrupted).toHaveBeenCalledWith({ generation: 1, reason: 'protocol-fault' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // Mutation guard: mapping a `'run'` fault arriving in `'starting'` to
+  // `capture-interrupted` (rather than refusing it as `protocol-fault`, per
+  // spec §4.3 "Stage legality") turns the reason assertion red; publishing it
+  // anyway turns the `not.toHaveBeenCalled()` assertion red.
+  it("a fault{run} while 'starting' settles protocol-fault and publishes nothing", async () => {
+    const host = await loadHost();
+    const onInterrupted = vi.fn();
+    host.setAudiocapInterruptListener(onInterrupted);
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    child.handlers.message({ kind: 'fault', stage: 'run', message: 'x' });
+
+    await expect(started).resolves.toEqual({ ok: false, reason: 'protocol-fault' });
+    expect(onInterrupted).not.toHaveBeenCalled();
+  });
+
+  // Mutation guard: passing a non-null interrupt reason from `stopAudiocapHost`'s
+  // `retire`/`settleOnce` call turns this red.
+  it('stopAudiocapHost publishes nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      const onInterrupted = vi.fn();
+      const { host, child } = await capturing(onInterrupted);
+
+      host.stopAudiocapHost();
+      vi.advanceTimersByTime(200);
+
+      expect(onInterrupted).not.toHaveBeenCalled();
+      expect(child.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Mutation guard: passing a non-null interrupt reason from `killAudiocapHost`'s
+  // `retire`-shaped teardown turns this red.
+  it('killAudiocapHost publishes nothing', async () => {
+    const onInterrupted = vi.fn();
+    const { host, child } = await capturing(onInterrupted);
+
+    host.killAudiocapHost();
+
+    expect(onInterrupted).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // Mutation guard: same as `killAudiocapHost` above -- `startAudiocapHost`'s I3
+  // supersede calls `killAudiocapHost` internally, so this pins the same call
+  // site from the caller a live share actually uses.
+  it('a superseding startAudiocapHost publishes nothing for the superseded session', async () => {
+    const onInterrupted = vi.fn();
+    const { host, child } = await capturing(onInterrupted);
+
+    const second = makeChild();
+    fork.mockReturnValue(second);
+    void host.startAudiocapHost(2, 99);
+
+    expect(onInterrupted).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // Mutation guard: passing a non-null interrupt reason from `killAudiocapCapture`
+  // (or from the `killAudiocapHost` call it wraps) turns this red.
+  it('killAudiocapCapture publishes nothing', async () => {
+    const onInterrupted = vi.fn();
+    const { host, child } = await capturing(onInterrupted);
+
+    host.killAudiocapCapture();
+
+    expect(onInterrupted).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  // The app-start capability probe (`windowHandle === null`) never reaches
+  // `'capturing'` at all -- see the `probeAudiocapCapability` describe block
+  // above -- so this is a belt-and-braces pin on the call-site table in the
+  // plan (spec §4.3 "Never publish": "the probe"), not a case that currently
+  // exercises `retire()`'s publish gate the way the `'capturing'` cases do.
+  it('killing the app-start capability probe mid-handshake publishes nothing', async () => {
+    const host = await loadHost();
+    const onInterrupted = vi.fn();
+    host.setAudiocapInterruptListener(onInterrupted);
+    const child = makeChild();
+    fork.mockReturnValue(child);
+
+    const probe = host.probeAudiocapCapability();
+    host.killAudiocapHost();
+    await probe;
+
+    expect(onInterrupted).not.toHaveBeenCalled();
+  });
+
+  // C14-shaped: mirrors "a started from a child already being stopped is dropped
+  // without a reap" earlier in this file. Mutation guard: removing the
+  // `session !== live` guard on the child's `'message'` listener (audiocapHost.ts)
+  // turns BOTH assertions red -- the stale `live` would reach `handleChildMessage`
+  // and `retire` would reap and (post-implementation) publish.
+  it('a fault{run} from a detached stopping child publishes nothing and does not reap', async () => {
+    vi.useFakeTimers();
+    try {
+      const onInterrupted = vi.fn();
+      const { host, child } = await capturing(onInterrupted);
+
+      host.stopAudiocapHost();
+      child.kill.mockClear();
+      onInterrupted.mockClear();
+
+      child.handlers.message({ kind: 'fault', stage: 'run', message: 'x' });
+
+      expect(onInterrupted).not.toHaveBeenCalled();
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The drop is LOGGED (observability.md principle 3 constrains the ERROR OBJECT,
+  // not the fact of a drop), mirroring the existing capability-listener case
+  // above in this file. Mutation guard: logging the caught value instead of the
+  // fixed string turns the "does not contain" assertion red; removing the
+  // try/catch around `onInterrupted?.(...)` in `retire()` turns the whole case
+  // red (the throw would propagate out of the fault handler).
+  it('a throwing listener does not break retire, and console.warn logs a fixed string with no error object', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const onInterrupted = vi.fn(() => {
+      throw new Error('SECRET-CAUSE-SHOULD-NOT-BE-LOGGED');
+    });
+    const { child } = await capturing(onInterrupted);
+
+    expect(() => child.handlers.exit(1)).not.toThrow();
+
+    expect(child.kill).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith('[audiocap] interrupt listener threw');
+    const logged = warn.mock.calls.flat().map(String).join(' ');
+    expect(logged).not.toContain('SECRET-CAUSE-SHOULD-NOT-BE-LOGGED');
+    warn.mockRestore();
+  });
+
+  // Mutation guard: if `retire()` reads a captured `live`/`session` variable
+  // AFTER the re-entrant `startAudiocapHost(2, ...)` call inside the listener has
+  // already replaced `session`, `fork` is called once (the re-entrant start never
+  // runs) or the second `startAudiocapHost` throws/double-settles. Correct
+  // behaviour: the old session is fully forgotten (settled + reaped) BEFORE the
+  // listener runs, so a re-entrant start proceeds normally and forks a second
+  // child with no double settle on either promise.
+  it('a re-entrant listener calling startAudiocapHost runs after the old session is forgotten, without a double settle', async () => {
+    const host = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+
+    const second = makeChild();
+    let secondStarted: Promise<unknown> | undefined;
+    const onInterrupted = vi.fn(() => {
+      fork.mockReturnValue(second);
+      secondStarted = host.startAudiocapHost(2, 99);
+    });
+    host.setAudiocapInterruptListener(onInterrupted);
+
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    child.handlers.message(STARTED);
+    await started;
+    child.kill.mockClear();
+
+    expect(() =>
+      child.handlers.message({ kind: 'fault', stage: 'run', message: 'x' })
+    ).not.toThrow();
+
+    expect(onInterrupted).toHaveBeenCalledTimes(1);
+    expect(fork).toHaveBeenCalledTimes(2);
+    expect(secondStarted).toBeDefined();
+    second.handlers.message(validHello());
+    second.handlers.message(STARTED);
+    await expect(secondStarted).resolves.toEqual({
+      ok: true,
+      generation: 2,
+      perProcessAudio: true,
+    });
+    // The FIRST start must not settle a second time (no unhandled "already
+    // settled" throw, and no interference with the second promise's own value):
+    // it still holds the ok:true it resolved with at `started`.
+    await expect(started).resolves.toEqual({ ok: true, generation: 1, perProcessAudio: true });
+  });
+
+  // PUBLISH DECIDED AT ENTRY (spec §4.3, plan Step 5's named falsification):
+  // `retire()` must compute its publish decision from the state `live` arrived
+  // in, BEFORE any mutation -- never from `session`/`hostState` re-read after
+  // `session = null; hostState = nextState` has already run. A mutant that moves
+  // the `publish` computation below that assignment reads `session === live` as
+  // false post-mutation and this case's `onInterrupted` call count goes to 0.
+  it('publish is decided at entry, not re-derived after session is cleared (mutation guard)', async () => {
+    const onInterrupted = vi.fn();
+    const { child } = await capturing(onInterrupted);
+
+    child.handlers.message({ kind: 'fault', stage: 'run', message: 'x' });
+
+    expect(onInterrupted).toHaveBeenCalledTimes(1);
+    expect(onInterrupted).toHaveBeenCalledWith({ generation: 1, reason: 'capture-interrupted' });
+  });
+});
+
+// A SIBLING describe, not nested inside the one above: it does not inherit any
+// local `beforeEach` the interrupt-publication suite might carry, and it never
+// calls `setAudiocapInterruptListener`. It independently drives the same
+// fork -> hello -> start -> started sequence the `capturing()` helper above
+// uses, and asserts on the START PROMISE's resolved value -- proof, from a
+// completely separate setup, that the harness genuinely reaches `'capturing'`
+// (rather than merely not throwing) before any interrupt-publish case above
+// relies on it. Per tests.md "Vacuity": a fixture that never actually reaches
+// the state under test would let every "publishes nothing" case in the suite
+// above pass for the wrong reason.
+describe('mid-share interrupt publication — the harness genuinely reaches capturing (#3394 PR 2 control)', () => {
+  it("hello -> start -> started resolves ok:true, proving hostState really becomes 'capturing'", async () => {
+    const host = await loadHost();
+    const child = makeChild();
+    fork.mockReturnValue(child);
+    host.setAudiocapPortSink(vi.fn());
+
+    const started = host.startAudiocapHost(1, 42);
+    child.handlers.message(validHello());
+    child.handlers.message(STARTED);
+
+    await expect(started).resolves.toEqual({ ok: true, generation: 1, perProcessAudio: true });
+
+    // Independent corroboration of "capturing", not just "settled ok": a fault
+    // delivered post-settle still reaches the child (rather than being dropped
+    // the way a detached/stopping child's message is -- see the `session !==
+    // live` guard tested elsewhere in this file), which is only possible while
+    // this session is still the live one.
+    child.kill.mockClear();
+    child.handlers.message({ kind: 'fault', stage: 'protocol', message: 'x' });
+    expect(child.kill).toHaveBeenCalled();
   });
 });

@@ -76,7 +76,8 @@ no longer answers `NoBackend`; with no target supplied it answers `NoTarget`,
 which is the refusal happening _before_ any Core Audio call. The state machine
 lives in `rt/platform/macos/tap_backend.h` — header-only and free of any Apple
 header, over a POD of function pointers in `hal_api.h` — so all of it runs on the
-Linux ASAN/UBSAN/TSAN legs against a fake HAL. `tap_backend.mm` is ten wrappers,
+Linux ASAN/UBSAN/TSAN legs against a fake HAL. `tap_backend.mm` is fourteen
+wrappers (four of them the process-tree entries #3394 PR 2 added — see below),
 a version read and the singleton, and is the only file here that names Core Audio.
 
 **`status()` carries two counters R9 forced.** Consent denial does not fail
@@ -89,6 +90,21 @@ callbacks have arrived, `signalTotal` is still zero and a 10 s budget has elapse
 A granted tap on a paused or muted app produces byte-identical all-zero output —
 measured — so nothing at this seam distinguishes the two. It never faults, never
 stops a capture, and is cleared permanently by the first non-zero sample.
+
+**`allowDescendants` is honoured on macOS too, since #3394 PR 2.**
+`CATapDescription` has no process-tree flag of its own, so the backend expands
+one owner PID into its object-holding descendants itself (`rt/process_tree.h`):
+it snapshots the HAL's process-object list at `start()`, keeps every pid whose
+parent chain reaches the owner before it reaches the host's own subtree, and
+refuses rather than subset. It requires exactly one PID — any other count is
+`BadOptions`.
+
+**`status()` gained a LIVE reader in the same PR, and `silentSinceStart` is
+deliberately not it.** The capture child now polls `status()` once a second for
+the life of a running capture (the fault watch) and forwards only
+`faulted`/`faultReason` off it, turning a latched pump fault into one posted
+`fault{stage:'run'}`. `silentSinceStart` stays one-shot and advisory as above,
+with no mid-share reader of its own — the live poll never inspects it.
 
 ```js
 const { start, drain, stop } = require('./native/concord-audiocap');

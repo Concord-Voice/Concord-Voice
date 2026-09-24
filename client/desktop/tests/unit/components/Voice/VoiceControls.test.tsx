@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { render, screen, fireEvent, act, waitFor } from '../../../test-utils';
 import { resetAllStores } from '../../../helpers/store-helpers';
-import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
+import { useVoiceStore, type ScreenAudioState } from '@/renderer/stores/voice/voiceStore';
 import { useUserStore } from '@/renderer/stores/auth/userStore';
 import { useChannelStore } from '@/renderer/stores/chat/channelStore';
 import { vi } from 'vitest';
@@ -1414,5 +1414,352 @@ describe('#2153 media-policy latch in the toolbar', () => {
       'utf-8'
     );
     expect(css).toMatch(/\.voice-controls__row\s*\{[^}]*position:\s*relative/);
+  });
+});
+
+// ── Share sound interrupted state (#3394 PR 2 T5b) ──────────────────────────
+//
+// None of this exists yet: `screenAudioInterruptMessage`, the badge, the toast,
+// the live region, and the `'interrupted'` arm of `ScreenAudioState`. Every case
+// below is RED until T5b lands. `screenAudio` is set with a cast because the
+// store's `ScreenAudioState` union does not carry an `'interrupted'` member yet
+// (T5a, landing in parallel).
+//
+// MODULE ISOLATION. The plan gates the live-region announcement on a
+// module-level `let lastAnnouncedGeneration` inside `VoiceControls.tsx`. A
+// statically-imported module instance is shared and CUMULATIVE across every
+// `it()` in this file, so any test that inspects whether the region is
+// populated must not share that instance with another such test — otherwise
+// test ORDER decides the outcome, not the code under test. Every test in this
+// describe therefore runs `vi.resetModules()` in `beforeEach` and dynamically
+// re-imports both the voice store and `VoiceControls` fresh, so
+// `lastAnnouncedGeneration` starts at -1 every time, including for the tests
+// that do not themselves inspect the announcement (kept uniform on purpose —
+// a mixed pattern is what lets the next added test forget the isolation).
+describe('Share sound interrupted state (#3394 PR 2)', () => {
+  let freshVoiceStore: (typeof import('@/renderer/stores/voice/voiceStore'))['useVoiceStore'];
+  let FreshVoiceControls: (typeof import('@/renderer/components/Voice/VoiceControls'))['default'];
+
+  // jsdom does not implement requestAnimationFrame. Stub it so the live
+  // region's "next frame" population is drivable and deterministic.
+  let rafCallbacks: FrameRequestCallback[] = [];
+  const rafStub = vi.fn((cb: FrameRequestCallback): number => {
+    rafCallbacks.push(cb);
+    return rafCallbacks.length;
+  });
+
+  function flushRaf() {
+    const pending = rafCallbacks;
+    rafCallbacks = [];
+    pending.forEach((cb) => cb(0));
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    rafCallbacks = [];
+    vi.stubGlobal('requestAnimationFrame', rafStub);
+
+    const [storeModule, controlsModule] = await Promise.all([
+      import('@/renderer/stores/voice/voiceStore'),
+      import('@/renderer/components/Voice/VoiceControls'),
+    ]);
+    freshVoiceStore = storeModule.useVoiceStore;
+    FreshVoiceControls = controlsModule.default;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const INTERRUPT_SENTENCE =
+    'App sound stopped. Your screen is still being shared. Turn on Share sound to try again.';
+
+  const BASE_STATE = {
+    activeChannelId: VOICE_CHANNEL_ID,
+    connectionState: 'connected' as const,
+    isMuted: false,
+    isDeafened: false,
+    isVideoOn: false,
+    isScreenSharing: true,
+    isScreenAudioOn: false,
+    screenAudioVerdict: 'system-loopback' as const,
+    showVoiceTextChat: false,
+    participants: {},
+    videoSlotError: null,
+    tunedInScreenShares: {},
+    activeScreenShares: {},
+    voiceViewMode: 'front-center' as const,
+    keepActiveWhileUnfocused: false,
+    voiceControlsPinned: false,
+  };
+
+  function setFreshState(overrides: Record<string, unknown> = {}) {
+    freshVoiceStore.setState({ ...BASE_STATE, ...overrides });
+  }
+
+  const INTERRUPTED_SCREEN_AUDIO = {
+    mode: 'interrupted',
+    reason: 'child-crash',
+    generation: 7,
+    overrun: 0,
+  } as unknown as ScreenAudioState;
+
+  const OFF_SCREEN_AUDIO = { mode: 'off', overrun: 0 } as ScreenAudioState;
+
+  function findShareSoundButton(): HTMLButtonElement {
+    return screen.getByText('Share sound').closest('button') as HTMLButtonElement;
+  }
+
+  it('control: a non-interrupted state shows no badge, keeps the title, and shows no toast', () => {
+    setFreshState({ screenAudio: OFF_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const button = findShareSoundButton();
+    expect(button.querySelector('.voice-controls__badge')).toBeNull();
+    expect(button).toHaveAttribute('title');
+    expect(document.querySelector('.voice-controls__audio-toast')).toBeNull();
+  });
+
+  it('while badged, the title equals the interrupt sentence, and aria-describedby resolves to an element holding the same sentence', () => {
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const button = findShareSoundButton();
+    expect(button.querySelector('.voice-controls__badge')).not.toBeNull();
+    // A1: `badge` REPLACES `title` (never joins it), so a sighted user who never
+    // hovers still learns what the dot means the moment they do.
+    expect(button).toHaveAttribute('title', INTERRUPT_SENTENCE);
+
+    const describedBy = button.getAttribute('aria-describedby');
+    expect(describedBy).toBeTruthy();
+    const target = describedBy ? document.getElementById(describedBy) : null;
+    expect(target).not.toBeNull();
+    expect(target).toHaveTextContent(INTERRUPT_SENTENCE);
+  });
+
+  it('when not interrupted, the button shows its normal title and no badge', () => {
+    setFreshState({ screenAudio: OFF_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const button = findShareSoundButton();
+    expect(button.querySelector('.voice-controls__badge')).toBeNull();
+    expect(button).toHaveAttribute(
+      'title',
+      'Share every sound on this computer, not only this screen'
+    );
+  });
+
+  it('the live region mounts empty and holds the sentence after the next frame', async () => {
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const region = document.querySelector('.voice-controls__audio-status');
+    expect(region).not.toBeNull();
+    expect(region).toHaveAttribute('role', 'status');
+    // Positive gate before the negative assertion: mounting already happened
+    // synchronously inside `render`, so asserting empty here is sound (tests.md
+    // "never wrap a negative assertion in waitFor" — this one is not wrapped).
+    expect(region).toBeEmptyDOMElement();
+
+    await act(async () => flushRaf());
+
+    expect(document.querySelector('.voice-controls__audio-status')).toHaveTextContent(
+      INTERRUPT_SENTENCE
+    );
+  });
+
+  it('populates only one status region with two instances mounted', async () => {
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+    render(<FreshVoiceControls />);
+
+    await act(async () => flushRaf());
+
+    const regions = Array.from(document.querySelectorAll('.voice-controls__audio-status'));
+    expect(regions).toHaveLength(2);
+    const populated = regions.filter((r) => (r.textContent ?? '').length > 0);
+    expect(populated).toHaveLength(1);
+  });
+
+  it('does not re-announce on remount with the same generation, but a new generation announces', async () => {
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    const first = render(<FreshVoiceControls />);
+    await act(async () => flushRaf());
+    expect(document.querySelector('.voice-controls__audio-status')).toHaveTextContent(
+      INTERRUPT_SENTENCE
+    );
+    first.unmount();
+
+    // Same module instance, same generation (7): the gate must not re-fire.
+    const second = render(<FreshVoiceControls />);
+    await act(async () => flushRaf());
+    expect(document.querySelector('.voice-controls__audio-status')).toBeEmptyDOMElement();
+    second.unmount();
+
+    // A NEW generation (8) must announce once.
+    setFreshState({
+      screenAudio: { ...INTERRUPTED_SCREEN_AUDIO, generation: 8 } as unknown as ScreenAudioState,
+    });
+    render(<FreshVoiceControls />);
+    await act(async () => flushRaf());
+    expect(document.querySelector('.voice-controls__audio-status')).toHaveTextContent(
+      INTERRUPT_SENTENCE
+    );
+  });
+
+  it('clamps the toast inside the window for an anchor near the left edge', () => {
+    setFreshState({ screenAudio: OFF_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const anchor = document.querySelector('.voice-controls--full') as HTMLElement;
+    expect(anchor).not.toBeNull();
+    vi.spyOn(anchor, 'getBoundingClientRect').mockReturnValue({
+      left: 5,
+      top: 0,
+      right: 5,
+      bottom: 0,
+      width: 0,
+      height: 0,
+      x: 5,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    act(() => {
+      freshVoiceStore.setState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    });
+
+    const toast = document.querySelector('.voice-controls__audio-toast') as HTMLElement;
+    expect(toast).not.toBeNull();
+    const left = parseFloat(toast.style.left);
+    expect(left).toBeGreaterThanOrEqual(160 + 8);
+    expect(left).toBeLessThanOrEqual(globalThis.innerWidth - 160 - 8);
+  });
+
+  it('clamps the toast inside the window for an anchor near the right edge', () => {
+    setFreshState({ screenAudio: OFF_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const anchor = document.querySelector('.voice-controls--full') as HTMLElement;
+    const x = globalThis.innerWidth - 5;
+    vi.spyOn(anchor, 'getBoundingClientRect').mockReturnValue({
+      left: x,
+      top: 0,
+      right: x,
+      bottom: 0,
+      width: 0,
+      height: 0,
+      x,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    act(() => {
+      freshVoiceStore.setState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    });
+
+    const toast = document.querySelector('.voice-controls__audio-toast') as HTMLElement;
+    expect(toast).not.toBeNull();
+    const left = parseFloat(toast.style.left);
+    expect(left).toBeGreaterThanOrEqual(160 + 8);
+    expect(left).toBeLessThanOrEqual(globalThis.innerWidth - 160 - 8);
+  });
+
+  it('the toast is gone after 10 seconds', () => {
+    vi.useFakeTimers();
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    expect(document.querySelector('.voice-controls__audio-toast')).not.toBeNull();
+
+    act(() => {
+      vi.advanceTimersByTime(10000);
+    });
+
+    expect(document.querySelector('.voice-controls__audio-toast')).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // F4: toast expiry is a MODULE-level gate (`lastToastExpiredGeneration`), not a
+  // per-instance one, so a VoiceView <-> PersistentVoiceBar remount does not re-show
+  // a toast that already ran out its 10s for the same generation.
+  it('a toast that already expired for this generation does not reappear on remount', () => {
+    vi.useFakeTimers();
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    const first = render(<FreshVoiceControls />);
+    expect(document.querySelector('.voice-controls__audio-toast')).not.toBeNull();
+
+    act(() => {
+      vi.advanceTimersByTime(10000);
+    });
+    expect(document.querySelector('.voice-controls__audio-toast')).toBeNull();
+    first.unmount();
+
+    // Same module instance, same generation (7): the toast must stay gone.
+    render(<FreshVoiceControls />);
+    expect(document.querySelector('.voice-controls__audio-toast')).toBeNull();
+
+    vi.useRealTimers();
+  });
+
+  it('control: remounting BEFORE the toast expires still shows it', () => {
+    vi.useFakeTimers();
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    const first = render(<FreshVoiceControls />);
+    expect(document.querySelector('.voice-controls__audio-toast')).not.toBeNull();
+
+    act(() => {
+      vi.advanceTimersByTime(5000); // well before the 10s expiry
+    });
+    first.unmount();
+
+    render(<FreshVoiceControls />);
+    expect(document.querySelector('.voice-controls__audio-toast')).not.toBeNull();
+
+    vi.useRealTimers();
+  });
+
+  it('a new generation shows its own toast even after an earlier generation expired', () => {
+    vi.useFakeTimers();
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    const first = render(<FreshVoiceControls />);
+    act(() => {
+      vi.advanceTimersByTime(10000);
+    });
+    expect(document.querySelector('.voice-controls__audio-toast')).toBeNull();
+    first.unmount();
+
+    setFreshState({
+      screenAudio: { ...INTERRUPTED_SCREEN_AUDIO, generation: 8 } as unknown as ScreenAudioState,
+    });
+    render(<FreshVoiceControls />);
+    expect(document.querySelector('.voice-controls__audio-toast')).not.toBeNull();
+
+    vi.useRealTimers();
+  });
+
+  it('a click calls the existing toggle, and the badge clears once the mode leaves interrupted', async () => {
+    setFreshState({ screenAudio: INTERRUPTED_SCREEN_AUDIO });
+    render(<FreshVoiceControls />);
+
+    const button = findShareSoundButton();
+    expect(button.querySelector('.voice-controls__badge')).not.toBeNull();
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    // isScreenAudioOn is false while interrupted, so the toggle asks to turn it on.
+    expect(mockSetScreenAudioEnabled).toHaveBeenCalledWith(true);
+
+    act(() => {
+      freshVoiceStore.setState({
+        screenAudio: { mode: 'per-process', overrun: 0 } as ScreenAudioState,
+        isScreenAudioOn: true,
+      });
+    });
+
+    const activeButton = screen.getByText(/app sound|desktop sound/i).closest('button');
+    expect(activeButton?.querySelector('.voice-controls__badge')).toBeNull();
   });
 });

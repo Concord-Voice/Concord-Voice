@@ -10,6 +10,11 @@ import { configureRefreshFailureReset } from './services/system/apiClient';
 // module-scope IPC subscription, because the push can arrive on `did-finish-load` —
 // before any React tree mounts, so a component effect would miss it.
 import './services/voice/machineAudioCapability';
+// Side-effect import (#3394 PR 2, contract 30): subscribes the interrupt replay slot
+// to main's `audiocap:interrupted` push at module scope, for the same reason as
+// `machineAudioCapability` above -- the push can arrive before any bridge exists to
+// claim it.
+import './services/voice/screenAudioInterrupts';
 import { install as installLogBuffer } from './services/system/logBufferService';
 import { gracefulReset, nuclearReset } from './services/system/resetService';
 import './styles/index.css';

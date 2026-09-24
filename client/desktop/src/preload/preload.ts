@@ -1,8 +1,8 @@
 import { contextBridge, ipcRenderer, webFrame } from 'electron';
 
 // TYPE-ONLY, and that is load-bearing rather than stylistic: the comment below
-// records that `audiocapRelay` and `uiZoom` are the file's ONLY runtime local
-// imports, both inlined rather than `require`d — a property
+// records the file's ONLY runtime local imports, all inlined rather than
+// `require`d — a property
 // `tests/integration/preload-sandbox-contract.test.ts` pins. `import type` is erased
 // by esbuild, so this adds no `require`. Same shape as the `ipcContract` import above.
 import type { AudiocapStartResult } from '../main/audiocapHost';
@@ -17,10 +17,16 @@ import type {
 } from '../shared/sso';
 import type { SpaFallbackDiagnostic } from '../shared/spaIpcTypes';
 
-// The ONLY two runtime local imports in this file. `scripts/build-preload.mjs`
-// runs esbuild with `bundle: true, external: ['electron']`, so both are inlined
-// into `dist/preload/preload.js` rather than becoming a `require` — which is what
-// keeps `tests/integration/preload-sandbox-contract.test.ts` green.
+// The ONLY three runtime local imports in this file. `scripts/build-preload.mjs`
+// runs esbuild with `bundle: true, external: ['electron']`, so all three are
+// inlined into `dist/preload/preload.js` rather than becoming a `require` — which
+// is what keeps `tests/integration/preload-sandbox-contract.test.ts` green.
+//
+// `audiocapProtocol` adds no new code to the bundle: `audiocapRelay` already
+// inlines it for `decodeQuantumHeader`, and it has no imports of its own. It is
+// imported here for `isAudiocapInterrupted`, so the `audiocap:interrupted` bridge
+// narrows against the same anchor main and the renderer use (#3394 PR 2).
+import { isAudiocapInterrupted, type AudiocapInterrupted } from '../shared/audiocapProtocol';
 import { AUDIOCAP_PORT_TAG, installAudiocapRelay, type AudiocapRelayWindow } from './audiocapRelay';
 import { createSetZoomFactor } from './uiZoom';
 
@@ -560,7 +566,14 @@ contextBridge.exposeInMainWorld('electron', {
      * a shell below 28 lacks it and the renderer stays on the pre-addon rungs — video-only,
      * never a system mix (C9).
      *
-     * Pure pass-through. The value authorises nothing: it feeds the renderer's affordance
+     * FIELD-COPIED, NOT FORWARDED (#3394 PR 2). A non-object payload or a non-boolean
+     * `perProcessAudio` is dropped, and the callback receives a NEW `{ perProcessAudio }`,
+     * so no other key the payload carries ever reaches the main world. This was a
+     * by-reference pass-through until `onInterrupted` below was written with the copy;
+     * hardening one twin and leaving the other forwarding `data` would have made the older
+     * channel the weaker one.
+     *
+     * The value authorises nothing: it feeds the renderer's affordance
      * ladder, and every enforcement decision MAIN MAKES is re-derived from inputs main
      * re-validates — so a renderer that lies to itself about this bit gains nothing.
      *
@@ -578,11 +591,56 @@ contextBridge.exposeInMainWorld('electron', {
      * for one PR — exactly the drift the docs-ship-with-the-code rule exists to stop.
      */
     onCapability: (callback: (data: { perProcessAudio: boolean }) => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, data: { perProcessAudio: boolean }) =>
-        callback(data);
+      // Disarmed on unsubscribe for the reason `onInterrupted` documents below.
+      let subscribed = true;
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => {
+        if (!subscribed || typeof data !== 'object' || data === null) return;
+        const perProcessAudio = (data as { perProcessAudio?: unknown }).perProcessAudio;
+        if (typeof perProcessAudio !== 'boolean') return;
+        callback({ perProcessAudio });
+      };
       ipcRenderer.on('audiocap:capability', handler);
       return () => {
+        subscribed = false;
         ipcRenderer.removeListener('audiocap:capability', handler);
+      };
+    },
+
+    /**
+     * A LIVE per-process capture ended without the user asking (#3394 PR 2, contract 30):
+     * the tap faulted mid-share, the capture child crashed, or it broke protocol after
+     * `started`. Pushed by main to the main window only. Its PRESENCE is the capability
+     * probe — the renderer feature-detects
+     * `typeof globalThis.electron?.audiocap?.onInterrupted === 'function'`, and a shell
+     * below 30 simply does not tell the user; `SPA_MIN_CONTRACT` stays 19.
+     *
+     * A push, so there is no sender to validate, exactly as for `onCapability` above.
+     *
+     * VALIDATED, THEN FIELD-COPIED. `isAudiocapInterrupted` checks both fields against the
+     * shared anchor and tolerates extras, so the callback receives a NEW
+     * `{ generation, reason }` built from those two fields alone — never `data` itself. A
+     * reason this preload does not know (one a newer main might send) is dropped here
+     * rather than handed to a renderer that would have to guess at it.
+     *
+     * UNSUBSCRIBE DISARMS THE HANDLER, NOT ONLY THE REGISTRATION. `ipcRenderer` is an
+     * EventEmitter, and a `removeListener` issued while an emit is in progress does not
+     * remove the listener from THAT emit (Node `events` docs) — so a subscriber whose
+     * sibling unsubscribes it from inside the same push would still be called. The flag
+     * makes "nothing after `unsubscribe()` returns" true by construction.
+     *
+     * Authorises nothing: the renderer uses it to tear down the audio half of a share whose
+     * child is already gone. It carries no PID, window handle or diagnostic text.
+     */
+    onInterrupted: (callback: (data: AudiocapInterrupted) => void) => {
+      let subscribed = true;
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => {
+        if (!subscribed || !isAudiocapInterrupted(data)) return;
+        callback({ generation: data.generation, reason: data.reason });
+      };
+      ipcRenderer.on('audiocap:interrupted', handler);
+      return () => {
+        subscribed = false;
+        ipcRenderer.removeListener('audiocap:interrupted', handler);
       };
     },
 
@@ -592,8 +650,8 @@ contextBridge.exposeInMainWorld('electron', {
      * Named `start`, not `startAudiocap`: inside the namespace the latter reads
      * `audiocap.startAudiocap`.
      *
-     * ADDITIVE WITHIN CONTRACT 28 — `IPC_CONTRACT_VERSION` does not move and
-     * `SPA_MIN_CONTRACT` stays 19. The renderer feature-detects
+     * ADDED WITHIN CONTRACT 28 — #3198 PR 3 did not move `IPC_CONTRACT_VERSION`,
+     * and `SPA_MIN_CONTRACT` stays 19. The renderer feature-detects
      * `typeof window.electron?.audiocap?.start !== 'function'`, so a shell without
      * this channel loses per-process audio and falls back to video-only, never to a
      * system mix (C9). Capability, not demand (#2967).
@@ -610,7 +668,7 @@ contextBridge.exposeInMainWorld('electron', {
     /**
      * End the live per-process capture (#3198 PR 3).
      *
-     * Zero-argument: the renderer triggers, main decides what to reap. Additive within
+     * Zero-argument: the renderer triggers, main decides what to reap. Added within
      * contract 28 like `start`, so feature-detect rather than demand -- a shell without
      * it falls back to the quit hooks, which is the pre-PR-3 behaviour.
      */
@@ -898,19 +956,33 @@ export interface ElectronAPI {
   };
 
   /**
-   * Per-process screen-share audio (#3195). The PRESENCE of this function is
-   * the capability probe; its value is the discriminator on the one-shot
-   * `window` message that carries the relay's main-world `MessagePort`.
+   * Per-process screen-share audio (#3195). EVERY member is feature-detected on its
+   * own — `typeof globalThis.electron?.audiocap?.<member> === 'function'` — because
+   * each arrived in a different shell and `SPA_MIN_CONTRACT` stays 19: a renderer on
+   * an older shell loses that one member's feature and nothing else. The contract
+   * each arrived in is noted per member, so the version a shell must reach for a
+   * given feature is read here rather than reconstructed from `ipcContract.ts`.
    */
   audiocap: {
+    /**
+     * Contract 27. Its value is the discriminator on the one-shot `window` message
+     * that carries the relay's main-world `MessagePort`.
+     */
     getPortMessageTag: () => string;
+    /** Contract 28. Field-copied: the callback receives a new `{ perProcessAudio }`. */
     onCapability: (callback: (data: { perProcessAudio: boolean }) => void) => () => void;
     /**
-     * #3198 PR 3. Additive within contract 28; feature-detect its presence rather
-     * than demanding a contract bump (`SPA_MIN_CONTRACT` stays 19).
+     * Contract 30 (#3394 PR 2). Validated and field-copied: the callback receives a
+     * new `{ generation, reason }`, and a reason outside the shared anchor never
+     * arrives. A shell below 30 simply does not tell the user.
+     */
+    onInterrupted: (callback: (data: AudiocapInterrupted) => void) => () => void;
+    /**
+     * #3198 PR 3. Shipped inside contract 28 without a bump, so a v28 shell may
+     * lack it — feature-detection, not the contract number, is the only test.
      */
     start: (sourceId: string) => Promise<AudiocapStartResult>;
-    /** #3198 PR 3. Zero-argument; additive within contract 28. */
+    /** #3198 PR 3. Zero-argument; shipped inside contract 28 like `start`. */
     stop: () => Promise<void>;
   };
 }

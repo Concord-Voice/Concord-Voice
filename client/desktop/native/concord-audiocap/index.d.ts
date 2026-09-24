@@ -69,21 +69,29 @@ export interface AudioCapStartOptions {
    *
    * WHY A BOUNDED LIST AND NOT ONE PID. The window's PID is not necessarily the
    * process rendering the audio (ADR-0043 risk 2). Windows expresses that with
-   * `INCLUDE_TARGET_PROCESS_TREE` on one PID; macOS cannot — `CATapDescription`
-   * takes an explicit process-object list. 8 is a bound on a caller-supplied
+   * `INCLUDE_TARGET_PROCESS_TREE` on one PID; `CATapDescription` has no such
+   * flag and takes an explicit process-object list, which is why the macOS
+   * backend expands one owner itself when `allowDescendants` is set (#3394 PR 2).
+   * 8 is a bound on a caller-supplied
    * array length, not a claim about how many helper processes a browser has.
    */
   targetPids?: number[];
 
   /**
-   * OPTIONAL, default false. Honoured natively by Windows; on macOS the list is
-   * documented as ALREADY EXPANDED by the caller.
+   * OPTIONAL, default false. Honoured NATIVELY on macOS. The Windows backend
+   * (#3196) is not built yet; its planned mechanism is
+   * `INCLUDE_TARGET_PROCESS_TREE` on the one target PID. `CATapDescription` has no
+   * equivalent flag, so since #3394 PR 2 the macOS backend expands the owner
+   * itself (`rt/process_tree.h`): it snapshots the HAL's process-object list at
+   * start and targets the owner plus every descendant that holds a process
+   * object, excluding the host's own subtree — under-capture is the only failure
+   * direction.
    *
-   * Only meaningful alongside `targetPids`, and supplying it without one is
-   * `BadOptions` rather than being ignored — there is no list for it to expand,
-   * so the only alternative is to accept a request the addon did not honour. A
-   * non-boolean is `BadOptions` too: widening a capture to a process tree on a
-   * truthy coercion is the permissive reading of an ambiguous request.
+   * REQUIRES EXACTLY ONE PID. Only meaningful alongside `targetPids`, and
+   * supplying it without one — or with more than one PID, which a tree
+   * expansion cannot take as a root — is `BadOptions` rather than being
+   * ignored. A non-boolean is `BadOptions` too: widening a capture to a process
+   * tree on a truthy coercion is the permissive reading of an ambiguous request.
    */
   allowDescendants?: boolean;
 }
@@ -295,7 +303,10 @@ export interface AudioCapStatus {
    * this counter existed it failed silently.
    *
    * The correct response is to KILL THE CHILD — process exit is what actually
-   * reaps the tap. #3198's watchdog reads this beside `poisoned`.
+   * reaps the tap. The capture child's `handleStop` reads this beside `poisoned`
+   * once the share has ended (#3198 PR 3); the live fault watch (#3394 PR 2)
+   * polls `status()` once a second while a capture is running but reads only
+   * `faulted`/`faultReason` off it, not this.
    */
   destroyFailures: number;
 

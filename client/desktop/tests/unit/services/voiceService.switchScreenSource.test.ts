@@ -20,6 +20,7 @@ import { voiceService } from '@/renderer/services/voice/voiceService';
 import { resetAllStores } from '../../helpers/store-helpers';
 import { useVoiceStore } from '@/renderer/stores/voice/voiceStore';
 import { createScreenAudioBridge } from '@/renderer/services/voice/screenAudioBridge';
+import { screenAudioDegradeMessage } from '@/renderer/utils/policy/screenAudioDegradeCopy';
 import { deferred } from '../../helpers/deferred';
 
 // The bridge builds a `MediaStreamTrackGenerator`, which jsdom does not implement. The
@@ -1068,6 +1069,78 @@ describe('per-process audio ownership across a switch (#3349)', () => {
       mode: 'degraded',
       reason: 'no-backend',
     });
+  });
+
+  // -- `degradeScreenAudio` writes the toast, not just the state (#3394 PR 2 M3) ---
+  //
+  // Before `degradeScreenAudio` existed, all three shapes below wrote
+  // `voiceStore.screenAudio` alone. No component renders `mode: 'degraded'`, so a
+  // refused per-process share (a Safari window, a silent Finder window) went live
+  // with no sound and no explanation -- found on hardware. These cases assert the
+  // OUTERMOST observable effect (`videoSlotError`, what `VoiceControls` actually
+  // renders), not a spy on `degradeScreenAudio` or `setVideoSlotError` itself.
+
+  it('CONTROL: a successful per-process capture leaves videoSlotError untouched', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(useVoiceStore.getState().videoSlotError).toBeNull();
+  });
+
+  it('tells the user why when the audiocap start invoke rejects (protocol-fault)', async () => {
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    // Shape 1: the invoke itself throws -- main rejected rather than returning an
+    // outcome. `degradeScreenAudio` is called with the literal 'protocol-fault'.
+    globalThis.electron.audiocap!.start = vi
+      .fn()
+      .mockRejectedValue(new Error('ipc boundary broke'));
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(useVoiceStore.getState().screenAudio).toEqual({
+      mode: 'degraded',
+      reason: 'protocol-fault',
+      overrun: 0,
+    });
+    expect(useVoiceStore.getState().videoSlotError).toBe(
+      screenAudioDegradeMessage('protocol-fault')
+    );
+  });
+
+  it('tells the user why when the audiocap start invoke resolves ok:false', async () => {
+    // Shape 2: `start` resolves `{ ok: false, reason }` -- one of main's own fences
+    // refused before a child was ever produced.
+    arm({ ok: false, reason: 'target-unresolved' });
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(useVoiceStore.getState().screenAudio).toEqual({
+      mode: 'degraded',
+      reason: 'target-unresolved',
+      overrun: 0,
+    });
+    expect(useVoiceStore.getState().videoSlotError).toBe(
+      screenAudioDegradeMessage('target-unresolved')
+    );
+  });
+
+  it('tells the user why when bridge construction throws after a successful start (no-backend)', async () => {
+    // Shape 3: the start succeeded but `createScreenAudioBridge` throws -- the
+    // machine said it could and this renderer cannot.
+    arm({ ok: true, generation: 7, perProcessAudio: true });
+    vi.mocked(createScreenAudioBridge).mockImplementationOnce(() => {
+      throw new Error('bridge unsupported');
+    });
+
+    await svc.captureScreenElectron(WINDOW_ID, { w: 1280, h: 720 }, 30, true);
+
+    expect(useVoiceStore.getState().screenAudio).toEqual({
+      mode: 'degraded',
+      reason: 'no-backend',
+      overrun: 0,
+    });
+    expect(useVoiceStore.getState().videoSlotError).toBe(screenAudioDegradeMessage('no-backend'));
   });
 
   it('does not attach a late audiocap completion after explicit share stop wins', async () => {

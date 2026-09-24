@@ -69,6 +69,30 @@
 //     the first quantum" refinement: that is the packaging-defect signal, and it
 //     must be the loudest case rather than the quietest. The next share forks
 //     fresh.
+//
+// I7. PUBLISH ONLY THE INVOLUNTARY END OF A LIVE CAPTURE (#3394 PR 2; spec §2 I5,
+//     which numbers it differently). `retire()` is the one publisher. It
+//     publishes iff three facts held WHEN THE CAUSE ARRIVED: the caller named an
+//     interrupt reason (non-null), `session === live` (I2), and `hostState ===
+//     'capturing'` (the start promise already settled `ok:true`, so the renderer
+//     holds a bridge that nothing else will tell it is dead). The decision is
+//     taken at entry, before `retire` forgets the session; the listener runs
+//     last, after the child is reaped and the promise settled, inside a
+//     try/catch. At most once per session: the first retire forgets it, and the
+//     `session !== live` fence drops everything that child says afterwards.
+//
+//     The child is information, never authorization (spec §2 I1). What it can
+//     steer is WHICH of three main-owned reasons describes its own capture
+//     ending -- which it could already end by exiting. The generation is main's,
+//     and the reason is main's mapping of the cause, never the child's text.
+//
+//     WHAT BREAKS IT: deciding after `session = null` (never publishes, and the
+//     renderer keeps a bridge around a dead child -- the silent per-process
+//     defect); dropping the `'capturing'` conjunct (a start-phase refusal is
+//     both settled AND published, so the renderer is told twice about a share
+//     it never had); and any voluntary path -- stop, kill, supersede,
+//     `killAudiocapCapture`, the probe -- passing a reason. Those paths do not
+//     call `retire` at all today; a future one that does passes `null`.
 
 import path from 'node:path';
 import { app, utilityProcess, MessageChannelMain, type UtilityProcess } from 'electron';
@@ -89,7 +113,9 @@ import {
   type AudiocapCapability,
   type AudiocapFaultStage,
   type AudiocapHello,
+  type AudiocapInterrupted,
   type AudiocapStart,
+  type ScreenAudioInterruptReason,
 } from '../shared/audiocapProtocol';
 import { NATIVE_ADDON_ENV, resolveNativeAddonPath } from './nativeAddonPath';
 
@@ -109,6 +135,13 @@ import { NATIVE_ADDON_ENV, resolveNativeAddonPath } from './nativeAddonPath';
  *
  * Deliberately no count. This said "Six of the seven" while the union held ten;
  * `SCREEN_AUDIO_DEGRADE_REASONS` below is the membership list the compiler checks.
+ *
+ * A START PRODUCES THESE; A LIVE CAPTURE THAT ENDS DOES NOT (#3394 PR 2). Once
+ * `started` has settled the promise, an involuntary end is an `AudiocapInterrupted`
+ * whose reason is a `ScreenAudioInterruptReason` (`src/shared/audiocapProtocol.ts`)
+ * -- see I7 above. `capture-starved` was a member until then: an advisory for a
+ * silent tap with no producer on any path, removed together with the silence
+ * advisory it belonged to. Do not re-add a mid-share reason here.
  */
 export type ScreenAudioDegradeReason =
   | 'no-backend'
@@ -118,37 +151,6 @@ export type ScreenAudioDegradeReason =
   | 'capability-fault'
   | 'protocol-fault'
   | 'produce-rejected'
-  // The tap is alive and delivering, and nothing has ever been audible.
-  //
-  // ADVISORY, AND DELIBERATELY NOT `consent-denied`. R9 measured that a
-  // TCC-denied Core Audio tap returns noErr from every call and delivers ~94
-  // correctly-shaped callbacks a second carrying only zeros -- byte-identical
-  // to a granted tap on a paused app. Nothing at the capture seam distinguishes
-  // them, so a `consent-denied` member would be a mechanism string the
-  // mechanism cannot detect, which is the same defect as inventing a reason to
-  // describe a caller bug. See the #3197 PR 2 spec amendment, section 9.0.
-  //
-  // DECLARED AND UNREACHABLE IN THIS PR, stated here for the same reason
-  // `kPermissionDenied` and `ThreadStartFailed` state it at their own
-  // declarations: nothing produces it. The route the design names is
-  // `status().faulted` -> `fault{stage:'run'}` -> here, and neither leg exists
-  // yet -- `QuantumPump::fault()` has a production caller (`tap_backend.h:245`,
-  // `kFormatChanged`), but nothing turns a latched fault into a host-visible outcome
-  // mid-share, and `AudiocapFaultStage` has no `'run'` member. #3198 PR 2 DECLINED this work,
-  // deliberately: every fault routes to `retire()`, which reaps the capturing
-  // child, so a mid-share silence latch would kill a live, correct share rather
-  // than merely quiet one channel of it. Filed as its own follow-up issue at
-  // Phase 9 of the #3198 lifecycle rather than left implicit here. A reader who
-  // assumed a live path would go looking for a producer that is not there.
-  //
-  // PR 3 DOES NOT CHANGE THIS, and gets closer to it in a way worth stating: PR 3
-  // gives `status()` a second reader by posting `{kind:'stop'}` at teardown, so the
-  // detector's output now reaches a human. That is still a POST-SHARE read. The
-  // missing piece is unchanged — a non-terminal `notice` message kind that could
-  // carry a mid-share latch without routing through `retire()`. Read "PR 2 (this
-  // PR)", which this comment said until PR 3, as "PR 2" — the parenthetical outlived
-  // the PR it referred to.
-  | 'capture-starved'
   | 'unsupported-os'
   // Main could not turn the renderer's source id into a live window handle, or
   // the child could not turn that handle into an owning PID. ONE member for both
@@ -191,7 +193,6 @@ export const SCREEN_AUDIO_DEGRADE_REASONS: Readonly<Record<ScreenAudioDegradeRea
   'capability-fault': true,
   'protocol-fault': true,
   'produce-rejected': true,
-  'capture-starved': true,
   'unsupported-os': true,
   'target-unresolved': true,
 };
@@ -344,8 +345,15 @@ function buildChildEnv(addonPath: string): NodeJS.ProcessEnv {
   return childEnv;
 }
 
-/** A `fault` names the stage that failed; main maps it to a degrade mechanism. */
-function reasonForFaultStage(stage: AudiocapFaultStage): ScreenAudioDegradeReason {
+/**
+ * A `fault` names the stage that failed; main maps it to a degrade mechanism.
+ *
+ * `'run'` IS EXCLUDED BY TYPE. It is the one stage that describes a capture that was
+ * live, and a live capture's end is an interrupt, never a degrade (I7). The fault arm
+ * of `handleChildMessage` handles it before calling this, so a new caller cannot hand
+ * a mid-share fault to the start-result union without a compile error.
+ */
+function reasonForFaultStage(stage: Exclude<AudiocapFaultStage, 'run'>): ScreenAudioDegradeReason {
   switch (stage) {
     case 'guard':
     case 'load':
@@ -384,12 +392,25 @@ function settleOnce(live: HostSession, result: AudiocapStartResult): void {
 }
 
 /**
- * Terminal for THIS session: stop its timers, forget it, kill its child.
+ * Terminal for THIS session: stop its timers, forget it, kill its child, and --
+ * only for the involuntary end of a live capture -- tell main (I7).
  *
  * Killing after forgetting is what makes the kill safe to issue from anywhere —
  * the `exit` that follows finds `session !== live` and does nothing.
+ *
+ * `interrupt` IS REQUIRED, WITH NO DEFAULT. Every caller names its cause, and a
+ * cause that is not an involuntary mid-share end names `null`. A defaulted
+ * parameter is the `screenAudioRefusalMessage(platform = null)` defect shape: the
+ * compiler stops naming the call sites that have to decide.
  */
-function retire(live: HostSession, result: AudiocapStartResult, nextState: HostState): void {
+function retire(
+  live: HostSession,
+  result: AudiocapStartResult,
+  nextState: HostState,
+  interrupt: ScreenAudioInterruptReason | null
+): void {
+  // I7: decided at ENTRY, before any mutation, from the state the cause arrived in.
+  const publish = interrupt !== null && session === live && hostState === 'capturing';
   if (session === live) {
     session = null;
     hostState = nextState;
@@ -400,6 +421,19 @@ function retire(live: HostSession, result: AudiocapStartResult, nextState: HostS
   // to come up unreachable. See `reapChild`.
   reapChild(live.child);
   settleOnce(live, result);
+  // LAST, so a listener that throws cannot skip the reap or the settle, and one
+  // that re-enters `startAudiocapHost` finds this session already forgotten.
+  // `interrupt !== null` is repeated so TypeScript narrows it; `publish` alone does not.
+  if (publish && interrupt !== null) {
+    try {
+      onInterrupted?.({ generation: live.generation, reason: interrupt });
+    } catch {
+      // Fixed string only -- never the caught value, which may carry an
+      // `Error.cause` (observability.md principle 3). No reason either: a line
+      // per cause is the reason dimension principle 7 rules out.
+      console.warn('[audiocap] interrupt listener threw');
+    }
+  }
 }
 
 /**
@@ -450,8 +484,12 @@ export function killAudiocapHost(): void {
  * the OS tap at once, and the document that owned it is already gone; the graceful stop would
  * leave the tap alive for up to STOP_QUIESCE_MS while the child acted on `stop`, for a share
  * nobody can see any more. The cost is stated rather than hidden: the child's `handleStop` is
- * the only caller of the addon's `status()`, so on this path the R9 silence detector,
- * `quiesceProved` and `destroyFailures` go unread.
+ * the only reader of the addon's TEARDOWN evidence in `status()` -- `quiesceProved`,
+ * `destroyFailures` and the R9 counters `signalTotal` / `silentSinceStart` -- so on this path
+ * those go unread. The claim is about those fields, not about `status()` itself: a mid-capture
+ * reader that looks only at `faulted` (spec §4.1's fault watch) forfeits nothing here.
+ *
+ * PUBLISHES NOTHING (I7): this is a voluntary end, and `killAudiocapHost` never calls `retire`.
  */
 export function killAudiocapCapture(): void {
   const live = session;
@@ -530,13 +568,18 @@ function drainStoppingChild(): void {
  * other would either break the supersede or make the quit path await.
  *
  * WHAT POSTING `stop` BUYS, since killing alone already destroys the tap (process exit
- * reaps it — #3197). The child's `handleStop` is the ONLY caller of the addon's
- * `status()`, so it is the only path on which `signalTotal` / `silentSinceStart` (the
- * R9 silence detector), `quiesceProved` and `destroyFailures` are ever read. Kill-only
- * computes all of them on every callback and shows them to nobody — which is the
- * shipped-but-unread failure this epic has now produced five times, reproduced one more
- * layer up. The child writes that line to stderr and `startAudiocapHost` echoes it in
- * unpackaged builds.
+ * reaps it — #3197). The child's `handleStop` is the ONLY path on which the addon's
+ * TEARDOWN evidence in `status()` is read: `signalTotal` / `silentSinceStart` (the R9
+ * counters), `quiesceProved` and `destroyFailures`. It is not necessarily the only caller
+ * of `status()` -- a mid-capture reader that looks only at `faulted` (spec §4.1's fault
+ * watch) reads none of those. Kill-only computes all of them on every callback and shows
+ * them to nobody — which is the shipped-but-unread failure this epic has now produced
+ * five times, reproduced one more layer up. The child writes that line to stderr and
+ * `startAudiocapHost` echoes it in unpackaged builds.
+ *
+ * PUBLISHES NOTHING (I7): the user ended this share, and this function never calls
+ * `retire`. A late `fault` or `exit` from the detached child is dropped by the
+ * `session !== live` fence in its listeners.
  *
  * A non-zero `destroyFailures` means an OS tap may have outlived the share, and the
  * correct response is exactly what the timer already does: kill the process.
@@ -715,7 +758,8 @@ function armStartAck(live: HostSession): void {
     if (session !== live) return;
     // Same reason as a missed hello: the child did not finish in time. The copy for
     // it already says "didn't start in time", which is exactly what happened.
-    retire(live, { ok: false, reason: 'handshake-timeout' }, 'faulted');
+    // `null`: the start never settled, so the start result IS the report (I7).
+    retire(live, { ok: false, reason: 'handshake-timeout' }, 'faulted', null);
   }, START_ACK_TIMEOUT_MS);
   // `unref` for the handshake timer's reason: a pending ack must never hold the loop open at quit.
   timer.unref();
@@ -728,7 +772,9 @@ function armStartAck(live: HostSession): void {
  */
 function handleStarted(live: HostSession): void {
   if (hostState !== 'starting') {
-    retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted');
+    // A duplicate `started` arrives in `capturing` and publishes (I7); one before
+    // `hello` does not, because nothing had settled yet.
+    retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted', 'protocol-fault');
     return;
   }
   // The shared helper, not a hand-rolled clear of the one timer this arm armed: it is the
@@ -801,7 +847,8 @@ function handleHello(live: HostSession, message: AudiocapHello): void {
   // child re-announcing a capability after main already decided the rung —
   // I5's failure mode arriving late rather than early. Refuse it.
   if (hostState !== 'handshaking') {
-    retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted');
+    // Publishes only when the late hello arrives in `capturing` (I7).
+    retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted', 'protocol-fault');
     return;
   }
   if (live.handshakeTimer) {
@@ -865,10 +912,13 @@ function handleHello(live: HostSession, message: AudiocapHello): void {
   // `retire` on the failure arm, not `settleOnce`: a child that was told to start
   // and whose port never reached the renderer is a child holding an OS tap nobody
   // is listening to. Reaping it is the only thing that destroys that tap.
+  //
+  // `null`: this arm runs in `ready`, before anything settled, so the start result
+  // is the whole report (I7).
   if (outcome.ok) {
     settleOnce(live, outcome);
   } else {
-    retire(live, outcome, 'faulted');
+    retire(live, outcome, 'faulted', null);
   }
   notifyMachineCapability(message.capability.perProcessAudio);
 }
@@ -890,13 +940,28 @@ function handleChildMessage(live: HostSession, message: unknown): void {
     // which is the mechanism by which a cause has no path here.
     const detail = sanitizeDiagnostic(message.message, FAULT_MESSAGE_MAX_CHARS);
     console.warn('[audiocap] child fault', { stage: message.stage, detail });
-    retire(live, { ok: false, reason: reasonForFaultStage(message.stage) }, 'faulted');
+    if (message.stage === 'run') {
+      // STAGE LEGALITY (spec §4.3). `'run'` means a capture that was live failed, so
+      // it is legal only after `started`. In `handshaking` or `starting` it is the
+      // child speaking outside its contract: the start settles `protocol-fault`, and
+      // `retire`'s `capturing` gate keeps it unpublished.
+      retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted', 'capture-interrupted');
+    } else {
+      // A start-phase stage while `capturing` is equally out of contract, so it
+      // publishes `protocol-fault`; before `started` only the start result reports it.
+      retire(
+        live,
+        { ok: false, reason: reasonForFaultStage(message.stage) },
+        'faulted',
+        'protocol-fault'
+      );
+    }
     return;
   }
 
   // There is no "unknown message ignored" branch on parentPort (spec §4a): a
   // message outside the closed control set means kill the child.
-  retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted');
+  retire(live, { ok: false, reason: 'protocol-fault' }, 'faulted', 'protocol-fault');
 }
 
 /**
@@ -1009,7 +1074,7 @@ export function startAudiocapHost(
 
     const handshakeTimer = setTimeout(() => {
       if (session !== live) return;
-      retire(live, { ok: false, reason: 'handshake-timeout' }, 'faulted');
+      retire(live, { ok: false, reason: 'handshake-timeout' }, 'faulted', null);
     }, HANDSHAKE_TIMEOUT_MS);
     handshakeTimer.unref();
     live.handshakeTimer = handshakeTimer;
@@ -1021,16 +1086,17 @@ export function startAudiocapHost(
 
     // A child that died without a word is a PACKAGING DEFECT surfacing, and it
     // must read as one rather than as an absent capability. I6: no respawn.
+    // Mid-share, the same death is published as `child-crash` (I7).
     child.on('exit', () => {
       if (session !== live) return;
-      retire(live, { ok: false, reason: 'child-crash' }, 'faulted');
+      retire(live, { ok: false, reason: 'child-crash' }, 'faulted', 'child-crash');
     });
 
     // 'error' carries a Node diagnostic report; none of its arguments is read,
     // let alone logged (C8).
     child.on('error', () => {
       if (session !== live) return;
-      retire(live, { ok: false, reason: 'child-crash' }, 'faulted');
+      retire(live, { ok: false, reason: 'child-crash' }, 'faulted', 'child-crash');
     });
   });
 }
@@ -1113,6 +1179,23 @@ export function setAudiocapCapabilityListener(
   listener: ((perProcessAudio: boolean) => void) | null
 ): void {
   onMachineCapabilityChange = listener;
+}
+
+/**
+ * Notified when a LIVE capture ends involuntarily, so main can push
+ * `audiocap:interrupted` (#3394 PR 2). A callback for the reason
+ * `onMachineCapabilityChange` is one: this module owns no window.
+ *
+ * Its only caller is `retire()`, under I7. The object it receives is minted there
+ * from two main-owned values; a listener that forwards it should still copy the two
+ * fields rather than pass the reference on.
+ */
+let onInterrupted: ((interrupt: AudiocapInterrupted) => void) | null = null;
+
+export function setAudiocapInterruptListener(
+  listener: ((interrupt: AudiocapInterrupted) => void) | null
+): void {
+  onInterrupted = listener;
 }
 
 /**

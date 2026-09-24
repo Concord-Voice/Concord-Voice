@@ -141,6 +141,8 @@ import {
 } from '../../utils/policy/screenAudioCapability';
 import { screenAudioDegradeMessage } from '../../utils/policy/screenAudioDegradeCopy';
 import { createScreenAudioBridge, type ScreenAudioBridge } from './screenAudioBridge';
+import { claimInterrupts, releaseInterrupts } from './screenAudioInterrupts';
+import type { ScreenAudioInterruptReason } from '../../../shared/audiocapProtocol';
 import type { CallState } from './voiceService/callStateMachine';
 
 /** Ceiling for the saturating production-observation witness. Any non-zero value proves the
@@ -4465,7 +4467,7 @@ class VoiceService {
       // The invoke itself rejected — main threw rather than returning an outcome.
       // Nothing is logged: the rejection can carry an `Error.cause` from across the
       // IPC boundary, and `observability.md` principle 3 keeps that out of any sink.
-      store.setScreenAudioState({ mode: 'degraded', reason: 'protocol-fault', overrun: 0 });
+      this.degradeScreenAudio('protocol-fault');
       return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
     }
 
@@ -4474,11 +4476,11 @@ class VoiceService {
     }
 
     if (!started.ok) {
-      // Main's own fences, surfaced as the reason they produced. Task 13b's phrase map
-      // already has a live consumer, so this reaches the user as words rather than
-      // silence — which is the difference between this arm and the placeholder it
-      // replaces.
-      store.setScreenAudioState({ mode: 'degraded', reason: started.reason, overrun: 0 });
+      // Main's own fences, surfaced as the reason they produced — as words, through
+      // `degradeScreenAudio`. Before #3394 PR 2's M3 check this wrote the state alone,
+      // which no component renders, so a refused share (Safari, a silent Finder window)
+      // went live with no sound and no explanation.
+      this.degradeScreenAudio(started.reason);
       return { stream, sourceId: chosenId, ownsScreenAudioOutcome: true };
     }
 
@@ -4512,13 +4514,26 @@ class VoiceService {
       // `overrun: 0` for the same reason the sibling gives -- the counter belongs to
       // the share, not the session, so a previous share's drops must not carry over.
       store.setScreenAudioState({ mode: 'per-process', overrun: 0 });
+
+      // Claim this generation's interrupt slot the moment the share is live, so a
+      // push that arrives before this line (buffered by `screenAudioInterrupts.ts`)
+      // or after it (delivered directly) both reach the same handler. Routed through
+      // the screen reproduce tail like every other mutation of this share (#3394 PR 2
+      // §4.4-4.5): the handler itself re-checks currentness, but it still has to
+      // serialize against a concurrent switch/stop rather than run inline off an
+      // IPC push.
+      claimInterrupts(started.generation, (reason) => {
+        void this.enqueueVideoReproduce('screen', () =>
+          this.handleScreenAudioInterrupt(started.generation, reason)
+        );
+      });
     } catch {
       this.stopScreenAudioHost();
       // `createScreenAudioBridge` throws a TypeError when the shell cannot support
       // per-process audio at all — a preload predating the relay, or an engine without
       // `MediaStreamTrackGenerator`. `no-backend` is the mechanism: the machine said it
       // could and this renderer cannot. Video-only, never a system mix.
-      store.setScreenAudioState({ mode: 'degraded', reason: 'no-backend', overrun: 0 });
+      this.degradeScreenAudio('no-backend');
     }
 
     // The success arm and the `no-backend` catch share this return: both ran past the
@@ -4541,6 +4556,12 @@ class VoiceService {
     // track that is already ended or muted, and say so, rather than advertising audio
     // nobody can hear.
     const audioTrack = audioTracks[0];
+    // WHETHER THIS IS A BRIDGE TRACK is decided HERE, before the `produceEncrypted`
+    // round trip, and never re-read after it (#3394 PR 2, Phase-4 red-team). An
+    // interrupt (`handleScreenAudioInterrupt`) or a Share-sound OFF (`stopScreenAudioHost`)
+    // can release the bridge during that await, and a post-await re-read then saw no
+    // bridge and filed a WINDOW share's torn-down track as the system mix.
+    const isBridgeTrack = this.screenAudioBridge?.track === audioTrack;
     if (audioTrack.readyState !== 'live' || audioTrack.muted) {
       console.warn('produceScreen: screen-audio track is not live; sharing video only');
       useVoiceStore
@@ -4572,7 +4593,10 @@ class VoiceService {
         transport.closed ||
         this.localScreenStream !== stream ||
         !this.producers.get('screen') ||
-        this.producers.has('screen-audio')
+        this.producers.has('screen-audio') ||
+        // Releasing a bridge stops its track, and the OS can end a desktop track, so an
+        // ended track here means the audio this produce was for is already gone.
+        audioTrack.readyState !== 'live'
       ) {
         this.discardProducedProducer(audioProducer, socket);
         console.debug('produceScreen: discarding screen audio for a share that ended');
@@ -4583,7 +4607,7 @@ class VoiceService {
       useVoiceStore.getState().setScreenAudioOn(true);
       // Bridge tracks are per-process; desktop-capture tracks are the system mix.
       useVoiceStore.getState().setScreenAudioState({
-        mode: this.screenAudioBridge?.track === audioTrack ? 'per-process' : 'system',
+        mode: isBridgeTrack ? 'per-process' : 'system',
         overrun: 0,
       });
 
@@ -4612,14 +4636,15 @@ class VoiceService {
         this.sendTransport === transport &&
         !transport.closed &&
         this.localScreenStream === stream &&
-        !!this.producers.get('screen');
+        !!this.producers.get('screen') &&
+        // An interrupt or a Share-sound OFF during the await ended the track and wrote
+        // its own state; a rejected produce must not overwrite that with `degraded`.
+        audioTrack.readyState === 'live';
       if (shareStillLive) {
-        const store = useVoiceStore.getState();
-        store.setScreenAudioState({ mode: 'degraded', reason: 'produce-rejected', overrun: 0 });
         // #3198 Task 13b: tell the user why, not just that. Asserted at the
         // outermost observable seam (the rendered slot error), not at the mapping
         // function's return value (tests.md § "Test the consumer, not the handshake").
-        store.setVideoSlotError(screenAudioDegradeMessage('produce-rejected'));
+        this.degradeScreenAudio('produce-rejected');
       }
     }
   }
@@ -5574,6 +5599,68 @@ class VoiceService {
   }
 
   /**
+   * Release THIS bridge's renderer-side port and its interrupt claim. Never reaps the
+   * capture child (#3394 PR 2 §4.5) -- main has already retired it by the time an
+   * interrupt reaches the renderer, so calling `audiocap:stop` here would invoke on a
+   * child that no longer exists. `stopScreenAudioHost()` is the one that also reaps;
+   * this is the half an interrupt needs alone.
+   */
+  private releaseScreenAudioBridge(): void {
+    const bridge = this.screenAudioBridge;
+    this.screenAudioBridge = null;
+    if (bridge === null) return;
+    releaseInterrupts(bridge.generation);
+    bridge.stop();
+  }
+
+  /**
+   * A share that asked for app sound started without it. Writes the `degraded` state AND
+   * tells the user why, through the same slot-error toast `produce-rejected` has always
+   * used. The two halves are one call because the state alone reaches nobody: no
+   * component renders `mode: 'degraded'`, and #3394 PR 2's M3 hardware check (a Safari
+   * window share, refused as `target-unresolved`) went live silent with no message
+   * while the store held the reason.
+   */
+  private degradeScreenAudio(reason: Parameters<typeof screenAudioDegradeMessage>[0]): void {
+    const store = useVoiceStore.getState();
+    store.setScreenAudioState({ mode: 'degraded', reason, overrun: 0 });
+    store.setVideoSlotError(screenAudioDegradeMessage(reason));
+  }
+
+  /**
+   * A LIVE per-process share lost its audio without the user asking (#3394 PR 2 §4.5).
+   * Retires the audio half only -- the `screen` producer and its video track are left
+   * running, because the share itself did not end.
+   *
+   * THE GENERATION IS RE-CHECKED BEFORE AND AFTER THE AWAIT. `retireScreenAudioProducer`
+   * round-trips the transport queue, and a concurrent switch or stop can supersede this
+   * bridge while that await is in flight -- writing `interrupted` after a successor has
+   * already taken over would stamp a stale mechanism over live state (I6, the same
+   * currentness discipline every other screen mutation in this file follows).
+   */
+  private async handleScreenAudioInterrupt(
+    generation: number,
+    reason: ScreenAudioInterruptReason
+  ): Promise<void> {
+    if (this.screenAudioBridge?.generation !== generation) return;
+    if (this.sendTransport) await this.retireScreenAudioProducer(this.sendTransport);
+    if (this.screenAudioBridge?.generation !== generation) return;
+    this.releaseScreenAudioBridge();
+    const stream = this.localScreenStream;
+    for (const track of stream?.getAudioTracks() ?? []) {
+      track.stop();
+      stream?.removeTrack(track);
+    }
+    const store = useVoiceStore.getState();
+    store.setScreenAudioOn(false);
+    store.setScreenAudioState({ mode: 'interrupted', reason, generation, overrun: 0 });
+    // The renderer log is still the only production witness (spec C11) -- nothing
+    // beyond `{generation, reason}` reaches this line, and `reason` is a closed
+    // three-member enum, never attacker- or main-authored free text.
+    console.warn('[screen-audio] interrupted', { generation, reason });
+  }
+
+  /**
    * THE SINGLE TEARDOWN CHOKE POINT FOR THE **LOCAL** SCREEN-AUDIO CAPTURE
    * (#3195, ADR-0043, design section 6c teardown rails 1 and 2).
    *
@@ -5601,30 +5688,22 @@ class VoiceService {
    * reaches `cleanupScreenState`, and the media-plane's `producer-closed` self-echo for
    * the same share lands moments later on rail 2.
    *
-   * IT NOW RELEASES THE BRIDGE, which is half of what #3195 promised here. That note
-   * read "IT RELEASES NO HOST LEASE, and there is none to release" -- true while main
-   * forked only its app-start capability probe, which it kills itself. #3198 PR 3 gives
-   * this function something to reap, exactly as that note anticipated ("#3198 brings back
-   * both together"), and this is the choke point it was built for: seven local paths
-   * already route here behind the local-user fence, so nothing new had to be found.
-   *
-   * THE SECOND HALF IS NOT WIRED YET. Releasing the bridge closes the renderer's end of
-   * the port; it does not reap the CAPTURE CHILD, which holds the OS tap. Every
-   * `killAudiocapHost` caller is a quit or crash hook and `audiocapChild.ts`'s
-   * `handleStop` "deliberately does NOT exit", so until an `audiocap:stop` invoke exists
-   * a share the user ended leaves that child capturing until the app quits or the next
-   * share supersedes it. `'per-process'` is therefore still unreachable by construction
-   * (no call site passes `canCarryScreenAudio`'s third argument), and it must STAY
-   * unreachable until that channel lands -- making the verdict reachable first is what
-   * would turn this gap into a live tap outliving its share.
+   * BOTH HALVES ARE WIRED. That was not always true: an earlier revision of this note
+   * read "IT RELEASES NO HOST LEASE, and there is none to release" while main forked
+   * only its app-start capability probe, which it kills itself; a later one read "THE
+   * SECOND HALF IS NOT WIRED YET" once #3198 PR 3 gave this function a real child to
+   * reap but before the `audiocap:stop` invoke below existed. Both are stale. This
+   * function now releases the renderer-side bridge (`releaseScreenAudioBridge()`, also
+   * called alone by `handleScreenAudioInterrupt` for a share whose child main has
+   * already retired) AND reaps the capture child over `audiocap:stop`, so `'per-process'`
+   * is reachable and a share the user ends leaves no tap running behind it. Seven local
+   * paths route here behind the local-user fence above; nothing new had to be found to
+   * wire the reap.
    */
   private stopScreenAudioHost(): void {
-    // BEFORE the early return below, and idempotent, so a repeated teardown still
-    // releases the port. The bridge holds an adopted `MessagePort` terminating at the
-    // process that loaded native code, and stopping a TRACK does not close a PORT --
-    // which is why the bridge is held on the service rather than left to the stream.
-    this.screenAudioBridge?.stop();
-    this.screenAudioBridge = null;
+    // Idempotent and BEFORE the early return below, same as `releaseScreenAudioBridge`
+    // alone: a repeated teardown still releases the port.
+    this.releaseScreenAudioBridge();
 
     // REAP THE CHILD, which is the half releasing the bridge cannot do. Closing the
     // renderer's port leaves the capture child holding its OS tap: every
@@ -7999,19 +8078,34 @@ class VoiceService {
       useVoiceStore.getState().clearMediaPolicyPausedByProducer(producerId);
 
       // F6: when the server's pause of a policed producer fails, it closes the
-      // producer outright and the owner receives ONLY this self-echo. Screen-audio
-      // already stops capture below (gated on the local userId); mic and camera did
-      // not, so the device kept running and the UI kept showing unmuted/on until the
-      // user left. Mirror the permissions-changed handler's ownership check: a
-      // producer this client STILL HOLDS locally (this.producers keeps this client's
-      // own producers only, keyed by source) means this client did NOT initiate the
-      // close — closeProducer() deletes the map entry before it ever emits, so a
-      // locally-initiated close's own echo always misses here and stays a no-op.
+      // producer outright and the owner receives ONLY this self-echo. Nothing else
+      // stops the local side: the SFU closes exactly one producer (no screen /
+      // screen-audio pairing), and a client-side Producer outlives its server twin,
+      // so the device kept capturing and the closed producer kept sending RTP until
+      // the user left. That held for all four sources — screen and screen-audio were
+      // left out when mic and camera were fixed (#3394 PR 2 review). Mirror the
+      // permissions-changed handler's ownership check: a producer this client STILL
+      // HOLDS locally (this.producers keeps this client's own producers only, keyed
+      // by source) means this client did NOT initiate the close — every local path
+      // deletes the map entry before it emits `close-producer`, so a locally-initiated
+      // close's own echo always misses here and stays a no-op. Each source runs the
+      // teardown a user stop runs. Screen-audio takes the Share-sound OFF path rather
+      // than closeProducer: that retires the producer (so RTP stops), clears Share
+      // sound and reaps the capture host, but keeps the captured track, so turning
+      // Share sound back on reuses it instead of re-capturing and replacing the video
+      // every viewer is watching (see setScreenAudioEnabledQueued).
       if (
-        (source === 'mic' || source === 'camera') &&
+        (source === 'mic' ||
+          source === 'camera' ||
+          source === 'screen' ||
+          source === 'screen-audio') &&
         this.producers.get(source)?.id === producerId
       ) {
-        void this.closeProducer(source).catch((err) =>
+        const serverCloseCleanup =
+          source === 'screen-audio'
+            ? this.setScreenAudioEnabled(false)
+            : this.closeProducer(source);
+        void serverCloseCleanup.catch((err) =>
           console.warn(
             '[media-policy] server-initiated producer close cleanup failed:',
             errorMessage(err)
@@ -8052,12 +8146,15 @@ class VoiceService {
       } else if (source === 'screen-audio') {
         store.updateParticipant(userId, { screenAudioStream: undefined });
         this.pendingScreenAudioProducers.delete(userId);
-        // Teardown rail 2: the SFU closes the paired `screen-audio` producer when the
-        // `screen` producer closes and echoes it back here, which catches a local share
-        // that ended without any of rail 1's local paths running. GATED ON THE LOCAL
-        // USER -- this handler fires for every participant, and an ungated call would
-        // tear down THIS client's capture whenever a REMOTE peer stopped sharing audio.
-        if (userId === useUserStore.getState().user?.id) this.stopScreenAudioHost();
+        // Teardown rail 2 is the F6 branch above: a server close of a screen-audio
+        // producer this client still holds runs the Share-sound OFF path, which reaps
+        // the capture host. It is GATED ON OWNERSHIP, never on the echo alone.
+        // Every local path that drops the producer reaps the host itself, and each one
+        // emits `close-producer` whose echo lands here. Ungated, that echo undid them:
+        // #3394 PR 2's M5 check measured the interrupt handler writing `interrupted`
+        // and a teardown here overwriting it with `off` 7 ms later, so the notice never
+        // showed; and a re-produce or source switch retires the OLD producer id while a
+        // new capture is live, which the echo would then stop.
       }
 
       // Notify PiP proxy so open PiP windows can close their consumers

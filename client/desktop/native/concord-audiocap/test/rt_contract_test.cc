@@ -20,6 +20,7 @@
 #include "../rt/sink_gate.h"
 #include "../rt/platform/macos/tap_floor.h"
 #include "../rt/teardown.h"
+#include "../rt/process_tree.h"
 
 // EVERY include below is here for a symbol this file names directly, and <cstdlib>
 // in particular is not optional: CHECK calls std::abort(), which libc++ on macOS
@@ -1759,14 +1760,19 @@ static void test_buildTarget_refusalPublishesNothing() {
   // never one holding the admissible PREFIX of a rejected list. Seed the target
   // with a previously-good list first, so a refusal that merely fails to write is
   // distinguishable from one that clears.
-  rt::u32 good[2] = {301u, 302u};
+  // Seeded with ONE pid and allowDescendants=true (#3394 PR 2: a 2-PID
+  // allowDescendants=true seed would itself be refused by the new one-root
+  // rule, for the wrong reason this case is testing).
+  rt::u32 good[1] = {301u};
   rt::CaptureTarget t;
-  CHECK(rt::buildTarget(good, 2u, true, &t));
-  CHECK(t.pidCount == 2u);
+  CHECK(rt::buildTarget(good, 1u, true, &t));
+  CHECK(t.pidCount == 1u);
   CHECK(t.allowDescendants);
 
+  // The bad list refuses for its OWN reason (pid 0), with allowDescendants=false
+  // so the one-root rule is not what fires here.
   rt::u32 bad[3] = {303u, 304u, 0u};
-  CHECK(!rt::buildTarget(bad, 3u, true, &t));
+  CHECK(!rt::buildTarget(bad, 3u, false, &t));
   CHECK(t.pidCount == 0u);
   CHECK(!t.allowDescendants);
   for (rt::u32 i = 0u; i < rt::kMaxTargetPids; ++i) {
@@ -1776,9 +1782,9 @@ static void test_buildTarget_refusalPublishesNothing() {
   // A null array with a non-zero count, and a null destination. Neither may be
   // dereferenced and both must refuse.
   rt::CaptureTarget nullSrc;
-  CHECK(!rt::buildTarget(nullptr, 2u, false, &nullSrc));
+  CHECK(!rt::buildTarget(nullptr, 1u, false, &nullSrc));
   CHECK(nullSrc.pidCount == 0u);
-  CHECK(!rt::buildTarget(good, 2u, false, nullptr));
+  CHECK(!rt::buildTarget(good, 1u, false, nullptr));
 }
 
 static void test_buildTarget_carriesAllowDescendantsBothWays() {
@@ -1794,6 +1800,135 @@ static void test_buildTarget_carriesAllowDescendantsBothWays() {
   rt::CaptureTarget off;
   CHECK(rt::buildTarget(pids, 1u, false, &off));
   CHECK(!off.allowDescendants);
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 (#3394 PR 2) — rt/process_tree.h, the pure `inTree` walk, and the
+// one-root rule buildTarget gains for allowDescendants.
+// ---------------------------------------------------------------------------
+
+// A parent table the tests control. Unknown pids fail the lookup, and every
+// lookup is recorded so a test can prove a pid was NEVER asked about.
+namespace {
+struct ParentTable {
+  rt::u32 child[64];
+  rt::u32 parent[64];
+  rt::u32 count;
+  rt::u32 asked[64];
+  rt::u32 askedCount;
+};
+bool tableParentOf(void* ctx, rt::u32 pid, rt::u32* out) noexcept {
+  ParentTable* t = static_cast<ParentTable*>(ctx);
+  if (t->askedCount < 64u) { t->asked[t->askedCount++] = pid; }
+  for (rt::u32 i = 0u; i < t->count; ++i) {
+    if (t->child[i] == pid) { *out = t->parent[i]; return true; }
+  }
+  return false;
+}
+void edge(ParentTable& t, rt::u32 c, rt::u32 p) { t.child[t.count] = c; t.parent[t.count] = p; ++t.count; }
+bool wasAsked(const ParentTable& t, rt::u32 pid) {
+  for (rt::u32 i = 0u; i < t.askedCount; ++i) { if (t.asked[i] == pid) { return true; } }
+  return false;
+}
+constexpr rt::u32 kHost = 900u;   // the Electron main process in these fixtures
+}  // namespace
+
+static void test_inTree_walksMultipleHops() {
+  ParentTable t{};
+  edge(t, 300u, 200u); edge(t, 200u, 100u); edge(t, 100u, 50u); edge(t, 50u, 1u);
+  CHECK(rt::inTree(300u, 100u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kIncluded);
+  CHECK(rt::inTree(100u, 100u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kIncluded);  // the owner itself
+}
+
+static void test_inTree_excludesNonDescendantAtLaunchd() {
+  ParentTable t{};
+  edge(t, 400u, 1u);
+  CHECK(rt::inTree(400u, 100u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+  CHECK(!wasAsked(t, 1u));   // launchd is never looked up: the <= 1 arm stops the walk
+}
+
+static void test_inTree_lookupFailureExcludes() {
+  ParentTable t{};           // 500 has no row: the lookup fails
+  CHECK(rt::inTree(500u, 100u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+}
+
+static void test_inTree_depthBoundAndCycleExclude() {
+  // A chain whose root is 33 hops up: one hop beyond kMaxAncestorDepth (32).
+  ParentTable deep{};
+  for (rt::u32 i = 0u; i < 33u; ++i) { edge(deep, 1000u + i, 1001u + i); }
+  // The owner's own ancestry must be readable (rootOutsideHost), as every real
+  // process's is: 1033 is under launchd.
+  edge(deep, 1033u, 1u);
+  CHECK(rt::inTree(1000u, 1033u, kHost, &tableParentOf, &deep) == rt::TreeVerdict::kExcluded);
+  CHECK(rt::inTree(1001u, 1033u, kHost, &tableParentOf, &deep) == rt::TreeVerdict::kIncluded);  // 32 hops: inside
+  ParentTable cycle{};
+  edge(cycle, 600u, 601u); edge(cycle, 601u, 600u);
+  CHECK(rt::inTree(600u, 100u, kHost, &tableParentOf, &cycle) == rt::TreeVerdict::kExcluded);
+}
+
+static void test_inTree_hostSubtreeExcludedFirst() {
+  ParentTable t{};
+  // Claude.app (100) -> shell (150) -> Concord main (900) -> Concord helper (950)
+  edge(t, 950u, kHost); edge(t, kHost, 150u); edge(t, 150u, 100u); edge(t, 100u, 1u);
+  CHECK(rt::inTree(950u, 100u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+  CHECK(rt::inTree(150u, 100u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kIncluded);  // the rest stays capturable
+  // Sharing a Concord window: owner == host. Exclusion wins even on the first hop.
+  CHECK(rt::inTree(kHost, kHost, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+}
+
+static void test_inTree_refusesRootOrHostAtLaunchdAndNullLookup() {
+  ParentTable t{};
+  edge(t, 300u, 100u);
+  CHECK(rt::inTree(300u, 1u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);   // root <= 1
+  CHECK(rt::inTree(300u, 100u, 1u, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);    // host died: exclude all
+  CHECK(rt::inTree(300u, 100u, kHost, nullptr, &t) == rt::TreeVerdict::kExcluded);
+}
+
+// RED-TEAM PoC (#3394 PR 2 Phase 4). I4 says a tree "never contains the host's
+// own subtree", and ADR-0043's addendum says "a share of a window belonging to
+// Concord's own process tree ... captures none of it". The walk tests
+// `excludeRoot` before `root` on every hop -- but it STOPS at `root`, so it never
+// asks whether `root` itself descends from `excludeRoot`. The existing
+// hostSubtree cases cover owner == host and owner-above-host, never owner BELOW
+// host. Fixture: Concord main (kHost) -> a Concord-spawned window owner (950) ->
+// that owner's audio helper (960). Both are inside the host's subtree.
+static void test_redteam_inTree_ownerInsideHostSubtreeIsExcluded() {
+  ParentTable t{};
+  edge(t, 960u, 950u); edge(t, 950u, kHost); edge(t, kHost, 1u);
+  CHECK(rt::inTree(950u, 950u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+  CHECK(rt::inTree(960u, 950u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+}
+
+// CONTROL for the case above: the same shape with the owner OUTSIDE the host's
+// subtree stays capturable, so the case above is about the host ancestry and
+// nothing else in the fixture.
+static void test_redteam_inTree_ownerOutsideHostSubtreeStillIncluded() {
+  ParentTable t{};
+  edge(t, 960u, 950u); edge(t, 950u, 1u); edge(t, kHost, 1u);
+  CHECK(rt::inTree(950u, 950u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kIncluded);
+  CHECK(rt::inTree(960u, 950u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kIncluded);
+}
+
+// rootOutsideHost's FAILED-LOOKUP arm. The owner's own parent cannot be read (no edge
+// for 950), so "outside the host" is unprovable and the owner and its helper are
+// excluded -- fail closed, never assumed outside. The control above differs only by
+// the 950 -> 1 edge, so this case can fail for no other reason.
+static void test_inTree_ownerAncestryUnreadableIsExcluded() {
+  ParentTable t{};
+  edge(t, 960u, 950u); edge(t, kHost, 1u);
+  CHECK(rt::inTree(950u, 950u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+  CHECK(rt::inTree(960u, 950u, kHost, &tableParentOf, &t) == rt::TreeVerdict::kExcluded);
+}
+
+static void test_buildTarget_descendantsRequireOneRoot() {
+  rt::u32 two[2] = {501u, 502u};
+  rt::CaptureTarget t;
+  CHECK(!rt::buildTarget(two, 2u, true, &t));
+  CHECK(t.pidCount == 0u);
+  CHECK(rt::buildTarget(two, 2u, false, &t));   // a plain list is still admitted
+  rt::u32 one[1] = {503u};
+  CHECK(rt::buildTarget(one, 1u, true, &t));
+  CHECK(t.allowDescendants && t.pidCount == 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -3019,6 +3154,18 @@ int main() {
   test_buildTarget_refusesDuplicatePids();
   test_buildTarget_refusalPublishesNothing();
   test_buildTarget_carriesAllowDescendantsBothWays();
+
+  test_inTree_walksMultipleHops();
+  test_inTree_excludesNonDescendantAtLaunchd();
+  test_inTree_lookupFailureExcludes();
+  test_inTree_depthBoundAndCycleExclude();
+  test_inTree_hostSubtreeExcludedFirst();
+  test_inTree_refusesRootOrHostAtLaunchdAndNullLookup();
+  test_buildTarget_descendantsRequireOneRoot();
+  test_redteam_inTree_ownerOutsideHostSubtreeStillIncluded();
+  test_redteam_inTree_ownerInsideHostSubtreeIsExcluded();
+  test_inTree_ownerAncestryUnreadableIsExcluded();
+
   test_backendContract_unsupportedFormatIsRefusedNotResampled();
   test_backendContract_startFailsClosedWithNoTarget();
   test_backendContract_bothShapesSatisfyThePostCondition();

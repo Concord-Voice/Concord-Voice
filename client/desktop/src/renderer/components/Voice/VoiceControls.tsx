@@ -30,6 +30,7 @@ import {
   verdictOffersAudio,
   type ScreenAudioVerdict,
 } from '../../utils/policy/screenAudioCapability';
+import { screenAudioInterruptMessage } from '../../utils/policy/screenAudioInterruptCopy';
 import { useUserStore } from '../../stores/auth/userStore';
 import { useHasVoiceTextTarget } from '../../hooks/voice/useVoiceTextChatTarget';
 import { useOsPermissionStore } from '../../stores/voice/osPermissionStore';
@@ -156,6 +157,96 @@ function getPortalStyle(ref: React.RefObject<HTMLElement | null>): React.CSSProp
   };
 }
 
+/** getPortalStyle, with the centred box clamped inside the window. */
+function getClampedPortalStyle(
+  ref: React.RefObject<HTMLElement | null>,
+  maxWidth: number
+): React.CSSProperties {
+  const style = getPortalStyle(ref);
+  const rect = ref.current?.getBoundingClientRect();
+  if (!rect) return style;
+  const half = maxWidth / 2;
+  const gutter = 8;
+  const centre = rect.left + rect.width / 2;
+  const left = Math.min(Math.max(centre, half + gutter), globalThis.innerWidth - half - gutter);
+  return { ...style, left };
+}
+
+/**
+ * Announce-once-per-generation gate for the interrupted live region (#3394 PR 2
+ * §4.6). Module-level so a VoiceView <-> PersistentVoiceBar remount (two live
+ * `VoiceControls` instances, briefly, during the swap) does not re-announce the
+ * same interruption, and so an entry made while popped out is still announced
+ * once on remount (C16).
+ */
+let lastAnnouncedGeneration = -1;
+
+/**
+ * Same shape for the toast: the generation whose 10s toast has run out. Module-level
+ * because the controls remount on every VoiceView <-> PersistentVoiceBar switch, and a
+ * per-instance record re-showed the toast for another 10s on each navigation while the
+ * share stayed interrupted.
+ * ponytail: a remount DURING the 10s restarts the timer (up to ~20s shown); record the
+ * start time here if that ever matters.
+ */
+let lastToastExpiredGeneration = -1;
+
+/**
+ * The `interrupted` arm of the Share sound control (#3394 PR 2 §4.5/§4.6): a live
+ * per-process share that lost its audio without the user asking. `message` is '' outside
+ * that state. The toast and the announcement each record the GENERATION they last acted
+ * on, and their visible values are derived from it, so nothing resets in an effect: a
+ * record for an older generation simply does not apply to the current one.
+ */
+function useScreenAudioInterruptNotice() {
+  const screenAudio = useVoiceStore((s) => s.screenAudio);
+  const interrupted = screenAudio.mode === 'interrupted';
+  const generation = interrupted ? screenAudio.generation : undefined;
+  const message = interrupted ? screenAudioInterruptMessage(screenAudio.reason) : '';
+  // `announcedFor` is set on the frame after the live region mounts (so it mounts
+  // empty); `toastExpiredFor` is set by the 10s timer.
+  const [announcedFor, setAnnouncedFor] = useState<number | null>(null);
+  const [toastExpiredFor, setToastExpiredFor] = useState<number | null>(null);
+
+  // Toast: shown for 10s per interruption, keyed by generation so a fresh interrupt
+  // while still interrupted re-shows it rather than leaving a stale toast to expire on
+  // its own clock.
+  useEffect(() => {
+    if (generation === undefined || generation === lastToastExpiredGeneration) return undefined;
+    const timer = setTimeout(() => {
+      lastToastExpiredGeneration = generation;
+      setToastExpiredFor(generation);
+    }, 10000);
+    return () => clearTimeout(timer);
+  }, [generation]);
+
+  // Live region: mounts empty, gets its text on the next frame, and announces AT MOST
+  // ONCE PER GENERATION via the module-level gate above — deliberately not
+  // `cancelAnimationFrame` in cleanup, since jsdom implements neither it nor
+  // `requestAnimationFrame`; a `cancelled` flag closed over the callback is total in every
+  // environment this component renders in.
+  useEffect(() => {
+    if (generation === undefined) return undefined;
+    let cancelled = false;
+    requestAnimationFrame(() => {
+      if (cancelled || generation === lastAnnouncedGeneration) return;
+      lastAnnouncedGeneration = generation;
+      setAnnouncedFor(generation);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [generation]);
+
+  return {
+    interrupted,
+    message,
+    announcement: announcedFor === generation ? message : '',
+    toastVisible:
+      interrupted && toastExpiredFor !== generation && generation !== lastToastExpiredGeneration,
+  };
+}
+
 /** Build PiP window options for the given mode. */
 function buildPipOptions(mode: 'frames' | 'screen', producerId?: string) {
   const isFrames = mode === 'frames';
@@ -269,6 +360,15 @@ interface MediaButtonProps {
   locked?: boolean;
   /** id of the element that explains a locked state (#2153: the mic notice row). */
   describedBy?: string;
+  /**
+   * An 8px warning dot shown UNTIL THE USER ACTS (#3394 PR 2 §4.6) — the Share-sound
+   * button's interrupted state today. The string is the explanation, and it REPLACES
+   * `title` while the dot shows: the toast is gone after 10s, and without it a sighted
+   * user had a dot and no way to learn what it meant. It replaces rather than joins
+   * the normal tooltip so the two never compete, and `aria-describedby` still wins as
+   * the accessible description, so a screen reader does not hear it twice.
+   */
+  badge?: string;
 }
 
 /** Generic media toggle button — mic, deafen, video, screen share. */
@@ -282,6 +382,7 @@ const MediaButton: React.FC<MediaButtonProps> = ({
   inactiveLabel,
   locked = false,
   describedBy,
+  badge,
 }) => {
   const classes = [
     'voice-controls__btn',
@@ -300,12 +401,13 @@ const MediaButton: React.FC<MediaButtonProps> = ({
         if (locked) return;
         onClick();
       }}
-      title={title}
+      title={badge || title}
       aria-disabled={locked}
       aria-describedby={describedBy}
     >
       {isActive ? activeIcon : inactiveIcon}
       <span className="voice-controls__btn-label">{isActive ? activeLabel : inactiveLabel}</span>
+      {badge && <span className="voice-controls__badge" aria-hidden="true" />}
     </button>
   );
 };
@@ -403,6 +505,7 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
   // during an app-scoped share while `screenAudioTitle`'s `'per-process'` arm stayed dead.
   // The store carries the verdict now; there is nothing left to map.
   const screenAudioVerdict = useVoiceStore((s) => s.screenAudioVerdict);
+  const audioInterrupt = useScreenAudioInterruptNotice();
   const showVoiceTextChat = useVoiceStore((s) => s.showVoiceTextChat);
   const toggleVoiceTextChat = useVoiceStore((s) => s.toggleVoiceTextChat);
   const activeScreenShares = useVoiceStore((s) => s.activeScreenShares);
@@ -638,9 +741,34 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
                   inactiveIcon={<VolumeX size={18} />}
                   activeLabel={screenAudioVerdict === 'per-process' ? 'App sound' : 'Desktop sound'}
                   inactiveLabel="Share sound"
+                  badge={audioInterrupt.interrupted ? audioInterrupt.message : undefined}
+                  describedBy={
+                    audioInterrupt.interrupted ? 'voice-controls-audio-interrupted' : undefined
+                  }
                 />
               )}
             </div>
+
+            {/* Always rendered so `aria-describedby` above never points at a
+                not-yet-mounted node; empty outside the interrupted state. */}
+            <span id="voice-controls-audio-interrupted" className="voice-controls__sr-only">
+              {audioInterrupt.message}
+            </span>
+
+            {/* Mounted only while interrupted, so it never adds a second
+                `role="status"` beside the #2153 policy notice in any other state.
+                It mounts empty -- leaving the interrupted state resets the text --
+                and is populated on the next frame by the effect above, at most
+                once per generation (module-level gate). */}
+            {audioInterrupt.interrupted && (
+              <div
+                className="voice-controls__audio-status voice-controls__sr-only"
+                role="status"
+                aria-live="polite"
+              >
+                {audioInterrupt.announcement}
+              </div>
+            )}
 
             {/* Acts on how YOU view the call, not on what you send. Every member is
               conditional, so this cluster can render empty — see the :empty rule. */}
@@ -711,6 +839,21 @@ const VoiceControls: React.FC<VoiceControlsProps> = ({ context = 'voiceView', on
             style={getPortalStyle(controlsRef)}
           >
             {videoSlotError}
+          </div>,
+          document.body
+        )}
+
+      {/* Portaled interrupted-audio toast — 10s, then gone (effect above). The
+          accessible announcement is the separate live region; this is the visual
+          surface, led by the same badge dot. */}
+      {audioInterrupt.toastVisible &&
+        createPortal(
+          <div
+            className="voice-controls__audio-toast"
+            style={getClampedPortalStyle(controlsRef, 320)}
+          >
+            <span className="voice-controls__badge" aria-hidden="true" />
+            <span>{audioInterrupt.message}</span>
           </div>,
           document.body
         )}

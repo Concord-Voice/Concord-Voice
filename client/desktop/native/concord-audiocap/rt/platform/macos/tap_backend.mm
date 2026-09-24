@@ -3,7 +3,7 @@
 // Everything above it -- the refusal ordering, the format admission, the
 // teardown barrier -- lives in tap_backend.h and is exercised by
 // test/macos_tap_test.cc on the Linux ASAN/UBSAN/TSAN legs through a fake HAL.
-// This file is deliberately thin: ten wrappers, a version read, and the
+// This file is deliberately thin: fourteen wrappers, a version read, and the
 // singleton. If logic starts accumulating here it belongs in the header, where
 // it can be tested.
 //
@@ -17,8 +17,12 @@
 #import <Foundation/Foundation.h>
 
 #include <atomic>
+#include <cstring>
+#include <libproc.h>
 #include <mach/mach_time.h>
+#include <sys/proc_info.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 #include "tap_backend.h"
 
@@ -127,7 +131,7 @@ OSStatus ioProcThunk(AudioObjectID, const AudioTimeStamp*,
 }
 
 // ---------------------------------------------------------------------------
-// The ten wrappers. Each is a direct translation and holds no policy.
+// The fourteen wrappers. Each is a direct translation and holds no policy.
 // ---------------------------------------------------------------------------
 
 u32 halTranslatePid(u32 pid, u32* outObject) noexcept {
@@ -308,6 +312,81 @@ u32 halDestroyTap(u32 tap) noexcept {
   return static_cast<u32>(AudioHardwareDestroyProcessTap(static_cast<AudioObjectID>(tap)));
 }
 
+// ---------------------------------------------------------------------------
+// #3394 PR 2 -- the process-tree wrappers. OS reads only: which objects are
+// in the tree is decided by rt/process_tree.h and TapBackend::resolveTree, never
+// here. Each fills a CALLER buffer, so none of them allocates (AV 206 stays
+// start-path-only in this file, and these add no new instance).
+// ---------------------------------------------------------------------------
+
+static_assert(sizeof(AudioObjectID) == sizeof(u32), "the object list is read into u32 storage");
+
+/// The object list, read in the HAL's two-call shape. Refuses a list longer
+/// than `capacity` BEFORE the data read, so the buffer is never overrun. The
+/// buffer is then offered in full, which is room for growth between the two
+/// calls -- and a list that grew past it comes back exactly `capacity` long.
+/// That residual is the caller's to refuse (hal_api.h), not this wrapper's to
+/// hide.
+API_AVAILABLE(macos(14.2))
+u32 halProcessObjectList(u32* outObjects, u32 capacity, u32* outCount) noexcept {
+  if (outObjects == nullptr || outCount == nullptr) { return static_cast<u32>(kAudio_ParamError); }
+  *outCount = 0u;
+  AudioObjectPropertyAddress addr = {kAudioHardwarePropertyProcessObjectList,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  OSStatus s = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, nullptr, &size);
+  if (s != noErr) { return static_cast<u32>(s); }
+  if (size / sizeof(AudioObjectID) > capacity) { return kStatusListOverflow; }
+  size = static_cast<UInt32>(capacity * sizeof(AudioObjectID));   // room for growth between the two calls
+  s = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &size, outObjects);
+  if (s != noErr) { return static_cast<u32>(s); }
+  *outCount = static_cast<u32>(size / sizeof(AudioObjectID));
+  return static_cast<u32>(noErr);
+}
+
+API_AVAILABLE(macos(14.2))
+u32 halProcessObjectPid(u32 object, u32* outPid) noexcept {
+  if (outPid == nullptr) { return static_cast<u32>(kAudio_ParamError); }
+  *outPid = 0u;
+  AudioObjectPropertyAddress addr = {kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain};
+  pid_t pid = 0;
+  UInt32 size = sizeof(pid);
+  const OSStatus s = AudioObjectGetPropertyData(static_cast<AudioObjectID>(object), &addr, 0,
+                                                nullptr, &size, &pid);
+  if (s != noErr) { return static_cast<u32>(s); }
+  // A short write leaves pid at 0 and a pid of 0 or below is never a process
+  // this share can target; both are refused as a bad object rather than handed
+  // up as though they named one.
+  if (size != sizeof(pid) || pid <= 0) { return static_cast<u32>(kAudioHardwareBadObjectError); }
+  *outPid = static_cast<u32>(pid);
+  return static_cast<u32>(noErr);
+}
+
+/// Public libproc, not the private responsibility SPI. proc_pidinfo returns the
+/// byte count it wrote, so anything short of a whole proc_bsdinfo -- an exited
+/// pid, EPERM, a sandboxed caller -- is "unreadable", which inTree() excludes.
+/// std::int32_t rather than the SDK's `int` spelling: AV 209 binds this file,
+/// and the two are the same type on every Darwin target.
+bool halParentPid(u32 pid, u32* outParent) noexcept {
+  if (outParent == nullptr) { return false; }
+  *outParent = 0u;
+  struct proc_bsdinfo info;
+  std::memset(&info, 0, sizeof(info));
+  const std::int32_t n = proc_pidinfo(static_cast<pid_t>(pid), PROC_PIDTBSDINFO, 0u, &info,
+                                      static_cast<std::int32_t>(sizeof(info)));
+  if (n != static_cast<std::int32_t>(sizeof(info))) { return false; }
+  *outParent = static_cast<u32>(info.pbi_ppid);
+  return true;
+}
+
+/// The capture child is a utilityProcess forked by Electron main WITHOUT
+/// `disclaim`, so its parent is the main process -- the root of Concord's own
+/// subtree. If main has died the child is reparented and this reads 1, which
+/// inTree() treats as "host unknown" and excludes everything.
+u32 halHostRootPid() noexcept { return static_cast<u32>(getppid()); }
+
 /// Carries the 14.2 requirement because it takes the addresses of two symbols
 /// that have it -- taking an unavailable function's address is as unguarded as
 /// calling it, which -Werror=unguarded-availability-new is right to reject.
@@ -316,7 +395,10 @@ const HalApi& realHal() noexcept {
   static const HalApi hal = {halTranslatePid,   halCreateTap,      halTapFormat,
                              halCreateAggregate, halCreateIoProc,  halStartDevice,
                              halStopDevice,      halDestroyIoProc, halDestroyAggregate,
-                             halDestroyTap};
+                             halDestroyTap,
+                             // #3394 PR 2, in hal_api.h's declaration order.
+                             halProcessObjectList, halProcessObjectPid, halParentPid,
+                             halHostRootPid};
   return hal;
 }
 

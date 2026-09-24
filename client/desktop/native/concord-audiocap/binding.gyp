@@ -37,11 +37,13 @@
 
     'conditions': [
       [ "OS=='mac'", {
-        # The Core Audio backend. The .mm is thin by design -- ten HAL wrappers
-        # and the singleton -- because the state machine above it lives in
-        # rt/platform/macos/tap_backend.h and is compiled by the LINUX sanitizer
-        # legs against a fake HAL. That is the only coverage it can have:
-        # client/desktop/native/** is outside sonar.sources.
+        # The Core Audio backend. The .mm is thin by design -- fourteen HAL
+        # wrappers and the singleton (four of the fourteen are the process-tree
+        # entries #3394 PR 2 added to hal_api.h) -- because the state machine
+        # above it lives in rt/platform/macos/tap_backend.h and is compiled by
+        # the LINUX sanitizer legs against a fake HAL. That is the only
+        # coverage it can have: client/desktop/native/** is outside
+        # sonar.sources.
         'sources': [ 'rt/platform/macos/tap_backend.mm' ],
         'xcode_settings': {
           'CLANG_CXX_LANGUAGE_STANDARD': 'c++17',

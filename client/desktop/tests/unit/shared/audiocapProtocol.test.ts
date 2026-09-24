@@ -10,8 +10,11 @@ import {
   encodeQuantumHeader,
   isAudiocapFault,
   isAudiocapHello,
+  isAudiocapInterrupted,
   isAudiocapStarted,
+  isScreenAudioInterruptReason,
   sanitizeDiagnostic,
+  SCREEN_AUDIO_INTERRUPT_REASONS,
 } from '../../../src/shared/audiocapProtocol';
 
 /**
@@ -276,27 +279,32 @@ describe('sanitizeDiagnostic', () => {
  * error protects.
  */
 describe('AUDIOCAP_FAULT_STAGES — the #3198 addition', () => {
-  it('has exactly the six stages, including target', () => {
+  // #3394 PR 2 §4.2: `'run'` joins the set (6 -> 7 members). Mutation guard:
+  // reverting `AUDIOCAP_FAULT_STAGE_ANCHOR` to omit `run` (audiocapProtocol.ts)
+  // turns this red.
+  it('has exactly the seven stages, including target and run', () => {
     expect([...AUDIOCAP_FAULT_STAGES].sort()).toEqual(
-      ['capability', 'guard', 'load', 'protocol', 'start', 'target'].sort()
+      ['capability', 'guard', 'load', 'protocol', 'run', 'start', 'target'].sort()
     );
-    expect(AUDIOCAP_FAULT_STAGES.size).toBe(6);
+    expect(AUDIOCAP_FAULT_STAGES.size).toBe(7);
   });
 
-  it('does not carry run', () => {
-    // Not an omission. A mid-share silence latch routed through `retire()`,
-    // which reaps the child, so a `'run'` fault would kill a live, correct
-    // share -- #3197's advisory-only ruling inverted into a teardown. It needs
-    // a non-terminal `notice` kind, which is its own issue.
-    expect(AUDIOCAP_FAULT_STAGES.has('run')).toBe(false);
+  it('carries run — the only stage legal after started (#3394 PR 2 §4.2)', () => {
+    // Was "does not carry run" pre-#3394 PR 2: a mid-share fault used to have no
+    // legal stage at all. It now does, and `audiocapHost.ts`'s `retire()` maps it
+    // to `AudiocapInterrupted` rather than a start-time degrade reason -- see
+    // `interruptReasonFor` coverage in audiocapHost.test.ts.
+    expect(AUDIOCAP_FAULT_STAGES.has('run')).toBe(true);
   });
 
-  it('admits a target fault and refuses an out-of-set stage', () => {
+  it('admits target and run faults and refuses an out-of-set stage', () => {
     // The type and the runtime guard have to agree: a union member without its
     // set entry type-checks everywhere and is then refused HERE, which main
-    // reads as a protocol fault and answers by killing the child.
+    // reads as a protocol fault and answers by killing the child. 'run' joined
+    // the set in #3394 PR 2; 'notice' is the stage that PR deliberately did not add.
     expect(isAudiocapFault({ kind: 'fault', stage: 'target', message: 'x' })).toBe(true);
-    expect(isAudiocapFault({ kind: 'fault', stage: 'run', message: 'x' })).toBe(false);
+    expect(isAudiocapFault({ kind: 'fault', stage: 'run', message: 'x' })).toBe(true);
+    expect(isAudiocapFault({ kind: 'fault', stage: 'notice', message: 'x' })).toBe(false);
   });
 });
 
@@ -319,6 +327,44 @@ describe('isAudiocapStarted (#3394 PR 1)', () => {
     ['a kind that is not a string', { kind: ['started'] }],
   ])('refuses %s', (_label, value) => {
     expect(isAudiocapStarted(value)).toBe(false);
+  });
+});
+
+/**
+ * `ScreenAudioInterruptReason` (#3394 PR 2 §4.2). Moved into `src/shared` so
+ * both preload and the renderer can validate a pushed `AudiocapInterrupted`
+ * payload at runtime, against one anchor.
+ */
+describe('ScreenAudioInterruptReason (#3394 PR 2)', () => {
+  // Mutation guard: dropping a member from `SCREEN_AUDIO_INTERRUPT_REASON_ANCHOR`
+  // (audiocapProtocol.ts) turns this red.
+  it('admits exactly the three reasons', () => {
+    expect([...SCREEN_AUDIO_INTERRUPT_REASONS].sort()).toEqual([
+      'capture-interrupted',
+      'child-crash',
+      'protocol-fault',
+    ]);
+  });
+
+  // Mutation guard: replacing `Object.hasOwn(...)` with a plain `in` check
+  // (which also sees inherited prototype keys) turns the first two rows red.
+  it('refuses prototype keys and non-strings', () => {
+    expect(isScreenAudioInterruptReason('constructor')).toBe(false);
+    expect(isScreenAudioInterruptReason('toString')).toBe(false);
+    expect(isScreenAudioInterruptReason(1)).toBe(false);
+    expect(isScreenAudioInterruptReason('capture-interrupted')).toBe(true);
+  });
+
+  // Mutation guard: dropping the `Number.isSafeInteger`/`>= 0` conjuncts from
+  // `isAudiocapInterrupted` (audiocapProtocol.ts) turns the second and third
+  // rows red; dropping the `isScreenAudioInterruptReason(reason)` delegation
+  // turns the fourth row red.
+  it('validates a whole interrupt payload', () => {
+    expect(isAudiocapInterrupted({ generation: 3, reason: 'child-crash' })).toBe(true);
+    expect(isAudiocapInterrupted({ generation: -1, reason: 'child-crash' })).toBe(false);
+    expect(isAudiocapInterrupted({ generation: 1.5, reason: 'child-crash' })).toBe(false);
+    expect(isAudiocapInterrupted({ generation: 3, reason: 'capture-starved' })).toBe(false);
+    expect(isAudiocapInterrupted(null)).toBe(false);
   });
 });
 

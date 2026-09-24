@@ -75,11 +75,22 @@ export const HANDSHAKE_TIMEOUT_MS = 10000;
  * SEPARATE from HANDSHAKE_TIMEOUT_MS because it bounds a different thing: tap creation,
  * which on a first run was expected to sit behind a macOS TCC prompt.
  *
- * T0 MEASURED IT (2026-09-23, macOS 26.6.2, dev Electron, audio grant reset): `start` to a
- * live share took 1-2 s and NO prompt appeared -- tap creation does not wait on the user,
- * so an ungranted tap starts at once and delivers silence. 10000 is therefore ~5x the
- * measured value, not a guess. Not measured: a Developer-ID-signed packaged build, whose
- * TCC path may differ. See ADR-0043 § As-built addendum — #3394 PR 1.
+ * MEASURED (T0, 2026-09-23, macOS 26.6.2, dev Electron): `start` to `started` took 1-2 s.
+ * That figure STANDS as a GRANTED-state figure, and 10000 is ~5x it rather than a guess.
+ *
+ * CORRECTED (#3394 PR 2). This said T0 showed that tap creation does not wait on the user,
+ * so "an ungranted tap starts at once and delivers silence". MEASURED from TCC's retained
+ * log: T0's audio-capture checks were credited to the LAUNCHING app, never to Electron --
+ * three to Claude.app (allowed) and three to `com.anthropic.claude-code` (denied, reason 8,
+ * which the TCC reason table lists as a missing usage string, so no prompt was possible).
+ * T0 therefore held granted and denied taps alike, and all were silent. INFERRED: that
+ * silence is over-determined, because every T0 share targeted one window-owner PID.
+ *
+ * TWO GAPS, both UNMEASURED: an ungranted first share with the target fixed, and a
+ * Developer-ID-packaged build, whose credited app carries the usage description and may
+ * prompt. Were tap creation to wait on a prompt there, this timeout would cap how long the
+ * user has to answer it. See ADR-0043 § As-built addendum — #3394 PR 1, and
+ * `[internal]reports/2026-09-23-3394-audiocap-capture-measurements.md`.
  */
 export const START_ACK_TIMEOUT_MS = 10000;
 
@@ -157,6 +168,9 @@ export type AudiocapFaultStage =
   // per-process audio when the truth is that we could not find the process
   // behind that window (#3198 spec §4.3).
   | 'target'
+  // A capture that was live failed. The only stage legal after `started`, and the
+  // only one main maps to an interrupt rather than a degrade (#3394 PR 2 §4).
+  | 'run'
   | 'protocol';
 
 /**
@@ -176,6 +190,7 @@ const AUDIOCAP_FAULT_STAGE_ANCHOR: Readonly<Record<AudiocapFaultStage, true>> = 
   capability: true,
   start: true,
   target: true,
+  run: true,
   protocol: true,
 };
 
@@ -187,6 +202,26 @@ const AUDIOCAP_FAULT_STAGE_ANCHOR: Readonly<Record<AudiocapFaultStage, true>> = 
  */
 export const AUDIOCAP_FAULT_STAGES: ReadonlySet<string> = new Set(
   Object.keys(AUDIOCAP_FAULT_STAGE_ANCHOR)
+);
+
+/**
+ * Why a LIVE per-process capture ended without the user asking (#3394 PR 2 §4.3).
+ * Separate from `ScreenAudioDegradeReason`, which only a START produces: a reason
+ * that arrives after the start settled does not belong in the start-result union.
+ * In `src/shared` so preload and the renderer validate it against one anchor.
+ */
+export type ScreenAudioInterruptReason = 'capture-interrupted' | 'child-crash' | 'protocol-fault';
+
+/** The exhaustiveness anchor, for the reason `AUDIOCAP_FAULT_STAGE_ANCHOR` is one. */
+const SCREEN_AUDIO_INTERRUPT_REASON_ANCHOR: Readonly<Record<ScreenAudioInterruptReason, true>> = {
+  'capture-interrupted': true,
+  'child-crash': true,
+  'protocol-fault': true,
+};
+
+/** Exported for the runtime membership pin only, as `AUDIOCAP_FAULT_STAGES` is. */
+export const SCREEN_AUDIO_INTERRUPT_REASONS: ReadonlySet<string> = new Set(
+  Object.keys(SCREEN_AUDIO_INTERRUPT_REASON_ANCHOR)
 );
 
 export interface AudiocapCapability {
@@ -252,6 +287,18 @@ export interface AudiocapStop {
  */
 export type AudiocapControlMessage =
   AudiocapHello | AudiocapFault | AudiocapStarted | AudiocapStart | AudiocapStop;
+
+/**
+ * A live capture ended involuntarily (#3394 PR 2). MAIN -> RENDERER, and NOT a member of
+ * `AudiocapControlMessage` on purpose: the child never sends one (spec §2 I1). Main mints it
+ * in `audiocapHost.ts`'s `retire()` from two values it owns -- the session's generation and
+ * its own mapping of the cause -- so the child's choice is limited to WHICH of the three
+ * reasons describes its own capture ending, which it could already end.
+ */
+export interface AudiocapInterrupted {
+  generation: number;
+  reason: ScreenAudioInterruptReason;
+}
 
 export interface QuantumHeader {
   seq: number;
@@ -330,6 +377,29 @@ export function isAudiocapFault(v: unknown): v is AudiocapFault {
 
 export function isAudiocapStarted(v: unknown): v is AudiocapStarted {
   return isRecord(v) && v.kind === 'started';
+}
+
+/**
+ * `Object.hasOwn`, never `in` or a bare lookup: the anchor is an object literal, so
+ * `'constructor'` and `'toString'` would otherwise be members.
+ */
+export function isScreenAudioInterruptReason(v: unknown): v is ScreenAudioInterruptReason {
+  return typeof v === 'string' && Object.hasOwn(SCREEN_AUDIO_INTERRUPT_REASON_ANCHOR, v);
+}
+
+/**
+ * Validates the two fields and tolerates extras. A consumer must COPY those two fields
+ * rather than forward the object, so an extra key never travels further (spec §4.4).
+ */
+export function isAudiocapInterrupted(v: unknown): v is AudiocapInterrupted {
+  if (!isRecord(v)) return false;
+  const { generation, reason } = v;
+  return (
+    typeof generation === 'number' &&
+    Number.isSafeInteger(generation) &&
+    generation >= 0 &&
+    isScreenAudioInterruptReason(reason)
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -26,13 +26,18 @@ const EXPECTED: Record<string, string> = {
   'produce-rejected':
     'This call can’t carry another audio track, so your screen is being shared without sound.',
   'target-unresolved': `We couldn’t capture that app’s sound.${REMEDY}`,
-  'capture-starved': `No sound has come through from that app.${REMEDY}`,
 };
 
 describe('screenAudioDegradeMessage (#3198 Task 13b)', () => {
   // The exhaustiveness anchor stays on the runtime set, so a union member added
   // without an EXPECTED entry fails here with a clear "no expected string"
   // message rather than a silent undefined-vs-string mismatch.
+  //
+  // #3394 PR 2: `capture-starved` leaves `ScreenAudioDegradeReason` (a `'run'`
+  // fault is now reported through `AudiocapInterrupted`, not a start-time
+  // degrade reason), so EXPECTED above is one entry short of the CURRENT
+  // (pre-implementation) runtime set on purpose — this assertion is RED until
+  // `SCREEN_AUDIO_DEGRADE_REASONS` also drops the key (audiocapHost.ts).
   it('EXPECTED covers exactly the reasons the runtime set declares', () => {
     expect(Object.keys(EXPECTED).sort()).toEqual(Object.keys(SCREEN_AUDIO_DEGRADE_REASONS).sort());
   });

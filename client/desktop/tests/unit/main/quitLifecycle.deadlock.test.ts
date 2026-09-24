@@ -231,6 +231,11 @@ vi.mock('../../../src/main/audiocapHost', () => ({
   // fail the suite — the rejection surfaced as an "unhandled error" after the run while
   // all 1557 tests still reported green, which is why the count is not the thing to read.
   setAudiocapPortSink: vi.fn(),
+  // #3394 PR 2 (contract 30). REQUIRED: `main.ts` calls it unconditionally in the
+  // `whenReady()` body, ABOVE `registerAudiocapIpc` and before the window exists -- so
+  // omitting it here throws before `createWindow` runs and every close-listener assertion
+  // below sees zero listeners.
+  setAudiocapInterruptListener: vi.fn(),
   // #3394 PR 1 C15. REQUIRED: `createWindow` calls it unconditionally, and a
   // missing mock export throws on ACCESS -- this suite's `main.ts` import reaches it.
   wireAudiocapRendererLoss: vi.fn(),

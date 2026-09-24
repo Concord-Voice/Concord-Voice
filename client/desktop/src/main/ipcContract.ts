@@ -260,8 +260,29 @@
  *        The SERVER's spaIpcContract stays 19: the renderer feature-detects with
  *        `typeof …window.setZoomFactor === 'function'`, and a shell without it keeps
  *        the legacy `--ui-scale` engine at 0.85–1.3. Capability, not demand.
+ * - v30: audiocap mid-share interrupt (#3394 PR 2): one main -> renderer push,
+ *        `audiocap:interrupted`, carrying `{ generation: number, reason:
+ *        ScreenAudioInterruptReason }`, sent when a LIVE per-process capture ends
+ *        without the user asking — a fault the tap latched mid-share, a child crash,
+ *        or a protocol break after `started`. Sent to the main window only, and like
+ *        `audiocap:capability` it has no sender to validate (a push has none). Main
+ *        re-mints the object from the host's two fields; the preload bridge
+ *        (`audiocap.onInterrupted`) re-checks both against `isAudiocapInterrupted`
+ *        and forwards a NEW `{ generation, reason }`, so an extra key never reaches
+ *        the main world. `onCapability` was narrowed to the same field-copy shape in
+ *        the same change.
+ *
+ *        The push AUTHORISES NOTHING: it tells the renderer to tear down its own
+ *        audio half of a share whose child is already gone. It carries no PID, no
+ *        window handle and no diagnostic text.
+ *
+ *        The SERVER's spaIpcContract stays 19: the renderer feature-detects with
+ *        `typeof globalThis.electron?.audiocap?.onInterrupted === 'function'`, and a
+ *        shell below 30 simply does not tell the user — the share keeps its video and
+ *        its app sound goes silent with no notice, which is the pre-30 behaviour.
+ *        Capability, not demand.
  */
-export const IPC_CONTRACT_VERSION = 29;
+export const IPC_CONTRACT_VERSION = 30;
 
 /**
  * The oldest shell this repository's RENDERER actually runs on.

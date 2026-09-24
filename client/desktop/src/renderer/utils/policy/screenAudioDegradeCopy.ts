@@ -9,33 +9,40 @@ import type { ScreenAudioDegradeReason } from '../../../main/audiocapHost';
  * unread shape this epic has now produced four times (#3194's smoke harness,
  * `capture-starved`, `screenAudioBridge.ts`, and this).
  *
- * A `Record`, NOT A SWITCH. An eleventh union member becomes a COMPILE ERROR here
+ * A `Record`, NOT A SWITCH. A new union member becomes a COMPILE ERROR here
  * rather than falling through a `default` into "something went wrong", which would
  * degrade a real mechanism into no answer at the moment a user needs one. Same
  * shape as `SCREEN_AUDIO_DEGRADE_REASONS` and `START_FAILURE_REASONS`, and for the
  * same reason: `tsconfig.json` includes only `src/**`, so a union enumerated
  * inside a test file is never type-checked and reads like a gate it cannot be.
  *
- * NINE OF TEN MESSAGES CARRY THE WHOLE-SCREEN REMEDY, and the tenth is the
- * reason this paragraph is not a blanket rule. The nine are reachable only AFTER
- * a per-process start is attempted -- and THROUGH PR 2 NOTHING ATTEMPTS ONE, on
- * any platform. `'produce-rejected'` is the only arm with a production caller;
- * the other nine are written, exhaustive and unreached, exactly as
- * `'capture-starved'` already discloses of itself below. An earlier version of
- * this paragraph named a PLATFORM precondition (Windows and macOS only, Linux
- * never leaving the `'none'` rung), which is true but is not the operative one
- * and reads as though the other nine reach users on two of three platforms
- * today. They reach nobody. The whole-screen remedy is therefore correct-by-
- * vacuity for now and correct-by-construction once PR 3 wires the seam, since a
- * per-process start is refused outright on Linux (plan OQ1).
+ * EVERY MESSAGE BUT ONE CARRIES THE WHOLE-SCREEN REMEDY, and the one is the
+ * reason this paragraph is not a blanket rule. The others describe a PER-PROCESS
+ * start that failed before the child reported `started`. The renderer attempts
+ * one only on the `'per-process'` rung, which Linux never reaches (plan OQ1), and
+ * on every other platform a whole-screen share takes the `'system-loopback'` rung
+ * -- so the remedy is only ever computed where following it yields sound.
+ *
+ * SHOWN AS A TOAST, since #3394 PR 2. `voiceService.degradeScreenAudio` is the one
+ * production caller: it writes `{ mode: 'degraded', reason }` into
+ * `voiceStore.screenAudio` and puts this sentence in the voice bar's slot-error toast,
+ * for every reason the capture seam produces. Until then only `'produce-rejected'`
+ * reached the toast; the other reasons were stored, rendered by nothing, and a
+ * refused share (a Safari window, found by that PR's M3 hardware check) went live
+ * with no sound and no explanation.
  *
  * `'produce-rejected'` IS THE EXCEPTION, and an earlier version of this comment
  * asserted the rule over it without checking. Its only caller is the catch in
  * `voiceService.produceScreen`'s screen-audio production, which runs on the
  * `chromeMediaSource: 'desktop'` loopback path -- so the only user who can ever
  * read it is ALREADY sharing a whole screen, and the remedy told them to do the
- * one thing they were doing. A justification that covers nine of ten arms is not
- * a platform fact; check the call site before appending REMEDY to a new member.
+ * one thing they were doing. A justification that covers most arms is not a
+ * platform fact; check the call site before appending REMEDY to a new member.
+ *
+ * A LIVE CAPTURE THAT ENDS IS NOT A DEGRADE (#3394 PR 2). Its reason is a
+ * `ScreenAudioInterruptReason`, not one of these, and its copy must never carry
+ * REMEDY: telling a user mid-share to share a whole screen would widen what they
+ * send (#2161).
  *
  * NOTHING HERE IS LOGGED OR COUNTED PER CAUSE (`observability.md` principle 7).
  * The principle governs telemetry, not telling a user about their own share.
@@ -56,7 +63,9 @@ const DEGRADE_COPY: Readonly<Record<ScreenAudioDegradeReason, string>> = {
   'load-fault': 'App sound couldn’t start on this computer.' + REMEDY,
   'capability-fault': 'App sound couldn’t start on this computer.' + REMEDY,
 
-  // Mid-share: it was running and stopped.
+  // Before `started`: the start was pending when the helper died, or when the
+  // exchange with it broke down. The same two mechanisms AFTER `started` are
+  // interrupt reasons, not these (#3394 PR 2).
   'child-crash': 'App sound stopped unexpectedly.' + REMEDY,
   'protocol-fault': 'App sound stopped unexpectedly.' + REMEDY,
 
@@ -77,14 +86,6 @@ const DEGRADE_COPY: Readonly<Record<ScreenAudioDegradeReason, string>> = {
   // of them, deliberately, and a test pins that it never leaks "closed",
   // "version", "snapshot", a platform name, or "pid"/"process id".
   'target-unresolved': 'We couldn’t capture that app’s sound.' + REMEDY,
-
-  // ADVISORY AND CURRENTLY UNREACHABLE. `capture-starved` has no producer: the
-  // route the design names is status().faulted -> fault{stage:'run'} -> here, and
-  // neither leg exists. Copy is supplied because the Record demands exhaustiveness,
-  // NOT because a user can see it today. It must never read as an accusation --
-  // a granted tap on a paused app is byte-identical to a denied one (#3197 R9), so
-  // this says what was observed and nothing about why.
-  'capture-starved': 'No sound has come through from that app.' + REMEDY,
 };
 
 /**
@@ -96,17 +97,17 @@ const DEGRADE_COPY: Readonly<Record<ScreenAudioDegradeReason, string>> = {
  * error. The closed set failing open through the one door a closed set shuts.
  *
  * The PARAMETER stays typed rather than widening to `unknown`, because the
- * compile-time contract is what keeps the `Record` exhaustive and an eleventh
- * union member a build error. The guard is for the boundary the type cannot
- * see. The guard is DEFENCE-IN-DEPTH FOR A BOUNDARY PR 3 OPENS, not for one
- * that exists: no reason reaches this function over IPC today. `reasonForFaultStage`
- * feeds `AudiocapStartResult.reason`, whose only production consumer is
- * `runCapabilityProbe`, which stores it and `console.debug`s it -- nothing forwards
- * a `ScreenAudioDegradeReason` to the renderer. The guard stays (it matches
- * `startFailureMessage`, and two sibling closed-set lookups should not disagree
- * about whether their source is trusted); what changed is that this paragraph no
- * longer justifies it by a sender that is not yet there. The IPC path it
- * anticipates lands with the `audiocap:start` handler in PR 3.
+ * compile-time contract is what keeps the `Record` exhaustive and a new union
+ * member a build error. The guard is for the boundary the type cannot see, and
+ * since #3198 PR 3 that boundary exists: `AudiocapStartResult.reason` crosses
+ * from main over `audiocap:start`, and the preload bridge and the capture seam
+ * store it in `voiceStore.screenAudio` as it arrived, checked against no anchor.
+ * A remote SPA runs on shells older and newer than itself, so a reason this build
+ * does not know is a version-skew fact rather than a hypothesis. No such value
+ * reaches this function YET -- its one production call site passes a literal --
+ * so the guard is for any surface that renders the stored reason. It also
+ * matches `startFailureMessage`, and two sibling closed-set lookups should not
+ * disagree about whether their source is trusted.
  */
 export function screenAudioDegradeMessage(reason: ScreenAudioDegradeReason): string {
   if (typeof reason === 'string' && Object.hasOwn(DEGRADE_COPY, reason)) {

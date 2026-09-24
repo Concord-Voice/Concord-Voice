@@ -5196,6 +5196,158 @@ describe('main.ts', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────
+  // audiocap:interrupted PUSH (#3394 PR 2, IPC contract 30).
+  //
+  // A live per-process capture ending involuntarily is reported to main via
+  // `setAudiocapInterruptListener`, registered beside `setAudiocapCapabilityListener`
+  // during app start. That registration is a one-time call, not a per-invocation read
+  // like `audiocapMachineCapability()` above -- so, exactly like the renderer-loss block
+  // below, capturing the listener main registers needs a FRESH import: the shared
+  // `beforeAll` import already ran (or, pre-T4, never calls this at all), and a spy
+  // installed afterward cannot retroactively intercept a registration that already
+  // happened. Each case therefore resets modules for itself rather than relying on the
+  // one shared import the rest of this file uses.
+  // ─────────────────────────────────────────────────────────────────────
+  describe('audiocap:interrupted delivery (#3394 PR 2, IPC contract 30)', () => {
+    /**
+     * Resets modules, spies on the real `setAudiocapInterruptListener` export so main's
+     * registration call is intercepted rather than wired to the live host, imports
+     * `main.ts` fresh, and returns the captured listener. `spy` is returned too so a
+     * caller can assert the registration itself happened (the non-vacuity check every
+     * other case in this block relies on).
+     */
+    async function captureInterruptListener(): Promise<{
+      listener: (interrupt: Record<string, unknown>) => void;
+      spy: ReturnType<typeof vi.spyOn>;
+    }> {
+      vi.resetModules();
+      const hostModule = await import('../../../src/main/audiocapHost');
+      let captured: ((interrupt: Record<string, unknown>) => void) | null = null;
+      const spy = vi
+        .spyOn(hostModule, 'setAudiocapInterruptListener')
+        .mockImplementation((listener) => {
+          captured = listener as (interrupt: Record<string, unknown>) => void;
+        });
+
+      mockWebContents.send.mockClear();
+      await import('../../../src/main/main');
+      // Real `setTimeout` drain, matching this file's own `beforeAll` pattern -- lets
+      // every microtask up to app-start setup settle, with no dependency on guessing a
+      // tick count.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(
+        spy,
+        'main never registered a listener via setAudiocapInterruptListener'
+      ).toHaveBeenCalledOnce();
+      expect(captured, 'no listener was captured from the registration call').toBeTypeOf(
+        'function'
+      );
+
+      return { listener: captured!, spy };
+    }
+
+    function interruptPushes() {
+      return mockWebContents.send.mock.calls.filter((c) => c[0] === 'audiocap:interrupted');
+    }
+
+    it('sends the exact channel and payload when the host reports an interrupt', async () => {
+      const { listener, spy } = await captureInterruptListener();
+
+      listener({ generation: 4, reason: 'child-crash' });
+
+      expect(interruptPushes()).toEqual([
+        ['audiocap:interrupted', { generation: 4, reason: 'child-crash' }],
+      ]);
+
+      spy.mockRestore();
+    });
+
+    it('sends a NEW object, never the input reference, and carries no extra field', async () => {
+      const { listener, spy } = await captureInterruptListener();
+
+      const input = { generation: 4, reason: 'child-crash', extra: 'nope' };
+      listener(input);
+
+      const pushes = interruptPushes();
+      expect(pushes).toHaveLength(1);
+      const sent = pushes[0]![1];
+      expect(sent).not.toBe(input);
+      expect(sent).toEqual({ generation: 4, reason: 'child-crash' });
+      expect(Object.keys(sent as object)).toEqual(['generation', 'reason']);
+
+      spy.mockRestore();
+    });
+
+    it('does not push into a destroyed main window', async () => {
+      // Non-vacuity: `captureInterruptListener` already asserts the listener was
+      // registered, so this case's zero pushes cannot be explained by "nothing was ever
+      // wired" -- only by the `isDestroyed()` guard this case exists to pin.
+      const { listener, spy } = await captureInterruptListener();
+
+      mockMainWindow.isDestroyed.mockReturnValueOnce(true);
+      listener({ generation: 4, reason: 'child-crash' });
+
+      expect(interruptPushes()).toEqual([]);
+
+      spy.mockRestore();
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // AUDIOCAP REGISTRATION ORDER (#3394 PR 2).
+  //
+  // `setAudiocapInterruptListener` and `setAudiocapPortSink` must both register BEFORE
+  // `registerAudiocapIpc`, which installs the `audiocap:start` handler -- the only way a
+  // capture can begin. Reusing the `audiocap:interrupted delivery` block's harness and
+  // mocks above: same `vi.resetModules()` + fresh `main.ts` import shape, same reason
+  // (a one-time registration call cannot be spied on after the fact).
+  // ─────────────────────────────────────────────────────────────────────
+  describe('audiocap registration order (#3394 PR 2)', () => {
+    it('registers setAudiocapInterruptListener and setAudiocapPortSink before registerAudiocapIpc', async () => {
+      vi.resetModules();
+      const hostModule = await import('../../../src/main/audiocapHost');
+      const ipcModule = await import('../../../src/main/ipc/audiocap');
+
+      // Call-through spies: both host setters are trivial variable assignments and
+      // `registerAudiocapIpc` only calls the already-mocked `ipcMain.handle`, so letting
+      // each run for real costs nothing and keeps this test about ORDER, not stubbing.
+      const interruptSpy = vi.spyOn(hostModule, 'setAudiocapInterruptListener');
+      const portSinkSpy = vi.spyOn(hostModule, 'setAudiocapPortSink');
+      const registerSpy = vi.spyOn(ipcModule, 'registerAudiocapIpc');
+
+      await import('../../../src/main/main');
+      // Real `setTimeout` drain, matching this file's own `beforeAll` pattern -- lets every
+      // microtask up to app-start setup settle.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Non-vacuity: each registration call happened exactly once before asserting order --
+      // an order assertion over a mock never called is vacuously satisfied by
+      // `invocationCallOrder[0]` reading `undefined` on both sides.
+      expect(
+        interruptSpy,
+        'main never registered a listener via setAudiocapInterruptListener'
+      ).toHaveBeenCalledOnce();
+      expect(
+        portSinkSpy,
+        'main never registered a sink via setAudiocapPortSink'
+      ).toHaveBeenCalledOnce();
+      expect(registerSpy, 'main never called registerAudiocapIpc').toHaveBeenCalledOnce();
+
+      const interruptOrder = interruptSpy.mock.invocationCallOrder[0]!;
+      const portSinkOrder = portSinkSpy.mock.invocationCallOrder[0]!;
+      const registerOrder = registerSpy.mock.invocationCallOrder[0]!;
+
+      expect(interruptOrder).toBeLessThan(registerOrder);
+      expect(portSinkOrder).toBeLessThan(registerOrder);
+
+      interruptSpy.mockRestore();
+      portSinkSpy.mockRestore();
+      registerSpy.mockRestore();
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
   // RENDERER-LOSS WIRING ORDER (#3394 PR 1, R3).
   //
   // `createWindow` calls `wireAudiocapRendererLoss(mainWindow.webContents)` AFTER
@@ -5206,12 +5358,15 @@ describe('main.ts', () => {
   // document that no longer exists. Nothing later can see those events, because the wire
   // that eventually registers only sees FUTURE ones.
   //
-  // DELIBERATELY THE LAST DESCRIBE BLOCK IN THIS FILE. It is the only place in this suite
-  // that calls `vi.resetModules()` and re-imports `main.ts` a second time -- every other
-  // test in this file shares the SINGLE `beforeAll` import. A second import re-runs every
+  // DELIBERATELY THE LAST DESCRIBE BLOCK IN THIS FILE. It is the LAST place in this
+  // suite that calls `vi.resetModules()` and re-imports `main.ts` -- the
+  // `audiocap:interrupted delivery` block above also does, for the same reason (a
+  // one-time registration call cannot be spied on after the fact); every OTHER test in
+  // this file shares the SINGLE `beforeAll` import. A second import re-runs every
   // module-scope side effect against the SAME hoisted `mockMainWindow` /
-  // `mockWebContents` singletons this file already uses, so ordering it last means no
-  // later test can observe the mutated mock state this block produces.
+  // `mockWebContents` singletons this file already uses, so ordering the reset-module
+  // blocks last (and this one last among them) means no later test can observe the
+  // mutated mock state they produce.
   // ─────────────────────────────────────────────────────────────────────
   describe('audiocap renderer-loss wiring order (#3394 PR 1, R3)', () => {
     it('RED: a did-navigate landing before the initial load resolves still reaches the audiocap wire', async () => {

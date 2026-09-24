@@ -249,6 +249,13 @@ export interface ScreenAudioBridgeStats {
 export interface ScreenAudioBridge {
   /** The audio track to publish. Owned by the caller's capture stream, not by this bridge. */
   readonly track: MediaStreamTrack;
+  /**
+   * The generation this bridge was built for (#3394 PR 2). The service claims and
+   * releases its interrupt subscription against this value, and re-checks it as its
+   * currentness fence across the awaits in `handleScreenAudioInterrupt` -- so it has
+   * to be readable from the bridge itself rather than threaded separately.
+   */
+  readonly generation: number;
   stop(): void;
   stats(): ScreenAudioBridgeStats;
 }
@@ -497,6 +504,7 @@ export function createScreenAudioBridge(generation: number): ScreenAudioBridge {
 
   return {
     track: generator,
+    generation,
     stop(): void {
       if (stopped) return;
       stopped = true;

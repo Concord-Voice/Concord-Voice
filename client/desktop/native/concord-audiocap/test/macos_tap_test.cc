@@ -69,6 +69,16 @@ rt::u32  g_destroyTapStatus       = macos::kNoErr;
 rt::u32  g_destroyAggregateStatus = macos::kNoErr;
 rt::u32  g_destroyIoProcStatus    = macos::kNoErr;
 
+// #3394 PR 2 — the process-tree fake surface.
+rt::u32  g_listObjects[rt::kMaxProcessObjects];
+rt::u32  g_listCount      = 0u;
+rt::u32  g_listStatus     = macos::kNoErr;
+rt::u32  g_objPid[64];            // object id -> pid (object ids < 64 in fixtures)
+rt::u32  g_parentOf[4096];        // pid -> ppid; 0 = lookup fails
+rt::u32  g_hostRoot       = 900u;
+rt::u32  g_tapObjects[rt::kMaxTreeObjects];
+rt::u32  g_tapObjectCount = 0u;
+
 void note(char c) { if (g_orderLen < 255u) { g_order[g_orderLen++] = c; } }
 
 const char* order() { g_order[g_orderLen] = '\0'; return g_order; }
@@ -87,14 +97,27 @@ void resetFake() {
   g_destroyTapStatus       = macos::kNoErr;
   g_destroyAggregateStatus = macos::kNoErr;
   g_destroyIoProcStatus    = macos::kNoErr;
+
+  // #3394 PR 2 — the process-tree fake surface.
+  std::memset(g_listObjects, 0, sizeof(g_listObjects));
+  std::memset(g_objPid, 0, sizeof(g_objPid));
+  std::memset(g_parentOf, 0, sizeof(g_parentOf));
+  std::memset(g_tapObjects, 0, sizeof(g_tapObjects));
+  g_listCount      = 0u;
+  g_listStatus     = macos::kNoErr;
+  g_hostRoot       = 900u;
+  g_tapObjectCount = 0u;
 }
 
 macos::HalApi fakeHal() {
   macos::HalApi h;
   h.translatePidToProcessObject = [](rt::u32, rt::u32* out) noexcept -> rt::u32 {
     note('t'); *out = g_translateObject; return g_translateStatus; };
-  h.createProcessTap = [](const rt::u32*, rt::u32, rt::u32* o) noexcept -> rt::u32 {
-    note('T'); *o = 11u; return g_createTapStatus; };
+  h.createProcessTap = [](const rt::u32* objs, rt::u32 n, rt::u32* o) noexcept -> rt::u32 {
+    note('T');
+    g_tapObjectCount = n;
+    for (rt::u32 i = 0u; i < n && i < rt::kMaxTreeObjects; ++i) { g_tapObjects[i] = objs[i]; }
+    *o = 11u; return g_createTapStatus; };
   h.tapFormat = [](rt::u32, rt::SourceFormat* f) noexcept -> rt::u32 {
     note('f');
     f->sampleRate   = g_tapRate;
@@ -114,6 +137,20 @@ macos::HalApi fakeHal() {
   h.destroyIoProc    = [](rt::u32, void*) noexcept -> rt::u32 { note('p'); return g_destroyIoProcStatus; };
   h.destroyAggregate = [](rt::u32) noexcept -> rt::u32 { note('a'); return g_destroyAggregateStatus; };
   h.destroyTap       = [](rt::u32) noexcept -> rt::u32 { note('D'); return g_destroyTapStatus; };
+  // #3394 PR 2 — the process-tree entries.
+  h.processObjectList = [](rt::u32* out, rt::u32 cap, rt::u32* n) noexcept -> rt::u32 {
+    note('L');
+    if (g_listStatus != macos::kNoErr) { *n = 0u; return g_listStatus; }
+    if (g_listCount > cap) { *n = 0u; return 0x6F76666Cu; }   // 'ovfl': overflow refuses
+    for (rt::u32 i = 0u; i < g_listCount; ++i) { out[i] = g_listObjects[i]; }
+    *n = g_listCount; return macos::kNoErr; };
+  h.processObjectPid = [](rt::u32 obj, rt::u32* pid) noexcept -> rt::u32 {
+    if (obj >= 64u || g_objPid[obj] == 0u) { *pid = 0u; return 0x21706964u; }
+    *pid = g_objPid[obj]; return macos::kNoErr; };
+  h.parentPid = [](rt::u32 pid, rt::u32* ppid) noexcept -> bool {
+    if (pid >= 4096u || g_parentOf[pid] == 0u) { return false; }
+    *ppid = g_parentOf[pid]; return true; };
+  h.hostRootPid = []() noexcept -> rt::u32 { return g_hostRoot; };
   return h;
 }
 
@@ -305,6 +342,8 @@ static void test_start_admitsAt48kAndArmsInOrder() {
 
   CHECK(backend.start(target, sink.pump, fakeHost()) == rt::BackendStart::kOk);
   CHECK(std::strcmp(order(), "tTfAPs") == 0);
+  // #3394 PR 2: a list-less allowDescendants=false path must never enumerate.
+  CHECK(std::strchr(order(), 'L') == nullptr);
 }
 
 static void test_start_secondStartIsRefusedAsAlreadyRunning() {
@@ -853,7 +892,223 @@ static void test_ioProc_aDegenerateCallbackIsNotAFormatChange() {
   backend.stop();
 }
 
+// ---------------------------------------------------------------------------
+// #3394 PR 2 — process-tree targeting, via the fake HAL's process-object
+// surface above.
+// ---------------------------------------------------------------------------
+
+static rt::CaptureTarget treeOf(rt::u32 owner) {
+  rt::CaptureTarget t;
+  const rt::u32 pids[1] = {owner};
+  CHECK(rt::buildTarget(pids, 1u, true, &t));
+  return t;
+}
+static void object(rt::u32 obj, rt::u32 pid) { g_listObjects[g_listCount++] = obj; g_objPid[obj] = pid; }
+
+static void test_tree_filtersToObjectHoldingDescendants() {
+  resetFake();
+  // owner 100 <- 200 (no object) <- 300; 400 is a stranger under launchd.
+  g_parentOf[300] = 200u; g_parentOf[200] = 100u; g_parentOf[100] = 1u; g_parentOf[400] = 1u;
+  object(1u, 100u); object(2u, 300u); object(3u, 400u);
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(100u), sink.pump, fakeHost()) == rt::BackendStart::kOk);
+  CHECK(g_tapObjectCount == 2u);
+  CHECK(g_tapObjects[0] == 1u && g_tapObjects[1] == 2u);
+  CHECK(std::strchr(order(), 't') == nullptr);   // the tree path never translates a pid
+}
+
+static void test_tree_ownerWithoutObjectUsesDescendants() {
+  resetFake();   // the Discord shape (E1): the owner has an object, only a helper renders
+  g_parentOf[1284] = 1068u; g_parentOf[1068] = 1u;
+  object(5u, 1284u);
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(1068u), sink.pump, fakeHost()) == rt::BackendStart::kOk);
+  CHECK(g_tapObjectCount == 1u && g_tapObjects[0] == 5u);
+}
+
+static void test_tree_emptyRefusesBeforeTap() {
+  resetFake();
+  g_parentOf[400] = 1u;
+  object(3u, 400u);
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(100u), sink.pump, fakeHost()) == rt::BackendStart::kNoTarget);
+  CHECK(std::strcmp(order(), "L") == 0);   // listed, then stopped: no tap exists
+}
+
+static void test_tree_capRefusesNeverSubsets() {
+  for (rt::u32 n = 16u; n <= 17u; ++n) {
+    resetFake();
+    g_parentOf[100] = 1u;
+    for (rt::u32 i = 0u; i < n; ++i) { g_parentOf[200u + i] = 100u; object(10u + i, 200u + i); }
+    const macos::HalApi hal = fakeHal();
+    macos::TapBackend backend(hal, "14.4");
+    Sink sink;
+    const rt::BackendStart r = backend.start(treeOf(100u), sink.pump, fakeHost());
+    if (n == 16u) { CHECK(r == rt::BackendStart::kOk); CHECK(g_tapObjectCount == 16u); }
+    else          { CHECK(r == rt::BackendStart::kNoTarget); CHECK(std::strcmp(order(), "L") == 0); }
+  }
+}
+
+static void test_tree_rootLaunchdRefused() {
+  resetFake();
+  rt::CaptureTarget t = treeOf(2u);
+  t.pids[0] = 1u;   // hand-assembled: buildTarget admits any non-zero pid
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(t, sink.pump, fakeHost()) == rt::BackendStart::kNoTarget);
+  CHECK(g_orderLen == 0u);   // refused before enumeration
+}
+
+static void test_tree_listFailureIsDeviceError() {
+  resetFake();
+  g_listStatus = 0xBADu;
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(100u), sink.pump, fakeHost()) == rt::BackendStart::kDeviceError);
+  CHECK(backend.failStage() == macos::StartStage::kListProcesses);
+  CHECK(backend.failStatus() == 0xBADu);
+  CHECK(std::strcmp(order(), "L") == 0);
+}
+
+static void test_tree_hostSubtreeExcluded() {
+  resetFake();
+  g_hostRoot = 900u;   // Concord main under the shared window's tree
+  g_parentOf[950] = 900u; g_parentOf[900] = 150u; g_parentOf[150] = 100u; g_parentOf[100] = 1u;
+  object(1u, 950u); object(2u, 150u);
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(100u), sink.pump, fakeHost()) == rt::BackendStart::kOk);
+  CHECK(g_tapObjectCount == 1u && g_tapObjects[0] == 2u);   // 950 is Concord's own: excluded
+}
+
+// A FULL BUFFER REFUSES, EVEN WHEN IT HOLDS A REAL DESCENDANT. The HAL's size
+// read and data read are two calls, so a list that grew past kMaxProcessObjects
+// between them comes back holding EXACTLY that many entries -- indistinguishable
+// here from a list that really was that long. Refusing a full buffer outright,
+// before the match loop ever runs, is the only reading that never classifies a
+// subset as the whole tree.
+static void test_tree_fullListRefusesEvenWithALegitimateDescendant() {
+  resetFake();
+  g_parentOf[100] = 1u;      // owner
+  g_parentOf[300] = 100u;    // a legitimate descendant of the owner
+  object(1u, 300u);          // present in the list, and still refused with it
+  for (rt::u32 i = 1u; i < rt::kMaxProcessObjects; ++i) { object(2u, 500u); }
+  CHECK(g_listCount == rt::kMaxProcessObjects);
+
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(100u), sink.pump, fakeHost()) == rt::BackendStart::kDeviceError);
+  CHECK(backend.failStage() == macos::StartStage::kListProcesses);
+  CHECK(backend.failStatus() == macos::kStatusListOverflow);
+  CHECK(std::strchr(order(), 'T') == nullptr);   // no tap: refused before createProcessTap
+}
+
+// THE CONTROL FOR THE CASE ABOVE. One entry short of the cap, with the same
+// descendant present, succeeds -- so the case above is provably about the
+// buffer being full, not about anything else in the fixture.
+static void test_tree_belowCapWithSameDescendantSucceeds() {
+  resetFake();
+  g_parentOf[100] = 1u;
+  g_parentOf[300] = 100u;
+  object(1u, 300u);
+  for (rt::u32 i = 1u; i < rt::kMaxProcessObjects - 1u; ++i) { object(2u, 500u); }
+  CHECK(g_listCount == rt::kMaxProcessObjects - 1u);
+
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(100u), sink.pump, fakeHost()) == rt::BackendStart::kOk);
+  CHECK(g_tapObjectCount == 1u && g_tapObjects[0] == 1u);
+  backend.stop();
+}
+
+// RESOLVETREE'S OWN ONE-ROOT CHECK. buildTarget already refuses a multi-PID
+// descendant request, so this hand-assembles a target to reach the backend
+// directly -- the only way to exercise resolveTree's own `pidCount != 1u`
+// guard rather than the caller-side one buildTarget enforces first.
+static void test_tree_multiPidDescendantRequestRefusedBeforeEnumeration() {
+  resetFake();
+  g_parentOf[100] = 1u;
+  rt::CaptureTarget t = treeOf(100u);
+  t.pidCount  = 2u;
+  t.pids[1]   = 101u;
+
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(t, sink.pump, fakeHost()) == rt::BackendStart::kNoTarget);
+  CHECK(g_orderLen == 0u);   // refused before enumeration: no HAL call at all
+}
+
+// THE CONTROL FOR THE CASE ABOVE. The same owner with pidCount 1 -- what
+// buildTarget actually produces -- proceeds to enumerate and succeeds, so the
+// refusal above is provably about the second pid, not the owner or fixture.
+static void test_tree_singlePidDescendantRequestEnumeratesAndSucceeds() {
+  resetFake();
+  g_parentOf[100] = 1u;
+  g_parentOf[300] = 100u;
+  object(1u, 300u);
+  rt::CaptureTarget t = treeOf(100u);
+  CHECK(t.pidCount == 1u);
+
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(t, sink.pump, fakeHost()) == rt::BackendStart::kOk);
+  CHECK(order()[0] == 'L');
+  backend.stop();
+}
+
+// RED-TEAM PoC (#3394 PR 2 Phase 4), end to end through resolveTree. The owner
+// (950) is a process Concord main (900) spawned; its helper (960) holds the
+// audio object. Every object in this list is inside the host's own subtree, so
+// I4 ("never contains the host's own subtree") requires that no tap be created.
+static void test_redteam_tree_ownerInsideHostSubtreeCreatesNoTap() {
+  resetFake();
+  g_hostRoot = 900u;
+  g_parentOf[900] = 1u; g_parentOf[950] = 900u; g_parentOf[960] = 950u;
+  object(1u, 950u); object(2u, 960u);
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  const rt::BackendStart r = backend.start(treeOf(950u), sink.pump, fakeHost());
+  if (r == rt::BackendStart::kOk) {
+    std::fprintf(stderr, "PoC: tap created over %u host-subtree object(s): %u %u\n",
+                 g_tapObjectCount, g_tapObjects[0], g_tapObjects[1]);
+  }
+  CHECK(r == rt::BackendStart::kNoTarget);
+  CHECK(std::strchr(order(), 'T') == nullptr);
+  backend.stop();
+}
+
+// CONTROL: the same objects with the owner reparented to launchd (outside the
+// host subtree) are captured, so the refusal above is about host ancestry only.
+static void test_redteam_tree_ownerOutsideHostSubtreeIsCaptured() {
+  resetFake();
+  g_hostRoot = 900u;
+  g_parentOf[900] = 1u; g_parentOf[950] = 1u; g_parentOf[960] = 950u;
+  object(1u, 950u); object(2u, 960u);
+  const macos::HalApi hal = fakeHal();
+  macos::TapBackend backend(hal, "14.4");
+  Sink sink;
+  CHECK(backend.start(treeOf(950u), sink.pump, fakeHost()) == rt::BackendStart::kOk);
+  CHECK(g_tapObjectCount == 2u);
+  backend.stop();
+}
+
 int main() {
+  test_redteam_tree_ownerOutsideHostSubtreeIsCaptured();
+  test_redteam_tree_ownerInsideHostSubtreeCreatesNoTap();
   test_floor_backendExistsOnlyAtOrAboveTheProductFloor();
   test_start_belowFloorRefusesWithoutTouchingTheOs();
   test_start_emptyTargetIsRefusedBeforeAnyOsCall();
@@ -891,6 +1146,18 @@ int main() {
   test_stop_destroysWhileACallbackIsStillInsideTheGate();
   test_stop_aFailedDestroyIsCountedRatherThanSwallowed();
   test_stop_aCleanTeardownCountsNoDestroyFailures();
+
+  test_tree_filtersToObjectHoldingDescendants();
+  test_tree_ownerWithoutObjectUsesDescendants();
+  test_tree_emptyRefusesBeforeTap();
+  test_tree_capRefusesNeverSubsets();
+  test_tree_rootLaunchdRefused();
+  test_tree_listFailureIsDeviceError();
+  test_tree_hostSubtreeExcluded();
+  test_tree_fullListRefusesEvenWithALegitimateDescendant();
+  test_tree_belowCapWithSameDescendantSucceeds();
+  test_tree_multiPidDescendantRequestRefusedBeforeEnumeration();
+  test_tree_singlePidDescendantRequestEnumeratesAndSucceeds();
 
   std::printf("macos_tap_test: %d checks passed\n", g_checks);
   return 0;

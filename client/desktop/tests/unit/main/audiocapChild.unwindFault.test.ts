@@ -179,7 +179,7 @@ describe('audiocap child failed-start unwind (#3197)', () => {
     }
   );
 
-  // I-PID, THE TEARDOWN HALF. `unwindFailedStart` concatenates the caller's
+  // I-PID, THE TEARDOWN HALF. `unwindCapture` concatenates the caller's
   // message with the teardown exception into ONE postFault('start', ...), and
   // only the caller's half was routed through `pidFreeErrorMessage` when that
   // helper first shipped. Both halves run after `resolveTargetPid` succeeded,
